@@ -19,8 +19,9 @@
 //! scan, colour, pixel format or aspect the engine cannot produce yet, an
 //! invalid size, or a format on a kind slice B does not convert for).
 //!
-//! Every type is `#[non_exhaustive]`: slice C adds per-output rates, slice D
-//! passthrough and slice F subtitle slots.
+//! Every type is `#[non_exhaustive]`. Slice C (#343) accepts a format `fps`
+//! other than the canvas rate on converting kinds (a per-output clock); slice D
+//! adds passthrough and slice F subtitle slots.
 
 use serde::{Deserialize, Serialize};
 
@@ -175,7 +176,8 @@ pub struct OutputFormat {
     pub width: u32,
     /// Height in pixels (even, 16..=8192).
     pub height: u32,
-    /// Frame rate; absent ⇒ the canvas rate. Other rates are slice C (#343).
+    /// Frame rate; absent ⇒ the canvas rate. Another rate runs the output on
+    /// its own output clock (slice C, #343, §12.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fps: Option<Fps>,
     /// Scan; only progressive is produced in slice B.
@@ -493,6 +495,47 @@ fn unsupported(output: &Output, detail: &str) -> ConfigError {
     ))
 }
 
+/// Slowest per-output rate (#343), frames per second.
+pub const MIN_OUTPUT_FPS: i64 = 1;
+/// Fastest per-output rate (#343), frames per second.
+pub const MAX_OUTPUT_FPS: i64 = 120;
+
+/// Whether `fps` is a rate an output clock and its encoder produce (#343):
+/// positive `num/den` with `den` 1 or 1001 and 1..=120 fps.
+#[must_use]
+pub fn is_output_rate(fps: Fps) -> bool {
+    let r = fps.rational();
+    r.num > 0
+        && (r.den == 1 || r.den == 1001)
+        && i128::from(r.num) >= i128::from(MIN_OUTPUT_FPS) * i128::from(r.den)
+        && i128::from(r.num) <= i128::from(MAX_OUTPUT_FPS) * i128::from(r.den)
+}
+
+/// The output's own frame rate when it differs from the canvas (#343): the
+/// output runs on a per-output clock. `None` = Program's rate (no format fps,
+/// or an equal rational).
+#[must_use]
+pub fn output_rate(output: &Output, canvas: &Canvas) -> Option<Fps> {
+    output
+        .format()
+        .and_then(|f| f.fps)
+        .filter(|fps| !rationals_equal(*fps, canvas.fps))
+}
+
+/// Whether two rates are the same rational (`60000/2002` = `30000/1001`).
+#[must_use]
+pub fn same_rate(a: Fps, b: Fps) -> bool {
+    rationals_equal(a, b)
+}
+
+/// Whether the output is a binding of the Program egress (every kind but the
+/// RTSP server, which the engine does not run as a sink yet, and a display
+/// head, which is fed outside the egress).
+#[must_use]
+pub const fn is_packet_output(output: &Output) -> bool {
+    !matches!(output, Output::RtspServer { .. } | Output::Display { .. })
+}
+
 const fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         let t = a % b;
@@ -681,13 +724,28 @@ fn validate_format(
     }
     if let Some(fps) = format.fps {
         if !rationals_equal(fps, canvas.fps) {
-            return Err(unsupported(
-                output,
-                &format!(
-                    "format fps {fps} differs from the Program's {} (per-output rates are slice C, #343)",
-                    canvas.fps
-                ),
-            ));
+            // Slice C (#343, §12.6): a rate output runs on its own output
+            // clock, latching Program frame-sync style. Only kinds the engine
+            // converts for, at a rate an output encoder and HLS/TS carry.
+            if !cap.format_convertible {
+                return Err(unsupported(
+                    output,
+                    &format!(
+                        "format fps {fps} differs from the Program's {} and this output kind \
+                         has no per-output clock (hls, ll_hls, srt, rist and rtmp do)",
+                        canvas.fps
+                    ),
+                ));
+            }
+            if !is_output_rate(fps) {
+                return Err(unsupported(
+                    output,
+                    &format!(
+                        "format fps {fps} is not an output rate: num/den with den 1 or 1001, \
+                         {MIN_OUTPUT_FPS}..={MAX_OUTPUT_FPS} fps"
+                    ),
+                ));
+            }
         }
     }
     if !format.scan.is_progressive() {

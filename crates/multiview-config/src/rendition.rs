@@ -690,7 +690,9 @@ fn video_key_for_output(
         height,
         fit,
         bitrate_kbps: output.video_slot0().and_then(|slot| slot.bitrate_kbps),
-        cadence,
+        // #343: a rate output's encoder runs at its own rate.
+        cadence: crate::output_format::output_rate(output, &config.canvas)
+            .map_or(cadence, |fps| fps.rational().reduce()),
         pixel_format: config.canvas.pixel_format.clone(),
         color: color.clone(),
         gpu_pin: output.gpu_pin().cloned(),
