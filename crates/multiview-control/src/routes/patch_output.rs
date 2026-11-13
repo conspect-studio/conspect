@@ -323,7 +323,10 @@ pub(crate) fn take(
 /// The `outputs` section of `GET /patch`: every output the caller passes the
 /// output axis for, with its format, video slot 0 (from the engine readback;
 /// a feed it cannot read is `{redacted:true}`) and audio slots (from config).
-pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlResult<Vec<Value>> {
+pub(crate) async fn outputs_view(
+    state: &AppState,
+    principal: &Principal,
+) -> ControlResult<Vec<Value>> {
     let resources = crate::boot_model::accepted_resources(state, "outputs")?
         .map_or_else(|| state.outputs.list(), Ok)?;
     // The accepted crosspoints (#342 review M3): audio slot 0 reports the
@@ -338,8 +341,13 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
         .and_then(|c| c.routing.snapshot());
     let redacted = json!({ "redacted": true });
     // A layout feed is readable only with Read on the layout AND every
-    // source it shows (§6.3), exactly as `GET /routing` redacts it.
-    let layouts = super::routing::layout_sources(state)?;
+    // source it shows (§6.3), exactly as `GET /routing` redacts it. Only the
+    // layouts the live readback names for an output this caller may see are
+    // read (#342 review T-I2), each once, through the bounded off-handler
+    // [`super::output_routing::read_layout`] (a caller without Read on the
+    // layout id costs no read: it is redacted regardless). Never a
+    // synchronous whole-library list on the async handler.
+    let layouts = layouts_on_air(state, principal, &resources, live.as_ref()).await?;
     let mut out = Vec::new();
     for versioned in resources {
         let api_id = versioned.resource.id;
@@ -411,4 +419,66 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
         }));
     }
     Ok(out)
+}
+
+/// The source closures of the layouts the live readback shows (on air or
+/// pending) on an output `principal` may see, read once each through the
+/// bounded off-handler [`super::output_routing::read_layout`] (#342 review
+/// T-I2). A layout the caller cannot read is not read (it is redacted).
+async fn layouts_on_air(
+    state: &AppState,
+    principal: &Principal,
+    resources: &[crate::resource_store::VersionedResource],
+    live: Option<&crate::output_routing::RoutingLive>,
+) -> ControlResult<super::routing::LayoutSources> {
+    let mut wanted: Vec<String> = Vec::new();
+    if let Some(live) = live {
+        for versioned in resources {
+            if !may_patch_output(principal, &versioned.resource.id) {
+                continue;
+            }
+            let Ok(body) =
+                serde_json::from_value::<multiview_config::Output>(versioned.resource.body.clone())
+            else {
+                continue;
+            };
+            let Some(readback) = live.outputs.get(&body.id()) else {
+                continue;
+            };
+            let buses = std::iter::once(readback.bus.as_str())
+                .chain(readback.pending.as_ref().map(|(bus, _)| bus.as_str()));
+            for bus in buses {
+                if let Some(id) = bus.strip_prefix("aux:") {
+                    if crate::auth::authorize_object(principal, id).is_ok()
+                        && !wanted.iter().any(|w| w == id)
+                    {
+                        wanted.push(id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    let mut layouts = super::routing::LayoutSources::new();
+    for id in wanted {
+        let read = super::output_routing::read_layout(state, &id).await?;
+        if let Some(body) = read.body.as_ref() {
+            if let Ok(doc) = multiview_config::LayoutDocument::from_body(body) {
+                let sources = doc
+                    .cells
+                    .iter()
+                    .filter_map(|c| c.source.input_id.clone())
+                    .collect();
+                // #306: the layout's `audio` attribute rides along (what
+                // `follow` resolves to on it), exactly as `layout_sources`.
+                layouts.insert(
+                    id,
+                    super::routing::LayoutReadback {
+                        sources,
+                        audio: doc.audio,
+                    },
+                );
+            }
+        }
+    }
+    Ok(layouts)
 }

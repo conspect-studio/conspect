@@ -13,14 +13,14 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_control::output_routing::{
-    AudioPlanCost, OutputLive, OutputOutcome, OutputReformatRequest, OutputRouting,
+    AudioPlanCost, LayoutBody, OutputLive, OutputOutcome, OutputReformatRequest, OutputRouting,
     OutputTakeRequest, PlanCost, PlanPath, PlanRefusal, ReformatSubmitError, RoutedAudio,
     RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
 };
 
 use crate::output_routing::{
     FallbackReason, OutputRoutingHandle, OutputRoutingSlot, OutputTake, ReformatRefusal,
-    RefuseReason, TakeOutcome, TakeResult, DEFAULT_MAX_AUX_CANVASES, DEFAULT_MAX_ENCODERS,
+    RefuseReason, TakeOutcome, TakeResult, DEFAULT_MAX_ENCODERS,
 };
 use crate::routing_audio::AudioChoice;
 use crate::routing_aux::PictureBus;
@@ -218,7 +218,6 @@ const RELAY_CAPACITY: usize = 64;
 pub struct OutputRoutingAdapter {
     slot: OutputRoutingSlot,
     max_encoders: usize,
-    max_aux_canvases: usize,
     outcome_tx: SyncSender<OutputOutcome>,
     outcome_rx: Mutex<Option<Receiver<OutputOutcome>>>,
     /// The handle whose outcome stream the pump already took.
@@ -240,7 +239,6 @@ impl OutputRoutingAdapter {
         Self {
             slot,
             max_encoders: DEFAULT_MAX_ENCODERS,
-            max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             outcome_tx,
             outcome_rx: Mutex::new(Some(outcome_rx)),
             pumped: Mutex::new(None),
@@ -340,11 +338,11 @@ impl OutputRouting for OutputRoutingAdapter {
             && !distinct.contains(&bus.as_str());
         if matches!(feed, RoutedFeed::Layout(_))
             && !distinct.contains(&bus.as_str())
-            && distinct.len() >= self.max_aux_canvases
+            && distinct.len() >= handle.max_aux_canvases()
         {
             return Err(PlanRefusal::AuxCapacity {
                 active: distinct.len(),
-                max: self.max_aux_canvases,
+                max: handle.max_aux_canvases(),
             });
         }
         let shared = *feed == RoutedFeed::Program
@@ -515,6 +513,64 @@ impl OutputRouting for OutputRoutingAdapter {
             .map_err(|_| ReformatSubmitError::Busy)
     }
 
+    fn plan_layout_audio(
+        &self,
+        output: &str,
+        video: &RoutedFeed,
+        layout_audio: &multiview_config::LayoutAudio,
+        audio: Option<&RoutedAudio>,
+    ) -> Result<AudioPlanCost, PlanRefusal> {
+        let Some(handle) = self.handle() else {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        };
+        let Some(index) = handle.index_of(output) else {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        };
+        let Some(run_output) = handle.outputs().get(index) else {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        };
+        if !run_output.routable {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        }
+        let snapshot = handle.snapshot();
+        let label = layout_follow_label(layout_audio);
+        audio_cost_following(
+            run_output.program_audio,
+            snapshot.outputs.get(index),
+            Some(video),
+            audio,
+            Some(&label),
+        )
+    }
+
+    fn layout_changed(&self, id: &str, body: Option<LayoutBody>) -> bool {
+        // No run: nothing composes the layout, nothing to tell.
+        let Some(handle) = self.handle() else {
+            return true;
+        };
+        let change = match body {
+            Some(body) if body.0.id == id => crate::output_routing::LayoutChange::Edited(
+                crate::routing_aux::LayoutRef::new(Arc::clone(&body.0)),
+            ),
+            Some(_) => return false,
+            None => crate::output_routing::LayoutChange::Removed {
+                id: id.to_owned(),
+                revision: crate::output_routing::next_layout_revision(),
+            },
+        };
+        handle.try_layout_change(change).is_ok()
+    }
+
+    fn routed_layouts(&self) -> Vec<String> {
+        self.handle().map_or_else(Vec::new, |handle| {
+            handle
+                .routed_layouts()
+                .into_iter()
+                .filter_map(|bus| bus.strip_prefix("aux:").map(str::to_owned))
+                .collect()
+        })
+    }
+
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
         let handle = self.handle().ok_or(TakeSubmitError::Busy)?;
         let index = handle
@@ -605,6 +661,28 @@ fn audio_cost(
     video: Option<&RoutedFeed>,
     audio: Option<&RoutedAudio>,
 ) -> Result<AudioPlanCost, PlanRefusal> {
+    audio_cost_following(program_audio, view, video, audio, None)
+}
+
+/// The carried label `follow` resolves to on a routed layout whose `audio`
+/// attribute is `audio` (the engine's `AudioSource::follow`, §5.1).
+fn layout_follow_label(audio: &multiview_config::LayoutAudio) -> String {
+    match audio {
+        multiview_config::LayoutAudio::None => "none".to_owned(),
+        multiview_config::LayoutAudio::Source(id) => format!("src:{id}"),
+        _ => "program".to_owned(),
+    }
+}
+
+/// [`audio_cost`] where `follow` on the new video resolves to
+/// `follow_label` when given (a routed layout's attribute).
+fn audio_cost_following(
+    program_audio: bool,
+    view: Option<&crate::output_routing::OutputRouteView>,
+    video: Option<&RoutedFeed>,
+    audio: Option<&RoutedAudio>,
+    follow_label: Option<&str>,
+) -> Result<AudioPlanCost, PlanRefusal> {
     if take_audio(audio, program_audio).is_some() && !program_audio {
         return Err(PlanRefusal::AudioUnsupported);
     }
@@ -614,7 +692,11 @@ fn audio_cost(
     };
     let choice = audio.map_or_else(|| view.audio_choice.clone(), RoutedAudio::label);
     let bus = video.map_or_else(|| view.bus.clone(), RoutedFeed::bus_name);
-    let changes = carried_label(&choice, &bus) != view.audio;
+    let carried = match follow_label {
+        Some(label) if choice == "follow" => label.to_owned(),
+        _ => carried_label(&choice, &bus),
+    };
+    let changes = carried != view.audio;
     Ok(AudioPlanCost {
         needs_encoder: changes && !view.private_audio,
     })

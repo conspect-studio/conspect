@@ -1660,6 +1660,11 @@ segment_ms = 1000
 /// A routed layout for the 64x64 test canvas: the Program grid with its two
 /// cells swapped (`b` left, `a` right).
 fn swapped_layout(prefix: &str) -> PictureBus {
+    two_cell_layout(prefix, ["b", "a"])
+}
+
+/// The `swapped` layout id with its cells `order` (left, right).
+fn two_cell_layout(prefix: &str, order: [&str; 2]) -> PictureBus {
     use multiview_core::layout::{Canvas, Cell, FitMode, Layout};
     let cell = |x: f32, source: &str| Cell {
         x,
@@ -1679,12 +1684,14 @@ fn swapped_layout(prefix: &str) -> PictureBus {
             fps_num: 25,
             fps_den: 1,
         },
-        cells: vec![cell(0.0, "b"), cell(0.5, "a")],
+        cells: vec![cell(0.0, order[0]), cell(0.5, order[1])],
     };
     PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::new(
         crate::aux_layout::RoutedLayout {
             id: "swapped".to_owned(),
             slates: vec![multiview_config::FailoverSlate::Black; 2],
+            audio: multiview_config::LayoutAudio::default(),
+            revision: crate::output_routing::next_layout_revision(),
             layout,
         },
     )))
@@ -1823,6 +1830,128 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
         );
     }
     assert_eq!(run.final_snapshot.dynamic_encoders_live, 0);
+}
+
+/// PR 2 (#306) through the real pipeline: a live edit of the routed layout
+/// (its cells un-swapped) reaches output 1 with no take: from an IDR on, its
+/// picture is Program's unswapped. Then the layout is deleted: output 1 falls
+/// back to Program at a keyframe. Output 0 keeps every Program window and
+/// output 1's PTS step stays one tick throughout.
+#[test]
+#[allow(clippy::too_many_lines)] // One end-to-end scenario with its assertions.
+fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
+    const TICKS: u64 = 300;
+    let observed = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&observed);
+    let run = drive_config(LAYOUT_CONFIG, false, "live_edit", TICKS, move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+            slot.load()
+        });
+        let outcomes = handle.outcomes().expect("one outcome reader");
+        wait_for("the first routing tick", Duration::from_secs(10), || {
+            (handle.snapshot().video_keys > 0).then_some(())
+        });
+        std::thread::sleep(Duration::from_millis(800));
+        let swapped = swapped_layout("live_edit");
+        handle.try_take(take("to-layout", 1, swapped)).unwrap();
+        let applied = wait_for("to-layout outcome", Duration::from_secs(10), || {
+            outcomes.try_recv().ok()
+        });
+        assert_eq!(applied.outcome, TakeResult::Applied, "{applied:?}");
+        // Past the per-key IDR floor, then the live edit.
+        std::thread::sleep(Duration::from_millis(1500));
+        let PictureBus::Layout(edited) = two_cell_layout("live_edit", ["a", "b"]) else {
+            panic!("a layout bus");
+        };
+        let edit_tick = handle.snapshot().outputs[1].since_tick;
+        handle
+            .try_layout_change(crate::output_routing::LayoutChange::Edited(edited))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(outcomes.try_recv().is_err(), "a live edit is not a take");
+        assert_eq!(handle.snapshot().outputs[1].bus, "aux:swapped");
+        handle
+            .try_layout_change(crate::output_routing::LayoutChange::Removed {
+                id: "swapped".to_owned(),
+                revision: crate::output_routing::next_layout_revision(),
+            })
+            .unwrap();
+        let fell = wait_for("fallback outcome", Duration::from_secs(10), || {
+            outcomes.try_recv().ok()
+        });
+        assert_eq!(
+            fell.outcome,
+            TakeResult::Fallback(crate::output_routing::FallbackReason::AuxFailed),
+            "{fell:?}"
+        );
+        wait_for("back on Program", Duration::from_secs(2), || {
+            (handle.snapshot().outputs[1].bus == "program").then_some(())
+        });
+        *record.lock().unwrap() = Some((applied, edit_tick, fell));
+    });
+    let (applied, edit_tick, fell) = observed.lock().unwrap().clone().expect("observed");
+    assert_eq!(edit_tick, applied.tick, "the edit did not re-take");
+    assert_eq!(run.frames, TICKS);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(pts_of(&run.outputs[0]), all, "output 0 gets every window");
+    assert_eq!(
+        pts_of(&run.outputs[1]),
+        all,
+        "output 1: one packet per tick"
+    );
+    let fell_at = run.outputs[1]
+        .iter()
+        .find(|p| p.0 == i64::try_from(fell.tick).unwrap())
+        .unwrap();
+    assert!(fell_at.1, "the fallback cut is a keyframe");
+    // Before the edit the halves are swapped; after it they match Program.
+    let program = decode_luma(&run.video[0]);
+    let routed = decode_luma(&run.video[1]);
+    let mean = |plane: &[u8], x0: usize| -> i64 {
+        let mut sum = 0i64;
+        let mut n = 0i64;
+        for row in 8..56 {
+            for x in x0 + 8..x0 + 24 {
+                sum += i64::from(plane[row * 64 + x]);
+                n += 1;
+            }
+        }
+        sum / n
+    };
+    let at = i64::try_from(applied.tick).unwrap();
+    let fell_tick = i64::try_from(fell.tick).unwrap();
+    let mut swapped_seen = 0;
+    let mut unswapped_seen = 0;
+    let mut first_unswapped = None;
+    for t in at + 5..fell_tick {
+        let (Some(p), Some(r)) = (program.get(&t), routed.get(&t)) else {
+            continue;
+        };
+        let (pl, pr, rl, rr) = (mean(p, 0), mean(p, 32), mean(r, 0), mean(r, 32));
+        if (rl - pr).abs() <= 6 && (rr - pl).abs() <= 6 {
+            assert!(
+                unswapped_seen == 0,
+                "tick {t}: never back to swapped after the edit"
+            );
+            swapped_seen += 1;
+        } else if (rl - pl).abs() <= 6 && (rr - pr).abs() <= 6 {
+            first_unswapped.get_or_insert(t);
+            unswapped_seen += 1;
+        }
+    }
+    assert!(
+        swapped_seen >= 10,
+        "swapped before the edit ({swapped_seen})"
+    );
+    assert!(unswapped_seen >= 10, "the edit is live ({unswapped_seen})");
+    let first = first_unswapped.unwrap();
+    // The edited picture starts within a GOP of a forced keyframe.
+    assert!(
+        run.outputs[1]
+            .iter()
+            .any(|p| p.1 && (first - 3..=first + 1).contains(&p.0)),
+        "an IDR near the edit at {first}"
+    );
 }
 
 /// ADR-0108 slice 2 §6.1: a run whose config persists `audio = { source =

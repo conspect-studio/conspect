@@ -6698,8 +6698,9 @@ export interface components {
             fits: boolean;
             /**
              * @description The audio the output carries on this video feed when its audio
-             *     follows: `program` (the mix), `source` (the source's own) or `preview`
-             *     (the PVW source's). A layout carries the program mix.
+             *     follows: `program` (the mix), `source` (the source's own), `preview`
+             *     (the PVW source's) or `none` (silence). A layout carries its `audio`
+             *     attribute: the mix by default, `none`, or one cell's `source`.
              */
             follow_audio?: string | null;
             /**
@@ -15858,6 +15859,15 @@ export interface operations {
             };
             /** @description Role lacks Read. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description engine-busy: every layout-read slot is in use (a layout on air on a visible output); retry */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
