@@ -266,6 +266,10 @@ pub(crate) struct SessionState {
     protocol: Option<String>,
     closed_tx: watch::Sender<Option<WtError>>,
     connect_send: tokio::sync::Mutex<Option<ConnectSend>>,
+    /// The runtime the connection is served on (the front door's). Every
+    /// task this session spawns runs there, whichever runtime or thread
+    /// calls [`WtSession::close`] or drops the last handle.
+    runtime: tokio::runtime::Handle,
 }
 
 impl SessionState {
@@ -297,14 +301,12 @@ impl SessionState {
     }
 
     /// Sends `CLOSE_WEBTRANSPORT_SESSION` on the CONNECT stream and finishes
-    /// it (best effort, on the current Tokio runtime).
+    /// it (best effort, bounded), on the connection's runtime: callable from
+    /// any runtime or from a plain thread.
     fn send_close(self: &Arc<Self>, code: u32, reason: &str) {
         let capsule = Bytes::from(capsule::encode_close(code, reason));
         let state = Arc::clone(self);
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        handle.spawn(async move {
+        self.runtime.spawn(async move {
             let mut guard = state.connect_send.lock().await;
             if let Some(mut send) = guard.take() {
                 // Bounded: a peer that never grants flow-control credit
@@ -376,6 +378,7 @@ pub(crate) struct SessionParts {
 
 impl WtSession {
     pub(crate) fn create(
+        runtime: tokio::runtime::Handle,
         conn: noq::Connection,
         session_id: u64,
         protocol: Option<String>,
@@ -391,6 +394,7 @@ impl WtSession {
             protocol,
             closed_tx: watch::channel(None).0,
             connect_send: tokio::sync::Mutex::new(Some(connect_send)),
+            runtime,
         });
         let session = Self {
             inner: Arc::new(Handle {
@@ -422,6 +426,16 @@ impl WtSession {
         out
     }
 
+    /// The datagram context prefix: the quarter stream id of the CONNECT
+    /// stream (RFC 9297 section 2.1, draft-ietf-webtrans-http3 section 4.5),
+    /// which is what browsers send and expect.
+    ///
+    /// Interop note: `web-transport-moq` 1.3.5 (moq-tokio's own client)
+    /// prefixes datagrams with the FULL CONNECT stream id, so its datagrams
+    /// and ours do not round-trip until its prefix matches the draft. The
+    /// moq-transport-16/18 versions this deployment uses deliver objects on
+    /// streams, not datagrams, so nothing depends on it today; do not change
+    /// this framing to match that client (browsers would break).
     fn quarter_id(&self) -> u64 {
         self.inner.state.session_id / 4
     }

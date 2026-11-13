@@ -9,6 +9,9 @@ pub struct Counters {
     pub connections_accepted: AtomicU64,
     /// Incoming connections refused by the global or per-source cap.
     pub connections_refused: AtomicU64,
+    /// Incoming connections refused because `max_handshakes` (or the
+    /// per-source handshake cap) were in progress.
+    pub handshakes_refused: AtomicU64,
     /// Handshakes that failed or exceeded the handshake deadline.
     pub handshakes_failed: AtomicU64,
     /// Requests handed to the [`Site`](crate::Site).
@@ -24,6 +27,9 @@ pub struct Counters {
     /// (oversized control frame, SETTINGS late, partial frame too old,
     /// QPACK stream over its byte cap).
     pub control_stream_rejections: AtomicU64,
+    /// Requests whose site did not return the response head within
+    /// `H3Limits::response_head_timeout`.
+    pub response_timeouts: AtomicU64,
     /// WebTransport sessions accepted (200 sent).
     pub wt_sessions: AtomicU64,
     /// Extended `CONNECTs` answered 429 (the one-session-per-connection rule).

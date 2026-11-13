@@ -99,6 +99,14 @@ struct Caps {
 }
 
 impl Caps {
+    /// True when a connection from `remote` would be over a cap now (a
+    /// cheap pre-check before the handshake; nothing is reserved).
+    fn full(caps: &Arc<Mutex<Self>>, remote: SocketAddr) -> bool {
+        let c = unpoison(caps.lock());
+        c.total >= c.max_total
+            || c.per_source.get(&source_key(remote)).copied().unwrap_or(0) >= c.max_per_source
+    }
+
     fn try_take(caps: &Arc<Mutex<Self>>, remote: SocketAddr) -> Option<CapGuard> {
         let key = source_key(remote);
         let mut c = unpoison(caps.lock());
@@ -226,7 +234,7 @@ impl H3Endpoint {
                     noq_runtime,
                 )
                 .map_err(Error::Io)?;
-                let accept = tokio::spawn(accept_loop(
+                let accept = tokio::runtime::Handle::current().spawn(accept_loop(
                     endpoint.clone(),
                     site,
                     wt,
@@ -282,6 +290,28 @@ impl H3Endpoint {
     }
 }
 
+/// Accounting of handshakes in progress (`H3Limits::max_handshakes`, and
+/// per source). Separate from the connection caps: an incomplete handshake
+/// never holds a connection slot.
+#[derive(Debug)]
+struct Handshakes(Arc<Mutex<Caps>>);
+
+impl Handshakes {
+    fn new(max_total: usize, max_per_source: usize) -> Self {
+        Self(Arc::new(Mutex::new(Caps {
+            total: 0,
+            per_source: HashMap::new(),
+            max_total,
+            max_per_source,
+        })))
+    }
+
+    /// A handshake slot, released on drop (also on task abort).
+    fn try_take(&self, remote: SocketAddr) -> Option<CapGuard> {
+        Caps::try_take(&self.0, remote)
+    }
+}
+
 async fn accept_loop(
     endpoint: noq::Endpoint,
     site: Arc<dyn Site>,
@@ -296,20 +326,27 @@ async fn accept_loop(
         max_total: limits.max_connections,
         max_per_source: limits.max_connections_per_source,
     }));
+    let handshakes = Handshakes::new(limits.max_handshakes, limits.max_handshakes_per_source);
+    let runtime = tokio::runtime::Handle::current();
     while let Some(incoming) = endpoint.accept().await {
         let remote = incoming.remote_address();
-        let Some(cap) = Caps::try_take(&caps, remote) else {
+        if Caps::full(&caps, remote) {
             Counters::inc(&counters.connections_refused);
             incoming.refuse();
             continue;
+        }
+        let Some(handshake) = handshakes.try_take(remote) else {
+            Counters::inc(&counters.handshakes_refused);
+            incoming.refuse();
+            continue;
         };
+        let caps = Arc::clone(&caps);
         let site = Arc::clone(&site);
         let wt = wt.clone();
         let limits = limits.clone();
         let peers = peers.clone();
         let counters = Arc::clone(&counters);
-        tokio::spawn(async move {
-            let _cap = cap;
+        runtime.spawn(async move {
             let connecting = match incoming.accept() {
                 Ok(connecting) => connecting,
                 Err(err) => {
@@ -330,6 +367,14 @@ async fn accept_loop(
                     tracing::debug!(%remote, "QUIC handshake timed out");
                     return;
                 }
+            };
+            drop(handshake);
+            // The connection caps are charged only now: incomplete
+            // handshakes never occupy an established connection's slot.
+            let Some(_cap) = Caps::try_take(&caps, remote) else {
+                Counters::inc(&counters.connections_refused);
+                conn.close(noq::VarInt::from_u32(0x107), b"connection limit");
+                return;
             };
             Counters::inc(&counters.connections_accepted);
             let _peer = peers.map(|hook| {
@@ -373,5 +418,21 @@ mod tests {
         assert!(Caps::try_take(&caps, b).is_none());
         drop(g1);
         assert!(Caps::try_take(&caps, b).is_some());
+    }
+
+    #[test]
+    fn handshake_slots_are_bounded_and_released() {
+        let hs = Handshakes::new(2, 1);
+        let a: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
+        let a2: SocketAddr = "[2001:db8::2]:1".parse().unwrap();
+        let b: SocketAddr = "[2001:db9::1]:1".parse().unwrap();
+        let c: SocketAddr = "[2001:dba::1]:1".parse().unwrap();
+        let g = hs.try_take(a).unwrap();
+        assert!(hs.try_take(a2).is_none(), "per source (same /64)");
+        let _h = hs.try_take(b).unwrap();
+        assert!(hs.try_take(c).is_none(), "global");
+        drop(g);
+        assert!(hs.try_take(c).is_some());
+        assert_eq!(unpoison(hs.0.lock()).total, 1);
     }
 }

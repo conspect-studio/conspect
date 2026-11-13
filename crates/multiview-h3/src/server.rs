@@ -342,6 +342,8 @@ struct Shared {
     limits: H3Limits,
     counters: Arc<Counters>,
     router: Arc<Router>,
+    /// The runtime serving this connection (see [`serve_connection`]).
+    runtime: tokio::runtime::Handle,
 }
 
 /// Serves one established QUIC connection until it ends.
@@ -356,6 +358,11 @@ struct Shared {
 /// wants another session opens another connection, as the
 /// `max_webtransport_sessions = 1` setting tells it).
 ///
+/// Run it on the front door's runtime: every task the connection or its
+/// WebTransport session spawns (request tasks, the session close) goes to
+/// the runtime this future runs on, captured when it starts, never to the
+/// runtime of whoever later calls into a [`WtSession`].
+///
 /// # Errors
 ///
 /// The h3 handshake failed or the connection closed with an error other
@@ -368,6 +375,7 @@ pub async fn serve_connection(
     limits: &H3Limits,
     counters: Arc<Counters>,
 ) -> Result<(), Error> {
+    let runtime = tokio::runtime::Handle::current();
     let router = Arc::new(Router {
         requests: Arc::new(Semaphore::new(limits.max_concurrent_requests)),
         counters: Arc::clone(&counters),
@@ -402,6 +410,7 @@ pub async fn serve_connection(
         limits: limits.clone(),
         counters,
         router,
+        runtime: runtime.clone(),
     });
     // Bounded: every task holds a request permit (its stream) or is the
     // session task, which holds the CONNECT stream's permit.
@@ -411,14 +420,17 @@ pub async fn serve_connection(
         match h3conn.accept().await {
             Ok(Some(resolver)) => {
                 let shared = Arc::clone(&shared);
-                tasks.spawn(async move {
-                    match resolver.resolve_request().await {
-                        Ok((req, stream)) => handle_request(shared, req, stream).await,
-                        Err(err) => {
-                            tracing::debug!(%err, "h3 request not resolved");
+                tasks.spawn_on(
+                    async move {
+                        match resolver.resolve_request().await {
+                            Ok((req, stream)) => handle_request(shared, req, stream).await,
+                            Err(err) => {
+                                tracing::debug!(%err, "h3 request not resolved");
+                            }
                         }
-                    }
-                });
+                    },
+                    &runtime,
+                );
             }
             Ok(None) => break Ok(()),
             Err(err) if err.is_h3_no_error() => break Ok(()),
@@ -495,6 +507,7 @@ async fn handle_request(shared: Arc<Shared>, req: http::Request<()>, mut stream:
         return;
     }
     let parts_for_session = webtransport::WtSession::create(
+        shared.runtime.clone(),
         shared.conn.clone(),
         session_id,
         selected.map(str::to_owned),
@@ -512,8 +525,31 @@ async fn handle_request(shared: Arc<Shared>, req: http::Request<()>, mut stream:
     let state = parts_for_session.state;
     let handler_fut = handler.accept(session, token, parts, shared.peer);
     let driver = webtransport::drive_connect_stream(recv, Arc::clone(&state));
-    tokio::join!(handler_fut, driver);
+    run_session(handler_fut, driver, shared.limits.wt_close_grace).await;
     shared.router.end();
+}
+
+/// Runs the handler beside the CONNECT-stream driver. The driver ends when
+/// the session ends (either side's close, FIN, reset, connection loss); the
+/// handler then gets `grace` to return before its future is dropped, so a
+/// handler that ignores `closed()` cannot pin its task and the CONNECT
+/// stream's request permit.
+pub(crate) async fn run_session(
+    handler: impl std::future::Future<Output = ()>,
+    driver: impl std::future::Future<Output = ()>,
+    grace: std::time::Duration,
+) {
+    tokio::pin!(handler, driver);
+    let mut handler_done = false;
+    loop {
+        tokio::select! {
+            () = &mut handler, if !handler_done => handler_done = true,
+            () = &mut driver => break,
+        }
+    }
+    if !handler_done && tokio::time::timeout(grace, handler).await.is_err() {
+        tracing::debug!("WebTransport handler outlived the session grace; dropped");
+    }
 }
 
 /// Converts the h3 request for the [`Site`]: `host` from `:authority` when
@@ -546,10 +582,18 @@ pub fn strip_connection_headers(headers: &mut http::HeaderMap) {
 
 async fn serve_site(shared: &Shared, req: http::Request<()>, stream: H3Stream) {
     Counters::inc(&shared.counters.requests);
-    let (send, recv) = stream.split();
+    let (mut send, recv) = stream.split();
     let req = site_request(req, RequestBody::new(recv));
-    let response = shared.site.call(req, shared.peer).await;
-    if let Err(err) = send_site_response(send, response).await {
+    let call = shared.site.call(req, shared.peer);
+    let Ok(response) = tokio::time::timeout(shared.limits.response_head_timeout, call).await else {
+        // The site future (and the request body's receive half in it) is
+        // dropped; resetting the send half releases the request permit.
+        Counters::inc(&shared.counters.response_timeouts);
+        send.stop_stream(Code::H3_REQUEST_REJECTED);
+        return;
+    };
+    if let Err(err) = send_site_response(send, response, shared.limits.response_stall_timeout).await
+    {
         tracing::debug!(%err, "h3 response not completed");
     }
 }
@@ -557,11 +601,17 @@ async fn serve_site(shared: &Shared, req: http::Request<()>, stream: H3Stream) {
 async fn send_site_response(
     mut send: H3Send,
     response: http::Response<ResponseBody>,
+    stall: std::time::Duration,
 ) -> Result<(), BoxError> {
     let (mut parts, mut body) = response.into_parts();
     strip_connection_headers(&mut parts.headers);
-    send.send_response(http::Response::from_parts(parts, ()))
-        .await?;
+    let head = http::Response::from_parts(parts, ());
+    // Every write is bounded by `stall` (a peer that grants no flow-control
+    // credit); the body itself may take any time (SSE).
+    if stalled(stall, send.send_response(head)).await? {
+        send.stop_stream(Code::H3_REQUEST_CANCELLED);
+        return Err("response write stalled".into());
+    }
     while let Some(frame) = body.frame().await {
         let frame = match frame {
             Ok(frame) => frame,
@@ -572,19 +622,38 @@ async fn send_site_response(
         };
         match frame.into_data() {
             Ok(data) => {
-                if !data.is_empty() {
-                    send.send_data(data).await?;
+                if !data.is_empty() && stalled(stall, send.send_data(data)).await? {
+                    send.stop_stream(Code::H3_REQUEST_CANCELLED);
+                    return Err("response write stalled".into());
                 }
             }
             Err(frame) => {
                 if let Ok(trailers) = frame.into_trailers() {
-                    send.send_trailers(trailers).await?;
+                    if stalled(stall, send.send_trailers(trailers)).await? {
+                        send.stop_stream(Code::H3_REQUEST_CANCELLED);
+                        return Err("response write stalled".into());
+                    }
                 }
             }
         }
     }
-    send.finish().await?;
+    if stalled(stall, send.finish()).await? {
+        send.stop_stream(Code::H3_REQUEST_CANCELLED);
+        return Err("response write stalled".into());
+    }
     Ok(())
+}
+
+/// Awaits one response write. `Ok(true)`: it made no progress for `stall`
+/// (the caller resets the stream; the write future is already dropped).
+async fn stalled<E: Into<BoxError>>(
+    stall: std::time::Duration,
+    write: impl std::future::Future<Output = Result<(), E>>,
+) -> Result<bool, BoxError> {
+    match tokio::time::timeout(stall, write).await {
+        Ok(res) => res.map(|()| false).map_err(Into::into),
+        Err(_) => Ok(true),
+    }
 }
 
 #[cfg(test)]
