@@ -7820,6 +7820,200 @@
         }
       }
     },
+    "/api/v1/patch": {
+      "get": {
+        "tags": [
+          "patch"
+        ],
+        "summary": "The live patch (mixer plane), built from the engine's readback.",
+        "operationId": "get_patch",
+        "responses": {
+          "200": {
+            "description": "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ] }` from the engine's live readback; a mixer the caller cannot read (M/E object + Program scope) is omitted, and a source it cannot read is `{\"redacted\": true}`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Role lacks Read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/patch/plan": {
+      "post": {
+        "tags": [
+          "patch"
+        ],
+        "summary": "Plan 1..64 mixer crosspoints: path, on-air flag and refusals; no change.",
+        "operationId": "plan_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PatchPlan"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for a destination (M/E object + Program scope) or a source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`switcher-unavailable`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, or not 1..=64 crosspoints.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/patch/take": {
+      "post": {
+        "tags": [
+          "patch"
+        ],
+        "summary": "Take 1..64 mixer crosspoints atomically at one engine tick.",
+        "operationId": "take_patch",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required; a replay answers the first 202.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PatchAccepted"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for a destination (M/E object + Program scope) or a source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, or no source lease.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, missing Idempotency-Key, or not 1..=64 crosspoints.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`engine-busy` (the key and leases are released) or `idempotency-capacity`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/preview/capabilities": {
       "get": {
         "tags": [
@@ -12493,6 +12687,247 @@
         }
       }
     },
+    "/api/v1/tls/credential": {
+      "post": {
+        "tags": [
+          "tls"
+        ],
+        "operationId": "tls_credential",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Stored as `<state_dir>/secrets/<NAME>`, mode 0600. Loopback admin listener only; body at most 8 KiB."
+          },
+          "400": {
+            "description": "Malformed body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not loopback, or not admin.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "NAME is not referenced by the configuration.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/tls/issue": {
+      "post": {
+        "tags": [
+          "tls"
+        ],
+        "operationId": "tls_issue",
+        "responses": {
+          "202": {
+            "description": "Issuance attempt queued.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueAccepted"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Front door: neither an admin bearer nor a setup session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin listener: not loopback or not admin.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The ACME service is busy or stopped.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/tls/setup-code": {
+      "post": {
+        "tags": [
+          "tls"
+        ],
+        "operationId": "tls_setup_code",
+        "responses": {
+          "200": {
+            "description": "A new one-time setup code, returned once (replaces the previous code). Loopback admin listener only.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetupCodeBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not loopback, or not admin.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/tls/setup/session": {
+      "post": {
+        "tags": [
+          "tls"
+        ],
+        "operationId": "tls_setup_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetupSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Setup session created: an `HttpOnly; Secure; SameSite=Strict` cookie valid one hour, honoured only in setup."
+          },
+          "401": {
+            "description": "Wrong, expired or used setup code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not in setup.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Five failed attempts from this source (IPv6 /64) in 15 minutes: locked for 15 minutes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tls/status": {
+      "get": {
+        "tags": [
+          "tls"
+        ],
+        "operationId": "tls_status",
+        "responses": {
+          "200": {
+            "description": "Non-secret certificate status. Unauthenticated while the front door is in setup; Read role once serving.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TlsStatusBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Serving and no valid credential.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No `[network.tls]` configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/weather/locations": {
       "get": {
         "tags": [
@@ -15469,6 +15904,26 @@
         },
         "additionalProperties": false
       },
+      "CredentialRequest": {
+        "type": "object",
+        "description": "`POST /api/v1/tls/credential` body (loopback admin listener only).",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "One of the environment-variable NAMES the configuration references\n(`[network.tls]` EAB names, `[network.tls.dns]` credential names)."
+          },
+          "value": {
+            "type": "string",
+            "format": "password",
+            "description": "The secret value. Write-only: never logged, never echoed.",
+            "writeOnly": true
+          }
+        }
+      },
       "CueInput": {
         "type": "object",
         "description": "`POST cue` body.",
@@ -16801,6 +17256,19 @@
           "x-nmos-api": {
             "$ref": "#/components/schemas/NmosApiClaim",
             "description": "The NMOS per-API access grant — `x-nmos-api`."
+          }
+        }
+      },
+      "IssueAccepted": {
+        "type": "object",
+        "description": "`POST /api/v1/tls/issue` response.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Always `issue`."
           }
         }
       },
@@ -18250,6 +18718,14 @@
         ],
         "description": "An IS-04 **Node**: the top-level host (a running Conspect instance)."
       },
+      "OnAir": {
+        "type": "string",
+        "description": "`on_air`: whether a crosspoint may re-patch the input on Program.",
+        "enum": [
+          "protect",
+          "allow"
+        ]
+      },
       "OperationId": {
         "type": "string",
         "description": "A correlation id for an asynchronously-applied control command.\n\nReturned to the client in a `202 Accepted` response and echoed by the engine\non the realtime stream (`corr`) when the command's outcome is known."
@@ -19572,6 +20048,152 @@
           }
         }
       },
+      "PatchAccepted": {
+        "type": "object",
+        "description": "`POST /patch/take` 202 answer; the outcome arrives as `switcher.operation`.",
+        "required": [
+          "operation_id",
+          "status"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "description": "Correlates with `switcher.operation.operation_id`."
+          },
+          "status": {
+            "type": "string",
+            "description": "Always `accepted`; never `applied`."
+          }
+        }
+      },
+      "PatchCrosspoint": {
+        "type": "object",
+        "description": "One crosspoint `{ plane, destination, source }`.",
+        "required": [
+          "plane",
+          "destination",
+          "source"
+        ],
+        "properties": {
+          "destination": {
+            "$ref": "#/components/schemas/PatchDestination",
+            "description": "Where the source is patched."
+          },
+          "plane": {
+            "type": "string",
+            "description": "`video` (this slice), `audio` or `subtitle`."
+          },
+          "source": {
+            "type": "object",
+            "description": "`{\"source\": id}` or `\"none\"` (this slice); `{\"layout\": id}`,\n`{\"bus\": ..}`, `\"follow\"` arrive in later slices."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PatchDestination": {
+        "type": "object",
+        "description": "One crosspoint destination: a mixer input (`{\"mixer\",\"input\"}`) or, in a\nlater slice, an output slot (`{\"output\",\"slot\"}`).",
+        "properties": {
+          "input": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Mixer input number, 1..=64.",
+            "minimum": 0
+          },
+          "mixer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "M/E id (`me1`)."
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Output id (output slots arrive in a later slice; refused here)."
+          },
+          "slot": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Output slot index (later slice).",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "PatchPlan": {
+        "type": "object",
+        "description": "`POST /patch/plan` answer.",
+        "required": [
+          "class",
+          "crosspoints",
+          "can_take"
+        ],
+        "properties": {
+          "can_take": {
+            "type": "boolean",
+            "description": "`true` when every crosspoint can be taken."
+          },
+          "class": {
+            "type": "string",
+            "description": "Change class (a mixer re-patch is Class-1, hot)."
+          },
+          "crosspoints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlannedCrosspoint"
+            },
+            "description": "Per-crosspoint plan, request order."
+          }
+        }
+      },
+      "PatchRefusal": {
+        "type": "object",
+        "description": "A typed refusal (`type` suffix + detail).",
+        "required": [
+          "type",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Human-readable reason."
+          },
+          "type": {
+            "type": "string",
+            "description": "RFC 9457 `type` suffix, e.g. `on-air-protected`."
+          }
+        }
+      },
+      "PatchRequest": {
+        "type": "object",
+        "description": "Plan/take body: 1..=64 crosspoints applied atomically at one tick.",
+        "required": [
+          "crosspoints"
+        ],
+        "properties": {
+          "crosspoints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PatchCrosspoint"
+            },
+            "description": "The crosspoints."
+          },
+          "on_air": {
+            "$ref": "#/components/schemas/OnAir",
+            "description": "On-air guard for the input on Program."
+          }
+        },
+        "additionalProperties": false
+      },
       "PendingAction": {
         "type": "object",
         "description": "One queued remote action.",
@@ -19761,6 +20383,40 @@
           "composite",
           "encode"
         ]
+      },
+      "PlannedCrosspoint": {
+        "type": "object",
+        "description": "One planned crosspoint.",
+        "required": [
+          "destination",
+          "path",
+          "on_air"
+        ],
+        "properties": {
+          "destination": {
+            "$ref": "#/components/schemas/PatchDestination",
+            "description": "The destination as requested."
+          },
+          "on_air": {
+            "type": "boolean",
+            "description": "Whether the destination input is on Program now."
+          },
+          "path": {
+            "type": "string",
+            "description": "The path this crosspoint takes (`mixer-input`)."
+          },
+          "refusal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PatchRefusal",
+                "description": "`null` when the crosspoint can be taken."
+              }
+            ]
+          }
+        }
       },
       "PlaybackUrlDoc": {
         "type": "object",
@@ -21433,6 +22089,41 @@
           "mode": {
             "type": "string",
             "description": "The desired converged work mode (driver vocabulary, e.g. `encoder`)."
+          }
+        }
+      },
+      "SetupCodeBody": {
+        "type": "object",
+        "description": "`POST /api/v1/tls/setup-code` response: the new code, returned once.",
+        "required": [
+          "code",
+          "expires_in"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The one-time setup code (8 words, valid one hour, single use)."
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds until it expires.",
+            "minimum": 0
+          }
+        }
+      },
+      "SetupSessionRequest": {
+        "type": "object",
+        "description": "`POST /api/v1/tls/setup/session` body.",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "format": "password",
+            "description": "The one-time setup code (8 words) printed on the host.",
+            "writeOnly": true
           }
         }
       },
@@ -23291,6 +23982,15 @@
             "description": "AUTO duration at the output's exact cadence; no floating milliseconds.",
             "minimum": 0
           },
+          "input": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Numbered mixer input for `select_program`/`select_preview` (ADR-0110\n§12.8); exactly one of `source`/`input`. Requires declared inputs.",
+            "minimum": 0
+          },
           "layout": {
             "type": [
               "string",
@@ -24070,6 +24770,103 @@
         ],
         "description": "`OpenAPI` mirror of `multiview_config::timer::TimerTarget` (tagged by\n`target`; flattened into the `Timer` source variant alongside `kind`)."
       },
+      "TlsStatusBody": {
+        "type": "object",
+        "description": "Non-secret certificate status (`GET /api/v1/tls/status`).",
+        "required": [
+          "state",
+          "staging",
+          "challenge",
+          "names",
+          "alarm",
+          "reasons",
+          "hints"
+        ],
+        "properties": {
+          "alarm": {
+            "type": "string",
+            "description": "`none`, `warning` (renewal failing, under 50 % of the lifetime left),\n`critical` (under 25 %) or `expired`."
+          },
+          "bootstrap_fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SHA-256 fingerprint of the bootstrap certificate (setup only)."
+          },
+          "ca": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "CA profile (`letsencrypt`, `google`, `custom`)."
+          },
+          "challenge": {
+            "type": "string",
+            "description": "`dns-01` or `tls-alpn-01`."
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Expiry of the served ACME certificate, Unix seconds."
+          },
+          "hints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Operator hints (e.g. the TLS-ALPN-01 reachability note)."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sanitized token of the last failure (e.g. `ca-unavailable`)."
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names requested on the certificate."
+          },
+          "next_attempt_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the next attempt runs after a failure, Unix seconds."
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Why the engine is still in setup, e.g. `credential-missing: CLOUDFLARE_API_TOKEN`\n(names only, never values)."
+          },
+          "renewal_due_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the next renewal is due, Unix seconds."
+          },
+          "staging": {
+            "type": "boolean",
+            "description": "Whether the CA's staging directory is configured."
+          },
+          "state": {
+            "type": "string",
+            "description": "`setup`, `serving` or `expired` (serving an expired certificate)."
+          }
+        }
+      },
       "TransitionDoc": {
         "type": "object",
         "description": "A transition preset.",
@@ -24379,7 +25176,8 @@
           "gpu-present-no-vulkan-adapter",
           "container-no-host-networking",
           "catalogue-link-attention",
-          "accepted-state-rejected"
+          "accepted-state-rejected",
+          "tls-certificate"
         ]
       },
       "WarningSeverityDoc": {
@@ -24768,6 +25566,10 @@
       "description": "Per-stream crosspoint routing: classify (plan) + apply (take)"
     },
     {
+      "name": "patch",
+      "description": "The patch panel (ADR-0110): the live patch and atomic plan/take of mixer-input crosspoints"
+    },
+    {
       "name": "tally",
       "description": "Tally state, profiles, and manual override"
     },
@@ -24806,6 +25608,10 @@
     {
       "name": "realtime",
       "description": "WebSocket + SSE event stream"
+    },
+    {
+      "name": "tls",
+      "description": "Front-door ACME certificates (ADR-0107 section 5a): status, the setup-code login, issuance, and the loopback-only setup-code and credential admin routes"
     }
   ]
 }

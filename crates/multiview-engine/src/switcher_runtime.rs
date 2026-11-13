@@ -37,7 +37,7 @@ impl SwitcherRuntime {
     /// same cadence and must not silently switch to a different bus.
     pub fn tick(&mut self, tick: Tick) -> Result<BusFrames> {
         let projection = self.driver.drain_at_tick(tick);
-        let (program, preview) = self.driver.selections();
+        let (program, preview) = self.driver.resolved_selections();
         let program = program.clone();
         let preview = preview.clone();
         let pair = self

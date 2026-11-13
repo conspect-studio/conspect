@@ -348,6 +348,11 @@ jobs:
           # dedicated `acme-pebble` job below.
           - crate: multiview-control
             feature: acme
+          # Slice 5 PR B: the ACME boot wiring, `multiview tls` CLI and the
+          # dead-CA boot test (`tests/tls_cli.rs`: the realtime software clock
+          # keeps 50/50 ticks while the CA refuses).
+          - crate: multiview-cli
+            feature: acme
           # multiview-hal off-by-default features
           - crate: multiview-hal
             feature: i915-pmu
@@ -1382,6 +1387,10 @@ jobs:
       # --all-features: that pulls the opt-in GPL codecs by design.
       - name: cargo deny (webrtc-native closure)
         run: cargo deny --features multiview-cli/webrtc-native check
+      # The ACME closure (instant-acme, hickory, x509-parser) ships in every
+      # preset since slice 5 PR B (#291): gate its advisories and licenses too.
+      - name: cargo deny (acme closure)
+        run: cargo deny --features multiview-cli/acme check
 
   # ── release-artifact feature guard (task #109) ───────────────────────────────
   # A test-only Cargo feature (multiview-control's `_test-seams`, the config-watch
@@ -1543,6 +1552,36 @@ jobs:
       - name: build
         working-directory: web
         run: npm run build
+
+  # ── embedded UI serving (ADR-0107 slice 6, #292) ─────────────────────────────
+  # The engine serves the UI itself on TCP 443 (nginx removed): hashed assets
+  # immutable, index no-cache, strong ETag + 304, gzip, 404 for a stale chunk.
+  # Those tests need the real `web/dist` (embed-web inlines it at compile
+  # time), so this job builds the UI first. No other job compiles embed-web.
+  embed-web:
+    name: embedded UI serving (multiview-control --features embed-web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: build the UI (web/dist)
+        working-directory: web
+        run: npm ci && npm run build
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: embed-web
+      - name: test the embedded UI serving
+        run: >
+          cargo test --locked -p multiview-control --features embed-web
+          --test embed_web --lib spa
 
   # ── web Playwright end-to-end (real browser) ─────────────────────────────────
   # Drives the REAL built SPA in a real Chromium (the failure class these specs

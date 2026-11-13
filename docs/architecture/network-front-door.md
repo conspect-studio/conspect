@@ -387,9 +387,8 @@ never on pull requests.
 
 ### Slice 5 engine as built (PR A)
 
-Library only, behind the off-by-default `acme` feature of `multiview-control` (forwarded by
-`multiview-cli`, in no preset yet); boot wiring, the `multiview tls` CLI and the setup routes are
-PR B.
+Library, behind the `acme` feature of `multiview-control` (forwarded by `multiview-cli`); boot
+wiring, the `multiview tls` CLI and the setup routes are PR B (next section).
 
 * Files: `crates/multiview-control/src/acme/{mod,egress,dns,cloudflare,store,engine}.rs`. instant-acme
   0.8.5 is built without its `hyper-rustls` client; the engine supplies the HTTP client. No OpenSSL.
@@ -417,7 +416,98 @@ PR B.
   of the lifetime ±(lifetime/30, at most one day); failures back off 15 min doubling to 6 h, never
   under 60 s. Alarm: while renewal fails, under 50 % of the lifetime left = warning, under 25 % =
   critical; past `notAfter` = expired (still served). `CertificateStatus` carries `alarm`,
-  `renewal_due_at`, `next_attempt_at`; an optional hook lets PR B feed the alarm store.
+  `renewal_due_at`, `next_attempt_at`; an optional hook feeds the alarm surface (PR B: the
+  `tls-certificate` health warning).
+
+### Slice 5 setup, boot wiring and CLI as built (PR B)
+
+Operator runbook: [acme-certificates.md](../runbooks/acme-certificates.md).
+
+* The `acme` feature is in the `nvidia`, `apple`, `linux-vaapi` and (through them) `full` presets.
+  A config with `[network.tls]` in a build without it is a startup error, and `multiview validate`
+  reports it.
+* Boot (`crates/multiview-cli/src/tls_boot.rs`) runs before the control plane binds and never on
+  the clock path:
+  * a bootstrap certificate is created; its key is written 0600 and its fingerprint logged;
+  * `AcmeCertificateSource` + `ChallengeResolver` are built;
+  * `AcmeService` starts. A stored valid certificate is installed first; otherwise issuance starts
+    at once. The bootstrap certificate is rotated every 6 days on the service thread while in
+    setup;
+  * a one-time setup code is printed on stderr (journal) only, never through `tracing`, so the
+    `GET /api/v1/logs` ring never holds it.
+* The DNS provider re-reads its credential at the start of every attempt. A credential missing at
+  boot keeps the engine in setup (`credential-missing: NAME` in the status reasons), and
+  `multiview tls set-credential` + `issue` then completes without a restart.
+* Alarms reuse the health-warning surface the UI already shows (`GET /api/v1/health`): new code
+  `tls-certificate`, severity warning or critical (expired = critical). It is raised and cleared
+  through the engine's drop-oldest event lane by the engine's alarm hook. The `alarm_store` was not
+  used: its records are media-timeline X.733 alarms keyed by probes, while health warnings are the
+  latched, coalescing, remediation-carrying surface this is.
+* `multiview_control::tls_setup` (`acme`, unix):
+  * `front_door_router(state)` is the control router behind the setup gate. The slice-4 TCP door
+    serves it (see "Slice 4 and slice 5 together as built" below). In `setup`, only these answer:
+    * `GET /tls-setup` (a self-contained page with a CSP, the fingerprint and "Issue now", and no
+      secret input);
+    * `GET /api/v1/tls/status`;
+    * `POST /api/v1/tls/setup/session`;
+    * `POST /api/v1/tls/issue`;
+    * `GET /` → `303 /tls-setup`.
+
+    Everything else is `503` `/problems/tls-setup-required` with `Retry-After: 30`, and HSTS is
+    stripped. In `serving` the gate is one read of the source state.
+  * Setup codes are 8 BIP-39 words, valid 1 h, single use, compared in constant time. Sessions are
+    32 random bytes in an `HttpOnly; Secure; SameSite=Strict` cookie, valid 1 h and only in setup.
+    5 failures per source (IPv6 /64) in 15 min lock it for 15 min. The LRU table holds 4096 entries.
+  * The admin listener (`[control] listen`, not gated) carries `GET /api/v1/tls/status` and three
+    routes that require a loopback TCP peer AND an admin principal: `POST setup-code`,
+    `POST credential` (a name referenced by the config, written to `secrets/<NAME>` 0600, 8 KiB
+    cap, never logged or echoed) and `POST issue`. The front door never mounts these.
+* `multiview tls status | setup-code | set-credential NAME | issue` talk HTTP/1.1 to the loopback
+  admin listener; `[::]` is dialled as `[::1]` and any other address is refused. `status` and
+  `set-credential` work offline from `state_dir`.
+* QUIC: with `[network.tls]` and `network.https_port`, the front-door QUIC lane is taken at start
+  and held. A control-plane task waits on `subscribe()` (cancelled at shutdown), then starts MoQ
+  with `Runtime::listen_resolver_on` and a `SourceResolver` over the ACME source. This uses a new
+  opt-in `resolver` field on vendored `moq-tokio`'s `Listen`, recorded in
+  `vendor/MOQ-DELIVERY-PROVENANCE.md`. Until then the MoQ provider is unavailable (honest `503`).
+  The `MULTIVIEW_MOQ_CERTIFICATE` files are not used on the front door with `[network.tls]`.
+  Without `[network.tls]` nothing changes.
+* The setup page does not choose the CA, challenge or names, unlike the "lets an authenticated
+  operator choose CA, challenge and domain names" wording above. They come from `[network.tls]`
+  only, so the TOML stays the single source of truth and recovery needs no browser. The page shows
+  them and starts issuance.
+* PR B was written before slice 4 merged; the door wiring below closes that gap.
+
+### Slice 4 and slice 5 together as built (TCP door with ACME)
+
+Slice 4 merged first (#328), so slice 5 PR B wires the ACME source into its TCP door
+(`crates/multiview-cli/src/control.rs` `attach_front_door_site`, `frontdoor.rs` `install_site`):
+
+* The TCP door needs `network.mode` (and `https_port`). `[network.tls]` without `mode` has no
+  door, and the boot warns that the setup page and TLS-ALPN-01 are unreachable from outside.
+* Site TLS (section 4 `site`): `site_server_config` over the ACME `CertificateSource` (ALPN
+  `http/1.1`, a `SourceResolver` read per handshake), so `setup` serves the bootstrap certificate
+  and `serving` the issued one; an `install` or renewal reaches the next handshake with no
+  restart. `[network.tls]` wins over `[control.tls]` for the door; with both, a warning is logged
+  and the `[control] listen` listener keeps its own static TLS unchanged.
+* `TlsRouting.acme` (section 4 ALPN exactly `acme-tls/1`): `acme_challenge_server_config`, a
+  rustls config with ALPN exactly `acme-tls/1` over the `ChallengeResolver`, so TLS-ALPN-01 is
+  answered on the door in both states. The `TODO(#291)` is gone.
+* The door's router is `tls_setup::front_door_router_with` (the control router plus the HLS
+  mounts, behind the setup gate). Without `[network.tls]` the door keeps slice 4's ungated router
+  on the `[control.tls]` certificate. The `[control] listen` listener stays the ungated admin
+  listener. `router_with` starts the routing relay and the metrics sampler only for the admin
+  surface, so building the door router does not start them twice.
+* `TlsContext.behind_proxy` follows `network.mode = "behind_proxy"`, so `tls status` reports the
+  section 5a TLS-ALPN-01 hint.
+* The real client address: the door hands `SiteService::serve` the PROXY v2 source address in
+  `behind_proxy` mode (the TCP peer in `direct`), and `ConnectionServer` installs it as
+  `ConnectInfo`. The setup-code limiter and session log read that `ConnectInfo`, so they key on
+  the real client, never the proxy. The session cookie is `Secure`, which is correct on the door.
+* Test: `crates/multiview-cli/tests/tls_door.rs` runs the real front door with a TCP door on
+  `[::1]` and a dead CA: bootstrap certificate and the 503 gate, status without HSTS, the RFC 8737
+  challenge certificate (acmeIdentifier extension) for an `acme-tls/1`-only hello, the swap after
+  `install` and the open gate, and in `behind_proxy` the limiter keyed per PROXY v2 source.
 
 ### Changes to #167-#172
 
@@ -537,7 +627,7 @@ supported as `[network] mode = "behind_proxy"`:
 
 | Target | How 80/443 are bound |
 | --- | --- |
-| Linux systemd (mda001) | systemd socket activation: `conspect.socket` with `ListenStream=[::]:443`, `ListenStream=[::]:80`, `ListenDatagram=[::]:443`, `BindIPv6Only=both`, `ReceiveBuffer=8M`, `FileDescriptorName=` per socket. The service keeps `User=operations` and needs no capability. Fallback: `AmbientCapabilities=CAP_NET_BIND_SERVICE` when started without the socket unit |
+| Linux systemd (mda001) | systemd socket activation: `conspect.socket` with `ListenStream=[::]:443`, `ListenStream=[::]:80`, `ListenDatagram=[::]:443` twice with `ReusePort=yes` (the validated-flow steering pair, as built in slice 6), `BindIPv6Only=both`, `ReceiveBuffer=8M`; sockets are matched by type and port, so no `FileDescriptorName=` is needed. The service keeps `User=operations` and needs no capability. Fallback: `AmbientCapabilities=CAP_NET_BIND_SERVICE` when started without the socket unit |
 | Restarts | with socket activation the sockets survive an engine restart: the kernel queues TCP SYNs (backlog) and UDP datagrams (rcvbuf) while the engine restarts, so a browser's retry lands on the new process instead of a refused port. QUIC connections still die with the process (keys are in memory); clients reconnect |
 | Container | `--cap-add NET_BIND_SERVICE` is not needed in Docker when the container runs as root inside its namespace. Rootless: `net.ipv4.ip_unprivileged_port_start=443` in the container sysctls, or map host 443 to 8443. `deploy/compose.yaml` publishes `443/tcp`, `443/udp`, `80/tcp` |
 | macOS | reported to allow unprivileged binds below 1024 since macOS 10.14 (unverified: no primary Apple source found); launchd `Sockets` can pass the sockets in either way. The office matrix checks it on mst001 before slice 4 closes |
@@ -590,7 +680,7 @@ challenge = "dns-01"             # "dns-01" | "tls-alpn-01"
 domains = ["mda001.example.net"] # SANs; IP literals allowed with tls-alpn-01 (Let's Encrypt short-lived)
 contact_email = "ops@example.net"
 acme_profile = "shortlived"      # used only when the directory advertises it
-state_dir = "/var/lib/conspect/tls"  # 0700; account.<host>-<hash>.json, active.pem/.json, pending-txt.json, bootstrap
+state_dir = "/var/lib/conspect/tls"  # 0700; account.<host>-<hash>.json, active.pem, pending-txt.json, bootstrap.key, secrets/
 [network.tls.dns]
 provider = "cloudflare"
 token_env = "CLOUDFLARE_API_TOKEN"   # Zone:DNS:Edit + Zone:Zone:Read (recommended)
@@ -1143,3 +1233,62 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
   no SNI fail the handshake with no certificate presented; the published name still works).
 * **Not in this PR**: a real-browser ICE-TCP check (browsers gather active TCP candidates
   themselves); the deferred items above other than the str0m consumer.
+
+### Slice 6 as built (issue #292)
+
+The engine serves TCP 443, TCP 80 and UDP 443 on mda001; nginx is removed by the
+[front-door cutover runbook](../runbooks/front-door-cutover.md).
+
+* **Socket activation** (`multiview-frontdoor::activation`, `deploy/systemd/conspect.socket`):
+  `main` adopts `LISTEN_FDS` (`listenfd`, which checks each descriptor's type, sets close-on-exec
+  and clears `LISTEN_PID`/`LISTEN_FDS`) before the Tokio runtime exists, so the environment is
+  never changed while another thread reads it. Each inherited socket is matched to its listener
+  by **type and port** (TCP `tcp_port`/`https_port` = the TCP door, TCP `http_redirect_port` =
+  the redirect, UDP `https_port` = the UDP door); an unmatched socket is logged. Any listener
+  without an inherited socket binds its own, so the non-activated path is unchanged.
+  `FrontDoor::start_with` / `start_tcp_with` / `start_redirect_with` take the inherited sockets.
+* **Deviation, UDP pair**: section 9 had one `ListenDatagram=`. Slice 3a's validated-flow
+  steering needs a `SO_REUSEPORT` pair whose members share an owner, so the unit passes **two**
+  UDP 443 sockets with `ReusePort=yes`, in listener-then-established order (the reuseport group
+  index order); the engine attaches the CBPF program to the inherited pair exactly as to one it
+  bound. One inherited UDP socket runs single-socket (logged with the reason).
+* **Restart window**: the door accepts before the control plane is built; a site `ClientHello`
+  in that window (with activation: every connection the kernel queued during the restart) waits
+  for the site, bounded by the 10 s handshake deadline (`FrontDoor::set_site_pending`), instead
+  of being closed. With no `[control]` nothing waits.
+* **Certificates for the cutover**: `[network] cert_file`/`key_file` give the door its own static
+  certificate without making the loopback admin listener TLS; exclusive with `[network.tls]`.
+  Static pairs (these and `[control.tls]`) are reloaded without a restart: every 30 s each file
+  is opened once, `fstat`ed and read (at most 1 MiB) on the blocking pool; when the stamps
+  (device, inode, size, mtime of the opened file; certbot re-points `live/` symlinks) change, the
+  bytes just read are parsed and key/leaf-checked and swapped into the
+  `StaticCertificateSource` the resolver reads per handshake; a broken pair keeps the old
+  certificate. `[network] acme_webroot` makes the
+  port-80 listener answer `/.well-known/acme-challenge/<base64url token>` from
+  `<webroot>/.well-known/acme-challenge/` (regular files, at most 1 KiB, no symlinks), so certbot
+  `--webroot` renews without nginx. The port-80 listener now reads to the end of the request
+  head (`\r\n\r\n`, at most 8 KiB, 5 s), or answers 300 ms after a complete request line when
+  the client stops sending, so a request line split across segments is parsed whole. The move to the engine's own ACME and the point where
+  certbot is retired are in the runbook.
+* **HLS** (`multiview-output::hls::http`): confinement, open and `fstat` in one blocking-pool
+  hop (was five `tokio::fs` round trips); the length and validators come from the opened handle;
+  64 KiB body chunks (`BODY_CHUNK`, never the whole file); nginx's `ETag` format
+  (`"<mtime hex>-<size hex>"`), `Last-Modified`, `If-None-Match`/`If-Modified-Since` -> `304` (with `Range`, only an exact
+  strong tag revalidates), `If-Range`. `deploy/hls-nginx.conf` stays the contract; `tests/hls_nginx_parity.rs` pins it.
+  Zero-copy `sendfile` is not possible under rustls without kTLS; the bounded chunked read is
+  the as-built form, and `scripts/hls-ttfb.py` measures TTFB against nginx (acceptance on
+  mda001).
+* **UI** (`multiview-control::spa`): the representation (identity or gzip, from
+  `Accept-Encoding`) is chosen first; strong `ETag` per representation (SHA-256, `-gz` suffix),
+  `304` only for the selected representation's tag; gzip for text assets with
+  `Vary: Accept-Encoding` (compressed once per content hash, cached for the process; bounded by
+  the servable file set), a missing `/assets/*` is `404`. `[control] ui_dir` serves a UI build from
+  disk instead of the embedded copy, read into memory at start-up (at most 10 000 files /
+  256 MiB) so a request never touches the filesystem.
+* **Invariants #1/#10**: everything above runs on the front-door runtime or the control plane's;
+  file I/O on the blocking pool; nothing is shared with the program runtime.
+  `multiview-cli/tests/frontdoor_site_chaos.rs` runs the real tick loop while 64 stalled 4 MiB
+  downloads, download/range lanes and a port-80 flood hit the door: one frame per tick, no extra
+  repeats, RSS growth under 64 MiB.
+* **Not in this slice**: HTTP/2 (slice 7), the mda001 measurements (TTFB, restart window, office
+  browser rows of #290), which the lead runs from the runbook.

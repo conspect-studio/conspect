@@ -55,3 +55,17 @@ bind, same `Socket`, same sharding. Combining an injected socket with a reusepor
 group member is refused (`ShardWithQuicLb`). `noq::{AsyncUdpSocket,
 EndpointConfig}` are re-exported from `moq_tokio::noq` for the embedder. Existing
 `NoqServer::new` test callers pass `None`. No wire behaviour changes.
+
+## Certificate resolver for the ACME front door (ADR-0107 slice 5, issue #291)
+
+`moq-tokio` 0.19.34 gains one more opt-in field, `tls::Listen::resolver:
+Option<Arc<dyn rustls::server::ResolvesServerCert>>` (`#[serde(skip)]`,
+`#[usage(skip)]`, so not settable from the CLI or a config file). When set,
+`NoqServer::new` hands it to rustls as the only certificate source: `cert`, `key`,
+`generate` and `identity` are not loaded, and the file-reload watcher has no paths
+and stays inert. multiview passes `multiview_control::certificate_source::SourceResolver`,
+which reads the front door's hot-swappable ACME `CertificateSource` on every
+ClientHello, so a renewal reaches new QUIC handshakes without a restart. `None`
+(every existing caller, including every test) keeps the original path byte for
+byte. Only the QUIC (`noq`) server honours it; the plain-TLS `server_config` path
+is unchanged. No wire behaviour changes.

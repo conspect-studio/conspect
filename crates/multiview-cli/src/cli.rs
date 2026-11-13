@@ -66,6 +66,13 @@ pub enum Command {
     /// resolved enrollment + presentation plan. The live ingest → scanout path
     /// and the real enrollment HTTP are hardware/network follow-ons.
     Node(NodeArgs),
+    /// Front-door TLS certificates (ACME, ADR-0107 section 5a): status, the
+    /// one-time setup code, credentials and issuance. Talks to the running
+    /// engine's loopback `[control] listen` (bearer from
+    /// `MULTIVIEW_CONTROL_TOKEN`); `status` and `set-credential` also work
+    /// offline from `network.tls.state_dir`.
+    #[command(subcommand)]
+    Tls(TlsCommand),
     /// Acknowledge a start-up fallback (#324): when a start could not use the
     /// saved configuration (`<config-dir>/.multiview/desired.json`) and ran
     /// from the last configuration that started, the `accepted-state-rejected`
@@ -86,6 +93,59 @@ pub struct AcknowledgeFallbackArgs {
     /// to acknowledge.
     #[arg(value_name = "CONFIG")]
     pub config: PathBuf,
+}
+
+/// Default config path for `multiview tls` (the deploy image's config).
+pub const DEFAULT_CONFIG: &str = "/etc/multiview/multiview.toml";
+
+/// The `multiview tls` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum TlsCommand {
+    /// Show the certificate state, CA, names, expiry, fingerprint, alarm,
+    /// last error and reasons. Reads `state_dir` offline when the engine is
+    /// not running.
+    Status(TlsStatusArgs),
+    /// Mint a fresh one-time setup code (valid 1 h, single use).
+    SetupCode(TlsConfigArg),
+    /// Store a credential named by the config, read from stdin (no echo on a
+    /// TTY; never from the command line), then start issuance.
+    SetCredential(TlsSetCredentialArgs),
+    /// Start an issuance attempt now (recovery).
+    Issue(TlsConfigArg),
+}
+
+/// `--config` for `multiview tls` subcommands.
+#[derive(Debug, Args)]
+#[non_exhaustive]
+pub struct TlsConfigArg {
+    /// The engine's TOML config (for `[control] listen` and `[network.tls]`).
+    #[arg(long, value_name = "PATH", default_value = DEFAULT_CONFIG)]
+    pub config: PathBuf,
+}
+
+/// Arguments for `multiview tls status`.
+#[derive(Debug, Args)]
+#[non_exhaustive]
+pub struct TlsStatusArgs {
+    /// Config path.
+    #[command(flatten)]
+    pub config: TlsConfigArg,
+    /// Print the status JSON instead of the table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `multiview tls set-credential`.
+#[derive(Debug, Args)]
+#[non_exhaustive]
+pub struct TlsSetCredentialArgs {
+    /// The environment-variable NAME the config references (e.g.
+    /// `CLOUDFLARE_API_TOKEN`). The value is read from stdin.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+    /// Config path.
+    #[command(flatten)]
+    pub config: TlsConfigArg,
 }
 
 /// Arguments for `multiview validate`.

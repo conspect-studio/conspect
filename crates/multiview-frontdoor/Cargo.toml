@@ -32,6 +32,7 @@ tracing = { workspace = true }
 # The WebRTC lane adapter (str0m driver). Off by default: `native` links str0m
 # and aws-lc; the default build of this crate stays free of native deps.
 multiview-webrtc = { workspace = true, optional = true }
+listenfd = "1.0.2"
 
 # `SO_ATTACH_REUSEPORT_CBPF` (validated-flow steering) and `SO_RCVBUFFORCE`:
 # two `setsockopt` calls that neither std nor socket2 expose. Already in

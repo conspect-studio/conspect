@@ -27,6 +27,10 @@ pub struct SwitcherRequest {
     /// Referenced source for `select_program`/`select_preview`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Numbered mixer input for `select_program`/`select_preview` (ADR-0110
+    /// §12.8); exactly one of `source`/`input`. Requires declared inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<u16>,
     /// Referenced stored layout, when selecting an authored scene.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<String>,
@@ -122,14 +126,18 @@ fn validate_first_slice(req: &SwitcherRequest, kind: &str) -> ControlResult<()> 
     }
     match kind {
         "select_program" | "select_preview"
-            if req.source.as_ref().is_some_and(|id| !id.is_empty())
+            if (req.source.as_ref().is_some_and(|id| !id.is_empty()) != req.input.is_some())
                 && req.duration_frames.is_none() =>
         {
             Ok(())
         }
-        "cut" if req.source.is_none() && req.duration_frames.is_none() => Ok(()),
+        "cut" if req.source.is_none() && req.input.is_none() && req.duration_frames.is_none() => {
+            Ok(())
+        }
         "auto"
-            if req.source.is_none() && req.duration_frames.is_some_and(|duration| duration > 0) =>
+            if req.source.is_none()
+                && req.input.is_none()
+                && req.duration_frames.is_some_and(|duration| duration > 0) =>
         {
             Ok(())
         }
@@ -139,18 +147,15 @@ fn validate_first_slice(req: &SwitcherRequest, kind: &str) -> ControlResult<()> 
     }
 }
 
-fn verb(req: &SwitcherRequest, kind: &str) -> ControlResult<SwitcherVerb> {
+fn verb(req: &SwitcherRequest, kind: &str, target: Option<&Target>) -> ControlResult<SwitcherVerb> {
+    let target = || {
+        target
+            .map(|t| t.engine_ref.clone())
+            .ok_or_else(|| ControlError::Validation("source required".into()))
+    };
     match kind {
-        "select_program" => Ok(SwitcherVerb::SelectProgram(SourceRef::new(
-            req.source
-                .clone()
-                .ok_or_else(|| ControlError::Validation("source required".into()))?,
-        ))),
-        "select_preview" => Ok(SwitcherVerb::SelectPreview(SourceRef::new(
-            req.source
-                .clone()
-                .ok_or_else(|| ControlError::Validation("source required".into()))?,
-        ))),
+        "select_program" => Ok(SwitcherVerb::SelectProgram(target()?)),
+        "select_preview" => Ok(SwitcherVerb::SelectPreview(target()?)),
         "cut" => Ok(SwitcherVerb::Cut),
         "auto" => Ok(SwitcherVerb::Auto(
             FrameCount::try_from(
@@ -163,6 +168,88 @@ fn verb(req: &SwitcherRequest, kind: &str) -> ControlResult<SwitcherVerb> {
             kind: "switcher-verb",
             id: kind.into(),
         }),
+    }
+}
+
+/// What a select names: the engine ref (`in:<n>` with numbered inputs, else
+/// the source id) and the SOURCE behind it, which takes the bus lease.
+struct Target {
+    engine_ref: SourceRef,
+    source: String,
+}
+
+/// A typed 422 (`unknown-slot`, `not-on-an-input`), RFC 9457.
+fn typed(kind: &str, detail: impl Into<String>) -> Response {
+    crate::problem::Problem::new(422, kind, "Selection refused")
+        .with_detail(detail)
+        .into_response()
+}
+
+/// Resolve a select's `source`/`input` against the engine's live input table
+/// (ADR-0110 §12.8): with inputs declared, `input` must be declared and
+/// patched (`unknown-slot`) and a bare `source` selects the lowest input it is
+/// patched to (`not-on-an-input`); without inputs, `input` is refused.
+fn resolve_target(
+    handle: &SwitcherControl,
+    req: &SwitcherRequest,
+) -> Result<Option<Target>, Box<Response>> {
+    if !matches!(req.action.as_str(), "select_program" | "select_preview") {
+        return Ok(None);
+    }
+    let Some(table) = handle.inputs() else {
+        if req.input.is_some() {
+            return Err(Box::new(typed(
+                "unknown-slot",
+                "this M/E declares no numbered inputs; select a source",
+            )));
+        }
+        return Ok(req.source.clone().map(|source| Target {
+            engine_ref: SourceRef::new(&source),
+            source,
+        }));
+    };
+    let (number, source) = if let Some(number) = req.input {
+        let source = table
+            .inputs
+            .iter()
+            .find(|i| i.number == number)
+            .and_then(|i| i.source.as_ref())
+            .ok_or_else(|| {
+                Box::new(typed(
+                    "unknown-slot",
+                    format!("mixer input {number} is not declared or not patched"),
+                ))
+            })?;
+        (number, source.as_str().to_owned())
+    } else {
+        let Some(source) = req.source.clone() else {
+            return Ok(None);
+        };
+        let number = table
+            .inputs
+            .iter()
+            .find(|i| i.source.as_ref().is_some_and(|s| s.as_str() == source))
+            .map(|i| i.number)
+            .ok_or_else(|| {
+                Box::new(typed(
+                    "not-on-an-input",
+                    format!("source {source:?} is not patched to a mixer input"),
+                ))
+            })?;
+        (number, source)
+    };
+    Ok(Some(Target {
+        engine_ref: SourceRef::input(number),
+        source,
+    }))
+}
+
+/// The input-resolved source a select puts on a bus must still be readable:
+/// `authorize_refs` checked a named `source`; an `input` names one indirectly.
+fn authorize_target(principal: &Principal, target: Option<&Target>) -> ControlResult<()> {
+    match target {
+        Some(target) => authorize_object(principal, &target.source),
+        None => Ok(()),
     }
 }
 
@@ -189,18 +276,23 @@ fn validate_source_configured(state: &AppState, req: &SwitcherRequest) -> Contro
 
 /// #247: a take or a PVW selection that cannot change the picture is refused
 /// up front with a typed reason. The engine re-checks at the tick.
-fn validate_buses(handle: &SwitcherControl, req: &SwitcherRequest) -> ControlResult<()> {
+fn validate_buses(
+    handle: &SwitcherControl,
+    req: &SwitcherRequest,
+    target: Option<&Target>,
+) -> ControlResult<()> {
     let Some(snapshot) = handle.snapshot() else {
         return Ok(());
     };
     let program = snapshot.program.as_str();
+    let selected = target.map(|t| t.source.as_str());
     match req.action.as_str() {
-        "select_preview" if req.source.as_deref() == Some(program) => Err(
-            ControlError::Validation(multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into()),
-        ),
-        "select_program" if req.source.as_deref() == Some(program) => Err(
-            ControlError::Validation("source is already on program".into()),
-        ),
+        "select_preview" if selected == Some(program) => Err(ControlError::Validation(
+            multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into(),
+        )),
+        "select_program" if selected == Some(program) => Err(ControlError::Validation(
+            "source is already on program".into(),
+        )),
         "cut" | "auto" if snapshot.preview == snapshot.program => Err(ControlError::Validation(
             multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into(),
         )),
@@ -260,7 +352,12 @@ pub(crate) async fn plan_switcher(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
         ));
     }
-    validate_buses(handle, &req)?;
+    let target = match resolve_target(handle, &req) {
+        Ok(target) => target,
+        Err(response) => return Ok(*response),
+    };
+    authorize_target(&principal, target.as_ref())?;
+    validate_buses(handle, &req, target.as_ref())?;
     let version = handle
         .scene_version()
         .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;
@@ -277,6 +374,9 @@ pub(crate) async fn plan_switcher(
 
 /// Enqueue a checked verb; a 202 never asserts frame application.
 #[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path)), request_body = SwitcherRequest, responses((status = 202, body = SwitcherAccepted), (status = 403, body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, body = crate::problem::Problem), (status = 503, body = crate::problem::Problem))))]
+#[allow(clippy::too_many_lines)]
+// reason: one linear admission sequence (authz → resolve input → buses → key →
+// lease → enqueue); the input resolution added the lines, not new branches.
 pub(crate) async fn submit_switcher(
     State(state): State<AppState>,
     principal: Principal,
@@ -299,11 +399,16 @@ pub(crate) async fn submit_switcher(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
         ));
     }
-    validate_buses(handle, &req)?;
+    let target = match resolve_target(handle, &req) {
+        Ok(target) => target,
+        Err(response) => return Ok(*response),
+    };
+    authorize_target(&principal, target.as_ref())?;
+    validate_buses(handle, &req, target.as_ref())?;
     let scene_version = handle
         .scene_version()
         .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;
-    let verb = verb(&req, &kind)?;
+    let verb = verb(&req, &kind, target.as_ref())?;
     // The request's lease is acquired only on the Fresh reservation arm below;
     // a replay never changes PVW demand. Keep the old lease through admission.
     let demand = state.source_demand.clone();
@@ -319,7 +424,8 @@ pub(crate) async fn submit_switcher(
         Reservation::Fresh(op) => {
             let program_bus = req.action == "select_program";
             let lease = if req.action == "select_preview" || program_bus {
-                match (demand.as_ref(), req.source.as_ref()) {
+                // The lease is on the RESOLVED source (the input's patch).
+                match (demand.as_ref(), target.as_ref().map(|t| &t.source)) {
                     (Some(demand), Some(source)) => {
                         let label = if program_bus {
                             "switcher:me1:pgm"

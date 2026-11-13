@@ -15,6 +15,9 @@ pub mod relay;
 /// Publisher-side uplink budgeting and bounded peer subscription tracking.
 pub mod uplink;
 use bytes::Bytes;
+/// The rustls version the vendored `moq-tokio` links, for a certificate
+/// resolver handed to [`provider::Runtime::listen_resolver_on`].
+pub use moq_tokio::rustls as moq_tokio_rustls;
 use std::time::Duration;
 
 /// Immutable shared encoded packet; `verified_rap` must come from the codec parser.
