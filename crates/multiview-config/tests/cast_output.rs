@@ -287,3 +287,61 @@ fn accessors_transport_and_playback_of_a_cast_output() {
         assert!(urls[0].notes[0].contains("no playback URL"), "{urls:?}");
     }
 }
+
+#[test]
+fn a_cast_output_accepts_every_feed_kind_an_hls_output_accepts() {
+    const SWITCHER: &str = "\n[switcher]\n[[switcher.mix_effects]]\nid = \"me1\"\n\
+                            program = \"main\"\nprogram_source = \"a\"\npreview_source = \"b\"\n";
+    // The same row on the HLS output and on the cast output: equal verdicts.
+    for (feed, switcher) in [
+        ("{ bus = \"program\" }", false),
+        ("{ source = \"b\" }", false),
+        ("{ layout = \"NewsOne\" }", false),
+        ("{ layout = \" \" }", false),
+        ("{ source = \"nope\" }", false),
+        ("{ bus = \"preview\" }", true),
+        ("{ bus = \"clean\" }", true),
+        ("{ bus = \"preview\" }", false),
+    ] {
+        let doc = |output: &str| {
+            format!(
+                "{CAST}{}\n[[routing.output]]\noutput = \"{output}\"\nvideo = {feed}\n",
+                if switcher { SWITCHER } else { "" }
+            )
+        };
+        let hls = load_hd(&doc("program-hls"));
+        let cast = load_hd(&doc("cast-1"));
+        assert_eq!(
+            hls.is_ok(),
+            cast.is_ok(),
+            "{feed}: hls {hls:?}, cast {cast:?}"
+        );
+    }
+    // A stored layout (ADR-0108 slice 3) is routable to a cast output.
+    load_hd(&format!(
+        "{CAST}\n[[routing.output]]\noutput = \"cast-1\"\nvideo = {{ layout = \"NewsOne\" }}\n"
+    ))
+    .unwrap();
+}
+
+#[test]
+fn a_cast_output_shares_the_h264_video_key_of_an_hls_output() {
+    // One distinct base video key for the HLS output and the cast output:
+    // the cast output adds no encoder on Program.
+    let cfg = load_hd(CAST).unwrap();
+    assert_eq!(
+        multiview_config::rendition::distinct_base_video_keys(&cfg),
+        1
+    );
+    let alone = load_hd("").unwrap();
+    assert_eq!(
+        multiview_config::rendition::distinct_base_video_keys(&alone),
+        1
+    );
+    // It declares no format and no slots of its own.
+    let out: Output = toml::from_str("kind = \"cast\"\nid = \"c\"\n").unwrap();
+    assert!(out.format().is_none() && out.slots().is_none());
+    let cap = out.slot_capability();
+    assert_eq!((cap.video_max, cap.audio_max), (1, Some(1)));
+    assert!(!cap.format_convertible && !cap.raw_video);
+}

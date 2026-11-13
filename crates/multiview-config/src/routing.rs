@@ -258,7 +258,8 @@ pub enum VideoFeed {
     Bus(OutputBus),
     /// Any configured source directly (cameras, media players, generators).
     Source(String),
-    /// A stored layout (ADR-0108 slice 3; refused by validation until then).
+    /// A stored layout (ADR-0108 slice 3): an aux canvas of its cells, taken
+    /// live; resolved against the layouts library at take time.
     Layout(String),
 }
 
@@ -322,7 +323,8 @@ pub enum FollowAudio {
     Source(String),
     /// The audio of whatever source the M/E's PVW currently selects.
     PreviewSource,
-    /// The layout's `audio` attribute (slice 3); Program by default.
+    /// A routed layout's audio: the program mix (no stored layout carries an
+    /// `audio` attribute yet, ADR-0108 §5.1).
     LayoutDefault,
 }
 

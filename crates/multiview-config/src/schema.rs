@@ -23,6 +23,7 @@ use crate::audio::{OutputAudio, OutputAudioCapability, TrackCapacity, TrackDeliv
 use crate::error::ConfigError;
 use crate::failover::{default_failover_slate, FailoverSlate};
 use crate::grid::{GridLayout, Track};
+use crate::output_format::{OutputFormat, OutputSlots};
 use crate::placement::DevicePin;
 
 /// An exact frame rate parsed from a `"num/den"` string (e.g. `"30000/1001"`).
@@ -2418,6 +2419,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
     },
     /// Low-latency HLS packager.
     LlHls {
@@ -2452,6 +2461,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
     },
     /// HLS packager.
     Hls {
@@ -2486,6 +2503,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
     },
     /// NDI output.
     Ndi {
@@ -2516,6 +2541,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
     },
     /// RTMP push.
     Rtmp {
@@ -2558,6 +2591,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
     },
     /// SRT push.
     ///
@@ -2597,6 +2638,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
         /// Optional typed SRT options: mode, latency, `AES` encryption via a
         /// passphrase reference, stream id, listener, `oheadbw_pct`, `maxbw`,
         /// the peer-idle/connect timeouts, and `backend`. Runtime wiring is
@@ -2637,6 +2686,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
         /// Optional typed RIST options (profile, buffer, pkt size, PSK
         /// encryption, bonding peers).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2710,6 +2767,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
     },
     /// WHIP push (RFC 9725 **client**): publishes the program to a remote WHIP
     /// endpoint — the WebRTC sibling of the `rtmp`/`srt` push variants
@@ -2766,6 +2831,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
     },
     /// AES67 / SMPTE ST 2110-30 PCM-audio RTP output (open-audio over IP).
     ///
@@ -2815,6 +2888,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
     },
     /// Local DRM/KMS display-head output (HDMI/DisplayPort glass) — ADR-0044.
     ///
@@ -2870,6 +2951,14 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// The picture format this output carries (ADR-0110 / §12.3, slice B).
+        /// Absent ⇒ the Program canvas, exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<OutputFormat>,
+        /// The output's media slots (ADR-0110 / §12.3). Absent ⇒ one video slot
+        /// with the output's codec and one program audio slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<OutputSlots>,
     },
     /// Cast output (ADR-0111): an HLS + CMAF fMP4 stream for a Google Cast
     /// receiver, written to a private directory **only while a cast stream is

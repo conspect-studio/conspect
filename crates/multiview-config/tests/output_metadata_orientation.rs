@@ -67,6 +67,8 @@ codec = "h264"
 #[test]
 fn metadata_json_roundtrips() {
     let out = Output::Hls {
+        format: None,
+        slots: None,
         id: None,
         path: "/hls/multiview".to_owned(),
         codec: "h264".to_owned(),
@@ -200,6 +202,8 @@ service_id = 70000
 
 fn hls_with(meta: OutputMetadata) -> Output {
     Output::Hls {
+        format: None,
+        slots: None,
         id: None,
         path: "/hls/mv".to_owned(),
         codec: "h264".to_owned(),
@@ -213,6 +217,8 @@ fn hls_with(meta: OutputMetadata) -> Output {
 
 fn srt_with(meta: OutputMetadata) -> Output {
     Output::Srt {
+        format: None,
+        slots: None,
         id: None,
         url: "srt://[::1]:9000".to_owned(),
         codec: "h264".to_owned(),
@@ -226,6 +232,8 @@ fn srt_with(meta: OutputMetadata) -> Output {
 
 fn rtmp_with(meta: OutputMetadata) -> Output {
     Output::Rtmp {
+        format: None,
+        slots: None,
         id: None,
         url: "rtmp://[::1]/live/key".to_owned(),
         codec: "h264".to_owned(),
@@ -322,6 +330,8 @@ fn plan_only_reports_requested_fields() {
 #[test]
 fn no_metadata_is_empty_plan() {
     let out = Output::Hls {
+        format: None,
+        slots: None,
         id: None,
         path: "/hls/mv".to_owned(),
         codec: "h264".to_owned(),
@@ -380,6 +390,8 @@ turn = "cw180"
 #[test]
 fn orientation_json_roundtrips() {
     let out = Output::Hls {
+        format: None,
+        slots: None,
         id: None,
         path: "/hls/mv".to_owned(),
         codec: "h264".to_owned(),
@@ -407,6 +419,8 @@ fn tag_mode_rejected_on_mpegts_transport() {
     // SRT (MPEG-TS), RTSP and NDI carry no rotation tag ⇒ mode = "tag" is a
     // validation error.
     let srt = Output::Srt {
+        format: None,
+        slots: None,
         id: None,
         url: "srt://[::1]:9000".to_owned(),
         codec: "h264".to_owned(),
@@ -431,6 +445,8 @@ fn tag_mode_rejected_on_mpegts_transport() {
 #[test]
 fn tag_mode_accepted_on_hls() {
     let hls = Output::Hls {
+        format: None,
+        slots: None,
         id: None,
         path: "/hls/mv".to_owned(),
         codec: "h264".to_owned(),

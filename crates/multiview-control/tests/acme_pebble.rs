@@ -141,6 +141,7 @@ fn config(
             email_env: None,
             api_key_env: None,
             propagation_timeout_s: 30,
+            confirm: multiview_config::DnsConfirm::Authoritative,
         }),
     }
 }
@@ -300,21 +301,28 @@ async fn dns01_wildcard_and_apex_share_one_txt_name() {
     );
 }
 
-/// Serve TLS-ALPN-01 on `[::]:<PEBBLE_TLS_PORT>` through the `ChallengeResolver`.
+fn pebble_tls_port() -> u16 {
+    std::env::var("PEBBLE_TLS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5001)
+}
+
+/// Serve TLS-ALPN-01 on `[::]:<PEBBLE_TLS_PORT>` through the `ChallengeResolver`,
+/// then mark the responder ready (as the front door does once installed).
 async fn alpn_listener(resolver: Arc<ChallengeResolver>) -> tokio::task::JoinHandle<()> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
-        .with_cert_resolver(resolver);
+        .with_cert_resolver(resolver.clone());
     config.alpn_protocols = vec![b"acme-tls/1".to_vec(), b"http/1.1".to_vec()];
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-    let port: u16 = std::env::var("PEBBLE_TLS_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(5001);
-    let listener = tokio::net::TcpListener::bind(("::", port)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("::", pebble_tls_port()))
+        .await
+        .unwrap();
+    resolver.mark_responder_ready();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
@@ -343,6 +351,85 @@ async fn tls_alpn01_issues_through_the_challenge_resolver() {
     assert_eq!(issued.unwrap().names, vec![name.clone()]);
     assert_eq!(leaf_sans(&h), vec![name]);
     assert_eq!(h.source.status().state, TlsState::Serving);
+}
+
+/// Boot race (production incident): the ACME service starts before the front
+/// door installs the `acme-tls/1` responder. The engine must wait for it
+/// instead of setting the challenge ready against a door that closes the
+/// validator's hello.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Pebble; run by the acme-pebble CI job"]
+async fn tls_alpn01_waits_for_a_late_responder() {
+    let h = harness(CfAuth::Token("unused".into())).await;
+    let name = format!("{}.{ZONE}", unique("late"));
+    let cfg = config(
+        &env("PEBBLE_DIRECTORY"),
+        &h.state_dir,
+        AcmeChallenge::TlsAlpn01,
+        std::slice::from_ref(&name),
+    );
+    let e = engine(&h, cfg, None).with_responder_wait(Duration::from_secs(30));
+    let attempt = tokio::spawn(async move { e.issue_once(None).await });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !attempt.is_finished(),
+        "the attempt waits for the responder"
+    );
+    let listener = alpn_listener(h.resolver.clone()).await;
+    let issued = tokio::time::timeout(Duration::from_secs(90), attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    listener.abort();
+    assert_eq!(issued.unwrap().names, vec![name.clone()]);
+    assert_eq!(leaf_sans(&h), vec![name]);
+    assert_eq!(h.source.status().state, TlsState::Serving);
+}
+
+/// A failed TLS-ALPN-01 validation reports the CA's own problem: the
+/// responder is "ready" but nothing listens on Pebble's tlsPort.
+#[test]
+#[ignore = "needs Pebble; run by the acme-pebble CI job"]
+fn tls_alpn01_failure_reports_the_problem_detail() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let h = rt.block_on(harness(CfAuth::Token("unused".into())));
+    // Nothing may listen there (another test's listener is gone).
+    assert!(std::net::TcpListener::bind(("::", pebble_tls_port())).is_ok());
+    h.resolver.mark_responder_ready();
+    let name = format!("{}.{ZONE}", unique("nolisten"));
+    let cfg = config(
+        &env("PEBBLE_DIRECTORY"),
+        &h.state_dir,
+        AcmeChallenge::TlsAlpn01,
+        std::slice::from_ref(&name),
+    );
+    let handle = AcmeService::spawn(engine(&h, cfg, None)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while h.source.status().last_error.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(handle);
+    let status = h.source.status();
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("challenge-failed"),
+        "{status:?}"
+    );
+    let detail = status.last_error_detail.clone().unwrap_or_default();
+    assert!(
+        ["connection", "tls", "unauthorized", "incorrectResponse"]
+            .iter()
+            .any(|kind| detail.contains(kind)),
+        "{status:?}"
+    );
+    assert!(detail.contains(&name), "{status:?}");
+    assert!(detail.len() <= 512);
+    assert!(!detail.chars().any(char::is_control));
+    drop(rt);
 }
 
 /// Review #338 L-1: an unparseable stored account file is kept aside and a

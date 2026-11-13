@@ -14,13 +14,13 @@
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use multiview_config::MultiviewConfig;
 
-use crate::cli::{TlsCommand, TlsSetCredentialArgs, TlsStatusArgs};
+use crate::cli::{TlsCommand, TlsConfigArg, TlsSetCredentialArgs, TlsStatusArgs, DEFAULT_CONFIG};
 
 /// Connect / read deadline for the loopback admin listener.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -56,7 +56,7 @@ pub fn run(command: &TlsCommand) -> anyhow::Result<String> {
     match command {
         TlsCommand::Status(args) => status(args),
         TlsCommand::SetupCode(args) => {
-            let config = load(&args.config)?;
+            let config = load(&resolve_config(args)?.path)?;
             let admin = AdminClient::from_config(&config)?;
             let (code, body) = admin.post("/api/v1/tls/setup-code", None)?;
             if code != 200 {
@@ -72,16 +72,299 @@ pub fn run(command: &TlsCommand) -> anyhow::Result<String> {
         }
         TlsCommand::SetCredential(args) => set_credential(args),
         TlsCommand::Issue(args) => {
-            let config = load(&args.config)?;
+            let config = load(&resolve_config(args)?.path)?;
             issue(&AdminClient::from_config(&config)?)
+        }
+        TlsCommand::DohCheck(_) => {
+            anyhow::bail!("tls doh-check needs a build with the `acme` feature (unix)")
         }
     }
 }
 
+/// `multiview tls doh-check <fqdn> <value> [--wait S]`: run the engine's
+/// DNS-01 `DoH` confirmation query and report what it sees. Returns the
+/// report and whether the value was seen. Never prints secrets (none used).
+#[cfg(all(feature = "acme", unix))]
+pub async fn doh_check(args: &crate::cli::TlsDohCheckArgs) -> (String, bool) {
+    use multiview_control::acme::cloudflare::{
+        doh_host_screen, doh_lookup, production_doh_client, DohOutcome, DOH_URL,
+    };
+    let mut out = String::new();
+    let _ = writeln!(out, "endpoint  {DOH_URL}");
+    match doh_host_screen().await {
+        Ok(addrs) => {
+            for (ip, refused) in addrs {
+                let verdict =
+                    refused.map_or_else(|| "admitted".to_owned(), |r| format!("REFUSED ({r})"));
+                let _ = writeln!(out, "address   {ip}  {verdict}");
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "address   resolution failed: {e}");
+        }
+    }
+    let client = match production_doh_client() {
+        Ok(client) => client,
+        Err(e) => {
+            let _ = writeln!(out, "result    client could not be built: {e}");
+            return (out, false);
+        }
+    };
+    let started = std::time::Instant::now();
+    let deadline = Duration::from_secs(args.wait);
+    let mut poll = 0_u32;
+    let mut last: Option<String> = None;
+    loop {
+        poll += 1;
+        let outcome = doh_lookup(&client, DOH_URL, &args.fqdn, &args.value).await;
+        let line = outcome.to_string();
+        if outcome == DohOutcome::Seen {
+            let _ = writeln!(
+                out,
+                "result    SEEN at poll {poll} (+{} s)",
+                started.elapsed().as_secs()
+            );
+            return (out, true);
+        }
+        if last.as_deref() != Some(line.as_str()) {
+            let _ = writeln!(
+                out,
+                "poll {poll:<4} +{:>3} s  not seen: {line}",
+                started.elapsed().as_secs()
+            );
+            last = Some(line);
+        }
+        if started.elapsed() + Duration::from_secs(2) > deadline {
+            let _ = writeln!(out, "result    NOT SEEN after {poll} poll(s)");
+            return (out, false);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Where the config of a `multiview tls` command came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigOrigin {
+    /// `--config` on the command line.
+    Explicit,
+    /// The running engine (`multiview run <CONFIG>`) with this pid.
+    RunningEngine(u32),
+    /// [`DEFAULT_CONFIG`].
+    DefaultPath,
+}
+
+/// The config a `multiview tls` command uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConfig {
+    /// The config file.
+    pub path: PathBuf,
+    /// Where it came from.
+    pub origin: ConfigOrigin,
+}
+
+impl ResolvedConfig {
+    /// The `config` status line value, e.g. `/etc/x.toml (running engine pid 42)`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let origin = match self.origin {
+            ConfigOrigin::Explicit => "--config".to_owned(),
+            ConfigOrigin::RunningEngine(pid) => format!("running engine pid {pid}"),
+            ConfigOrigin::DefaultPath => "default path".to_owned(),
+        };
+        format!("{} ({origin})", shown(&self.path))
+    }
+}
+
+/// A path for display: control characters escaped (`\n`, `\u{1b}`, …), so a
+/// hostile path cannot forge terminal output.
+#[must_use]
+pub fn shown(path: &Path) -> String {
+    let mut out = String::new();
+    for c in path.display().to_string().chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether a config path discovered from another process may be used:
+/// absolute after resolution and free of control characters.
+#[must_use]
+pub fn acceptable_discovered_path(path: &Path) -> bool {
+    path.is_absolute() && !path.to_string_lossy().chars().any(char::is_control)
+}
+
+/// Whether a process owned by `owner_uid` is trusted by a CLI running with
+/// effective uid `euid`: only the same user. (Under root this means
+/// root-owned only. Another user's process could carry a forged command line
+/// that names a config pointing the CLI at a listener of its choosing.)
+#[must_use]
+pub const fn trusted_owner(owner_uid: u32, euid: u32) -> bool {
+    owner_uid == euid
+}
+
+/// Whether `set-credential` may write the secret straight into `state_dir`
+/// while the engine is not reachable: only for a config the operator named
+/// with `--config` (never for a discovered or default one).
+#[must_use]
+pub const fn offline_write_allowed(origin: &ConfigOrigin) -> bool {
+    matches!(origin, ConfigOrigin::Explicit)
+}
+
+/// Options of `multiview run` that take a separate value (so the value is
+/// not mistaken for the CONFIG positional).
+const RUN_VALUE_OPTIONS: [&str; 3] = ["--ticks", "--duration", "--subtitles"];
+
+/// The CONFIG of a `multiview run` command line, resolved against `cwd`
+/// when relative; `None` when `argv` is not a `multiview run` invocation.
+/// Pure (no I/O): the `/proc` scan feeds it.
+#[must_use]
+pub fn engine_config_from_argv(argv: &[String], cwd: Option<&Path>) -> Option<PathBuf> {
+    let program = Path::new(argv.first()?).file_name()?;
+    if program != "multiview" {
+        return None;
+    }
+    if argv.get(1).map(String::as_str) != Some("run") {
+        return None;
+    }
+    let mut rest = argv.iter().skip(2);
+    let mut positional_only = false;
+    let config = loop {
+        let arg = rest.next()?;
+        if positional_only {
+            break arg;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if RUN_VALUE_OPTIONS.contains(&arg.as_str()) {
+            rest.next();
+            continue;
+        }
+        if arg.starts_with('-') && arg.len() > 1 {
+            continue;
+        }
+        break arg;
+    };
+    let path = PathBuf::from(config);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        cwd.map(|cwd| cwd.join(path))
+    }
+}
+
+/// `(pid, config)` of every running `multiview run` engine (Linux `/proc`)
+/// owned by this CLI's effective uid ([`trusted_owner`]; `/proc/<pid>` is
+/// owned by the process's effective uid) whose config path is acceptable
+/// ([`acceptable_discovered_path`]). Others are skipped.
+#[cfg(target_os = "linux")]
+fn running_engines() -> Vec<(u32, PathBuf)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let own = std::process::id();
+    let Ok(euid) = std::fs::metadata("/proc/self").map(|m| m.uid()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own {
+            continue;
+        }
+        let Ok(owner) = std::fs::metadata(entry.path()).map(|m| m.uid()) else {
+            continue;
+        };
+        if !trusted_owner(owner, euid) {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let argv: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        let cwd = std::fs::read_link(entry.path().join("cwd")).ok();
+        if let Some(config) = engine_config_from_argv(&argv, cwd.as_deref())
+            .filter(|config| acceptable_discovered_path(config))
+        {
+            found.push((pid, config));
+        }
+    }
+    found.sort();
+    found
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_engines() -> Vec<(u32, PathBuf)> {
+    Vec::new()
+}
+
+/// Pick the config: `--config`, else the one running engine, else
+/// [`DEFAULT_CONFIG`] when it exists.
+///
+/// # Errors
+/// Several engines run (their configs are listed), or none runs and the
+/// default config does not exist.
+pub fn resolve_config(arg: &TlsConfigArg) -> anyhow::Result<ResolvedConfig> {
+    if let Some(path) = &arg.config {
+        return Ok(ResolvedConfig {
+            path: path.clone(),
+            origin: ConfigOrigin::Explicit,
+        });
+    }
+    choose_config(&running_engines(), Path::new(DEFAULT_CONFIG).exists())
+}
+
+/// The selection rule of [`resolve_config`] over the scan result (pure).
+///
+/// # Errors
+/// As [`resolve_config`].
+pub fn choose_config(
+    engines: &[(u32, PathBuf)],
+    default_exists: bool,
+) -> anyhow::Result<ResolvedConfig> {
+    match engines {
+        [(pid, path)] => Ok(ResolvedConfig {
+            path: path.clone(),
+            origin: ConfigOrigin::RunningEngine(*pid),
+        }),
+        [] if default_exists => Ok(ResolvedConfig {
+            path: PathBuf::from(DEFAULT_CONFIG),
+            origin: ConfigOrigin::DefaultPath,
+        }),
+        [] => anyhow::bail!(
+            "no running multiview engine found and {DEFAULT_CONFIG} does not exist: pass --config <path>"
+        ),
+        several => anyhow::bail!(
+            "several multiview engines are running ({}): pass --config <path>",
+            several
+                .iter()
+                .map(|(pid, path)| format!("pid {pid}: {}", shown(path)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 fn load(path: &Path) -> anyhow::Result<MultiviewConfig> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config {}", path.display()))?;
-    MultiviewConfig::load_from_toml(&text).with_context(|| format!("parsing {}", path.display()))
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading config {}", shown(path)))?;
+    MultiviewConfig::load_from_toml(&text).with_context(|| format!("parsing {}", shown(path)))
 }
 
 fn tls_config(config: &MultiviewConfig) -> anyhow::Result<&multiview_config::NetworkTlsConfig> {
@@ -271,7 +554,8 @@ fn issue(admin: &AdminClient) -> anyhow::Result<String> {
 }
 
 fn status(args: &TlsStatusArgs) -> anyhow::Result<String> {
-    let config = load(&args.config.config)?;
+    let resolved = resolve_config(&args.config)?;
+    let config = load(&resolved.path)?;
     let tls = tls_config(&config)?;
     let online = AdminClient::from_config(&config)
         .ok()
@@ -292,7 +576,12 @@ fn status(args: &TlsStatusArgs) -> anyhow::Result<String> {
     if args.json {
         Ok(serde_json::to_string_pretty(&value)?)
     } else {
-        Ok(render_status(&value).trim_end().to_owned())
+        Ok(format!(
+            "{:<13} {}\n{}",
+            "config",
+            resolved.describe(),
+            render_status(&value).trim_end()
+        ))
     }
 }
 
@@ -319,7 +608,7 @@ pub fn offline_status(
         let meta = multiview_control::acme::stored_meta(&tls.state_dir).map_err(|e| {
             anyhow::anyhow!(
                 "stored certificate in {} unreadable ({})",
-                tls.state_dir.display(),
+                shown(&tls.state_dir),
                 e.as_reason()
             )
         })?;
@@ -438,6 +727,7 @@ pub fn render_status(value: &serde_json::Value) -> String {
         ("fingerprint", text("bootstrap_fingerprint")),
         ("alarm", text("alarm")),
         ("last error", text("last_error")),
+        ("last error detail", text("last_error_detail")),
     ];
     for (k, v) in rows {
         let _ = writeln!(out, "{k:<13} {v}");
@@ -508,7 +798,8 @@ fn read_secret_stdin(name: &str) -> anyhow::Result<zeroize_string::Secret> {
 }
 
 fn set_credential(args: &TlsSetCredentialArgs) -> anyhow::Result<String> {
-    let config = load(&args.config.config)?;
+    let resolved = resolve_config(&args.config)?;
+    let config = load(&resolved.path)?;
     let tls = tls_config(&config)?;
     if !tls.secret_names().contains(&args.name.as_str()) {
         anyhow::bail!(
@@ -517,10 +808,13 @@ fn set_credential(args: &TlsSetCredentialArgs) -> anyhow::Result<String> {
             tls.secret_names().join(", ")
         );
     }
-    let value = read_secret_stdin(&args.name)?;
     let online = AdminClient::from_config(&config)
         .ok()
         .filter(AdminClient::running);
+    if online.is_none() && !offline_write_allowed(&resolved.origin) {
+        anyhow::bail!(offline_refusal(&resolved));
+    }
+    let value = read_secret_stdin(&args.name)?;
     if let Some(admin) = online {
         let body = zeroize_string::Secret(
             serde_json::json!({"name": args.name, "value": value.0}).to_string(),
@@ -542,9 +836,19 @@ fn set_credential(args: &TlsSetCredentialArgs) -> anyhow::Result<String> {
         Ok(format!(
             "{} stored in {}/secrets/ (0600); the engine was not running: it is used at the next start",
             args.name,
-            tls.state_dir.display()
+            shown(&tls.state_dir)
         ))
     }
+}
+
+/// Why `set-credential` will not write offline into a config it did not get
+/// from `--config`.
+fn offline_refusal(resolved: &ResolvedConfig) -> String {
+    format!(
+        "the engine is not reachable and the config was not named explicitly ({}): \
+         pass --config <path> to store the credential offline in its state directory",
+        resolved.describe()
+    )
 }
 
 #[cfg(all(feature = "acme", unix))]
@@ -556,7 +860,7 @@ fn write_offline(
     multiview_control::tls_setup::write_secret(&tls.state_dir, name, value).map_err(|e| {
         anyhow::anyhow!(
             "could not write {}/secrets/{name} ({})",
-            tls.state_dir.display(),
+            shown(&tls.state_dir),
             e.as_reason()
         )
     })
@@ -623,5 +927,146 @@ mod tests {
         assert!(text.contains("letsencrypt (staging)"));
         assert!(text.contains("AB:CD"));
         assert!(text.contains("reason        credential-missing: CF_TOKEN"));
+    }
+
+    #[test]
+    fn finds_the_config_of_a_run_command_line() {
+        let argv = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+        let cwd = Path::new("/srv/mv");
+        assert_eq!(
+            engine_config_from_argv(&argv(&["/usr/bin/multiview", "run", "/etc/m.toml"]), None),
+            Some(PathBuf::from("/etc/m.toml"))
+        );
+        assert_eq!(
+            engine_config_from_argv(&argv(&["multiview", "run", "conf/m.toml"]), Some(cwd)),
+            Some(PathBuf::from("/srv/mv/conf/m.toml"))
+        );
+        assert_eq!(
+            engine_config_from_argv(
+                &argv(&[
+                    "./multiview",
+                    "run",
+                    "--software",
+                    "--ticks",
+                    "10",
+                    "m.toml"
+                ]),
+                Some(cwd)
+            ),
+            Some(PathBuf::from("/srv/mv/m.toml"))
+        );
+        assert_eq!(
+            engine_config_from_argv(
+                &argv(&[
+                    "multiview",
+                    "run",
+                    "--duration",
+                    "5",
+                    "--program-audio",
+                    "/a.toml"
+                ]),
+                None
+            ),
+            Some(PathBuf::from("/a.toml"))
+        );
+        assert_eq!(
+            engine_config_from_argv(&argv(&["multiview", "run", "--", "-odd.toml"]), Some(cwd)),
+            Some(PathBuf::from("/srv/mv/-odd.toml"))
+        );
+        // Relative without a known cwd, not `run`, not `multiview`, no CONFIG.
+        assert_eq!(
+            engine_config_from_argv(&argv(&["multiview", "run", "m.toml"]), None),
+            None
+        );
+        for other in [
+            &["multiview", "validate", "/etc/m.toml"][..],
+            &["multiview", "tls", "status"][..],
+            &["multiview-old", "run", "/etc/m.toml"][..],
+            &["/usr/bin/vim", "run", "/etc/m.toml"][..],
+            &["multiview", "run", "--software"][..],
+            &["multiview"][..],
+            &[][..],
+        ] {
+            assert_eq!(
+                engine_config_from_argv(&argv(other), Some(cwd)),
+                None,
+                "{other:?}"
+            );
+        }
+    }
+
+    /// Review S2: discovery trusts only same-euid processes and clean
+    /// absolute paths; offline writes need --config; paths are escaped.
+    #[test]
+    fn discovery_is_restricted_and_paths_are_escaped() {
+        assert!(trusted_owner(1000, 1000));
+        assert!(trusted_owner(0, 0));
+        assert!(!trusted_owner(1001, 1000), "another user's process");
+        assert!(!trusted_owner(0, 1000), "root's process for a non-root CLI");
+        assert!(!trusted_owner(1000, 0), "a user's process for a root CLI");
+
+        assert!(acceptable_discovered_path(Path::new(
+            "/etc/multiview/m.toml"
+        )));
+        assert!(!acceptable_discovered_path(Path::new("conf/m.toml")));
+        assert!(!acceptable_discovered_path(Path::new("/etc/m\n.toml")));
+        assert!(!acceptable_discovered_path(Path::new(
+            "/etc/\u{1b}[31mm.toml"
+        )));
+
+        assert!(offline_write_allowed(&ConfigOrigin::Explicit));
+        assert!(!offline_write_allowed(&ConfigOrigin::RunningEngine(7)));
+        assert!(!offline_write_allowed(&ConfigOrigin::DefaultPath));
+        let refusal = offline_refusal(&ResolvedConfig {
+            path: PathBuf::from("/srv/a.toml"),
+            origin: ConfigOrigin::RunningEngine(7),
+        });
+        assert!(refusal.contains("pass --config <path>"), "{refusal}");
+        assert!(
+            refusal.contains("/srv/a.toml (running engine pid 7)"),
+            "{refusal}"
+        );
+
+        let hostile = ResolvedConfig {
+            path: PathBuf::from("/x\n\u{1b}[2Jy.toml"),
+            origin: ConfigOrigin::Explicit,
+        };
+        let text = hostile.describe();
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+        assert_eq!(text, "/x\\n\\u{1b}[2Jy.toml (--config)");
+        let several = choose_config(
+            &[(1, PathBuf::from("/a\r")), (2, PathBuf::from("/b"))],
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!several.chars().any(char::is_control), "{several:?}");
+    }
+
+    #[test]
+    fn chooses_the_running_engine_then_the_default_path() {
+        let one = vec![(42, PathBuf::from("/srv/a.toml"))];
+        let chosen = choose_config(&one, true).unwrap();
+        assert_eq!(chosen.origin, ConfigOrigin::RunningEngine(42));
+        assert_eq!(chosen.describe(), "/srv/a.toml (running engine pid 42)");
+        let chosen = choose_config(&[], true).unwrap();
+        assert_eq!(chosen.path, PathBuf::from(DEFAULT_CONFIG));
+        assert_eq!(
+            chosen.describe(),
+            format!("{DEFAULT_CONFIG} (default path)")
+        );
+        let none = choose_config(&[], false).unwrap_err().to_string();
+        assert_eq!(
+            none,
+            "no running multiview engine found and /etc/multiview/multiview.toml does not \
+             exist: pass --config <path>"
+        );
+        let two = vec![
+            (7, PathBuf::from("/srv/a.toml")),
+            (9, PathBuf::from("/srv/b.toml")),
+        ];
+        let several = choose_config(&two, true).unwrap_err().to_string();
+        assert!(several.contains("pid 7: /srv/a.toml"), "{several}");
+        assert!(several.contains("pid 9: /srv/b.toml"), "{several}");
     }
 }

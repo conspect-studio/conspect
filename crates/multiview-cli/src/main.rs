@@ -290,6 +290,16 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
         // + control-plane state and exceeds clippy's large-future bound.
         Command::Run(args) => Box::pin(run_run(args)).await,
         Command::Node(args) => run_node(&args),
+        #[cfg(all(feature = "acme", unix))]
+        Command::Tls(multiview_cli::cli::TlsCommand::DohCheck(args)) => {
+            let (text, seen) = multiview_cli::tls_cli::doh_check(&args).await;
+            println!("{text}");
+            Ok(if seen {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
         Command::Tls(command) => {
             println!("{}", multiview_cli::tls_cli::run(&command)?);
             Ok(ExitCode::SUCCESS)
@@ -816,6 +826,16 @@ async fn serve_control_plane(
     let tls = start_tls(config, publisher)?;
     #[allow(unused_mut)]
     let mut front_door = multiview_cli::frontdoor::FrontDoorRun::start(config);
+    // Install the capability snapshot + live metrics source for the control
+    // plane (ADR-0107 slice 3) before `front_door` moves into
+    // `RunningPersist` below: `GET /api/v1/system/capabilities` and
+    // `GET /api/v1/metrics/frontdoor` read this process-global slot the same
+    // way Program metrics and output routing already do.
+    multiview_cli::frontdoor::install(front_door.as_ref().map(|door| {
+        let source: Arc<dyn multiview_control::frontdoor_metrics::FrontDoorMetricsSource> =
+            door.metrics_source();
+        (door.capability(), source)
+    }));
     #[cfg(feature = "webrtc-native")]
     let (whep, whip, whep_output) = {
         let rtc_lane = front_door
@@ -1968,6 +1988,10 @@ async fn shutdown_run_tenants(tenants: RunTenants) {
     // runtime shuts down on a blocking-pool thread, bounded, so this never
     // blocks a worker of this runtime.
     if let Some(door) = front_door {
+        // Clear the capability/metrics slot before the door itself goes
+        // away, so a straggling request never reads a snapshot/source whose
+        // underlying runtime is already shutting down.
+        multiview_cli::frontdoor::install(None);
         door.shutdown().await;
     }
     signal.abort();

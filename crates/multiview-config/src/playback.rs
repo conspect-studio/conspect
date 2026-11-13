@@ -644,6 +644,8 @@ mod tests {
             ..Default::default()
         };
         let output = Output::Srt {
+            format: None,
+            slots: None,
             id: Some("srt-out".into()),
             url: "srt://[::]:9000".into(),
             codec: "h264".into(),
@@ -682,6 +684,8 @@ mod tests {
             ..Default::default()
         };
         let output = Output::Srt {
+            format: None,
+            slots: None,
             id: None,
             url: "srt://[::]:9000".into(),
             codec: "h264".into(),
@@ -708,6 +712,8 @@ mod tests {
             ..Default::default()
         };
         let output = Output::Srt {
+            format: None,
+            slots: None,
             id: None,
             url: "srt://[::]:9000".into(),
             codec: "h264".into(),
@@ -736,6 +742,8 @@ mod tests {
             ..Default::default()
         };
         let output = Output::Srt {
+            format: None,
+            slots: None,
             id: None,
             url: "srt://[::]:9000".into(),
             codec: "h264".into(),
@@ -760,6 +768,8 @@ mod tests {
             ..Default::default()
         };
         let output = Output::Srt {
+            format: None,
+            slots: None,
             id: None,
             url: "srt://viewer-origin.example:9001?streamid=secretkey".into(),
             codec: "h264".into(),
@@ -784,6 +794,8 @@ mod tests {
         // No `srt` block at all ⇒ libav's own default (`caller`): a push, no
         // viewer URL.
         let output = Output::Srt {
+            format: None,
+            slots: None,
             id: None,
             url: "srt://dest.example:9000".into(),
             codec: "h264".into(),
@@ -805,6 +817,8 @@ mod tests {
             ..Default::default()
         };
         let output = Output::Srt {
+            format: None,
+            slots: None,
             id: None,
             url: "srt://[2001:db8::10]:9000".into(),
             codec: "h264".into(),
@@ -829,6 +843,8 @@ mod tests {
             ..Default::default()
         };
         let output = Output::Srt {
+            format: None,
+            slots: None,
             id: None,
             url: "srt://[::]:9000".into(),
             codec: "h264".into(),
@@ -847,6 +863,8 @@ mod tests {
     #[test]
     fn rist_listener_bind_yields_viewer_url() {
         let output = Output::Rist {
+            format: None,
+            slots: None,
             id: None,
             url: "rist://[::]:5000".into(),
             codec: "h264".into(),
@@ -864,6 +882,8 @@ mod tests {
     #[test]
     fn rist_push_destination_has_no_viewer_url() {
         let output = Output::Rist {
+            format: None,
+            slots: None,
             id: None,
             url: "rist://remote.example:5000".into(),
             codec: "h264".into(),
@@ -882,6 +902,8 @@ mod tests {
     #[test]
     fn rtmp_push_has_no_viewer_url_and_redacts_query() {
         let output = Output::Rtmp {
+            format: None,
+            slots: None,
             id: None,
             url: "rtmp://ingest.example/live/streamkey123".into(),
             codec: "h264".into(),
@@ -900,6 +922,8 @@ mod tests {
     #[test]
     fn whip_push_has_no_viewer_url() {
         let output = Output::WhipPush {
+            format: None,
+            slots: None,
             id: None,
             url: "https://origin.example/whip/pgm1".into(),
             token: None,
@@ -917,6 +941,8 @@ mod tests {
     #[test]
     fn hls_mount_resolves_absolute_url() {
         let output = Output::Hls {
+            format: None,
+            slots: None,
             id: Some("program".into()),
             path: "/var/lib/multiview/hls/program/multiview.m3u8".into(),
             codec: "h264".into(),
@@ -943,6 +969,8 @@ mod tests {
     #[test]
     fn hls_mount_resolves_absolute_url_with_https_scheme() {
         let output = Output::Hls {
+            format: None,
+            slots: None,
             id: Some("program".into()),
             path: "/var/lib/multiview/hls/program/multiview.m3u8".into(),
             codec: "h264".into(),
@@ -973,6 +1001,8 @@ mod tests {
     #[test]
     fn hls_mount_missing_route_notes_reason() {
         let output = Output::LlHls {
+            format: None,
+            slots: None,
             id: Some("program".into()),
             path: "/var/lib/multiview/hls/program".into(),
             codec: "h264".into(),
@@ -990,6 +1020,8 @@ mod tests {
     #[test]
     fn webrtc_output_yields_whep_url() {
         let output = Output::Webrtc {
+            format: None,
+            slots: None,
             id: Some("pgm-webrtc".into()),
             label: "Program WebRTC".into(),
             max_viewers: 8,
@@ -1120,6 +1152,8 @@ mod tests {
     #[test]
     fn webrtc_output_yields_absolute_url_when_public_host_is_known() {
         let output = Output::Webrtc {
+            format: None,
+            slots: None,
             id: Some("pgm-webrtc".into()),
             label: "Program WebRTC".into(),
             max_viewers: 8,

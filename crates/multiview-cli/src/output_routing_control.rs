@@ -19,7 +19,7 @@ use multiview_control::output_routing::{
 
 use crate::output_routing::{
     FallbackReason, OutputRoutingHandle, OutputRoutingSlot, OutputTake, RefuseReason, TakeOutcome,
-    TakeResult, DEFAULT_MAX_ENCODERS,
+    TakeResult, DEFAULT_MAX_AUX_CANVASES, DEFAULT_MAX_ENCODERS,
 };
 use crate::routing_audio::AudioChoice;
 use crate::routing_aux::PictureBus;
@@ -46,16 +46,26 @@ fn routed_feed(bus: &PictureBus) -> RoutedFeed {
         PictureBus::Preview => RoutedFeed::Preview,
         PictureBus::Clean => RoutedFeed::Clean,
         PictureBus::Source(id) => RoutedFeed::Source(id.clone()),
+        PictureBus::Layout(layout) => RoutedFeed::Layout(layout.id.clone()),
     }
 }
 
-fn picture_bus(feed: &RoutedFeed) -> PictureBus {
-    match feed {
+/// The engine bus of a take: a layout needs its resolved body (`None` for a
+/// layout take without one, refused as unroutable).
+fn picture_bus(
+    feed: &RoutedFeed,
+    layout: Option<&multiview_control::output_routing::LayoutBody>,
+) -> Option<PictureBus> {
+    Some(match feed {
         RoutedFeed::Program => PictureBus::Program,
         RoutedFeed::Preview => PictureBus::Preview,
         RoutedFeed::Clean => PictureBus::Clean,
         RoutedFeed::Source(id) => PictureBus::Source(id.clone()),
-    }
+        RoutedFeed::Layout(id) => {
+            let body = layout.filter(|b| b.0.id == *id)?;
+            PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::clone(&body.0)))
+        }
+    })
 }
 
 /// The engine audio choice of a control-plane audio feed.
@@ -119,6 +129,7 @@ const RELAY_CAPACITY: usize = 64;
 pub struct OutputRoutingAdapter {
     slot: OutputRoutingSlot,
     max_encoders: usize,
+    max_aux_canvases: usize,
     outcome_tx: SyncSender<OutputOutcome>,
     outcome_rx: Mutex<Option<Receiver<OutputOutcome>>>,
     /// The handle whose outcome stream the pump already took.
@@ -140,6 +151,7 @@ impl OutputRoutingAdapter {
         Self {
             slot,
             max_encoders: DEFAULT_MAX_ENCODERS,
+            max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             outcome_tx,
             outcome_rx: Mutex::new(Some(outcome_rx)),
             pumped: Mutex::new(None),
@@ -218,6 +230,49 @@ impl OutputRouting for OutputRoutingAdapter {
         }
         let snapshot = handle.snapshot();
         let bus = feed.bus_name();
+        // §7 rule 1: a layout not composing for another output needs a free
+        // aux canvas; this output's own layout is replaced by the take.
+        let own = snapshot.outputs.get(index).map(|v| v.bus.as_str());
+        let held_by_others: Vec<&str> = snapshot
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .flat_map(|(_, v)| {
+                std::iter::once(v.bus.as_str()).chain(v.pending.as_ref().map(|p| p.bus.as_str()))
+            })
+            .filter(|b| b.starts_with("aux:"))
+            .collect();
+        let mut distinct = held_by_others.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let needs_aux_canvas = matches!(feed, RoutedFeed::Layout(_))
+            && own != Some(bus.as_str())
+            && !distinct.contains(&bus.as_str());
+        if matches!(feed, RoutedFeed::Layout(_))
+            && !distinct.contains(&bus.as_str())
+            && distinct.len() >= self.max_aux_canvases
+        {
+            return Err(PlanRefusal::AuxCapacity {
+                active: distinct.len(),
+                max: self.max_aux_canvases,
+            });
+        }
+        // #342: a routed source/PVW is encoded at the output's feed format,
+        // so its key is (bus@format, settings); Program/Clean stay the bus.
+        let routed = matches!(feed, RoutedFeed::Source(_) | RoutedFeed::Preview);
+        let key_name = |format: Option<crate::routing_aux::AuxFormat>| -> String {
+            if routed {
+                // Only a source/PVW feed is routed here; it never needs a body.
+                picture_bus(feed, None).map_or_else(
+                    || bus.clone(),
+                    |b| crate::routing_aux::feed_name(&b, format),
+                )
+            } else {
+                bus.clone()
+            }
+        };
+        let wanted = key_name(run_output.feed_format);
         // +0 when the feed is Program (the base encoder), another output
         // with the same settings already carries this bus, or a live encoder
         // for (bus, settings) still runs (a lingering one is reused by the
@@ -225,18 +280,20 @@ impl OutputRouting for OutputRoutingAdapter {
         let shared = *feed == RoutedFeed::Program
             || handle.outputs().iter().enumerate().any(|(i, o)| {
                 o.settings == run_output.settings
+                    && key_name(o.feed_format) == wanted
                     && snapshot.outputs.get(i).is_some_and(|v| v.bus == bus)
             })
             || snapshot
                 .live_keys
                 .iter()
-                .any(|(b, settings)| *b == bus && *settings == run_output.settings);
+                .any(|(b, settings)| *b == wanted && *settings == run_output.settings);
         Ok(PlanCost {
             needs_encoder: !shared,
             sessions_in_use: snapshot
                 .dynamic_encoders_live
                 .saturating_add(snapshot.opens_in_flight),
             sessions_max: self.max_encoders,
+            needs_aux_canvas,
         })
     }
 
@@ -289,7 +346,12 @@ impl OutputRouting for OutputRoutingAdapter {
             // already answered `audio-unsupported` from the plan.
             return Err(TakeSubmitError::Unroutable);
         }
-        let bus = take.video.as_ref().map(picture_bus);
+        let bus = match take.video.as_ref() {
+            Some(feed) => {
+                Some(picture_bus(feed, take.layout.as_ref()).ok_or(TakeSubmitError::Unroutable)?)
+            }
+            None => None,
+        };
         if bus.is_none() && audio.is_none() {
             return Err(TakeSubmitError::Unroutable);
         }

@@ -39,6 +39,7 @@ use multiview_core::time::Rational;
 use thiserror::Error;
 
 use crate::audio::{AudioChannels, AudioRouting, OutputAudio, OutputAudioMode, PROGRAM_TRACK};
+use crate::output_format::OutputFit;
 use crate::placement::DevicePin;
 use crate::program::ProgramId;
 use crate::schema::{CanvasColor, Output, OutputOrientation};
@@ -254,10 +255,15 @@ pub struct VideoRenditionKey {
     pub program_id: ProgramId,
     /// The requested logical video codec.
     pub codec: RenditionVideoCodec,
-    /// Encoded width in pixels (the canvas width today).
+    /// Encoded width in pixels: the output format's, else the canvas's.
     pub width: u32,
-    /// Encoded height in pixels (the canvas height today).
+    /// Encoded height in pixels: the output format's, else the canvas's.
     pub height: u32,
+    /// The fit used to convert the Program canvas to a non-canvas size
+    /// (#342); `None` at canvas size (identity: the fit is irrelevant).
+    pub fit: Option<OutputFit>,
+    /// Video slot 0's bit rate (#342); `None` = the engine default.
+    pub bitrate_kbps: Option<u32>,
     /// Exact rational output cadence, in reduced form.
     pub cadence: Rational,
     /// Working pixel format (`nv12`, `p010`, …).
@@ -598,6 +604,37 @@ fn push_unique<T: PartialEq>(items: &mut Vec<T>, candidate: T) {
 /// The WebRTC kinds are included: they consume the program rendition they name
 /// (default `h264`) and therefore admit exactly one video key, which other
 /// outputs may share. They never encode a second time.
+/// The number of distinct base video encoder keys the document needs (#342
+/// review A2), counting every output whose codec is known: one per distinct
+/// (codec, format, settings, placement, orientation). Unknown codec tokens
+/// are left to the plan's own refusal.
+#[must_use]
+pub fn distinct_base_video_keys(config: &MultiviewConfig) -> usize {
+    /// Every codec counts: availability is the plan's question, not this one.
+    struct Any;
+    impl EncodeCapabilities for Any {
+        fn video_encoder_available(&self, _codec: RenditionVideoCodec) -> bool {
+            true
+        }
+        fn audio_encoder_available(&self, _codec: RenditionAudioCodec) -> bool {
+            true
+        }
+    }
+    let program_id = ProgramId::main();
+    let cadence = config.canvas.fps.rational().reduce();
+    let color = RenditionColorKey::from_canvas(&config.canvas.color);
+    let mut keys: Vec<VideoRenditionKey> = Vec::new();
+    for (index, output) in config.outputs.iter().enumerate() {
+        let key = video_key_for_output(output, index, &program_id, config, cadence, &color, &Any);
+        if let Ok(Some(key)) = key {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys.len()
+}
+
 fn video_key_for_output(
     output: &Output,
     output_index: usize,
@@ -619,6 +656,21 @@ fn video_key_for_output(
         | Output::Cast { codec, .. } => codec.as_str(),
         Output::Ndi { .. } | Output::Aes67 { .. } | Output::Display { .. } => return Ok(None),
     };
+    // #342: video slot 0's codec, when declared, is the encoded codec. Its
+    // token is resolved through the shared codec table (encoder names such
+    // as `h264_nvenc` are valid slot codecs).
+    let slot_token = output
+        .video_slot0()
+        .and_then(|slot| slot.codec.as_deref())
+        .map(|codec| match crate::output_format::CodecFamily::of(codec) {
+            Some(crate::output_format::CodecFamily::H264) => "h264",
+            Some(crate::output_format::CodecFamily::Hevc) => "hevc",
+            Some(crate::output_format::CodecFamily::Mpeg2) => "mpeg2video",
+            Some(crate::output_format::CodecFamily::Ffv1) => "ffv1",
+            Some(crate::output_format::CodecFamily::Mjpeg) => "mjpeg",
+            _ => codec,
+        });
+    let token = slot_token.unwrap_or(token);
     let codec =
         RenditionVideoCodec::parse(token).ok_or_else(|| RenditionPlanError::UnknownVideoCodec {
             output_index,
@@ -632,11 +684,21 @@ fn video_key_for_output(
             codec,
         });
     }
+    // #342: the base key is at the output's format; a canvas-sized format is
+    // the canvas key (identity, fit irrelevant).
+    let (width, height, fit) = match output.format() {
+        Some(f) if f.width != config.canvas.width || f.height != config.canvas.height => {
+            (f.width, f.height, Some(f.fit))
+        }
+        _ => (config.canvas.width, config.canvas.height, None),
+    };
     Ok(Some(VideoRenditionKey {
         program_id: program_id.clone(),
         codec,
-        width: config.canvas.width,
-        height: config.canvas.height,
+        width,
+        height,
+        fit,
+        bitrate_kbps: output.video_slot0().and_then(|slot| slot.bitrate_kbps),
         cadence,
         pixel_format: config.canvas.pixel_format.clone(),
         color: color.clone(),
@@ -785,8 +847,8 @@ fn audio_keys_for_output(
             codec,
         });
     }
-    let tracks = match output.audio() {
-        Some(selection) => context.resolve_selection(selection, output_index, output_id)?,
+    let tracks = match output.effective_audio() {
+        Some(selection) => context.resolve_selection(&selection, output_index, output_id)?,
         None => vec![AudioTrackId::ProgramBus],
     };
     let mut keys = Vec::with_capacity(tracks.len());

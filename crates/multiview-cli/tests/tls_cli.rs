@@ -21,17 +21,16 @@ fn tls_subcommands_parse() {
     {
         Command::Tls(TlsCommand::Status(a)) => {
             assert!(a.json);
-            assert_eq!(a.config.config, std::path::PathBuf::from("/c.toml"));
+            assert_eq!(a.config.config, Some(std::path::PathBuf::from("/c.toml")));
         }
         other => panic!("{other:?}"),
     }
     match parse(&["multiview", "tls", "status"]).unwrap() {
         Command::Tls(TlsCommand::Status(a)) => {
             assert!(!a.json);
-            assert_eq!(
-                a.config.config,
-                std::path::PathBuf::from(multiview_cli::cli::DEFAULT_CONFIG)
-            );
+            // No default any more: resolved at run time (running engine,
+            // else /etc/multiview/multiview.toml when it exists).
+            assert_eq!(a.config.config, None);
         }
         other => panic!("{other:?}"),
     }

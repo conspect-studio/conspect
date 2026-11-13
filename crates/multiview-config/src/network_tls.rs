@@ -17,6 +17,35 @@ pub const DEFAULT_HTTPS_PORT: u16 = 443;
 pub const DEFAULT_WORKERS: u16 = 2;
 /// Most `network.workers` accepted.
 pub const MAX_WORKERS: u16 = 64;
+/// Default `network.udp.recv_buffer_bytes` (`SO_RCVBUF` request).
+pub const DEFAULT_RECV_BUFFER_BYTES: u32 = 8 * 1024 * 1024;
+/// Most `network.udp.recv_buffer_bytes` accepted (256 MiB).
+pub const MAX_RECV_BUFFER_BYTES: u32 = 256 * 1024 * 1024;
+/// Default `network.udp.new_flow_pps_per_source`.
+pub const DEFAULT_NEW_FLOW_PPS_PER_SOURCE: u32 = 500;
+/// Default `network.udp.new_flow_burst`.
+pub const DEFAULT_NEW_FLOW_BURST: u32 = 200;
+/// Default `network.udp.new_flow_global_pps`.
+pub const DEFAULT_NEW_FLOW_GLOBAL_PPS: u32 = 50_000;
+/// Default `network.udp.stun_pps_per_source`.
+pub const DEFAULT_STUN_PPS_PER_SOURCE: u32 = 50;
+/// Default `network.udp.stun_global_pps`.
+pub const DEFAULT_STUN_GLOBAL_PPS: u32 = 5_000;
+/// Default `network.udp.nft_floor_status_file`: where the shipped systemd
+/// unit's `ExecStartPre=+` writes `nft -j list table inet conspect_floor`
+/// (`deploy/systemd/conspect.service`), for the engine (running unprivileged,
+/// unable to list the ruleset itself) to read as a pure file parse. The
+/// directory is created root-owned (0755) by that root step, so the service
+/// user cannot replace or redirect the file; the engine also only trusts a
+/// root-owned regular file that is not group/other-writable.
+pub const DEFAULT_NFT_FLOOR_STATUS_FILE: &str = "/run/conspect-floor/nft-floor.json";
+/// Default `network.quic.retry_above_handshakes` (QUIC Retry, RFC 9000
+/// section 8.1.2).
+pub const DEFAULT_RETRY_ABOVE_HANDSHAKES: usize = 8;
+/// Default `network.quic.max_connections`.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 1024;
+/// Most `network.quic.max_connections` accepted.
+pub const MAX_MAX_CONNECTIONS: u32 = 65_536;
 
 /// Default `network.http_redirect_port` in `direct` mode.
 pub const DEFAULT_HTTP_REDIRECT_PORT: u16 = 80;
@@ -129,6 +158,46 @@ fn prefix_match(net: &[u8], ip: &[u8], prefix: u8) -> bool {
     true
 }
 
+const fn default_recv_buffer_bytes() -> u32 {
+    DEFAULT_RECV_BUFFER_BYTES
+}
+
+const fn default_new_flow_pps_per_source() -> u32 {
+    DEFAULT_NEW_FLOW_PPS_PER_SOURCE
+}
+
+const fn default_new_flow_burst() -> u32 {
+    DEFAULT_NEW_FLOW_BURST
+}
+
+const fn default_new_flow_global_pps() -> u32 {
+    DEFAULT_NEW_FLOW_GLOBAL_PPS
+}
+
+const fn default_validated_steering() -> bool {
+    true
+}
+
+const fn default_stun_pps_per_source() -> u32 {
+    DEFAULT_STUN_PPS_PER_SOURCE
+}
+
+const fn default_stun_global_pps() -> u32 {
+    DEFAULT_STUN_GLOBAL_PPS
+}
+
+fn default_nft_floor_status_file() -> PathBuf {
+    PathBuf::from(DEFAULT_NFT_FLOOR_STATUS_FILE)
+}
+
+const fn default_retry_above_handshakes() -> usize {
+    DEFAULT_RETRY_ABOVE_HANDSHAKES
+}
+
+const fn default_max_connections() -> u32 {
+    DEFAULT_MAX_CONNECTIONS
+}
+
 /// The front-door `[network]` section (ADR-0107).
 ///
 /// Slice 1 (the shared UDP socket) reads `https_port`, `advertise` and
@@ -190,6 +259,14 @@ pub struct NetworkConfig {
     /// `[network.ice_tcp]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ice_tcp: Option<IceTcpConfig>,
+    /// `[network.udp]`: the dispatcher's receive buffer and new-flow limits
+    /// (slice 3, design note section 10).
+    #[serde(default)]
+    pub udp: NetworkUdpConfig,
+    /// `[network.quic]`: the noq endpoint's Retry policy and connection cap
+    /// (slice 3, design note section 10).
+    #[serde(default)]
+    pub quic: NetworkQuicConfig,
     /// HTTP-01 bridge for an external ACME client (slice 6, issue #292): the
     /// port-80 redirect listener answers `GET /.well-known/acme-challenge/<token>`
     /// with the file `<acme_webroot>/.well-known/acme-challenge/<token>` (the
@@ -226,10 +303,141 @@ impl Default for NetworkConfig {
             trusted_proxies: Vec::new(),
             proxy_listen: None,
             ice_tcp: None,
+            udp: NetworkUdpConfig::default(),
+            quic: NetworkQuicConfig::default(),
             acme_webroot: None,
             cert_file: None,
             key_file: None,
         }
+    }
+}
+
+/// `[network.udp]` (design note section 10): the front door's receive buffer
+/// and new-flow limits. Every field is optional with a default equal to
+/// `multiview-frontdoor`'s crate default, so an old `[network]` section
+/// without `[network.udp]` parses unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkUdpConfig {
+    /// `SO_RCVBUF` request; the kernel may clamp it (`rmem_max`), which is
+    /// logged at startup.
+    #[serde(default = "default_recv_buffer_bytes")]
+    pub recv_buffer_bytes: u32,
+    /// Sustained new-flow datagrams per second per source key (IPv4 address
+    /// or IPv6 /64).
+    #[serde(default = "default_new_flow_pps_per_source")]
+    pub new_flow_pps_per_source: u32,
+    /// Burst per source key.
+    #[serde(default = "default_new_flow_burst")]
+    pub new_flow_burst: u32,
+    /// Sustained new-flow datagrams per second for all sources together.
+    #[serde(default = "default_new_flow_global_pps")]
+    pub new_flow_global_pps: u32,
+    /// Validated-flow steering (Linux `SO_REUSEPORT` + CBPF). `false` forces
+    /// one socket.
+    #[serde(default = "default_validated_steering")]
+    pub validated_steering: bool,
+    /// Sustained well-formed STUN datagrams per second per source, from
+    /// unvalidated sources.
+    #[serde(default = "default_stun_pps_per_source")]
+    pub stun_pps_per_source: u32,
+    /// Sustained STUN datagrams per second from unvalidated sources, all
+    /// sources together.
+    #[serde(default = "default_stun_global_pps")]
+    pub stun_global_pps: u32,
+    /// Where the shipped systemd unit's `ExecStartPre=+` writes
+    /// `nft -j list table inet conspect_floor` for the engine to read (it
+    /// runs unprivileged and cannot list the ruleset itself). Default
+    /// `/run/conspect-floor/nft-floor.json`; only a root-owned regular file
+    /// that is not group/other-writable is trusted (a status report, never
+    /// an enforcement input).
+    #[serde(default = "default_nft_floor_status_file")]
+    pub nft_floor_status_file: PathBuf,
+}
+
+impl Default for NetworkUdpConfig {
+    fn default() -> Self {
+        Self {
+            recv_buffer_bytes: DEFAULT_RECV_BUFFER_BYTES,
+            new_flow_pps_per_source: DEFAULT_NEW_FLOW_PPS_PER_SOURCE,
+            new_flow_burst: DEFAULT_NEW_FLOW_BURST,
+            new_flow_global_pps: DEFAULT_NEW_FLOW_GLOBAL_PPS,
+            validated_steering: true,
+            stun_pps_per_source: DEFAULT_STUN_PPS_PER_SOURCE,
+            stun_global_pps: DEFAULT_STUN_GLOBAL_PPS,
+            nft_floor_status_file: default_nft_floor_status_file(),
+        }
+    }
+}
+
+impl NetworkUdpConfig {
+    /// Validate ranges (design note section 10): every rate non-zero,
+    /// `recv_buffer_bytes` within `(0, MAX_RECV_BUFFER_BYTES]`.
+    ///
+    /// # Errors
+    /// Returns a field-specific validation error.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.recv_buffer_bytes == 0 || self.recv_buffer_bytes > MAX_RECV_BUFFER_BYTES {
+            return Err(network_fail(
+                "udp.recv_buffer_bytes",
+                "must be between 1 and 256 MiB",
+            ));
+        }
+        for (field, value) in [
+            ("udp.new_flow_pps_per_source", self.new_flow_pps_per_source),
+            ("udp.new_flow_burst", self.new_flow_burst),
+            ("udp.new_flow_global_pps", self.new_flow_global_pps),
+            ("udp.stun_pps_per_source", self.stun_pps_per_source),
+            ("udp.stun_global_pps", self.stun_global_pps),
+        ] {
+            if value == 0 {
+                return Err(network_fail(field, "must be non-zero"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `[network.quic]` (design note section 10): the noq endpoint's Retry
+/// policy and connection cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkQuicConfig {
+    /// Above this many handshakes in flight, an unvalidated `Incoming` that
+    /// may still retry is sent a QUIC Retry (RFC 9000 section 8.1.2) instead
+    /// of accepted.
+    #[serde(default = "default_retry_above_handshakes")]
+    pub retry_above_handshakes: usize,
+    /// Cap on established QUIC (`MoQ`) peers.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+}
+
+impl Default for NetworkQuicConfig {
+    fn default() -> Self {
+        Self {
+            retry_above_handshakes: DEFAULT_RETRY_ABOVE_HANDSHAKES,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
+    }
+}
+
+impl NetworkQuicConfig {
+    /// Validate `max_connections` is in `1..=65536` (design note section
+    /// 10). `retry_above_handshakes` has no invalid value: 0 means "retry
+    /// every unvalidated handshake", which is a legitimate (if aggressive)
+    /// choice.
+    ///
+    /// # Errors
+    /// Returns a validation error when `max_connections` is out of range.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_connections == 0 || self.max_connections > MAX_MAX_CONNECTIONS {
+            return Err(network_fail(
+                "quic.max_connections",
+                "must be between 1 and 65536",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -318,7 +526,31 @@ pub enum DnsProviderConfig {
         /// DNS propagation deadline in seconds.
         #[serde(default = "default_propagation_timeout")]
         propagation_timeout_s: u64,
+        /// How the engine confirms the TXT record before telling the CA
+        /// (`auto` by default; see [`DnsConfirm`]).
+        #[serde(default)]
+        confirm: DnsConfirm,
     },
+}
+
+/// How a DNS-01 TXT record is confirmed before the CA is told to validate.
+///
+/// Some networks intercept every outbound port-53 query (UDP and TCP) and
+/// answer it from a hijacking resolver, so asking the zone's authoritative
+/// nameservers directly can never see the record. DNS over HTTPS (RFC 8484,
+/// Cloudflare's own resolver `cloudflare-dns.com`) still works there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsConfirm {
+    /// Probe for port-53 interception (a query to documentation addresses
+    /// where nothing listens; any answer means interception): intercepted →
+    /// DNS over HTTPS, otherwise the authoritative nameservers.
+    #[default]
+    Auto,
+    /// Always ask every authoritative nameserver directly (UDP, then TCP, port 53).
+    Authoritative,
+    /// Always confirm through DNS over HTTPS at Cloudflare's resolver.
+    Doh,
 }
 
 const fn default_propagation_timeout() -> u64 {
@@ -327,6 +559,12 @@ const fn default_propagation_timeout() -> u64 {
 
 fn fail(field: &str, message: &str) -> ConfigError {
     ConfigError::Validation(format!("network.tls.{field}: {message}"))
+}
+
+/// A validation error for a `[network]` sub-table other than `tls`:
+/// `path` is relative to `network.` (e.g. `udp.new_flow_burst`).
+fn network_fail(path: &str, message: &str) -> ConfigError {
+    ConfigError::Validation(format!("network.{path}: {message}"))
 }
 
 fn env_name(field: &str, value: &str) -> Result<(), ConfigError> {
@@ -420,6 +658,8 @@ impl NetworkConfig {
     /// Returns a field-specific validation error on malformed configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_socket()?;
+        self.udp.validate()?;
+        self.quic.validate()?;
         self.validate_tcp()?;
         match (&self.cert_file, &self.key_file) {
             (None, None) => {}
@@ -875,6 +1115,7 @@ impl NetworkTlsConfig {
                     email_env,
                     api_key_env,
                     propagation_timeout_s,
+                    ..
                 }),
             ) => {
                 let token = token_env.is_some();
@@ -951,6 +1192,94 @@ mod socket_tests {
             assert!(n.validate().is_err(), "{bad}");
         }
         assert!(toml::from_str::<NetworkConfig>("bogus = 1").is_err());
+    }
+
+    #[test]
+    fn udp_and_quic_sections_are_optional_and_default() {
+        let n: NetworkConfig = toml::from_str("").unwrap();
+        assert_eq!(n.udp, NetworkUdpConfig::default());
+        assert_eq!(n.quic, NetworkQuicConfig::default());
+        assert_eq!(n.udp.recv_buffer_bytes, DEFAULT_RECV_BUFFER_BYTES);
+        assert!(n.udp.validated_steering);
+        assert_eq!(
+            n.udp.nft_floor_status_file,
+            PathBuf::from(DEFAULT_NFT_FLOOR_STATUS_FILE)
+        );
+        assert_eq!(
+            n.quic.retry_above_handshakes,
+            DEFAULT_RETRY_ABOVE_HANDSHAKES
+        );
+        assert_eq!(n.quic.max_connections, DEFAULT_MAX_CONNECTIONS);
+        n.validate().unwrap();
+
+        let n: NetworkConfig = toml::from_str(
+            "[udp]\nrecv_buffer_bytes = 4194304\nnew_flow_pps_per_source = 10\nnew_flow_burst = 5\n\
+             new_flow_global_pps = 100\nvalidated_steering = false\nstun_pps_per_source = 10\n\
+             stun_global_pps = 200\nnft_floor_status_file = \"/tmp/floor.json\"\n\
+             [quic]\nretry_above_handshakes = 16\nmax_connections = 2048\n",
+        )
+        .unwrap();
+        n.validate().unwrap();
+        assert_eq!(n.udp.recv_buffer_bytes, 4_194_304);
+        assert!(!n.udp.validated_steering);
+        assert_eq!(
+            n.udp.nft_floor_status_file,
+            PathBuf::from("/tmp/floor.json")
+        );
+        assert_eq!(n.quic.retry_above_handshakes, 16);
+        assert_eq!(n.quic.max_connections, 2048);
+    }
+
+    #[test]
+    fn rejects_bad_udp_and_quic_values_and_unknown_keys() {
+        for (bad, message) in [
+            (
+                "[udp]\nrecv_buffer_bytes = 0",
+                "network.udp.recv_buffer_bytes: must be between 1 and 256 MiB",
+            ),
+            (
+                "[udp]\nrecv_buffer_bytes = 300000000",
+                "network.udp.recv_buffer_bytes: must be between 1 and 256 MiB",
+            ),
+            (
+                "[udp]\nnew_flow_pps_per_source = 0",
+                "network.udp.new_flow_pps_per_source: must be non-zero",
+            ),
+            (
+                "[udp]\nnew_flow_burst = 0",
+                "network.udp.new_flow_burst: must be non-zero",
+            ),
+            (
+                "[udp]\nnew_flow_global_pps = 0",
+                "network.udp.new_flow_global_pps: must be non-zero",
+            ),
+            (
+                "[udp]\nstun_pps_per_source = 0",
+                "network.udp.stun_pps_per_source: must be non-zero",
+            ),
+            (
+                "[udp]\nstun_global_pps = 0",
+                "network.udp.stun_global_pps: must be non-zero",
+            ),
+            (
+                "[quic]\nmax_connections = 0",
+                "network.quic.max_connections: must be between 1 and 65536",
+            ),
+            (
+                "[quic]\nmax_connections = 100000",
+                "network.quic.max_connections: must be between 1 and 65536",
+            ),
+        ] {
+            let n: NetworkConfig = toml::from_str(bad).unwrap();
+            let err = n.validate().unwrap_err().to_string();
+            assert!(err.contains(message), "{bad}: {err}");
+            assert!(!err.contains("network.tls."), "{bad}: {err}");
+        }
+        assert!(toml::from_str::<NetworkConfig>("[udp]\nbogus = 1").is_err());
+        assert!(toml::from_str::<NetworkConfig>("[quic]\nbogus = 1").is_err());
+        // retry_above_handshakes = 0 is a legitimate (aggressive) choice, not an error.
+        let n: NetworkConfig = toml::from_str("[quic]\nretry_above_handshakes = 0").unwrap();
+        n.validate().unwrap();
     }
 
     #[test]
