@@ -151,17 +151,26 @@ impl Watchdog {
             if due_at > now {
                 // #350: a timed wait can wake late, by more for a longer
                 // timeout (macOS timer coalescing; a CI VM fired 92-106 ms
-                // late after one long wait). Every wait is at most
-                // MAX_PARK, and the last FINAL_APPROACH in FINAL_STEP waits.
-                // The worst single-wait lateness is reported with the fire.
+                // late after one long wait). Every wait is at most MAX_PARK,
+                // and the last FINAL_APPROACH goes in FINAL_STEP waits. Each
+                // wait targets the absolute deadline, so lateness never
+                // accumulates: the fire is late by at most the lateness of
+                // the one wait that crosses the deadline. Reported with the
+                // fire: the worst single-wait lateness, measured tightly
+                // around the park, and the longest wait requested.
                 let left = due_at - now;
                 let step = if left > FINAL_APPROACH {
                     left.min(MAX_PARK)
                 } else {
                     left.min(FINAL_STEP)
                 };
+                MAX_STEP_US.fetch_max(
+                    u64::try_from(step.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                let parked_at = Instant::now();
                 std::thread::park_timeout(step);
-                let late = now.elapsed().saturating_sub(step);
+                let late = parked_at.elapsed().saturating_sub(step);
                 WORST_WAKE_LATE_MS.fetch_max(
                     u64::try_from(late.as_millis()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
@@ -256,11 +265,12 @@ fn exit_process(cause: ExitCause) {
         "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
          code {} (outputs finalised before the bound are valid; detached sinks may be \
          incomplete; the supervisor restarts the service) \
-         [fired_after_decision_ms={} worst_wake_late_ms={}]\n",
+         [fired_after_decision_ms={} worst_wake_late_ms={} max_wait_ms={}]\n",
         EXIT_DEADLINE.as_millis(),
         cause.code(),
         FIRE_AFTER_ARM_MS.load(Ordering::Acquire),
-        WORST_WAKE_LATE_MS.load(Ordering::Relaxed)
+        WORST_WAKE_LATE_MS.load(Ordering::Relaxed),
+        MAX_STEP_US.load(Ordering::Relaxed).div_ceil(1000)
     );
     write_stderr_raw(line.as_bytes());
     std::process::exit(cause.code());
@@ -377,6 +387,8 @@ pub fn arm(cause: ExitCause) {
 static FIRE_AFTER_ARM_MS: AtomicU64 = AtomicU64::new(0);
 /// The worst lateness of one watchdog wait while armed (#350 diagnostics).
 static WORST_WAKE_LATE_MS: AtomicU64 = AtomicU64::new(0);
+/// The longest single watchdog wait requested while armed, in µs (#350).
+static MAX_STEP_US: AtomicU64 = AtomicU64::new(0);
 
 /// The armed state as a cheap poll: `Some(cause)` once any exit was decided.
 /// The binary's "exit decided" task polls this (every few ms, off the clock) to
@@ -512,15 +524,17 @@ mod tests {
 
     #[test]
     fn a_fatal_during_a_stop_upgrades_the_code_and_keeps_the_first_deadline() {
+        // #365: deterministic. Both arms happen BEFORE the watchdog thread
+        // starts, so the fire cannot race the upgrade. The Fatal asks for a
+        // 10 s deadline: if an upgrade moved the deadline, the fire would come
+        // 10 s later, not at the first decision's 300 ms.
         static W: OnceLock<Watchdog> = OnceLock::new();
         let w = W.get_or_init(Watchdog::new);
-        assert!(w.start(record2));
         let start = Instant::now();
-        w.arm(ExitCause::Stop, Duration::from_millis(300));
-        std::thread::sleep(Duration::from_millis(200));
-        let fatal_at = Instant::now();
-        w.arm(ExitCause::Fatal, Duration::from_millis(300));
-        let until = start + Duration::from_secs(5);
+        assert!(w.arm(ExitCause::Stop, Duration::from_millis(300)));
+        assert!(!w.arm(ExitCause::Fatal, Duration::from_secs(10)));
+        assert!(w.start(record2));
+        let until = start + Duration::from_secs(8);
         while FIRED2
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -533,7 +547,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        assert_eq!(fired.len(), 1);
+        assert_eq!(fired.len(), 1, "fired once, at the first deadline");
         let (cause, at) = fired[0];
         assert_eq!(cause, ExitCause::Fatal, "the failure is reported");
         assert!(
@@ -541,8 +555,8 @@ mod tests {
             "not before the first deadline"
         );
         assert!(
-            at < fatal_at + Duration::from_millis(250),
-            "the first decision's deadline holds; the upgrade does not extend it"
+            at < start + Duration::from_secs(8),
+            "the first decision's deadline holds; the upgrade does not extend it to 10 s"
         );
     }
 

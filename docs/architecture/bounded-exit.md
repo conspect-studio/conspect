@@ -37,15 +37,16 @@ restarting.
      first exit decision. A later `Fatal` upgrades a `Stop` (a run that fails during its stop
      exits 1), but it does not extend the deadline. A `Stop` never downgrades a `Fatal`.
    - At the deadline, if the process is still alive, the thread acts as follows:
-     - It writes one line to `/dev/stderr` from a helper thread, through its own file handle
-       (no std stderr lock, no tracing: either may be the stuck part).
+     - It starts a backstop thread. That thread ends the process if the rest has not
+       finished within 500 ms: `SIGKILL` in builds with `rustix` (every `ffmpeg` build),
+       `abort()` otherwise. Both skip atexit handlers. If the backstop cannot start, the
+       watchdog exits at once, without the notice.
+     - It writes one line to fd 2 itself, with raw complete writes (no std stderr lock, no
+       tracing: either may be the stuck part). A blocked stderr is cut by the backstop.
      - It calls `std::process::exit` with the cause's code: 1 for a fatal, 0 for a stop.
        A stop exits 1 instead when outputs are still open, or when the run's own verdict
        is a failure (it faltered: frames were shed). That is the same code a normal return
        would give.
-     - A backstop thread ends the process if the C runtime exit path (atexit handlers, stdio
-       flush) has not finished within 500 ms: `SIGKILL` in builds with `rustix` (every
-       `ffmpeg` build), `abort()` otherwise. Both skip atexit handlers.
 2. **Arm points: every exit decision.**
    - The bake consumer returns a fatal error (live run only, never with a test seam), or the
      consumer could not be spawned.
@@ -80,24 +81,26 @@ restarting.
      library use) each phase keeps its full grace, as before.
    - **The bound (#350).** It has three parts:
      - **The deadline:** the watchdog fires 2 s after the first exit decision, measured on
-       its own monotonic clock. Its own logic adds at most a few ms: no wait is longer than
-       20 ms, and the last 20 ms go in 1 ms steps. (One long wait could wake late by an
-       amount that grows with the timeout: macOS timer coalescing.)
+       its own monotonic clock. No wait is longer than 20 ms, the last 20 ms go in 1 ms
+       steps, and every wait targets the absolute deadline. So lateness never accumulates:
+       the fire is late by at most the lateness of the one wait that crosses the deadline.
+       (One long wait could wake late by an amount that grows with the timeout: macOS
+       timer coalescing.)
      - **The wake latency:** the OS decides when a waiting thread runs again. The watchdog
        runs at the output clock's scheduling class (macOS QoS user-interactive; the class it
-       got is logged), and it reports the worst lateness of one wait
-       (`worst_wake_late_ms`). This latency is the host's, not the design's:
+       got is logged). The hard-exit line reports its longest wait (`max_wait_ms`) and the
+       worst lateness of a single wait (`worst_wake_late_ms`, measured tightly around the
+       wait). This latency is the host's, not the design's:
        - a dedicated Apple-silicon host, idle or with 28 busy CPU loops: at most 11 ms;
-       - a shared macOS CI VM: up to 143 ms seen, on a single 20 ms wait at QoS
-         user-interactive. The cause is outside the process (the shared VM's scheduling).
-     - **The exit path:** after the fire, a backstop thread starts first; then the watchdog
-       writes the notice (a complete raw write to fd 2) and calls the C runtime exit. If
-       either blocks, the backstop kills the process: at most 500 ms
-       (`EXIT_PATH_GRACE`).
-   - **What the design promises:** decision → process gone ≤ 2 s + the host's wake latency +
-     550 ms. On a host whose wake latency is at most 50 ms that is **2.6 s**; measured
-     2.00–2.03 s on the Apple-silicon host, idle or loaded. It is not a hard real-time
-     guarantee: the watchdog and the backstop are sleeping threads.
+       - a shared macOS CI VM (3 vCPUs, software-heavy encode): 92 and 106 ms on one long
+         wait; with 20 ms waits, 121–151 ms in every one of 40 runs, and 143 ms in another.
+         The cause is outside the process (the VM's scheduling under load).
+     - **The exit path:** after the fire, the backstop starts, the notice is written and the
+       C runtime exit runs; the backstop cuts any of them at 500 ms (`EXIT_PATH_GRACE`).
+   - **What the design promises:** decision → process gone ≤ 2 s + the host's single-wait
+     wake latency + 550 ms. On a host whose wake latency is at most 50 ms that is **2.6 s**;
+     measured 2.00–2.03 s on the Apple-silicon host, idle or loaded. It is not a hard
+     real-time guarantee: the watchdog and the backstop are sleeping threads.
    - The hard-exit line carries `fired_after_decision_ms`, so every hard exit shows its own
      decision → fire time.
    - On a fatal, the bound starts at the fault, before the sinks begin to finalise (they see
@@ -200,11 +203,11 @@ change shortens dead output after a fault; it does not change the tick path.
   that shed nothing, so the run correctly exited 0, and the test failed, #350.)
 
   Every run asserts:
-  - the watchdog's own decision → fire time is 2000 ms plus at most its reported worst wake
-    lateness plus 5 ms (its own logic: one 1 ms step and ms rounding). So the watchdog
-    cannot be late by itself;
-  - the worst wake lateness is within the host bound: 50 ms by default, 500 ms on CI (a
-    shared VM; `CHAOS_MAX_WAKE_LATE_MS` overrides it);
+  - the watchdog's longest wait is at most 20 ms (its own logic, independent of the host);
+  - its decision → fire time is 2000 ms plus at most its worst single-wait lateness plus
+    5 ms (one 1 ms step and ms rounding);
+  - the worst single-wait lateness is within the host bound: 50 ms by default, 200 ms in
+    the macOS CI job (`CHAOS_MAX_WAKE_LATE_MS`; 121–151 ms seen there over 40 runs);
   - the process is gone within 550 ms of the fire, as the observer sees it. One helper
     process measures on one monotonic clock: it sends the signal (or, for a fatal, sees the
     fatal line) and polls at 1 ms. The first version used separate clock reads, a wall-clock
@@ -213,12 +216,13 @@ change shortens dead output after a fault; it does not change the tick path.
 
   On the Apple-silicon host:
   - 12 runs idle and 40 runs with 28 busy CPU loops, 0 failures;
-  - decision → fire 2000–2004 ms in every run, with or without load (one wait was at most
-    11 ms late);
+  - decision → fire 2000–2009 ms in every run, with or without load (one wait was at most
+    11 ms late; the longest wait 20 ms);
   - decision → process gone 2.00–2.03 s, idle or loaded. (Earlier series, before the
     bounded waits and the notice move: fire 2000–2011 ms, gone 2.01–2.08 s.)
 
-  CI (macOS job) runs 10 × each mode.
+  CI (macOS job) runs 10 × each mode. One green CI series (40 runs): fire 2001–2141 ms, worst
+  single wait 121–151 ms late, gone 2.01–2.16 s.
 - The script also proves that the watchdog ended the process:
   - no normal-return stage (`run-tenants`) is logged;
   - the exit code equals the code in the watchdog's line;

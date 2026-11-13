@@ -24,16 +24,22 @@ BIN="${1:?usage: chaos-bounded-exit.sh <multiview-binary> [runs] [fatal|stop|bot
 RUNS="${2:-20}"
 MODE="${3:-both}"
 BOUND_MS=2000
-# The watchdog's own decision->fire time (monotonic) may exceed the deadline
-# only by the OS wake latency of its last wait (each wait is <= 20 ms). The
-# watchdog reports the worst wait lateness it saw (worst_wake_late_ms): the
-# fire may be late by at most that plus LOGIC_SLACK_MS (one 1 ms step and ms
-# rounding). The OS wake latency is the host's: <= 11 ms measured on a
-# dedicated Apple-silicon host (28 busy loops), up to 143 ms on a shared macOS
-# CI VM, where the hypervisor deschedules the vCPU. CHAOS_MAX_WAKE_LATE_MS
-# bounds it too where the host can promise one (default 50 ms off CI).
+# The watchdog's own decision->fire time (monotonic). Every wait targets the
+# absolute deadline, so the fire is late by at most the lateness of the one
+# wait that crosses it. The watchdog reports:
+#   max_wait_ms        - its longest single wait (the design: <= 20 ms);
+#   worst_wake_late_ms - the worst lateness of a single wait, measured tightly
+#                        around the park (the OS wake latency: the host's).
+# Asserted: max_wait <= MAX_WAIT_MS (the watchdog's own logic, independent of
+# the host); fire <= 2000 + worst_wake_late + LOGIC_SLACK_MS (one 1 ms step
+# and ms rounding); worst_wake_late <= MAX_WAKE_LATE_MS, the host's bound.
+# Measured worst single-wait lateness: <= 11 ms on a dedicated Apple-silicon
+# host (idle and 28 busy loops; the default 50 ms bound); on the shared macOS
+# CI VM 92 and 106 ms (one long wait), and with 20 ms waits 121-151 ms in
+# every one of 40 runs, so CI sets 200 ms.
+MAX_WAIT_MS=20
 LOGIC_SLACK_MS=5
-MAX_WAKE_LATE_MS="${CHAOS_MAX_WAKE_LATE_MS:-$([ -n "${CI:-}" ] && echo 500 || echo 50)}"
+MAX_WAKE_LATE_MS="${CHAOS_MAX_WAKE_LATE_MS:-50}"
 # Fire -> process gone: the notice write plus the C runtime exit, cut by the
 # 500 ms backstop (EXIT_PATH_GRACE); the observer adds its 1 ms poll and, for
 # a fatal, the log write it waits for. Off CI: decision -> gone <= 2.6 s.
@@ -225,10 +231,11 @@ PY
   # promises; it excludes the shell's own observation latency.
   local fire_ms
   fire_ms="$(grep -o 'fired_after_decision_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2 || true)"
-  local wake_ms
+  local wake_ms wait_ms
   wake_ms="$(grep -o 'worst_wake_late_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2 || true)"
+  wait_ms="$(grep -o 'max_wait_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2 || true)"
   local extra=0
-  echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms (armed->fired ${fire_ms} ms, worst wake late ${wake_ms} ms)"
+  echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms (armed->fired ${fire_ms} ms, worst wake late ${wake_ms} ms, max wait ${wait_ms} ms)"
   if [ "${mode}" = falterstop ] && grep -q "ticks behind the clock" "${log}"; then
     echo "  FAIL: falterstop hit the fatal envelope (stall too long for this host)"; return 1
   fi
@@ -260,7 +267,8 @@ PY
     || { echo "  FAIL: the exit-time Running persist did not land"; grep -E "persist|armed|overran|control plane|stage=" "${log}" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-200 | tail -12; ls -la "${WORK}/.multiview" 2>&1 | head -5; return 1; }
   # The design bound: the watchdog fires at EXIT_DEADLINE after the decision
   # (its own clock), late only by the host's wake latency, never by itself.
-  [ -n "${fire_ms}" ] && [ -n "${wake_ms}" ] || { echo "  FAIL: no fired_after_decision_ms / worst_wake_late_ms in the hard-exit line"; return 1; }
+  [ -n "${fire_ms}" ] && [ -n "${wake_ms}" ] && [ -n "${wait_ms}" ] || { echo "  FAIL: no fired_after_decision_ms / worst_wake_late_ms / max_wait_ms in the hard-exit line"; return 1; }
+  [ "${wait_ms}" -le "${MAX_WAIT_MS}" ] || { echo "  FAIL: a watchdog wait of ${wait_ms} ms (design: <= ${MAX_WAIT_MS} ms)"; return 1; }
   [ "${fire_ms}" -ge "${BOUND_MS}" ] && [ "${fire_ms}" -le $((BOUND_MS + wake_ms + LOGIC_SLACK_MS)) ] \
     || { echo "  FAIL: watchdog fired ${fire_ms} ms after the decision (want ${BOUND_MS}..$((BOUND_MS + wake_ms + LOGIC_SLACK_MS)): its worst wait was ${wake_ms} ms late)"; grep -E "scheduling class|chaos|teardown overran" "${log}" | cut -c1-240 | tail -6; return 1; }
   [ "${wake_ms}" -le "${MAX_WAKE_LATE_MS}" ] \
