@@ -7680,6 +7680,20 @@ fn consumer_main<D: WindowDelivery>(
         // live-opened encoders. Never waits; a no-take run does nothing here.
         let tick_pts =
             MediaTime::from_tick(i64::try_from(item.tick_index).unwrap_or(i64::MAX), cadence);
+        // The ticks this consumer missed (a transient stall shed them from
+        // the hot queue), computed ONCE before the router tick and reused
+        // below for the base-worker substitution loop: the existing error
+        // behaviour (a gap beyond the admitted envelope fails the run) is
+        // preserved exactly, before anything is offered to either Clean or
+        // the base workers.
+        let missing = missing_ticks_before(last_tick, item.tick_index)?;
+        // Clean is substituted exactly like Program: each missing tick is
+        // offered Clean's own last pre-bake frame BEFORE `publish_clean`
+        // publishes the surviving tick, so the Clean worker sees ticks
+        // strictly increasing (missing ticks, then the surviving tick) and
+        // a consumer stall never relies solely on Clean's own `GapFill` to
+        // absorb the gap. One bool check when Clean is not active.
+        router.substitute_clean(missing.clone());
         // The Clean bus is this tick's Program canvas BEFORE the overlay bake,
         // published before the router tick so a Clean encoder gets frame T
         // this tick. One bool check when nothing selects Clean.
@@ -7733,13 +7747,13 @@ fn consumer_main<D: WindowDelivery>(
         // deployed continuity contract is untouched) and the muxed stream has
         // a frame for EVERY output tick. A gap beyond the admitted envelope
         // fails the run explicitly (never silently skips forward).
-        for missing in missing_ticks_before(last_tick, item.tick_index)? {
+        for missing_tick in missing {
             let canvas = last_baked.as_ref().unwrap_or(&overlaid);
             for worker in &workers {
                 worker
                     .offer_within(
                         BakedTick {
-                            tick: missing,
+                            tick: missing_tick,
                             canvas: Arc::clone(canvas),
                         },
                         offer_horizon,

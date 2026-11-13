@@ -322,6 +322,12 @@ impl BoundedBatchQueue {
     /// Returns [`OfferError`] for an invalid window, a full or stale queue,
     /// a reversed clock, or a missing recovery point after delivery loss.
     pub fn try_offer(&mut self, batch: Arc<PacketBatch>, now: Instant) -> Result<(), OfferError> {
+        // Take the pending flag up front so it belongs to exactly the next
+        // OFFERED window, win or lose: a rejected offer (even one that never
+        // calls `invalidate`, e.g. Closed/Oversized/WrongProgramShape/
+        // ClockReversed/NeedsRecoveryPoint) must not let a later window
+        // steal a flag that was meant for this one.
+        let decoder_config_changed = std::mem::take(&mut self.config_change_pending);
         if self.closed {
             return Err(OfferError::Closed);
         }
@@ -391,7 +397,6 @@ impl BoundedBatchQueue {
         debug_assert!(self.reservations.packets.load(Ordering::Acquire) <= packets);
         debug_assert!(self.reservations.bytes.load(Ordering::Acquire) <= bytes);
         self.needs_keyframe = false;
-        let decoder_config_changed = std::mem::take(&mut self.config_change_pending);
         self.entries.push_back(Queued {
             batch,
             offered_at: now,
@@ -913,6 +918,55 @@ mod tests {
         assert!(
             !q.pop_at(now).unwrap().unwrap().decoder_config_changed(),
             "report_loss never sets the flag, whatever its reason"
+        );
+    }
+
+    #[test]
+    fn config_change_lands_on_the_cut_window_even_with_a_queued_backlog() {
+        // Reviewer scenario: the queue already holds earlier windows (not yet
+        // popped) when the discontinuity is marked. Those windows were
+        // already stamped `false` at their OWN admission, so they cannot
+        // steal the flag meant for the cut window admitted afterward.
+        let now = Instant::now();
+        let mut q = strict_queue();
+        q.try_offer(h264_au(0x65, true), now).unwrap();
+        q.try_offer(h264_au(0x41, false), now).unwrap();
+        assert_eq!(q.queued_windows(), 2, "two earlier windows stay queued");
+        q.mark_discontinuity(OfferError::DecoderConfigChanged);
+        // The cut window: admitted after the mark, gate not armed (no loss).
+        q.try_offer(h264_au(0x65, true), now).unwrap();
+        // One more window after the cut window must not also carry the flag.
+        q.try_offer(h264_au(0x41, false), now).unwrap();
+        let flags: Vec<bool> = (0..4)
+            .map(|_| q.pop_at(now).unwrap().unwrap().decoder_config_changed())
+            .collect();
+        assert_eq!(
+            flags,
+            [false, false, true, false],
+            "only the cut window (3rd admitted) reports the change"
+        );
+    }
+
+    #[test]
+    fn a_rejected_offer_after_the_mark_consumes_the_pending_flag() {
+        // The hole the reviewer found: try_offer can return early with an
+        // error (no `invalidate` call) without clearing `config_change_pending`,
+        // letting the NEXT admitted window (not the intended cut window)
+        // wrongly carry the flag. Fixed by taking the flag at the start of
+        // `try_offer` into a local and only stamping it on success.
+        let now = Instant::now();
+        let mut q = BoundedBatchQueue::with_limits(1, 1, MAX_QUEUE_AGE);
+        q.mark_discontinuity(OfferError::DecoderConfigChanged);
+        // Oversized: returns early, no `invalidate` call, but the pending
+        // flag must still be consumed by this rejected offer.
+        let big = window(vec![packet(StreamKind::Video, 999, true)]);
+        assert_eq!(q.try_offer(big, now), Err(OfferError::Oversized));
+        // The following admitted window must report false, not true.
+        q.try_offer(audio(), now).unwrap();
+        assert!(
+            !q.pop_at(now).unwrap().unwrap().decoder_config_changed(),
+            "the rejected offer consumed the pending flag; it must not leak \
+             onto the next admitted window"
         );
     }
 

@@ -338,9 +338,14 @@ source and the same source on a full-canvas Program cell give byte-identical fra
   before the router's tick, so the Clean encoder gets frame T in tick T. It is one `Arc` clone into
   a wait-free `SwapCell`, no copy, and a single cached-bool check when nothing selects Clean. The
   aux thread never composes Clean and never wakes for it: routing only Clean leaves the clock's aux
-  gate closed and sends no aux tick. Clean is always fresh (§4.5), its health never degrades, and
-  an aux-thread failure never moves an output off Clean (only aux-composed buses fall back).
-  `audio = follow` on Clean is the program mix.
+  gate closed and sends no aux tick. Clean is always fresh for the take gate (§4.5): it is published
+  every tick by the bake consumer itself, never by the aux thread, so an aux-thread failure never
+  moves an output off Clean (only aux-composed buses fall back on that path). A Clean output still
+  degrades and falls back (§4.4) when its OWN live encoder refuses frames (a full worker queue,
+  counted per key) — a starved encoder, not a stale feed. A bake-consumer stall
+  that sheds hot-queue ticks substitutes Clean with its own last pre-bake frame
+  (`OutputRouter::substitute_clean`), exactly like Program's base-worker substitution, so a consumer
+  gap alone never fails the Clean key either. `audio = follow` on Clean is the program mix.
 
 ---
 
@@ -503,12 +508,16 @@ Tick T is the move tick (§4.5).
    changes on a take, because the destination key includes the output's own settings. A format
    change is RT-15's migration, a separate operation.
 6. **Lagging feeds.** A picture bus whose aux frame for tick T has not arrived is held: its encoder
-   is fed the newest frame with that frame's own generation label. After 60 held ticks the alarm
+   is fed the newest frame with that frame's own generation label. A live encoder that refuses
+   the offered frame (a full worker queue) is counted per key, not per bus (§4.4): Clean included,
+   whose picture is otherwise published fresh every tick, its outputs degrade at 60 refused offers
+   and fall back at 150. After 60 held ticks the alarm
    `routing.degraded` is raised. After 150 held ticks (5 s), whether the aux thread is dead or
-   wedged, every output subscribed to that bus moves to Program at an IDR, with the typed event
-   `fallback:aux-failed`. An output is never frozen forever. The bake consumer's own substitution
-   path (`crates/multiview-cli/src/pipeline.rs:7173-7195`) becomes per picture bus, so a consumer stall never feeds Program
-   pixels into another bus's encoder.
+   wedged, every output subscribed to that bus moves to
+   Program at an IDR, with the typed event `fallback:aux-failed`. An output is never frozen
+   forever. The bake consumer's own substitution path (`crates/multiview-cli/src/pipeline.rs:7173-7195`)
+   becomes per picture bus, so a consumer stall never feeds Program pixels into another bus's
+   encoder.
 
 What each consumer is expected to see at the move. The design relies on the facts below. Each is
 verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS rows.
@@ -633,7 +642,12 @@ verified per protocol in the slice that ships it (§9). §4.6 proved the MPEG-TS
   (`fallback:aux-failed`) at 150 ticks. A drop guard publishes `routing.feed_state = failed` and an alarm.
   Program and every default output continue, which is the ADR-0103 wall pattern.
 - **A wedged encoder** costs only the outputs subscribed to its encoded bus. The dispatcher already isolates bindings
-  (`crates/multiview-cli/src/rendition_dispatch.rs:1-5`).
+  (`crates/multiview-cli/src/rendition_dispatch.rs:1-5`). Starvation is counted per encoder
+  key, not per bus: each refused offer to a key's worker counts, an accepted one resets it, so a healthy sibling key on
+  the same bus never hides a starved one. At 60 refused offers in a row the key's outputs show `degraded`; at 150 the
+  key is closed and its outputs fall back to Program (`fallback:encoder-failed`), Clean included. A consumer stall
+  substitutes a Clean key's own last frame for the missing ticks and stops at the first refused offer; the key's
+  `GapFill` (bound 24 ticks: a full 8-tick substitution gap on top of a full 4-deep queue) closes the rest.
 
 ### 4.5 Take gating
 
