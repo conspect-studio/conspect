@@ -4998,6 +4998,9 @@ fn a_reformat_flood_keeps_one_in_flight_and_the_other_output_untouched() {
         .iter()
         .filter(|(op, r, _)| op.starts_with("rf") && matches!(r, TakeResult::ResetRefused(_)))
         .count();
+    // Review V-low: every outcome reached the relay (none dropped on a full
+    // outcome queue), so the tally below is exact.
+    assert_eq!(x.h.snapshot().dropped_outcomes, 0, "no outcome dropped");
     assert_eq!(
         applied + refused + busy,
         200,
