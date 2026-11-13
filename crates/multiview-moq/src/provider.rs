@@ -856,6 +856,115 @@ struct State {
     entries: Mutex<HashMap<String, Entry>>,
     ready: AtomicBool,
     shutdown: watch::Sender<bool>,
+    /// Live externally served sessions ([`Runtime::serve_external`]); the
+    /// listener path counts its own `JoinSet` against the same cap.
+    external_sessions: Arc<AtomicUsize>,
+}
+
+/// Concurrent `MoQ` sessions one runtime serves (the listener's `JoinSet`, or
+/// the external path's live count); beyond it a valid ticket is burned and the
+/// session refused with `429`.
+pub const MAX_SESSIONS: usize = 16;
+
+/// How long an externally served session may take from the transport being
+/// accepted to the `MoQ` SETUP exchange completing.
+pub const EXTERNAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why [`Runtime::claim_ticket`] refused a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimReject {
+    /// No ticket, an unknown, already used, or revoked ticket (`401`).
+    Unauthorized,
+    /// [`MAX_SESSIONS`] sessions are live; the ticket was burned (`429`).
+    Capacity,
+    /// The runtime is shutting down (`503`).
+    Unavailable,
+}
+
+/// A claimed single-use ticket: the admitted origin, its fence and a slot of
+/// the session cap. Dropping it (served to its end, or never served) revokes
+/// the fence and frees the slot.
+pub struct Claim {
+    origin: moq_net::origin::Consumer,
+    fence: Arc<Fence>,
+    slot: Option<Arc<AtomicUsize>>,
+}
+
+impl std::fmt::Debug for Claim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Claim").finish_non_exhaustive()
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.fence.revoke();
+        if let Some(slot) = self.slot.take() {
+            slot.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// The `ticket` query parameter. The WebTransport backend can carry its
+/// request target as an in-band path rather than a parsed URL; both paths
+/// hand the raw query here, so URL-only extraction never rejects a valid
+/// browser ticket.
+fn ticket_of(query: Option<&str>) -> Option<String> {
+    query.and_then(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(k, _)| k == "ticket")
+            .map(|(_, v)| v.into_owned())
+    })
+}
+
+/// Marks a ticket used and returns its origin and fence: unknown, used and
+/// revoked tickets are refused. Shared by the listener and the external path.
+fn take_ticket(
+    state: &State,
+    query: Option<&str>,
+) -> Option<(moq_net::origin::Consumer, Arc<Fence>)> {
+    let token = ticket_of(query)?;
+    let mut entries = state.entries.lock().ok()?;
+    let entry = entries.get_mut(&token)?;
+    if entry.used || entry.fence.revoked.load(Ordering::Acquire) {
+        return None;
+    }
+    entry.used = true;
+    Some((entry.origin.clone(), entry.fence.clone()))
+}
+
+/// Runs an accepted viewer session until it closes or its authorization is
+/// cancelled, then aborts it and waits (at most 1 s) for the close. Shared
+/// by the listener and the external path so the two cannot drift.
+///
+/// Isolation: this is a *viewer's* session. Its transport counters must never
+/// drive the shared ladder's uplink controller, or one viewer's downlink would
+/// decide what every other viewer receives.
+async fn run_viewer(
+    session: moq_net::Session,
+    fence: &Fence,
+    cancel: &mut watch::Receiver<bool>,
+    shutdown: Option<&mut watch::Receiver<bool>>,
+) {
+    // The listener path ends its sessions by aborting its `JoinSet` on
+    // shutdown (no arm here); the external path has no owner to abort it, so
+    // it watches the runtime's shutdown itself.
+    let shutdown = async move {
+        match shutdown {
+            Some(shutdown) => {
+                let _ = shutdown.wait_for(|value| *value).await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = session.closed() => fence.record_terminal(TerminalEvent::ViewerClosed),
+        _ = cancel.wait_for(|value| *value) => fence.record_terminal(TerminalEvent::AuthorizationCancelled),
+        () = shutdown => fence.record_terminal(TerminalEvent::AuthorizationCancelled),
+    }
+    session.abort(moq_net::Error::Cancel);
+    let _ = tokio::time::timeout(Duration::from_secs(1), session.closed()).await;
+    drop(session);
 }
 struct SubscriptionCleanup {
     state: Arc<State>,
@@ -1110,6 +1219,7 @@ impl Runtime {
                 entries: Mutex::new(HashMap::new()),
                 ready: AtomicBool::new(true),
                 shutdown: watch::channel(false).0,
+                external_sessions: Arc::new(AtomicUsize::new(0)),
             }),
             base_url: base_url.trim_end_matches('/').into(),
             protocol: protocol.into(),
@@ -1124,19 +1234,8 @@ impl Runtime {
                     Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
                     request = listener.accept() => {
                         let Some(request) = request else { break };
-                        // The WebTransport backend can carry its request target as an
-                        // in-band path rather than a parsed URL. Request::query covers
-                        // both cases; URL-only extraction rejects valid browser tickets.
-                        let token = request.query().and_then(|query| url::form_urlencoded::parse(query.as_bytes()).find(|(k, _)| k == "ticket").map(|(_, v)| v.into_owned()));
-                        let admitted = token.and_then(|token| {
-                            let mut entries = state.entries.lock().ok()?;
-                            let entry = entries.get_mut(&token)?;
-                            if entry.used || entry.fence.revoked.load(Ordering::Acquire) { return None }
-                            entry.used = true;
-                            Some((entry.origin.clone(), entry.fence.clone()))
-                        });
-                        let Some((origin, fence)) = admitted else { let _ = request.reject(moq_tokio::server::Reject::Unauthorized).await; continue };
-                        if sessions.len() >= 16 { fence.revoke(); let _ = request.reject(moq_tokio::server::Reject::App(429)).await; continue }
+                        let Some((origin, fence)) = take_ticket(&state, request.query()) else { let _ = request.reject(moq_tokio::server::Reject::Unauthorized).await; continue };
+                        if sessions.len() >= MAX_SESSIONS { fence.revoke(); let _ = request.reject(moq_tokio::server::Reject::App(429)).await; continue }
                         // The handshake is complete here, so the address is validated.
                         let peer = peers.clone().zip(request.remote_addr());
                         if let Some((hook, addr)) = &peer { hook(*addr, true) }
@@ -1148,16 +1247,7 @@ impl Runtime {
                                 _ = cancel.wait_for(|value| *value) => None,
                             };
                             if let Some(session) = accepted {
-                                // Isolation: this is a *viewer's* session. Its transport counters must
-                                // never drive the shared ladder's uplink controller, or one viewer's
-                                // downlink would decide what every other viewer receives.
-                                tokio::select! {
-                                    _ = session.closed() => fence.record_terminal(TerminalEvent::ViewerClosed),
-                                    _ = cancel.wait_for(|value| *value) => fence.record_terminal(TerminalEvent::AuthorizationCancelled),
-                                }
-                                session.abort(moq_net::Error::Cancel);
-                                let _ = tokio::time::timeout(Duration::from_secs(1), session.closed()).await;
-                                drop(session);
+                                run_viewer(session, &fence, &mut cancel, None).await;
                             }
                             fence.revoke();
                         });
@@ -1174,6 +1264,142 @@ impl Runtime {
         });
         Ok(runtime)
     }
+    /// A runtime with no listener of its own (front-door slice 2): the caller
+    /// terminates QUIC/HTTP/3 and WebTransport itself (`multiview-h3` on the
+    /// front door) and hands each admitted session to
+    /// [`serve_external`](Self::serve_external). Ready at once; leases point
+    /// at `base_url` exactly as for [`listen`](Self::listen). Dropping the last
+    /// handle ends every session it serves.
+    ///
+    /// # Errors
+    ///
+    /// An unsupported `protocol` or an invalid `base_url` (as for `listen`).
+    pub fn external(base_url: String, protocol: &str) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(
+            matches!(protocol, "moq-transport-16" | "moq-transport-18"),
+            "unsupported protocol"
+        );
+        anyhow::ensure!(
+            base_url.starts_with("https://") && !base_url.contains('?') && !base_url.contains('#'),
+            "invalid endpoint"
+        );
+        Ok(Arc::new(Self {
+            state: Arc::new(State {
+                entries: Mutex::new(HashMap::new()),
+                ready: AtomicBool::new(true),
+                shutdown: watch::channel(false).0,
+                external_sessions: Arc::new(AtomicUsize::new(0)),
+            }),
+            base_url: base_url.trim_end_matches('/').into(),
+            protocol: protocol.into(),
+        }))
+    }
+
+    /// The configured `MoQ` version.
+    ///
+    /// # Errors
+    ///
+    /// The protocol string is not a `moq-net` version (never for a runtime
+    /// built by `external`/`listen*`, which validate it).
+    pub fn version(&self) -> anyhow::Result<moq_net::Version> {
+        self.protocol.parse().map_err(anyhow::Error::msg)
+    }
+
+    /// The WebTransport subprotocol (`wt-protocol`) of the configured version,
+    /// the only one an external session may negotiate (`moqt-16`/`moqt-18`).
+    ///
+    /// # Errors
+    ///
+    /// As [`version`](Self::version).
+    pub fn wt_protocol(&self) -> anyhow::Result<&'static str> {
+        Ok(self.version()?.alpn())
+    }
+
+    /// Claims the single-use `ticket` in `query` for an external session,
+    /// synchronously and before the transport answers the client: the same
+    /// lookup as the listener (unknown, used or revoked -> `Unauthorized`),
+    /// then the [`MAX_SESSIONS`] cap (over it the ticket is burned and its
+    /// fence revoked -> `Capacity`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClaimReject`].
+    pub fn claim_ticket(&self, query: Option<&str>) -> Result<Claim, ClaimReject> {
+        if !self.available() || *self.state.shutdown.borrow() {
+            return Err(ClaimReject::Unavailable);
+        }
+        let (origin, fence) = take_ticket(&self.state, query).ok_or(ClaimReject::Unauthorized)?;
+        let slots = &self.state.external_sessions;
+        let taken = slots.try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+            (live < MAX_SESSIONS).then_some(live + 1)
+        });
+        if taken.is_err() {
+            fence.revoke();
+            return Err(ClaimReject::Capacity);
+        }
+        Ok(Claim {
+            origin,
+            fence,
+            slot: Some(Arc::clone(slots)),
+        })
+    }
+
+    /// Serves one external `MoQ` session for `claim` on the CURRENT runtime
+    /// (the caller runs it on the front door's): the `MoQ` SETUP with exactly
+    /// the configured version, bounded by [`EXTERNAL_HANDSHAKE_TIMEOUT`];
+    /// then the admitted origin is published and the session runs until it
+    /// closes, the ticket's authorization is cancelled, or the runtime shuts
+    /// down. The fence is revoked and the session slot released at the end
+    /// (also when this future is dropped). `peer` is reported up/down to
+    /// `peers` while the session runs.
+    pub async fn serve_external<S>(
+        &self,
+        claim: Claim,
+        session: S,
+        peer: std::net::SocketAddr,
+        peers: Option<PeerHook>,
+    ) where
+        S: moq_net::transport::poll::Boxable,
+        S::SendStream: moq_net::web_transport_trait::MaybeSync,
+        S::RecvStream: moq_net::web_transport_trait::MaybeSync,
+    {
+        let Ok(version) = self.version() else {
+            return;
+        };
+        let mut shutdown = self.state.shutdown.subscribe();
+        if *shutdown.borrow() {
+            return;
+        }
+        let peer = peers.map(|hook| {
+            hook(peer, true);
+            (hook, peer)
+        });
+        let _peer = PeerGuard(peer);
+        let fence = Arc::clone(&claim.fence);
+        let mut cancel = fence.cancel.subscribe();
+        let server = moq_net::Server::new().with_versions(moq_net::Versions::from(version));
+        let handshake = async {
+            let request = server
+                .accept_request(tokio::time::Instant::now().into_std(), session)
+                .await
+                .ok()?;
+            request.with_publisher(claim.origin.clone()).ok().await.ok()
+        };
+        let accepted = tokio::select! {
+            value = tokio::time::timeout(EXTERNAL_HANDSHAKE_TIMEOUT, handshake) => value.ok().flatten(),
+            _ = cancel.wait_for(|value| *value) => None,
+            _ = shutdown.wait_for(|value| *value) => None,
+        };
+        if let Some((session, driver)) = accepted {
+            // The driver runs on the caller's runtime (the front door's) and
+            // ends when the session does.
+            let driver = tokio::spawn(moq_net::time::run(driver));
+            run_viewer(session, &fence, &mut cancel, Some(&mut shutdown)).await;
+            driver.abort();
+        }
+        drop(claim);
+    }
+
     pub fn available(&self) -> bool {
         self.state.ready.load(Ordering::Acquire)
     }
@@ -1396,6 +1622,89 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn external_with_tickets(tickets: &[&str]) -> (Arc<Runtime>, Vec<Arc<Fence>>) {
+        let runtime =
+            Runtime::external("https://localhost/moq".into(), "moq-transport-16").unwrap();
+        let mut fences = Vec::new();
+        for ticket in tickets {
+            let (fence, _rx) = Fence::channel(1);
+            runtime.state.entries.lock().unwrap().insert(
+                (*ticket).to_owned(),
+                Entry {
+                    origin: moq_tokio::origin::spawn().consume(),
+                    fence: fence.clone(),
+                    used: false,
+                },
+            );
+            fences.push(fence);
+        }
+        (runtime, fences)
+    }
+
+    #[tokio::test]
+    async fn external_claim_is_single_use_capped_and_releases_on_drop() {
+        let names: Vec<String> = (0..=MAX_SESSIONS).map(|i| format!("t{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (runtime, fences) = external_with_tickets(&refs);
+        assert!(runtime.available());
+        assert_eq!(runtime.wt_protocol().unwrap(), "moqt-16");
+        assert_eq!(
+            runtime.claim_ticket(None).unwrap_err(),
+            ClaimReject::Unauthorized
+        );
+        assert_eq!(
+            runtime.claim_ticket(Some("ticket=nope")).unwrap_err(),
+            ClaimReject::Unauthorized
+        );
+        let mut claims = Vec::new();
+        for name in names.iter().take(MAX_SESSIONS) {
+            claims.push(
+                runtime
+                    .claim_ticket(Some(&format!("x=1&ticket={name}")))
+                    .unwrap(),
+            );
+        }
+        // Reuse of a claimed ticket is refused.
+        assert_eq!(
+            runtime.claim_ticket(Some("ticket=t0")).unwrap_err(),
+            ClaimReject::Unauthorized
+        );
+        // The cap: the 17th valid ticket is burned and its fence revoked.
+        let last = &names[MAX_SESSIONS];
+        assert_eq!(
+            runtime
+                .claim_ticket(Some(&format!("ticket={last}")))
+                .unwrap_err(),
+            ClaimReject::Capacity
+        );
+        assert!(fences[MAX_SESSIONS].revocation().is_revoked());
+        assert_eq!(
+            runtime
+                .claim_ticket(Some(&format!("ticket={last}")))
+                .unwrap_err(),
+            ClaimReject::Unauthorized
+        );
+        // Dropping a claim revokes its fence and frees its slot.
+        drop(claims.remove(0));
+        assert!(fences[0].revocation().is_revoked());
+        assert_eq!(
+            runtime.state.external_sessions.load(Ordering::Acquire),
+            MAX_SESSIONS - 1
+        );
+        drop(claims);
+        assert_eq!(runtime.state.external_sessions.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn external_runtime_validates_like_listen() {
+        assert!(Runtime::external("http://h/moq".into(), "moq-transport-16").is_err());
+        assert!(Runtime::external("https://h/moq?x".into(), "moq-transport-16").is_err());
+        assert!(Runtime::external("https://h/moq".into(), "moq-lite-03").is_err());
+        let r = Runtime::external("https://h/moq/".into(), "moq-transport-18").unwrap();
+        assert_eq!(r.wt_protocol().unwrap(), "moqt-18");
+        assert_eq!(r.base_url, "https://h/moq");
+    }
 
     #[tokio::test]
     async fn observer_install_race_and_clones_are_level_triggered_once() {
@@ -1638,6 +1947,7 @@ mod tests {
                 entries: Mutex::new(HashMap::new()),
                 ready: AtomicBool::new(true),
                 shutdown: watch::channel(false).0,
+                external_sessions: Arc::new(AtomicUsize::new(0)),
             });
             let (fence, _rx) = Fence::channel(1);
             let origin = moq_tokio::origin::spawn();
@@ -1686,6 +1996,7 @@ mod tests {
             entries: Mutex::new(HashMap::new()),
             ready: AtomicBool::new(true),
             shutdown: watch::channel(false).0,
+            external_sessions: Arc::new(AtomicUsize::new(0)),
         });
         let runtime = Runtime {
             state: state.clone(),
@@ -1910,6 +2221,7 @@ mod tests {
                 entries: Mutex::new(HashMap::new()),
                 ready: AtomicBool::new(true),
                 shutdown: watch::channel(false).0,
+                external_sessions: Arc::new(AtomicUsize::new(0)),
             }),
             base_url: "https://localhost:4443".into(),
             protocol: "moq-transport-16".into(),
