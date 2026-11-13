@@ -594,3 +594,57 @@ fn ipv4_unspecified_is_never_bound() {
     assert!(err.is_err());
     door.shutdown_blocking();
 }
+
+/// Slice 6 (#292): the port-80 listener answers certbot's HTTP-01 challenge
+/// from `acme_webroot` (`certbot --webroot`), so a certbot certificate keeps
+/// renewing after nginx is gone; everything else still gets the 301.
+#[test]
+fn redirect_serves_http01_challenges_from_the_webroot() {
+    let dir = std::env::temp_dir().join(format!("fd-webroot-{}", std::process::id()));
+    let challenges = dir.join(".well-known").join("acme-challenge");
+    std::fs::create_dir_all(&challenges).unwrap();
+    std::fs::write(challenges.join("tok_EN-1"), b"tok_EN-1.thumbprint").unwrap();
+    std::fs::write(dir.join("secret"), b"never served").unwrap();
+    std::fs::write(challenges.join("big"), vec![b'x'; 2048]).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.join("secret"), challenges.join("link")).unwrap();
+    let mut door = udp_door();
+    let mut cfg = RedirectConfig::new(
+        "[::1]:0".parse().unwrap(),
+        "mda001.example.net".to_owned(),
+        443,
+    );
+    cfg.acme_webroot = Some(dir.clone());
+    let addr = door.start_redirect(cfg).unwrap();
+    let get = |head: &'static [u8]| {
+        client_rt().block_on(async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(head).await.unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).await.unwrap();
+            out
+        })
+    };
+    let ok = get(b"GET /.well-known/acme-challenge/tok_EN-1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
+    assert!(ok.contains("Content-Length: 19\r\n"), "{ok}");
+    assert!(ok.ends_with("\r\n\r\ntok_EN-1.thumbprint"), "{ok}");
+    let head = get(b"HEAD /.well-known/acme-challenge/tok_EN-1 HTTP/1.1\r\n\r\n");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n") && head.ends_with("\r\n\r\n"), "{head}");
+    for missing in [
+        &b"GET /.well-known/acme-challenge/nope HTTP/1.1\r\n\r\n"[..],
+        b"GET /.well-known/acme-challenge/big HTTP/1.1\r\n\r\n",
+        b"GET /.well-known/acme-challenge/link HTTP/1.1\r\n\r\n",
+    ] {
+        let out = get(missing);
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+    }
+    // Traversal is not a token: it gets the redirect, never a file.
+    let out = get(b"GET /.well-known/acme-challenge/../../secret HTTP/1.1\r\n\r\n");
+    assert!(out.starts_with("HTTP/1.1 301"), "{out}");
+    assert!(!out.contains("never served"));
+    let out = get(b"GET /app HTTP/1.1\r\n\r\n");
+    assert!(out.contains("Location: https://mda001.example.net/app\r\n"), "{out}");
+    door.shutdown_blocking();
+    let _ = std::fs::remove_dir_all(&dir);
+}

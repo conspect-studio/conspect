@@ -177,6 +177,7 @@ fn compressible(mime: &str) -> bool {
             mime,
             "application/javascript"
                 | "application/json"
+                | "application/geo+json"
                 | "application/manifest+json"
                 | "image/svg+xml"
                 | "application/wasm"
@@ -377,6 +378,35 @@ mod tests {
         assert_eq!(asset_key(""), INDEX_HTML);
         assert_eq!(asset_key("/assets/app.js"), "assets/app.js");
         assert_eq!(asset_key("/layouts/new"), "layouts/new");
+    }
+
+    #[test]
+    fn ui_dir_loads_a_build_and_requires_index() {
+        let dir = std::env::temp_dir().join(format!("spa-ui-dir-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("assets/app-abc.js"), b"console.log(1)").unwrap();
+        assert!(UiDir::load(&dir).is_err(), "no index.html is refused");
+        std::fs::write(dir.join("index.html"), b"<!doctype html>").unwrap();
+        let ui = UiDir::load(&dir).unwrap();
+        assert_eq!(ui.len(), 2);
+        assert!(ui.files.contains_key("assets/app-abc.js"));
+        assert!(ui.files.contains_key("index.html"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gzip_negotiation() {
+        let h = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(header::ACCEPT_ENCODING, HeaderValue::from_str(v).unwrap());
+            m
+        };
+        assert!(accepts_gzip(&h("gzip, deflate, br")));
+        assert!(accepts_gzip(&h("br;q=1.0, gzip;q=0.8")));
+        assert!(accepts_gzip(&h("*")));
+        assert!(!accepts_gzip(&h("gzip;q=0")));
+        assert!(!accepts_gzip(&h("br")));
+        assert!(!accepts_gzip(&HeaderMap::new()));
     }
 
     #[test]
