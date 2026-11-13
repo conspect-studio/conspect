@@ -159,9 +159,10 @@ export function OutputFeedRow({
   const allChoices = useMemo<readonly FeedChoice[]>(() => {
     const buses: FeedChoice[] = [
       { key: 'bus:program', label: t`Program (follows the switcher)`, group: 'buses' },
-      // Without an M/E the plan refuses `switcher-required`; its text becomes
-      // the Take key's disabled reason.
+      // Without an M/E the plan refuses `switcher-required` for Preview and
+      // Clean; its text becomes the Take key's disabled reason.
       { key: 'bus:preview', label: t`Preview`, group: 'buses' },
+      { key: 'bus:clean', label: t`Clean (Program without labels and tally)`, group: 'buses' },
     ];
     const all = [...buses, ...choices];
     // The on-air feed may be one the page does not list (e.g. a removed
@@ -272,6 +273,7 @@ export function OutputFeedRow({
     if (route === undefined) return t`Unknown`;
     if (route.tally === 'program') return t`PGM`;
     if (route.tally === 'preview') return t`PVW`;
+    if (route.tally === 'clean') return t`CLEAN`;
     if (current !== undefined && 'source' in current) {
       const id = current.source;
       return t`direct: ${id}`;

@@ -69,7 +69,8 @@ enum AudioSource {
 impl AudioSource {
     fn follow(bus: &PictureBus) -> Self {
         match bus {
-            PictureBus::Program => Self::Program,
+            // Clean is the Program picture: it follows the program mix.
+            PictureBus::Program | PictureBus::Clean => Self::Program,
             PictureBus::Preview => Self::Preview,
             PictureBus::Source(id) => Self::Source(id.clone()),
         }

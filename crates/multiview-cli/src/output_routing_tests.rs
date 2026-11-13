@@ -366,9 +366,19 @@ struct Harness {
     base_force: Arc<AtomicU64>,
     live: bool,
     max_router: std::time::Duration,
+    /// The pre-bake canvas handed to `publish_clean` per tick (kept alive so
+    /// pointer identity is meaningful).
+    clean: Vec<(u64, Arc<Nv12Image>)>,
+    /// The clock's aux send gate and sent-tick counter.
+    aux_active: Arc<AtomicBool>,
+    aux_sent: Arc<AtomicU64>,
 }
 
 fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
+    harness_with(outputs, max, open, false)
+}
+
+fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: bool) -> Harness {
     let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
     let store2 = Arc::new(TileStore::<Nv12Image>::with_defaults("cam2"));
     let lookup = Arc::clone(&store);
@@ -377,6 +387,8 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
     let failed = Arc::new(AtomicBool::new(false));
     let encoded = Arc::new(AtomicUsize::new(0));
     let enc2 = Arc::clone(&encoded);
+    let aux_active = Arc::new(AtomicBool::new(false));
+    let aux_sent = Arc::new(AtomicU64::new(0));
     let open = open.unwrap_or_else(|| {
         Box::new(move |_| {
             let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
@@ -394,14 +406,14 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
             base_force: vec![Arc::clone(&base_force)],
             max_encoders: max,
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
-            has_preview: false,
+            has_preview,
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
-            active: Arc::new(AtomicBool::new(false)),
+            active: Arc::clone(&aux_active),
             failed: Arc::clone(&failed),
             dropped: Arc::new(AtomicU64::new(0)),
-            sent: Arc::new(AtomicU64::new(0)),
+            sent: Arc::clone(&aux_sent),
             stores: Arc::new(move |id: &str| match id {
                 "cam" => Some(Arc::clone(&lookup)),
                 "cam2" => Some(Arc::clone(&lookup2)),
@@ -427,6 +439,9 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
         base_force,
         live: true,
         max_router: std::time::Duration::ZERO,
+        clean: Vec::new(),
+        aux_active,
+        aux_sent,
     }
 }
 
@@ -475,6 +490,10 @@ impl Harness {
                 }
             }
         }
+        // The bake consumer publishes the pre-bake canvas before the router.
+        let clean = canvas();
+        self.r.publish_clean(t, &clean);
+        self.clean.push((t, clean));
         let started = Instant::now();
         self.r
             .on_tick(t, pts(t), &mut self.d, &mut self.rec)
@@ -493,6 +512,15 @@ impl Harness {
     }
     fn results(&self) -> Vec<TakeResult> {
         self.outcomes.try_iter().map(|o| o.outcome).collect()
+    }
+    /// Simulate a consumer gap on Clean exactly as the pipeline computes it:
+    /// `substitute_clean(skip_from..t)` is called for the missing range
+    /// (never published/ticked at all — the hot queue shed them), BEFORE
+    /// this tick's own `publish_clean`/`on_tick` for the surviving tick `t`,
+    /// matching the pipeline's call order.
+    fn tick_after_clean_gap(&mut self, skip_from: u64, t: u64) {
+        self.r.substitute_clean(skip_from..t);
+        self.tick(t);
     }
 }
 
@@ -1040,6 +1068,9 @@ fn inject(
         lost,
         generation,
         silent: 0,
+        starved: 0,
+        refused_this_tick: false,
+        reported_degraded: false,
     });
     key
 }
@@ -1647,4 +1678,703 @@ fn a_panicking_live_encoder_falls_back_to_program() {
 #[test]
 fn a_wedged_live_encoder_falls_back_to_program() {
     a_dying_live_encoder_falls_back(true, u64::from(WEDGED_ENCODER_TICKS) + 20);
+}
+
+/// A live encoder recording the canvas pointer of every tick it encodes.
+struct PtrEnc {
+    forced: bool,
+    seen: Arc<Mutex<Vec<(u64, usize)>>>,
+}
+
+impl VideoEncodeWorker for PtrEnc {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((item.tick, Arc::as_ptr(&item.canvas).addr()));
+        let key = std::mem::take(&mut self.forced);
+        Ok(vec![pkt(item.tick, key)])
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.forced = true;
+    }
+}
+
+impl LiveEncoder for PtrEnc {
+    fn start_at(&mut self, _t0: u64) {
+        self.forced = true;
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        Box::new(|p| p.is_keyframe() && p.len() == 77)
+    }
+}
+
+/// The (tick, canvas address) pairs a [`PtrEnc`] encoded.
+type SeenPtrs = Arc<Mutex<Vec<(u64, usize)>>>;
+
+fn ptr_harness(outputs: usize) -> (Harness, SeenPtrs) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let rec = Arc::clone(&seen);
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(PtrEnc {
+            forced: false,
+            seen: Arc::clone(&rec),
+        });
+        Ok(enc)
+    });
+    (harness_with(outputs, 6, Some(open), true), seen)
+}
+
+fn apply(x: &mut Harness, from: u64, op: &str) -> (u64, u64) {
+    for t in from..from + OPEN_DEADLINE_TICKS {
+        x.tick(t);
+        if let Some(o) = x.outcomes.try_iter().next() {
+            assert_eq!(o.operation_id, op, "unexpected outcome {o:?}");
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+            return (o.tick, t + 1);
+        }
+    }
+    panic!("{op} never applied");
+}
+
+/// ADR-0108 slice 2 (§2.5): a take to Clean opens one live encoder fed
+/// exactly the pre-bake canvases handed to `publish_clean` (same `Arc`, the
+/// frame of the same tick), applies at a RAP, and never wakes the aux thread.
+#[test]
+fn a_take_to_clean_feeds_the_pre_bake_canvas_and_never_wakes_aux() {
+    let (mut x, seen) = ptr_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    assert!(!x.r.clean_active && x.r.slot(&PictureBus::Clean).is_none());
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "no Clean take: publish_clean stores nothing and nothing opens"
+    );
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (at, now) = apply(&mut x, 5, "c");
+    assert_eq!(x.d.video_key_count(), 2, "+1 encoder for Clean");
+    assert_eq!(x.d.binding_video_key(1), Some(1));
+    assert_eq!(
+        x.d.binding_video_key(0),
+        Some(0),
+        "output 0 stays on Program"
+    );
+    let o1 = x.windows_of(1);
+    let first = o1
+        .iter()
+        .find(|w| w.first().is_some_and(|p| p.0 == i64::try_from(at).unwrap()))
+        .unwrap();
+    assert!(
+        first[0].1,
+        "the first packet on Clean is a self-contained RAP"
+    );
+    for t in now..now + 20 {
+        x.tick(t);
+    }
+    // Let the worker drain what it was offered.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.len() >= 20,
+        "the Clean encoder was fed: {}",
+        seen.len()
+    );
+    for (tick, ptr) in &seen {
+        let published = x
+            .clean
+            .iter()
+            .find(|(t, _)| t == tick)
+            .map(|(_, c)| Arc::as_ptr(c).addr());
+        assert_eq!(
+            published,
+            Some(*ptr),
+            "tick {tick}: the encoder got exactly the canvas published for that tick"
+        );
+    }
+    assert!(
+        !x.aux_active.load(Ordering::Acquire),
+        "only Clean routed: the aux send gate stays closed"
+    );
+    assert_eq!(x.aux_sent.load(Ordering::Relaxed), 0, "no aux tick sent");
+    assert_eq!(
+        x.h.snapshot().outputs[1].bus,
+        "clean",
+        "readback names the Clean bus"
+    );
+}
+
+/// The aux thread failing never moves an output off Clean (Clean is fed by
+/// the bake consumer, not by the aux thread).
+#[test]
+fn an_aux_failure_never_moves_an_output_off_clean() {
+    let (mut x, _seen) = ptr_harness(2);
+    x.tick(0);
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, mut now) = apply(&mut x, 1, "c");
+    x.failed.store(true, Ordering::Release);
+    for _ in 0..30 {
+        x.tick(now);
+        now += 1;
+    }
+    assert_eq!(x.results(), Vec::new(), "no Fallback outcome");
+    assert_eq!(x.d.binding_video_key(1), Some(1), "still on the Clean key");
+    assert_eq!(x.h.snapshot().outputs[1].bus, "clean");
+}
+
+/// Clean without an M/E is unroutable (like Preview).
+#[test]
+fn clean_without_a_switcher_is_refused() {
+    let mut x = harness(2, 6, None);
+    x.tick(0);
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    x.tick(1);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Unroutable)]
+    );
+}
+
+/// Slice 1 limit fixed: the plan counts a lingering live encoder for the
+/// same (bus, settings) as +0 (the take reuses it), and +1 once it closed.
+#[test]
+fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
+    use multiview_control::output_routing::{OutputRouting, RoutedFeed};
+    let mut x = harness(2, 6, None);
+    let h = x.h.clone().with_outputs(vec![
+        RunOutput {
+            id: Some("a".into()),
+            settings: 0,
+            routable: true,
+        },
+        RunOutput {
+            id: Some("b".into()),
+            settings: 0,
+            routable: true,
+        },
+    ]);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let cam = RoutedFeed::Source("cam".into());
+    x.tick(0);
+    assert!(
+        adapter.plan("b", &cam).unwrap().needs_encoder,
+        "+1 at first"
+    );
+    x.h.try_take(take("to-src", 1, src())).unwrap();
+    let (_, now) = apply(&mut x, 1, "to-src");
+    x.h.try_take(take("back", 1, PictureBus::Program)).unwrap();
+    let (_, now) = apply(&mut x, now, "back");
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 1, "lingering");
+    assert_eq!(
+        x.h.snapshot().live_keys,
+        vec![("src:cam".to_owned(), 0)],
+        "the lingering key is published"
+    );
+    assert!(
+        !adapter.plan("b", &cam).unwrap().needs_encoder,
+        "a lingering encoder is reused: +0"
+    );
+    assert!(
+        !adapter.plan("a", &cam).unwrap().needs_encoder,
+        "same settings on the other output: +0 too"
+    );
+    for t in now..=now + LINGER_TICKS + 1 {
+        x.tick(t);
+    }
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 0, "closed");
+    assert_eq!(x.h.snapshot().live_keys, Vec::<(String, usize)>::new());
+    assert!(
+        adapter.plan("b", &cam).unwrap().needs_encoder,
+        "after the linger closed: +1"
+    );
+}
+
+/// I1: a live encoder that blocks forever in `encode` (never drains its
+/// input queue, `WORKER_QUEUE_TICKS` = 4): once its bounded queue fills, the
+/// consumer's `offer` is rejected (`Overloaded`), never waited on. A dropped
+/// offer counts as a held tick for that key's bus, so Clean — published
+/// fresh by the bake consumer every tick, which would otherwise always look
+/// "fresh" — degrades and falls back exactly like a lagging aux bus.
+struct BlockedEnc {
+    forced: bool,
+    block: Arc<AtomicBool>,
+    gate: Mutex<Receiver<()>>,
+    /// The production encoder's contract (`encode_frame_at`): after
+    /// `start_at(t0)` it accepts only its next tick, and any other tick is an
+    /// error that ends the worker. Enforced here so gap-fill is tested against it.
+    next: Option<u64>,
+}
+
+impl VideoEncodeWorker for BlockedEnc {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        // Block while `block` is set, polling it so a later `store(false,
+        // ..)` lets this call return (used by the transient-stall test);
+        // never releases on its own otherwise, so the input queue never
+        // drains while `block` stays set.
+        let gate = self.gate.lock().unwrap();
+        while self.block.load(Ordering::SeqCst) {
+            let _ = gate.recv_timeout(std::time::Duration::from_millis(5));
+        }
+        drop(gate);
+        if let Some(next) = self.next {
+            if item.tick != next {
+                return Err(PipelineError::Output {
+                    kind: "encode",
+                    reason: format!(
+                        "video tick discontinuity: expected {next}, got {}",
+                        item.tick
+                    ),
+                });
+            }
+        }
+        self.next = Some(item.tick + 1);
+        let key = std::mem::take(&mut self.forced);
+        Ok(vec![pkt(item.tick, key)])
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.forced = true;
+    }
+}
+
+impl LiveEncoder for BlockedEnc {
+    fn start_at(&mut self, t0: u64) {
+        self.forced = true;
+        self.next = Some(t0);
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        Box::new(|p| p.is_keyframe() && p.len() == 77)
+    }
+}
+
+/// Build a harness whose live-opened encoder blocks forever in `encode` once
+/// `block` is set (never draining its input queue, so `worker.offer` starts
+/// returning `Overloaded` once the bounded queue fills). The returned sender
+/// keeps the worker's gate open; drop it at the end of the test to let the
+/// blocked worker thread return (never leaking a spinning/blocked thread).
+fn blocked_harness(outputs: usize) -> (Harness, Arc<AtomicBool>, SyncSender<()>) {
+    let block = Arc::new(AtomicBool::new(false));
+    let b = Arc::clone(&block);
+    let (release, gate) = mpsc::sync_channel::<()>(0);
+    let mut gate = Some(gate);
+    let open: OpenFn = Box::new(move |_| {
+        let e: Box<dyn LiveEncoder> = Box::new(BlockedEnc {
+            forced: false,
+            block: Arc::clone(&b),
+            gate: Mutex::new(gate.take().expect("opened once")),
+            next: None,
+        });
+        Ok(e)
+    });
+    (harness_with(outputs, 6, Some(open), true), block, release)
+}
+
+/// (a): a Clean output whose live encoder worker is blocked never drains its
+/// input queue -> `degraded` in the snapshot after ~60 held ticks, then
+/// `Fallback(...)` back to Program by ~150. Output 0 (Program) stays
+/// contiguous and on time throughout; every `on_tick` call stays well under
+/// the real-time envelope (never waits on the blocked encoder).
+#[test]
+fn a_blocked_clean_encoder_degrades_then_falls_back_and_program_is_unaffected() {
+    let (mut x, block, release) = blocked_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    assert_eq!(x.d.binding_video_key(1), Some(1), "on the Clean key");
+    // Let a few healthy ticks pass before wedging the encoder, so "held"
+    // below counts cleanly from the wedge point.
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    block.store(true, Ordering::SeqCst);
+    let wedged_at = t;
+    let mut degraded_at = None;
+    let mut fell_back_at = None;
+    // The pre-existing wedged-worker rule (`WEDGED_ENCODER_TICKS` = 90, a
+    // worker producing no events at all) may close the key before the new
+    // 150-tick held-bus rule even gets a chance to: either path is a
+    // legitimate Fallback, so this loop accepts the first of either and
+    // only pins the NEW behaviour this task adds (`degraded` raised from a
+    // dropped offer, which did not happen before this change).
+    for _ in 0..FALLBACK_AFTER_TICKS + 20 {
+        let started = Instant::now();
+        x.tick(t);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "on_tick never waits on the blocked encoder: took {:?}",
+            started.elapsed()
+        );
+        if degraded_at.is_none() && x.h.snapshot().outputs[1].degraded {
+            degraded_at = Some(t);
+        }
+        if matches!(
+            x.results()
+                .iter()
+                .find(|r| matches!(r, TakeResult::Fallback(_))),
+            Some(TakeResult::Fallback(_))
+        ) {
+            fell_back_at = Some(t);
+            break;
+        }
+        t += 1;
+    }
+    // Margin: the worker's own bounded queue (`WORKER_QUEUE_TICKS`) must
+    // first fill with real offers before any one is actually dropped (an
+    // in-flight recv on the worker thread can also absorb one more), so the
+    // "held" count only starts climbing a few ticks after the wedge; the
+    // design doc states the bounds as "~60"/"~150" for exactly this reason.
+    let sched_margin: u64 = 20;
+    let degraded_at = degraded_at.expect("Clean degrades once its queue is saturated");
+    let fell_back_at = fell_back_at.expect("Clean falls back to Program");
+    assert!(
+        degraded_at - wedged_at < DEGRADED_AFTER_TICKS + sched_margin,
+        "degraded close to the 60-held-tick bound: {} ticks after the wedge",
+        degraded_at - wedged_at + 1
+    );
+    assert!(
+        fell_back_at - wedged_at < FALLBACK_AFTER_TICKS + sched_margin,
+        "fallback close to the 150-held-tick bound: {} ticks after the wedge",
+        fell_back_at - wedged_at + 1
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(0), "back on Program");
+    let o0: Vec<i64> = x
+        .windows_of(0)
+        .iter()
+        .filter_map(|w| w.first().map(|p| p.0))
+        .collect();
+    assert!(
+        o0.windows(2).all(|w| w[1] == w[0] + 1),
+        "Program windows contiguous and on time throughout: {o0:?}"
+    );
+    assert_eq!(
+        o0.len(),
+        usize::try_from(t).unwrap(),
+        "Program delivered exactly one window per tick"
+    );
+    drop(release);
+}
+
+/// (b): same scenario, on a source bus (not Clean): a live encoder whose
+/// queue fills with dropped offers degrades and falls back just like Clean.
+#[test]
+fn a_blocked_source_encoder_degrades_then_falls_back() {
+    let (mut x, block, release) = blocked_harness(2);
+    x.tick(0);
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let (_, now) = apply(&mut x, 1, "a");
+    assert_eq!(x.d.binding_video_key(1), Some(1));
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    block.store(true, Ordering::SeqCst);
+    let wedged_at = t;
+    let mut degraded_at = None;
+    let mut fell_back_at = None;
+    // As in the Clean test: the pre-existing wedged-worker rule (90 ticks of
+    // total silence) may close the key before the new 150-tick held-bus
+    // rule gets a chance to; either is a legitimate Fallback here.
+    for _ in 0..FALLBACK_AFTER_TICKS + 20 {
+        x.tick(t);
+        if degraded_at.is_none() && x.h.snapshot().outputs[1].degraded {
+            degraded_at = Some(t);
+        }
+        if x.results()
+            .iter()
+            .any(|r| matches!(r, TakeResult::Fallback(_)))
+        {
+            fell_back_at = Some(t);
+            break;
+        }
+        t += 1;
+    }
+    // Margin, same reasoning as the Clean test above.
+    let sched_margin: u64 = 20;
+    let degraded_at = degraded_at.expect("degrades once its queue is saturated");
+    let fell_back_at = fell_back_at.expect("falls back to Program");
+    assert!(
+        degraded_at - wedged_at < DEGRADED_AFTER_TICKS + sched_margin,
+        "degraded close to the 60-held-tick bound"
+    );
+    assert!(
+        fell_back_at - wedged_at < FALLBACK_AFTER_TICKS + sched_margin,
+        "fallback close to the 150-held-tick bound"
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(0), "back on Program");
+    drop(release);
+}
+
+/// (c): a transient stall of fewer than `MAX_GAP_FILL_TICKS` dropped offers
+/// must not degrade or fall back: the encoder catches up (unblocks) well
+/// inside the gap-fill horizon.
+#[test]
+fn a_transient_offer_stall_within_the_gap_fill_horizon_never_degrades() {
+    let (mut x, block, release) = blocked_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    block.store(true, Ordering::SeqCst);
+    // A short stall (6 ticks, as when this test was written against the old
+    // 8-tick gap-fill bound): well under the degraded bound.
+    let stall_ticks: u64 = 6;
+    for _ in 0..stall_ticks {
+        x.tick(t);
+        t += 1;
+    }
+    block.store(false, Ordering::SeqCst);
+    for _ in 0..10 {
+        x.tick(t);
+        t += 1;
+    }
+    assert!(
+        !x.h.snapshot().outputs[1].degraded,
+        "a transient stall under the gap-fill horizon never degrades"
+    );
+    assert!(
+        x.results()
+            .iter()
+            .all(|r| !matches!(r, TakeResult::Fallback(_))),
+        "no fallback from a transient stall"
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(1), "still on the Clean key");
+    drop(release);
+}
+
+/// R2-1 (media lens): a bake-consumer stall sheds hot-queue ticks from the
+/// Clean bus exactly like Program's own base-worker substitution loop.
+/// Scenario: a genuine consumer gap of `k = 8` missed ticks (never
+/// published/ticked at all, simulating what the pipeline's
+/// `missing_ticks_before` computes when the hot queue sheds them),
+/// substituted via `substitute_clean` before the surviving tick's own
+/// `publish_clean`/`on_tick`. Observed directly at the Clean live encoder
+/// (`PtrEnc`, which records every tick `encode()` actually received, i.e.
+/// strictly AFTER `GapFill` has already tried to paper over any gap):
+/// without `substitute_clean`, the Clean worker would be offered only the
+/// surviving tick 8+ ticks after its last offer — a gap beyond `GapFill`'s
+/// own `MAX_GAP_FILL_TICKS` bound — and `GapFill::encode` would return an
+/// error (`tick gap ...`), ending the worker thread and failing the key
+/// (`Fallback`). The fix makes the Clean worker see every tick strictly
+/// consecutively (the substituted ticks, then the surviving tick), so
+/// `GapFill` never sees a gap at all and the key survives.
+#[test]
+fn a_consumer_gap_on_clean_is_substituted_like_program_and_never_fails_the_key() {
+    let (mut x, seen) = ptr_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    let last_fed_tick = t;
+    // The genuine consumer gap: `FRAME_SUBSTITUTION_LIMIT` in `pipeline.rs`
+    // is 8, matching `MAX_GAP_FILL_TICKS` — exactly the boundary where an
+    // unfilled gap handed straight to the Clean worker (no
+    // `substitute_clean`) would fail it outright, since `GapFill::encode`
+    // checks `item.tick - next > MAX_GAP_FILL_TICKS` BEFORE filling anything
+    // in, and 8 is already over that strict `>` bound once GapFill's own
+    // `next` is one past `last_fed_tick`.
+    let gap: u64 = 8;
+    let surviving_tick = last_fed_tick + gap + 1;
+    x.tick_after_clean_gap(last_fed_tick + 1, surviving_tick);
+    // Let the worker thread drain everything it was offered.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        x.results()
+            .iter()
+            .all(|r| !matches!(r, TakeResult::Fallback(_))),
+        "the Clean key must not fail from a substituted consumer gap: {:?}",
+        x.results()
+    );
+    assert!(
+        !x.d.is_key_failed(1),
+        "the Clean key's encoder must not have ended from an unfilled gap"
+    );
+    let ticks: Vec<u64> = seen.lock().unwrap().iter().map(|(t, _)| *t).collect();
+    assert!(
+        ticks.contains(&surviving_tick),
+        "the surviving tick reached the Clean encoder: {ticks:?}"
+    );
+    assert!(
+        ticks.windows(2).all(|w| w[1] == w[0] + 1),
+        "the Clean encoder's observed tick sequence is strictly consecutive \
+         with no gap, proving the substituted ticks closed it: {ticks:?}"
+    );
+    assert!(
+        ticks
+            .iter()
+            .min()
+            .is_some_and(|&first| first <= last_fed_tick),
+        "the sequence covers back through the last healthy tick: {ticks:?}"
+    );
+}
+
+/// PR #326 round 3 (invariants + abuse lenses): starvation is counted per
+/// KEY. A second, healthy key on the same picture bus (another output with
+/// other encoder settings) accepts its offers every tick; that must not hide
+/// the starved key the output rides: the output is marked degraded at about
+/// `DEGRADED_AFTER_TICKS` refused offers, before any fallback.
+#[test]
+fn a_healthy_sibling_key_never_hides_a_starved_key_on_the_same_bus() {
+    let (mut x, block, release) = blocked_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    assert_eq!(x.d.binding_video_key(1), Some(1), "on the Clean key");
+    // A healthy sibling on Clean (as a second output with other settings).
+    let live = Arc::new(AtomicUsize::new(0));
+    let sibling = inject(
+        &mut x.r,
+        &mut x.d,
+        PictureBus::Clean,
+        Counted::boxed(&live, 0),
+    );
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    block.store(true, Ordering::SeqCst);
+    let wedged_at = t;
+    let mut degraded_at = None;
+    for _ in 0..FALLBACK_AFTER_TICKS + 20 {
+        x.tick(t);
+        let fell_back = x
+            .results()
+            .iter()
+            .any(|r| matches!(r, TakeResult::Fallback(_)));
+        if x.h.snapshot().outputs[1].degraded {
+            degraded_at = Some(t);
+            break;
+        }
+        assert!(
+            !fell_back,
+            "the starved key fell back before it was ever reported degraded"
+        );
+        t += 1;
+    }
+    let degraded_at = degraded_at.expect("the starved key's output is marked degraded");
+    assert!(
+        degraded_at - wedged_at < DEGRADED_AFTER_TICKS + 20,
+        "degraded near the 60-refused-offer bound: {} ticks after the wedge",
+        degraded_at - wedged_at
+    );
+    assert!(
+        x.r.dynamic.iter().any(|d| d.key == sibling),
+        "the healthy sibling key is untouched"
+    );
+    drop(release);
+}
+
+/// PR #326 round 3: a consumer gap while the Clean worker's queue is already
+/// full. Substitution offers are refused; the refused ticks must stay a gap
+/// the key's own `GapFill` closes once the encoder drains, never a jump that
+/// fails the key.
+#[test]
+fn a_consumer_gap_on_a_full_clean_queue_never_fails_the_key() {
+    let (mut x, block, release) = blocked_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    // Fill the worker's queue (and its in-flight slot).
+    block.store(true, Ordering::SeqCst);
+    for _ in 0..6 {
+        x.tick(t);
+        t += 1;
+    }
+    // A full consumer gap of 8 ticks while the queue is full.
+    let surviving = t + 8;
+    x.tick_after_clean_gap(t, surviving);
+    t = surviving + 1;
+    block.store(false, Ordering::SeqCst);
+    for _ in 0..20 {
+        x.tick(t);
+        t += 1;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let results = x.results();
+    assert!(
+        results
+            .iter()
+            .all(|r| !matches!(r, TakeResult::Fallback(_))),
+        "the Clean key survives the gap: {results:?}"
+    );
+    assert!(!x.d.is_key_failed(1), "the Clean key's worker did not end");
+    assert_eq!(x.d.binding_video_key(1), Some(1), "still on the Clean key");
+    drop(release);
+}
+
+/// PR #326 round 4: a key that refuses every substitution offer but accepts
+/// every surviving tick is still starved: the accepted survivor after a
+/// refused substitution never resets the count, so repeated consumer gaps
+/// reach the degraded bound.
+#[test]
+fn refused_substitutions_count_toward_starvation_across_accepted_survivors() {
+    let (mut x, seen) = ptr_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    x.tick(now);
+    let key = x.d.binding_video_key(1).unwrap();
+    // Model "refuse the substitution, accept the survivor" directly on the
+    // key's bookkeeping: each round, a substitution offer is refused.
+    for round in 0..=DEGRADED_AFTER_TICKS {
+        if let Some(d) = x.r.dynamic.iter_mut().find(|d| d.key == key) {
+            d.starved = d.starved.saturating_add(1);
+            d.refused_this_tick = true;
+        }
+        x.tick(now + 1 + round);
+    }
+    let starved = x.r.dynamic.iter().find(|d| d.key == key).map(|d| d.starved);
+    assert!(
+        starved.is_some_and(|s| s > DEGRADED_AFTER_TICKS),
+        "accepted survivors did not reset the refusals: {starved:?}"
+    );
+    assert!(x.h.snapshot().outputs[1].degraded, "the output is degraded");
+    drop(seen);
 }

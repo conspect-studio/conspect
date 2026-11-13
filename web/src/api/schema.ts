@@ -6310,7 +6310,7 @@ export interface components {
         /** @description The body of an output plan / take. */
         OutputRouteRequest: {
             audio?: null | components["schemas"]["OutputTakeAudio"];
-            /** @description The feed: `{"bus":"program"|"preview"}` or `{"source":"vt1"}`. */
+            /** @description The feed: `{"bus":"program"|"preview"|"clean"}` or `{"source":"vt1"}`. */
             feed: Record<string, never>;
             /** @description The output and stream. */
             target: components["schemas"]["OutputTargetKind"];
