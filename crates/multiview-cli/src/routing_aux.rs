@@ -134,13 +134,13 @@ impl AuxFormat {
     }
 
     /// The format an output declares, normalised: `None` when it is the
-    /// canvas picture as composed today (canvas size, default fit), so such
-    /// an output shares feeds and keys with an output declaring no format.
+    /// canvas size (identity: the fit is irrelevant, §12.4 P2), so such an
+    /// output shares feeds and keys with an output declaring no format.
     #[must_use]
     pub fn of_output(output: &multiview_config::Output, canvas: AuxCanvas) -> Option<Self> {
         let f = output.format()?;
-        let format = Self::new(f.width, f.height, f.fit);
-        (format != Self::new(canvas.width, canvas.height, OutputFit::default())).then_some(format)
+        (f.width != canvas.width || f.height != canvas.height)
+            .then(|| Self::new(f.width, f.height, f.fit))
     }
 }
 
@@ -864,6 +864,15 @@ height = 1920
 fit = { mode = "cover" }
 [[outputs]]
 kind = "hls"
+id = "same-cover"
+path = "/w"
+codec = "h264"
+[outputs.format]
+width = 1920
+height = 1080
+fit = { mode = "cover", anchor = "top" }
+[[outputs]]
+kind = "hls"
 id = "none"
 path = "/z"
 codec = "h264"
@@ -875,6 +884,6 @@ codec = "h264"
             .iter()
             .map(|o| AuxFormat::of_output(o, canvas()))
             .collect();
-        assert_eq!(formats, vec![None, Some(vertical()), None]);
+        assert_eq!(formats, vec![None, Some(vertical()), None, None]);
     }
 }
