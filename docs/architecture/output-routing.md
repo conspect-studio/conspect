@@ -1873,6 +1873,47 @@ non-canvas format on a kind slice B does not convert for: `webrtc`, `whip_push`,
 `aes67`, `rtsp_server`). Only an explicitly declared slot codec is checked. Absent `format` and
 `slots` give exactly the previous behaviour and serialization.
 
+**As built in slice B (#342, part B3): live format reset of one output.**
+`PUT /api/v1/outputs/{id}` whose ONLY change is `format` and/or `slots.video[0].bitrate_kbps` on a
+running output whose container carries parameter sets in band (HLS with TS segments, SRT, RIST) is
+applied live as a Class-2 reset of that output only. The answer is `x-multiview-apply: live`, the note
+"resets output <id> (about 1 s); Program and other outputs are not affected", and an operation id
+whose `route.output` outcome is `reset:applied` or `reset:refused:<reason>`.
+
+What the engine does (`crates/multiview-cli/src/output_routing_reformat.rs`):
+- **Open off the clock.** A bounded `Reformat` command opens a new encoder on the routing-open
+  thread: the SAME codec, the new size, fit and bitrate.
+  - Program/Clean are converted on the key's worker (`ConvertLive`).
+  - A routed source/PVW is re-keyed at the new feed format.
+- **Make-before-break.** Once the encoder's first window is staged, the output is FORCE-moved onto it
+  at an IDR; the old key feeds the output until the move lands.
+- **Flagged change.** The move changes the decoder configuration, which the dispatcher signals:
+  - HLS writes `EXT-X-DISCONTINUITY` at the segment the IDR starts;
+  - the segment muxer is rebuilt with the next TS `tables_version`, so PAT/PMT `version_number` changes
+    there. That is legal because the segment is discontinuous anyway.
+- **New base key.** The new key becomes the output's base key (fallback and later takes) and never
+  lingers while pinned. A previous reformat key no output uses lingers out and retires.
+- **Bounded.**
+  - At most one reformat in flight per output: a newer one supersedes it.
+  - It counts against `max_encoders` (`capacity`).
+  - Its deadline is 150 ticks (`encoder-not-ready`); a failed or wedged open leaves the output on its
+    old format.
+- **Program and every other output are untouched:** no shared key changes and no clock work.
+- **Same gate as a take:** the reset is authorized on the output axis (`authorize_output_end`) and
+  rate-limited with the take limiter (one reset = one take).
+
+What stays restart-pending, with today's `x-multiview-apply: restart` and why:
+- **A codec change.** A new encoder family cannot splice into an existing TS elementary stream type.
+- **An audio-slot change.** The muxer's stream layout is pinned for the session (ADR-R005 §3.3).
+- **Any other field.**
+- **Kinds that carry parameter sets out of band** (LL-HLS fMP4 init, RTMP FLV sequence header,
+  RTSP/WebRTC SDP). A new configuration needs a new init/header that the running session cannot take
+  without a reconnect; the router refuses `restart-required`.
+
+The Outputs page shows the format and slots editor with the matching warning: "Applying resets
+this output (about 1 s); Program and other outputs are not affected" or "Applies on the next
+restart".
+
 ### 12.4 The cheapest path per crosspoint
 
 For every crosspoint the engine computes a path; the plan shows it, and `GET /patch` reports it per slot.

@@ -200,11 +200,12 @@ pub(crate) async fn create_output(
         params(("id" = String, Path, description = "Output id.")),
         request_body = crate::openapi_schemas::OutputResourceInputDoc,
         responses(
-            (status = 200, description = "The replaced output (new ETag in the response header).", body = crate::resource_store::Resource),
+            (status = 200, description = "The replaced output (new ETag in the response header). `x-multiview-apply: live` when the change is ONLY the output's `format` and/or `slots.video[0].bitrate_kbps` on a running HLS, SRT or RIST output: that output is reset live (about 1 s; Program and other outputs are not affected; `x-multiview-apply-note` says so, `x-multiview-operation-id` correlates the `route.output` outcome `reset:applied` or `reset:refused:<reason>`). Otherwise `x-multiview-apply: restart` (a codec, audio-slot or other change, or a kind whose container carries parameter sets out of band).", body = crate::resource_store::Resource),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 403, description = "Not authorized to write.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to write (a live reset also needs the output axis).", body = crate::problem::Problem),
             (status = 404, description = "No output with that id.", body = crate::problem::Problem),
             (status = 412, description = "If-Match precondition failed.", body = crate::problem::Problem),
+            (status = 429, description = "A live reset over 2/s for this output or 10/s for the principal (one reset = one take); nothing committed. See Retry-After.", body = crate::problem::Problem),
         ),
     )
 )]
