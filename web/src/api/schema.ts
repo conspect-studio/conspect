@@ -15595,7 +15595,7 @@ export interface operations {
                     "application/json": components["schemas"]["PatchAccepted"];
                 };
             };
-            /** @description Not authorized for a destination (M/E object + Program scope) or a source. */
+            /** @description Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source; a replayed key is re-authorized. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -15613,7 +15613,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or no source lease. */
+            /** @description `conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -16977,7 +16977,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized for the output or the feed. */
+            /** @description Not authorized for the output (object AND output axis) or the feed; a replayed key is re-authorized under the caller's current grants. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -16995,7 +16995,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable` or `capacity`. */
+            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or `conflict` (the Idempotency-Key was first used for another output or feed; nothing is enqueued). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -17064,7 +17064,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized to plan this crosspoint. */
+            /** @description Not authorized to plan this crosspoint (an output target: object AND output axis). */
             403: {
                 headers: {
                     [name: string]: unknown;
