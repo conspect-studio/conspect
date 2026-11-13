@@ -14,6 +14,7 @@ import { i18n } from '@lingui/core';
 import { I18nProvider } from '@lingui/react';
 import { MemoryRouter } from 'react-router-dom';
 import { messages } from '../../locales/en/messages';
+import { CastProvider } from '../../cast';
 import { ProductionDesk } from './ProductionDesk';
 
 i18n.load('en', messages);
@@ -37,7 +38,7 @@ function page() {
     t2: { id: 't2', state: 'RECONNECTING', input: 'b' },
     c: { id: 'c', state: 'NO_SIGNAL' },
   });
-  return render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><ProductionDesk /></MemoryRouter></I18nProvider></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><CastProvider><ProductionDesk /></CastProvider></MemoryRouter></I18nProvider></QueryClientProvider>);
 }
 
 describe('ProductionDesk truthful wall, indices and meters', () => {

@@ -34,6 +34,7 @@ import { hlsPlaybackCollisionIds, hlsPlaybackPaths } from '../preview/outputPlay
 import { Trans, useLingui } from '@lingui/react/macro';
 import { CircleCheck, Hourglass, MonitorCog, Pencil, Plus, Trash2 } from 'lucide-react';
 
+import { CastButton } from '../cast';
 import { OutputFromDeviceSection } from '../devices/FromDevice';
 import { useAudioRouting } from '../resources/audioRouting';
 import { getResource, whepPlayUrl } from '../resources/api';
@@ -1097,6 +1098,9 @@ function OutputCard({
             <Trash2 aria-hidden="true" />
             <Trans>Delete</Trans>
           </TouchAction>
+          {playbackPath !== undefined ? (
+            <CastButton target={{ key: `output:${output.id}`, name: output.name, path: playbackPath }} compact />
+          ) : null}
         </div>
       </div>
     );
@@ -1215,6 +1219,9 @@ function OutputCard({
             <Trash2 aria-hidden="true" />
             <Trans>Delete</Trans>
           </TouchAction>
+          {playbackPath !== undefined ? (
+            <CastButton target={{ key: `output:${output.id}`, name: output.name, path: playbackPath }} compact />
+          ) : null}
         </div>
       </div>
     </TaskWorkspace>

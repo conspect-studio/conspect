@@ -10,6 +10,7 @@ import { i18n } from '@lingui/core';
 import { I18nProvider } from '@lingui/react';
 import { MemoryRouter } from 'react-router-dom';
 import { messages } from '../../locales/en/messages';
+import { CastProvider } from '../../cast';
 import { ProductionDesk } from './ProductionDesk';
 vi.mock('../../realtime/useEngineEvents', () => ({ useEngineEvents: () => ({ status: 'open' }), TILES_QUERY_KEY: ['tiles'] }));
 vi.mock('../../preview/PreviewSurface', () => ({ PreviewSurface: () => null }));
@@ -42,7 +43,7 @@ afterAll(() => { server.close(); });
 
 function page() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  const view = render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><ProductionDesk /></MemoryRouter></I18nProvider></QueryClientProvider>);
+  const view = render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><CastProvider><ProductionDesk /></CastProvider></MemoryRouter></I18nProvider></QueryClientProvider>);
   return { client, ...view };
 }
 function frame(id: string, data: unknown, override: Partial<Envelope> = {}): Envelope {
@@ -137,7 +138,7 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     const { client, unmount } = page();
     await waitFor(() => { expect(client.getQueryData(['switcher', 'me1'])).toBeTruthy(); });
     unmount();
-    render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><ProductionDesk /></MemoryRouter></I18nProvider></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><CastProvider><ProductionDesk /></CastProvider></MemoryRouter></I18nProvider></QueryClientProvider>);
     expect(screen.getByText('○ PROGRAM — unconfirmed')).toBeInTheDocument();
     frozenTick = false;
     await screen.findByText('● ON AIR — PROGRAM', undefined, { timeout: 6000 });

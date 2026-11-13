@@ -14,6 +14,7 @@ import { i18n } from '@lingui/core';
 import { I18nProvider } from '@lingui/react';
 import { MemoryRouter } from 'react-router-dom';
 import { messages } from '../../locales/en/messages';
+import { CastProvider } from '../../cast';
 import { BroadcastShell } from './BroadcastShell';
 import { ProductionDesk } from './ProductionDesk';
 
@@ -34,7 +35,7 @@ afterAll(() => { server.close(); });
 
 function page() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return { client, ...render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><BroadcastShell managementLabel="Connected"><ProductionDesk /></BroadcastShell></MemoryRouter></I18nProvider></QueryClientProvider>) };
+  return { client, ...render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><CastProvider><BroadcastShell managementLabel="Connected"><ProductionDesk /></BroadcastShell></CastProvider></MemoryRouter></I18nProvider></QueryClientProvider>) };
 }
 
 describe('header ProducerStatus and Desk share one tick observation', () => {

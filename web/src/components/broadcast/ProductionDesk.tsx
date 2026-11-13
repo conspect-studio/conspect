@@ -1,5 +1,5 @@
 import { busKeyReason, deskControlReason, tallyForSource } from './deskSafety';
-import { Info, TriangleAlert } from 'lucide-react';
+import { Cast as CastIcon, Info, TriangleAlert } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
@@ -11,7 +11,8 @@ import { newIdempotencyKey } from '../../api/operations';
 import { createApiClient } from '../../api/client';
 import { useLayouts } from '../../api/queries';
 import { useAlarms } from '../../api/alarmsQueries';
-import { useSources } from '../../resources/queries';
+import { useOutputs, useSources } from '../../resources/queries';
+import { hlsPlaybackPaths } from '../../preview/outputPlayback';
 import { useSourceStatus } from '../../api/sourceStatus';
 import type { SourceDemand } from '../../api/sourceStatus';
 import { subscribeRealtime } from '../../realtime/shared';
@@ -24,11 +25,13 @@ import { usePreviewCapabilities, whepAvailable } from '../../preview/capabilitie
 import { PreviewSurface } from '../../preview/PreviewSurface';
 import { useJpegStill } from '../../preview/useJpegPreview';
 import { WallCrop, WallStreamProvider, useWallStatus, useWallSurface } from '../../preview/WallStream';
+import { Button } from '../ui/button';
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog';
 import { useOperationFeedback, useSubmitTrackedOperation } from './useOperationFeedback';
 import { OperationFeedback } from './OperationFeedback';
 import { useTakeLock } from './BroadcastShell';
 import { tickConfirmed, useTickAdvancedAt } from './tickObservation';
+import { CastButton } from '../../cast';
 
 const STATE_KEY = ['switcher', 'me1'] as const;
 const SENDING = '\u0000sending';
@@ -47,9 +50,32 @@ function PreviewMonitor({ program, source, fresh }: { readonly program: boolean;
   return <figure className={`bd-monitor ${program ? 'bd-pgm' : 'bd-pvw'}`} data-tally={fresh && source ? (program ? 'program' : 'preview') : 'unknown'}>
     <div className="bd-picture">{program ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/api/v1/preview/program.jpg" label={t`Program monitor`} capabilities={caps.data} className="bd-video" diagnosticsHost={diagHost} onTransportUnavailable={() => { setTransportUnavailable(true); }} /> : pvwLive && wallPreview.previewSource ? <WallCrop source={wallPreview.previewSource} label={t`Preview monitor`} className="bd-video" testId="preview-wall" /> : pvwUnavailable ? <span role="status" data-testid="preview-unavailable"><Trans>Preview unavailable — switcher backend not deployed</Trans></span> : pvw ? <div className="bd-jpeg"><img src={pvw} alt={t`Preview monitor`} />{pvwStill.state === 'stale' ? <em className="bd-stale" data-testid="preview-stale"><Trans>Stale</Trans></em> : null}</div> : <span><Trans>Waiting for a frame…</Trans></span>}</div>
     {program ? <div className="bd-diag-slot" ref={setDiagHost} data-testid="desk-fallback-slot" /> : null}
-    <figcaption><div className="bd-capline"><b>{program ? (fresh && source ? t`● ON AIR — PROGRAM` : t`○ PROGRAM — unconfirmed`) : (fresh && source ? t`▲ PREVIEW` : t`△ PREVIEW — unconfirmed`)}</b><span>{source ?? t`Unknown source`}</span></div><small>{fresh ? t`Engine-confirmed bus` : t`Unconfirmed / stale`}{pvwUnavailable ? null : still ? <> · {t`Still preview (~1 fps) — live video is unavailable for this preview`}</> : null}</small></figcaption>
+    <figcaption><div className="bd-capline"><b>{program ? (fresh && source ? t`● ON AIR — PROGRAM` : t`○ PROGRAM — unconfirmed`) : (fresh && source ? t`▲ PREVIEW` : t`△ PREVIEW — unconfirmed`)}</b><span>{source ?? t`Unknown source`}</span>{program ? <ProgramCastButton /> : null}</div><small>{fresh ? t`Engine-confirmed bus` : t`Unconfirmed / stale`}{pvwUnavailable ? null : still ? <> · {t`Still preview (~1 fps) — live video is unavailable for this preview`}</> : null}</small></figcaption>
     {program && <ProgramLevels />}
   </figure>;
+}
+
+/**
+ * Cast the Program monitor from the browser (PR 1 scope): Program casts the
+ * FIRST HLS/LL-HLS output in configuration order (there is no dedicated
+ * "program" stream endpoint yet). With none configured, the button is
+ * disabled with an honest reason.
+ */
+function ProgramCastButton(): JSX.Element {
+  const { t } = useLingui();
+  const outputs = useOutputs();
+  const list = outputs.data ?? [];
+  const paths = hlsPlaybackPaths(list);
+  const firstHls = list.find((output) => (output.kind === 'hls' || output.kind === 'll-hls') && paths.has(output.id));
+  const path = firstHls === undefined ? undefined : paths.get(firstHls.id);
+  if (firstHls === undefined || path === undefined) {
+    return (
+      <Button variant="outline" size="icon" disabled aria-label={t`Cast needs an HLS output that shows Program`} title={t`Cast needs an HLS output that shows Program`}>
+        <CastIcon aria-hidden="true" />
+      </Button>
+    );
+  }
+  return <CastButton target={{ key: `output:${firstHls.id}`, name: t`Program`, path }} compact />;
 }
 
 /** Program L/R levels strictly from the audio.meter telemetry; otherwise explicitly unavailable. */

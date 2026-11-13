@@ -9,6 +9,7 @@ import { i18n } from '@lingui/core';
 import { I18nProvider } from '@lingui/react';
 
 import { messages } from '../locales/en/messages';
+import { CastProvider } from '../cast';
 
 i18n.load('en', messages);
 i18n.activate('en');
@@ -20,7 +21,9 @@ export function TestProviders({ children }: { children: ReactNode }): ReactEleme
   });
   return (
     <QueryClientProvider client={client}>
-      <I18nProvider i18n={i18n}>{children}</I18nProvider>
+      <I18nProvider i18n={i18n}>
+        <CastProvider>{children}</CastProvider>
+      </I18nProvider>
     </QueryClientProvider>
   );
 }

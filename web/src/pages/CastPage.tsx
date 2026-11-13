@@ -1,13 +1,20 @@
-// Cast — ad-hoc Cast (Chromecast / Google Cast) device sessions.
+// Cast — two independent casting methods to a Google Cast / Chromecast
+// receiver:
 //
-// An operator casts a running output's rendition to a Cast receiver on the
-// network as an EPHEMERAL session, then optionally promotes it to a permanent
-// managed device. Discovered Cast receivers come from the shared discovery
-// inventory (driver_kind === 'cast'); the live ephemeral session list is POLLED
-// (the cast.session.started/.removed realtime events live on a separate lane, so
-// this surface refetches — a live-WS upgrade is a later drop-in). Volume is a
-// 202 command: the applied level lands on the realtime stream, surfaced here as
-// the accepted operation id.
+//   * "Cast from this browser" (NEW): the operator's Chrome/Edge is the Cast
+//     SENDER; the TV fetches an HTTPS HLS URL the engine itself serves. Works
+//     wherever the engine runs, including a cloud-hosted engine, as long as
+//     this page is served over HTTPS with a valid certificate. See `../cast/`.
+//   * "Cast from the engine" (existing, server-side, same network only): the
+//     engine dials the receiver directly over the LAN as an ephemeral session,
+//     then optionally promotes it to a permanent managed device. Discovered
+//     receivers come from the shared discovery inventory (driver_kind ===
+//     'cast'); the session list is POLLED (a live-WS upgrade is a later
+//     drop-in). Volume is a 202 command: the applied level lands on the
+//     realtime stream, surfaced here as the accepted operation id.
+//
+// Google Cast and Chromecast are trademarks of Google LLC; this project is
+// independent and not affiliated with or endorsed by Google.
 import { useMemo, useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
@@ -21,7 +28,10 @@ import {
   useStopCastSession,
 } from '../api/cast-sessionsQueries';
 import type { CastSession } from '../api/cast-sessionsQueries';
+import { useOutputs } from '../resources/queries';
+import { hlsPlaybackPaths } from '../preview/outputPlayback';
 import { useDiscoveredInventory } from '../devices/queries';
+import { CastButton } from '../cast';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
@@ -75,6 +85,19 @@ export function CastPage(): JSX.Element {
   const stop = useStopCastSession();
   const save = useSaveCastSession();
   const volume = useSetCastVolume();
+  const outputs = useOutputs();
+  const outputList = useMemo(() => outputs.data ?? [], [outputs.data]);
+  const hlsPaths = useMemo(() => hlsPlaybackPaths(outputList), [outputList]);
+  const hlsOutputs = useMemo(
+    () => outputList.filter((output) => (output.kind === 'hls' || output.kind === 'll-hls') && hlsPaths.has(output.id)),
+    [outputList, hlsPaths],
+  );
+  const programOutput = hlsOutputs[0];
+  const programPath = programOutput === undefined ? undefined : hlsPaths.get(programOutput.id);
+  // Google Cast devices need HTTPS with a valid certificate; `http:` still
+  // works for same-origin requests but a Cast device will refuse the media
+  // URL, so this is a warning, not a hard block.
+  const insecureOrigin = window.location.protocol !== 'https:';
 
   const [startDraft, setStartDraft] = useState<StartDraft | null>(null);
   const [saveDraft, setSaveDraft] = useState<SaveDraft | null>(null);
@@ -115,9 +138,17 @@ export function CastPage(): JSX.Element {
           setStartDraft(null);
         },
         onError: (error): void => {
+          // A 409 means the engine cannot reach/encode for this target right
+          // now (not-castable / no-encoder / capacity / engine-not-running);
+          // the server's `detail` names the reason. Browser casting (above)
+          // does not depend on the engine dialing the device, so point the
+          // operator there.
+          const is409 = error.status === 409;
           toast({
             title: t`Could not start the cast session`,
-            description: error.message,
+            description: is409
+              ? `${error.detail ?? error.message} ${t`Use Cast from this browser instead.`}`
+              : error.detail ?? error.message,
             variant: 'destructive',
           });
         },
@@ -227,6 +258,94 @@ export function CastPage(): JSX.Element {
           </Button>
         }
       />
+
+      <section aria-labelledby="cast-browser" className="mb-8">
+        <h2 id="cast-browser" className="mb-2 text-sm font-semibold">
+          <Trans>Cast from this browser</Trans>
+        </h2>
+        <p className="mb-3 text-sm text-muted-foreground">
+          <Trans>
+            Your Chrome or Edge browser is the Cast sender; the TV fetches the
+            stream straight from the engine. Works wherever the engine runs —
+            including a cloud-hosted engine — as long as this page is served
+            over HTTPS with a valid certificate.
+          </Trans>
+        </p>
+        {insecureOrigin ? (
+          <p role="alert" className="mb-3 text-sm text-destructive">
+            <Trans>
+              This page is not served over HTTPS. Cast devices need an HTTPS
+              address with a valid certificate; casting from this browser may
+              not work until the engine is reached that way.
+            </Trans>
+          </p>
+        ) : null}
+        <div className="grid gap-2">
+          <div className="flex flex-wrap items-center gap-3 rounded-md border p-3">
+            <span className="min-w-24 font-medium">
+              <Trans>Program</Trans>
+            </span>
+            {programOutput !== undefined && programPath !== undefined ? (
+              <CastButton
+                target={{ key: `output:${programOutput.id}`, name: t`Program`, path: programPath }}
+              />
+            ) : (
+              <Button variant="outline" size="sm" disabled aria-label={t`Cast needs an HLS output that shows Program`} title={t`Cast needs an HLS output that shows Program`}>
+                <Cast aria-hidden="true" />
+                <Trans>Cast needs an HLS output that shows Program</Trans>
+              </Button>
+            )}
+          </div>
+          {outputs.isPending ? (
+            <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
+              <Trans>Loading castable targets…</Trans>
+            </p>
+          ) : null}
+          {hlsOutputs.map((output) => {
+            const path = hlsPaths.get(output.id);
+            if (path === undefined) {
+              return null;
+            }
+            return (
+              <div
+                key={output.id}
+                className="flex flex-wrap items-center gap-3 rounded-md border p-3"
+              >
+                <span lang="" dir="auto" className="min-w-24 font-medium">
+                  {output.name}
+                </span>
+                <CastButton target={{ key: `output:${output.id}`, name: output.name, path }} />
+              </div>
+            );
+          })}
+          {outputs.isSuccess && hlsOutputs.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              <Trans>No HLS output is configured yet — browser casting needs one.</Trans>
+            </p>
+          ) : null}
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">
+          <Trans>
+            Google Cast and Chromecast are trademarks of Google LLC. This
+            project is independent and not affiliated with or endorsed by
+            Google.
+          </Trans>
+        </p>
+      </section>
+
+      <section aria-labelledby="cast-engine-intro" className="mb-4">
+        <h2 id="cast-engine-intro" className="mb-2 text-sm font-semibold">
+          <Trans>Cast from the engine (same network only)</Trans>
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          <Trans>
+            The engine dials the receiver itself over the local network, so
+            this only works when the engine and the TV share a network. It
+            also requires <code>control.cast_media_base</code> to be
+            configured.
+          </Trans>
+        </p>
+      </section>
 
       <section aria-labelledby="cast-discovered" className="mb-8">
         <h2 id="cast-discovered" className="mb-2 text-sm font-semibold">

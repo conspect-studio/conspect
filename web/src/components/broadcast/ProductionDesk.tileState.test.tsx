@@ -44,6 +44,7 @@ import { i18n } from '@lingui/core';
 import { I18nProvider } from '@lingui/react';
 import { MemoryRouter } from 'react-router-dom';
 import { messages } from '../../locales/en/messages';
+import { CastProvider } from '../../cast';
 import { ProductionDesk } from './ProductionDesk';
 import type { SourceDemand } from '../../api/sourceStatus';
 
@@ -83,7 +84,7 @@ afterAll(() => { server.close(); });
 function page() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   client.setQueryData(['tiles'], {});
-  return render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><ProductionDesk /></MemoryRouter></I18nProvider></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><CastProvider><ProductionDesk /></CastProvider></MemoryRouter></I18nProvider></QueryClientProvider>);
 }
 
 /** The wall tile whose source-name is `name`. */
