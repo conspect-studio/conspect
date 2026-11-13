@@ -190,6 +190,14 @@ pub struct NetworkConfig {
     /// `[network.ice_tcp]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ice_tcp: Option<IceTcpConfig>,
+    /// HTTP-01 bridge for an external ACME client (slice 6, issue #292): the
+    /// port-80 redirect listener answers `GET /.well-known/acme-challenge/<token>`
+    /// with the file `<acme_webroot>/.well-known/acme-challenge/<token>` (the
+    /// layout `certbot --webroot -w <acme_webroot>` writes) instead of the 301,
+    /// so a certbot certificate keeps renewing after nginx is gone. Absolute
+    /// path; `direct` mode with the redirect enabled only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme_webroot: Option<String>,
 }
 
 impl Default for NetworkConfig {
@@ -207,6 +215,7 @@ impl Default for NetworkConfig {
             trusted_proxies: Vec::new(),
             proxy_listen: None,
             ice_tcp: None,
+            acme_webroot: None,
         }
     }
 }
@@ -399,6 +408,20 @@ impl NetworkConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_socket()?;
         self.validate_tcp()?;
+        if let Some(webroot) = &self.acme_webroot {
+            if !std::path::Path::new(webroot).is_absolute() {
+                return Err(ConfigError::Validation(
+                    "network.acme_webroot must be an absolute path".to_owned(),
+                ));
+            }
+            if self.effective_redirect_port().is_none() {
+                return Err(ConfigError::Validation(
+                    "network.acme_webroot is served by the port-80 redirect listener: it needs \
+                     network.mode = \"direct\" and a non-zero http_redirect_port"
+                        .to_owned(),
+                ));
+            }
+        }
         if let Some(public_host) = &self.public_host {
             domain("public_host", public_host, AcmeChallenge::TlsAlpn01).map_err(|_| {
                 ConfigError::Validation(

@@ -283,7 +283,7 @@ fn classify(extension: &str) -> Option<(HeaderValue, CacheTier)> {
 /// This is a **cheap pre-check only**: it stops the obvious `..`/absolute
 /// traversals before any filesystem work, but it cannot stop a symlink
 /// **inside** the tree pointing out of it (its components are all `Normal`).
-/// The symlink confinement is enforced separately by [`confine_to_root`],
+/// The symlink confinement is enforced separately by [`confine_to_root_blocking`],
 /// which canonicalises the resolved target against the canonical root.
 fn resolve_media_path(root: &Path, relative: &str) -> Option<PathBuf> {
     let relative = Path::new(relative);
@@ -297,43 +297,136 @@ fn resolve_media_path(root: &Path, relative: &str) -> Option<PathBuf> {
     any.then(|| root.join(relative))
 }
 
+/// Bytes per body chunk read off disk (and the most one response holds in
+/// memory at a time): 64 KiB, the size nginx's `output_buffers` default
+/// reads per `sendfile`-less write (TLS cannot `sendfile` without kTLS).
+pub const BODY_CHUNK: usize = 64 * 1024;
+
+/// An opened, confined media file: the handle positioned at offset 0 and the
+/// metadata of **that** handle (`fstat`, so the length and validators describe
+/// exactly the bytes that are streamed, even if the segmenter replaces the
+/// path meanwhile).
+struct Opened {
+    file: std::fs::File,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// Resolve, confine, open and `fstat` in ONE blocking-pool hop (slice 6,
+/// #292): the previous path took five separate `tokio::fs` hops
+/// (canonicalize x2, metadata, open, seek), each a round trip through the
+/// blocking pool, which is what segment time-to-first-byte pays.
+fn open_confined(root: &Path, lexical: &Path) -> std::io::Result<Option<Opened>> {
+    let Some(target) = confine_to_root_blocking(root, lexical) else {
+        return Ok(None);
+    };
+    let file = match std::fs::File::open(&target) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(Opened {
+        file,
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    }))
+}
+
 /// Confine a lexically-resolved `target` to the served `root` by canonicalising
-/// both and requiring the real target to live under the real root — so a
+/// both and requiring the real target to live under the real root, so a
 /// symlink **inside** the tree pointing outside it is rejected (the lexical
-/// pre-check in [`resolve_media_path`] cannot catch that; its components are all
-/// `Normal`).
-///
-/// Canonicalisation requires the path to exist, so a *missing* file (the
-/// common 404) is handled by canonicalising the target's **parent** and
-/// re-appending the final component: a request for a file that does not exist
-/// yet still resolves its real directory and 404s as a missing file (never a
-/// `500`), while a request whose parent escapes the root is rejected.
-///
-/// Returns the canonical, confined absolute path on success, or `None` when the
-/// target (or its parent) cannot be confined to the canonical root — the caller
-/// maps `None` to `404`.
-async fn confine_to_root(canonical_root: &Path, target: &Path) -> Option<PathBuf> {
-    // Fast path: the target itself exists (a real file or a symlink to one
-    // inside the tree) — canonicalise it directly.
-    if let Ok(canonical) = tokio::fs::canonicalize(target).await {
+/// pre-check in [`resolve_media_path`] cannot catch that). A *missing* file
+/// canonicalises its parent and re-appends the final component, so it still
+/// 404s as a missing file (never a `500`), while a parent that escapes the
+/// root is rejected. `None` maps to `404`.
+fn confine_to_root_blocking(canonical_root: &Path, target: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(target) {
         return canonical.starts_with(canonical_root).then_some(canonical);
     }
-    // The target does not exist (the common 404): canonicalise its parent and
-    // re-append the final component, so a missing file still resolves its real
-    // directory and confines correctly instead of erroring.
     let parent = target.parent()?;
     let file_name = target.file_name()?;
-    let canonical_parent = tokio::fs::canonicalize(parent).await.ok()?;
+    let canonical_parent = std::fs::canonicalize(parent).ok()?;
     canonical_parent
         .starts_with(canonical_root)
         .then(|| canonical_parent.join(file_name))
 }
 
-/// Serve one playlist/segment/init file (`GET`/`HEAD`) with the §6 contract.
+/// The nginx-format strong validator: `"<mtime secs hex>-<size hex>"`
+/// (`ngx_http_set_etag`), so a cache that held an nginx-served copy
+/// revalidates against the engine without refetching.
+fn etag(len: u64, modified: Option<std::time::SystemTime>) -> Option<HeaderValue> {
+    let secs = modified?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    HeaderValue::from_str(&format!("\"{secs:x}-{len:x}\"")).ok()
+}
+
+/// Whether the request's validators say the client's copy is current
+/// (RFC 9110 section 13.1.2 / 13.1.3; `If-None-Match` wins over
+/// `If-Modified-Since`, which nginx compares exactly by default).
+fn not_modified(
+    headers: &HeaderMap,
+    etag: Option<&HeaderValue>,
+    modified: Option<std::time::SystemTime>,
+) -> bool {
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
+        let Some(etag) = etag.and_then(|e| e.to_str().ok()) else {
+            return false;
+        };
+        let Ok(inm) = inm.to_str() else {
+            return false;
+        };
+        return inm.split(',').map(str::trim).any(|candidate| {
+            candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+        });
+    }
+    let (Some(ims), Some(modified)) = (
+        headers
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| httpdate::parse_http_date(v).ok()),
+        modified,
+    ) else {
+        return false;
+    };
+    // HTTP dates have one-second resolution.
+    let secs = |t: std::time::SystemTime| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    };
+    secs(modified) <= secs(ims)
+}
+
+/// Whether an `If-Range` precondition still matches (RFC 9110 section
+/// 13.1.5): absent, or equal to the current strong `ETag` / `Last-Modified`.
+/// A mismatch serves the full `200` instead of the range.
+fn if_range_matches(
+    headers: &HeaderMap,
+    etag: Option<&HeaderValue>,
+    last_modified: Option<&HeaderValue>,
+) -> bool {
+    match headers.get(header::IF_RANGE) {
+        None => true,
+        Some(value) => {
+            Some(value) == etag || (!value.as_bytes().starts_with(b"\"") && Some(value) == last_modified)
+        }
+    }
+}
+
+/// Serve one playlist/segment/init file (`GET`/`HEAD`) with the §6 contract
+/// and nginx's static-file behaviour (`deploy/hls-nginx.conf`, the golden
+/// table in `tests/hls_nginx_parity.rs`): `ETag` + `Last-Modified`
+/// validators, `304 Not Modified`, `If-Range`, single-range `206`/`416`.
 ///
-/// Reads only what the response needs: `HEAD` is metadata-only, a `Range`
-/// `206` reads exactly the requested span (seek + exact read), a full `GET`
-/// reads the file once. All I/O is `tokio::fs` off the engine hot path.
+/// Reads only what the response needs: `HEAD` and `304` never read a byte, a
+/// `Range` `206` streams exactly the requested span, a full `GET` streams the
+/// file in [`BODY_CHUNK`] pieces. All file I/O is on the blocking pool, off
+/// the engine hot path.
 async fn serve_media(
     State(root): State<Arc<PathBuf>>,
     UrlPath(relative): UrlPath<String>,
@@ -350,23 +443,51 @@ async fn serve_media(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // Symlink confinement: canonicalise the lexically-resolved target against
-    // the canonical root, so a symlink **inside** the tree pointing outside it
-    // is rejected (the lexical check above cannot catch that). A missing file
-    // still 404s (handled inside `confine_to_root`), never 500s.
-    let Some(file) = confine_to_root(&root, &lexical).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let len = match tokio::fs::metadata(&file).await {
-        Ok(meta) if meta.is_file() => meta.len(),
-        // Missing, a directory, or unreadable: not a servable media file.
-        Ok(_) | Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    // Symlink confinement + open + fstat, in one blocking hop. A missing file
+    // (or one that raced away, e.g. the segmenter's deferred-unlink prune)
+    // is an honest 404, never a 500.
+    let root_for_open = Arc::clone(&root);
+    let opened =
+        match tokio::task::spawn_blocking(move || open_confined(&root_for_open, &lexical)).await {
+            Ok(Ok(Some(opened))) => opened,
+            Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "HLS delivery open failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    let len = opened.len;
+    let etag = etag(len, opened.modified);
+    let last_modified = opened
+        .modified
+        .and_then(|t| HeaderValue::from_str(&httpdate::fmt_http_date(t)).ok());
+
+    let validators = |headers: &mut HeaderMap| {
+        if let Some(value) = &etag {
+            headers.insert(header::ETAG, value.clone());
+        }
+        if let Some(value) = &last_modified {
+            headers.insert(header::LAST_MODIFIED, value.clone());
+        }
     };
 
-    let range = request_headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map_or(ByteRange::Ignored, |spec| byte_range(spec, len));
+    if not_modified(&request_headers, etag.as_ref(), opened.modified) {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        let headers = response.headers_mut();
+        headers.insert(header::CACHE_CONTROL, tier.cache_control());
+        validators(headers);
+        return response;
+    }
+
+    let range = if if_range_matches(&request_headers, etag.as_ref(), last_modified.as_ref()) {
+        request_headers
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map_or(ByteRange::Ignored, |spec| byte_range(spec, len))
+    } else {
+        ByteRange::Ignored
+    };
 
     let (status, span) = match range {
         ByteRange::Unsatisfiable => {
@@ -388,26 +509,18 @@ async fn serve_media(
     };
 
     let body = if method == Method::HEAD {
-        // Metadata only — never open or read a segment to answer HEAD.
+        // Metadata only: never read a segment to answer HEAD.
         Body::empty()
     } else {
-        // Open + seek to the span start, then **stream** the (bounded) span
-        // straight off disk: never buffer a whole multi-MB segment into RAM.
-        // The open/seek happens before the response is built, so a raced-away
-        // file (404) or an I/O fault (500) still maps to the right status; once
-        // streaming begins the `Content-Length` framing is already fixed.
-        match open_span(&file, body_start).await {
-            Ok(handle) => span_body(handle, body_len),
-            // The file raced away (e.g. the segmenter's deferred-unlink prune)
-            // between metadata and open: honest 404, never a panic.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            Err(e) => {
-                tracing::warn!(file = %file.display(), error = %e, "HLS delivery open failed");
+        let mut handle = tokio::fs::File::from_std(opened.file);
+        if body_start > 0 {
+            use tokio::io::AsyncSeekExt;
+            if let Err(e) = handle.seek(SeekFrom::Start(body_start)).await {
+                tracing::warn!(error = %e, "HLS delivery seek failed");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
+        span_body(handle, body_len)
     };
 
     let mut response = (status, body).into_response();
@@ -415,6 +528,7 @@ async fn serve_media(
     headers.insert(header::CONTENT_TYPE, content_type);
     headers.insert(header::CACHE_CONTROL, tier.cache_control());
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    validators(headers);
     // Explicit length: load-bearing for HEAD (empty body would otherwise
     // advertise 0) and harmless-correct for GET.
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body_len));
@@ -426,20 +540,6 @@ async fn serve_media(
     response
 }
 
-/// Open `file` and seek to byte `start`, returning the positioned handle.
-///
-/// The handle is then streamed by [`span_body`] — the whole segment is never
-/// materialised in RAM (an unauthenticated GET of a multi-MB segment must not
-/// amplify into a multi-MB allocation, and streaming improves LL-HLS TTFB).
-async fn open_span(file: &Path, start: u64) -> std::io::Result<tokio::fs::File> {
-    use tokio::io::AsyncSeekExt;
-    let mut handle = tokio::fs::File::open(file).await?;
-    if start > 0 {
-        handle.seek(SeekFrom::Start(start)).await?;
-    }
-    Ok(handle)
-}
-
 /// Stream exactly `count` bytes from the positioned `handle` into a response
 /// [`Body`], holding only a bounded chunk in memory at a time.
 ///
@@ -448,5 +548,5 @@ async fn open_span(file: &Path, start: u64) -> std::io::Result<tokio::fs::File> 
 /// `206` Range path) — framing is unchanged from the previous buffered path.
 fn span_body(handle: tokio::fs::File, count: u64) -> Body {
     use tokio::io::AsyncReadExt;
-    Body::from_stream(ReaderStream::new(handle.take(count)))
+    Body::from_stream(ReaderStream::with_capacity(handle.take(count), BODY_CHUNK))
 }

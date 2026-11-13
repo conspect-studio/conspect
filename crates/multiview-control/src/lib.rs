@@ -901,6 +901,20 @@ pub fn site_server_config(
     Ok(std::sync::Arc::new(config))
 }
 
+/// [`RustlsMaterial`] for the plain `[control] listen` TLS listener over a
+/// [`CertificateSource`](certificate_source::CertificateSource), so it follows a
+/// reloaded static certificate exactly like the front door (slice 6): the
+/// configuration of [`site_server_config`] (ALPN `http/1.1` only).
+///
+/// # Errors
+/// As [`site_server_config`].
+#[cfg(all(feature = "tls", unix))]
+pub fn rustls_material_from_source(
+    source: std::sync::Arc<dyn certificate_source::CertificateSource>,
+) -> Result<RustlsMaterial, TlsSetupError> {
+    site_server_config(source).map(RustlsMaterial)
+}
+
 /// A rustls [`ServerConfig`](rustls::ServerConfig) for the TLS-ALPN-01
 /// challenge responder (RFC 8737) on the network front door's TCP door: the
 /// explicit `aws-lc-rs` provider (as [`load_tls_material`] / [`site_server_config`]),
@@ -975,6 +989,96 @@ pub fn static_certificate_source(
     Ok(certificate_source::StaticCertificateSource::new(
         std::sync::Arc::new(key),
     ))
+}
+
+/// How often [`spawn_static_certificate_reload`] checks the PEM files.
+#[cfg(all(feature = "tls", unix))]
+pub const STATIC_CERTIFICATE_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The change fingerprint of the static PEM pair: per file the resolved
+/// target (certbot's `live/` names are symlinks into `archive/`), its size,
+/// modification time and inode. A renewal changes at least one.
+#[cfg(all(feature = "tls", unix))]
+fn pem_fingerprint(tls: &multiview_config::TlsConfig) -> Option<Vec<(std::path::PathBuf, u64, i64, i64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    let multiview_config::TlsConfig::Static { cert_file, key_file } = tls else {
+        return None;
+    };
+    [cert_file, key_file]
+        .into_iter()
+        .map(|path| {
+            let target = std::fs::canonicalize(path).ok()?;
+            let meta = std::fs::metadata(&target).ok()?;
+            Some((target, meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ino()))
+        })
+        .collect()
+}
+
+/// Watch the `[control.tls] mode = "static"` PEM files and swap a renewed
+/// certificate into `source` without a restart (slice 6, issue #292): certbot
+/// renews in place (`live/<host>/fullchain.pem` re-pointed to a new
+/// `archive/` file), and every handshake after the swap presents the new
+/// certificate (the door's resolver reads the source per `ClientHello`).
+///
+/// Polls every `every` (a `stat` of two files; no inotify watch to lose on a
+/// symlink swap). A changed pair is parsed and checked (the key must match
+/// the leaf) before it replaces the served one; a half-written or broken pair
+/// is logged and the previous certificate keeps serving, and the reload is
+/// retried on the next change. Runs on the caller's runtime (the control
+/// plane's), never touches the engine, and blocks nothing: file reads run on
+/// the blocking pool.
+#[cfg(all(feature = "tls", unix))]
+pub fn spawn_static_certificate_reload(
+    tls: multiview_config::TlsConfig,
+    source: std::sync::Arc<certificate_source::StaticCertificateSource>,
+    every: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let fingerprint = |tls: multiview_config::TlsConfig| async move {
+            tokio::task::spawn_blocking(move || pem_fingerprint(&tls))
+                .await
+                .ok()
+                .flatten()
+        };
+        let mut last = fingerprint(tls.clone()).await;
+        let mut failed = None;
+        let mut ticker = tokio::time::interval(every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let now = fingerprint(tls.clone()).await;
+            if now.is_none() || now == last || now == failed {
+                continue;
+            }
+            let load = tls.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                let (certs, key_der) = load_pem_pair(&load)?;
+                let provider = rustls::crypto::aws_lc_rs::default_provider();
+                Ok::<_, TlsSetupError>(rustls::sign::CertifiedKey::from_der(
+                    certs, key_der, &provider,
+                )?)
+            })
+            .await;
+            match loaded {
+                Ok(Ok(key)) => {
+                    source.replace(std::sync::Arc::new(key));
+                    last = now;
+                    failed = None;
+                    tracing::info!("[control.tls] static certificate changed on disk; new handshakes use the renewed certificate");
+                }
+                Ok(Err(error)) => {
+                    // `last` is not advanced: a pair caught mid-write (cert
+                    // renewed, key not yet) changes again when the write
+                    // completes and is retried then. The same broken pair is
+                    // reported once, not every poll.
+                    failed = now;
+                    tracing::warn!(%error, "[control.tls] static certificate changed on disk but does not load; the previous certificate keeps serving");
+                }
+                Err(_) => {}
+            }
+        }
+    })
 }
 
 /// Read the `[control.tls] static` PEM chain + key (shared by

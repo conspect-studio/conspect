@@ -172,6 +172,9 @@ pub struct RedirectConfig {
     pub max_per_source: usize,
     /// Total deadline per connection.
     pub deadline: Duration,
+    /// HTTP-01 bridge: answer `/.well-known/acme-challenge/<token>` from
+    /// `<dir>/.well-known/acme-challenge/<token>` (certbot `--webroot`).
+    pub acme_webroot: Option<std::path::PathBuf>,
 }
 
 impl RedirectConfig {
@@ -185,6 +188,7 @@ impl RedirectConfig {
             max_connections: 256,
             max_per_source: 16,
             deadline: Duration::from_secs(5),
+            acme_webroot: None,
         }
     }
 }
@@ -334,6 +338,28 @@ impl DoorRouting {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         (tls, site)
+    }
+}
+
+/// The listener for `addr`: the inherited one when the service manager passed
+/// it (socket activation; made non-blocking and registered in the current
+/// runtime, its backlog is the unit's `Backlog=`), else a fresh bind.
+pub(crate) fn listener(
+    addr: SocketAddr,
+    inherited: Option<std::net::TcpListener>,
+) -> std::io::Result<TcpListener> {
+    match inherited {
+        Some(listener) => {
+            let socket = socket2::Socket::from(listener);
+            if socket.local_addr()?.is_ipv6() && socket.only_v6().unwrap_or(false) {
+                tracing::warn!(%addr, "front door: the inherited TCP socket is IPv6-only (BindIPv6Only=both missing from the socket unit); IPv4 clients cannot reach it");
+            }
+            socket.set_tcp_nodelay(true)?;
+            socket.set_nonblocking(true)?;
+            tracing::info!(%addr, local = ?socket.local_addr()?.as_socket(), "front door: TCP socket inherited from the service manager");
+            TcpListener::from_std(socket.into())
+        }
+        None => bind_listener(addr),
     }
 }
 
@@ -647,7 +673,43 @@ async fn redirect_one(config: &RedirectConfig, mut stream: TcpStream) -> std::io
         }
     }
     let request = head.get(..filled).unwrap_or_default();
-    let response = redirect::redirect_response(&config.public_host, config.https_port, request);
+    let response = match (&config.acme_webroot, redirect::acme_token(request)) {
+        (Some(webroot), Some(token)) => {
+            let path = webroot
+                .join(".well-known")
+                .join("acme-challenge")
+                .join(token);
+            let head_only = request.starts_with(b"HEAD ");
+            match read_challenge(path).await {
+                Some(body) => redirect::acme_response(&body, head_only),
+                None => redirect::ACME_NOT_FOUND.to_vec(),
+            }
+        }
+        _ => redirect::redirect_response(&config.public_host, config.https_port, request),
+    };
     stream.write_all(&response).await?;
     stream.shutdown().await
+}
+
+/// Read one HTTP-01 key authorization file: a regular file (symlinks not
+/// followed) of at most [`redirect::MAX_ACME_RESPONSE`] bytes, on the
+/// blocking pool. Anything else is "no challenge" (404).
+async fn read_challenge(path: std::path::PathBuf) -> Option<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > redirect::MAX_ACME_RESPONSE {
+            return None;
+        }
+        let mut body = Vec::with_capacity(usize::try_from(meta.len()).ok()?);
+        std::fs::File::open(&path)
+            .ok()?
+            .take(redirect::MAX_ACME_RESPONSE)
+            .read_to_end(&mut body)
+            .ok()?;
+        Some(body)
+    })
+    .await
+    .ok()
+    .flatten()
 }

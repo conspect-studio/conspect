@@ -30,6 +30,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod activation;
 pub mod classify;
 pub mod limits;
 pub mod quic;
@@ -49,6 +50,7 @@ pub use tcp::ice_tcp::UsernameCheck;
 /// A ready site TLS configuration for [`TlsRouting::site`] (re-exported so
 /// callers need not name `rustls`).
 pub type SiteTlsConfig = Arc<rustls::ServerConfig>;
+pub use activation::ListenSockets;
 pub use classify::{classify, first_byte_class, ByteClass, DropReason, Lane, QuicKind, Verdict};
 pub use limits::{Budget, EstablishedSet, NewFlowLimiter, NewFlowLimits, Refusal};
 pub use quic::QuicLane;
@@ -428,6 +430,20 @@ impl FrontDoor {
     ///
     /// [`Error::Runtime`] or [`Error::Socket`].
     pub fn start(config: &FrontDoorConfig) -> Result<Self, Error> {
+        Self::start_with(config, None)
+    }
+
+    /// [`start`](Self::start) on an inherited UDP socket when `inherited` is
+    /// `Some` (systemd socket activation, design note section 9): the socket
+    /// is adopted instead of bound, so it survives an engine restart.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Runtime`] or [`Error::Socket`].
+    pub fn start_with(
+        config: &FrontDoorConfig,
+        inherited: Option<std::net::UdpSocket>,
+    ) -> Result<Self, Error> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.workers.max(1))
             .thread_name_fn(|| {
@@ -442,8 +458,17 @@ impl FrontDoor {
             // The tokio socket registers with the reactor of the runtime it is
             // created in: the front door's, never the caller's.
             let _guard = runtime.enter();
-            SharedSocket::bind(addr, config.recv_buffer_bytes)
-                .map_err(|source| Error::Socket { addr, source })?
+            let activated = inherited.is_some();
+            match inherited {
+                Some(std_socket) => SharedSocket::from_std(std_socket, config.recv_buffer_bytes),
+                None => SharedSocket::bind(addr, config.recv_buffer_bytes),
+            }
+            .map_err(|source| Error::Socket { addr, source })
+            .inspect(|_| {
+                if activated {
+                    tracing::info!(%addr, "front door: UDP socket inherited from the service manager");
+                }
+            })?
         };
         let socket = Arc::new(socket);
         let stats = Arc::new(Stats::default());
@@ -561,13 +586,29 @@ impl FrontDoor {
         tls: TlsRouting,
         site: Option<Arc<dyn SiteService>>,
     ) -> Result<SocketAddr, Error> {
+        self.start_tcp_with(cfg, tls, site, None)
+    }
+
+    /// [`start_tcp`](Self::start_tcp) on an inherited listening socket when
+    /// `inherited` is `Some` (systemd socket activation).
+    ///
+    /// # Errors
+    ///
+    /// As [`start_tcp`](Self::start_tcp).
+    pub fn start_tcp_with(
+        &mut self,
+        cfg: TcpDoorConfig,
+        tls: TlsRouting,
+        site: Option<Arc<dyn SiteService>>,
+        inherited: Option<std::net::TcpListener>,
+    ) -> Result<SocketAddr, Error> {
         if self.tcp.is_some() {
             return Err(Error::TcpDoorRunning);
         }
         let addr = cfg.listen;
         let listener = {
             let _guard = self.handle.enter();
-            tcp::bind_listener(addr).map_err(|source| Error::Socket { addr, source })?
+            tcp::listener(addr, inherited).map_err(|source| Error::Socket { addr, source })?
         };
         let local = listener
             .local_addr()
@@ -592,10 +633,24 @@ impl FrontDoor {
     ///
     /// [`Error::Socket`] on a bind failure.
     pub fn start_redirect(&mut self, cfg: RedirectConfig) -> Result<SocketAddr, Error> {
+        self.start_redirect_with(cfg, None)
+    }
+
+    /// [`start_redirect`](Self::start_redirect) on an inherited listening
+    /// socket when `inherited` is `Some` (systemd socket activation).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Socket`] on a bind (or adoption) failure.
+    pub fn start_redirect_with(
+        &mut self,
+        cfg: RedirectConfig,
+        inherited: Option<std::net::TcpListener>,
+    ) -> Result<SocketAddr, Error> {
         let addr = cfg.listen;
         let listener = {
             let _guard = self.handle.enter();
-            tcp::bind_listener(addr).map_err(|source| Error::Socket { addr, source })?
+            tcp::listener(addr, inherited).map_err(|source| Error::Socket { addr, source })?
         };
         let local = listener
             .local_addr()

@@ -41,7 +41,35 @@ impl SharedSocket {
             }
         }
         socket.bind(&addr.into())?;
-        let std_socket: std::net::UdpSocket = socket.into();
+        Self::adopt(socket.into(), recv_buffer_bytes)
+    }
+
+    /// Adopt an already-bound UDP socket (systemd socket activation, slice 6):
+    /// made non-blocking and registered in the current runtime's reactor.
+    /// `SO_RCVBUF` is left as the service manager set it (`ReceiveBuffer=`);
+    /// the clamp warning below still reports a smaller grant.
+    pub(crate) fn from_std(
+        std_socket: std::net::UdpSocket,
+        recv_buffer_bytes: usize,
+    ) -> io::Result<Self> {
+        let socket = socket2::Socket::from(std_socket);
+        if !matches!(socket.local_addr()?.as_socket(), Some(SocketAddr::V6(_))) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an inherited front-door UDP socket must be IPv6 (dual-stack [::]:443)",
+            ));
+        }
+        if socket.only_v6().unwrap_or(false) {
+            tracing::warn!(
+                "front door: the inherited UDP socket is IPv6-only (BindIPv6Only=both missing \
+                 from the socket unit); IPv4 clients cannot reach it"
+            );
+        }
+        socket.set_nonblocking(true)?;
+        Self::adopt(socket.into(), recv_buffer_bytes)
+    }
+
+    fn adopt(std_socket: std::net::UdpSocket, recv_buffer_bytes: usize) -> io::Result<Self> {
         // Enables GRO, PKTINFO and ECN reporting on the socket.
         let state = UdpSocketState::new((&std_socket).into())?;
         let local = std_socket.local_addr()?;
