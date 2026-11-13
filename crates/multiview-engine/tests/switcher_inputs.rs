@@ -10,7 +10,7 @@ use multiview_engine::switcher::SwitcherState;
 use multiview_engine::switcher_control::{
     PatchSet, ScenePair, SwitcherCommand, SwitcherControl, SwitcherTickDriver, SwitcherVerb,
     COMMAND_CAPACITY, MAX_COMMANDS_PER_TICK, REFUSE_NOT_AN_INPUT, REFUSE_NO_FRESH_FRAME,
-    REFUSE_ON_AIR_PROTECTED, REFUSE_PATCH_DURING_AUTO, REFUSE_UNKNOWN_INPUT,
+    REFUSE_ON_AIR_PROTECTED, REFUSE_PATCH_DURING_AUTO, REFUSE_SAME_SOURCE, REFUSE_UNKNOWN_INPUT,
     TAKE_PRIME_DEADLINE_TICKS,
 };
 use multiview_engine::switcher_inputs::MixerInputs;
@@ -446,5 +446,40 @@ fn a_patch_flood_is_bounded_per_tick_and_by_the_mailbox() {
     assert_eq!(
         handle.snapshot().unwrap().inputs_version,
         u64::try_from(COMMAND_CAPACITY).unwrap()
+    );
+}
+
+/// Review A-1: punching the Preview input, or another input carrying the
+/// Program source, is refused, and both buses stay distinct.
+#[test]
+fn punching_the_preview_input_or_the_program_source_is_refused() {
+    let (handle, mut driver) = with_inputs();
+    let mut outcomes = handle.outcomes();
+    run(&mut driver, 0);
+    // Input 3 is on Preview.
+    handle
+        .try_send(command(1, SwitcherVerb::SelectProgram(SourceRef::input(3))))
+        .unwrap();
+    run(&mut driver, 1);
+    assert_eq!(
+        outcomes.try_recv().unwrap().event.error.as_deref(),
+        Some(REFUSE_SAME_SOURCE)
+    );
+    // Input 4 now carries `a`, the Program source.
+    handle
+        .try_send(command(2, patch(&[(4, Some("a"))], false)))
+        .unwrap();
+    run(&mut driver, 2);
+    assert!(outcomes.try_recv().unwrap().event.error.is_none());
+    handle
+        .try_send(command(3, SwitcherVerb::SelectProgram(SourceRef::input(4))))
+        .unwrap();
+    run(&mut driver, 3);
+    assert!(outcomes.try_recv().unwrap().event.error.is_some());
+    assert_eq!(resolved(&driver), ("a".into(), "c".into()));
+    let snapshot = handle.snapshot().unwrap();
+    assert_eq!(
+        (snapshot.program_input, snapshot.preview_input),
+        (Some(1), Some(3))
     );
 }

@@ -61,6 +61,8 @@ describe('MixerInputBank on the Switcher page', () => {
     expect(within(one).getByText(/abc-news/)).toBeTruthy();
     expect(within(one).getByRole('status', { name: 'On Program' })).toBeTruthy();
     expect(within(screen.getByRole('listitem', { name: 'Input 2' })).getByRole('status', { name: 'On Preview' })).toBeTruthy();
+    // Review A-1: the input on Preview cannot be punched to Program.
+    expect(within(screen.getByRole('listitem', { name: 'Input 2' })).getByRole('button', { name: 'PGM' })).toHaveProperty('disabled', true);
     expect(within(screen.getByRole('listitem', { name: 'Input 3' })).getByText(/Restricted source/)).toBeTruthy();
     expect(within(screen.getByRole('listitem', { name: 'Input 4' })).getByText(/Unpatched/)).toBeTruthy();
     // The source-id select of today's page is replaced by the bank.

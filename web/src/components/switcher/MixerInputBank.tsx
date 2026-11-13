@@ -61,7 +61,7 @@ function InputRow({ me, input, sources, disabled, onSelect, onRepatch }: {
       <span className="text-muted-foreground">· {sourceLabel}</span>
       {tally !== undefined && <span role="status" aria-label={tally === 'PGM' ? t`On Program` : t`On Preview`} className={`rounded px-1 text-xs text-white ${tally === 'PGM' ? 'bg-red-600' : 'bg-green-600'}`}>{tally}</span>}
       <Button size="sm" disabled={disabled || !patched || input.on_preview || input.on_program} onClick={() => { onSelect('select_preview', input.number); }}><Trans>PVW</Trans></Button>
-      <Button size="sm" disabled={disabled || !patched || input.on_program} onClick={() => { onSelect('select_program', input.number); }}><Trans>PGM</Trans></Button>
+      <Button size="sm" disabled={disabled || !patched || input.on_program || input.on_preview} onClick={() => { onSelect('select_program', input.number); }}><Trans>PGM</Trans></Button>
       <label className="sr-only" htmlFor={`repatch-${String(input.number)}`}><Trans>Patch source for input {input.number}</Trans></label>
       <select id={`repatch-${String(input.number)}`} className="rounded border bg-background p-1" value={choice} disabled={disabled || busy} onChange={(event) => { setChoice(event.target.value); }}>
         <option value="">{t`Re-patch…`}</option>

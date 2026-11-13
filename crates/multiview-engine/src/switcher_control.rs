@@ -869,8 +869,17 @@ impl SwitcherTickDriver {
             } else if matches!(command.verb, SwitcherVerb::Auto(_)) && self.machine.is_in_flight() {
                 Err("cannot start a second AUTO during an active take".into())
             } else if let SwitcherVerb::SelectProgram(source) = &command.verb {
-                if source == self.machine.program() {
+                if source == self.machine.program()
+                    || self.resolve(source) == self.resolved_selections().0
+                {
+                    // The picture, not the reference: another input carrying
+                    // the Program source is the same source on Program.
                     Err("source is already on program".into())
+                } else if self.inputs.is_some() && source == self.machine.preview() {
+                    // #341 review A-1: punching the Preview input would put one
+                    // input on both buses (CUT/AUTO then refuse, flip-flop
+                    // cannot swap). Select another input, or CUT.
+                    Err(REFUSE_SAME_SOURCE.into())
                 } else if scenes.as_ref().is_some_and(|pair| {
                     scene_admits_source(&pair.program, self.resolve(source).as_str())
                 }) {
