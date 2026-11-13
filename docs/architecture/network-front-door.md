@@ -321,6 +321,15 @@ page alone.
   the runbook recommends the token because the global key can change everything on the account.
   `validate_credential()` runs before any order (token: `GET /user/tokens/verify` then zone lookup;
   key: zone lookup) and reports which permission is missing. Wildcard names need `DNS-01`.
+  `confirm_at_authoritative` asks every authoritative nameserver directly on port 53. Some
+  networks intercept all outbound port 53 (UDP and TCP) and answer from a hijacking resolver, so
+  that check can never pass there. `[network.tls.dns] confirm` (`auto` default, `authoritative`,
+  `doh`): `auto` first sends one query to RFC 5737/3849 documentation addresses where nothing
+  listens; any answer means interception, and confirmation then uses DNS over HTTPS (RFC 8484 GET
+  to `cloudflare-dns.com`, through the screened egress client). Trade-off: DoH is a resolver's
+  view, not a check of each authoritative server; it is Cloudflare's own resolver, adjacent to the
+  authoritative servers of a Cloudflare zone, and the challenge TTL is 60 s. The verdict is
+  cached per provider for 10 minutes.
 * `TLS-ALPN-01` (RFC 8737). Answered on TCP 443: a ClientHello offering only `acme-tls/1` gets the
   challenge certificate (built with `rcgen`'s `CustomExtension::new_acme_identifier`), in both
   states, before any real certificate exists. It needs the CA to reach TCP 443 of the host.
@@ -329,6 +338,16 @@ page alone.
   ([Let's Encrypt, first IP certificate](https://letsencrypt.org/2025/07/01/issuing-our-first-ip-address-certificate),
   [GA post](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability)): so `TLS-ALPN-01`
   is what makes a host with no DNS name work.
+  The ACME service starts before the front door attaches the `acme-tls/1` responder (that happens
+  once the control plane is built), and the CA's validator connects as soon as a challenge is set
+  ready. So the challenge resolver carries a "responder installed" signal that the door sets after
+  installing it, and a TLS-ALPN-01 attempt waits for it (60 s, on the ACME thread) after reaching
+  the CA and before ordering; without it the attempt fails as `tls-alpn-responder-not-installed`.
+  After any failed attempt that created an order, its still-`pending` authorizations are
+  deactivated (best effort, bounded): Boulder hands an existing pending order for the same account
+  and names back on the next new-order request, and a stale one must not be reused. Every failure
+  also records a bounded (512 bytes), sanitized human detail (the CA's problem type, detail,
+  subproblems and the challenge's own error), shown as `last_error_detail`.
 * `HTTP-01` is not supported.
 
 | Mode | DNS-01 | TLS-ALPN-01 | Reported when unavailable |

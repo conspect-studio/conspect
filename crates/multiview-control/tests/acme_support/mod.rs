@@ -148,6 +148,22 @@ pub struct CfState {
     pub log: Vec<(String, String, bool)>,
     /// Header pairs seen on the last request (names lowercased).
     pub last_headers: Vec<(String, String)>,
+    /// DNS-over-HTTPS queries answered by the fake `/dns-query` route.
+    pub doh_queries: usize,
+    /// How the fake `DoH` route answers.
+    pub doh: DohMode,
+}
+
+/// How the fake `DoH` route answers TXT queries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DohMode {
+    /// From the published records.
+    #[default]
+    Records,
+    /// Never any TXT (NOERROR, empty answer).
+    Empty,
+    /// A TXT with this value instead of the published one.
+    Value(String),
 }
 
 pub type SharedCf = Arc<Mutex<CfState>>;
@@ -165,6 +181,8 @@ pub fn cf_state(auth: CfAuth, zones: &[(&str, &str)], challtestsrv: Option<Strin
         challtestsrv,
         log: Vec::new(),
         last_headers: Vec::new(),
+        doh_queries: 0,
+        doh: DohMode::Records,
     }))
 }
 
@@ -346,9 +364,143 @@ async fn remove(
     Ok(Json(json!({"success": true, "result": {"id": record.id}})))
 }
 
-/// The fake API router under `/client/v4`.
+/// A TXT answer for one query message (`None` if `query` does not parse).
+fn txt_response(query: &[u8], values: &[String]) -> Option<Vec<u8>> {
+    use hickory_resolver::proto::op::{Message, MessageType, OpCode};
+    use hickory_resolver::proto::rr::rdata::TXT;
+    use hickory_resolver::proto::rr::{RData, Record};
+    let request = Message::from_vec(query).ok()?;
+    let question = request.queries.first()?.clone();
+    let mut response = Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+    response.metadata.recursion_desired = request.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.add_query(question.clone());
+    for value in values {
+        response.add_answer(Record::from_rdata(
+            question.name().clone(),
+            60,
+            RData::TXT(TXT::new(vec![value.clone()])),
+        ));
+    }
+    response.to_vec().ok()
+}
+
+/// The TXT values the fake currently serves for the name asked in `query`.
+fn published_values(state: &SharedCf, query: &[u8]) -> Vec<String> {
+    use hickory_resolver::proto::op::Message;
+    let Some(name) = Message::from_vec(query)
+        .ok()
+        .and_then(|m| m.queries.first().map(|q| q.name().to_ascii()))
+    else {
+        return Vec::new();
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    state
+        .lock()
+        .unwrap()
+        .records
+        .iter()
+        .filter(|r| r.name.to_ascii_lowercase() == name)
+        .map(|r| r.content.clone())
+        .collect()
+}
+
+/// RFC 8484 GET `/dns-query?dns=<base64url>`: answers TXT per [`DohMode`].
+async fn doh(
+    State(s): State<SharedCf>,
+    h: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<([(axum::http::HeaderName, &'static str); 1], Vec<u8>), StatusCode> {
+    use base64::Engine as _;
+    assert_eq!(
+        h.get("accept").and_then(|v| v.to_str().ok()),
+        Some("application/dns-message")
+    );
+    let wire = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(q.get("dns").ok_or(StatusCode::BAD_REQUEST)?)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mode = {
+        let mut st = s.lock().unwrap();
+        st.doh_queries += 1;
+        st.doh.clone()
+    };
+    let values = match mode {
+        DohMode::Records => published_values(&s, &wire),
+        DohMode::Empty => Vec::new(),
+        DohMode::Value(v) => vec![v],
+    };
+    let body = txt_response(&wire, &values).ok_or(StatusCode::BAD_REQUEST)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/dns-message")],
+        body,
+    ))
+}
+
+/// How a fake port-53 server answers.
+#[derive(Debug, Clone)]
+pub enum FakeDns {
+    /// A hijacking resolver: every query gets NOERROR, no answer, and a bogus
+    /// SOA (`a.misconfigured.dns.server.invalid`) in the authority section.
+    Intercepting,
+    /// An honest authoritative server for the fake's published TXT records.
+    Authoritative(SharedCf),
+    /// Never answers.
+    Silent,
+}
+
+/// A UDP DNS server on `[::1]:0` (see [`FakeDns`]); returns its address.
+/// The socket lives as long as the returned task.
+pub async fn fake_dns(mode: FakeDns) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use hickory_resolver::proto::op::{Message, MessageType, OpCode};
+    use hickory_resolver::proto::rr::rdata::SOA;
+    use hickory_resolver::proto::rr::{Name, RData, Record};
+    let socket = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut buf = [0_u8; 1500];
+        loop {
+            let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            let query = buf[..len].to_vec();
+            let reply = match &mode {
+                FakeDns::Silent => continue,
+                FakeDns::Authoritative(state) => {
+                    let values = published_values(state, &query);
+                    txt_response(&query, &values).map(|wire| {
+                        let mut m = Message::from_vec(&wire).unwrap();
+                        m.metadata.authoritative = true;
+                        m.to_vec().unwrap()
+                    })
+                }
+                FakeDns::Intercepting => Message::from_vec(&query).ok().map(|request| {
+                    let mut m =
+                        Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                    m.metadata.recursion_available = true;
+                    for q in request.queries {
+                        m.add_query(q);
+                    }
+                    let bogus = Name::from_ascii("a.misconfigured.dns.server.invalid.").unwrap();
+                    m.add_authority(Record::from_rdata(
+                        Name::root(),
+                        60,
+                        RData::SOA(SOA::new(bogus.clone(), bogus, 1, 3600, 600, 86400, 60)),
+                    ));
+                    m.to_vec().unwrap()
+                }),
+            };
+            if let Some(reply) = reply {
+                let _ = socket.send_to(&reply, peer).await;
+            }
+        }
+    });
+    (addr, task)
+}
+
+/// The fake API router under `/client/v4`, plus the fake `DoH` endpoint at `/dns-query`.
 pub fn cf_router(state: SharedCf) -> Router {
     Router::new()
+        .route("/dns-query", get(doh))
         .route("/client/v4/user/tokens/verify", get(verify))
         .route("/client/v4/zones", get(zones))
         .route(

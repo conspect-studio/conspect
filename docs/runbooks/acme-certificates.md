@@ -77,6 +77,16 @@ state_dir = "/var/lib/conspect/tls"
 provider = "cloudflare"
 token_env = "CLOUDFLARE_API_TOKEN"
 propagation_timeout_s = 120
+# confirm = "auto"                  # auto (default) | authoritative | doh, see below
+```
+
+With the Cloudflare global key instead of a token:
+
+```toml
+[network.tls.dns]
+provider = "cloudflare"
+email_env = "CLOUDFLARE_EMAIL"      # env-var NAMES; values via `multiview tls set-credential`
+api_key_env = "CLOUDFLARE_API_KEY"
 ```
 
 The same with TLS-ALPN-01. No DNS credential is needed, but the CA must reach TCP 443 of this host
@@ -149,6 +159,22 @@ company installed its root.
 At the start of every attempt the engine checks the credential (`/user/tokens/verify` and a zone
 lookup). A rejected credential shows as `dns-credential-rejected`.
 
+### How the TXT record is confirmed (`confirm`)
+
+Before telling the CA to validate, the engine checks that the TXT record is visible:
+
+* `authoritative`: ask every authoritative nameserver of the zone directly (UDP then TCP, port 53).
+* `doh`: ask Cloudflare's resolver over DNS over HTTPS (`https://cloudflare-dns.com/dns-query`).
+* `auto` (default): send one query to documentation addresses where nothing listens
+  (`192.0.2.1`, `2001:db8::1`). Any answer means the network intercepts port 53, and the engine
+  uses DoH; otherwise it asks the authoritative servers. The journal says which (`acme: DNS-01
+  confirmation via ...`), and the choice is reused for 10 minutes.
+
+**Interception symptoms.** `dns-propagation-timeout` after the full `propagation_timeout_s` while
+the record is visible in the Cloudflare dashboard, and `dig @<cloudflare-ns> _acme-challenge.<name>
+TXT` (or `dig @192.0.2.1 example.org SOA`, where nothing should answer) returns NOERROR with a bogus
+SOA such as `a.misconfigured.dns.server.invalid`. Keep `confirm = "auto"` or set `confirm = "doh"`.
+
 ### CAA
 
 If the zone has CAA records, allow the CA and the methods:
@@ -216,6 +242,7 @@ never falls back to the bootstrap certificate.
 ## Verify
 
 ```sh
+multiview tls status                                                  # config of the running engine
 multiview tls status --config /etc/multiview/multiview.toml          # table
 multiview tls status --config /etc/multiview/multiview.toml --json   # machine-readable
 openssl s_client -connect mda001.example.net:443 -servername mda001.example.net </dev/null \
@@ -225,8 +252,21 @@ stat -c '%a %n' /var/lib/conspect/tls /var/lib/conspect/tls/*      # 700 dir, 60
 
 `status` shows the state (`setup` / `serving` / `expired`), the CA (and staging), the challenge,
 the names, the expiry, when renewal is due, the next retry, the bootstrap fingerprint (setup only),
-the alarm, the last error token and the reasons. If the engine is not running, it reads
-`<state_dir>/active.pem` offline and says so.
+the alarm, the last error token, the `last error detail` and the reasons. If the engine is not
+running, it reads `<state_dir>/active.pem` offline and says so.
+
+Without `--config`, every `multiview tls` command uses the config of the one running
+`multiview run <CONFIG>` engine (found through `/proc`, a relative path resolved against the
+engine's working directory), else `/etc/multiview/multiview.toml` if it exists. The first status
+line says which (`config  <path> (running engine pid N)` or `(default path)`). With several engines
+running it lists their configs and asks for `--config`.
+
+`last error detail` is the human reason behind the token: the CA's problem type and text (with
+subproblems and the challenge's own error, for example `unauthorized: Failed to connect to
+203.0.113.7:443 for the tls-alpn-01 challenge`), or a local explanation such as "TXT not seen via
+DNS over HTTPS ... (port 53 intercepted)". It is also in the journal line `acme: issuance attempt
+failed` (`detail=`), the setup page and `GET /api/v1/tls/status` (`last_error_detail`). It is
+bounded to 512 bytes and never contains a credential.
 
 ## Alarms and renewal
 
@@ -265,7 +305,11 @@ the alarm, the last error token and the reasons. If the engine is not running, i
   * `ca-unavailable` (CA unreachable or refusing);
   * `ca-offers-no-supported-challenge`;
   * `dns-credential-rejected`;
-  * `dns-propagation-timeout`;
+  * `dns-propagation-timeout` (see "How the TXT record is confirmed"; `last error detail` says
+    whether DoH or the authoritative servers were asked);
+  * `challenge-failed` (`last error detail` carries the CA's reason);
+  * `tls-alpn-responder-not-installed` (TLS-ALPN-01 waited 60 s for the front door's `acme-tls/1`
+    responder: `network.mode` and `network.https_port` must be set so the TCP door runs);
   * `eab-unavailable`;
   * `egress-refused` (the CA resolves to a private address without `allow_private_directory`, or
     the trust anchor does not match).

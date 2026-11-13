@@ -1,4 +1,7 @@
-use multiview_config::{AcmeChallenge, CertificateAuthority, NetworkConfig, NetworkTlsConfig};
+use multiview_config::{
+    AcmeChallenge, CertificateAuthority, DnsConfirm, DnsProviderConfig, NetworkConfig,
+    NetworkTlsConfig,
+};
 
 fn sample() -> &'static str {
     r#"schema_version = 1
@@ -60,6 +63,35 @@ fn custom_profile_round_trips_and_rejects_literal_credentials() {
         *token_env = Some("Ab3kQ9x2Lm7Zr0Tq5Wv8Yc1Nd4Hs6Jf2Gp9Ke3Ru".into());
     }
     assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn dns_confirm_parses_defaults_to_auto_and_rejects_unknown_values() {
+    let base = "ca='letsencrypt'\nchallenge='dns-01'\ndomains=['a.example.org']\nstate_dir='/var/lib/tls'\n[dns]\nprovider='cloudflare'\nemail_env='CF_EMAIL'\napi_key_env='CF_API_KEY'\n";
+    let confirm = |toml_text: &str| -> DnsConfirm {
+        let tls: NetworkTlsConfig = toml::from_str(toml_text).unwrap();
+        tls.validate().unwrap();
+        match tls.dns {
+            Some(DnsProviderConfig::Cloudflare { confirm, .. }) => confirm,
+            None => panic!("cloudflare"),
+        }
+    };
+    assert_eq!(confirm(base), DnsConfirm::Auto);
+    assert_eq!(confirm(&format!("{base}confirm='doh'\n")), DnsConfirm::Doh);
+    assert_eq!(
+        confirm(&format!("{base}confirm='authoritative'\n")),
+        DnsConfirm::Authoritative
+    );
+    assert_eq!(
+        confirm(&format!("{base}confirm='auto'\n")),
+        DnsConfirm::Auto
+    );
+    for bad in ["'DoH'", "'udp'", "''", "1"] {
+        assert!(
+            toml::from_str::<NetworkTlsConfig>(&format!("{base}confirm={bad}\n")).is_err(),
+            "{bad}"
+        );
+    }
 }
 
 #[test]

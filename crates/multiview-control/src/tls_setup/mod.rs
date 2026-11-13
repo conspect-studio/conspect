@@ -389,6 +389,7 @@ pub fn status_body(tls: &TlsContext) -> TlsStatusBody {
         next_attempt_at: status.next_attempt_at,
         alarm: alarm_name(status.alarm).to_owned(),
         last_error: status.last_error.clone(),
+        last_error_detail: status.last_error_detail.clone(),
         bootstrap_fingerprint: if status.state == TlsState::Setup {
             status.bootstrap_fingerprint.clone()
         } else {
