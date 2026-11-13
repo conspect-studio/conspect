@@ -20,6 +20,10 @@ pub struct Counters {
     pub header_guard_rejections: AtomicU64,
     /// Request streams failed by the per-request header deadline.
     pub header_deadline_rejections: AtomicU64,
+    /// Connections closed by the control-stream guard or its deadlines
+    /// (oversized control frame, SETTINGS late, partial frame too old,
+    /// QPACK stream over its byte cap).
+    pub control_stream_rejections: AtomicU64,
     /// WebTransport sessions accepted (200 sent).
     pub wt_sessions: AtomicU64,
     /// Extended `CONNECTs` answered 429 (the one-session-per-connection rule).

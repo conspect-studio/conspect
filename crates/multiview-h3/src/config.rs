@@ -143,6 +143,30 @@ pub struct H3Limits {
     pub max_connections_per_source: usize,
     /// TLS/QUIC handshake deadline.
     pub handshake_timeout: Duration,
+    /// Handshakes in progress on the endpoint; an `Incoming` beyond it is
+    /// refused. A handshake holds no connection slot: the connection caps
+    /// are charged only once it completes.
+    pub max_handshakes: usize,
+    /// Handshakes in progress per source (IPv4 address or IPv6 /64).
+    pub max_handshakes_per_source: usize,
+    /// From connection start until the peer's SETTINGS frame is complete
+    /// (else the connection is closed with `H3_MISSING_SETTINGS`).
+    pub settings_deadline: Duration,
+    /// How long one frame on the peer's control stream may stay incomplete
+    /// (else the connection is closed with `H3_EXCESSIVE_LOAD`).
+    pub control_frame_deadline: Duration,
+    /// From request accept until the [`Site`](crate::Site) returns the
+    /// response head; on expiry the stream is reset with
+    /// `H3_REQUEST_REJECTED` and the site future dropped.
+    pub response_head_timeout: Duration,
+    /// How long one response write (head, DATA, trailers, FIN) may make no
+    /// progress (peer not granting flow control) before the stream is reset
+    /// with `H3_REQUEST_CANCELLED`. The body itself may take any time (SSE).
+    pub response_stall_timeout: Duration,
+    /// After a WebTransport session ended (either side's close, FIN, reset
+    /// or connection loss), how long the handler future may keep running
+    /// before it is dropped.
+    pub wt_close_grace: Duration,
     /// How long `shutdown` waits for connections to drain.
     pub shutdown_timeout: Duration,
 }
@@ -160,7 +184,14 @@ impl Default for H3Limits {
             wt_early_streams: 16,
             max_connections: 1024,
             max_connections_per_source: 64,
-            handshake_timeout: Duration::from_secs(10),
+            handshake_timeout: Duration::from_secs(5),
+            max_handshakes: 64,
+            max_handshakes_per_source: 16,
+            settings_deadline: Duration::from_secs(10),
+            control_frame_deadline: Duration::from_secs(10),
+            response_head_timeout: Duration::from_secs(30),
+            response_stall_timeout: Duration::from_secs(30),
+            wt_close_grace: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(2),
         }
     }
@@ -189,6 +220,14 @@ mod tests {
         assert_eq!(l.max_connections, 1024);
         assert_eq!(l.max_connections_per_source, 64);
         assert_eq!(l.wt_prefix, "/moq/");
+        assert_eq!(l.handshake_timeout, Duration::from_secs(5));
+        assert_eq!(l.max_handshakes, 64);
+        assert_eq!(l.max_handshakes_per_source, 16);
+        assert_eq!(l.settings_deadline, Duration::from_secs(10));
+        assert_eq!(l.control_frame_deadline, Duration::from_secs(10));
+        assert_eq!(l.response_head_timeout, Duration::from_secs(30));
+        assert_eq!(l.response_stall_timeout, Duration::from_secs(30));
+        assert_eq!(l.wt_close_grace, Duration::from_secs(5));
         let q = l.quic;
         assert_eq!(q.max_concurrent_bidi_streams, 128);
         assert_eq!(q.max_concurrent_uni_streams, 128);

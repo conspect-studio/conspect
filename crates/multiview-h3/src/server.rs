@@ -382,6 +382,8 @@ pub async fn serve_connection(
         GuardConfig {
             max_field_section_size: limits.settings.max_field_section_size,
             header_deadline: limits.header_deadline,
+            settings_deadline: limits.settings_deadline,
+            control_frame_deadline: limits.control_frame_deadline,
             counters: Arc::clone(&counters),
         },
     )

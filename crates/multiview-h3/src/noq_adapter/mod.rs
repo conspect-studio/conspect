@@ -27,6 +27,21 @@
 //! Server-side request streams carry the header-block guard
 //! ([`crate::guard`]) and the per-request header deadline: both act on the
 //! receive path before h3 buffers anything.
+//!
+//! Server-side, every peer stream is classified by its first varint before
+//! h3 sees it, reading at most [`HEAD_MAX`] bytes into a fixed buffer. A
+//! stream still unclassified at the header deadline is failed (bidi:
+//! `H3_REQUEST_REJECTED`; uni: `H3_STREAM_CREATION_ERROR`); one timer for
+//! the earliest such deadline is registered with the accept task, so a
+//! silent stream is retired while the accept loop is parked. Of the peer's
+//! unidirectional streams only the control stream is handed to h3, behind
+//! the [`ControlGuard`] (per-frame caps) and two connection deadlines
+//! (SETTINGS arrival, partial-frame age) whose timer is also polled from
+//! `poll_accept_recv`. QPACK encoder/decoder streams are read and discarded
+//! by the adapter (the server advertises a zero dynamic table, so a peer
+//! has almost nothing legitimate to say there) up to [`QPACK_STREAM_MAX`]
+//! bytes; push and unknown stream types are stopped with
+//! `H3_STREAM_CREATION_ERROR` at classification.
 
 pub mod datagram;
 
@@ -43,6 +58,8 @@ use std::{
     time::Duration,
 };
 
+use tokio::time::{Instant, Sleep};
+
 use bytes::{Buf, Bytes};
 use futures_util::{
     stream::{self},
@@ -56,7 +73,7 @@ use h3::{
 use noq::{ReadError, VarInt};
 
 use crate::counters::Counters;
-use crate::guard::{HeaderGuard, Verdict};
+use crate::guard::{ControlGuard, HeaderGuard, Verdict};
 
 /// State shared by the two halves of one stream: the reset code the receive
 /// guard asks the send half to apply, and the request-concurrency permit
@@ -94,8 +111,155 @@ pub struct GuardConfig {
     /// Time from stream accept until the first frame (the request HEADERS)
     /// must be complete.
     pub header_deadline: Duration,
+    /// From connection start until the peer's SETTINGS frame is complete;
+    /// on expiry the connection is closed with `H3_MISSING_SETTINGS`.
+    pub settings_deadline: Duration,
+    /// How long one control-stream frame may stay incomplete; on expiry the
+    /// connection is closed with `H3_EXCESSIVE_LOAD`.
+    pub control_frame_deadline: Duration,
     /// Where rejections are counted.
     pub counters: Arc<Counters>,
+}
+
+/// Bytes the classifier reads before deciding (two varints of at most 8
+/// bytes each: the stream type / frame type and the session id / length).
+/// No per-stream buffer larger than this is held before classification.
+pub const HEAD_MAX: usize = 16;
+
+/// Bytes a peer may send over the life of its QPACK encoder or decoder
+/// stream. The server advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY` 0 (h3
+/// 0.0.8 never sends it, so it is 0), so the peer's encoder can only set
+/// capacity 0 and its decoder has nothing to acknowledge.
+pub const QPACK_STREAM_MAX: usize = 64;
+
+/// HTTP/3 unidirectional stream types the adapter handles.
+const UNI_CONTROL: u64 = 0x00;
+const UNI_QPACK_ENCODER: u64 = 0x02;
+const UNI_QPACK_DECODER: u64 = 0x03;
+
+/// The first bytes of a stream, at most [`HEAD_MAX`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HeadBuf {
+    buf: [u8; HEAD_MAX],
+    len: usize,
+}
+
+impl HeadBuf {
+    /// Room left (the read limit for the next classification read).
+    pub(crate) fn room(&self) -> usize {
+        HEAD_MAX.saturating_sub(self.len)
+    }
+
+    /// Appends `data`; bytes beyond the room are dropped and reported.
+    pub(crate) fn push(&mut self, data: &[u8]) -> usize {
+        let n = data.len().min(self.room());
+        if let (Some(dst), Some(src)) = (self.buf.get_mut(self.len..self.len + n), data.get(..n)) {
+            dst.copy_from_slice(src);
+            self.len += n;
+        }
+        data.len() - n
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.buf.get(..self.len).unwrap_or_default()
+    }
+}
+
+/// Connection-level control-stream state shared by the adapter's
+/// connection (which owns the timer) and the control stream's guard.
+#[derive(Debug, Default)]
+struct ControlWatch {
+    settings_done: std::sync::atomic::AtomicBool,
+    /// When the current partially received control frame started.
+    frame_started: std::sync::Mutex<Option<Instant>>,
+    /// The accept task, woken when a partial frame starts so the deadline
+    /// timer is armed although the control stream itself stays pending.
+    waker: std::sync::Mutex<Option<task::Waker>>,
+}
+
+impl ControlWatch {
+    fn frame_started(&self) -> Option<Instant> {
+        *crate::webtransport::unpoison(self.frame_started.lock())
+    }
+
+    fn set_frame_started(&self, in_frame: bool) {
+        let mut started = crate::webtransport::unpoison(self.frame_started.lock());
+        match (in_frame, *started) {
+            (true, None) => {
+                *started = Some(Instant::now());
+                drop(started);
+                if let Some(waker) = crate::webtransport::unpoison(self.waker.lock()).take() {
+                    waker.wake();
+                }
+            }
+            (false, Some(_)) => *started = None,
+            _ => {}
+        }
+    }
+}
+
+/// The connection deadlines (server side).
+struct ControlState {
+    watch: Arc<ControlWatch>,
+    started: Instant,
+    settings_deadline: Duration,
+    frame_deadline: Duration,
+    timer: Option<Pin<Box<Sleep>>>,
+}
+
+/// The guard on the peer's control stream.
+struct CtlGuard {
+    guard: ControlGuard,
+    watch: Arc<ControlWatch>,
+    conn: noq::Connection,
+    counters: Arc<Counters>,
+}
+
+impl CtlGuard {
+    /// Feeds control-stream bytes; on an oversized frame closes the
+    /// connection with `H3_EXCESSIVE_LOAD` and returns the error for h3.
+    fn check(&mut self, data: &[u8]) -> Result<(), ConnectionErrorIncoming> {
+        if let Verdict::Reject {
+            frame_type,
+            declared,
+        } = self.guard.feed(data)
+        {
+            Counters::inc(&self.counters.control_stream_rejections);
+            tracing::debug!(frame_type, declared, "control frame over its cap");
+            let code = Code::H3_EXCESSIVE_LOAD.value();
+            self.conn.close(to_varint(code), b"control frame too large");
+            return Err(ConnectionErrorIncoming::ApplicationClose { error_code: code });
+        }
+        if self.guard.first_frame_complete() {
+            self.watch.settings_done.store(true, Ordering::Release);
+        }
+        self.watch.set_frame_started(self.guard.in_frame());
+        Ok(())
+    }
+}
+
+/// A QPACK stream the adapter drains (server side).
+struct QpackStream {
+    recv: RecvStream,
+    encoder: bool,
+    seen: usize,
+}
+
+/// Arms `timer` for `at` (or disarms it) and polls it. True when it fired.
+fn poll_timer(
+    timer: &mut Option<Pin<Box<Sleep>>>,
+    at: Option<Instant>,
+    cx: &mut task::Context<'_>,
+) -> bool {
+    let Some(at) = at else {
+        *timer = None;
+        return false;
+    };
+    let sleep = timer.get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
+    if sleep.deadline() != at {
+        sleep.as_mut().reset(at);
+    }
+    sleep.as_mut().poll(cx).is_ready()
 }
 
 /// A QUIC connection backed by noq; implements [`quic::Connection`].
@@ -113,6 +277,12 @@ pub struct Connection {
     pending_bi: Vec<PendingBi>,
     /// Uni streams whose type varint is still unknown (same bounds).
     pending_uni: Vec<PendingUni>,
+    /// One timer for the earliest pending-stream deadline.
+    pending_timer: Option<Pin<Box<Sleep>>>,
+    /// Control-stream deadlines (server side).
+    control: Option<ControlState>,
+    /// The peer's QPACK streams (server side; at most one of each kind).
+    qpack: Vec<QpackStream>,
 }
 
 /// What the server does with peer-initiated streams before h3 sees them.
@@ -130,12 +300,15 @@ pub trait StreamRouter: Send + Sync + 'static {
 struct PendingBi {
     send: Option<noq::SendStream>,
     recv: RecvStream,
-    head: Vec<u8>,
+    head: HeadBuf,
+    /// The header deadline (server side).
+    deadline: Option<Instant>,
 }
 
 struct PendingUni {
     recv: RecvStream,
-    head: Vec<u8>,
+    head: HeadBuf,
+    deadline: Option<Instant>,
 }
 
 /// Stream type of a WebTransport unidirectional stream.
@@ -172,6 +345,48 @@ fn classify(head: &[u8], wt_type: u64) -> Head {
     }
 }
 
+/// What a peer unidirectional stream is, by its type varint.
+enum UniKind {
+    /// WebTransport (classified by [`classify`]).
+    WebTransport,
+    /// The HTTP/3 control stream: to h3, behind the control guard.
+    Control,
+    /// A QPACK stream (`true`: encoder): drained by the adapter.
+    Qpack(bool),
+    /// Push (never valid toward a server) or an unknown/grease type.
+    Other,
+}
+
+fn uni_kind(ty: u64) -> UniKind {
+    match ty {
+        WEBTRANSPORT_UNI => UniKind::WebTransport,
+        UNI_CONTROL => UniKind::Control,
+        UNI_QPACK_ENCODER => UniKind::Qpack(true),
+        UNI_QPACK_DECODER => UniKind::Qpack(false),
+        _ => UniKind::Other,
+    }
+}
+
+/// Reads the next classification bytes (at most the head buffer's room)
+/// into `head`. `Ready(Ok(true))`: the peer finished the stream.
+fn poll_head(
+    recv: &mut RecvStream,
+    head: &mut HeadBuf,
+    cx: &mut task::Context<'_>,
+) -> Poll<Result<bool, ()>> {
+    match recv.poll_data_max(cx, head.room().max(1)) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(Some(chunk))) => {
+            // `room() >= 1` whenever classification is still incomplete
+            // (two varints fit in HEAD_MAX), so nothing is dropped here.
+            let _ = head.push(&chunk);
+            Poll::Ready(Ok(false))
+        }
+        Poll::Ready(Ok(None)) => Poll::Ready(Ok(true)),
+        Poll::Ready(Err(_)) => Poll::Ready(Err(())),
+    }
+}
+
 impl Connection {
     /// Wraps a noq connection without receive guards (client side).
     #[must_use]
@@ -180,13 +395,21 @@ impl Connection {
     }
 
     /// Wraps a noq connection; every accepted bidirectional stream gets the
-    /// header-block guard and the header deadline (server side).
+    /// header-block guard and the header deadline, the control stream its
+    /// guard and deadlines (server side).
     #[must_use]
     pub fn with_guard(conn: noq::Connection, guard: GuardConfig) -> Self {
         Self::build(conn, Some(guard))
     }
 
     fn build(conn: noq::Connection, guard: Option<GuardConfig>) -> Self {
+        let control = guard.as_ref().map(|g| ControlState {
+            watch: Arc::new(ControlWatch::default()),
+            started: Instant::now(),
+            settings_deadline: g.settings_deadline,
+            frame_deadline: g.control_frame_deadline,
+            timer: None,
+        });
         Self {
             conn: conn.clone(),
             incoming_bi: Box::pin(stream::unfold(conn.clone(), |conn| async {
@@ -201,6 +424,9 @@ impl Connection {
             router: None,
             pending_bi: Vec::new(),
             pending_uni: Vec::new(),
+            pending_timer: None,
+            control,
+            qpack: Vec::new(),
         }
     }
 
@@ -212,6 +438,160 @@ impl Connection {
         self
     }
 
+    fn stream_deadline(&self) -> Option<Instant> {
+        self.guard
+            .as_ref()
+            .map(|g| Instant::now() + g.header_deadline)
+    }
+
+    /// Fails every pending stream whose header deadline passed and keeps
+    /// one timer, registered with `cx`, for the earliest remaining one: a
+    /// silent stream is retired even while the accept loop is parked.
+    fn expire_pending(&mut self, cx: &mut task::Context<'_>) {
+        for _ in 0..4 {
+            let now = Instant::now();
+            let mut i = 0;
+            while i < self.pending_bi.len() {
+                if self
+                    .pending_bi
+                    .get(i)
+                    .and_then(|e| e.deadline)
+                    .is_some_and(|d| d <= now)
+                {
+                    let mut entry = self.pending_bi.swap_remove(i);
+                    if let Some(g) = &self.guard {
+                        Counters::inc(&g.counters.header_deadline_rejections);
+                    }
+                    let code = Code::H3_REQUEST_REJECTED.value();
+                    if let Some(mut send) = entry.send.take() {
+                        let _ = send.reset(to_varint(code));
+                    }
+                    entry.recv.stop_final(code);
+                } else {
+                    i += 1;
+                }
+            }
+            let mut i = 0;
+            while i < self.pending_uni.len() {
+                if self
+                    .pending_uni
+                    .get(i)
+                    .and_then(|e| e.deadline)
+                    .is_some_and(|d| d <= now)
+                {
+                    let mut entry = self.pending_uni.swap_remove(i);
+                    if let Some(g) = &self.guard {
+                        Counters::inc(&g.counters.header_deadline_rejections);
+                    }
+                    entry
+                        .recv
+                        .stop_final(Code::H3_STREAM_CREATION_ERROR.value());
+                } else {
+                    i += 1;
+                }
+            }
+            let earliest = self
+                .pending_bi
+                .iter()
+                .filter_map(|e| e.deadline)
+                .chain(self.pending_uni.iter().filter_map(|e| e.deadline))
+                .min();
+            if !poll_timer(&mut self.pending_timer, earliest, cx) {
+                return;
+            }
+        }
+        // The timer keeps firing without an entry expiring (clock skew):
+        // poll again soon instead of spinning here.
+        cx.waker().wake_by_ref();
+    }
+
+    /// The connection deadlines: SETTINGS arrival and the age of a partial
+    /// control frame. Closes the connection and returns its error on
+    /// expiry; otherwise the timer for the next one is registered with `cx`.
+    fn poll_control_deadlines(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Result<(), ConnectionErrorIncoming> {
+        let Some(control) = self.control.as_mut() else {
+            return Ok(());
+        };
+        {
+            let mut waker = crate::webtransport::unpoison(control.watch.waker.lock());
+            if !waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+                *waker = Some(cx.waker().clone());
+            }
+        }
+        let settings_at = (!control.watch.settings_done.load(Ordering::Acquire))
+            .then(|| control.started + control.settings_deadline);
+        let frame_at = control
+            .watch
+            .frame_started()
+            .map(|t| t + control.frame_deadline);
+        let at = match (settings_at, frame_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if !poll_timer(&mut control.timer, at, cx) {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let (code, counter) = if settings_at.is_some_and(|t| t <= now) {
+            (Code::H3_MISSING_SETTINGS, "settings")
+        } else {
+            (Code::H3_EXCESSIVE_LOAD, "frame")
+        };
+        if let Some(g) = &self.guard {
+            Counters::inc(&g.counters.control_stream_rejections);
+        }
+        tracing::debug!(deadline = counter, "control stream deadline expired");
+        self.conn.close(to_varint(code.value()), b"control stream");
+        Err(ConnectionErrorIncoming::ApplicationClose {
+            error_code: code.value(),
+        })
+    }
+
+    /// Drains the peer's QPACK streams (at most [`QPACK_STREAM_MAX`] bytes
+    /// each over their life, else the connection is closed).
+    fn poll_qpack(&mut self, cx: &mut task::Context<'_>) -> Result<(), ConnectionErrorIncoming> {
+        let mut i = 0;
+        while i < self.qpack.len() {
+            let Some(entry) = self.qpack.get_mut(i) else {
+                break;
+            };
+            let room = QPACK_STREAM_MAX.saturating_sub(entry.seen) + 1;
+            let ended = loop {
+                match entry.recv.poll_data_max(cx, room) {
+                    Poll::Pending => break false,
+                    Poll::Ready(Ok(Some(chunk))) => {
+                        entry.seen = entry.seen.saturating_add(chunk.len());
+                        if entry.seen > QPACK_STREAM_MAX {
+                            let code = if entry.encoder {
+                                Code::QPACK_ENCODER_STREAM_ERROR
+                            } else {
+                                Code::QPACK_DECODER_STREAM_ERROR
+                            };
+                            if let Some(g) = &self.guard {
+                                Counters::inc(&g.counters.control_stream_rejections);
+                            }
+                            self.conn.close(to_varint(code.value()), b"qpack stream");
+                            return Err(ConnectionErrorIncoming::ApplicationClose {
+                                error_code: code.value(),
+                            });
+                        }
+                    }
+                    Poll::Ready(Ok(None) | Err(_)) => break true,
+                }
+            };
+            if ended {
+                // Keep the kind registered (a second stream of the same kind
+                // is still an error); only release the QUIC stream.
+                entry.recv.stop_final(Code::H3_NO_ERROR.value());
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+
     /// Polls every pending bidi stream once; returns a request stream ready
     /// for h3 if one resolved.
     fn poll_pending_bi<B: Buf>(&mut self, cx: &mut task::Context<'_>) -> Option<BidiStream<B>> {
@@ -221,17 +601,18 @@ impl Connection {
             let Some(entry) = self.pending_bi.get_mut(i) else {
                 break;
             };
+            // Every entry is polled (registering its waker) on every call.
             let outcome = loop {
-                match classify(&entry.head, crate::guard::WEBTRANSPORT_BIDI) {
+                match classify(entry.head.as_slice(), crate::guard::WEBTRANSPORT_BIDI) {
                     Head::Incomplete => {}
                     other => break Some(other),
                 }
-                match quic::RecvStream::poll_data(&mut entry.recv, cx) {
+                match poll_head(&mut entry.recv, &mut entry.head, cx) {
                     Poll::Pending => break None,
-                    Poll::Ready(Ok(Some(chunk))) => entry.head.extend_from_slice(&chunk),
+                    Poll::Ready(Ok(false)) => {}
                     // FIN before the head: h3 handles (and errors) it.
-                    Poll::Ready(Ok(None)) => break Some(Head::H3),
-                    Poll::Ready(Err(_)) => break Some(Head::Failed),
+                    Poll::Ready(Ok(true)) => break Some(Head::H3),
+                    Poll::Ready(Err(())) => break Some(Head::Failed),
                 }
             };
             let Some(outcome) = outcome else {
@@ -239,7 +620,7 @@ impl Connection {
                 continue;
             };
             let mut entry = self.pending_bi.swap_remove(i);
-            let head = Bytes::from(std::mem::take(&mut entry.head));
+            let head = Bytes::copy_from_slice(entry.head.as_slice());
             match outcome {
                 Head::WebTransport { session_id, rest } => {
                     entry.recv.guard = None;
@@ -274,34 +655,48 @@ impl Connection {
                     }
                     let mut send = send;
                     let _ = send.reset(to_varint(Code::H3_REQUEST_REJECTED.value()));
-                    quic::RecvStream::stop_sending(
-                        &mut entry.recv,
-                        Code::H3_REQUEST_REJECTED.value(),
-                    );
+                    entry.recv.stop_final(Code::H3_REQUEST_REJECTED.value());
                 }
             }
         }
         None
     }
 
-    /// Polls every pending uni stream once; returns a non-WT stream for h3.
-    fn poll_pending_uni(&mut self, cx: &mut task::Context<'_>) -> Option<RecvStream> {
-        let router = self.router.clone()?;
+    /// Polls every pending uni stream once; returns the control stream for
+    /// h3 when it resolved. Other stream kinds are routed (WebTransport),
+    /// drained (QPACK) or stopped (push, unknown).
+    fn poll_pending_uni(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Result<Option<RecvStream>, ConnectionErrorIncoming> {
+        let Some(router) = self.router.clone() else {
+            return Ok(None);
+        };
         let mut i = 0;
         while i < self.pending_uni.len() {
             let Some(entry) = self.pending_uni.get_mut(i) else {
                 break;
             };
             let outcome = loop {
-                match classify(&entry.head, WEBTRANSPORT_UNI) {
-                    Head::Incomplete => {}
-                    other => break Some(other),
+                if let Some((ty, _)) = crate::varint::decode(entry.head.as_slice()) {
+                    match uni_kind(ty) {
+                        UniKind::WebTransport => {
+                            match classify(entry.head.as_slice(), WEBTRANSPORT_UNI) {
+                                Head::Incomplete => {}
+                                other => break Some(Ok(other)),
+                            }
+                        }
+                        // Client side (no guard): everything else to h3.
+                        _ if self.guard.is_none() => break Some(Ok(Head::H3)),
+                        kind => break Some(Err(kind)),
+                    }
                 }
-                match quic::RecvStream::poll_data(&mut entry.recv, cx) {
+                match poll_head(&mut entry.recv, &mut entry.head, cx) {
                     Poll::Pending => break None,
-                    Poll::Ready(Ok(Some(chunk))) => entry.head.extend_from_slice(&chunk),
-                    Poll::Ready(Ok(None)) => break Some(Head::H3),
-                    Poll::Ready(Err(_)) => break Some(Head::Failed),
+                    Poll::Ready(Ok(false)) => {}
+                    // Closed or reset before the header: tolerated, dropped
+                    // (RFC 9114 section 6.2).
+                    Poll::Ready(Ok(true) | Err(())) => break Some(Ok(Head::Failed)),
                 }
             };
             let Some(outcome) = outcome else {
@@ -309,20 +704,61 @@ impl Connection {
                 continue;
             };
             let mut entry = self.pending_uni.swap_remove(i);
-            let head = Bytes::from(std::mem::take(&mut entry.head));
             match outcome {
-                Head::WebTransport { session_id, rest } => {
+                Ok(Head::WebTransport { session_id, rest }) => {
                     entry.recv.unread(rest);
                     router.webtransport_uni(session_id, entry.recv);
                 }
-                Head::Failed => {}
-                Head::H3 | Head::Incomplete => {
+                Ok(Head::H3) if self.guard.is_none() => {
+                    let head = Bytes::copy_from_slice(entry.head.as_slice());
                     entry.recv.unread(head);
-                    return Some(entry.recv);
+                    return Ok(Some(entry.recv));
+                }
+                Ok(Head::Failed | Head::H3 | Head::Incomplete) => entry.recv.fin = true,
+                Err(UniKind::Control) => {
+                    let head = Bytes::copy_from_slice(entry.head.as_slice());
+                    if let (Some(control), Some(g)) = (&self.control, &self.guard) {
+                        let mut guard = CtlGuard {
+                            guard: ControlGuard::new(),
+                            watch: Arc::clone(&control.watch),
+                            conn: self.conn.clone(),
+                            counters: Arc::clone(&g.counters),
+                        };
+                        // The head bytes bypass `poll_data`'s guard (they
+                        // come back as the prefix): feed them here.
+                        guard.check(&head)?;
+                        entry.recv.ctl = Some(guard);
+                    }
+                    entry.recv.unread(head);
+                    return Ok(Some(entry.recv));
+                }
+                Err(UniKind::Qpack(encoder)) => {
+                    if self.qpack.iter().any(|q| q.encoder == encoder) {
+                        let code = Code::H3_STREAM_CREATION_ERROR;
+                        self.conn
+                            .close(to_varint(code.value()), b"second qpack stream");
+                        return Err(ConnectionErrorIncoming::ApplicationClose {
+                            error_code: code.value(),
+                        });
+                    }
+                    let seen = entry.head.as_slice().len().saturating_sub(1);
+                    self.qpack.push(QpackStream {
+                        recv: entry.recv,
+                        encoder,
+                        seen,
+                    });
+                }
+                Err(UniKind::Other | UniKind::WebTransport) => {
+                    // RFC 9114 section 6.2: abort reading unknown types with
+                    // H3_STREAM_CREATION_ERROR (a push stream toward a
+                    // server is not valid either).
+                    entry
+                        .recv
+                        .stop_final(Code::H3_STREAM_CREATION_ERROR.value());
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// The underlying noq connection.
@@ -372,6 +808,7 @@ where
             if let Some(ready) = self.poll_pending_bi(cx) {
                 return Poll::Ready(Ok(ready));
             }
+            self.expire_pending(cx);
             let (send, recv) = match ready!(self.incoming_bi.poll_next_unpin(cx)) {
                 Some(res) => res.map_err(convert_connection_error)?,
                 None => return Poll::Ready(Err(closed_stream_source())),
@@ -387,10 +824,12 @@ where
                     recv,
                 }));
             }
+            let deadline = self.stream_deadline();
             self.pending_bi.push(PendingBi {
                 send: Some(send),
                 recv,
-                head: Vec::new(),
+                head: HeadBuf::default(),
+                deadline,
             });
         }
     }
@@ -400,9 +839,12 @@ where
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
         loop {
-            if let Some(ready) = self.poll_pending_uni(cx) {
+            self.poll_control_deadlines(cx)?;
+            self.poll_qpack(cx)?;
+            if let Some(ready) = self.poll_pending_uni(cx)? {
                 return Poll::Ready(Ok(ready));
             }
+            self.expire_pending(cx);
             let recv = match ready!(self.incoming_uni.poll_next_unpin(cx)) {
                 Some(res) => res.map_err(convert_connection_error)?,
                 None => return Poll::Ready(Err(closed_stream_source())),
@@ -411,9 +853,11 @@ where
             if self.router.is_none() {
                 return Poll::Ready(Ok(recv));
             }
+            let deadline = self.stream_deadline();
             self.pending_uni.push(PendingUni {
                 recv,
-                head: Vec::new(),
+                head: HeadBuf::default(),
+                deadline,
             });
         }
     }
@@ -611,6 +1055,7 @@ impl<B: Buf> BidiStream<B> {
                 prefix: None,
                 fin: true,
                 guard: None,
+                ctl: None,
                 abort,
             },
         }
@@ -736,6 +1181,8 @@ pub struct RecvStream {
     /// The peer finished the stream and every byte was returned.
     fin: bool,
     guard: Option<RecvGuard>,
+    /// The control-stream guard (the peer's control stream, server side).
+    ctl: Option<CtlGuard>,
     /// Shared with the send half: a non-zero value is the h3 code the send
     /// half must reset with (set when the guard fails the stream).
     abort: Arc<StreamShared>,
@@ -749,8 +1196,18 @@ impl RecvStream {
             prefix: None,
             fin: false,
             guard: None,
+            ctl: None,
             abort,
         }
+    }
+
+    /// Stops the stream with `code` and marks it done (no further stop on
+    /// drop).
+    fn stop_final(&mut self, code: u64) {
+        if let Some(stream) = self.stream.as_mut() {
+            let _ = stream.stop(to_varint(code));
+        }
+        self.fin = true;
     }
 
     /// Pushes bytes back to the front of the stream (at most one chunk; a
@@ -809,13 +1266,14 @@ impl RecvStream {
     }
 }
 
-impl quic::RecvStream for RecvStream {
-    type Buf = Bytes;
-
-    fn poll_data(
+impl RecvStream {
+    /// [`quic::RecvStream::poll_data`] reading at most `max` bytes (the
+    /// classifier's bounded read; a pushed-back prefix is returned whole).
+    fn poll_data_max(
         &mut self,
         cx: &mut task::Context<'_>,
-    ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+        max: usize,
+    ) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
         let code = self.abort.abort.load(Ordering::Acquire);
         if code != 0 {
             return Poll::Ready(Err(StreamErrorIncoming::Unknown(Box::new(
@@ -833,7 +1291,7 @@ impl quic::RecvStream for RecvStream {
         // calls noq's `poll_read_chunk`), so a fresh future per poll is
         // equivalent to h3-quinn's stored `ReusableBoxFuture`.
         let polled = {
-            let fut = stream.read_chunk(usize::MAX);
+            let fut = stream.read_chunk(max);
             let mut fut = std::pin::pin!(fut);
             fut.as_mut().poll(cx)
         };
@@ -871,7 +1329,25 @@ impl quic::RecvStream for RecvStream {
                 }
             }
         }
+        if let (Some(ctl), Some(data)) = (self.ctl.as_mut(), chunk.as_ref()) {
+            if let Err(connection_error) = ctl.check(data) {
+                return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error,
+                }));
+            }
+        }
         Poll::Ready(Ok(chunk))
+    }
+}
+
+impl quic::RecvStream for RecvStream {
+    type Buf = Bytes;
+
+    fn poll_data(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+        self.poll_data_max(cx, usize::MAX)
     }
 
     fn stop_sending(&mut self, error_code: u64) {
@@ -1090,5 +1566,40 @@ impl<B: Buf> SendStream<B> {
             Some(stream) => Ok(stream.stopped().await?.map(VarInt::into_inner)),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn head_buffer_is_capped_at_head_max() {
+        let mut head = HeadBuf::default();
+        assert_eq!(head.room(), HEAD_MAX);
+        assert_eq!(head.push(&[0x41]), 0);
+        // A whole chunk offered: only the room is kept, the rest reported.
+        assert_eq!(head.push(&[0u8; 4096]), 4096 - (HEAD_MAX - 1));
+        assert_eq!(head.as_slice().len(), HEAD_MAX);
+        assert_eq!(head.room(), 0);
+        assert_eq!(head.push(&[1, 2, 3]), 3);
+        assert_eq!(head.as_slice().len(), HEAD_MAX);
+    }
+
+    #[test]
+    fn two_maximal_varints_classify_within_head_max() {
+        let mut bytes = Vec::new();
+        crate::varint::encode(crate::guard::WEBTRANSPORT_BIDI, &mut bytes);
+        crate::varint::encode(crate::varint::MAX, &mut bytes);
+        assert!(bytes.len() <= HEAD_MAX);
+        let mut head = HeadBuf::default();
+        let _ = head.push(&bytes);
+        assert!(matches!(
+            classify(head.as_slice(), crate::guard::WEBTRANSPORT_BIDI),
+            Head::WebTransport { session_id, .. } if session_id == crate::varint::MAX
+        ));
+        // A request stream decides on the first varint.
+        assert!(matches!(classify(&[0x01], 0x41), Head::H3));
+        assert!(matches!(classify(&[0x40], 0x41), Head::Incomplete));
     }
 }

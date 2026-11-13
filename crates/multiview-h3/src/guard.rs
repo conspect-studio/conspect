@@ -164,6 +164,157 @@ impl HeaderGuard {
     }
 }
 
+/// HTTP/3 frame type SETTINGS.
+pub const FRAME_SETTINGS: u64 = 0x04;
+/// HTTP/3 frame types with one varint payload (`CANCEL_PUSH`, GOAWAY,
+/// `MAX_PUSH_ID`).
+pub const FRAMES_ONE_VARINT: [u64; 3] = [0x03, 0x07, 0x0d];
+/// Largest SETTINGS payload the control-stream guard admits. h3 keeps at
+/// most 8 settings (each two varints of at most 8 bytes); 1 KiB leaves room
+/// for grease settings.
+pub const CONTROL_SETTINGS_MAX: u64 = 1024;
+/// Largest payload of a one-varint control frame.
+pub const CONTROL_SMALL_MAX: u64 = 16;
+/// Largest payload of any other (unknown, grease, or unexpected) frame on
+/// the control stream.
+pub const CONTROL_OTHER_MAX: u64 = 1024;
+/// Total payload of such other frames over the connection's life.
+pub const CONTROL_OTHER_TOTAL: u64 = 16 * 1024;
+
+/// Streaming walker over the peer's HTTP/3 control stream (after the
+/// stream-type varint), run BEFORE h3 sees the bytes. h3 buffers each
+/// control frame whole and only then decodes it, on the connection's accept
+/// path; the guard bounds what it may be asked to buffer and tells the
+/// adapter whether a frame is in progress (the partial-frame deadline).
+#[derive(Clone, Debug)]
+pub struct ControlGuard {
+    head: [u8; 16],
+    head_len: usize,
+    skip: u64,
+    /// Frames fully seen; the first one is the SETTINGS frame.
+    frames_complete: u64,
+    other_total: u64,
+    /// The stream-type varint (one byte for `0x00`) is still to be skipped.
+    type_pending: bool,
+    done: Option<Verdict>,
+}
+
+impl Default for ControlGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ControlGuard {
+    /// A guard positioned at the start of the control stream (its type
+    /// varint `0x00` comes first).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            head: [0; 16],
+            head_len: 0,
+            skip: 0,
+            frames_complete: 0,
+            other_total: 0,
+            type_pending: true,
+            done: None,
+        }
+    }
+
+    /// The payload cap for a control frame of type `frame_type`.
+    #[must_use]
+    pub fn cap(frame_type: u64) -> u64 {
+        if frame_type == FRAME_SETTINGS {
+            CONTROL_SETTINGS_MAX
+        } else if FRAMES_ONE_VARINT.contains(&frame_type) {
+            CONTROL_SMALL_MAX
+        } else {
+            CONTROL_OTHER_MAX
+        }
+    }
+
+    /// True once the first frame (SETTINGS) was fully received.
+    #[must_use]
+    pub fn first_frame_complete(&self) -> bool {
+        self.frames_complete > 0
+    }
+
+    /// True while a frame header or payload is partially received.
+    #[must_use]
+    pub fn in_frame(&self) -> bool {
+        self.head_len > 0 || self.skip > 0
+    }
+
+    /// Feeds the next received bytes; a [`Verdict::Reject`] is sticky.
+    pub fn feed(&mut self, mut data: &[u8]) -> Verdict {
+        if let Some(done) = self.done {
+            return done;
+        }
+        if self.type_pending {
+            // The type varint of a control stream is the single byte 0x00.
+            let Some((_, rest)) = data.split_first() else {
+                return Verdict::Continue;
+            };
+            self.type_pending = false;
+            data = rest;
+        }
+        while !data.is_empty() {
+            if self.skip > 0 {
+                let available = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                let step = self.skip.min(available);
+                self.skip -= step;
+                if self.skip == 0 {
+                    self.frames_complete = self.frames_complete.saturating_add(1);
+                }
+                let step = usize::try_from(step).unwrap_or(data.len());
+                data = data.get(step..).unwrap_or_default();
+                continue;
+            }
+            let Some(slot) = self.head.get_mut(self.head_len) else {
+                return self.reject(0, u64::MAX);
+            };
+            let Some((&byte, rest)) = data.split_first() else {
+                break;
+            };
+            *slot = byte;
+            self.head_len += 1;
+            data = rest;
+            let head = self.head.get(..self.head_len).unwrap_or_default();
+            let Some((frame_type, type_len)) = varint::decode(head) else {
+                continue;
+            };
+            let Some((declared, _)) = varint::decode(head.get(type_len..).unwrap_or_default())
+            else {
+                continue;
+            };
+            self.head_len = 0;
+            if declared > Self::cap(frame_type) {
+                return self.reject(frame_type, declared);
+            }
+            if frame_type != FRAME_SETTINGS && !FRAMES_ONE_VARINT.contains(&frame_type) {
+                self.other_total = self.other_total.saturating_add(declared);
+                if self.other_total > CONTROL_OTHER_TOTAL {
+                    return self.reject(frame_type, declared);
+                }
+            }
+            self.skip = declared;
+            if declared == 0 {
+                self.frames_complete = self.frames_complete.saturating_add(1);
+            }
+        }
+        Verdict::Continue
+    }
+
+    fn reject(&mut self, frame_type: u64, declared: u64) -> Verdict {
+        let verdict = Verdict::Reject {
+            frame_type,
+            declared,
+        };
+        self.done = Some(verdict);
+        verdict
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +392,78 @@ mod tests {
             guard.feed(&frame(FRAME_HEADERS, 100 + FRAMING_SLACK)),
             Verdict::Continue
         );
+    }
+
+    fn control(frames: &[(u64, u64)]) -> Vec<u8> {
+        let mut out = vec![0x00];
+        for &(ty, len) in frames {
+            out.extend(frame(ty, len));
+            out.extend(std::iter::repeat_n(0u8, usize::try_from(len).unwrap()));
+        }
+        out
+    }
+
+    #[test]
+    fn control_settings_then_goaway_pass() {
+        let mut guard = ControlGuard::new();
+        assert!(!guard.first_frame_complete());
+        let bytes = control(&[(FRAME_SETTINGS, 12), (0x07, 1), (0x21, 100)]);
+        // Byte by byte, as a trickling peer would send it.
+        for b in &bytes[..3] {
+            assert_eq!(guard.feed(std::slice::from_ref(b)), Verdict::Continue);
+        }
+        assert!(guard.in_frame());
+        assert_eq!(guard.feed(&bytes[3..]), Verdict::Continue);
+        assert!(guard.first_frame_complete());
+        assert!(!guard.in_frame());
+    }
+
+    #[test]
+    fn control_oversized_frames_rejected_on_the_length() {
+        let mut guard = ControlGuard::new();
+        let mut bytes = vec![0x00];
+        bytes.extend(frame(FRAME_SETTINGS, 16 * 1024));
+        assert!(matches!(guard.feed(&bytes), Verdict::Reject { .. }));
+        // Sticky.
+        assert!(matches!(guard.feed(&[0]), Verdict::Reject { .. }));
+
+        let mut guard = ControlGuard::new();
+        assert_eq!(
+            guard.feed(&control(&[(FRAME_SETTINGS, CONTROL_SETTINGS_MAX)])),
+            Verdict::Continue
+        );
+        assert!(matches!(
+            guard.feed(&frame(0x07, CONTROL_SMALL_MAX + 1)),
+            Verdict::Reject {
+                frame_type: 0x07,
+                ..
+            }
+        ));
+
+        let mut guard = ControlGuard::new();
+        assert!(matches!(
+            guard.feed(&control(&[(0x21, CONTROL_OTHER_MAX + 1)])),
+            Verdict::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn control_other_frames_bounded_over_the_lifetime() {
+        let mut guard = ControlGuard::new();
+        assert_eq!(
+            guard.feed(&control(&[(FRAME_SETTINGS, 0)])),
+            Verdict::Continue
+        );
+        let per = CONTROL_OTHER_MAX;
+        let fits = CONTROL_OTHER_TOTAL / per;
+        for _ in 0..fits {
+            let mut one = frame(0x21, per);
+            one.extend(std::iter::repeat_n(0u8, usize::try_from(per).unwrap()));
+            assert_eq!(guard.feed(&one), Verdict::Continue);
+        }
+        assert!(matches!(
+            guard.feed(&frame(0x21, 1)),
+            Verdict::Reject { .. }
+        ));
     }
 }
