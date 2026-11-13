@@ -1030,6 +1030,9 @@ fn system_ack_clock() -> MediaTime {
 impl AppState {
     /// Assemble an [`AppState`] from its parts, with an in-memory alarm store and
     /// the system acknowledgement clock.
+    // One initializer per field of a wide state struct: its length tracks the
+    // field count, not branching logic.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn new(
         engine: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
