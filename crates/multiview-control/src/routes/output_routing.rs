@@ -755,9 +755,7 @@ pub(crate) fn take_output_slot0(
     // re-authorized; a different body is refused and nothing is enqueued.
     if let Some((replay, recorded)) = control.replay_with_take(&key) {
         if !same_take(state, &recorded, output_id, video, audio)? {
-            return Err(ControlError::Conflict(
-                "Idempotency-Key reused with a different request".into(),
-            ));
+            return Err(key_reused());
         }
         return Ok(SlotTake::Replay(replay));
     }
@@ -805,10 +803,24 @@ pub(crate) fn take_output_slot0(
         feed: feed.clone(),
         audio: audio.clone(),
     };
+    let pending_check = pending.clone();
     let op = match control.reserve_take(&key, &principal.key_id, pending) {
         TakeReservation::Capacity => return Err(ControlError::IdempotencyCapacity),
-        // Lost a race with a concurrent request bearing the same key.
-        TakeReservation::Replay(replay) => return Ok(SlotTake::Replay(replay)),
+        // Lost a race with a concurrent request bearing the same key and a
+        // DIFFERENT take: refused atomically by the store (#342 review A1-r2).
+        TakeReservation::Conflict => return Err(key_reused()),
+        // Lost a race with a concurrent request bearing the same key and the
+        // same take. Re-check the binding (defense in depth: the store
+        // already compared the takes under its lock).
+        TakeReservation::Replay(replay) => {
+            let same = control
+                .replay_with_take(&key)
+                .is_some_and(|(_, recorded)| recorded == pending_check);
+            if !same {
+                return Err(key_reused());
+            }
+            return Ok(SlotTake::Replay(replay));
+        }
         TakeReservation::Fresh(op) => op,
     };
     let take = OutputTakeRequest {
@@ -839,6 +851,11 @@ pub(crate) fn take_output_slot0(
         })),
     );
     Ok(SlotTake::Accepted(op.to_string()))
+}
+
+/// The refusal of a take key first used for another take (409 `conflict`).
+fn key_reused() -> ControlError {
+    ControlError::Conflict("Idempotency-Key reused with a different request".into())
 }
 
 /// Whether a replayed key's recorded take is this request's take: the same

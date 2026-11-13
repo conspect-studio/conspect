@@ -132,6 +132,9 @@ struct FakeState {
 
 struct Fake {
     state: Mutex<FakeState>,
+    /// Race seam: when armed, every take-time plan waits here, so two
+    /// concurrent takes both pass the replay peek before either reserves.
+    rendezvous: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
     _tx: SyncSender<OutputOutcome>,
     rx: Mutex<Option<Receiver<OutputOutcome>>>,
 }
@@ -141,6 +144,7 @@ impl Fake {
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         Arc::new(Self {
             state: Mutex::new(FakeState::default()),
+            rendezvous: Mutex::new(None),
             _tx: tx,
             rx: Mutex::new(Some(rx)),
         })
@@ -166,6 +170,18 @@ impl Fake {
 
 impl OutputRouting for Fake {
     fn plan(&self, _output: &str, feed: &RoutedFeed) -> Result<PlanCost, PlanRefusal> {
+        let rendezvous = self.rendezvous.lock().unwrap().clone();
+        if let Some(arrived) = rendezvous {
+            // Wait (bounded: a request refused before the plan never hangs
+            // the other) until both concurrent takes are here.
+            arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while arrived.load(std::sync::atomic::Ordering::SeqCst) < 2
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         if *feed == RoutedFeed::Preview {
             return Err(PlanRefusal::SwitcherRequired);
         }
@@ -935,4 +951,128 @@ async fn get_reports_the_accepted_audio_feed_of_slot_zero() {
         json!({"redacted": true}),
         "{scoped}"
     );
+}
+
+/// Review A1-r2: the body binding is atomic with the reservation. Two
+/// concurrent requests of one principal with the SAME key and two DIFFERENT
+/// authorized bodies (one per route, other outputs) are released together
+/// through a barrier, 50 times: every iteration gives exactly one 202 and
+/// one 409, enqueues exactly one take, and the 202's operation id is that
+/// take's — the loser never receives the winner's operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_concurrent_reuse_of_one_key_with_two_bodies_is_one_202_and_one_409() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = DOC.to_owned();
+    for i in 0..18 {
+        let _ = write!(
+            doc,
+            "[[outputs]]\nkind = \"hls\"\npath = \"/tmp/patch-outputs/r{i}/index.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n"
+        );
+    }
+    let rig = Arc::new(rig_with(&dir.path().join("boot.toml"), &doc));
+    for iteration in 0..50usize {
+        // Two fresh outputs per iteration (20 outputs, cycled), so neither
+        // per-output limit is hit; the per-principal limit (10/s) is waited
+        // out below.
+        let a = format!("output-{}", (2 * iteration) % 20);
+        let b = format!("output-{}", (2 * iteration + 1) % 20);
+        let key = format!("race-{iteration}");
+        let before = rig.fake.takes().len();
+        // Each request runs on its own OS thread and runtime, released
+        // together by a barrier; both meet again inside the take-time plan
+        // gate (the fake's rendezvous), i.e. AFTER the replay peek and BEFORE
+        // the reservation: the race the store's own lock must decide.
+        *rig.fake.rendezvous.lock().unwrap() =
+            Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let run = |request: Request<Body>| {
+            let (router, barrier) = (rig.router.clone(), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                barrier.wait();
+                runtime.block_on(async move {
+                    let resp = send(&router, request).await;
+                    let status = resp.status();
+                    (status, body_json(resp).await)
+                })
+            })
+        };
+        let patch_side = run(post(
+            "/api/v1/patch/take",
+            OPERATOR_TOKEN,
+            Some(&key),
+            &patch(vec![video(&a, json!({"source": "bars"}))]),
+        ));
+        let alias_side = run(post(
+            "/api/v1/routing/output/take",
+            OPERATOR_TOKEN,
+            Some(&key),
+            &alias(&b, json!({"bus": "program"})),
+        ));
+        let (p_status, p_body) = patch_side.join().unwrap();
+        let (a_status, a_body) = alias_side.join().unwrap();
+        let arrived = rig.fake.rendezvous.lock().unwrap().take();
+        assert_eq!(
+            arrived.map(|a| a.load(std::sync::atomic::Ordering::SeqCst)),
+            Some(2),
+            "iteration {iteration}: both requests passed the replay peek"
+        );
+        let mut statuses = [p_status, a_status];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [StatusCode::ACCEPTED, StatusCode::CONFLICT],
+            "iteration {iteration}: {p_body} {a_body}"
+        );
+        let takes = rig.fake.takes();
+        assert_eq!(
+            takes.len(),
+            before + 1,
+            "iteration {iteration}: one enqueue"
+        );
+        let winner = if p_status == StatusCode::ACCEPTED {
+            &p_body
+        } else {
+            &a_body
+        };
+        let loser = if p_status == StatusCode::ACCEPTED {
+            &a_body
+        } else {
+            &p_body
+        };
+        assert_eq!(
+            winner["operation_id"].as_str().unwrap(),
+            takes[before].operation_id,
+            "iteration {iteration}: the 202 names the enqueued take"
+        );
+        assert!(loser.get("operation_id").is_none(), "{loser}");
+        // The enqueued take is the winner's body.
+        let expected = if p_status == StatusCode::ACCEPTED {
+            &a
+        } else {
+            &b
+        };
+        assert_eq!(
+            takes[before].output,
+            format!("hls /tmp/patch-outputs/{}/index.m3u8", api_path(expected)),
+            "iteration {iteration}"
+        );
+        // Stay well under the per-principal limit (10/s): two requests a
+        // round, about four a second.
+        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    }
+}
+
+/// The config path segment of a test output API id (`output-0` = a,
+/// `output-1` = b, `output-N` = r{N-2}).
+fn api_path(api_id: &str) -> String {
+    let n: usize = api_id.trim_start_matches("output-").parse().unwrap();
+    match n {
+        0 => "a".to_owned(),
+        1 => "b".to_owned(),
+        n => format!("r{}", n - 2),
+    }
 }

@@ -436,8 +436,14 @@ struct TakeRecord {
 pub enum TakeReservation {
     /// The key was unseen: enqueue the take under this new operation id.
     Fresh(crate::command::OperationId),
-    /// The key already names a take: answer it, never enqueue again.
+    /// The key already names THIS take (the stored take equals the one being
+    /// reserved): answer it, never enqueue again.
     Replay(TakeReplay),
+    /// The key already names a DIFFERENT take (another output, video or
+    /// audio): refuse (409 `conflict`), never enqueue and never disclose the
+    /// other take's operation (#342 review A1-r2). Decided under the same
+    /// lock as the reservation, so two concurrent bodies cannot both miss it.
+    Conflict,
     /// No record can be made: the principal's records (or, globally, every
     /// record) are all pending. Fail closed (`idempotency-capacity`).
     Capacity,
@@ -532,8 +538,17 @@ impl TakeStore {
     }
 
     fn reserve(&mut self, key: &str, principal: &str, take: PendingTake) -> TakeReservation {
-        if let Some(replay) = self.replay(key) {
-            return TakeReservation::Replay(replay);
+        if let Some(record) = self.by_key.get(key) {
+            // The key is bound to the take it was first reserved for: the
+            // replay is answered only for that very take, atomically with the
+            // reservation.
+            if record.take != take {
+                return TakeReservation::Conflict;
+            }
+            return TakeReservation::Replay(TakeReplay {
+                operation_id: record.operation_id.clone(),
+                outcome: record.outcome.clone(),
+            });
         }
         // The reservation order is the eviction age: it must never wrap (a
         // wrapped seq would sort the NEWEST record first and evict it). A u64

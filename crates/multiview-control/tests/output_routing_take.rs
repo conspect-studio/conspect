@@ -1559,3 +1559,45 @@ async fn readback_redacts_live_and_configured_video_independently() {
     assert_eq!(r["tally"], "program", "{r}");
     assert_eq!(r["state"], "on_air", "{r}");
 }
+
+/// #342 review A1-r2, at the store: two threads reserve the SAME key with
+/// two DIFFERENT takes at the same instant (barrier), 200 times. Exactly one
+/// is `Fresh` and the other is `Conflict` — never `Replay` of the other's
+/// operation — because the body binding is decided under the reservation's
+/// own lock.
+#[test]
+fn concurrent_reservations_of_one_key_with_two_takes_never_share_an_operation() {
+    use multiview_control::output_routing::{OutputRoutingControl, PendingTake, TakeReservation};
+    let control = Arc::new(OutputRoutingControl::new(Fake::new()));
+    for i in 0..200 {
+        let key = format!("race-{i}");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let spawn = |output: &'static str, feed: RoutedFeed| {
+            let (control, barrier, key) = (Arc::clone(&control), Arc::clone(&barrier), key.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                control.reserve_take(
+                    &key,
+                    "p",
+                    PendingTake {
+                        api_id: output.to_owned(),
+                        feed: Some(feed),
+                        audio: None,
+                    },
+                )
+            })
+        };
+        let a = spawn("output-0", RoutedFeed::Source("bars".into()));
+        let b = spawn("output-1", RoutedFeed::Program);
+        let results = [a.join().unwrap(), b.join().unwrap()];
+        let fresh = results
+            .iter()
+            .filter(|r| matches!(r, TakeReservation::Fresh(_)))
+            .count();
+        let conflict = results
+            .iter()
+            .filter(|r| matches!(r, TakeReservation::Conflict))
+            .count();
+        assert_eq!((fresh, conflict), (1, 1), "iteration {i}: {results:?}");
+    }
+}
