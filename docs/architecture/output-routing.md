@@ -2131,7 +2131,19 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   - the bounded `try_send`, the `route.output` outcome, and persistence on `applied`.
 
   The patch take answers `202 {operation_id, status: "accepted"}`; the alias keeps its own bodies.
-  The alias checks the output's object axis, as before; the patch route also checks the output axis.
+- **Authorization (review round 1).** Both routes check the output end the same way: the object AND
+  the output axis (`ObjectAndOutput` + `authorize_output`). This is an intentional change of the
+  slice-1 contract of `/routing/output/take`, which checked the object axis only. A take key is bound
+  to the (output, feed) it was first used for, on either route:
+  - the same key with another output or feed is 409 `conflict` and enqueues nothing;
+  - a matching replay is re-authorized under the caller's current grants, so a revoked axis is 403
+    before any operation id or outcome is returned.
+- **Plan identity.** The plan's P2 is the aux thread's own pass-through predicate
+  (`routing_aux::passes_through`), so plan and engine cannot drift. Program and Clean are P2 only on a
+  canvas-sized base key. A source or the PVW source is P2 when its newest tile has the output's
+  size, is opaque and carries the canvas colour; any fit of an equal-size picture is the identity.
+- **Audio slot 0 in `GET /patch`.** It reports the output's accepted audio feed exactly as
+  `GET /routing` projects and redacts it (default `follow`).
 
 ### 12.9 The Routing page (#308)
 

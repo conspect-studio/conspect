@@ -528,9 +528,9 @@ pub(crate) async fn plan_patch(
     params(("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")),
     responses(
         (status = 202, body = PatchAccepted),
-        (status = 403, description = "Not authorized for a destination (M/E object + Program scope) or a source.", body = crate::problem::Problem),
+        (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source; a replayed key is re-authorized.", body = crate::problem::Problem),
         (status = 404, description = "Unknown output.", body = crate::problem::Problem),
-        (status = 409, description = "`on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or no source lease.", body = crate::problem::Problem),
+        (status = 409, description = "`conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or no source lease.", body = crate::problem::Problem),
         (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, missing Idempotency-Key, or not 1..=64 crosspoints.", body = crate::problem::Problem),
         (status = 429, description = "Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After.", body = crate::problem::Problem),
         (status = 503, description = "`engine-busy` (the key and leases are released) or `idempotency-capacity`.", body = crate::problem::Problem),

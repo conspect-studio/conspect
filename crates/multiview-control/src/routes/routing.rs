@@ -100,7 +100,7 @@ const ROUTING_KIND: &str = "crosspoint";
         responses(
             (status = 200, description = "A crosspoint: the #11 classification (class1/reset_lite/class2 + coerced). An output target (`target.kind = output`): an `OutputPlan` with cost and refusals.", body = RoutingPlanResponseDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 403, description = "Not authorized to plan this crosspoint.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to plan this crosspoint (an output target: object AND output axis).", body = crate::problem::Problem),
         ),
     )
 )]

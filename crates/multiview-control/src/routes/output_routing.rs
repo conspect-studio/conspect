@@ -416,9 +416,9 @@ fn plan_gate(
         responses(
             (status = 202, description = "Accepted (`status: accepted`, `adopt: next_tick`). A replay of the key returns the same operation id with `status: pending` (no outcome yet) or `status: settled` + the recorded outcome; it never re-enqueues.", body = OutputTakeAccepted),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 403, description = "Not authorized for the output or the feed.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized for the output (object AND output axis) or the feed; a replayed key is re-authorized under the caller's current grants.", body = crate::problem::Problem),
             (status = 404, description = "Unknown output.", body = crate::problem::Problem),
-            (status = 409, description = "`routing-unavailable`, `switcher-required`, `output-kind-unroutable` or `capacity`.", body = crate::problem::Problem),
+            (status = 409, description = "`routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or `conflict` (the Idempotency-Key was first used for another output or feed; nothing is enqueued).", body = crate::problem::Problem),
             (status = 422, description = "`unknown-feed`, missing Idempotency-Key, or an unsupported audio request.", body = crate::problem::Problem),
             (status = 429, description = "Over 2 takes/s per output or 10/s per principal; see Retry-After.", body = crate::problem::Problem),
             (status = 503, description = "`engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the take store holds its maximum of distinct keys (fails closed; existing keys still replay).", body = crate::problem::Problem),
