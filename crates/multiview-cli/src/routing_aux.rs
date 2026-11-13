@@ -401,20 +401,13 @@ impl FeedState {
             }
             return None;
         }
-        let Some(format) = format else {
-            if is_identity(tile, canvas) {
-                return Some(Arc::clone(tile));
-            }
-            return self.ring.letterbox(tile, canvas);
-        };
-        // Identity at the output's format: same size, opaque, same tag.
-        if tile.width() == format.width
-            && tile.height() == format.height
-            && tile.alpha_plane().is_none()
-        {
+        if passes_through(tile, canvas, format) {
             return Some(Arc::clone(tile));
         }
-        self.ring.fit(tile, canvas, format)
+        match format {
+            None => self.ring.letterbox(tile, canvas),
+            Some(format) => self.ring.fit(tile, canvas, format),
+        }
     }
 }
 
@@ -427,6 +420,25 @@ pub fn is_identity(tile: &Nv12Image, canvas: AuxCanvas) -> bool {
         && tile.height() == canvas.height
         && tile.alpha_plane().is_none()
         && tile.color() == canvas.color
+}
+
+/// Whether the aux thread passes `tile` to a feed at `format` as the SAME
+/// `Arc` (no copy, no convert): §12.4 P2. `None` = the canvas, the §2.4
+/// identity rule; `Some(format)`: the tile is exactly the format's size,
+/// opaque and tagged like the canvas — any fit of an equal-size picture is
+/// the identity. The one predicate the aux compose and the plan share
+/// (#342 review M1/M2), so they cannot drift.
+#[must_use]
+pub fn passes_through(tile: &Nv12Image, canvas: AuxCanvas, format: Option<AuxFormat>) -> bool {
+    match format {
+        None => is_identity(tile, canvas),
+        Some(f) => {
+            tile.width() == f.width
+                && tile.height() == f.height
+                && tile.alpha_plane().is_none()
+                && tile.color() == canvas.color
+        }
+    }
 }
 
 /// The centred, aspect-preserving rectangle for `(sw, sh)` inside the canvas,

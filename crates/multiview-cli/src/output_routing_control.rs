@@ -57,40 +57,39 @@ fn picture_bus(feed: &RoutedFeed) -> PictureBus {
     }
 }
 
-/// Whether `feed` is identity at `run_output`'s format (§12.4 P2): Program
-/// (its base key is at the format); Clean at a canvas-sized output; Preview
-/// not composed at an output format; a source whose newest tile has the
-/// output's size, no alpha and the canvas colour. Wait-free.
+/// Whether `feed` reaches the output's encoder as the SAME picture `Arc`
+/// (§12.4 P2, #342 review M1/M2): Program and Clean when the output's base
+/// format is the canvas (no convert); a source or the PVW source when its
+/// newest tile passes the aux thread's own pass-through predicate
+/// ([`crate::routing_aux::passes_through`]) at the output's feed format —
+/// the very check the aux compose runs, so plan and engine cannot drift.
+/// Wait-free.
 fn is_identity(
     handle: &OutputRoutingHandle,
     run_output: &crate::output_routing::RunOutput,
     feed: &RoutedFeed,
 ) -> bool {
-    match feed {
-        RoutedFeed::Program => true,
-        // Clean is the canvas picture: identity whenever the output is
-        // canvas-sized (its key converts only at another size).
-        RoutedFeed::Clean => handle.pictures().is_none_or(|(_, canvas)| {
-            run_output
-                .feed_format
-                .is_none_or(|f| f.width == canvas.width && f.height == canvas.height)
-        }),
-        // Preview is composed from the PVW source tile: identity only when it
-        // is not composed at an output format.
-        RoutedFeed::Preview => run_output.feed_format.is_none(),
-        RoutedFeed::Source(id) => handle.pictures().is_some_and(|(stores, canvas)| {
-            let (w, h) = run_output
-                .feed_format
-                .map_or((canvas.width, canvas.height), |f| (f.width, f.height));
-            stores(id)
+    let tile_passes = |id: &str| {
+        handle.pictures().is_some_and(|pictures| {
+            (pictures.stores)(id)
                 .and_then(|store| store.slot().load())
                 .is_some_and(|tile| {
-                    tile.width() == w
-                        && tile.height() == h
-                        && tile.alpha_plane().is_none()
-                        && tile.color() == canvas.color
+                    crate::routing_aux::passes_through(
+                        &tile,
+                        pictures.canvas,
+                        run_output.feed_format,
+                    )
                 })
-        }),
+        })
+    };
+    match feed {
+        RoutedFeed::Program | RoutedFeed::Clean => run_output.base_format.is_none(),
+        RoutedFeed::Source(id) => tile_passes(id),
+        RoutedFeed::Preview => handle
+            .pictures()
+            .and_then(|p| p.preview_selection.as_ref())
+            .and_then(|selection| selection.load())
+            .is_some_and(|id| tile_passes(&id)),
     }
 }
 

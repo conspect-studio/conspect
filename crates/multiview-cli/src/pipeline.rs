@@ -3739,6 +3739,7 @@ impl Pipeline {
                 id: binding_ids.get(index).cloned().flatten(),
                 settings,
                 feed_format: self.output_formats.get(index).copied().flatten(),
+                base_format: self.rendition_formats.get(settings).copied().flatten(),
                 routable: self.rendition_configs.get(settings).is_some_and(|cfg| {
                     !(cfg.codec_name.contains("vaapi") || cfg.codec_name.contains("videotoolbox"))
                 }),
@@ -3750,7 +3751,11 @@ impl Pipeline {
         self.output_routing.store(Some(Arc::new(
             handle
                 .with_outputs(run_outputs)
-                .with_pictures(plan_stores, aux_canvas),
+                .with_pictures(crate::output_routing::PlanPictures {
+                    stores: plan_stores,
+                    canvas: aux_canvas,
+                    preview_selection: preview_selection.clone(),
+                }),
         )));
         Ok(RunRouting {
             consumer: ConsumerRouting {

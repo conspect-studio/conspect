@@ -287,7 +287,20 @@ pub struct OutputRoutingHandle {
     /// What the plan needs to tell an identity picture (P2) from a convert
     /// (P3), #342 B2: the run's store lookup and its canvas. `None` until
     /// [`OutputRoutingHandle::with_pictures`].
-    pictures: Option<(StoreLookup, crate::routing_aux::AuxCanvas)>,
+    pictures: Option<PlanPictures>,
+}
+
+/// What the plan reads to tell an identity picture (P2) from a convert
+/// (P3), #342 B2: the run's store lookup, its canvas and the M/E's PVW
+/// source id (all wait-free).
+#[derive(Clone)]
+pub struct PlanPictures {
+    /// Source id → its tile store.
+    pub stores: StoreLookup,
+    /// The canvas the aux pictures match.
+    pub canvas: crate::routing_aux::AuxCanvas,
+    /// The PVW source id, when the run has an M/E.
+    pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
 }
 
 /// One routable position of the run (the router's output index).
@@ -302,6 +315,9 @@ pub struct RunOutput {
     /// The format a routed source/PVW is composed at for this output (#342;
     /// `None` = the canvas with the default fit).
     pub feed_format: Option<AuxFormat>,
+    /// The format of the output's base key, which Program and Clean are
+    /// converted to (#342; `None` = canvas-sized: the zero-copy picture).
+    pub base_format: Option<AuxFormat>,
     /// Whether slice 1 can cut this output cleanly (its encoder family has
     /// the parameter-set RAP check; VAAPI/VideoToolbox do not, §4.2).
     pub routable: bool,
@@ -355,18 +371,14 @@ impl OutputRoutingHandle {
     /// Attach the run's store lookup and canvas (#342 B2: the plan's P2/P3
     /// identity check reads a source's newest tile, wait-free).
     #[must_use]
-    pub fn with_pictures(
-        mut self,
-        stores: StoreLookup,
-        canvas: crate::routing_aux::AuxCanvas,
-    ) -> Self {
-        self.pictures = Some((stores, canvas));
+    pub fn with_pictures(mut self, pictures: PlanPictures) -> Self {
+        self.pictures = Some(pictures);
         self
     }
 
     /// The run's store lookup and canvas, when attached.
     #[must_use]
-    pub fn pictures(&self) -> Option<&(StoreLookup, crate::routing_aux::AuxCanvas)> {
+    pub fn pictures(&self) -> Option<&PlanPictures> {
         self.pictures.as_ref()
     }
 
