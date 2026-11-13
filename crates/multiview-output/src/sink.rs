@@ -2284,6 +2284,10 @@ struct SegmentState<'a> {
     /// Test seam: fail the next segment-muxer rebuild once (review V2).
     #[cfg(test)]
     fail_rebuild_once: bool,
+    /// Test seam: the next rebuild of the master's video rendition muxer
+    /// fails once (review R2-V1).
+    #[cfg(test)]
+    fail_rendition_rebuild_once: bool,
     /// Consecutive failed reopen attempts; terminal errors reach the supervisor.
     recovery_failures: u8,
     /// A close/playlist publication failure must reach the caller, not hide.
@@ -2420,6 +2424,8 @@ impl<'a> SegmentState<'a> {
             fail_packet_write_once: false,
             #[cfg(test)]
             fail_rebuild_once: false,
+            #[cfg(test)]
+            fail_rendition_rebuild_once: false,
             recovery_failures: 0,
             publication_failed: false,
             #[cfg(test)]
@@ -2594,6 +2600,10 @@ impl<'a> SegmentState<'a> {
         let Some(renditions) = self.renditions.as_mut() else {
             return Ok(());
         };
+        let tables_version = self.tables_version;
+        let reseed = self.reseed.as_ref();
+        #[cfg(test)]
+        let fail_video_rebuild = &mut self.fail_rendition_rebuild_once;
         for state in renditions
             .states
             .iter_mut()
@@ -2607,9 +2617,36 @@ impl<'a> SegmentState<'a> {
                 segment.write_path = write_path;
                 segment.packets = 0;
             } else {
-                let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
+                // The master's video-only rendition carries the video stream:
+                // after a live reset it is (re)built like the main muxer, from
+                // the NEW encoder's parameters at the run's current
+                // `tables_version` (review R2-V1). Audio renditions keep their
+                // own (unchanged) stream at version 0.
+                let video = state.kind == StreamKind::Video;
+                let version = if video { tables_version } else { 0 };
+                #[cfg(test)]
+                if video && version > 0 && std::mem::take(fail_video_rebuild) {
+                    return Err(Error::Output(
+                        "injected video rendition rebuild failure".to_owned(),
+                    ));
+                }
+                let mut muxer = if version == 0 {
+                    Muxer::create_as(&write_path, "mpegts").map_err(ff)?
+                } else {
+                    let version = version.to_string();
+                    Muxer::create_with_options(
+                        &write_path,
+                        "mpegts",
+                        &[("tables_version", version.as_str())],
+                    )
+                    .map_err(ff)?
+                };
+                let params = match reseed {
+                    Some(params) if video => params,
+                    _ => state.stream.params,
+                };
                 let stream_index = muxer
-                    .add_stream_from_parameters(state.stream.params, state.stream.time_base)
+                    .add_stream_from_parameters(params, state.stream.time_base)
                     .map_err(ff)?;
                 muxer.write_header().map_err(ff)?;
                 state.current = Some(AudioSegment {
@@ -3127,15 +3164,30 @@ impl<'a> SegmentState<'a> {
         } else {
             path.clone()
         };
-        self.open_audio_segments(index)?;
+        // The config change is handled BEFORE any redirect (review R2-V1):
+        // the main muxer and the master's video-only rendition muxer are
+        // both released here and rebuilt below from the NEW encoder's
+        // parameters at the next `tables_version`.
         if config_changed {
-            self.rebuild_pending = true;
+            // Bumped once per change: a retry of this change at the next
+            // RAP (after a failed build, `change_pending`) reuses the bumped
+            // version; it is cleared once both muxers are built below.
+            if !self.rebuild_pending {
+                self.rebuild_pending = true;
+                self.tables_version = (self.tables_version + 1) % 32;
+            }
             if let Some(mut old) = self.current.take() {
                 // Flush and close the finished segment's file (already
                 // published by `close_current`); the muxer is then rebuilt.
                 old.muxer.release_output().map_err(ff)?;
             }
+            if let Some(renditions) = self.renditions.as_mut() {
+                if let Some(mut old) = renditions.video.current.take() {
+                    old.muxer.release_output().map_err(ff)?;
+                }
+            }
         }
+        self.open_audio_segments(index)?;
         if let Some(segment) = self.current.as_mut() {
             // Redirect the SAME long-lived muxer to the new file. Every
             // PID's continuity counter, PCR bookkeeping, etc. on this
@@ -3150,10 +3202,8 @@ impl<'a> SegmentState<'a> {
         } else {
             // First segment of the run: build the ONE long-lived muxer +
             // register its streams. Rebuilt for a later segment only at a
-            // decoder-configuration change (with the next tables_version).
-            if std::mem::take(&mut self.rebuild_pending) {
-                self.tables_version = (self.tables_version + 1) % 32;
-            }
+            // decoder-configuration change (with the next tables_version,
+            // bumped above).
             #[cfg(test)]
             if self.tables_version > 0 && std::mem::take(&mut self.fail_rebuild_once) {
                 return Err(Error::Output(
@@ -3208,6 +3258,8 @@ impl<'a> SegmentState<'a> {
                 start_pts,
             });
         }
+        // Both muxers are built: the change (if any) is complete.
+        self.rebuild_pending = false;
         Ok(())
     }
 
@@ -4033,6 +4085,160 @@ mod tests {
         let first = dir.path().join(uris[0]);
         assert_eq!(ts_video_size(&first), (160, 120));
         assert!(playlist.contains("#EXT-X-DISCONTINUITY\n"), "{playlist}");
+        // The retried rebuild uses the ONE bumped version (review R2-V1).
+        let (_, before) = ts_table_versions(&first);
+        let (_, rebuilt) = ts_table_versions(&last);
+        assert_eq!(rebuilt, (before + 1) % 32, "{playlist}");
+    }
+
+    /// A live `SegmentState` with the master/rendition layout (the master's
+    /// video-only rendition alongside the main muxer), over `dir`.
+    fn rendition_state<'a>(
+        dir: &'a std::path::Path,
+        params: &'a multiview_ffmpeg::StreamCodecParameters,
+    ) -> super::SegmentState<'a> {
+        use super::{MuxStream, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        let mut state = SegmentState::new(
+            StreamSeed::Params(params),
+            Rational::new(1, 30),
+            None,
+            dir,
+            "seg",
+        );
+        let playlist = dir.join("index.m3u8");
+        state.live = Some(LivePlaylist::new(playlist.clone(), 10));
+        state
+            .set_audio_renditions(
+                &playlist,
+                10,
+                crate::epoch::SharedEpoch::new(),
+                MuxStream::new(params, Rational::new(1, 30)),
+                None,
+                &[],
+            )
+            .unwrap();
+        state
+    }
+
+    /// The `.ts` URIs a media playlist lists, in order.
+    fn playlist_uris(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// #342 B3 review R2-V1: on a live reset of an HLS output with the
+    /// master/rendition layout, the master's video-only rendition is rebuilt
+    /// exactly like the main muxer: its segment at the flagged keyframe
+    /// declares the NEW encoder's size with the bumped PAT/PMT
+    /// `version_number`, and both the main and the rendition media playlists
+    /// carry one discontinuity there.
+    #[test]
+    fn a_reset_rebuilds_the_masters_video_rendition_from_the_new_encoder() {
+        let _counter_guard = counter_guard();
+        let (mut packets, old_params) = sized_packets(160, 120, 0, 6);
+        let (new_packets, new_params) = sized_packets(80, 120, 6, 6);
+        packets.extend(new_packets);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = rendition_state(dir.path(), &old_params);
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: 6,
+            params: Some(new_params),
+            last_pts: None,
+        };
+        state.drive_from_packets(&mut source).unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let video_playlist = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().is_some_and(|x| x == "m3u8")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("video-g"))
+            })
+            .expect("the video rendition playlist");
+        let uris = playlist_uris(&video_playlist);
+        assert_eq!(uris.len(), 4, "{uris:?}");
+        let sizes: Vec<(u32, u32)> = uris
+            .iter()
+            .map(|u| ts_video_size(&dir.path().join(u)))
+            .collect();
+        assert_eq!(sizes, vec![(160, 120), (160, 120), (80, 120), (80, 120)]);
+        let (_, before) = ts_table_versions(&dir.path().join(&uris[1]));
+        let (_, after) = ts_table_versions(&dir.path().join(&uris[2]));
+        assert_eq!(
+            after,
+            (before + 1) % 32,
+            "the rendition's PMT version bumps"
+        );
+        for playlist in [dir.path().join("index.m3u8"), video_playlist] {
+            let text = std::fs::read_to_string(&playlist).unwrap();
+            assert_eq!(
+                text.matches("#EXT-X-DISCONTINUITY\n").count(),
+                1,
+                "{}: {text}",
+                playlist.display()
+            );
+        }
+    }
+
+    /// Review R2-V1: a failed rebuild of the video rendition is contained
+    /// like the main muxer's: the segment is abandoned and both muxers
+    /// recover at the next RAP, rebuilt from the new parameters (never a
+    /// fatal error, never the old size after the switch).
+    #[test]
+    fn a_failed_video_rendition_rebuild_recovers_at_the_next_rap() {
+        let _counter_guard = counter_guard();
+        let (mut packets, old_params) = sized_packets(160, 120, 0, 6);
+        let (new_packets, new_params) = sized_packets(80, 120, 6, 9);
+        packets.extend(new_packets);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = rendition_state(dir.path(), &old_params);
+        state.fail_rendition_rebuild_once = true;
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: 6,
+            params: Some(new_params),
+            last_pts: None,
+        };
+        state
+            .drive_from_packets(&mut source)
+            .expect("recovered, not fatal");
+        assert!(
+            !state.fail_rendition_rebuild_once,
+            "the video rendition was rebuilt (and the injected failure hit)"
+        );
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        for playlist in std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "m3u8"))
+            .filter(|p| p.file_name().is_some_and(|n| n != "master.m3u8"))
+        {
+            let uris = playlist_uris(&playlist);
+            let text = std::fs::read_to_string(&playlist).unwrap();
+            let last = dir.path().join(uris.last().unwrap());
+            assert_eq!(
+                ts_video_size(&last),
+                (80, 120),
+                "{}: {text}",
+                playlist.display()
+            );
+            assert_eq!(ts_video_size(&dir.path().join(&uris[0])), (160, 120));
+            assert!(text.contains("#EXT-X-DISCONTINUITY\n"), "{text}");
+            // The retried rebuild uses the ONE bumped version, not two.
+            let (_, first) = ts_table_versions(&dir.path().join(&uris[0]));
+            let (_, rebuilt) = ts_table_versions(&last);
+            assert_eq!(rebuilt, (first + 1) % 32, "{}", playlist.display());
+        }
     }
 
     /// The `version_number` of the PAT and of the PMT it points at, from the

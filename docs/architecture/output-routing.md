@@ -2014,7 +2014,10 @@ What the engine does (`crates/multiview-cli/src/output_routing_reformat.rs`):
   take opens (or reuses) an encoder at the reset codec, size and bitrate.
 - **The rebuilt muxer is seeded from the NEW encoder** (review V2). Its `StreamCodecParameters` ride the
   flagged change on the batch lease, so the rebuilt segment's PMT and stream declare the new size. A failed
-  rebuild abandons the segment and recovers at the next RAP; it is never fatal.
+  rebuild abandons the segment and recovers at the next RAP; it is never fatal. With a master
+  playlist, the video-only rendition muxer is rebuilt the same way at the same segment (same new
+  parameters, same single `tables_version` bump, handled before any redirect; review R2-V1), so
+  the main and rendition playlists agree, and a failed rendition rebuild recovers alike.
 - **A refused move never leaves a gap** (review V1). Retiring a key a binding still reads first routes
   that binding through the RAP-gated fallback; an emptied stage never proves a window it does not hold.
 - **Bounded.**
