@@ -1514,7 +1514,10 @@ Citations are to `main` at 2c29aa8d.
 | 5 | A salvo recalls a layout, cell sources, tally, UMD | `crates/multiview-config/src/salvo.rs:59-77` | A salvo also applies many patch crosspoints (video, audio, subtitle; outputs and mixer inputs) at one tick, atomically |
 | 6 | Persisted output routing is replaced by the boot file at start | `running.routing.clone_from(&boot.routing)`, `crates/multiview-cli/src/boot.rs:126` (#329) | The patch is store-backed accepted state; readback is the engine's live state |
 
-Passthrough building blocks exist and are tested but have no production caller:
+Passthrough building blocks exist and are tested but have no production caller (none of them is
+the passthrough clock of §12.5: `GuardedPacketSource` pulls the demuxer on its emitting thread and
+`RestampAccumulator` is ADR-0030's offset clamp, not `dts = tick`; slice D reuses the slate bake,
+the liveness thresholds and the RAP scan, and builds the clock itself):
 `GuardedPacketSource` (`crates/multiview-output/src/guarded.rs`), `BakedSlate`
 (`crates/multiview-output/src/slate.rs:184`), `RestampAccumulator`
 (`crates/multiview-output/src/restamp.rs:40`), `PacketLiveness`
@@ -1562,8 +1565,14 @@ there is no compressed tap.
   ```
 
   Absent `inputs`: today's behaviour, every source is selectable by id and `program_source` /
-  `preview_source` stay. With `inputs`, `program_source`/`preview_source` are replaced by
-  `program_input`/`preview_input`; one of the pair is required, validated.
+  `preview_source` stay required. With `inputs`, `program_input` and `preview_input` are required
+  and name the starting inputs (each must be patched); `program_source`/`preview_source` may then be
+  omitted and, when present, must equal the source patched to that input. Input numbers are 1-64,
+  unique. Selecting an unpatched input, and unpatching the input on PGM or PVW, are refused.
+  Inside the engine the M/E state machine selects input references, so a CUT's flip-flop swaps
+  inputs, and the switcher hook resolves the input to its source through a fixed-size table owned by
+  the tick driver (a bounded, allocation-free lookup on the clock); a re-patch of the PGM input
+  rebinds the Program cell at the adoption tick exactly like a punch.
 - **Output** with typed slots and its own format (§12.3).
 - **Crosspoint**: `{ plane, source, destination }`, where `destination` is `me1.in<N>` or
   `<output>.<plane>[<i>]`. The patch is the set of crosspoints; each destination carries at most one.
@@ -1610,19 +1619,22 @@ A vertical output is `width = 1080, height = 1920, fit = { mode = "cover", ancho
 with a centre anchor.
 
 **Capability table per medium** (validation at config and at plan; slots beyond the medium are
-refused `slot-medium-mismatch`):
+refused `slot-medium-mismatch`). Audio rows follow `Output::audio_capability`
+(`crates/multiview-config/src/schema.rs:3251-3290`) and `OutputCapability::for_transport`
+(`crates/multiview-audio/src/capability.rs:100-113`); "N" means `TrackCapacity::Unlimited`.
 
-| Medium | video slots | audio slots | subtitle slots | codecs | scan | notes |
-| --- | --- | --- | --- | --- | --- | --- |
-| HLS (TS) | 1 (a ladder later) | N as `EXT-X-MEDIA` renditions; today 1 (`TrackSupport::SelectOne`, `crates/multiview-audio/src/capability.rs:107`) | N WebVTT renditions | H.264, HEVC | progressive, interlaced (TS) | segment duration must be a multiple of the GOP for passthrough |
-| LL-HLS (CMAF) | 1 | N | N WebVTT | H.264, HEVC, AV1 | progressive | init per rendition |
-| SRT / RIST / TS file | N programs' PIDs; 1 in v1 | N (`TrackSupport::Multiple`) | N (DVB, A53 in video) | H.264, HEVC, MPEG-2 | any | |
-| RTMP / FLV | 1 | 1 (`SingleProgramOnly`) | A53 in video only | H.264 (HEVC via enhanced RTMP) | progressive | |
-| RTSP | 1 | N | 0 | H.264, HEVC | progressive | |
-| WebRTC (WHEP/WHIP), MoQ preview | 1 | 1 | 0 | H.264 (VP8/AV1 later) | progressive | B-frames forbidden: no passthrough of a B-frame source |
-| NDI | 1 (raw) | 1 channel map | 0 | raw | any | no encoder; never passthrough |
-| Display (KMS) | 1 (raw) | 0 | 0 | raw | progressive | |
-| SDI (future) | 1 (raw, 1.5G/3G/12G by format) | 8 or 16 channel pairs | 1 (ST 2031/608 VANC) | raw | per SMPTE format | frame rates restricted to SMPTE rates |
+| Output kind | video slots | audio slots | subtitle slots | video codecs | notes |
+| --- | --- | --- | --- | --- | --- |
+| `hls` | 1 (a ladder later) | N, select-one renditions (`SelectOne`) | N WebVTT renditions (slice F) | H.264, HEVC | the production segmenter writes **MPEG-TS** segments (`MediaPlaylist::new(SegmentType::MpegTs)`, `crates/multiview-output/src/sink.rs:1458`); `SegmentType::Fmp4` exists in the playlist writer but is not selectable on the output yet. Passthrough needs an IDR within every `segment_ms` |
+| `ll_hls` | 1 | N, select-one (`SelectOne`, as HLS) | N WebVTT | H.264, HEVC | fMP4/CMAF parts with `EXT-X-MAP` |
+| `srt`, `rist` | 1 in v1 (N PIDs later) | N simultaneous PIDs | N (DVB; A53 in the video) | H.264, HEVC, MPEG-2 | MPEG-TS |
+| `rtmp` | 1 | 1; N when `multitrack = true` (Enhanced RTMP v2) | A53 in the video only | H.264 (HEVC with Enhanced RTMP) | FLV |
+| `rtsp_server` | 1 | N simultaneous | 0 | H.264, HEVC | |
+| `webrtc` (WHEP), `whip_push`, MoQ preview | 1 | 1 (`AtMost(1)`, Opus) | 0 | H.264 | B-frames forbidden: a B-frame source never passes through |
+| `ndi` | 1 (raw) | 1 PCM channel-map feed (no discrete tracks) | 0 | raw | no encoder; never passthrough |
+| `display` | 1 (raw) | 1 LPCM channel-map feed (ELD-gated) | 0 | raw | progressive |
+| `aes67` | 0 | 1 PCM channel-map feed | 0 | — | audio-only output |
+| SDI (future) | 1 (raw, by SMPTE format) | channel pairs per SMPTE format | 1 (ST 2031/608 VANC) | raw | SMPTE frame rates only |
 
 **Live change.** Editing `format` or the slot list is Class-2 for **that output only**: the output
 is stopped and restarted with its new encoders and muxer (make-before-break where the sink allows
@@ -1651,8 +1663,11 @@ For every crosspoint the engine computes a path; the plan shows it, and `GET /pa
 - **One convert per (picture, format).** A convert is an aux canvas (ADR-0108 §2.2) at the output's
   format: scale, fit (contain, cover with anchor, fill), colour convert, scan, frame-rate latch. On
   the compositor path the order is invariant #8's and never changes. **Gate:** a colour convert
-  needs the source's true colour; ingest retags tiles without converting (#310). Until #310 lands, a
-  slot whose `color` differs from the canvas colour is refused `slot-format-unsupported`.
+  needs the source's true colour, and ingest today retags every tile to the canvas colour without
+  converting (#310). Until #310 lands, for a direct source a slot whose `color` differs from the
+  **source's true colour** (its stream tags, read at ingest) is refused `slot-format-unsupported`;
+  when they are equal the samples are copied unconverted and tagged with the slot's colour, which is
+  then correct. A layout or bus picture is a canvas, so its slots must equal the canvas colour.
   Interlaced slots: `Nv12Image` is progressive (ingest deinterlaces, `crates/multiview-cli/src/routing_aux.rs:319-320`),
   so an interlaced slot is encoded as interlaced-coded progressive frames at field rate/2 in v1
   (the encoder's field flags), and a native interlaced picture path is out of scope.
@@ -1673,7 +1688,8 @@ settings, D is P1 (+0).
 
 ### 12.5 Passthrough and invariant #1
 
-**Match rules** (all required; any miss means P1-P3): codec equal; profile and level within the
+**Match rules** (all required; any miss means P1-P3): a constant frame rate (every source DTS
+delta exactly one frame period over the last 10 s); codec equal; profile and level within the
 slot's settings; coded size equal to the slot's; frame rate exactly equal (as a rational) to the
 output's; scan equal; all four colour tags equal (primaries, transfer, matrix, range; untagged is
 not equal); bit depth and chroma equal; the source's measured GOP not longer than the medium allows
@@ -1686,20 +1702,52 @@ intra-refresh or recovery-point stream does not match).
 Program's rate; else its own, §12.6). The compressed tap fills a **jitter buffer** of AUs (bounded:
 3 ticks of target depth, 8 ticks maximum; drop-oldest). On every tick the clock does exactly one of:
 
-1. pop one AU and emit it with `dts = tick` and `pts = tick + d`, where `d` is the AU's
-   presentation offset in ticks from its DTS (0 without B-frames). Integers only, invariant #3;
+1. emit the queued AU whose rebased DTS equals this tick (below);
 2. emit the **bridge** AU for this tick (below).
 
-It never waits on the tap. The demuxer never touches the muxer.
+**Timestamps: an offset rebase, never `pts = f(tick)` per AU** (ADR-0030 §4's rule, kept). For each
+passthrough run the clock fixes one integer `offset` (in the output's time base) so that the run's
+first AU, a strict IDR, gets `dts' = T`, the tick of the move. Every later AU gets
+`dts' = source_dts + offset` and `pts' = source_pts + offset`, in exact integer arithmetic after
+converting the source time base to the output's (invariant #3); raw deltas and the B-frame reorder
+offset `pts − dts` pass through unchanged. The match rules require a constant frame rate equal to the
+output's, so in steady state each AU's DTS advances by exactly one tick and the clock emits exactly
+one AU per tick, B-frames or not (decode order advances one AU per frame period; only presentation
+order is reordered). The offset changes **only at a strict source IDR** (a new run: after a bridge,
+or a drift correction below), which is where ADR-0030 allows a rebase. A source DTS that is not on
+the run's grid (a dropped frame, a timestamp jump, a VFR source) does not get a clamp-fixed stamp:
+that tick has no matching AU, which is a stall, handled below. The monotonic clamp of
+`RestampAccumulator` stays only as the last guard against a malformed source (a clamp event ends the
+run and bridges).
+
+It never waits on the tap. The demuxer (on the ingest thread) is only ever the **writer** of the
+bounded drop-oldest ring; the clock is its only reader; the demuxer never touches the muxer.
+
+**A bridge always exists before the slot is passthrough (tick 0 included).** A slot never starts
+in passthrough and is never moved into it without a baked slate:
+- every encoded output slot has, from the moment its output starts, a **format slate**: black and
+  silence baked once, off the clock, at the slot's own format and codec settings (a short static
+  encode at output start, then no session). An output's sink does not start until its format
+  slates exist. Before any source packet has arrived (a cold start, a restart with a persisted
+  passthrough patch, a source with no extradata yet), the slot's ticks are emitted from its current
+  encoded path (Program, the picture bridge) or, when none is admitted, from the format slate
+  restamped from the tick counter;
+- a slot becomes passthrough only by a move at a strict source IDR (takes, below), and only after
+  the **matched slate** (ADR-0030 GP-4, baked off the clock from the source's probed parameter
+  sets) is ready. Until it is ready the slot stays on its encoded path. A failed bake leaves the
+  slot on its encoded path and the readback says why;
+- so on every tick the clock has either a queued AU or a ready bridge AU.
 
 **Cadence drift.** Source and output clocks are nominally equal but drift (tens of ppm; a
-broadcast source vs our monotonic clock). The buffer depth is tracked; when it leaves `[1, 5]`
-ticks the clock corrects **only at the next source IDR**:
+broadcast source vs our monotonic clock). The buffer depth (arrival time versus the AU's rebased
+DTS) is tracked; when it leaves `[1, 5]` ticks the clock corrects **only at the next source IDR**,
+by starting a new run there with a new offset:
 - too deep: drop the last AU before the IDR (a non-reference or the final reference of a closed
   GOP; nothing after the IDR depends on it);
 - too shallow: insert one synthesised **repeat AU** before the IDR: a non-reference picture with
   every macroblock/CTU skipped (H.264 P_Skip, HEVC skip CUs), built once per parameter-set
-  generation. A B-frame source cannot take a repeat AU safely; for it an underrun goes to the bridge.
+  generation, with frame_num/POC valid there because the IDR that follows resets both. A B-frame
+  source cannot take a repeat AU safely; for it an underrun goes to the bridge.
 At 50 ppm the correction is one frame every 11 minutes at 30 fps.
 
 **Stall, parameter change, non-strict RAP.** The clock switches the slot to the **bridge at the
@@ -1714,10 +1762,15 @@ same tick** (it never emits a hole):
   first, picture bridge at its first IDR once open).
 - A move between slate, picture bridge and passthrough happens only at an IDR of the destination
   with in-band parameter sets (ADR-0108 §4.2 move gate).
-- **Return to passthrough**: at the first strict source IDR after the source has delivered 30
-  consecutive on-time ticks; after a parameter change, only if the new parameters still match the
-  slot (else the slot stays on the picture bridge, which is now its path, P2/P3, and the plan
-  readback says why).
+- **Return to passthrough** (ticks of that output's clock): after a stall, at the first strict
+  source IDR after **30** consecutive on-time ticks; after a parameter change, at the first strict
+  source IDR after **300** consecutive ticks with the new parameters unchanged, and only if they
+  still match the slot and a matched slate has been re-baked for them (else the slot stays on the
+  picture bridge, which is now its path, P2/P3, and the readback says why).
+- **Who pays for a bridge.** An on-demand picture bridge is an encoder session charged to the
+  principal whose take patched that slot (§12.8 admission). If that principal is at its cap, or the
+  pool is full, the slot stays on the slate bridge (0 sessions) and the readback says
+  "bridging on slate: no encoder session".
 
 **Takes.**
 - **Into passthrough** at tick T: the take is frame-accurate onto the **picture bridge** (an
@@ -1729,15 +1782,28 @@ same tick** (it never emits a hole):
   the per-bus floor), exactly ADR-0108 decision 3.
 - **Program on a passthrough-capable output** is not passthrough (a bus is a picture).
 
-**Muxing rules at every move** (passthrough ↔ encoded, slate ↔ picture). One persistent muxer per
-output: TS continuity counters and PCR continue (no reset). When the parameter sets differ from the
-output's current ones: HLS TS writes `EXT-X-DISCONTINUITY` before the segment that starts at the
-move IDR (the segmenter already rotates there, `crates/multiview-output/src/sink.rs:2693-2715`),
-the media sequence continues and the discontinuity sequence increments; fMP4/CMAF writes a new
-`EXT-X-MAP` plus a discontinuity; FLV sends a new sequence header; MoQ starts a new group with an
-updated catalog; TS/SRT/RIST carry the new sets in band at the IDR. Equal sets: none of these.
-(ADR-0108's slice-1 behaviour of refusing such moves on non-TS outputs ends once each muxer writes
-its rule.)
+**Muxing rules at every move** (passthrough ↔ encoded, slate ↔ picture bridge ↔ passthrough).
+Every path of a slot emits on the same output tick grid: encoders stamp from the tick counter
+(ADR-0108 §4.2), slates are restamped from it, and a passthrough run's offset puts its first IDR on
+the move tick and changes only at a later IDR. So no move is a timestamp jump: PTS/DTS advance one
+tick across it, and one persistent muxer per output keeps TS continuity counters and generates a
+continuous PCR from those timestamps. The rule then depends only on the parameter sets:
+
+- **equal in-band parameter sets** (and the same codec, size, format): no playlist tag, no new init,
+  TS continuity counters and PCR continue;
+- **different parameter sets**: HLS (TS segments) writes `EXT-X-DISCONTINUITY` before the segment
+  that starts at the move IDR (the segmenter starts a segment there, `start_segment`,
+  `crates/multiview-output/src/sink.rs:2994`; the playlist marks it as
+  `crates/multiview-output/src/hls/live.rs:176` does for a new map) and increments
+  `EXT-X-DISCONTINUITY-SEQUENCE`; LL-HLS/fMP4 also writes a new `EXT-X-MAP`; TS (SRT, RIST, HLS
+  segments) carries the new sets in band at the IDR and sets the adaptation-field
+  `discontinuity_indicator` on that packet; FLV sends a new AVC/HEVC sequence header; MoQ starts a
+  new group with an updated catalog; WebRTC carries the sets in band;
+- a move that **would** jump the timeline (impossible by construction above; a defect) is treated as
+  different parameter sets, so a player is always told.
+
+(ADR-0108's slice-1 behaviour of refusing parameter-set changes on non-TS outputs ends, per medium,
+once that muxer writes its rule.)
 
 **Audio with passthrough video.** Audio is always decoded and re-encoded on the global AAC grid
 (ADR-0108 §5.2). For lip sync, the audio of a passthrough slot is read at the source time of the
@@ -1797,15 +1863,41 @@ Request (plan and take):
 `"follow"` (audio) or `"none"`.
 
 **Atomic at one tick.** The control plane authorizes and validates every member first (any 403 or
-422 changes nothing and burns no idempotency key), then sends the whole set as one command. The
-engine primes every member (fresh feed by ADR-0104's rule; destination encoder or bridge warm;
-passthrough members on their picture bridge), up to 50 ticks for freshness and 90 for opens. When
-every member is ready it picks one adoption tick T and applies all members at T: mixer inputs at
-T's compose, output video slots at T's window (moving at the destination's IDR at T, forced within
-the per-bus floor; a member whose destination cannot key at T delays T, never splits the set),
-audio slots at the grid boundary G(T). If any member fails or its deadline passes, nothing changes
-and every member gets the same refusal. A single take for a member that lands first supersedes the
-salvo as a whole (ADR-0108 §6.2).
+422 changes nothing and burns no idempotency key), then admits the whole set's resource delta
+(below) and sends it as one command. The engine primes every member (fresh feed by ADR-0104's
+rule; destination encoder or picture bridge open and warm) off every clock: the take state machine
+runs on the router (the bake consumer, ADR-0108 §4.5) and in the switcher tick driver's one
+held-command slot; neither waits. When every member is ready the router picks one adoption tick T
+and applies all members at T: mixer inputs at T's compose, output video slots at T's window, audio
+slots at the grid boundary G(T).
+
+- **Keying at T.** Every output-video member moves at an IDR at T. Encoded destinations are forced
+  at T (the force counts against each destination bus's 2 s floor; a bus inside its floor makes the
+  set wait for the floor to expire, at most 60 ticks). A passthrough member of a multi-member set
+  moves at T onto its **picture bridge**, never at the source's next IDR; if its picture bridge
+  cannot be admitted, the whole set is refused `capacity` at plan and at admission (a lone
+  passthrough take may still wait for a source IDR, §12.5).
+- **Bounds.** Freshness at most 50 ticks and opens at most 90 ticks from admission, then a key wait
+  of at most 60 ticks; a set not adopted within **150 ticks** of admission is refused with its
+  first cause (`feed-not-fresh`, `encoder-not-ready`, `capacity`) and nothing changes. Program's
+  clock and every other output's clock run unchanged throughout; until T every member's destination
+  carries its previous source.
+- If any member fails, nothing changes and every member gets the same refusal. A single take for a
+  member that lands first supersedes the set as a whole (ADR-0108 §6.2).
+
+**Admission of a multi-crosspoint take (per principal; §4.3 and §6.4 carried forward).**
+
+1. Every session, convert (aux canvas), decode resize, per-output clock and picture bridge the set
+   reserves counts against the **taking principal's** caps (`routing.max_encoders_per_principal`,
+   default 2) and the global caps of §7 and §12.10 from the moment of reservation. The set is
+   refused `capacity` before any open when its delta would exceed a cap.
+2. Every reservation is released on refusal, supersede or deadline; a superseded in-flight set
+   releases its reservations before the superseding take reserves.
+3. One `POST /patch/take` counts as **one** take against the 10/s per-principal limit and as one
+   take per distinct destination against that destination's 2/s limit, so 64 crosspoints cannot
+   multiply either budget.
+4. An on-demand picture bridge is charged to the principal that patched the slot (§12.5); at its
+   cap the slot stays on the slate bridge.
 
 **Mixer input on PGM.** Re-patching an input currently on PGM changes Program at T. Default
 `on_air = "protect"` refuses it (409 `on-air-protected`); `"allow"` applies it as a cut on Program;
@@ -1822,7 +1914,8 @@ during an AUTO on that input it is always refused.
 - Source: Read on the source; a layout needs its whole source closure; a bus needs Program scope.
 - Every body (plan, 409, `GET /patch`, `patch.take`) redacts sources and destinations the caller
   cannot read; `patch.take` is delivered per destination with that destination's scope.
-- Limits: 2 takes/s per destination, 10/s per principal, 64 crosspoints per request.
+- Limits: 2 takes/s per destination, 10/s per principal (one request = one take), 64 crosspoints per
+  request; the per-principal encoder and linger caps of §4.3 apply to everything a patch reserves.
 
 **Salvos.** A stored `Salvo` gains `patch: Vec<Crosspoint>`; `POST /salvos/{id}/take` with patch
 members runs the same atomic path. A salvo with only layout/sources/tally/UMD keeps today's
@@ -1873,15 +1966,23 @@ default 2). The plan reports each delta; a refusal is 409 `capacity` with the re
 **Tests owed per slice** (in addition to §9): mixer-input patch applied at one tick with tally and
 audio-follow-video unchanged; a patch on the PGM input refused under `protect`; a salvo across
 outputs and mixer inputs lands on one tick (pixel and PTS probes on each stream) or changes nothing;
-an output format reset leaves Program's tick count and PTS and another output untouched; passthrough:
-PTS = tick on every packet across 10 min, a source stall bridges on the same tick (no hole, no
-repeat beyond the bridge), a parameter change bridges and writes the medium's discontinuity, a 200
-ppm drift both ways keeps the buffer within bounds and corrects only at IDRs, a wedged demuxer
-cannot move the output clock; per-output clock: 25 fps output on a 29.97 Program has exactly one
-frame per tick, a Program cut lands on one output frame, A/V offset within one source frame plus one
-tick. **Chaos/soak per R3 slice:** take flood and salvo flood (2,000/s, almost all 429), a dying
-source on every path, a wedged convert thread, a wedged per-output clock (only its output stops),
-and the Program protection bound on mda001.
+a multi-crosspoint take where one member cannot key or prime (a destination bus inside its force
+floor, a passthrough member without an admitted picture bridge, a never-fresh source) leaves every
+member's destination unchanged until the single adoption tick, or refuses the whole set within 150
+ticks, while Program's tick count and PTS are unchanged; an output format reset leaves Program's
+tick count and PTS and another output untouched; passthrough: PTS = tick on every packet across 10
+min, a cold start and a restart with a persisted passthrough patch emit the encoded path or the
+format slate from the output's first tick, a source stall bridges on the same tick (no hole, no
+repeat beyond the bridge) and returns not before 30 stable ticks, a parameter change bridges, writes
+the medium's discontinuity and returns not before 300 stable ticks, a 200 ppm drift both ways keeps
+the buffer within bounds and corrects only at IDRs, a wedged demuxer cannot move the output clock;
+per-output clock: 25 fps output on a 29.97 Program has exactly one frame per tick, a Program cut
+lands on one output frame, A/V offset within one source frame plus one tick. **Chaos/soak per R3
+slice:** take flood and salvo flood (2,000/s, almost all 429); a principal at its encoder cap
+flooding multi-crosspoint takes that all refuse never raises any other principal's held-session
+count and never starves another principal's admissible take; a dying source on every path; a
+wedged convert thread; a wedged per-output clock (only its output stops); and the Program
+protection bound on mda001.
 
 ### 12.11 Slices (epic #303)
 
