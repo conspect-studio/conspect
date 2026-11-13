@@ -16,7 +16,9 @@ use std::sync::OnceLock;
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 
-/// The bound from the exit decision to the process exit.
+/// The deadline: the watchdog fires this long after the first exit decision.
+/// The process is then gone within [`EXIT_PATH_GRACE`] more
+/// (docs/architecture/bounded-exit.md).
 pub const EXIT_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Why the exit was decided; selects the exit code. A fatal cause overrides a
@@ -64,6 +66,11 @@ pub struct Watchdog {
     /// never moved: the bound is measured from the first exit decision. A later
     /// Fatal only upgrades the cause (the exit code), not the deadline.
     due_ns: AtomicU64,
+    /// The first arm's instant, in ns after `origin` (at least 1); 0 = not
+    /// armed. Whoever sets it sets `due_ns`.
+    armed_ns: AtomicU64,
+    /// First arm -> fire, in ms; set when the deadline fires.
+    fired_after_ms: AtomicU64,
     /// [`ExitCause::tag`] of the strongest cause armed so far; 0 = none.
     cause: AtomicU8,
     /// The watchdog thread to unpark on the first arm.
@@ -77,6 +84,8 @@ impl Watchdog {
         Self {
             origin: Instant::now(),
             due_ns: AtomicU64::new(0),
+            armed_ns: AtomicU64::new(0),
+            fired_after_ms: AtomicU64::new(0),
             cause: AtomicU8::new(0),
             thread: OnceLock::new(),
         }
@@ -86,14 +95,21 @@ impl Watchdog {
     /// deadline; a later Fatal upgrades a Stop cause. Returns `true` when this
     /// call set the deadline.
     pub fn arm(&self, cause: ExitCause, deadline: Duration) -> bool {
-        let due = u64::try_from(self.origin.elapsed().saturating_add(deadline).as_nanos())
+        let now = self.origin.elapsed();
+        let now_ns = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX).max(1);
+        let due = u64::try_from(now.saturating_add(deadline).as_nanos())
             .unwrap_or(u64::MAX)
             .max(1);
         self.cause.fetch_max(cause.tag(), Ordering::AcqRel);
+        // The first arm claims `armed_ns`, then publishes the deadline; a
+        // racing later arm only upgrades the cause.
         let set = self
-            .due_ns
-            .compare_exchange(0, due, Ordering::AcqRel, Ordering::Acquire)
+            .armed_ns
+            .compare_exchange(0, now_ns, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
+        if set {
+            self.due_ns.store(due, Ordering::Release);
+        }
         if let Some(thread) = self.thread.get() {
             thread.unpark();
         }
@@ -109,6 +125,12 @@ impl Watchdog {
         })
     }
 
+    /// First arm -> fire, in ms (0 until the deadline fired).
+    #[must_use]
+    pub fn fired_after_arm_ms(&self) -> u64 {
+        self.fired_after_ms.load(Ordering::Acquire)
+    }
+
     /// The armed cause, if any.
     #[must_use]
     pub fn cause(&self) -> Option<ExitCause> {
@@ -121,16 +143,52 @@ impl Watchdog {
         loop {
             let due = self.due_ns.load(Ordering::Acquire);
             if due == 0 {
-                std::thread::park();
+                // Bounded, so an arm whose unpark raced this load is seen
+                // within MAX_PARK even if its wake token was consumed (an arm
+                // racing `start` is not ordered before start's unpark). Cost:
+                // one wake per MAX_PARK while disarmed, beside an engine that
+                // runs at frame rate.
+                std::thread::park_timeout(MAX_PARK);
                 continue;
             }
             let due_at = self.origin + Duration::from_nanos(due);
             let now = Instant::now();
             if due_at > now {
-                // Wake at the deadline, or earlier on an arm that moved it.
-                std::thread::park_timeout(due_at - now);
+                // #350: a timed wait can wake late, by more for a longer
+                // timeout (macOS timer coalescing; a CI VM fired 92-106 ms
+                // late after one long wait). Every wait is at most MAX_PARK,
+                // and the last FINAL_APPROACH goes in FINAL_STEP waits. Each
+                // wait targets the absolute deadline, so lateness never
+                // accumulates: the fire is late by at most the lateness of
+                // the one wait that crosses the deadline. Reported with the
+                // fire: the worst single-wait lateness, measured tightly
+                // around the park, and the longest wait requested.
+                let left = due_at - now;
+                let step = if left > FINAL_APPROACH {
+                    left.min(MAX_PARK)
+                } else {
+                    left.min(FINAL_STEP)
+                };
+                MAX_STEP_US.fetch_max(
+                    u64::try_from(step.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                let parked_at = Instant::now();
+                std::thread::park_timeout(step);
+                let late = parked_at.elapsed().saturating_sub(step);
+                WORST_WAKE_LATE_MS.fetch_max(
+                    u64::try_from(late.as_millis()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
                 continue;
             }
+            // Decision (the first arm) -> fire, on the monotonic clock.
+            let armed = Duration::from_nanos(self.armed_ns.load(Ordering::Acquire));
+            let fired_after =
+                u64::try_from(self.origin.elapsed().saturating_sub(armed).as_millis())
+                    .unwrap_or(u64::MAX);
+            self.fired_after_ms.store(fired_after, Ordering::Release);
+            FIRE_AFTER_ARM_MS.store(fired_after, Ordering::Release);
             on_deadline(self.cause().unwrap_or(ExitCause::Fatal));
             return;
         }
@@ -144,8 +202,15 @@ impl Watchdog {
         }
         match std::thread::Builder::new()
             .name("multiview-exit-watchdog".to_owned())
-            .spawn(move || self.run(on_deadline))
-        {
+            .spawn(move || {
+                // #350: on a loaded host a normal-priority sleeper can wake
+                // late; the watchdog runs at the same raised class as the
+                // output clock (macOS QoS user-interactive; no-op elsewhere).
+                // Best effort, and reported.
+                let class = multiview_clocksys::raise_current_thread();
+                tracing::info!(class = ?class, "exit watchdog scheduling class");
+                self.run(on_deadline);
+            }) {
             Ok(handle) => {
                 let _ = self.thread.set(handle.thread().clone());
                 // An arm that raced the spawn may have missed the unpark.
@@ -163,56 +228,83 @@ impl Default for Watchdog {
     }
 }
 
+/// The watchdog's last approach to the deadline is made in [`FINAL_STEP`]
+/// waits, which the OS wakes almost on time (#350).
+const FINAL_APPROACH: Duration = Duration::from_millis(20);
+/// One short wait of the final approach.
+const FINAL_STEP: Duration = Duration::from_millis(1);
+/// The longest single wait before the final approach.
+const MAX_PARK: Duration = Duration::from_millis(20);
+
 /// How long the ordinary exit path may take before the process is killed.
 pub const EXIT_PATH_GRACE: Duration = Duration::from_millis(500);
 
 #[allow(clippy::exit)]
 // reason: this IS the bounded hard exit (#309). It runs only after the deadline,
 // when teardown overran; `process::exit` ends the process without running the
-// destructors that overran. The message is best-effort on a helper thread
-// through its own /dev/stderr handle (no std stderr lock, no tracing: either may
-// be the stuck part). The C runtime exit path (atexit handlers, stdio flush)
-// could itself block, so a backstop thread kills the process with SIGKILL if
-// `exit` has not finished within EXIT_PATH_GRACE.
+// destructors that overran. The backstop thread starts FIRST: it kills the
+// process with SIGKILL if the notice write or the C runtime exit path (atexit
+// handlers, stdio flush) has not finished within EXIT_PATH_GRACE. The notice is
+// then written on this thread, completely, with a raw write to fd 2 (no std
+// stderr lock, no tracing: either may be the stuck part); a blocked stderr is
+// cut by the backstop.
 fn exit_process(cause: ExitCause) {
     // A stop whose outputs have not finalised by the deadline, or whose run
     // faltered, did not stop cleanly: report it as a failure (#309).
-    let cause = if cause == ExitCause::Stop
-        && (OUTPUTS_OPEN.load(Ordering::Acquire) > 0 || RUN_FAILED.load(Ordering::Acquire))
-    {
-        ExitCause::Fatal
-    } else {
-        cause
-    };
-    let _ = std::thread::Builder::new()
-        .name("multiview-exit-notice".to_owned())
-        .spawn(move || {
-            let line = format!(
-                "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
-                 code {} (outputs finalised before the bound are valid; detached sinks may be \
-                 incomplete; the supervisor restarts the service)\n",
-                EXIT_DEADLINE.as_millis(),
-                cause.code()
-            );
-            write_stderr_raw(line.as_bytes());
-        });
-    let _ = std::thread::Builder::new()
+    let cause = effective_cause(
+        cause,
+        OUTPUTS_OPEN.load(Ordering::Acquire) > 0,
+        RUN_FAILED.load(Ordering::Acquire),
+    );
+    let backstop = std::thread::Builder::new()
         .name("multiview-exit-backstop".to_owned())
         .spawn(|| {
             std::thread::sleep(EXIT_PATH_GRACE);
             kill_self();
         });
-    // Give the notice a moment; never wait for it.
-    std::thread::sleep(Duration::from_millis(20));
+    if backstop.is_err() {
+        // No backstop: never risk a blocked stderr write; exit at once.
+        std::process::exit(cause.code());
+    }
+    let line = format!(
+        "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
+         code {} (outputs finalised before the bound are valid; detached sinks may be \
+         incomplete; the supervisor restarts the service) \
+         [fired_after_decision_ms={} worst_wake_late_ms={} max_wait_ms={}]\n",
+        EXIT_DEADLINE.as_millis(),
+        cause.code(),
+        FIRE_AFTER_ARM_MS.load(Ordering::Acquire),
+        WORST_WAKE_LATE_MS.load(Ordering::Relaxed),
+        MAX_STEP_US.load(Ordering::Relaxed).div_ceil(1000)
+    );
+    write_stderr_raw(line.as_bytes());
     std::process::exit(cause.code());
+}
+
+/// The exit code's cause: a stop with outputs still open, or after the run
+/// faltered (frames were shed), is reported as a failure (#309, #350).
+#[must_use]
+pub const fn effective_cause(cause: ExitCause, outputs_open: bool, run_failed: bool) -> ExitCause {
+    match cause {
+        ExitCause::Stop if outputs_open || run_failed => ExitCause::Fatal,
+        other => other,
+    }
 }
 
 /// Write to the already-open fd 2, without the std stderr lock and without
 /// reopening its path (a socket stderr — systemd's journal default — cannot be
 /// reopened). Best effort.
 #[cfg(all(unix, feature = "ffmpeg"))]
-fn write_stderr_raw(bytes: &[u8]) {
-    let _ = rustix::io::write(rustix::stdio::stderr(), bytes);
+fn write_stderr_raw(mut bytes: &[u8]) {
+    // Loop on a short write; retry EINTR; give up on any other error.
+    while !bytes.is_empty() {
+        match rustix::io::write(rustix::stdio::stderr(), bytes) {
+            Ok(0) => return,
+            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// Without `rustix`: reopen the stderr path append-only (no socket support).
@@ -295,6 +387,14 @@ pub fn arm(cause: ExitCause) {
     }
 }
 
+/// Monotonic ms from the first exit decision to the deadline firing,
+/// reported in the hard-exit notice (#350).
+static FIRE_AFTER_ARM_MS: AtomicU64 = AtomicU64::new(0);
+/// The worst lateness of one watchdog wait while armed (#350 diagnostics).
+static WORST_WAKE_LATE_MS: AtomicU64 = AtomicU64::new(0);
+/// The longest single watchdog wait requested while armed, in µs (#350).
+static MAX_STEP_US: AtomicU64 = AtomicU64::new(0);
+
 /// The armed state as a cheap poll: `Some(cause)` once any exit was decided.
 /// The binary's "exit decided" task polls this (every few ms, off the clock) to
 /// start the durable shutdown work — control drain, final Running persist,
@@ -322,6 +422,26 @@ mod tests {
     fn exit_codes_follow_the_cause() {
         assert_eq!(ExitCause::Fatal.code(), 1);
         assert_eq!(ExitCause::Stop.code(), 0);
+    }
+
+    #[test]
+    fn a_stop_after_a_falter_or_with_open_outputs_exits_1() {
+        assert_eq!(
+            effective_cause(ExitCause::Stop, false, false),
+            ExitCause::Stop
+        );
+        assert_eq!(
+            effective_cause(ExitCause::Stop, false, true),
+            ExitCause::Fatal
+        );
+        assert_eq!(
+            effective_cause(ExitCause::Stop, true, false),
+            ExitCause::Fatal
+        );
+        assert_eq!(
+            effective_cause(ExitCause::Fatal, false, false),
+            ExitCause::Fatal
+        );
     }
 
     #[test]
@@ -390,6 +510,13 @@ mod tests {
             elapsed < Duration::from_millis(400),
             "promptly at: {elapsed:?}"
         );
+        // The reported decision -> fire time is measured from the arm, for any
+        // deadline (not derived from EXIT_DEADLINE).
+        let reported = w.fired_after_arm_ms();
+        assert!(
+            (150..400).contains(&reported),
+            "reported fired_after_arm_ms {reported}"
+        );
     }
 
     static FIRED2: Mutex<Vec<(ExitCause, Instant)>> = Mutex::new(Vec::new());
@@ -402,15 +529,18 @@ mod tests {
 
     #[test]
     fn a_fatal_during_a_stop_upgrades_the_code_and_keeps_the_first_deadline() {
+        // #365: deterministic. Both arms happen BEFORE the watchdog thread
+        // starts, so the fire cannot race the upgrade (the old form slept
+        // 200 ms against a 300 ms deadline). The Fatal asks for a 10 s
+        // deadline: an upgrade that moved the deadline would fire far later
+        // than the first decision's 300 ms.
         static W: OnceLock<Watchdog> = OnceLock::new();
         let w = W.get_or_init(Watchdog::new);
-        assert!(w.start(record2));
         let start = Instant::now();
-        w.arm(ExitCause::Stop, Duration::from_millis(300));
-        std::thread::sleep(Duration::from_millis(200));
-        let fatal_at = Instant::now();
-        w.arm(ExitCause::Fatal, Duration::from_millis(300));
-        let until = start + Duration::from_secs(5);
+        assert!(w.arm(ExitCause::Stop, Duration::from_millis(300)));
+        assert!(!w.arm(ExitCause::Fatal, Duration::from_secs(10)));
+        assert!(w.start(record2));
+        let until = start + Duration::from_secs(8);
         while FIRED2
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -423,16 +553,20 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        assert_eq!(fired.len(), 1);
+        assert_eq!(fired.len(), 1, "fired once, at the first deadline");
         let (cause, at) = fired[0];
         assert_eq!(cause, ExitCause::Fatal, "the failure is reported");
         assert!(
             at >= start + Duration::from_millis(300),
             "not before the first deadline"
         );
+        // The first decision's deadline holds: the fire comes near 300 ms,
+        // not at the Fatal's 10 s nor a reset EXIT_DEADLINE (2 s). 1 s is the
+        // same margin class as the sibling test (150 ms deadline, < 400 ms).
         assert!(
-            at < fatal_at + Duration::from_millis(250),
-            "the first decision's deadline holds; the upgrade does not extend it"
+            at < start + Duration::from_secs(1),
+            "fired at {:?}; the upgrade must not move the first deadline",
+            at - start
         );
     }
 

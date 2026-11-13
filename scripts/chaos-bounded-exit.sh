@@ -8,11 +8,12 @@
 #   stop:  SIGTERM while source teardown is held;
 #   stopwedge: SIGTERM while the consumer is stalled (an output that cannot
 #          finalise during the stop): exit code 1 within the bound;
-#   falterstop: a short stall sheds frames (no fatal), then SIGTERM: the run
-#          faltered, so exit code 1 within the bound.
-# Asserts for every run: exit code (1 fatal, 0 stop), the time from the
-# decision (the fatal log line / the signal) to the process exit is within the
-# bound + slack, and the on-disk HLS manifest is valid and lists only complete
+#   falterstop: a deterministic seam (MULTIVIEW_CHAOS_SHED_AT) makes the hot
+#          queue refuse one tick, as a full queue does (no fatal); then SIGTERM:
+#          the run faltered, so exit code 1 within the bound.
+# Asserts for every run: exit code (1 fatal, 0 stop), the binary's own
+# decision -> fire time, the time from the decision (the fatal log line / the
+# signal) to the process exit, and the on-disk HLS manifest is valid and lists only complete
 # segments.
 #
 # Usage: scripts/chaos-bounded-exit.sh <multiview-binary> [runs=20] [mode=both]
@@ -23,12 +24,29 @@ BIN="${1:?usage: chaos-bounded-exit.sh <multiview-binary> [runs] [fatal|stop|bot
 RUNS="${2:-20}"
 MODE="${3:-both}"
 BOUND_MS=2000
-SLACK_MS=500
+# The watchdog's own decision->fire time (monotonic). Every wait targets the
+# absolute deadline, so the fire is late by at most the lateness of the one
+# wait that crosses it. The watchdog reports:
+#   max_wait_ms        - its longest single wait (the design: <= 20 ms);
+#   worst_wake_late_ms - the worst lateness of a single wait, measured tightly
+#                        around the park (the OS wake latency: the host's).
+# Asserted: max_wait <= MAX_WAIT_MS (the watchdog's own logic, independent of
+# the host); fire <= 2000 + worst_wake_late + LOGIC_SLACK_MS (one 1 ms step
+# and ms rounding); worst_wake_late <= MAX_WAKE_LATE_MS, the host's bound.
+# Measured worst single-wait lateness: <= 11 ms on a dedicated Apple-silicon
+# host (idle and 28 busy loops; the default 50 ms bound); on the shared macOS
+# CI VM 92 and 106 ms (one long wait), and with 20 ms waits 121-156 ms in
+# every run of two 40-run series, so CI sets 200 ms.
+MAX_WAIT_MS=20
+LOGIC_SLACK_MS=5
+MAX_WAKE_LATE_MS="${CHAOS_MAX_WAKE_LATE_MS:-50}"
+# Fire -> process gone: the notice write plus the C runtime exit, cut by the
+# 500 ms backstop (EXIT_PATH_GRACE); the observer adds its 1 ms poll and, for
+# a fatal, the log write it waits for. Off CI: decision -> gone <= 2.6 s.
+EXIT_PATH_MS=550
 HOLD_MS=20000   # teardown held 10x past the bound
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
-
-now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
 
 write_config() {
   cat > "${WORK}/cfg.toml" <<TOML
@@ -87,14 +105,17 @@ check_hls() {
 }
 
 run_once() {
-  local mode="$1" i="$2" log="${WORK}/run.log" rc t_exit t_decide pid
+  local mode="$1" i="$2" log="${WORK}/run.log" rc pid
   rm -rf "${WORK}/hls" "${WORK}/.multiview" && mkdir -p "${WORK}/hls"
   export MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS="${HOLD_MS}"
+  unset MULTIVIEW_CHAOS_SHED_AT
   if [ "${mode}" = falterstop ]; then
-    # A short stall (about 6 ticks: past the 4-slot live queue, inside the
-    # 8-tick envelope) sheds frames without a fatal; then SIGTERM. The run
-    # faltered, so it must exit 1.
-    export MULTIVIEW_CHAOS_CONSUMER_STALL_MS=200 MULTIVIEW_CHAOS_CONSUMER_STALL_AT=60
+    # A deterministic shed (#350): the hot queue refuses tick 60 exactly as a
+    # full queue does, with no timing dependence (a 200 ms stall sheds
+    # nothing on a fast host, and its outcome depended on the runner). The
+    # run faltered, so it must exit 1.
+    unset MULTIVIEW_CHAOS_CONSUMER_STALL_MS MULTIVIEW_CHAOS_CONSUMER_STALL_AT
+    export MULTIVIEW_CHAOS_SHED_AT=60
   elif [ "${mode}" = stopwedge ]; then
     # SIGTERM while the consumer is stalled 10 s (an output that cannot
     # finalise during the stop): the run must report failure (rc 1).
@@ -122,7 +143,15 @@ run_once() {
       fi
       [ "${waited}" -lt 300 ] || { echo "run ${i} (${mode}): pipeline never started"; tail -20 "${log}"; kill -KILL "${pid}" 2>/dev/null || true; return 1; }
     done
-    if [ "${mode}" = stopwedge ] || [ "${mode}" = falterstop ]; then
+    if [ "${mode}" = falterstop ]; then
+      # Signal only after the forced shed happened (bounded wait).
+      local w3=0
+      until grep -q "chaos: forced shed" "${log}" 2>/dev/null; do
+        sleep 0.05; w3=$((w3 + 1))
+        [ "${w3}" -lt 400 ] || { echo "run ${i} (${mode}): forced shed never happened"; tail -20 "${log}"; kill -KILL "${pid}"; return 1; }
+      done
+      sleep 0.2
+    elif [ "${mode}" = stopwedge ]; then
       local w2=0
       until grep -q "chaos: stalling the bake consumer" "${log}" 2>/dev/null; do
         sleep 0.05; w2=$((w2 + 1))
@@ -135,46 +164,78 @@ run_once() {
         fi
         [ "${w2}" -lt 400 ] || { echo "run ${i} (${mode}): stall seam never reached"; tail -20 "${log}"; kill -KILL "${pid}"; return 1; }
       done
-      if [ "${mode}" = falterstop ]; then sleep 1.5; else sleep 0.2; fi
+      sleep 0.2
     else
       sleep 2
     fi
     kill -0 "${pid}" || { echo "run ${i} (stop): process died before the signal"; tail -20 "${log}"; return 1; }
-    t_decide="$(now_ms)"
-    kill -TERM "${pid}"
   fi
-  # Bounded wait: a run that never exits is a failure, never a hang.
-  local polls=0
-  while kill -0 "${pid}" 2>/dev/null; do
-    sleep 0.02; polls=$((polls + 1))
-    if [ "${polls}" -gt 2500 ]; then   # 50 s
-      kill -KILL "${pid}" 2>/dev/null || true
-      echo "run ${i} (${mode}): did not exit within 50 s"; tail -20 "${log}"; return 1
-    fi
-  done
+  # One helper measures decision -> process gone on ONE monotonic clock, with a
+  # 1 ms poll. Signal modes: the decision is the signal it sends. Fatal: the
+  # decision is the moment it sees the fatal line in the log (the binary arms
+  # the deadline before it logs, so this instant is at or after the decision;
+  # the binary's own fired_after_decision_ms covers the decision side).
+  # #350: separate python clock reads, a wall-clock log timestamp and 20 ms
+  # shell polls added up to 0.5 s of observation error on a loaded host.
+  local sig=0; [ "${mode}" = fatal ] || sig=1
+  python3 - "${pid}" "${sig}" "${log}" > "${WORK}/gone" <<'PY'
+import os, signal, sys, time
+pid, sig, log = int(sys.argv[1]), sys.argv[2] == "1", sys.argv[3]
+def alive():
+    try:
+        os.kill(pid, 0); return True
+    except ProcessLookupError:
+        return False
+start = time.monotonic(); t0 = None
+if sig:
+    try:
+        t0 = time.monotonic(); os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        print("gone-before-signal"); sys.exit(0)
+else:
+    pat = "fatal encoded-output consumer failure"
+    with open(log, errors="replace") as f:
+        buf = ""
+        while t0 is None:
+            buf = (buf + f.read())[-65536:]
+            if pat in buf and "ticks behind the clock" in buf:
+                t0 = time.monotonic(); break
+            if not alive():
+                print("no-fatal-line"); sys.exit(0)
+            if time.monotonic() - start > 60:
+                print("timeout"); sys.exit(0)
+            time.sleep(0.001)
+while alive():
+    if time.monotonic() - t0 > 50:
+        print("timeout"); sys.exit(0)
+    time.sleep(0.001)
+print(int((time.monotonic() - t0) * 1000))
+PY
+  local took
+  took="$(cat "${WORK}/gone")"
+  case "${took}" in
+    timeout) kill -KILL "${pid}" 2>/dev/null || true
+             echo "run ${i} (${mode}): did not exit within 50 s"; tail -20 "${log}"; return 1 ;;
+    no-fatal-line) echo "run ${i} (${mode}): no fatal line"; tail -20 "${log}"; return 1 ;;
+    gone-before-signal) echo "run ${i} (${mode}): process died before the signal"; tail -20 "${log}"; return 1 ;;
+    ''|*[!0-9]*) kill -KILL "${pid}" 2>/dev/null || true
+             echo "  FAIL: observer produced no measurement (${took})"; return 1 ;;
+  esac
   set +e
   wait "${pid}"
   rc=$?
   set -e
-  t_exit="$(now_ms)"
-  if [ "${mode}" = fatal ]; then
-    # The decision instant is the fatal log line's own timestamp (UTC).
-    t_decide="$(python3 - "${log}" <<'PY'
-import re,sys,datetime
-for line in open(sys.argv[1], errors="replace"):
-    if "fatal encoded-output consumer failure" in line and "ticks behind the clock" in line:
-        m = re.search(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.(\d+)Z", line)
-        if m:
-            base = datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
-            frac = float("0." + m.group(2))
-            print(int((base.timestamp() + frac) * 1000)); break
-PY
-)"
-    [ -n "${t_decide}" ] || { echo "run ${i} (${mode}): no fatal line"; tail -20 "${log}"; return 1; }
-  fi
-  local took=$((t_exit - t_decide)) want=$([ "${mode}" = stop ] && echo 0 || echo 1)
+  local want=$([ "${mode}" = stop ] && echo 0 || echo 1)
+  # #350: the watchdog's own monotonic clock, read inside the binary:
+  # decision (first arm) -> deadline fired. This is the bound the design
+  # promises; it excludes the shell's own observation latency.
+  local fire_ms
+  fire_ms="$(grep -o 'fired_after_decision_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2 || true)"
+  local wake_ms wait_ms
+  wake_ms="$(grep -o 'worst_wake_late_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2 || true)"
+  wait_ms="$(grep -o 'max_wait_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2 || true)"
   local extra=0
-  echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms"
+  echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms (armed->fired ${fire_ms} ms, worst wake late ${wake_ms} ms, max wait ${wait_ms} ms)"
   if [ "${mode}" = falterstop ] && grep -q "ticks behind the clock" "${log}"; then
     echo "  FAIL: falterstop hit the fatal envelope (stall too long for this host)"; return 1
   fi
@@ -204,7 +265,21 @@ PY
   # The durable Running state was written at the exit decision.
   grep -q "exit-time running-state persist written" "${log}" && [ -s "${WORK}/.multiview/active.toml" ] \
     || { echo "  FAIL: the exit-time Running persist did not land"; grep -E "persist|armed|overran|control plane|stage=" "${log}" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-200 | tail -12; ls -la "${WORK}/.multiview" 2>&1 | head -5; return 1; }
-  [ "${took}" -le $((BOUND_MS + SLACK_MS + extra)) ] || { echo "  FAIL: exit took ${took} ms > ${BOUND_MS}+${SLACK_MS}"; grep -E "teardown|exit|chaos" "${log}" | tail -12; return 1; }
+  # The design bound: the watchdog fires at EXIT_DEADLINE after the decision
+  # (its own clock), late only by the host's wake latency, never by itself.
+  [ -n "${fire_ms}" ] && [ -n "${wake_ms}" ] && [ -n "${wait_ms}" ] || { echo "  FAIL: no fired_after_decision_ms / worst_wake_late_ms / max_wait_ms in the hard-exit line"; return 1; }
+  [ "${wait_ms}" -le "${MAX_WAIT_MS}" ] || { echo "  FAIL: a watchdog wait of ${wait_ms} ms (design: <= ${MAX_WAIT_MS} ms)"; return 1; }
+  [ "${fire_ms}" -ge "${BOUND_MS}" ] && [ "${fire_ms}" -le $((BOUND_MS + wake_ms + LOGIC_SLACK_MS)) ] \
+    || { echo "  FAIL: watchdog fired ${fire_ms} ms after the decision (want ${BOUND_MS}..$((BOUND_MS + wake_ms + LOGIC_SLACK_MS)): its worst wait was ${wake_ms} ms late)"; grep -E "scheduling class|chaos|teardown overran" "${log}" | cut -c1-240 | tail -6; return 1; }
+  [ "${wake_ms}" -le "${MAX_WAKE_LATE_MS}" ] \
+    || { echo "  FAIL: a watchdog wait woke ${wake_ms} ms late (host bound ${MAX_WAKE_LATE_MS} ms)"; return 1; }
+  grep -q "exit watchdog scheduling class" "${log}" || { echo "  FAIL: watchdog class not reported"; return 1; }
+  if [ "${mode}" = falterstop ]; then
+    grep -q "chaos: forced shed" "${log}" || { echo "  FAIL: forced shed not exercised"; return 1; }
+  fi
+  # And the process was gone within the exit path after the fire, as the
+  # observer sees it.
+  [ "${took}" -le $((fire_ms + EXIT_PATH_MS + extra)) ] || { echo "  FAIL: exit took ${took} ms > fire ${fire_ms} + ${EXIT_PATH_MS}"; grep -E "teardown|exit|chaos" "${log}" | tail -12; return 1; }
   if [ "${mode}" = stopwedge ]; then
     # The output could not finalise: only require that what is on disk is valid.
     local m="${WORK}/hls/index.m3u8"
