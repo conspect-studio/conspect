@@ -26,6 +26,10 @@ SVC_USER="${SVC_USER:-operations}"
 STATE="$MV/.multiview/desired.json"
 
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo" >&2; exit 1; }
+[[ "$SVC_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "SVC_USER is not a plain user name" >&2; exit 1; }
+for p in "$MV" "$BIN"; do
+    [[ "$p" =~ ^/[A-Za-z0-9._/@+-]*$ && "$p" != *..* ]] || { echo "unsafe path: $p" >&2; exit 1; }
+done
 for f in "$MV/conspect.toml.pre-cutover" "$STATE.pre-cutover" "$STATE" "$BIN"; do
     [ -e "$f" ] || { echo "missing $f (preflight step 1 of the runbook makes the copies)" >&2; exit 1; }
 done

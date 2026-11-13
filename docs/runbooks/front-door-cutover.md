@@ -66,8 +66,9 @@ sudo HOST=mda001.public-servers.sy4.aperim.net bash deploy/systemd/front-door-cu
 What it does, in order (the script header has the detail):
 
 1. Copies the certbot pair to `/etc/conspect/tls/` (`root:operations`, key `0640`) and installs
-   `/etc/letsencrypt/renewal-hooks/deploy/conspect-copy.sh`, which repeats the copy on every
-   renewal.
+   `/etc/letsencrypt/renewal-hooks/deploy/conspect-copy.sh` (static text; its paths and group
+   are in `/etc/conspect/certbot-hook.env`), which repeats the copy on every renewal. `HOST`,
+   `UI_DIR` and the service user are allow-listed before anything is written.
 2. Builds the new state **in a scratch copy** from the current `~/mv/.multiview/desired.json`
    (all operator edits kept) and `conspect.toml`, and runs `multiview validate` on it. It stops
    here, changing nothing, unless the output has `OK   start: accepted state`. The keys it sets:
@@ -195,7 +196,8 @@ only, bound by the engine as before). The binary stays: it runs the old state un
   2. validate, restart, and wait for `multiview tls status` = `serving` with the CA's
      certificate (`openssl s_client` shows the new issuer/serial);
   3. only then retire certbot: `sudo systemctl disable --now certbot.timer`, remove the deploy
-     hook `/etc/letsencrypt/renewal-hooks/deploy/conspect-copy.sh`, and leave
+     hook `/etc/letsencrypt/renewal-hooks/deploy/conspect-copy.sh` and
+     `/etc/conspect/certbot-hook.env`, and leave
      `/etc/letsencrypt` in place (the rollback of that step is re-enabling the timer and
      putting the two keys back).
   Never disable `certbot.timer` while `cert_file`/`key_file` are configured: that host's

@@ -39,6 +39,14 @@ LE="/etc/letsencrypt/live/$HOST"
 HOOK=/etc/letsencrypt/renewal-hooks/deploy/conspect-copy.sh
 
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo" >&2; exit 1; }
+# Every value below lands in root-run files (the certbot hook, the renewal
+# config, conspect.toml): allow-list them before any use.
+[[ "$HOST" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || { echo "HOST must be a lowercase DNS name" >&2; exit 1; }
+[[ "$SVC_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "SVC_USER is not a plain user name" >&2; exit 1; }
+safe_path() { [[ "$1" =~ ^/[A-Za-z0-9._/@+-]*$ ]] && [[ "$1" != *..* ]]; }
+for p in "$MV" "$BIN" "$UNITS"; do
+    safe_path "$p" || { echo "unsafe path: $p" >&2; exit 1; }
+done
 for f in "$BIN" "$STATE" "$MV/conspect.toml" "$LE/fullchain.pem" "$LE/privkey.pem" \
          "$UNITS/conspect.socket" "$UNITS/conspect.service.d/10-socket-activation.conf"; do
     [ -e "$f" ] || { echo "missing $f" >&2; exit 1; }
@@ -52,21 +60,29 @@ if [ -z "${UI_DIR:-}" ]; then
 fi
 [ -n "${UI_DIR:-}" ] && [ -f "$UI_DIR/index.html" ] || { echo "UI_DIR not found (set UI_DIR=/var/www/conspect-ui/<sha>)" >&2; exit 1; }
 UI_DIR="${UI_DIR%/}"
+safe_path "$UI_DIR" || { echo "unsafe UI_DIR: $UI_DIR" >&2; exit 1; }
 echo "host $HOST, UI $UI_DIR"
 
 echo "== 1. certificate readable by $SVC_USER, renewed copies follow"
 install -d -m 0750 -o root -g "$SVC_USER" "$TLS_DIR"
-cat > "$HOOK" <<EOF
+# The hook is static text (quoted heredoc); its three values live in an env
+# file it reads, validated above, so nothing is interpolated into shell source.
+install -d -m 0755 "$(dirname "$HOOK")"
+printf 'CONSPECT_LE=%s\nCONSPECT_TLS_DIR=%s\nCONSPECT_GROUP=%s\n' "$LE" "$TLS_DIR" "$SVC_USER" \
+    > /etc/conspect/certbot-hook.env
+chmod 0644 /etc/conspect/certbot-hook.env
+cat > "$HOOK" <<'HOOKEOF'
 #!/bin/sh
 # Installed by deploy/systemd/front-door-cutover.sh: copy the renewed
 # certificate for the conspect engine (it reloads the files within 30 s).
 set -e
-[ "\${RENEWED_LINEAGE:-$LE}" = "$LE" ] || exit 0
-install -m 0644 -o root -g $SVC_USER "$LE/fullchain.pem" "$TLS_DIR/fullchain.pem.new"
-install -m 0640 -o root -g $SVC_USER "$LE/privkey.pem" "$TLS_DIR/privkey.pem.new"
-mv -f "$TLS_DIR/privkey.pem.new" "$TLS_DIR/privkey.pem"
-mv -f "$TLS_DIR/fullchain.pem.new" "$TLS_DIR/fullchain.pem"
-EOF
+. /etc/conspect/certbot-hook.env
+[ "${RENEWED_LINEAGE:-$CONSPECT_LE}" = "$CONSPECT_LE" ] || exit 0
+install -m 0644 -o root -g "$CONSPECT_GROUP" "$CONSPECT_LE/fullchain.pem" "$CONSPECT_TLS_DIR/fullchain.pem.new"
+install -m 0640 -o root -g "$CONSPECT_GROUP" "$CONSPECT_LE/privkey.pem" "$CONSPECT_TLS_DIR/privkey.pem.new"
+mv -f "$CONSPECT_TLS_DIR/privkey.pem.new" "$CONSPECT_TLS_DIR/privkey.pem"
+mv -f "$CONSPECT_TLS_DIR/fullchain.pem.new" "$CONSPECT_TLS_DIR/fullchain.pem"
+HOOKEOF
 chmod 0755 "$HOOK"
 RENEWED_LINEAGE="$LE" "$HOOK"
 install -d -m 0755 "$WEBROOT/.well-known/acme-challenge"
@@ -106,7 +122,7 @@ with os.fdopen(fd, "w") as f:
 # file, so ui_dir must be there too. Replace or add the key in [control].
 with open(toml_path) as f:
     text = f.read()
-line = f'ui_dir = "{env["UI_DIR"]}"'
+line = "ui_dir = " + json.dumps(env["UI_DIR"])
 m = re.search(r"(?m)^\[control\][ \t]*$", text)
 if m is None:
     raise SystemExit("conspect.toml has no [control] section")
@@ -192,6 +208,11 @@ cp -p "$conf" "$conf.pre-cutover"
 python3 - "$conf" "$HOST" "$WEBROOT" <<'PY'
 import re, sys
 path, host, webroot = sys.argv[1:4]
+# Both are allow-listed by the shell above; refuse anything that could add a
+# line or a section to the certbot config regardless.
+for v in (host, webroot):
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", v):
+        raise SystemExit(f"refusing unsafe value for the renewal config: {v!r}")
 text = open(path).read()
 text = re.sub(r"(?m)^authenticator = .*$", "authenticator = webroot", text)
 text = re.sub(r"(?m)^installer = .*\n", "", text)
