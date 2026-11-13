@@ -117,10 +117,14 @@ output when one `[control] ui_dir` key changed (#367).
   probes, programs, tally profiles, salvos, walls, devices, sync groups, media players and
   fills, weather locations, graphics data sources/items/channels, audio routes, routing
   crosspoints) the unit is the item — an item the file added or changed takes the file's
-  value, an item the file removed is removed, every other accepted item stays. `layout` +
-  `cells` are one unit (cells name the layout's areas); the canvas is one unit. When the
-  accepted list still equals the previous file's list, the new list is taken whole (a reorder
-  lands). The function destructures `MultiviewConfig` exhaustively, so a new section is a
+  value, an item the file removed is removed, every other accepted item stays (hash-indexed,
+  linear in the list sizes). Smaller units where the operator edits parts of a section: the
+  canvas's pinned signal (width, height, cadence) is one unit and each other canvas axis is
+  its own; the switcher and its M/Es (by id) and the IPTV publication (entries by kind + ref)
+  merge field by field, so editing one key keeps the API-set others; a layout change takes the
+  file's layout with its cells (cells name the layout's areas), while a cells-only edit merges
+  cells by id. When the accepted list still equals the previous file's list, the new list is
+  taken whole (a reorder lands). The function destructures `MultiviewConfig` exhaustively, so a new section is a
   compile error until the merge decides how an edit carries it.
 * A file whose document did not change (a touch, a reformat, the unchanged boot file at start)
   is no edit at all, even where the accepted state differs from the file.
@@ -128,22 +132,33 @@ output when one `[control] ui_dir` key changed (#367).
   does not combine with the accepted state (e.g. the file drops a source the accepted
   switcher uses) is refused whole and latched like an invalid document; nothing is written.
 * The live apply (§4) diffs the merged document against the running baseline, as before.
-* Before a file commit **removes sources, outputs, the switcher (or an M/E) or audio routes
-  that exist in the accepted state**, the watcher keeps a byte copy of the accepted envelope as
-  `.multiview/rejected/replaced-<unix-ms>-<n>.json` (owner-only, atomic, deduplicated,
-  newest 5 kept) and raises the latched critical warning **`config-file-removed-accepted`**
+* Before a file commit **removes sources, outputs, the switcher (or an M/E), audio routes or
+  IPTV entries that exist in the accepted state**, the watcher keeps a byte copy of the accepted envelope as
+  `.multiview/rejected/replaced-<unix-ms>-<n>.json` (owner-only, atomic, deduplicated by
+  reading only same-size regular files, never a symlink; at most 1000 name attempts; newest 5
+  kept) and raises the latched critical warning **`config-file-removed-accepted`**
   naming every removed item and the copy's path. No copy, no commit (the edit is retried).
 
-### 3b. No watcher commit during shutdown (#367)
+### 3b. No accepted-state commit after the exit decision (#367)
 
-The watcher commits nothing once an exit is decided or the engine's command bus is closed.
-The run stops the watcher the moment it decides to exit (the stop-signal task and the
-exit-durable thread, #309), not at the late tenant teardown; and every commit path checks
-"stopped or bus closed" **under the config-mutation lock, after waiting for it**, so a commit
-can never start after the decision to stop. On #367 the old process's watcher committed the
-file while its engine was already gone (`command bus receiver is closed`). A file edit seen
-during shutdown is applied by the next process from its own boot state; the accepted state is
-never written by a dying process.
+Once the run decides to exit, nothing writes the accepted state any more. On #367 the old
+process's watcher committed the file while its engine was already gone (`command bus receiver
+is closed`).
+
+* Every exit decision **freezes the accepted state** (`AppState::freeze_accepted_state`) and
+  stops the watcher: the stop-signal task, the exit-durable thread (#309, any armed exit on
+  the pipeline path), and the return of either drive loop (stop, fatal fault or error, on both
+  the pipeline and the software path), before tenant teardown and the final persist.
+* The durable write (`write_desired`, which every accepted-state commit goes through: the
+  watcher, the REST mutations and revert-to-start) re-checks the freeze **under its write
+  serial, immediately before the rename**. A commit that was already past every earlier check
+  when the exit was decided fails, and so does one waiting behind another write.
+* The watcher also checks "stopped, frozen, or command bus closed" under the config-mutation
+  lock before every commit path. A closed bus (the receiver already dropped) is only a
+  backstop: it becomes true after the exit decision, never in a normal run.
+
+A file edit seen during shutdown is applied by the next process from its own boot state; a
+dying process never writes the accepted state.
 
 ### 4. Apply each diff item through the SAME machinery the API uses
 

@@ -215,3 +215,98 @@ fn a_file_audio_route_edit_keeps_the_accepted_routes() {
         .collect();
     assert_eq!(tracks, [Some("clean".to_owned()), Some("file".to_owned())]);
 }
+
+/// Review L1-2: a cosmetic canvas edit keeps the accepted pinned signal.
+#[test]
+fn a_canvas_background_edit_keeps_the_accepted_resolution() {
+    let prev = parse(&boot("/srv/ui-old"));
+    let next = parse(&boot("/srv/ui-old").replace("#101014", "#202020"));
+    let accepted = parse(
+        &accepted()
+            .replacen("width = 64", "width = 128", 1)
+            .replacen("height = 64", "height = 128", 1),
+    );
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    assert_eq!((merged.canvas.width, merged.canvas.height), (128, 128));
+    assert_eq!(merged.canvas.background, "#202020");
+}
+
+/// Review L1-3a: a cells-only file edit keeps the accepted binding of the
+/// cell it did not touch.
+#[test]
+fn a_cells_only_edit_merges_cells_by_id() {
+    let doc = |left: &str, right: &str| {
+        let grid = boot("/srv/ui-old")
+            .replace("columns = [\"1fr\"]", "columns = [\"1fr\", \"1fr\"]")
+            .replace("areas = [\"a\"]", "areas = [\"a b\"]")
+            .replace(
+                "[[sources]]\nid = \"in_hls\"\nkind = \"bars\"\n",
+                "[[sources]]\nid = \"in_hls\"\nkind = \"bars\"\n[[sources]]\nid = \"in_b\"\nkind = \"bars\"\n",
+            )
+            .replace(
+                "[cells.source]\ninput_id = \"in_hls\"\n",
+                &format!(
+                    "[cells.source]\ninput_id = \"{left}\"\n[[cells]]\nid = \"d\"\narea = \"b\"\n[cells.source]\ninput_id = \"{right}\"\n"
+                ),
+            );
+        parse(&grid)
+    };
+    let prev = doc("in_hls", "in_hls");
+    let next = doc("in_hls", "in_b"); // the file rebinds `d`
+    let accepted = doc("in_b", "in_hls"); // the API rebound `c`
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    merged.validate().unwrap();
+    assert_eq!(
+        merged.cells[0], accepted.cells[0],
+        "the API binding of c stays"
+    );
+    assert_eq!(
+        merged.cells[1], next.cells[1],
+        "the file's binding of d lands"
+    );
+}
+
+/// Review L1-3b: an edit of one M/E field keeps the accepted other fields.
+#[test]
+fn a_switcher_field_edit_keeps_the_accepted_other_fields() {
+    let me = |program: &str, flip: bool| {
+        format!(
+            "[switcher]\n[[switcher.mix_effects]]\nid = \"me1\"\nprogram = \"main\"\nprogram_source = \"{program}\"\npreview_source = \"in_c\"\nflip_flop = {flip}\n"
+        )
+    };
+    let base = accepted();
+    let prev = parse(&format!("{base}{}", me("in_b", true)));
+    let next = parse(&format!("{base}{}", me("in_hls", true)));
+    let accepted = parse(&format!("{base}{}", me("in_b", false)));
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    let m = &merged.switcher.as_ref().unwrap().mix_effects[0];
+    assert_eq!(m.program_source, "in_hls");
+    assert!(!m.flip_flop, "the API-set flip_flop stays");
+}
+
+/// Review L1-1: a file edit of one IPTV key keeps the API-published entries,
+/// and a removed entry is reported.
+#[test]
+fn an_iptv_key_edit_keeps_the_published_entries() {
+    let iptv = |enabled: bool, entry: bool| {
+        let mut text = format!("[iptv]\nenabled = {enabled}\nguide_refresh_minutes = 30\n");
+        if entry {
+            text.push_str("[[iptv.entries]]\nkind = \"output\"\nref = \"restream\"\n");
+        }
+        text
+    };
+    let file = boot("/srv/ui-old");
+    let prev = parse(&format!("{file}{}", iptv(false, false)));
+    let next = parse(&format!("{file}{}", iptv(true, false)));
+    let accepted = parse(&format!("{}{}", accepted(), iptv(false, true)));
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    let out = merged.iptv.as_ref().unwrap();
+    assert!(out.enabled);
+    assert_eq!(out.entries.len(), 1, "the published entry stays");
+    let mut gone = merged.clone();
+    gone.iptv.as_mut().unwrap().entries.clear();
+    assert_eq!(
+        removed_accepted_items(&accepted, &gone),
+        ["iptv entry restream"]
+    );
+}

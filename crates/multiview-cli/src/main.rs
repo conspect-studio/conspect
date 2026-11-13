@@ -37,6 +37,37 @@ use multiview_telemetry::tracing_init::SubscriberBuilder;
 /// `active.toml` write per window (~2 s), coalescing a burst of live changes.
 const RUNNING_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// What an exit decision freezes (#367): the config-file watcher stops, and
+/// the accepted state (`desired.json`) takes no further commit from any path
+/// (the watcher, a REST mutation, a revert). Cloneable into the signal task and
+/// the exit-durable thread; [`Self::freeze`] is wait-free and idempotent.
+#[derive(Clone)]
+struct ExitFreeze {
+    watch: Option<multiview_cli::config_watch::ConfigWatchHandle>,
+    state: Option<multiview_control::AppState>,
+}
+
+impl ExitFreeze {
+    fn new(
+        watch: Option<&multiview_cli::config_watch::ConfigWatchHandle>,
+        state: Option<&multiview_control::AppState>,
+    ) -> Self {
+        Self {
+            watch: watch.cloned(),
+            state: state.cloned(),
+        }
+    }
+
+    fn freeze(&self) {
+        if let Some(state) = &self.state {
+            state.freeze_accepted_state();
+        }
+        if let Some(watch) = &self.watch {
+            watch.stop();
+        }
+    }
+}
+
 /// The run's handle on the debounced ADR-W024 Running persister: the spawned
 /// task plus the served [`multiview_control::AppState`] it persists from.
 struct RunningPersist {
@@ -1264,14 +1295,15 @@ async fn run_pipeline_until_ctrl_c(
     // #367: the config-file watcher stops committing the moment an exit is
     // decided, not at the late tenant teardown: a boot-file edit seen during
     // shutdown must never be written over the accepted state.
-    let watch_for_signal = config_watch.clone();
+    let freeze_for_signal = ExitFreeze::new(
+        config_watch.as_ref(),
+        running_persist.as_ref().map(|p| &p.state),
+    );
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
         // #309: decide first, log second.
         stop_for_signal.stop();
-        if let Some(watch) = &watch_for_signal {
-            watch.stop();
-        }
+        freeze_for_signal.freeze();
         multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
@@ -1285,7 +1317,10 @@ async fn run_pipeline_until_ctrl_c(
     // (the persist writes the same Running state again; idempotent).
     let early_persist_state = running_persist.as_ref().map(|p| p.state.clone());
     let decided_drain = std::sync::Arc::clone(&early_drain);
-    let decided_watch = config_watch.clone();
+    let decided_freeze = ExitFreeze::new(
+        config_watch.as_ref(),
+        running_persist.as_ref().map(|p| &p.state),
+    );
     // A dedicated OS thread with its own small runtime: the main runtime's
     // workers can be busy with the synchronous pipeline teardown (a task parked
     // behind it would miss the bound), and this work must not depend on them.
@@ -1302,9 +1337,7 @@ async fn run_pipeline_until_ctrl_c(
             }
             // #367: no config-file commit after an exit is decided (a fatal
             // output fault as well as a stop signal).
-            if let Some(watch) = &decided_watch {
-                watch.stop();
-            }
+            decided_freeze.freeze();
             // Begin the control plane's graceful drain now (the deadline cuts it).
             decided_drain.notify_one();
             // Journal counters first (bounded wait for the worker to apply it):
@@ -1448,9 +1481,17 @@ async fn run_pipeline_until_ctrl_c(
     // MP-1 (ADR-0030 §2.2): build the engine `ProgramSet` and drive this single
     // program (id "main") through it — behaviour-identical to today (one program,
     // the same drive/stop/publisher/preview/drain). See `drive_main_program_in_set`.
+    let exit_freeze = ExitFreeze::new(
+        config_watch.as_ref(),
+        running_persist.as_ref().map(|p| &p.state),
+    );
     let report =
-        drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain)
-            .await?;
+        drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain).await;
+    // #367: the drive loop returned (a stop, a fatal fault, or an error): the
+    // run is exiting, so no config-file commit may write the accepted state
+    // from here on, whatever made it return.
+    exit_freeze.freeze();
+    let report = report?;
     let tenants_start = std::time::Instant::now();
 
     // The run is over: release this generation's preview demand explicitly
@@ -1776,14 +1817,15 @@ async fn run_software_until_ctrl_c(
     // #367: the config-file watcher stops committing the moment an exit is
     // decided, not at the late tenant teardown: a boot-file edit seen during
     // shutdown must never be written over the accepted state.
-    let watch_for_signal = config_watch.clone();
+    let freeze_for_signal = ExitFreeze::new(
+        config_watch.as_ref(),
+        running_persist.as_ref().map(|p| &p.state),
+    );
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
         // #309: decide first, log second.
         stop_for_signal.stop();
-        if let Some(watch) = &watch_for_signal {
-            watch.stop();
-        }
+        freeze_for_signal.freeze();
         multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
@@ -1835,6 +1877,13 @@ async fn run_software_until_ctrl_c(
     let report = engine
         .run_until_stopped_with_control(&stop, publisher.as_ref(), drain)
         .await;
+    // #367: the engine loop returned (a stop or an error): the run is exiting,
+    // so no config-file commit may write the accepted state from here on.
+    ExitFreeze::new(
+        config_watch.as_ref(),
+        running_persist.as_ref().map(|p| &p.state),
+    )
+    .freeze();
     if report.is_err() {
         // #309: an engine error is an exit decision.
         multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);

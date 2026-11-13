@@ -189,10 +189,14 @@ pub fn keep_rejected_copy_with(
     writer: &AtomicWriter<'_>,
 ) -> Result<PathBuf, String> {
     let rejected_dir = state_dir_for(boot_path).join(REJECTED_DIR);
-    if let Some(existing) = rejected_files(&rejected_dir)
-        .into_iter()
-        .find(|p| std::fs::read_to_string(p).is_ok_and(|kept| kept == rejected_text))
-    {
+    if let Some(existing) = rejected_files(&rejected_dir).into_iter().find(|p| {
+        // Only a regular file of the same size is read (never a symlink,
+        // FIFO or an oversized file planted in the directory).
+        std::fs::symlink_metadata(p).is_ok_and(|m| {
+            m.file_type().is_file()
+                && u64::try_from(rejected_text.len()).is_ok_and(|len| m.len() == len)
+        }) && std::fs::read_to_string(p).is_ok_and(|kept| kept == rejected_text)
+    }) {
         // The bound holds on a reuse too (files may have been dropped in by
         // hand or by an older build); the reused copy is never pruned.
         prune_rejected(&rejected_dir, &existing);

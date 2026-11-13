@@ -17,17 +17,28 @@
 //! added or changed takes the file's value, an item the file removed is
 //! removed, and every other accepted item stays. When the accepted section is
 //! still exactly what the previous file said (nothing diverged), the new
-//! file's section is taken whole, so a pure reorder still lands. The working
-//! canvas is one unit, and `layout` + `cells` are one unit (cells name the
-//! layout's areas).
+//! file's section is taken whole, so a pure reorder still lands. Inside a
+//! few sections the unit is smaller: the canvas's pinned signal (width,
+//! height, cadence) is one unit and each other canvas axis its own; the
+//! switcher and the IPTV publication merge field by field (M/Es by id, IPTV
+//! entries by kind + ref); a layout change takes the file's layout with its
+//! cells (cells name the layout's areas), a cells-only edit merges cells by id.
 //!
 //! Pure and total: no I/O. The caller validates the merged document (a merge
 //! can combine an edit with accepted content into a document that no longer
 //! validates; that edit is refused, never half-applied).
 
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+
 use crate::audio::AudioRouting;
+use crate::iptv::IptvConfig;
 use crate::routing::RoutingTable;
-use crate::MultiviewConfig;
+use crate::switcher::SwitcherConfig;
+use crate::{Canvas, MultiviewConfig};
 
 /// Pick a whole section: the file's new value when the file changed it,
 /// otherwise the accepted value.
@@ -43,11 +54,24 @@ fn section<T: PartialEq + Clone>(prev: &T, next: &T, accepted: &T) -> T {
 /// accepted items stay in their accepted order; items the file added are
 /// appended in the file's order. When the accepted list still equals the
 /// previous file's list, the new file's list is taken whole (keeps a reorder).
-fn keyed<T: PartialEq + Clone, K: PartialEq>(
+/// Linear in the list sizes (hash-indexed by key).
+fn keyed<T: PartialEq + Clone, K: Eq + Hash>(
     prev: &[T],
     next: &[T],
     accepted: &[T],
     key: impl Fn(&T) -> K,
+) -> Vec<T> {
+    keyed_with(prev, next, accepted, key, |_, after, _| after.clone())
+}
+
+/// [`keyed`] where an item the file changed and the accepted state still has
+/// is combined by `combine(before, after, accepted)` instead of replaced.
+fn keyed_with<'a, T: PartialEq + Clone, K: Eq + Hash>(
+    prev: &'a [T],
+    next: &'a [T],
+    accepted: &[T],
+    key: impl Fn(&T) -> K,
+    combine: impl Fn(&T, &T, &T) -> T,
 ) -> Vec<T> {
     if prev == next {
         return accepted.to_vec();
@@ -55,36 +79,154 @@ fn keyed<T: PartialEq + Clone, K: PartialEq>(
     if prev == accepted {
         return next.to_vec();
     }
-    let find = |list: &[T], k: &K| list.iter().find(|item| key(item) == *k).cloned();
+    let index = |list: &'a [T]| -> HashMap<K, &'a T> {
+        let mut map = HashMap::with_capacity(list.len());
+        for item in list {
+            map.entry(key(item)).or_insert(item);
+        }
+        map
+    };
+    let (prev_at, next_at) = (index(prev), index(next));
     let mut merged: Vec<T> = Vec::with_capacity(accepted.len().max(next.len()));
+    let mut present: HashSet<K> = HashSet::with_capacity(merged.capacity());
     for item in accepted {
         let k = key(item);
-        let before = find(prev, &k);
-        let after = find(next, &k);
+        let before = prev_at.get(&k).copied();
+        let after = next_at.get(&k).copied();
         match (before, after) {
             // The file removed it: the edit removes it.
-            (Some(_), None) => {}
-            // The file changed it: the edit wins.
-            (Some(before), Some(after)) if before != after => merged.push(after),
+            (Some(_), None) => continue,
+            // The file changed it: the edit's change wins.
+            (Some(before), Some(after)) if before != after => {
+                merged.push(combine(before, after, item));
+            }
             // The file added an id the accepted state already has: the
             // file's explicit value wins.
-            (None, Some(after)) => merged.push(after),
+            (None, Some(after)) => merged.push(after.clone()),
             // Untouched by the edit: the accepted value stays.
             _ => merged.push(item.clone()),
         }
+        present.insert(k);
     }
     for item in next {
         let k = key(item);
-        let in_prev = prev.iter().any(|p| key(p) == k);
-        let in_merged = merged.iter().any(|m| key(m) == k);
+        if present.contains(&k) {
+            continue;
+        }
         // Added by the file (absent before), or changed by the file while the
-        // accepted state had removed it: the edit re-creates it.
-        let changed = prev.iter().find(|p| key(p) == k).is_some_and(|p| p != item);
-        if !in_merged && (!in_prev || changed) {
+        // accepted state had removed it: the edit (re-)creates it.
+        let keep = prev_at.get(&k).is_none_or(|before| *before != item);
+        if keep {
             merged.push(item.clone());
+            present.insert(k);
         }
     }
     merged
+}
+
+/// Merge one object field by field (one level): a field the file changed
+/// takes the file's value, every other field keeps the accepted value. When
+/// the result does not deserialize (e.g. a tagged enum whose kind changed), the
+/// file's whole value is taken.
+fn fields<T: PartialEq + Clone + Serialize + DeserializeOwned>(
+    prev: &T,
+    next: &T,
+    accepted: &T,
+) -> T {
+    if prev == next {
+        return accepted.clone();
+    }
+    if prev == accepted {
+        return next.clone();
+    }
+    let as_object = |value: &T| match serde_json::to_value(value) {
+        Ok(serde_json::Value::Object(map)) => Some(map),
+        _ => None,
+    };
+    let (Some(p), Some(n), Some(mut out)) = (as_object(prev), as_object(next), as_object(accepted))
+    else {
+        return next.clone();
+    };
+    let keys: HashSet<&String> = p.keys().chain(n.keys()).collect();
+    for k in keys {
+        if p.get(k) == n.get(k) {
+            continue;
+        }
+        match n.get(k) {
+            Some(value) => {
+                out.insert(k.clone(), value.clone());
+            }
+            None => {
+                out.remove(k);
+            }
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(out)).unwrap_or_else(|_| next.clone())
+}
+
+/// The canvas: the pinned signal (width, height, cadence) is one unit — it
+/// changes together or not at all (ADR-R004) — and every other axis (pixel
+/// format, background, colour) is its own unit.
+fn merge_canvas(prev: &Canvas, next: &Canvas, accepted: &Canvas) -> Canvas {
+    let signal = |c: &Canvas| (c.width, c.height, c.fps);
+    let mut out = accepted.clone();
+    if signal(prev) != signal(next) {
+        out.width = next.width;
+        out.height = next.height;
+        out.fps = next.fps;
+    }
+    out.pixel_format = section(
+        &prev.pixel_format,
+        &next.pixel_format,
+        &accepted.pixel_format,
+    );
+    out.background = section(&prev.background, &next.background, &accepted.background);
+    out.color = section(&prev.color, &next.color, &accepted.color);
+    out
+}
+
+/// `[switcher]`: root fields one by one, M/Es keyed by id and merged field
+/// by field (so an edit of `program_source` keeps an API-set `flip_flop`).
+fn merge_switcher(
+    prev: Option<&SwitcherConfig>,
+    next: Option<&SwitcherConfig>,
+    accepted: Option<&SwitcherConfig>,
+) -> Option<SwitcherConfig> {
+    if prev == next {
+        return accepted.cloned();
+    }
+    let (Some(p), Some(n), Some(a)) = (prev, next, accepted) else {
+        // Added or removed as a whole by the file: the file said so.
+        return next.cloned();
+    };
+    let mut out = fields(p, n, a);
+    out.mix_effects = keyed_with(
+        &p.mix_effects,
+        &n.mix_effects,
+        &a.mix_effects,
+        |m| m.id.clone(),
+        fields,
+    );
+    Some(out)
+}
+
+/// `[iptv]`: scalars one by one, entries keyed by `(kind, ref)`.
+fn merge_iptv(
+    prev: Option<&IptvConfig>,
+    next: Option<&IptvConfig>,
+    accepted: Option<&IptvConfig>,
+) -> Option<IptvConfig> {
+    if prev == next {
+        return accepted.cloned();
+    }
+    let (Some(p), Some(n), Some(a)) = (prev, next, accepted) else {
+        return next.cloned();
+    };
+    let mut out = fields(p, n, a);
+    out.entries = keyed(&p.entries, &n.entries, &a.entries, |e| {
+        (e.kind, e.reference.clone())
+    });
+    Some(out)
 }
 
 /// `[audio]`: the sample rate is one value, the routes are keyed by
@@ -197,16 +339,20 @@ pub fn merge_file_edit(
     } = prev_file;
     let n = next_file;
     let a = accepted;
-    // `layout` + `cells` are one unit: the cells name the layout's areas.
-    let layout_unit_changed = p_layout != &n.layout || p_cells != &n.cells;
-    let (layout, cells) = if layout_unit_changed {
-        (n.layout.clone(), n.cells.clone())
+    // A layout change takes the file's layout AND cells (the cells name the
+    // layout's areas, so accepted cells cannot be carried onto a new layout).
+    // A cells-only edit merges the cells by id.
+    let (layout, cells) = if p_layout == &n.layout {
+        (
+            a.layout.clone(),
+            keyed(p_cells, &n.cells, &a.cells, |c| c.id.clone()),
+        )
     } else {
-        (a.layout.clone(), a.cells.clone())
+        (n.layout.clone(), n.cells.clone())
     };
     MultiviewConfig {
         schema_version: section(p_schema_version, &n.schema_version, &a.schema_version),
-        canvas: section(p_canvas, &n.canvas, &a.canvas),
+        canvas: merge_canvas(p_canvas, &n.canvas, &a.canvas),
         layout,
         sources: keyed(p_sources, &n.sources, &a.sources, |s| s.id.clone()),
         cells,
@@ -230,7 +376,11 @@ pub fn merge_file_edit(
         api: section(p_api, &n.api, &a.api),
         placement: section(p_placement, &n.placement, &a.placement),
         audio: merge_audio(p_audio.as_ref(), n.audio.as_ref(), a.audio.as_ref()),
-        switcher: section(p_switcher, &n.switcher, &a.switcher),
+        switcher: merge_switcher(
+            p_switcher.as_ref(),
+            n.switcher.as_ref(),
+            a.switcher.as_ref(),
+        ),
         routing: merge_routing(p_routing.as_ref(), n.routing.as_ref(), a.routing.as_ref()),
         discovery: section(p_discovery, &n.discovery, &a.discovery),
         catalogues: section(p_catalogues, &n.catalogues, &a.catalogues),
@@ -258,7 +408,7 @@ pub fn merge_file_edit(
                 |l| l.id.clone(),
             ),
         },
-        iptv: section(p_iptv, &n.iptv, &a.iptv),
+        iptv: merge_iptv(p_iptv.as_ref(), n.iptv.as_ref(), a.iptv.as_ref()),
         graphics: Box::new(crate::graphics::GraphicsConfig {
             data_sources: keyed(
                 &p_graphics.data_sources,
@@ -313,6 +463,22 @@ pub fn removed_accepted_items(accepted: &MultiviewConfig, merged: &MultiviewConf
             }
         }
         _ => {}
+    }
+    let entries = |config: &MultiviewConfig| {
+        config
+            .iptv
+            .as_ref()
+            .map(|iptv| iptv.entries.clone())
+            .unwrap_or_default()
+    };
+    let merged_entries = entries(merged);
+    for entry in entries(accepted) {
+        if !merged_entries
+            .iter()
+            .any(|e| e.kind == entry.kind && e.reference == entry.reference)
+        {
+            removed.push(format!("iptv entry {}", entry.reference));
+        }
     }
     let routes = |config: &MultiviewConfig| {
         config

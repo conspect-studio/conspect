@@ -945,6 +945,11 @@ pub struct AppState {
     /// across the engine bus — it serializes two rare admin operations and can
     /// never back-pressure the engine (invariant #10).
     config_mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Set once the run decided to exit (#367): from then on no commit writes
+    /// the accepted state (`desired.json`). Checked by the durable write itself,
+    /// after it holds the write serial, so a commit already in flight when the
+    /// exit is decided does not land either. One-way; never cleared.
+    accepted_frozen: Arc<std::sync::atomic::AtomicBool>,
     /// The coalescing **Running-changed** signal (ADR-W024 §3): a one-permit
     /// [`tokio::sync::Notify`] fired by [`AppState::audit`] — the ONE choke
     /// point every successful mutation passes through — that the debounced
@@ -1152,6 +1157,7 @@ impl AppState {
             watch_handle: Arc::new(std::sync::RwLock::new(None)),
             // The promote/revert mutation serial (ADR-W024 MAJOR-C2/C3).
             config_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            accepted_frozen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Honest default: nothing applies live until the binary declares
             // what the running engine can take (ADR-W022).
             live_apply: crate::live_apply::LiveApplyCaps::default(),
@@ -1289,6 +1295,21 @@ impl AppState {
     /// engine bus (invariant #10).
     pub async fn lock_config_mutation(&self) -> tokio::sync::OwnedMutexGuard<()> {
         Arc::clone(&self.config_mutation_lock).lock_owned().await
+    }
+
+    /// Freeze the accepted state (#367): the run decided to exit, so no commit
+    /// may write `desired.json` any more. Wait-free; call it at every exit
+    /// decision. One-way.
+    pub fn freeze_accepted_state(&self) {
+        self.accepted_frozen
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`Self::freeze_accepted_state`] ran.
+    #[must_use]
+    pub fn accepted_state_frozen(&self) -> bool {
+        self.accepted_frozen
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Declare what the **running** engine can take live (ADR-W022). The

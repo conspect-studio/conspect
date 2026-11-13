@@ -1449,12 +1449,16 @@ async fn commit_watched_desired(
     Ok(())
 }
 
-/// Whether the watcher must not commit any more (#367 (2)): shutdown began
-/// (the run stopped the watcher) or the engine's command bus is closed (the
-/// engine is gone, so the file and the running engine would disagree at the
-/// moment the state is written).
+/// Whether the watcher must not commit any more (#367 (2)). The exit
+/// decision is the signal: the run stops the watcher and freezes the accepted
+/// state at every exit decision (stop signal, fatal fault, drive-loop return).
+/// A closed command bus (the engine's receiver already dropped) is only a
+/// backstop. The durable write re-checks the freeze under its write serial,
+/// so a commit already past this check when the exit is decided never lands.
 fn shutting_down(state: &AppState, handle: &ConfigWatchHandle) -> bool {
-    handle.stop.load(Ordering::Acquire) || state.commands.is_closed()
+    handle.stop.load(Ordering::Acquire)
+        || state.accepted_state_frozen()
+        || state.commands.is_closed()
 }
 
 /// The accepted configuration a file edit applies onto (#367): the

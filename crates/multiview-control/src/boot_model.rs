@@ -295,10 +295,23 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
     let json = serde_json::to_string(&desired)
         .map_err(|e| ControlError::Repository(format!("serializing desired state: {e}")))?;
     let model = Arc::clone(model);
+    if state.accepted_state_frozen() {
+        return Err(shutting_down_error());
+    }
+    let frozen = state.clone();
     let result = tokio::task::spawn_blocking({
         let model = Arc::clone(&model);
         move || {
             let _serial = model.lock_writes();
+            // #367: re-checked under the write serial, immediately before the
+            // rename: a commit that was already past every earlier check when
+            // the run decided to exit (or waited behind another write) does
+            // not land.
+            if frozen.accepted_state_frozen() {
+                return Err(AtomicWriteError::BeforeRename(std::io::Error::other(
+                    SHUTTING_DOWN,
+                )));
+            }
             create_state_dir(&model.state_dir()).map_err(AtomicWriteError::BeforeRename)?;
             write_atomic_commit(&model.state_dir().join(DESIRED_FILE), &json)
         }
@@ -323,6 +336,14 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
         model.set_accepted(desired);
     }
     result
+}
+
+/// Why a commit was refused once the run decided to exit (#367).
+const SHUTTING_DOWN: &str = "the engine is shutting down; the accepted state is frozen";
+
+/// The error a commit gets once the accepted state is frozen (#367).
+fn shutting_down_error() -> ControlError {
+    ControlError::Repository(SHUTTING_DOWN.to_owned())
 }
 
 /// Read the accepted config. Before the first commit (migration of an existing
@@ -2349,6 +2370,9 @@ pub const REJECTED_DIR: &str = "rejected";
 /// How many `replaced-*.json` copies a boot-file edit keeps (oldest pruned).
 pub const MAX_REPLACED: usize = 5;
 
+/// How many names one millisecond's copy may try before failing closed.
+const MAX_NAME_ATTEMPTS: u32 = 1000;
+
 /// Keep a copy of a state about to be replaced (#367) as
 /// `<dir>/<prefix>-<13-digit ms>-<3-digit n>.json`: owner-only directory,
 /// atomic write, deduplicated (identical bytes already kept are reused) and
@@ -2394,20 +2418,23 @@ pub fn keep_state_copy(
             }
         }
     };
-    if let Some(existing) = list(dir)
-        .into_iter()
-        .find(|p| std::fs::read_to_string(p).is_ok_and(|kept| kept == content))
-    {
+    // Dedup reads only a regular file (never a symlink, FIFO or device:
+    // `DirEntry::file_type` does not follow links) whose size equals the new
+    // content's, so a planted or oversized file is never read.
+    if let Some(existing) = list(dir).into_iter().find(|p| {
+        std::fs::symlink_metadata(p).is_ok_and(|m| {
+            m.file_type().is_file() && u64::try_from(content.len()).is_ok_and(|len| m.len() == len)
+        }) && std::fs::read_to_string(p).is_ok_and(|kept| kept == content)
+    }) {
         prune(&existing);
         return Ok(existing);
     }
     create_state_dir(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let mut n = 0_u32;
-    let mut kept = dir.join(format!("{prefix}-{now_ms:013}-{n:03}.json"));
-    while kept.exists() {
-        n = n.saturating_add(1);
-        kept = dir.join(format!("{prefix}-{now_ms:013}-{n:03}.json"));
-    }
+    let free = |n: u32| dir.join(format!("{prefix}-{now_ms:013}-{n:03}.json"));
+    let kept = (0..MAX_NAME_ATTEMPTS)
+        .map(free)
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .ok_or_else(|| format!("no free copy name in {}", dir.display()))?;
     match write_atomic_commit(&kept, content) {
         Ok(()) => {}
         Err(AtomicWriteError::AfterRename(error))
