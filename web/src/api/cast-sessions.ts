@@ -21,13 +21,28 @@ import {
   readProblem,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
+import type { OutputVideoFeed } from './outputRouting';
 import type { components } from './types';
 
-/** One live cast session, exactly as the control plane returns it. */
-export type CastSession = components['schemas']['CastSessionDoc'];
+/**
+ * One live cast session as the control plane returns it. The optional fields
+ * past the generated doc are the receiver-state additions of the cast2 lane
+ * (`feed`, `player_state`, `idle_reason`, `last_report`); a server without
+ * them simply omits them, and `media_url` is redacted or absent for a token
+ * stream.
+ */
+export type CastSession = Omit<components['schemas']['CastSessionDoc'], 'media_url'> & {
+  readonly media_url?: string | null;
+  readonly feed?: unknown;
+  readonly player_state?: string | null;
+  readonly idle_reason?: string | null;
+  readonly last_report?: { readonly received_unix_ms: number; readonly report: unknown } | null;
+};
 
-/** The body of a start-cast-session request. */
-export type StartCastSessionRequest = components['schemas']['StartCastSessionRequest'];
+/** The body of a start-cast-session request (`feed`: what to show, as a cast stream takes it). */
+export type StartCastSessionRequest = components['schemas']['StartCastSessionRequest'] & {
+  readonly feed?: OutputVideoFeed;
+};
 
 /** The body of a save (promote-to-device) request. */
 export type SaveCastSessionRequest = components['schemas']['SaveCastSessionRequest'];
@@ -50,7 +65,6 @@ function isCastSession(value: unknown): value is CastSession {
     isRecord(value) &&
     typeof value.address === 'string' &&
     typeof value.id === 'string' &&
-    typeof value.media_url === 'string' &&
     typeof value.output === 'string' &&
     typeof value.state === 'string'
   );
