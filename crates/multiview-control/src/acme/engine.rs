@@ -46,6 +46,26 @@ const BACKOFF_BASE: Duration = Duration::from_secs(15 * 60);
 const BACKOFF_CAP: Duration = Duration::from_secs(6 * 60 * 60);
 /// No retry or recheck is ever scheduled sooner than this.
 const MIN_DELAY: Duration = Duration::from_secs(60);
+/// How long a TLS-ALPN-01 attempt waits for the front door's `acme-tls/1`
+/// responder before ordering (boot: the door installs it after the control
+/// plane is built).
+pub const RESPONDER_WAIT: Duration = Duration::from_secs(60);
+/// Deadline of each best-effort call after a failure (authorization refresh
+/// for the problem detail, deactivation of a stale pending authorization).
+const AFTERMATH_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total of the TXT removals after one attempt (each call also keeps
+/// [`CLEANUP_CALL_TIMEOUT`]); what is not removed stays in the ledger.
+const AFTERMATH_TXT_TOTAL: Duration = Duration::from_secs(30);
+/// Total of the deactivation of a failed order's pending authorizations.
+const AFTERMATH_DEACTIVATE_TOTAL: Duration = Duration::from_secs(30);
+/// Total deadline of everything after an attempt (TXT removal, then
+/// deactivation): the sum of the two caps above, enforced on its own.
+pub const AFTERMATH_TOTAL: Duration = Duration::from_secs(60);
+/// On `Shutdown` during an attempt: the most spent removing published TXT
+/// records (under the 2 s `AcmeHandle` drop budget).
+const SHUTDOWN_CLEANUP: Duration = Duration::from_secs(1);
+/// Longest human failure detail kept (bytes, cut on a char boundary).
+pub const DETAIL_CAP: usize = 512;
 /// Fallback-renewal jitter cap.
 const JITTER_CAP_S: i64 = 24 * 60 * 60;
 /// Longest the service sleeps before re-evaluating its schedule.
@@ -200,6 +220,282 @@ fn acme_category(error: &instant_acme::Error, default: AcmeError) -> AcmeError {
         }
         instant_acme::Error::Timeout(_) => AcmeError::Timeout,
         _ => default,
+    }
+}
+
+/// Bound and sanitize a human failure detail: control characters become
+/// spaces (runs collapsed), the result is trimmed and cut at [`DETAIL_CAP`]
+/// bytes on a char boundary. `None` when nothing printable is left.
+#[must_use]
+pub fn sanitize_detail(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len().min(DETAIL_CAP));
+    let mut space = false;
+    for c in raw.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if c == ' ' {
+            if space || out.is_empty() {
+                continue;
+            }
+            space = true;
+        } else {
+            space = false;
+        }
+        if out.len() + c.len_utf8() > DETAIL_CAP {
+            break;
+        }
+        out.push(c);
+    }
+    let trimmed = out.trim_end();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// The short problem type (`urn:ietf:params:acme:error:` stripped).
+fn short_type(kind: Option<&str>) -> &str {
+    kind.map_or("", |t| {
+        t.strip_prefix("urn:ietf:params:acme:error:").unwrap_or(t)
+    })
+}
+
+/// An identifier as text, cut at [`DETAIL_FIELD_CAP`] bytes (CA-supplied).
+fn identifier_text(identifier: &Identifier) -> String {
+    match identifier {
+        Identifier::Dns(name) => prefix_within(name, DETAIL_FIELD_CAP).to_owned(),
+        Identifier::Ip(ip) => ip.to_string(),
+        _ => "identifier".to_owned(),
+    }
+}
+
+/// Append an authorization's identifier (`*.` for a wildcard), bounded.
+fn write_identifier(out: &mut DetailBuf, authz: &instant_acme::AuthorizationState) {
+    if authz.wildcard {
+        out.push("*.");
+    }
+    out.field(&identifier_text(authz.identifier().identifier));
+}
+
+/// Longest single CA-supplied field (type, detail, identifier) copied into a
+/// failure detail (bytes, cut on a char boundary).
+const DETAIL_FIELD_CAP: usize = 200;
+/// Most subproblems / authorizations / challenges formatted into one detail.
+const DETAIL_ITEMS_CAP: usize = 8;
+
+/// A string builder that never holds more than [`DETAIL_CAP`] bytes: every
+/// append is cut at the remaining room on a char boundary and appends after
+/// the cap are no-ops. CA text (problem documents, authorizations) is only
+/// ever formatted through it, so a hostile or broken CA cannot make us
+/// allocate more than [`DETAIL_CAP`] bytes per detail, whatever it sends.
+#[derive(Debug, Default)]
+struct DetailBuf {
+    out: String,
+}
+
+impl DetailBuf {
+    fn new() -> Self {
+        Self {
+            out: String::with_capacity(DETAIL_CAP),
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.out.len() >= DETAIL_CAP
+    }
+
+    /// Append `text`, cut at the room left (char boundary).
+    fn push(&mut self, text: &str) {
+        let room = DETAIL_CAP.saturating_sub(self.out.len());
+        self.out.push_str(prefix_within(text, room));
+    }
+
+    /// Append one CA-supplied field, first cut at [`DETAIL_FIELD_CAP`].
+    fn field(&mut self, text: &str) {
+        self.push(prefix_within(text, DETAIL_FIELD_CAP));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.out.is_empty()
+    }
+
+    fn finish(self) -> String {
+        self.out
+    }
+}
+
+/// The longest prefix of `text` of at most `max` bytes ending on a char boundary.
+fn prefix_within(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Append a CA problem document to `out` (see [`describe_problem`]).
+fn write_problem(out: &mut DetailBuf, problem: &instant_acme::Problem) {
+    let kind = short_type(problem.r#type.as_deref());
+    out.field(if kind.is_empty() { "problem" } else { kind });
+    if let Some(detail) = problem.detail.as_deref().filter(|d| !d.is_empty()) {
+        out.push(": ");
+        out.field(detail);
+    }
+    for (index, sub) in problem.subproblems.iter().enumerate() {
+        if out.is_full() {
+            return;
+        }
+        if index == DETAIL_ITEMS_CAP {
+            out.push(&format!(
+                "; and {} more subproblems",
+                problem.subproblems.len() - DETAIL_ITEMS_CAP
+            ));
+            return;
+        }
+        out.push("; [");
+        match &sub.identifier {
+            Some(identifier) => out.field(&identifier_text(identifier)),
+            None => out.push("?"),
+        }
+        out.push("] ");
+        let kind = short_type(sub.r#type.as_deref());
+        out.field(if kind.is_empty() { "problem" } else { kind });
+        if let Some(detail) = sub.detail.as_deref().filter(|d| !d.is_empty()) {
+            out.push(": ");
+            out.field(detail);
+        }
+    }
+}
+
+/// Human text of a CA problem document: `type: detail`, then up to
+/// [`DETAIL_ITEMS_CAP`] subproblems as `[identifier] type: detail`; each
+/// field cut at [`DETAIL_FIELD_CAP`] and the whole at [`DETAIL_CAP`] bytes
+/// (built in a [`DetailBuf`], never larger). Unsanitized: callers pass the
+/// result through [`sanitize_detail`]. CA problem text never carries our
+/// credentials; our requests and headers are never formatted.
+#[must_use]
+pub fn describe_problem(problem: &instant_acme::Problem) -> String {
+    let mut out = DetailBuf::new();
+    write_problem(&mut out, problem);
+    out.finish()
+}
+
+/// Human text of an instant-acme error: the CA's problem, else a short
+/// local category (never `Display` of transport errors, which may echo URLs).
+fn describe_error(error: &instant_acme::Error) -> Option<String> {
+    match error {
+        instant_acme::Error::Api(problem) => Some(describe_problem(problem)),
+        instant_acme::Error::Timeout(_) => {
+            Some("timed out waiting for the CA to update the order".to_owned())
+        }
+        instant_acme::Error::Other(inner) => inner
+            .downcast_ref::<HttpFailure>()
+            .map(|failure| format!("CA request failed ({})", failure.0.as_reason())),
+        _ => None,
+    }
+}
+
+/// The lowercase name of a challenge type (`tls-alpn-01`, …), bounded.
+fn challenge_name(kind: &ChallengeType) -> String {
+    match kind {
+        ChallengeType::Http01 => "http-01".to_owned(),
+        ChallengeType::Dns01 => "dns-01".to_owned(),
+        ChallengeType::TlsAlpn01 => "tls-alpn-01".to_owned(),
+        ChallengeType::DeviceAttest01 => "device-attest-01".to_owned(),
+        ChallengeType::Unknown(other) => prefix_within(other, DETAIL_FIELD_CAP).to_owned(),
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// Append an authorization that is not pending/valid, with up to
+/// [`DETAIL_ITEMS_CAP`] challenge errors.
+fn write_authorization(out: &mut DetailBuf, authz: &instant_acme::AuthorizationState) {
+    out.push("authorization for ");
+    write_identifier(out, authz);
+    out.push(&format!(" is {:?}", authz.status).to_ascii_lowercase());
+    for challenge in authz
+        .challenges
+        .iter()
+        .filter(|c| c.error.is_some())
+        .take(DETAIL_ITEMS_CAP)
+    {
+        if out.is_full() {
+            return;
+        }
+        if let Some(problem) = &challenge.error {
+            out.push("; ");
+            out.push(&challenge_name(&challenge.r#type));
+            out.push(" challenge: ");
+            write_problem(out, problem);
+        }
+    }
+}
+
+/// Describe an authorization that is not pending/valid, with any challenge
+/// errors (bounded like [`describe_problem`]).
+fn describe_authorization(authz: &instant_acme::AuthorizationState) -> String {
+    let mut out = DetailBuf::new();
+    write_authorization(&mut out, authz);
+    out.finish()
+}
+
+/// The failure detail when `authz` offers no challenge of the `wanted` type
+/// (`None` when it does): the attempt cannot proceed for that identifier.
+fn missing_challenge_detail(
+    authz: &instant_acme::AuthorizationState,
+    wanted: &ChallengeType,
+) -> Option<String> {
+    if authz.challenges.iter().any(|c| c.r#type == *wanted) {
+        return None;
+    }
+    let mut out = DetailBuf::new();
+    out.push("the CA offers no ");
+    out.push(&challenge_name(wanted));
+    out.push(" challenge for ");
+    write_identifier(&mut out, authz);
+    let offered: Vec<String> = authz
+        .challenges
+        .iter()
+        .take(DETAIL_ITEMS_CAP)
+        .map(|c| challenge_name(&c.r#type))
+        .collect();
+    if offered.is_empty() {
+        out.push(" (it offers none)");
+    } else {
+        out.push(" (offered: ");
+        out.push(&offered.join(", "));
+        out.push(")");
+    }
+    Some(out.finish())
+}
+
+/// Append the `wanted` challenge's errors of one authorization (`; `
+/// separated), or the authorization itself when it is neither valid nor
+/// pending and nothing was written yet. Bounded by `out`.
+fn write_challenge_errors(
+    out: &mut DetailBuf,
+    state: &instant_acme::AuthorizationState,
+    wanted: &ChallengeType,
+) {
+    for challenge in state
+        .challenges
+        .iter()
+        .filter(|c| c.r#type == *wanted)
+        .take(DETAIL_ITEMS_CAP)
+    {
+        if let Some(problem) = &challenge.error {
+            if !out.is_empty() {
+                out.push("; ");
+            }
+            write_identifier(out, state);
+            out.push(": ");
+            write_problem(out, problem);
+        }
+    }
+    if state.status != AuthorizationStatus::Valid
+        && state.status != AuthorizationStatus::Pending
+        && out.is_empty()
+    {
+        write_authorization(out, state);
     }
 }
 
@@ -381,6 +677,14 @@ enum Published {
     Alpn(String),
 }
 
+/// What an attempt leaves behind for its aftermath.
+#[derive(Default)]
+struct Leftovers {
+    published: Vec<Published>,
+    /// The placed order (account + order URL), once one exists.
+    placed: Option<(Account, String)>,
+}
+
 /// The ACME engine for one `[network.tls]` configuration.
 pub struct AcmeEngine {
     config: NetworkTlsConfig,
@@ -396,6 +700,12 @@ pub struct AcmeEngine {
     alarm: Mutex<CertificateAlarm>,
     /// `(public host, period)`: rotate the bootstrap certificate this often while in setup.
     bootstrap_rotation: Option<(String, Duration)>,
+    /// Human detail of the last failed attempt (sanitized, bounded).
+    last_detail: Mutex<Option<String>>,
+    /// How long TLS-ALPN-01 waits for the responder ([`RESPONDER_WAIT`]).
+    responder_wait: Duration,
+    /// Total deadline of the post-attempt work ([`AFTERMATH_TOTAL`]).
+    aftermath_total: Duration,
 }
 
 impl std::fmt::Debug for AcmeEngine {
@@ -442,7 +752,44 @@ impl AcmeEngine {
             alarm_hook: None,
             alarm: Mutex::new(CertificateAlarm::None),
             bootstrap_rotation: None,
+            last_detail: Mutex::new(None),
+            responder_wait: RESPONDER_WAIT,
+            aftermath_total: AFTERMATH_TOTAL,
         })
+    }
+
+    /// Override how long a TLS-ALPN-01 attempt waits for the `acme-tls/1`
+    /// responder (default [`RESPONDER_WAIT`]; tests shorten it).
+    #[must_use]
+    pub fn with_responder_wait(mut self, wait: Duration) -> Self {
+        self.responder_wait = wait;
+        self
+    }
+
+    /// Override the total deadline of the post-attempt work (default
+    /// [`AFTERMATH_TOTAL`]; tests shorten it).
+    #[must_use]
+    pub fn with_aftermath_total(mut self, total: Duration) -> Self {
+        self.aftermath_total = total;
+        self
+    }
+
+    /// The human detail of the last failed [`Self::issue_once`] (sanitized,
+    /// at most [`DETAIL_CAP`] bytes), `None` after a success.
+    #[must_use]
+    pub fn last_failure_detail(&self) -> Option<String> {
+        self.last_detail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_detail(&self, detail: Option<String>) {
+        let detail = detail.and_then(|raw| sanitize_detail(&raw));
+        *self
+            .last_detail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = detail;
     }
 
     /// Rotate the 7-day bootstrap certificate every `every` while the source is
@@ -540,6 +887,12 @@ impl AcmeEngine {
         Ok(Some(ExternalAccountKey::new(kid.to_string(), &bytes)))
     }
 
+    /// Categorize an instant-acme error and keep its human detail.
+    fn note(&self, error: &instant_acme::Error, default: AcmeError) -> AcmeError {
+        self.set_detail(describe_error(error));
+        acme_category(error, default)
+    }
+
     /// Load the stored account for this directory, or register one.
     async fn account(&self) -> Result<Account, AcmeError> {
         let name = store::account_file_name(&self.directory_url)?;
@@ -555,7 +908,7 @@ impl AcmeEngine {
                 return Account::builder_with_http(self.http()?)
                     .from_credentials(credentials)
                     .await
-                    .map_err(|e| acme_category(&e, AcmeError::Authority));
+                    .map_err(|e| self.note(&e, AcmeError::Authority));
             }
             unreadable = Some(raw);
         }
@@ -574,7 +927,7 @@ impl AcmeEngine {
         let (account, credentials) = Account::builder_with_http(self.http()?)
             .create(&registration, self.directory_url.clone(), eab.as_ref())
             .await
-            .map_err(|e| acme_category(&e, AcmeError::Authority))?;
+            .map_err(|e| self.note(&e, AcmeError::Authority))?;
         let raw = zeroize::Zeroizing::new(
             serde_json::to_vec(&credentials).map_err(|_| AcmeError::Storage)?,
         );
@@ -705,13 +1058,180 @@ impl AcmeEngine {
         &self,
         replaces: Option<CertificateIdentifier<'static>>,
     ) -> Result<Issued, AcmeError> {
-        let mut published = Vec::new();
-        let result =
-            tokio::time::timeout(self.attempt_timeout, self.attempt(replaces, &mut published))
-                .await
-                .unwrap_or(Err(AcmeError::Timeout));
-        self.cleanup(published).await;
+        let mut leftovers = Leftovers::default();
+        let result = self.bounded_attempt(replaces, &mut leftovers).await;
+        self.aftermath(leftovers, result.is_err()).await;
+        if result.is_ok() {
+            self.set_detail(None);
+        }
         result
+    }
+
+    /// The attempt itself under [`Self::attempt_timeout`]; what it leaves
+    /// behind (published TXT/ALPN, the placed order) is recorded in
+    /// `leftovers` for [`Self::aftermath`].
+    async fn bounded_attempt(
+        &self,
+        replaces: Option<CertificateIdentifier<'static>>,
+        leftovers: &mut Leftovers,
+    ) -> Result<Issued, AcmeError> {
+        self.set_detail(None);
+        tokio::time::timeout(
+            self.attempt_timeout,
+            self.attempt(replaces, &mut leftovers.published, &mut leftovers.placed),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            if self.last_failure_detail().is_none() {
+                self.set_detail(Some(format!(
+                    "the whole attempt exceeded its {} s deadline",
+                    self.attempt_timeout.as_secs()
+                )));
+            }
+            Err(AcmeError::Timeout)
+        })
+    }
+
+    /// After the attempt (outside its timeout): ALPN challenges are removed at
+    /// once; then published TXT records are removed and, after a failure, the
+    /// placed order's pending authorizations are deactivated, all under ONE
+    /// total deadline ([`AFTERMATH_TOTAL`]; each step also keeps its own
+    /// cap). A TXT record not removed in time stays in the ledger and is
+    /// retried by [`Self::cleanup_pending`] at the next start. The service
+    /// loop additionally cuts this short on `Shutdown`.
+    async fn aftermath(&self, leftovers: Leftovers, failed: bool) {
+        let Leftovers { published, placed } = leftovers;
+        let published = self.remove_alpn(published);
+        let work = async {
+            if tokio::time::timeout(AFTERMATH_TXT_TOTAL, self.cleanup(published))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "acme: TXT cleanup timed out; left in the ledger for the next start"
+                );
+            }
+            if failed {
+                if let Some((account, url)) = placed {
+                    self.deactivate_pending(&account, url).await;
+                }
+            }
+        };
+        if tokio::time::timeout(self.aftermath_total, work)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "acme: post-attempt cleanup exceeded its {} s total; the rest is left",
+                self.aftermath_total.as_secs()
+            );
+        }
+    }
+
+    /// On `Shutdown` during an attempt: remove ALPN challenges and try the
+    /// published TXT records for at most [`SHUTDOWN_CLEANUP`] (the ledger
+    /// keeps whatever is left for the next start). No CA call is made.
+    async fn shutdown_cleanup(&self, leftovers: Leftovers) {
+        let published = self.remove_alpn(leftovers.published);
+        if published.is_empty() {
+            return;
+        }
+        if tokio::time::timeout(SHUTDOWN_CLEANUP, self.cleanup(published))
+            .await
+            .is_err()
+        {
+            tracing::warn!("acme: TXT cleanup cut short by shutdown; left in the ledger");
+        }
+    }
+
+    /// Remove every ALPN challenge (local, instant); returns the TXT items.
+    fn remove_alpn(&self, published: Vec<Published>) -> Vec<Published> {
+        published
+            .into_iter()
+            .filter(|item| match item {
+                Published::Alpn(name) => {
+                    self.resolver.remove(name);
+                    false
+                }
+                Published::Txt(_) => true,
+            })
+            .collect()
+    }
+
+    /// After a failed attempt that created an order: deactivate its
+    /// authorizations that are still `pending` (best effort, every call
+    /// bounded, errors only logged). Boulder (Let's Encrypt) hands an
+    /// existing pending ORDER for the same account and names back on the next
+    /// new-order request, so a pending order left behind (e.g. a DNS-01
+    /// attempt that timed out before `set_ready`) would otherwise be reused,
+    /// stale state and all; deactivating its authorizations invalidates it.
+    async fn deactivate_pending(&self, account: &Account, url: String) {
+        let work = async {
+            let Ok(Ok(mut order)) =
+                tokio::time::timeout(AFTERMATH_CALL_TIMEOUT, account.order(url)).await
+            else {
+                tracing::debug!("acme: failed order not re-read; pending authorizations left");
+                return;
+            };
+            let mut authorizations = order.authorizations();
+            while let Ok(Some(next)) =
+                tokio::time::timeout(AFTERMATH_CALL_TIMEOUT, authorizations.next()).await
+            {
+                let Ok(mut authz) = next else { break };
+                if authz.status != AuthorizationStatus::Pending {
+                    continue;
+                }
+                match tokio::time::timeout(AFTERMATH_CALL_TIMEOUT, authz.deactivate()).await {
+                    Ok(Ok(_)) => {
+                        tracing::info!(
+                            "acme: deactivated a pending authorization of the failed order"
+                        );
+                    }
+                    Ok(Err(_)) => tracing::warn!(
+                        "acme: could not deactivate a pending authorization of the failed order"
+                    ),
+                    Err(_) => {
+                        tracing::warn!("acme: deactivating a pending authorization timed out");
+                    }
+                }
+            }
+        };
+        if tokio::time::timeout(AFTERMATH_DEACTIVATE_TOTAL, work)
+            .await
+            .is_err()
+        {
+            tracing::warn!("acme: deactivating the failed order's authorizations timed out");
+        }
+    }
+
+    /// The wanted challenge's own error from (up to [`DETAIL_ITEMS_CAP`])
+    /// authorizations of `order` (each refreshed, bounded): why the CA
+    /// rejected the challenge. Built in one [`DetailBuf`] (≤ [`DETAIL_CAP`]).
+    async fn challenge_errors(
+        &self,
+        order: &mut instant_acme::Order,
+        wanted: &ChallengeType,
+    ) -> Option<String> {
+        let mut out = DetailBuf::new();
+        let work = async {
+            let mut authorizations = order.authorizations();
+            let mut seen = 0_usize;
+            while let Some(next) = authorizations.next().await {
+                if seen == DETAIL_ITEMS_CAP || out.is_full() {
+                    break;
+                }
+                seen += 1;
+                let Ok(mut authz) = next else { break };
+                let Ok(Ok(state)) =
+                    tokio::time::timeout(AFTERMATH_CALL_TIMEOUT, authz.refresh()).await
+                else {
+                    continue;
+                };
+                write_challenge_errors(&mut out, state, wanted);
+            }
+        };
+        let _ = tokio::time::timeout(AFTERMATH_CALL_TIMEOUT * 3, work).await;
+        (!out.is_empty()).then(|| out.finish())
     }
 
     async fn cleanup(&self, published: Vec<Published>) {
@@ -744,6 +1264,7 @@ impl AcmeEngine {
         &self,
         replaces: Option<CertificateIdentifier<'static>>,
         published: &mut Vec<Published>,
+        placed: &mut Option<(Account, String)>,
     ) -> Result<Issued, AcmeError> {
         let dns = match self.config.challenge {
             AcmeChallenge::Dns01 => {
@@ -754,6 +1275,25 @@ impl AcmeEngine {
             AcmeChallenge::TlsAlpn01 => None,
         };
         let account = self.account().await?;
+        // TLS-ALPN-01: the CA's validator connects as soon as a challenge is
+        // set ready, so the `acme-tls/1` responder must be live first. At
+        // boot the service starts before the front door attaches it (after
+        // the control plane is built): wait for it here, on the ACME thread,
+        // after the CA was reached (so an unreachable CA still reports
+        // `ca-unavailable`) and before any order exists.
+        if self.config.challenge == AcmeChallenge::TlsAlpn01
+            && !self
+                .resolver
+                .wait_responder_ready(self.responder_wait)
+                .await
+        {
+            self.set_detail(Some(format!(
+                "the front door's acme-tls/1 responder was not installed within {} s \
+                 (TLS-ALPN-01 needs the TCP door: set network.mode and network.https_port)",
+                self.responder_wait.as_secs()
+            )));
+            return Err(AcmeError::Responder);
+        }
         let identifiers: Vec<Identifier> = self
             .config
             .domains
@@ -785,9 +1325,10 @@ impl AcmeEngine {
             Err(instant_acme::Error::Unsupported(_)) if replaces.is_some() => account
                 .new_order(&build(false))
                 .await
-                .map_err(|e| acme_category(&e, AcmeError::Authority))?,
-            other => other.map_err(|e| acme_category(&e, AcmeError::Authority))?,
+                .map_err(|e| self.note(&e, AcmeError::Authority))?,
+            other => other.map_err(|e| self.note(&e, AcmeError::Authority))?,
         };
+        *placed = Some((account.clone(), order.url().to_owned()));
         let wanted = match self.config.challenge {
             AcmeChallenge::Dns01 => ChallengeType::Dns01,
             AcmeChallenge::TlsAlpn01 => ChallengeType::TlsAlpn01,
@@ -802,11 +1343,18 @@ impl AcmeEngine {
         let ledger = self.ledger();
         let mut authorizations = order.authorizations();
         while let Some(next) = authorizations.next().await {
-            let mut authz = next.map_err(|e| acme_category(&e, AcmeError::Authority))?;
+            let mut authz = next.map_err(|e| self.note(&e, AcmeError::Authority))?;
             match authz.status {
                 AuthorizationStatus::Valid => continue,
                 AuthorizationStatus::Pending => {}
-                _ => return Err(AcmeError::Challenge),
+                _ => {
+                    self.set_detail(Some(describe_authorization(&authz)));
+                    return Err(AcmeError::Challenge);
+                }
+            }
+            if let Some(detail) = missing_challenge_detail(&authz, &wanted) {
+                self.set_detail(Some(detail));
+                return Err(AcmeError::Unsupported);
             }
             let mut challenge = authz
                 .challenge(wanted.clone())
@@ -822,13 +1370,29 @@ impl AcmeEngine {
                         Ok(handle) => handle,
                         Err(error) => {
                             let _ = ledger.forget_intent(&fqdn);
+                            self.set_detail(Some(format!(
+                                "publishing the TXT record at {fqdn} via the {} API failed",
+                                dns.name()
+                            )));
                             return Err(error);
                         }
                     };
                     published.push(Published::Txt(handle.clone()));
                     ledger.record_handle(&fqdn, &handle)?;
-                    dns.confirm_at_authoritative(&fqdn, &value, propagation)
-                        .await?;
+                    if let Err(error) = dns
+                        .confirm_at_authoritative(&fqdn, &value, propagation)
+                        .await
+                    {
+                        let how = dns.propagation_detail().unwrap_or_else(|| {
+                            "TXT not seen at the authoritative nameservers before the deadline"
+                                .to_owned()
+                        });
+                        self.set_detail(Some(format!(
+                            "{fqdn}: {how} ({} s)",
+                            propagation.as_secs()
+                        )));
+                        return Err(error);
+                    }
                 }
                 (Identifier::Dns(_) | Identifier::Ip(_), None) => {
                     let (sni, cert_name) = match &identifier {
@@ -849,31 +1413,47 @@ impl AcmeEngine {
             challenge
                 .set_ready()
                 .await
-                .map_err(|e| acme_category(&e, AcmeError::Challenge))?;
+                .map_err(|e| self.note(&e, AcmeError::Challenge))?;
         }
         let retry = RetryPolicy::new()
             .initial_delay(Duration::from_millis(500))
             .backoff(1.5)
             .timeout(POLL_TIMEOUT);
-        let status = order
-            .poll_ready(&retry)
-            .await
-            .map_err(|e| acme_category(&e, AcmeError::Challenge))?;
-        if status != OrderStatus::Ready {
-            return Err(AcmeError::Challenge);
+        let status = match order.poll_ready(&retry).await {
+            Ok(status) => Ok(status),
+            Err(error) => Err(self.note(&error, AcmeError::Challenge)),
+        };
+        if status != Ok(OrderStatus::Ready) {
+            // The order-level problem (if any) rarely says why: the
+            // challenge's own error does.
+            let order_level = self.last_failure_detail();
+            let challenge = self.challenge_errors(&mut order, &wanted).await;
+            let detail = match (challenge, order_level) {
+                // The order problem usually repeats the challenge's: keep it once.
+                (Some(c), Some(o)) if c.contains(&o) => Some(c),
+                (Some(c), Some(o)) => Some(format!("{c}; order: {o}")),
+                (Some(c), None) => Some(c),
+                (None, Some(o)) => Some(o),
+                (None, None) => Some("the order became invalid".to_owned()),
+            };
+            self.set_detail(detail);
+            return Err(status.err().unwrap_or(AcmeError::Challenge));
         }
         let key_pem = zeroize::Zeroizing::new(
             order
                 .finalize()
                 .await
-                .map_err(|e| acme_category(&e, AcmeError::Authority))?,
+                .map_err(|e| self.note(&e, AcmeError::Authority))?,
         );
         let chain_pem = order
             .poll_certificate(&retry)
             .await
-            .map_err(|e| acme_category(&e, AcmeError::Authority))?;
+            .map_err(|e| self.note(&e, AcmeError::Authority))?;
         let parsed = parse_bundle(chain_pem.as_bytes(), key_pem.as_bytes())?;
         if normalized(&parsed.names) != normalized(&self.config.domains) {
+            self.set_detail(Some(
+                "the issued certificate's names differ from the configured domains".to_owned(),
+            ));
             return Err(AcmeError::Mismatch);
         }
         let dir = self.config.state_dir.clone();
@@ -1192,10 +1772,24 @@ async fn run(engine: AcmeEngine, mut receiver: mpsc::Receiver<AcmeCommand>) {
                 .as_ref()
                 .and_then(|m| m.ari_cert_id.clone())
                 .and_then(|id| parse_cert_id(&id));
-            let Some(result) = unless_shutdown(engine.issue_once(replaces), &mut receiver).await
-            else {
+            // The attempt, then its aftermath, each cut short by `Shutdown`:
+            // on shutdown during the attempt only a short local/TXT cleanup
+            // runs (no CA call), so the 2 s drop budget holds.
+            let mut leftovers = Leftovers::default();
+            let attempt = engine.bounded_attempt(replaces, &mut leftovers);
+            let Some(result) = unless_shutdown(attempt, &mut receiver).await else {
+                engine.shutdown_cleanup(leftovers).await;
                 return;
             };
+            if unless_shutdown(engine.aftermath(leftovers, result.is_err()), &mut receiver)
+                .await
+                .is_none()
+            {
+                return;
+            }
+            if result.is_ok() {
+                engine.set_detail(None);
+            }
             match result {
                 Ok(issued) => {
                     tracing::info!(not_after = issued.not_after, "acme: certificate installed");
@@ -1215,9 +1809,13 @@ async fn run(engine: AcmeEngine, mut receiver: mpsc::Receiver<AcmeCommand>) {
                     failures = failures.saturating_add(1);
                     let delay = backoff_delay(failures);
                     next_attempt = Some(unix_now().saturating_add(secs(delay)));
-                    engine.source.report_error(error.as_reason());
+                    let detail = engine.last_failure_detail();
+                    engine
+                        .source
+                        .report_failure(error.as_reason(), detail.clone());
                     tracing::warn!(
                         reason = error.as_reason(),
+                        detail = %detail.as_deref().unwrap_or("-"),
                         failures,
                         "acme: issuance attempt failed"
                     );
@@ -1327,6 +1925,191 @@ mod tests {
         assert!(!engine.needs_reissue(&meta), "{meta:?}");
         assert_eq!(meta.ca, "letsencrypt");
         assert!(!Arc::ptr_eq(&boot.certificate, &source.current()));
+    }
+
+    #[test]
+    fn details_are_sanitized_and_bounded() {
+        assert_eq!(sanitize_detail(""), None);
+        assert_eq!(sanitize_detail(" \n\t\u{7}"), None);
+        assert_eq!(
+            sanitize_detail("a\r\nb\u{1b}[31m  c\n").as_deref(),
+            Some("a b [31m c")
+        );
+        // Cut at DETAIL_CAP bytes on a char boundary (é is 2 bytes).
+        let long = "é".repeat(DETAIL_CAP);
+        let cut = sanitize_detail(&long).unwrap();
+        assert!(cut.len() <= DETAIL_CAP, "{}", cut.len());
+        assert_eq!(cut.len(), DETAIL_CAP);
+        let odd = format!("x{}", "é".repeat(DETAIL_CAP));
+        let cut = sanitize_detail(&odd).unwrap();
+        assert_eq!(cut.len(), DETAIL_CAP - 1);
+        assert!(cut.chars().all(|c| !c.is_control()));
+    }
+
+    #[test]
+    fn problems_with_subproblems_are_described() {
+        let problem: instant_acme::Problem = serde_json::from_value(serde_json::json!({
+            "type": "urn:ietf:params:acme:error:rejectedIdentifier",
+            "detail": "Error creating new order",
+            "status": 400,
+            "subproblems": [
+                {
+                    "type": "urn:ietf:params:acme:error:caa",
+                    "detail": "CAA record forbids issuance",
+                    "identifier": {"type": "dns", "value": "a.example.org"}
+                },
+                {
+                    "type": "urn:ietf:params:acme:error:malformed",
+                    "detail": "bad\nname",
+                    "identifier": {"type": "ip", "value": "2001:db8::1"}
+                }
+            ]
+        }))
+        .unwrap();
+        let text = describe_problem(&problem);
+        assert_eq!(
+            text,
+            "rejectedIdentifier: Error creating new order; [a.example.org] caa: CAA record \
+             forbids issuance; [2001:db8::1] malformed: bad\nname"
+        );
+        assert!(!sanitize_detail(&text).unwrap().contains('\n'));
+        let bare: instant_acme::Problem =
+            serde_json::from_value(serde_json::json!({"type": "custom:thing"})).unwrap();
+        assert_eq!(describe_problem(&bare), "custom:thing");
+        let connection: instant_acme::Problem = serde_json::from_value(serde_json::json!({
+            "type": "urn:ietf:params:acme:error:connection",
+            "detail": "203.0.113.7: Connection refused"
+        }))
+        .unwrap();
+        assert_eq!(
+            describe_error(&instant_acme::Error::Api(connection)).as_deref(),
+            Some("connection: 203.0.113.7: Connection refused")
+        );
+    }
+
+    fn authz(value: serde_json::Value) -> instant_acme::AuthorizationState {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// Review C1: an authorization without the wanted challenge yields the
+    /// `ca-offers-no-supported-challenge` detail (and the attempt returns
+    /// `Unsupported` right after setting it: see `tests/acme_cadence.rs`
+    /// `clock_keeps_cadence_while_deactivation_hangs` for the engine path).
+    #[test]
+    fn a_missing_challenge_type_is_described() {
+        let offered = authz(serde_json::json!({
+            "identifier": {"type": "dns", "value": "a.example.org"},
+            "status": "pending",
+            "wildcard": true,
+            "challenges": [
+                {"type": "http-01", "url": "https://ca/c/1", "token": "t", "status": "pending"},
+                {"type": "dns-01", "url": "https://ca/c/2", "token": "t", "status": "pending"}
+            ]
+        }));
+        assert_eq!(
+            missing_challenge_detail(&offered, &ChallengeType::TlsAlpn01).as_deref(),
+            Some(
+                "the CA offers no tls-alpn-01 challenge for *.a.example.org \
+                 (offered: http-01, dns-01)"
+            )
+        );
+        assert_eq!(
+            missing_challenge_detail(&offered, &ChallengeType::Dns01),
+            None
+        );
+        let none = authz(serde_json::json!({
+            "identifier": {"type": "ip", "value": "2001:db8::1"},
+            "status": "pending",
+            "challenges": []
+        }));
+        assert_eq!(
+            missing_challenge_detail(&none, &ChallengeType::Dns01).as_deref(),
+            Some("the CA offers no dns-01 challenge for 2001:db8::1 (it offers none)")
+        );
+        assert_eq!(
+            AcmeError::Unsupported.as_reason(),
+            "ca-offers-no-supported-challenge"
+        );
+    }
+
+    /// Review S1: CA text is only formatted through a builder capped at
+    /// `DETAIL_CAP`, whatever the CA sends (1 MiB details, 10 000 subproblems,
+    /// huge identifiers, many challenges).
+    #[test]
+    fn ca_text_is_formatted_into_a_bounded_builder() {
+        let huge = "é".repeat(512 * 1024); // 1 MiB of 2-byte chars
+        let long = "d".repeat(4096);
+        let subproblems: Vec<serde_json::Value> = (0..10_000)
+            .map(|i| {
+                serde_json::json!({
+                    "type": format!("urn:ietf:params:acme:error:{}", "x".repeat(1000)),
+                    "detail": long,
+                    "identifier": {"type": "dns", "value": format!("{i}.{}", "n".repeat(500))}
+                })
+            })
+            .collect();
+        let problem: instant_acme::Problem = serde_json::from_value(serde_json::json!({
+            "type": "urn:ietf:params:acme:error:rejectedIdentifier",
+            "detail": huge,
+            "subproblems": subproblems
+        }))
+        .unwrap();
+        let text = describe_problem(&problem);
+        assert!(text.len() <= DETAIL_CAP, "{}", text.len());
+        assert!(text.starts_with("rejectedIdentifier: é"));
+        // The first field alone is cut at DETAIL_FIELD_CAP (char boundary).
+        let first = text.strip_prefix("rejectedIdentifier: ").unwrap();
+        let detail_part = first.split(';').next().unwrap();
+        assert!(detail_part.len() <= DETAIL_FIELD_CAP);
+        assert!(sanitize_detail(&text).unwrap().len() <= DETAIL_CAP);
+
+        // Few short subproblems: the item cap names how many were left out.
+        let many: Vec<serde_json::Value> = (0..20)
+            .map(|i| serde_json::json!({"type": "caa", "identifier": {"type": "dns", "value": format!("{i}.x")}}))
+            .collect();
+        let short: instant_acme::Problem =
+            serde_json::from_value(serde_json::json!({"type": "t", "subproblems": many})).unwrap();
+        let text = describe_problem(&short);
+        assert_eq!(text.matches("] caa").count(), DETAIL_ITEMS_CAP, "{text}");
+        assert!(text.ends_with("; and 12 more subproblems"), "{text}");
+
+        // An authorization with 10 000 failed challenges carrying 4 KiB each.
+        let challenges: Vec<serde_json::Value> = (0..10_000)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "tls-alpn-01", "url": format!("https://ca/c/{i}"), "token": "t",
+                    "status": "invalid",
+                    "error": {"type": "urn:ietf:params:acme:error:tls", "detail": long}
+                })
+            })
+            .collect();
+        let state = authz(serde_json::json!({
+            "identifier": {"type": "dns", "value": "n".repeat(100_000)},
+            "status": "invalid",
+            "challenges": challenges
+        }));
+        let text = describe_authorization(&state);
+        assert!(text.len() <= DETAIL_CAP, "{}", text.len());
+        let mut out = DetailBuf::new();
+        write_challenge_errors(&mut out, &state, &ChallengeType::TlsAlpn01);
+        assert!(out.out.len() <= DETAIL_CAP);
+        // Appends after the cap are no-ops: the builder never grows past it.
+        let capacity = out.out.capacity();
+        for _ in 0..1000 {
+            write_challenge_errors(&mut out, &state, &ChallengeType::TlsAlpn01);
+            out.push(&huge);
+        }
+        assert!(out.out.len() <= DETAIL_CAP);
+        assert_eq!(out.out.capacity(), capacity, "no reallocation past the cap");
+        assert!(out.finish().is_char_boundary(0));
+        assert!(
+            missing_challenge_detail(&state, &ChallengeType::Dns01)
+                .unwrap()
+                .len()
+                <= DETAIL_CAP
+        );
+        assert_eq!(prefix_within("aé", 2), "a");
+        assert_eq!(prefix_within("aé", 3), "aé");
     }
 
     #[test]

@@ -8851,6 +8851,13 @@ export interface components {
             hints: string[];
             /** @description Sanitized token of the last failure (e.g. `ca-unavailable`). */
             last_error?: string | null;
+            /**
+             * @description Human detail of the last failure: the CA's problem type and detail
+             *     (with subproblems and the challenge's own error), or a short local
+             *     explanation (e.g. "TXT not seen via DNS over HTTPS"). Control
+             *     characters stripped, at most 512 bytes, never a credential.
+             */
+            last_error_detail?: string | null;
             /** @description Names requested on the certificate. */
             names: string[];
             /**

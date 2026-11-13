@@ -77,6 +77,7 @@ fn fixture() -> Fixture {
             email_env: None,
             api_key_env: None,
             propagation_timeout_s: 120,
+            confirm: multiview_config::DnsConfirm::Authoritative,
         }),
     };
     let tls = Arc::new(TlsContext {

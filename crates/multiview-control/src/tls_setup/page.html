@@ -28,6 +28,7 @@ on the host. If they differ, someone is between you and the host: stop.</p>
 <dt>CA / challenge</dt><dd id="ca"></dd>
 <dt>Names</dt><dd id="names"></dd>
 <dt>Last error</dt><dd id="err"></dd>
+<dt>Error detail</dt><dd id="errdetail"></dd>
 <dt>Reasons</dt><dd><ul id="reasons"></ul></dd>
 </dl>
 <p>The CA, challenge and names come from the engine configuration (<code>[network.tls]</code>). Secrets
@@ -49,7 +50,7 @@ async function refresh(){
     const s=await r.json();
     text("fp",s.bootstrap_fingerprint);text("state",s.state);
     text("ca",(s.ca||"")+(s.staging?" (staging)":"")+" / "+(s.challenge||""));
-    text("names",(s.names||[]).join(", "));text("err",s.last_error);
+    text("names",(s.names||[]).join(", "));text("err",s.last_error);text("errdetail",s.last_error_detail);
     const ul=$("reasons");ul.textContent="";
     for(const x of (s.reasons||[])){const li=document.createElement("li");li.textContent=x;ul.appendChild(li);}
     if(s.state==="serving"){text("msg","A certificate is installed. Reload this page over the new certificate.");}
