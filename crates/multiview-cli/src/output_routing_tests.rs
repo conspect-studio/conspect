@@ -4694,8 +4694,17 @@ fn layout_changes_coalesce_and_keep_the_newest() {
         })
         .unwrap();
     }
-    t += 1;
-    x.tick_layouts(t, std::slice::from_ref(&first));
+    // The inbox is bounded; the composing layout's change survives the
+    // flood, and a tick applies at most LAYOUT_CHANGES_PER_TICK changes.
+    let inbox = |x: &Harness| x.r.layout_changes.lock().unwrap().changes.len();
+    assert!(inbox(&x) <= crate::output_routing::LAYOUT_INBOX);
+    while inbox(&x) > 0 {
+        let before = inbox(&x);
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(&first));
+        assert!(before - inbox(&x) <= crate::output_routing::LAYOUT_CHANGES_PER_TICK);
+        assert!(before > inbox(&x), "the inbox drains");
+    }
     let composing =
         x.r.aux
             .feeds
@@ -4830,4 +4839,75 @@ fn layout_audio_follows_live_edits_also_mid_move() {
         t += 1;
     }
     assert_eq!(x.h.snapshot().outputs[1].audio, "none");
+}
+
+/// #369 review round 3 (lens 1): an output on an edited layout whose pending
+/// take to another bus is refused keeps the layout's picture AND its edited
+/// audio attribute (not the audio captured before the edit).
+#[test]
+fn a_refused_move_off_an_edited_layout_follows_its_current_audio() {
+    use multiview_config::LayoutAudio;
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(2, CADENCE, open);
+    let mut t = x.run(0, 3);
+    x.h.try_take(OutputTake {
+        audio: Some(AudioChoice::Follow),
+        ..take(
+            "to-layout",
+            1,
+            layout_bus_with_audio("L", LayoutAudio::None),
+        )
+    })
+    .unwrap();
+    for _ in 0..60 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+        if x.outcomes
+            .try_iter()
+            .any(|o| o.operation_id == "to-layout" && o.outcome == TakeResult::Applied)
+        {
+            break;
+        }
+    }
+    for _ in 0..20 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(x.h.snapshot().outputs[1].audio, "none");
+    // A take to a source that is never fresh: pending while the layout is
+    // edited, then refused.
+    x.h.try_take(take("nowhere", 1, PictureBus::Source("nowhere".to_owned())))
+        .unwrap();
+    x.compose_layouts(t);
+    x.tick(t);
+    t += 1;
+    let PictureBus::Layout(edited) = layout_bus_with_audio("L", LayoutAudio::Source("bars".into()))
+    else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(edited))
+        .unwrap();
+    let mut refused = false;
+    for _ in 0..TAKE_PRIME_DEADLINE_TICKS + 40 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+        refused |= x
+            .outcomes
+            .try_iter()
+            .any(|o| o.operation_id == "nowhere" && matches!(o.outcome, TakeResult::Refused(_)));
+    }
+    assert!(refused);
+    let view = &x.h.snapshot().outputs[1];
+    assert_eq!(view.bus, "aux:L");
+    assert_eq!(view.audio, "src:bars", "the edited attribute is on air");
 }

@@ -1726,11 +1726,14 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
   (`aux_layout::tests::a_1080p_layout_compose_costs_less_than_a_tick_on_one_core` prints it).
 - **Live edits (PR 2).** Every committed `PUT /layouts/{id}` is re-resolved on the control plane
   and handed to the router (`LayoutChange::Edited`). The changes are coalesced per layout id in an
-  inbox. The newest revision wins, and the inbox never evicts, so it is bounded by the layouts
-  library. The router drains it with `try_lock`, so it never blocks. The router swaps the body that every output and pending take on that layout composes,
+  inbox of at most 64 ids, and the newest revision wins. A change for a layout that composes now is
+  never evicted. Another evicted change raises a watermark, so a take older than that change fails
+  closed. The router drains the inbox with `try_lock`, so it never blocks. It applies at most 8
+  changes per tick. The router swaps the body that every output and pending take on that layout composes,
   from the next tick, and requests an IDR on its encoders (within the per-key force floor). Outputs
   whose audio follows re-resolve the layout's `audio` attribute. An output whose move lands
-  after an edit follows the body that landed. It is not a take: no outcome, no
+  after an edit follows the body that landed. An output whose move off an edited layout is refused
+  follows the layout's current body. It is not a take: no outcome, no
   persistence change. Every resolved body carries a process-wide revision: a take takes it before
   it reads the library, and an edit or delete takes it after its commit. A take queued with a body
   older than a later edit or removal of its layout is refused (`refused:unroutable`), and so is a

@@ -159,13 +159,25 @@ pub use multiview_control::output_routing::next_layout_revision;
 /// refused (fail closed).
 pub const LAYOUT_STATES: usize = 64;
 
+/// Layout changes the inbox holds at most (distinct ids).
+pub const LAYOUT_INBOX: usize = 64;
+/// Layout changes the router applies per tick at most (the rest wait).
+pub const LAYOUT_CHANGES_PER_TICK: usize = 8;
+
 /// Latest layout changes not yet applied, coalesced per id (the newest
-/// revision wins), so a burst of edits never loses one: never evicted, so
-/// bounded by the layouts library (one entry per committed layout id,
-/// control-plane memory). Written by the control plane, drained by the router
-/// with `try_lock` (never blocks the consumer; on contention it retries next
-/// tick).
-type LayoutInbox = Arc<Mutex<HashMap<String, LayoutChange>>>;
+/// revision wins). Bounded at [`LAYOUT_INBOX`] ids: a change for a layout
+/// that composes now is never evicted (at most `max_aux_canvases` plus
+/// lingering ones, far below the bound); another evicted change raises
+/// `forgotten`, so a take older than it fails closed at the router.
+/// Written by the control plane, drained by the router with `try_lock` (never
+/// blocks the consumer; on contention it retries next tick).
+#[derive(Default)]
+struct InboxState {
+    changes: HashMap<String, LayoutChange>,
+    forgotten: u64,
+}
+
+type LayoutInbox = Arc<Mutex<InboxState>>;
 
 /// Insert `change` into a revision-ordered map (an older revision for the
 /// same id is ignored). At `bound` entries the oldest is evicted (removals
@@ -175,6 +187,7 @@ fn remember(
     map: &mut HashMap<String, LayoutChange>,
     change: LayoutChange,
     bound: usize,
+    keep: &[String],
 ) -> Option<u64> {
     if map
         .get(change.id())
@@ -186,6 +199,7 @@ fn remember(
     if !map.contains_key(change.id()) && map.len() >= bound {
         if let Some((oldest, revision)) = map
             .iter()
+            .filter(|(id, _)| !keep.iter().any(|k| k == *id))
             .min_by_key(|(_, c)| (matches!(c, LayoutChange::Edited(_)), c.revision()))
             .map(|(id, c)| (id.clone(), c.revision()))
         {
@@ -458,11 +472,21 @@ impl OutputRoutingHandle {
         if change.id().len() > MAX_TAKE_ID_BYTES {
             return Err(TakeBusy);
         }
+        // Changes for layouts composing now are never evicted.
+        let keep: Vec<String> = self
+            .snapshot
+            .load()
+            .aux_canvases
+            .iter()
+            .filter_map(|bus| bus.strip_prefix("aux:").map(str::to_owned))
+            .collect();
         let mut inbox = self
             .layout_changes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = remember(&mut inbox, change, usize::MAX);
+        if let Some(evicted) = remember(&mut inbox.changes, change, LAYOUT_INBOX, &keep) {
+            inbox.forgotten = inbox.forgotten.max(evicted);
+        }
         Ok(())
     }
 
@@ -942,7 +966,7 @@ impl OutputRouter {
         mut open: BusOpenFn,
     ) -> std::io::Result<(Self, OutputRoutingHandle)> {
         let (take_tx, takes) = mpsc::sync_channel(TAKE_MAILBOX);
-        let layout_changes: LayoutInbox = Arc::new(Mutex::new(HashMap::new()));
+        let layout_changes: LayoutInbox = Arc::new(Mutex::new(InboxState::default()));
         let layout_tx = Arc::clone(&layout_changes);
         let (outcomes, outcome_rx) = mpsc::sync_channel(OUTCOME_CAPACITY);
         let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
@@ -1499,8 +1523,24 @@ impl OutputRouter {
     /// each). Never blocks: a contended inbox is retried next tick.
     fn drain_layout_changes(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let changes: Vec<LayoutChange> = match self.layout_changes.try_lock() {
-            Ok(mut inbox) if !inbox.is_empty() => inbox.drain().map(|(_, c)| c).collect(),
-            _ => return,
+            Ok(mut inbox) => {
+                self.layout_states_forgotten = self
+                    .layout_states_forgotten
+                    .max(std::mem::take(&mut inbox.forgotten));
+                if inbox.changes.is_empty() {
+                    return;
+                }
+                let ids: Vec<String> = inbox
+                    .changes
+                    .keys()
+                    .take(LAYOUT_CHANGES_PER_TICK)
+                    .cloned()
+                    .collect();
+                ids.iter()
+                    .filter_map(|id| inbox.changes.remove(id))
+                    .collect()
+            }
+            Err(_) => return,
         };
         for change in changes {
             if self
@@ -1536,7 +1576,7 @@ impl OutputRouter {
     /// Record a layout's latest state (bounded; an eviction raises the
     /// fail-closed watermark).
     fn remember_state(&mut self, change: LayoutChange) {
-        if let Some(evicted) = remember(&mut self.layout_states, change, LAYOUT_STATES) {
+        if let Some(evicted) = remember(&mut self.layout_states, change, LAYOUT_STATES, &[]) {
             self.layout_states_forgotten = self.layout_states_forgotten.max(evicted);
         }
     }
@@ -1735,6 +1775,11 @@ impl OutputRouter {
                 audio.finish_take(index, false, &bus, tick, dispatcher);
             } else {
                 audio.video_refused(index, tick, dispatcher);
+                // The output stays on a layout that may have been edited
+                // while the move was pending: follow its current body.
+                if matches!(bus, PictureBus::Layout(_)) {
+                    audio.fallback(index, &bus, tick, None, dispatcher);
+                }
             }
         }
     }
