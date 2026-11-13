@@ -144,7 +144,10 @@ impl Watchdog {
             let due = self.due_ns.load(Ordering::Acquire);
             if due == 0 {
                 // Bounded, so an arm whose unpark raced this load is seen
-                // within MAX_PARK even if its wake token was consumed.
+                // within MAX_PARK even if its wake token was consumed (an arm
+                // racing `start` is not ordered before start's unpark). Cost:
+                // one wake per MAX_PARK while disarmed, beside an engine that
+                // runs at frame rate.
                 std::thread::park_timeout(MAX_PARK);
                 continue;
             }

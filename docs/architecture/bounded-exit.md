@@ -28,7 +28,8 @@ restarting.
 
 1. **One watchdog thread, a wait-free arm.**
    - `exit_watchdog::enable()` runs once in the `multiview` binary's `main`. It starts one
-     dedicated OS thread that parks. Library users (tests, other binaries) never call it, so
+     dedicated OS thread that waits, at most 20 ms at a time, so an arm that races its
+     start is still seen. Library users (tests, other binaries) never call it, so
      nothing can end their process.
    - `exit_watchdog::arm(cause)` is wait-free and allocation-free and never logs: it
      compare-and-sets a deadline, raises the cause, and unparks the thread. So it is safe to
