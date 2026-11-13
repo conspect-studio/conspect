@@ -269,7 +269,9 @@ pub struct OutputSlots {
     pub audio: Vec<AudioSlot>,
 }
 
-/// A video codec family a medium carries.
+/// A video codec family a medium carries. [`CodecFamily::of`] is THE codec
+/// token table: the engine resolves encoder tokens through it too, so a token
+/// config accepts is a token the engine can open (and vice versa).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CodecFamily {
@@ -279,21 +281,23 @@ pub enum CodecFamily {
     Hevc,
     /// MPEG-2 video.
     Mpeg2,
+    /// FFV1 (lossless; no medium carries it as a slot codec).
+    Ffv1,
+    /// Motion JPEG (no medium carries it as a slot codec).
+    Mjpeg,
 }
 
 impl CodecFamily {
-    /// The family of an encoder/codec token (`h264`, `libx264`, `hevc_nvenc`,
-    /// `mpeg2video`, …); `None` for a token of no known family.
+    /// The family of an encoder/codec token (case-insensitive); `None` for a
+    /// token the engine cannot encode.
     #[must_use]
     pub fn of(token: &str) -> Option<Self> {
-        let t = token.trim().to_ascii_lowercase();
-        match t.as_str() {
-            "h264" | "avc" | "libx264" | "libopenh264" => Some(Self::H264),
-            "hevc" | "h265" | "libx265" => Some(Self::Hevc),
-            "mpeg2video" | "mpeg2" => Some(Self::Mpeg2),
-            _ if t.starts_with("h264_") => Some(Self::H264),
-            _ if t.starts_with("hevc_") || t.starts_with("h265_") => Some(Self::Hevc),
-            _ if t.starts_with("mpeg2_") => Some(Self::Mpeg2),
+        match token.trim().to_ascii_lowercase().as_str() {
+            "h264" | "avc" | "libx264" | "h264_nvenc" => Some(Self::H264),
+            "h265" | "hevc" | "libx265" | "hevc_nvenc" => Some(Self::Hevc),
+            "mpeg2video" => Some(Self::Mpeg2),
+            "ffv1" => Some(Self::Ffv1),
+            "mjpeg" => Some(Self::Mjpeg),
             _ => None,
         }
     }

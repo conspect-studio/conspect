@@ -456,14 +456,17 @@ struct ResolvedEncoder {
 
 /// Map a config output `codec` token to a logical [`multiview_ffmpeg::VideoCodec`].
 /// Unknown codec names are rejected, never silently replaced.
+/// The engine codec of `token`, through the config crate's single codec
+/// token table ([`multiview_config::CodecFamily::of`], #342 review M2).
 fn logical_codec(token: &str) -> Result<multiview_ffmpeg::VideoCodec, PipelineError> {
+    use multiview_config::CodecFamily;
     use multiview_ffmpeg::VideoCodec;
-    match token.to_ascii_lowercase().as_str() {
-        "h264" | "avc" | "libx264" | "h264_nvenc" => Ok(VideoCodec::H264),
-        "h265" | "hevc" | "libx265" | "hevc_nvenc" => Ok(VideoCodec::H265),
-        "ffv1" => Ok(VideoCodec::Ffv1),
-        "mjpeg" => Ok(VideoCodec::Mjpeg),
-        "mpeg2video" => Ok(VideoCodec::Mpeg2Video),
+    match CodecFamily::of(token) {
+        Some(CodecFamily::H264) => Ok(VideoCodec::H264),
+        Some(CodecFamily::Hevc) => Ok(VideoCodec::H265),
+        Some(CodecFamily::Ffv1) => Ok(VideoCodec::Ffv1),
+        Some(CodecFamily::Mjpeg) => Ok(VideoCodec::Mjpeg),
+        Some(CodecFamily::Mpeg2) => Ok(VideoCodec::Mpeg2Video),
         _ => Err(PipelineError::Codec {
             codec: token.to_owned(),
             reason: "unsupported codec".to_owned(),
@@ -493,6 +496,43 @@ fn resolve_encoder(codec_token: &str) -> Result<ResolvedEncoder, PipelineError> 
         name: name.to_owned(),
         format: encoder_input_format(name),
     })
+}
+
+#[cfg(test)]
+mod codec_table_tests {
+    use super::logical_codec;
+    use multiview_config::CodecFamily;
+
+    /// #342 review M2: config and engine agree on every token, including
+    /// the NVENC names and tokens both refuse.
+    #[test]
+    fn config_and_engine_share_one_codec_token_table() {
+        for token in [
+            "h264",
+            "AVC",
+            "libx264",
+            "h264_nvenc",
+            "hevc",
+            "H265",
+            "libx265",
+            "hevc_nvenc",
+            "mpeg2video",
+            "ffv1",
+            "mjpeg",
+            "libopenh264",
+            "mpeg2",
+            "mpeg2_qsv",
+            "h264_vaapi",
+            "vp9",
+            "",
+        ] {
+            assert_eq!(
+                CodecFamily::of(token).is_some(),
+                logical_codec(token).is_ok(),
+                "{token:?}"
+            );
+        }
+    }
 }
 
 fn codec_for_encoder(name: &str) -> multiview_ffmpeg::VideoCodec {

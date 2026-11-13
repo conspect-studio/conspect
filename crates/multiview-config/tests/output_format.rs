@@ -574,3 +574,45 @@ bitrate_kbps = 1000000
     .validate()
     .expect("the cap itself is accepted");
 }
+
+#[test]
+fn slot_codec_tokens_follow_the_engine_table() {
+    let slot = |kind: &str, codec: &str| {
+        format!(
+            r#"
+[[outputs]]
+kind = "{kind}"
+url = "srt://[::1]:9000"
+codec = "h264"
+[[outputs.slots.video]]
+codec = "{codec}"
+"#
+        )
+    };
+    for codec in [
+        "h264_nvenc",
+        "hevc_nvenc",
+        "libx264",
+        "libx265",
+        "mpeg2video",
+    ] {
+        parse(&slot("srt", codec))
+            .validate()
+            .unwrap_or_else(|e| panic!("{codec}: {e:?}"));
+    }
+    for codec in [
+        "libopenh264",
+        "mpeg2",
+        "mpeg2_qsv",
+        "h264_vaapi",
+        "ffv1",
+        "mjpeg",
+        "vp9",
+    ] {
+        assert_code(
+            &slot("srt", codec),
+            SLOT_FORMAT_UNSUPPORTED,
+            "is not carried",
+        );
+    }
+}
