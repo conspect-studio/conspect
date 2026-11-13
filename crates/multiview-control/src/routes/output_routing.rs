@@ -82,7 +82,7 @@ pub enum OutputTakeAudio {
 pub struct OutputRouteRequest {
     /// The output and stream.
     pub target: OutputTargetKind,
-    /// The feed: `{"bus":"program"|"preview"}` or `{"source":"vt1"}`.
+    /// The feed: `{"bus":"program"|"preview"|"clean"}` or `{"source":"vt1"}`.
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     pub feed: VideoFeed,
     /// Optional audio (take only; `follow` is the only slice-1 value).
@@ -221,7 +221,7 @@ fn source_exists(state: &AppState, id: &str) -> ControlResult<bool> {
     Ok(config.sources.iter().any(|s| s.id == id))
 }
 
-/// The feed as a slice-1 routed feed, after existence checks: `Err` is the
+/// The feed as a routed feed (Program, Preview, Clean or a source), after existence checks: `Err` is the
 /// typed refusal response (`unknown-feed`, `output-kind-unroutable`).
 fn resolve_feed(state: &AppState, feed: &VideoFeed) -> ControlResult<Result<RoutedFeed, Response>> {
     let Some(routed) = RoutedFeed::of(feed) else {
@@ -294,7 +294,7 @@ pub(crate) fn plan_output(
             }
             Err(PlanRefusal::SwitcherRequired) => refusals.push(OutputPlanRefusal {
                 kind: "switcher-required".to_owned(),
-                detail: "Preview needs a switcher (M/E) in this run".to_owned(),
+                detail: "Preview and Clean need a switcher (M/E) in this run".to_owned(),
             }),
             Err(PlanRefusal::OutputKindUnroutable) => refusals.push(OutputPlanRefusal {
                 kind: "output-kind-unroutable".to_owned(),
@@ -367,7 +367,7 @@ fn plan_gate(
         Err(PlanRefusal::SwitcherRequired) => Some(refusal_problem(
             409,
             "switcher-required",
-            "Preview needs a switcher (M/E) in this run".to_owned(),
+            "Preview and Clean need a switcher (M/E) in this run".to_owned(),
         )),
         Err(PlanRefusal::OutputKindUnroutable) => Some(unroutable_kind()),
         Ok(cost) if !cost.fits() => Some(refusal_problem(

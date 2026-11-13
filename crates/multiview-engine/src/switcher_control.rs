@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::switcher::{SwitcherProjection, SwitcherState};
+use crate::switcher_inputs::{InputsReadback, MixerInputs, INPUT_SLOTS, MAX_PATCH_MEMBERS};
 
 /// Maximum command applications in one output frame.
 pub const MAX_COMMANDS_PER_TICK: usize = 16;
@@ -67,17 +68,43 @@ pub const REFUSE_LOST_DURING_AUTO: &str =
 pub const REFUSE_SAME_SOURCE: &str =
     "preview and program carry the same source; select a different preview source";
 
+/// Typed refusal: a patch member targets the input on PGM under `protect`.
+pub const REFUSE_ON_AIR_PROTECTED: &str =
+    "on-air-protected: the patch re-patches the input on Program; retry with on_air=allow to cut Program";
+/// Typed refusal: a patch member targets the PGM or PVW input during an AUTO.
+pub const REFUSE_PATCH_DURING_AUTO: &str =
+    "on-air-protected: the patch targets the Program or Preview input while an AUTO is in flight";
+/// Typed refusal: a select names a raw source on an M/E with numbered inputs.
+pub const REFUSE_NOT_AN_INPUT: &str =
+    "not-on-an-input: this M/E selects numbered inputs; select an input, not a source";
+/// Typed refusal: a select names an undeclared or unpatched input.
+pub const REFUSE_UNKNOWN_INPUT: &str = "unknown-slot: the input is not declared or not patched";
+
+/// A set of mixer-input crosspoints applied at one tick, all or none
+/// (ADR-0110 §12.8). Bounded by the control plane to 64 members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchSet {
+    /// `(input number, new source)`; `None` unpatches the input.
+    pub members: Vec<(u16, Option<SourceRef>)>,
+    /// `on_air = "allow"`: a member may re-patch the input on PGM (a cut).
+    pub allow_on_air: bool,
+}
+
 /// An operator verb, already authorized and reference-validated on admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwitcherVerb {
-    /// Arm a new preview source, without changing on-air output.
+    /// Arm a new preview source, without changing on-air output. With numbered
+    /// inputs installed this must be an input reference (`in:<n>`).
     SelectPreview(SourceRef),
     /// Punch a source directly onto on-air PGM at the next frame boundary.
+    /// With numbered inputs installed this must be an input reference.
     SelectProgram(SourceRef),
     /// Atomically take PVW to PGM at the next frame boundary.
     Cut,
     /// Begin an exact-duration automatic take on the next frame boundary.
     Auto(FrameCount),
+    /// Re-patch numbered mixer inputs at one tick (all members or none).
+    Patch(PatchSet),
 }
 
 /// One correlated command; `operation_id` is opaque and never interpreted by
@@ -97,10 +124,16 @@ pub struct SwitcherCommand {
 pub struct SwitcherSnapshot {
     /// Output tick on which this snapshot was published.
     pub tick: u64,
-    /// Current PGM source id.
+    /// Current PGM source id (resolved through the input table, if any).
     pub program: SourceRef,
-    /// Current PVW source id.
+    /// Current PVW source id (resolved through the input table, if any).
     pub preview: SourceRef,
+    /// Current PGM input number when numbered inputs are installed.
+    pub program_input: Option<u16>,
+    /// Current PVW input number when numbered inputs are installed.
+    pub preview_input: Option<u16>,
+    /// Bumped once per applied patch; 0 without inputs or before any patch.
+    pub inputs_version: u64,
     /// Whether an automatic transition is in progress.
     pub in_flight: bool,
     /// Number of completed takes, monotonic within one runtime.
@@ -131,6 +164,7 @@ pub struct SwitcherControl {
     applied_tick: Arc<std::sync::atomic::AtomicU64>,
     composed_count: Arc<std::sync::atomic::AtomicU64>,
     auto_capable: Arc<std::sync::atomic::AtomicBool>,
+    inputs: LatestState<InputsReadback>,
 }
 
 /// Actual paired-bus frame capability, published after the rendering provider
@@ -180,6 +214,7 @@ impl SwitcherControl {
             applied_tick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             composed_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auto_capable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inputs: LatestState::new(),
         };
         let driver = SwitcherTickDriver {
             rx,
@@ -199,6 +234,10 @@ impl SwitcherControl {
             staged_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
             spare_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
             before_staged: None,
+            inputs: None,
+            inputs_version: 0,
+            published_inputs_version: 0,
+            inputs_readback: handle.inputs.clone(),
         };
         (handle, driver)
     }
@@ -288,6 +327,13 @@ impl SwitcherControl {
         self.scenes.latest().map(|pair| pair.version)
     }
 
+    /// The engine's live mixer-input table, published once at install and then
+    /// only on a committed patch tick. `None` when the M/E has no inputs.
+    #[must_use]
+    pub fn inputs(&self) -> Option<Arc<InputsReadback>> {
+        self.inputs.latest()
+    }
+
     /// Subscribe to correlated, drop-oldest applied outcomes. A lagged reader
     /// must re-fetch state and operation status; it never stalls the output tick.
     #[must_use]
@@ -316,6 +362,11 @@ pub struct SwitcherTickDriver {
     staged_success: Vec<String>,
     spare_success: Vec<String>,
     before_staged: Option<Staged>,
+    /// Numbered mixer inputs (§12.2); `None` = PGM/PVW select sources by id.
+    inputs: Option<MixerInputs>,
+    inputs_version: u64,
+    published_inputs_version: u64,
+    inputs_readback: LatestState<InputsReadback>,
 }
 
 /// Everything a rejected tick must restore (review SW2-03): the machine and
@@ -325,9 +376,171 @@ struct Staged {
     machine: SwitcherState,
     active_auto: Option<String>,
     active_auto_scenes: Option<Arc<ScenePair>>,
+    /// The input table before this tick's first patch, captured lazily (only
+    /// on a patch tick, so the steady state never clones the table).
+    inputs: Option<(MixerInputs, u64)>,
 }
 
 impl SwitcherTickDriver {
+    /// Install the numbered mixer-input table before the clock starts (like
+    /// [`Self::set_prime_stores`]). The machine's PGM/PVW must then be input
+    /// references (`in:<n>`). Publishes the initial readback.
+    pub fn set_inputs(&mut self, inputs: MixerInputs) {
+        self.inputs_readback
+            .publish(inputs.readback(self.last_tick, self.inputs_version));
+        self.published_inputs_version = self.inputs_version;
+        self.inputs = Some(inputs);
+    }
+
+    /// Resolve a machine ref to its source through the input table (identity
+    /// without a table). Allocation-free.
+    fn resolve<'a>(&'a self, reference: &'a SourceRef) -> &'a SourceRef {
+        match &self.inputs {
+            Some(table) => table.resolve(reference),
+            None => reference,
+        }
+    }
+
+    /// The SOURCES on PGM and PVW for this tick: the machine's input refs
+    /// resolved through the table (identity without a table). Everything that
+    /// touches a store or a cell uses these, never [`Self::selections`].
+    #[must_use]
+    pub fn resolved_selections(&self) -> (&SourceRef, &SourceRef) {
+        (
+            self.resolve(self.machine.program()),
+            self.resolve(self.machine.preview()),
+        )
+    }
+
+    /// With inputs installed, a select must name a declared, patched input;
+    /// a raw source is refused (the control plane translates).
+    fn select_error(&self, verb: &SwitcherVerb) -> Option<&'static str> {
+        let table = self.inputs.as_ref()?;
+        let (SwitcherVerb::SelectPreview(target) | SwitcherVerb::SelectProgram(target)) = verb
+        else {
+            return None;
+        };
+        match target.as_input() {
+            None => Some(REFUSE_NOT_AN_INPUT),
+            Some(number) if table.source(number).is_none() => Some(REFUSE_UNKNOWN_INPUT),
+            Some(_) => None,
+        }
+    }
+
+    /// Validate a patch against the live table and buses. On success returns
+    /// the new PGM source when the patch changes it (it must be fresh first).
+    fn validate_patch<'a>(&self, set: &'a PatchSet) -> Result<Option<&'a SourceRef>, String> {
+        let Some(table) = self.inputs.as_ref() else {
+            return Err("unknown-slot: this M/E declares no numbered inputs".into());
+        };
+        if set.members.is_empty() || set.members.len() > MAX_PATCH_MEMBERS {
+            return Err(format!(
+                "a patch carries 1..={MAX_PATCH_MEMBERS} crosspoints"
+            ));
+        }
+        let program_input = self.machine.program().as_input();
+        let preview_input = self.machine.preview().as_input();
+        // Fixed-size duplicate guard: no allocation on the clock.
+        let mut seen = [false; INPUT_SLOTS];
+        let mut new_program = None;
+        for (number, source) in &set.members {
+            if !table.is_declared(*number) {
+                return Err(format!(
+                    "unknown-slot: mixer input {number} is not declared"
+                ));
+            }
+            // `is_declared` bounded the number to 1..=64 above.
+            let Some(slot) = seen.get_mut(usize::from(*number)) else {
+                return Err(format!(
+                    "unknown-slot: mixer input {number} is not declared"
+                ));
+            };
+            if *slot {
+                return Err(format!("mixer input {number} is patched twice in one set"));
+            }
+            *slot = true;
+            let on_program = program_input == Some(*number);
+            let on_bus = on_program || preview_input == Some(*number);
+            match source {
+                Some(source) => {
+                    let known = self
+                        .primed_stores
+                        .as_ref()
+                        .is_some_and(|stores| stores.contains_key(source.as_str()));
+                    if !known {
+                        return Err(format!(
+                            "unknown-source: {:?} has no frame store in this run",
+                            source.as_str()
+                        ));
+                    }
+                }
+                None if on_bus => {
+                    return Err(format!(
+                        "mixer input {number} is on Program or Preview and cannot be unpatched"
+                    ));
+                }
+                None => {}
+            }
+            if on_bus && self.machine.is_in_flight() {
+                return Err(REFUSE_PATCH_DURING_AUTO.into());
+            }
+            if on_program {
+                if !set.allow_on_air {
+                    return Err(REFUSE_ON_AIR_PROTECTED.into());
+                }
+                if source.as_ref() != table.source(*number) {
+                    new_program = source.as_ref();
+                }
+            }
+        }
+        Ok(new_program)
+    }
+
+    /// Apply a validated patch: every member lands in this drain, the table
+    /// is captured first so a rejected frame restores it. Cloning a
+    /// `SourceRef` (a `String`) happens only here, on a patch tick, never in
+    /// the steady state.
+    fn apply_patch(&mut self, set: &PatchSet) {
+        self.stage_inputs();
+        if let Some(table) = self.inputs.as_mut() {
+            for (number, source) in &set.members {
+                table.set(*number, source.clone());
+            }
+            self.inputs_version = self.inputs_version.saturating_add(1);
+        }
+    }
+
+    /// Validate, then apply now, hold for the new PGM source's first fresh
+    /// frame (the single held-take slot), or refuse.
+    fn gate_patch(
+        &mut self,
+        command: &SwitcherCommand,
+        set: &PatchSet,
+        tick: Tick,
+        held: bool,
+    ) -> Result<bool, String> {
+        let fresh = match self.validate_patch(set)? {
+            None => Some(true),
+            Some(source) => self.fresh_at(source.as_str(), tick),
+        };
+        match fresh {
+            Some(true) => {
+                self.apply_patch(set);
+                Ok(true)
+            }
+            Some(false) => {
+                if !held {
+                    self.pending_take = Some((
+                        command.clone(),
+                        tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
+                    ));
+                }
+                Ok(false)
+            }
+            None => Err("switcher source prime provider is unavailable".into()),
+        }
+    }
+
     /// Install the shared, already allocated source stores before the clock
     /// starts. Only `is_primed` is sampled on a tick; ingest remains off-clock.
     pub fn set_prime_stores(&mut self, stores: HashMap<String, Arc<TileStore<Nv12Image>>>) {
@@ -360,7 +573,18 @@ impl SwitcherTickDriver {
                 machine: self.machine.clone(),
                 active_auto: self.active_auto.clone(),
                 active_auto_scenes: self.active_auto_scenes.clone(),
+                inputs: None,
             });
+        }
+    }
+
+    /// Capture the input table for restore before this tick's first patch.
+    fn stage_inputs(&mut self) {
+        self.stage();
+        if let (Some(staged), Some(table)) = (self.before_staged.as_mut(), self.inputs.as_ref()) {
+            if staged.inputs.is_none() {
+                staged.inputs = Some((table.clone(), self.inputs_version));
+            }
         }
     }
 
@@ -374,11 +598,11 @@ impl SwitcherTickDriver {
         }
     }
 
-    /// The source a take verb puts on Program.
+    /// The source a take verb puts on Program (resolved through the table).
     fn incoming<'a>(&'a self, verb: &'a SwitcherVerb) -> &'a str {
         match verb {
-            SwitcherVerb::SelectProgram(source) => source.as_str(),
-            _ => self.machine.preview().as_str(),
+            SwitcherVerb::SelectProgram(source) => self.resolve(source).as_str(),
+            _ => self.resolve(self.machine.preview()).as_str(),
         }
     }
 
@@ -408,7 +632,7 @@ impl SwitcherTickDriver {
                     })
                     .and_then(|()| self.machine.auto(tick).map_err(|e| e.to_string()))
             }
-            SwitcherVerb::SelectPreview(_) => Err("not a take".into()),
+            SwitcherVerb::SelectPreview(_) | SwitcherVerb::Patch(_) => Err("not a take".into()),
         }
     }
 
@@ -498,7 +722,9 @@ impl SwitcherTickDriver {
         self.machine.auto_window()
     }
 
-    /// Authoritative post-command selected sources for the same output tick.
+    /// Authoritative post-command machine selections for the same output
+    /// tick: input refs (`in:<n>`) when numbered inputs are installed, else
+    /// sources. Use [`Self::resolved_selections`] to touch a store or cell.
     #[must_use]
     pub fn selections(&self) -> (&SourceRef, &SourceRef) {
         (self.machine.program(), self.machine.preview())
@@ -534,8 +760,8 @@ impl SwitcherTickDriver {
         // SW2-02: never complete an AUTO onto a source without a fresh frame.
         if let Some((start, rate)) = self.machine.auto_window() {
             let terminal = i128::from(tick.index) - start >= i128::from(rate.get());
-            let preview = self.machine.preview().as_str().to_owned();
-            if terminal && self.fresh_at(&preview, tick) == Some(false) {
+            let (_, preview) = self.resolved_selections();
+            if terminal && self.fresh_at(preview.as_str(), tick) == Some(false) {
                 self.machine.abort();
                 if let Some(operation_id) = self.active_auto.take() {
                     self.active_auto_scenes = None;
@@ -552,8 +778,23 @@ impl SwitcherTickDriver {
         }
         let mut projection = self.machine.sample(tick);
         if let Some((command, deadline)) = self.pending_take.take() {
-            let incoming = self.incoming(&command.verb).to_owned();
-            if self.fresh_at(&incoming, tick) == Some(true) {
+            if let SwitcherVerb::Patch(set) = &command.verb {
+                // A held patch re-validates against the live table: nothing
+                // else could change it while it held the only slot.
+                match self.gate_patch(&command, set, tick, true) {
+                    Ok(true) => self.staged_success.push(command.operation_id),
+                    Ok(false) if tick.index >= deadline => self.publish_outcome(
+                        command.operation_id,
+                        tick.index,
+                        false,
+                        Some(REFUSE_NO_FRESH_FRAME.into()),
+                    ),
+                    Ok(false) => self.pending_take = Some((command, deadline)),
+                    Err(err) => {
+                        self.publish_outcome(command.operation_id, tick.index, false, Some(err));
+                    }
+                }
+            } else if self.fresh_at(self.incoming(&command.verb), tick) == Some(true) {
                 self.stage();
                 let scenes = self.scenes.latest();
                 match self.apply_take(&command.verb, scenes.as_ref(), tick) {
@@ -602,13 +843,22 @@ impl SwitcherTickDriver {
             } else if self.pending_take.is_some() {
                 // One held take at a time; a PVW change would retarget it.
                 Err("a take is already held waiting for source prime".into())
+            } else if let SwitcherVerb::Patch(set) = &command.verb {
+                match self.gate_patch(&command, set, tick, false) {
+                    // Applied: the projection is unchanged by a patch.
+                    Ok(true) => Ok(Some(projection)),
+                    Ok(false) => Ok(None),
+                    Err(err) => Err(err),
+                }
+            } else if let Some(error) = self.select_error(&command.verb) {
+                Err(error.into())
             } else if let SwitcherVerb::SelectPreview(source) = &command.verb {
-                if !scenes
-                    .as_ref()
-                    .is_some_and(|pair| scene_admits_source(&pair.preview, source.as_str()))
-                {
+                if !scenes.as_ref().is_some_and(|pair| {
+                    scene_admits_source(&pair.preview, self.resolve(source).as_str())
+                }) {
                     Err("preview source is absent from the active scene".into())
-                } else if source == self.machine.program() {
+                } else if self.resolve(source) == self.resolved_selections().0 {
+                    // #247 compares the pictures: the resolved SOURCES.
                     Err(REFUSE_SAME_SOURCE.into())
                 } else {
                     self.machine
@@ -619,17 +869,25 @@ impl SwitcherTickDriver {
             } else if matches!(command.verb, SwitcherVerb::Auto(_)) && self.machine.is_in_flight() {
                 Err("cannot start a second AUTO during an active take".into())
             } else if let SwitcherVerb::SelectProgram(source) = &command.verb {
-                if source == self.machine.program() {
-                    Err("source is already on program".into())
-                } else if scenes
-                    .as_ref()
-                    .is_some_and(|pair| scene_admits_source(&pair.program, source.as_str()))
+                if source == self.machine.program()
+                    || self.resolve(source) == self.resolved_selections().0
                 {
+                    // The picture, not the reference: another input carrying
+                    // the Program source is the same source on Program.
+                    Err("source is already on program".into())
+                } else if self.inputs.is_some() && source == self.machine.preview() {
+                    // #341 review A-1: punching the Preview input would put one
+                    // input on both buses (CUT/AUTO then refuse, flip-flop
+                    // cannot swap). Select another input, or CUT.
+                    Err(REFUSE_SAME_SOURCE.into())
+                } else if scenes.as_ref().is_some_and(|pair| {
+                    scene_admits_source(&pair.program, self.resolve(source).as_str())
+                }) {
                     self.gate_take(&command, scenes.as_ref(), tick)
                 } else {
                     Err("program source is absent from the active scene".into())
                 }
-            } else if self.machine.preview() == self.machine.program() {
+            } else if self.resolved_selections().0 == self.resolved_selections().1 {
                 Err(REFUSE_SAME_SOURCE.into())
             } else {
                 self.gate_take(&command, scenes.as_ref(), tick)
@@ -661,8 +919,7 @@ impl SwitcherTickDriver {
         scenes: Option<&Arc<ScenePair>>,
         tick: Tick,
     ) -> Result<Option<SwitcherProjection>, String> {
-        let incoming = self.incoming(&command.verb).to_owned();
-        match self.fresh_at(&incoming, tick) {
+        match self.fresh_at(self.incoming(&command.verb), tick) {
             Some(true) => self.apply_take(&command.verb, scenes, tick).map(Some),
             Some(false) => {
                 self.pending_take = Some((
@@ -689,20 +946,43 @@ impl SwitcherTickDriver {
         self.before_staged = None;
         self.applied_tick
             .store(tick.index, std::sync::atomic::Ordering::Release);
+        let (program, preview) = self.resolved_selections();
+        let (program_input, preview_input) = if self.inputs.is_some() {
+            (
+                self.machine.program().as_input(),
+                self.machine.preview().as_input(),
+            )
+        } else {
+            (None, None)
+        };
         let changed = self.snapshots.latest().is_none_or(|previous| {
-            previous.program != *self.machine.program()
-                || previous.preview != *self.machine.preview()
+            previous.program != *program
+                || previous.preview != *preview
+                || previous.program_input != program_input
+                || previous.preview_input != preview_input
+                || previous.inputs_version != self.inputs_version
                 || previous.in_flight != self.machine.is_in_flight()
                 || previous.completion_count != self.machine.completion_count()
         });
         if changed {
             self.snapshots.publish(SwitcherSnapshot {
                 tick: tick.index,
-                program: self.machine.program().clone(),
-                preview: self.machine.preview().clone(),
+                program: program.clone(),
+                preview: preview.clone(),
+                program_input,
+                preview_input,
+                inputs_version: self.inputs_version,
                 in_flight: self.machine.is_in_flight(),
                 completion_count: self.machine.completion_count(),
             });
+        }
+        // Readback only on a committed patch tick (allocates; never steady state).
+        if self.inputs_version != self.published_inputs_version {
+            if let Some(table) = self.inputs.as_ref() {
+                self.inputs_readback
+                    .publish(table.readback(tick.index, self.inputs_version));
+            }
+            self.published_inputs_version = self.inputs_version;
         }
         self.composed_count
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -722,6 +1002,10 @@ impl SwitcherTickDriver {
             self.machine = previous.machine;
             self.active_auto = previous.active_auto;
             self.active_auto_scenes = previous.active_auto_scenes;
+            if let Some((table, version)) = previous.inputs {
+                self.inputs = Some(table);
+                self.inputs_version = version;
+            }
         }
         // A rejected frame aborts any AUTO: Program stays on the source the
         // restored machine names, which the hook re-binds.

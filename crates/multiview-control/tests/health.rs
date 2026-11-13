@@ -263,3 +263,94 @@ async fn slow_ingest_lags_without_back_pressuring_the_engine() {
     .expect("lagged recovery must not block");
     assert_eq!(step, WarningIngestStep::Lagged);
 }
+
+/// #324 review D: the acknowledge must not write the store ahead of the warning
+/// ingest. A raise still queued in the engine broadcast when the operator
+/// acknowledges would otherwise be applied AFTER a direct "cleared" upsert and
+/// re-activate the alarm. Here the ingest is driven by hand: the acknowledge
+/// returns only once its own clear (FIFO behind the raise) was applied, and the
+/// store then stays cleared.
+#[tokio::test]
+async fn ack_waits_for_its_clear_behind_a_queued_raise() {
+    use multiview_config::{MultiviewConfig, StartMode};
+    use multiview_control::boot_model::{
+        boot_fallback_marker_path, write_atomic, BootFallbackMarker, BootModel,
+    };
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let boot_path = dir.path().join("conspect.toml");
+    let doc = "schema_version = 1\n[canvas]\nwidth = 64\nheight = 64\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"absolute\"\n[[sources]]\nid = \"a\"\nkind = \"bars\"\n[[cells]]\nid = \"c\"\nrect = { x = 0.0, y = 0.0, w = 1.0, h = 1.0 }\n[cells.source]\ninput_id = \"a\"\n";
+    std::fs::write(&boot_path, doc).unwrap();
+    let config = MultiviewConfig::load_from_toml(doc).unwrap();
+    let model = Arc::new(BootModel::new(
+        boot_path.clone(),
+        config.clone(),
+        config,
+        StartMode::Boot,
+        false,
+        None,
+    ));
+    std::fs::create_dir_all(dir.path().join(".multiview")).unwrap();
+    let marker = BootFallbackMarker::new("r".into(), None, 1, "m".into());
+    write_atomic(
+        &boot_fallback_marker_path(&boot_path),
+        &serde_json::to_string(&marker).unwrap(),
+    )
+    .unwrap();
+    let h = support::harness_with(|state| state.with_boot_model(model));
+    let mut sub = h.engine.subscribe();
+    // The engine raised the warning; the ingest has not applied it yet.
+    multiview_control::emit_accepted_state_rejected(&h.engine, "raised", 1);
+    let ack = tokio::spawn({
+        let router = h.router.clone();
+        async move {
+            send(
+                &router,
+                support::post_if_match(
+                    "/api/v1/health/accepted-state-rejected/ack",
+                    support::OPERATOR_TOKEN,
+                    None,
+                ),
+            )
+            .await
+            .status()
+        }
+    });
+    // Give the acknowledge time to run while the raise is still queued.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // Now the ingest applies the queued raise.
+    let applied = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        warning_ingest_step(&mut sub, h.warnings.as_ref()),
+    )
+    .await
+    .expect("the ingest receives the raise");
+    assert_eq!(applied, WarningIngestStep::Applied);
+    // Whenever the acknowledge has answered, the alarm must be cleared — an
+    // acknowledge that wrote the store before the queued raise was applied
+    // answers 204 while the raise re-activates it.
+    if ack.is_finished() {
+        let resp = send(&h.router, get("/api/v1/health", VIEWER_TOKEN)).await;
+        let body = body_json(resp).await;
+        assert!(
+            !body.to_string().contains("accepted-state-rejected"),
+            "answered 204 but the alarm is active: {body}"
+        );
+    }
+    // Then the acknowledge's own clear, FIFO behind the raise.
+    let applied = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        warning_ingest_step(&mut sub, h.warnings.as_ref()),
+    )
+    .await
+    .expect("the ingest receives the clear");
+    assert_eq!(applied, WarningIngestStep::Applied);
+    assert_eq!(ack.await.unwrap(), StatusCode::NO_CONTENT);
+    let resp = send(&h.router, get("/api/v1/health", VIEWER_TOKEN)).await;
+    let body = body_json(resp).await;
+    assert!(
+        !body.to_string().contains("accepted-state-rejected"),
+        "{body}"
+    );
+    assert!(!boot_fallback_marker_path(&boot_path).exists());
+}

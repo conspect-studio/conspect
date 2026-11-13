@@ -618,7 +618,10 @@ impl JournalWorker {
                 });
                 state.pair_pdt(media_sequence);
             }
-            Observation::Flush => self.flush(wall_now_ns()),
+            Observation::Flush => {
+                self.flush(wall_now_ns());
+                FLUSHES_APPLIED.fetch_add(1, Ordering::Release);
+            }
         }
     }
 
@@ -1004,11 +1007,34 @@ pub fn live_summary(source: &str) -> Option<Arc<LiveSummary>> {
         .and_then(|service| service.live.load().get(source).cloned())
 }
 
+/// Flushes the worker has applied (for [`flush_and_wait`]).
+static FLUSHES_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Ask the worker to persist repeat counters before shutdown.
 pub fn flush() {
     if let Some(feed) = feed() {
         feed.offer(Observation::Flush);
     }
+}
+
+/// [`flush`], then wait up to `bound` for the worker to apply it (#309: the
+/// exit path must see the counters persisted before a hard exit). Returns
+/// whether the flush was applied in time; never waits past `bound`. Off the
+/// output clock only.
+pub fn flush_and_wait(bound: std::time::Duration) -> bool {
+    let Some(feed) = feed() else {
+        return true;
+    };
+    let before = FLUSHES_APPLIED.load(Ordering::Acquire);
+    feed.offer(Observation::Flush);
+    let until = std::time::Instant::now() + bound;
+    while FLUSHES_APPLIED.load(Ordering::Acquire) == before {
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    true
 }
 
 #[cfg(test)]

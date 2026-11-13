@@ -348,6 +348,11 @@ jobs:
           # dedicated `acme-pebble` job below.
           - crate: multiview-control
             feature: acme
+          # Slice 5 PR B: the ACME boot wiring, `multiview tls` CLI and the
+          # dead-CA boot test (`tests/tls_cli.rs`: the realtime software clock
+          # keeps 50/50 ticks while the CA refuses).
+          - crate: multiview-cli
+            feature: acme
           # multiview-hal off-by-default features
           - crate: multiview-hal
             feature: i915-pmu
@@ -1167,6 +1172,15 @@ jobs:
           otool -L "$bin" | grep libavformat
           otool -L "$bin" | grep -q "${FF_PREFIX}/lib/libavformat" \
             || { echo "::error::test binary is not linked against ${FF_PREFIX}"; exit 1; }
+      - name: Chaos — bounded exit after a fatal output fault and SIGTERM (#309)
+        # Mandatory chaos test for the invariant-#1 exit bound: the REAL binary
+        # (with the env-armed `_chaos-test-seams`) is forced behind the clock
+        # (fatal) and SIGTERMed, with source teardown held 10x past the bound.
+        # Every run must exit within 2 s + 0.5 s with valid HLS on disk.
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p multiview-cli --features apple,_chaos-test-seams
+          bash scripts/chaos-bounded-exit.sh target/release/multiview 10 both
       - name: Release bundle check (apple preset, deploy/macos-bundle.sh, ad-hoc signed)
         # The release workflow only runs on tags; this proves on every PR that
         # the apple binary bundles into a self-contained, signed directory that
@@ -1373,6 +1387,10 @@ jobs:
       # --all-features: that pulls the opt-in GPL codecs by design.
       - name: cargo deny (webrtc-native closure)
         run: cargo deny --features multiview-cli/webrtc-native check
+      # The ACME closure (instant-acme, hickory, x509-parser) ships in every
+      # preset since slice 5 PR B (#291): gate its advisories and licenses too.
+      - name: cargo deny (acme closure)
+        run: cargo deny --features multiview-cli/acme check
 
   # ── HTTP/3 front-door fuzzing (#288) ─────────────────────────────────────────
   # The multiview-h3 header-block guard, capsule parser and the real h3 server

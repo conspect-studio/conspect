@@ -90,6 +90,7 @@
 
 pub mod alarm;
 pub mod clock;
+pub mod clock_thread;
 pub mod cycle;
 pub mod degrade;
 pub mod demand;
@@ -119,6 +120,7 @@ pub mod switcher;
 pub mod switcher_bus;
 pub mod switcher_control;
 pub mod switcher_hook;
+pub mod switcher_inputs;
 pub mod switcher_plan;
 pub mod switcher_runtime;
 pub mod sysref;
@@ -180,8 +182,8 @@ pub use routing_aux::{
     aux_tick_channel, AuxTick, AuxTickSender, ClosureControl, WithAuxTick, AUX_TICK_CAPACITY,
 };
 pub use runtime::{
-    CooperativePacer, EngineRuntime, Pacer, RealtimePacer, RunOutcome, RunStop, StopSignal,
-    MAX_REPEATS_BETWEEN_CONTROL, MAX_REPEATS_PER_TICK,
+    CooperativePacer, EngineRuntime, Handoff, Pacer, RealtimePacer, RunOutcome, RunStop,
+    StopSignal, HANDOFF_LEAD_TICKS, MAX_REPEATS_BETWEEN_CONTROL, MAX_REPEATS_PER_TICK,
 };
 pub use salvo::{Salvo, SalvoBatch, SalvoChange, SalvoPhase};
 pub use scheduler::{EventKind, ScheduledAction, Scheduler, TriggerEvent};

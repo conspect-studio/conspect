@@ -277,6 +277,9 @@ zeroize = { version = "1", optional = true }
 
 
 [dev-dependencies]
+# Capture every tracing field in the TLS setup tests to prove a credential value
+# is never logged (`tests/tls_setup.rs`). Workspace crate, already in the lock.
+tracing-subscriber = { workspace = true }
 hang = "=0.21.22"
 url = "2"
 moq-net = "=0.3.21"
@@ -478,6 +481,11 @@ required-features = ["acme"]
 [[test]]
 # Cloudflare provider request shapes against an in-process fake API on [::1].
 name = "acme_cloudflare"
+required-features = ["acme"]
+
+[[test]]
+# The front-door setup gate, setup codes and TLS admin routes (ADR-0107 §5a).
+name = "tls_setup"
 required-features = ["acme"]
 
 [[test]]

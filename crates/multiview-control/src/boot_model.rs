@@ -1857,6 +1857,22 @@ impl BootModel {
         }
     }
 
+    /// Seed the in-memory accepted snapshot with `desired` instead of lazily
+    /// loading `desired.json` (#324). Used when this start fell back to the
+    /// last-good copy: the operator's `desired.json` stays untouched on disk,
+    /// but the stores, the `GET` routes and the engine must all agree with what
+    /// actually RUNS. The first operator commit through the API then writes a
+    /// new `desired.json` based on what runs.
+    #[must_use]
+    pub fn with_accepted_override(mut self, desired: DesiredState) -> Self {
+        *self
+            .accepted_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            AcceptedCache::Loaded(Arc::new(desired));
+        self
+    }
+
     /// The boot config file path.
     #[must_use]
     pub fn boot_path(&self) -> &Path {
@@ -2145,6 +2161,114 @@ impl BootModel {
     }
 }
 
+/// The persisted start-up fallback marker's file name (#324).
+pub const BOOT_FALLBACK_FILE: &str = "boot-fallback.json";
+
+/// The persisted start-up fallback marker (#324): written when a start ran
+/// from the last-good copy because the accepted state could not start, read
+/// at every later start so the `accepted-state-rejected` warning survives a
+/// restart (and a `--ticks` / no-`[control]` run) until an operator
+/// acknowledges it. A latched in-memory warning alone would vanish on the
+/// very restart that is most likely to follow a bad start.
+///
+/// Deliberately NOT `deny_unknown_fields`: a marker written by a newer build
+/// with extra fields must still raise the warning (and be acknowledgeable)
+/// after a rollback to this one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct BootFallbackMarker {
+    /// Why the accepted state could not start (the exact start-up reason).
+    pub reason: String,
+    /// Where a copy of the rejected accepted-state bytes was kept, if it could
+    /// be written.
+    pub kept_at: Option<String>,
+    /// Unix milliseconds of the start that fell back.
+    pub since_unix_ms: i64,
+    /// The operator-facing warning text.
+    pub message: String,
+}
+
+impl BootFallbackMarker {
+    /// Build a marker.
+    #[must_use]
+    pub fn new(
+        reason: String,
+        kept_at: Option<String>,
+        since_unix_ms: i64,
+        message: String,
+    ) -> Self {
+        Self {
+            reason,
+            kept_at,
+            since_unix_ms,
+            message,
+        }
+    }
+}
+
+/// The start-up fallback marker path for the boot config at `boot_path`.
+#[must_use]
+pub fn boot_fallback_marker_path(boot_path: &Path) -> PathBuf {
+    state_dir_for(boot_path).join(BOOT_FALLBACK_FILE)
+}
+
+/// Read the start-up fallback marker, if one is pending. A missing file is
+/// `Ok(None)`; an unreadable or unparsable one is an error the caller logs
+/// (it still means "a fallback happened": the caller raises a generic warning
+/// rather than silently dropping the alarm).
+///
+/// # Errors
+/// The marker exists but cannot be read or parsed.
+pub fn read_boot_fallback_marker(boot_path: &Path) -> Result<Option<BootFallbackMarker>, String> {
+    use std::io::Read as _;
+    let path = boot_fallback_marker_path(boot_path);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    // Bounded read (#324): a marker is a few KiB; anything larger is not one of
+    // ours and is treated as unreadable (still removable by an acknowledge).
+    let mut text = String::new();
+    file.take(MAX_BOOT_FALLBACK_MARKER_BYTES.saturating_add(1))
+        .read_to_string(&mut text)
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    if text.len() > usize::try_from(MAX_BOOT_FALLBACK_MARKER_BYTES).unwrap_or(usize::MAX) {
+        return Err(format!(
+            "{} is larger than {MAX_BOOT_FALLBACK_MARKER_BYTES} bytes",
+            path.display()
+        ));
+    }
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("parsing {}: {e}", path.display()))
+}
+
+/// The largest start-up fallback marker [`read_boot_fallback_marker`] reads.
+pub const MAX_BOOT_FALLBACK_MARKER_BYTES: u64 = 64 * 1024;
+
+/// Remove the start-up fallback marker (the operator acknowledged it). Returns
+/// whether a marker was present. Blocking file I/O: call it at start-up or on
+/// the blocking pool, never on an engine thread.
+///
+/// # Errors
+/// The marker exists but could not be removed.
+pub fn clear_boot_fallback_marker(boot_path: &Path) -> std::io::Result<bool> {
+    let path = boot_fallback_marker_path(boot_path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            if let Some(dir) = path.parent() {
+                // Best effort: the removal is what matters; a lost directory
+                // sync at worst re-raises the warning once on the next start.
+                let _ = sync_parent_directory(dir);
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// The state directory for a boot config at `boot_path`
 /// (`<config-dir>/.multiview`; a bare filename resolves against `.`).
 #[must_use]
@@ -2214,12 +2338,50 @@ pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     })
 }
 
+/// [`write_atomic`] that keeps the before/after-rename distinction (#324): the
+/// start-up fallback writes its kept copy and marker with this so an
+/// `AfterRename` (the bytes are visible, only the directory fsync failed) is
+/// judged by reading the file back instead of being mistaken for a write that
+/// never happened.
+///
+/// # Errors
+/// [`AtomicWriteError::BeforeRename`]: nothing became visible at `path`;
+/// [`AtomicWriteError::AfterRename`]: the new bytes are visible but their
+/// durability is not confirmed.
+pub fn write_atomic_checked(path: &Path, content: &str) -> Result<(), AtomicWriteError> {
+    write_atomic_commit(path, content)
+}
+
 /// Distinguish a failed prepare from an already-visible rename whose directory
 /// fsync failed. An after-rename error cannot be treated as a rollback.
 #[derive(Debug)]
-enum AtomicWriteError {
+#[non_exhaustive]
+pub enum AtomicWriteError {
+    /// The write failed before the rename: `path` still holds its old content
+    /// (or does not exist).
     BeforeRename(std::io::Error),
+    /// The rename is visible but the parent-directory fsync failed: the new
+    /// content is in place, its durability across a power cut is not confirmed.
     AfterRename(std::io::Error),
+}
+
+impl std::fmt::Display for AtomicWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeRename(e) => write!(f, "{e}"),
+            Self::AfterRename(e) => {
+                write!(f, "renamed into place, but the directory sync failed: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AtomicWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BeforeRename(e) | Self::AfterRename(e) => Some(e),
+        }
+    }
 }
 
 fn write_atomic_commit(path: &Path, content: &str) -> Result<(), AtomicWriteError> {

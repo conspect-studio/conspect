@@ -28,29 +28,33 @@ pub enum RoutedFeed {
     Program,
     /// The M/E's Preview bus.
     Preview,
+    /// The Program picture before the overlay bake (no labels, no tally).
+    Clean,
     /// One source directly (camera, media player, generator).
     Source(String),
 }
 
 impl RoutedFeed {
-    /// The slice-1 routed feed of `feed`, or `None` for Clean / a layout.
+    /// The routed feed of `feed`, or `None` for a layout.
     #[must_use]
     pub fn of(feed: &VideoFeed) -> Option<Self> {
         use multiview_config::OutputBus;
         match feed {
             VideoFeed::Bus(OutputBus::Program) => Some(Self::Program),
             VideoFeed::Bus(OutputBus::Preview) => Some(Self::Preview),
+            VideoFeed::Bus(OutputBus::Clean) => Some(Self::Clean),
             VideoFeed::Source(id) => Some(Self::Source(id.clone())),
             _ => None,
         }
     }
 
-    /// The picture-bus name (`program`, `preview`, `src:<id>`).
+    /// The picture-bus name (`program`, `preview`, `clean`, `src:<id>`).
     #[must_use]
     pub fn bus_name(&self) -> String {
         match self {
             Self::Program => "program".to_owned(),
             Self::Preview => "preview".to_owned(),
+            Self::Clean => "clean".to_owned(),
             Self::Source(id) => format!("src:{id}"),
         }
     }
@@ -61,6 +65,7 @@ impl RoutedFeed {
         match name {
             "program" => Some(Self::Program),
             "preview" => Some(Self::Preview),
+            "clean" => Some(Self::Clean),
             _ => name
                 .strip_prefix("src:")
                 .map(|id| Self::Source(id.to_owned())),
@@ -73,6 +78,7 @@ impl RoutedFeed {
         match self {
             Self::Program => VideoFeed::PROGRAM,
             Self::Preview => VideoFeed::Bus(multiview_config::OutputBus::Preview),
+            Self::Clean => VideoFeed::Bus(multiview_config::OutputBus::Clean),
             Self::Source(id) => VideoFeed::Source(id.clone()),
         }
     }
@@ -106,7 +112,7 @@ pub enum TakeSubmitError {
 pub enum PlanRefusal {
     /// The output's kind cannot be routed in this release.
     OutputKindUnroutable,
-    /// Preview requested on a run without an M/E.
+    /// Preview or Clean requested on a run without an M/E.
     SwitcherRequired,
 }
 
@@ -424,6 +430,40 @@ impl TakeLimiter {
         Ok(())
     }
 
+    /// Admit one request of `principal` touching every destination in
+    /// `destinations` as ONE take against the principal's limit and one take
+    /// per distinct destination (ADR-0110 §12.8 rule 3). All limits are
+    /// checked before any records, so a refusal consumes nothing.
+    ///
+    /// # Errors
+    /// The longest delay until every needed slot frees.
+    pub fn admit_set(
+        &self,
+        destinations: &[String],
+        principal: &str,
+        now: Instant,
+    ) -> Result<(), Duration> {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (outputs, principals) = &mut *guard;
+        let mut wait: Option<Duration> = None;
+        for destination in destinations {
+            if let Err(delay) = outputs.check(destination, now) {
+                wait = Some(wait.map_or(delay, |w| w.max(delay)));
+            }
+        }
+        if let Err(delay) = principals.check(principal, now) {
+            wait = Some(wait.map_or(delay, |w| w.max(delay)));
+        }
+        if let Some(wait) = wait {
+            return Err(wait);
+        }
+        for destination in destinations {
+            outputs.record(destination, now);
+        }
+        principals.record(principal, now);
+        Ok(())
+    }
+
     /// Tracked (outputs, principals) — the bound is the cap.
     #[must_use]
     pub fn tracked(&self) -> (usize, usize) {
@@ -728,9 +768,18 @@ mod tests {
         for feed in [
             RoutedFeed::Program,
             RoutedFeed::Preview,
+            RoutedFeed::Clean,
             RoutedFeed::Source("bars".into()),
         ] {
             assert_eq!(RoutedFeed::from_bus_name(&feed.bus_name()), Some(feed));
         }
+    }
+
+    #[test]
+    fn clean_is_a_routed_picture_bus() {
+        let clean = VideoFeed::Bus(multiview_config::OutputBus::Clean);
+        assert_eq!(RoutedFeed::of(&clean), Some(RoutedFeed::Clean));
+        assert_eq!(RoutedFeed::Clean.bus_name(), "clean");
+        assert_eq!(RoutedFeed::Clean.video_feed(), clean);
     }
 }

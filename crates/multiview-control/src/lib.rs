@@ -79,6 +79,7 @@ pub mod moq_startup;
 pub mod nmos;
 pub mod notify;
 pub mod output_routing;
+pub mod patch;
 pub mod pending_actions;
 pub mod preview;
 pub mod problem;
@@ -103,6 +104,9 @@ pub mod system;
 pub mod tally_ingest;
 pub mod tally_state;
 pub mod telemetry_consent;
+pub mod tls_api;
+#[cfg(all(feature = "acme", unix))]
+pub mod tls_setup;
 pub(crate) mod typed_resources;
 pub mod versioning;
 pub mod warning_ingest;
@@ -239,9 +243,10 @@ pub use versioning::{
     RevisionId, CONFIG_REVISION_KIND,
 };
 pub use warning_ingest::{
-    emit_accepted_state_rejected, emit_capability_warnings, emit_network_warnings,
+    bounded_text, bounded_warning_text, emit_accepted_state_rejected,
+    emit_accepted_state_rejected_cleared, emit_capability_warnings, emit_network_warnings,
     run_warning_ingest, warning_ingest_step, warning_transition, CompositeMismatchView,
-    NetworkMismatchView, WarningIngestStep,
+    NetworkMismatchView, WarningIngestStep, MAX_WARNING_TEXT,
 };
 pub use warning_store::{InMemoryWarningStore, WarningFilter, WarningRepository, WARNING_KIND};
 pub use watch_status::{ConfigWatchStatus, WatchStamp, WatchStatusBody};
@@ -261,15 +266,43 @@ pub use whip::{no_whip, NoWhip, SharedWhip, WhipAnswer, WhipAuth, WhipProvider, 
 ///
 /// The returned router carries `AppState`, so it is ready to serve.
 pub fn router(state: AppState) -> Router {
+    router_with(state, Surface::Admin)
+}
+
+/// The served router type ([`router`], [`tls_setup::front_door_router`]),
+/// named for callers that compose it without depending on axum directly.
+pub type ControlRouter = Router;
+
+/// Which listener a router is built for. The two differ only in the
+/// `/api/v1/tls/*` routes (ADR-0107 section 5a): the admin listener carries
+/// the loopback-only certificate admin routes, the front door the setup-code
+/// login. Both carry them only when [`AppState::with_tls`] is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// The `[control] listen` loopback admin listener.
+    Admin,
+    /// The network front door (TCP 443, slice 4).
+    FrontDoor,
+}
+
+/// [`router`] for an explicit [`Surface`].
+pub fn router_with(state: AppState, surface: Surface) -> Router {
     // SEC-14: install the management-plane request-concurrency + rate caps only when
     // the operator has limits enabled (the default). Disabled ⇒ the router is exactly
     // what it was before — no middleware, no overhead.
     let limits_enabled = state.limiters.is_enabled();
-    if let Some(control) = state.output_routing.as_ref() {
-        output_routing::spawn_outcome_relay(&state, control);
-    }
-    if let Some(metrics) = state.program_metrics.as_ref() {
-        program_metrics::spawn_sampler(metrics);
+    // The background relay and sampler belong to the admin router, which every
+    // run builds. The front door router shares the same state. If it spawned
+    // them again, the sampler would push two samples per second and halve the
+    // metrics window.
+    if surface == Surface::Admin {
+        if let Some(control) = state.output_routing.as_ref() {
+            output_routing::spawn_outcome_relay(&state, control);
+        }
+        patch::spawn_persist_relay(&state);
+        if let Some(metrics) = state.program_metrics.as_ref() {
+            program_metrics::spawn_sampler(metrics);
+        }
     }
 
     let api = routes::api_router()
@@ -289,7 +322,15 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(realtime::sse_handler))
         // Unauthenticated auth-mode discovery: the SPA reads this before it has a
         // token, to decide whether to show a login gate (and to validate a key).
-        .route("/auth/status", get(realtime::auth_status_handler))
+        .route("/auth/status", get(realtime::auth_status_handler));
+    // Front-door certificate routes (ADR-0107 section 5a), only with `[network.tls]`.
+    #[cfg(all(feature = "acme", unix))]
+    let api = if state.tls.is_some() {
+        api.merge(tls_setup::api_routes(surface))
+    } else {
+        api
+    };
+    let api = api
         // The Conspect config-lock interceptor (S2 backend, ADR-0050 §5): one
         // additive guard over the whole `/api/v1` surface that refuses
         // *configuration* mutations with a `409 config_locked` problem when the

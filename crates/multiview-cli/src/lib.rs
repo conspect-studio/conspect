@@ -281,6 +281,8 @@ pub mod player;
 
 #[cfg(feature = "ffmpeg")]
 mod binding_delivery;
+/// Bounded process exit after a fatal fault or a stop signal (#309).
+pub mod exit_watchdog;
 /// Existing encoded output conversion and authorized MoQ family adapter.
 #[cfg(feature = "moq-output")]
 pub mod moq_outputs;
@@ -386,6 +388,15 @@ pub mod webrtc_outputs;
 /// The network front door (ADR-0107 slice 1): one dual-stack UDP socket for
 /// MoQ and WebRTC, on its own runtime, when `[network]` is configured.
 pub mod frontdoor;
+
+/// Front-door ACME boot wiring (ADR-0107 section 5a, slice 5): bootstrap
+/// certificate, ACME service, alarm hook, setup code. Behind `acme`, unix.
+#[cfg(all(feature = "acme", unix))]
+pub mod tls_boot;
+
+/// The `multiview tls ...` subcommand: status, setup-code, set-credential,
+/// issue, over the loopback admin listener (or offline from `state_dir`).
+pub mod tls_cli;
 
 /// The **single-socket** WebRTC orchestration (ADR-0048 §4): binds ONE shared
 /// dual-stack UDP socket and adopts every WebRTC role onto it — preview WHEP, WHIP

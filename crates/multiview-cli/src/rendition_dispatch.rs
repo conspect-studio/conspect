@@ -3180,6 +3180,91 @@ mod tests {
         assert_eq!(discontinuities, 0, "equal sets splice");
     }
 
+    /// M1 regression (batch.rs `try_offer`): with a queued backlog already
+    /// sitting in the output's queue (not yet popped) when a move with
+    /// changed parameter sets lands, the flag must still land on exactly the
+    /// cut window's lease, not on an earlier queued one or a later one.
+    #[test]
+    fn decoder_config_changed_lands_on_the_cut_window_lease_with_a_queued_backlog() {
+        let now = Instant::now();
+        let mut moved = binding(1, 1, 1);
+        moved.inband_parameter_changes_ok = true;
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), moved], 2, 1)).unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        // Differing parameter sets: base key's RAPs report `[1]`, the live
+        // key's gated RAP reports `[77]` (its packet length).
+        for k in [1, key] {
+            d.set_parameter_sets(
+                k,
+                Box::new(move |p: &EncodedPacket| {
+                    if p.is_keyframe() {
+                        RapParameterSets::Sets(vec![u8::try_from(p.len()).unwrap()])
+                    } else {
+                        RapParameterSets::Absent
+                    }
+                }),
+            )
+            .unwrap();
+        }
+        d.rebind_video(1, key, 2, 3).unwrap();
+        // Windows 0 and 1 stay queued on output 1 (not popped): a real
+        // backlog is present when the move lands at window 2.
+        for i in 0..2_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            d.dispatch(
+                ve(key, u64::try_from(i).unwrap(), vec![video(i, 8, false)], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+        }
+        assert_eq!(sink.queues[1].queued_windows(), 2, "backlog stays queued");
+        // Window 2: the gated RAP triggers the move; this is the cut window.
+        let m = Some(mark(TICK * 3));
+        d.dispatch(ve(key, 2, vec![rap77(2)], m), now, &mut sink)
+            .unwrap();
+        feed_base(&mut d, &mut sink, 2, 2, now, plain(2)).unwrap();
+        pop_all(&mut sink, 0, now);
+        // Window 3: one more window after the cut, still queued.
+        let m = Some(mark(TICK * 4));
+        d.dispatch(ve(key, 3, vec![video(3, 8, false)], m), now, &mut sink)
+            .unwrap();
+        feed_base(&mut d, &mut sink, 2, 3, now, plain(3)).unwrap();
+        pop_all(&mut sink, 0, now);
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Applied {
+                output_index: 1,
+                key,
+                tick: 2,
+                parameter_sets_changed: true
+            }]
+        );
+        assert_eq!(sink.queues[1].queued_windows(), 4, "nothing popped yet");
+        let flags: Vec<bool> = (0..4)
+            .map(|_| {
+                sink.queues[1]
+                    .pop_at(now)
+                    .unwrap()
+                    .unwrap()
+                    .decoder_config_changed()
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            [false, false, true, false],
+            "only the cut window's lease (the one whose first video packet \
+             is the moved RAP) reports the change; both earlier queued \
+             windows and the later window report false"
+        );
+    }
+
     /// V1: output 1 moves 1 -> 0 at tick 1 and back 0 -> 1 at tick 3 between
     /// base keys whose RAPs carry `sets0` / `sets1`; every base window is a
     /// gated RAP. Returns (outcomes, discontinuities, final key).

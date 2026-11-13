@@ -708,9 +708,16 @@ impl NoqServer {
 
 		let provider = crate::crypto::provider();
 
-		let certs = ServeCerts::new(provider.clone());
-		certs.load_certs(&config.tls)?;
-		let certs = Arc::new(certs);
+		let certs = Arc::new(ServeCerts::new(provider.clone()));
+		// An embedder resolver (multiview's ACME source) is the only certificate
+		// source when set: nothing is loaded from disk.
+		let resolver: Arc<dyn rustls::server::ResolvesServerCert> = match config.tls.resolver.clone() {
+			Some(resolver) => resolver,
+			None => {
+				certs.load_certs(&config.tls)?;
+				certs.clone()
+			}
+		};
 
 		let tls_builder = rustls::ServerConfig::builder_with_provider(provider.clone())
 			.with_protocol_versions(&[&rustls::version::TLS13])
@@ -719,8 +726,8 @@ impl NoqServer {
 		let mut tls = match config.tls.client_auth(provider)? {
 			Some(verifier) => tls_builder
 				.with_client_cert_verifier(verifier)
-				.with_cert_resolver(certs.clone()),
-			None => tls_builder.with_no_client_auth().with_cert_resolver(certs.clone()),
+				.with_cert_resolver(resolver),
+			None => tls_builder.with_no_client_auth().with_cert_resolver(resolver),
 		};
 
 		// H3 is last because it requires WebTransport framing which not all H3 endpoints support.
