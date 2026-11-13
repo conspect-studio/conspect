@@ -952,8 +952,8 @@ encoded as frame T.
   (`RunOutput::program_audio`), so the control plane can refuse before enqueue. An output without
   it, and every audio take on a run without program audio, is refused `unroutable` by the engine.
   NDI, AES67 and display outputs have no packet binding with a program-audio slot in this build, so
-  they are refused for audio (the API PR maps this to a typed `audio-unsupported` refusal). There is
-  no NDI routed-audio path yet. Config validation keeps the per-transport rules
+  they are refused for audio: the control plane answers a typed `audio-unsupported` (409) from the
+  plan before enqueue (§6.2). There is no NDI routed-audio path yet. Config validation keeps the per-transport rules
   (`Output::audio_capability`): a `{ tracks = [..] }` feed holds more than one track only where the
   transport carries tracks simultaneously (SRT, RIST, RTSP, multitrack RTMP); HLS/LL-HLS
   (select-one), NDI/AES67/display (no tracks), legacy RTMP and WebRTC (one) take at most one.
@@ -962,9 +962,13 @@ encoded as frame T.
   `propagate_routing_change`, rewrites `[[routing.output]] audio = { tracks = [..] }` to a renamed
   track and drops a removed one (an emptied feed becomes `program`). `PUT /api/v1/audio-routing`
   commits it in the same prospective document and reports it in `outputs_updated`.
-- **Start-up stays on `follow`.** An explicit audio feed in the config validates, but start-up does
-  not apply one yet: `outputs_carry_program` refuses it ("this engine starts every output on follow
-  audio"). An explicit choice is a live take.
+- **Start-up re-applies a persisted audio feed.** An explicit audio feed in the config is admitted
+  at start-up (`outputs_carry_program` no longer refuses it). The run starts every output on
+  `follow` and, right after its routing handle is published, issues one **audio-only boot take**
+  per output whose persisted audio is not `follow` (`Pipeline::issue_boot_audio_takes`, operation
+  id `boot-audio:<output>`). An audio-only take has no fresh gate, so there is no retry: a boot take
+  that cannot be enqueued or is refused (an output without a program-audio slot, a multi-track or
+  undeclared-track feed) is logged, the output stays on `follow`, and the persisted value is kept.
 
 ---
 
@@ -991,6 +995,11 @@ audio = "program"                 # | "none" | { source = "<a cell's source>" }
 The existing `bus` field (`crates/multiview-config/src/routing.rs:236`) stays as an alias: `bus = "preview"` means
 `video = { bus = "preview" }`. When both are present they must agree, or validation fails. The
 desugar (`crates/multiview-config/src/lib.rs:1590-1600`) keeps writing Program.
+
+**Audio rows (slice 2).** `audio` in a `[[routing.output]]` row is accepted at start-up and
+re-applied by a boot audio take (§5.5). A take persists its audio feed with its video: an applied
+audio-only take writes `audio` and keeps the row's video; a row that ends on Program video and
+`follow` audio is removed (absent = the default). Boot takes are not persisted again.
 
 A take is persisted **only after its `applied` outcome**, never on `refused:*` or `superseded`, under
 the same config-mutation lock `apply-layout` uses (`crates/multiview-control/src/routes/mod.rs:811`). A restart therefore comes
@@ -1055,14 +1064,48 @@ Possible refusals (typed, RFC 9457 `type` suffixes):
 - `unknown-feed`;
 - `encoder-format-mismatch` (internal fault, §4.2 step 4);
 - `switcher-required` (Preview or Clean without an M/E);
-- `output-kind-unroutable`.
+- `output-kind-unroutable`;
+- `audio-unsupported` (no program-audio slot, a transport without discrete tracks, or more than
+  one track).
 
 The class is `class1` for every feed change, because the format never changes (§4.2). A format
 change is not offered here.
 
-**`POST /api/v1/routing/output/take`.** The body is the same as plan plus an optional `audio`: a
-take carries a video feed, an audio choice, or both (`audio` alone is an audio-only take; the
-engine side is built in slice 2, the HTTP body field is the slice 2 API PR). It requires an
+**Audio in plan and take (slice 2, as built).** `target.stream` is `video` or `audio`. `feed` is the
+video feed; `audio` is the full audio feed, externally tagged like the config `audio`:
+`"follow" | "program" | "none" | {"source": "<id>"} | {"tracks": ["<name>"]}`.
+
+- `stream: "video"` + `feed` (+ optional `audio`): a video take, with the audio taken together.
+  Absent `audio` keeps the output's audio choice (slice-1 bodies, `audio: "follow"` included,
+  behave as before).
+- `stream: "audio"` + `audio`, no `feed`: an **audio-only take**; the video is untouched.
+- Any other combination is 422 with a detail naming the missing or extra field.
+
+```json
+{ "target": {"kind": "output", "output": "restream", "stream": "audio"},
+  "audio": {"source": "cnn-usa"} }
+```
+
+A track resolves to its `[audio].routes[].target_track` route `input_id`. Only one track is
+takeable: the routed audio rides the output's single program-audio slot (§5.5), so
+`{"tracks": [a, b]}` is 422 `audio-unsupported` ("This output carries one routed audio feed;
+choose one track"). An unknown source or track is 422 `unknown-feed`. An output without a
+program-audio slot (`RunOutput::program_audio == false`: NDI, AES67, display, or a run without
+program audio) is 409 `audio-unsupported` ("This output cannot carry a routed audio feed"); a
+`tracks` feed on a transport whose `Output::audio_capability()` delivery is `None` is 409
+`audio-unsupported` too. The plan reports the same refusals in `refusals`.
+
+The plan's cost gains `audio_encoders` (`0` or `1`) and `audio_cost`: `1` and
+"+1 audio encode (transient, CPU)" when the take changes what the output carries and the output has
+no private audio bus yet; `0` (and no `audio_cost`; the UI says "No extra encoder") when the target
+is what it already carries or a private bus already runs. The engine readback carries per output
+the carried audio, the pending take's audio and whether a private bus runs. `GET /routing` keeps
+`audio` as the persisted choice; `effective_audio` comes from the live readback when present, and
+`pending.audio` shows a pending take's audio; all redacted per §6.3. `route.output` is unchanged
+in shape and covers audio-only takes.
+
+**`POST /api/v1/routing/output/take`.** The body is the same as plan: a take carries a video feed,
+an audio choice, or both (`stream: "audio"` is an audio-only take). It requires an
 `Idempotency-Key`. The response is
 `202 {operation_id, status: "accepted"|"pending"|"settled", adopt?: "next_tick", outcome?, tick?}`.
 `accepted` (with `adopt: "next_tick"`) answers only the request that enqueued the take. A replay of
@@ -1125,7 +1168,15 @@ A take or plan requires:
 | Feed `source:x` | `authorize_object(principal, x)` with Read (`crates/multiview-control/src/auth.rs:336`) |
 | Feed `layout:L` | Read on L **and on every source its cells bind**. A layout picture shows those sources' pixels, so a principal limited to L could otherwise route a source it cannot read |
 | Feed `bus:*` (Program, Preview, Clean) and `layout:*` cells binding `bus:*` | `authorize_scope(Program("main"))` plus `authorize_object(me1)`, as `authorize_refs` does (`crates/multiview-control/src/routes/switcher.rs:99-112`). **This deliberately replaces per-source Read**: a bus shows whatever the M/E selects, now or later, so the grant is the Program scope itself. Only principals that already hold Program scope can route a bus |
+| Audio feed `source:x` | `authorize_object(principal, x)` |
+| Audio feed `program`, and `follow` of a bus video | the bus rule above: `authorize_scope(Program("main"))` plus `authorize_object(me1)` (`follow` is covered by the video end) |
+| Audio feed `tracks:[t]` | `authorize_object(principal, t)` **and** `authorize_object(principal, <t's route input_id>)`: the track carries that source's audio |
+| Audio feed `none`, `follow` | nothing beyond the output (and the video end, when present) |
 | Salvo | every crosspoint independently, all before enqueue |
+
+The audio-feed rules are the same as `may_read_audio` in `GET /routing` (plus the track's route
+input), so readback never discloses an audio feed a take would refuse. They run before existence:
+an audio source or track the caller may not read is 403 whether or not it exists.
 
 **The rule is checked on every change, not only at the take.** A layout routed to an output can be
 edited after the take. The principal making a change is checked against every output the change
@@ -1354,7 +1405,16 @@ Video  [ Program (follows the switcher) ▾ ]  on air since 12:04:31     Audio  
 
 The dropdown is grouped Buses / Layouts / Players / Generators / Sources, with disabled items and
 their reasons. Choosing an item runs plan, shows the cost line, and offers [Take]. The outcome uses
-`OperationFeedback`. Output CRUD stays restart-class for format, and the callout says so; the feed
+`OperationFeedback`.
+
+**Audio row as built (slice 2, `web/src/pages/OutputAudioRow.tsx`).** The select starts on the
+persisted choice (`GET /routing` `audio`); `follow` reads "Follow (<effective audio>)". Groups:
+Follow; Program mix; Silence; Sources (the sources the page already loads for the video row);
+Tracks (`GET /api/v1/audio-routing` `selectable_tracks` without `prog`; while that is unknown the
+group is omitted and the row says so). Choosing an item runs plan with `stream: "audio"`, shows
+the `audio_cost` line or "No extra encoder", shows a refusal as the Take key's disabled reason,
+and [Take] posts the audio-only take with an `Idempotency-Key`; the outcome uses the same
+`OperationFeedback` pattern as the video row. Output CRUD stays restart-class for format, and the callout says so; the feed
 row is live.
 
 ---
@@ -1486,7 +1546,7 @@ clock-adjacent path, otherwise as `scripts/classify.sh` says.
 | # | Slice | Gives the operator | Risk / crates | Does NOT yet do |
 | --- | --- | --- | --- | --- |
 | **1** (#304) | **Route preview, program, VT, bars or a source to any output, live, from the Outputs page and the API**: each output on its own, also when outputs share settings | The operator's named items except layout. Audio follows (`follow`), with a crossfade. "On Program" and "source direct" are distinct | R3. `multiview-config` (feed fields, `bus` alias), `multiview-engine` (aux thread with one-cell canvases: identity or CPU letterbox; picture-bus slots; take state machine on the bake consumer), `multiview-output` (`forced-idr=1`, force-keyframe, `starting_at(T0)` for video and AAC), `multiview-cli` (encoder registry keyed by picture bus + settings, live open off the clock, linger-close, dispatcher `rebind` at a window, per-bus substitution, routed audio buses), `multiview-control` (`GET /routing`, `output` take kind, `route.output` event, BOLA on the object axis, limits), `web` (Outputs page feed rows) | Layouts as feeds, Clean, explicit audio selection, salvos, the matrix page |
-| 2 (#305) | Explicit audio feed per output (`program`, `source`, `tracks`, `none`) live; Clean bus to an output (part 1 built: Clean bus, plan counts lingering encoders as +0, HLS discontinuity at a changed-set move; part 2 built: the engine's explicit audio choice, audio-only and combined takes, one fade at a time, return to the shared program stream, config validation and rename propagation; still to do: the HTTP `audio` field and the Audio row) | "how do I route audio?": any source's audio alone on any output, live | R2-R3. `multiview-cli`, `-config`, `-control`, `web` (Audio row) | Layout audio attribute (slice 3) |
+| 2 (#305) | Explicit audio feed per output (`program`, `source`, `tracks`, `none`) live; Clean bus to an output (part 1 built: Clean bus, plan counts lingering encoders as +0, HLS discontinuity at a changed-set move; part 2 built: the engine's explicit audio choice, audio-only and combined takes, one fade at a time, return to the shared program stream, config validation and rename propagation; part 3 built: the HTTP `audio` feed and `stream: "audio"`, audio-feed authorization, `audio-unsupported`, the plan's audio cost, audio persistence, boot audio takes from config, and the Outputs page Audio row) | "how do I route audio?": any source's audio alone on any output, live | R2-R3. `multiview-cli`, `-config`, `-control`, `web` (Audio row) | Layout audio attribute (slice 3) |
 | 3 (#306) | Route a stored layout to an output (GPU aux canvas + CPU integer path), admission and cost in plan, the `routing.degraded` path | "layout": NewsOne on the HLS output while the switcher stays on | R3. `multiview-engine`, `-cli`, `-control`, `web` | Layout on the M/E, buses inside layouts |
 | 4 (#307) | Layout-as-a-source on the M/E (PVW/PGM/AUTO); `bus:program` and `bus:preview` cells; cycle refusal; first-slice restriction removed; `apply-layout` semantics | "in, around, through" (#243) | R3. `multiview-engine`, `-cli`, `-config`, `-control` | More than one M/E |
 | 5 (#308) | Crosspoint matrix Routing page (video + audio, tally, all states), output salvos (`/routing/salvo/*`, `Salvo.output`) | One screen for everything, atomic multi-output takes | R2. `web`, `multiview-control`, `-config`, `-engine` (salvo adoption) | — |
