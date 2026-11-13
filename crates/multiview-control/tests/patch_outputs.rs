@@ -1505,6 +1505,7 @@ async fn get_without_a_readback_reports_the_live_state_unknown() {
 struct CountingRepository {
     inner: Arc<dyn multiview_control::repository::Repository>,
     gets: std::sync::atomic::AtomicUsize,
+    lists: std::sync::atomic::AtomicUsize,
 }
 
 impl multiview_control::repository::Repository for CountingRepository {
@@ -1512,6 +1513,7 @@ impl multiview_control::repository::Repository for CountingRepository {
         &self,
     ) -> multiview_control::error::ControlResult<Vec<multiview_control::repository::VersionedLayout>>
     {
+        self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.list_layouts()
     }
     fn get_layout(
@@ -1549,6 +1551,7 @@ fn counting_rig(path: &Path) -> (Rig, Arc<CountingRepository>) {
     let counting = Arc::new(CountingRepository {
         inner: Arc::clone(&rig.state.repository),
         gets: std::sync::atomic::AtomicUsize::new(0),
+        lists: std::sync::atomic::AtomicUsize::new(0),
     });
     let repository: Arc<dyn multiview_control::repository::Repository> = counting.clone();
     rig.state.repository = repository;
@@ -1654,4 +1657,48 @@ async fn layout_reads_without_a_free_permit_are_503_and_never_touch_the_reposito
     let (status, _) = take(&rig, OPERATOR_TOKEN, "busy", body()).await;
     assert_eq!(status, StatusCode::ACCEPTED, "proceeds once a permit frees");
     assert_eq!(gets(), 1);
+}
+
+/// Review T-I2: `GET /patch` never lists the layout library on the async
+/// handler. It reads only the layouts the live readback names for outputs the
+/// caller may see (each once, through the bounded off-handler read); with no
+/// layout on air it reads none; and a layout feed is still redacted for a
+/// caller who cannot read one of its sources.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_patch_reads_only_the_layouts_on_air_and_never_lists_the_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rig, counting) = counting_rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "NewsOne", "bars");
+    store_layout(&rig, "Other", "bars");
+    let gets = || counting.gets.load(std::sync::atomic::Ordering::SeqCst);
+    let lists = || counting.lists.load(std::sync::atomic::Ordering::SeqCst);
+    // No layout on air: no read at all.
+    let resp = send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!((gets(), lists()), (0, 0), "no layout on air, no read");
+    // A layout on air (and pending on another output): one read each.
+    let live = |bus: &str, pending: Option<&str>| OutputLive {
+        bus: bus.to_owned(),
+        since_tick: 1,
+        pending: pending.map(|p| (p.to_owned(), 3)),
+        degraded: false,
+        audio: None,
+        pending_audio: None,
+        private_audio: false,
+    };
+    rig.fake.state.lock().unwrap().live = Some(RoutingLive {
+        outputs: HashMap::from([
+            (OUT_A.to_owned(), live("aux:NewsOne", None)),
+            (OUT_B.to_owned(), live("src:bars", Some("aux:NewsOne"))),
+        ]),
+        ..RoutingLive::default()
+    });
+    let all = body_json(send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await).await;
+    assert_eq!(
+        all["outputs"][0]["video"][0]["source"],
+        json!({"layout": "NewsOne"}),
+        "{all}"
+    );
+    assert_eq!(gets(), 1, "the one layout on air is read once");
+    assert_eq!(lists(), 0, "the library is never listed");
 }

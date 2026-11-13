@@ -507,7 +507,7 @@ pub(crate) async fn get_patch(
             }));
         }
     }
-    let outputs = super::patch_output::outputs_view(&state, &principal)?;
+    let outputs = super::patch_output::outputs_view(&state, &principal).await?;
     Ok((
         StatusCode::OK,
         Json(json!({ "mixer": mixer, "outputs": outputs })),
