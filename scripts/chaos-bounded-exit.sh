@@ -23,7 +23,13 @@ BIN="${1:?usage: chaos-bounded-exit.sh <multiview-binary> [runs] [fatal|stop|bot
 RUNS="${2:-20}"
 MODE="${3:-both}"
 BOUND_MS=2000
-SLACK_MS=500
+# The watchdog's own decision->fire time may exceed the deadline only by its
+# wake-up latency (it runs at the raised clock class).
+FIRE_SLACK_MS=150
+# Decision->process-gone as the shell observes it: the fire slack, plus the
+# 500 ms exit-path backstop (EXIT_PATH_GRACE) the design allows, plus the
+# shell's own observation (20 ms polls, a python clock read per sample).
+SLACK_MS=800
 HOLD_MS=20000   # teardown held 10x past the bound
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
@@ -90,11 +96,14 @@ run_once() {
   local mode="$1" i="$2" log="${WORK}/run.log" rc t_exit t_decide pid
   rm -rf "${WORK}/hls" "${WORK}/.multiview" && mkdir -p "${WORK}/hls"
   export MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS="${HOLD_MS}"
+  unset MULTIVIEW_CHAOS_SHED_AT
   if [ "${mode}" = falterstop ]; then
-    # A short stall (about 6 ticks: past the 4-slot live queue, inside the
-    # 8-tick envelope) sheds frames without a fatal; then SIGTERM. The run
-    # faltered, so it must exit 1.
-    export MULTIVIEW_CHAOS_CONSUMER_STALL_MS=200 MULTIVIEW_CHAOS_CONSUMER_STALL_AT=60
+    # A deterministic shed (#350): the hot queue refuses tick 60 exactly as a
+    # full queue does, with no timing dependence (a 200 ms stall sheds
+    # nothing on a fast host, and its outcome depended on the runner). The
+    # run faltered, so it must exit 1.
+    unset MULTIVIEW_CHAOS_CONSUMER_STALL_MS MULTIVIEW_CHAOS_CONSUMER_STALL_AT
+    export MULTIVIEW_CHAOS_SHED_AT=60
   elif [ "${mode}" = stopwedge ]; then
     # SIGTERM while the consumer is stalled 10 s (an output that cannot
     # finalise during the stop): the run must report failure (rc 1).
@@ -122,7 +131,10 @@ run_once() {
       fi
       [ "${waited}" -lt 300 ] || { echo "run ${i} (${mode}): pipeline never started"; tail -20 "${log}"; kill -KILL "${pid}" 2>/dev/null || true; return 1; }
     done
-    if [ "${mode}" = stopwedge ] || [ "${mode}" = falterstop ]; then
+    if [ "${mode}" = falterstop ]; then
+      # Signal once the forced shed tick (60, ~2 s) has passed.
+      sleep 3
+    elif [ "${mode}" = stopwedge ]; then
       local w2=0
       until grep -q "chaos: stalling the bake consumer" "${log}" 2>/dev/null; do
         sleep 0.05; w2=$((w2 + 1))
@@ -135,7 +147,7 @@ run_once() {
         fi
         [ "${w2}" -lt 400 ] || { echo "run ${i} (${mode}): stall seam never reached"; tail -20 "${log}"; kill -KILL "${pid}"; return 1; }
       done
-      if [ "${mode}" = falterstop ]; then sleep 1.5; else sleep 0.2; fi
+      sleep 0.2
     else
       sleep 2
     fi
@@ -173,8 +185,15 @@ PY
     [ -n "${t_decide}" ] || { echo "run ${i} (${mode}): no fatal line"; tail -20 "${log}"; return 1; }
   fi
   local took=$((t_exit - t_decide)) want=$([ "${mode}" = stop ] && echo 0 || echo 1)
+  # #350: the watchdog's own instants (wall clock, read inside the binary):
+  # decision (first arm) -> deadline fired. This is the bound the design
+  # promises; it excludes the shell's own observation latency.
+  local armed fired fire_ms
+  armed="$(grep -o 'armed_wall_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2)"
+  fired="$(grep -o 'fired_wall_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2)"
+  fire_ms=$(( ${fired:-0} - ${armed:-0} ))
   local extra=0
-  echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms"
+  echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms (armed->fired ${fire_ms} ms)"
   if [ "${mode}" = falterstop ] && grep -q "ticks behind the clock" "${log}"; then
     echo "  FAIL: falterstop hit the fatal envelope (stall too long for this host)"; return 1
   fi
@@ -204,6 +223,12 @@ PY
   # The durable Running state was written at the exit decision.
   grep -q "exit-time running-state persist written" "${log}" && [ -s "${WORK}/.multiview/active.toml" ] \
     || { echo "  FAIL: the exit-time Running persist did not land"; grep -E "persist|armed|overran|control plane|stage=" "${log}" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-200 | tail -12; ls -la "${WORK}/.multiview" 2>&1 | head -5; return 1; }
+  # The design bound: the watchdog fires within EXIT_DEADLINE + FIRE_SLACK of
+  # the decision (its own clock).
+  [ -n "${armed}" ] && [ -n "${fired}" ] && [ "${fire_ms}" -ge "${BOUND_MS}" ] && [ "${fire_ms}" -le $((BOUND_MS + FIRE_SLACK_MS)) ] \
+    || { echo "  FAIL: watchdog fired ${fire_ms} ms after the decision (want ${BOUND_MS}..$((BOUND_MS + FIRE_SLACK_MS)))"; return 1; }
+  # And the process was gone soon after, as the shell sees it (the exit path
+  # plus the shell's own polling and clock reads).
   [ "${took}" -le $((BOUND_MS + SLACK_MS + extra)) ] || { echo "  FAIL: exit took ${took} ms > ${BOUND_MS}+${SLACK_MS}"; grep -E "teardown|exit|chaos" "${log}" | tail -12; return 1; }
   if [ "${mode}" = stopwedge ]; then
     # The output could not finalise: only require that what is on disk is valid.

@@ -3841,6 +3841,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hang",
  "multiview-audio",
+ "multiview-clocksys",
  "multiview-compositor",
  "multiview-config",
  "multiview-control",

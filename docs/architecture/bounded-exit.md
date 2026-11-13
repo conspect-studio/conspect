@@ -76,8 +76,14 @@ restarting.
      phase ends at that one instant: the join never waits past the bound, and a sink still
      running then counts as wedged (outputs open). Without an armed deadline (offline renders,
      library use) each phase keeps its full grace, as before.
-   - The bound is 2 s plus, at most, the 500 ms exit-path backstop (atexit handlers or a stdio
-     flush that block in the C runtime exit).
+   - **The promise (#350).** The watchdog fires 2 s after the first exit decision, measured
+     on its own clock, and at most 150 ms later than that. It runs at the output clock's
+     scheduling class (macOS QoS user-interactive), so a loaded host does not delay its wake.
+     The process is then gone within the exit-path backstop: at most 500 ms more, when atexit
+     handlers or a stdio flush block in the C runtime exit. Decision → process gone is
+     therefore at most **2.65 s**; on an idle host it is about 2.1 s.
+   - The hard-exit line carries `armed_wall_ms` and `fired_wall_ms`, so every hard exit
+     shows its own decision → fire time.
    - On a fatal, the bound starts at the fault, before the sinks begin to finalise (they see
      end-of-program when the failing consumer returns). So a sink gets the rest of the bound
      to finalise, not a fresh grace; the join never waits past the armed deadline. A sink
@@ -172,11 +178,22 @@ change shortens dead output after a fault; it does not change the tick path.
   The `stopwedge` mode sends SIGTERM while the consumer is stalled (an output that cannot
   finalise during a stop). It requires exit code 1 within 2 s + 0.5 s of the signal (the bound runs from the stop decision; the failure only changes the code).
 
-  The `falterstop` mode stalls the consumer for 200 ms (frames are shed but the envelope holds),
-  then sends SIGTERM. It requires exit code 1, because the run faltered.
+  The `falterstop` mode makes the hot queue refuse one tick, exactly as a full queue does (a
+  deterministic seam, `MULTIVIEW_CHAOS_SHED_AT`), then sends SIGTERM. It requires exit code 1,
+  because the run faltered. (An earlier form stalled the consumer for 200 ms. On a fast host
+  that shed nothing, so the run correctly exited 0, and the test failed, #350.)
 
-  On the Apple-silicon host: 20 × each of the four modes, 0 failures, exits at 2.08–2.13 s. CI
-  (macOS job) runs 10 × each mode.
+  Every run asserts two things. First, the watchdog's own decision → fire time is within
+  2000–2150 ms. Second, the decision → process-gone time is at most 2.8 s as the shell sees it.
+  That covers the fire slack, the 500 ms exit-path backstop, and the shell's own polling and
+  clock reads.
+
+  On the Apple-silicon host:
+  - 12 runs idle and 20 runs with 28 busy CPU loops, 0 failures;
+  - decision → fire 2000–2010 ms in every run, with or without load;
+  - decision → process gone 2.08–2.12 s idle, 2.13–2.56 s loaded.
+
+  CI (macOS job) runs 10 × each mode.
 - The script also proves that the watchdog ended the process:
   - no normal-return stage (`run-tenants`) is logged;
   - the exit code equals the code in the watchdog's line;

@@ -144,8 +144,14 @@ impl Watchdog {
         }
         match std::thread::Builder::new()
             .name("multiview-exit-watchdog".to_owned())
-            .spawn(move || self.run(on_deadline))
-        {
+            .spawn(move || {
+                // #350: on a loaded host a normal-priority sleeper wakes late
+                // (measured 200-600 ms on hosted macOS runners); the watchdog
+                // runs at the same raised class as the output clock (macOS QoS
+                // user-interactive; no-op elsewhere). Best effort.
+                let _ = multiview_clocksys::raise_current_thread();
+                self.run(on_deadline);
+            }) {
             Ok(handle) => {
                 let _ = self.thread.set(handle.thread().clone());
                 // An arm that raced the spawn may have missed the unpark.
@@ -175,24 +181,25 @@ pub const EXIT_PATH_GRACE: Duration = Duration::from_millis(500);
 // could itself block, so a backstop thread kills the process with SIGKILL if
 // `exit` has not finished within EXIT_PATH_GRACE.
 fn exit_process(cause: ExitCause) {
+    let fired_wall_ms = wall_ms();
     // A stop whose outputs have not finalised by the deadline, or whose run
     // faltered, did not stop cleanly: report it as a failure (#309).
-    let cause = if cause == ExitCause::Stop
-        && (OUTPUTS_OPEN.load(Ordering::Acquire) > 0 || RUN_FAILED.load(Ordering::Acquire))
-    {
-        ExitCause::Fatal
-    } else {
-        cause
-    };
+    let cause = effective_cause(
+        cause,
+        OUTPUTS_OPEN.load(Ordering::Acquire) > 0,
+        RUN_FAILED.load(Ordering::Acquire),
+    );
     let _ = std::thread::Builder::new()
         .name("multiview-exit-notice".to_owned())
         .spawn(move || {
             let line = format!(
                 "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
                  code {} (outputs finalised before the bound are valid; detached sinks may be \
-                 incomplete; the supervisor restarts the service)\n",
+                 incomplete; the supervisor restarts the service) \
+                 [armed_wall_ms={} fired_wall_ms={fired_wall_ms}]\n",
                 EXIT_DEADLINE.as_millis(),
-                cause.code()
+                cause.code(),
+                ARMED_WALL_MS.load(Ordering::Acquire)
             );
             write_stderr_raw(line.as_bytes());
         });
@@ -205,6 +212,16 @@ fn exit_process(cause: ExitCause) {
     // Give the notice a moment; never wait for it.
     std::thread::sleep(Duration::from_millis(20));
     std::process::exit(cause.code());
+}
+
+/// The exit code's cause: a stop with outputs still open, or after the run
+/// faltered (frames were shed), is reported as a failure (#309, #350).
+#[must_use]
+pub const fn effective_cause(cause: ExitCause, outputs_open: bool, run_failed: bool) -> ExitCause {
+    match cause {
+        ExitCause::Stop if outputs_open || run_failed => ExitCause::Fatal,
+        other => other,
+    }
 }
 
 /// Write to the already-open fd 2, without the std stderr lock and without
@@ -291,8 +308,21 @@ pub fn enable() {
 /// allocation-free: safe on the output clock. A no-op unless [`enable`] ran.
 pub fn arm(cause: ExitCause) {
     if let Some(watchdog) = WATCHDOG.get() {
-        watchdog.arm(cause, EXIT_DEADLINE);
+        if watchdog.arm(cause, EXIT_DEADLINE) {
+            // The decision instant on the wall clock, so the exit notice can
+            // state decision -> fire exactly (a clock read, no allocation).
+            ARMED_WALL_MS.store(wall_ms(), Ordering::Release);
+        }
     }
+}
+
+/// Wall-clock ms of the first arm (0 = not armed), reported in the notice.
+static ARMED_WALL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// The armed state as a cheap poll: `Some(cause)` once any exit was decided.
@@ -322,6 +352,26 @@ mod tests {
     fn exit_codes_follow_the_cause() {
         assert_eq!(ExitCause::Fatal.code(), 1);
         assert_eq!(ExitCause::Stop.code(), 0);
+    }
+
+    #[test]
+    fn a_stop_after_a_falter_or_with_open_outputs_exits_1() {
+        assert_eq!(
+            effective_cause(ExitCause::Stop, false, false),
+            ExitCause::Stop
+        );
+        assert_eq!(
+            effective_cause(ExitCause::Stop, false, true),
+            ExitCause::Fatal
+        );
+        assert_eq!(
+            effective_cause(ExitCause::Stop, true, false),
+            ExitCause::Fatal
+        );
+        assert_eq!(
+            effective_cause(ExitCause::Fatal, false, false),
+            ExitCause::Fatal
+        );
     }
 
     #[test]
