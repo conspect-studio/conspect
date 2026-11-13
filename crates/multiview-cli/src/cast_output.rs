@@ -324,8 +324,9 @@ impl CastGate {
         self.ready.store(false, Ordering::Release);
     }
 
-    /// Install the sink-thread hook (tests only).
-    #[cfg(test)]
+    /// Install the sink-thread hook (the real-encoder pipeline tests only,
+    /// which need libx264).
+    #[cfg(all(test, feature = "gpl-codecs"))]
     pub(crate) fn set_test_hook(&self, hook: Option<CastTestHook>) {
         *self.hook.lock().unwrap_or_else(PoisonError::into_inner) = hook;
     }

@@ -4979,7 +4979,7 @@ impl Pipeline {
     ///
     /// # Errors
     /// See [`Self::drive_streaming_for_test`].
-    #[cfg(test)]
+    #[cfg(all(test, feature = "gpl-codecs"))]
     pub(crate) async fn drive_streaming_with_cast_for_test<P: Pacer + Send>(
         &mut self,
         params: StreamTestParams<P>,
