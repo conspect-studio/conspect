@@ -50,7 +50,8 @@ export function resetsLive(kind: OutputKind): boolean {
 
 /** Kinds without an encoded video slot (raw frames or audio only). */
 export function hasEncodedVideo(kind: OutputKind): boolean {
-  return kind !== 'ndi' && kind !== 'display' && kind !== 'aes67';
+  // NDI and the display head carry raw frames (no encoded video slot).
+  return kind !== 'ndi' && kind !== 'display';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
