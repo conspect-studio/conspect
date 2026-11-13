@@ -544,14 +544,22 @@ impl AcmeEngine {
     async fn account(&self) -> Result<Account, AcmeError> {
         let name = store::account_file_name(&self.directory_url)?;
         let dir = self.config.state_dir.clone();
+        // A permission/ownership problem stays a hard error (read_private).
         if let Some(raw) = store::read_private(&dir, &name)? {
             let raw = zeroize::Zeroizing::new(raw);
-            let credentials: AccountCredentials =
-                serde_json::from_slice(&raw).map_err(|_| AcmeError::Storage)?;
-            return Account::builder_with_http(self.http()?)
-                .from_credentials(credentials)
-                .await
-                .map_err(|e| acme_category(&e, AcmeError::Authority));
+            if let Ok(credentials) = serde_json::from_slice::<AccountCredentials>(&raw) {
+                return Account::builder_with_http(self.http()?)
+                    .from_credentials(credentials)
+                    .await
+                    .map_err(|e| acme_category(&e, AcmeError::Authority));
+            }
+            // Unparseable (truncated, emptied, corrupt): keep it aside for the
+            // operator and register a fresh account, as the runbook promises.
+            let aside = store::quarantine_private(&dir, &name)?;
+            tracing::warn!(
+                file = %aside,
+                "acme: the stored account file was unreadable; kept aside, registering a new account"
+            );
         }
         let eab = self.eab()?;
         let contact = self

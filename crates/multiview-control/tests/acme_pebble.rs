@@ -345,6 +345,45 @@ async fn tls_alpn01_issues_through_the_challenge_resolver() {
     assert_eq!(h.source.status().state, TlsState::Serving);
 }
 
+/// Review #338 L-1: an unparseable stored account file is kept aside and a
+/// fresh account is registered (the runbook's recovery), not a permanent
+/// `state-storage-failed`.
+#[tokio::test]
+#[ignore = "needs Pebble; run by the acme-pebble CI job"]
+async fn a_corrupt_account_file_is_kept_aside_and_replaced() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = harness(CfAuth::Token("unused".into())).await;
+    let listener = alpn_listener(h.resolver.clone()).await;
+    let directory = env("PEBBLE_DIRECTORY");
+    let account = multiview_control::acme::store::account_file_name(&directory).unwrap();
+    let path = h.state_dir.join(&account);
+    std::fs::write(&path, b"{ truncated").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let name = format!("{}.{ZONE}", unique("acct"));
+    let cfg = config(
+        &directory,
+        &h.state_dir,
+        AcmeChallenge::TlsAlpn01,
+        std::slice::from_ref(&name),
+    );
+    let issued = engine(&h, cfg, None).issue_once(None).await;
+    listener.abort();
+    issued.unwrap();
+    let fresh = std::fs::read(&path).unwrap();
+    assert!(serde_json::from_slice::<serde_json::Value>(&fresh).is_ok());
+    let aside: Vec<_> = std::fs::read_dir(&h.state_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{account}.bad-"))
+        })
+        .collect();
+    assert_eq!(aside.len(), 1);
+    assert_eq!(std::fs::read(aside[0].path()).unwrap(), b"{ truncated");
+}
+
 #[tokio::test]
 #[ignore = "needs Pebble; run by the acme-pebble CI job"]
 async fn eab_account_binding_and_missing_eab() {

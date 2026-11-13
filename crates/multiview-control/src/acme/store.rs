@@ -165,6 +165,26 @@ pub fn read_owner_file(path: &Path) -> Result<Option<Vec<u8>>, AcmeError> {
     Ok(Some(data))
 }
 
+/// Rename `dir/name` to `dir/name.bad-<unix seconds>` (same directory, so the
+/// 0600 mode and owner stay) and fsync the directory. Returns the new name.
+///
+/// # Errors
+/// [`AcmeError::Storage`] on an invalid name or an I/O failure.
+pub fn quarantine_private(dir: &Path, name: &str) -> Result<String, AcmeError> {
+    plain_name(name)?;
+    private_dir(dir)?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let aside = format!("{name}.bad-{secs}");
+    plain_name(&aside)?;
+    std::fs::rename(dir.join(name), dir.join(&aside)).map_err(|_| AcmeError::Storage)?;
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|_| AcmeError::Storage)?;
+    Ok(aside)
+}
+
 /// Remove `dir/name` if present (durably).
 ///
 /// # Errors

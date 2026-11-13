@@ -248,9 +248,12 @@ the alarm, the last error token and the reasons. If the engine is not running, i
 * **Credential rotated or revoked.** Run `multiview tls set-credential NAME` with the new value. It
   overwrites the file and triggers issuance. If the secret comes from the environment, update the
   service environment and restart.
-* **Lost or corrupt account key.** Stop the engine. Delete
-  `<state_dir>/account.<directory-host>-<hash>.json`, then start it. A new ACME account is
-  registered. With EAB, Google needs a fresh EAB key, because a key binds one account.
+* **Lost or corrupt account key.** A missing account file, or one that does not parse, is replaced
+  automatically. An unreadable file is kept aside as `account.<directory-host>-<hash>.json.bad-<unix>`
+  and a new ACME account is registered on the next attempt (`multiview tls issue` to start it now).
+  To force a new account, stop the engine, delete `<state_dir>/account.<directory-host>-<hash>.json`
+  and start it. A file with the wrong mode or owner is never replaced: fix it to 0600 and owned by
+  the service user. With EAB, Google needs a fresh EAB key, because a key binds one account.
 * **Changed CA.** Edit `[network.tls]` (`ca`, `directory`, EAB names) and restart. Accounts are
   stored per directory, so the old CA's account is untouched. The stored certificate is installed at
   start and keeps serving until the new CA issues. A changed CA or name set only triggers an
