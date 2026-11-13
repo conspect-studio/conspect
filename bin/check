@@ -15,10 +15,17 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GIB = 1024 ** 3
-# The build host disk is shared with other repositories' containers, which move free
-# space by tens of GiB within minutes. A floor inside that noise aborts every gate
-# mid-run, so it sits below it. One gate grows its targets by at most MAX_TARGET.
-MIN_FREE = 300 * GIB
+# The build host disk (1.7 TiB) is shared with other repositories' containers, which
+# move free space by tens of GiB within minutes. This floor is a SAMPLE, not a quota: this
+# checkout refuses to start (or continue) a gate below it, and nothing more. It does not
+# reserve space, and the run lock below serialises gates of this worktree only, so other
+# worktrees and other users of the disk are not protected by it. MAX_TARGET caps this
+# worktree's targets only. Running one gate at a time across worktrees is a convention
+# outside this script (no cross-worktree lock here), and the host-wide residual depends on
+# what other gates and other users write. Lowered from
+# 300 to 150 GiB on 2026-11-13, when the sample sat at 277-313 GiB for hours and blocked
+# every gate while this repository used 65 GiB.
+MIN_FREE = 150 * GIB
 # Authoring stays <=2 GiB; this proposed execution cap needs separate review.
 MAX_TARGET = 15 * GIB
 

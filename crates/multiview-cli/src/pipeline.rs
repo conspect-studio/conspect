@@ -270,8 +270,9 @@ struct StreamPlan {
 
 /// ADR-0108 slice 1, step 1 start-up refusal; the rule itself lives in
 /// Every configured output whose persisted video feed is not Program, as
-/// `(config id, picture bus)` (#329). A feed the engine cannot carry (a
-/// layout) never reaches here: start-up admission refuses it first.
+/// `(config id, picture bus)` (#329). A stored-layout feed (slice 3) is
+/// skipped: its body lives in the layouts library, which start-up does not
+/// resolve, so that output starts and stays on Program until a live take.
 fn boot_output_feeds(config: &MultiviewConfig) -> Vec<(String, crate::routing_aux::PictureBus)> {
     config
         .output_feeds()
@@ -1856,7 +1857,7 @@ segment_ms = 1000
     /// take); only a feed the engine cannot carry at all — a layout — is
     /// refused, loudly, by the same single start-up rule.
     #[test]
-    fn default_program_outputs_run_a_source_feed_is_accepted_and_a_layout_is_refused() {
+    fn default_program_outputs_run_and_source_and_layout_feeds_are_accepted() {
         let plain = MultiviewConfig::load_from_toml(DOC).expect("parses");
         assert!(ensure_outputs_carry_program(&plain).is_ok());
         let routed = MultiviewConfig::load_from_toml(&format!(
@@ -1881,8 +1882,14 @@ segment_ms = 1000
             "{DOC}\n[[routing.output]]\noutput = \"o\"\nvideo = {{ layout = \"L\" }}\n"
         ))
         .expect("parses");
-        let err = ensure_outputs_carry_program(&layout).expect_err("refused");
-        assert!(err.to_string().contains("aux:L"), "{err}");
+        // ADR-0108 slice 3 (behaviour intentionally changed, #306): a
+        // persisted layout feed no longer refuses a start; it starts on
+        // Program and is not re-taken at boot (no boot take for it).
+        ensure_outputs_carry_program(&layout).expect("a layout feed never refuses a start");
+        assert!(
+            super::boot_output_feeds(&layout).is_empty(),
+            "no boot take for a layout feed"
+        );
     }
 }
 
@@ -3809,6 +3816,18 @@ impl Pipeline {
         Arc::new(self.live_spawner())
     }
 
+    /// The canvas a routed layout composes onto (ADR-0108 slice 3): Program's
+    /// size and colour, and Program's background encoded once here.
+    fn layout_canvas_spec(&self) -> crate::aux_layout::LayoutCanvasSpec {
+        crate::aux_layout::LayoutCanvasSpec {
+            width: self.encode_cfg.width,
+            height: self.encode_cfg.height,
+            color: self.canvas_color,
+            background: crate::aux_layout::background_codes(self.canvas_color, self.background)
+                .unwrap_or([16, 128, 128]),
+        }
+    }
+
     /// Build one run's output routing (ADR-0108 slice 1): the clock's aux tick
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
@@ -3848,6 +3867,7 @@ impl Pipeline {
                 height: self.encode_cfg.height,
                 color: self.canvas_color.output_tag(),
             },
+            layout_canvas: self.layout_canvas_spec(),
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
@@ -3868,6 +3888,7 @@ impl Pipeline {
                 max_encoders: crate::output_routing::DEFAULT_MAX_ENCODERS,
                 max_per_principal: crate::output_routing::DEFAULT_MAX_PER_PRINCIPAL,
                 has_preview,
+                max_aux_canvases: crate::output_routing::DEFAULT_MAX_AUX_CANVASES,
                 formats: self.output_formats.clone(),
                 boot_retry: self.boot_retry,
             },
@@ -7637,9 +7658,13 @@ fn live_opener(
         let encoder = VideoRenditionEncoder::new(cfg).map_err(|e| e.to_string())?;
         let live: Box<dyn crate::output_routing::LiveEncoder> =
             Box::new(PipelineVideoWorker(encoder));
+        // Program, Clean and a routed layout are canvas-sized pictures; a
+        // non-canvas output format converts on the key's own worker.
         let canvas_bus = matches!(
             bus,
-            crate::routing_aux::PictureBus::Program | crate::routing_aux::PictureBus::Clean
+            crate::routing_aux::PictureBus::Program
+                | crate::routing_aux::PictureBus::Clean
+                | crate::routing_aux::PictureBus::Layout(_)
         );
         match formats.get(settings).copied().flatten() {
             Some(format) if canvas_bus => Ok(Box::new(crate::format_convert::ConvertLive::new(

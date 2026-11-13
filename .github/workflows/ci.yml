@@ -989,6 +989,26 @@ jobs:
           -p multiview-cli
           --features ffmpeg,aes67
           --lib audio
+      - name: test multiview-cli --features ffmpeg,aes67 (output routing lib tests)
+        # ADR-0108 output routing (the take state machine, live encoders, the
+        # routing-aux thread and the routed-layout compose) lives behind
+        # `ffmpeg`, so its chaos tests (take floods, wedged/panicking aux,
+        # held layout canvases, aux-canvas admission) and the end-to-end
+        # pipeline takes never ran in CI. Scoped to the three routing modules,
+        # NOT the full ffmpeg suite (issue #163). `--test-threads=2`: the
+        # router tests sleep per tick to let live workers encode; on a loaded
+        # runner full parallelism starves them into `EncoderNotReady`.
+        if: ${{ success() || steps.audio-lib-tests.outcome == 'failure' }}
+        timeout-minutes: 15
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features ffmpeg,aes67
+          --lib
+          --
+          output_routing routing_aux aux_layout
+          --test-threads=2
       - name: test multiview-cli --features ffmpeg,aes67 (hls_fetch lib tests)
         # Same gap as the audio step above, for the `hls_fetch`-module lib unit
         # tests (live/VOD playlist parsing, byte-range scheduling, 403/429 backoff,
