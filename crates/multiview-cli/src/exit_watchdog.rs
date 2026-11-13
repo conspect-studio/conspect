@@ -149,15 +149,22 @@ impl Watchdog {
             let due_at = self.origin + Duration::from_nanos(due);
             let now = Instant::now();
             if due_at > now {
-                // #350: macOS lets a timed wait wake late by a slop that grows
-                // with the timeout (timer coalescing; a CI VM fired 92 ms late
-                // after one 2 s wait). Wait until FINAL_APPROACH before the
-                // deadline, then in short steps that get almost no slop.
+                // #350: a timed wait can wake late, by more for a longer
+                // timeout (macOS timer coalescing; a CI VM fired 92-106 ms
+                // late after one long wait). Every wait is at most
+                // MAX_PARK, and the last FINAL_APPROACH in FINAL_STEP waits.
+                // The worst single-wait lateness is reported with the fire.
                 let left = due_at - now;
-                std::thread::park_timeout(
-                    left.checked_sub(FINAL_APPROACH)
-                        .filter(|far| !far.is_zero())
-                        .unwrap_or_else(|| left.min(FINAL_STEP)),
+                let step = if left > FINAL_APPROACH {
+                    left.min(MAX_PARK)
+                } else {
+                    left.min(FINAL_STEP)
+                };
+                std::thread::park_timeout(step);
+                let late = now.elapsed().saturating_sub(step);
+                WORST_WAKE_LATE_MS.fetch_max(
+                    u64::try_from(late.as_millis()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
                 );
                 continue;
             }
@@ -212,6 +219,8 @@ impl Default for Watchdog {
 const FINAL_APPROACH: Duration = Duration::from_millis(20);
 /// One short wait of the final approach.
 const FINAL_STEP: Duration = Duration::from_millis(1);
+/// The longest single wait before the final approach.
+const MAX_PARK: Duration = Duration::from_millis(20);
 
 /// How long the ordinary exit path may take before the process is killed.
 pub const EXIT_PATH_GRACE: Duration = Duration::from_millis(500);
@@ -233,20 +242,25 @@ fn exit_process(cause: ExitCause) {
         OUTPUTS_OPEN.load(Ordering::Acquire) > 0,
         RUN_FAILED.load(Ordering::Acquire),
     );
-    let _ = std::thread::Builder::new()
+    let backstop = std::thread::Builder::new()
         .name("multiview-exit-backstop".to_owned())
         .spawn(|| {
             std::thread::sleep(EXIT_PATH_GRACE);
             kill_self();
         });
+    if backstop.is_err() {
+        // No backstop: never risk a blocked stderr write; exit at once.
+        std::process::exit(cause.code());
+    }
     let line = format!(
         "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
          code {} (outputs finalised before the bound are valid; detached sinks may be \
          incomplete; the supervisor restarts the service) \
-         [fired_after_decision_ms={}]\n",
+         [fired_after_decision_ms={} worst_wake_late_ms={}]\n",
         EXIT_DEADLINE.as_millis(),
         cause.code(),
-        FIRE_AFTER_ARM_MS.load(Ordering::Acquire)
+        FIRE_AFTER_ARM_MS.load(Ordering::Acquire),
+        WORST_WAKE_LATE_MS.load(Ordering::Relaxed)
     );
     write_stderr_raw(line.as_bytes());
     std::process::exit(cause.code());
@@ -361,6 +375,8 @@ pub fn arm(cause: ExitCause) {
 /// Monotonic ms from the first exit decision to the deadline firing,
 /// reported in the hard-exit notice (#350).
 static FIRE_AFTER_ARM_MS: AtomicU64 = AtomicU64::new(0);
+/// The worst lateness of one watchdog wait while armed (#350 diagnostics).
+static WORST_WAKE_LATE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// The armed state as a cheap poll: `Some(cause)` once any exit was decided.
 /// The binary's "exit decided" task polls this (every few ms, off the clock) to

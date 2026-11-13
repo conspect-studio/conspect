@@ -219,9 +219,11 @@ PY
   # decision (first arm) -> deadline fired. This is the bound the design
   # promises; it excludes the shell's own observation latency.
   local fire_ms
-  fire_ms="$(grep -o 'fired_after_decision_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2)"
+  fire_ms="$(grep -o 'fired_after_decision_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2 || true)"
+  local wake_ms
+  wake_ms="$(grep -o 'worst_wake_late_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2 || true)"
   local extra=0
-  echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms (armed->fired ${fire_ms} ms)"
+  echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms (armed->fired ${fire_ms} ms, worst wake late ${wake_ms} ms)"
   if [ "${mode}" = falterstop ] && grep -q "ticks behind the clock" "${log}"; then
     echo "  FAIL: falterstop hit the fatal envelope (stall too long for this host)"; return 1
   fi
