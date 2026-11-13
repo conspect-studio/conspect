@@ -408,6 +408,8 @@ pub mod webrtc_unified;
 
 /// Pure-integer NV12 cell scaler (monitor wall, routing aux canvases).
 pub mod nv12_blit;
+/// Pure-integer fit maths for per-output formats (#342).
+pub mod output_fit;
 /// The `routing-aux` thread: one-cell routed feeds (ADR-0108 slice 1).
 pub mod routing_aux;
 
