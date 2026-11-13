@@ -148,7 +148,10 @@ impl CredentialReloading {
     fn reload(&self) -> Result<Arc<CloudflareDns>, multiview_control::acme::AcmeError> {
         let provider = Arc::new(
             CloudflareCredential::from_config(&self.config, &self.secrets)
-                .and_then(CloudflareDns::new)?,
+                .and_then(CloudflareDns::new)?
+                .with_confirm(match &self.config {
+                    DnsProviderConfig::Cloudflare { confirm, .. } => *confirm,
+                }),
         );
         *self
             .current
@@ -201,6 +204,13 @@ impl DnsProvider for CredentialReloading {
                 .confirm_at_authoritative(fqdn, value, deadline)
                 .await
         })
+    }
+    fn propagation_detail(&self) -> Option<String> {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|provider| provider.propagation_detail())
     }
     fn remove_txt<'a>(
         &'a self,

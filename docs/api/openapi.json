@@ -9657,7 +9657,7 @@
             }
           },
           "409": {
-            "description": "`routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track).",
+            "description": "`routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track).",
             "content": {
               "application/json": {
                 "schema": {
@@ -9667,7 +9667,7 @@
             }
           },
           "422": {
-            "description": "`unknown-feed` (video or audio), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key.",
+            "description": "`unknown-feed` (video or audio, including an unknown layout), `layout-not-admissible` (a layout authored for another canvas, one that does not solve, or one with a translucent cell), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key.",
             "content": {
               "application/json": {
                 "schema": {
@@ -19687,6 +19687,19 @@
             "type": "boolean",
             "description": "Whether the take fits the encoder budget now."
           },
+          "follow_audio": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The audio the output carries on this video feed when its audio\nfollows: `program` (the mix), `source` (the source's own) or `preview`\n(the PVW source's). A layout carries the program mix."
+          },
+          "new_aux_canvases": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`1` when the take starts a new layout canvas (`routing-aux`), else `0`.",
+            "minimum": 0
+          },
           "new_encoders": {
             "type": "integer",
             "format": "int32",
@@ -19709,7 +19722,7 @@
           },
           "type": {
             "type": "string",
-            "description": "`capacity` | `unknown-feed` | `switcher-required` |\n`output-kind-unroutable` | `audio-unsupported`."
+            "description": "`capacity` | `unknown-feed` | `switcher-required` |\n`output-kind-unroutable` | `audio-unsupported` | `layout-not-admissible`\n| `aux-capacity`."
           }
         }
       },
@@ -19766,7 +19779,7 @@
               "object",
               "null"
             ],
-            "description": "The video feed: `{\"bus\":\"program\"|\"preview\"|\"clean\"}` or\n`{\"source\":\"vt1\"}`. Required with `stream: video`; absent with\n`stream: audio`."
+            "description": "The video feed: `{\"bus\":\"program\"|\"preview\"|\"clean\"}`,\n`{\"source\":\"vt1\"}` or `{\"layout\":\"NewsOne\"}` (a stored layout,\nADR-0108 slice 3). Required with `stream: video`; absent with\n`stream: audio`."
           },
           "target": {
             "$ref": "#/components/schemas/OutputTargetKind",
@@ -24843,6 +24856,13 @@
               "null"
             ],
             "description": "Sanitized token of the last failure (e.g. `ca-unavailable`)."
+          },
+          "last_error_detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human detail of the last failure: the CA's problem type and detail\n(with subproblems and the challenge's own error), or a short local\nexplanation (e.g. \"TXT not seen via DNS over HTTPS\"). Control\ncharacters stripped, at most 512 bytes, never a credential."
           },
           "names": {
             "type": "array",

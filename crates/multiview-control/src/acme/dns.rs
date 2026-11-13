@@ -42,6 +42,13 @@ pub trait DnsProvider: Send + Sync {
         deadline: Duration,
     ) -> DnsFuture<'a, ()>;
 
+    /// A short, credential-free human detail for the last
+    /// [`AcmeError::Propagation`] (how confirmation was attempted). `None`
+    /// when the provider has nothing to add.
+    fn propagation_detail(&self) -> Option<String> {
+        None
+    }
+
     /// Remove a record this provider published. An already-absent record is success.
     fn remove_txt<'a>(&'a self, handle: &'a TxtHandle) -> DnsFuture<'a, ()>;
 }

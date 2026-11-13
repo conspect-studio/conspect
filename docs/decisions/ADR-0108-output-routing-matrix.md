@@ -357,3 +357,8 @@ Results (ffprobe and the run log):
   5. the matrix page and output salvos.
 - **Interactions.** None with ADR-0107. A future dedicated clock thread carries the one `try_send`
   unchanged.
+
+**Amendment (slice 3, #306).** Layout to an output ships on the CPU integer path in every build
+(no wgpu aux), with a translucent-cell refusal, control-plane resolution and the
+`max_aux_canvases` = 2 admission; details and the items left to the second slice-3 PR are in note
+§10.1.

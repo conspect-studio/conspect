@@ -950,7 +950,18 @@ where
         // Alt-Svc on the TCP door only (never the plain `[control]` listener);
         // the switch is off until the h3 endpoint is up.
         let app = multiview_control::h3_site::alt_svc_layer(site_app, door.alt_svc());
-        door.install_site(server(app, watch), site, challenge);
+        let responder = door.install_site(server(app, watch), site, challenge);
+        // The ACME engine started before the control plane was built and waits
+        // for this before a TLS-ALPN-01 order: until now `acme-tls/1` hellos
+        // were closed, so a validation would have failed at once.
+        #[cfg(all(feature = "acme", unix))]
+        if responder {
+            if let Some(tls) = state.tls.as_ref() {
+                tls.resolver.mark_responder_ready();
+            }
+        }
+        #[cfg(not(all(feature = "acme", unix)))]
+        let _ = responder;
     }
     Ok(Box::pin(async move {
         shutdown.await;
@@ -1513,7 +1524,7 @@ pub fn cast_delivery(
             .outputs
             .iter()
             .find(|output| output.id() == mount.output_id)
-            .and_then(multiview_config::Output::audio)
+            .and_then(multiview_config::Output::effective_audio)
             .is_some_and(|selection| {
                 let names: Vec<&str> = config
                     .audio

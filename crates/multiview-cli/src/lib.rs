@@ -406,9 +406,15 @@ pub mod tls_cli;
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_unified;
 
+/// A routed stored layout's integer aux canvas (ADR-0108 slice 3).
+pub mod aux_layout;
+/// Per-output format convert with a shared per-tick cache (#342).
+pub mod format_convert;
 /// Pure-integer NV12 cell scaler (monitor wall, routing aux canvases).
 pub mod nv12_blit;
-/// The `routing-aux` thread: one-cell routed feeds (ADR-0108 slice 1).
+/// Pure-integer fit maths for per-output formats (#342).
+pub mod output_fit;
+/// The `routing-aux` thread: routed feeds (ADR-0108 slices 1 and 3).
 pub mod routing_aux;
 
 /// The shared monitor wall (ADR-0103): one composed, once-encoded MoQ stream.

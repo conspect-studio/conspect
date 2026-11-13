@@ -22,6 +22,8 @@ path = "src/main.rs"
 [dependencies]
 multiview-core = { workspace = true }
 multiview-engine = { workspace = true }
+# #350: the exit watchdog thread runs at the output clock's scheduling class.
+multiview-clocksys = { workspace = true }
 multiview-control = { workspace = true }
 multiview-weather = { workspace = true }
 multiview-graphics = { workspace = true }

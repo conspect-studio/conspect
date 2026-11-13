@@ -24,8 +24,9 @@ pub mod store;
 pub use dns::{DnsFuture, DnsProvider, TxtHandle};
 pub use egress::{AcmeHttp, EgressPolicy};
 pub use engine::{
-    alarm_for, ari_renewal_at, backoff_delay, fallback_renewal_at, stored_meta, AcmeCommand,
-    AcmeEngine, AcmeHandle, AcmeService, AlarmHook, IssueTrigger, Issued, SendError,
+    alarm_for, ari_renewal_at, backoff_delay, describe_problem, fallback_renewal_at,
+    sanitize_detail, stored_meta, AcmeCommand, AcmeEngine, AcmeHandle, AcmeService, AlarmHook,
+    IssueTrigger, Issued, SendError,
 };
 
 /// A credential-safe failure category. Underlying HTTP / ACME / DNS errors
@@ -70,6 +71,10 @@ pub enum AcmeError {
     /// The configuration cannot drive an issuance (e.g. DNS-01 without a provider).
     #[error("ACME configuration incomplete")]
     Config,
+    /// TLS-ALPN-01: no listener answers `acme-tls/1` through the challenge
+    /// resolver (the front door never installed the responder in time).
+    #[error("the TLS-ALPN-01 responder was not installed")]
+    Responder,
 }
 
 impl AcmeError {
@@ -89,6 +94,7 @@ impl AcmeError {
             Self::Mismatch => "certificate-mismatch",
             Self::Timeout => "attempt-timed-out",
             Self::Config => "acme-config-incomplete",
+            Self::Responder => "tls-alpn-responder-not-installed",
         }
     }
 }
@@ -112,6 +118,7 @@ mod tests {
             AcmeError::Mismatch,
             AcmeError::Timeout,
             AcmeError::Config,
+            AcmeError::Responder,
         ];
         let set: std::collections::HashSet<_> = all.iter().map(|e| e.as_reason()).collect();
         assert_eq!(set.len(), all.len());

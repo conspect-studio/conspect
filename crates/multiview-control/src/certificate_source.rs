@@ -52,6 +52,10 @@ pub struct CertificateStatus {
     pub expires_at: Option<i64>,
     /// Last issuance/renewal failure, sanitized before entering this type.
     pub last_error: Option<String>,
+    /// Human detail of the last failure (the CA's problem type and detail,
+    /// or a short local explanation): control characters stripped, at most
+    /// 512 bytes, never a credential.
+    pub last_error_detail: Option<String>,
     /// SHA-256 fingerprint of the bootstrap leaf certificate.
     pub bootstrap_fingerprint: Option<String>,
     /// Expiry alarm level (non-secret).
@@ -216,16 +220,45 @@ pub struct ChallengeResolver {
     /// Normal site certificate source.
     pub source: Arc<dyn CertificateSource>,
     challenges: RwLock<std::collections::HashMap<String, Arc<CertifiedKey>>>,
+    /// Whether a listener answers `acme-tls/1` through this resolver
+    /// (set once by the front door after it installed the responder).
+    responder: watch::Sender<bool>,
 }
 
 impl ChallengeResolver {
     /// Construct the resolver with an ACME or static certificate source.
     #[must_use]
     pub fn new(source: Arc<dyn CertificateSource>) -> Self {
+        let (responder, _) = watch::channel(false);
         Self {
             source,
             challenges: RwLock::new(std::collections::HashMap::new()),
+            responder,
         }
+    }
+
+    /// Signal that a TLS listener now answers `acme-tls/1` hellos through
+    /// this resolver. The ACME engine waits for it before ordering a
+    /// TLS-ALPN-01 certificate: otherwise the CA's validator can connect
+    /// before the responder exists and the challenge fails at once.
+    pub fn mark_responder_ready(&self) {
+        self.responder.send_replace(true);
+    }
+
+    /// Whether [`Self::mark_responder_ready`] has been called.
+    #[must_use]
+    pub fn responder_ready(&self) -> bool {
+        *self.responder.borrow()
+    }
+
+    /// Wait (at most `timeout`) until the responder is installed; `true`
+    /// once it is. Off the data path: only the ACME thread awaits this.
+    pub async fn wait_responder_ready(&self, timeout: std::time::Duration) -> bool {
+        let mut ready = self.responder.subscribe();
+        let outcome = tokio::time::timeout(timeout, ready.wait_for(|r| *r))
+            .await
+            .map(|seen| seen.is_ok());
+        outcome == Ok(true)
     }
 
     /// Install one temporary challenge before acknowledging it to the CA.
@@ -312,6 +345,7 @@ impl AcmeCertificateSource {
                 names,
                 expires_at: None,
                 last_error: None,
+                last_error_detail: None,
                 bootstrap_fingerprint: Some(fingerprint),
                 alarm: CertificateAlarm::None,
                 renewal_due_at: None,
@@ -385,16 +419,26 @@ impl AcmeCertificateSource {
         status.state = TlsState::Serving;
         status.expires_at = Some(expires_at);
         status.last_error = None;
+        status.last_error_detail = None;
         status.bootstrap_fingerprint = None;
         Ok(())
     }
 
     /// Report a sanitized failure; the active certificate never changes.
+    /// Clears any previous detail (see [`Self::report_failure`]).
     pub fn report_error(&self, reason: &'static str) {
-        self.status
+        self.report_failure(reason, None);
+    }
+
+    /// Report a sanitized failure with its human detail (already bounded
+    /// and sanitized by the caller); the active certificate never changes.
+    pub fn report_failure(&self, reason: &'static str, detail: Option<String>) {
+        let mut status = self
+            .status
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last_error = Some(reason.to_owned());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.last_error = Some(reason.to_owned());
+        status.last_error_detail = detail;
     }
 
     /// Publish the renewal schedule (non-secret, Unix seconds).
@@ -477,6 +521,7 @@ impl CertificateSource for StaticCertificateSource {
             names: Vec::new(),
             expires_at: None,
             last_error: None,
+            last_error_detail: None,
             bootstrap_fingerprint: None,
             alarm: CertificateAlarm::None,
             renewal_due_at: None,

@@ -338,6 +338,17 @@ page alone.
   the runbook recommends the token because the global key can change everything on the account.
   `validate_credential()` runs before any order (token: `GET /user/tokens/verify` then zone lookup;
   key: zone lookup) and reports which permission is missing. Wildcard names need `DNS-01`.
+  `confirm_at_authoritative` asks every authoritative nameserver directly on port 53. Some
+  networks intercept all outbound port 53 (UDP and TCP) and answer from a hijacking resolver, so
+  that check can never pass there. `[network.tls.dns] confirm` (`auto` default, `authoritative`,
+  `doh`): `auto` first sends one query to RFC 5737/3849 documentation addresses where nothing
+  listens; a reply to that query (a DNS response with the query's id, from a probe address) means
+  interception, and confirmation then uses DNS over HTTPS (RFC 8484 GET
+  to `cloudflare-dns.com`, through the screened egress client). Trade-off: DoH is a resolver's
+  view, not a check of each authoritative server; it is Cloudflare's own resolver, adjacent to the
+  authoritative servers of a Cloudflare zone, and the challenge TTL is 60 s. The verdict is
+  probed once per issuance attempt (the provider is rebuilt with the credential each attempt;
+  within one attempt it is reused for at most 10 minutes).
 * `TLS-ALPN-01` (RFC 8737). Answered on TCP 443: a ClientHello offering only `acme-tls/1` gets the
   challenge certificate (built with `rcgen`'s `CustomExtension::new_acme_identifier`), in both
   states, before any real certificate exists. It needs the CA to reach TCP 443 of the host.
@@ -346,6 +357,20 @@ page alone.
   ([Let's Encrypt, first IP certificate](https://letsencrypt.org/2025/07/01/issuing-our-first-ip-address-certificate),
   [GA post](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability)): so `TLS-ALPN-01`
   is what makes a host with no DNS name work.
+  The ACME service starts before the front door attaches the `acme-tls/1` responder (that happens
+  once the control plane is built), and the CA's validator connects as soon as a challenge is set
+  ready. So the challenge resolver carries a "responder installed" signal that the door sets after
+  installing it, and a TLS-ALPN-01 attempt waits for it (60 s, on the ACME thread) after reaching
+  the CA and before ordering; without it the attempt fails as `tls-alpn-responder-not-installed`
+  (cadence while waiting: `tests/acme_cadence.rs`
+  `clock_keeps_cadence_while_waiting_for_the_alpn_responder`; the late-responder issuance:
+  `tests/acme_pebble.rs` `tls_alpn01_waits_for_a_late_responder`).
+  After any failed attempt that created an order, its still-`pending` authorizations are
+  deactivated (best effort, bounded): Boulder hands an existing pending order for the same account
+  and names back on the next new-order request, and a stale one must not be reused. Every failure
+  also records a bounded (512 bytes, built in a capped buffer: each CA field at most 200 bytes, at
+  most 8 subproblems/challenges/authorizations), sanitized human detail (the CA's problem type, detail,
+  subproblems and the challenge's own error), shown as `last_error_detail`.
 * `HTTP-01` is not supported.
 
 | Mode | DNS-01 | TLS-ALPN-01 | Reported when unavailable |
@@ -423,12 +448,22 @@ wiring, the `multiview tls` CLI and the setup routes are PR B (next section).
   `pending-txt.json` (DNS-01 ledger: intent before `publish_txt`, handle after, entry removed after
   `remove_txt`; at most 64 entries; replayed by `cleanup_pending()` at start), `secrets/<NAME>` as
   the fallback for every env-var name.
-* Cleanup: every attempt runs inside a 10 min timeout so TXT records and ALPN challenges are removed
-  on success, failure and timeout; the ledger covers a crash or kill.
+* Cleanup: every attempt runs inside a 10 min timeout. The aftermath runs after the attempt, outside
+  that timeout, under its own total cap (60 s): ALPN challenges are removed at once, then published
+  TXT records are removed (30 s in total, each call also capped at 30 s), then, after a failure, the placed order's
+  still-pending authorizations are deactivated (30 s total, 10 s per call). A `Shutdown` cuts the
+  aftermath short. A `Shutdown` during the attempt runs only ALPN removal and at most 1 s of TXT
+  removal, with no CA call. `AcmeHandle` drop still detaches the thread after 2 s, so process
+  teardown is never delayed. A TXT record not removed in time stays in the ledger and is retried at
+  the next start, which also covers a crash or kill.
 * Runtime: `AcmeService` runs on its own OS thread (`acme`) with its own current-thread Tokio runtime;
   commands go through a bounded queue (capacity 4, full = dropped); `CertificateSource::status()` is
   the only read path. `tests/acme_cadence.rs` proves the output clock keeps cadence while the CA
-  hangs or refuses.
+  hangs or refuses. Against an in-process fake CA whose account step succeeds, it also covers three
+  more cases: the ACME thread waiting in `wait_responder_ready` (TLS-ALPN-01 responder never
+  installed); a failed order being examined (`challenge_errors`, then re-reading the order for
+  deactivation); and a deactivation that hangs, cut by the aftermath cap. It also proves that a
+  `Shutdown` during a hanging aftermath stops the thread within the drop budget.
 * Renewal: ARI window (uniform random instant, `Retry-After` floors the next ARI check) or two thirds
   of the lifetime ±(lifetime/30, at most one day); failures back off 15 min doubling to 6 h, never
   under 60 s. Alarm: while renewal fails, under 50 % of the lifetime left = warning, under 25 % =

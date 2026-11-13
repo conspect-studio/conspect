@@ -119,8 +119,11 @@ pub enum TlsCommand {
 #[non_exhaustive]
 pub struct TlsConfigArg {
     /// The engine's TOML config (for `[control] listen` and `[network.tls]`).
-    #[arg(long, value_name = "PATH", default_value = DEFAULT_CONFIG)]
-    pub config: PathBuf,
+    /// Optional: without it the config of the one running `multiview run`
+    /// engine is used (found through `/proc` on Linux), else
+    /// `/etc/multiview/multiview.toml` when it exists.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
 }
 
 /// Arguments for `multiview tls status`.

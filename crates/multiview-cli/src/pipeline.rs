@@ -270,8 +270,9 @@ struct StreamPlan {
 
 /// ADR-0108 slice 1, step 1 start-up refusal; the rule itself lives in
 /// Every configured output whose persisted video feed is not Program, as
-/// `(config id, picture bus)` (#329). A feed the engine cannot carry (a
-/// layout) never reaches here: start-up admission refuses it first.
+/// `(config id, picture bus)` (#329). A stored-layout feed (slice 3) is
+/// skipped: its body lives in the layouts library, which start-up does not
+/// resolve, so that output starts and stays on Program until a live take.
 fn boot_output_feeds(config: &MultiviewConfig) -> Vec<(String, crate::routing_aux::PictureBus)> {
     config
         .output_feeds()
@@ -577,14 +578,17 @@ struct ResolvedEncoder {
 
 /// Map a config output `codec` token to a logical [`multiview_ffmpeg::VideoCodec`].
 /// Unknown codec names are rejected, never silently replaced.
+/// The engine codec of `token`, through the config crate's single codec
+/// token table ([`multiview_config::CodecFamily::of`], #342 review M2).
 fn logical_codec(token: &str) -> Result<multiview_ffmpeg::VideoCodec, PipelineError> {
+    use multiview_config::CodecFamily;
     use multiview_ffmpeg::VideoCodec;
-    match token.to_ascii_lowercase().as_str() {
-        "h264" | "avc" | "libx264" | "h264_nvenc" => Ok(VideoCodec::H264),
-        "h265" | "hevc" | "libx265" | "hevc_nvenc" => Ok(VideoCodec::H265),
-        "ffv1" => Ok(VideoCodec::Ffv1),
-        "mjpeg" => Ok(VideoCodec::Mjpeg),
-        "mpeg2video" => Ok(VideoCodec::Mpeg2Video),
+    match CodecFamily::of(token) {
+        Some(CodecFamily::H264) => Ok(VideoCodec::H264),
+        Some(CodecFamily::Hevc) => Ok(VideoCodec::H265),
+        Some(CodecFamily::Ffv1) => Ok(VideoCodec::Ffv1),
+        Some(CodecFamily::Mjpeg) => Ok(VideoCodec::Mjpeg),
+        Some(CodecFamily::Mpeg2) => Ok(VideoCodec::Mpeg2Video),
         _ => Err(PipelineError::Codec {
             codec: token.to_owned(),
             reason: "unsupported codec".to_owned(),
@@ -614,6 +618,43 @@ fn resolve_encoder(codec_token: &str) -> Result<ResolvedEncoder, PipelineError> 
         name: name.to_owned(),
         format: encoder_input_format(name),
     })
+}
+
+#[cfg(test)]
+mod codec_table_tests {
+    use super::logical_codec;
+    use multiview_config::CodecFamily;
+
+    /// #342 review M2: config and engine agree on every token, including
+    /// the NVENC names and tokens both refuse.
+    #[test]
+    fn config_and_engine_share_one_codec_token_table() {
+        for token in [
+            "h264",
+            "AVC",
+            "libx264",
+            "h264_nvenc",
+            "hevc",
+            "H265",
+            "libx265",
+            "hevc_nvenc",
+            "mpeg2video",
+            "ffv1",
+            "mjpeg",
+            "libopenh264",
+            "mpeg2",
+            "mpeg2_qsv",
+            "h264_vaapi",
+            "vp9",
+            "",
+        ] {
+            assert_eq!(
+                CodecFamily::of(token).is_some(),
+                logical_codec(token).is_ok(),
+                "{token:?}"
+            );
+        }
+    }
 }
 
 fn codec_for_encoder(name: &str) -> multiview_ffmpeg::VideoCodec {
@@ -1816,7 +1857,7 @@ segment_ms = 1000
     /// take); only a feed the engine cannot carry at all — a layout — is
     /// refused, loudly, by the same single start-up rule.
     #[test]
-    fn default_program_outputs_run_a_source_feed_is_accepted_and_a_layout_is_refused() {
+    fn default_program_outputs_run_and_source_and_layout_feeds_are_accepted() {
         let plain = MultiviewConfig::load_from_toml(DOC).expect("parses");
         assert!(ensure_outputs_carry_program(&plain).is_ok());
         let routed = MultiviewConfig::load_from_toml(&format!(
@@ -1841,8 +1882,14 @@ segment_ms = 1000
             "{DOC}\n[[routing.output]]\noutput = \"o\"\nvideo = {{ layout = \"L\" }}\n"
         ))
         .expect("parses");
-        let err = ensure_outputs_carry_program(&layout).expect_err("refused");
-        assert!(err.to_string().contains("aux:L"), "{err}");
+        // ADR-0108 slice 3 (behaviour intentionally changed, #306): a
+        // persisted layout feed no longer refuses a start; it starts on
+        // Program and is not re-taken at boot (no boot take for it).
+        ensure_outputs_carry_program(&layout).expect("a layout feed never refuses a start");
+        assert!(
+            super::boot_output_feeds(&layout).is_empty(),
+            "no boot take for a layout feed"
+        );
     }
 }
 
@@ -2357,6 +2404,16 @@ pub struct Pipeline {
     encode_cfg: EncodeConfig,
     /// Distinct concrete video encoders and one key per runnable output.
     rendition_configs: Vec<EncodeConfig>,
+    /// Per rendition key: the format its worker converts the Program canvas
+    /// to (#342); `None` = the canvas (zero-copy, as before).
+    rendition_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
+    /// Test seam (#342 review I3): a hook run on each `format-convert`
+    /// thread before each convert (a chaos test wedges it). Always `None`
+    /// outside tests.
+    convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// Per runnable output (same order as `output_video_keys`): the format a
+    /// routed source/PVW is composed at for it (#342 review M3).
+    output_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
     output_video_keys: Vec<usize>,
     /// Per runnable output (same order as `output_video_keys`): its muxer
     /// reads decoder configuration in band (MPEG-TS), so a routing move onto
@@ -3267,32 +3324,76 @@ impl Pipeline {
             discrete_tracks.iter().map(|t| t.input_id.clone()).collect();
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
         let mut rendition_configs = Vec::<EncodeConfig>::new();
+        // #342: per rendition key, the picture format its worker converts the
+        // Program canvas to (`None` = the canvas, the zero-copy path).
+        let mut rendition_formats = Vec::<Option<crate::routing_aux::AuxFormat>>::new();
+        let mut output_formats = Vec::with_capacity(outputs.len());
+        let aux_canvas = crate::routing_aux::AuxCanvas {
+            width: config.canvas.width,
+            height: config.canvas.height,
+            color: canvas_color.output_tag(),
+        };
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         let mut output_inband_sets = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
-            let requested = config
-                .outputs
-                .iter()
-                .find(|item| item.id() == output.id())
-                .and_then(output_codec)
+            let declared = config.outputs.iter().find(|item| item.id() == output.id());
+            // #342: video slot 0's codec (absent = the output's `codec`).
+            let requested = declared
+                .and_then(|item| item.video_slot0().and_then(|v| v.codec.as_deref()))
+                .or_else(|| declared.and_then(output_codec))
                 .unwrap_or("mpeg2video");
             let concrete = resolve_encoder(requested)?;
+            // #342: the output's picture format (absent or the canvas = today)
+            // and video slot 0's bit rate (absent = today's).
+            // The base key's format collapses at canvas size (identity); the
+            // routed-feed format keeps a non-default fit (#342 review M3).
+            let format = declared
+                .and_then(|item| crate::routing_aux::AuxFormat::base_of_output(item, aux_canvas));
+            let feed_format = declared
+                .and_then(|item| crate::routing_aux::AuxFormat::feed_of_output(item, aux_canvas));
+            let (width, height) = format.map_or((cfg.width, cfg.height), |f| (f.width, f.height));
+            let bit_rate = declared
+                .and_then(|item| item.video_slot0().and_then(|v| v.bitrate_kbps))
+                .map_or(Ok(cfg.bit_rate), |kbps| {
+                    // Config caps a slot at MAX_SLOT_BITRATE_KBPS; never wrap.
+                    usize::try_from(kbps)
+                        .ok()
+                        .and_then(|kbps| kbps.checked_mul(1000))
+                        .filter(|_| kbps <= multiview_config::MAX_SLOT_BITRATE_KBPS)
+                        .ok_or_else(|| PipelineError::Codec {
+                            codec: requested.to_owned(),
+                            reason: format!("video bit rate {kbps} kbit/s is out of range"),
+                        })
+                })?;
+            // One base encoder per distinct (codec, width, height, bitrate,
+            // fit): outputs with equal format and settings share it (P1).
             let key = if let Some(index) = rendition_configs
                 .iter()
-                .position(|cfg| cfg.codec_name == concrete.name)
-            {
+                .zip(&rendition_formats)
+                .position(|(existing, existing_format)| {
+                    existing.codec_name == concrete.name
+                        && existing.width == width
+                        && existing.height == height
+                        && existing.bit_rate == bit_rate
+                        && *existing_format == format
+                }) {
                 index
             } else {
                 let mut video_cfg = cfg.clone();
                 video_cfg.codec_name = concrete.name;
                 video_cfg.format = concrete.format;
+                video_cfg.width = width;
+                video_cfg.height = height;
+                video_cfg.bit_rate = bit_rate;
                 video_cfg.audio = None;
                 rendition_configs.push(video_cfg);
+                rendition_formats.push(format);
                 rendition_configs.len() - 1
             };
             output_video_keys.push(key);
+            output_formats.push(feed_format);
             let ll_hls = config
                 .outputs
                 .iter()
@@ -3336,7 +3437,7 @@ impl Pipeline {
                 .outputs
                 .iter()
                 .find(|item| item.id() == output.id())
-                .and_then(multiview_config::Output::audio)
+                .and_then(multiview_config::Output::effective_audio)
                 .is_some();
             if explicit && !tracks.is_empty() {
                 declared_audio_outputs.push((output.id().to_owned(), tracks));
@@ -3494,6 +3595,9 @@ impl Pipeline {
             encoder,
             encode_cfg: cfg,
             rendition_configs,
+            rendition_formats,
+            convert_hook: None,
+            output_formats,
             output_video_keys,
             output_inband_sets,
             output_audio_tracks,
@@ -3712,6 +3816,18 @@ impl Pipeline {
         Arc::new(self.live_spawner())
     }
 
+    /// The canvas a routed layout composes onto (ADR-0108 slice 3): Program's
+    /// size and colour, and Program's background encoded once here.
+    fn layout_canvas_spec(&self) -> crate::aux_layout::LayoutCanvasSpec {
+        crate::aux_layout::LayoutCanvasSpec {
+            width: self.encode_cfg.width,
+            height: self.encode_cfg.height,
+            color: self.canvas_color,
+            background: crate::aux_layout::background_codes(self.canvas_color, self.background)
+                .unwrap_or([16, 128, 128]),
+        }
+    }
+
     /// Build one run's output routing (ADR-0108 slice 1): the clock's aux tick
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
@@ -3751,6 +3867,7 @@ impl Pipeline {
                 height: self.encode_cfg.height,
                 color: self.canvas_color.output_tag(),
             },
+            layout_canvas: self.layout_canvas_spec(),
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
@@ -3758,17 +3875,11 @@ impl Pipeline {
             .iter()
             .map(|_| crate::output_routing::force_cell())
             .collect();
-        let configs = self.rendition_configs.clone();
-        let open: crate::output_routing::OpenFn = Box::new(move |settings| {
-            let cfg = configs
-                .get(settings)
-                .ok_or_else(|| "unknown rendition settings".to_owned())?;
-            let encoder = VideoRenditionEncoder::new(cfg).map_err(|e| e.to_string())?;
-            let live: Box<dyn crate::output_routing::LiveEncoder> =
-                Box::new(PipelineVideoWorker(encoder));
-            Ok(live)
-        });
-        let (router, handle) = crate::output_routing::OutputRouter::new(
+        let open = live_opener(
+            self.rendition_configs.clone(),
+            self.rendition_formats.clone(),
+        );
+        let (router, handle) = crate::output_routing::OutputRouter::new_with_bus(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -3777,6 +3888,8 @@ impl Pipeline {
                 max_encoders: crate::output_routing::DEFAULT_MAX_ENCODERS,
                 max_per_principal: crate::output_routing::DEFAULT_MAX_PER_PRINCIPAL,
                 has_preview,
+                max_aux_canvases: crate::output_routing::DEFAULT_MAX_AUX_CANVASES,
+                formats: self.output_formats.clone(),
                 boot_retry: self.boot_retry,
             },
             crate::output_routing::AuxWiring {
@@ -3800,6 +3913,7 @@ impl Pipeline {
             .map(|(index, &settings)| crate::output_routing::RunOutput {
                 id: binding_ids.get(index).cloned().flatten(),
                 settings,
+                feed_format: self.output_formats.get(index).copied().flatten(),
                 routable: self.rendition_configs.get(settings).is_some_and(|cfg| {
                     !(cfg.codec_name.contains("vaapi") || cfg.codec_name.contains("videotoolbox"))
                 }),
@@ -3816,6 +3930,8 @@ impl Pipeline {
                 router: Box::new(router),
                 base_force,
                 inband_sets: self.output_inband_sets.clone(),
+                base_formats: self.rendition_formats.clone(),
+                convert_hook: self.convert_hook.clone(),
             },
             aux_tx,
             preview_selection,
@@ -4205,11 +4321,30 @@ impl Pipeline {
         Arc::clone(&self.window_subscriptions)
     }
 
+    /// Test seam (#342 review I3): run `hook` on every `format-convert`
+    /// thread before each convert.
+    #[cfg(test)]
+    pub(crate) fn set_convert_hook(&mut self, hook: crate::format_convert::ConvertHook) {
+        self.convert_hook = Some(hook);
+    }
+
     /// How many distinct video rendition configs (= Program encoder keys)
     /// this pipeline opens per run.
     #[cfg(test)]
     pub(crate) fn rendition_config_count(&self) -> usize {
         self.rendition_configs.len()
+    }
+
+    /// Test view (#342): per output its base key, per key (w, h, bit rate).
+    #[cfg(test)]
+    pub(crate) fn rendition_keys_for_test(&self) -> (Vec<usize>, Vec<(u32, u32, usize)>) {
+        (
+            self.output_video_keys.clone(),
+            self.rendition_configs
+                .iter()
+                .map(|cfg| (cfg.width, cfg.height, cfg.bit_rate))
+                .collect(),
+        )
     }
 
     /// The run's output-routing handle slot (ADR-0108 slice 1): empty until a
@@ -4578,6 +4713,9 @@ impl Pipeline {
         if !live {
             if let Some(hls_key) = hls_key {
                 self.output_video_keys.insert(0, hls_key);
+                let hls_format =
+                    hls_index.and_then(|i| self.output_formats.get(i).copied().flatten());
+                self.output_formats.insert(0, hls_format);
                 // The anchor is a `program.ts` file: MPEG-TS, in band.
                 self.output_inband_sets.insert(0, true);
                 self.output_audio_tracks
@@ -5543,7 +5681,7 @@ impl Pipeline {
                         egress_stop.stop();
                     }
                 }
-                SendPolicy::DropOnOverload => match hot_tx.try_send(item) {
+                SendPolicy::DropOnOverload => match send_or_forced_shed(&hot_tx, item) {
                     Ok(()) => bump_occupancy(&in_flight, &peak_occupancy),
                     Err(TrySendError::Full(_)) => {
                         // Shed and COUNT — never block (inv #1/#10).
@@ -6310,6 +6448,23 @@ struct SinkRunOutcome {
     playlist: Option<(PathBuf, String)>,
     /// How many baked frames this sink consumed (for tests).
     frames: usize,
+}
+
+/// The live hot-queue send. In `_chaos-test-seams` builds, a deterministic
+/// shed seam (#350) can refuse one tick exactly as a full queue does.
+// The error is `try_send`'s own: it hands the item back without a copy.
+// Boxing it would allocate on the output path. Its size depends on the
+// codec features, so `allow`, not `expect`.
+#[allow(clippy::result_large_err)]
+fn send_or_forced_shed(
+    hot_tx: &std::sync::mpsc::SyncSender<StreamItem>,
+    item: StreamItem,
+) -> Result<(), TrySendError<StreamItem>> {
+    #[cfg(feature = "_chaos-test-seams")]
+    if chaos::force_shed(item.tick_index) {
+        return Err(TrySendError::Full(item));
+    }
+    hot_tx.try_send(item)
 }
 
 /// Request a tick-boundary stop if the shared encoded-output producer fails.
@@ -7476,10 +7631,49 @@ struct ConsumerRouting {
     base_force: Vec<Arc<AtomicU64>>,
     /// Per output: [`BindingConfig::inband_parameter_changes_ok`].
     inband_sets: Vec<bool>,
+    /// Per base video key: the format its worker encodes (#342), converted
+    /// by that format's `format-convert` thread; `None` = the canvas, the
+    /// unchanged zero-copy path.
+    base_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
+    /// Chaos/test hook run on every convert thread before each convert
+    /// (#342 review I3); `None` in production.
+    convert_hook: Option<crate::format_convert::ConvertHook>,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
 const ROUTING_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
+/// The routing opener (ADR-0108, #342): opens a live encoder for a rendition
+/// settings index. A Program/Clean key at a non-canvas format converts on its
+/// own worker (never erroring: it repeats or blacks). A routed source/PVW
+/// arrives already at the format (aux feed).
+fn live_opener(
+    configs: Vec<EncodeConfig>,
+    formats: Vec<Option<crate::routing_aux::AuxFormat>>,
+) -> crate::output_routing::BusOpenFn {
+    Box::new(move |settings, bus| {
+        let cfg = configs
+            .get(settings)
+            .ok_or_else(|| "unknown rendition settings".to_owned())?;
+        let encoder = VideoRenditionEncoder::new(cfg).map_err(|e| e.to_string())?;
+        let live: Box<dyn crate::output_routing::LiveEncoder> =
+            Box::new(PipelineVideoWorker(encoder));
+        // Program, Clean and a routed layout are canvas-sized pictures; a
+        // non-canvas output format converts on the key's own worker.
+        let canvas_bus = matches!(
+            bus,
+            crate::routing_aux::PictureBus::Program
+                | crate::routing_aux::PictureBus::Clean
+                | crate::routing_aux::PictureBus::Layout(_)
+        );
+        match formats.get(settings).copied().flatten() {
+            Some(format) if canvas_bus => Ok(Box::new(crate::format_convert::ConvertLive::new(
+                format, live,
+            ))),
+            _ => Ok(live),
+        }
+    })
+}
 
 /// The concrete encoder owned exclusively by one bounded rendition worker.
 struct PipelineVideoWorker(VideoRenditionEncoder);
@@ -7945,7 +8139,13 @@ fn consumer_main<D: WindowDelivery>(
         mut router,
         base_force,
         inband_sets,
+        base_formats,
+        convert_hook,
     } = routing;
+    // #342 review I1/I2: one `format-convert` thread per distinct non-canvas
+    // base format, fed non-blocking right after the bake. Empty (no thread,
+    // no work) for a run whose base keys are all at the canvas format.
+    let mut convert_stages = crate::format_convert::ConvertStages::default();
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
     if video_encoders.is_empty() {
@@ -7992,14 +8192,27 @@ fn consumer_main<D: WindowDelivery>(
             .get(key)
             .cloned()
             .unwrap_or_else(crate::output_routing::force_cell);
+        // A base key at a non-canvas format encodes its format's convert
+        // thread's newest picture (never converting, never failing on a
+        // convert); the canvas format keeps the zero-copy path untouched.
+        let encode: Box<dyn VideoEncodeWorker> = match base_formats.get(key).copied().flatten() {
+            Some(format) => {
+                let slot = convert_stages
+                    .slot_for(format, convert_hook.as_ref())
+                    .map_err(|e| PipelineError::thread_spawn("format-convert", e))?;
+                Box::new(crate::format_convert::ConvertedWorker::new(
+                    slot,
+                    format,
+                    Box::new(PipelineVideoWorker(encoder)),
+                ))
+            }
+            None => Box::new(PipelineVideoWorker(encoder)),
+        };
         let worker = RenditionWorker::spawn(
             key,
             cadence,
             base,
-            Box::new(crate::output_routing::ForceAt::with_cell(
-                Box::new(PipelineVideoWorker(encoder)),
-                force,
-            )),
+            Box::new(crate::output_routing::ForceAt::with_cell(encode, force)),
             move |event| {
                 tx.send(event).map_err(|e| PipelineError::Output {
                     kind: "video-worker",
@@ -8281,6 +8494,7 @@ fn consumer_main<D: WindowDelivery>(
         // fails the run explicitly (never silently skips forward).
         for missing_tick in missing {
             let canvas = last_baked.as_ref().unwrap_or(&overlaid);
+            convert_stages.offer(missing_tick, canvas);
             for worker in &workers {
                 worker
                     .offer_within(
@@ -8302,6 +8516,9 @@ fn consumer_main<D: WindowDelivery>(
         // absorbing engine ticks meanwhile — nothing is shed inside the
         // envelope); only a worker wedged beyond the horizon fails
         // explicitly, never pacing the program clock.
+        // #342: the non-canvas base formats' convert threads get it first
+        // (try_send, never blocks; a full queue drops and counts).
+        convert_stages.offer(item.tick_index, &overlaid);
         for worker in &workers {
             worker
                 .offer_within(
@@ -8533,6 +8750,9 @@ fn consumer_main<D: WindowDelivery>(
     // Live-opened encoders are retired first and handed to the routing reaper
     // (bounded wait; they never gate the base windows).
     (*router).shutdown(&mut dispatcher, ROUTING_SHUTDOWN_GRACE);
+    // The base formats' convert threads: input closed, joined within the
+    // same grace (a wedged one is left to end on its own, never awaited).
+    let _joined = convert_stages.shutdown(ROUTING_SHUTDOWN_GRACE);
     drop(event_tx);
     let joiner = std::thread::Builder::new()
         .name("multiview-worker-join".to_owned())
@@ -13549,7 +13769,8 @@ fn output_audio_selection(
     output: &Output,
     tracks: &[DeclaredTrack],
 ) -> multiview_output::AudioSelection {
-    let Some(selection) = output.audio() else {
+    // `slots.audio`, when declared, is the output's selection (#342).
+    let Some(selection) = output.effective_audio() else {
         return multiview_output::AudioSelection::default();
     };
     let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
@@ -26224,6 +26445,27 @@ mod chaos {
             tracing::warn!(ms, "chaos: holding source teardown");
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
+    }
+
+    /// Refuse ONE hot-queue send in the whole process, at the first tick at
+    /// or after `MULTIVIEW_CHAOS_SHED_AT`: a deterministic shed, independent
+    /// of timing (#350). One shed is enough for the falter verdict (any shed
+    /// makes the run exit 1); with several outputs only the first to reach
+    /// the tick sheds.
+    pub(super) fn force_shed(tick: u64) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let at = *AT.get_or_init(|| {
+            std::env::var("MULTIVIEW_CHAOS_SHED_AT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+        });
+        let shed = at.is_some_and(|at| tick >= at && !DONE.swap(true, Ordering::AcqRel));
+        if shed {
+            tracing::warn!(tick, "chaos: forced shed of one hot-queue send");
+        }
+        shed
     }
 
     impl ConsumerStall {

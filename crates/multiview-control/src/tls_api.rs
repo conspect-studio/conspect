@@ -34,6 +34,12 @@ pub struct TlsStatusBody {
     pub alarm: String,
     /// Sanitized token of the last failure (e.g. `ca-unavailable`).
     pub last_error: Option<String>,
+    /// Human detail of the last failure: the CA's problem type and detail
+    /// (with subproblems and the challenge's own error), or a short local
+    /// explanation (e.g. "TXT not seen via DNS over HTTPS"). Control
+    /// characters stripped, at most 512 bytes, never a credential.
+    #[serde(default)]
+    pub last_error_detail: Option<String>,
     /// SHA-256 fingerprint of the bootstrap certificate (setup only).
     pub bootstrap_fingerprint: Option<String>,
     /// Why the engine is still in setup, e.g. `credential-missing: CLOUDFLARE_API_TOKEN`

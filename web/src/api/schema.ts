@@ -6492,6 +6492,17 @@ export interface components {
             /** @description Whether the take fits the encoder budget now. */
             fits: boolean;
             /**
+             * @description The audio the output carries on this video feed when its audio
+             *     follows: `program` (the mix), `source` (the source's own) or `preview`
+             *     (the PVW source's). A layout carries the program mix.
+             */
+            follow_audio?: string | null;
+            /**
+             * Format: int32
+             * @description `1` when the take starts a new layout canvas (`routing-aux`), else `0`.
+             */
+            new_aux_canvases?: number;
+            /**
              * Format: int32
              * @description `0` when an existing encoder carries the feed, `1` for a new one.
              */
@@ -6503,7 +6514,8 @@ export interface components {
             detail: string;
             /**
              * @description `capacity` | `unknown-feed` | `switcher-required` |
-             *     `output-kind-unroutable` | `audio-unsupported`.
+             *     `output-kind-unroutable` | `audio-unsupported` | `layout-not-admissible`
+             *     | `aux-capacity`.
              */
             type: string;
         };
@@ -6534,8 +6546,9 @@ export interface components {
              */
             audio?: Record<string, never> | null;
             /**
-             * @description The video feed: `{"bus":"program"|"preview"|"clean"}` or
-             *     `{"source":"vt1"}`. Required with `stream: video`; absent with
+             * @description The video feed: `{"bus":"program"|"preview"|"clean"}`,
+             *     `{"source":"vt1"}` or `{"layout":"NewsOne"}` (a stored layout,
+             *     ADR-0108 slice 3). Required with `stream: video`; absent with
              *     `stream: audio`.
              */
             feed?: Record<string, never> | null;
@@ -8851,6 +8864,13 @@ export interface components {
             hints: string[];
             /** @description Sanitized token of the last failure (e.g. `ca-unavailable`). */
             last_error?: string | null;
+            /**
+             * @description Human detail of the last failure: the CA's problem type and detail
+             *     (with subproblems and the challenge's own error), or a short local
+             *     explanation (e.g. "TXT not seen via DNS over HTTPS"). Control
+             *     characters stripped, at most 512 bytes, never a credential.
+             */
+            last_error_detail?: string | null;
             /** @description Names requested on the certificate. */
             names: string[];
             /**
@@ -16991,7 +17011,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track). */
+            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -17000,7 +17020,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `unknown-feed` (video or audio), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key. */
+            /** @description `unknown-feed` (video or audio, including an unknown layout), `layout-not-admissible` (a layout authored for another canvas, one that does not solve, or one with a translucent cell), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key. */
             422: {
                 headers: {
                     [name: string]: unknown;

@@ -449,27 +449,35 @@ impl FrontDoorRun {
     /// `acme-tls/1`) when `[network.tls]` is configured (slice 5). Without a
     /// site TLS configuration the door keeps serving ICE-TCP only (a warning
     /// says so).
+    ///
+    /// Returns whether the `acme-tls/1` responder is now installed: the
+    /// caller then marks its challenge resolver ready
+    /// ([`ChallengeResolver::mark_responder_ready`](multiview_control::certificate_source::ChallengeResolver::mark_responder_ready)),
+    /// which the ACME engine waits for before a TLS-ALPN-01 order.
     pub fn install_site(
         &self,
         server: multiview_control::ConnectionServer,
         tls_site: Option<multiview_frontdoor::SiteTlsConfig>,
         acme: Option<multiview_frontdoor::SiteTlsConfig>,
-    ) {
+    ) -> bool {
         let Some(tcp) = self.door.tcp_local_addr() else {
-            return;
+            return false;
         };
         let Some(site) = tls_site else {
             let _ = self.door.set_site_pending(false);
             tracing::warn!(%tcp, "front-door TCP door: no site certificate ([network.tls] in an `acme` build, or [network] cert_file/key_file or [control.tls] static in a `tls` build, on unix), so TLS on the door is unavailable; ICE-TCP still runs");
-            return;
+            return false;
         };
         // Read-modify-write per half (#291): the site half here; the ACME
         // (TLS-ALPN-01) half through `set_acme_config`, so neither clobbers
         // the other.
         let challenge = acme.is_some();
         let service: Arc<dyn multiview_frontdoor::SiteService> = Arc::new(ControlSite(server));
+        let mut responder = false;
         if let Some(acme) = acme {
-            if self.door.set_acme_config(Some(acme)).is_err() {
+            if self.door.set_acme_config(Some(acme)).is_ok() {
+                responder = true;
+            } else {
                 tracing::error!(%tcp, "front-door TCP door: installing the ACME TLS-ALPN-01 responder failed");
             }
         }
@@ -482,6 +490,7 @@ impl FrontDoorRun {
                 tracing::info!(%tcp, tls_site = true, "front-door TCP door serves the site (HTTP/1.1 over the [control.tls] certificate)");
             }
         }
+        responder
     }
 
     /// The bound TCP door address, if the door runs.
@@ -502,9 +511,12 @@ impl FrontDoorRun {
         let Some(tcp) = self.door.tcp_local_addr() else {
             return;
         };
+        let marker = Arc::clone(&resolver);
         match multiview_control::acme_challenge_server_config(resolver) {
             Ok(config) => {
                 if self.door.set_acme_config(Some(config)).is_ok() {
+                    // The engine may now order TLS-ALPN-01 (it waits for this).
+                    marker.mark_responder_ready();
                     tracing::info!(%tcp, "front-door TCP door serves the ACME TLS-ALPN-01 challenge responder");
                 }
             }
