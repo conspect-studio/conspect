@@ -394,6 +394,12 @@ where
             crate::output_routing_control::OutputRoutingAdapter::new(slot),
         ));
     }
+    // The network front door's live counters (ADR-0107 slice 3,
+    // `GET /api/v1/metrics/frontdoor`); absent when `[network]` is not
+    // configured this run (404, not an error).
+    if let Some(source) = crate::frontdoor::installed_metrics_source() {
+        state = state.with_frontdoor_metrics(source);
+    }
     if let Some(leases) = switcher_leases {
         state.switcher_preview_lease = leases;
     }
@@ -495,6 +501,7 @@ where
     .with_capabilities(crate::system_capabilities::resolve_system_capabilities(
         compositor_adapter.as_ref(),
         youtube_probe,
+        crate::frontdoor::installed_capability(),
     ))
     // The `[discovery]` browse configuration: the operator-configured
     // zowietek-control service type (the vendor's type is unverified — only a

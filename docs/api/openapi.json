@@ -7005,6 +7005,57 @@
         }
       }
     },
+    "/api/v1/metrics/frontdoor": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "`GET /api/v1/metrics/frontdoor` — the network front door's live counters\n(role: read; whole-system principals only).",
+        "operationId": "get_frontdoor_metrics",
+        "responses": {
+          "200": {
+            "description": "Front-door counters and gauges.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FrontDoorMetricsReport"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Scoped principal (whole-system metric).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No running front door reports metrics.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/metrics/program": {
       "get": {
         "tags": [
@@ -12225,7 +12276,7 @@
         "tags": [
           "system"
         ],
-        "summary": "`GET /api/v1/system/capabilities` — the build's codec/compositor backend\navailability, compositor classification, effective build-profile licence, and\nNDI attribution (ADR-W030). Role: read.",
+        "summary": "`GET /api/v1/system/capabilities` — the build's codec/compositor backend\navailability, compositor classification, effective build-profile licence, and\nNDI attribution (ADR-W030). Role: read. The `network` section (front-door\nhost posture) is included only for an unscoped principal; a scoped key\ngets the response without it.",
         "operationId": "system_capabilities",
         "responses": {
           "200": {
@@ -16878,6 +16929,199 @@
           }
         }
       },
+      "FrontDoorMetricsReport": {
+        "type": "object",
+        "description": "The `GET /api/v1/metrics/frontdoor` body: the live\n`multiview_frontdoor::StatsSnapshot` counters, plus the steering,\nkernel-drop and nft-floor gauges and the QUIC retry counter.",
+        "required": [
+          "received",
+          "to_quic",
+          "to_rtc",
+          "dropped_classify",
+          "dropped_per_source",
+          "dropped_global",
+          "dropped_vn",
+          "dropped_initial",
+          "dropped_queue_full",
+          "dropped_no_consumer",
+          "recv_errors",
+          "tracked_sources",
+          "received_established_socket",
+          "received_listener_socket",
+          "steered_unverified",
+          "steering_overflow",
+          "steering_updates",
+          "steering_update_errors",
+          "steered_peers",
+          "kernel_drops_listener",
+          "kernel_drops_established",
+          "dropped_stun_per_source",
+          "dropped_stun_global",
+          "dropped_established_peer",
+          "quic_retries",
+          "udp443_steering",
+          "nft_floor"
+        ],
+        "properties": {
+          "dropped_classify": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dropped by the classifier.",
+            "minimum": 0
+          },
+          "dropped_established_peer": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dropped by the per-established-peer bucket.",
+            "minimum": 0
+          },
+          "dropped_global": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dropped by the global new-flow budget.",
+            "minimum": 0
+          },
+          "dropped_initial": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dropped by the global handshake (Initial) budget.",
+            "minimum": 0
+          },
+          "dropped_no_consumer": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dropped because the lane had no consumer.",
+            "minimum": 0
+          },
+          "dropped_per_source": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dropped by the per-source new-flow bucket.",
+            "minimum": 0
+          },
+          "dropped_queue_full": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dropped because a lane queue was full.",
+            "minimum": 0
+          },
+          "dropped_stun_global": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dropped by the global STUN budget.",
+            "minimum": 0
+          },
+          "dropped_stun_per_source": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dropped by the per-source STUN bucket.",
+            "minimum": 0
+          },
+          "dropped_vn": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dropped by the global Version Negotiation budget.",
+            "minimum": 0
+          },
+          "kernel_drops_established": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Kernel receive drops on the established socket.",
+            "minimum": 0
+          },
+          "kernel_drops_listener": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Kernel receive drops on the listener socket.",
+            "minimum": 0
+          },
+          "nft_floor": {
+            "$ref": "#/components/schemas/NftFloorStatus",
+            "description": "The current nft UDP-443 floor status (re-read periodically; see\n`GET /api/v1/system/capabilities` for the startup snapshot)."
+          },
+          "quic_retries": {
+            "type": "integer",
+            "format": "int64",
+            "description": "QUIC Retries sent (RFC 9000 section 8.1.2).",
+            "minimum": 0
+          },
+          "received": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Datagrams read from the socket(s).",
+            "minimum": 0
+          },
+          "received_established_socket": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Datagrams read from the established socket (steered peers).",
+            "minimum": 0
+          },
+          "received_listener_socket": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Datagrams read from the listener socket.",
+            "minimum": 0
+          },
+          "recv_errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Socket receive errors (other than `WouldBlock`).",
+            "minimum": 0
+          },
+          "steered_peers": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Peers the current steering program steers.",
+            "minimum": 0
+          },
+          "steered_unverified": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Datagrams read from the established socket whose source was in no\nestablished set.",
+            "minimum": 0
+          },
+          "steering_overflow": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Established peers not steered because of the program's peer cap.",
+            "minimum": 0
+          },
+          "steering_update_errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Steering attaches that failed.",
+            "minimum": 0
+          },
+          "steering_updates": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Steering programs attached.",
+            "minimum": 0
+          },
+          "to_quic": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Delivered to the QUIC lane.",
+            "minimum": 0
+          },
+          "to_rtc": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Delivered to the WebRTC lane.",
+            "minimum": 0
+          },
+          "tracked_sources": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Source keys currently tracked by the new-flow limiter.",
+            "minimum": 0
+          },
+          "udp443_steering": {
+            "$ref": "#/components/schemas/Udp443Steering",
+            "description": "How the front door currently receives."
+          }
+        }
+      },
       "GpuLimitDoc": {
         "oneOf": [
           {
@@ -18664,6 +18908,50 @@
             "description": "A link to the NDI site."
           }
         }
+      },
+      "NetworkCapability": {
+        "type": "object",
+        "description": "The front door's capability snapshot (design note section 10.1 and \"Slice\n3 as built, part B\"), filled\nat startup by the CLI.",
+        "required": [
+          "udp443_steering",
+          "recv_buffer",
+          "kernel_drops_supported",
+          "nft_floor"
+        ],
+        "properties": {
+          "kernel_drops_supported": {
+            "type": "boolean",
+            "description": "Whether the kernel-drop gauges are sampled on this platform (Linux\n`/proc/net/udp6` only)."
+          },
+          "nft_floor": {
+            "$ref": "#/components/schemas/NftFloorStatus",
+            "description": "Whether the nftables UDP-443 floor was seen at startup (design note,\n\"Slice 3 as built, part B\"): `\"present\"`, `\"absent\"`, or `\"unknown\"`\n(see [`NftFloorStatus`])."
+          },
+          "recv_buffer": {
+            "$ref": "#/components/schemas/RecvBufferCapability",
+            "description": "The receive buffer the kernel granted for the front-door socket(s)."
+          },
+          "steering_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why steering is `single_socket` (configuration, platform, or the\nerror that forced it). Absent when steering is active."
+          },
+          "udp443_steering": {
+            "$ref": "#/components/schemas/Udp443Steering",
+            "description": "How the front door receives: `\"reuseport_cbpf\"` (validated-flow\nsteering active) or `\"single_socket\"`."
+          }
+        }
+      },
+      "NftFloorStatus": {
+        "type": "string",
+        "description": "[`NetworkCapability::nft_floor`] (design note, \"Slice 3 as built, part B\").",
+        "enum": [
+          "present",
+          "absent",
+          "unknown"
+        ]
       },
       "NmosAccess": {
         "type": "string",
@@ -21101,6 +21389,40 @@
             "type": "integer",
             "format": "int32",
             "description": "Backoff ceiling in milliseconds (`initial_ms..=3_600_000`).",
+            "minimum": 0
+          }
+        }
+      },
+      "RecvBufferCapability": {
+        "type": "object",
+        "description": "[`NetworkCapability::recv_buffer`].",
+        "required": [
+          "requested",
+          "granted",
+          "usable",
+          "clamped"
+        ],
+        "properties": {
+          "clamped": {
+            "type": "boolean",
+            "description": "`usable < requested`: the kernel clamped the request."
+          },
+          "granted": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What `getsockopt(SO_RCVBUF)` reads back.",
+            "minimum": 0
+          },
+          "requested": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The `SO_RCVBUF` request (`network.udp.recv_buffer_bytes`).",
+            "minimum": 0
+          },
+          "usable": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The usable size (`granted / 2` on Linux).",
             "minimum": 0
           }
         }
@@ -24190,6 +24512,17 @@
               }
             ]
           },
+          "network": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NetworkCapability",
+                "description": "The network front door's capability snapshot (ADR-0107 slice 3):\nsteering mode, receive-buffer report, kernel-drop support, nft floor.\n`None` when `[network]` is not configured this run (the front door\ndid not start). A one-shot startup snapshot — `nft_floor` reflects\nthe startup read only; the live value is `/api/v1/metrics/frontdoor`.\nWhole-system host posture: omitted from the response for a scoped\nprincipal."
+              }
+            ]
+          },
           "youtube": {
             "oneOf": [
               {
@@ -24999,6 +25332,14 @@
             "description": "The TXT value (decoded as UTF-8 by the browser)."
           }
         }
+      },
+      "Udp443Steering": {
+        "type": "string",
+        "description": "[`NetworkCapability::udp443_steering`].",
+        "enum": [
+          "reuseport_cbpf",
+          "single_socket"
+        ]
       },
       "UmdRecallDoc": {
         "type": "object",

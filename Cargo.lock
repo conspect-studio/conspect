@@ -4165,6 +4165,7 @@ dependencies = [
  "proptest",
  "rcgen",
  "rustls",
+ "smallvec",
  "socket2 0.6.4",
  "tokio",
  "tokio-rustls",

@@ -72,6 +72,7 @@ systemctl stop conspect.service
 systemctl stop conspect.socket || true
 systemctl disable conspect.socket || true
 rm -f /etc/systemd/system/conspect.service.d/10-socket-activation.conf
+rm -f /etc/systemd/system/conspect.service.d/20-nft-floor.conf
 systemctl daemon-reload
 
 echo "== install the rolled-back files"
