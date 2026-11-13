@@ -369,3 +369,94 @@ async fn a_probe_reply_with_the_wrong_id_or_from_elsewhere_is_not_interception()
         assert!(!detail.contains("intercepted"), "{label}: {detail}");
     }
 }
+
+/// #374: a resolver front end that keeps answering the pre-publish negative on
+/// the connection it gave it. A pooled (kept-alive) client never leaves that
+/// connection and times out; every poll must use a fresh connection.
+#[tokio::test]
+async fn doh_polls_do_not_stay_on_a_connection_that_cached_the_negative() {
+    let state = doh_state();
+    state.lock().unwrap().doh = DohMode::StickyPerConnection { hidden: 1 };
+    let (dns, _t) = fake_with_confirm(&state, DnsConfirm::Doh, Vec::new(), Vec::new()).await;
+    dns.publish_txt(FQDN, "the-value").await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        dns.confirm_at_authoritative(FQDN, "the-value", Duration::from_secs(7)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let st = state.lock().unwrap();
+    assert!(st.doh_queries >= 2, "{}", st.doh_queries);
+    assert_eq!(
+        st.doh_conns.len(),
+        st.doh_queries,
+        "one connection per poll"
+    );
+}
+
+/// Every silent "not seen" now carries its reason into the failure detail.
+#[tokio::test]
+async fn a_doh_failure_detail_names_the_last_reason() {
+    for (mode, expect) in [
+        (DohMode::Empty, "rcode 0 (NOERROR), 0 answer(s), 0 TXT"),
+        (
+            DohMode::Value("another-value".into()),
+            "1 answer(s), 1 TXT, value absent",
+        ),
+        (DohMode::Status(503), "HTTP status 503"),
+    ] {
+        let state = doh_state();
+        state.lock().unwrap().doh = mode.clone();
+        let (dns, _t) = fake_with_confirm(&state, DnsConfirm::Doh, Vec::new(), Vec::new()).await;
+        dns.publish_txt(FQDN, "the-value").await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(6),
+            dns.confirm_at_authoritative(FQDN, "the-value", Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err(), AcmeError::Propagation, "{mode:?}");
+        let detail = dns.propagation_detail().unwrap();
+        assert!(detail.contains("last DoH answer: "), "{detail}");
+        assert!(detail.contains(expect), "{mode:?}: {detail}");
+        assert!(!detail.contains("the-value"), "{detail}");
+    }
+}
+
+/// The `DoH` egress screen still refuses a loopback endpoint that the test
+/// seam did not admit, and the detail says so.
+#[tokio::test]
+async fn a_screened_doh_endpoint_is_reported_as_refused() {
+    let state = doh_state();
+    let pki = fixture_pki();
+    let addr = serve_https(cf_router(state.clone()), &pki).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = write_root(&pki, tmp.path());
+    let dns = CloudflareDns::for_tests_with_confirm(
+        CloudflareCredential::Token(Zeroizing::new("t".into())),
+        &format!("https://[::1]:{}/client/v4", addr.port()),
+        addr.port(),
+        Some(&root),
+        Vec::new(),
+        TestConfirm {
+            mode: DnsConfirm::Doh,
+            probe: Vec::new(),
+            // Same server, but the DoH client admits loopback on another port only.
+            doh_url: format!("https://[::1]:{}/dns-query", addr.port()),
+            doh_port: addr.port().wrapping_add(1),
+        },
+    )
+    .unwrap();
+    dns.publish_txt(FQDN, "the-value").await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(6),
+        dns.confirm_at_authoritative(FQDN, "the-value", Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap_err(), AcmeError::Propagation);
+    assert_eq!(state.lock().unwrap().doh_queries, 0, "never dialled");
+    let detail = dns.propagation_detail().unwrap();
+    assert!(detail.contains("egress refused (loopback)"), "{detail}");
+}

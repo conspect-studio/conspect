@@ -270,8 +270,9 @@ struct StreamPlan {
 
 /// ADR-0108 slice 1, step 1 start-up refusal; the rule itself lives in
 /// Every configured output whose persisted video feed is not Program, as
-/// `(config id, picture bus)` (#329). A feed the engine cannot carry (a
-/// layout) never reaches here: start-up admission refuses it first.
+/// `(config id, picture bus)` (#329). A stored-layout feed (slice 3) is
+/// skipped: its body lives in the layouts library, which start-up does not
+/// resolve, so that output starts and stays on Program until a live take.
 fn boot_output_feeds(config: &MultiviewConfig) -> Vec<(String, crate::routing_aux::PictureBus)> {
     config
         .output_feeds()
@@ -1856,7 +1857,7 @@ segment_ms = 1000
     /// take); only a feed the engine cannot carry at all — a layout — is
     /// refused, loudly, by the same single start-up rule.
     #[test]
-    fn default_program_outputs_run_a_source_feed_is_accepted_and_a_layout_is_refused() {
+    fn default_program_outputs_run_and_source_and_layout_feeds_are_accepted() {
         let plain = MultiviewConfig::load_from_toml(DOC).expect("parses");
         assert!(ensure_outputs_carry_program(&plain).is_ok());
         let routed = MultiviewConfig::load_from_toml(&format!(
@@ -1881,8 +1882,14 @@ segment_ms = 1000
             "{DOC}\n[[routing.output]]\noutput = \"o\"\nvideo = {{ layout = \"L\" }}\n"
         ))
         .expect("parses");
-        let err = ensure_outputs_carry_program(&layout).expect_err("refused");
-        assert!(err.to_string().contains("aux:L"), "{err}");
+        // ADR-0108 slice 3 (behaviour intentionally changed, #306): a
+        // persisted layout feed no longer refuses a start; it starts on
+        // Program and is not re-taken at boot (no boot take for it).
+        ensure_outputs_carry_program(&layout).expect("a layout feed never refuses a start");
+        assert!(
+            super::boot_output_feeds(&layout).is_empty(),
+            "no boot take for a layout feed"
+        );
     }
 }
 
@@ -3809,6 +3816,27 @@ impl Pipeline {
         Arc::new(self.live_spawner())
     }
 
+    /// The canvas a routed layout composes onto (ADR-0108 slice 3): Program's
+    /// size and colour, and Program's background encoded once here.
+    fn layout_canvas_spec(&self) -> crate::aux_layout::LayoutCanvasSpec {
+        crate::aux_layout::LayoutCanvasSpec {
+            width: self.encode_cfg.width,
+            height: self.encode_cfg.height,
+            color: self.canvas_color,
+            background: crate::aux_layout::background_codes(self.canvas_color, self.background)
+                .unwrap_or([16, 128, 128]),
+        }
+    }
+
+    /// The Program canvas the aux path composes routed pictures against.
+    fn aux_canvas(&self) -> crate::routing_aux::AuxCanvas {
+        crate::routing_aux::AuxCanvas {
+            width: self.encode_cfg.width,
+            height: self.encode_cfg.height,
+            color: self.canvas_color.output_tag(),
+        }
+    }
+
     /// Build one run's output routing (ADR-0108 slice 1): the clock's aux tick
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
@@ -3838,11 +3866,7 @@ impl Pipeline {
             has_preview.then(|| Arc::new(multiview_framestore::SwapCell::new(None)));
         let feeds: crate::routing_aux::AuxFeeds =
             Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new()));
-        let aux_canvas = crate::routing_aux::AuxCanvas {
-            width: self.encode_cfg.width,
-            height: self.encode_cfg.height,
-            color: self.canvas_color.output_tag(),
-        };
+        let aux_canvas = self.aux_canvas();
         let plan_stores = Arc::clone(&stores);
         let aux = crate::routing_aux::spawn_routing_aux(crate::routing_aux::AuxInputs {
             rx: aux_rx,
@@ -3850,6 +3874,7 @@ impl Pipeline {
             stores: Arc::clone(&stores),
             preview_selection: preview_selection.clone(),
             canvas: aux_canvas,
+            layout_canvas: self.layout_canvas_spec(),
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
@@ -3870,6 +3895,7 @@ impl Pipeline {
                 max_encoders: crate::output_routing::DEFAULT_MAX_ENCODERS,
                 max_per_principal: crate::output_routing::DEFAULT_MAX_PER_PRINCIPAL,
                 has_preview,
+                max_aux_canvases: crate::output_routing::DEFAULT_MAX_AUX_CANVASES,
                 formats: self.output_formats.clone(),
                 boot_retry: self.boot_retry,
             },
@@ -5669,7 +5695,7 @@ impl Pipeline {
                         egress_stop.stop();
                     }
                 }
-                SendPolicy::DropOnOverload => match hot_tx.try_send(item) {
+                SendPolicy::DropOnOverload => match send_or_forced_shed(&hot_tx, item) {
                     Ok(()) => bump_occupancy(&in_flight, &peak_occupancy),
                     Err(TrySendError::Full(_)) => {
                         // Shed and COUNT — never block (inv #1/#10).
@@ -6436,6 +6462,23 @@ struct SinkRunOutcome {
     playlist: Option<(PathBuf, String)>,
     /// How many baked frames this sink consumed (for tests).
     frames: usize,
+}
+
+/// The live hot-queue send. In `_chaos-test-seams` builds, a deterministic
+/// shed seam (#350) can refuse one tick exactly as a full queue does.
+// The error is `try_send`'s own: it hands the item back without a copy.
+// Boxing it would allocate on the output path. Its size depends on the
+// codec features, so `allow`, not `expect`.
+#[allow(clippy::result_large_err)]
+fn send_or_forced_shed(
+    hot_tx: &std::sync::mpsc::SyncSender<StreamItem>,
+    item: StreamItem,
+) -> Result<(), TrySendError<StreamItem>> {
+    #[cfg(feature = "_chaos-test-seams")]
+    if chaos::force_shed(item.tick_index) {
+        return Err(TrySendError::Full(item));
+    }
+    hot_tx.try_send(item)
 }
 
 /// Request a tick-boundary stop if the shared encoded-output producer fails.
@@ -7629,9 +7672,13 @@ fn live_opener(
         let encoder = VideoRenditionEncoder::new(cfg).map_err(|e| e.to_string())?;
         let live: Box<dyn crate::output_routing::LiveEncoder> =
             Box::new(PipelineVideoWorker(encoder));
+        // Program, Clean and a routed layout are canvas-sized pictures; a
+        // non-canvas output format converts on the key's own worker.
         let canvas_bus = matches!(
             bus,
-            crate::routing_aux::PictureBus::Program | crate::routing_aux::PictureBus::Clean
+            crate::routing_aux::PictureBus::Program
+                | crate::routing_aux::PictureBus::Clean
+                | crate::routing_aux::PictureBus::Layout(_)
         );
         match formats.get(settings).copied().flatten() {
             Some(format) if canvas_bus => Ok(Box::new(crate::format_convert::ConvertLive::new(
@@ -26412,6 +26459,27 @@ mod chaos {
             tracing::warn!(ms, "chaos: holding source teardown");
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
+    }
+
+    /// Refuse ONE hot-queue send in the whole process, at the first tick at
+    /// or after `MULTIVIEW_CHAOS_SHED_AT`: a deterministic shed, independent
+    /// of timing (#350). One shed is enough for the falter verdict (any shed
+    /// makes the run exit 1); with several outputs only the first to reach
+    /// the tick sheds.
+    pub(super) fn force_shed(tick: u64) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let at = *AT.get_or_init(|| {
+            std::env::var("MULTIVIEW_CHAOS_SHED_AT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+        });
+        let shed = at.is_some_and(|at| tick >= at && !DONE.swap(true, Ordering::AcqRel));
+        if shed {
+            tracing::warn!(tick, "chaos: forced shed of one hot-queue send");
+        }
+        shed
     }
 
     impl ConsumerStall {

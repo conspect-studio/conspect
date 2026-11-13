@@ -185,6 +185,7 @@ fn router(
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview: false,
             formats: Vec::new(),
+            max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
         },
         aux,
@@ -420,6 +421,7 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview,
             formats: Vec::new(),
+            max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
         },
         AuxWiring {
@@ -1538,6 +1540,7 @@ fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
         output: output.into(),
         video: None,
         audio: Some(src.clone()),
+        layout: None,
         principal: "p".into(),
     };
     assert_eq!(
@@ -1622,6 +1625,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             output: "renamed".into(),
             video: Some(RoutedFeed::Program),
             audio: None,
+            layout: None,
             principal: "p".into(),
         })
         .unwrap();
@@ -2099,6 +2103,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview: false,
             formats: Vec::new(),
+            max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
         },
         AuxWiring {
@@ -3757,8 +3762,12 @@ fn an_operator_take_ends_a_boot_take_retry_window() {
 /// own `MAX_GAP_FILL_TICKS` bound — and `GapFill::encode` would return an
 /// error (`tick gap ...`), ending the worker thread and failing the key
 /// (`Fallback`). The fix makes the Clean worker see every tick strictly
-/// consecutively (the substituted ticks, then the surviving tick), so
-/// `GapFill` never sees a gap at all and the key survives.
+/// consecutively (the substituted ticks, then the surviving tick) and the key
+/// survives. The test pins that substitution itself delivers the gap (the
+/// first four substituted ticks reach the encoder before anything new is
+/// published); on a loaded host the tail of a long substitution can be
+/// dropped by the bounded queue and is closed by `GapFill` at the next
+/// accepted offer (one extra tick at most), as `substitute_clean` documents.
 #[test]
 fn a_consumer_gap_on_clean_is_substituted_like_program_and_never_fails_the_key() {
     let (mut x, seen) = ptr_harness(2);
@@ -3773,6 +3782,16 @@ fn a_consumer_gap_on_clean_is_substituted_like_program_and_never_fails_the_key()
         t += 1;
     }
     let last_fed_tick = t;
+    // Bounded waits that publish NOTHING: only the worker thread advances.
+    let wait_for_encoded = |tick: u64| {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while Instant::now() < deadline && !seen.lock().unwrap().iter().any(|(s, _)| *s >= tick) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    // The worker has drained every pre-gap tick, so its bounded queue
+    // (`WORKER_QUEUE_TICKS` = 4) is empty when the gap is substituted.
+    wait_for_encoded(last_fed_tick - 1);
     // The genuine consumer gap: `FRAME_SUBSTITUTION_LIMIT` in `pipeline.rs`
     // is 8, matching `MAX_GAP_FILL_TICKS` — exactly the boundary where an
     // unfilled gap handed straight to the Clean worker (no
@@ -3783,8 +3802,34 @@ fn a_consumer_gap_on_clean_is_substituted_like_program_and_never_fails_the_key()
     let gap: u64 = 8;
     let surviving_tick = last_fed_tick + gap + 1;
     x.tick_after_clean_gap(last_fed_tick + 1, surviving_tick);
-    // Let the worker thread drain everything it was offered.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Substitution, not the GapFill backstop: with the queue empty, the
+    // first four substituted ticks are accepted whatever the scheduling, and
+    // they reach the encoder before any later tick is published.
+    let first_four = last_fed_tick + 4;
+    wait_for_encoded(first_four);
+    {
+        let got: Vec<u64> = seen.lock().unwrap().iter().map(|(s, _)| *s).collect();
+        assert!(
+            (last_fed_tick + 1..=first_four).all(|s| got.contains(&s)),
+            "the substituted ticks reached the encoder before any new frame: {got:?}"
+        );
+    }
+    // On a loaded runner the worker may not keep up with the rest of the
+    // substitution: `substitute_clean` stops at the first refused offer, and
+    // the surviving tick's own offer can be dropped (never blocked). The
+    // key's `GapFill` then closes the rest at the next accepted offer, by
+    // design (its bound covers a full substitution gap plus a full queue).
+    // At most ONE further tick is published for that backstop.
+    wait_for_encoded(surviving_tick);
+    if !seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(s, _)| *s == surviving_tick)
+    {
+        x.tick(surviving_tick + 1);
+        wait_for_encoded(surviving_tick + 1);
+    }
     assert!(
         x.results()
             .iter()
@@ -4247,6 +4292,13 @@ fn plan_slot_reports_the_cheapest_path() {
     // Clean: the canvas picture; converted only on a formatted base key.
     assert_eq!(path("cover", &RoutedFeed::Clean), (PlanPath::P2, 0, true));
     assert_eq!(path("tall", &RoutedFeed::Clean), (PlanPath::P3, 1, true));
+    // #368 merge: a routed layout is composed at the CANVAS size (never per
+    // output format), so it is P2 exactly where Program/Clean are: a
+    // canvas-sized base key; a formatted base key converts it (P3).
+    let layout = RoutedFeed::Layout("L".into());
+    assert_eq!(path("wide", &layout), (PlanPath::P2, 0, true));
+    assert_eq!(path("cover", &layout), (PlanPath::P2, 0, true));
+    assert_eq!(path("tall", &layout), (PlanPath::P3, 1, true));
     assert_eq!(path("tall", &cam), (PlanPath::P3, 1, true));
     // Take `tall` to the source: its (src:cam@format, settings) key goes live.
     x.h.try_take(take("t", 1, src())).unwrap();
@@ -4265,4 +4317,238 @@ fn plan_slot_reports_the_cheapest_path() {
     assert_eq!(adapter.current_path("tall2"), Some(PlanPath::P1));
     // An output still on Program reads back P1 (its base key).
     assert_eq!(adapter.current_path("wide"), Some(PlanPath::P1));
+}
+
+fn layout_bus(id: &str) -> PictureBus {
+    use multiview_core::layout::{Canvas, Cell, Layout};
+    PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::new(
+        crate::aux_layout::RoutedLayout {
+            id: id.to_owned(),
+            layout: Layout {
+                name: id.to_owned(),
+                canvas: Canvas {
+                    width: 16,
+                    height: 16,
+                    fps_num: 5,
+                    fps_den: 1,
+                },
+                cells: vec![Cell {
+                    w: 1.0,
+                    h: 1.0,
+                    source: Some("cam".to_owned()),
+                    ..Cell::default()
+                }],
+            },
+            slates: vec![multiview_config::FailoverSlate::Black],
+        },
+    )))
+}
+
+impl Harness {
+    /// One tick with the aux thread "composing" every active layout bus.
+    fn tick_layouts(&mut self, t: u64, buses: &[PictureBus]) {
+        for bus in buses {
+            if let Some(slot) = self.r.slot(bus) {
+                slot.latest
+                    .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                        tick: t,
+                        generation: 1,
+                        frame: canvas(),
+                    })));
+            }
+        }
+        self.tick(t);
+    }
+}
+
+/// ADR-0108 slice 3 admission and failure (design §7, §4.4): with
+/// `max_aux_canvases = 1`, a second distinct layout is refused `Capacity`
+/// while the first composes; a second output on the SAME layout shares its
+/// canvas (and encoder: +0); the aux thread failing moves every output on a
+/// layout back to Program at once, and Program never misses a window.
+#[test]
+fn layout_canvases_are_admitted_shared_and_fall_back_when_aux_fails() {
+    let mut x = harness(3, 6, None);
+    x.r.cfg.max_aux_canvases = 1;
+    let (l1, l2) = (layout_bus("L1"), layout_bus("L2"));
+    let buses = [l1.clone(), l2.clone()];
+    let mut t = 0;
+    x.tick_layouts(t, &buses);
+    x.h.try_take(take("one", 1, l1.clone())).unwrap();
+    let mut got = Vec::new();
+    while !got
+        .iter()
+        .any(|(op, r)| op == "one" && *r == TakeResult::Applied)
+    {
+        t += 1;
+        x.tick_layouts(t, &buses);
+        got.extend(x.outcomes.try_iter().map(|o| (o.operation_id, o.outcome)));
+        assert!(t < 60, "{got:?}");
+    }
+    assert_eq!(x.h.snapshot().aux_canvases, vec!["aux:L1".to_owned()]);
+    assert!(
+        x.aux_active.load(Ordering::Acquire),
+        "the aux thread is woken"
+    );
+    // A second layout: refused at the cap, output 2 keeps Program.
+    x.h.try_take(take("two", 2, l2.clone())).unwrap();
+    t += 1;
+    x.tick_layouts(t, &buses);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Capacity)]
+    );
+    assert_eq!(x.d.binding_video_key(2), Some(0));
+    // The same layout on output 2 shares the canvas and the encoder (past
+    // the per-key forced-IDR floor: the fake encoder has no natural IDR).
+    for _ in 0..FORCE_FLOOR_TICKS {
+        t += 1;
+        x.tick_layouts(t, &buses);
+    }
+    let keys = x.d.video_key_count();
+    x.h.try_take(take("share", 2, l1.clone())).unwrap();
+    let mut shared = false;
+    let mut seen = Vec::new();
+    for _ in 0..60 {
+        t += 1;
+        x.tick_layouts(t, &buses);
+        seen.extend(x.outcomes.try_iter().map(|o| (o.operation_id, o.outcome)));
+        if seen
+            .iter()
+            .any(|(op, r)| op == "share" && *r == TakeResult::Applied)
+        {
+            shared = true;
+            break;
+        }
+    }
+    assert!(
+        shared,
+        "the second output joins the composing layout: {seen:?}"
+    );
+    assert_eq!(x.d.video_key_count(), keys, "+0 encoders");
+    assert_eq!(x.h.snapshot().aux_canvases, vec!["aux:L1".to_owned()]);
+    // Output 1 moving from L1 to L2 is still refused: output 2 holds L1.
+    x.h.try_take(take("swap", 1, l2.clone())).unwrap();
+    t += 1;
+    x.tick_layouts(t, &buses);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Capacity)]
+    );
+    // The aux thread dies: both layout outputs fall back to Program at once.
+    x.failed.store(true, Ordering::Release);
+    t += 1;
+    x.tick_layouts(t, &buses);
+    let fallen = x.results();
+    assert_eq!(
+        fallen,
+        vec![TakeResult::Fallback(FallbackReason::AuxFailed); 2],
+        "{fallen:?}"
+    );
+    for _ in 0..5 {
+        t += 1;
+        x.tick_layouts(t, &buses);
+    }
+    assert_eq!(x.d.binding_video_key(1), Some(0));
+    assert_eq!(x.d.binding_video_key(2), Some(0));
+    assert_eq!(
+        x.windows_of(0).len(),
+        usize::try_from(t).unwrap(),
+        "Program never missed a window"
+    );
+}
+
+/// A layout whose canvas stops publishing (every cell's tile store wedged is
+/// NOT this: dead cells show slates; this is the aux canvas itself holding)
+/// degrades at 60 held ticks and falls back at 150, like any aux bus.
+#[test]
+fn a_held_layout_canvas_degrades_then_falls_back() {
+    let mut x = harness(2, 6, None);
+    let l1 = layout_bus("L1");
+    let mut t = 0;
+    x.tick_layouts(t, std::slice::from_ref(&l1));
+    x.h.try_take(take("one", 1, l1.clone())).unwrap();
+    while !x
+        .outcomes
+        .try_iter()
+        .any(|o| o.outcome == TakeResult::Applied)
+    {
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(&l1));
+        assert!(t < 60);
+    }
+    let held_from = t + 1;
+    let mut fell = None;
+    for _ in 0..FALLBACK_AFTER_TICKS + 5 {
+        t += 1;
+        x.tick(t); // nothing composes the layout any more
+        if x.outcomes
+            .try_iter()
+            .any(|o| o.outcome == TakeResult::Fallback(FallbackReason::AuxFailed))
+        {
+            fell = Some(t);
+            break;
+        }
+    }
+    assert_eq!(fell.map(|f| f - held_from + 1), Some(FALLBACK_AFTER_TICKS));
+    for _ in 0..10 {
+        t += 1;
+        x.tick(t);
+    }
+    assert_eq!(
+        x.d.binding_video_key(1),
+        Some(0),
+        "back on Program at a RAP"
+    );
+}
+
+/// #368 review (lens 1 #3): a re-take of a composing layout with an edited
+/// body swaps the body the aux thread composes and requests an IDR on that
+/// layout's encoder, so the edited picture starts on a random-access point.
+#[test]
+fn a_re_take_of_an_edited_layout_swaps_the_body_and_requests_an_idr() {
+    let mut x = harness(2, 6, None);
+    let first = layout_bus("L1");
+    let mut t = 0;
+    x.tick_layouts(t, std::slice::from_ref(&first));
+    x.h.try_take(take("one", 1, first.clone())).unwrap();
+    while !x
+        .outcomes
+        .try_iter()
+        .any(|o| o.outcome == TakeResult::Applied)
+    {
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(&first));
+        assert!(t < 60);
+    }
+    // Past the per-key forced-IDR floor.
+    for _ in 0..FORCE_FLOOR_TICKS {
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(&first));
+    }
+    let edited = layout_bus("L1");
+    let (PictureBus::Layout(old), PictureBus::Layout(new)) = (&first, &edited) else {
+        panic!("layout buses");
+    };
+    assert!(!Arc::ptr_eq(&old.body, &new.body), "a new body");
+    x.h.try_take(take("edit", 1, edited.clone())).unwrap();
+    t += 1;
+    x.tick_layouts(t, std::slice::from_ref(&edited));
+    let composing = x.r.aux.feeds.load();
+    let body = composing
+        .iter()
+        .find_map(|f| match &f.bus {
+            PictureBus::Layout(l) => Some(Arc::clone(&l.body)),
+            _ => None,
+        })
+        .expect("the layout still composes");
+    assert!(
+        Arc::ptr_eq(&body, &new.body),
+        "the aux thread composes the edit"
+    );
+    assert_eq!(
+        x.r.last_forced.get(&x.r.dynamic[0].key).copied(),
+        Some(t + 1),
+        "an IDR is requested on the layout's encoder"
+    );
 }

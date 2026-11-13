@@ -142,7 +142,7 @@ fn layout_response(status: StatusCode, versioned: &VersionedLayout) -> Response 
 /// Read the accepted layout library, not its replaceable SQLite projection.
 /// Review R3-03: the in-memory accepted snapshot, not a fresh
 /// `desired.json` read-parse-validate on every layout list/GET.
-fn authoritative_layouts(
+pub(crate) fn authoritative_layouts(
     state: &AppState,
 ) -> ControlResult<Option<std::sync::Arc<crate::boot_model::DesiredState>>> {
     let Some(model) = &state.boot_model else {
@@ -153,7 +153,7 @@ fn authoritative_layouts(
 
 /// Return a layout with the envelope-owned version. Older envelopes without
 /// explicit counters use version one until their next accepted mutation.
-fn authoritative_layout(
+pub(crate) fn authoritative_layout(
     desired: &crate::boot_model::DesiredState,
     id: &str,
 ) -> ControlResult<VersionedLayout> {

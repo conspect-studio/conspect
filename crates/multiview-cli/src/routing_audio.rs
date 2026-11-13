@@ -145,8 +145,10 @@ enum AudioSource {
 impl AudioSource {
     fn follow(bus: &PictureBus) -> Self {
         match bus {
-            // Clean is the Program picture: it follows the program mix.
-            PictureBus::Program | PictureBus::Clean => Self::Program,
+            // Clean is the Program picture: it follows the program mix. A
+            // routed layout carries the program mix too (no stored layout has
+            // an `audio` attribute yet; ADR-0108 §5.1).
+            PictureBus::Program | PictureBus::Clean | PictureBus::Layout(_) => Self::Program,
             PictureBus::Preview => Self::Preview,
             PictureBus::Source(id) => Self::Source(id.clone()),
         }

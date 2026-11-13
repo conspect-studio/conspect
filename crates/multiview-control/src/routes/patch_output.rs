@@ -2,8 +2,8 @@
 //! #342 B2): the `outputs` section of `GET /api/v1/patch`, and the output
 //! crosspoints of `POST /patch/plan` and `POST /patch/take`.
 //!
-//! A request patches the slots of ONE output: its video slot 0 (`{source}`
-//! or `{bus}`) and optionally audio slot 0 with `"follow"`, which rides the
+//! A request patches the slots of ONE output: its video slot 0 (`{source}`,
+//! `{bus}` or `{layout}`: a stored layout, ADR-0108 slice 3) and optionally audio slot 0 with `"follow"`, which rides the
 //! video take. Other slots are fixed by config in this slice. The take goes
 //! through [`super::output_routing::take_output_slot0`], the same machinery
 //! as `POST /routing/output/take` (that route is the slot-0 alias).
@@ -52,7 +52,7 @@ fn video_feed(xp: &PatchCrosspoint) -> Result<VideoFeed, Box<Response>> {
     let refuse = |detail: &str| Box::new(problem(422, "unknown-source", detail.to_owned()));
     let Value::Object(map) = &xp.source else {
         return Err(refuse(
-            "an output video slot takes {\"source\": id} or {\"bus\": \"program\"|\"preview\"|\"clean\"}",
+            "an output video slot takes {\"source\": id}, {\"layout\": id} or {\"bus\": \"program\"|\"preview\"|\"clean\"}",
         ));
     };
     if map.len() != 1 {
@@ -61,16 +61,19 @@ fn video_feed(xp: &PatchCrosspoint) -> Result<VideoFeed, Box<Response>> {
     if let Some(id) = map.get("source").and_then(Value::as_str) {
         return Ok(VideoFeed::Source(id.to_owned()));
     }
+    // A stored layout (ADR-0108 slice 3, #306): its id is authorized by the
+    // patch route's `authorize`, its whole source closure by `resolve_feed`
+    // (plan, take and a replay alike).
+    if let Some(id) = map.get("layout").and_then(Value::as_str) {
+        return Ok(VideoFeed::Layout(id.to_owned()));
+    }
     match map.get("bus").and_then(Value::as_str) {
         Some("program") => Ok(VideoFeed::Bus(OutputBus::Program)),
         Some("preview") => Ok(VideoFeed::Bus(OutputBus::Preview)),
         Some("clean") => Ok(VideoFeed::Bus(OutputBus::Clean)),
         Some(_) => Err(refuse("unknown bus; use program, preview or clean")),
-        None if map.contains_key("layout") => Err(refuse(
-            "layouts as output feeds arrive with layout pictures (#306)",
-        )),
         None => Err(refuse(
-            "an output video slot takes {\"source\": id} or {\"bus\": ...}",
+            "an output video slot takes {\"source\": id}, {\"layout\": id} or {\"bus\": ...}",
         )),
     }
 }
@@ -189,14 +192,16 @@ pub(crate) fn plan(
     let mut planned_path = "P1";
     let mut cost = None;
     let mut refused: Option<PatchRefusal> = None;
-    match resolve_feed(state, &patch.video)? {
-        Err(_) => {
+    match resolve_feed(state, principal, &patch.video)? {
+        Err((_, "unknown-feed", _)) => {
             refused = Some(refusal(
                 "unknown-source",
                 "the feed does not exist or cannot be routed",
             ));
         }
-        Ok(feed) => match control.routing.plan_slot(&config_id, &feed) {
+        // `layout-not-admissible` (another canvas, unsolvable, translucent).
+        Err((_, kind, detail)) => refused = Some(refusal(kind, detail)),
+        Ok((feed, _)) => match control.routing.plan_slot(&config_id, &feed) {
             Ok(planned) => {
                 planned_path = planned.path.as_str();
                 let fits = planned.cost.fits();
@@ -235,6 +240,12 @@ pub(crate) fn plan(
                 refused = Some(refusal(
                     "audio-unsupported",
                     "This output cannot carry a routed audio feed",
+                ));
+            }
+            Err(PlanRefusal::AuxCapacity { active, max }) => {
+                refused = Some(refusal(
+                    "aux-capacity",
+                    super::output_routing::aux_capacity_text(principal, active, max),
                 ));
             }
         },
@@ -306,6 +317,9 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
         .as_ref()
         .and_then(|c| c.routing.snapshot());
     let redacted = json!({ "redacted": true });
+    // A layout feed is readable only with Read on the layout AND every
+    // source it shows (§6.3), exactly as `GET /routing` redacts it.
+    let layouts = super::routing::layout_sources(state)?;
     let mut out = Vec::new();
     for versioned in resources {
         let api_id = versioned.resource.id;
@@ -320,7 +334,7 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
         let feed_view = |bus: &str| {
             crate::output_routing::RoutedFeed::from_bus_name(bus)
                 .map(|feed| feed.video_feed())
-                .filter(|feed| super::routing::may_read_feed(principal, feed))
+                .filter(|feed| super::routing::may_read_feed(principal, &layouts, feed))
                 .and_then(|feed| serde_json::to_value(feed).ok())
                 .unwrap_or_else(|| redacted.clone())
         };

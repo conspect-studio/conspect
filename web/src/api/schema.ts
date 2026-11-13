@@ -6500,6 +6500,17 @@ export interface components {
             /** @description Whether the take fits the encoder budget now. */
             fits: boolean;
             /**
+             * @description The audio the output carries on this video feed when its audio
+             *     follows: `program` (the mix), `source` (the source's own) or `preview`
+             *     (the PVW source's). A layout carries the program mix.
+             */
+            follow_audio?: string | null;
+            /**
+             * Format: int32
+             * @description `1` when the take starts a new layout canvas (`routing-aux`), else `0`.
+             */
+            new_aux_canvases?: number;
+            /**
              * Format: int32
              * @description `0` when an existing encoder carries the feed, `1` for a new one.
              */
@@ -6511,7 +6522,8 @@ export interface components {
             detail: string;
             /**
              * @description `capacity` | `unknown-feed` | `switcher-required` |
-             *     `output-kind-unroutable` | `audio-unsupported`.
+             *     `output-kind-unroutable` | `audio-unsupported` | `layout-not-admissible`
+             *     | `aux-capacity`.
              */
             type: string;
         };
@@ -6542,8 +6554,9 @@ export interface components {
              */
             audio?: Record<string, never> | null;
             /**
-             * @description The video feed: `{"bus":"program"|"preview"|"clean"}` or
-             *     `{"source":"vt1"}`. Required with `stream: video`; absent with
+             * @description The video feed: `{"bus":"program"|"preview"|"clean"}`,
+             *     `{"source":"vt1"}` or `{"layout":"NewsOne"}` (a stored layout,
+             *     ADR-0108 slice 3). Required with `stream: video`; absent with
              *     `stream: audio`.
              */
             feed?: Record<string, never> | null;
@@ -6718,8 +6731,9 @@ export interface components {
             /** @description `video` (this slice), `audio` or `subtitle`. */
             plane: string;
             /**
-             * @description `{"source": id}` or `"none"` (this slice); `{"layout": id}`,
-             *     `{"bus": ..}`, `"follow"` arrive in later slices.
+             * @description A mixer input: `{"source": id}` or `"none"`. An output video slot 0:
+             *     `{"source": id}`, `{"layout": id}` (a stored layout; Read on it AND on
+             *     every source its cells bind) or `{"bus": ..}`; audio slot 0: `"follow"`.
              */
             source: Record<string, never>;
         };
@@ -15613,7 +15627,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout, #306), or not 1..=64 crosspoints. */
+            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout or bus on a mixer input; an unknown feed), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -15666,7 +15680,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or no source lease. */
+            /** @description `conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -15675,7 +15689,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, missing Idempotency-Key, or not 1..=64 crosspoints. */
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -17048,7 +17062,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track), or `conflict` (the Idempotency-Key was first used for another output, feed or audio; nothing is enqueued). */
+            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track), or `conflict` (the Idempotency-Key was first used for another output, feed or audio; nothing is enqueued). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -17057,7 +17071,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `unknown-feed` (video or audio), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key. */
+            /** @description `unknown-feed` (video or audio, including an unknown layout), `layout-not-admissible` (a layout authored for another canvas, one that does not solve, or one with a translucent cell), `audio-unsupported` (more than one track: the output carries one routed audio feed), a body whose `stream` and `feed`/`audio` do not match (`stream: video` needs `feed`; `stream: audio` needs `audio` and no `feed`), or a missing Idempotency-Key. */
             422: {
                 headers: {
                     [name: string]: unknown;

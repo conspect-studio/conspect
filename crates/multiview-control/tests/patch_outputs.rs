@@ -108,6 +108,16 @@ fn keys() -> ApiKeyStore {
         "patch-out1-secret",
         scoped("patch-out1", &["output-1", "bars"], &["output-1"]),
     );
+    // The layouts `NewsOne`/`Secret` and the source `a`, but not `secret-cam`.
+    keys.register(
+        "patch-lay",
+        "patch-lay-secret",
+        scoped(
+            "patch-lay",
+            &["output-1", "Secret", "NewsOne", "a", "bars"],
+            &["output-1"],
+        ),
+    );
     keys.register(
         "patch-noaxis",
         "patch-noaxis-secret",
@@ -196,6 +206,7 @@ impl OutputRouting for Fake {
             needs_encoder: *feed != RoutedFeed::Program,
             sessions_in_use: 1,
             sessions_max: 6,
+            needs_aux_canvas: matches!(feed, RoutedFeed::Layout(_)),
         })
     }
     fn plan_slot(&self, output: &str, feed: &RoutedFeed) -> Result<SlotPlan, PlanRefusal> {
@@ -245,6 +256,7 @@ struct Rig {
     router: axum::Router,
     fake: Arc<Fake>,
     keys: Arc<ApiKeyStore>,
+    state: AppState,
 }
 
 fn rig(path: &Path) -> Rig {
@@ -278,9 +290,10 @@ fn rig_with(path: &Path, doc: &str) -> Rig {
     )))
     .with_output_routing(seam);
     Rig {
-        router: multiview_control::router(state),
+        router: multiview_control::router(state.clone()),
         fake,
         keys: api_keys,
+        state,
     }
 }
 
@@ -527,11 +540,9 @@ async fn unsupported_output_slots_are_typed_422s() {
             "slot-medium-mismatch",
             "fixed by the output's configuration",
         ),
-        (
-            vec![video("output-0", json!({"layout": "NewsOne"}))],
-            "unknown-source",
-            "#306",
-        ),
+        // A layout on video slot 0 is routable since #368 (see
+        // `a_layout_patches_onto_output_video_slot_0`); an unknown one is an
+        // unknown feed.
         (
             vec![video("output-0", bars()), video("output-1", bars())],
             "unknown-slot",
@@ -1130,4 +1141,124 @@ async fn a_track_feed_with_an_unreadable_route_input_is_redacted_on_both_endpoin
     let routing = body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await;
     assert_eq!(patch_audio(&patch), json!({"tracks": ["eng"]}), "{patch}");
     assert_eq!(patch_audio(&patch), routing_audio(&routing));
+}
+
+/// Store a layout (two cells: `a` and `right`) in the repository.
+fn store_layout(rig: &Rig, id: &str, right: &str) {
+    rig.state
+        .repository
+        .create_layout(
+            id,
+            multiview_control::repository::LayoutInput {
+                name: id.to_owned(),
+                body: json!({
+                    "canvas": {"width": 640, "height": 360, "fps": "30000/1001"},
+                    "layout": {"kind": "grid", "columns": ["1fr", "1fr"], "rows": ["1fr"], "areas": ["a b"]},
+                    "cells": [
+                        {"id": "l", "area": "a", "source": {"input_id": "a"}},
+                        {"id": "r", "area": "b", "source": {"input_id": right}},
+                    ],
+                }),
+            },
+        )
+        .unwrap();
+}
+
+/// #342 B2 x #368: `{layout}` on an output's video slot 0 goes through the
+/// shared slot-0 take (the alias's machinery): it plans (+1 encoder), takes
+/// with the resolved layout body, and replays; an unknown layout is
+/// `unknown-source`, and a principal that may read the layout but not every
+/// source it shows is a bare 403 (plan and take), with nothing enqueued.
+#[tokio::test]
+async fn a_layout_patches_onto_output_video_slot_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "NewsOne", "bars");
+    store_layout(&rig, "Secret", "secret-cam");
+    let body = patch(vec![video("output-0", json!({"layout": "NewsOne"}))]);
+    let (status, plan_body) = plan(&rig, OPERATOR_TOKEN, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{plan_body}");
+    assert_eq!(plan_body["can_take"], true, "{plan_body}");
+    let (status, first) = take(&rig, OPERATOR_TOKEN, "lay-1", body.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    {
+        let takes = rig.fake.takes();
+        assert_eq!(takes.len(), 1);
+        assert_eq!(
+            takes[0].video,
+            Some(RoutedFeed::Layout("NewsOne".to_owned()))
+        );
+        let layout = takes[0]
+            .layout
+            .as_ref()
+            .expect("the resolved layout body rides the take");
+        assert_eq!(layout.0.id, "NewsOne");
+    }
+    // A replay of the same key answers the same operation, never re-enqueues.
+    let (status, again) = take(&rig, OPERATOR_TOKEN, "lay-1", body).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(again["operation_id"], first["operation_id"]);
+    assert_eq!(rig.fake.takes().len(), 1);
+    // Unknown layout: unknown-source in the plan, a typed 422 on take.
+    let unknown = patch(vec![video("output-0", json!({"layout": "Nope"}))]);
+    let (status, plan_body) = plan(&rig, OPERATOR_TOKEN, unknown.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(plan_body["can_take"], false, "{plan_body}");
+    assert_eq!(
+        plan_body["crosspoints"][0]["refusal"]["type"],
+        "unknown-source"
+    );
+    let (status, _) = take(&rig, OPERATOR_TOKEN, "lay-2", unknown).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    // `patch-lay` may read the layout `Secret` and output-1, but not the
+    // `secret-cam` source the layout shows (§6.3 source closure).
+    let token = "patch-lay.patch-lay-secret";
+    let secret = patch(vec![video("output-1", json!({"layout": "Secret"}))]);
+    let (status, _) = plan(&rig, token, secret.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the layout's closure is authorized"
+    );
+    let (status, _) = take(&rig, token, "lay-3", secret).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(rig.fake.takes().len(), 1, "nothing more reached the engine");
+}
+
+/// #342 B2 x #368: a replayed layout take is re-authorized on the layout's
+/// whole source closure under the CURRENT grants (the shared slot-0 key):
+/// once a source the layout shows is revoked, the replay of the very same
+/// key is a 403 on `/patch/take` and on the alias, and nothing re-enqueues.
+#[tokio::test]
+async fn a_layout_replay_reauthorizes_its_source_closure() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "NewsOne", "bars");
+    let token = "patch-lay.patch-lay-secret";
+    let body = || patch(vec![video("output-1", json!({"layout": "NewsOne"}))]);
+    let (status, first) = take(&rig, token, "k", body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    // Revoke `bars` (shown by the layout); the layout object stays.
+    assert!(rig.keys.set_principal(
+        "patch-lay",
+        Principal {
+            key_id: "patch-lay".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: Some(vec![
+                "output-1".to_owned(),
+                "NewsOne".to_owned(),
+                "a".to_owned(),
+            ]),
+            scoped_output_ids: Some(vec!["output-1".to_owned()]),
+            scoped_discovery_domains: None,
+        },
+    ));
+    let (status, problem) = take(&rig, token, "k", body()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert!(problem.get("operation_id").is_none());
+    assert_eq!(
+        alias_take(&rig, token, "k", "output-1", json!({"layout": "NewsOne"})).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(rig.fake.takes().len(), 1);
 }
