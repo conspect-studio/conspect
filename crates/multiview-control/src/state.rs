@@ -747,6 +747,12 @@ pub struct AppState {
     /// Mixer patch take limits (ADR-0110 §12.8: 2/s per destination, 10/s
     /// per principal; one request = one take). Control-plane only.
     pub patch_limiter: Arc<crate::output_routing::TakeLimiter>,
+    /// Admission of the slot-0 routes' stored-layout reads (#342 review
+    /// T-I1): each read runs on `spawn_blocking` (the repository is
+    /// synchronous, SQLite behind it) only with a permit taken by
+    /// `try_acquire`; none free answers 503 `engine-busy`. Shared by every
+    /// clone of the state, so it bounds the whole process.
+    pub layout_reads: Arc<tokio::sync::Semaphore>,
     /// The command-outcome correlation registry: pairs each accepted command's
     /// [`OperationId`](crate::command::OperationId) with the realtime outcome
     /// event it will produce, so the outcome's envelope echoes the op id as
@@ -1075,6 +1081,7 @@ impl AppState {
             frontdoor_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
             patch_limiter: Arc::new(crate::output_routing::TakeLimiter::default()),
+            layout_reads: crate::routes::output_routing::layout_read_semaphore(),
             // Bound the in-flight correlations: a generous ceiling for pending
             // command outcomes (drop-oldest beyond it, invariant #10). A backlog
             // this deep means outcomes are not being consumed; the oldest

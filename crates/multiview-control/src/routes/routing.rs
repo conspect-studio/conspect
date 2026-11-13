@@ -100,7 +100,8 @@ const ROUTING_KIND: &str = "crosspoint";
         responses(
             (status = 200, description = "A crosspoint: the #11 classification (class1/reset_lite/class2 + coerced). An output target (`target.kind = output`): an `OutputPlan` with cost and refusals.", body = RoutingPlanResponseDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 403, description = "Not authorized to plan this crosspoint.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to plan this crosspoint (an output target: object AND output axis).", body = crate::problem::Problem),
+            (status = 503, description = "`engine-busy`: an output target's `{layout}` feed could not be read now (every layout-read slot is in use); retry.", body = crate::problem::Problem),
         ),
     )
 )]
@@ -119,7 +120,7 @@ pub(crate) async fn plan_route(
         principal.role.require(Action::Read)?;
         let req: super::output_routing::OutputRouteRequest = serde_json::from_value(body)
             .map_err(|e| ControlError::Validation(format!("output plan body: {e}")))?;
-        return super::output_routing::plan_output(&state, &principal, &req);
+        return super::output_routing::plan_output(&state, &principal, &req).await;
     }
     let req: RouteTakeRequest = serde_json::from_value(body)
         .map_err(|e| ControlError::Validation(format!("plan body: {e}")))?;
@@ -711,18 +712,7 @@ fn redact_track_inputs(
     config: &multiview_config::MultiviewConfig,
     row: &mut OutputRouteState,
 ) {
-    let readable = |value: &serde_json::Value| -> bool {
-        let Some(tracks) = value.get("tracks").and_then(serde_json::Value::as_array) else {
-            return true;
-        };
-        tracks
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .all(|track| {
-                super::output_routing::track_input(config, track)
-                    .is_none_or(|input| crate::auth::authorize_object(principal, &input).is_ok())
-            })
-    };
+    let readable = |value: &serde_json::Value| track_inputs_readable(principal, config, value);
     let redacted = serde_json::json!({ "redacted": true });
     if !readable(&row.audio) {
         row.audio = redacted.clone();
@@ -783,6 +773,54 @@ fn program_scope(principal: &Principal) -> bool {
         multiview_events::AuthzScope::Program(multiview_config::MAIN_PROGRAM),
     )
     .is_ok()
+}
+
+/// The accepted audio feed of `config_id`'s crosspoint as `GET /routing`
+/// shows it (#342 review M3): the feed (default `follow`), or
+/// `{"redacted": true}` when the caller may not read it.
+pub(crate) fn audio_feed_view(
+    principal: &Principal,
+    config: &multiview_config::MultiviewConfig,
+    feeds: &[multiview_config::OutputCrosspoint],
+    config_id: &str,
+) -> serde_json::Value {
+    let redacted = serde_json::json!({ "redacted": true });
+    let audio = feeds
+        .iter()
+        .find(|xp| xp.output == config_id)
+        .map_or(multiview_config::AudioFeed::Follow, |xp| xp.audio.clone());
+    if !may_read_audio(principal, &audio) {
+        return redacted;
+    }
+    let value = serde_json::to_value(&audio).unwrap_or_else(|_| redacted.clone());
+    // The same route-input rule `GET /routing` applies to a track feed
+    // (#342 review M6), so both endpoints redact identically.
+    if track_inputs_readable(principal, config, &value) {
+        value
+    } else {
+        redacted
+    }
+}
+
+/// Whether every track of a `{"tracks": [..]}` audio value has a route input
+/// the caller may read (§6.3: a track carries its route input's audio); any
+/// other value is readable here (its own rule is [`may_read_audio`]). The one
+/// rule behind `GET /routing`'s and `GET /patch`'s track redaction.
+fn track_inputs_readable(
+    principal: &Principal,
+    config: &multiview_config::MultiviewConfig,
+    value: &serde_json::Value,
+) -> bool {
+    let Some(tracks) = value.get("tracks").and_then(serde_json::Value::as_array) else {
+        return true;
+    };
+    tracks
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .all(|track| {
+            super::output_routing::track_input(config, track)
+                .is_none_or(|input| crate::auth::authorize_object(principal, &input).is_ok())
+        })
 }
 
 /// Whether `principal` may read an audio feed: Read on a named source, the
