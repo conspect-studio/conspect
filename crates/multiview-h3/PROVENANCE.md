@@ -32,6 +32,12 @@ Used as dependencies, unmodified: `h3 =0.0.8`
    deadline on every accepted bidirectional stream (`GuardConfig`,
    `crate::guard`); a rejected stream is stopped and reset with
    `H3_EXCESSIVE_LOAD` (guard) or `H3_REQUEST_REJECTED` (deadline).
+   Every peer stream still being classified carries the header deadline,
+   with one timer for the earliest polled from the accept path. The peer's
+   control stream is handed to h3 behind `crate::guard::ControlGuard` (per
+   frame caps) with SETTINGS and partial-frame deadlines; its QPACK streams
+   are drained by the adapter (64 bytes each); push/unknown uni stream types
+   are stopped at classification. Classification reads at most 16 bytes.
 5. Added: the `StreamRouter` hook. Peer streams are classified by their first
    varint before h3 sees them: `0x41` bidi / `0x54` uni (WebTransport) are
    handed to the router as raw noq streams; request streams take a
@@ -69,6 +75,12 @@ requests, so the design's pooling contract holds.
    `StreamId::index()`, which is only correct for stream 0.)
 4. Datagrams are framed directly with the quarter stream id. (h3-datagram
    0.0.2's `Datagram::encode` never copies the encoded id into its output.)
+   Interop note: moq-tokio's own WebTransport client (`web-transport-moq`
+   1.3.5) prefixes datagrams with the FULL CONNECT stream id, so it does not
+   round-trip datagrams with this server until its prefix matches the draft
+   (`tests/datagram.rs` pins the quarter-id framing browsers use). The
+   moq-transport-16/18 versions this deployment uses deliver objects on
+   streams, not datagrams.
 5. New: `web_transport_trait::Session` for `WtSession` (accept/open
    streams, datagrams, `protocol()`, `close(code, reason)` sending
    `CLOSE_WEBTRANSPORT_SESSION` (0x2843, reason truncated to 1024 bytes)

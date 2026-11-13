@@ -40,17 +40,24 @@
 //!
 //! | Peer-driven state | Cap |
 //! | --- | --- |
-//! | Connections | [`H3Limits::max_connections`] (1024) and [`H3Limits::max_connections_per_source`] (64 per IPv4 address / IPv6 /64), checked before the handshake; over a cap the `Incoming` is refused. Pending handshakes: noq `max_incoming` / `incoming_buffer_size_total` from the caller. Handshake deadline [`H3Limits::handshake_timeout`] (10 s) |
+//! | Connections | [`H3Limits::max_connections`] (1024) and [`H3Limits::max_connections_per_source`] (64 per IPv4 address / IPv6 /64), pre-checked before the handshake (over a cap the `Incoming` is refused) and charged only when the handshake completes |
+//! | Handshakes in progress | [`H3Limits::max_handshakes`] (64) and [`H3Limits::max_handshakes_per_source`] (16), counted separately from connections (an incomplete handshake never holds a connection slot); beyond them the `Incoming` is refused. Deadline [`H3Limits::handshake_timeout`] (5 s). noq `max_incoming` / `incoming_buffer_size_total` from the caller bound the queue before that |
 //! | Streams per connection | QUIC [`QuicLimits::max_concurrent_bidi_streams`] (128) / [`QuicLimits::max_concurrent_uni_streams`] (128); every stream the adapter holds while classifying it is one of these |
+//! | Unclassified streams | the classifier reads at most [`noq_adapter::HEAD_MAX`] (16) bytes per stream into a fixed buffer; a stream still unclassified at [`H3Limits::header_deadline`] is reset (bidi `H3_REQUEST_REJECTED`, uni `H3_STREAM_CREATION_ERROR`) by one timer polled from the accept path, so a silent stream never stalls the connection |
 //! | Bytes per stream / connection | [`QuicLimits::stream_receive_window`] (1 MiB) / [`QuicLimits::receive_window`] (16 MiB) |
 //! | Request header block | the guard ([`guard`]) rejects any non-DATA frame declaring more than `max_field_section_size` (16 384) + 1 KiB the moment its length varint arrives (`H3_EXCESSIVE_LOAD`), before h3 buffers it; QPACK then enforces the field-section size; header deadline [`H3Limits::header_deadline`] (10 s from stream accept to a complete HEADERS frame, else `H3_REQUEST_REJECTED`) |
+//! | Peer control stream | [`guard::ControlGuard`]: SETTINGS at most 1 KiB, `CANCEL_PUSH`/GOAWAY/`MAX_PUSH_ID` at most 16 bytes, any other frame at most 1 KiB and 16 KiB over the connection's life, else the connection is closed `H3_EXCESSIVE_LOAD`; SETTINGS complete within [`H3Limits::settings_deadline`] (10 s from connection start, else `H3_MISSING_SETTINGS`); no frame partially received for longer than [`H3Limits::control_frame_deadline`] (10 s, else `H3_EXCESSIVE_LOAD`). The timer is polled from the accept path |
+//! | Peer QPACK streams | one encoder and one decoder (a second is `H3_STREAM_CREATION_ERROR`), drained by the adapter, [`noq_adapter::QPACK_STREAM_MAX`] (64) bytes each over their life (the server's dynamic table is 0), else `QPACK_ENCODER/DECODER_STREAM_ERROR` |
+//! | Other peer uni streams | push and unknown/grease types are stopped with `H3_STREAM_CREATION_ERROR` at classification |
 //! | Requests in flight | [`H3Limits::max_concurrent_requests`] (128) permits; a request stream beyond it is reset with `H3_REQUEST_REJECTED`, never queued |
+//! | Site handler | [`Site::call`] must return the response head within [`H3Limits::response_head_timeout`] (30 s), else the future is dropped, the stream reset `H3_REQUEST_REJECTED` and the permit released; each response write (head, DATA, trailers, FIN) must progress within [`H3Limits::response_stall_timeout`] (30 s), else `H3_REQUEST_CANCELLED`. The body's total duration is unbounded (SSE) but held by QUIC flow control |
 //! | Request body | streamed on demand, one QUIC chunk at a time ([`RequestBody`]) |
+//! | WT handler | runs until the session ends (either side's close, FIN, reset, connection loss), then [`H3Limits::wt_close_grace`] (5 s), after which its future is dropped |
 //! | WT streams before the session exists | [`H3Limits::wt_early_streams`] (16), then reset with `H3_WEBTRANSPORT_BUFFERED_STREAM_REJECTED` |
 //! | WT incoming stream queues | [`H3Limits::wt_bidi_queue`] / [`H3Limits::wt_uni_queue`] (64 each, `try_send`); when full the new stream is reset with `H3_WEBTRANSPORT_BUFFERED_STREAM_REJECTED` |
 //! | WT datagrams | noq's receive buffer [`QuicLimits::datagram_receive_buffer_size`] (256 KiB), which drops the OLDEST datagram when full; nothing is queued above it |
 //! | CONNECT-stream capsules | one capsule body of at most 1028 bytes; unknown capsules are skipped by counting |
-//! | Request tasks | one per admitted request (bounded by the permits) plus the session task |
+//! | Request tasks | one per admitted request (bounded by the permits) plus the session task; all spawned on the runtime serving the connection (the session close too, from whichever runtime or thread `close`/drop happens) |
 //!
 //! Nothing here awaits the engine; the caller runs the endpoint on the
 //! front door's own runtime.
