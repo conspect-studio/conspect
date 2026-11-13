@@ -2256,6 +2256,10 @@ pub struct Pipeline {
     /// Per rendition key: the format its worker converts the Program canvas
     /// to (#342); `None` = the canvas (zero-copy, as before).
     rendition_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
+    /// Test seam (#342 review I3): a hook run on each `format-convert`
+    /// thread before each convert (a chaos test wedges it). Always `None`
+    /// outside tests.
+    convert_hook: Option<crate::format_convert::ConvertHook>,
     /// Per runnable output (same order as `output_video_keys`): the format a
     /// routed source/PVW is composed at for it (#342 review M3).
     output_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
@@ -3431,6 +3435,7 @@ impl Pipeline {
             encode_cfg: cfg,
             rendition_configs,
             rendition_formats,
+            convert_hook: None,
             output_formats,
             output_video_keys,
             output_inband_sets,
@@ -3742,6 +3747,7 @@ impl Pipeline {
                 base_force,
                 inband_sets: self.output_inband_sets.clone(),
                 base_formats: self.rendition_formats.clone(),
+                convert_hook: self.convert_hook.clone(),
             },
             aux_tx,
             preview_selection,
@@ -4071,6 +4077,13 @@ impl Pipeline {
     #[must_use]
     pub fn window_subscriptions(&self) -> crate::output_window_registry::WindowSubscriptionSlot {
         Arc::clone(&self.window_subscriptions)
+    }
+
+    /// Test seam (#342 review I3): run `hook` on every `format-convert`
+    /// thread before each convert.
+    #[cfg(test)]
+    pub(crate) fn set_convert_hook(&mut self, hook: crate::format_convert::ConvertHook) {
+        self.convert_hook = Some(hook);
     }
 
     /// How many distinct video rendition configs (= Program encoder keys)
@@ -7333,9 +7346,13 @@ struct ConsumerRouting {
     base_force: Vec<Arc<AtomicU64>>,
     /// Per output: [`BindingConfig::inband_parameter_changes_ok`].
     inband_sets: Vec<bool>,
-    /// Per base video key: the format its worker converts the baked Program
-    /// canvas to (#342); `None` = the canvas, the unchanged zero-copy path.
+    /// Per base video key: the format its worker encodes (#342), converted
+    /// by that format's `format-convert` thread; `None` = the canvas, the
+    /// unchanged zero-copy path.
     base_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
+    /// Chaos/test hook run on every convert thread before each convert
+    /// (#342 review I3); `None` in production.
+    convert_hook: Option<crate::format_convert::ConvertHook>,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
@@ -7343,13 +7360,12 @@ const ROUTING_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// The routing opener (ADR-0108, #342): opens a live encoder for a rendition
 /// settings index. A Program/Clean key at a non-canvas format converts on its
-/// own worker; keys at one format share one convert per tick. A routed
-/// source/PVW arrives already at the format (aux feed).
+/// own worker (never erroring: it repeats or blacks). A routed source/PVW
+/// arrives already at the format (aux feed).
 fn live_opener(
     configs: Vec<EncodeConfig>,
     formats: Vec<Option<crate::routing_aux::AuxFormat>>,
 ) -> crate::output_routing::BusOpenFn {
-    let mut caches = crate::format_convert::ConvertCaches::default();
     Box::new(move |settings, bus| {
         let cfg = configs
             .get(settings)
@@ -7362,12 +7378,9 @@ fn live_opener(
             crate::routing_aux::PictureBus::Program | crate::routing_aux::PictureBus::Clean
         );
         match formats.get(settings).copied().flatten() {
-            Some(format) if canvas_bus => {
-                let convert = crate::format_convert::FormatConvert::new(format, caches.get(format));
-                Ok(Box::new(crate::format_convert::ConvertLive::new(
-                    convert, live,
-                )))
-            }
+            Some(format) if canvas_bus => Ok(Box::new(crate::format_convert::ConvertLive::new(
+                format, live,
+            ))),
             _ => Ok(live),
         }
     })
@@ -7838,9 +7851,12 @@ fn consumer_main<D: WindowDelivery>(
         base_force,
         inband_sets,
         base_formats,
+        convert_hook,
     } = routing;
-    // #342: base keys at one format share one convert per tick.
-    let mut convert_caches = crate::format_convert::ConvertCaches::default();
+    // #342 review I1/I2: one `format-convert` thread per distinct non-canvas
+    // base format, fed non-blocking right after the bake. Empty (no thread,
+    // no work) for a run whose base keys are all at the canvas format.
+    let mut convert_stages = crate::format_convert::ConvertStages::default();
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
     if video_encoders.is_empty() {
@@ -7887,14 +7903,20 @@ fn consumer_main<D: WindowDelivery>(
             .get(key)
             .cloned()
             .unwrap_or_else(crate::output_routing::force_cell);
-        // A base key at a non-canvas format converts the baked canvas on its
-        // own worker thread (never here, never on the clock); the canvas
-        // format keeps the zero-copy path untouched.
+        // A base key at a non-canvas format encodes its format's convert
+        // thread's newest picture (never converting, never failing on a
+        // convert); the canvas format keeps the zero-copy path untouched.
         let encode: Box<dyn VideoEncodeWorker> = match base_formats.get(key).copied().flatten() {
-            Some(format) => Box::new(crate::format_convert::ConvertWorker::new(
-                crate::format_convert::FormatConvert::new(format, convert_caches.get(format)),
-                Box::new(PipelineVideoWorker(encoder)),
-            )),
+            Some(format) => {
+                let slot = convert_stages
+                    .slot_for(format, convert_hook.as_ref())
+                    .map_err(|e| PipelineError::thread_spawn("format-convert", e))?;
+                Box::new(crate::format_convert::ConvertedWorker::new(
+                    slot,
+                    format,
+                    Box::new(PipelineVideoWorker(encoder)),
+                ))
+            }
             None => Box::new(PipelineVideoWorker(encoder)),
         };
         let worker = RenditionWorker::spawn(
@@ -8183,6 +8205,7 @@ fn consumer_main<D: WindowDelivery>(
         // fails the run explicitly (never silently skips forward).
         for missing_tick in missing {
             let canvas = last_baked.as_ref().unwrap_or(&overlaid);
+            convert_stages.offer(missing_tick, canvas);
             for worker in &workers {
                 worker
                     .offer_within(
@@ -8204,6 +8227,9 @@ fn consumer_main<D: WindowDelivery>(
         // absorbing engine ticks meanwhile — nothing is shed inside the
         // envelope); only a worker wedged beyond the horizon fails
         // explicitly, never pacing the program clock.
+        // #342: the non-canvas base formats' convert threads get it first
+        // (try_send, never blocks; a full queue drops and counts).
+        convert_stages.offer(item.tick_index, &overlaid);
         for worker in &workers {
             worker
                 .offer_within(

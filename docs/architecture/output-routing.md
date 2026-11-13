@@ -1749,20 +1749,36 @@ settings, D is P1 (+0).
 
 **As built in slice B (#342, part B1, boot path).** A base (Program) rendition key is
 (codec, width, height, bit rate, fit). Outputs with equal format and slot-0 settings share one
-encoder (P1); others get their own. A base key whose format is not the canvas wraps its encoder in
-a `FormatConvert` (`crates/multiview-cli/src/format_convert.rs`). The convert runs on that key's
-worker thread, never on the bake consumer or the clock; it uses `fit_rects` + `blit_region`
-(integer, even-aligned, 2×2 box) into a bounded ring of 4 buffers, keeps the canvas colour tag,
-and repeats its last picture rather than waiting. Keys at one format share a wait-free `SwapCell`
-cache of the newest converted picture (a race may convert twice, never waits), so there is one
-convert per (picture, format). A format equal to the canvas size with the default fit is
-normalised away: it is the unchanged zero-copy path.
-Routed feeds: `AuxFeed` is keyed (picture bus, format). The aux thread composes a source/PVW tile
-directly at the output's format with its fit, and a tile already at the format passes as the same
-`Arc`. Program/Clean on a dynamic key at a non-canvas format are converted on that key's worker.
-Dynamic keys stay (bus, settings index); the settings index is the output's base key, so it already
-names (format, codec settings), and the encoded bus is keyed (picture, format, settings). A
-formatted output falls back to its own base key (Program at its format).
+encoder (P1); others get their own. Every distinct base key counts against
+`MAX_VIDEO_RENDITIONS_PER_PROGRAM` (8) at config validation. A format whose size equals the
+canvas's is the canvas key, whatever its fit (identity: the zero-copy path is unchanged).
+
+For each distinct non-canvas base format there is **one `format-convert` thread** (normal priority,
+`catch_unwind`, a failed flag; `crates/multiview-cli/src/format_convert.rs`). Right after the bake,
+the bake consumer hands it the baked canvas with `try_send` on a bounded channel of capacity 2:
+when the channel is full the tick is dropped and counted, and the consumer never blocks. The thread
+converts with `fit_rects` + `blit_region` (integer, even-aligned, 2×2 box) into a bounded ring of 4
+buffers, keeps the canvas colour tag, and publishes `(tick, picture)` into a wait-free `SwapCell`.
+A base worker at that format never converts and never fails on a convert. Each tick it encodes the
+newest published picture, or a black picture at the format until the first one arrives. **A
+converted base output therefore lags the Program by up to one tick**, the same newest-frame rule as
+the aux path. A slow or wedged convert thread freezes (or blacks) only its own outputs; the clock,
+the bake consumer, Program and every other output are untouched (chaos test
+`a_wedged_convert_thread_never_moves_the_clock_or_another_output`). There is one convert per
+(Program, format) by construction. Encode coupling between base keys through the consumer's
+bounded `offer_within` is as before (outputs on different codecs already had it).
+
+Routed feeds: `AuxFeed` is keyed (picture bus, feed format). The aux thread composes a source/PVW
+tile directly at the output's format with its fit, and a tile already at the format passes as the
+same `Arc`. The feed format is `None` only when the output is canvas-sized *with the default fit*,
+so a canvas-sized cover/fill/anchored output gets its fit for a routed source. Program/Clean on a
+dynamic key at a non-canvas format are converted on that key's worker (repeating its last picture,
+or black, never erroring). Dynamic keys stay (bus, settings index); the settings index is the
+output's base key, so it already names (format, codec settings), and the encoded bus is keyed
+(picture, format, settings). The published `live_keys` and the take plan name the feed
+(`src:cam@1080x1920/Cover/Center`), so a take at another format reports +1 encoder. The feed set
+is bounded by the dynamic-key caps (live keys + opens ≤ `max_encoders`) plus one per pending take.
+A formatted output falls back to its own base key (Program at its format).
 
 ### 12.5 Passthrough and invariant #1
 
