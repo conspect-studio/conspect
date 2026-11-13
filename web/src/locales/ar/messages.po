@@ -1609,7 +1609,7 @@ msgstr ""
 msgid "auto"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:110
+#: src/pages/SwitcherPage.tsx:149
 msgid "Auto"
 msgstr ""
 
@@ -1626,7 +1626,7 @@ msgid "Auto (first usable track)"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:211
-#: src/pages/SwitcherPage.tsx:109
+#: src/pages/SwitcherPage.tsx:148
 msgid "Auto frames"
 msgstr ""
 
@@ -1963,6 +1963,7 @@ msgstr ""
 
 #: src/components/broadcast/BroadcastShell.tsx:45
 #: src/components/broadcast/ProductionDesk.tsx:216
+#: src/components/switcher/MixerInputBank.tsx:75
 #: src/events/AutomationPanel.tsx:135
 #: src/iptv/AddSourceDialog.tsx:79
 #: src/iptv/BulkAddDialog.tsx:192
@@ -2293,7 +2294,7 @@ msgstr ""
 msgid "Checked from this server."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:85
+#: src/pages/SwitcherPage.tsx:115
 msgid "Checking switcher engine…"
 msgstr ""
 
@@ -2313,7 +2314,7 @@ msgstr ""
 msgid "Choose a feed…"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:102
+#: src/pages/SwitcherPage.tsx:139
 msgid "Choose a source"
 msgstr ""
 
@@ -2718,6 +2719,10 @@ msgstr ""
 
 #: src/pages/OutputFeedRow.tsx:410
 msgid "Confirm a take on a Program output?"
+msgstr ""
+
+#: src/components/switcher/MixerInputBank.tsx:72
+msgid "Confirm on-air re-patch"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:216
@@ -3496,7 +3501,7 @@ msgstr ""
 msgid "Custom…"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:108
+#: src/pages/SwitcherPage.tsx:147
 msgid "Cut"
 msgstr ""
 
@@ -3506,6 +3511,10 @@ msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:210
 msgid "CUT — Preview and Program carry the same source"
+msgstr ""
+
+#: src/components/switcher/MixerInputBank.tsx:74
+msgid "Cut Program"
 msgstr ""
 
 #: src/components/broadcast/BroadcastShell.tsx:45
@@ -5650,6 +5659,17 @@ msgstr ""
 msgid "Input (route {row})"
 msgstr ""
 
+#. placeholder {0}: input.number
+#: src/components/switcher/MixerInputBank.tsx:57
+#: src/components/switcher/MixerInputBank.tsx:59
+msgid "Input {0}"
+msgstr ""
+
+#. placeholder {0}: input.number
+#: src/components/switcher/MixerInputBank.tsx:73
+msgid "Input {0} is on Program: re-patching cuts Program to the new source."
+msgstr ""
+
 #: src/pages/DeviceDetailPage.tsx:619
 msgid "Input elementary streams"
 msgstr ""
@@ -5806,7 +5826,7 @@ msgstr ""
 msgid "Journal"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:112
+#: src/pages/SwitcherPage.tsx:151
 msgid "Keyers, aux buses, multi-M/E and compositions as sources remain future switcher stages."
 msgstr ""
 
@@ -6830,6 +6850,11 @@ msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:210
 msgid "MIX is the only supported transition"
+msgstr ""
+
+#: src/components/switcher/MixerInputBank.tsx:86
+#: src/components/switcher/MixerInputBank.tsx:87
+msgid "Mixer inputs"
 msgstr ""
 
 #: src/docs/registry.ts:688
@@ -7922,6 +7947,14 @@ msgstr ""
 msgid "On PGM out now"
 msgstr ""
 
+#: src/components/switcher/MixerInputBank.tsx:62
+msgid "On Preview"
+msgstr ""
+
+#: src/components/switcher/MixerInputBank.tsx:62
+msgid "On Program"
+msgstr ""
+
 #: src/layout/components/CellPropertiesPanel.tsx:166
 msgid "On signal loss"
 msgstr ""
@@ -8121,7 +8154,7 @@ msgstr ""
 msgid "outcome unknown; do not repeat"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:92
+#: src/pages/SwitcherPage.tsx:122
 msgid "Outcome unknown; refresh the engine state before taking again"
 msgstr ""
 
@@ -8267,8 +8300,17 @@ msgstr ""
 msgid "Paste this command into a terminal to open the stream in VLC."
 msgstr ""
 
+#: src/components/switcher/MixerInputBank.tsx:70
+msgid "Patch"
+msgstr ""
+
 #: src/pages/approved/RoutingSurface.tsx:81
 msgid "Patch a source to a destination. Plan classifies the take without applying it; Take applies it."
+msgstr ""
+
+#. placeholder {0}: input.number
+#: src/components/switcher/MixerInputBank.tsx:65
+msgid "Patch source for input {0}"
 msgstr ""
 
 #: src/components/broadcast/library/AssetAuditionControls.tsx:165
@@ -8310,6 +8352,7 @@ msgstr ""
 msgid "Per-family result for {0}"
 msgstr ""
 
+#: src/components/switcher/MixerInputBank.tsx:64
 #: src/pages/AudioPage.tsx:477
 #: src/pages/graphics/PlayoutView.tsx:240
 #: src/pages/graphics/PlayoutView.tsx:402
@@ -8694,7 +8737,7 @@ msgstr ""
 msgid "Program (follows the switcher)"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:83
+#: src/pages/SwitcherPage.tsx:113
 msgid "Program / Preview switcher"
 msgstr ""
 
@@ -8837,7 +8880,7 @@ msgstr ""
 msgid "Publisher token (optional)"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:107
+#: src/pages/SwitcherPage.tsx:144
 msgid "Punch PGM"
 msgstr ""
 
@@ -8849,6 +8892,7 @@ msgstr ""
 msgid "Push to/from streaming platforms"
 msgstr ""
 
+#: src/components/switcher/MixerInputBank.tsx:63
 #: src/pages/graphics/PlayoutView.tsx:234
 #: src/pages/graphics/PlayoutView.tsx:403
 #: src/pages/OutputFeedRow.tsx:289
@@ -8921,6 +8965,10 @@ msgstr ""
 
 #: src/pages/SourcesPage.tsx:483
 msgid "Re-arm to the next occurrence (recurring daily)"
+msgstr ""
+
+#: src/components/switcher/MixerInputBank.tsx:67
+msgid "Re-patch…"
 msgstr ""
 
 #: src/pages/SourcesPage.tsx:481
@@ -9357,6 +9405,10 @@ msgstr ""
 
 #: src/events/AutomationPanel.tsx:27
 msgid "Restoring…"
+msgstr ""
+
+#: src/components/switcher/MixerInputBank.tsx:35
+msgid "Restricted source"
 msgstr ""
 
 #: src/iptv/BulkAddDialog.tsx:174
@@ -9860,7 +9912,7 @@ msgstr ""
 msgid "Select or cue an item to see its fields."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:106
+#: src/pages/SwitcherPage.tsx:143
 msgid "Select PVW"
 msgstr ""
 
@@ -10111,7 +10163,7 @@ msgstr ""
 #: src/pages/approved/ShowPage.tsx:90
 #: src/pages/approved/SourcesSurface.tsx:337
 #: src/pages/IptvPage.tsx:232
-#: src/pages/SwitcherPage.tsx:100
+#: src/pages/SwitcherPage.tsx:137
 msgid "Source"
 msgstr ""
 
@@ -10623,20 +10675,20 @@ msgstr ""
 
 #: src/app/navigation.tsx:63
 #: src/components/broadcast/ProductionDesk.tsx:203
-#: src/pages/SwitcherPage.tsx:89
+#: src/pages/SwitcherPage.tsx:119
 msgid "Switcher"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:203
-#: src/pages/SwitcherPage.tsx:91
+#: src/pages/SwitcherPage.tsx:121
 msgid "Switcher operation rejected"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:84
+#: src/pages/SwitcherPage.tsx:114
 msgid "Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:84
+#: src/pages/SwitcherPage.tsx:114
 msgid "Switcher unavailable: this server does not provide it yet (backend not deployed). Controls are disabled."
 msgstr ""
 
@@ -11268,6 +11320,10 @@ msgstr ""
 msgid "The output clock, genlock, PTP, and wall-clock time — how frames are paced and aligned."
 msgstr ""
 
+#: src/pages/SwitcherPage.tsx:96
+msgid "The patch cannot be taken"
+msgstr ""
+
 #: src/pages/approved/RoutingSurface.tsx:100
 msgid "the plan is a dry run that classifies the take. Only Take applies it; a Class-2 migration is accepted asynchronously (HTTP 202 is not applied) and its outcome arrives on the realtime stream."
 msgstr ""
@@ -11670,7 +11726,7 @@ msgstr ""
 msgid "This URL must start with http:// or https://."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:94
+#: src/pages/SwitcherPage.tsx:124
 msgid "Tick"
 msgstr ""
 
@@ -11852,7 +11908,7 @@ msgstr ""
 msgid "Transition"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:94
+#: src/pages/SwitcherPage.tsx:124
 msgid "Transition running"
 msgstr ""
 
@@ -12078,6 +12134,10 @@ msgstr ""
 
 #: src/preview/WhepPlayer.tsx:382
 msgid "Unmute {label}"
+msgstr ""
+
+#: src/components/switcher/MixerInputBank.tsx:35
+msgid "Unpatched"
 msgstr ""
 
 #: src/devices/DeviceStateBadge.tsx:66
@@ -12340,7 +12400,7 @@ msgstr ""
 msgid "Waiting for a frame…"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:28
+#: src/pages/SwitcherPage.tsx:34
 msgid "Waiting for a real frame"
 msgstr ""
 

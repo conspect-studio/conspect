@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser as _;
-use multiview_cli::cli::{Cli, Command, NodeArgs, RunArgs, ValidateArgs};
+use multiview_cli::cli::{AcknowledgeFallbackArgs, Cli, Command, NodeArgs, RunArgs, ValidateArgs};
 use multiview_cli::control;
 use multiview_cli::run::{RunReport, SoftwareEngine};
 use multiview_cli::validate::validate_config;
@@ -48,6 +48,87 @@ struct RunningPersist {
     /// for the run's lifetime and dropped at teardown (its runtime shuts down
     /// in the background, never blocking this one).
     front_door: Option<multiview_cli::frontdoor::FrontDoorRun>,
+    /// The front-door ACME wiring (ADR-0107 section 5a) when `[network.tls]`
+    /// is configured: the ACME service thread lives as long as the run.
+    _tls: Option<TlsWiring>,
+}
+
+/// The run's ACME wiring: the service plus a shutdown signal for the task
+/// that holds the QUIC lane until the certificate is serving.
+struct TlsWiring {
+    #[cfg(all(feature = "acme", unix, feature = "moq-output"))]
+    context: Arc<multiview_control::tls_setup::TlsContext>,
+    #[cfg(all(feature = "acme", unix))]
+    boot: multiview_cli::tls_boot::TlsBoot,
+    #[cfg(all(feature = "acme", unix))]
+    shutdown: tokio_util_shutdown::Shutdown,
+}
+
+/// A cloneable one-shot shutdown flag (no extra dependency).
+#[cfg(all(feature = "acme", unix))]
+mod tokio_util_shutdown {
+    /// Fires once; every clone observes it.
+    #[derive(Clone)]
+    pub(crate) struct Shutdown(std::sync::Arc<tokio::sync::watch::Sender<bool>>);
+    impl Shutdown {
+        pub(crate) fn new() -> Self {
+            Self(std::sync::Arc::new(tokio::sync::watch::channel(false).0))
+        }
+        pub(crate) fn fire(&self) {
+            self.0.send_replace(true);
+        }
+        #[cfg(feature = "moq-output")]
+        pub(crate) async fn wait(self) {
+            let mut rx = self.0.subscribe();
+            let _ = rx.wait_for(|v| *v).await;
+        }
+    }
+}
+
+impl Drop for TlsWiring {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "acme", unix))]
+        {
+            self.shutdown.fire();
+            multiview_cli::tls_boot::install_tls_context(None);
+            // `boot` (the ACME service) drops after this: bounded join (2 s).
+            let _ = self.boot.service_finished();
+        }
+    }
+}
+
+/// Start the front-door ACME wiring when `[network.tls]` is configured.
+#[allow(clippy::unnecessary_wraps)]
+fn start_tls(
+    config: &MultiviewConfig,
+    publisher: &Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+) -> anyhow::Result<Option<TlsWiring>> {
+    #[cfg(all(feature = "acme", unix))]
+    {
+        let Some(boot) = multiview_cli::tls_boot::TlsBoot::start(
+            config,
+            Some(Arc::clone(publisher)),
+            &multiview_cli::tls_boot::BootOptions::default(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let context = Arc::clone(&boot.context);
+        multiview_cli::tls_boot::install_tls_context(Some(Arc::clone(&context)));
+        #[cfg(not(feature = "moq-output"))]
+        drop(context);
+        Ok(Some(TlsWiring {
+            #[cfg(feature = "moq-output")]
+            context,
+            boot,
+            shutdown: tokio_util_shutdown::Shutdown::new(),
+        }))
+    }
+    #[cfg(not(all(feature = "acme", unix)))]
+    {
+        let _ = (config, publisher);
+        Ok(None)
+    }
 }
 
 impl RunningPersist {
@@ -128,8 +209,25 @@ impl Drop for LeaseCleanup {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // Socket activation (slice 6, #292): adopt the sockets systemd passed and
+    // clear `LISTEN_FDS`/`LISTEN_PID` BEFORE the runtime starts any thread
+    // (mutating the environment is not thread-safe). The front door claims
+    // them when `run` starts it; without activation this is a no-op.
+    multiview_cli::frontdoor::set_inherited_sockets(multiview_frontdoor::ListenSockets::from_env());
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(async_main()),
+        Err(err) => {
+            eprintln!("multiview: failed to start the async runtime: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn async_main() -> ExitCode {
     if let Err(err) = init_tracing() {
         // Logging failed to initialize; report on stderr (tracing is unavailable)
         // and bail. This is startup code, not the data plane.
@@ -192,7 +290,32 @@ async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
         // + control-plane state and exceeds clippy's large-future bound.
         Command::Run(args) => Box::pin(run_run(args)).await,
         Command::Node(args) => run_node(&args),
+        Command::Tls(command) => {
+            println!("{}", multiview_cli::tls_cli::run(&command)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::AcknowledgeFallback(args) => run_acknowledge_fallback(&args),
     }
+}
+
+/// The `acknowledge-fallback` subcommand (#324): remove the persisted
+/// start-up fallback marker, silencing the current `accepted-state-rejected`
+/// alarm. A later start that still cannot use the saved configuration raises
+/// it again. The saved configuration is not touched.
+fn run_acknowledge_fallback(args: &AcknowledgeFallbackArgs) -> anyhow::Result<ExitCode> {
+    match multiview_cli::last_good::acknowledge(&args.config).map_err(anyhow::Error::msg)? {
+        Some(message) => {
+            println!("acknowledged the start-up fallback warning: {message}");
+            println!(
+                "the saved configuration is unchanged. The warning is raised again on every \
+                 start that still cannot use it, until it is fixed or replaced; a start that \
+                 uses it clears the warning by itself. A running engine's banner is cleared \
+                 only through the API (POST /api/v1/health/accepted-state-rejected/ack)."
+            );
+        }
+        None => println!("no start-up fallback warning is pending"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The `node` subcommand (DEV-B5 / ADR-0045): resolve + validate the display-
@@ -238,6 +361,10 @@ async fn run_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // silently ride the system clock while the config asks for a PHC.
     multiview_cli::timing_gate::ensure_ptp_phc_supported(start.running.timing.as_ref())
         .map_err(|reason| anyhow::anyhow!(reason))?;
+    // `[network.tls]` in a build without `acme` cannot provide certificates:
+    // a hard startup error, never a silent plain-HTTP front door.
+    multiview_cli::tls_cli::ensure_acme_supported(&start.running)
+        .map_err(|reason| anyhow::anyhow!(reason))?;
 
     if args.software {
         return Box::pin(run_software(&start, &args)).await;
@@ -267,14 +394,22 @@ async fn run_software(
     // (S1). A running engine is NEVER re-gated; this only refuses a *new* start at
     // the block-new-instance rung (the never-off-air promise).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
-    // #317: build from the start decision; a build failure on the accepted
-    // state falls back to a different last-good that builds. Only AFTER a
-    // successful build is a planned fallback committed to disk.
-    let (start, mut engine) =
-        multiview_cli::boot::build_with_fallback(start.clone(), &args.config, |config| {
-            SoftwareEngine::build_gated(config, plane.level()).map_err(|e| e.to_string())
-        })
-        .map_err(anyhow::Error::msg)?;
+    // #317/#324: build from the start decision; a STATE-class build failure on
+    // the accepted state falls back to a different last-good that builds, an
+    // environment-class one (an expired lease) is retried and then fails. Only
+    // AFTER a successful build is a planned fallback recorded (a kept copy +
+    // the persisted marker; desired.json itself is never changed).
+    let (start, mut engine) = multiview_cli::boot::build_with_fallback(
+        start.clone(),
+        &args.config,
+        &multiview_cli::boot::RetryPolicy::startup(),
+        |config| {
+            SoftwareEngine::build_gated(config, plane.level()).map_err(|e| {
+                multiview_cli::boot::BuildFailure::new(e.failure_class(), e.to_string())
+            })
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
     let start =
         multiview_cli::boot::commit_fallback(start, &args.config).map_err(anyhow::Error::msg)?;
     let start = &start;
@@ -323,15 +458,30 @@ async fn run_pipeline(
     // re-gated (the never-off-air promise).
     let plane = multiview_cli::licence::EntitlementPlane::from_env();
     multiview_cli::run::start_gate(plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    // #317: build from the start decision; a build failure on the accepted
-    // state falls back to a different last-good that builds. Only AFTER a
-    // successful build is a planned fallback committed to disk (the operator's
-    // state is never moved aside for a fault that breaks every state).
-    let (start, built) =
-        multiview_cli::boot::build_with_fallback(start.clone(), &args.config, |config| {
-            Pipeline::build(config).map_err(|e| format!("building the pipeline: {e}"))
-        })
-        .map_err(anyhow::Error::msg)?;
+    // #317/#324: build from the start decision; a STATE-class build failure on
+    // the accepted state falls back to a different last-good that builds. An
+    // environment-class one (`PipelineError::Io` classified by its OS error
+    // kind — e.g. permission denied / a full volume creating the HLS dir — or a
+    // refused thread spawn) is retried on the same state and then fails: a
+    // fault that breaks every state never falls back. Only AFTER a successful
+    // build is a planned fallback recorded (a kept copy + the persisted marker;
+    // desired.json itself is never changed). No socket binds during the build:
+    // the control-plane/MoQ listeners bind later, so EADDRINUSE there fails
+    // start-up and never reaches this decision.
+    let (start, built) = multiview_cli::boot::build_with_fallback(
+        start.clone(),
+        &args.config,
+        &multiview_cli::boot::RetryPolicy::startup(),
+        |config| {
+            Pipeline::build(config).map_err(|e| {
+                multiview_cli::boot::BuildFailure::new(
+                    e.failure_class(),
+                    format!("building the pipeline: {e}"),
+                )
+            })
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
     let start =
         multiview_cli::boot::commit_fallback(start, &args.config).map_err(anyhow::Error::msg)?;
     let start = &start;
@@ -478,7 +628,45 @@ struct ControlPlaneWiring {
 async fn start_moq_listener(
     factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
     front_door: Option<&mut multiview_cli::frontdoor::FrontDoorRun>,
+    tls: Option<&TlsWiring>,
 ) -> anyhow::Result<Option<Arc<multiview_control::moq::MoqRegistry>>> {
+    #[cfg(all(feature = "acme", unix))]
+    if let (Some(door), Some(tls)) = (front_door.as_ref(), tls) {
+        // ADR-0107 section 5a: with `[network.tls]` the front-door QUIC lane
+        // serves the ACME certificate and is NOT started while in setup. The
+        // lane is taken now (so nothing else binds it); MoQ starts from a
+        // control-plane task once the source is serving. Until then every MoQ
+        // lease answers the existing honest 503 (provider unavailable).
+        let _ = door;
+        let Some((endpoint, protocol)) =
+            multiview_control::moq_startup::MoqListenerConfig::endpoint_from_env()
+                .map_err(|_| anyhow::anyhow!("invalid explicit MoQ listener configuration"))?
+        else {
+            return Ok(None);
+        };
+        let door = front_door.ok_or_else(|| anyhow::anyhow!("front door unavailable"))?;
+        let socket = door
+            .take_moq_socket()
+            .ok_or_else(|| anyhow::anyhow!("front-door QUIC lane unavailable"))?;
+        let deferred = Arc::new(multiview_control::moq_startup::DeferredProvider::default());
+        let registry = Arc::new(multiview_control::moq::MoqRegistry::new(
+            deferred.clone(),
+            std::time::Duration::from_secs(30),
+            16,
+        ));
+        tokio::spawn(multiview_cli::frontdoor::start_moq_when_serving(
+            tls.context.clone(),
+            tls.shutdown.clone().wait(),
+            endpoint,
+            protocol,
+            factory,
+            socket,
+            deferred,
+        ));
+        return Ok(Some(registry));
+    }
+    #[cfg(not(all(feature = "acme", unix)))]
+    let _ = tls;
     if let Some(door) = front_door {
         // ADR-0107 slice 1: MoQ rides the front-door socket's QUIC lane.
         let Some(config) =
@@ -621,6 +809,11 @@ async fn serve_control_plane(
     // The network front door (ADR-0107 slice 1): with `[network]`, ONE
     // dual-stack UDP socket for MoQ and WebRTC, on its own runtime. Without it,
     // both keep their legacy sockets unchanged.
+    // Front-door ACME (ADR-0107 section 5a): bootstrap certificate + ACME
+    // service + setup code, before the control plane binds. Startup only, on
+    // this control runtime; the output clock never waits on it (the service
+    // runs on its own thread + runtime).
+    let tls = start_tls(config, publisher)?;
     #[allow(unused_mut)]
     let mut front_door = multiview_cli::frontdoor::FrontDoorRun::start(config);
     #[cfg(feature = "webrtc-native")]
@@ -675,7 +868,7 @@ async fn serve_control_plane(
     // revert-to-start/promote actions, and is the persister's target.
     let boot_model = Arc::new(start.to_boot_model(config_path));
     #[cfg(feature = "moq-output")]
-    let moq = start_moq_listener(moq_factory, front_door.as_mut()).await?;
+    let moq = start_moq_listener(moq_factory, front_door.as_mut(), tls.as_ref()).await?;
     let (addr, handle, state) = control::bind_and_serve_with_moq(
         listen,
         config,
@@ -719,6 +912,7 @@ async fn serve_control_plane(
         ),
         state: state.clone(),
         front_door,
+        _tls: tls,
     };
     // Watch the boot config file for external edits (ADR-W020): a valid write
     // hot-reloads the impacted parts through the SAME router state + command
@@ -1234,7 +1428,8 @@ async fn run_pipeline_until_ctrl_c(
         .unwrap_or(i64::MAX);
         let _ = multiview_control::emit_network_warnings(publisher.as_ref(), mismatch, since_nanos);
     }
-    announce_boot_fallback(start, publisher.as_ref());
+    // #317/#324: this start's fallback, or a persisted one not yet acknowledged.
+    let _raised = multiview_cli::last_good::announce(config_path, start, publisher.as_ref());
     let _last_good = spawn_last_good_recorder(start, config_path, &publisher, &stop);
 
     // MP-1 (ADR-0030 §2.2): build the engine `ProgramSet` and drive this single
@@ -1279,25 +1474,6 @@ async fn run_pipeline_until_ctrl_c(
     decided_stop.store(true, std::sync::atomic::Ordering::Release);
     drop(decided);
     Ok(report)
-}
-
-/// #317: when this run started from the last-good copy because the accepted
-/// state could not start, raise the latched `accepted-state-rejected` warning
-/// (UI banner + `GET /api/v1/health`). Before the output clock exists (inv #1),
-/// through the drop-oldest lane (inv #10).
-fn announce_boot_fallback(
-    start: &multiview_cli::boot::StartConfig,
-    publisher: &EnginePublisher<EngineStateSnapshot, Event>,
-) {
-    if let Some(fallback) = &start.boot_fallback {
-        let since_nanos = i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-        )
-        .unwrap_or(i64::MAX);
-        multiview_control::emit_accepted_state_rejected(publisher, fallback.message(), since_nanos);
-    }
 }
 
 /// #317: record the started accepted state as last-good after the first tick
@@ -1613,8 +1789,9 @@ async fn run_software_until_ctrl_c(
     // CONSPECT engine-seam S5 (ADR-0052 §3): the consent-independent local-metrics
     // retention feed for the software run.
     let (retention_store, retention_task) = spawn_metrics_retention(&publisher);
-    // #317: after the control plane's warning ingest subscribed.
-    announce_boot_fallback(start, publisher.as_ref());
+    // #317/#324: after the control plane's warning ingest subscribed — this
+    // start's fallback, or a persisted one not yet acknowledged.
+    let _raised = multiview_cli::last_good::announce(config_path, start, publisher.as_ref());
     let _last_good = spawn_last_good_recorder(start, config_path, &publisher, &stop);
 
     // DEV-C1 (ADR-M010): the outbound presentation epoch publishes on the

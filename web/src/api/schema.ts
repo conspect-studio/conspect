@@ -1299,6 +1299,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/health/{code}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/health/{code}/ack` — acknowledge the persisted
+         *     `accepted-state-rejected` warning (role: write, unscoped; #324).
+         * @description Removes the start-up fallback marker (on the blocking pool, under the
+         *     config-mutation lock — file I/O never runs on a runtime worker, and never on
+         *     the engine), then publishes `health.warning.cleared` through the
+         *     drop-oldest lane (inv #10) and waits briefly for the warning ingest to apply
+         *     it. Acknowledging silences the CURRENT alarm only: a later start that still
+         *     cannot use the saved configuration raises it again. The saved configuration
+         *     is not touched. An unreadable or unparsable marker still counts as pending
+         *     and is removed.
+         */
+        post: operations["ack_health_warning"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/inputs/{id}/events": {
         parameters: {
             query?: never;
@@ -2135,6 +2163,57 @@ export interface paths {
         post: operations["create_overlay"];
         /** `DELETE /api/v1/overlays/{id}` — delete an overlay (role: administer; If-Match). */
         delete: operations["delete_overlay"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/patch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The live patch (mixer plane), built from the engine's readback. */
+        get: operations["get_patch"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/patch/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Plan 1..64 mixer crosspoints: path, on-air flag and refusals; no change. */
+        post: operations["plan_patch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/patch/take": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Take 1..64 mixer crosspoints atomically at one engine tick. */
+        post: operations["take_patch"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -3362,6 +3441,86 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tls/credential": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["tls_credential"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tls/issue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["tls_issue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tls/setup-code": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["tls_setup_code"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tls/setup/session": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["tls_setup_session"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tls/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["tls_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/weather/locations": {
         parameters: {
             query?: never;
@@ -4523,6 +4682,19 @@ export interface components {
             /** @description Whether to consent to the outbound daily telemetry pipe. */
             enabled: boolean;
         };
+        /** @description `POST /api/v1/tls/credential` body (loopback admin listener only). */
+        CredentialRequest: {
+            /**
+             * @description One of the environment-variable NAMES the configuration references
+             *     (`[network.tls]` EAB names, `[network.tls.dns]` credential names).
+             */
+            name: string;
+            /**
+             * Format: password
+             * @description The secret value. Write-only: never logged, never echoed.
+             */
+            value: string;
+        };
         /** @description `POST cue` body. */
         CueInput: {
             /** @description The item to put on preview. */
@@ -5261,6 +5433,11 @@ export interface components {
             /** @description The NMOS per-API access grant — `x-nmos-api`. */
             "x-nmos-api"?: components["schemas"]["NmosApiClaim"];
         };
+        /** @description `POST /api/v1/tls/issue` response. */
+        IssueAccepted: {
+            /** @description Always `issue`. */
+            kind: string;
+        };
         /** @description A graphics item. */
         ItemDoc: {
             /** @description Bound data source id. */
@@ -5991,6 +6168,11 @@ export interface components {
             href?: string;
         };
         /**
+         * @description `on_air`: whether a crosspoint may re-patch the input on Program.
+         * @enum {string}
+         */
+        OnAir: "protect" | "allow";
+        /**
          * @description A correlation id for an asynchronously-applied control command.
          *
          *     Returned to the client in a `202 Accepted` response and echoed by the engine
@@ -6497,6 +6679,68 @@ export interface components {
             /** @description The tally target the override applies to. */
             target: components["schemas"]["TallyTargetDoc"];
         };
+        /** @description `POST /patch/take` 202 answer; the outcome arrives as `switcher.operation`. */
+        PatchAccepted: {
+            /** @description Correlates with `switcher.operation.operation_id`. */
+            operation_id: string;
+            /** @description Always `accepted`; never `applied`. */
+            status: string;
+        };
+        /** @description One crosspoint `{ plane, destination, source }`. */
+        PatchCrosspoint: {
+            /** @description Where the source is patched. */
+            destination: components["schemas"]["PatchDestination"];
+            /** @description `video` (this slice), `audio` or `subtitle`. */
+            plane: string;
+            /**
+             * @description `{"source": id}` or `"none"` (this slice); `{"layout": id}`,
+             *     `{"bus": ..}`, `"follow"` arrive in later slices.
+             */
+            source: Record<string, never>;
+        };
+        /**
+         * @description One crosspoint destination: a mixer input (`{"mixer","input"}`) or, in a
+         *     later slice, an output slot (`{"output","slot"}`).
+         */
+        PatchDestination: {
+            /**
+             * Format: int32
+             * @description Mixer input number, 1..=64.
+             */
+            input?: number | null;
+            /** @description M/E id (`me1`). */
+            mixer?: string | null;
+            /** @description Output id (output slots arrive in a later slice; refused here). */
+            output?: string | null;
+            /**
+             * Format: int32
+             * @description Output slot index (later slice).
+             */
+            slot?: number | null;
+        };
+        /** @description `POST /patch/plan` answer. */
+        PatchPlan: {
+            /** @description `true` when every crosspoint can be taken. */
+            can_take: boolean;
+            /** @description Change class (a mixer re-patch is Class-1, hot). */
+            class: string;
+            /** @description Per-crosspoint plan, request order. */
+            crosspoints: components["schemas"]["PlannedCrosspoint"][];
+        };
+        /** @description A typed refusal (`type` suffix + detail). */
+        PatchRefusal: {
+            /** @description Human-readable reason. */
+            detail: string;
+            /** @description RFC 9457 `type` suffix, e.g. `on-air-protected`. */
+            type: string;
+        };
+        /** @description Plan/take body: 1..=64 crosspoints applied atomically at one tick. */
+        PatchRequest: {
+            /** @description The crosspoints. */
+            crosspoints: components["schemas"]["PatchCrosspoint"][];
+            /** @description On-air guard for the input on Program. */
+            on_air?: components["schemas"]["OnAir"];
+        };
         /** @description One queued remote action. */
         PendingAction: {
             /** @description The opaque, unique action id (a UUID) the cancel/execute paths address. */
@@ -6579,6 +6823,16 @@ export interface components {
          * @enum {string}
          */
         PipelineStage: "decode" | "composite" | "encode";
+        /** @description One planned crosspoint. */
+        PlannedCrosspoint: {
+            /** @description The destination as requested. */
+            destination: components["schemas"]["PatchDestination"];
+            /** @description Whether the destination input is on Program now. */
+            on_air: boolean;
+            /** @description The path this crosspoint takes (`mixer-input`). */
+            path: string;
+            refusal?: null | components["schemas"]["PatchRefusal"];
+        };
         /**
          * @description `OpenAPI` mirror of [`multiview_config::playback::PlaybackUrl`] — one
          *     viewer playback URL (or no-URL note) for an output
@@ -7402,6 +7656,24 @@ export interface components {
             /** @description The desired converged work mode (driver vocabulary, e.g. `encoder`). */
             mode: string;
         };
+        /** @description `POST /api/v1/tls/setup-code` response: the new code, returned once. */
+        SetupCodeBody: {
+            /** @description The one-time setup code (8 words, valid one hour, single use). */
+            code: string;
+            /**
+             * Format: int64
+             * @description Seconds until it expires.
+             */
+            expires_in: number;
+        };
+        /** @description `POST /api/v1/tls/setup/session` body. */
+        SetupSessionRequest: {
+            /**
+             * Format: password
+             * @description The one-time setup code (8 words) printed on the host.
+             */
+            code: string;
+        };
         /**
          * @description The `202 Accepted` body of `POST /api/v1/diagnostics/snapshot`: the id to read
          *     the assembled bundle back with.
@@ -8117,6 +8389,12 @@ export interface components {
              * @description AUTO duration at the output's exact cadence; no floating milliseconds.
              */
             duration_frames?: number | null;
+            /**
+             * Format: int32
+             * @description Numbered mixer input for `select_program`/`select_preview` (ADR-0110
+             *     §12.8); exactly one of `source`/`input`. Requires declared inputs.
+             */
+            input?: number | null;
             /** @description Referenced stored layout, when selecting an authored scene. */
             layout?: string | null;
             /** @description M/E identity (`me1` for the first slice). */
@@ -8477,6 +8755,50 @@ export interface components {
              */
             tz_offset_minutes?: number;
         };
+        /** @description Non-secret certificate status (`GET /api/v1/tls/status`). */
+        TlsStatusBody: {
+            /**
+             * @description `none`, `warning` (renewal failing, under 50 % of the lifetime left),
+             *     `critical` (under 25 %) or `expired`.
+             */
+            alarm: string;
+            /** @description SHA-256 fingerprint of the bootstrap certificate (setup only). */
+            bootstrap_fingerprint?: string | null;
+            /** @description CA profile (`letsencrypt`, `google`, `custom`). */
+            ca?: string | null;
+            /** @description `dns-01` or `tls-alpn-01`. */
+            challenge: string;
+            /**
+             * Format: int64
+             * @description Expiry of the served ACME certificate, Unix seconds.
+             */
+            expires_at?: number | null;
+            /** @description Operator hints (e.g. the TLS-ALPN-01 reachability note). */
+            hints: string[];
+            /** @description Sanitized token of the last failure (e.g. `ca-unavailable`). */
+            last_error?: string | null;
+            /** @description Names requested on the certificate. */
+            names: string[];
+            /**
+             * Format: int64
+             * @description When the next attempt runs after a failure, Unix seconds.
+             */
+            next_attempt_at?: number | null;
+            /**
+             * @description Why the engine is still in setup, e.g. `credential-missing: CLOUDFLARE_API_TOKEN`
+             *     (names only, never values).
+             */
+            reasons: string[];
+            /**
+             * Format: int64
+             * @description When the next renewal is due, Unix seconds.
+             */
+            renewal_due_at?: number | null;
+            /** @description Whether the CA's staging directory is configured. */
+            staging: boolean;
+            /** @description `setup`, `serving` or `expired` (serving an expired certificate). */
+            state: string;
+        };
         /** @description A transition preset. */
         TransitionDoc: {
             /**
@@ -8658,7 +8980,7 @@ export interface components {
          *     Serde-equivalent: a unit enum rendered as its `kebab-case` variant name.
          * @enum {string}
          */
-        WarningCodeDoc: "gpu-present-no-vulkan-adapter" | "container-no-host-networking" | "catalogue-link-attention" | "accepted-state-rejected";
+        WarningCodeDoc: "gpu-present-no-vulkan-adapter" | "container-no-host-networking" | "catalogue-link-attention" | "accepted-state-rejected" | "tls-certificate";
         /**
          * @description `OpenAPI` mirror of [`multiview_events::WarningSeverity`] (SA-0).
          *
@@ -12152,6 +12474,54 @@ export interface operations {
             };
         };
     };
+    ack_health_warning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Warning code to acknowledge; only `accepted-state-rejected` is acknowledgeable. */
+                code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Acknowledged: the persisted marker is removed and the warning cleared. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to acknowledge (read-only role, or a scoped key: this is a whole-system action). */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not an acknowledgeable code, no config-file run, or nothing pending. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     get_source_events: {
         parameters: {
             query?: never;
@@ -15035,6 +15405,165 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ] }` from the engine's live readback; a mixer the caller cannot read (M/E object + Program scope) is omitted, and a source it cannot read is `{"redacted": true}`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Role lacks Read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    plan_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatchRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PatchPlan"];
+                };
+            };
+            /** @description Not authorized for a destination (M/E object + Program scope) or a source. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `switcher-unavailable`. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, or not 1..=64 crosspoints. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    take_patch: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required; a replay answers the first 202. */
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatchRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PatchAccepted"];
+                };
+            };
+            /** @description Not authorized for a destination (M/E object + Program scope) or a source. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, or no source lease. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, missing Idempotency-Key, or not 1..=64 crosspoints. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy` (the key and leases are released) or `idempotency-capacity`. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -18841,6 +19370,218 @@ export interface operations {
             };
             /** @description Authenticated but not authorized to read. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    tls_credential: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CredentialRequest"];
+            };
+        };
+        responses: {
+            /** @description Stored as `<state_dir>/secrets/<NAME>`, mode 0600. Loopback admin listener only; body at most 8 KiB. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed body. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not loopback, or not admin. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description NAME is not referenced by the configuration. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    tls_issue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Issuance attempt queued. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssueAccepted"];
+                };
+            };
+            /** @description Front door: neither an admin bearer nor a setup session. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Admin listener: not loopback or not admin. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The ACME service is busy or stopped. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    tls_setup_code: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A new one-time setup code, returned once (replaces the previous code). Loopback admin listener only. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetupCodeBody"];
+                };
+            };
+            /** @description Not loopback, or not admin. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    tls_setup_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetupSessionRequest"];
+            };
+        };
+        responses: {
+            /** @description Setup session created: an `HttpOnly; Secure; SameSite=Strict` cookie valid one hour, honoured only in setup. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Wrong, expired or used setup code. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not in setup. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Five failed attempts from this source (IPv6 /64) in 15 minutes: locked for 15 minutes. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    tls_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Non-secret certificate status. Unauthenticated while the front door is in setup; Read role once serving. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TlsStatusBody"];
+                };
+            };
+            /** @description Serving and no valid credential. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No `[network.tls]` configured. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -407,6 +407,16 @@ impl AcmeCertificateSource {
         status.next_attempt_at = next_attempt_at;
     }
 
+    /// The front-door state alone: one read lock, no clone of the name list.
+    /// This is what the setup gate reads on every request.
+    #[must_use]
+    pub fn state(&self) -> TlsState {
+        self.status
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state
+    }
+
     /// Publish the expiry alarm level.
     pub fn set_alarm(&self, alarm: CertificateAlarm) {
         self.status
@@ -442,6 +452,14 @@ impl StaticCertificateSource {
     pub fn new(key: Arc<CertifiedKey>) -> Self {
         let (sender, _) = watch::channel(key);
         Self { sender }
+    }
+}
+
+impl StaticCertificateSource {
+    /// Replace the served certificate (the static-file reloader, slice 6):
+    /// applies to the next handshake; a handshake in flight keeps its key.
+    pub fn replace(&self, key: Arc<CertifiedKey>) {
+        self.sender.send_replace(key);
     }
 }
 

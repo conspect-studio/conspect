@@ -44,6 +44,7 @@ pub mod moq;
 pub mod output_routing;
 pub mod outputs;
 pub mod overlays;
+pub mod patch;
 pub mod preview;
 pub mod probes;
 pub mod routing;
@@ -1194,6 +1195,8 @@ fn resource_router() -> Router<AppState> {
                 .delete(probes::delete_probe),
         )
         .merge(device_router())
+        // The patch panel, mixer-input slice (ADR-0110 §12.8, #341).
+        .merge(patch::router())
 }
 
 /// Build the managed-devices surface (ADR-M008/M009/M011/W017): the device
@@ -1359,6 +1362,16 @@ fn conspect_router() -> Router<AppState> {
         )
 }
 
+/// The health-warning routes: the read-only list (SA-0 / ADR-0035: active
+/// capability mismatches, e.g. GPU present but compositing fell back to CPU,
+/// with remediation) and the acknowledgement of the persisted
+/// `accepted-state-rejected` warning (#324).
+fn health_router() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(health::list_health))
+        .route("/health/{code}/ack", post(health::ack_health_warning))
+}
+
 /// Build the `/api/v1` resource + command routes (without the realtime or docs
 /// routes, which are wired by [`crate::router()`]).
 pub fn api_router() -> Router<AppState> {
@@ -1376,9 +1389,7 @@ pub fn api_router() -> Router<AppState> {
         // Read-only structured log tail (ADR-0060): recent buffered records from
         // the bounded drop-oldest ring, filterable by resource/kind/level/since.
         .route("/logs", get(logs::list_logs))
-        // Read-only health warnings (SA-0 / ADR-0035): active capability mismatches
-        // (e.g. GPU present but compositing fell back to CPU) with remediation.
-        .route("/health", get(health::list_health))
+        .merge(health_router())
         // Read-only system capability + licence surface (ADR-W030): which
         // codec/compositor backends are available, the compositor class, the
         // effective build-profile licence, and the NDI attribution. System-global

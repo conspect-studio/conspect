@@ -63,19 +63,80 @@ pub fn emit_network_warnings<S>(
 /// output clock exists (inv #1).
 pub fn emit_accepted_state_rejected<S>(
     publisher: &EnginePublisher<S, Event>,
-    message: String,
+    message: &str,
     since_nanos: i64,
 ) {
+    // #324: the text can come from a file on disk; bound it before it is
+    // logged, published or stored.
+    let message = bounded_warning_text(message);
     tracing::error!(code = "accepted-state-rejected", %message, "accepted state rejected at start");
     publisher.publish_event(Event::HealthWarningRaised(HealthWarning {
         code: WarningCode::AcceptedStateRejected,
         severity: WarningSeverity::Critical,
         subsystem: "config".to_owned(),
         message,
-        remediation: "Check the configuration (`multiview validate <config>`); fix the cause or re-apply a layout the switcher can use. The rejected file is kept for inspection; this warning clears on the next clean start.".to_owned(),
+        remediation: ACCEPTED_STATE_REJECTED_REMEDIATION.to_owned(),
         since: since_nanos,
         active: true,
     }));
+}
+
+/// The longest warning text (message/reason) persisted, published or logged
+/// for the start-up fallback (#324): it embeds an engine error that can be
+/// arbitrarily long, and it is read back from a file on disk.
+pub const MAX_WARNING_TEXT: usize = 2048;
+
+/// `text` cut to at most [`MAX_WARNING_TEXT`] bytes on a char boundary, with a
+/// `…` suffix when it was cut (#324).
+#[must_use]
+pub fn bounded_warning_text(text: &str) -> String {
+    bounded_text(text, MAX_WARNING_TEXT)
+}
+
+/// `text` cut to at most `max` bytes (`max` >= 3) on a char boundary, with a
+/// `…` suffix when it was cut (#324).
+#[must_use]
+pub fn bounded_text(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let suffix = "…";
+    let mut end = max.saturating_sub(suffix.len());
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut out = text.get(..end).unwrap_or_default().to_owned();
+    out.push_str(suffix);
+    out
+}
+
+/// The `accepted-state-rejected` remediation (#324): the saved configuration is
+/// NOT changed by a fallback, so the operator must know that it is still
+/// there, that the warning comes back for as long as it cannot start, and
+/// what acknowledging does (silences the current alarm only).
+const ACCEPTED_STATE_REJECTED_REMEDIATION: &str = "The saved configuration was not changed: it is still in .multiview/desired.json and a copy is kept under .multiview/rejected/. Every start tries it first again. Check it with `multiview validate <config>`; fix the cause, or re-apply a layout from the running configuration (the first change through the API saves what runs). This warning is raised again on every start that still cannot use the saved configuration, until it is fixed or replaced; a start that uses it clears the warning automatically. Acknowledging (POST /api/v1/health/accepted-state-rejected/ack or `multiview acknowledge-fallback <config>`) silences the current alarm only.";
+
+/// Clear the `accepted-state-rejected` warning (#324): the operator
+/// acknowledged it. Published through the drop-oldest lane (inv #10) as a
+/// `health.warning.cleared` transition, so every subscriber (the warning
+/// store's ingest, the UI banner) converges on it. Returns the cleared warning.
+#[must_use = "the caller records the cleared warning in its store"]
+pub fn emit_accepted_state_rejected_cleared<S>(
+    publisher: &EnginePublisher<S, Event>,
+    message: &str,
+    since_nanos: i64,
+) -> HealthWarning {
+    let warning = HealthWarning {
+        code: WarningCode::AcceptedStateRejected,
+        severity: WarningSeverity::Critical,
+        subsystem: "config".to_owned(),
+        message: bounded_warning_text(message),
+        remediation: ACCEPTED_STATE_REJECTED_REMEDIATION.to_owned(),
+        since: since_nanos,
+        active: false,
+    };
+    publisher.publish_event(Event::HealthWarningCleared(warning.clone()));
+    warning
 }
 
 /// A control-owned, dependency-light view of the SA-0 composite MISMATCH.
@@ -272,6 +333,17 @@ mod tests {
             since: 1,
             active,
         }
+    }
+
+    /// #324: the fallback text is bounded on a char boundary with a suffix.
+    #[test]
+    fn warning_text_is_bounded_on_a_char_boundary() {
+        use super::{bounded_warning_text, MAX_WARNING_TEXT};
+        assert_eq!(bounded_warning_text("short"), "short");
+        let long = "é".repeat(MAX_WARNING_TEXT);
+        let cut = bounded_warning_text(&long);
+        assert!(cut.len() <= MAX_WARNING_TEXT, "{}", cut.len());
+        assert!(cut.ends_with('…'));
     }
 
     #[test]

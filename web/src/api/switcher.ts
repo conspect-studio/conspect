@@ -4,7 +4,9 @@ import type { components } from './types';
 import { apiUrl, buildHeaders, OperationApiError, readPendingProblem, newIdempotencyKey } from './operations';
 import type { RequestOptions } from './operations';
 
-export type SwitcherRequest = components['schemas']['SwitcherRequest'];
+// `input` (ADR-0110 §12.8) is served by main; the pending superset still
+// shadows SwitcherRequest without it, so it is added here until pending/ goes.
+export type SwitcherRequest = components['schemas']['SwitcherRequest'] & { input?: number | null };
 export type SwitcherState = components['schemas']['SwitcherStateResponse'];
 export type SwitcherPlan = components['schemas']['SwitcherPlan'];
 export type SwitcherAccepted = components['schemas']['SwitcherAccepted'];

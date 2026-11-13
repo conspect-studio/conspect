@@ -208,14 +208,20 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # note's "ring or aws-lc provider" allowance) that negotiates the
 # `acme-tls/1` ALPN and inspects the leaf it receives. All three are already
 # in the lock via `multiview-frontdoor`'s dev-deps / `multiview-control`'s
-# `tls` feature; no new crate.
+# `tls` feature; no new crate. Also used by `tests/tls_cli.rs` (rcgen: a
+# stored bundle and a trust anchor) and `tests/tls_door.rs` (the real door
+# with `[network.tls]`), which use the `aws-lc-rs` provider explicitly.
 rustls = { version = "0.23", default-features = false, features = [
     "std",
     "ring",
+    "aws_lc_rs",
     "tls12",
 ] }
 tokio-rustls = { version = "0.26", default-features = false }
 rcgen = "0.14"
+# `tests/frontdoor_site_chaos.rs` mounts the HLS router on the door (already
+# in the graph via multiview-control / multiview-output).
+axum = { version = "0.8.9", default-features = false, features = ["tokio"] }
 
 # The pipeline-ingest integration test needs the `ffmpeg` feature (a libav*
 # build + the `ffmpeg`/`ffprobe` CLIs at runtime).
@@ -228,6 +234,12 @@ required-features = ["ffmpeg"]
 # `StaticCertificateSource`, unix only).
 [[test]]
 name = "acme_tls_alpn_resolver"
+required-features = ["tls"]
+
+# Invariants #1/#10 with the site (HLS, redirect) served by the front door
+# itself (ADR-0107 slice 6, #292): the real tick loop under stalled readers.
+[[test]]
+name = "frontdoor_site_chaos"
 required-features = ["tls"]
 
 # Audio routing applies live to the running program bus (no restart).
@@ -389,10 +401,13 @@ sqlite = ["multiview-control/sqlite"]
 # umbrella presets below so the deploy images can terminate HTTPS without a proxy.
 tls = ["multiview-control/tls"]
 
-# The front-door ACME issuance engine (slice 5, ADR-0107 §5a, #291): library only
-# in this release; boot wiring and the `multiview tls` CLI land with the next
-# slice, so it is deliberately NOT in any preset yet. Implies `tls`.
-acme = ["tls", "multiview-control/acme"]
+# The front-door ACME certificates (slice 5, ADR-0107 §5a, #291): the issuance
+# engine, the boot wiring (`[network.tls]` → bootstrap certificate + ACME
+# service + setup surface) and the `multiview tls` recovery CLI (rustix termios
+# turns echo off while a credential is typed). In the shipped presets next to
+# `tls`. A config with `[network.tls]` in a build without it is a hard startup
+# error. Implies `tls`.
+acme = ["tls", "multiview-control/acme", "dep:rustix", "rustix/termios"]
 
 # mDNS/DNS-SD managed-device discovery (DEV-A5 / ADR-M008 §6 / ADR-0041): install
 # the real `mdns-sd`-backed browser so `POST /api/v1/discovery/devices/scan`
@@ -621,6 +636,7 @@ nvidia = [
     # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
     # on the management listener with an operator cert (`[control.tls]`).
     "tls",
+    "acme",
     "sqlite",
     # The cli's OWN `ffmpeg` feature — gates the run/pipeline path itself; without
     # it `multiview run` has no ingest/encode pipeline at all (GPU-6b: the presets
@@ -701,6 +717,7 @@ apple = [
     # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
     # on the management listener with an operator cert (`[control.tls]`).
     "tls",
+    "acme",
     "sqlite",
     "ffmpeg",
     # IPTV-ORG source browser (ADR-M015): catalogue sync + link tracker + deep probe
@@ -743,6 +760,7 @@ linux-vaapi = [
     # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
     # on the management listener with an operator cert (`[control.tls]`).
     "tls",
+    "acme",
     "sqlite",
     "ffmpeg",
     # IPTV-ORG source browser (ADR-M015): catalogue sync + link tracker + deep probe

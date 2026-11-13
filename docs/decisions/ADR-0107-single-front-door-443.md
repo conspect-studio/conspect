@@ -67,7 +67,9 @@ door runs on its own Tokio runtime (`network.workers` OS threads), never on the 
 the output clock: today that clock is a `tokio::spawn`ed task on the main runtime
 (`crates/multiview-engine/src/programset.rs:546`, `runtime.rs:125`, `crates/multiview-cli/src/main.rs:124`).
 On Linux, validated flows are steered to their own socket in a `SO_REUSEPORT` group, so a flood of
-unvalidated traffic fills a kernel queue no paying viewer shares.
+unvalidated traffic fills a kernel queue no paying viewer shares. The steering program is classic BPF
+(`SO_ATTACH_REUSEPORT_CBPF`), not eBPF: it needs no `CAP_BPF`/`CAP_SYS_ADMIN` and works with
+`kernel.unprivileged_bpf_disabled=1` (slice 3, issue #289).
 
 B. **HTTP/3 for the site: the engine terminates TLS (shape 1).** One QUIC endpoint (ALPN `h3`, the
 same ACME certificate as TCP) serves both the site/API and MoQ. Browsers do not pool WebTransport
@@ -157,8 +159,9 @@ the detail. In short:
   per directory. ARI (RFC 9773) where offered, else one third of lifetime remaining.
 - Secrets are never in the TOML (env-var names, or a CLI-written 0600 file), never logged, never in
   an API response, and never typed into the setup page: on the bootstrap certificate an interceptor
-  could read them. The page chooses non-secret settings and starts issuance against credentials
-  already stored on the host. TLS-ALPN-01 needs no secret.
+  could read them. The page shows the non-secret settings (CA, challenge, names come from
+  `[network.tls]` only, so the config stays the single source of truth; as built in slice 5) and
+  starts issuance against credentials already stored on the host. TLS-ALPN-01 needs no secret.
 - Renewal failure keeps the current certificate and alarms at 50% and 25% of remaining lifetime.
   After expiry the front door keeps serving the expired certificate and reports `expired`; recovery
   works entirely by CLI and config (an HSTS host cannot be clicked through).
@@ -262,4 +265,6 @@ Chrome for Testing 149.0.7827.55, curl 8.14.1 (nghttp3), a native `web-transport
 - Safari's ICE-TCP behaviour, Firefox behind a proxy, and TLS-intercepting proxies (N6) are
   unverified until the office matrix runs. N6 may end at stills, with an honest caption.
 - The operator-facing runbook for the mda001 cutover (nginx removal, socket unit, firewall) is
-  written with slice 6, when the change is made.
+  [front-door-cutover.md](../runbooks/front-door-cutover.md) (slice 6, #292). As built, the socket
+  unit passes UDP 443 as a `ReusePort=yes` pair so validated-flow steering survives socket
+  activation (design note, "Slice 6 as built").

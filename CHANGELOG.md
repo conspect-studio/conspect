@@ -36,7 +36,44 @@ implementation will build against.
 
 ### Added
 
-- **ACME certificate engine for the network front door (library, off by default)**: the
+- **The engine serves TCP 443, TCP 80 and UDP 443 itself; nginx is no longer needed (front-door
+  slice 6, #292)**: systemd socket activation (`deploy/systemd/conspect.socket`: TCP 443, TCP 80
+  and a `ReusePort=yes` UDP 443 pair, so validated-flow steering survives) keeps the sockets
+  open across engine restarts; without it the engine binds them itself. HLS delivery now
+  matches the nginx static contract (`ETag`/`Last-Modified`, `304`, `If-Range`, 64 KiB bounded
+  chunks, one blocking-pool hop per request); the embedded UI gets strong `ETag`s, `304`, gzip
+  and a `404` for a stale hashed chunk. New keys: `[network] cert_file`/`key_file` (the door's
+  own static certificate), `[network] acme_webroot` (HTTP-01 for certbot on port 80) and
+  `[control] ui_dir` (serve a UI build from disk). `[control.tls]` static certificates reload
+  without a restart. `scripts/hls-ttfb.py` measures segment TTFB against the nginx path; the
+  mda001 cutover and rollback are in `docs/runbooks/front-door-cutover.md`.
+- **Numbered mixer inputs and the mixer patch (patch panel, slice A).** An M/E may declare
+  `[[switcher.mix_effects.inputs]] { number, label, video = { source } }` with `program_input` /
+  `preview_input`; PGM/PVW then select input numbers and a CUT swaps inputs. The Switcher page
+  shows the input bank with tally and a per-input re-patch. `GET /api/v1/patch` reads the
+  engine's live table; `POST /api/v1/patch/plan|take` re-patch up to 64 inputs atomically on one
+  tick (Idempotency-Key, 202, outcome on `switcher.operation`). Re-patching the input on Program
+  is refused (`on-air-protected`) unless `on_air = "allow"`, and always during an AUTO on it. An
+  applied patch is persisted into the accepted state. `select_program`/`select_preview` accept
+  `input`. Without inputs, behaviour is unchanged (#341, ADR-0110).
+
+- **Front-door certificates: setup, boot wiring and `multiview tls` (ACME, slice 5)**:
+  `network.public_host` + `[network.tls]` now start the ACME service at boot. While it waits for a
+  certificate, the front door serves a self-generated bootstrap certificate and stays in setup
+  (fingerprint and a one-time setup code in the log). In setup it serves only the setup page and
+  `/api/v1/tls/*`; everything else is a `503 /problems/tls-setup-required`. QUIC/MoQ on the
+  front door starts once the certificate is installed, and renewals apply without a restart.
+  Failing renewals raise the `tls-certificate` health warning. On the host, `multiview tls status`,
+  `setup-code`, `set-credential` (value from stdin only, stored 0600) and `issue` give full
+  recovery without a browser. The `acme` feature is now in the shipped presets; a `[network.tls]`
+  config in a build without it refuses to start. Runbook: `docs/runbooks/acme-certificates.md` (#291).
+- **The TCP 443 door serves the ACME certificate (slices 4 + 5)**: with `network.mode` and
+  `[network.tls]`, the engine's TCP door serves the bootstrap, then the issued certificate (renewals
+  on the next handshake), answers TLS-ALPN-01 (ALPN `acme-tls/1`) and gates every route behind the
+  setup state; `[network.tls]` wins over `[control.tls]` for the door. Behind a proxy, setup-code
+  limits key on the PROXY v2 client address and `multiview tls status` shows the TLS-ALPN-01 hint
+  (#291).
+- **ACME certificate engine for the network front door**: the
   `acme` feature of `multiview-control` issues and renews the front-door certificate over
   DNS-01 (Cloudflare token or global key) or TLS-ALPN-01 from Let's Encrypt, Google or a custom
   directory, with SSRF-screened egress, a private 0700 state directory, crash-safe TXT cleanup,

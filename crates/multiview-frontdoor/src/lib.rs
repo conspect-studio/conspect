@@ -24,23 +24,43 @@
 //! Per lane: an *established* queue (1024) for validated peers and a *new*
 //! queue (256) behind a per-source token bucket (IPv4 address or IPv6 /64, in a
 //! 16 384-entry LRU) and a global new-flow budget; unsupported-version long
-//! headers (Version Negotiation triggers) also pay a global VN budget. The
-//! established set is written only by the consumers after validation and is
-//! capped by the session/connection caps. Nothing grows with attacker traffic.
+//! headers (Version Negotiation triggers) also pay a global VN budget,
+//! supported-version Initials a global handshake budget (from any source,
+//! established or not), and STUN from unvalidated sources its own per-source
+//! and global STUN budgets. Established peers pass a generous per-peer bucket.
+//! The established set is written only by the consumers after validation and
+//! is capped by the session/connection caps. Nothing grows with attacker
+//! traffic.
+//!
+//! ## Validated-flow steering (slice 3, Linux)
+//!
+//! With [`FrontDoorConfig::steering`] the door binds a `SO_REUSEPORT` pair on
+//! the same port: a listener (all unvalidated traffic, and every send) and an
+//! established socket that a classic BPF program ([`steering`]) feeds with the
+//! datagrams of validated peers, so a flood fills the listener's kernel queue,
+//! never the paying viewers'. A steering updater task recompiles the program
+//! off the data plane when an established set changes; the dispatcher never
+//! compiles or attaches. Without Linux, or on any setup error, the door runs
+//! one socket ([`SteeringMode::SingleSocket`]).
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod activation;
 pub mod classify;
+pub mod flood;
 pub mod limits;
 pub mod quic;
 pub mod rtc;
 mod socket;
+pub mod steering;
+#[cfg(target_os = "linux")]
+mod sys;
 pub mod tcp;
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -49,11 +69,15 @@ pub use tcp::ice_tcp::UsernameCheck;
 /// A ready site TLS configuration for [`TlsRouting::site`] (re-exported so
 /// callers need not name `rustls`).
 pub type SiteTlsConfig = Arc<rustls::ServerConfig>;
+pub use activation::ListenSockets;
 pub use classify::{classify, first_byte_class, ByteClass, DropReason, Lane, QuicKind, Verdict};
-pub use limits::{Budget, EstablishedSet, NewFlowLimiter, NewFlowLimits, Refusal};
+pub use limits::{Budget, EstablishedSet, NewFlowLimiter, NewFlowLimits, PeerBuckets, Refusal};
 pub use quic::QuicLane;
 pub use rtc::RtcLane;
-pub use socket::SharedSocket;
+pub use socket::{
+    kernel_drops, kernel_drops_supported, parse_udp_drops, RecvBufferReport, SharedSocket,
+};
+pub use steering::{ProgramSet, ReuseportGroup, SteeringMode, STEERING_MAX_PEERS};
 pub use tcp::{
     BoxFuture, ConnGuard, DoorStream, DoorTlsStream, IceTcpFrame, IceTcpLane, IceTcpSender,
     RedirectConfig, SendOutcome, SiteService, TcpDoorConfig, TlsRouting, TrustedProxies,
@@ -68,6 +92,13 @@ pub const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 /// Default cap on established QUIC peers (`network.quic.max_connections`).
 pub const DEFAULT_MAX_QUIC_PEERS: usize = 1024;
+/// How long the steering updater waits after a change before compiling, so a
+/// burst of joins becomes one program (design: at most 20 ms).
+pub const STEERING_DEBOUNCE: Duration = Duration::from_millis(20);
+/// How often the kernel-drop sampler reads `/proc/net/udp6`.
+pub const KERNEL_DROP_SAMPLE: Duration = Duration::from_secs(1);
+/// Least interval between two kernel-drop (or steering-error) warnings.
+const WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Front-door settings (the `[network]` section, slice 1 subset).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,8 +118,13 @@ pub struct FrontDoorConfig {
     /// Cap on established QUIC peers (`network.quic.max_connections`).
     pub max_quic_peers: usize,
     /// TURN servers the WebRTC endpoint allocates on. Only datagrams from these
-    /// addresses may be TURN `ChannelData` (first byte 64-79).
+    /// addresses may be TURN `ChannelData` (first byte 64-79). They are also
+    /// steered to the established socket (validated by configuration).
     pub turn_servers: Vec<SocketAddr>,
+    /// Validated-flow steering (Linux `SO_REUSEPORT` + CBPF). `false` forces
+    /// one socket. Default `true`; falls back to one socket where it cannot
+    /// run (see [`FrontDoor::steering`]).
+    pub steering: bool,
 }
 
 impl Default for FrontDoorConfig {
@@ -101,6 +137,7 @@ impl Default for FrontDoorConfig {
             max_rtc_peers: 256,
             max_quic_peers: DEFAULT_MAX_QUIC_PEERS,
             turn_servers: Vec::new(),
+            steering: true,
         }
     }
 }
@@ -147,6 +184,32 @@ pub struct Stats {
     pub recv_errors: AtomicU64,
     /// Source keys currently tracked by the new-flow limiter.
     pub tracked_sources: AtomicU64,
+    /// Datagrams read from the established socket (steered peers).
+    pub received_established_socket: AtomicU64,
+    /// Datagrams read from the listener socket.
+    pub received_listener_socket: AtomicU64,
+    /// Datagrams read from the established socket whose source is in no
+    /// established set (a hash collision, or a peer that just left): they
+    /// took the new-flow path like any other new flow.
+    pub steered_unverified: AtomicU64,
+    /// Gauge: established peers not steered because of [`STEERING_MAX_PEERS`].
+    pub steering_overflow: AtomicU64,
+    /// Steering programs attached.
+    pub steering_updates: AtomicU64,
+    /// Steering attaches that failed (the previous program stays).
+    pub steering_update_errors: AtomicU64,
+    /// Gauge: peers the current program steers.
+    pub steered_peers: AtomicU64,
+    /// Gauge: kernel receive drops on the listener socket (`/proc/net/udp6`).
+    pub kernel_drops_listener: AtomicU64,
+    /// Gauge: kernel receive drops on the established socket.
+    pub kernel_drops_established: AtomicU64,
+    /// Dropped by the per-source STUN bucket.
+    pub dropped_stun_per_source: AtomicU64,
+    /// Dropped by the global STUN budget.
+    pub dropped_stun_global: AtomicU64,
+    /// Dropped by the per-established-peer bucket (issue #325).
+    pub dropped_established_peer: AtomicU64,
     /// TCP connections admitted at accept.
     pub tcp_accepted: AtomicU64,
     /// TCP accept errors (EMFILE and friends; backed off, never fatal).
@@ -217,6 +280,18 @@ impl Stats {
             dropped_no_consumer: get(&self.dropped_no_consumer),
             recv_errors: get(&self.recv_errors),
             tracked_sources: get(&self.tracked_sources),
+            received_established_socket: get(&self.received_established_socket),
+            received_listener_socket: get(&self.received_listener_socket),
+            steered_unverified: get(&self.steered_unverified),
+            steering_overflow: get(&self.steering_overflow),
+            steering_updates: get(&self.steering_updates),
+            steering_update_errors: get(&self.steering_update_errors),
+            steered_peers: get(&self.steered_peers),
+            kernel_drops_listener: get(&self.kernel_drops_listener),
+            kernel_drops_established: get(&self.kernel_drops_established),
+            dropped_stun_per_source: get(&self.dropped_stun_per_source),
+            dropped_stun_global: get(&self.dropped_stun_global),
+            dropped_established_peer: get(&self.dropped_established_peer),
             tcp_accepted: get(&self.tcp_accepted),
             tcp_accept_errors: get(&self.tcp_accept_errors),
             tcp_refused_global: get(&self.tcp_refused_global),
@@ -260,6 +335,18 @@ pub struct StatsSnapshot {
     pub dropped_no_consumer: u64,
     pub recv_errors: u64,
     pub tracked_sources: u64,
+    pub received_established_socket: u64,
+    pub received_listener_socket: u64,
+    pub steered_unverified: u64,
+    pub steering_overflow: u64,
+    pub steering_updates: u64,
+    pub steering_update_errors: u64,
+    pub steered_peers: u64,
+    pub kernel_drops_listener: u64,
+    pub kernel_drops_established: u64,
+    pub dropped_stun_per_source: u64,
+    pub dropped_stun_global: u64,
+    pub dropped_established_peer: u64,
     pub tcp_accepted: u64,
     pub tcp_accept_errors: u64,
     pub tcp_refused_global: u64,
@@ -428,6 +515,22 @@ impl FrontDoor {
     ///
     /// [`Error::Runtime`] or [`Error::Socket`].
     pub fn start(config: &FrontDoorConfig) -> Result<Self, Error> {
+        Self::start_with(config, Vec::new())
+    }
+
+    /// [`start`](Self::start) on inherited UDP sockets when `inherited` is
+    /// not empty (systemd socket activation, design note section 9): the
+    /// socket (or the `ReusePort=yes` pair, listener first, which keeps
+    /// validated-flow steering) is adopted instead of bound, so it survives
+    /// an engine restart.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Runtime`] or [`Error::Socket`].
+    pub fn start_with(
+        config: &FrontDoorConfig,
+        inherited: Vec<std::net::UdpSocket>,
+    ) -> Result<Self, Error> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.workers.max(1))
             .thread_name_fn(|| {
@@ -438,12 +541,22 @@ impl FrontDoor {
             .build()
             .map_err(Error::Runtime)?;
         let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.port);
+        let turn_servers: Vec<SocketAddr> = config
+            .turn_servers
+            .iter()
+            .copied()
+            .map(classify::canonical)
+            .collect();
         let socket = {
             // The tokio socket registers with the reactor of the runtime it is
             // created in: the front door's, never the caller's.
             let _guard = runtime.enter();
-            SharedSocket::bind(addr, config.recv_buffer_bytes)
-                .map_err(|source| Error::Socket { addr, source })?
+            if inherited.is_empty() {
+                bind_socket(addr, config, &turn_servers)?
+            } else {
+                tracing::info!(%addr, sockets = inherited.len(), "front door: UDP inherited from the service manager");
+                adopt_socket(inherited, addr, config, &turn_servers)?
+            }
         };
         let socket = Arc::new(socket);
         let stats = Arc::new(Stats::default());
@@ -451,28 +564,40 @@ impl FrontDoor {
         let rtc_established = Arc::new(EstablishedSet::new(config.max_rtc_peers));
         let (quic_tx, quic_rx) = lane_channel();
         let (rtc_tx, rtc_rx) = lane_channel();
+        let now = Instant::now();
         let dispatcher = Dispatcher {
             socket: Arc::clone(&socket),
             stats: Arc::clone(&stats),
-            limiter: NewFlowLimiter::new(config.limits, Instant::now()),
+            limiter: NewFlowLimiter::new(config.limits, now),
+            peers: PeerBuckets::new(
+                &config.limits,
+                config
+                    .max_quic_peers
+                    .saturating_add(config.max_rtc_peers)
+                    .max(1),
+            ),
+            peers_generation: 0,
             quic: quic_tx,
             rtc: rtc_tx,
             quic_established: Arc::clone(&quic_established),
             rtc_established: Arc::clone(&rtc_established),
-            turn_servers: config
-                .turn_servers
-                .iter()
-                .copied()
-                .map(classify::canonical)
-                .collect(),
+            turn_servers: turn_servers.clone(),
         };
         runtime.spawn(dispatcher.run());
-        tracing::info!(
-            local = %socket.local_addr(),
-            workers = config.workers.max(1),
-            rcvbuf = socket.recv_buffer_size().unwrap_or(0),
-            "front door: one UDP socket for QUIC and WebRTC on its own runtime"
-        );
+        if socket.has_established() && *socket.mode() == SteeringMode::ReuseportCbpf {
+            stats.steering_updates.fetch_add(1, Ordering::Relaxed);
+            runtime.spawn(steering_updater(
+                Arc::clone(&socket),
+                Arc::clone(&stats),
+                Arc::clone(&quic_established),
+                Arc::clone(&rtc_established),
+                turn_servers,
+            ));
+        }
+        if kernel_drops_supported() {
+            runtime.spawn(kernel_drop_sampler(Arc::clone(&socket), Arc::clone(&stats)));
+        }
+        log_mode(&socket, config);
         Ok(Self {
             handle: runtime.handle().clone(),
             runtime: Some(runtime),
@@ -491,6 +616,24 @@ impl FrontDoor {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.socket.local_addr()
+    }
+
+    /// How the front door receives: the steered pair or one socket (and why).
+    #[must_use]
+    pub fn steering(&self) -> SteeringMode {
+        self.socket.mode().clone()
+    }
+
+    /// The receive buffer the kernel granted (the smaller of the pair's).
+    #[must_use]
+    pub fn buffer_report(&self) -> RecvBufferReport {
+        self.socket.buffer_report()
+    }
+
+    /// Whether the kernel-drop gauges are sampled on this platform.
+    #[must_use]
+    pub const fn kernel_drops_supported(&self) -> bool {
+        kernel_drops_supported()
     }
 
     /// A handle to the front door's own runtime. Spawn every task that serves
@@ -561,13 +704,29 @@ impl FrontDoor {
         tls: TlsRouting,
         site: Option<Arc<dyn SiteService>>,
     ) -> Result<SocketAddr, Error> {
+        self.start_tcp_with(cfg, tls, site, None)
+    }
+
+    /// [`start_tcp`](Self::start_tcp) on an inherited listening socket when
+    /// `inherited` is `Some` (systemd socket activation).
+    ///
+    /// # Errors
+    ///
+    /// As [`start_tcp`](Self::start_tcp).
+    pub fn start_tcp_with(
+        &mut self,
+        cfg: TcpDoorConfig,
+        tls: TlsRouting,
+        site: Option<Arc<dyn SiteService>>,
+        inherited: Option<std::net::TcpListener>,
+    ) -> Result<SocketAddr, Error> {
         if self.tcp.is_some() {
             return Err(Error::TcpDoorRunning);
         }
         let addr = cfg.listen;
         let listener = {
             let _guard = self.handle.enter();
-            tcp::bind_listener(addr).map_err(|source| Error::Socket { addr, source })?
+            tcp::listener(addr, inherited).map_err(|source| Error::Socket { addr, source })?
         };
         let local = listener
             .local_addr()
@@ -592,10 +751,24 @@ impl FrontDoor {
     ///
     /// [`Error::Socket`] on a bind failure.
     pub fn start_redirect(&mut self, cfg: RedirectConfig) -> Result<SocketAddr, Error> {
+        self.start_redirect_with(cfg, None)
+    }
+
+    /// [`start_redirect`](Self::start_redirect) on an inherited listening
+    /// socket when `inherited` is `Some` (systemd socket activation).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Socket`] on a bind (or adoption) failure.
+    pub fn start_redirect_with(
+        &mut self,
+        cfg: RedirectConfig,
+        inherited: Option<std::net::TcpListener>,
+    ) -> Result<SocketAddr, Error> {
         let addr = cfg.listen;
         let listener = {
             let _guard = self.handle.enter();
-            tcp::bind_listener(addr).map_err(|source| Error::Socket { addr, source })?
+            tcp::listener(addr, inherited).map_err(|source| Error::Socket { addr, source })?
         };
         let local = listener
             .local_addr()
@@ -687,6 +860,21 @@ impl FrontDoor {
         Ok(())
     }
 
+    /// Mark a site as expected (`true`) until [`set_site`](Self::set_site)
+    /// installs one: site hellos that arrive meanwhile wait within their
+    /// handshake deadline instead of being closed (start-up, and the
+    /// connections a socket-activated restart queued). `false` releases the
+    /// waiters (they then close if no site was installed).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoTcpDoor`] when the TCP door is not running.
+    pub fn set_site_pending(&self, pending: bool) -> Result<(), Error> {
+        let (_, state) = self.tcp.as_ref().ok_or(Error::NoTcpDoor)?;
+        state.routing.site_pending.send_replace(pending);
+        Ok(())
+    }
+
     /// Install (or replace) the site service; applies to the next connection.
     ///
     /// # Errors
@@ -699,6 +887,7 @@ impl FrontDoor {
             .site
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = site;
+        state.routing.site_pending.send_replace(false);
         Ok(())
     }
 
@@ -758,11 +947,110 @@ impl Drop for FrontDoor {
     }
 }
 
-/// The one task that reads the socket and feeds the lanes.
+/// Bind the door's socket(s) in the current runtime: the steered pair where
+/// possible (first program attached), else one socket with the reason.
+fn bind_socket(
+    addr: SocketAddr,
+    config: &FrontDoorConfig,
+    turn_servers: &[SocketAddr],
+) -> Result<SharedSocket, Error> {
+    let steering = config.steering && cfg!(target_os = "linux");
+    let mut socket = SharedSocket::bind(addr, config.recv_buffer_bytes, steering)
+        .map_err(|source| Error::Socket { addr, source })?;
+    if socket.has_established() {
+        // The first attach decides the mode: on failure, close the pair and
+        // run one socket on the same port.
+        let first = ProgramSet::build(steering::random_salt(), turn_servers.iter().copied());
+        if let Err(e) = socket.attach(&first) {
+            let port = socket.local_addr().port();
+            let reason = format!("SO_ATTACH_REUSEPORT_CBPF failed: {e}");
+            drop(socket);
+            let addr = SocketAddr::new(addr.ip(), port);
+            socket = SharedSocket::bind(addr, config.recv_buffer_bytes, false)
+                .map_err(|source| Error::Socket { addr, source })?
+                .with_reason(reason);
+        }
+    } else if config.steering && !cfg!(target_os = "linux") {
+        socket = socket.with_reason(
+            "validated-flow steering is Linux only (one kernel queue on this platform)".to_owned(),
+        );
+    }
+    Ok(socket)
+}
+
+/// Adopt inherited UDP socket(s) (socket activation). A pair gets the first
+/// steering program like a self-bound pair; when the attach fails (or
+/// `steering` is off) both sockets stay open and are both read (the kernel
+/// then spreads datagrams across the group by hash), reported as single
+/// socket with the reason.
+fn adopt_socket(
+    inherited: Vec<std::net::UdpSocket>,
+    addr: SocketAddr,
+    config: &FrontDoorConfig,
+    turn_servers: &[SocketAddr],
+) -> Result<SharedSocket, Error> {
+    let socket =
+        SharedSocket::from_inherited(inherited).map_err(|source| Error::Socket { addr, source })?;
+    if !socket.has_established() {
+        return Ok(socket);
+    }
+    if !config.steering {
+        return Ok(socket.into_unsteered(
+            "disabled by configuration (steering = false); the inherited ReusePort pair is \
+             read as one socket"
+                .to_owned(),
+        ));
+    }
+    let first = ProgramSet::build(steering::random_salt(), turn_servers.iter().copied());
+    match socket.attach(&first) {
+        Ok(()) => Ok(socket),
+        Err(e) => Ok(socket.into_unsteered(format!(
+            "SO_ATTACH_REUSEPORT_CBPF failed on the inherited pair: {e}; both sockets are read"
+        ))),
+    }
+}
+
+/// Log the receive mode at start: info when steering is active (or off by
+/// configuration / platform), warn when it fell back on Linux.
+fn log_mode(socket: &SharedSocket, config: &FrontDoorConfig) {
+    let buffers = socket.buffer_report();
+    match socket.mode() {
+        SteeringMode::ReuseportCbpf => tracing::info!(
+            local = %socket.local_addr(),
+            workers = config.workers.max(1),
+            rcvbuf_usable = buffers.usable,
+            "front door: UDP for QUIC and WebRTC on its own runtime, validated flows \
+             steered to their own socket (SO_REUSEPORT + CBPF)"
+        ),
+        SteeringMode::SingleSocket { reason } if config.steering && cfg!(target_os = "linux") => {
+            tracing::warn!(
+                local = %socket.local_addr(),
+                workers = config.workers.max(1),
+                rcvbuf_usable = buffers.usable,
+                %reason,
+                "front door: one UDP socket (validated-flow steering unavailable): a \
+                 flood shares the kernel queue with established viewers"
+            );
+        }
+        SteeringMode::SingleSocket { reason } => tracing::info!(
+            local = %socket.local_addr(),
+            workers = config.workers.max(1),
+            rcvbuf_usable = buffers.usable,
+            %reason,
+            "front door: one UDP socket for QUIC and WebRTC on its own runtime"
+        ),
+    }
+}
+
+/// The one task that reads the socket(s) and feeds the lanes. It alone owns
+/// the limiter and the per-peer buckets (no lock).
 struct Dispatcher {
     socket: Arc<SharedSocket>,
     stats: Arc<Stats>,
     limiter: NewFlowLimiter,
+    peers: PeerBuckets,
+    /// Sum of both established sets' generations when `peers` was last pruned.
+    peers_generation: u64,
     quic: LaneTx,
     rtc: LaneTx,
     quic_established: Arc<EstablishedSet>,
@@ -784,24 +1072,11 @@ impl Dispatcher {
                 tokio::task::yield_now().await;
                 continue;
             }
-            let mut handled = 0usize;
-            while handled < MAX_DATAGRAMS_PER_WAKE {
-                match self.socket.try_recv_batch(&mut batch) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let now = Instant::now();
-                        for (src, dst_ip, ecn, payload) in batch.datagrams(n) {
-                            handled += 1;
-                            self.dispatch(src, dst_ip, ecn, payload, now);
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        Stats::bump(&self.stats.recv_errors);
-                        break;
-                    }
-                }
-            }
+            self.prune_peers();
+            // The established socket first: a flood on the listener can never
+            // delay a steered peer's datagrams behind its own.
+            let mut handled = self.drain(socket::Which::Established, &mut batch, 0);
+            handled = self.drain(socket::Which::Listener, &mut batch, handled);
             if handled >= MAX_DATAGRAMS_PER_WAKE {
                 tokio::task::yield_now().await;
             }
@@ -812,6 +1087,60 @@ impl Dispatcher {
         }
     }
 
+    /// Read `which` until drained or the per-wake budget is spent; returns the
+    /// running total.
+    fn drain(
+        &mut self,
+        which: socket::Which,
+        batch: &mut socket::RecvBatch,
+        mut handled: usize,
+    ) -> usize {
+        let from_established = which == socket::Which::Established;
+        while handled < MAX_DATAGRAMS_PER_WAKE {
+            match self.socket.try_recv_batch(which, batch) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let now = Instant::now();
+                    for (src, dst_ip, ecn, payload) in batch.datagrams(n) {
+                        handled += 1;
+                        Stats::bump(if from_established {
+                            &self.stats.received_established_socket
+                        } else {
+                            &self.stats.received_listener_socket
+                        });
+                        self.dispatch(src, dst_ip, ecn, payload, now, from_established);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    Stats::bump(&self.stats.recv_errors);
+                    break;
+                }
+            }
+        }
+        handled
+    }
+
+    /// Drop the per-peer buckets of peers that left both established sets
+    /// (only when a set's membership changed: two atomic loads otherwise).
+    fn prune_peers(&mut self) {
+        let generation = self
+            .quic_established
+            .generation()
+            .wrapping_add(self.rtc_established.generation());
+        if generation == self.peers_generation {
+            return;
+        }
+        self.peers_generation = generation;
+        let (quic, rtc, turn) = (
+            &self.quic_established,
+            &self.rtc_established,
+            &self.turn_servers,
+        );
+        self.peers
+            .retain(|a| turn.contains(&a) || quic.contains(a) || rtc.contains(a));
+    }
+
     fn dispatch(
         &mut self,
         src: SocketAddr,
@@ -819,16 +1148,18 @@ impl Dispatcher {
         ecn: Option<noq::udp::EcnCodepoint>,
         payload: &[u8],
         now: Instant,
+        from_established_socket: bool,
     ) {
         Stats::bump(&self.stats.received);
-        let from_turn =
-            !self.turn_servers.is_empty() && self.turn_servers.contains(&classify::canonical(src));
+        let canonical_src = classify::canonical(src);
+        let from_turn = !self.turn_servers.is_empty() && self.turn_servers.contains(&canonical_src);
         let verdict = classify(payload, from_turn);
         let (lane, budget) = match verdict {
             Verdict::Drop(_) => {
                 Stats::bump(&self.stats.dropped_classify);
                 return;
             }
+            Verdict::Rtc if classify::is_stun(payload) => (Lane::Rtc, Budget::Stun),
             Verdict::Rtc => (Lane::Rtc, Budget::None),
             Verdict::Quic(QuicKind::VersionNegotiationTrigger) => {
                 (Lane::Quic, Budget::VersionNegotiation)
@@ -840,24 +1171,51 @@ impl Dispatcher {
             Lane::Quic => (&self.quic, &self.quic_established),
             Lane::Rtc => (&self.rtc, &self.rtc_established),
         };
-        // A TURN server we allocated on is validated by configuration.
-        // A VN trigger always pays its budget: no validated peer needs one.
-        let is_established =
-            budget != Budget::VersionNegotiation && (from_turn || established.contains(src));
-        let queue = if is_established {
-            &tx.established
-        } else {
+        // A TURN server we allocated on is validated by configuration. The
+        // exact set decides, whichever socket the datagram arrived on: the
+        // steering hash may collide, the set cannot.
+        let is_established = from_turn || established.contains(src);
+        if from_established_socket && !is_established {
+            Stats::bump(&self.stats.steered_unverified);
+        }
+        // Issue #325: a VN-shaped datagram (first byte 128-191, zero version)
+        // from an unvalidated source is not RTP anyone sends before ICE.
+        if lane == Lane::Rtc && !is_established && classify::is_vn_shaped_rtp(payload) {
+            Stats::bump(&self.stats.dropped_classify);
+            return;
+        }
+        let admitted = match budget {
+            // A VN trigger always pays its budget: no validated peer needs one.
+            Budget::VersionNegotiation => self.limiter.admit(src, budget, now).map(|()| false),
+            // Issue #325: the address is spoofable, so an Initial always pays
+            // the handshake and global budgets, established source or not.
+            Budget::Initial if is_established => {
+                self.limiter.admit_initial_established(now).map(|()| false)
+            }
+            _ if is_established => {
+                if !self.peers.admit(canonical_src, now) {
+                    Stats::bump(&self.stats.dropped_established_peer);
+                    return;
+                }
+                Ok(true)
+            }
             // New-flow limits run before the datagram is copied anywhere.
-            if let Err(refusal) = self.limiter.admit(src, budget, now) {
+            _ => self.limiter.admit(src, budget, now).map(|()| false),
+        };
+        let queue = match admitted {
+            Ok(true) => &tx.established,
+            Ok(false) => &tx.new,
+            Err(refusal) => {
                 Stats::bump(match refusal {
                     Refusal::PerSource => &self.stats.dropped_per_source,
                     Refusal::Global => &self.stats.dropped_global,
                     Refusal::VersionNegotiation => &self.stats.dropped_vn,
                     Refusal::Initial => &self.stats.dropped_initial,
+                    Refusal::StunPerSource => &self.stats.dropped_stun_per_source,
+                    Refusal::StunGlobal => &self.stats.dropped_stun_global,
                 });
                 return;
             }
-            &tx.new
         };
         let datagram = Datagram {
             src,
@@ -875,6 +1233,95 @@ impl Dispatcher {
                 Stats::bump(&self.stats.dropped_no_consumer);
             }
         }
+    }
+}
+
+fn gauge(counter: &AtomicU64, value: usize) {
+    counter.store(u64::try_from(value).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// Recompile and attach the steering program when an established set
+/// changes. Off the data plane: it runs on the front-door runtime, debounces,
+/// snapshots both sets (bounded by their caps), compiles one program (bounded
+/// by [`STEERING_MAX_PEERS`]) and attaches it with one `setsockopt`; the
+/// kernel swaps it atomically. A failed attach keeps the previous program.
+async fn steering_updater(
+    socket: Arc<SharedSocket>,
+    stats: Arc<Stats>,
+    quic: Arc<EstablishedSet>,
+    rtc: Arc<EstablishedSet>,
+    turn_servers: Vec<SocketAddr>,
+) {
+    gauge(&stats.steered_peers, turn_servers.len());
+    let mut last_warn: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            () = quic.changed() => {}
+            () = rtc.changed() => {}
+        }
+        tokio::time::sleep(STEERING_DEBOUNCE).await;
+        let peers = quic
+            .snapshot()
+            .into_iter()
+            .chain(rtc.snapshot())
+            .chain(turn_servers.iter().copied());
+        let set = ProgramSet::build(steering::random_salt(), peers);
+        match socket.attach(&set) {
+            Ok(()) => {
+                gauge(&stats.steered_peers, set.steered());
+                gauge(&stats.steering_overflow, set.overflow());
+                Stats::bump(&stats.steering_updates);
+            }
+            Err(e) => {
+                Stats::bump(&stats.steering_update_errors);
+                if last_warn.is_none_or(|t| t.elapsed() >= WARN_INTERVAL) {
+                    last_warn = Some(Instant::now());
+                    tracing::warn!(
+                        error = %e,
+                        peers = set.steered(),
+                        "front door: steering update failed; the previous program stays"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Sample the kernel receive drops of both sockets every
+/// [`KERNEL_DROP_SAMPLE`] into the stats gauges, and warn (at most once per
+/// 10 s) when they grow.
+async fn kernel_drop_sampler(socket: Arc<SharedSocket>, stats: Arc<Stats>) {
+    let (listener, established) = socket.inodes();
+    let mut tick = tokio::time::interval(KERNEL_DROP_SAMPLE);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = (0u64, 0u64);
+    let mut last_warn: Option<Instant> = None;
+    loop {
+        tick.tick().await;
+        // procfs read on the blocking pool, never on a worker.
+        let Ok(Ok(table)) =
+            tokio::task::spawn_blocking(|| std::fs::read_to_string("/proc/net/udp6")).await
+        else {
+            continue;
+        };
+        let l = listener
+            .and_then(|i| parse_udp_drops(&table, i))
+            .unwrap_or(0);
+        let e = established
+            .and_then(|i| parse_udp_drops(&table, i))
+            .unwrap_or(0);
+        stats.kernel_drops_listener.store(l, Ordering::Relaxed);
+        stats.kernel_drops_established.store(e, Ordering::Relaxed);
+        if (l > last.0 || e > last.1) && last_warn.is_none_or(|t| t.elapsed() >= WARN_INTERVAL) {
+            last_warn = Some(Instant::now());
+            tracing::warn!(
+                listener_drops = l,
+                established_drops = e,
+                "front door: the kernel dropped UDP datagrams (receive queue full); see \
+                 docs/runbooks/udp-443-flood.md"
+            );
+        }
+        last = (l, e);
     }
 }
 

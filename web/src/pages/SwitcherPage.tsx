@@ -17,8 +17,14 @@ import { OperationFeedback } from '../components/broadcast/OperationFeedback';
 import { switcherOperationEvidence } from '../realtime/operationEvidence';
 import { isBackendUnavailable, newIdempotencyKey } from '../api/operations';
 import { useJpegPreview } from '../preview/useJpegPreview';
+import { getPatch, planPatch, takePatch } from '../api/patch';
+import type { PatchRequest } from '../api/patch';
+import { MixerInputBank } from '../components/switcher/MixerInputBank';
 
 const STATE_KEY = ['switcher', 'me1'] as const;
+const PATCH_KEY = ['patch'] as const;
+/** A select or take; a select by mixer input carries `input`, not `source`. */
+type Intent = SwitcherAction | { readonly action: 'select_preview' | 'select_program'; readonly input: number };
 function SwitcherMonitor({ bus, path }: { readonly bus: string; readonly path: string }): JSX.Element {
   const src = useJpegPreview(path, 1000, bus === 'PGM');
   return (
@@ -38,6 +44,9 @@ export function SwitcherPage(): JSX.Element {
   const submitTracked = useSubmitTrackedOperation();
   const state = useQuery({ queryKey: STATE_KEY, queryFn: () => getSwitcher(), retry: false });
   const sources = useSources();
+  // No mixer block (no inputs declared, or not readable): today's page unchanged.
+  const patch = useQuery({ queryKey: PATCH_KEY, queryFn: () => getPatch(), retry: false });
+  const mixer = patch.data?.mixer.find((m) => m.me === 'me1');
   const [selected, setSelected] = useState('');
   const [duration, setDuration] = useState('25');
   const [operationId, setOperationId] = useState<string | undefined>();
@@ -52,16 +61,21 @@ export function SwitcherPage(): JSX.Element {
       setFailureReason(evidence.reason);
     }
     void queryClient.invalidateQueries({ queryKey: STATE_KEY });
+    void queryClient.invalidateQueries({ queryKey: PATCH_KEY });
   }, undefined, () => {
     void queryClient.invalidateQueries({ queryKey: STATE_KEY });
+    void queryClient.invalidateQueries({ queryKey: PATCH_KEY });
   }), [queryClient, operationId]);
   const mutate = useMutation({
-    mutationFn: async (action: SwitcherAction) => {
-      const source = action === 'select_program' || action === 'select_preview' ? selected : undefined;
+    mutationFn: async (intent: Intent) => {
+      const action = typeof intent === 'string' ? intent : intent.action;
+      const input = typeof intent === 'string' ? undefined : intent.input;
+      const source = input === undefined && (action === 'select_program' || action === 'select_preview') ? selected : undefined;
       const durationFrames = action === 'auto' ? Number(duration) : undefined;
       const req: SwitcherRequest = {
         me: 'me1', program: 'main', action,
         ...(source === undefined ? {} : { source }),
+        ...(input === undefined ? {} : { input }),
         ...(durationFrames === undefined ? {} : { duration_frames: durationFrames }),
       };
       await planSwitcher(req);
@@ -75,9 +89,25 @@ export function SwitcherPage(): JSX.Element {
     },
     onError: (reason: Error) => { setError(reason.message); },
   });
+  const repatch = useMutation({
+    mutationFn: async (request: PatchRequest) => {
+      const plan = await planPatch(request);
+      const refusal = plan.crosspoints.find((xp) => xp.refusal !== null && xp.refusal !== undefined)?.refusal;
+      if (!plan.can_take) throw new Error(refusal?.detail ?? t`The patch cannot be taken`);
+      // The tracker keys on the operation id; `kind` names the verb.
+      return submitTracked(async () => ({ ...(await takePatch(request, { idempotencyKey: newIdempotencyKey() })), kind: 'patch.take' }),
+        { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
+    },
+    onSuccess: (result) => {
+      setOperationId(result.operationId);
+      setFailureReason(undefined);
+      setError(undefined);
+    },
+    onError: (reason: Error) => { setError(reason.message); },
+  });
   // Unknown (including unobserved/replay) is not permission to take again.
   const settled = operation?.phase === 'applied' || operation?.phase === 'failed';
-  const ready = state.data !== undefined && (operationId === undefined || settled) && !mutate.isPending;
+  const ready = state.data !== undefined && (operationId === undefined || settled) && !mutate.isPending && !repatch.isPending;
   return (
     <main className="space-y-5 p-4">
       <PageHeader title={t`Program / Preview switcher`} />
@@ -96,7 +126,14 @@ export function SwitcherPage(): JSX.Element {
         <SwitcherMonitor bus="PGM" path="/api/v1/preview/program.jpg" />
         <SwitcherMonitor bus="PVW" path="/api/v1/preview/switcher/me1/preview.jpg" />
       </div>
-      <div className="flex flex-wrap items-end gap-3">
+      {mixer !== undefined && <MixerInputBank
+        mixer={mixer}
+        sources={sources.data ?? []}
+        disabled={!ready}
+        onSelect={(action, input) => { mutate.mutate({ action, input }); }}
+        onRepatch={async (request) => { await repatch.mutateAsync(request).catch(() => undefined); }}
+      />}
+      {mixer === undefined && <div className="flex flex-wrap items-end gap-3">
         <div className="space-y-1"><Label htmlFor="switcher-source"><Trans>Source</Trans></Label>
           <select id="switcher-source" className="rounded border bg-background p-2" value={selected} disabled={!ready} onChange={(event) => { setSelected(event.target.value); }}>
             <option value="">{t`Choose a source`}</option>
@@ -105,6 +142,8 @@ export function SwitcherPage(): JSX.Element {
         </div>
         <Button disabled={!ready || selected === ''} onClick={() => { mutate.mutate('select_preview'); }}><Trans>Select PVW</Trans></Button>
         <Button disabled={!ready || selected === ''} onClick={() => { mutate.mutate('select_program'); }}><Trans>Punch PGM</Trans></Button>
+      </div>}
+      <div className="flex flex-wrap items-end gap-3">
         <Button disabled={!ready} onClick={() => { mutate.mutate('cut'); }}><Trans>Cut</Trans></Button>
         <div className="space-y-1"><Label htmlFor="switcher-duration"><Trans>Auto frames</Trans></Label><Input id="switcher-duration" type="number" min="1" max="1000" value={duration} onChange={(event) => { setDuration(event.target.value); }} /></div>
         <Button disabled={!ready || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { mutate.mutate('auto'); }}><Trans>Auto</Trans></Button>

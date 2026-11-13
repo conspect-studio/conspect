@@ -126,6 +126,13 @@ Every lane has two bounded queues, *established* and *new*, and drains establish
   flows never consult it. A global new-flow budget sits on top (a per-second cap on all new-flow
   datagrams), so a spoofed or distributed flood is bounded in userspace work even though no
   per-source key can stop it.
+* **What the established path still charges (slice 3, issue #325).** The established set is keyed
+  on the remote address, which an off-path spoofer can forge if it knows a viewer's exact IP and
+  port. So the bypass is not total: a supported-version Initial always pays the Initial and global
+  budgets (VN triggers always pay theirs), every established peer has its own generous token
+  bucket (20 000/s, burst 4 000) so one spoofed 4-tuple cannot take the whole established queue,
+  and a Version Negotiation shape in the RTP range (first byte 128-191, zero version) is dropped
+  from any source that is not established. The residual risk is stated in "Slice 3 as built".
 
 ### Stateless replies the endpoint can be made to send
 
@@ -134,7 +141,7 @@ Every lane has two bounded queues, *established* and *new*, and drains establish
 | QUIC Version Negotiation | long header with an unsupported version | noq answers unconditionally and RFC 9000's 3x anti-amplification limit does **not** apply (no connection exists). The dispatcher reads the version field (bytes 1-4) and only passes unsupported-version packets of at least 1200 bytes (RFC 9000 section 14.1: clients pad Initials) through the new-flow bucket and a global VN budget; the reply is about 60 bytes, so the factor is below 1 |
 | QUIC Retry | Initial when more than `retry_above_handshakes` are pending | Retry is smaller than the Initial; the token proves the address on the next Initial |
 | QUIC stateless reset | short header for an unknown CID | `EndpointConfig::min_reset_interval` is **one interval for the whole endpoint**, not per peer (moq-noq-proto `endpoint.rs`). The front door sets it explicitly (200 ms) and only lets unknown short headers through the new-flow bucket. A flood can still occupy the interval; the cost is that a client whose connection died (engine restart) learns it at its idle timeout (30 s) instead of at once, and the MoQ client then reconnects. Accepted and stated |
-| STUN Binding response | Binding Request | str0m answers only for a live session's ufrag with a valid MESSAGE-INTEGRITY (`ice/agent.rs` `accepts_message`), so a spoofed request draws nothing |
+| STUN Binding response | Binding Request | str0m answers only for a live session's ufrag with a valid MESSAGE-INTEGRITY (`ice/agent.rs` `accepts_message`), so a spoofed request draws nothing. Since slice 3 a well-formed STUN message from a non-established source also pays its own per-source (50/s, burst 50) and global (5 000/s) STUN budgets before reaching str0m |
 
 Batching: `UdpSocketState::recv` reads up to 32 messages per syscall with GRO (64 segments on the
 spike host). Sends use GSO through `UdpSocketState::send`. These are pure Rust (`moq-noq-udp`,
@@ -380,9 +387,8 @@ never on pull requests.
 
 ### Slice 5 engine as built (PR A)
 
-Library only, behind the off-by-default `acme` feature of `multiview-control` (forwarded by
-`multiview-cli`, in no preset yet); boot wiring, the `multiview tls` CLI and the setup routes are
-PR B.
+Library, behind the `acme` feature of `multiview-control` (forwarded by `multiview-cli`); boot
+wiring, the `multiview tls` CLI and the setup routes are PR B (next section).
 
 * Files: `crates/multiview-control/src/acme/{mod,egress,dns,cloudflare,store,engine}.rs`. instant-acme
   0.8.5 is built without its `hyper-rustls` client; the engine supplies the HTTP client. No OpenSSL.
@@ -410,7 +416,98 @@ PR B.
   of the lifetime ±(lifetime/30, at most one day); failures back off 15 min doubling to 6 h, never
   under 60 s. Alarm: while renewal fails, under 50 % of the lifetime left = warning, under 25 % =
   critical; past `notAfter` = expired (still served). `CertificateStatus` carries `alarm`,
-  `renewal_due_at`, `next_attempt_at`; an optional hook lets PR B feed the alarm store.
+  `renewal_due_at`, `next_attempt_at`; an optional hook feeds the alarm surface (PR B: the
+  `tls-certificate` health warning).
+
+### Slice 5 setup, boot wiring and CLI as built (PR B)
+
+Operator runbook: [acme-certificates.md](../runbooks/acme-certificates.md).
+
+* The `acme` feature is in the `nvidia`, `apple`, `linux-vaapi` and (through them) `full` presets.
+  A config with `[network.tls]` in a build without it is a startup error, and `multiview validate`
+  reports it.
+* Boot (`crates/multiview-cli/src/tls_boot.rs`) runs before the control plane binds and never on
+  the clock path:
+  * a bootstrap certificate is created; its key is written 0600 and its fingerprint logged;
+  * `AcmeCertificateSource` + `ChallengeResolver` are built;
+  * `AcmeService` starts. A stored valid certificate is installed first; otherwise issuance starts
+    at once. The bootstrap certificate is rotated every 6 days on the service thread while in
+    setup;
+  * a one-time setup code is printed on stderr (journal) only, never through `tracing`, so the
+    `GET /api/v1/logs` ring never holds it.
+* The DNS provider re-reads its credential at the start of every attempt. A credential missing at
+  boot keeps the engine in setup (`credential-missing: NAME` in the status reasons), and
+  `multiview tls set-credential` + `issue` then completes without a restart.
+* Alarms reuse the health-warning surface the UI already shows (`GET /api/v1/health`): new code
+  `tls-certificate`, severity warning or critical (expired = critical). It is raised and cleared
+  through the engine's drop-oldest event lane by the engine's alarm hook. The `alarm_store` was not
+  used: its records are media-timeline X.733 alarms keyed by probes, while health warnings are the
+  latched, coalescing, remediation-carrying surface this is.
+* `multiview_control::tls_setup` (`acme`, unix):
+  * `front_door_router(state)` is the control router behind the setup gate. The slice-4 TCP door
+    serves it (see "Slice 4 and slice 5 together as built" below). In `setup`, only these answer:
+    * `GET /tls-setup` (a self-contained page with a CSP, the fingerprint and "Issue now", and no
+      secret input);
+    * `GET /api/v1/tls/status`;
+    * `POST /api/v1/tls/setup/session`;
+    * `POST /api/v1/tls/issue`;
+    * `GET /` → `303 /tls-setup`.
+
+    Everything else is `503` `/problems/tls-setup-required` with `Retry-After: 30`, and HSTS is
+    stripped. In `serving` the gate is one read of the source state.
+  * Setup codes are 8 BIP-39 words, valid 1 h, single use, compared in constant time. Sessions are
+    32 random bytes in an `HttpOnly; Secure; SameSite=Strict` cookie, valid 1 h and only in setup.
+    5 failures per source (IPv6 /64) in 15 min lock it for 15 min. The LRU table holds 4096 entries.
+  * The admin listener (`[control] listen`, not gated) carries `GET /api/v1/tls/status` and three
+    routes that require a loopback TCP peer AND an admin principal: `POST setup-code`,
+    `POST credential` (a name referenced by the config, written to `secrets/<NAME>` 0600, 8 KiB
+    cap, never logged or echoed) and `POST issue`. The front door never mounts these.
+* `multiview tls status | setup-code | set-credential NAME | issue` talk HTTP/1.1 to the loopback
+  admin listener; `[::]` is dialled as `[::1]` and any other address is refused. `status` and
+  `set-credential` work offline from `state_dir`.
+* QUIC: with `[network.tls]` and `network.https_port`, the front-door QUIC lane is taken at start
+  and held. A control-plane task waits on `subscribe()` (cancelled at shutdown), then starts MoQ
+  with `Runtime::listen_resolver_on` and a `SourceResolver` over the ACME source. This uses a new
+  opt-in `resolver` field on vendored `moq-tokio`'s `Listen`, recorded in
+  `vendor/MOQ-DELIVERY-PROVENANCE.md`. Until then the MoQ provider is unavailable (honest `503`).
+  The `MULTIVIEW_MOQ_CERTIFICATE` files are not used on the front door with `[network.tls]`.
+  Without `[network.tls]` nothing changes.
+* The setup page does not choose the CA, challenge or names, unlike the "lets an authenticated
+  operator choose CA, challenge and domain names" wording above. They come from `[network.tls]`
+  only, so the TOML stays the single source of truth and recovery needs no browser. The page shows
+  them and starts issuance.
+* PR B was written before slice 4 merged; the door wiring below closes that gap.
+
+### Slice 4 and slice 5 together as built (TCP door with ACME)
+
+Slice 4 merged first (#328), so slice 5 PR B wires the ACME source into its TCP door
+(`crates/multiview-cli/src/control.rs` `attach_front_door_site`, `frontdoor.rs` `install_site`):
+
+* The TCP door needs `network.mode` (and `https_port`). `[network.tls]` without `mode` has no
+  door, and the boot warns that the setup page and TLS-ALPN-01 are unreachable from outside.
+* Site TLS (section 4 `site`): `site_server_config` over the ACME `CertificateSource` (ALPN
+  `http/1.1`, a `SourceResolver` read per handshake), so `setup` serves the bootstrap certificate
+  and `serving` the issued one; an `install` or renewal reaches the next handshake with no
+  restart. `[network.tls]` wins over `[control.tls]` for the door; with both, a warning is logged
+  and the `[control] listen` listener keeps its own static TLS unchanged.
+* `TlsRouting.acme` (section 4 ALPN exactly `acme-tls/1`): `acme_challenge_server_config`, a
+  rustls config with ALPN exactly `acme-tls/1` over the `ChallengeResolver`, so TLS-ALPN-01 is
+  answered on the door in both states. The `TODO(#291)` is gone.
+* The door's router is `tls_setup::front_door_router_with` (the control router plus the HLS
+  mounts, behind the setup gate). Without `[network.tls]` the door keeps slice 4's ungated router
+  on the `[control.tls]` certificate. The `[control] listen` listener stays the ungated admin
+  listener. `router_with` starts the routing relay and the metrics sampler only for the admin
+  surface, so building the door router does not start them twice.
+* `TlsContext.behind_proxy` follows `network.mode = "behind_proxy"`, so `tls status` reports the
+  section 5a TLS-ALPN-01 hint.
+* The real client address: the door hands `SiteService::serve` the PROXY v2 source address in
+  `behind_proxy` mode (the TCP peer in `direct`), and `ConnectionServer` installs it as
+  `ConnectInfo`. The setup-code limiter and session log read that `ConnectInfo`, so they key on
+  the real client, never the proxy. The session cookie is `Secure`, which is correct on the door.
+* Test: `crates/multiview-cli/tests/tls_door.rs` runs the real front door with a TCP door on
+  `[::1]` and a dead CA: bootstrap certificate and the 503 gate, status without HSTS, the RFC 8737
+  challenge certificate (acmeIdentifier extension) for an `acme-tls/1`-only hello, the swap after
+  `install` and the open gate, and in `behind_proxy` the limiter keyed per PROXY v2 source.
 
 ### Changes to #167-#172
 
@@ -530,7 +627,7 @@ supported as `[network] mode = "behind_proxy"`:
 
 | Target | How 80/443 are bound |
 | --- | --- |
-| Linux systemd (mda001) | systemd socket activation: `conspect.socket` with `ListenStream=[::]:443`, `ListenStream=[::]:80`, `ListenDatagram=[::]:443`, `BindIPv6Only=both`, `ReceiveBuffer=8M`, `FileDescriptorName=` per socket. The service keeps `User=operations` and needs no capability. Fallback: `AmbientCapabilities=CAP_NET_BIND_SERVICE` when started without the socket unit |
+| Linux systemd (mda001) | systemd socket activation: `conspect.socket` with `ListenStream=[::]:443`, `ListenStream=[::]:80`, `ListenDatagram=[::]:443` twice with `ReusePort=yes` (the validated-flow steering pair, as built in slice 6), `BindIPv6Only=both`, `ReceiveBuffer=8M`; sockets are matched by type and port, so no `FileDescriptorName=` is needed. The service keeps `User=operations` and needs no capability. Fallback: `AmbientCapabilities=CAP_NET_BIND_SERVICE` when started without the socket unit |
 | Restarts | with socket activation the sockets survive an engine restart: the kernel queues TCP SYNs (backlog) and UDP datagrams (rcvbuf) while the engine restarts, so a browser's retry lands on the new process instead of a refused port. QUIC connections still die with the process (keys are in memory); clients reconnect |
 | Container | `--cap-add NET_BIND_SERVICE` is not needed in Docker when the container runs as root inside its namespace. Rootless: `net.ipv4.ip_unprivileged_port_start=443` in the container sysctls, or map host 443 to 8443. `deploy/compose.yaml` publishes `443/tcp`, `443/udp`, `80/tcp` |
 | macOS | reported to allow unprivileged binds below 1024 since macOS 10.14 (unverified: no primary Apple source found); launchd `Sockets` can pass the sockets in either way. The office matrix checks it on mst001 before slice 4 closes |
@@ -583,7 +680,7 @@ challenge = "dns-01"             # "dns-01" | "tls-alpn-01"
 domains = ["mda001.example.net"] # SANs; IP literals allowed with tls-alpn-01 (Let's Encrypt short-lived)
 contact_email = "ops@example.net"
 acme_profile = "shortlived"      # used only when the directory advertises it
-state_dir = "/var/lib/conspect/tls"  # 0700; account.<host>-<hash>.json, active.pem/.json, pending-txt.json, bootstrap
+state_dir = "/var/lib/conspect/tls"  # 0700; account.<host>-<hash>.json, active.pem, pending-txt.json, bootstrap.key, secrets/
 [network.tls.dns]
 provider = "cloudflare"
 token_env = "CLOUDFLARE_API_TOKEN"   # Zone:DNS:Edit + Zone:Zone:Read (recommended)
@@ -689,8 +786,8 @@ What S6 and S7 mean for the design:
   anything. Three layers, in order of strength:
   1. **Separate queues for validated flows.** Once a WebRTC 4-tuple is ICE-connected or a QUIC
      connection is confirmed, its packets are steered to a second socket in the same
-     `SO_REUSEPORT` group by a CBPF/eBPF program keyed on the established 4-tuple set (moq-tokio
-     already ships a CBPF steering filter for QUIC CIDs, `vendor/moq-tokio/src/noq.rs:918`). A flood
+     `SO_REUSEPORT` group by a classic BPF program keyed on the established source addresses
+     (built in slice 3: CBPF, not eBPF, see "Slice 3 as built"). A flood
      of unvalidated traffic then fills the listener queue, not the one paying viewers use. This is
      the only layer that also works against spoofed and distributed floods. Linux only; other
      platforms keep one queue (stated as a platform limit).
@@ -700,7 +797,8 @@ What S6 and S7 mean for the design:
      absent). Honest limit: it stops a real source, not a spoofed one (it depends on BCP 38 at the
      attacker's network) and not a botnet.
   3. **Buffer sizing.** systemd `ReceiveBuffer=8M` (`SO_RCVBUFFORCE`, which bypasses `rmem_max`);
-     the engine logs when the kernel clamps its request.
+     the engine itself tries `SO_RCVBUFFORCE` first (works with `CAP_NET_ADMIN`), falls back to
+     `SO_RCVBUF`, reads the result back and warns when the usable size is below the request.
   Beyond these, a volumetric attack is an upstream (network/DDoS-provider) problem; the engine's job
   is that it cannot be turned into an amplifier and that its own state stays bounded.
 * **Output clock exposure is real and must be designed out, not explained away.** The production
@@ -714,8 +812,8 @@ What S6 and S7 mean for the design:
   front door (UDP dispatcher, QUIC endpoint, h3 and router handlers it serves, TCP door, TURN) runs on
   **its own Tokio runtime** with a fixed, small worker count (`network.workers`, default 2), started
   on its own OS threads. It never runs on the runtime that drives programs. Slice 1 creates that
-  runtime. Slice 3's chaos suite measures tick lateness with a flood running, on the engine's real
-  clock, and fails on any "ticks behind" increase. Moving the program clock itself onto a dedicated
+  runtime. Slice 3's chaos suite runs the engine's real clock with a flood running and fails on any
+  repeat or slip that a whole-process stall does not explain (the stall witness, issue #321). Moving the program clock itself onto a dedicated
   thread is outside this design; the dedicated front-door runtime removes the front door from that
   question.
 
@@ -766,16 +864,20 @@ How the UI skips a dead rung fast:
 * **#10, every structure bounded, nothing cleared by an attacker.** Dispatcher lanes (1024
   established + 256 new per lane, `try_send`, drop); the established 4-tuple set (bounded by session
   and connection caps, written only after validation, entries removed with their session); source
-  buckets (16 384, LRU eviction, never a global clear); a global new-flow budget; ICE-TCP
+  buckets (16 384, LRU eviction, never a global clear); a global new-flow budget; per-source STUN
+  buckets (16 384, LRU) and a global STUN budget; per-established-peer buckets (bounded by the
+  established-set caps); one steering program at a time (at most 1 244 peers, 4 096 instructions);
+  the sender-waker list (1 024, overflow wakes every held waker); ICE-TCP
   per-connection out queue (256) and read buffer (one RFC 4571 frame, 65 535 bytes); TCP per-IP and
   global connection caps at accept; QUIC `max_connections` and per-connection stream limits; h3
   `max_field_section_size`; TURN allocations (one per lease, 4 per source, global cap). Nothing
   awaits a client: UDP sends are non-blocking (`try_send_to` / noq's `UdpSender`); TCP writes run in
   the per-connection task, fed by a bounded queue with `try_send`.
 * **Amplification.** Before address validation noq applies the 3x limit (RFC 9000 section 8.1);
-  Retry above `retry_above_handshakes`; Version Negotiation and stateless reset are rate-limited as
-  in section 3 (the 3x limit does not cover them); STUN answers only an authenticated Binding
-  Request (str0m); TURN's pre-auth reply is a 401 no larger than the request, with no state.
+  Retry above `retry_above_handshakes` (wired in slice 3's PR B); Version Negotiation and stateless
+  reset are rate-limited as in section 3 (the 3x limit does not cover them); STUN answers only an
+  authenticated Binding Request (str0m); TURN's pre-auth reply is a 401 no larger than the request,
+  with no state. `tests/amplification.rs` measures all three QUIC shapes against a real endpoint.
 
 ## 14. Test plan
 
@@ -847,6 +949,125 @@ does not block 1-3. Public UDP 443 opens only after slice 3. 6, 7, 8 depend on 4
 * Shutdown: the daemon drops the front door last, after the control-plane drain, with a
   bounded `shutdown_timeout` (2 s) on a blocking-pool thread, so the socket is closed when
   teardown returns.
+
+### Slice 3 as built, part A: flood hardening in `multiview-frontdoor` (issues #289, #321, #325)
+
+**Validated-flow steering (Linux).** `FrontDoorConfig::steering` (default `true`).
+
+* Group: two dual-stack UDP sockets on the same `[::]:port`, both `SO_REUSEPORT`, created in a
+  fixed order so the kernel group index is known: the **listener** first (index 0: every
+  unvalidated datagram, and every send), then the **established** socket (index 1). With port 0
+  the listener's ephemeral port is read back and the established socket binds it.
+  `steering::ReuseportGroup` is that pair, public so tests exercise the kernel mechanism directly.
+* Program: classic BPF via `SO_ATTACH_REUSEPORT_CBPF` (on the listener; it applies to the group).
+  CBPF needs no `CAP_BPF`/`CAP_SYS_ADMIN` and works with `kernel.unprivileged_bpf_disabled=1`. The
+  program sees `skb->data` at the UDP payload, so every header field is read through `SKF_NET_OFF`:
+  IP version nibble; IPv4 source address and (after the IHL, `ldxb msh`) source port; IPv6 only
+  when the next header is UDP (an extension header goes to the listener), the four address words
+  and the port. A load that fails returns 0 (listener). It returns 1 when the source's key is in
+  the set.
+* Key and lookup: a 32-bit hash of a family tag, the address words and the port, salted with a
+  fresh random value per program (std `RandomState`), computed identically in userspace and in
+  CBPF (xor, mul, rsh; 32-bit wrapping). IPv4-mapped peers hash as IPv4, since an IPv4 datagram on
+  the dual-stack socket carries an IPv4 header. The sorted keys form a balanced binary search
+  (`jeq`/`jgt`, with a 32-bit `ja` to each right subtree). The program length depends only on the
+  number of keys; `STEERING_MAX_PEERS` = 1 244 is the largest set that fits `BPF_MAXINSNS` (4 096;
+  2 379 instructions at the cap), checked on both sides by a unit test. Peers beyond the cap stay
+  on the listener (served through the new-flow path and their per-peer bucket) and are counted
+  (`steering_overflow`).
+* Collisions: a non-member whose salted hash equals a member's only shares the established queue.
+  The dispatcher checks the exact `EstablishedSet` for every datagram from either socket; a
+  non-member read from the established socket pays the new-flow limits like any other new flow
+  and is counted (`steered_unverified`).
+* Update path, off the data plane: `EstablishedSet` bumps a generation and notifies on every
+  insert that adds an address and every remove that deletes one. A steering-updater task on the
+  front-door runtime waits for either set, debounces 20 ms, snapshots both sets (QUIC and WebRTC
+  peers in one program) plus the configured TURN servers, compiles and attaches with one
+  `setsockopt` (the kernel swaps the program under RCU). The dispatcher never compiles or
+  attaches. A failed attach keeps the previous program and counts `steering_update_errors`
+  (warning at most every 10 s).
+* Dispatcher: one task, sole owner of the limiter. It waits for either socket and drains the
+  established socket first (the per-wake budget of 1 024 datagrams covers both), then the
+  listener.
+* Fallback: if the pair cannot be created (second socket, `SO_REUSEPORT`) or the first attach
+  fails, the door runs one socket on the same port; off Linux it always does.
+  `FrontDoor::steering()` reports `ReuseportCbpf` or `SingleSocket { reason }`, logged at start
+  (info when active or disabled by configuration, warn for a fallback on Linux).
+* Group membership: the kernel lets a socket join a reuseport group only with the same effective
+  uid as the group, so only a process running as the engine's own user could take a share of the
+  traffic. Run the engine as a dedicated user.
+* Residual risk (issue #325): steering and the established bypass are keyed on the source address
+  and port. An off-path spoofer that knows a viewer's exact IP and port lands in the established
+  kernel queue and shares it with that viewer; its userspace share is bounded by the viewer's
+  per-peer bucket (20 000/s, burst 4 000; `dropped_established_peer`), its Initials still pay the
+  Initial and global budgets, and it cannot reach any other viewer's queue position. A key a
+  spoofer cannot forge (QUIC connection ID, ICE-validated 5-tuple in the kernel) is not used:
+  connection IDs are not visible to CBPF for WebRTC, and the address key keeps one program for
+  both lanes.
+
+**STUN caps.** `Budget::Stun` for a well-formed STUN message from a non-established source:
+per-source 50/s burst 50 (an ICE agent paces checks at Ta >= 50 ms per pair) in its own bounded
+LRU (same `max_sources` cap and key) and a global 5 000/s, both checked before the generic
+per-source and global buckets, so a refused STUN message spends nothing else. Established peers
+(consent freshness) never pay it. Counters `dropped_stun_per_source`, `dropped_stun_global`.
+
+**Receive buffers.** Each socket tries `SO_RCVBUFFORCE` first, then `SO_RCVBUF`, reads back, and
+reports `usable` (Linux: half of what `getsockopt` returns). A warning names the request, the
+grant, `net.core.rmem_max` and the fix (`docs/runbooks/udp-443-flood.md`, slice 3 PR B).
+`FrontDoor::buffer_report()` returns the shallower of the pair.
+
+**Kernel drops.** A sampler task reads `/proc/net/udp6` every second (dual-stack sockets are
+listed there), matches each socket's inode (`/proc/self/fd/<fd>`) and stores the `drops` column in
+`kernel_drops_listener` / `kernel_drops_established`, warning at most every 10 s when they grow.
+Off Linux the gauges stay 0 and `kernel_drops_supported()` is false.
+
+**Other #325 fixes.** Supported-version Initials always pay the Initial and global budgets (also
+from established addresses); per-established-peer buckets as above; a QUIC VN shape in the RTP
+range from a non-established source is dropped (0x80 RTP is not affected; an established peer's
+datagram is never touched); the sender-waker list is capped at 1 024 (a full list wakes every held
+waker and restarts, so no sender is ever left parked).
+
+**Chaos suite.** `multiview_frontdoor::flood` (shapes, sources: one, many IPv4 loopback, rotating
+IPv6 /64s via `IPV6_FREEBIND`) drives `tests/chaos_flood.rs`, the steering and amplification
+tests, and `examples/udp443_flood.rs` (the second-host tool: `--target --pps --secs --threads
+--sources --shapes`). Chaos arms: idle; door on with an established MoQ viewer under each flood kind
+(one source, many IPv4 sources, rotating /64s); door off with the many-source flood. Per arm: tick
+count within 2, every PTS exactly `MediaTime::from_tick(index)` with consecutive indices, on Linux
+zero unexplained repeats (absolute, every arm), viewer >= 95% of groups, RSS bound, and with steering the viewer's datagrams
+read from the established socket.
+
+**The #321 stall witness.** The slice-1 suite asserted `repeats == 0` on every arm, which asserted
+that the CI host never stalls the process for more than a period (macOS run 43192931229: one
+~104 ms whole-process stall, three last-good repeats, door off). The clock absorbs such a stall by
+design (ADR-T018). The witness is a std thread that sleeps 1 ms in a loop on the clock's own time
+base and records every sleep that took at least 5 ms, stamped inside the sleep (clock read just
+before `sleep`, just after it returns), so a gap holds only time the witness was blocked. What
+needs explaining is a repeat (a tick behind, the metric #289 asserts). A repeat is explained only
+when its lateness minus the witness-observed stall time inside its `[deadline, emit]` window is
+under one period: without the time the process was seen not running, it would not have been
+behind. The excuse is proportional, never a pass for any overlap. The suite asserts zero
+unexplained repeats, absolutely, plus the exact PTS of every tick. `tests/stall_witness.rs`
+records the red case (a SIGSTOP/SIGCONT stall of 150 ms fails the old assertion with 3-4
+repeats), the green case (all of them explained), a pure classifier test on fixed numbers, and
+three controls that must stay unexplained: a 150 ms spin on the program runtime while the process
+runs; a 100 ms program-runtime block immediately followed by a 150 ms SIGSTOP; and a 100 ms block
+under a 20k pps loopback flood (review PR 333). Why proportional, measured: on macOS CI (run
+43324610127) the witness and the clock thread were descheduled at slightly different moments
+(gaps 43.6 and 76.5 ms against repeats 50 and 103 ms late), which a whole-window cover rule
+blamed on the code; the proportional rule explains them and still fails every control.
+**Platform limit (measured).** The witness is judged on Linux only. On macOS CI (run 43331219140)
+it recorded 255-302 gaps of at least 5 ms in a 3 s run with no stall injected, and a 136 ms gap
+while another thread merely spun (headless processes there get coalesced timers), so it can
+neither prove nor excuse a stall. On macOS the chaos suite asserts what the design guarantees on
+any host (one frame per tick, consecutive indices, exact PTS from the tick, the viewer's >= 95 %,
+RSS), prints that ticks behind were not judged, and reports the repeats; the witness-judged
+controls are `cfg(linux)`. The production target (mda001) and the ubuntu CI runner are Linux,
+where the absolute zero-unexplained-repeats assertion runs in every arm. A whole-process stall
+witness cannot see thread-level starvation of the program runtime: on a host oversubscribed 2x
+(60 busy loops on 56 cores) one in six runs showed one such repeat, in the door-off arm as often
+as in a door-on arm; at the build host's normal load (load average 32-76) 10/10 runs had 0
+repeats in every arm. CI runners are not oversubscribed that way; a failure there is a real
+signal to investigate, never to rerun blindly.
 
 ### Slice 4 as built (issue #290)
 
@@ -1012,3 +1233,62 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
   no SNI fail the handshake with no certificate presented; the published name still works).
 * **Not in this PR**: a real-browser ICE-TCP check (browsers gather active TCP candidates
   themselves); the deferred items above other than the str0m consumer.
+
+### Slice 6 as built (issue #292)
+
+The engine serves TCP 443, TCP 80 and UDP 443 on mda001; nginx is removed by the
+[front-door cutover runbook](../runbooks/front-door-cutover.md).
+
+* **Socket activation** (`multiview-frontdoor::activation`, `deploy/systemd/conspect.socket`):
+  `main` adopts `LISTEN_FDS` (`listenfd`, which checks each descriptor's type, sets close-on-exec
+  and clears `LISTEN_PID`/`LISTEN_FDS`) before the Tokio runtime exists, so the environment is
+  never changed while another thread reads it. Each inherited socket is matched to its listener
+  by **type and port** (TCP `tcp_port`/`https_port` = the TCP door, TCP `http_redirect_port` =
+  the redirect, UDP `https_port` = the UDP door); an unmatched socket is logged. Any listener
+  without an inherited socket binds its own, so the non-activated path is unchanged.
+  `FrontDoor::start_with` / `start_tcp_with` / `start_redirect_with` take the inherited sockets.
+* **Deviation, UDP pair**: section 9 had one `ListenDatagram=`. Slice 3a's validated-flow
+  steering needs a `SO_REUSEPORT` pair whose members share an owner, so the unit passes **two**
+  UDP 443 sockets with `ReusePort=yes`, in listener-then-established order (the reuseport group
+  index order); the engine attaches the CBPF program to the inherited pair exactly as to one it
+  bound. One inherited UDP socket runs single-socket (logged with the reason).
+* **Restart window**: the door accepts before the control plane is built; a site `ClientHello`
+  in that window (with activation: every connection the kernel queued during the restart) waits
+  for the site, bounded by the 10 s handshake deadline (`FrontDoor::set_site_pending`), instead
+  of being closed. With no `[control]` nothing waits.
+* **Certificates for the cutover**: `[network] cert_file`/`key_file` give the door its own static
+  certificate without making the loopback admin listener TLS; exclusive with `[network.tls]`.
+  Static pairs (these and `[control.tls]`) are reloaded without a restart: every 30 s each file
+  is opened once, `fstat`ed and read (at most 1 MiB) on the blocking pool; when the stamps
+  (device, inode, size, mtime of the opened file; certbot re-points `live/` symlinks) change, the
+  bytes just read are parsed and key/leaf-checked and swapped into the
+  `StaticCertificateSource` the resolver reads per handshake; a broken pair keeps the old
+  certificate. `[network] acme_webroot` makes the
+  port-80 listener answer `/.well-known/acme-challenge/<base64url token>` from
+  `<webroot>/.well-known/acme-challenge/` (regular files, at most 1 KiB, no symlinks), so certbot
+  `--webroot` renews without nginx. The port-80 listener now reads to the end of the request
+  head (`\r\n\r\n`, at most 8 KiB, 5 s), or answers 300 ms after a complete request line when
+  the client stops sending, so a request line split across segments is parsed whole. The move to the engine's own ACME and the point where
+  certbot is retired are in the runbook.
+* **HLS** (`multiview-output::hls::http`): confinement, open and `fstat` in one blocking-pool
+  hop (was five `tokio::fs` round trips); the length and validators come from the opened handle;
+  64 KiB body chunks (`BODY_CHUNK`, never the whole file); nginx's `ETag` format
+  (`"<mtime hex>-<size hex>"`), `Last-Modified`, `If-None-Match`/`If-Modified-Since` -> `304` (with `Range`, only an exact
+  strong tag revalidates), `If-Range`. `deploy/hls-nginx.conf` stays the contract; `tests/hls_nginx_parity.rs` pins it.
+  Zero-copy `sendfile` is not possible under rustls without kTLS; the bounded chunked read is
+  the as-built form, and `scripts/hls-ttfb.py` measures TTFB against nginx (acceptance on
+  mda001).
+* **UI** (`multiview-control::spa`): the representation (identity or gzip, from
+  `Accept-Encoding`) is chosen first; strong `ETag` per representation (SHA-256, `-gz` suffix),
+  `304` only for the selected representation's tag; gzip for text assets with
+  `Vary: Accept-Encoding` (compressed once per content hash, cached for the process; bounded by
+  the servable file set), a missing `/assets/*` is `404`. `[control] ui_dir` serves a UI build from
+  disk instead of the embedded copy, read into memory at start-up (at most 10 000 files /
+  256 MiB) so a request never touches the filesystem.
+* **Invariants #1/#10**: everything above runs on the front-door runtime or the control plane's;
+  file I/O on the blocking pool; nothing is shared with the program runtime.
+  `multiview-cli/tests/frontdoor_site_chaos.rs` runs the real tick loop while 64 stalled 4 MiB
+  downloads, download/range lanes and a port-80 flood hit the door: one frame per tick, no extra
+  repeats, RSS growth under 64 MiB.
+* **Not in this slice**: HTTP/2 (slice 7), the mda001 measurements (TTFB, restart window, office
+  browser rows of #290), which the lead runs from the runbook.

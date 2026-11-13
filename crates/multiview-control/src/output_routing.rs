@@ -630,6 +630,40 @@ impl TakeLimiter {
         Ok(())
     }
 
+    /// Admit one request of `principal` touching every destination in
+    /// `destinations` as ONE take against the principal's limit and one take
+    /// per distinct destination (ADR-0110 §12.8 rule 3). All limits are
+    /// checked before any records, so a refusal consumes nothing.
+    ///
+    /// # Errors
+    /// The longest delay until every needed slot frees.
+    pub fn admit_set(
+        &self,
+        destinations: &[String],
+        principal: &str,
+        now: Instant,
+    ) -> Result<(), Duration> {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (outputs, principals) = &mut *guard;
+        let mut wait: Option<Duration> = None;
+        for destination in destinations {
+            if let Err(delay) = outputs.check(destination, now) {
+                wait = Some(wait.map_or(delay, |w| w.max(delay)));
+            }
+        }
+        if let Err(delay) = principals.check(principal, now) {
+            wait = Some(wait.map_or(delay, |w| w.max(delay)));
+        }
+        if let Some(wait) = wait {
+            return Err(wait);
+        }
+        for destination in destinations {
+            outputs.record(destination, now);
+        }
+        principals.record(principal, now);
+        Ok(())
+    }
+
     /// Tracked (outputs, principals) — the bound is the cap.
     #[must_use]
     pub fn tracked(&self) -> (usize, usize) {

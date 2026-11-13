@@ -294,3 +294,57 @@ async fn handshake_with(
     task.await??;
     Ok(())
 }
+
+/// Review of #338 (final head): an RFC 8738 IP identifier's challenge is
+/// published under the reverse name, which is a DNS name (not an IP literal),
+/// so rustls exposes it as SNI and the door's challenge-only route selects
+/// it. The acmeIdentifier is SHA-256 of the RAW key authorization, hashed
+/// once (`VerifyAcmeExtension` checks the exact bytes).
+#[cfg(unix)]
+#[tokio::test]
+async fn ip_identifier_challenge_is_selected_by_its_reverse_name_sni() {
+    let bootstrap = bootstrap_certificate("test.example.org").unwrap();
+    let source = Arc::new(AcmeCertificateSource::new(
+        bootstrap.certificate,
+        bootstrap.fingerprint,
+        "custom".into(),
+        vec!["203.0.113.5".into()],
+    ));
+    let resolver = Arc::new(ChallengeResolver::new(source));
+    let cert = alpn_challenge_certificate("203.0.113.5", b"token.authorization").unwrap();
+    resolver.publish("5.113.0.203.in-addr.arpa".into(), cert);
+    let server = multiview_control::acme_challenge_server_config(resolver).unwrap();
+    let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(VerifyAcmeExtension))
+    .with_no_client_auth();
+    client.alpn_protocols = vec![b"acme-tls/1".to_vec()];
+    let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio_rustls::TlsAcceptor::from(server)
+            .accept(stream)
+            .await
+            .map(|_| ())
+    });
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let name = ServerName::try_from("5.113.0.203.in-addr.arpa").unwrap();
+    assert!(
+        matches!(name, ServerName::DnsName(_)),
+        "the reverse name is a DNS name, sent as SNI"
+    );
+    let handshake = tokio_rustls::TlsConnector::from(Arc::new(client))
+        .connect(name, stream)
+        .await
+        .expect("challenge certificate selected by the reverse-name SNI, digest verified");
+    assert_eq!(
+        handshake.get_ref().1.alpn_protocol(),
+        Some(b"acme-tls/1".as_slice())
+    );
+    task.await.unwrap().unwrap();
+}

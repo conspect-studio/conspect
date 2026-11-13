@@ -49,6 +49,9 @@ fn me(cfg: &mut MultiviewConfig) {
             program_source: "a".into(),
             preview_source: "b".into(),
             flip_flop: true,
+            inputs: vec![],
+            program_input: None,
+            preview_input: None,
         }],
         extra: serde_json::Map::new(),
     });
