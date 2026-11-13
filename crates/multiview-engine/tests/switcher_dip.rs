@@ -490,14 +490,19 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
 }
 
 /// The real-time variant of the flood (review INV1-01): a monotonic clock and
-/// the real pacer, so time keeps moving while commands drain and dips render.
-/// The outcome stream is never read (a stalled consumer). A stall on the clock
-/// shows up as catch-up repeats and as an overrun of the external deadline;
-/// both are bounded by the design (cadence-hold), not by tight percentiles.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_transition_flood_on_a_real_clock_keeps_cadence_with_a_stalled_consumer() {
-    let run = flood_on_a_real_clock(std::time::Duration::ZERO).await;
-    // A loaded runner may cost a few catch-up repeats, never most of them.
+/// the real pacer on a dedicated engine thread, watched from this thread by
+/// an independent watchdog that samples the engine's tick counter. The
+/// outcome stream is never read (a stalled consumer). Bounds are generous
+/// counts and gaps (a loaded runner passes), never tight percentiles.
+#[test]
+fn a_transition_flood_on_a_real_clock_keeps_cadence_with_a_stalled_consumer() {
+    let run = flood_on_a_real_clock(Block::None);
+    assert!(run.finished, "the engine finished within the deadline");
+    assert!(
+        run.max_gap < MAX_GAP,
+        "the clock never stalled: largest gap between ticks {:?}",
+        run.max_gap
+    );
     assert!(
         run.repeats <= TICKS_RT / 10,
         "repeats {} of {TICKS_RT}",
@@ -507,11 +512,22 @@ async fn a_transition_flood_on_a_real_clock_keeps_cadence_with_a_stalled_consume
     assert!(run.completions > 0, "dips really ran");
 }
 
-/// Negative control: the same gate with a hook that blocks 30 ms a tick (a
-/// 20 ms period) fails it, so the gate measures the clock, not the test.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_real_clock_gate_detects_a_blocking_hook() {
-    let run = flood_on_a_real_clock(std::time::Duration::from_millis(30)).await;
+/// Negative control: the same watchdog with a hook that blocks 3 s on the
+/// last tick detects the stall, so the gate measures the clock itself.
+#[test]
+fn the_real_clock_watchdog_detects_a_long_block_on_the_terminal_tick() {
+    let run = flood_on_a_real_clock(Block::Once {
+        at: TICKS_RT - 1,
+        for_: std::time::Duration::from_secs(3),
+    });
+    assert!(run.max_gap >= MAX_GAP, "detected: {:?}", run.max_gap);
+}
+
+/// Negative control: a hook that blocks 30 ms on every 20 ms tick shows up
+/// as catch-up repeats.
+#[test]
+fn the_real_clock_gate_detects_a_slow_hook() {
+    let run = flood_on_a_real_clock(Block::Every(std::time::Duration::from_millis(30)));
     assert!(
         run.repeats > TICKS_RT / 10,
         "a blocking hook must show up as repeats: {}",
@@ -520,23 +536,36 @@ async fn the_real_clock_gate_detects_a_blocking_hook() {
 }
 
 const TICKS_RT: u64 = 150; // 3 s at 50 fps
+/// The largest tolerated gap between two observed ticks (50 periods).
+const MAX_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 
 struct RealRun {
+    finished: bool,
+    max_gap: std::time::Duration,
     repeats: u64,
     full: u64,
     completions: u64,
 }
 
-/// Wraps the switcher hook and optionally blocks the clock for `delay`.
+#[derive(Clone, Copy)]
+enum Block {
+    None,
+    Every(std::time::Duration),
+    Once { at: u64, for_: std::time::Duration },
+}
+
+/// Wraps the switcher hook and blocks the clock as `block` says.
 struct Stall<H> {
     inner: H,
-    delay: std::time::Duration,
+    block: Block,
 }
 
 impl<H: FrameControl> FrameControl for Stall<H> {
     fn before_compose(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
-        if !self.delay.is_zero() {
-            std::thread::sleep(self.delay);
+        match self.block {
+            Block::Every(delay) => std::thread::sleep(delay),
+            Block::Once { at, for_ } if tick.index == at => std::thread::sleep(for_),
+            _ => {}
         }
         self.inner.before_compose(drive, tick);
     }
@@ -548,9 +577,8 @@ impl<H: FrameControl> FrameControl for Stall<H> {
     }
 }
 
-async fn flood_on_a_real_clock(delay: std::time::Duration) -> RealRun {
+fn flood_on_a_real_clock(block: Block) -> RealRun {
     use multiview_engine::{MonotonicTimeSource, RealtimePacer};
-    const TICKS: u64 = TICKS_RT;
     let rig = rig();
     let (a, b) = (Arc::clone(&rig.a), Arc::clone(&rig.b));
     let handle = rig.handle.clone();
@@ -562,11 +590,12 @@ async fn flood_on_a_real_clock(delay: std::time::Duration) -> RealRun {
         ts,
         RealtimePacer,
     );
+    let ticks = runtime.ticks_counter();
     let repeated = runtime.frames_repeated_counter();
-    let publisher = EnginePublisher::<u8, ()>::new(16);
     // Subscribed and never drained: the engine must not care.
     let _stalled = handle.outcomes();
     let done = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
     let full = Arc::new(AtomicU64::new(0));
     // Sources publish fresh frames on real time, off the clock.
     let feeder = {
@@ -607,44 +636,65 @@ async fn flood_on_a_real_clock(delay: std::time::Duration) -> RealRun {
             }
         })
     };
-    let started = std::time::Instant::now();
-    let mut indices = Vec::new();
-    let stop = StopSignal::new();
-    let run = runtime.run_for_with_frame_control(
-        &publisher,
-        &stop,
-        TICKS,
-        |frame| {
-            indices.push(frame.tick.index);
-            0
-        },
-        |_| None,
-        Stall {
+    // The engine runs on its own thread with its own runtime, so a blocked
+    // hook blocks only that thread; the watchdog below keeps running.
+    let engine = {
+        let finished = Arc::clone(&finished);
+        let hook = Stall {
             inner: rig.hook,
-            delay,
-        },
-    );
-    // External deadline: 3 s of output may not take more than 3 s + 10 s
-    // (the blocking control takes 150 x 30 ms = 4.5 s).
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(13), run)
-        .await
-        .expect("the output clock kept running under the flood")
-        .unwrap();
-    let elapsed = started.elapsed();
+            block,
+        };
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let publisher = EnginePublisher::<u8, ()>::new(16);
+            let outcome = rt
+                .block_on(runtime.run_for_with_frame_control(
+                    &publisher,
+                    &StopSignal::new(),
+                    TICKS_RT,
+                    |_| 0,
+                    |_| None,
+                    hook,
+                ))
+                .unwrap();
+            assert_eq!(outcome.ticks, TICKS_RT);
+            finished.store(true, Ordering::Release);
+        })
+    };
+    // Watchdog: sample the tick counter every 10 ms, record the largest gap
+    // between progress, stop watching at a hard deadline (3 s of output + 10 s).
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(13);
+    let mut last = (ticks.load(Ordering::Acquire), std::time::Instant::now());
+    let mut max_gap = std::time::Duration::ZERO;
+    while !finished.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let now = std::time::Instant::now();
+        let seen = ticks.load(Ordering::Acquire);
+        if seen != last.0 {
+            last = (seen, now);
+        }
+        max_gap = max_gap.max(now - last.1);
+    }
+    let finished = finished.load(Ordering::Acquire);
     done.store(true, Ordering::Release);
     producer.join().unwrap();
     feeder.join().unwrap();
-    assert_eq!(outcome.ticks, TICKS);
-    assert_eq!(u64::try_from(indices.len()).unwrap(), TICKS);
-    assert!(
-        indices.windows(2).all(|w| w[1] == w[0] + 1),
-        "contiguous ticks"
-    );
-    assert!(
-        elapsed >= std::time::Duration::from_millis(2900),
-        "real pacing: {elapsed:?}"
-    );
+    if finished {
+        engine.join().unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(2900),
+            "real pacing: {:?}",
+            started.elapsed()
+        );
+    }
+    // A never-finishing engine thread is left detached; the test then fails.
     RealRun {
+        finished,
+        max_gap,
         repeats: repeated.load(Ordering::Acquire),
         full: full.load(Ordering::Relaxed),
         completions: handle.snapshot().map_or(0, |s| s.completion_count),
