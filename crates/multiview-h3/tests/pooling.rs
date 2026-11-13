@@ -2,7 +2,12 @@
 //! during and after one WebTransport session on ONE QUIC connection; a
 //! second CONNECT gets 429; admit rejections leave the slot free.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 mod common;
 
@@ -108,20 +113,22 @@ async fn harness(reject_ticket: Option<&'static str>) -> Harness {
     }
 }
 
-async fn open_session(
-    client: &mut Client,
-    path: &str,
-) -> (http::Response<()>, ClientStream) {
+async fn open_session(client: &mut Client, path: &str) -> (http::Response<()>, ClientStream) {
     let fut = async {
         let mut stream = client
             .send
-            .send_request(connect_request(path, Some(r#""other", "moqt-15", "moq-lite-03""#)))
+            .send_request(connect_request(
+                path,
+                Some(r#""other", "moqt-15", "moq-lite-03""#),
+            ))
             .await
             .unwrap();
         let resp = stream.recv_response().await.unwrap();
         (resp, stream)
     };
-    tokio::time::timeout(TIMEOUT, fut).await.expect("CONNECT timed out")
+    tokio::time::timeout(TIMEOUT, fut)
+        .await
+        .expect("CONNECT timed out")
 }
 
 fn quarter(id: h3::quic::StreamId) -> u64 {
@@ -183,7 +190,10 @@ async fn pooled_connection_serves_pages_around_one_session() {
     // A second CONNECT on the same connection: 429, stream finished.
     let (resp, mut second) = open_session(&mut client, "/moq/x?ticket=u").await;
     assert_eq!(resp.status(), 429);
-    let end = tokio::time::timeout(TIMEOUT, second.recv_data()).await.unwrap().unwrap();
+    let end = tokio::time::timeout(TIMEOUT, second.recv_data())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(end.is_none(), "the 429 stream was not finished");
     assert_eq!(Counters::get(&h.server.endpoint.counters().wt_429), 1);
 
@@ -211,7 +221,10 @@ async fn pooled_connection_serves_pages_around_one_session() {
     let (resp, _) = open_session(&mut client, "/moq/x?ticket=v").await;
     assert_eq!(resp.status(), 429);
     assert_eq!(Counters::get(&h.server.endpoint.counters().wt_sessions), 1);
-    assert_eq!(Counters::get(&h.server.endpoint.counters().connections_accepted), 1);
+    assert_eq!(
+        Counters::get(&h.server.endpoint.counters().connections_accepted),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -220,7 +233,10 @@ async fn admit_rejection_keeps_the_slot_free() {
     let mut client = h3_client(&h.server).await;
     let (resp, mut stream) = open_session(&mut client, "/moq/x?ticket=bad").await;
     assert_eq!(resp.status(), 401);
-    let end = tokio::time::timeout(TIMEOUT, stream.recv_data()).await.unwrap().unwrap();
+    let end = tokio::time::timeout(TIMEOUT, stream.recv_data())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(end.is_none());
     let (resp, _) = fetch(&mut client.send, request(http::Method::GET, "/page")).await;
     assert_eq!(resp.status(), 200);

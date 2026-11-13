@@ -62,7 +62,9 @@ pub fn server_tls(tls: &rustls::ServerConfig) -> Result<rustls::ServerConfig, Er
     if rustls::quic::ServerConnection::new(Arc::clone(&tls), rustls::quic::Version::V1, Vec::new())
         .is_err()
     {
-        return Err(Error::Config("the TLS config does not enable TLS 1.3 for QUIC"));
+        return Err(Error::Config(
+            "the TLS config does not enable TLS 1.3 for QUIC",
+        ));
     }
     Ok(Arc::unwrap_or_clone(tls))
 }
@@ -270,7 +272,8 @@ impl H3Endpoint {
     /// `H3Limits::shutdown_timeout`) for connections to send their close.
     pub async fn shutdown(self) {
         self.accept_task.abort();
-        self.endpoint.close(noq::VarInt::from_u32(0x100), b"shutdown");
+        self.endpoint
+            .close(noq::VarInt::from_u32(0x100), b"shutdown");
         let endpoint = self.endpoint.clone();
         let wait = self
             .runtime

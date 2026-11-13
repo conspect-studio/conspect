@@ -115,7 +115,11 @@ pub trait WtHandler: Send + Sync + 'static {
     /// # Errors
     ///
     /// The status to answer with.
-    fn admit(&self, req: &http::request::Parts, peer: SocketAddr) -> Result<AdmitToken, http::StatusCode>;
+    fn admit(
+        &self,
+        req: &http::request::Parts,
+        peer: SocketAddr,
+    ) -> Result<AdmitToken, http::StatusCode>;
 
     /// Runs the accepted session. Returning (or dropping every clone of the
     /// session) closes it.

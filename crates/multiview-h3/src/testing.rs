@@ -26,6 +26,10 @@ fn chunks(data: &[u8]) -> Vec<&[u8]> {
 /// `header_guard` target: feeds arbitrary bytes in arbitrary chunks, and
 /// checks against an independent whole-buffer walk that the guard never
 /// accepts a non-DATA frame declared longer than its limit.
+///
+/// # Panics
+///
+/// When the guard diverges from the reference walk (a fuzz finding).
 pub fn header_guard(data: &[u8]) {
     let limit = 64;
     let mut guard = HeaderGuard::new(limit);
@@ -74,6 +78,10 @@ pub fn header_guard(data: &[u8]) {
 /// `capsule` target: arbitrary bytes in arbitrary chunks through the
 /// capsule parser; it never panics and every CLOSE it yields carries a
 /// bounded reason.
+///
+/// # Panics
+///
+/// When a reason exceeds its bound (a fuzz finding).
 pub fn capsule(data: &[u8]) {
     let mut parser = CapsuleParser::new();
     let mut out = Vec::new();

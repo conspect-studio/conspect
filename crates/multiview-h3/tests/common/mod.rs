@@ -1,7 +1,13 @@
 //! Shared harness: a real noq endpoint on `[::1]:0` with a self-signed
 //! certificate, and an h3 client over the same noq adapter.
 
-#![allow(dead_code, unreachable_pub, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    dead_code,
+    unreachable_pub,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -106,8 +112,10 @@ pub async fn quic_connect(
 }
 
 /// WebTransport streams the server opened toward the client.
+pub type UniItem = (u64, noq::RecvStream, Option<Bytes>);
+
 pub struct ClientRouter {
-    pub uni: Mutex<Option<mpsc::UnboundedSender<(u64, noq::RecvStream, Option<Bytes>)>>>,
+    pub uni: Mutex<Option<mpsc::UnboundedSender<UniItem>>>,
     permits: Arc<Semaphore>,
 }
 
@@ -132,7 +140,7 @@ pub type ClientStream = h3::client::RequestStream<noq_adapter::BidiStream<Bytes>
 pub struct Client {
     pub conn: noq::Connection,
     pub send: SendRequest,
-    pub uni: mpsc::UnboundedReceiver<(u64, noq::RecvStream, Option<Bytes>)>,
+    pub uni: mpsc::UnboundedReceiver<UniItem>,
     driver: tokio::task::JoinHandle<()>,
 }
 
@@ -177,16 +185,22 @@ pub fn request(method: http::Method, path: &str) -> http::Request<()> {
 
 pub fn connect_request(path: &str, protocols: Option<&str>) -> http::Request<()> {
     let mut req = request(http::Method::CONNECT, path);
-    req.extensions_mut().insert(h3::ext::Protocol::WEB_TRANSPORT);
+    req.extensions_mut()
+        .insert(h3::ext::Protocol::WEB_TRANSPORT);
     if let Some(p) = protocols {
-        req.headers_mut()
-            .insert("wt-available-protocols", http::HeaderValue::from_str(p).unwrap());
+        req.headers_mut().insert(
+            "wt-available-protocols",
+            http::HeaderValue::from_str(p).unwrap(),
+        );
     }
     req
 }
 
 /// Sends a body-less request and reads the full response.
-pub async fn fetch(send: &mut SendRequest, req: http::Request<()>) -> (http::Response<()>, Vec<u8>) {
+pub async fn fetch(
+    send: &mut SendRequest,
+    req: http::Request<()>,
+) -> (http::Response<()>, Vec<u8>) {
     let fut = async {
         let mut stream = send.send_request(req).await.unwrap();
         stream.finish().await.unwrap();
@@ -194,7 +208,9 @@ pub async fn fetch(send: &mut SendRequest, req: http::Request<()>) -> (http::Res
         let body = read_body(&mut stream).await;
         (resp, body)
     };
-    tokio::time::timeout(TIMEOUT, fut).await.expect("fetch timed out")
+    tokio::time::timeout(TIMEOUT, fut)
+        .await
+        .expect("fetch timed out")
 }
 
 pub async fn read_body(stream: &mut ClientStream) -> Vec<u8> {

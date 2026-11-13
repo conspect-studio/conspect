@@ -126,7 +126,10 @@ pub fn parse_protocol_list(value: &str) -> Vec<String> {
                 && token
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~:/".contains(c));
-            (ok.then(|| token.to_owned()), rest.get(end..).unwrap_or_default())
+            (
+                ok.then(|| token.to_owned()),
+                rest.get(end..).unwrap_or_default(),
+            )
         };
         if let Some(item) = item {
             out.push(item);
@@ -159,7 +162,10 @@ pub fn encode_sf_string(value: &str) -> Option<String> {
 
 /// Picks the first protocol the client offered that the server supports.
 #[must_use]
-pub fn select_protocol(headers: &http::HeaderMap, supported: &[&'static str]) -> Option<&'static str> {
+pub fn select_protocol(
+    headers: &http::HeaderMap,
+    supported: &[&'static str],
+) -> Option<&'static str> {
     let offered: Vec<String> = [AVAILABLE_PROTOCOLS, AVAILABLE_PROTOCOLS_LEGACY]
         .iter()
         .flat_map(|name| headers.get_all(*name))
@@ -616,7 +622,9 @@ impl WtSendStream {
 
     fn check_session(&mut self) -> Result<(), WtError> {
         if let Some(err) = self.state.closed_now() {
-            let _ = self.stream.reset(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
+            let _ = self
+                .stream
+                .reset(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
             self.finished = true;
             return Err(err);
         }
@@ -695,7 +703,9 @@ impl WtRecvStream {
 
     fn check_session(&mut self) -> Result<(), WtError> {
         if let Some(err) = self.state.closed_now() {
-            let _ = self.stream.stop(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
+            let _ = self
+                .stream
+                .stop(noq::VarInt::from_u64(SESSION_GONE).unwrap_or(noq::VarInt::MAX));
             return Err(err);
         }
         Ok(())
@@ -835,10 +845,19 @@ mod tests {
             vec!["moq-lite-03", "moqt-15", "tok"]
         );
         assert_eq!(parse_protocol_list(r#""a\"b""#), vec!["a\"b"]);
-        assert!(parse_protocol_list(r#""unterminated"#).is_empty());
+        assert_eq!(
+            parse_protocol_list(r#""unterminated"#),
+            Vec::<String>::new()
+        );
         let mut headers = http::HeaderMap::new();
-        headers.insert(AVAILABLE_PROTOCOLS, http::HeaderValue::from_static(r#""x", "moqt-15""#));
-        assert_eq!(select_protocol(&headers, &["moq-lite-03", "moqt-15"]), Some("moqt-15"));
+        headers.insert(
+            AVAILABLE_PROTOCOLS,
+            http::HeaderValue::from_static(r#""x", "moqt-15""#),
+        );
+        assert_eq!(
+            select_protocol(&headers, &["moq-lite-03", "moqt-15"]),
+            Some("moqt-15")
+        );
         assert_eq!(select_protocol(&headers, &["none"]), None);
         assert_eq!(encode_sf_string("moq"), Some("\"moq\"".into()));
         let resp = connect_response(Some("moqt-15")).unwrap();

@@ -88,12 +88,14 @@ impl CapsuleParser {
                     let Some((ty, ty_len)) = varint::decode(&self.head) else {
                         continue;
                     };
-                    let Some((len, _)) = varint::decode(self.head.get(ty_len..).unwrap_or_default())
+                    let Some((len, _)) =
+                        varint::decode(self.head.get(ty_len..).unwrap_or_default())
                     else {
                         continue;
                     };
                     self.head.clear();
-                    let known = ty == CLOSE_WEBTRANSPORT_SESSION || ty == DRAIN_WEBTRANSPORT_SESSION;
+                    let known =
+                        ty == CLOSE_WEBTRANSPORT_SESSION || ty == DRAIN_WEBTRANSPORT_SESSION;
                     if known && len > MAX_KNOWN_CAPSULE {
                         return Err(CapsuleError::TooLarge(len));
                     }
@@ -122,7 +124,9 @@ impl CapsuleParser {
                             let Some((code, reason)) = self.body.split_first_chunk::<4>() else {
                                 return Err(CapsuleError::Truncated);
                             };
-                            let reason = reason.get(..MAX_REASON.min(reason.len())).unwrap_or_default();
+                            let reason = reason
+                                .get(..MAX_REASON.min(reason.len()))
+                                .unwrap_or_default();
                             out.push(Capsule::Close {
                                 code: u32::from_be_bytes(*code),
                                 reason: String::from_utf8_lossy(reason).into_owned(),

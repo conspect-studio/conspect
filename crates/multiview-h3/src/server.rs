@@ -239,7 +239,12 @@ impl Router {
         }
     }
 
-    fn install(&self, session_id: u64, bi_tx: mpsc::Sender<QueuedBi>, uni_tx: mpsc::Sender<QueuedUni>) {
+    fn install(
+        &self,
+        session_id: u64,
+        bi_tx: mpsc::Sender<QueuedBi>,
+        uni_tx: mpsc::Sender<QueuedUni>,
+    ) {
         let mut state = self.lock();
         let early = std::mem::take(&mut state.early);
         for item in early {
@@ -350,7 +355,12 @@ pub async fn serve_connection(
         },
     )
     .with_router(Arc::<Router>::clone(&router));
-    let mut h3conn: H3Conn = limits.settings.builder().build(quic).await.map_err(Error::H3)?;
+    let mut h3conn: H3Conn = limits
+        .settings
+        .builder()
+        .build(quic)
+        .await
+        .map_err(Error::H3)?;
     let shared = Arc::new(Shared {
         conn,
         peer,
@@ -514,7 +524,8 @@ async fn send_site_response(
 ) -> Result<(), BoxError> {
     let (mut parts, mut body) = response.into_parts();
     strip_connection_headers(&mut parts.headers);
-    send.send_response(http::Response::from_parts(parts, ())).await?;
+    send.send_response(http::Response::from_parts(parts, ()))
+        .await?;
     while let Some(frame) = body.frame().await {
         let frame = match frame {
             Ok(frame) => frame,

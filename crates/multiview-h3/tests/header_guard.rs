@@ -1,7 +1,12 @@
 //! Oversized header blocks (acceptance): the declared-length guard and the
 //! decoded field-section limit, on a real connection.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 mod common;
 
@@ -33,7 +38,9 @@ async fn declared_huge_headers_frame_is_rejected_before_buffering() {
         .unwrap();
     assert_eq!(stopped.map(noq::VarInt::into_inner), Some(0x107));
     assert!(started.elapsed() < Duration::from_secs(5));
-    let read = tokio::time::timeout(TIMEOUT, recv.read_to_end(1024)).await.unwrap();
+    let read = tokio::time::timeout(TIMEOUT, recv.read_to_end(1024))
+        .await
+        .unwrap();
     assert!(
         matches!(read, Err(noq::ReadToEndError::Read(noq::ReadError::Reset(code))) if code.into_inner() == 0x107),
         "{read:?}"
@@ -47,13 +54,13 @@ async fn declared_huge_headers_frame_is_rejected_before_buffering() {
     assert_eq!(resp.status(), 200);
 }
 
-/// A QPACK block (static table only) for GET https://localhost/ plus
+/// A QPACK block (static table only) for `GET https://localhost/` plus
 /// `extra` empty fields named "a" (33 bytes of field-section size each).
 fn header_block(extra: usize) -> Vec<u8> {
     let mut block = vec![0x00, 0x00]; // required insert count 0, base 0
-    block.push(0xC0 | 17); // :method GET
-    block.push(0xC0 | 23); // :scheme https
-    block.push(0xC0 | 1); // :path /
+    block.push(0xC0 | 0x11); // :method GET
+    block.push(0xC0 | 0x17); // :scheme https
+    block.push(0xC0 | 0x01); // :path /
     block.push(0x50); // :authority with literal value
     block.push(9);
     block.extend_from_slice(b"localhost");
@@ -81,13 +88,18 @@ async fn decoded_field_section_over_the_cap_is_refused() {
     frame.extend_from_slice(&block);
     send.write_all(&frame).await.unwrap();
     send.finish().unwrap();
-    let read = tokio::time::timeout(TIMEOUT, recv.read_to_end(64 * 1024)).await.unwrap();
+    let read = tokio::time::timeout(TIMEOUT, recv.read_to_end(64 * 1024))
+        .await
+        .unwrap();
     match read {
         // 431 response: a HEADERS frame back, never a 200 from the site.
         Ok(bytes) => {
             let (ty, _) = varint::decode(&bytes).unwrap();
             assert_eq!(ty, 0x01, "not a HEADERS frame: {bytes:?}");
-            assert!(!bytes.windows(5).any(|w| w == b"hello"), "the site answered");
+            assert!(
+                !bytes.windows(5).any(|w| w == b"hello"),
+                "the site answered"
+            );
         }
         // Or a stream error.
         Err(noq::ReadToEndError::Read(noq::ReadError::Reset(_))) => {}
@@ -111,7 +123,10 @@ async fn decoded_field_section_over_the_cap_is_refused() {
         .await
         .unwrap()
         .unwrap();
-    assert!(bytes.windows(7).any(|w| w == b"hello /"), "control request not served");
+    assert!(
+        bytes.windows(7).any(|w| w == b"hello /"),
+        "control request not served"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

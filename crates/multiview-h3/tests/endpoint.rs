@@ -1,6 +1,11 @@
 //! Endpoint policy: ALPN, 0-RTT off, connection caps, the peers hook.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 mod common;
 
@@ -52,7 +57,10 @@ async fn per_source_and_global_caps_refuse() {
     let server = start(TestSite::new(), None, limits, None).await;
     let a = quic_connect(&server, b"h3").await.unwrap();
     let b = quic_connect(&server, b"h3").await.unwrap();
-    assert!(quic_connect(&server, b"h3").await.is_err(), "per-source cap");
+    assert!(
+        quic_connect(&server, b"h3").await.is_err(),
+        "per-source cap"
+    );
     assert_eq!(
         Counters::get(&server.endpoint.counters().connections_refused),
         1

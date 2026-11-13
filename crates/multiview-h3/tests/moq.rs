@@ -1,10 +1,15 @@
-//! A real MoQ session over a `WtSession`: the server wraps it with
+//! A real `MoQ` session over a `WtSession`: the server wraps it with
 //! `moq_tokio::transport::Session::new` and hands it to
 //! `moq_net::Server::accept_request`; the client is moq-tokio's own
 //! WebTransport client (web-transport-moq over noq), which subscribes and
 //! reads a frame.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 mod common;
 
@@ -57,7 +62,9 @@ impl WtHandler for MoqHandler {
 async fn moq_setup_and_subscribe_over_wt_session() {
     let origin = moq_tokio::origin::spawn();
     let broadcast = origin.create_broadcast("test").unwrap();
-    broadcast.announce(Default::default()).unwrap();
+    broadcast
+        .announce(moq_net::origin::Route::default())
+        .unwrap();
     let track = broadcast.create_track("video", None).unwrap();
     let mut group = track.append_group().unwrap();
     group
@@ -77,7 +84,7 @@ async fn moq_setup_and_subscribe_over_wt_session() {
     config.tls.insecure = Some(true);
     config.bind = Some("[::1]:0".parse().unwrap());
     let client = config
-        .init(Default::default())
+        .init(moq_tokio::quic::Config::default())
         .unwrap()
         .with_subscriber(sub_origin);
     let url: url::Url = format!("https://[::1]:{}/moq/x?ticket=t", server.addr.port())
@@ -98,7 +105,12 @@ async fn moq_setup_and_subscribe_over_wt_session() {
         .await
         .expect("broadcast timed out")
         .expect("broadcast resolves");
-    let mut sub = remote.track("video").unwrap().subscribe(None).await.unwrap();
+    let mut sub = remote
+        .track("video")
+        .unwrap()
+        .subscribe(None)
+        .await
+        .unwrap();
     let mut got = tokio::time::timeout(TIMEOUT, sub.recv_group())
         .await
         .unwrap()

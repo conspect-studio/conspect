@@ -250,7 +250,11 @@ impl Connection {
                 }
                 Head::Failed => {
                     let code = entry.recv.abort.abort.load(Ordering::Acquire);
-                    let code = if code == 0 { Code::H3_REQUEST_CANCELLED.value() } else { code };
+                    let code = if code == 0 {
+                        Code::H3_REQUEST_CANCELLED.value()
+                    } else {
+                        code
+                    };
                     if let Some(mut send) = entry.send.take() {
                         let _ = send.reset(to_varint(code));
                     }
@@ -958,7 +962,9 @@ where
             let _ = stream.reset(to_varint(code));
         }
         self.writing = None;
-        Some(StreamErrorIncoming::Unknown(Box::new(AdapterError::Rejected(code))))
+        Some(StreamErrorIncoming::Unknown(Box::new(
+            AdapterError::Rejected(code),
+        )))
     }
 
     fn stream_mut(&mut self) -> Result<&mut noq::SendStream, StreamErrorIncoming> {
@@ -1000,10 +1006,10 @@ where
         &mut self,
         _cx: &mut task::Context<'_>,
     ) -> Poll<Result<(), StreamErrorIncoming>> {
-        Poll::Ready(
-            self.stream_mut()
-                .and_then(|s| s.finish().map_err(|e| StreamErrorIncoming::Unknown(Box::new(e)))),
-        )
+        Poll::Ready(self.stream_mut().and_then(|s| {
+            s.finish()
+                .map_err(|e| StreamErrorIncoming::Unknown(Box::new(e)))
+        }))
     }
 
     fn reset(&mut self, reset_code: u64) {
