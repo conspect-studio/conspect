@@ -2256,7 +2256,8 @@ pub struct Pipeline {
     /// Per rendition key: the format its worker converts the Program canvas
     /// to (#342); `None` = the canvas (zero-copy, as before).
     rendition_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
-    /// Per runnable output (same order as `output_video_keys`): its format.
+    /// Per runnable output (same order as `output_video_keys`): the format a
+    /// routed source/PVW is composed at for it (#342 review M3).
     output_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
     output_video_keys: Vec<usize>,
     /// Per runnable output (same order as `output_video_keys`): its muxer
@@ -3181,8 +3182,12 @@ impl Pipeline {
             let concrete = resolve_encoder(requested)?;
             // #342: the output's picture format (absent or the canvas = today)
             // and video slot 0's bit rate (absent = today's).
+            // The base key's format collapses at canvas size (identity); the
+            // routed-feed format keeps a non-default fit (#342 review M3).
             let format = declared
-                .and_then(|item| crate::routing_aux::AuxFormat::of_output(item, aux_canvas));
+                .and_then(|item| crate::routing_aux::AuxFormat::base_of_output(item, aux_canvas));
+            let feed_format = declared
+                .and_then(|item| crate::routing_aux::AuxFormat::feed_of_output(item, aux_canvas));
             let (width, height) = format.map_or((cfg.width, cfg.height), |f| (f.width, f.height));
             let bit_rate = declared
                 .and_then(|item| item.video_slot0().and_then(|v| v.bitrate_kbps))
@@ -3223,7 +3228,7 @@ impl Pipeline {
                 rendition_configs.len() - 1
             };
             output_video_keys.push(key);
-            output_formats.push(format);
+            output_formats.push(feed_format);
             let ll_hls = config
                 .outputs
                 .iter()

@@ -498,9 +498,10 @@ pub struct RouterConfig {
     pub max_per_principal: usize,
     /// Whether an M/E exists (Preview is routable).
     pub has_preview: bool,
-    /// Per output: its picture format (#342); `None` (or a missing entry) =
-    /// the canvas. A routed source/PVW is composed at it by the aux thread;
-    /// Program/Clean are converted on the key's worker by the opener.
+    /// Per output: the format a routed source/PVW is composed at for it
+    /// (#342; `None` or a missing entry = the canvas with the default fit).
+    /// Program/Clean ignore it: their key's format is the output's base key
+    /// (its settings index), converted on the key's worker by the opener.
     pub formats: Vec<Option<AuxFormat>>,
 }
 

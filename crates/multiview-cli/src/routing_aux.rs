@@ -133,14 +133,26 @@ impl AuxFormat {
         Self { width, height, fit }
     }
 
-    /// The format an output declares, normalised: `None` when it is the
-    /// canvas size (identity: the fit is irrelevant, §12.4 P2), so such an
-    /// output shares feeds and keys with an output declaring no format.
+    /// The format of an output's BASE (Program) key: `None` whenever its size
+    /// is the canvas's. The Program canvas is identity there (the fit is
+    /// irrelevant for a canvas-sized picture, §12.4 P2), so such an output
+    /// shares the canvas key and its zero-copy path.
     #[must_use]
-    pub fn of_output(output: &multiview_config::Output, canvas: AuxCanvas) -> Option<Self> {
+    pub fn base_of_output(output: &multiview_config::Output, canvas: AuxCanvas) -> Option<Self> {
         let f = output.format()?;
         (f.width != canvas.width || f.height != canvas.height)
             .then(|| Self::new(f.width, f.height, f.fit))
+    }
+
+    /// The format a routed source/PVW FEED is composed at for an output:
+    /// `None` only when it is the canvas size with the default fit (contain,
+    /// centre) — exactly today's letterbox. A canvas-sized cover/fill or an
+    /// anchored contain is honoured (#342 review M3).
+    #[must_use]
+    pub fn feed_of_output(output: &multiview_config::Output, canvas: AuxCanvas) -> Option<Self> {
+        let f = output.format()?;
+        let format = Self::new(f.width, f.height, f.fit);
+        (format != Self::new(canvas.width, canvas.height, OutputFit::default())).then_some(format)
     }
 }
 
@@ -827,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn of_output_normalises_the_canvas_format_to_none() {
+    fn base_formats_collapse_at_canvas_size_and_feed_formats_keep_the_fit() {
         let cfg = multiview_config::MultiviewConfig::load_from_toml(
             r##"
 schema_version = 1
@@ -879,11 +891,61 @@ codec = "h264"
 "##,
         )
         .unwrap();
-        let formats: Vec<_> = cfg
+        let base: Vec<_> = cfg
             .outputs
             .iter()
-            .map(|o| AuxFormat::of_output(o, canvas()))
+            .map(|o| AuxFormat::base_of_output(o, canvas()))
             .collect();
-        assert_eq!(formats, vec![None, Some(vertical()), None, None]);
+        assert_eq!(base, vec![None, Some(vertical()), None, None]);
+        // A routed feed honours a canvas-sized non-default fit (#342 M3).
+        let feeds: Vec<_> = cfg
+            .outputs
+            .iter()
+            .map(|o| AuxFormat::feed_of_output(o, canvas()))
+            .collect();
+        let canvas_cover_top = AuxFormat::new(
+            1920,
+            1080,
+            OutputFit::new(
+                multiview_config::OutputFitMode::Cover,
+                multiview_config::Anchor::Top,
+            ),
+        );
+        assert_eq!(
+            feeds,
+            vec![None, Some(vertical()), Some(canvas_cover_top), None]
+        );
+    }
+
+    #[test]
+    fn a_canvas_sized_cover_feed_fills_the_canvas_instead_of_letterboxing() {
+        let c = canvas();
+        let tile = Arc::new(gradient(640, 480, c.color));
+        let cover = AuxFormat::new(
+            1920,
+            1080,
+            OutputFit::new(
+                multiview_config::OutputFitMode::Cover,
+                multiview_config::Anchor::Center,
+            ),
+        );
+        let out = FeedState::default()
+            .compose_at(&tile, c, Some(cover))
+            .unwrap();
+        let (crop, dst) = fit_rects(
+            640,
+            480,
+            1920,
+            1080,
+            multiview_config::OutputFitMode::Cover,
+            multiview_config::Anchor::Center,
+        )
+        .unwrap();
+        assert_eq!(dst, Rect::full(1920, 1080), "no letterbox bars");
+        let mut y = vec![0u8; 1920 * 1080];
+        let mut uv = vec![0u8; 1920 * 1080 / 2];
+        blit_region(&tile, crop, 1920, &mut y, &mut uv, dst);
+        assert!(out.y_plane().eq(y.as_slice()), "luma parity");
+        assert!(out.uv_plane().eq(uv.as_slice()), "chroma parity");
     }
 }
