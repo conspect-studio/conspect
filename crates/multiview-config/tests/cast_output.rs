@@ -162,6 +162,82 @@ fn an_authored_dir_may_not_be_empty() {
     load_hd(&format!("{CAST}dir = \"/var/lib/cast/one\"\n")).unwrap();
 }
 
+#[test]
+fn a_cast_dir_is_absolute_and_shared_with_no_other_writing_output() {
+    let cast = |id: &str, dir: &str| {
+        format!("\n[[outputs]]\nkind = \"cast\"\nid = \"{id}\"\ndir = \"{dir}\"\n")
+    };
+    // Absolute only.
+    for relative in ["cast/one", "./cast", "../cast"] {
+        let err = load_hd(&cast("cast-1", relative)).unwrap_err();
+        assert!(
+            err.contains("cast output \"cast-1\"") && err.contains("must be an absolute path"),
+            "{relative}: {err}"
+        );
+    }
+    // Two cast outputs: never the same directory, also after normalisation.
+    for second in [
+        "/var/lib/cast/one",
+        "/var/lib/cast/./one/",
+        "/var/lib/cast/two/../one",
+    ] {
+        let err = load_hd(&format!(
+            "{}{}",
+            cast("cast-1", "/var/lib/cast/one"),
+            cast("cast-2", second)
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("cast outputs \"cast-1\" and \"cast-2\" use the same dir"),
+            "{second}: {err}"
+        );
+    }
+    // One cast directory inside another is refused too.
+    let err = load_hd(&format!(
+        "{}{}",
+        cast("cast-1", "/var/lib/cast"),
+        cast("cast-2", "/var/lib/cast/two")
+    ))
+    .unwrap_err();
+    assert!(
+        err.contains("cast output \"cast-1\"") && err.contains("output \"cast-2\" writes to"),
+        "{err}"
+    );
+    load_hd(&format!(
+        "{}{}",
+        cast("cast-1", "/var/lib/cast/one"),
+        cast("cast-2", "/var/lib/cast/two")
+    ))
+    .unwrap();
+    // BASE's HLS output writes to /srv/hls/program (the playlist's parent):
+    // equal, inside and around it are all refused, naming both outputs.
+    for dir in [
+        "/srv/hls/program",
+        "/srv/hls/program/cast",
+        "/srv/hls",
+        "/srv",
+        "/",
+        "/srv/hls/x/../program/",
+    ] {
+        let err = load_hd(&cast("cast-1", dir)).unwrap_err();
+        assert!(
+            err.contains("cast output \"cast-1\"")
+                && err.contains("/srv/hls/program that output \"program-hls\" writes to"),
+            "{dir}: {err}"
+        );
+    }
+    // A sibling directory is fine; so is a name that merely shares a prefix.
+    load_hd(&cast("cast-1", "/srv/hls/cast-1")).unwrap();
+    load_hd(&cast("cast-1", "/srv/hls/program-cast")).unwrap();
+    // An HLS output whose path is a directory (no .m3u8) is that directory.
+    let hls_dir = "\n[[outputs]]\nid = \"dir-hls\"\nkind = \"ll_hls\"\npath = \"/srv/ll\"\ncodec = \"h264\"\n";
+    let err = load_hd(&format!("{hls_dir}{}", cast("cast-1", "/srv/ll/sub"))).unwrap_err();
+    assert!(
+        err.contains("/srv/ll that output \"dir-hls\" writes to"),
+        "{err}"
+    );
+}
+
 const FORMAT_HD: &str = "[outputs.format]\nwidth = 1920\nheight = 1080\n";
 
 #[test]

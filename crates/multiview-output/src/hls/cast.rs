@@ -124,8 +124,14 @@ pub struct CastPackagerConfig {
     /// The audio rendition; `None` packages video only.
     pub audio: Option<CastAudioConfig>,
     /// The `EXT-X-PROGRAM-DATE-TIME` anchor source; `None` (or a still-empty
-    /// cell) anchors on the system clock at the first video segment.
+    /// cell) falls back to [`Self::wall_anchor`].
     pub epoch: Option<SharedEpoch>,
+    /// `(pts in nanoseconds, Unix time in nanoseconds)`: the wall clock of
+    /// one media instant, used when `epoch` gives none. A caller that feeds
+    /// packets it buffered earlier (a pre-roll) passes the arrival time of a
+    /// buffered packet here, so old packets are not stamped "now". `None`
+    /// anchors on the system clock at the first video segment.
+    pub wall_anchor: Option<(i64, i64)>,
 }
 
 /// One H.264 access unit, Annex B or AVCC framed.
@@ -224,20 +230,52 @@ fn remove_quietly(path: &Path) {
     }
 }
 
-/// Delete every `*.m3u8`, `*.m4s`, `*.mp4` and `*.tmp` file directly in
-/// `dir` (best effort; sub-directories and other files are left alone).
+/// Whether `text` is `<digits>-<digits>` (the `<generation>-<index>` part of
+/// a packager file name).
+fn is_generation_index(text: &str) -> bool {
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    text.split_once('-')
+        .is_some_and(|(generation, index)| digits(generation) && digits(index))
+}
+
+/// Whether `name` is a file name a [`CastPackager`] writes: `master.m3u8`,
+/// `video.m3u8`, `audio.m3u8`, `seg-v-<gen>-<n>.m4s`, `seg-a-<gen>-<n>.m4s`,
+/// `init-v-<gen>-<k>.mp4`, `init-a-<gen>-<k>.mp4`, or one of those with
+/// `.tmp` appended (the write-then-rename temporary).
+#[must_use]
+pub fn is_packager_file_name(name: &str) -> bool {
+    let name = name.strip_suffix(".tmp").unwrap_or(name);
+    if matches!(name, MASTER_PLAYLIST | VIDEO_PLAYLIST | AUDIO_PLAYLIST) {
+        return true;
+    }
+    let segment = name.strip_suffix(".m4s").and_then(|stem| {
+        stem.strip_prefix("seg-v-")
+            .or_else(|| stem.strip_prefix("seg-a-"))
+    });
+    let init = name.strip_suffix(".mp4").and_then(|stem| {
+        stem.strip_prefix("init-v-")
+            .or_else(|| stem.strip_prefix("init-a-"))
+    });
+    segment.or(init).is_some_and(is_generation_index)
+}
+
+/// Delete the files a [`CastPackager`] wrote directly in `dir` (best effort):
+/// only names [`is_packager_file_name`] accepts, only regular files (never a
+/// symlink, never a sub-directory). Every other file is left alone, so a
+/// directory that also holds an operator's files loses none of them.
 pub fn purge_dir(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        let ours = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| matches!(ext, "m3u8" | "m4s" | "mp4" | "tmp"));
+        let ours = entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_packager_file_name);
+        // `DirEntry::file_type` does not follow symlinks: a symlink with a
+        // packager name is not a regular file and is left alone.
         if ours && entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            remove_quietly(&path);
+            remove_quietly(&entry.path());
         }
     }
 }
@@ -386,6 +424,7 @@ pub struct CastPackager {
     window: usize,
     target_segment_ns: i64,
     epoch: Option<SharedEpoch>,
+    wall_anchor: Option<(i64, i64)>,
     video: VideoState,
     audio: Option<AudioState>,
     /// Closed video segments not yet published (bounded).
@@ -495,6 +534,7 @@ impl CastPackager {
             window: config.window,
             target_segment_ns: config.target_segment_ns,
             epoch: config.epoch,
+            wall_anchor: config.wall_anchor,
             video: VideoState {
                 clock: VideoClock::new(config.video.time_base),
                 config: config.video,
@@ -701,11 +741,15 @@ impl CastPackager {
         }
         if self.anchor.is_none() {
             let media_ns = to_ns(sample.pts, self.video.clock.tb);
-            let wall_ns = self
+            let from_epoch = self
                 .epoch
                 .as_ref()
                 .and_then(SharedEpoch::get)
-                .map_or_else(system_time_ns, |epoch| epoch.wall_at(media_ns));
+                .map(|epoch| epoch.wall_at(media_ns));
+            let from_caller = self
+                .wall_anchor
+                .map(|(pts_ns, unix_ns)| unix_ns.saturating_add(media_ns.saturating_sub(pts_ns)));
+            let wall_ns = from_epoch.or(from_caller).unwrap_or_else(system_time_ns);
             self.anchor = Some((wall_ns, media_ns));
         }
         if let Some(audio) = self.audio.as_mut() {

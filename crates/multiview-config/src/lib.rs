@@ -32,6 +32,7 @@
 pub mod admission;
 pub mod api;
 pub mod audio;
+pub mod cast_dir;
 pub mod catalogues;
 pub mod device;
 pub mod diff;
@@ -1536,6 +1537,7 @@ impl MultiviewConfig {
                 rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM
             )));
         }
+        cast_dir::validate_cast_dirs(&self.outputs)?;
         self.validate_cast_pictures()
     }
 

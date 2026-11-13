@@ -164,6 +164,7 @@ fn main() {
             audio_specific_config: None,
         }),
         epoch: None,
+        wall_anchor: None,
     })
     .expect("create the packager");
 

@@ -13,8 +13,8 @@ use std::path::Path;
 use multiview_core::time::Rational;
 use multiview_core::wallclock::WallClockRef;
 use multiview_output::hls::cast::{
-    purge_dir, AudioUnit, CastAudioConfig, CastPackager, CastPackagerConfig, CastVideoConfig,
-    VideoUnit,
+    is_packager_file_name, purge_dir, AudioUnit, CastAudioConfig, CastPackager, CastPackagerConfig,
+    CastVideoConfig, VideoUnit,
 };
 use multiview_output::hls::cast_check::{check_cast_dir, CastCheckReport};
 use multiview_output::hls::cmaf;
@@ -121,6 +121,7 @@ fn config(dir: &Path, audio: bool) -> CastPackagerConfig {
             audio_specific_config: None,
         }),
         epoch: None,
+        wall_anchor: None,
     }
 }
 
@@ -303,16 +304,85 @@ fn avcc_and_adts_input_produce_byte_identical_segments() {
 }
 
 #[test]
-fn purge_dir_removes_only_the_packager_file_kinds() {
+fn purge_dir_removes_only_files_the_packager_writes() {
     let dir = tempfile::tempdir().unwrap();
     let mut feeder = Feeder::new(config(dir.path(), true));
     feeder.run(0..200).unwrap();
-    std::fs::write(dir.path().join("keep.txt"), b"x").unwrap();
-    std::fs::write(dir.path().join("stale.m4s.tmp"), b"x").unwrap();
-    std::fs::create_dir(dir.path().join("sub.mp4")).unwrap();
-    assert!(files(dir.path()).len() > 8);
+    // Files of an operator who pointed a cast output at a used directory.
+    let foreign = [
+        "holiday.mp4",
+        "index.m3u8",
+        "seg00001.ts",
+        "notes.tmp",
+        "seg-v-1-0.m4s.bak",
+        "seg-v-1.m4s",
+        "seg-v-a-0.m4s",
+        "init-v-1-0.mp4.orig",
+        "master.m3u8.bak",
+        ".conspect-cast-output",
+    ];
+    for name in foreign {
+        std::fs::write(dir.path().join(name), b"keep").unwrap();
+    }
+    std::fs::create_dir(dir.path().join("seg-v-9-9.m4s")).unwrap();
+    std::fs::write(dir.path().join("seg-v-9-9.m4s").join("inner.m4s"), b"keep").unwrap();
+    // Stale packager files of another generation, and write temporaries.
+    for name in [
+        "seg-v-3-12.m4s",
+        "seg-a-3-12.m4s",
+        "init-v-3-0.mp4",
+        "init-a-3-0.mp4",
+        "seg-v-3-13.m4s.tmp",
+        "video.m3u8.tmp",
+    ] {
+        std::fs::write(dir.path().join(name), b"stale").unwrap();
+    }
+    #[cfg(unix)]
+    {
+        // A symlink with a packager name is not ours: neither it nor its
+        // target is removed.
+        let target = dir.path().join("holiday.mp4");
+        std::os::unix::fs::symlink(&target, dir.path().join("seg-v-5-0.m4s")).unwrap();
+    }
+    assert!(files(dir.path()).len() > 20);
     purge_dir(dir.path());
-    assert_eq!(files(dir.path()), ["keep.txt", "sub.mp4"]);
+    let mut expected: Vec<String> = foreign.iter().map(|name| (*name).to_owned()).collect();
+    expected.push("seg-v-9-9.m4s".to_owned());
+    #[cfg(unix)]
+    expected.push("seg-v-5-0.m4s".to_owned());
+    expected.sort();
+    assert_eq!(files(dir.path()), expected);
+    assert!(dir.path().join("seg-v-9-9.m4s").join("inner.m4s").exists());
+    assert_eq!(
+        std::fs::read(dir.path().join("holiday.mp4")).unwrap(),
+        b"keep"
+    );
+
+    for name in [
+        "master.m3u8",
+        "video.m3u8",
+        "audio.m3u8.tmp",
+        "seg-v-0-0.m4s",
+        "seg-a-18446744073709551615-7.m4s.tmp",
+        "init-v-7-0.mp4",
+        "init-a-7-0.mp4.tmp",
+    ] {
+        assert!(is_packager_file_name(name), "{name}");
+    }
+    for name in [
+        "index.m3u8",
+        "seg-v--0.m4s",
+        "seg-v-1-.m4s",
+        "seg-x-1-0.m4s",
+        "seg-v-1-0.mp4",
+        "init-v-1-0.m4s",
+        "seg-v-1-0-0.m4s",
+        "seg-v-1-0.m4s.tmp.tmp",
+        "Master.m3u8",
+        "",
+    ] {
+        assert!(!is_packager_file_name(name), "{name}");
+    }
 
     // remove_files deletes exactly what one generation wrote.
     let dir = tempfile::tempdir().unwrap();
@@ -755,6 +825,53 @@ fn the_validator_reports_each_corruption() {
     let dir = good_dir();
     std::fs::remove_file(dir.path().join("master.m3u8")).unwrap();
     assert_reports(dir.path(), "master.m3u8: cannot be read");
+}
+
+#[test]
+fn a_wall_anchor_stamps_buffered_packets_with_their_own_time() {
+    // Without an epoch a packager fed packets that were buffered earlier
+    // must not stamp them "now": the caller's anchor (one media instant and
+    // its wall clock) decides, exactly like an epoch would.
+    let dir = tempfile::tempdir().unwrap();
+    let wall_at_frame_300 = 1_767_323_055_010_000_000_i64; // 2026-01-02T03:04:15.010Z
+    let mut cfg = config(dir.path(), true);
+    cfg.wall_anchor = Some((300 * 1001 * 1_000_000_000 / 30_000, wall_at_frame_300));
+    let mut feeder = Feeder::new(cfg);
+    // The first segment starts 60 frames (2.002 s) BEFORE the anchor.
+    feeder.next_audio = 240 * 1001 * 48 / 30 / 1024 - 3;
+    feeder.run(240..520).unwrap();
+    validate(dir.path());
+    let first = read(dir.path(), "video.m3u8")
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:")
+                .map(str::to_owned)
+        })
+        .unwrap();
+    assert_eq!(first, "2026-01-02T03:04:13.008Z");
+
+    // An anchored epoch wins over the caller's anchor.
+    let dir = tempfile::tempdir().unwrap();
+    let epoch = SharedEpoch::new();
+    epoch.set(WallClockRef::new(
+        1_767_323_045_000_000_000,
+        0,
+        Rational::new(1_000_000_000, 1),
+    ));
+    let mut cfg = config(dir.path(), true);
+    cfg.epoch = Some(epoch);
+    cfg.wall_anchor = Some((0, 5));
+    let mut feeder = Feeder::new(cfg);
+    feeder.next_audio = 300 * 1001 * 48 / 30 / 1024 - 3;
+    feeder.run(300..520).unwrap();
+    let first = read(dir.path(), "video.m3u8")
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:")
+                .map(str::to_owned)
+        })
+        .unwrap();
+    assert_eq!(first, "2026-01-02T03:04:15.010Z");
 }
 
 #[test]
