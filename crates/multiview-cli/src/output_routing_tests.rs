@@ -4292,13 +4292,14 @@ struct ReformatRec {
 impl WindowDelivery for ReformatRec {
     fn offer_window(
         &mut self,
-        o: usize,
-        g: u64,
-        p: Vec<EncodedPacket>,
-        s: std::time::Duration,
-        n: Instant,
+        output: usize,
+        generation: u64,
+        packets: Vec<EncodedPacket>,
+        span: std::time::Duration,
+        now: Instant,
     ) -> Result<(), multiview_output::batch::EmissionError> {
-        self.inner.offer_window(o, g, p, s, n)
+        self.inner
+            .offer_window(output, generation, packets, span, now)
     }
     fn report_loss(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
     fn mark_discontinuity(&mut self, o: usize, _r: multiview_output::batch::OfferError) {
@@ -4382,10 +4383,12 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
     let base_force = Arc::new(AtomicU64::new(NO_FORCE));
     let opened = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&opened);
+    // The sender lives in the opener closure for the router's life, so a
+    // wedged open blocks until the run ends (never a disconnect).
     let (wedge_tx, wedge_rx) = mpsc::channel::<()>();
-    std::mem::forget(wedge_tx);
     let wedge_rx = Mutex::new(wedge_rx);
     let reformat_open: ReformatOpenFn = Box::new(move |_settings, _bus| {
+        let _keep_sender = &wedge_tx;
         counter.fetch_add(1, Ordering::SeqCst);
         match mode {
             OpenMode::Ok => {

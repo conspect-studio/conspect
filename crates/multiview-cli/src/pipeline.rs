@@ -3273,7 +3273,7 @@ impl Pipeline {
             format: encoder.format,
             cadence,
             gop,
-            bit_rate: DEFAULT_VIDEO_KBPS as usize * 1000,
+            bit_rate: usize::try_from(DEFAULT_VIDEO_KBPS).unwrap_or(4_000) * 1000,
             // AUD-4: video-only until the program-audio path is wired through
             // drive_streaming (subsequent slice); `None` keeps the muxer
             // single-stream so the existing run output is unchanged.
@@ -3813,6 +3813,9 @@ impl Pipeline {
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
     /// [`Self::output_routing`]. Nothing here runs per tick.
+    #[allow(clippy::too_many_lines)]
+    // reason: one linear wiring of a run's routing (aux thread, router,
+    // openers, handle, boot takes); splitting it would scatter the order.
     fn build_output_routing(
         &self,
         binding_ids: &[Option<String>],

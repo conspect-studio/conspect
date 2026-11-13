@@ -1145,14 +1145,13 @@ async fn a_track_feed_with_an_unreadable_route_input_is_redacted_on_both_endpoin
     assert_eq!(patch_audio(&patch), routing_audio(&routing));
 }
 
-fn put_output(
-    token: &str,
-    id: &str,
-    etag: &str,
-    name: &str,
-    body: &Value,
-) -> Request<Body> {
-    let mut request = post(&format!("/api/v1/outputs/{id}"), token, None, &json!({"name": name, "body": body}));
+fn put_output(token: &str, id: &str, etag: &str, name: &str, body: &Value) -> Request<Body> {
+    let mut request = post(
+        &format!("/api/v1/outputs/{id}"),
+        token,
+        None,
+        &json!({"name": name, "body": body}),
+    );
     *request.method_mut() = axum::http::Method::PUT;
     request
         .headers_mut()
@@ -1161,7 +1160,11 @@ fn put_output(
 }
 
 async fn current_output(rig: &Rig, id: &str) -> (String, String, Value) {
-    let resp = send(&rig.router, get(&format!("/api/v1/outputs/{id}"), OPERATOR_TOKEN)).await;
+    let resp = send(
+        &rig.router,
+        get(&format!("/api/v1/outputs/{id}"), OPERATOR_TOKEN),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let etag = resp
         .headers()
@@ -1171,7 +1174,11 @@ async fn current_output(rig: &Rig, id: &str) -> (String, String, Value) {
         .unwrap()
         .to_owned();
     let body = body_json(resp).await;
-    (etag, body["name"].as_str().unwrap().to_owned(), body["body"].clone())
+    (
+        etag,
+        body["name"].as_str().unwrap().to_owned(),
+        body["body"].clone(),
+    )
 }
 
 /// #342 B3: a PUT changing ONLY an HLS output's format (and video bitrate)
@@ -1186,7 +1193,11 @@ async fn a_format_only_put_resets_the_output_live_and_a_codec_change_is_restart(
     let (etag, name, mut body) = current_output(&rig, "output-1").await;
     body["format"] = json!({"width": 720, "height": 1280, "fit": {"mode": "cover"}});
     body["slots"]["video"] = json!([{"bitrate_kbps": 3000}]);
-    let resp = send(&rig.router, put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &body)).await;
+    let resp = send(
+        &rig.router,
+        put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &body),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()["x-multiview-apply"], "live");
     assert_eq!(
@@ -1210,7 +1221,11 @@ async fn a_format_only_put_resets_the_output_live_and_a_codec_change_is_restart(
     // A codec change: restart, no reset.
     let mut codec = stored.clone();
     codec["codec"] = json!("h264");
-    let resp = send(&rig.router, put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &codec)).await;
+    let resp = send(
+        &rig.router,
+        put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &codec),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()["x-multiview-apply"], "restart");
     assert!(resp.headers().get("x-multiview-operation-id").is_none());
@@ -1226,14 +1241,22 @@ async fn a_live_reset_needs_the_output_axis() {
     let rig = rig(&dir.path().join("boot.toml"));
     let (etag, name, mut body) = current_output(&rig, "output-1").await;
     body["format"]["width"] = json!(720);
-    let resp = send(&rig.router, put_output(NO_OUTPUT_AXIS, "output-1", &etag, &name, &body)).await;
+    let resp = send(
+        &rig.router,
+        put_output(NO_OUTPUT_AXIS, "output-1", &etag, &name, &body),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert!(rig.fake.state.lock().unwrap().reformats.is_empty());
+    assert_eq!(rig.fake.state.lock().unwrap().reformats.len(), 0);
     let (after, _, stored) = current_output(&rig, "output-1").await;
     assert_eq!(after, etag, "nothing committed");
     assert_eq!(stored["format"]["width"], 360);
     // With the output axis it is applied live.
-    let resp = send(&rig.router, put_output(OUT1, "output-1", &etag, &name, &body)).await;
+    let resp = send(
+        &rig.router,
+        put_output(OUT1, "output-1", &etag, &name, &body),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()["x-multiview-apply"], "live");
 }
@@ -1248,8 +1271,11 @@ async fn live_resets_are_rate_limited_like_takes() {
     for (i, width) in [720, 1080, 540].into_iter().enumerate() {
         let (etag, name, mut body) = current_output(&rig, "output-1").await;
         body["format"]["width"] = json!(width);
-        let resp =
-            send(&rig.router, put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &body)).await;
+        let resp = send(
+            &rig.router,
+            put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &body),
+        )
+        .await;
         if i < 2 {
             assert_eq!(resp.status(), StatusCode::OK, "reset {i}");
             assert_eq!(resp.headers()["x-multiview-apply"], "live");

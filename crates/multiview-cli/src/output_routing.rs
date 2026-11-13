@@ -764,6 +764,10 @@ enum Reap {
     Encoder(Box<dyn LiveEncoder>),
 }
 
+#[allow(clippy::struct_excessive_bools)]
+// reason: each flag is an independent per-key health/ownership fact read on
+// the consumer tick (seen, refused, degraded, reformat); a state enum would
+// conflate orthogonal facts.
 struct DynamicKey {
     bus: PictureBus,
     format: Option<AuxFormat>,
@@ -883,6 +887,9 @@ struct BusHealth {
 }
 
 /// The per-run router (lives on the bake consumer).
+#[allow(clippy::struct_excessive_bools)]
+// reason: independent cached gates (dirty, clean/program feeds active,
+// reformat opener present), each checked on its own hot path.
 pub struct OutputRouter {
     cfg: RouterConfig,
     aux: AuxWiring,
