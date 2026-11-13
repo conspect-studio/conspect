@@ -28,12 +28,21 @@ use multiview_webrtc::transport::{MediaKind, Session, SessionConfig, UnifiedEndp
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Steering as the platform allows (the default: on, Linux pair + CBPF).
 fn config() -> FrontDoorConfig {
     FrontDoorConfig {
         port: 0,
         workers: 2,
         recv_buffer_bytes: 0,
         ..FrontDoorConfig::default()
+    }
+}
+
+/// One socket, no reuseport group (slice-1 behaviour).
+fn single_socket_config() -> FrontDoorConfig {
+    FrontDoorConfig {
+        steering: false,
+        ..config()
     }
 }
 
@@ -270,7 +279,11 @@ fn publish_rtc(
 }
 
 fn both_on_one_socket(loopback: &str, advertise: std::net::IpAddr) {
-    let mut door = FrontDoor::start(&config()).unwrap();
+    both_on_one_socket_with(&config(), loopback, advertise);
+}
+
+fn both_on_one_socket_with(config: &FrontDoorConfig, loopback: &str, advertise: std::net::IpAddr) {
+    let mut door = FrontDoor::start(config).unwrap();
     let port = door.local_addr().port();
     assert!(door.local_addr().is_ipv6(), "bound [::] dual-stack");
     let server: SocketAddr = format!("{loopback}:{port}").parse().unwrap();
@@ -318,6 +331,15 @@ fn moq_and_webrtc_share_one_socket_on_ipv6_loopback() {
 #[test]
 fn moq_and_webrtc_share_one_socket_on_ipv4_loopback() {
     both_on_one_socket("127.0.0.1", "127.0.0.1".parse().unwrap());
+}
+
+/// The same acceptance with steering forced off: the single-socket fallback
+/// serves both stacks unchanged.
+#[test]
+fn moq_and_webrtc_share_one_socket_with_steering_off() {
+    let cfg = single_socket_config();
+    both_on_one_socket_with(&cfg, "[::1]", "::1".parse().unwrap());
+    both_on_one_socket_with(&cfg, "127.0.0.1", "127.0.0.1".parse().unwrap());
 }
 
 /// The S4 sweep on the live socket: one 1300-byte datagram per first byte
