@@ -526,6 +526,20 @@ impl Default for LiveSourceCapability {
     }
 }
 
+/// The accepted-state exit fence (#367).
+#[derive(Debug, Default)]
+struct AcceptedFence {
+    /// Set once the run decided to exit: from then on no commit writes the
+    /// accepted state (`desired.json`). Checked by the durable write under
+    /// [`Self::gate`], right before the rename. One-way; never cleared.
+    frozen: std::sync::atomic::AtomicBool,
+    /// The commit gate: held across "check the freeze, then rename
+    /// `desired.json`" (never across an fsync or an `.await`). The freeze
+    /// itself never takes it (wait-free); the exit path waits on it, bounded,
+    /// to know no rename is still in flight.
+    gate: std::sync::Mutex<()>,
+}
+
 /// The shared application state.
 ///
 /// Cloned cheaply (`Arc`) into every handler via axum's `State` extractor. It
@@ -948,16 +962,9 @@ pub struct AppState {
     /// across the engine bus — it serializes two rare admin operations and can
     /// never back-pressure the engine (invariant #10).
     config_mutation_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Set once the run decided to exit (#367): from then on no commit writes
-    /// the accepted state (`desired.json`). Checked by the durable write itself
-    /// under the commit gate, right before the rename, so a commit in flight
-    /// when the exit is decided does not land after it. One-way; never cleared.
-    accepted_frozen: Arc<std::sync::atomic::AtomicBool>,
-    /// The commit gate (#367): held across "check the freeze, then rename
-    /// `desired.json`" (never across an fsync or an `.await`). The freeze
-    /// itself never takes it (wait-free); the exit path waits on it, bounded,
-    /// to know no rename is still in flight.
-    commit_gate: Arc<std::sync::Mutex<()>>,
+    /// The accepted-state exit fence (#367): the freeze flag and the commit
+    /// gate. See [`AcceptedFence`].
+    accepted_fence: Arc<AcceptedFence>,
     /// The coalescing **Running-changed** signal (ADR-W024 §3): a one-permit
     /// [`tokio::sync::Notify`] fired by [`AppState::audit`] — the ONE choke
     /// point every successful mutation passes through — that the debounced
@@ -1166,8 +1173,7 @@ impl AppState {
             watch_handle: Arc::new(std::sync::RwLock::new(None)),
             // The promote/revert mutation serial (ADR-W024 MAJOR-C2/C3).
             config_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
-            accepted_frozen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            commit_gate: Arc::new(std::sync::Mutex::new(())),
+            accepted_fence: Arc::default(),
             // Honest default: nothing applies live until the binary declares
             // what the running engine can take (ADR-W022).
             live_apply: crate::live_apply::LiveApplyCaps::default(),
@@ -1315,7 +1321,8 @@ impl AppState {
     /// [`Self::await_accepted_commits`] where the exit path can afford a
     /// bounded wait.
     pub fn freeze_accepted_state(&self) {
-        self.accepted_frozen
+        self.accepted_fence
+            .frozen
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1342,7 +1349,7 @@ impl AppState {
     pub fn await_accepted_commits(&self, bound: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + bound;
         loop {
-            match self.commit_gate.try_lock() {
+            match self.accepted_fence.gate.try_lock() {
                 Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => return true,
                 Err(std::sync::TryLockError::WouldBlock) => {}
             }
@@ -1354,7 +1361,7 @@ impl AppState {
     }
 
     fn lock_commit_gate(&self) -> std::sync::MutexGuard<'_, ()> {
-        match self.commit_gate.lock() {
+        match self.accepted_fence.gate.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -1363,7 +1370,8 @@ impl AppState {
     /// Whether [`Self::freeze_accepted_state`] ran.
     #[must_use]
     pub fn accepted_state_frozen(&self) -> bool {
-        self.accepted_frozen
+        self.accepted_fence
+            .frozen
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
