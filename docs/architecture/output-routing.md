@@ -1742,12 +1742,19 @@ in passthrough and is never moved into it without a baked slate:
 broadcast source vs our monotonic clock). The buffer depth (arrival time versus the AU's rebased
 DTS) is tracked; when it leaves `[1, 5]` ticks the clock corrects **only at the next source IDR**,
 by starting a new run there with a new offset:
-- too deep: drop the last AU before the IDR (a non-reference or the final reference of a closed
-  GOP; nothing after the IDR depends on it);
-- too shallow: insert one synthesised **repeat AU** before the IDR: a non-reference picture with
-  every macroblock/CTU skipped (H.264 P_Skip, HEVC skip CUs), built once per parameter-set
-  generation, with frame_num/POC valid there because the IDR that follows resets both. A B-frame
-  source cannot take a repeat AU safely; for it an underrun goes to the bridge.
+- too deep (the source runs fast; more than 5 ticks queued): the decision is taken when an IDR
+  enters the queue, while the AU before it is still queued (the depth is above 1): drop that AU (a non-reference or the final reference of a closed GOP;
+  nothing after the IDR depends on it) and start the new run so that the **IDR takes the dropped
+  AU's tick** (the offset decreases by one frame period). No tick is skipped: the AU count emitted
+  equals the tick count, every rebased DTS stays on the grid, and the queue shrinks by one;
+- too shallow (the source runs slow; below 1 tick queued): when the next AU due is an IDR, emit on
+  this tick one synthesised **repeat AU** instead and the IDR on the next tick: a non-reference picture with every macroblock/CTU skipped
+  (H.264 P_Skip, HEVC skip CUs), built once per parameter-set generation, with frame_num/POC valid
+  there because the IDR that follows resets both; the IDR's run starts on the next tick (the offset
+  increases by one frame period). A B-frame source cannot take a repeat AU safely; for it an underrun
+  goes to the bridge.
+- In both cases exactly one AU is emitted on every tick; the correction is one frame period per IDR
+  at most.
 At 50 ppm the correction is one frame every 11 minutes at 30 fps.
 
 **Stall, parameter change, non-strict RAP.** The clock switches the slot to the **bridge at the
