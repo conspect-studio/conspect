@@ -660,6 +660,21 @@ fn redirect_serves_http01_challenges_from_the_webroot() {
     });
     assert!(split.starts_with("HTTP/1.1 200 OK\r\n"), "{split}");
     assert!(split.ends_with("tok_EN-1.thumbprint"), "{split}");
+    // A request line and one CRLF, then silence (no half-close): answered
+    // after the short idle gap, well before the 5 s deadline.
+    let (lone, took) = client_rt().block_on(async move {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /app HTTP/1.0\r\n").await.unwrap();
+        let started = std::time::Instant::now();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        (out, started.elapsed())
+    });
+    assert!(
+        lone.contains("Location: https://mda001.example.net/app\r\n"),
+        "{lone}"
+    );
+    assert!(took < Duration::from_secs(3), "{took:?}");
     // Traversal is not a token: it gets the redirect, never a file.
     let out = get(b"GET /.well-known/acme-challenge/../../secret HTTP/1.1\r\n\r\n");
     assert!(out.starts_with("HTTP/1.1 301"), "{out}");

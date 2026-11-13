@@ -1266,7 +1266,9 @@ The engine serves TCP 443, TCP 80 and UDP 443 on mda001; nginx is removed by the
   certificate. `[network] acme_webroot` makes the
   port-80 listener answer `/.well-known/acme-challenge/<base64url token>` from
   `<webroot>/.well-known/acme-challenge/` (regular files, at most 1 KiB, no symlinks), so certbot
-  `--webroot` renews without nginx. The move to the engine's own ACME and the point where
+  `--webroot` renews without nginx. The port-80 listener now reads to the end of the request
+  head (`\r\n\r\n`, at most 8 KiB, 5 s), or answers 300 ms after a complete request line when
+  the client stops sending, so a request line split across segments is parsed whole. The move to the engine's own ACME and the point where
   certbot is retired are in the runbook.
 * **HLS** (`multiview-output::hls::http`): confinement, open and `fstat` in one blocking-pool
   hop (was five `tokio::fs` round trips); the length and validators come from the opened handle;

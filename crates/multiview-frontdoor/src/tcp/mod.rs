@@ -669,14 +669,29 @@ pub(crate) async fn redirect_loop(listener: TcpListener, state: Arc<RedirectStat
     }
 }
 
+/// After a complete request line, how long the port-80 listener waits for
+/// more of the head before answering from what it has.
+const REDIRECT_IDLE_AFTER_LINE: Duration = Duration::from_millis(300);
+
 async fn redirect_one(config: &RedirectConfig, mut stream: TcpStream) -> std::io::Result<()> {
     let mut head = vec![0u8; redirect::MAX_REQUEST_HEAD];
     let mut filled = 0usize;
+    let mut line_done = false;
     while let Some(slot) = head.get_mut(filled..) {
         if slot.is_empty() {
             break;
         }
-        let n = stream.read(slot).await?;
+        // Once the request line is complete, a client that stops sending
+        // (an HTTP/1.0-style `GET /x HTTP/1.0\r\n` and wait) is answered
+        // after a short idle gap instead of at the 5 s deadline.
+        let n = if line_done {
+            match tokio::time::timeout(REDIRECT_IDLE_AFTER_LINE, stream.read(slot)).await {
+                Ok(read) => read?,
+                Err(_) => break,
+            }
+        } else {
+            stream.read(slot).await?
+        };
         if n == 0 {
             break;
         }
@@ -686,6 +701,10 @@ async fn redirect_one(config: &RedirectConfig, mut stream: TcpStream) -> std::io
         // MAX_REQUEST_HEAD and the per-connection deadline.
         let seen_from = filled.saturating_sub(3);
         filled += n;
+        line_done = line_done
+            || head
+                .get(..filled)
+                .is_some_and(|h| h.windows(2).any(|p| p == b"\r\n"));
         if head
             .get(seen_from..filled)
             .is_some_and(|w| w.windows(4).any(|p| p == b"\r\n\r\n"))
