@@ -174,7 +174,8 @@ fn splice_output_routing(
     let empty = table.output.is_empty()
         && table.video.is_empty()
         && table.audio.is_empty()
-        && table.subtitle.is_empty();
+        && table.subtitle.is_empty()
+        && table.max_aux_canvases.is_none();
     (!empty).then_some(table)
 }
 
