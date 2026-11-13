@@ -63,6 +63,7 @@ pub mod cors;
 pub mod devices;
 pub mod error;
 pub mod event_automation;
+pub mod frontdoor_metrics;
 pub mod iptv;
 pub mod is07;
 pub mod jwt;

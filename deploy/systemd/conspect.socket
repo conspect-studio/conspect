@@ -1,0 +1,23 @@
+# Placeholder socket unit for socket activation (ADR-0107 slice 6 — NOT
+# wired up yet: the engine does not currently accept passed file
+# descriptors, and `conspect.service` above binds its own sockets). Kept in
+# the tree now so `ReceiveBuffer=8M` (the design's target buffer size, design
+# note section 9) is documented and true once slice 6 lands, instead of being
+# promised in prose only. Do NOT enable this unit today; it has no effect
+# because nothing in the engine listens for LISTEN_FDS yet.
+[Unit]
+Description=Conspect multiview engine sockets (slice 6, not yet wired)
+
+[Socket]
+ListenStream=[::]:443
+ListenStream=[::]:80
+ListenDatagram=[::]:443
+BindIPv6Only=both
+# The slice-3 target the engine's own SO_RCVBUFFORCE/SO_RCVBUF path
+# (deploy/sysctl/90-conspect-udp.conf) stands in for until this unit is
+# actually passed to the engine.
+ReceiveBuffer=8M
+FileDescriptorName=conspect-udp443
+
+[Install]
+WantedBy=sockets.target

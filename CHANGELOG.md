@@ -44,6 +44,20 @@ implementation will build against.
   `[network.tls] allow_private_directory` gates a private custom directory. Tested against Pebble
   in the new `acme-pebble` CI job (#291).
 
+- **Network front door: QUIC Retry, config wiring, capability + metrics, nft floor (ADR-0107
+  slice 3, issue #289).** `network.quic.retry_above_handshakes` sends a QUIC Retry (RFC 9000
+  §8.1.2) once that many handshakes are in flight, forcing an address-validation round trip before
+  the vendored `MoQ` server spends a handshake slot; `[network.udp]`/`[network.quic]` expose every
+  slice-3 limit (receive buffer, new-flow/STUN rates, validated-flow steering, retry threshold,
+  connection cap) as config, all optional with the existing crate defaults. `GET
+  /api/v1/system/capabilities` gains a `network` capability (steering mode, receive-buffer report,
+  kernel-drop support, the nft UDP-443 floor as read at startup); `GET /api/v1/metrics/frontdoor`
+  reports the live counters, steering gauges, the live nft-floor status and the QUIC retry count.
+  Deploy artefacts: `deploy/nftables/conspect-udp443-floor.nft` (a per-source/per-/64 floor on new
+  UDP 443 traffic), `deploy/systemd/conspect.service` (+ a not-yet-wired `conspect.socket`
+  placeholder for slice 6), `deploy/sysctl/90-conspect-udp.conf`, and
+  `docs/runbooks/udp-443-flood.md`.
+
 - **Event journal.** Every raw SCTE-35, timed ID3 and HLS cue observation is recorded off-clock
   with its full decode, predicted wall-clock and on-air times, per source and day, with bounded
   retention (`[events]`). Read it in the Events dialog's Journal tab, or through

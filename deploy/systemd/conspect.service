@@ -1,0 +1,56 @@
+# Example systemd unit for a Linux host running the conspect engine with the
+# network front door (ADR-0107). NOT installed automatically — copy, adjust
+# the paths/user for your host, then `systemctl enable --now conspect`. See
+# docs/runbooks/udp-443-flood.md for the full install/verify/rollback story.
+[Unit]
+Description=Conspect multiview engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Placeholder dedicated user: never run as root. The front door's validated-
+# flow steering (SO_REUSEPORT group membership, slice 3) only admits sockets
+# with the SAME effective uid as the group's first socket, so every process
+# that should share the steered pair must run as this one user.
+User=operations
+Group=operations
+# Low ports (443) without CAP_NET_BIND_SERVICE need this ambient capability;
+# socket activation (slice 6, deploy/systemd/conspect.socket) removes the
+# need for it entirely, at which point this line can be dropped.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# `RuntimeDirectory=conspect` creates (and on stop removes) /run/conspect
+# 0755 root:root, world-readable — exactly what an unprivileged engine
+# process needs to read the nft-floor status file below.
+RuntimeDirectory=conspect
+RuntimeDirectoryMode=0755
+
+# Writes the nft floor's current ruleset state to the status file the engine
+# reads (network.udp.nft_floor_status_file, default
+# /run/conspect/nft-floor.json; design note section 10.1). `ExecStartPre=+`
+# runs as root (the `+` prefix) regardless of the service's own User=, which
+# is required here: `nft list` needs CAP_NET_ADMIN, which this unit does NOT
+# grant the engine itself. On success this writes the table's JSON; on a
+# missing table (the floor was never installed, or was removed) `nft`
+# writes its own "No such file or directory" error text instead (captured
+# via `2>&1`) — the engine's parser recognises that text as "absent". Any
+# other failure (nft itself missing, a permissions problem) leaves the file
+# empty or stale, which the parser honestly reports as "unknown".
+ExecStartPre=+/bin/sh -c 'nft -j list table inet conspect_floor > /run/conspect/nft-floor.json 2>&1 || true'
+
+ExecStart=/usr/local/bin/conspect run --config /etc/conspect/conspect.toml
+Restart=on-failure
+RestartSec=2
+
+# NOTE on receive-buffer sizing (design note section 9/"Slice 3 as built"):
+# this unit intentionally sets NOTHING for the UDP receive buffer. Without a
+# socket unit (deploy/systemd/conspect.socket is NOT wired up yet — socket
+# activation is slice 6), the engine binds its own socket and tries
+# SO_RCVBUFFORCE (needs CAP_NET_ADMIN, which this unit does not grant) before
+# falling back to plain SO_RCVBUF (capped by net.core.rmem_max). Until slice 6
+# ships ReceiveBuffer=8M on a real socket unit, raise net.core.rmem_max
+# instead — see deploy/sysctl/90-conspect-udp.conf and the runbook.
+
+[Install]
+WantedBy=multi-user.target

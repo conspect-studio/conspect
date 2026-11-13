@@ -648,6 +648,13 @@ impl Server {
 				Some(_conn) = noq_accept => {
 					#[cfg(feature = "noq")]
 					{
+						// Retry policy (RFC 9000 section 8.1.2, `noq::Injected::retry_above_handshakes`):
+						// `self.accept.len()` is exactly the handshakes in flight (accepted
+						// `Incoming`s whose handshake + SETUP has not finished). `None` threshold
+						// (every caller before this field existed) returns `_conn` unchanged.
+						let in_flight = self.accept.len();
+						let Some(noq) = self.noq.as_ref() else { continue };
+						let Some(_conn) = noq.maybe_retry(_conn, in_flight) else { continue };
 						let alpns = versions.alpns();
 						let deadline = setup.deadline();
 						self.accept.push(async move {

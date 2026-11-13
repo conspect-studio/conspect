@@ -11,11 +11,17 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use noq::udp::{EcnCodepoint, RecvMeta, Transmit, UdpSocketState};
+use smallvec::SmallVec;
 
 use crate::steering::{ProgramSet, ReuseportGroup, SteeringMode};
 
 /// The largest UDP payload a segment can carry (Ethernet MTU minus IP/UDP).
 const MAX_SEGMENT: usize = 1472;
+
+/// Inline capacity of the per-call `IoSliceMut` slice built in
+/// [`SharedSocket::try_recv_batch`]: every platform's `noq::udp::BATCH_SIZE`
+/// (32 on Linux, 1 elsewhere) fits without spilling to the heap.
+const RECV_BATCH_INLINE: usize = 32;
 
 /// What the kernel granted for one socket's receive buffer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -316,11 +322,18 @@ impl SharedSocket {
             },
         };
         io.try_io(tokio::io::Interest::READABLE, || {
-            let mut slices: Vec<IoSliceMut<'_>> = batch
-                .bufs
-                .iter_mut()
-                .map(|b| IoSliceMut::new(b.as_mut_slice()))
-                .collect();
+            // `slices` is a `SmallVec` sized to `RECV_BATCH_INLINE` (>= every
+            // platform's `noq::udp::BATCH_SIZE`), so rebuilding the borrowed
+            // `IoSliceMut`s into `batch.bufs` each call stays on the stack:
+            // no heap allocation per batch (the per-call `Vec<IoSliceMut>`
+            // this replaced always allocated).
+            let mut slices: SmallVec<[IoSliceMut<'_>; RECV_BATCH_INLINE]> = SmallVec::new();
+            slices.extend(
+                batch
+                    .bufs
+                    .iter_mut()
+                    .map(|b| IoSliceMut::new(b.as_mut_slice())),
+            );
             state.recv(io.into(), &mut slices, &mut batch.meta)
         })
     }

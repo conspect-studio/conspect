@@ -565,12 +565,17 @@ new_flow_pps_per_source = 500
 new_flow_burst = 200
 new_flow_global_pps = 50_000     # cap on all unvalidated datagrams per second
 validated_steering = true        # Linux: SO_REUSEPORT + BPF, validated flows on their own queue
+stun_pps_per_source = 50         # well-formed STUN from an unvalidated source, per source key
+stun_global_pps = 5_000          # same, summed over every unvalidated source
+nft_floor_status_file = "/run/conspect/nft-floor.json"  # written by the systemd unit's ExecStartPre=+ (section 10.1)
 
 [network.quic]
 retry_above_handshakes = 8       # send Retry (address validation) once this many handshakes are open
 max_connections = 1024
-idle_timeout_secs = 30
-min_reset_interval_ms = 200      # endpoint-wide (noq), not per peer
+# idle_timeout_secs and min_reset_interval_ms are future slice-3 follow-ups, not read by this
+# slice: idle_timeout_secs is not wired into the noq transport config yet, and
+# min_reset_interval_ms is fixed at 200 ms in code (multiview_frontdoor::quic::MIN_RESET_INTERVAL),
+# not yet config-driven. Removed here rather than left as a key that silently does nothing.
 
 [network.ice_tcp]
 enabled = true
@@ -1072,3 +1077,74 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
   lands second; TODO in `multiview-cli/src/frontdoor.rs`); the str0m ICE-TCP consumer, passive TCP
   candidates in the SDP and the browser ladder (PR2 of this slice); systemd socket activation
   (section 9) and the mda001 cutover (slice 6).
+
+### Slice 3 as built, part B: Retry policy, config wiring, capability + metrics, deploy artefacts (issue #289)
+
+**QUIC Retry policy.** Vendored `vendor/moq-tokio`: `noq::Injected` gains `retry_above_handshakes:
+Option<usize>` and `retry_counter: Option<Arc<AtomicU64>>`. In `Server::accept_next`'s `noq_accept`
+arm, `self.accept.len()` (the `FuturesUnordered` of accepted `Incoming`s whose handshake + SETUP
+has not finished) is the handshake-in-flight count; `NoqServer::maybe_retry` compares it against
+the threshold and, for an `Incoming` that is not yet address-validated and may still retry, calls
+`incoming.retry()` (bumping the counter) instead of handing it to the accept pipeline. A failed
+`retry()` (the `Incoming` already carries a validated token) falls through to `ignore()`. `None`
+(every caller before this field existed) returns the `Incoming` unchanged — byte for byte identical
+to the pre-slice-3 path. `multiview_frontdoor::quic::DEFAULT_RETRY_ABOVE_HANDSHAKES` is 8;
+`multiview-moq::provider::SharedSocket` carries the same two fields through to the injected socket.
+Tested in `crates/multiview-frontdoor/tests/retry.rs`: a real `MoQ` client still connects end to
+end through a Retry round trip with `Some(0)` (the counter bumps >= 1), the counter stays 0 with
+`None`, and a flood of random-key Initials under `Some(0)` never makes total reply bytes exceed
+total sent bytes (no amplification from the Retry path itself).
+
+**Config.** `multiview-config::network_tls` gains `NetworkUdpConfig` (`[network.udp]`) and
+`NetworkQuicConfig` (`[network.quic]`), both `#[serde(default)]` nested structs on `NetworkConfig`
+so an old `[network]` section with neither sub-table parses unchanged. Every field name matches
+section 10's TOML block above; `deny_unknown_fields` on both; validation rejects a zero rate, a
+`recv_buffer_bytes` outside `1..=256 MiB`, and a `max_connections` outside `1..=65536`.
+`retry_above_handshakes` has no invalid value (0 is a legitimate, if aggressive, "retry everything"
+choice).
+
+**CLI wiring.** `crates/multiview-cli/src/frontdoor.rs::config_from` maps every `[network.udp]` key
+onto `FrontDoorConfig`/`NewFlowLimits` and `validated_steering` onto `FrontDoorConfig::steering`;
+`network.quic.max_connections` onto `max_quic_peers`. `network.quic.retry_above_handshakes` and
+`network.udp.nft_floor_status_file` are not `FrontDoorConfig` fields (they feed the `MoQ` socket
+wiring and the nft-floor probe respectively) and are read by their own small accessors. At start,
+one `tracing::info!` names the steering mode, the rcvbuf requested/granted/usable/clamped report,
+kernel-drop support, and the nft floor read at that moment.
+
+**nft floor probe.** `crates/multiview-cli/src/nft_floor.rs` is a pure, panic-free parser (no
+sockets, no `nft` invocation from the engine — it runs unprivileged and cannot list the ruleset
+itself). It reads `network.udp.nft_floor_status_file`: JSON containing a `set` (nft's JSON reports
+a meter as a `set` with `dynamic`/`timeout` flags) named `conspect_udp443_new` (or a name starting
+with it, covering the shipped file's separate IPv4/IPv6 meters) inside `table inet conspect_floor`
+→ `Present`; the literal content `absent`, or nft's own "No such file or directory" error text
+(what `nft -j list` prints for a table that was never installed) → `Absent`; a missing, unreadable
+or unparsable file → `Unknown`. Re-read every 10 minutes
+(`multiview_cli::nft_floor::NFT_FLOOR_REREAD_INTERVAL`) on the front-door runtime via
+`tokio::task::spawn_blocking` (a plain file read, never the program runtime).
+
+**Capability report and metric.** `multiview_control::system::SystemCapabilities` gains `network:
+Option<NetworkCapability>` (`{udp443_steering, steering_reason, recv_buffer, kernel_drops_supported,
+nft_floor}`), filled once at startup by `FrontDoorRun::capability()` and installed into a
+process-global slot (`multiview_cli::frontdoor::install`, mirroring the existing Program-metrics
+and output-routing slots) before the control plane's capability snapshot is built — `nft_floor`
+here is the **startup** read only, named as such in the field doc. `GET /api/v1/metrics/frontdoor`
+(new `multiview_control::frontdoor_metrics` module, same auth as `/metrics/program`: Read +
+unscoped whole-system principals) reports the live `StatsSnapshot` counters, the steering mode, the
+**live** (periodically re-read) nft floor, and the QUIC retry counter, through a
+`FrontDoorMetricsSource` trait the CLI installs the same way; 404 when no front door runs this
+process. Registered in `openapi.rs`; `cargo xtask gen-openapi` regenerated `docs/api/openapi.json`.
+
+**Deploy artefacts.** `deploy/systemd/conspect.service` (example unit, `User=operations`
+placeholder, `AmbientCapabilities=CAP_NET_BIND_SERVICE`, `RuntimeDirectory=conspect`, and an
+`ExecStartPre=+` writing `nft -j list table inet conspect_floor`'s output — success or nft's own
+error text — to `/run/conspect/nft-floor.json`); `deploy/systemd/conspect.socket` (explicitly
+marked not-yet-wired: socket activation is slice 6, and it carries the `ReceiveBuffer=8M` target
+value so it is documented and true once that slice lands, rather than only promised in prose);
+`deploy/sysctl/90-conspect-udp.conf` (`net.core.rmem_max = 8388608`, the knob that actually raises
+the usable buffer until slice 6's socket unit exists); `deploy/nftables/conspect-udp443-floor.nft`
+(table `inet conspect_floor`, `filter hook input priority -5`, `ct state established,related
+accept` for UDP 443 first, then two `meter` statements — IPv4 per address, IPv6 per /64 via `ip6
+saddr and ffff:ffff:ffff:ffff::` — each `limit rate over 2000/second burst 1000 packets`, `size
+65536`, `timeout 2m`). Validated with `sudo unshare -Urn nft -c -f -` (piped via stdin; this
+container's `nft -c` needs a netlink cache init that `sudo nft -c -f <path>` alone cannot get past,
+even for a syntax-only check) — see `docs/runbooks/udp-443-flood.md` for the exact command and why.

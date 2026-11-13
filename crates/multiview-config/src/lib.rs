@@ -116,7 +116,7 @@ pub use multicast::{
 pub use network_diagnostics::NetworkDiagnosticsConfig;
 pub use network_tls::{
     AcmeChallenge, CertificateAuthority, DnsProviderConfig, IceTcpConfig, NetworkConfig,
-    NetworkMode, NetworkTlsConfig, TrustedProxy,
+    NetworkMode, NetworkQuicConfig, NetworkTlsConfig, NetworkUdpConfig, TrustedProxy,
 };
 pub use origin::{Origin, OriginParseError};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
