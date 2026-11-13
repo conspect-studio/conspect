@@ -2520,6 +2520,24 @@ impl OutputRouter {
             let Some(&base) = self.cfg.base_keys.get(index) else {
                 continue;
             };
+            // #342 B3 x #383: the output's base key can be its own reformat
+            // key, opened ON this very feed (a reset while on a layout or
+            // source). Falling back onto it would keep the fallen feed on air
+            // (a deleted layout composed by a pinned key). It is re-keyed to
+            // Program instead: the same canvas-sized picture its worker
+            // already converts to the output's format (sources/PVW, keyed at
+            // a feed format, never reach here: their reset key is not a
+            // canvas reader), fed by the bake consumer from the next tick.
+            if let Some(d) = self
+                .dynamic
+                .iter_mut()
+                .find(|d| d.key == base && d.bus == *bus && d.pinned_for == Some(index))
+            {
+                d.bus = PictureBus::Program;
+                d.format = None;
+                d.last_aux_tick = None;
+                self.dirty = true;
+            }
             // A take whose dispatcher move is in flight is settled first
             // (Superseded, audio restored): the forced rebind replaces
             // that move, which would otherwise strand it forever (#330

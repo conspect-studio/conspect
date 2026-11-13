@@ -6071,3 +6071,153 @@ fn a_forgotten_change_fails_closed_over_an_older_known_state() {
         "a later resolution passes"
     );
 }
+
+/// #383 x B3: an output reformatted while on a routed layout keeps it as its
+/// own (pinned) base key. That key must keep following the layout: a live
+/// edit reaches it (an IDR on the reformat key, the edited body composes),
+/// a halved aux cadence never degrades or fails it, and a DELETE of the
+/// layout moves it off the layout (the canvas stops composing, the output
+/// reads Program from its own base key, at the new format) — never a deleted
+/// layout kept on air by a pinned key.
+#[test]
+#[allow(clippy::too_many_lines)] // One scenario: reset, back-off, edit, delete.
+fn a_reformatted_layout_output_follows_edits_back_off_and_a_delete() {
+    let mut x = reformat_harness(1, 6, OpenMode::Ok);
+    let layout = layout_bus("L1");
+    let publish = |x: &mut ReformatHarness, t: u64, bus: &PictureBus| {
+        if let Some(slot) = x.r.slot(bus) {
+            slot.latest
+                .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                    tick: t,
+                    generation: 1,
+                    frame: canvas(),
+                })));
+        }
+    };
+    let mut t = 0;
+    let mut seen: Vec<(String, TakeResult, u64)> = Vec::new();
+    let until = |x: &mut ReformatHarness,
+                 t: &mut u64,
+                 seen: &mut Vec<(String, TakeResult, u64)>,
+                 bus: &PictureBus,
+                 op: &str,
+                 want: &TakeResult| {
+        let end = *t + REFORMAT_DEADLINE_TICKS;
+        while *t < end && !seen.iter().any(|(o, r, _)| o == op && r == want) {
+            publish(x, *t, bus);
+            x.tick(*t);
+            *t += 1;
+            seen.extend(x.results());
+        }
+        assert!(
+            seen.iter().any(|(o, r, _)| o == op && r == want),
+            "{op}: {seen:?}"
+        );
+    };
+    x.h.try_take(take("lay", 0, layout.clone())).unwrap();
+    until(
+        &mut x,
+        &mut t,
+        &mut seen,
+        &layout,
+        "lay",
+        &TakeResult::Applied,
+    );
+    x.reformat("rf", 0);
+    until(
+        &mut x,
+        &mut t,
+        &mut seen,
+        &layout,
+        "rf",
+        &TakeResult::ResetApplied,
+    );
+    let key = x.d.binding_video_key(0).unwrap();
+    assert_eq!(x.r.cfg.base_keys, vec![key]);
+    // Back-off: a halved cadence (the slot one tick old every other tick)
+    // neither degrades nor fails the reformat key.
+    x.halved.store(true, Ordering::Release);
+    for _ in 0..40 {
+        if t % 2 == 0 {
+            publish(&mut x, t, &layout);
+        }
+        x.tick(t);
+        t += 1;
+        seen.extend(x.results());
+    }
+    x.halved.store(false, Ordering::Release);
+    assert_eq!(
+        x.d.binding_video_key(0),
+        Some(key),
+        "no fallback while halved"
+    );
+    assert!(!x.d.is_key_failed(key));
+    assert!(!x.h.snapshot().outputs[0].degraded, "never degraded");
+    // A live edit: the reformat key follows it at an IDR.
+    for _ in 0..FORCE_FLOOR_TICKS {
+        publish(&mut x, t, &layout);
+        x.tick(t);
+        t += 1;
+    }
+    let edited = layout_bus("L1");
+    let PictureBus::Layout(new) = &edited else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(new.clone()))
+        .unwrap();
+    publish(&mut x, t, &edited);
+    x.tick(t);
+    let composed =
+        x.r.aux
+            .feeds
+            .load()
+            .iter()
+            .find_map(|f| match &f.bus {
+                PictureBus::Layout(l) => Some(Arc::clone(&l.body)),
+                _ => None,
+            })
+            .expect("the layout still composes");
+    assert!(Arc::ptr_eq(&composed, &new.body), "the edit is live");
+    assert_eq!(
+        x.r.last_forced.get(&key).copied(),
+        Some(t + 1),
+        "an IDR on the reformat key"
+    );
+    t += 1;
+    // Delete: the output leaves the layout; nothing composes it any more.
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Removed {
+        id: "L1".to_owned(),
+        revision: crate::output_routing::next_layout_revision(),
+    })
+    .unwrap();
+    for _ in 0..20 {
+        x.tick(t);
+        t += 1;
+        seen.extend(x.results());
+    }
+    assert_eq!(x.h.snapshot().outputs[0].bus, "program", "{seen:?}");
+    // The reformat key (the pinned base) is re-keyed to Program at once; the
+    // take's old layout key carries no output and lingers out like any
+    // unused key (#383), after which nothing composes the deleted layout.
+    assert_eq!(x.r.bus_of_key(key), Some(PictureBus::Program));
+    for _ in 0..LINGER_TICKS + 5 {
+        x.tick(t);
+        t += 1;
+    }
+    assert!(
+        x.r.aux
+            .feeds
+            .load()
+            .iter()
+            .all(|f| !matches!(f.bus, PictureBus::Layout(_))),
+        "a deleted layout is never kept composing by a pinned key"
+    );
+    assert_eq!(
+        x.d.binding_video_key(0),
+        Some(key),
+        "still its own base key"
+    );
+    assert_eq!(x.r.bus_of_key(key), Some(PictureBus::Program));
+    let o0 = x.windows_of(0);
+    assert!(o0.windows(2).all(|w| w[1] == w[0] + 1), "no gap: {o0:?}");
+}
