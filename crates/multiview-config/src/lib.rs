@@ -294,6 +294,14 @@ pub struct ControlConfig {
     /// serve time by `multiview-control`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<crate::tls::TlsConfig>,
+    /// Serve the web UI from this directory (a built `web/dist`: `index.html`
+    /// plus the content-hashed `assets/`) instead of the copy embedded in the
+    /// binary (slice 6, issue #292). Lets an operator deploy a UI build
+    /// without rebuilding the engine, as the nginx site on mda001 did from
+    /// `/var/www/conspect-ui/<sha>/`. Absent = the embedded UI (the default).
+    /// Must be an absolute path; read at startup (a restart switches it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_dir: Option<std::path::PathBuf>,
 }
 
 /// Process-wide system settings.
@@ -1220,6 +1228,14 @@ impl MultiviewConfig {
             // off the deployment host).
             if let Some(tls) = &control.tls {
                 tls.validate()?;
+            }
+            if let Some(dir) = &control.ui_dir {
+                if !dir.is_absolute() {
+                    return Err(ConfigError::Validation(format!(
+                        "control.ui_dir must be an absolute path (got {})",
+                        dir.display()
+                    )));
+                }
             }
         }
         Ok(())

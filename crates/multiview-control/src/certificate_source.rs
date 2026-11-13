@@ -455,6 +455,14 @@ impl StaticCertificateSource {
     }
 }
 
+impl StaticCertificateSource {
+    /// Replace the served certificate (the static-file reloader, slice 6):
+    /// applies to the next handshake; a handshake in flight keeps its key.
+    pub fn replace(&self, key: Arc<CertifiedKey>) {
+        self.sender.send_replace(key);
+    }
+}
+
 impl CertificateSource for StaticCertificateSource {
     fn current(&self) -> Arc<CertifiedKey> {
         self.sender.borrow().clone()
