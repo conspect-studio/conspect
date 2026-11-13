@@ -192,8 +192,8 @@ fn authorize(principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
             )?;
             authorize_output(principal, output)?;
         }
-        if let Some(object) = source_id(&xp.source)
-            .or_else(|| xp.source.get("layout").and_then(Value::as_str))
+        if let Some(object) =
+            source_id(&xp.source).or_else(|| xp.source.get("layout").and_then(Value::as_str))
         {
             authorize_object(principal, object)?;
         }
@@ -212,11 +212,11 @@ struct Member {
 }
 
 /// Shape checks: this slice's plane/destination/source kinds, no duplicates.
-fn shape(req: &PatchRequest) -> Result<Vec<Member>, Response> {
+fn shape(req: &PatchRequest) -> Result<Vec<Member>, Box<Response>> {
     let mut members = Vec::with_capacity(req.crosspoints.len());
     for xp in &req.crosspoints {
         if xp.plane != "video" {
-            return Err(problem(
+            return Err(Box::new(problem(
                 422,
                 "slot-medium-mismatch",
                 format!(
@@ -224,22 +224,22 @@ fn shape(req: &PatchRequest) -> Result<Vec<Member>, Response> {
                      (audio and subtitle slots arrive in a later slice)",
                     xp.plane
                 ),
-            ));
+            )));
         }
         let destination = &xp.destination;
         if destination.output.is_some() || destination.slot.is_some() {
-            return Err(problem(
+            return Err(Box::new(problem(
                 422,
                 "unknown-slot",
                 "output slots arrive in a later slice; this release patches mixer inputs only",
-            ));
+            )));
         }
         let (Some(_), Some(input)) = (&destination.mixer, destination.input) else {
-            return Err(problem(
+            return Err(Box::new(problem(
                 422,
                 "unknown-slot",
                 "a mixer destination needs both `mixer` and `input`",
-            ));
+            )));
         };
         let source = match &xp.source {
             Value::String(none) if none == "none" => None,
@@ -247,20 +247,20 @@ fn shape(req: &PatchRequest) -> Result<Vec<Member>, Response> {
                 source_id(&xp.source).map(str::to_owned)
             }
             _ => {
-                return Err(problem(
+                return Err(Box::new(problem(
                     422,
                     "unknown-source",
                     "a mixer input takes {\"source\": id} or \"none\"; layouts and buses as \
                      mixer inputs arrive in a later slice",
-                ))
+                )))
             }
         };
         if members.iter().any(|m: &Member| m.input == input) {
-            return Err(problem(
+            return Err(Box::new(problem(
                 422,
                 "unknown-slot",
                 format!("mixer input {input} appears twice in one patch"),
-            ));
+            )));
         }
         members.push(Member { input, source });
     }
@@ -278,27 +278,27 @@ fn configured_sources(state: &AppState) -> ControlResult<Vec<String>> {
 /// Live engine handle with numbered inputs, or the typed refusal.
 fn engine_with_inputs(
     state: &AppState,
-) -> Result<(&SwitcherControl, std::sync::Arc<InputsReadback>), Response> {
+) -> Result<(&SwitcherControl, std::sync::Arc<InputsReadback>), Box<Response>> {
     let Some(handle) = state.switcher.as_ref() else {
-        return Err(problem(
+        return Err(Box::new(problem(
             409,
             "switcher-unavailable",
             "no real Program/Preview switcher is attached to this run",
-        ));
+        )));
     };
     if !handle.is_ready() {
-        return Err(problem(
+        return Err(Box::new(problem(
             409,
             "switcher-unavailable",
             "no real paired Program/Preview frame has been published",
-        ));
+        )));
     }
     let Some(inputs) = handle.inputs() else {
-        return Err(problem(
+        return Err(Box::new(problem(
             422,
             "unknown-slot",
             "this M/E declares no numbered mixer inputs",
-        ));
+        )));
     };
     Ok((handle, inputs))
 }
@@ -318,7 +318,7 @@ fn check(
 ) -> ControlResult<Result<Checked, Response>> {
     let members = match shape(req) {
         Ok(members) => members,
-        Err(response) => return Ok(Err(response)),
+        Err(response) => return Ok(Err(*response)),
     };
     let sources = configured_sources(state)?;
     let program_input = snapshot.and_then(|s| s.program_input);
@@ -467,7 +467,7 @@ pub(crate) async fn plan_patch(
     authorize(&principal, &req)?;
     let (handle, inputs) = match engine_with_inputs(&state) {
         Ok(found) => found,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let snapshot = handle.snapshot();
     match check(&state, &req, &inputs, snapshot.as_deref())? {
@@ -501,7 +501,7 @@ pub(crate) async fn take_patch(
     authorize(&principal, &req)?;
     let (handle, inputs) = match engine_with_inputs(&state) {
         Ok(found) => found,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let snapshot = handle.snapshot();
     let checked = match check(&state, &req, &inputs, snapshot.as_deref())? {
@@ -524,9 +524,10 @@ pub(crate) async fn take_patch(
         .iter()
         .map(|m| format!("{ME}.in{}", m.input))
         .collect();
-    if let Err(retry) = state
-        .patch_limiter
-        .admit_set(&destinations, &principal.key_id, Instant::now())
+    if let Err(retry) =
+        state
+            .patch_limiter
+            .admit_set(&destinations, &principal.key_id, Instant::now())
     {
         return Ok(too_many(retry));
     }
@@ -537,7 +538,9 @@ pub(crate) async fn take_patch(
     };
     let Some(scene_version) = handle.scene_version() else {
         state.idempotency.release(Some(key), &op);
-        return Err(ControlError::Conflict("switcher has no active scene".into()));
+        return Err(ControlError::Conflict(
+            "switcher has no active scene".into(),
+        ));
     };
     // On-demand leases for a newly patched source landing on PGM or PVW, so
     // an on-demand source starts before the engine needs its fresh frame.
@@ -619,6 +622,15 @@ pub(crate) async fn take_patch(
         return Err(ControlError::EngineBusy);
     }
     Ok(accepted(op.to_string()))
+}
+
+/// The patch routes, merged into the API router.
+pub(crate) fn router() -> axum::Router<AppState> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/patch", get(get_patch))
+        .route("/patch/plan", post(plan_patch))
+        .route("/patch/take", post(take_patch))
 }
 
 fn accepted(operation_id: String) -> Response {

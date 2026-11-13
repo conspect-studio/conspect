@@ -71,7 +71,7 @@ fn scene(id: &str) -> Arc<Layout> {
     })
 }
 
-fn command(op: impl ToString, verb: SwitcherVerb) -> SwitcherCommand {
+fn command(op: impl std::fmt::Display, verb: SwitcherVerb) -> SwitcherCommand {
     SwitcherCommand {
         operation_id: op.to_string(),
         scene_version: 1,
@@ -155,12 +155,18 @@ fn without_a_table_selections_are_sources_and_input_fields_stay_empty() {
     assert_eq!(driver.selections(), driver.resolved_selections());
     let snapshot = handle.snapshot().unwrap();
     assert_eq!(
-        (snapshot.program_input, snapshot.preview_input, snapshot.inputs_version),
+        (
+            snapshot.program_input,
+            snapshot.preview_input,
+            snapshot.inputs_version
+        ),
         (None, None, 0)
     );
     assert!(handle.inputs().is_none());
     let mut outcomes = handle.outcomes();
-    handle.try_send(command(1, patch(&[(1, Some("c"))], true))).unwrap();
+    handle
+        .try_send(command(1, patch(&[(1, Some("c"))], true)))
+        .unwrap();
     run(&mut driver, 1);
     assert!(outcomes.try_recv().unwrap().event.error.is_some());
 }
@@ -172,7 +178,10 @@ fn select_input_then_cut_resolves_program_and_flip_flops_inputs() {
     run(&mut driver, 0);
     let snapshot = handle.snapshot().unwrap();
     assert_eq!(snapshot.program.as_str(), "a");
-    assert_eq!((snapshot.program_input, snapshot.preview_input), (Some(1), Some(3)));
+    assert_eq!(
+        (snapshot.program_input, snapshot.preview_input),
+        (Some(1), Some(3))
+    );
     handle
         .try_send(command(1, SwitcherVerb::SelectPreview(SourceRef::input(2))))
         .unwrap();
@@ -181,9 +190,16 @@ fn select_input_then_cut_resolves_program_and_flip_flops_inputs() {
     assert!(outcomes.try_recv().unwrap().event.error.is_none());
     assert!(outcomes.try_recv().unwrap().event.error.is_none());
     let snapshot = handle.snapshot().unwrap();
-    assert_eq!(snapshot.program.as_str(), "b", "Program shows the source behind input 2");
+    assert_eq!(
+        snapshot.program.as_str(),
+        "b",
+        "Program shows the source behind input 2"
+    );
     assert_eq!(snapshot.preview.as_str(), "a");
-    assert_eq!((snapshot.program_input, snapshot.preview_input), (Some(2), Some(1)));
+    assert_eq!(
+        (snapshot.program_input, snapshot.preview_input),
+        (Some(2), Some(1))
+    );
     assert_eq!(driver.selections().0, &SourceRef::input(2));
     // A raw source, an unpatched and an undeclared input are refused.
     for (op, target, error) in [
@@ -195,7 +211,10 @@ fn select_input_then_cut_resolves_program_and_flip_flops_inputs() {
             .try_send(command(op, SwitcherVerb::SelectProgram(target)))
             .unwrap();
         run(&mut driver, 1 + op);
-        assert_eq!(outcomes.try_recv().unwrap().event.error.as_deref(), Some(error));
+        assert_eq!(
+            outcomes.try_recv().unwrap().event.error.as_deref(),
+            Some(error)
+        );
     }
     assert_eq!(resolved(&driver), ("b".into(), "a".into()));
 }
@@ -208,7 +227,10 @@ fn a_three_member_patch_lands_on_one_tick_and_a_bad_member_changes_nothing() {
     let before = table(&handle);
     // One bad member (undeclared input 9): nothing changes.
     handle
-        .try_send(command("bad", patch(&[(4, Some("a")), (9, Some("b"))], false)))
+        .try_send(command(
+            "bad",
+            patch(&[(4, Some("a")), (9, Some("b"))], false),
+        ))
         .unwrap();
     // Unknown source: nothing changes.
     handle
@@ -216,7 +238,10 @@ fn a_three_member_patch_lands_on_one_tick_and_a_bad_member_changes_nothing() {
         .unwrap();
     // Duplicate destination: nothing changes.
     handle
-        .try_send(command("dup", patch(&[(4, Some("a")), (4, Some("b"))], false)))
+        .try_send(command(
+            "dup",
+            patch(&[(4, Some("a")), (4, Some("b"))], false),
+        ))
         .unwrap();
     // Unpatching the PVW input: refused.
     handle
@@ -241,9 +266,16 @@ fn a_three_member_patch_lands_on_one_tick_and_a_bad_member_changes_nothing() {
     assert!(outcome.completed && outcome.error.is_none(), "{outcome:?}");
     let snapshot = handle.snapshot().unwrap();
     assert_eq!(outcome.tick, 7);
-    assert_eq!(snapshot.tick, outcome.tick, "snapshot and outcome on one tick");
+    assert_eq!(
+        snapshot.tick, outcome.tick,
+        "snapshot and outcome on one tick"
+    );
     assert_eq!(snapshot.inputs_version, 1);
-    assert_eq!(snapshot.preview.as_str(), "b", "PVW follows its input's new source");
+    assert_eq!(
+        snapshot.preview.as_str(),
+        "b",
+        "PVW follows its input's new source"
+    );
     let readback = handle.inputs().unwrap();
     assert_eq!((readback.tick, readback.version), (7, 1));
     assert_eq!(
@@ -287,11 +319,16 @@ fn repatching_the_program_input_needs_allow_and_a_fresh_source() {
 
     // Cold source: held (single slot), then refused at the deadline.
     handle
-        .try_send(command("cold", patch(&[(1, Some("d")), (4, Some("c"))], true)))
+        .try_send(command(
+            "cold",
+            patch(&[(1, Some("d")), (4, Some("c"))], true),
+        ))
         .unwrap();
     run(&mut driver, 3);
     assert!(outcomes.try_recv().is_err(), "held, no outcome yet");
-    handle.try_send(command("queued", SwitcherVerb::Cut)).unwrap();
+    handle
+        .try_send(command("queued", SwitcherVerb::Cut))
+        .unwrap();
     run(&mut driver, 4);
     assert!(
         outcomes.try_recv().unwrap().event.error.is_some(),
@@ -339,7 +376,10 @@ fn a_patch_on_the_program_or_preview_input_is_refused_during_auto() {
         outcomes.try_recv().unwrap().event.error.as_deref(),
         Some(REFUSE_PATCH_DURING_AUTO)
     );
-    assert!(outcomes.try_recv().unwrap().event.error.is_none(), "off-air input patches");
+    assert!(
+        outcomes.try_recv().unwrap().event.error.is_none(),
+        "off-air input patches"
+    );
     assert_eq!(resolved(&driver), ("a".into(), "c".into()));
 }
 
@@ -399,9 +439,12 @@ fn a_patch_flood_is_bounded_per_tick_and_by_the_mailbox() {
         total += this_tick;
         index += 1;
     }
-    assert_eq!(index - 1, (COMMAND_CAPACITY / MAX_COMMANDS_PER_TICK) as u64);
+    assert_eq!(
+        index - 1,
+        u64::try_from(COMMAND_CAPACITY / MAX_COMMANDS_PER_TICK).unwrap()
+    );
     assert_eq!(
         handle.snapshot().unwrap().inputs_version,
-        COMMAND_CAPACITY as u64
+        u64::try_from(COMMAND_CAPACITY).unwrap()
     );
 }

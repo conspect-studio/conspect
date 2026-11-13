@@ -12,6 +12,9 @@ use multiview_core::switcher::SourceRef;
 /// Highest input number (and the most inputs one M/E declares).
 pub const MAX_INPUT_NUMBER: u16 = 64;
 
+/// Table slots for every possible input number (index 0 is unused).
+pub const INPUT_SLOTS: usize = 65;
+
 /// Maximum crosspoints in one mixer patch command.
 pub const MAX_PATCH_MEMBERS: usize = 64;
 
@@ -66,7 +69,9 @@ impl MixerInputs {
         }
         let mut slots = vec![None; usize::from(max) + 1];
         for (number, label, source) in entries {
-            let slot = &mut slots[usize::from(number)];
+            let Some(slot) = slots.get_mut(usize::from(number)) else {
+                return Err(format!("mixer input {number} is out of range"));
+            };
             if slot.is_some() {
                 return Err(format!("mixer input {number} is declared twice"));
             }

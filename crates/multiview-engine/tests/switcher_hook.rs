@@ -257,8 +257,11 @@ fn repatching_the_program_input_rebinds_the_program_cell_on_the_same_tick() {
             preview: layout("b"),
         })
         .unwrap();
-    let mut hook =
-        SwitcherFrameHook::new(driver, "pgm".into(), |_: &mut CompositorDrive<Nv12Image>| {});
+    let mut hook = SwitcherFrameHook::new(
+        driver,
+        "pgm".into(),
+        |_: &mut CompositorDrive<Nv12Image>| {},
+    );
     let mut outcomes = handle.outcomes();
     let mut luma = Vec::new();
     for index in 0..3 {
@@ -284,7 +287,10 @@ fn repatching_the_program_input_rebinds_the_program_cell_on_the_same_tick() {
         hook.after_compose(&frame);
     }
     assert!(luma[0] > 150, "input 1 = a before the patch: {luma:?}");
-    assert!(luma[1] < 100 && luma[2] < 100, "b from the patch tick on: {luma:?}");
+    assert!(
+        luma[1] < 100 && luma[2] < 100,
+        "b from the patch tick on: {luma:?}"
+    );
     let outcome = outcomes.try_recv().unwrap().event;
     assert_eq!((outcome.tick, outcome.completed), (1, true));
     let snapshot = handle.snapshot().unwrap();

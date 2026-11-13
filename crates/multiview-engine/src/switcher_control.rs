@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::switcher::{SwitcherProjection, SwitcherState};
-use crate::switcher_inputs::{InputsReadback, MixerInputs, MAX_INPUT_NUMBER, MAX_PATCH_MEMBERS};
+use crate::switcher_inputs::{InputsReadback, MixerInputs, INPUT_SLOTS, MAX_PATCH_MEMBERS};
 
 /// Maximum command applications in one output frame.
 pub const MAX_COMMANDS_PER_TICK: usize = 16;
@@ -441,13 +441,20 @@ impl SwitcherTickDriver {
         let program_input = self.machine.program().as_input();
         let preview_input = self.machine.preview().as_input();
         // Fixed-size duplicate guard: no allocation on the clock.
-        let mut seen = [false; MAX_INPUT_NUMBER as usize + 1];
+        let mut seen = [false; INPUT_SLOTS];
         let mut new_program = None;
         for (number, source) in &set.members {
             if !table.is_declared(*number) {
-                return Err(format!("unknown-slot: mixer input {number} is not declared"));
+                return Err(format!(
+                    "unknown-slot: mixer input {number} is not declared"
+                ));
             }
-            let slot = &mut seen[usize::from(*number)];
+            // `is_declared` bounded the number to 1..=64 above.
+            let Some(slot) = seen.get_mut(usize::from(*number)) else {
+                return Err(format!(
+                    "unknown-slot: mixer input {number} is not declared"
+                ));
+            };
             if *slot {
                 return Err(format!("mixer input {number} is patched twice in one set"));
             }

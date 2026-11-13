@@ -192,16 +192,16 @@ fn typed(kind: &str, detail: impl Into<String>) -> Response {
 fn resolve_target(
     handle: &SwitcherControl,
     req: &SwitcherRequest,
-) -> Result<Option<Target>, Response> {
+) -> Result<Option<Target>, Box<Response>> {
     if !matches!(req.action.as_str(), "select_program" | "select_preview") {
         return Ok(None);
     }
     let Some(table) = handle.inputs() else {
         if req.input.is_some() {
-            return Err(typed(
+            return Err(Box::new(typed(
                 "unknown-slot",
                 "this M/E declares no numbered inputs; select a source",
-            ));
+            )));
         }
         return Ok(req.source.clone().map(|source| Target {
             engine_ref: SourceRef::new(&source),
@@ -215,10 +215,10 @@ fn resolve_target(
             .find(|i| i.number == number)
             .and_then(|i| i.source.as_ref())
             .ok_or_else(|| {
-                typed(
+                Box::new(typed(
                     "unknown-slot",
                     format!("mixer input {number} is not declared or not patched"),
-                )
+                ))
             })?;
         (number, source.as_str().to_owned())
     } else {
@@ -231,10 +231,10 @@ fn resolve_target(
             .find(|i| i.source.as_ref().is_some_and(|s| s.as_str() == source))
             .map(|i| i.number)
             .ok_or_else(|| {
-                typed(
+                Box::new(typed(
                     "not-on-an-input",
                     format!("source {source:?} is not patched to a mixer input"),
-                )
+                ))
             })?;
         (number, source)
     };
@@ -287,12 +287,12 @@ fn validate_buses(
     let program = snapshot.program.as_str();
     let selected = target.map(|t| t.source.as_str());
     match req.action.as_str() {
-        "select_preview" if selected == Some(program) => Err(
-            ControlError::Validation(multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into()),
-        ),
-        "select_program" if selected == Some(program) => Err(
-            ControlError::Validation("source is already on program".into()),
-        ),
+        "select_preview" if selected == Some(program) => Err(ControlError::Validation(
+            multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into(),
+        )),
+        "select_program" if selected == Some(program) => Err(ControlError::Validation(
+            "source is already on program".into(),
+        )),
         "cut" | "auto" if snapshot.preview == snapshot.program => Err(ControlError::Validation(
             multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into(),
         )),
@@ -354,7 +354,7 @@ pub(crate) async fn plan_switcher(
     }
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     authorize_target(&principal, target.as_ref())?;
     validate_buses(handle, &req, target.as_ref())?;
@@ -374,6 +374,9 @@ pub(crate) async fn plan_switcher(
 
 /// Enqueue a checked verb; a 202 never asserts frame application.
 #[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path)), request_body = SwitcherRequest, responses((status = 202, body = SwitcherAccepted), (status = 403, body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, body = crate::problem::Problem), (status = 503, body = crate::problem::Problem))))]
+#[allow(clippy::too_many_lines)]
+// reason: one linear admission sequence (authz → resolve input → buses → key →
+// lease → enqueue); the input resolution added the lines, not new branches.
 pub(crate) async fn submit_switcher(
     State(state): State<AppState>,
     principal: Principal,
@@ -398,7 +401,7 @@ pub(crate) async fn submit_switcher(
     }
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     authorize_target(&principal, target.as_ref())?;
     validate_buses(handle, &req, target.as_ref())?;

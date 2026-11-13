@@ -128,7 +128,11 @@ fn keys() -> ApiKeyStore {
     keys.register(
         "patch-no-program",
         "patch-no-program-secret",
-        scoped("patch-no-program", &["me1", "abc-news", "vt1", "bars"], false),
+        scoped(
+            "patch-no-program",
+            &["me1", "abc-news", "vt1", "bars"],
+            false,
+        ),
     );
     keys
 }
@@ -315,7 +319,13 @@ async fn authorization_runs_before_existence_and_burns_no_key() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let response = take(&rig, VIEWER_TOKEN, "k1", body(vec![xp(4, "bars")], "protect")).await;
+    let response = take(
+        &rig,
+        VIEWER_TOKEN,
+        "k1",
+        body(vec![xp(4, "bars")], "protect"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     // The same key is still fresh for the principal: a 202 that really enqueues.
     let response = take(&rig, LIMITED, "k1", body(vec![xp(4, "bars")], "protect")).await;
@@ -384,10 +394,19 @@ async fn plan_reports_path_and_on_air_and_protect_refuses_the_program_input() {
     assert_eq!(plan["can_take"], false);
     assert_eq!(plan["crosspoints"][0]["path"], "mixer-input");
     assert_eq!(plan["crosspoints"][0]["on_air"], true);
-    assert_eq!(plan["crosspoints"][0]["refusal"]["type"], "on-air-protected");
+    assert_eq!(
+        plan["crosspoints"][0]["refusal"]["type"],
+        "on-air-protected"
+    );
     assert_eq!(plan["crosspoints"][1]["on_air"], false);
     assert!(plan["crosspoints"][1]["refusal"].is_null());
-    let response = take(&rig, OPERATOR_TOKEN, "p1", body(vec![xp(1, "bars")], "protect")).await;
+    let response = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "p1",
+        body(vec![xp(1, "bars")], "protect"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert!(body_json(response).await["type"]
         .as_str()
@@ -427,7 +446,10 @@ async fn take_is_202_replays_lands_on_one_tick_and_persists_after_applied() {
     let mut outcomes = rig.handle.outcomes();
     // Acceptance mda001: on_air=allow re-patches the PGM input (cut to bars);
     // three members land on one tick.
-    let set = body(vec![xp(1, "bars"), xp(2, "abc-news"), xp(4, "vt1")], "allow");
+    let set = body(
+        vec![xp(1, "bars"), xp(2, "abc-news"), xp(4, "vt1")],
+        "allow",
+    );
     let response = take(&rig, OPERATOR_TOKEN, "t1", set.clone()).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let accepted = body_json(response).await;
@@ -479,7 +501,10 @@ async fn take_is_202_replays_lands_on_one_tick_and_persists_after_applied() {
         "the Program placeholder cell follows program_source (admission)"
     );
     let reloaded = MultiviewConfig::load_from_toml(&toml::to_string(&config).unwrap()).unwrap();
-    assert_eq!(reloaded.switcher, config.switcher, "a restart reads the same table");
+    assert_eq!(
+        reloaded.switcher, config.switcher,
+        "a restart reads the same table"
+    );
 }
 
 #[tokio::test]
@@ -539,7 +564,13 @@ async fn takes_are_rate_limited_per_destination_with_retry_after() {
         .await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
-    let response = take(&rig, OPERATOR_TOKEN, "r2", body(vec![xp(4, "abc-news")], "protect")).await;
+    let response = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "r2",
+        body(vec![xp(4, "abc-news")], "protect"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(response.headers().get(header::RETRY_AFTER).is_some());
     // The limited request burned no key: once the window passes, the same key
@@ -547,7 +578,13 @@ async fn takes_are_rate_limited_per_destination_with_retry_after() {
     tokio::time::sleep(Duration::from_millis(1_050)).await;
     let mut outcomes = rig.handle.outcomes();
     let mut rig = rig;
-    let response = take(&rig, OPERATOR_TOKEN, "r2", body(vec![xp(4, "abc-news")], "protect")).await;
+    let response = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "r2",
+        body(vec![xp(4, "abc-news")], "protect"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     tick(&mut rig.driver, 1);
     let mut applied = 0;
@@ -555,7 +592,10 @@ async fn takes_are_rate_limited_per_destination_with_retry_after() {
         assert!(item.event.completed);
         applied += 1;
     }
-    assert_eq!(applied, 3, "r0, r1 and the retried r2 each reached the engine");
+    assert_eq!(
+        applied, 3,
+        "r0, r1 and the retried r2 each reached the engine"
+    );
 }
 
 #[tokio::test]
@@ -563,9 +603,7 @@ async fn select_accepts_an_input_and_translates_a_bare_source() {
     let (_dir, path) = temp_boot();
     let mut rig = rig(&path);
     let mut outcomes = rig.handle.outcomes();
-    let select = |input: Option<u16>, source: Option<&str>| {
-        json!({ "me": "me1", "program": "main", "action": "select_preview", "input": input, "source": source })
-    };
+    let select = |input: Option<u16>, source: Option<&str>| json!({ "me": "me1", "program": "main", "action": "select_preview", "input": input, "source": source });
     let path = "/api/v1/switcher/commands/select_preview";
     // Unpatched/undeclared input and a source on no input: typed 422s.
     for (request, kind) in [
@@ -594,7 +632,10 @@ async fn select_accepts_an_input_and_translates_a_bare_source() {
     // A bare source selects its input; the engine then holds in:1 / in:3.
     let response = send(
         &rig.router,
-        with_key(post_json(path, OPERATOR_TOKEN, &select(Some(3), None)), "s-ok"),
+        with_key(
+            post_json(path, OPERATOR_TOKEN, &select(Some(3), None)),
+            "s-ok",
+        ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);

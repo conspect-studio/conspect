@@ -18,11 +18,11 @@
 
 use std::sync::Arc;
 
+use multiview_config::MixEffectsConfig;
 use multiview_control::source_demand::{SwitcherPreviewLease, SwitcherPreviewLeases};
 use multiview_control::SharedSourceDemand;
 use multiview_core::switcher::SourceRef;
 use multiview_engine::switcher::SwitcherState;
-use multiview_config::MixEffectsConfig;
 use multiview_engine::switcher_control::{ScenePair, SwitcherControl};
 use multiview_engine::switcher_inputs::MixerInputs;
 
