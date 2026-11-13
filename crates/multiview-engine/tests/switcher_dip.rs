@@ -488,3 +488,165 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
     );
     assert!(u64::try_from(seen.len()).unwrap() >= TICKS);
 }
+
+/// The real-time variant of the flood (review INV1-01): a monotonic clock and
+/// the real pacer, so time keeps moving while commands drain and dips render.
+/// The outcome stream is never read (a stalled consumer). A stall on the clock
+/// shows up as catch-up repeats and as an overrun of the external deadline;
+/// both are bounded by the design (cadence-hold), not by tight percentiles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transition_flood_on_a_real_clock_keeps_cadence_with_a_stalled_consumer() {
+    let run = flood_on_a_real_clock(std::time::Duration::ZERO).await;
+    // A loaded runner may cost a few catch-up repeats, never most of them.
+    assert!(
+        run.repeats <= TICKS_RT / 10,
+        "repeats {} of {TICKS_RT}",
+        run.repeats
+    );
+    assert!(run.full > 0, "the flood met a full mailbox");
+    assert!(run.completions > 0, "dips really ran");
+}
+
+/// Negative control: the same gate with a hook that blocks 30 ms a tick (a
+/// 20 ms period) fails it, so the gate measures the clock, not the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_real_clock_gate_detects_a_blocking_hook() {
+    let run = flood_on_a_real_clock(std::time::Duration::from_millis(30)).await;
+    assert!(
+        run.repeats > TICKS_RT / 10,
+        "a blocking hook must show up as repeats: {}",
+        run.repeats
+    );
+}
+
+const TICKS_RT: u64 = 150; // 3 s at 50 fps
+
+struct RealRun {
+    repeats: u64,
+    full: u64,
+    completions: u64,
+}
+
+/// Wraps the switcher hook and optionally blocks the clock for `delay`.
+struct Stall<H> {
+    inner: H,
+    delay: std::time::Duration,
+}
+
+impl<H: FrameControl> FrameControl for Stall<H> {
+    fn before_compose(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.before_compose(drive, tick);
+    }
+    fn after_compose(&mut self, frame: &multiview_engine::CompositedFrame) {
+        self.inner.after_compose(frame);
+    }
+    fn on_repeat(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
+        self.inner.on_repeat(drive, tick);
+    }
+}
+
+async fn flood_on_a_real_clock(delay: std::time::Duration) -> RealRun {
+    use multiview_engine::{MonotonicTimeSource, RealtimePacer};
+    const TICKS: u64 = TICKS_RT;
+    let rig = rig();
+    let (a, b) = (Arc::clone(&rig.a), Arc::clone(&rig.b));
+    let handle = rig.handle.clone();
+    let time = Arc::new(MonotonicTimeSource::new());
+    let ts: Arc<dyn TimeSource> = time.clone();
+    let mut runtime = EngineRuntime::new(
+        OutputClock::new(Rational::new(50, 1)).unwrap(),
+        rig.drive,
+        ts,
+        RealtimePacer,
+    );
+    let repeated = runtime.frames_repeated_counter();
+    let publisher = EnginePublisher::<u8, ()>::new(16);
+    // Subscribed and never drained: the engine must not care.
+    let _stalled = handle.outcomes();
+    let done = Arc::new(AtomicBool::new(false));
+    let full = Arc::new(AtomicU64::new(0));
+    // Sources publish fresh frames on real time, off the clock.
+    let feeder = {
+        let (done, time) = (Arc::clone(&done), Arc::clone(&time));
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                let now = MediaTime::from_nanos(time.now_nanos());
+                a.publish(solid(A_Y), now);
+                b.publish(solid(B_Y), now);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+    };
+    let producer = {
+        let (handle, done, full) = (handle.clone(), Arc::clone(&done), Arc::clone(&full));
+        std::thread::spawn(move || {
+            let mut n: u64 = 0;
+            while !done.load(Ordering::Acquire) {
+                let verb = match n % 3 {
+                    0 => SwitcherVerb::SetTransition(dip(
+                        6,
+                        Some(Rgb8::new(u8::try_from(n % 251).unwrap(), 0, 0)),
+                        Rational::new(1, 3),
+                    )),
+                    1 => SwitcherVerb::Auto(FrameCount::try_from(6).unwrap()),
+                    _ => SwitcherVerb::SetTransition(dip(1, None, Rational::new(1, 2))),
+                };
+                let command = SwitcherCommand {
+                    operation_id: format!("rt-{n}"),
+                    scene_version: 1,
+                    verb,
+                };
+                if handle.try_send(command).is_err() {
+                    full.fetch_add(1, Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+                n += 1;
+            }
+        })
+    };
+    let started = std::time::Instant::now();
+    let mut indices = Vec::new();
+    let stop = StopSignal::new();
+    let run = runtime.run_for_with_frame_control(
+        &publisher,
+        &stop,
+        TICKS,
+        |frame| {
+            indices.push(frame.tick.index);
+            0
+        },
+        |_| None,
+        Stall {
+            inner: rig.hook,
+            delay,
+        },
+    );
+    // External deadline: 3 s of output may not take more than 3 s + 10 s
+    // (the blocking control takes 150 x 30 ms = 4.5 s).
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(13), run)
+        .await
+        .expect("the output clock kept running under the flood")
+        .unwrap();
+    let elapsed = started.elapsed();
+    done.store(true, Ordering::Release);
+    producer.join().unwrap();
+    feeder.join().unwrap();
+    assert_eq!(outcome.ticks, TICKS);
+    assert_eq!(u64::try_from(indices.len()).unwrap(), TICKS);
+    assert!(
+        indices.windows(2).all(|w| w[1] == w[0] + 1),
+        "contiguous ticks"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(2900),
+        "real pacing: {elapsed:?}"
+    );
+    RealRun {
+        repeats: repeated.load(Ordering::Acquire),
+        full: full.load(Ordering::Relaxed),
+        completions: handle.snapshot().map_or(0, |s| s.completion_count),
+    }
+}
