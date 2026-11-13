@@ -134,6 +134,8 @@ fn keys() -> ApiKeyStore {
 struct FakeState {
     takes: Vec<OutputTakeRequest>,
     reformats: Vec<multiview_control::output_routing::OutputReformatRequest>,
+    /// When set, the fake engine's reset mailbox is full (review X2).
+    reformat_busy: bool,
     paths: HashMap<(String, RoutedFeed), (PlanPath, bool, u8)>,
     live: Option<RoutingLive>,
 }
@@ -236,7 +238,11 @@ impl OutputRouting for Fake {
         if !matches!(request.config, multiview_config::Output::Hls { .. }) {
             return Err(multiview_control::output_routing::ReformatSubmitError::RestartRequired);
         }
-        self.state.lock().unwrap().reformats.push(request);
+        let mut state = self.state.lock().unwrap();
+        if state.reformat_busy {
+            return Err(multiview_control::output_routing::ReformatSubmitError::Busy);
+        }
+        state.reformats.push(request);
         Ok(())
     }
     fn current_path(&self, output: &str) -> Option<PlanPath> {
@@ -1202,7 +1208,8 @@ async fn a_format_only_put_resets_the_output_live_and_a_codec_change_is_restart(
     assert_eq!(resp.headers()["x-multiview-apply"], "live");
     assert_eq!(
         resp.headers()["x-multiview-apply-note"],
-        "resets output output-1 (about 1 s); Program and other outputs are not affected"
+        "resets this output (about 1 s); Program and other outputs are not affected",
+        "a static note, never the raw id (review X3)"
     );
     let op = resp.headers()["x-multiview-operation-id"]
         .to_str()
@@ -1288,4 +1295,113 @@ async fn live_resets_are_rate_limited_like_takes() {
         }
     }
     assert_eq!(rig.fake.state.lock().unwrap().reformats.len(), 2);
+}
+
+/// Review X2: a live reset the engine cannot take (its mailbox is full) is
+/// 503 `engine-busy`, the store is rolled back to the running body (GET
+/// shows the old format), and the rate-limit slot is refunded (two more
+/// resets in the same second still pass).
+#[tokio::test]
+async fn a_busy_engine_rolls_the_reset_back_and_charges_no_rate_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    rig.fake.state.lock().unwrap().reformat_busy = true;
+    let (etag, name, mut body) = current_output(&rig, "output-1").await;
+    body["format"]["width"] = json!(720);
+    let resp = send(
+        &rig.router,
+        put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let problem = body_json(resp).await;
+    assert!(
+        problem["type"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("engine-busy"),
+        "{problem}"
+    );
+    let (_, _, stored) = current_output(&rig, "output-1").await;
+    assert_eq!(
+        stored["format"]["width"], 360,
+        "rolled back to the running body"
+    );
+    assert_eq!(rig.fake.state.lock().unwrap().reformats.len(), 0);
+    // The refused attempt charged nothing: two resets still pass (2/s).
+    rig.fake.state.lock().unwrap().reformat_busy = false;
+    for width in [720, 1080] {
+        let (etag, name, mut body) = current_output(&rig, "output-1").await;
+        body["format"]["width"] = json!(width);
+        let resp = send(
+            &rig.router,
+            put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{width}");
+        assert_eq!(resp.headers()["x-multiview-apply"], "live");
+    }
+    assert_eq!(rig.fake.state.lock().unwrap().reformats.len(), 2);
+}
+
+/// Review M-4: a PUT whose format/bitrate differ only RAW (an explicit
+/// default bitrate for an absent one) but not EFFECTIVELY is a no-op: it is
+/// committed and answered applied, with no reset started and no operation id.
+#[tokio::test]
+async fn an_effectively_equal_format_put_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    let (etag, name, mut body) = current_output(&rig, "output-1").await;
+    assert!(
+        body.pointer("/slots/video/0/bitrate_kbps").is_none(),
+        "the fixture has no explicit bitrate: {body}"
+    );
+    body["slots"]["video"] = json!([{"bitrate_kbps": 4000}]);
+    let resp = send(
+        &rig.router,
+        put_output(OPERATOR_TOKEN, "output-1", &etag, &name, &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-multiview-apply"], "live");
+    assert!(resp.headers().get("x-multiview-operation-id").is_none());
+    assert_eq!(
+        rig.fake.state.lock().unwrap().reformats.len(),
+        0,
+        "no reset"
+    );
+    let (_, _, stored) = current_output(&rig, "output-1").await;
+    assert_eq!(
+        stored["slots"]["video"][0]["bitrate_kbps"], 4000,
+        "committed"
+    );
+    // An explicit canvas-size, default-fit format on an output without one
+    // equals the absent format: also a no-op.
+    let (etag, name, mut body) = current_output(&rig, "output-0").await;
+    assert!(body.get("format").is_none(), "{body}");
+    body["format"] = json!({"width": 640, "height": 360});
+    let resp = send(
+        &rig.router,
+        put_output(OPERATOR_TOKEN, "output-0", &etag, &name, &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-multiview-apply"], "live");
+    assert!(resp.headers().get("x-multiview-operation-id").is_none());
+    assert_eq!(
+        rig.fake.state.lock().unwrap().reformats.len(),
+        0,
+        "no reset"
+    );
+    // A real change on it is a reset.
+    let (etag, name, mut body) = current_output(&rig, "output-0").await;
+    body["format"] = json!({"width": 320, "height": 180});
+    let resp = send(
+        &rig.router,
+        put_output(OPERATOR_TOKEN, "output-0", &etag, &name, &body),
+    )
+    .await;
+    assert_eq!(resp.headers()["x-multiview-apply"], "live");
+    assert!(resp.headers().get("x-multiview-operation-id").is_some());
+    assert_eq!(rig.fake.state.lock().unwrap().reformats.len(), 1);
 }

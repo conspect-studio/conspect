@@ -237,8 +237,14 @@ pub struct SlotPlan {
     pub converts: u8,
 }
 
+/// The video bit rate of an output whose video slot 0 names none, kbit/s:
+/// the run's base encode default. The control plane compares a PUT's
+/// EFFECTIVE bitrate against it (review M-4); the engine encodes at it.
+pub const DEFAULT_VIDEO_KBPS: u32 = 4_000;
+
 /// A live format reset of one output (#342 B3), already authorized and
-/// committed by the HTTP layer.
+/// rate-limited by the HTTP layer and submitted BEFORE the store commit
+/// (review X2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputReformatRequest {
     /// The operation id minted for the reset (echoed in its outcome).
@@ -702,6 +708,16 @@ impl WindowLimiter {
         }
     }
 
+    /// Undo the most recent [`Self::record`] of `key` at `at` (a request
+    /// that was admitted but never reached the engine, review X2).
+    fn refund(&mut self, key: &str, at: Instant) {
+        if let Some((_, events)) = self.keys.get_mut(key) {
+            if let Some(i) = events.iter().rposition(|t| *t == at) {
+                events.remove(i);
+            }
+        }
+    }
+
     fn len(&self) -> usize {
         self.keys.len()
     }
@@ -744,6 +760,16 @@ impl TakeLimiter {
         outputs.record(output, now);
         principals.record(principal, now);
         Ok(())
+    }
+
+    /// Give back a slot [`Self::admit`] charged at `at` for a request that
+    /// never reached the engine (a busy mailbox or a restart-required
+    /// reset, review X2): only a submitted take or reset is charged.
+    pub fn refund(&self, output: &str, principal: &str, at: Instant) {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (outputs, principals) = &mut *guard;
+        outputs.refund(output, at);
+        principals.refund(principal, at);
     }
 
     /// Admit one request of `principal` touching every destination in

@@ -12383,7 +12383,7 @@ fn round_f64_to_i32(v: f64) -> i32 {
 
 /// The video bitrate of an output whose video slot 0 names none, kbit/s
 /// (the run's base encode default).
-pub(crate) const DEFAULT_VIDEO_KBPS: u32 = 4_000;
+pub(crate) const DEFAULT_VIDEO_KBPS: u32 = multiview_control::output_routing::DEFAULT_VIDEO_KBPS;
 
 /// The configured codec token of an output (`None` for raw kinds).
 pub(crate) fn configured_codec(output: &Output) -> Option<&str> {
