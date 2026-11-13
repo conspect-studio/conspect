@@ -2140,6 +2140,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/patch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The live patch (mixer plane), built from the engine's readback. */
+        get: operations["get_patch"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/patch/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Plan 1..64 mixer crosspoints: path, on-air flag and refusals; no change. */
+        post: operations["plan_patch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/patch/take": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Take 1..64 mixer crosspoints atomically at one engine tick. */
+        post: operations["take_patch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/preview/capabilities": {
         parameters: {
             query?: never;
@@ -5989,6 +6040,11 @@ export interface components {
             href?: string;
         };
         /**
+         * @description `on_air`: whether a crosspoint may re-patch the input on Program.
+         * @enum {string}
+         */
+        OnAir: "protect" | "allow";
+        /**
          * @description A correlation id for an asynchronously-applied control command.
          *
          *     Returned to the client in a `202 Accepted` response and echoed by the engine
@@ -6460,6 +6516,68 @@ export interface components {
             /** @description The tally target the override applies to. */
             target: components["schemas"]["TallyTargetDoc"];
         };
+        /** @description `POST /patch/take` 202 answer; the outcome arrives as `switcher.operation`. */
+        PatchAccepted: {
+            /** @description Correlates with `switcher.operation.operation_id`. */
+            operation_id: string;
+            /** @description Always `accepted`; never `applied`. */
+            status: string;
+        };
+        /** @description One crosspoint `{ plane, destination, source }`. */
+        PatchCrosspoint: {
+            /** @description Where the source is patched. */
+            destination: components["schemas"]["PatchDestination"];
+            /** @description `video` (this slice), `audio` or `subtitle`. */
+            plane: string;
+            /**
+             * @description `{"source": id}` or `"none"` (this slice); `{"layout": id}`,
+             *     `{"bus": ..}`, `"follow"` arrive in later slices.
+             */
+            source: Record<string, never>;
+        };
+        /**
+         * @description One crosspoint destination: a mixer input (`{"mixer","input"}`) or, in a
+         *     later slice, an output slot (`{"output","slot"}`).
+         */
+        PatchDestination: {
+            /**
+             * Format: int32
+             * @description Mixer input number, 1..=64.
+             */
+            input?: number | null;
+            /** @description M/E id (`me1`). */
+            mixer?: string | null;
+            /** @description Output id (output slots arrive in a later slice; refused here). */
+            output?: string | null;
+            /**
+             * Format: int32
+             * @description Output slot index (later slice).
+             */
+            slot?: number | null;
+        };
+        /** @description `POST /patch/plan` answer. */
+        PatchPlan: {
+            /** @description `true` when every crosspoint can be taken. */
+            can_take: boolean;
+            /** @description Change class (a mixer re-patch is Class-1, hot). */
+            class: string;
+            /** @description Per-crosspoint plan, request order. */
+            crosspoints: components["schemas"]["PlannedCrosspoint"][];
+        };
+        /** @description A typed refusal (`type` suffix + detail). */
+        PatchRefusal: {
+            /** @description Human-readable reason. */
+            detail: string;
+            /** @description RFC 9457 `type` suffix, e.g. `on-air-protected`. */
+            type: string;
+        };
+        /** @description Plan/take body: 1..=64 crosspoints applied atomically at one tick. */
+        PatchRequest: {
+            /** @description The crosspoints. */
+            crosspoints: components["schemas"]["PatchCrosspoint"][];
+            /** @description On-air guard for the input on Program. */
+            on_air?: components["schemas"]["OnAir"];
+        };
         /** @description One queued remote action. */
         PendingAction: {
             /** @description The opaque, unique action id (a UUID) the cancel/execute paths address. */
@@ -6533,6 +6651,16 @@ export interface components {
          * @enum {string}
          */
         PipelineStage: "decode" | "composite" | "encode";
+        /** @description One planned crosspoint. */
+        PlannedCrosspoint: {
+            /** @description The destination as requested. */
+            destination: components["schemas"]["PatchDestination"];
+            /** @description Whether the destination input is on Program now. */
+            on_air: boolean;
+            /** @description The path this crosspoint takes (`mixer-input`). */
+            path: string;
+            refusal?: null | components["schemas"]["PatchRefusal"];
+        };
         /**
          * @description `OpenAPI` mirror of [`multiview_config::playback::PlaybackUrl`] — one
          *     viewer playback URL (or no-URL note) for an output
@@ -8071,6 +8199,12 @@ export interface components {
              * @description AUTO duration at the output's exact cadence; no floating milliseconds.
              */
             duration_frames?: number | null;
+            /**
+             * Format: int32
+             * @description Numbered mixer input for `select_program`/`select_preview` (ADR-0110
+             *     §12.8); exactly one of `source`/`input`. Requires declared inputs.
+             */
+            input?: number | null;
             /** @description Referenced stored layout, when selecting an authored scene. */
             layout?: string | null;
             /** @description M/E identity (`me1` for the first slice). */
@@ -14989,6 +15123,165 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ] }` from the engine's live readback; a mixer the caller cannot read (M/E object + Program scope) is omitted, and a source it cannot read is `{"redacted": true}`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Role lacks Read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    plan_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatchRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PatchPlan"];
+                };
+            };
+            /** @description Not authorized for a destination (M/E object + Program scope) or a source. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `switcher-unavailable`. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, or not 1..=64 crosspoints. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    take_patch: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required; a replay answers the first 202. */
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatchRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PatchAccepted"];
+                };
+            };
+            /** @description Not authorized for a destination (M/E object + Program scope) or a source. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, or no source lease. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, missing Idempotency-Key, or not 1..=64 crosspoints. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy` (the key and leases are released) or `idempotency-capacity`. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
