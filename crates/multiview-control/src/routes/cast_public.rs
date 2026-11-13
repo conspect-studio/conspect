@@ -54,6 +54,16 @@ pub fn public_router() -> Router<AppState> {
             "/cast/{token}/{file}",
             get(media).options(preflight).post(report),
         )
+        // Anything else under `/cast/` is the same 404 (never the SPA
+        // fallback's index page, never a different body).
+        .route("/cast/", axum::routing::any(cast_other))
+        .route("/cast/{token}", axum::routing::any(cast_other))
+        .route("/cast/{token}/", axum::routing::any(cast_other))
+        .route("/cast/{token}/{file}/{*rest}", axum::routing::any(cast_other))
+}
+
+async fn cast_other(headers: HeaderMap) -> Response {
+    with_cors(not_found(), headers.get(header::ORIGIN))
 }
 
 fn not_found() -> Response {
