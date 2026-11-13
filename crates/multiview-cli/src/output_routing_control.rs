@@ -266,6 +266,7 @@ impl multiview_control::program_metrics::ProgramMetricsSource for ProgramMetrics
         let handles = self.0.load()?;
         Some(multiview_control::program_metrics::ProgramCounters {
             lateness: handles.lateness.snapshot(),
+            phases: handles.phases.snapshot(),
             frames_repeated: handles
                 .frames_repeated
                 .load(std::sync::atomic::Ordering::Acquire),

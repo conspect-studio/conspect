@@ -14,7 +14,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use multiview_engine::lateness::{LatenessSnapshot, FINE_LATENESS_EDGES_NS, LATENESS_EDGES_NS};
+use multiview_engine::lateness::{
+    LatenessSnapshot, PhasesSnapshot, FINE_LATENESS_EDGES_NS, LATENESS_EDGES_NS,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{Action, Principal};
@@ -28,6 +30,8 @@ pub struct ProgramCounters {
     pub lateness: LatenessSnapshot,
     /// Last-good repeats emitted (ticks behind).
     pub frames_repeated: u64,
+    /// Wake latency and compose-phase histograms (#311).
+    pub phases: PhasesSnapshot,
 }
 
 /// Reads the running Program's counters (wait-free loads).
@@ -104,8 +108,91 @@ impl ProgramMetrics {
                 .collect(),
             fine_buckets_total: now.lateness.fine_buckets.to_vec(),
             fine_buckets_window: window.fine_buckets.to_vec(),
+            emit_lateness: PhaseHistogram::of(&now.lateness, &window),
+            wake_lateness: PhaseHistogram::of(
+                &now.phases.wake,
+                &now.phases.wake.since(&oldest.phases.wake),
+            ),
+            compose_duration: PhaseHistogram::of(
+                &now.phases.compose,
+                &now.phases.compose.since(&oldest.phases.compose),
+            ),
+            compose_phases: ComposePhases {
+                hook: PhaseHistogram::of(
+                    &now.phases.hook,
+                    &now.phases.hook.since(&oldest.phases.hook),
+                ),
+                composite: PhaseHistogram::of(
+                    &now.phases.composite,
+                    &now.phases.composite.since(&oldest.phases.composite),
+                ),
+                after_compose: PhaseHistogram::of(
+                    &now.phases.after,
+                    &now.phases.after.since(&oldest.phases.after),
+                ),
+                project: PhaseHistogram::of(
+                    &now.phases.project,
+                    &now.phases.project.since(&oldest.phases.project),
+                ),
+            },
         })
     }
+}
+
+/// One per-tick histogram on the fine edges (`fine_bucket_edges_ms`), over
+/// the ~10 s window plus run totals (#311).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PhaseHistogram {
+    /// Ticks recorded in the window.
+    pub window_ticks: u64,
+    /// Mean over the window, ms (`null` when empty).
+    pub mean_ms: Option<f64>,
+    /// p50 over the window: the upper fine-bucket edge, ms (`null` when empty
+    /// or beyond the last edge).
+    pub p50_ms: Option<f64>,
+    /// p99 over the window: the upper fine-bucket edge, ms.
+    pub p99_ms: Option<f64>,
+    /// Largest value since the run started, ms.
+    pub max_ms: f64,
+    /// Mean since the run started, ms.
+    pub mean_total_ms: Option<f64>,
+    /// Per-fine-bucket counts in the window (fine edges, then overflow).
+    pub buckets_window: Vec<u64>,
+    /// Cumulative per-fine-bucket counts.
+    pub buckets_total: Vec<u64>,
+}
+
+impl PhaseHistogram {
+    fn of(total: &LatenessSnapshot, window: &LatenessSnapshot) -> Self {
+        let ms = |ns: Option<u64>| ns.filter(|ns| *ns != u64::MAX).map(ns_to_ms);
+        Self {
+            window_ticks: window.count,
+            mean_ms: window.mean_ns().map(ns_to_ms),
+            p50_ms: ms(window.fine_quantile_upper_ns(500)),
+            p99_ms: ms(window.fine_quantile_upper_ns(990)),
+            max_ms: ns_to_ms(total.max_ns),
+            mean_total_ms: total.mean_ns().map(ns_to_ms),
+            buckets_window: window.fine_buckets.to_vec(),
+            buckets_total: total.fine_buckets.to_vec(),
+        }
+    }
+}
+
+/// The four parts of `compose_duration` (fresh ticks only).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ComposePhases {
+    /// The frame-boundary control hook (`before_compose`: command drain,
+    /// switcher, routing).
+    pub hook: PhaseHistogram,
+    /// Sampling the sources and compositing the canvas.
+    pub composite: PhaseHistogram,
+    /// `after_compose` (switcher commit, preview tap, routing aux offer).
+    pub after_compose: PhaseHistogram,
+    /// The per-tick state projection (encode hand-off, taps, state snapshot)
+    /// plus `publish_state`.
+    pub project: PhaseHistogram,
 }
 
 fn ns_to_ms(ns: u64) -> f64 {
@@ -155,6 +242,18 @@ pub struct ProgramMetricsReport {
     pub fine_buckets_total: Vec<u64>,
     /// Per-fine-bucket counts in the window.
     pub fine_buckets_window: Vec<u64>,
+    /// Emit lateness (publish minus deadline, the value of the `lateness_*`
+    /// fields above) as one fine histogram, fresh and repeated ticks (#311).
+    pub emit_lateness: PhaseHistogram,
+    /// Wake lateness: the pacer's wait returning minus the deadline, before any
+    /// compose work (#311). OS wake latency plus clock-thread CPU starvation.
+    /// When the previous tick's work overran this deadline the wait returns at
+    /// once and the value is that backlog, not a wake (fresh ticks only).
+    pub wake_lateness: PhaseHistogram,
+    /// Fresh-tick work: `before_compose` through `publish_state` (#311).
+    pub compose_duration: PhaseHistogram,
+    /// `compose_duration` split into its four parts.
+    pub compose_phases: ComposePhases,
 }
 
 /// Start the 1 s sampler (control-plane task; ends with the runtime).
@@ -214,6 +313,7 @@ mod tests {
             Some(ProgramCounters {
                 lateness: self.0.snapshot(),
                 frames_repeated: self.1.load(std::sync::atomic::Ordering::Relaxed),
+                phases: PhasesSnapshot::default(),
             })
         }
     }
