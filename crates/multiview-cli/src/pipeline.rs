@@ -8461,6 +8461,9 @@ fn consumer_main<D: WindowDelivery>(
     // Live-opened encoders are retired first and handed to the routing reaper
     // (bounded wait; they never gate the base windows).
     (*router).shutdown(&mut dispatcher, ROUTING_SHUTDOWN_GRACE);
+    // The base formats' convert threads: input closed, joined within the
+    // same grace (a wedged one is left to end on its own, never awaited).
+    let _joined = convert_stages.shutdown(ROUTING_SHUTDOWN_GRACE);
     drop(event_tx);
     let joiner = std::thread::Builder::new()
         .name("multiview-worker-join".to_owned())

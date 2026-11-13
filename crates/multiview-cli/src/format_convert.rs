@@ -198,6 +198,7 @@ pub struct ConvertStage {
     format: AuxFormat,
     tx: Option<std::sync::mpsc::SyncSender<(u64, Arc<Nv12Image>)>>,
     slot: Arc<ConvertedSlot>,
+    join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for ConvertStage {
@@ -226,7 +227,7 @@ impl ConvertStage {
         let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Arc<Nv12Image>)>(CONVERT_QUEUE);
         let slot = Arc::new(ConvertedSlot::default());
         let thread_slot = Arc::clone(&slot);
-        std::thread::Builder::new()
+        let join = std::thread::Builder::new()
             .name("format-convert".to_owned())
             .spawn(move || {
                 let _raise = RaiseOnExit(Arc::clone(&thread_slot));
@@ -257,6 +258,7 @@ impl ConvertStage {
             format,
             tx: Some(tx),
             slot,
+            join: Some(join),
         })
     }
 
@@ -314,6 +316,34 @@ impl ConvertStages {
         for stage in &self.stages {
             stage.offer(tick, canvas);
         }
+    }
+
+    /// End of run (#342 review A-r2): close every stage's input, then join
+    /// the threads within `bound` in total. A stage still converting (or
+    /// wedged) past the bound is left to finish on its own: it holds only its
+    /// own ring and the canvases already handed to it, and it exits as soon
+    /// as its current convert returns (its input is closed). Returns the
+    /// stages joined. Never called on the clock.
+    #[must_use = "the number of stages joined"]
+    pub fn shutdown(mut self, bound: std::time::Duration) -> usize {
+        for stage in &mut self.stages {
+            stage.tx = None;
+        }
+        let deadline = std::time::Instant::now() + bound;
+        let mut joined = 0;
+        for stage in &mut self.stages {
+            let Some(join) = stage.join.take() else {
+                continue;
+            };
+            while !join.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if join.is_finished() {
+                let _ = join.join();
+                joined += 1;
+            }
+        }
+        joined
     }
 
     /// Whether any stage exists (a run with only canvas-format keys has none).
@@ -599,5 +629,40 @@ mod tests {
         stage.offer(3, &picture(192, 108));
         assert!(wait_for(|| slot.failed.load(Ordering::Acquire)));
         assert_eq!(slot.published.load(Ordering::Relaxed), 3);
+    }
+
+    /// #342 review A-r2: end of run closes every stage and joins the idle
+    /// ones; a wedged one is bounded by the grace and never awaited.
+    #[test]
+    fn shutdown_joins_idle_stages_and_bounds_a_wedged_one() {
+        let mut idle = ConvertStages::default();
+        idle.slot_for(vertical(), None).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            idle.shutdown(Duration::from_secs(1)),
+            1,
+            "idle stage joined"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let (_hold, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        let hook: ConvertHook = Arc::new(move |_| {
+            let _ = wait.lock().unwrap().recv();
+        });
+        let mut wedged = ConvertStages::default();
+        wedged.slot_for(vertical(), Some(&hook)).unwrap();
+        wedged.offer(0, &picture(192, 108));
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        assert_eq!(
+            wedged.shutdown(Duration::from_millis(100)),
+            0,
+            "wedged: not joined"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded by the grace"
+        );
     }
 }
