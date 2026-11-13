@@ -269,10 +269,131 @@ struct StreamPlan {
 }
 
 /// ADR-0108 slice 1, step 1 start-up refusal; the rule itself lives in
+/// Every configured output whose persisted video feed is not Program, as
+/// `(config id, picture bus)` (#329). A feed the engine cannot carry (a
+/// layout) never reaches here: start-up admission refuses it first.
+fn boot_output_feeds(config: &MultiviewConfig) -> Vec<(String, crate::routing_aux::PictureBus)> {
+    config
+        .output_feeds()
+        .into_iter()
+        .filter_map(|xp| {
+            let bus = crate::routing_aux::PictureBus::try_from(&xp.effective_video()).ok()?;
+            (bus != crate::routing_aux::PictureBus::Program).then_some((xp.output, bus))
+        })
+        .collect()
+}
+
+/// Enqueue one BOOT TAKE per output whose persisted feed is not Program
+/// (#329): `operation_id = "boot:<output index>"`, principal `system:boot`.
+/// PR #352 round 2: the id is keyed on the OUTPUT INDEX, never parsed from the
+/// config id — an HLS config id is a path and can be arbitrarily long, so
+/// truncating `boot:<config id>` to [`crate::output_routing::MAX_TAKE_ID_BYTES`]
+/// could collide with another output's truncated id or (for the audio-only
+/// take) be rejected by `try_take`'s own length check. `boot:<index>` is
+/// always well under the limit. The take rides the normal gate (fresh within
+/// the prime deadline, capacity); the router re-issues a refused one within
+/// its bounded retry window, matched on the output index (not by re-parsing
+/// the id). Called once per run, right after the handle exists and before the
+/// clock starts; the mailbox (64) is far larger than the outputs of any run,
+/// and a refused enqueue only logs (the output stays on Program). The config
+/// id is still named in the log line for operators.
+///
+/// A persisted explicit audio feed on the same output rides this take (a
+/// combined take, when the output has a program-audio slot), so the
+/// audio-only boot take of [`Pipeline::issue_boot_audio_takes`] never
+/// supersedes the video boot take on the same output; the router re-issues
+/// the audio alone if the combined take is given up.
+fn enqueue_boot_takes(
+    handle: &crate::output_routing::OutputRoutingHandle,
+    feeds: &[(String, crate::routing_aux::PictureBus)],
+    audio: &[(String, crate::routing_audio::AudioChoice)],
+) {
+    for (id, bus) in feeds {
+        let Some(output_index) = handle.index_of(id) else {
+            tracing::warn!(output = %id, "routing: no run output for the persisted feed; it stays on Program");
+            continue;
+        };
+        // The same rule the control-side take enforces: an encoder family
+        // slice 1 cannot cut cleanly (VAAPI/VideoToolbox) is never taken.
+        if !handle
+            .outputs()
+            .get(output_index)
+            .is_some_and(|o| o.routable)
+        {
+            tracing::warn!(output = %id, "routing: this output's kind cannot switch feeds live; it stays on Program");
+            continue;
+        }
+        // Short and fixed: always well under MAX_TAKE_ID_BYTES, no matter how
+        // long the config id is (an HLS config id is its path).
+        let operation_id = format!("{}{output_index}", crate::output_routing::BOOT_TAKE_PREFIX);
+        let audio = audio
+            .iter()
+            .find(|(output, _)| output == id)
+            .map(|(_, choice)| choice.clone())
+            .filter(|_| {
+                handle
+                    .outputs()
+                    .get(output_index)
+                    .is_some_and(|o| o.program_audio)
+            });
+        let take = crate::output_routing::OutputTake {
+            operation_id,
+            output_index,
+            bus: Some(bus.clone()),
+            audio,
+            principal: crate::output_routing::BOOT_PRINCIPAL.to_owned(),
+        };
+        if handle.try_take(take).is_err() {
+            tracing::warn!(output = %id, "routing: the start-up take could not be queued; the output stays on Program");
+        }
+    }
+}
+
 /// [`multiview_config::outputs_carry_program`] so start-up and `multiview
 /// validate` share it (#317).
 fn ensure_outputs_carry_program(config: &MultiviewConfig) -> Result<(), PipelineError> {
     multiview_config::outputs_carry_program(config).map_err(PipelineError::Engine)
+}
+
+/// The persisted non-`follow` audio feeds of `config`'s outputs as engine
+/// choices (a track resolved to its `audio-routing` route input; an
+/// undeclared track or a multi-track feed, which the routed slot cannot
+/// carry, is skipped with a warning).
+fn boot_audio_choices(
+    config: &MultiviewConfig,
+) -> Vec<(String, crate::routing_audio::AudioChoice)> {
+    use crate::routing_audio::AudioChoice;
+    use multiview_config::AudioFeed;
+    config
+        .output_feeds()
+        .into_iter()
+        .filter_map(|xp| {
+            let choice = match &xp.audio {
+                AudioFeed::Program => AudioChoice::Program,
+                AudioFeed::None => AudioChoice::Silence,
+                AudioFeed::Source(id) => AudioChoice::Source(id.clone()),
+                AudioFeed::Tracks(tracks) => {
+                    let input = match tracks.as_slice() {
+                        [name] => config.audio.as_ref().and_then(|a| {
+                            a.routes
+                                .iter()
+                                .find(|r| r.target_track.as_deref() == Some(name.as_str()))
+                                .map(|r| (name.clone(), r.input_id.clone()))
+                        }),
+                        _ => None,
+                    };
+                    let Some((name, input)) = input else {
+                        tracing::warn!(output = %xp.output, "output routing: persisted audio tracks cannot ride the routed slot; the output starts on follow");
+                        return None;
+                    };
+                    AudioChoice::Track { name, input }
+                }
+                // `follow` is what the run starts on.
+                _ => return None,
+            };
+            Some((xp.output, choice))
+        })
+        .collect()
 }
 
 /// Errors building or running the libav\* pipeline.
@@ -456,14 +577,17 @@ struct ResolvedEncoder {
 
 /// Map a config output `codec` token to a logical [`multiview_ffmpeg::VideoCodec`].
 /// Unknown codec names are rejected, never silently replaced.
+/// The engine codec of `token`, through the config crate's single codec
+/// token table ([`multiview_config::CodecFamily::of`], #342 review M2).
 fn logical_codec(token: &str) -> Result<multiview_ffmpeg::VideoCodec, PipelineError> {
+    use multiview_config::CodecFamily;
     use multiview_ffmpeg::VideoCodec;
-    match token.to_ascii_lowercase().as_str() {
-        "h264" | "avc" | "libx264" | "h264_nvenc" => Ok(VideoCodec::H264),
-        "h265" | "hevc" | "libx265" | "hevc_nvenc" => Ok(VideoCodec::H265),
-        "ffv1" => Ok(VideoCodec::Ffv1),
-        "mjpeg" => Ok(VideoCodec::Mjpeg),
-        "mpeg2video" => Ok(VideoCodec::Mpeg2Video),
+    match CodecFamily::of(token) {
+        Some(CodecFamily::H264) => Ok(VideoCodec::H264),
+        Some(CodecFamily::Hevc) => Ok(VideoCodec::H265),
+        Some(CodecFamily::Ffv1) => Ok(VideoCodec::Ffv1),
+        Some(CodecFamily::Mjpeg) => Ok(VideoCodec::Mjpeg),
+        Some(CodecFamily::Mpeg2) => Ok(VideoCodec::Mpeg2Video),
         _ => Err(PipelineError::Codec {
             codec: token.to_owned(),
             reason: "unsupported codec".to_owned(),
@@ -493,6 +617,43 @@ fn resolve_encoder(codec_token: &str) -> Result<ResolvedEncoder, PipelineError> 
         name: name.to_owned(),
         format: encoder_input_format(name),
     })
+}
+
+#[cfg(test)]
+mod codec_table_tests {
+    use super::logical_codec;
+    use multiview_config::CodecFamily;
+
+    /// #342 review M2: config and engine agree on every token, including
+    /// the NVENC names and tokens both refuse.
+    #[test]
+    fn config_and_engine_share_one_codec_token_table() {
+        for token in [
+            "h264",
+            "AVC",
+            "libx264",
+            "h264_nvenc",
+            "hevc",
+            "H265",
+            "libx265",
+            "hevc_nvenc",
+            "mpeg2video",
+            "ffv1",
+            "mjpeg",
+            "libopenh264",
+            "mpeg2",
+            "mpeg2_qsv",
+            "h264_vaapi",
+            "vp9",
+            "",
+        ] {
+            assert_eq!(
+                CodecFamily::of(token).is_some(),
+                logical_codec(token).is_ok(),
+                "{token:?}"
+            );
+        }
+    }
 }
 
 fn codec_for_encoder(name: &str) -> multiview_ffmpeg::VideoCodec {
@@ -1690,8 +1851,12 @@ codec = "mpeg2video"
 segment_ms = 1000
 "##;
 
+    /// #329: behaviour intentionally changed. A source feed is now accepted at
+    /// start-up (the engine starts on Program and takes it live as a boot
+    /// take); only a feed the engine cannot carry at all — a layout — is
+    /// refused, loudly, by the same single start-up rule.
     #[test]
-    fn default_program_outputs_run_and_a_source_feed_is_refused_loudly() {
+    fn default_program_outputs_run_a_source_feed_is_accepted_and_a_layout_is_refused() {
         let plain = MultiviewConfig::load_from_toml(DOC).expect("parses");
         assert!(ensure_outputs_carry_program(&plain).is_ok());
         let routed = MultiviewConfig::load_from_toml(&format!(
@@ -1699,8 +1864,25 @@ segment_ms = 1000
         ))
         .expect("parses");
         routed.validate().expect("valid");
-        let err = ensure_outputs_carry_program(&routed).expect_err("refused");
-        assert!(err.to_string().contains("src:a"), "{err}");
+        ensure_outputs_carry_program(&routed).expect("a source feed starts (as a boot take)");
+        assert_eq!(
+            super::boot_output_feeds(&routed),
+            vec![(
+                "o".to_owned(),
+                crate::routing_aux::PictureBus::Source("a".to_owned())
+            )],
+            "one boot take for the routed output"
+        );
+        assert!(
+            super::boot_output_feeds(&plain).is_empty(),
+            "Program needs no boot take"
+        );
+        let layout = MultiviewConfig::load_from_toml(&format!(
+            "{DOC}\n[[routing.output]]\noutput = \"o\"\nvideo = {{ layout = \"L\" }}\n"
+        ))
+        .expect("parses");
+        let err = ensure_outputs_carry_program(&layout).expect_err("refused");
+        assert!(err.to_string().contains("aux:L"), "{err}");
     }
 }
 
@@ -2215,6 +2397,16 @@ pub struct Pipeline {
     encode_cfg: EncodeConfig,
     /// Distinct concrete video encoders and one key per runnable output.
     rendition_configs: Vec<EncodeConfig>,
+    /// Per rendition key: the format its worker converts the Program canvas
+    /// to (#342); `None` = the canvas (zero-copy, as before).
+    rendition_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
+    /// Test seam (#342 review I3): a hook run on each `format-convert`
+    /// thread before each convert (a chaos test wedges it). Always `None`
+    /// outside tests.
+    convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// Per runnable output (same order as `output_video_keys`): the format a
+    /// routed source/PVW is composed at for it (#342 review M3).
+    output_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
     output_video_keys: Vec<usize>,
     /// Per runnable output (same order as `output_video_keys`): its muxer
     /// reads decoder configuration in band (MPEG-TS), so a routing move onto
@@ -2302,6 +2494,16 @@ pub struct Pipeline {
     /// slice 1). Published off-clock when the egress starts; the control plane
     /// loads it lock-free to enqueue takes and read the routing snapshot.
     output_routing: crate::output_routing::OutputRoutingSlot,
+    /// Per configured output (config id): its persisted video feed when it is
+    /// not Program (#329). Each becomes one boot take after the run's routing
+    /// handle is published; the engine itself always starts on Program.
+    boot_output_feeds: Vec<(String, crate::routing_aux::PictureBus)>,
+    /// The boot takes' retry policy (the defaults; a test shortens it).
+    boot_retry: crate::output_routing::BootRetryPolicy,
+    /// Persisted non-`follow` output audio feeds `(output config id, choice)`
+    /// (ADR-0108 slice 2 §6.1): each run issues them as audio-only boot takes
+    /// right after its routing handle is published.
+    boot_audio_takes: Vec<(String, crate::routing_audio::AudioChoice)>,
     /// The running Program's lateness histogram + repeats counter (ADR-0108
     /// §10), published at run start for the control plane's metrics route.
     program_metrics: ProgramMetricsSlot,
@@ -3115,32 +3317,76 @@ impl Pipeline {
             discrete_tracks.iter().map(|t| t.input_id.clone()).collect();
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
         let mut rendition_configs = Vec::<EncodeConfig>::new();
+        // #342: per rendition key, the picture format its worker converts the
+        // Program canvas to (`None` = the canvas, the zero-copy path).
+        let mut rendition_formats = Vec::<Option<crate::routing_aux::AuxFormat>>::new();
+        let mut output_formats = Vec::with_capacity(outputs.len());
+        let aux_canvas = crate::routing_aux::AuxCanvas {
+            width: config.canvas.width,
+            height: config.canvas.height,
+            color: canvas_color.output_tag(),
+        };
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         let mut output_inband_sets = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
-            let requested = config
-                .outputs
-                .iter()
-                .find(|item| item.id() == output.id())
-                .and_then(output_codec)
+            let declared = config.outputs.iter().find(|item| item.id() == output.id());
+            // #342: video slot 0's codec (absent = the output's `codec`).
+            let requested = declared
+                .and_then(|item| item.video_slot0().and_then(|v| v.codec.as_deref()))
+                .or_else(|| declared.and_then(output_codec))
                 .unwrap_or("mpeg2video");
             let concrete = resolve_encoder(requested)?;
+            // #342: the output's picture format (absent or the canvas = today)
+            // and video slot 0's bit rate (absent = today's).
+            // The base key's format collapses at canvas size (identity); the
+            // routed-feed format keeps a non-default fit (#342 review M3).
+            let format = declared
+                .and_then(|item| crate::routing_aux::AuxFormat::base_of_output(item, aux_canvas));
+            let feed_format = declared
+                .and_then(|item| crate::routing_aux::AuxFormat::feed_of_output(item, aux_canvas));
+            let (width, height) = format.map_or((cfg.width, cfg.height), |f| (f.width, f.height));
+            let bit_rate = declared
+                .and_then(|item| item.video_slot0().and_then(|v| v.bitrate_kbps))
+                .map_or(Ok(cfg.bit_rate), |kbps| {
+                    // Config caps a slot at MAX_SLOT_BITRATE_KBPS; never wrap.
+                    usize::try_from(kbps)
+                        .ok()
+                        .and_then(|kbps| kbps.checked_mul(1000))
+                        .filter(|_| kbps <= multiview_config::MAX_SLOT_BITRATE_KBPS)
+                        .ok_or_else(|| PipelineError::Codec {
+                            codec: requested.to_owned(),
+                            reason: format!("video bit rate {kbps} kbit/s is out of range"),
+                        })
+                })?;
+            // One base encoder per distinct (codec, width, height, bitrate,
+            // fit): outputs with equal format and settings share it (P1).
             let key = if let Some(index) = rendition_configs
                 .iter()
-                .position(|cfg| cfg.codec_name == concrete.name)
-            {
+                .zip(&rendition_formats)
+                .position(|(existing, existing_format)| {
+                    existing.codec_name == concrete.name
+                        && existing.width == width
+                        && existing.height == height
+                        && existing.bit_rate == bit_rate
+                        && *existing_format == format
+                }) {
                 index
             } else {
                 let mut video_cfg = cfg.clone();
                 video_cfg.codec_name = concrete.name;
                 video_cfg.format = concrete.format;
+                video_cfg.width = width;
+                video_cfg.height = height;
+                video_cfg.bit_rate = bit_rate;
                 video_cfg.audio = None;
                 rendition_configs.push(video_cfg);
+                rendition_formats.push(format);
                 rendition_configs.len() - 1
             };
             output_video_keys.push(key);
+            output_formats.push(feed_format);
             let ll_hls = config
                 .outputs
                 .iter()
@@ -3184,7 +3430,7 @@ impl Pipeline {
                 .outputs
                 .iter()
                 .find(|item| item.id() == output.id())
-                .and_then(multiview_config::Output::audio)
+                .and_then(multiview_config::Output::effective_audio)
                 .is_some();
             if explicit && !tracks.is_empty() {
                 declared_audio_outputs.push((output.id().to_owned(), tracks));
@@ -3342,6 +3588,9 @@ impl Pipeline {
             encoder,
             encode_cfg: cfg,
             rendition_configs,
+            rendition_formats,
+            convert_hook: None,
+            output_formats,
             output_video_keys,
             output_inband_sets,
             output_audio_tracks,
@@ -3381,6 +3630,9 @@ impl Pipeline {
             program_audio_preview: None,
             window_subscriptions: crate::output_window_registry::window_subscription_slot(),
             output_routing: crate::output_routing::output_routing_slot(),
+            boot_output_feeds: boot_output_feeds(config),
+            boot_retry: crate::output_routing::BootRetryPolicy::default(),
+            boot_audio_takes: boot_audio_choices(config),
             program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
@@ -3603,17 +3855,11 @@ impl Pipeline {
             .iter()
             .map(|_| crate::output_routing::force_cell())
             .collect();
-        let configs = self.rendition_configs.clone();
-        let open: crate::output_routing::OpenFn = Box::new(move |settings| {
-            let cfg = configs
-                .get(settings)
-                .ok_or_else(|| "unknown rendition settings".to_owned())?;
-            let encoder = VideoRenditionEncoder::new(cfg).map_err(|e| e.to_string())?;
-            let live: Box<dyn crate::output_routing::LiveEncoder> =
-                Box::new(PipelineVideoWorker(encoder));
-            Ok(live)
-        });
-        let (router, handle) = crate::output_routing::OutputRouter::new(
+        let open = live_opener(
+            self.rendition_configs.clone(),
+            self.rendition_formats.clone(),
+        );
+        let (router, handle) = crate::output_routing::OutputRouter::new_with_bus(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -3622,6 +3868,8 @@ impl Pipeline {
                 max_encoders: crate::output_routing::DEFAULT_MAX_ENCODERS,
                 max_per_principal: crate::output_routing::DEFAULT_MAX_PER_PRINCIPAL,
                 has_preview,
+                formats: self.output_formats.clone(),
+                boot_retry: self.boot_retry,
             },
             crate::output_routing::AuxWiring {
                 feeds,
@@ -3644,6 +3892,7 @@ impl Pipeline {
             .map(|(index, &settings)| crate::output_routing::RunOutput {
                 id: binding_ids.get(index).cloned().flatten(),
                 settings,
+                feed_format: self.output_formats.get(index).copied().flatten(),
                 routable: self.rendition_configs.get(settings).is_some_and(|cfg| {
                     !(cfg.codec_name.contains("vaapi") || cfg.codec_name.contains("videotoolbox"))
                 }),
@@ -3652,18 +3901,79 @@ impl Pipeline {
                 program_audio: audio_tracks.get(index).is_some_and(|t| t.contains(&0)),
             })
             .collect();
-        self.output_routing
-            .store(Some(Arc::new(handle.with_outputs(run_outputs))));
+        let handle = Arc::new(handle.with_outputs(run_outputs));
+        enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
+        self.output_routing.store(Some(handle));
         Ok(RunRouting {
             consumer: ConsumerRouting {
                 router: Box::new(router),
                 base_force,
                 inband_sets: self.output_inband_sets.clone(),
+                base_formats: self.rendition_formats.clone(),
+                convert_hook: self.convert_hook.clone(),
             },
             aux_tx,
             preview_selection,
             aux,
         })
+    }
+
+    /// Issue one audio-only take per output whose persisted audio feed is not
+    /// `follow` (ADR-0108 slice 2 §6.1), onto the handle
+    /// [`Self::build_output_routing`] just published. The consumer drains them
+    /// on its first ticks. An audio-only take has no fresh gate, so there is
+    /// no retry: a take that cannot be enqueued, or that the engine refuses
+    /// (an output without a program-audio slot), is logged and the persisted
+    /// value stays. Never blocks (bounded `try_send`).
+    fn issue_boot_audio_takes(&self) {
+        if self.boot_audio_takes.is_empty() {
+            return;
+        }
+        let Some(handle) = self.output_routing.load() else {
+            return;
+        };
+        for (output, choice) in &self.boot_audio_takes {
+            let Some(index) = handle.index_of(output) else {
+                tracing::warn!(%output, "output routing: boot audio take for an output this run does not route");
+                continue;
+            };
+            if !handle.outputs().get(index).is_some_and(|o| o.program_audio) {
+                tracing::warn!(%output, audio = %choice.label(), "output routing: this output cannot carry a routed audio feed; it starts on follow");
+                continue;
+            }
+            // A video boot take on this output already carries the audio (a
+            // combined take, see `enqueue_boot_takes`): an audio-only take
+            // here would supersede it.
+            let video_boot = self.boot_output_feeds.iter().any(|(id, _)| id == output)
+                && handle.outputs().get(index).is_some_and(|o| o.routable);
+            if video_boot {
+                continue;
+            }
+            // Keyed on the output index, not the config id (PR #352 round
+            // 2): an HLS config id is a path and can be arbitrarily long, and
+            // `try_take` rejects an id over MAX_TAKE_ID_BYTES outright, so
+            // parsing/truncating it here could silently drop a long-id
+            // output's boot audio.
+            let take = crate::output_routing::OutputTake {
+                operation_id: format!("{}{index}", crate::output_routing::BOOT_AUDIO_TAKE_PREFIX),
+                output_index: index,
+                bus: None,
+                audio: Some(choice.clone()),
+                principal: "boot".to_owned(),
+            };
+            if handle.try_take(take).is_err() {
+                tracing::warn!(%output, "output routing: boot audio take not enqueued; it starts on follow");
+            }
+        }
+    }
+
+    /// Test seam: the boot audio takes parsed from the config (the stream
+    /// test harness renames its bindings `test-sink-N`, so a test re-keys them).
+    #[cfg(test)]
+    pub(crate) fn boot_audio_takes_mut(
+        &mut self,
+    ) -> &mut Vec<(String, crate::routing_audio::AudioChoice)> {
+        &mut self.boot_audio_takes
     }
 
     /// Every catalogued source's frame store, keyed by id.
@@ -3990,11 +4300,30 @@ impl Pipeline {
         Arc::clone(&self.window_subscriptions)
     }
 
+    /// Test seam (#342 review I3): run `hook` on every `format-convert`
+    /// thread before each convert.
+    #[cfg(test)]
+    pub(crate) fn set_convert_hook(&mut self, hook: crate::format_convert::ConvertHook) {
+        self.convert_hook = Some(hook);
+    }
+
     /// How many distinct video rendition configs (= Program encoder keys)
     /// this pipeline opens per run.
     #[cfg(test)]
     pub(crate) fn rendition_config_count(&self) -> usize {
         self.rendition_configs.len()
+    }
+
+    /// Test view (#342): per output its base key, per key (w, h, bit rate).
+    #[cfg(test)]
+    pub(crate) fn rendition_keys_for_test(&self) -> (Vec<usize>, Vec<(u32, u32, usize)>) {
+        (
+            self.output_video_keys.clone(),
+            self.rendition_configs
+                .iter()
+                .map(|cfg| (cfg.width, cfg.height, cfg.bit_rate))
+                .collect(),
+        )
     }
 
     /// The run's output-routing handle slot (ADR-0108 slice 1): empty until a
@@ -4363,6 +4692,9 @@ impl Pipeline {
         if !live {
             if let Some(hls_key) = hls_key {
                 self.output_video_keys.insert(0, hls_key);
+                let hls_format =
+                    hls_index.and_then(|i| self.output_formats.get(i).copied().flatten());
+                self.output_formats.insert(0, hls_format);
                 // The anchor is a `program.ts` file: MPEG-TS, in band.
                 self.output_inband_sets.insert(0, true);
                 self.output_audio_tracks
@@ -4398,6 +4730,29 @@ impl Pipeline {
         // by the per-tick snapshot projection; replaced wholesale per run).
         self.push_links.store(Arc::new(links));
         (runners, binding_ids)
+    }
+
+    /// Test seam: shorten the boot-take retry policy (wall-clock bound tests).
+    #[cfg(test)]
+    pub(crate) fn set_boot_retry(&mut self, policy: crate::output_routing::BootRetryPolicy) {
+        self.boot_retry = policy;
+    }
+
+    /// Test seam: the fake sinks of [`Self::drive_streaming_for_test`] are
+    /// addressed as `test-sink-<index>`, so rename each boot feed's output to
+    /// the fake sink at the configured output's position.
+    #[cfg(test)]
+    pub(crate) fn address_boot_feeds_to_test_sinks(&mut self, config: &MultiviewConfig) {
+        let ids: Vec<String> = config
+            .outputs
+            .iter()
+            .map(multiview_config::Output::id)
+            .collect();
+        for (id, _) in &mut self.boot_output_feeds {
+            if let Some(index) = ids.iter().position(|o| o == id) {
+                *id = format!("test-sink-{index}");
+            }
+        }
     }
 
     /// **Test seam** (ADR-0025): drive the streaming bake→encode→fan-out path
@@ -5003,6 +5358,7 @@ impl Pipeline {
         // until a take routes a feed), the off-clock `routing-aux` thread (it
         // blocks on recv while nothing is routed), and the consumer's router.
         let routing = self.build_output_routing(&binding_ids, &enforced_audio_tracks)?;
+        self.issue_boot_audio_takes();
         let RunRouting {
             consumer: consumer_routing,
             aux_tx,
@@ -7237,10 +7593,45 @@ struct ConsumerRouting {
     base_force: Vec<Arc<AtomicU64>>,
     /// Per output: [`BindingConfig::inband_parameter_changes_ok`].
     inband_sets: Vec<bool>,
+    /// Per base video key: the format its worker encodes (#342), converted
+    /// by that format's `format-convert` thread; `None` = the canvas, the
+    /// unchanged zero-copy path.
+    base_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
+    /// Chaos/test hook run on every convert thread before each convert
+    /// (#342 review I3); `None` in production.
+    convert_hook: Option<crate::format_convert::ConvertHook>,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
 const ROUTING_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
+/// The routing opener (ADR-0108, #342): opens a live encoder for a rendition
+/// settings index. A Program/Clean key at a non-canvas format converts on its
+/// own worker (never erroring: it repeats or blacks). A routed source/PVW
+/// arrives already at the format (aux feed).
+fn live_opener(
+    configs: Vec<EncodeConfig>,
+    formats: Vec<Option<crate::routing_aux::AuxFormat>>,
+) -> crate::output_routing::BusOpenFn {
+    Box::new(move |settings, bus| {
+        let cfg = configs
+            .get(settings)
+            .ok_or_else(|| "unknown rendition settings".to_owned())?;
+        let encoder = VideoRenditionEncoder::new(cfg).map_err(|e| e.to_string())?;
+        let live: Box<dyn crate::output_routing::LiveEncoder> =
+            Box::new(PipelineVideoWorker(encoder));
+        let canvas_bus = matches!(
+            bus,
+            crate::routing_aux::PictureBus::Program | crate::routing_aux::PictureBus::Clean
+        );
+        match formats.get(settings).copied().flatten() {
+            Some(format) if canvas_bus => Ok(Box::new(crate::format_convert::ConvertLive::new(
+                format, live,
+            ))),
+            _ => Ok(live),
+        }
+    })
+}
 
 /// The concrete encoder owned exclusively by one bounded rendition worker.
 struct PipelineVideoWorker(VideoRenditionEncoder);
@@ -7706,7 +8097,13 @@ fn consumer_main<D: WindowDelivery>(
         mut router,
         base_force,
         inband_sets,
+        base_formats,
+        convert_hook,
     } = routing;
+    // #342 review I1/I2: one `format-convert` thread per distinct non-canvas
+    // base format, fed non-blocking right after the bake. Empty (no thread,
+    // no work) for a run whose base keys are all at the canvas format.
+    let mut convert_stages = crate::format_convert::ConvertStages::default();
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
     if video_encoders.is_empty() {
@@ -7753,14 +8150,27 @@ fn consumer_main<D: WindowDelivery>(
             .get(key)
             .cloned()
             .unwrap_or_else(crate::output_routing::force_cell);
+        // A base key at a non-canvas format encodes its format's convert
+        // thread's newest picture (never converting, never failing on a
+        // convert); the canvas format keeps the zero-copy path untouched.
+        let encode: Box<dyn VideoEncodeWorker> = match base_formats.get(key).copied().flatten() {
+            Some(format) => {
+                let slot = convert_stages
+                    .slot_for(format, convert_hook.as_ref())
+                    .map_err(|e| PipelineError::thread_spawn("format-convert", e))?;
+                Box::new(crate::format_convert::ConvertedWorker::new(
+                    slot,
+                    format,
+                    Box::new(PipelineVideoWorker(encoder)),
+                ))
+            }
+            None => Box::new(PipelineVideoWorker(encoder)),
+        };
         let worker = RenditionWorker::spawn(
             key,
             cadence,
             base,
-            Box::new(crate::output_routing::ForceAt::with_cell(
-                Box::new(PipelineVideoWorker(encoder)),
-                force,
-            )),
+            Box::new(crate::output_routing::ForceAt::with_cell(encode, force)),
             move |event| {
                 tx.send(event).map_err(|e| PipelineError::Output {
                     kind: "video-worker",
@@ -8042,6 +8452,7 @@ fn consumer_main<D: WindowDelivery>(
         // fails the run explicitly (never silently skips forward).
         for missing_tick in missing {
             let canvas = last_baked.as_ref().unwrap_or(&overlaid);
+            convert_stages.offer(missing_tick, canvas);
             for worker in &workers {
                 worker
                     .offer_within(
@@ -8063,6 +8474,9 @@ fn consumer_main<D: WindowDelivery>(
         // absorbing engine ticks meanwhile — nothing is shed inside the
         // envelope); only a worker wedged beyond the horizon fails
         // explicitly, never pacing the program clock.
+        // #342: the non-canvas base formats' convert threads get it first
+        // (try_send, never blocks; a full queue drops and counts).
+        convert_stages.offer(item.tick_index, &overlaid);
         for worker in &workers {
             worker
                 .offer_within(
@@ -8294,6 +8708,9 @@ fn consumer_main<D: WindowDelivery>(
     // Live-opened encoders are retired first and handed to the routing reaper
     // (bounded wait; they never gate the base windows).
     (*router).shutdown(&mut dispatcher, ROUTING_SHUTDOWN_GRACE);
+    // The base formats' convert threads: input closed, joined within the
+    // same grace (a wedged one is left to end on its own, never awaited).
+    let _joined = convert_stages.shutdown(ROUTING_SHUTDOWN_GRACE);
     drop(event_tx);
     let joiner = std::thread::Builder::new()
         .name("multiview-worker-join".to_owned())
@@ -13310,7 +13727,8 @@ fn output_audio_selection(
     output: &Output,
     tracks: &[DeclaredTrack],
 ) -> multiview_output::AudioSelection {
-    let Some(selection) = output.audio() else {
+    // `slots.audio`, when declared, is the output's selection (#342).
+    let Some(selection) = output.effective_audio() else {
         return multiview_output::AudioSelection::default();
     };
     let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();

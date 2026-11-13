@@ -966,8 +966,8 @@ encoded as frame T.
   (`RunOutput::program_audio`), so the control plane can refuse before enqueue. An output without
   it, and every audio take on a run without program audio, is refused `unroutable` by the engine.
   NDI, AES67 and display outputs have no packet binding with a program-audio slot in this build, so
-  they are refused for audio (the API PR maps this to a typed `audio-unsupported` refusal). There is
-  no NDI routed-audio path yet. Config validation keeps the per-transport rules
+  they are refused for audio: the control plane answers a typed `audio-unsupported` (409) from the
+  plan before enqueue (§6.2). There is no NDI routed-audio path yet. Config validation keeps the per-transport rules
   (`Output::audio_capability`): a `{ tracks = [..] }` feed holds more than one track only where the
   transport carries tracks simultaneously (SRT, RIST, RTSP, multitrack RTMP); HLS/LL-HLS
   (select-one), NDI/AES67/display (no tracks), legacy RTMP and WebRTC (one) take at most one.
@@ -976,9 +976,21 @@ encoded as frame T.
   `propagate_routing_change`, rewrites `[[routing.output]] audio = { tracks = [..] }` to a renamed
   track and drops a removed one (an emptied feed becomes `program`). `PUT /api/v1/audio-routing`
   commits it in the same prospective document and reports it in `outputs_updated`.
-- **Start-up stays on `follow`.** An explicit audio feed in the config validates, but start-up does
-  not apply one yet: `outputs_carry_program` refuses it ("this engine starts every output on follow
-  audio"). An explicit choice is a live take.
+- **Start-up re-applies a persisted audio feed.** An explicit audio feed in the config is admitted
+  at start-up (`outputs_carry_program` no longer refuses it). The run starts every output on
+  `follow` and, right after its routing handle is published, issues one **audio-only boot take**
+  per output whose persisted audio is not `follow` (`Pipeline::issue_boot_audio_takes`, operation
+  id `boot:audio:<output index>`). An audio-only take has no fresh gate, so there is no retry: a boot take
+  that cannot be enqueued or is refused (an output without a program-audio slot, a multi-track or
+  undeclared-track feed) is logged, the output stays on `follow`, and the persisted value is kept.
+  When the same row also persists a non-Program video feed, the audio rides that output's video
+  **boot take** instead (one combined take, `boot:<output index>`, see Restart below), so the two
+  never supersede each other; if that boot take is given up, the router issues its audio alone as
+  `boot:audio:<output index>` (no fresh gate), so a refused video never drops the persisted audio.
+  Every boot id is keyed on the run's OUTPUT INDEX, never parsed from the config id (PR #352 round
+  2): an HLS config id is a path and can be arbitrarily long, so a config-id-derived id risked
+  truncation collisions or outright rejection by the take-id length check; the index is always
+  short and fixed. Logs still name the config id for operators.
 
 ---
 
@@ -1006,11 +1018,43 @@ The existing `bus` field (`crates/multiview-config/src/routing.rs:236`) stays as
 `video = { bus = "preview" }`. When both are present they must agree, or validation fails. The
 desugar (`crates/multiview-config/src/lib.rs:1590-1600`) keeps writing Program.
 
+**Audio rows (slice 2).** `audio` in a `[[routing.output]]` row is accepted at start-up and
+re-applied by a boot audio take (§5.5). A take persists its audio feed with its video: an applied
+audio-only take writes `audio` and keeps the row's video; a row that ends on Program video and
+`follow` audio is removed (absent = the default). A boot outcome (any id under `boot:`, `is_boot_take`) is never persisted, applied or not.
+
 A take is persisted **only after its `applied` outcome**, never on `refused:*` or `superseded`, under
-the same config-mutation lock `apply-layout` uses (`crates/multiview-control/src/routes/mod.rs:811`). A restart therefore comes
-back on the operator's last feed that actually went on air. This differs from `apply-layout`, which
-commits before the engine adopts (`crates/multiview-control/src/routes/mod.rs:876-901`): a route take can still be refused by the
-fresh gate after the 202.
+the same config-mutation lock `apply-layout` uses (`crates/multiview-control/src/routes/mod.rs:811`). This differs from
+`apply-layout`, which commits before the engine adopts (`crates/multiview-control/src/routes/mod.rs:876-901`): a route take can
+still be refused by the fresh gate after the 202. A take back to Program removes the output's row, unless the boot file
+routes that output elsewhere: then an explicit Program row is kept, so a restart does not re-seed the boot row.
+
+**Restart (#329).** `routing.output` rows are **store-backed**: start-up takes them from the accepted
+state (`desired.json`, where `persist_feed` committed them), not from the boot file. The other routing
+tables (video, audio and subtitle crosspoints) stay restart-only and are spliced from the boot file as
+before. Per output, the accepted row wins; a boot-file `[[routing.output]]` row seeds an output the
+accepted state has no row for. The same rule applies to the accepted state, an `active.toml` resume and
+a last-good fallback (`crates/multiview-cli/src/boot.rs`, `splice_output_routing`).
+
+The engine itself always starts every output on Program. Right after the run's routing handle is
+published, before the clock starts, it enqueues one **boot take** per output whose persisted feed is not
+Program: `operation_id = "boot:<output index>"`, principal `system:boot`. A boot take goes through
+the normal gate (fresh within 50 ticks, capacity), so a source that is not up yet is refused
+`feed-not-fresh`. The router on the bake consumer then re-issues it at most once every 2 s, for up to
+30 s after the run's first tick. This state is O(outputs), lives off the clock on the consumer that
+already owns the take state machine, and needs no extra thread or timer. An operator take on the same
+output ends the boot take for good. After the window, or on a refusal that cannot clear (unroutable,
+format mismatch), the output stays on Program, a warning is logged, and the routing snapshot counts it
+(`boot_takes_given_up`). A refused or expired boot take never deletes the persisted feed: the operator's
+intent stays. An applied boot take is not persisted either: every boot id (`boot:<index>`, `boot:audio:<index>`) shares the one
+`BOOT_TAKE_PREFIX` in `multiview-control`, and the outcome relay skips persistence for `is_boot_take` ids.
+
+**What the operator sees when a boot take is refused.** `GET /routing` shows `video: {"bus":
+"program"}` with tally `program` (what is on air) and `configured_video` with the persisted feed, each
+redacted by its own read rule. The Outputs page shows the live feed (and the live `effective_audio` in the
+Audio row) in the select and a "configured: X (not on air)" note. Start-up
+admission (`outputs_carry_program`, the single start-up rule) refuses only a feed the engine cannot
+carry at all: a layout, which validation already refuses until slice 3.
 
 ### 6.2 HTTP surface
 
@@ -1027,15 +1071,19 @@ POST /api/v1/routing/output/take          new kind "output"
 POST /api/v1/routing/salvo/plan|take      several crosspoints, one tick (new)
 ```
 
-`GET /api/v1/routing`, filtered per object for scoped principals:
+`GET /api/v1/routing`, filtered per object for scoped principals. When the engine publishes a live
+snapshot for an output, `video`, `tally` and `effective_audio` describe what is **on air** (the live
+bus), and `configured_video` is the persisted feed. They differ after a refused boot take or a
+fallback. Each field is redacted by its own per-object rule. Without a live snapshot (no run), both
+fields are the configured feed and `state` is `configured`.
 
 ```json
 { "tick": 1843021,
   "outputs": [
-    { "output": "restream", "video": {"layout": "NewsOne"}, "audio": "follow",
+    { "output": "restream", "video": {"layout": "NewsOne"}, "configured_video": {"layout": "NewsOne"}, "audio": "follow",
       "effective_audio": "program", "encoded_bus": "aux:NewsOne/h264-1080p", "state": "on_air",
       "since_tick": 1841990, "pending": null },
-    { "output": "srt-multiview", "video": {"bus": "program"}, "audio": "follow",
+    { "output": "srt-multiview", "video": {"bus": "program"}, "configured_video": {"bus": "program"}, "audio": "follow",
       "effective_audio": "program", "state": "on_air", "since_tick": 0,
       "pending": {"video": {"source": "vt1"}, "held_ticks": 12, "operation_id": "…"} } ],
   "cells": [ … existing video/audio/subtitle crosspoints … ],
@@ -1069,14 +1117,48 @@ Possible refusals (typed, RFC 9457 `type` suffixes):
 - `unknown-feed`;
 - `encoder-format-mismatch` (internal fault, §4.2 step 4);
 - `switcher-required` (Preview or Clean without an M/E);
-- `output-kind-unroutable`.
+- `output-kind-unroutable`;
+- `audio-unsupported` (no program-audio slot, a transport without discrete tracks, or more than
+  one track).
 
 The class is `class1` for every feed change, because the format never changes (§4.2). A format
 change is not offered here.
 
-**`POST /api/v1/routing/output/take`.** The body is the same as plan plus an optional `audio`: a
-take carries a video feed, an audio choice, or both (`audio` alone is an audio-only take; the
-engine side is built in slice 2, the HTTP body field is the slice 2 API PR). It requires an
+**Audio in plan and take (slice 2, as built).** `target.stream` is `video` or `audio`. `feed` is the
+video feed; `audio` is the full audio feed, externally tagged like the config `audio`:
+`"follow" | "program" | "none" | {"source": "<id>"} | {"tracks": ["<name>"]}`.
+
+- `stream: "video"` + `feed` (+ optional `audio`): a video take, with the audio taken together.
+  Absent `audio` keeps the output's audio choice (slice-1 bodies, `audio: "follow"` included,
+  behave as before).
+- `stream: "audio"` + `audio`, no `feed`: an **audio-only take**; the video is untouched.
+- Any other combination is 422 with a detail naming the missing or extra field.
+
+```json
+{ "target": {"kind": "output", "output": "restream", "stream": "audio"},
+  "audio": {"source": "cnn-usa"} }
+```
+
+A track resolves to its `[audio].routes[].target_track` route `input_id`. Only one track is
+takeable: the routed audio rides the output's single program-audio slot (§5.5), so
+`{"tracks": [a, b]}` is 422 `audio-unsupported` ("This output carries one routed audio feed;
+choose one track"). An unknown source or track is 422 `unknown-feed`. An output without a
+program-audio slot (`RunOutput::program_audio == false`: NDI, AES67, display, or a run without
+program audio) is 409 `audio-unsupported` ("This output cannot carry a routed audio feed"); a
+`tracks` feed on a transport whose `Output::audio_capability()` delivery is `None` is 409
+`audio-unsupported` too. The plan reports the same refusals in `refusals`.
+
+The plan's cost gains `audio_encoders` (`0` or `1`) and `audio_cost`: `1` and
+"+1 audio encode (transient, CPU)" when the take changes what the output carries and the output has
+no private audio bus yet; `0` (and no `audio_cost`; the UI says "No extra encoder") when the target
+is what it already carries or a private bus already runs. The engine readback carries per output
+the carried audio, the pending take's audio and whether a private bus runs. `GET /routing` keeps
+`audio` as the persisted choice; `effective_audio` comes from the live readback when present, and
+`pending.audio` shows a pending take's audio; all redacted per §6.3. `route.output` is unchanged
+in shape and covers audio-only takes.
+
+**`POST /api/v1/routing/output/take`.** The body is the same as plan: a take carries a video feed,
+an audio choice, or both (`stream: "audio"` is an audio-only take). It requires an
 `Idempotency-Key`. The response is
 `202 {operation_id, status: "accepted"|"pending"|"settled", adopt?: "next_tick", outcome?, tick?}`.
 `accepted` (with `adopt: "next_tick"`) answers only the request that enqueued the take. A replay of
@@ -1095,11 +1177,17 @@ The replay decision is owned by a **take-scoped** store
 (`OutputRoutingControl` in `crates/multiview-control/src/output_routing.rs`), not by the
 process-global `IdempotencyStore`. Each record holds `{operation_id, take, outcome}`. The route does
 not use the global store at all: other routes `release`/`rebind` keys there, and a take's replay
-must not depend on them. The take store is bounded at 4096 records and **fails closed** at the cap
-(`503 idempotency-capacity`, like the global store); it never evicts. A record is removed only when
-its own enqueue failed (`engine-busy`, `output-kind-unroutable`), which frees the key for a retry.
-Settled records stay for the life of the process, the same lifetime as the global store's keys. The
-control-side
+must not depend on them. The take store is bounded at 4096 records in total and 256 **per principal**.
+A **pending** record (one with no outcome yet) is never evicted, so a key answered `accepted` always
+replays its own operation while that operation is pending. Under pressure, **settled** records are
+evicted oldest first. When a principal reaches its own cap, its own oldest settled record goes first. If
+all of that principal's records are pending, that principal gets `503 idempotency-capacity` and other
+principals are unaffected. At the global cap, the oldest settled record of any principal goes. Only
+when all 4096 records are pending does the store fail closed for everyone. This is the documented
+trade-off: **a replay of an evicted (settled) key is a new take**, because the store no longer knows
+the key. Clients already must mint a new key per distinct take, and a replay long after its settlement
+re-applies a feed the operator already chose. A record is also removed when its own enqueue failed
+(`engine-busy`, `output-kind-unroutable`), which frees the key for a retry. The control-side
 `route.output` subscriber writes the outcome when the engine publishes it. A salvo reserves its key
 only after every member is authorized and validated. So a denied or invalid salvo burns no key, and
 its replay can never return a 202 for an operation that never enqueued. The outcome arrives as the realtime event
@@ -1135,11 +1223,19 @@ A take or plan requires:
 
 | Object | Requirement |
 | --- | --- |
-| Destination | Role `Write` (`principal.role.require(Action::Write)`, as `crates/multiview-control/src/routes/routing.rs:151`) **and** `authorize_object(principal, output)` (`crates/multiview-control/src/auth.rs:336`), the same object axis the output routes use (`crates/multiview-control/src/routes/outputs.rs:77,110`). Not `authorize_output`, which reads a different allowlist (`crates/multiview-control/src/auth.rs:268-274,349`) |
+| Destination | Role `Write` (`principal.role.require(Action::Write)`, as `crates/multiview-control/src/routes/routing.rs:151`) **and** both axes of the output: `authorize_scope(principal, AuthzScope::ObjectAndOutput { object: output, output })` (#329). The object axis (`scoped_object_ids`) is the one the output routes use (`crates/multiview-control/src/routes/outputs.rs:77,110`). The output axis (`scoped_output_ids`, ADR-W026) is checked as well, so a key confined to some outputs can neither plan nor take another, nor read its row or its events |
 | Feed `source:x` | `authorize_object(principal, x)` with Read (`crates/multiview-control/src/auth.rs:336`) |
 | Feed `layout:L` | Read on L **and on every source its cells bind**. A layout picture shows those sources' pixels, so a principal limited to L could otherwise route a source it cannot read |
 | Feed `bus:*` (Program, Preview, Clean) and `layout:*` cells binding `bus:*` | `authorize_scope(Program("main"))` plus `authorize_object(me1)`, as `authorize_refs` does (`crates/multiview-control/src/routes/switcher.rs:99-112`). **This deliberately replaces per-source Read**: a bus shows whatever the M/E selects, now or later, so the grant is the Program scope itself. Only principals that already hold Program scope can route a bus |
+| Audio feed `source:x` | `authorize_object(principal, x)` |
+| Audio feed `program`, and `follow` of a bus video | the bus rule above: `authorize_scope(Program("main"))` plus `authorize_object(me1)` (`follow` is covered by the video end) |
+| Audio feed `tracks:[t]` | `authorize_object(principal, t)` **and** `authorize_object(principal, <t's route input_id>)`: the track carries that source's audio |
+| Audio feed `none`, `follow` | nothing beyond the output (and the video end, when present) |
 | Salvo | every crosspoint independently, all before enqueue |
+
+The audio-feed rules are the same as `may_read_audio` in `GET /routing` (plus the track's route
+input), so readback never discloses an audio feed a take would refuse. They run before existence:
+an audio source or track the caller may not read is 403 whether or not it exists.
 
 **The rule is checked on every change, not only at the take.** A layout routed to an output can be
 edited after the take. The principal making a change is checked against every output the change
@@ -1177,7 +1273,8 @@ affects:
   (`require_unscoped_for_whole_system`). A scoped principal gets its own cost (`+0` or `+1`
   encoder) and a boolean `fits`. Its capacity refusal reads "No free encoder session for this
   output", without counts.
-- `route.output` is delivered with `AuthzScope::Object(output)` (the same axis as the REST check).
+- `route.output` is delivered with `AuthzScope::ObjectAndOutput { object: output, output }`, the same two axes
+  as the REST check. `GET /routing` omits the rows that fail this rule.
 - Authorization runs before existence, as the existing routes do (`crates/multiview-control/src/routes/routing.rs:164-169`,
   `crates/multiview-control/src/routes/switcher.rs:288-289`). So an id the caller may not read gets 403 whether or not it exists.
 
@@ -1368,7 +1465,16 @@ Video  [ Program (follows the switcher) ▾ ]  on air since 12:04:31     Audio  
 
 The dropdown is grouped Buses / Layouts / Players / Generators / Sources, with disabled items and
 their reasons. Choosing an item runs plan, shows the cost line, and offers [Take]. The outcome uses
-`OperationFeedback`. Output CRUD stays restart-class for format, and the callout says so; the feed
+`OperationFeedback`.
+
+**Audio row as built (slice 2, `web/src/pages/OutputAudioRow.tsx`).** The select starts on the
+persisted choice (`GET /routing` `audio`); `follow` reads "Follow (<effective audio>)". Groups:
+Follow; Program mix; Silence; Sources (the sources the page already loads for the video row);
+Tracks (`GET /api/v1/audio-routing` `selectable_tracks` without `prog`; while that is unknown the
+group is omitted and the row says so). Choosing an item runs plan with `stream: "audio"`, shows
+the `audio_cost` line or "No extra encoder", shows a refusal as the Take key's disabled reason,
+and [Take] posts the audio-only take with an `Idempotency-Key`; the outcome uses the same
+`OperationFeedback` pattern as the video row. Output CRUD stays restart-class for format, and the callout says so; the feed
 row is live.
 
 ---
@@ -1500,7 +1606,7 @@ clock-adjacent path, otherwise as `scripts/classify.sh` says.
 | # | Slice | Gives the operator | Risk / crates | Does NOT yet do |
 | --- | --- | --- | --- | --- |
 | **1** (#304) | **Route preview, program, VT, bars or a source to any output, live, from the Outputs page and the API**: each output on its own, also when outputs share settings | The operator's named items except layout. Audio follows (`follow`), with a crossfade. "On Program" and "source direct" are distinct | R3. `multiview-config` (feed fields, `bus` alias), `multiview-engine` (aux thread with one-cell canvases: identity or CPU letterbox; picture-bus slots; take state machine on the bake consumer), `multiview-output` (`forced-idr=1`, force-keyframe, `starting_at(T0)` for video and AAC), `multiview-cli` (encoder registry keyed by picture bus + settings, live open off the clock, linger-close, dispatcher `rebind` at a window, per-bus substitution, routed audio buses), `multiview-control` (`GET /routing`, `output` take kind, `route.output` event, BOLA on the object axis, limits), `web` (Outputs page feed rows) | Layouts as feeds, Clean, explicit audio selection, salvos, the matrix page |
-| 2 (#305) | Explicit audio feed per output (`program`, `source`, `tracks`, `none`) live; Clean bus to an output (part 1 built: Clean bus, plan counts lingering encoders as +0, HLS discontinuity at a changed-set move; part 2 built: the engine's explicit audio choice, audio-only and combined takes, one fade at a time, return to the shared program stream, config validation and rename propagation; still to do: the HTTP `audio` field and the Audio row) | "how do I route audio?": any source's audio alone on any output, live | R2-R3. `multiview-cli`, `-config`, `-control`, `web` (Audio row) | Layout audio attribute (slice 3) |
+| 2 (#305) | Explicit audio feed per output (`program`, `source`, `tracks`, `none`) live; Clean bus to an output (part 1 built: Clean bus, plan counts lingering encoders as +0, HLS discontinuity at a changed-set move; part 2 built: the engine's explicit audio choice, audio-only and combined takes, one fade at a time, return to the shared program stream, config validation and rename propagation; part 3 built: the HTTP `audio` feed and `stream: "audio"`, audio-feed authorization, `audio-unsupported`, the plan's audio cost, audio persistence, boot audio takes from config, and the Outputs page Audio row) | "how do I route audio?": any source's audio alone on any output, live | R2-R3. `multiview-cli`, `-config`, `-control`, `web` (Audio row) | Layout audio attribute (slice 3) |
 | 3 (#306) | Route a stored layout to an output (GPU aux canvas + CPU integer path), admission and cost in plan, the `routing.degraded` path | "layout": NewsOne on the HLS output while the switcher stays on | R3. `multiview-engine`, `-cli`, `-control`, `web` | Layout on the M/E, buses inside layouts |
 | 4 (#307) | Layout-as-a-source on the M/E (PVW/PGM/AUTO); `bus:program` and `bus:preview` cells; cycle refusal; first-slice restriction removed; `apply-layout` semantics | "in, around, through" (#243) | R3. `multiview-engine`, `-cli`, `-config`, `-control` | More than one M/E |
 | 5 (#308) | Crosspoint matrix Routing page (video + audio, tally, all states), output salvos (`/routing/salvo/*`, `Salvo.output`) | One screen for everything, atomic multi-output takes | R2. `web`, `multiview-control`, `-config`, `-engine` (salvo adoption) | — |
@@ -1748,6 +1854,25 @@ new init/catalog. The patch on the output's slots survives a reset when the new 
 crosspoints to removed slots are dropped and named in the response. Program, the mixer and every
 other output are untouched; the plan states "resets output hls-1 (about N s)".
 
+**As built in slice B (#342, part B1).** The config lives in `multiview-config::output_format`.
+Slots are declared under `[[outputs.slots.video]]` / `[[outputs.slots.audio]]`, not
+`[[outputs.video]]` / `[[outputs.audio]]`: `[outputs.audio]` is already the ADR-R005 audio
+*selection* table, and TOML cannot make one key both a table and an array of tables. Declaring both
+`audio` and `slots.audio` is refused. With `slots.audio`, the output's effective selection
+(`Output::effective_audio`) is: slot 0 = the program mix (it names no `track`), slot `i > 0` = a
+declared discrete track (`[audio]` route `target_track`). An audio slot's `channels` /
+`sample_rate` / `codec`, when given, must be 2 / 48000 / `aac` (one AAC grid). A video slot carries
+`codec` and `bitrate_kbps` (default: the output's `codec`, 4000 kbit/s); `settings = {…}` (#216)
+comes later. `fit.anchor` is one of `center`, `top`, `bottom`, `left`, `right`, `top_left`,
+`top_right`, `bottom_left`, `bottom_right`. Validation reports a typed message prefix:
+`slot-medium-mismatch:` (more slots than `Output::slot_capability()` allows, a codec on a raw
+output, a video slot on `aes67`) or `slot-format-unsupported:` (a codec the medium does not carry,
+fps ≠ Program (slice C, #343), `tff`/`bff`, colour ≠ canvas (#310), pixel format ≠ canvas, an
+anamorphic `aspect`, a size that is odd, outside 16..=8192 or above 3840×2160 in area, or a
+non-canvas format on a kind slice B does not convert for: `webrtc`, `whip_push`, `ndi`, `display`,
+`aes67`, `rtsp_server`). Only an explicitly declared slot codec is checked. Absent `format` and
+`slots` give exactly the previous behaviour and serialization.
+
 ### 12.4 The cheapest path per crosspoint
 
 For every crosspoint the engine computes a path; the plan shows it, and `GET /patch` reports it per slot.
@@ -1789,6 +1914,39 @@ For every crosspoint the engine computes a path; the plan shows it, and `GET /pa
 
 Totals: 1 demux, 1 decode, 1 convert, 2 encodes. If a fourth output D equals C's format and
 settings, D is P1 (+0).
+
+**As built in slice B (#342, part B1, boot path).** A base (Program) rendition key is
+(codec, width, height, bit rate, fit). Outputs with equal format and slot-0 settings share one
+encoder (P1); others get their own. Every distinct base key counts against
+`MAX_VIDEO_RENDITIONS_PER_PROGRAM` (8) at config validation. A format whose size equals the
+canvas's is the canvas key, whatever its fit (identity: the zero-copy path is unchanged).
+
+For each distinct non-canvas base format there is **one `format-convert` thread** (normal priority,
+`catch_unwind`, a failed flag; `crates/multiview-cli/src/format_convert.rs`). Right after the bake,
+the bake consumer hands it the baked canvas with `try_send` on a bounded channel of capacity 2:
+when the channel is full the tick is dropped and counted, and the consumer never blocks. The thread
+converts with `fit_rects` + `blit_region` (integer, even-aligned, 2×2 box) into a bounded ring of 4
+buffers, keeps the canvas colour tag, and publishes `(tick, picture)` into a wait-free `SwapCell`.
+A base worker at that format never converts and never fails on a convert. Each tick it encodes the
+newest published picture, or a black picture at the format until the first one arrives. **A
+converted base output therefore lags the Program by up to one tick**, the same newest-frame rule as
+the aux path. A slow or wedged convert thread freezes (or blacks) only its own outputs; the clock,
+the bake consumer, Program and every other output are untouched (chaos test
+`a_wedged_convert_thread_never_moves_the_clock_or_another_output`). There is one convert per
+(Program, format) by construction. Encode coupling between base keys through the consumer's
+bounded `offer_within` is as before (outputs on different codecs already had it).
+
+Routed feeds: `AuxFeed` is keyed (picture bus, feed format). The aux thread composes a source/PVW
+tile directly at the output's format with its fit, and a tile already at the format passes as the
+same `Arc`. The feed format is `None` only when the output is canvas-sized *with the default fit*,
+so a canvas-sized cover/fill/anchored output gets its fit for a routed source. Program/Clean on a
+dynamic key at a non-canvas format are converted on that key's worker (repeating its last picture,
+or black, never erroring). Dynamic keys stay (bus, settings index); the settings index is the
+output's base key, so it already names (format, codec settings), and the encoded bus is keyed
+(picture, format, settings). The published `live_keys` and the take plan name the feed
+(`src:cam@1080x1920/Cover/Center`), so a take at another format reports +1 encoder. The feed set
+is bounded by the dynamic-key caps (live keys + opens ≤ `max_encoders`) plus one per pending take.
+A formatted output falls back to its own base key (Program at its format).
 
 ### 12.5 Passthrough and invariant #1
 

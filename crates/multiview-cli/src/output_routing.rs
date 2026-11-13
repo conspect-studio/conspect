@@ -36,7 +36,7 @@ use crate::rendition_workers::{
 };
 pub use crate::routing_audio::AudioChoice;
 use crate::routing_audio::{AudioTakeProgress, AudioTakeStart};
-use crate::routing_aux::{AuxFeed, AuxFeeds, PictureBus, PictureBusSlot};
+use crate::routing_aux::{AuxFeed, AuxFeeds, AuxFormat, PictureBus, PictureBusSlot};
 
 /// Longest accepted `principal` / `operation_id`, in bytes.
 pub const MAX_TAKE_ID_BYTES: usize = 128;
@@ -69,6 +69,29 @@ pub const REAPER_QUEUE: usize = 8;
 /// = 8 in the pipeline) on top of a full worker queue (`WORKER_QUEUE_TICKS` = 4)
 /// and the offers dropped meanwhile, so a transient stall never fails a key.
 pub const MAX_GAP_FILL_TICKS: u64 = 24;
+/// Operation-id prefixes of a start-up (boot) take — `boot:<output index>`
+/// and the audio-only `boot:audio:<output index>` — defined once in the
+/// control plane, whose outcome relay never persists a boot outcome
+/// ([`multiview_control::output_routing::is_boot_take`]). Every boot id is
+/// keyed on the OUTPUT INDEX, never parsed from the config id (PR #352 round
+/// 2): a config id (an HLS one is a path) can be arbitrarily long.
+pub use multiview_control::output_routing::{BOOT_AUDIO_TAKE_PREFIX, BOOT_TAKE_PREFIX};
+
+/// Whether `operation_id` is a video (or combined) boot take — the kind that
+/// enters the bounded retry window. An audio-only boot take
+/// (`boot:audio:<id>`) is a boot take too (never persisted) but has no fresh
+/// gate, so it is never retried.
+fn is_boot_video_take(operation_id: &str) -> bool {
+    multiview_control::output_routing::is_boot_take(operation_id)
+        && !operation_id.starts_with(BOOT_AUDIO_TAKE_PREFIX)
+}
+/// The principal a boot take is charged to.
+pub const BOOT_PRINCIPAL: &str = "system:boot";
+/// A refused boot take is re-issued at most once per this many seconds …
+pub const BOOT_RETRY_SECS: i64 = 2;
+/// … for at most this long after the run's first tick; then the output stays
+/// on Program (logged).
+pub const BOOT_WINDOW_SECS: i64 = 30;
 /// Live-opened workers' event queue to the consumer.
 const DYNAMIC_EVENT_QUEUE: usize = 64;
 const NO_FORCE: u64 = u64::MAX;
@@ -221,6 +244,9 @@ pub struct OutputRouteView {
     /// The output's audio choice: `follow`, `program`, `none`, `src:<id>`,
     /// `track:<name>`.
     pub audio_choice: String,
+    /// Whether the output runs a private encoded audio bus now (a take that
+    /// changes its audio then costs no new audio encode).
+    pub private_audio: bool,
 }
 
 /// Wait-free routing state, written by the consumer only on change.
@@ -256,10 +282,16 @@ pub struct RoutingSnapshot {
     pub audio_buses_live: usize,
     /// Routed-audio counters (opened, failed, refused, faded back).
     pub audio: crate::routing_audio::AudioRoutingCounters,
-    /// Live-opened encoder keys as `(bus name, settings index)`, sorted,
+    /// Live-opened encoder keys as `(feed name, settings index)`, sorted,
     /// lingering ones included and failed ones excluded: a take onto one of
-    /// these reuses it (+0 encoders).
+    /// these reuses it (+0 encoders). The feed name is the bus name for the
+    /// canvas format and `bus@WxH/mode/anchor` for an output format (#342):
+    /// a different format is a different key (+1).
     pub live_keys: Vec<(String, usize)>,
+    /// Start-up (boot) takes still inside their retry window (#329).
+    pub boot_takes_pending: usize,
+    /// Start-up takes given up: the output stayed on Program.
+    pub boot_takes_given_up: u64,
     /// Pending dispatcher moves the router could not cancel by re-asserting
     /// the output's key (it was already failed/retired); the move was
     /// cancelled directly instead (#330 item 4).
@@ -290,8 +322,12 @@ pub struct RunOutput {
     /// The output's config id (`None` for an internal sink, e.g. the
     /// `program.ts` anchor).
     pub id: Option<String>,
-    /// The base (Program) encoder settings index.
+    /// The base (Program) encoder settings index (names its codec settings
+    /// AND its base format, #342).
     pub settings: usize,
+    /// The format a routed source/PVW is composed at for this output (#342;
+    /// `None` = the canvas with the default fit).
+    pub feed_format: Option<AuxFormat>,
     /// Whether slice 1 can cut this output cleanly (its encoder family has
     /// the parameter-set RAP check; VAAPI/VideoToolbox do not, §4.2).
     pub routable: bool,
@@ -389,6 +425,11 @@ pub trait LiveEncoder: VideoEncodeWorker {
 
 /// Opens one encoder for a rendition settings index, on the opener thread.
 pub type OpenFn = Box<dyn FnMut(usize) -> Result<Box<dyn LiveEncoder>, String> + Send>;
+
+/// An opener that also learns the bus (#342): a Program/Clean key at a
+/// non-canvas format converts on its own worker.
+pub type BusOpenFn =
+    Box<dyn FnMut(usize, &PictureBus) -> Result<Box<dyn LiveEncoder>, String> + Send>;
 
 /// Resolve a source id to its store (wait-free, sees runtime-added sources).
 pub type StoreLookup = crate::routing_aux::StoreLookup;
@@ -516,7 +557,36 @@ pub struct RouterConfig {
     pub max_per_principal: usize,
     /// Whether an M/E exists (Preview is routable).
     pub has_preview: bool,
+    /// Per output: the format a routed source/PVW is composed at for it
+    /// (#342; `None` or a missing entry = the canvas with the default fit).
+    /// Program/Clean ignore it: their key's format is the output's base key
+    /// (its settings index), converted on the key's worker by the opener.
+    pub formats: Vec<Option<AuxFormat>>,
+    /// The start-up take retry policy (#329).
+    pub boot_retry: BootRetryPolicy,
 }
+
+/// How a refused start-up (boot) take is retried: re-issued at most once per
+/// `retry_secs`, for at most `window_secs` after the run's first tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootRetryPolicy {
+    /// Minimum seconds between two issues of one output's boot take.
+    pub retry_secs: i64,
+    /// The window after the first tick; then the output stays on Program.
+    pub window_secs: i64,
+}
+
+impl Default for BootRetryPolicy {
+    fn default() -> Self {
+        Self {
+            retry_secs: BOOT_RETRY_SECS,
+            window_secs: BOOT_WINDOW_SECS,
+        }
+    }
+}
+
+/// One picture feed: a bus at an output format (`None` = the canvas).
+pub type FeedKey = (PictureBus, Option<AuxFormat>);
 
 /// Aux-side wiring the router drives.
 pub struct AuxWiring {
@@ -536,9 +606,15 @@ pub struct AuxWiring {
     pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
 }
 
-struct OpenRequest {
+/// What the opener receives: the rendition settings index (which already
+/// names (format, codec settings)) plus the picture bus, so a Program/Clean
+/// key at a non-canvas format wraps its encoder in a `FormatConvert`.
+pub struct OpenRequest {
     id: u64,
-    settings: usize,
+    /// The rendition settings index (= the output's base key).
+    pub settings: usize,
+    /// The bus the encoder is fed.
+    pub bus: PictureBus,
 }
 
 struct OpenResult {
@@ -554,6 +630,7 @@ enum Reap {
 
 struct DynamicKey {
     bus: PictureBus,
+    format: Option<AuxFormat>,
     settings: usize,
     key: usize,
     worker: Option<RenditionWorker>,
@@ -591,6 +668,7 @@ struct DynamicKey {
 
 struct PendingOpen {
     bus: PictureBus,
+    format: Option<AuxFormat>,
     settings: usize,
     principal: String,
     deadline: u64,
@@ -626,6 +704,16 @@ struct OutputState {
     pending: Option<Pending>,
 }
 
+/// A boot take being carried through its retry window (#329): one per output
+/// at most, so the state is O(outputs).
+struct BootRetry {
+    take: OutputTake,
+    /// The tick it was last issued (entered the take state machine).
+    issued: u64,
+    /// When refused: the tick it may be re-issued.
+    due: Option<u64>,
+}
+
 struct BusHealth {
     held: u64,
     fallen: bool,
@@ -648,13 +736,13 @@ pub struct OutputRouter {
     dyn_tx: SyncSender<(u64, DispatchEvent)>,
     dyn_rx: Receiver<(u64, DispatchEvent)>,
     next_generation: u64,
-    feeds: HashMap<PictureBus, AuxFeed>,
+    feeds: HashMap<FeedKey, AuxFeed>,
     /// Whether a Clean feed is active (cached so `publish_clean` costs one
     /// bool load when nothing selects Clean).
     clean_active: bool,
     /// The last published `live_keys` (recomputed only while keys exist).
     live_keys: Vec<(String, usize)>,
-    health: HashMap<PictureBus, BusHealth>,
+    health: HashMap<FeedKey, BusHealth>,
     last_forced: HashMap<usize, u64>,
     dropped_outcomes: u64,
     reaper_overflow: u64,
@@ -674,6 +762,22 @@ pub struct OutputRouter {
     audio: Option<crate::routing_audio::RoutedAudio>,
     #[cfg(test)]
     audio_tap: crate::routing_audio::AudioTapCell,
+    /// Start-up (boot) takes (#329).
+    boot: BootTakes,
+    /// The run's first tick (the boot retry window's origin).
+    first_tick: Option<u64>,
+}
+
+/// The router's start-up (boot) take state, O(outputs).
+#[derive(Default)]
+struct BootTakes {
+    /// Per output: its boot take while inside the retry window.
+    slots: Vec<Option<BootRetry>>,
+    /// Boot takes given up (refused for good, or the window ended).
+    given_up: u64,
+    /// The audio of given-up combined boot takes, re-issued alone on the
+    /// next tick (at most one per output).
+    audio_after: Vec<OutputTake>,
 }
 
 impl OutputRouter {
@@ -686,6 +790,18 @@ impl OutputRouter {
         aux: AuxWiring,
         mut open: OpenFn,
     ) -> std::io::Result<(Self, OutputRoutingHandle)> {
+        Self::new_with_bus(cfg, aux, Box::new(move |settings, _bus| open(settings)))
+    }
+
+    /// [`Self::new`] with an opener that also learns the fed bus (#342).
+    ///
+    /// # Errors
+    /// The OS error if a helper thread cannot be spawned.
+    pub fn new_with_bus(
+        cfg: RouterConfig,
+        aux: AuxWiring,
+        mut open: BusOpenFn,
+    ) -> std::io::Result<(Self, OutputRoutingHandle)> {
         let (take_tx, takes) = mpsc::sync_channel(TAKE_MAILBOX);
         let (outcomes, outcome_rx) = mpsc::sync_channel(OUTCOME_CAPACITY);
         let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
@@ -695,7 +811,7 @@ impl OutputRouter {
             .spawn(move || {
                 while let Ok(req) = open_req_rx.recv() {
                     let encoder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        open(req.settings)
+                        open(req.settings, &req.bus)
                     }))
                     .unwrap_or_else(|_| Err("encoder open panicked".to_owned()));
                     if open_res_tx
@@ -781,6 +897,8 @@ impl OutputRouter {
             audio: None,
             #[cfg(test)]
             audio_tap,
+            boot: BootTakes::default(),
+            first_tick: None,
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -863,7 +981,10 @@ impl OutputRouter {
         if !self.clean_active {
             return;
         }
-        if let Some(feed) = self.feeds.get(&PictureBus::Clean) {
+        for (key, feed) in &self.feeds {
+            if key.0 != PictureBus::Clean {
+                continue;
+            }
             feed.slot
                 .latest
                 .store(Some(Arc::new(crate::routing_aux::AuxFrame {
@@ -873,6 +994,23 @@ impl OutputRouter {
                 })));
             feed.slot.composed.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// The output's picture format (`None` = the canvas).
+    fn format_of(&self, index: usize) -> Option<AuxFormat> {
+        self.cfg.formats.get(index).copied().flatten()
+    }
+
+    /// The feed an output at `index` reads for `bus`: Program and Clean are
+    /// the canvas picture (a non-canvas format is converted on the key's
+    /// worker), a source/PVW is composed at the output's format.
+    fn feed_key(&self, index: usize, bus: &PictureBus) -> FeedKey {
+        let format = if aux_composed(bus) {
+            self.format_of(index)
+        } else {
+            None
+        };
+        (bus.clone(), format)
     }
 
     /// Substitute every tick in `ticks` on the Clean bus with its own last
@@ -947,7 +1085,10 @@ impl OutputRouter {
             self.video_keys = keys;
             self.dirty = true;
         }
+        self.first_tick.get_or_insert(tick);
         self.drain_takes(tick, dispatcher);
+        self.retry_boot_takes(tick);
+        self.issue_boot_audio_after(tick, dispatcher);
         self.drain_opens(tick, dispatcher);
         self.expire_orphan_opens(tick);
         self.drain_moves(tick, dispatcher);
@@ -1028,6 +1169,9 @@ impl OutputRouter {
 
     fn emit(&mut self, operation_id: String, output_index: usize, tick: u64, outcome: TakeResult) {
         self.dirty = true;
+        if is_boot_video_take(&operation_id) {
+            self.on_boot_outcome(&operation_id, output_index, tick, outcome);
+        }
         // Outcomes are rare control events (not per tick); the clone is the
         // output's current bus name at most.
         let bus = self
@@ -1051,6 +1195,155 @@ impl OutputRouter {
         }
     }
 
+    /// Ticks in `secs` seconds at the Program cadence (rounded up, at least 1).
+    fn ticks_for(&self, secs: i64) -> u64 {
+        let (num, den) = (self.cfg.cadence.num, self.cfg.cadence.den);
+        if num <= 0 || den <= 0 {
+            return 1;
+        }
+        let ticks = secs.saturating_mul(num).saturating_add(den - 1) / den;
+        u64::try_from(ticks).unwrap_or(1).max(1)
+    }
+
+    /// A boot take's outcome: applied or superseded ends it; a refusal the
+    /// gate may lift later (not fresh, capacity, encoder not ready) schedules
+    /// a re-issue, no sooner than [`BOOT_RETRY_SECS`] after the last one; any
+    /// other refusal gives up. The persisted feed is never touched here: the
+    /// operator's intent stays, the readback shows the live bus.
+    fn on_boot_outcome(
+        &mut self,
+        operation_id: &str,
+        index: usize,
+        tick: u64,
+        outcome: TakeResult,
+    ) {
+        let retry_ticks = self.ticks_for(self.cfg.boot_retry.retry_secs);
+        let Some(slot) = self.boot.slots.get_mut(index).filter(|slot| {
+            slot.as_ref()
+                .is_some_and(|b| b.take.operation_id == operation_id)
+        }) else {
+            return;
+        };
+        match outcome {
+            TakeResult::Refused(
+                RefuseReason::FeedNotFresh | RefuseReason::Capacity | RefuseReason::EncoderNotReady,
+            ) => {
+                if let Some(boot) = slot.as_mut() {
+                    boot.due = Some(tick.max(boot.issued.saturating_add(retry_ticks)));
+                }
+            }
+            TakeResult::Refused(reason) => {
+                if let Some(boot) = slot.take() {
+                    self.boot.given_up = self.boot.given_up.saturating_add(1);
+                    self.boot_audio_alone(&boot.take);
+                    tracing::warn!(
+                        output = index,
+                        feed = %boot.take.bus.as_ref().map_or_else(|| "-".into(), PictureBus::as_str),
+                        reason = reason.operator_message(),
+                        "routing: the start-up take cannot be carried; the output stays on Program"
+                    );
+                }
+            }
+            TakeResult::Applied | TakeResult::Superseded | TakeResult::Fallback(_) => {
+                *slot = None;
+            }
+        }
+    }
+
+    /// A given-up boot take that also carried a persisted audio feed (a
+    /// combined take): its audio is still applied, alone (audio-only takes
+    /// have no fresh gate), so the video's refusal never drops it. Keyed on
+    /// the OUTPUT INDEX (PR #352 round 2), never by re-parsing the give-up
+    /// take's `operation_id`: a config id can be arbitrarily long (an HLS
+    /// config id is its path), so the audio id is minted fresh from the
+    /// index, always well under `MAX_TAKE_ID_BYTES`.
+    fn boot_audio_alone(&mut self, take: &OutputTake) {
+        let Some(audio) = take.audio.clone() else {
+            return;
+        };
+        if self.boot.audio_after.len() >= self.outputs.len().max(1) {
+            return;
+        }
+        self.boot.audio_after.push(OutputTake {
+            operation_id: format!("{BOOT_AUDIO_TAKE_PREFIX}{}", take.output_index),
+            output_index: take.output_index,
+            bus: None,
+            audio: Some(audio),
+            principal: take.principal.clone(),
+        });
+    }
+
+    /// Start the audio-only takes [`Self::boot_audio_alone`] queued, on an
+    /// output with no take in flight (an operator take wins).
+    fn issue_boot_audio_after(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        for take in std::mem::take(&mut self.boot.audio_after) {
+            let index = take.output_index;
+            let Some(out) = self.outputs.get_mut(index) else {
+                continue;
+            };
+            if out.pending.is_some() {
+                continue;
+            }
+            out.pending = Some(Pending {
+                take,
+                started: tick,
+                phase: Phase::Priming,
+            });
+            self.dirty = true;
+            self.start_audio_take(index, tick, dispatcher);
+        }
+    }
+
+    /// Re-issue due boot takes inside the window; give up after it. Bounded:
+    /// one check per output, only while a boot take is still unresolved.
+    fn retry_boot_takes(&mut self, tick: u64) {
+        let window = self.ticks_for(self.cfg.boot_retry.window_secs);
+        let first = self.first_tick.unwrap_or(tick);
+        for index in 0..self.boot.slots.len() {
+            let Some(due) = self
+                .boot
+                .slots
+                .get(index)
+                .and_then(|b| b.as_ref())
+                .and_then(|b| b.due)
+            else {
+                continue;
+            };
+            if tick < due || self.outputs.get(index).is_none_or(|o| o.pending.is_some()) {
+                continue;
+            }
+            if tick.saturating_sub(first) > window {
+                if let Some(boot) = self.boot.slots.get_mut(index).and_then(Option::take) {
+                    self.boot.given_up = self.boot.given_up.saturating_add(1);
+                    self.boot_audio_alone(&boot.take);
+                    self.dirty = true;
+                    tracing::warn!(
+                        output = index,
+                        feed = %boot.take.bus.as_ref().map_or_else(|| "-".into(), PictureBus::as_str),
+                        window_secs = self.cfg.boot_retry.window_secs,
+                        "routing: the start-up feed never became takeable; the output stays on \
+                         Program (the configured feed is kept)"
+                    );
+                }
+                continue;
+            }
+            let Some(boot) = self.boot.slots.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
+            boot.issued = tick;
+            boot.due = None;
+            let take = boot.take.clone();
+            if let Some(out) = self.outputs.get_mut(index) {
+                out.pending = Some(Pending {
+                    take,
+                    started: tick,
+                    phase: Phase::Priming,
+                });
+                self.dirty = true;
+            }
+        }
+    }
+
     fn drain_takes(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         loop {
             let take = match self.takes.try_recv() {
@@ -1058,6 +1351,21 @@ impl OutputRouter {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             };
             let index = take.output_index;
+            // A boot take enters its retry window; an operator take on the
+            // same output replaces the boot intent for good. One slot per
+            // output, allocated on the first take (bounded by the outputs).
+            if self.boot.slots.len() < self.outputs.len() {
+                self.boot.slots.resize_with(self.outputs.len(), || None);
+            }
+            // Any later take on the output replaces a queued boot audio too.
+            self.boot.audio_after.retain(|b| b.output_index != index);
+            if let Some(slot) = self.boot.slots.get_mut(index) {
+                *slot = is_boot_video_take(&take.operation_id).then(|| BootRetry {
+                    take: take.clone(),
+                    issued: tick,
+                    due: None,
+                });
+            }
             let needs_switcher = matches!(take.bus, Some(PictureBus::Preview | PictureBus::Clean));
             // Audio rides the output's program-audio slot (§5.5): a run
             // without program audio, or an output without that slot (NDI,
@@ -1318,6 +1626,7 @@ impl OutputRouter {
             self.last_forced.insert(key, tick);
             self.dynamic.push(DynamicKey {
                 bus: open.bus,
+                format: open.format,
                 settings: open.settings,
                 key,
                 worker: Some(worker),
@@ -1531,10 +1840,10 @@ impl OutputRouter {
     /// by the bake consumer itself and stays.
     fn check_aux(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let failed = self.aux.failed.load(Ordering::Acquire);
-        let fallen: Vec<PictureBus> = self
+        let fallen: Vec<FeedKey> = self
             .health
             .iter_mut()
-            .filter(|(bus, h)| {
+            .filter(|((bus, _), h)| {
                 let aux_failed = failed && aux_composed(bus);
                 !h.fallen && (aux_failed || h.held >= FALLBACK_AFTER_TICKS)
             })
@@ -1543,9 +1852,10 @@ impl OutputRouter {
                 bus.clone()
             })
             .collect();
-        for bus in fallen {
+        for (bus, format) in fallen {
             for index in 0..self.outputs.len() {
-                let on_bus = self.outputs.get(index).is_some_and(|o| o.bus == bus);
+                let on_bus = self.outputs.get(index).is_some_and(|o| o.bus == bus)
+                    && self.feed_key(index, &bus).1 == format;
                 if !on_bus {
                     continue;
                 }
@@ -1601,14 +1911,15 @@ impl OutputRouter {
         self.cfg.gop.saturating_add(3)
     }
 
-    fn slot_fresh(&self, bus: &PictureBus, tick: u64) -> bool {
+    fn slot_fresh(&self, feed: &FeedKey, tick: u64) -> bool {
         self.feeds
-            .get(bus)
+            .get(feed)
             .and_then(|f| f.slot.latest.load())
             .is_some_and(|frame| frame.tick.saturating_add(1) >= tick)
     }
 
-    fn feed_fresh(&self, bus: &PictureBus, tick: u64, pts: MediaTime) -> bool {
+    fn feed_fresh(&self, feed: &FeedKey, tick: u64, pts: MediaTime) -> bool {
+        let bus = &feed.0;
         let source: Option<Arc<str>> = match bus {
             // Program and Clean are always fresh (§4.5): both come from the
             // bake consumer's own Program canvas.
@@ -1619,7 +1930,7 @@ impl OutputRouter {
         let live = source
             .and_then(|id| (self.aux.stores)(&id))
             .is_some_and(|store: Arc<TileStore<Nv12Image>>| store.state_at(pts).is_live());
-        live && !self.aux.failed.load(Ordering::Acquire) && self.slot_fresh(bus, tick)
+        live && !self.aux.failed.load(Ordering::Acquire) && self.slot_fresh(feed, tick)
     }
 
     fn advance_takes(&mut self, tick: u64, pts: MediaTime, dispatcher: &mut RenditionDispatcher) {
@@ -1706,7 +2017,8 @@ impl OutputRouter {
                         }
                         continue;
                     }
-                    if !self.feed_fresh(&bus, tick, pts) {
+                    let feed = self.feed_key(index, &bus);
+                    if !self.feed_fresh(&feed, tick, pts) {
                         if tick.saturating_sub(started) >= TAKE_PRIME_DEADLINE_TICKS {
                             self.refuse_pending(
                                 index,
@@ -1799,6 +2111,10 @@ impl OutputRouter {
         let Some(&settings) = self.cfg.base_keys.get(index) else {
             return;
         };
+        // The settings index already names (format, codec settings): the
+        // base key of the output. Its feed is (bus, format) for a routed
+        // source/PVW, the canvas picture for Clean.
+        let (_, format) = self.feed_key(index, bus);
         // Take admission: open the output's private audio bus before the
         // video move (§5.2), so it is warm at the grid boundary G.
         if let Some(audio) = self.audio.as_mut() {
@@ -1810,7 +2126,10 @@ impl OutputRouter {
             self.dynamic
                 .iter()
                 .find(|d| {
-                    d.bus == *bus && d.settings == settings && !dispatcher.is_key_failed(d.key)
+                    d.bus == *bus
+                        && d.format == format
+                        && d.settings == settings
+                        && !dispatcher.is_key_failed(d.key)
                 })
                 .map(|d| d.key)
         };
@@ -1866,12 +2185,17 @@ impl OutputRouter {
         }
         let id = self.next_open;
         self.next_open = self.next_open.wrapping_add(1);
-        match self.open_tx.try_send(OpenRequest { id, settings }) {
+        match self.open_tx.try_send(OpenRequest {
+            id,
+            settings,
+            bus: bus.clone(),
+        }) {
             Ok(()) => {
                 self.opens.insert(
                     id,
                     PendingOpen {
                         bus: bus.clone(),
+                        format,
                         settings,
                         principal: principal.to_owned(),
                         deadline: tick.saturating_add(OPEN_DEADLINE_TICKS),
@@ -1924,10 +2248,11 @@ impl OutputRouter {
     /// closed (outputs fall back) even though its picture bus (Clean
     /// included) is published fresh every tick by the bake consumer.
     fn feed(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
-        let mut fresh_buses: Vec<(PictureBus, bool)> = Vec::new();
+        let mut fresh_buses: Vec<(FeedKey, bool)> = Vec::new();
         let mut dead: Vec<usize> = Vec::new();
         for d in &mut self.dynamic {
-            let latest = self.feeds.get(&d.bus).and_then(|f| f.slot.latest.load());
+            let feed_key = (d.bus.clone(), d.format);
+            let latest = self.feeds.get(&feed_key).and_then(|f| f.slot.latest.load());
             let new = latest
                 .as_ref()
                 .filter(|f| d.last_aux_tick.is_none_or(|t| f.tick > t));
@@ -1939,7 +2264,7 @@ impl OutputRouter {
             let (Some(canvas), Some(worker)) = (d.last_fed.clone(), d.worker.as_ref()) else {
                 // No canvas to offer yet: nothing was dropped, so this is
                 // not (yet) a held tick for the bus beyond slot freshness.
-                fresh_buses.push((d.bus.clone(), fresh));
+                fresh_buses.push((feed_key, fresh));
                 continue;
             };
             // Never blocks: a full queue drops and the worker gap-fills.
@@ -1960,7 +2285,7 @@ impl OutputRouter {
                 d.reported_degraded = !d.reported_degraded;
                 self.dirty = true;
             }
-            fresh_buses.push((d.bus.clone(), fresh));
+            fresh_buses.push((feed_key, fresh));
             d.silent = d.silent.saturating_add(1);
             // A panicked/exited worker, or one that emits nothing while fed
             // (wedged), would freeze its outputs forever: close the key so
@@ -2078,18 +2403,37 @@ impl OutputRouter {
         }
     }
 
-    /// Keep the feed set equal to the buses in use. The aux thread is handed
+    /// Keep the feed set equal to the buses in use.
+    ///
+    /// Bounded (#342 review A2): every feed is wanted by a live key, an open
+    /// or a pending take, so the set holds at most `max_encoders` (live keys
+    /// plus opens, which `has_capacity` caps) plus one per output with a
+    /// pending take, whatever the formats. There is no separate
+    /// `routing.max_aux_canvases` setting to enforce. The aux thread is handed
     /// (and the clock's send gate raised for) only the buses it composes
     /// (Preview, sources): routing only Clean never wakes it.
     fn sync_feeds(&mut self) {
-        let mut wanted: Vec<PictureBus> = self.dynamic.iter().map(|d| d.bus.clone()).collect();
-        wanted.extend(self.opens.values().map(|o| o.bus.clone()));
-        wanted.extend(
-            self.outputs
-                .iter()
-                .filter_map(|o| o.pending.as_ref().and_then(|p| p.take.bus.clone())),
-        );
-        wanted.retain(|b| *b != PictureBus::Program);
+        let mut wanted: Vec<FeedKey> = self
+            .dynamic
+            .iter()
+            .map(|d| (d.bus.clone(), d.format))
+            .collect();
+        wanted.extend(self.opens.values().map(|o| (o.bus.clone(), o.format)));
+        let pending: Vec<FeedKey> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                o.pending
+                    .as_ref()
+                    .and_then(|p| p.take.bus.as_ref())
+                    .map(|bus| self.feed_key(i, bus))
+            })
+            .collect();
+        wanted.extend(pending);
+        wanted.retain(|(b, _)| *b != PictureBus::Program);
+        wanted.sort_unstable_by_key(feed_order);
+        wanted.dedup();
         let unchanged = wanted.iter().all(|b| self.feeds.contains_key(b))
             && self.feeds.keys().all(|b| wanted.contains(b));
         if unchanged {
@@ -2097,12 +2441,13 @@ impl OutputRouter {
         }
         self.feeds.retain(|b, _| wanted.contains(b));
         self.health.retain(|b, _| wanted.contains(b));
-        for bus in wanted {
+        for key in wanted {
+            let (bus, format) = key.clone();
             self.feeds
-                .entry(bus.clone())
-                .or_insert_with(|| AuxFeed::new(bus));
+                .entry(key)
+                .or_insert_with(|| AuxFeed::with_format(bus, format));
         }
-        self.clean_active = self.feeds.contains_key(&PictureBus::Clean);
+        self.clean_active = self.feeds.keys().any(|(b, _)| *b == PictureBus::Clean);
         let list: Vec<AuxFeed> = self
             .feeds
             .values()
@@ -2124,7 +2469,7 @@ impl OutputRouter {
             .dynamic
             .iter()
             .filter(|d| !dispatcher.is_key_failed(d.key))
-            .map(|d| (d.bus.as_str().into_owned(), d.settings))
+            .map(|d| (crate::routing_aux::feed_name(&d.bus, d.format), d.settings))
             .collect();
         keys.sort_unstable();
         keys.dedup();
@@ -2154,7 +2499,14 @@ impl OutputRouter {
                 }),
                 degraded: self
                     .health
-                    .get(&o.bus)
+                    .get(&(
+                        o.bus.clone(),
+                        if aux_composed(&o.bus) {
+                            self.cfg.formats.get(i).copied().flatten()
+                        } else {
+                            None
+                        },
+                    ))
                     .is_some_and(|h| h.held >= DEGRADED_AFTER_TICKS)
                     || self
                         .dynamic
@@ -2168,6 +2520,7 @@ impl OutputRouter {
                     .audio
                     .as_ref()
                     .map_or_else(|| "follow".to_owned(), |a| a.choice(i).label()),
+                private_audio: self.audio.as_ref().is_some_and(|a| a.has_private_bus(i)),
             })
             .collect();
         let next = RoutingSnapshot {
@@ -2192,6 +2545,8 @@ impl OutputRouter {
                 .map(crate::routing_audio::RoutedAudio::counters)
                 .unwrap_or_default(),
             live_keys: self.live_keys.clone(),
+            boot_takes_pending: self.boot.slots.iter().filter(|b| b.is_some()).count(),
+            boot_takes_given_up: self.boot.given_up,
             move_cancel_failures: self.move_cancel_failures,
         };
         if *self.snapshot.load() != next {
@@ -2200,10 +2555,40 @@ impl OutputRouter {
         self.dirty = false;
     }
 
-    /// The picture-bus slot of an active feed (tests and diagnostics).
+    /// The picture-bus slot of an active canvas-format feed (tests and
+    /// diagnostics).
     #[must_use]
     pub fn slot(&self, bus: &PictureBus) -> Option<Arc<PictureBusSlot>> {
-        self.feeds.get(bus).map(|f| Arc::clone(&f.slot))
+        self.slot_at(bus, None)
+    }
+
+    /// The slot of the active feed of `bus` at `format` (#342).
+    #[must_use]
+    pub fn slot_at(
+        &self,
+        bus: &PictureBus,
+        format: Option<AuxFormat>,
+    ) -> Option<Arc<PictureBusSlot>> {
+        self.feeds
+            .get(&(bus.clone(), format))
+            .map(|f| Arc::clone(&f.slot))
+    }
+
+    /// Active feeds (bus, format), for tests and diagnostics.
+    #[must_use]
+    pub fn feed_keys(&self) -> Vec<FeedKey> {
+        let mut keys: Vec<FeedKey> = self.feeds.keys().cloned().collect();
+        keys.sort_unstable_by_key(feed_order);
+        keys
+    }
+
+    /// Live dynamic keys as (bus, format, settings, dispatcher key).
+    #[must_use]
+    pub fn dynamic_keys(&self) -> Vec<(PictureBus, Option<AuxFormat>, usize, usize)> {
+        self.dynamic
+            .iter()
+            .map(|d| (d.bus.clone(), d.format, d.settings, d.key))
+            .collect()
     }
 
     /// End of run: retire every live key and hand its worker to the reaper,
@@ -2250,6 +2635,20 @@ impl OutputRouter {
             }
         }
     }
+}
+
+/// A total order over feed keys (dedup and stable listings).
+fn feed_order(key: &FeedKey) -> (String, Option<(u32, u32, String)>) {
+    (
+        key.0.as_str().into_owned(),
+        key.1.map(|f| {
+            (
+                f.width,
+                f.height,
+                format!("{:?}/{:?}", f.fit.mode, f.fit.anchor),
+            )
+        }),
+    )
 }
 
 /// Whether the `routing-aux` thread composes `bus` (Program and Clean come

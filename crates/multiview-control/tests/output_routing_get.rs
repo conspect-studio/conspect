@@ -127,12 +127,11 @@ async fn rows_and_feeds_are_filtered_per_object() {
     // Object-scoped to an unrelated id: no output rows at all (never a leak of ids).
     let body = body_json(send(&router, get("/api/v1/routing", SCOPED_TOKEN)).await).await;
     assert_eq!(body["outputs"], serde_json::json!([]));
-    // Output-scoped without the Program scope: rows visible, the bus feed redacted.
+    // #329 F2 (behaviour intentionally changed): a key output-scoped to
+    // `wall-1` gets NO row for output-0/output-1 — the output axis now gates
+    // the readback, as it gates the take. (It used to list both outputs.)
     let body = body_json(send(&router, get("/api/v1/routing", OUTPUT_SCOPED_TOKEN)).await).await;
-    let rows = body["outputs"].as_array().unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["video"], serde_json::json!({"redacted": true}));
-    assert_eq!(rows[0]["tally"], "redacted");
+    assert_eq!(body["outputs"], serde_json::json!([]), "{body}");
 }
 
 #[tokio::test]

@@ -144,12 +144,90 @@ fn drive_full<F>(
 where
     F: FnOnce(OutputRoutingSlot) + Send + 'static,
 {
+    drive_clocked(template, audio, switcher, prefix, ticks, None, control)
+}
+
+/// As [`drive_full`], with an optional hook run on every `format-convert`
+/// thread before each convert (#342 review I3 chaos).
+fn drive_hooked<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    control: F,
+    convert_hook: Option<crate::format_convert::ConvertHook>,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
+    drive_prepared(
+        template,
+        audio,
+        switcher,
+        prefix,
+        ticks,
+        move |pipeline| {
+            if let Some(hook) = convert_hook {
+                pipeline.set_convert_hook(hook);
+            }
+        },
+        control,
+    )
+}
+
+/// As [`drive_full`], with an optional boot-take retry policy (a test of the
+/// give-up path shortens the 30 s window to stay within its wall bound).
+fn drive_clocked<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    boot_retry: Option<super::BootRetryPolicy>,
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
+    drive_prepared(
+        template,
+        audio,
+        switcher,
+        prefix,
+        ticks,
+        move |pipeline| {
+            if let Some(policy) = boot_retry {
+                pipeline.set_boot_retry(policy);
+            }
+        },
+        control,
+    )
+}
+
+/// As [`drive_full`]; `prep` sees the built pipeline before the run.
+fn drive_prepared<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    prep: impl FnOnce(&mut Pipeline),
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
     let config =
         multiview_config::MultiviewConfig::load_from_toml(&template.replace('@', prefix)).unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
+    pipeline.address_boot_feeds_to_test_sinks(&config);
+    prep(&mut pipeline);
     if audio {
         pipeline.enable_program_audio();
     }
+    // #342: a document without an M/E can still ask for decodable video.
+    let keep_video = switcher || template.contains("[outputs.format]");
     if switcher {
         crate::switcher_runtime::attach_first_slice(&mut pipeline, None)
             .unwrap()
@@ -165,7 +243,7 @@ where
         .zip(&seen_audio)
         .zip(&seen_video)
         .map(|((s, a), v)| {
-            if switcher {
+            if keep_video {
                 recorder_with_video(Arc::clone(s), Arc::clone(a), Some(Arc::clone(v)))
             } else {
                 recorder(Arc::clone(s), Arc::clone(a))
@@ -883,6 +961,519 @@ fn a_take_to_clean_carries_the_pre_bake_canvas_through_the_real_pipeline() {
     }
 }
 
+/// #342: two outputs at one non-canvas format (a vertical cover of the
+/// 64x64 canvas) share ONE base encoder; its worker converts the baked
+/// Program canvas, and the encoded pictures have that size.
+const VERTICAL_CONFIG: &str = r##"
+schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr"]
+areas = ["a b"]
+[[sources]]
+id = "@_a"
+kind = "test"
+[[sources]]
+id = "@_b"
+kind = "test"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "@_a"
+[[cells]]
+id = "cell_b"
+area = "b"
+[cells.source]
+input_id = "@_b"
+[[outputs]]
+id = "out0"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/a/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 32
+height = 64
+fit = { mode = "cover", anchor = "center" }
+[[outputs]]
+id = "out1"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/b/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 32
+height = 64
+fit = { mode = "cover" }
+"##;
+
+fn decode_size(packets: &[multiview_ffmpeg::EncodedPacket]) -> Option<(u32, u32)> {
+    let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::MPEG2VIDEO).unwrap();
+    let mut decoder = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+        .decoder()
+        .video()
+        .unwrap();
+    let mut frame = ffmpeg_next::frame::Video::empty();
+    for p in packets {
+        decoder.send_packet(&p.to_owned_packet()).unwrap();
+        if decoder.receive_frame(&mut frame).is_ok() {
+            return Some((frame.width(), frame.height()));
+        }
+    }
+    decoder.send_eof().unwrap();
+    decoder
+        .receive_frame(&mut frame)
+        .is_ok()
+        .then(|| (frame.width(), frame.height()))
+}
+
+#[test]
+fn outputs_at_one_format_share_a_base_encoder_at_that_size() {
+    const TICKS: u64 = 30;
+    let run = drive_full(
+        VERTICAL_CONFIG,
+        false,
+        false,
+        "route_vert",
+        TICKS,
+        |_slot| {},
+    );
+    assert_eq!(run.frames, TICKS);
+    assert_eq!(
+        run.rendition_configs, 1,
+        "one encoder for one (format, settings)"
+    );
+    assert_eq!(run.final_snapshot.video_keys, 1);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    for (i, output) in run.outputs.iter().enumerate() {
+        assert_eq!(pts_of(output), all, "output {i}: one frame per tick");
+    }
+    for (i, video) in run.video.iter().enumerate() {
+        assert_eq!(
+            decode_size(video),
+            Some((32, 64)),
+            "output {i} at its format"
+        );
+    }
+}
+
+/// #342: the base rendition key is (codec, width, height, bitrate, fit):
+/// equal formats and settings share, a different format or bit rate does not,
+/// and the canvas format declared explicitly is the canvas key.
+#[test]
+fn base_rendition_keys_follow_format_and_slot_settings() {
+    let doc = VERTICAL_CONFIG.replace('@', "route_keys")
+        + r#"
+[[outputs]]
+id = "out2"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/route_keys/c/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs]]
+id = "out3"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/route_keys/d/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 64
+height = 64
+[[outputs]]
+id = "out4"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/route_keys/e/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 32
+height = 64
+fit = { mode = "cover" }
+[[outputs.slots.video]]
+bitrate_kbps = 1500
+"#;
+    let config = multiview_config::MultiviewConfig::load_from_toml(&doc).unwrap();
+    config.validate().unwrap();
+    let pipeline = Pipeline::build(&config).unwrap();
+    let (keys, configs) = pipeline.rendition_keys_for_test();
+    assert_eq!(keys[0], keys[1], "same format and settings share (P1)");
+    assert_eq!(
+        keys[2], keys[3],
+        "an explicit canvas format is the canvas key"
+    );
+    assert_ne!(keys[0], keys[2], "another format: its own encoder");
+    assert_ne!(keys[0], keys[4], "another bit rate: its own encoder");
+    assert_eq!(configs.len(), 3);
+    assert_eq!((configs[keys[0]].0, configs[keys[0]].1), (32, 64));
+    assert_eq!((configs[keys[2]].0, configs[keys[2]].1), (64, 64));
+    assert_eq!(configs[keys[2]].2, 4_000_000, "default bit rate unchanged");
+    assert_eq!(configs[keys[4]].2, 1_500_000);
+}
+
+/// One canvas output and one 32x64 cover output.
+const MIXED_FORMAT_CONFIG: &str = r##"
+schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr"]
+areas = ["a b"]
+[[sources]]
+id = "@_a"
+kind = "test"
+[[sources]]
+id = "@_b"
+kind = "test"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "@_a"
+[[cells]]
+id = "cell_b"
+area = "b"
+[cells.source]
+input_id = "@_b"
+[[outputs]]
+id = "out0"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/a/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs]]
+id = "out1"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/b/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 32
+height = 64
+fit = { mode = "cover" }
+"##;
+
+/// #342 review I3 (§12.10 "a wedged convert thread"): the convert thread of
+/// a non-canvas output wedges forever from tick 20. The canvas output keeps
+/// exactly one frame per tick with a steady PTS step for 320 ticks, the run
+/// is not fatal, and the wedged output keeps one frame per tick too (its
+/// picture frozen at the last converted one).
+#[test]
+fn a_wedged_convert_thread_never_moves_the_clock_or_another_output() {
+    const TICKS: u64 = 320;
+    const WEDGE_AT: u64 = 20;
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let wedged = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&wedged);
+    let hook: crate::format_convert::ConvertHook = Arc::new(move |tick| {
+        if tick >= WEDGE_AT {
+            flag.store(true, Ordering::Release);
+            // Blocks until the test ends (the sender is dropped then).
+            let _ = wait.lock().unwrap().recv();
+        }
+    });
+    let run = drive_hooked(
+        MIXED_FORMAT_CONFIG,
+        false,
+        false,
+        "route_wedge",
+        TICKS,
+        |_slot| {},
+        Some(hook),
+    );
+    assert!(wedged.load(Ordering::Acquire), "the convert thread wedged");
+    assert_eq!(run.frames, TICKS, "the clock emitted every tick");
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(
+        pts_of(&run.outputs[0]),
+        all,
+        "canvas output: one frame per tick, PTS step one tick"
+    );
+    assert_eq!(
+        pts_of(&run.outputs[1]),
+        all,
+        "wedged output: still one (frozen) frame per tick"
+    );
+    assert_eq!(decode_size(&run.video[1]), Some((32, 64)));
+    // Frozen: every keyframe well after the wedge decodes to one picture.
+    let luma = decode_luma(&run.video[1]);
+    let late_keys: Vec<&Vec<u8>> = run.outputs[1]
+        .iter()
+        .filter(|(pts, key, _)| *key && *pts > i64::try_from(WEDGE_AT).unwrap() + 30)
+        .filter_map(|(pts, _, _)| luma.get(pts))
+        .collect();
+    assert!(late_keys.len() >= 5, "keyframes after the wedge");
+    assert!(
+        late_keys.windows(2).all(|w| w[0] == w[1]),
+        "the wedged output's picture is frozen"
+    );
+    drop(release);
+}
+
+/// `CONFIG` plus a persisted feed for `out1`: `video = { source = "<id>" }`,
+/// and a third source `@_never`: a file source whose file does not exist, so
+/// it never produces a picture (never fresh).
+fn boot_config(feed_source: &str) -> String {
+    format!(
+        "{CONFIG}\n[[sources]]\nid = \"@_never\"\nkind = \"file\"\npath = \"/nonexistent/multiview-routing-e2e/@/never.ts\"\n[[routing.output]]\noutput = \"out1\"\nvideo = {{ source = \"{feed_source}\" }}\n"
+    )
+}
+
+/// #329 F1(b): a run whose config persists `out1 = { source = X }` comes up
+/// with `out1` on `src:X` after the boot take (a live source; a refused boot
+/// take on a starved host is re-issued within the window), `out0` on Program
+/// throughout, one window per tick on both.
+#[test]
+fn a_persisted_source_feed_is_on_air_after_the_boot_take() {
+    const TICKS: u64 = 300;
+    let applied = Arc::new(Mutex::new(None::<TakeOutcome>));
+    let record = Arc::clone(&applied);
+    let template = boot_config("@_b");
+    let run = drive_clocked(
+        &template,
+        false,
+        false,
+        "route_boot",
+        TICKS,
+        None,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            // Keyed on the output index (PR #352 round 2), not the config
+            // id: `boot:1`, never `boot:test-sink-1`.
+            let o = wait_for("the boot take applied", Duration::from_secs(10), || {
+                outcomes
+                    .try_iter()
+                    .find(|o| o.operation_id == "boot:1" && o.outcome == TakeResult::Applied)
+            });
+            // The pipeline-minted id is a boot take to the control plane.
+            assert!(multiview_control::output_routing::is_boot_take(
+                &o.operation_id
+            ));
+            // The readback agrees with the outcome: out1 on air on the source.
+            wait_for(
+                "the readback shows the source on air",
+                Duration::from_secs(1),
+                || {
+                    let s = handle.snapshot();
+                    (s.outputs[1].bus == "src:route_boot_b"
+                        && s.outputs[0].bus == "program"
+                        && s.boot_takes_pending == 0)
+                        .then_some(())
+                },
+            );
+            *record.lock().unwrap() = Some(o);
+        },
+    );
+    let applied = applied.lock().unwrap().clone().expect("boot take applied");
+    assert_eq!(applied.output_index, 1);
+    assert_eq!(applied.bus, PictureBus::Source("route_boot_b".to_owned()));
+    assert_eq!(run.final_snapshot.boot_takes_given_up, 0);
+    assert_eq!(run.frames, TICKS);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(pts_of(&run.outputs[0]), all, "out0: every Program window");
+    // Contiguous, one window per tick, from tick 0 through the cut and on to
+    // within 5 ticks of the end. The last few windows of a live-opened
+    // encoder race the run's shutdown (seen under a parallel test load: one
+    // tail window missing); that end-of-run tail is outside this test.
+    let steady: Vec<i64> = pts_of(&run.outputs[1])
+        .into_iter()
+        .filter(|&t| t < i64::try_from(TICKS).unwrap() - 5)
+        .collect();
+    assert_eq!(
+        steady,
+        all[..steady.len()],
+        "out1: one window per tick across the cut"
+    );
+    assert_eq!(
+        u64::try_from(steady.len()).unwrap(),
+        TICKS - 5,
+        "out1 carried to the end"
+    );
+    let first = run.outputs[1]
+        .iter()
+        .find(|p| p.0 == i64::try_from(applied.tick).unwrap())
+        .unwrap();
+    assert!(
+        first.1 && first.2,
+        "the cut lands on a keyframe with a sequence header: {first:?}"
+    );
+}
+
+/// PR #352 round 2: a run output whose config id is 300 bytes long (an HLS
+/// config id is its path, which has no length bound) — well over
+/// `MAX_TAKE_ID_BYTES` (128). The boot take must still be minted, retried on
+/// its own slot, given up correctly, and its audio re-issued for the right
+/// output — all keyed on the output index, never on the (unbounded) id.
+#[test]
+fn a_300_byte_config_id_boot_take_is_retried_and_given_up_on_the_right_slot() {
+    // 25 fps: the 8 s window = 200 ticks; run past it.
+    const TICKS: u64 = 330;
+    let long_id = "o".repeat(300);
+    assert!(
+        long_id.len() > super::MAX_TAKE_ID_BYTES,
+        "the config id itself must exceed the take-id cap"
+    );
+    let template = boot_config("@_never")
+        .replace("id = \"out1\"", &format!("id = \"{long_id}\""))
+        .replacen("output = \"out1\"", &format!("output = \"{long_id}\""), 1);
+    let policy = super::BootRetryPolicy {
+        retry_secs: 2,
+        window_secs: 8,
+    };
+    let refusals = Arc::new(Mutex::new(Vec::<String>::new()));
+    let record = Arc::clone(&refusals);
+    let run = drive_clocked(
+        &template,
+        false,
+        false,
+        "route_bootlong",
+        TICKS,
+        Some(policy),
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(30) {
+                while let Ok(o) = outcomes.try_recv() {
+                    // Always `boot:1`, never a truncated/garbled form of the
+                    // 300-byte id (which would also risk colliding with
+                    // another output's truncated id).
+                    assert_eq!(o.operation_id, "boot:1", "{o:?}");
+                    assert!(
+                        o.operation_id.len() < super::MAX_TAKE_ID_BYTES,
+                        "the minted id stays well under the cap: {o:?}"
+                    );
+                    record.lock().unwrap().push(o.operation_id.clone());
+                }
+                if handle.snapshot().boot_takes_given_up == 1 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the boot take was never given up");
+        },
+    );
+    let seen = refusals.lock().unwrap().clone();
+    assert!(seen.len() >= 2, "retried on the same slot: {seen:?}");
+    let s = &run.final_snapshot;
+    assert_eq!(s.boot_takes_given_up, 1);
+    assert_eq!(s.boot_takes_pending, 0);
+    // The output stays on Program (never routed, since the long-id source
+    // never became fresh): the slot match, keyed on the output index, never
+    // let a stray outcome for a different output's index collide.
+    assert!(s
+        .outputs
+        .iter()
+        .all(|o| o.bus == "program" && o.pending.is_none()));
+    assert_eq!(run.frames, TICKS);
+}
+
+/// #329 F1(b): a persisted feed whose source never becomes fresh: the boot
+/// take is refused `feed-not-fresh`, re-issued (at most once per retry
+/// period) through the window, then given up; the output stays on Program and
+/// Program is untouched (one window per tick on both outputs). The policy is
+/// shortened (retry 2 s, window 8 s) only to bound the wall time; production
+/// uses 2 s / 30 s (`BootRetryPolicy::default`).
+#[test]
+fn a_never_fresh_boot_feed_is_retried_then_given_up_and_program_is_untouched() {
+    // 25 fps: the 8 s window = 200 ticks; run past it.
+    const TICKS: u64 = 330;
+    const WINDOW_TICKS: u64 = 200;
+    let refusals = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let record = Arc::clone(&refusals);
+    let template = boot_config("@_never");
+    let policy = super::BootRetryPolicy {
+        retry_secs: 2,
+        window_secs: 8,
+    };
+    let run = drive_clocked(
+        &template,
+        false,
+        false,
+        "route_bootnf",
+        TICKS,
+        Some(policy),
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(30) {
+                while let Ok(o) = outcomes.try_recv() {
+                    // Keyed on the output index (PR #352 round 2).
+                    assert_eq!(o.operation_id, "boot:1", "{o:?}");
+                    assert_eq!(
+                        o.outcome,
+                        TakeResult::Refused(super::RefuseReason::FeedNotFresh),
+                        "{o:?}"
+                    );
+                    record.lock().unwrap().push(o.tick);
+                }
+                if handle.snapshot().boot_takes_given_up == 1 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the boot take was never given up");
+        },
+    );
+    let ticks = refusals.lock().unwrap().clone();
+    // Each attempt waits out the 50-tick prime deadline; a re-issue comes no
+    // sooner than 2 s (50 ticks) after the previous issue, and only inside
+    // the window — so at most WINDOW/50 + 1 attempts.
+    assert!(ticks.len() >= 2, "retried: {ticks:?}");
+    assert!(ticks.len() <= 5, "bounded: {ticks:?}");
+    for pair in ticks.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= 50,
+            "at most one attempt per 2 s: {ticks:?}"
+        );
+    }
+    assert!(
+        ticks
+            .iter()
+            .all(|&t| t <= WINDOW_TICKS + super::TAKE_PRIME_DEADLINE_TICKS + 2),
+        "no attempt after the window: {ticks:?}"
+    );
+    let s = &run.final_snapshot;
+    assert_eq!(s.boot_takes_given_up, 1);
+    assert_eq!(s.boot_takes_pending, 0);
+    assert!(s
+        .outputs
+        .iter()
+        .all(|o| o.bus == "program" && o.pending.is_none()));
+    assert_eq!(s.dynamic_encoders_live, 0, "no encoder was ever opened");
+    assert_eq!(run.frames, TICKS);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    for (i, output) in run.outputs.iter().enumerate() {
+        assert_eq!(pts_of(output), all, "output {i}: Program untouched");
+    }
+}
+
 /// ADR-0108 slice 2 (spec G1) through the real pipeline: an audio-only take
 /// of output 1 to `Source(<bars>)` while its video stays on Program. Output
 /// 1's video is output 0's, packet for packet (same encoder, no move); its
@@ -1014,4 +1605,132 @@ fn an_audio_only_take_routes_a_source_and_returns_to_the_shared_stream() {
     let after = span(1, g(to_program.tick) + 4096, i64::MAX);
     assert!(after.len() > 1024);
     assert!(rms(&after) < 1e-3, "after the return: {}", rms(&after));
+}
+
+/// ADR-0108 slice 2 §6.1: a run whose config persists `audio = { source =
+/// "<b>" }` on output 1 starts it on follow and re-applies the persisted feed
+/// as an audio-only boot take: within a few ticks of the first routing tick
+/// the router snapshot shows output 1 carrying `src:<b>` (video unchanged),
+/// and output 0 keeps the program mix.
+#[test]
+fn a_persisted_audio_feed_is_re_applied_by_a_boot_take() {
+    const TICKS: u64 = 120;
+    let template = format!(
+        "{AUDIO_CONFIG}\n[[routing.output]]\noutput = \"out1\"\naudio = {{ source = \"@_b\" }}\n"
+    );
+    let seen = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let prep = |pipeline: &mut Pipeline| {
+        let takes = pipeline.boot_audio_takes_mut();
+        assert_eq!(
+            *takes,
+            vec![(
+                "out1".to_owned(),
+                super::AudioChoice::Source("route_boot_b".to_owned())
+            )],
+            "the persisted feed is parsed into one boot take"
+        );
+        // The harness binds its sinks as `test-sink-N` (positional).
+        takes[0].0 = "test-sink-1".to_owned();
+    };
+    let run = drive_prepared(
+        &template,
+        true,
+        false,
+        "route_boot",
+        TICKS,
+        prep,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let o = wait_for("the boot take outcome", Duration::from_secs(10), || {
+                outcomes.try_recv().ok()
+            });
+            // Keyed on the output index (PR #352 round 2), not `test-sink-1`.
+            assert_eq!(o.operation_id, "boot:audio:1");
+            assert!(multiview_control::output_routing::is_boot_take(
+                &o.operation_id
+            ));
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+            let s = wait_for("the boot audio on air", Duration::from_secs(5), || {
+                let s = handle.snapshot();
+                (s.outputs
+                    .get(1)
+                    .is_some_and(|v| v.audio == "src:route_boot_b"))
+                .then_some(s)
+            });
+            *record.lock().unwrap() = Some((o.tick, s));
+        },
+    );
+    let (tick, s) = seen.lock().unwrap().take().expect("observed");
+    assert!(
+        tick < 30,
+        "the boot take applies within a few ticks: {tick}"
+    );
+    assert_eq!(s.outputs[1].bus, "program", "the video is untouched");
+    assert_eq!(s.outputs[1].audio_choice, "src:route_boot_b");
+    assert_eq!(s.outputs[0].audio, "program");
+    assert_eq!(run.frames, TICKS);
+}
+
+/// PR #352 round 2: an audio-only boot take (no combined video) whose
+/// output's config id is 300 bytes long is still enqueued — not rejected by
+/// `try_take`'s length check, which the OLD `boot:audio:<config id>` id
+/// would hit for an id this long. `boot_audio_choices` parses the long id
+/// faithfully (it is not truncated at parse time); only the later mint, now
+/// keyed on the output index, must stay short.
+#[test]
+fn an_audio_only_boot_take_with_a_300_byte_config_id_is_enqueued() {
+    const TICKS: u64 = 120;
+    let long_id = "b".repeat(300);
+    let template = AUDIO_CONFIG.replace("id = \"out1\"", &format!("id = \"{long_id}\""))
+        + &format!("[[routing.output]]\noutput = \"{long_id}\"\naudio = {{ source = \"@_b\" }}\n");
+    let seen = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let prep = |pipeline: &mut Pipeline| {
+        let takes = pipeline.boot_audio_takes_mut();
+        assert_eq!(takes.len(), 1, "one persisted audio feed");
+        assert_eq!(
+            takes[0].0.len(),
+            300,
+            "boot_audio_choices preserves the long id, unparsed/untruncated"
+        );
+        // The harness binds its sinks as `test-sink-N` (positional); the
+        // real run would resolve the 300-byte id to its own output index the
+        // same way.
+        takes[0].0 = "test-sink-1".to_owned();
+    };
+    let run = drive_prepared(
+        &template,
+        true,
+        false,
+        "route_bootlongaudio",
+        TICKS,
+        prep,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            let o = wait_for("the boot take outcome", Duration::from_secs(10), || {
+                outcomes.try_recv().ok()
+            });
+            // Short and fixed, keyed on the output index: never a truncated
+            // 300-byte id, and never refused for being too long.
+            assert_eq!(o.operation_id, "boot:audio:1");
+            assert!(o.operation_id.len() < super::MAX_TAKE_ID_BYTES, "{o:?}");
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+            *record.lock().unwrap() = Some(o);
+        },
+    );
+    let o = seen.lock().unwrap().take().expect("observed");
+    assert_eq!(
+        o.audio,
+        Some(super::AudioChoice::Source(
+            "route_bootlongaudio_b".to_owned()
+        ))
+    );
+    assert_eq!(run.frames, TICKS);
 }
