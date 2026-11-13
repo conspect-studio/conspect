@@ -9,21 +9,20 @@
 //! accepted document. Everything the edit did not touch keeps the accepted
 //! value.
 //!
-//! The unit of change is a section. For the id-keyed list sections (sources,
-//! outputs, overlays, probes, programs, tally profiles, salvos, devices, sync
-//! groups, media players, media fills, weather locations, the graphics
-//! data sources/items/channels, the audio routes and the routing crosspoint
-//! tables) the unit is the item: an item the file
-//! added or changed takes the file's value, an item the file removed is
-//! removed, and every other accepted item stays. When the accepted section is
-//! still exactly what the previous file said (nothing diverged), the new
-//! file's section is taken whole, so a pure reorder still lands. Inside a
-//! few sections the unit is smaller: the canvas's pinned signal (width,
-//! height, cadence) is one unit and each other canvas axis its own; the
-//! switcher and the IPTV publication merge field by field (M/Es by id and
-//! their mixer inputs by number, IPTV
-//! entries by kind + ref); a layout change takes the file's layout with its
-//! cells (cells name the layout's areas), a cells-only edit merges cells by id.
+//! The unit of change is a section, and inside it the smallest value the
+//! file changed: id-keyed lists (sources, outputs, overlays, probes, programs,
+//! tally profiles, salvos, walls, devices, sync groups, media players and
+//! fills, weather locations, graphics, IPTV entries, audio routes, routing
+//! crosspoints, cells, M/Es and their mixer inputs) merge per item, and every
+//! changed item merges field by field at every depth (nested id- or
+//! number-keyed arrays per item too), so an API write of one field (a
+//! catalogue URL follow, an armed automation rule, a Program cell rebind, a
+//! propagated output track, a mixer patch) survives a file edit of another
+//! field of the same item. A file that changes an item's `kind` replaces the
+//! item. When the accepted list still equals the previous file's list, the
+//! new list is taken whole (a reorder lands). Exceptions by design: the
+//! canvas's pinned signal (width, height, cadence) is one unit, and a layout
+//! change takes the file's cells (cells name the layout's areas).
 //!
 //! Pure and total: no I/O. The caller validates the merged document (a merge
 //! can combine an edit with accepted content into a document that no longer
@@ -56,13 +55,13 @@ fn section<T: PartialEq + Clone>(prev: &T, next: &T, accepted: &T) -> T {
 /// appended in the file's order. When the accepted list still equals the
 /// previous file's list, the new file's list is taken whole (keeps a reorder).
 /// Linear in the list sizes (hash-indexed by key).
-fn keyed<T: PartialEq + Clone, K: Eq + Hash>(
+fn keyed<T: PartialEq + Clone + Serialize + DeserializeOwned, K: Eq + Hash>(
     prev: &[T],
     next: &[T],
     accepted: &[T],
     key: impl Fn(&T) -> K,
 ) -> Vec<T> {
-    keyed_with(prev, next, accepted, key, |_, after, _| after.clone())
+    keyed_with(prev, next, accepted, key, fields)
 }
 
 /// [`keyed`] where an item the file changed and the accepted state still has
@@ -125,15 +124,14 @@ fn keyed_with<'a, T: PartialEq + Clone, K: Eq + Hash>(
     merged
 }
 
-/// Merge one object field by field (one level): a field the file changed
-/// takes the file's value, every other field keeps the accepted value. A
-/// field skipped on serialization (`skip_serializing_if`, its default) is
-/// absent on both sides alike, so "absent" compares as "the default": a file
-/// that resets a field to its default (present -> absent) removes it from the
-/// result, which deserializes back to the default; a field that is the
-/// default in both file documents was not touched by the edit. When the
-/// result does not deserialize (e.g. a tagged enum whose kind changed), the
-/// file's whole value is taken.
+/// Merge one value as the edit `prev -> next` applied onto `accepted`, at
+/// every depth: a field the file changed takes the file's value, every other
+/// field keeps the accepted value (see [`merge_value`]). A field skipped on
+/// serialization (`skip_serializing_if`, its default) is absent on both sides
+/// alike, so "absent" compares as "the default": a file that resets a field to
+/// its default removes it from the result, which deserializes back to the
+/// default. When the result does not deserialize, the file's whole value is
+/// taken.
 fn fields<T: PartialEq + Clone + Serialize + DeserializeOwned>(
     prev: &T,
     next: &T,
@@ -145,29 +143,96 @@ fn fields<T: PartialEq + Clone + Serialize + DeserializeOwned>(
     if prev == accepted {
         return next.clone();
     }
-    let as_object = |value: &T| match serde_json::to_value(value) {
-        Ok(serde_json::Value::Object(map)) => Some(map),
-        _ => None,
-    };
-    let (Some(p), Some(n), Some(mut out)) = (as_object(prev), as_object(next), as_object(accepted))
-    else {
+    let (Ok(p), Ok(n), Ok(a)) = (
+        serde_json::to_value(prev),
+        serde_json::to_value(next),
+        serde_json::to_value(accepted),
+    ) else {
         return next.clone();
     };
-    let keys: HashSet<&String> = p.keys().chain(n.keys()).collect();
-    for k in keys {
-        if p.get(k) == n.get(k) {
-            continue;
-        }
-        match n.get(k) {
-            Some(value) => {
-                out.insert(k.clone(), value.clone());
-            }
-            None => {
-                out.remove(k);
-            }
-        }
+    serde_json::from_value(merge_value(&p, &n, &a)).unwrap_or_else(|_| next.clone())
+}
+
+/// The recursive three-way merge behind [`fields`].
+///
+/// * unchanged by the file (`prev == next`): the accepted value;
+/// * objects: an object whose tag (`kind`) the file changed is the file's
+///   whole object (a different variant); one whose tag only the accepted
+///   state changed stays accepted (the file edited a variant that is gone);
+///   otherwise per key, recursively;
+/// * arrays of objects that all carry a unique `id` (or `number`): per item,
+///   recursively, accepted order kept and file additions appended — the same
+///   rule as the top-level id-keyed lists;
+/// * anything else the file changed (a scalar, a plain array): the file's value.
+fn merge_value(
+    prev: &serde_json::Value,
+    next: &serde_json::Value,
+    accepted: &serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::Value;
+    if prev == next {
+        return accepted.clone();
     }
-    serde_json::from_value(serde_json::Value::Object(out)).unwrap_or_else(|_| next.clone())
+    if prev == accepted {
+        return next.clone();
+    }
+    match (prev, next, accepted) {
+        (Value::Object(p), Value::Object(n), Value::Object(a)) => {
+            if p.get("kind") != n.get("kind") {
+                // The file changed the variant: the file's whole object.
+                return next.clone();
+            }
+            if a.get("kind") != n.get("kind") {
+                // The API changed the variant and the file edited the old
+                // one: those fields no longer exist; the accepted object stays.
+                return accepted.clone();
+            }
+            let mut out = a.clone();
+            let keys: HashSet<&String> = p.keys().chain(n.keys()).collect();
+            for k in keys {
+                match (p.get(k), n.get(k), a.get(k)) {
+                    (pv, nv, _) if pv == nv => {}
+                    (_, None, _) => {
+                        out.remove(k);
+                    }
+                    (Some(pv), Some(nv), Some(av)) => {
+                        out.insert(k.clone(), merge_value(pv, nv, av));
+                    }
+                    (_, Some(nv), _) => {
+                        out.insert(k.clone(), nv.clone());
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        (Value::Array(p), Value::Array(n), Value::Array(a)) => {
+            let key = ["id", "number"]
+                .into_iter()
+                .find(|k| [p, n, a].iter().all(|list| unique_keys(list, k)));
+            match key {
+                Some(k) => Value::Array(keyed_with(
+                    p,
+                    n,
+                    a,
+                    |item| item.get(k).map(ToString::to_string).unwrap_or_default(),
+                    merge_value,
+                )),
+                None => next.clone(),
+            }
+        }
+        _ => next.clone(),
+    }
+}
+
+/// Whether every element of `list` is an object carrying a scalar `key`, and
+/// no two share it.
+fn unique_keys(list: &[serde_json::Value], key: &str) -> bool {
+    let mut seen = HashSet::with_capacity(list.len());
+    list.iter().all(|item| {
+        item.get(key)
+            .filter(|v| v.is_string() || v.is_number())
+            .is_some_and(|v| seen.insert(v.to_string()))
+    })
 }
 
 /// The canvas: the pinned signal (width, height, cadence) is one unit — it

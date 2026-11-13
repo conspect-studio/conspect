@@ -113,21 +113,22 @@ output when one `[control] ui_dir` key changed (#367).
 * The watcher keeps the **previous file document** next to its running baseline. A settled
   change is the edit `previous file → new file`, computed by the pure
   `multiview_config::merge_file_edit(previous_file, new_file, accepted)`: a section the file
-  did not change keeps the accepted value; for id-keyed lists (sources, outputs, overlays,
-  probes, programs, tally profiles, salvos, walls, devices, sync groups, media players and
-  fills, weather locations, graphics data sources/items/channels, audio routes, routing
-  crosspoints) the unit is the item — an item the file added or changed takes the file's
-  value, an item the file removed is removed, every other accepted item stays (hash-indexed,
-  linear in the list sizes). Smaller units where the operator edits parts of a section: the
-  canvas's pinned signal (width, height, cadence) is one unit, pixel format and background are
-  each their own, and the colour block merges field by field; the switcher, its M/Es (by
-  id) and each M/E's mixer inputs (by number) and the IPTV publication (scalars, and each entry by kind + ref) merge field by field, so editing one key keeps the API-set others; a layout change takes the
-  file's layout with its cells (cells name the layout's areas), while a cells-only edit merges
-  cells by id; each routing crosspoint row (keyed by its destination) and each graphics item and channel (by
-  id) merge field by field,
-  so a `bus` edit keeps an API-set audio/video feed. When the accepted list still equals the previous file's list, the new list is
-  taken whole (a reorder lands). The function destructures `MultiviewConfig` exhaustively, so a new section is a
-  compile error until the merge decides how an edit carries it.
+  did not change keeps the accepted value; id-keyed lists (sources, outputs, overlays, probes,
+  programs, tally profiles, salvos, walls, devices, sync groups, media players and fills,
+  weather locations, graphics data sources/items/channels, IPTV entries, audio routes, routing
+  crosspoints, cells, M/Es and their mixer inputs) merge per item — an item the file added or
+  changed takes the file's change, an item the file removed is removed, every other accepted
+  item stays (hash-indexed, linear in the list sizes) — and a changed item merges **field by
+  field at every depth** (a recursive three-way merge of its serialized form; nested arrays of
+  `id`- or `number`-keyed objects per item), so an API write of one field — a catalogue URL
+  follow, an armed automation rule, a Program cell rebind, a propagated output track, a mixer
+  patch, a channel rundown — survives a file edit of another field of the same item. A file
+  that changes an item's `kind` replaces the item; a file edit of a variant the API replaced
+  is dropped. Deliberate whole units: the canvas's pinned signal (width, height, cadence),
+  and a layout change, which takes the file's cells (cells name the layout's areas). When
+  the accepted list still equals the previous file's list, the new list is taken whole (a
+  reorder lands). The function destructures `MultiviewConfig` exhaustively, so a new section
+  is a compile error until the merge decides how an edit carries it.
 * A file whose document did not change (a touch, a reformat, the unchanged boot file at start)
   is no edit at all, even where the accepted state differs from the file.
 * The merged document is validated as a whole and admitted for boot (ADR-W032). An edit that

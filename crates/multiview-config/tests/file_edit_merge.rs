@@ -470,3 +470,53 @@ fn a_mixer_input_label_edit_keeps_the_api_patched_slot() {
     assert_eq!(m.inputs[0].label.as_deref(), Some("Camera 1"));
     assert_eq!(m.input_source(2), Some("in_hls"), "the API patch stays");
 }
+
+/// Review L1 round 6: a changed item merges field by field at every depth.
+/// A file rename of a source keeps the API's catalogue URL follow; a file
+/// `fit` edit of a cell keeps the API's Program rebind; a file `path` edit of
+/// an output keeps its propagated audio tracks.
+#[test]
+fn a_file_edit_of_one_item_field_keeps_api_writes_to_other_fields() {
+    let doc = |name: &str, url: &str, fit: &str, input: &str| {
+        parse(
+            &boot("/srv/ui-old")
+                .replace(
+                    "id = \"in_hls\"\nkind = \"bars\"",
+                    &format!(
+                        "id = \"in_hls\"\nkind = \"bars\"\n[[sources]]\nid = \"net\"\ndisplay_name = \"{name}\"\nkind = \"hls\"\nurl = \"{url}\""
+                    ),
+                )
+                .replace(
+                    "[cells.source]\ninput_id = \"in_hls\"",
+                    &format!("fit = \"{fit}\"\n[cells.source]\ninput_id = \"{input}\""),
+                ),
+        )
+    };
+    let prev = doc("News", "https://a.example/x.m3u8", "fill", "in_hls");
+    let next = doc("News HD", "https://a.example/x.m3u8", "contain", "in_hls");
+    let accepted = doc("News", "https://b.example/x.m3u8", "fill", "net");
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    merged.validate().unwrap();
+    let net = merged.sources.iter().find(|s| s.id == "net").unwrap();
+    assert_eq!(net.display_name.as_deref(), Some("News HD"));
+    assert_eq!(
+        net,
+        &{
+            let mut want = accepted
+                .sources
+                .iter()
+                .find(|s| s.id == "net")
+                .unwrap()
+                .clone();
+            want.display_name = Some("News HD".to_owned());
+            want
+        },
+        "the API-followed URL stays"
+    );
+    assert_eq!(merged.cells[0].fit.as_deref(), Some("contain"));
+    assert_eq!(
+        merged.cells[0].source.input_id.as_deref(),
+        Some("net"),
+        "the API rebind stays"
+    );
+}
