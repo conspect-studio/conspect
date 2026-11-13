@@ -52,6 +52,10 @@ pub const LATCH_DELAY: Duration = Duration::from_millis(100);
 /// the tick due now (counted in [`OutputLaneStats::skipped_ticks`]).
 pub const MAX_CATCHUP_TICKS: u64 = 8;
 
+/// The shortest [`LanePacing::Stepped`] sleep: a zero step is clamped up to
+/// this so a stepped lane can never busy-spin.
+pub const MIN_STEP: Duration = Duration::from_millis(1);
+
 /// How the lane waits for a tick's deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LanePacing {
@@ -60,8 +64,9 @@ pub enum LanePacing {
     #[default]
     Precise,
     /// Deterministic tests on a [`ManualTimeSource`](crate::ManualTimeSource):
-    /// re-read the source after real sleeps of `step`; never spins hot when the
-    /// manual clock is frozen.
+    /// re-read the source after real sleeps of `step` (clamped to
+    /// [`MIN_STEP`]..=[`STOP_POLL`]); never spins hot when the manual clock is
+    /// frozen.
     Stepped(Duration),
 }
 
@@ -208,8 +213,8 @@ impl OutputLaneHandle {
             }
             std::thread::park_timeout(Duration::from_millis(5));
         }
-        // Finished: the result is sent right after the flag, so this resolves
-        // at once (a minimal executor; no runtime needed).
+        // Finished: `clock_thread::spawn` delivers the result BEFORE raising
+        // `finished`, so this resolves on its first poll (never parks).
         clock_thread::block_on(self.thread.join())
             .map_err(|ClockThreadPanic(message)| LaneJoinError::Panicked(message))
     }
@@ -219,29 +224,36 @@ fn duration_nanos(d: Duration) -> i64 {
     i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)
 }
 
-/// The largest tick index whose deadline is `<= now` (exact integer floor,
-/// corrected against [`OutputLaneClock::deadline_nanos`] for rounding).
+/// The largest tick index whose deadline is `<= now`: the closed-form
+/// inversion of [`OutputLaneClock::deadline_nanos`],
+/// `k = floor((now - seed - delay) · num / (den · 1e9))`, in i128 (no
+/// overflow for any i64 inputs), clamped to `u64`, then corrected by at most
+/// ONE step each way for the deadline's rounding — never an unbounded loop,
+/// whatever the seed, delay or `now` (saturated deadlines included).
 fn due_index(cfg: &OutputLaneClock, clock: &OutputClock, now: i64) -> u64 {
-    let elapsed = now
-        .saturating_sub(cfg.seed_nanos)
-        .saturating_sub(duration_nanos(cfg.latch_delay));
+    let delay = i128::try_from(cfg.latch_delay.as_nanos()).unwrap_or(i128::MAX);
+    let elapsed = i128::from(now) - i128::from(cfg.seed_nanos) - delay.min(i128::from(i64::MAX));
     if elapsed <= 0 {
         return 0;
     }
     let cadence = clock.cadence();
-    let num = i128::from(elapsed).saturating_mul(i128::from(cadence.num));
-    let den = i128::from(cadence.den).saturating_mul(1_000_000_000);
-    let mut index = u64::try_from(num / den.max(1)).unwrap_or(u64::MAX);
-    while index < u64::MAX && cfg.deadline_nanos(clock, index + 1) <= now {
+    let num = elapsed.saturating_mul(i128::from(cadence.num));
+    let den = i128::from(cadence.den).saturating_mul(1_000_000_000).max(1);
+    let mut index = u64::try_from(num / den).unwrap_or(u64::MAX);
+    // `pts_at` rounds to the nearest nanosecond, so the exact floor may be one
+    // tick off either way; one bounded correction each way.
+    if index < u64::MAX && cfg.deadline_nanos(clock, index + 1) <= now {
         index += 1;
-    }
-    while index > 0 && cfg.deadline_nanos(clock, index) > now {
+    } else if index > 0 && cfg.deadline_nanos(clock, index) > now {
         index -= 1;
     }
     index
 }
 
-/// Wait until `deadline` on `time`, or either stop is raised.
+/// Wait until `deadline` on `time`, or either stop is raised. Both stops are
+/// checked between bounded real-time steps (at most [`STOP_POLL`], the
+/// portable spin included), so a raised stop is observed within one
+/// [`STOP_POLL`] even on a time source that never reaches the deadline.
 fn pace(
     pacing: LanePacing,
     deadline: i64,
@@ -249,22 +261,14 @@ fn pace(
     run_stop: &StopSignal,
     own_stop: &StopSignal,
 ) {
-    let poll = duration_nanos(STOP_POLL);
-    loop {
-        if run_stop.is_stopped() || own_stop.is_stopped() {
-            return;
-        }
-        let now = time.now_nanos();
-        if now >= deadline {
-            return;
-        }
-        match pacing {
-            // `sleep_until` checks `own_stop`; capping each call at STOP_POLL
-            // also bounds the run stop's observation latency.
-            LanePacing::Precise => {
-                clock_thread::sleep_until(deadline.min(now.saturating_add(poll)), time, own_stop);
+    let stopped = || run_stop.is_stopped() || own_stop.is_stopped();
+    match pacing {
+        LanePacing::Precise => clock_thread::sleep_until_or(deadline, time, &stopped),
+        LanePacing::Stepped(step) => {
+            let step = step.clamp(MIN_STEP, STOP_POLL);
+            while !stopped() && time.now_nanos() < deadline {
+                std::thread::sleep(step);
             }
-            LanePacing::Stepped(step) => std::thread::sleep(step.min(STOP_POLL)),
         }
     }
 }
@@ -572,16 +576,109 @@ mod tests {
     fn a_callback_that_never_returns_is_detached_within_the_grace() {
         let time: Arc<dyn TimeSource> = Arc::new(MonotonicTimeSource::new());
         let seed = time.now_nanos();
-        let lane = real_lane("stuck", &time, seed, |_| {
-            std::thread::sleep(Duration::from_secs(30));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let lane = real_lane("stuck", &time, seed, move |_| {
+            let _ = entered_tx.send(());
+            // Wedged until the test releases it (or drops the sender).
+            let _ = release_rx.lock().map(|rx| rx.recv());
         });
-        std::thread::sleep(Duration::from_millis(50));
+        // The callback is running (wedged) before the stop.
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let started = Instant::now();
         assert_eq!(
             lane.join_within(Duration::from_millis(200)),
             Err(LaneJoinError::Detached)
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(200) && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+        // Released, the detached thread observes its stop and ends.
+        drop(release_tx);
+    }
+
+    #[test]
+    fn run_stop_is_bounded_with_precise_pacing_on_a_frozen_clock() {
+        // A frozen manual source never reaches tick 0's deadline; Precise
+        // pacing must still observe the RUN stop (not only the lane's own).
+        let time: Arc<dyn TimeSource> = Arc::new(ManualTimeSource::new());
+        let run_stop = StopSignal::new();
+        let lane = spawn_output_lane(
+            OutputLaneClock::new("frozen", Rational::FPS_25, 0),
+            time,
+            run_stop.clone(),
+            |_| {},
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!lane.is_finished());
+        let started = Instant::now();
+        run_stop.stop();
+        assert!(wait_for(|| lane.is_finished()));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(lane.stats().ticks(), 0);
+        assert_eq!(lane.join_within(Duration::from_secs(1)), Ok(()));
+    }
+
+    #[test]
+    fn a_zero_step_is_clamped_and_never_spins() {
+        struct Counting(Arc<ManualTimeSource>, Arc<AtomicU64>);
+        impl TimeSource for Counting {
+            fn now_nanos(&self) -> i64 {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0.now_nanos()
+            }
+        }
+        let manual = Arc::new(ManualTimeSource::new());
+        let mut cfg = OutputLaneClock::new("zero", Rational::FPS_25, 0);
+        cfg.pacing = LanePacing::Stepped(Duration::ZERO);
+        let reads = Arc::new(AtomicU64::new(0));
+        let counting: Arc<dyn TimeSource> = Arc::new(Counting(manual, Arc::clone(&reads)));
+        let lane = spawn_output_lane(cfg, counting, StopSignal::new(), |_| {}).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        // With a >= 1 ms step, 100 ms of a frozen clock is at most ~100
+        // reads (a spin would be millions).
+        let n = reads.load(Ordering::Relaxed);
+        assert!(n <= 400, "{n} time reads in 100 ms: spinning");
+        assert_eq!(lane.join_within(Duration::from_secs(1)), Ok(()));
+    }
+
+    #[test]
+    fn due_index_is_bounded_on_extreme_inputs() {
+        let clock = OutputClock::new(Rational::FPS_29_97).unwrap();
+        let fast = OutputClock::new(Rational::new(120, 1)).unwrap();
+        for seed in [i64::MIN, -1, 0, 1, i64::MAX] {
+            for now in [i64::MIN, 0, i64::MAX] {
+                for delay in [Duration::ZERO, LATCH_DELAY, Duration::MAX] {
+                    for c in [&clock, &fast] {
+                        let mut cfg = OutputLaneClock::new("x", c.cadence(), seed);
+                        cfg.latch_delay = delay;
+                        let started = Instant::now();
+                        let k = due_index(&cfg, c, now);
+                        assert!(started.elapsed() < Duration::from_millis(50));
+                        // Never past the source: a returned tick > 0 is due.
+                        if k > 0 {
+                            assert!(
+                                cfg.deadline_nanos(c, k) <= now
+                                    || cfg.deadline_nanos(c, k) == i64::MAX
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // seed = i64::MIN: deadlines saturate; the result is the exact floor
+        // of the i128 inversion, clamped, with no loop toward u64::MAX.
+        let cfg = OutputLaneClock::new("x", Rational::FPS_25, i64::MIN);
+        let k = due_index(&cfg, &OutputClock::new(Rational::FPS_25).unwrap(), i64::MAX);
+        assert!(k > 0);
     }
 
     #[test]
