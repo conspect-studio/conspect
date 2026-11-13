@@ -41,7 +41,8 @@
 //!   loopback admin listener and is not gated.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_config::{MultiviewConfig, NetworkMode};
 use multiview_frontdoor::ListenSockets;
@@ -66,9 +67,69 @@ fn take_inherited_sockets() -> ListenSockets {
         .unwrap_or_default()
 }
 
+/// Install (or clear) the running front door's capability snapshot and
+/// metrics source for the control plane, mirroring
+/// `output_routing_control::install_program_metrics`: `main.rs` calls this
+/// once, right after [`FrontDoorRun::start`] and before the front door
+/// (which owns the data these borrow from) is moved into `RunningPersist`.
+pub fn install(
+    installed: Option<(
+        multiview_control::system::NetworkCapability,
+        Arc<dyn multiview_control::frontdoor_metrics::FrontDoorMetricsSource>,
+    )>,
+) {
+    *slot().lock().unwrap_or_else(PoisonError::into_inner) = installed;
+}
+
+/// The installed capability snapshot, if a front door is running this
+/// process.
+#[must_use]
+pub fn installed_capability() -> Option<multiview_control::system::NetworkCapability> {
+    slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|(cap, _)| cap.clone())
+}
+
+/// The installed metrics source, if a front door is running this process.
+#[must_use]
+pub fn installed_metrics_source(
+) -> Option<Arc<dyn multiview_control::frontdoor_metrics::FrontDoorMetricsSource>> {
+    slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|(_, source)| Arc::clone(source))
+}
+
+type InstalledSlot = Mutex<
+    Option<(
+        multiview_control::system::NetworkCapability,
+        Arc<dyn multiview_control::frontdoor_metrics::FrontDoorMetricsSource>,
+    )>,
+>;
+
+fn slot() -> &'static InstalledSlot {
+    static SLOT: OnceLock<InstalledSlot> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
 /// The running front door and the lanes its consumers have not taken yet.
 pub struct FrontDoorRun {
     door: multiview_frontdoor::FrontDoor,
+    /// QUIC Retries sent on the lane (bumped by the h3 endpoint's accept
+    /// loop through `multiview_h3::EndpointParts::retry_counter`; `0` until
+    /// [`start_h3`](Self::start_h3) serves the lane).
+    retry_counter: Arc<AtomicU64>,
+    /// `network.quic.retry_above_handshakes`, carried from config to the h3
+    /// endpoint's Retry policy ([`start_h3`](Self::start_h3)).
+    #[allow(dead_code)] // MERGE-ONLY: wired onto the h3 endpoint in the next commit
+    retry_above_handshakes: usize,
+    /// The live nft-floor status (re-read every
+    /// [`crate::nft_floor::NFT_FLOOR_REREAD_INTERVAL`] on the front-door
+    /// runtime, never the program runtime), plus the path to read.
+    nft_floor: Arc<NftFloorCell>,
     /// The TCP door runs with ICE-TCP on (direct mode, `network.ice_tcp`).
     ice_tcp: bool,
     /// The HTTP/3 endpoint on the QUIC lane (slice 2).
@@ -266,6 +327,41 @@ impl std::fmt::Debug for FrontDoorRun {
     }
 }
 
+/// A wait-free cell for the nft-floor status, re-read periodically on the
+/// front-door runtime. 3 states fit `u8`; `Relaxed` is enough (telemetry,
+/// not a correctness gate).
+struct NftFloorCell(std::sync::atomic::AtomicU8);
+
+impl NftFloorCell {
+    fn new(initial: crate::nft_floor::NftFloorStatus) -> Self {
+        Self(AtomicU8::new(encode(initial)))
+    }
+
+    fn store(&self, status: crate::nft_floor::NftFloorStatus) {
+        self.0.store(encode(status), Ordering::Relaxed);
+    }
+
+    fn load(&self) -> crate::nft_floor::NftFloorStatus {
+        decode(self.0.load(Ordering::Relaxed))
+    }
+}
+
+const fn encode(status: crate::nft_floor::NftFloorStatus) -> u8 {
+    match status {
+        crate::nft_floor::NftFloorStatus::Present => 0,
+        crate::nft_floor::NftFloorStatus::Absent => 1,
+        crate::nft_floor::NftFloorStatus::Unknown => 2,
+    }
+}
+
+const fn decode(value: u8) -> crate::nft_floor::NftFloorStatus {
+    match value {
+        0 => crate::nft_floor::NftFloorStatus::Present,
+        1 => crate::nft_floor::NftFloorStatus::Absent,
+        _ => crate::nft_floor::NftFloorStatus::Unknown,
+    }
+}
+
 /// The settings derived from `[network]` (and the legacy keys it replaces).
 #[must_use]
 pub fn config_from(config: &MultiviewConfig) -> Option<multiview_frontdoor::FrontDoorConfig> {
@@ -287,13 +383,50 @@ pub fn config_from(config: &MultiviewConfig) -> Option<multiview_frontdoor::Fron
         .collect();
     #[cfg(not(feature = "webrtc-native"))]
     let turn_servers = Vec::new();
+    let udp = &network.udp;
+    let max_quic = usize::try_from(network.quic.max_connections).unwrap_or(usize::MAX);
     Some(multiview_frontdoor::FrontDoorConfig {
         port,
         workers: usize::from(network.workers.max(1)),
+        recv_buffer_bytes: usize::try_from(udp.recv_buffer_bytes).unwrap_or(usize::MAX),
+        limits: multiview_frontdoor::NewFlowLimits {
+            per_source_pps: udp.new_flow_pps_per_source,
+            per_source_burst: udp.new_flow_burst,
+            global_pps: udp.new_flow_global_pps,
+            stun_per_source_pps: udp.stun_pps_per_source,
+            // The config schema (section 10) exposes one stun burst knob
+            // (`stun_pps_per_source`); the per-source burst mirrors it, same
+            // as the crate default's own 1:1 ratio.
+            stun_per_source_burst: udp.stun_pps_per_source,
+            stun_global_pps: udp.stun_global_pps,
+            ..multiview_frontdoor::NewFlowLimits::default()
+        },
         max_rtc_peers: max_rtc,
+        max_quic_peers: max_quic,
         turn_servers,
-        ..multiview_frontdoor::FrontDoorConfig::default()
+        steering: udp.validated_steering,
     })
+}
+
+/// `network.quic.retry_above_handshakes` and `network.udp.nft_floor_status_file`
+/// are not part of [`multiview_frontdoor::FrontDoorConfig`] (they wire into
+/// the h3 endpoint's Retry policy and the nft-floor probe respectively, not the front
+/// door itself); read them straight from `[network]` where needed.
+#[must_use]
+pub fn retry_above_handshakes(config: &MultiviewConfig) -> usize {
+    config.network.as_ref().map_or(
+        multiview_frontdoor::quic::DEFAULT_RETRY_ABOVE_HANDSHAKES,
+        |n| n.quic.retry_above_handshakes,
+    )
+}
+
+/// [`retry_above_handshakes`]'s sibling for the nft-floor status file path.
+#[must_use]
+pub fn nft_floor_status_file(config: &MultiviewConfig) -> std::path::PathBuf {
+    config.network.as_ref().map_or_else(
+        || std::path::PathBuf::from(multiview_config::network_tls::DEFAULT_NFT_FLOOR_STATUS_FILE),
+        |n| n.udp.nft_floor_status_file.clone(),
+    )
 }
 
 /// Warn about the legacy keys `[network]` deprecates (one release, then
@@ -336,6 +469,11 @@ impl FrontDoorRun {
     /// Sockets passed by systemd ([`set_inherited_sockets`]) are used for the
     /// listeners whose type and port they match (UDP `https_port`, TCP door
     /// port, redirect port); the rest bind their own (slice 6, #292).
+    ///
+    /// Logs one line at start naming the steering mode, rcvbuf
+    /// requested/granted/usable/clamped, kernel-drop support, and the nft
+    /// floor (design note, "Slice 3 as built, part B"); starts the nft-floor re-reader on
+    /// the front door's own runtime (never the program runtime).
     #[must_use]
     pub fn start(config: &MultiviewConfig) -> Option<Self> {
         Self::start_with(config, take_inherited_sockets())
@@ -363,8 +501,28 @@ impl FrontDoorRun {
                     .as_ref()
                     .is_none_or(multiview_config::NetworkConfig::alt_svc_enabled);
                 let refuse_source = refuse_source_from(config);
+                let nft_path = nft_floor_status_file(config);
+                let initial_floor = crate::nft_floor::probe(&nft_path);
+                let buffers = door.buffer_report();
+                tracing::info!(
+                    local = %door.local_addr(),
+                    steering = ?door.steering(),
+                    rcvbuf_requested = buffers.requested,
+                    rcvbuf_granted = buffers.granted,
+                    rcvbuf_usable = buffers.usable,
+                    rcvbuf_clamped = buffers.clamped,
+                    kernel_drops_supported = door.kernel_drops_supported(),
+                    nft_floor = ?initial_floor,
+                    "front door: started"
+                );
+                let nft_floor = Arc::new(NftFloorCell::new(initial_floor));
+                door.handle()
+                    .spawn(reread_nft_floor(nft_path, Arc::clone(&nft_floor)));
                 let mut run = Self {
                     door,
+                    retry_counter: Arc::new(AtomicU64::new(0)),
+                    retry_above_handshakes: retry_above_handshakes(config),
+                    nft_floor,
                     ice_tcp: false,
                     h3: H3Slot {
                         lane: Mutex::new(lane),
@@ -722,6 +880,139 @@ impl FrontDoorRun {
     #[must_use]
     pub fn stats(&self) -> Arc<multiview_frontdoor::Stats> {
         self.door.stats()
+    }
+
+    /// The startup capability snapshot (`GET /api/v1/system/capabilities`,
+    /// design note "Slice 3 as built, part B"): steering mode, rcvbuf report, kernel-drop
+    /// support, and the nft floor **as read at startup** (the live value is
+    /// `/api/v1/metrics/frontdoor`).
+    #[must_use]
+    pub fn capability(&self) -> multiview_control::system::NetworkCapability {
+        network_capability(&self.door, self.nft_floor.load())
+    }
+
+    /// A [`multiview_control::frontdoor_metrics::FrontDoorMetricsSource`]
+    /// over this run's live counters, steering mode and nft floor.
+    #[must_use]
+    pub fn metrics_source(
+        &self,
+    ) -> Arc<dyn multiview_control::frontdoor_metrics::FrontDoorMetricsSource> {
+        Arc::new(LiveFrontDoorMetrics {
+            stats: self.door.stats(),
+            mode: self.door.steering(),
+            retry_counter: Arc::clone(&self.retry_counter),
+            nft_floor: Arc::clone(&self.nft_floor),
+        })
+    }
+}
+
+/// Map the door's steering mode + a resolved nft-floor status onto the
+/// capability DTO (shared by [`FrontDoorRun::capability`] and
+/// [`LiveFrontDoorMetrics`]).
+fn network_capability(
+    door: &multiview_frontdoor::FrontDoor,
+    nft_floor: crate::nft_floor::NftFloorStatus,
+) -> multiview_control::system::NetworkCapability {
+    use multiview_control::system::{NftFloorStatus, RecvBufferCapability, Udp443Steering};
+    let buffers = door.buffer_report();
+    let (udp443_steering, steering_reason) = match door.steering() {
+        multiview_frontdoor::SteeringMode::ReuseportCbpf => (Udp443Steering::ReuseportCbpf, None),
+        multiview_frontdoor::SteeringMode::SingleSocket { reason } => {
+            (Udp443Steering::SingleSocket, Some(reason))
+        }
+    };
+    multiview_control::system::NetworkCapability {
+        udp443_steering,
+        steering_reason,
+        recv_buffer: RecvBufferCapability {
+            requested: u64::try_from(buffers.requested).unwrap_or(u64::MAX),
+            granted: u64::try_from(buffers.granted).unwrap_or(u64::MAX),
+            usable: u64::try_from(buffers.usable).unwrap_or(u64::MAX),
+            clamped: buffers.clamped,
+        },
+        kernel_drops_supported: door.kernel_drops_supported(),
+        nft_floor: match nft_floor {
+            crate::nft_floor::NftFloorStatus::Present => NftFloorStatus::Present,
+            crate::nft_floor::NftFloorStatus::Absent => NftFloorStatus::Absent,
+            crate::nft_floor::NftFloorStatus::Unknown => NftFloorStatus::Unknown,
+        },
+    }
+}
+
+/// [`FrontDoorRun::metrics_source`]'s implementation: every field is a
+/// wait-free atomic load (invariant #10), never an engine channel.
+struct LiveFrontDoorMetrics {
+    stats: Arc<multiview_frontdoor::Stats>,
+    mode: multiview_frontdoor::SteeringMode,
+    retry_counter: Arc<AtomicU64>,
+    nft_floor: Arc<NftFloorCell>,
+}
+
+impl multiview_control::frontdoor_metrics::FrontDoorMetricsSource for LiveFrontDoorMetrics {
+    fn read(&self) -> Option<multiview_control::frontdoor_metrics::FrontDoorMetricsReport> {
+        use multiview_control::system::{NftFloorStatus, Udp443Steering};
+        let s = self.stats.snapshot();
+        let udp443_steering = match self.mode {
+            multiview_frontdoor::SteeringMode::ReuseportCbpf => Udp443Steering::ReuseportCbpf,
+            multiview_frontdoor::SteeringMode::SingleSocket { .. } => Udp443Steering::SingleSocket,
+        };
+        let nft_floor = match self.nft_floor.load() {
+            crate::nft_floor::NftFloorStatus::Present => NftFloorStatus::Present,
+            crate::nft_floor::NftFloorStatus::Absent => NftFloorStatus::Absent,
+            crate::nft_floor::NftFloorStatus::Unknown => NftFloorStatus::Unknown,
+        };
+        Some(
+            multiview_control::frontdoor_metrics::FrontDoorMetricsReport {
+                received: s.received,
+                to_quic: s.to_quic,
+                to_rtc: s.to_rtc,
+                dropped_classify: s.dropped_classify,
+                dropped_per_source: s.dropped_per_source,
+                dropped_global: s.dropped_global,
+                dropped_vn: s.dropped_vn,
+                dropped_initial: s.dropped_initial,
+                dropped_queue_full: s.dropped_queue_full,
+                dropped_no_consumer: s.dropped_no_consumer,
+                recv_errors: s.recv_errors,
+                tracked_sources: s.tracked_sources,
+                received_established_socket: s.received_established_socket,
+                received_listener_socket: s.received_listener_socket,
+                steered_unverified: s.steered_unverified,
+                steering_overflow: s.steering_overflow,
+                steering_updates: s.steering_updates,
+                steering_update_errors: s.steering_update_errors,
+                steered_peers: s.steered_peers,
+                kernel_drops_listener: s.kernel_drops_listener,
+                kernel_drops_established: s.kernel_drops_established,
+                dropped_stun_per_source: s.dropped_stun_per_source,
+                dropped_stun_global: s.dropped_stun_global,
+                dropped_established_peer: s.dropped_established_peer,
+                quic_retries: self.retry_counter.load(Ordering::Relaxed),
+                udp443_steering,
+                nft_floor,
+            },
+        )
+    }
+}
+
+/// Re-read the nft-floor status file every
+/// [`crate::nft_floor::NFT_FLOOR_REREAD_INTERVAL`] into `cell`. Runs on the
+/// front-door runtime (never the program runtime, invariant #1): a plain
+/// file read every 10 minutes is cheap and never blocks a data-plane path.
+async fn reread_nft_floor(path: std::path::PathBuf, cell: Arc<NftFloorCell>) {
+    let mut tick = tokio::time::interval(crate::nft_floor::NFT_FLOOR_REREAD_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick fires immediately; the caller already probed once at
+    // startup, so skip it to avoid a redundant duplicate read.
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let path = path.clone();
+        if let Ok(status) =
+            tokio::task::spawn_blocking(move || crate::nft_floor::probe(&path)).await
+        {
+            cell.store(status);
+        }
     }
 }
 

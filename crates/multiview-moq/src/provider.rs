@@ -1011,6 +1011,14 @@ pub struct SharedSocket {
     /// `(max_incoming, incoming_buffer_size_total)` caps on handshakes noq
     /// holds before the accept loop takes them.
     pub incoming: Option<(usize, u64)>,
+    /// QUIC Retry policy threshold (`network.quic.retry_above_handshakes`):
+    /// above this many handshakes in flight, an unvalidated `Incoming` that
+    /// may still retry is sent a Retry instead of accepted. `None` disables
+    /// it.
+    pub retry_above_handshakes: Option<usize>,
+    /// Bumped once per successful Retry. `None` when the embedder does not
+    /// track it.
+    pub retry_counter: Option<Arc<AtomicU64>>,
     /// The front door's runtime: the noq driver, connections and accept loop
     /// all run here.
     pub runtime: tokio::runtime::Handle,
@@ -1261,6 +1269,8 @@ impl Runtime {
                     socket: shared.socket,
                     endpoint: shared.endpoint,
                     incoming: shared.incoming,
+                    retry_above_handshakes: shared.retry_above_handshakes,
+                    retry_counter: shared.retry_counter,
                 });
                 // Build the endpoint inside the front-door runtime: noq spawns
                 // its endpoint driver and every connection task on the runtime

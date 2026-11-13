@@ -530,6 +530,11 @@ pub(crate) struct NoqServer {
 	/// `None` when the embedder injected its own socket ([`Injected`]); the
 	/// embedder then owns the socket's lifetime.
 	socket: Option<Socket>,
+	/// [`Injected::retry_above_handshakes`]. `None` unless an injected socket
+	/// set it: every other caller keeps the original accept path unchanged.
+	pub retry_above_handshakes: Option<usize>,
+	/// [`Injected::retry_counter`].
+	pub retry_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 	_reload: crate::tls::Reload,
 }
 
@@ -548,11 +553,26 @@ pub struct Injected {
 	/// `(max_incoming, incoming_buffer_size_total bytes)`. noq's defaults
 	/// (65 536 and 100 MiB) are too generous for a socket shared with media.
 	pub incoming: Option<(usize, u64)>,
+	/// QUIC Retry policy (RFC 9000 section 8.1.2): once the number of
+	/// handshakes in flight (accepted `Incoming`s whose handshake and SETUP
+	/// have not finished) reaches this count, an unvalidated `Incoming` that
+	/// may still retry is sent a Retry instead of accepted. `None` (every
+	/// caller before this field existed) never retries, byte for byte
+	/// unchanged.
+	pub retry_above_handshakes: Option<usize>,
+	/// Bumped once per successful `retry()` call, when set. The embedder
+	/// reads it for telemetry; a failed `retry()` (the `Incoming` already
+	/// carries a validated token) falls through to `ignore()` instead and is
+	/// not counted here.
+	pub retry_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl std::fmt::Debug for Injected {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("Injected").field("endpoint", &self.endpoint).finish_non_exhaustive()
+		f.debug_struct("Injected")
+			.field("endpoint", &self.endpoint)
+			.field("retry_above_handshakes", &self.retry_above_handshakes)
+			.finish_non_exhaustive()
 	}
 }
 
@@ -696,10 +716,13 @@ impl NoqServer {
 		member: Option<listen::Socket>,
 		injected: Option<Injected>,
 	) -> Result<Self> {
-		let (mut endpoint_config, injected_socket, incoming) = match injected {
-			Some(Injected { socket, endpoint, incoming }) => (endpoint, Some(socket), incoming),
-			None => (noq::EndpointConfig::default(), None, None),
-		};
+		let (mut endpoint_config, injected_socket, incoming, retry_above_handshakes, retry_counter) =
+			match injected {
+				Some(Injected { socket, endpoint, incoming, retry_above_handshakes, retry_counter }) => {
+					(endpoint, Some(socket), incoming, retry_above_handshakes, retry_counter)
+				}
+				None => (noq::EndpointConfig::default(), None, None, None, None),
+			};
 		let mut transport = noq::TransportConfig::default();
 		let quic = quic.resolve();
 		apply_transport(&mut transport, &quic);
@@ -835,12 +858,47 @@ impl NoqServer {
 			quic,
 			certs,
 			socket,
+			retry_above_handshakes,
+			retry_counter,
 			_reload,
 		})
 	}
 
 	pub fn accept(&self) -> impl std::future::Future<Output = Option<noq::Incoming>> + '_ {
 		self.quic.accept()
+	}
+
+	/// QUIC Retry policy (RFC 9000 section 8.1.2, [`Injected::retry_above_handshakes`]).
+	///
+	/// Once `handshakes_in_flight` (accepted `Incoming`s whose handshake and
+	/// SETUP have not yet finished, i.e. [`crate::server::Server`]'s own
+	/// `accept` queue length) reaches the configured threshold, an
+	/// `Incoming` whose remote address is not yet validated and that may
+	/// still retry is sent a Retry instead of accepted, bumping
+	/// [`Injected::retry_counter`]. A `retry()` that fails (the `Incoming`
+	/// already carries a validated token) falls through to `ignore()`
+	/// instead: either way `None` is returned, so the caller never accepts
+	/// it. With `retry_above_handshakes` unset (every caller before this
+	/// field existed), `incoming` is returned unchanged.
+	pub(crate) fn maybe_retry(&self, incoming: noq::Incoming, handshakes_in_flight: usize) -> Option<noq::Incoming> {
+		let Some(threshold) = self.retry_above_handshakes else {
+			return Some(incoming);
+		};
+		if handshakes_in_flight < threshold || incoming.remote_address_validated() || !incoming.may_retry() {
+			return Some(incoming);
+		}
+		match incoming.retry() {
+			Ok(()) => {
+				if let Some(counter) = &self.retry_counter {
+					counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				}
+				None
+			}
+			Err(err) => {
+				err.into_incoming().ignore();
+				None
+			}
+		}
 	}
 
 	pub fn certificates(&self) -> crate::tls::Certificates {

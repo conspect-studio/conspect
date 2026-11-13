@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
 
 /// A private 0700 directory under a temp root.
@@ -77,10 +77,13 @@ pub async fn serve_https(app: Router, pki: &FixturePki) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
+        let mut next_conn = 0_u64;
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            next_conn += 1;
+            let conn = ConnId(next_conn);
             let acceptor = acceptor.clone();
             let app = app.clone();
             tokio::spawn(async move {
@@ -88,8 +91,9 @@ pub async fn serve_https(app: Router, pki: &FixturePki) -> SocketAddr {
                     return;
                 };
                 let service = hyper::service::service_fn(
-                    move |req: hyper::Request<hyper::body::Incoming>| {
+                    move |mut req: hyper::Request<hyper::body::Incoming>| {
                         let app = app.clone();
+                        req.extensions_mut().insert(conn);
                         async move {
                             use tower::ServiceExt;
                             app.oneshot(req.map(axum::body::Body::new)).await
@@ -104,6 +108,11 @@ pub async fn serve_https(app: Router, pki: &FixturePki) -> SocketAddr {
     });
     addr
 }
+
+/// Which accepted TCP connection a request arrived on (1-based), set by
+/// [`serve_https`] on every request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnId(pub u64);
 
 /// Fault knobs of the fake Cloudflare API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -152,6 +161,11 @@ pub struct CfState {
     pub doh_queries: usize,
     /// How the fake `DoH` route answers.
     pub doh: DohMode,
+    /// Connections that have been given an empty answer
+    /// ([`DohMode::StickyPerConnection`]).
+    pub doh_negative_conns: Vec<ConnId>,
+    /// Distinct connections that carried a `DoH` query.
+    pub doh_conns: Vec<ConnId>,
 }
 
 /// How the fake `DoH` route answers TXT queries.
@@ -164,6 +178,16 @@ pub enum DohMode {
     Empty,
     /// A TXT with this value instead of the published one.
     Value(String),
+    /// Models a resolver front end that pins a negative answer to the
+    /// connection it was given on (#374): the first `hidden` queries see no
+    /// record; a connection that was ever given that empty answer keeps
+    /// getting it; a new connection after that sees the published records.
+    StickyPerConnection {
+        /// Queries answered empty before the record "propagates".
+        hidden: usize,
+    },
+    /// Answers with this HTTP status and no DNS body.
+    Status(u16),
 }
 
 pub type SharedCf = Arc<Mutex<CfState>>;
@@ -183,6 +207,8 @@ pub fn cf_state(auth: CfAuth, zones: &[(&str, &str)], challtestsrv: Option<Strin
         last_headers: Vec::new(),
         doh_queries: 0,
         doh: DohMode::Records,
+        doh_negative_conns: Vec::new(),
+        doh_conns: Vec::new(),
     }))
 }
 
@@ -408,6 +434,7 @@ fn published_values(state: &SharedCf, query: &[u8]) -> Vec<String> {
 /// RFC 8484 GET `/dns-query?dns=<base64url>`: answers TXT per [`DohMode`].
 async fn doh(
     State(s): State<SharedCf>,
+    conn: Option<Extension<ConnId>>,
     h: HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Result<([(axum::http::HeaderName, &'static str); 1], Vec<u8>), StatusCode> {
@@ -419,15 +446,38 @@ async fn doh(
     let wire = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(q.get("dns").ok_or(StatusCode::BAD_REQUEST)?)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let mode = {
+    let conn = conn.map(|Extension(c)| c);
+    let (mode, query, conn_negative) = {
         let mut st = s.lock().unwrap();
         st.doh_queries += 1;
-        st.doh.clone()
+        if let Some(c) = conn {
+            if !st.doh_conns.contains(&c) {
+                st.doh_conns.push(c);
+            }
+        }
+        let negative = conn.is_some_and(|c| st.doh_negative_conns.contains(&c));
+        (st.doh.clone(), st.doh_queries, negative)
     };
     let values = match mode {
         DohMode::Records => published_values(&s, &wire),
         DohMode::Empty => Vec::new(),
         DohMode::Value(v) => vec![v],
+        DohMode::Status(code) => {
+            return Err(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY))
+        }
+        DohMode::StickyPerConnection { hidden } => {
+            if query <= hidden || conn_negative {
+                if let Some(c) = conn {
+                    let mut st = s.lock().unwrap();
+                    if !st.doh_negative_conns.contains(&c) {
+                        st.doh_negative_conns.push(c);
+                    }
+                }
+                Vec::new()
+            } else {
+                published_values(&s, &wire)
+            }
+        }
     };
     let body = txt_response(&wire, &values).ok_or(StatusCode::BAD_REQUEST)?;
     Ok((

@@ -296,6 +296,34 @@ impl EgressClient {
         timeouts: EgressTimeouts,
         body_cap: usize,
     ) -> Result<Self, AcmeError> {
+        Self::build(policy, trust_anchor, timeouts, body_cap, true)
+    }
+
+    /// As [`Self::new`], but every request opens a fresh connection (no idle
+    /// pool). Used for DNS-over-HTTPS polling: a kept-alive connection stays
+    /// pinned to one resolver front end, and measured against
+    /// cloudflare-dns.com (#374) such a connection can keep answering the
+    /// pre-publish NXDOMAIN for minutes after the record exists, while a new
+    /// connection sees it within seconds.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    pub fn new_unpooled(
+        policy: EgressPolicy,
+        trust_anchor: Option<&Path>,
+        timeouts: EgressTimeouts,
+        body_cap: usize,
+    ) -> Result<Self, AcmeError> {
+        Self::build(policy, trust_anchor, timeouts, body_cap, false)
+    }
+
+    fn build(
+        policy: EgressPolicy,
+        trust_anchor: Option<&Path>,
+        timeouts: EgressTimeouts,
+        body_cap: usize,
+        pooled: bool,
+    ) -> Result<Self, AcmeError> {
         let redirect_policy = policy.clone();
         let mut builder = reqwest::Client::builder()
             .no_proxy()
@@ -314,6 +342,9 @@ impl EgressClient {
                     Err(refused) => attempt.error(refused),
                 }
             }));
+        if !pooled {
+            builder = builder.pool_max_idle_per_host(0);
+        }
         if let Some(anchor) = trust_anchor {
             builder = builder.tls_built_in_root_certs(false);
             for cert in read_anchor(anchor)? {
@@ -339,26 +370,45 @@ impl EgressClient {
     /// # Errors
     /// [`EgressError`] (no request data in it).
     pub async fn send(&self, request: reqwest::Request) -> Result<EgressResponse, EgressError> {
+        self.send_explained(request).await.map_err(|f| f.error)
+    }
+
+    /// As [`Self::send`], with a bounded, secret-free reason for a failure
+    /// (for diagnostics: which screen class, TLS, connect, timeout, ...).
+    ///
+    /// # Errors
+    /// [`EgressFailure`] (no request data in it).
+    pub async fn send_explained(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<EgressResponse, EgressFailure> {
         self.policy
             .screen_url(request.url())
-            .map_err(|_| EgressError::Refused)?;
+            .map_err(|refused| EgressFailure {
+                error: EgressError::Refused,
+                reason: refused.0,
+            })?;
         let mut response = self
             .client
             .execute(request)
             .await
-            .map_err(|e| classify_error(&e))?;
+            .map_err(|e| explain_error(&e))?;
         let status = response.status();
         let headers = response.headers().clone();
+        let too_large = EgressFailure {
+            error: EgressError::TooLarge,
+            reason: "body-over-cap",
+        };
         if response
             .content_length()
             .is_some_and(|len| usize::try_from(len).map_or(true, |len| len > self.body_cap))
         {
-            return Err(EgressError::TooLarge);
+            return Err(too_large);
         }
         let mut body = BytesMut::new();
-        while let Some(chunk) = response.chunk().await.map_err(|e| classify_error(&e))? {
+        while let Some(chunk) = response.chunk().await.map_err(|e| explain_error(&e))? {
             if body.len().saturating_add(chunk.len()) > self.body_cap {
-                return Err(EgressError::TooLarge);
+                return Err(too_large);
             }
             body.extend_from_slice(&chunk);
         }
@@ -368,6 +418,54 @@ impl EgressClient {
             body: body.freeze(),
         })
     }
+}
+
+/// A failed egress request with a bounded reason (a fixed token such as
+/// `refused:loopback`, `tls`, `connect`, `timeout`; never request data).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{error} ({reason})")]
+pub struct EgressFailure {
+    /// The category.
+    pub error: EgressError,
+    /// Why, as a fixed token.
+    pub reason: &'static str,
+}
+
+/// [`classify_error`] plus a fixed-token reason.
+fn explain_error(error: &reqwest::Error) -> EgressFailure {
+    let kind = classify_error(error);
+    let reason = refusal_reason(error).unwrap_or(match kind {
+        EgressError::Refused => "tls",
+        EgressError::TooLarge => "body-over-cap",
+        EgressError::Transport if error.is_timeout() => "timeout",
+        EgressError::Transport if error.is_connect() => "connect",
+        EgressError::Transport if error.is_body() || error.is_decode() => "body",
+        EgressError::Transport if error.is_redirect() => "redirect",
+        EgressError::Transport => "transport",
+    });
+    EgressFailure {
+        error: kind,
+        reason,
+    }
+}
+
+/// The screen class of an [`EgressRefused`] in an error chain, if any.
+fn refusal_reason(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = current {
+        if let Some(refused) = e.downcast_ref::<EgressRefused>() {
+            return Some(refused.0);
+        }
+        if let Some(inner) = e
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            current = Some(inner);
+            continue;
+        }
+        current = e.source();
+    }
+    None
 }
 
 /// Walk an error chain: a screen refusal or a rustls trust failure is

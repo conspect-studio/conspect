@@ -48,7 +48,8 @@ for p in "$MV" "$BIN" "$UNITS"; do
     safe_path "$p" || { echo "unsafe path: $p" >&2; exit 1; }
 done
 for f in "$BIN" "$STATE" "$MV/conspect.toml" "$LE/fullchain.pem" "$LE/privkey.pem" \
-         "$UNITS/conspect.socket" "$UNITS/conspect.service.d/10-socket-activation.conf"; do
+         "$UNITS/conspect.socket" "$UNITS/conspect.service.d/10-socket-activation.conf" \
+         "$UNITS/conspect.service.d/20-nft-floor.conf"; do
     [ -e "$f" ] || { echo "missing $f" >&2; exit 1; }
 done
 if [ -e "$STATE.pre-cutover" ] && [ "${FORCE:-0}" != 1 ]; then
@@ -205,6 +206,10 @@ nginx -T > "$MV/nginx-T.pre-cutover.txt" 2>&1 || true
 install -m 0644 "$UNITS/conspect.socket" /etc/systemd/system/conspect.socket
 install -D -m 0644 "$UNITS/conspect.service.d/10-socket-activation.conf" \
     /etc/systemd/system/conspect.service.d/10-socket-activation.conf
+# The nft UDP 443 floor status writer (slice 3, docs/runbooks/udp-443-flood.md):
+# the engine reports nft_floor present/absent/unknown from what it writes.
+install -D -m 0644 "$UNITS/conspect.service.d/20-nft-floor.conf" \
+    /etc/systemd/system/conspect.service.d/20-nft-floor.conf
 systemctl daemon-reload
 t0=$(date +%s.%N)
 systemctl stop conspect.service

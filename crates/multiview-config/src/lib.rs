@@ -117,7 +117,8 @@ pub use multicast::{
 pub use network_diagnostics::NetworkDiagnosticsConfig;
 pub use network_tls::{
     AcmeChallenge, CertificateAuthority, DnsConfirm, DnsProviderConfig, IceTcpConfig,
-    NetworkConfig, NetworkMode, NetworkTlsConfig, TrustedProxy,
+    NetworkConfig, NetworkMode, NetworkQuicConfig, NetworkTlsConfig, NetworkUdpConfig,
+    TrustedProxy,
 };
 pub use origin::{Origin, OriginParseError};
 pub use output_format::{
