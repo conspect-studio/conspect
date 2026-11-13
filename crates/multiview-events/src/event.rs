@@ -424,6 +424,11 @@ pub enum WarningCode {
     /// `multiview acknowledge-fallback`) silences the current alarm only.
     /// Remediation: fix or re-apply the configuration.
     AcceptedStateRejected,
+    /// The front-door TLS certificate needs attention (ADR-0107 section 5a):
+    /// renewal is failing and under 50 % (warning) or 25 % (critical) of the
+    /// lifetime remains, or the served certificate has expired (critical).
+    /// Cleared when a renewal succeeds. Carries no secret.
+    TlsCertificate,
 }
 
 /// Which end of a RIST link a [`RistLinkStats`] sample describes.
@@ -558,6 +563,7 @@ impl WarningCode {
             Self::ContainerNoHostNetworking => "container-no-host-networking",
             Self::CatalogueLinkAttention => "catalogue-link-attention",
             Self::AcceptedStateRejected => "accepted-state-rejected",
+            Self::TlsCertificate => "tls-certificate",
         }
     }
 }

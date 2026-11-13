@@ -98,7 +98,8 @@ TLS-0 has **no hot-reload**: replace the `cert_file`/`key_file` PEMs and
 
 ## Scope / limits
 
-- **No ACME / auto-renew** in TLS-0 (a later phase); rotation is manual + restart.
+- **No ACME / auto-renew** in TLS-0; rotation is manual + restart. ACME certificates for the
+  network front door are `[network.tls]`: see [acme-certificates.md](acme-certificates.md).
 - **Slowloris** (half-open slow-header floods) remain out of scope for the
   in-process floor (as for plain HTTP, [ADR-W028](../decisions/ADR-W028.md)); front
   the plane with a reverse proxy if that is a concern (tracked as follow-up #126).

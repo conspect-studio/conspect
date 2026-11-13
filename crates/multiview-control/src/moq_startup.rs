@@ -53,6 +53,48 @@ impl MoqListenerConfig {
         })
     }
 
+    /// `(endpoint, protocol)` for a listener on the front door whose
+    /// certificate comes from the ACME source (ADR-0107 section 5a):
+    /// `MULTIVIEW_MOQ_ENDPOINT` and `MULTIVIEW_MOQ_PROTOCOL` with the same
+    /// checks as [`from_env`](Self::from_env); the certificate files are not
+    /// read (and are ignored with a warning when set).
+    ///
+    /// # Errors
+    /// Returns unavailable for incomplete or unsafe explicit settings.
+    pub fn endpoint_from_env() -> Result<Option<(String, String)>, MoqReject> {
+        Self::endpoint_from_values(|name| std::env::var(name).ok())
+    }
+
+    fn endpoint_from_values(
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<(String, String)>, MoqReject> {
+        let Some(endpoint) = get("MULTIVIEW_MOQ_ENDPOINT") else {
+            return Ok(None);
+        };
+        let url = url::Url::parse(&endpoint).map_err(|_| MoqReject::Unavailable)?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(MoqReject::Unavailable);
+        }
+        let protocol = get("MULTIVIEW_MOQ_PROTOCOL").ok_or(MoqReject::Unavailable)?;
+        if !matches!(protocol.as_str(), "moq-transport-16" | "moq-transport-18") {
+            return Err(MoqReject::Unavailable);
+        }
+        if get("MULTIVIEW_MOQ_CERTIFICATE").is_some() || get("MULTIVIEW_MOQ_PRIVATE_KEY").is_some()
+        {
+            tracing::warn!(
+                "MULTIVIEW_MOQ_CERTIFICATE/_PRIVATE_KEY are ignored while [network.tls] supplies \
+                 the front-door certificate (ADR-0107)"
+            );
+        }
+        Ok(Some((endpoint, protocol)))
+    }
+
     fn from_values(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, MoqReject> {
         let Some(endpoint) = get("MULTIVIEW_MOQ_ENDPOINT") else {
             return Ok(None);
@@ -131,6 +173,69 @@ pub async fn start_shared(
         std::time::Duration::from_secs(30),
         16,
     )))
+}
+
+/// A provider whose listener starts later (ADR-0107 section 5a: the front-door
+/// QUIC lane is not started while the certificate is in `setup`). Until
+/// [`DeferredProvider::set`] runs it is unavailable, so every `MoQ` lease answers
+/// the existing honest `503`; afterwards it forwards to the real provider.
+/// One lock-free read per admission check.
+#[derive(Default)]
+pub struct DeferredProvider {
+    inner: std::sync::OnceLock<Arc<dyn crate::moq::MoqProvider>>,
+}
+
+impl DeferredProvider {
+    /// Install the real provider (first call wins).
+    pub fn set(&self, provider: Arc<dyn crate::moq::MoqProvider>) {
+        let _ = self.inner.set(provider);
+    }
+
+    /// Whether the real provider is installed.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        self.inner.get().is_some()
+    }
+}
+
+impl crate::moq::MoqProvider for DeferredProvider {
+    fn available(&self) -> bool {
+        self.inner.get().is_some_and(|p| p.available())
+    }
+    fn admit(
+        &self,
+        principal: &crate::auth::Principal,
+        scope: &crate::preview::WhepScope,
+        subscription_id: &str,
+        ttl: std::time::Duration,
+    ) -> Result<(crate::moq::MoqLease, Arc<dyn crate::moq::MoqFence>), MoqReject> {
+        self.inner.get().ok_or(MoqReject::Unavailable)?.admit(
+            principal,
+            scope,
+            subscription_id,
+            ttl,
+        )
+    }
+}
+
+/// [`start_shared`] serving the certificate from `resolver` (the front door's
+/// ACME source) instead of `MULTIVIEW_MOQ_CERTIFICATE`/`_PRIVATE_KEY` files.
+///
+/// # Errors
+/// As for [`start_shared`].
+pub async fn start_shared_resolver(
+    endpoint: String,
+    protocol: String,
+    factory: Option<Arc<dyn AuthorizedFeedFactory>>,
+    on: multiview_moq::provider::SharedSocket,
+    resolver: Arc<dyn multiview_moq::moq_tokio_rustls::server::ResolvesServerCert>,
+) -> Result<Arc<dyn crate::moq::MoqProvider>, MoqReject> {
+    let factory = factory.ok_or(MoqReject::Unavailable)?;
+    let runtime =
+        multiview_moq::provider::Runtime::listen_resolver_on(on, endpoint, &protocol, resolver)
+            .await
+            .map_err(|_| MoqReject::Unavailable)?;
+    Ok(Arc::new(WebTransportProvider::new(runtime, factory)))
 }
 
 /// Start only with an actual authorized shared-rendition factory.
