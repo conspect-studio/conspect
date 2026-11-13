@@ -3683,16 +3683,18 @@ impl Pipeline {
             has_preview.then(|| Arc::new(multiview_framestore::SwapCell::new(None)));
         let feeds: crate::routing_aux::AuxFeeds =
             Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new()));
+        let aux_canvas = crate::routing_aux::AuxCanvas {
+            width: self.encode_cfg.width,
+            height: self.encode_cfg.height,
+            color: self.canvas_color.output_tag(),
+        };
+        let plan_stores = Arc::clone(&stores);
         let aux = crate::routing_aux::spawn_routing_aux(crate::routing_aux::AuxInputs {
             rx: aux_rx,
             feeds: Arc::clone(&feeds),
             stores: Arc::clone(&stores),
             preview_selection: preview_selection.clone(),
-            canvas: crate::routing_aux::AuxCanvas {
-                width: self.encode_cfg.width,
-                height: self.encode_cfg.height,
-                color: self.canvas_color.output_tag(),
-            },
+            canvas: aux_canvas,
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
@@ -3745,8 +3747,11 @@ impl Pipeline {
                 program_audio: audio_tracks.get(index).is_some_and(|t| t.contains(&0)),
             })
             .collect();
-        self.output_routing
-            .store(Some(Arc::new(handle.with_outputs(run_outputs))));
+        self.output_routing.store(Some(Arc::new(
+            handle
+                .with_outputs(run_outputs)
+                .with_pictures(plan_stores, aux_canvas),
+        )));
         Ok(RunRouting {
             consumer: ConsumerRouting {
                 router: Box::new(router),

@@ -284,6 +284,10 @@ pub struct OutputRoutingHandle {
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
     outputs: Arc<[RunOutput]>,
     has_preview: bool,
+    /// What the plan needs to tell an identity picture (P2) from a convert
+    /// (P3), #342 B2: the run's store lookup and its canvas. `None` until
+    /// [`OutputRoutingHandle::with_pictures`].
+    pictures: Option<(StoreLookup, crate::routing_aux::AuxCanvas)>,
 }
 
 /// One routable position of the run (the router's output index).
@@ -346,6 +350,24 @@ impl OutputRoutingHandle {
     pub fn with_outputs(mut self, outputs: Vec<RunOutput>) -> Self {
         self.outputs = outputs.into();
         self
+    }
+
+    /// Attach the run's store lookup and canvas (#342 B2: the plan's P2/P3
+    /// identity check reads a source's newest tile, wait-free).
+    #[must_use]
+    pub fn with_pictures(
+        mut self,
+        stores: StoreLookup,
+        canvas: crate::routing_aux::AuxCanvas,
+    ) -> Self {
+        self.pictures = Some((stores, canvas));
+        self
+    }
+
+    /// The run's store lookup and canvas, when attached.
+    #[must_use]
+    pub fn pictures(&self) -> Option<&(StoreLookup, crate::routing_aux::AuxCanvas)> {
+        self.pictures.as_ref()
     }
 
     /// The run's output map, by router index.
@@ -785,6 +807,7 @@ impl OutputRouter {
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
             outputs: Arc::from(Vec::new()),
             has_preview: cfg.has_preview,
+            pictures: None,
         };
         let mut router = Self {
             cfg,

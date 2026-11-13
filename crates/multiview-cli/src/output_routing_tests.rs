@@ -3960,3 +3960,68 @@ fn format_keyed_feeds_are_bounded_by_the_encoder_cap() {
     assert!(x.r.feed_keys().len() <= MAX, "{:?}", x.r.feed_keys());
     assert_eq!(x.r.dynamic_keys().len(), MAX);
 }
+
+/// #342 B2: the plan's §12.4 path through the adapter. Program is P1 (the
+/// base key); a source whose newest tile is the output's size is P2; the same
+/// source on a non-canvas output is P3 with one convert, and once that
+/// (picture, format) key is live a second output at the format is P1.
+#[test]
+fn plan_slot_reports_the_cheapest_path() {
+    use multiview_control::output_routing::{OutputRouting, PlanPath, RoutedFeed};
+    let mut x = harness(3, 6, None);
+    // Harness tiles are 16x16, and the canvas below is 16x16 too.
+    x.r.cfg.formats = vec![None, Some(vertical_format()), Some(vertical_format())];
+    let lookup_store = Arc::clone(&x.store);
+    let stores: crate::routing_aux::StoreLookup =
+        Arc::new(move |id: &str| (id == "cam").then(|| Arc::clone(&lookup_store)));
+    let canvas = crate::routing_aux::AuxCanvas {
+        width: 16,
+        height: 16,
+        color: CanvasColor::default().output_tag(),
+    };
+    let run = |id: &str, feed_format| RunOutput {
+        id: Some(id.into()),
+        settings: 0,
+        feed_format,
+        routable: true,
+        program_audio: true,
+    };
+    let h =
+        x.h.clone()
+            .with_outputs(vec![
+                run("wide", None),
+                run("tall", Some(vertical_format())),
+                run("tall2", Some(vertical_format())),
+            ])
+            .with_pictures(stores, canvas);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let cam = RoutedFeed::Source("cam".into());
+    for t in 0..5 {
+        x.tick(t);
+    }
+    let p = adapter.plan_slot("wide", &RoutedFeed::Program).unwrap();
+    assert_eq!(
+        (p.path, p.converts, p.cost.needs_encoder),
+        (PlanPath::P1, 0, false)
+    );
+    let p = adapter.plan_slot("wide", &cam).unwrap();
+    assert_eq!(
+        (p.path, p.converts, p.cost.needs_encoder),
+        (PlanPath::P2, 0, true)
+    );
+    let p = adapter.plan_slot("tall", &cam).unwrap();
+    assert_eq!(
+        (p.path, p.converts, p.cost.needs_encoder),
+        (PlanPath::P3, 1, true)
+    );
+    // Take `tall` to the source: its (src:cam@format, settings) key goes live.
+    x.h.try_take(take("t", 1, src())).unwrap();
+    take_until_applied(&mut x, &["t"], 5);
+    let p = adapter.plan_slot("tall2", &cam).unwrap();
+    assert_eq!(
+        (p.path, p.converts, p.cost.needs_encoder),
+        (PlanPath::P1, 0, false)
+    );
+}

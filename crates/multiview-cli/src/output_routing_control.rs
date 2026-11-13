@@ -13,8 +13,8 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_control::output_routing::{
-    OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost, PlanRefusal, RoutedFeed,
-    RoutingLive, TakeSubmitError,
+    OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost, PlanPath, PlanRefusal,
+    RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
 };
 
 use crate::output_routing::{
@@ -193,6 +193,70 @@ impl OutputRouting for OutputRoutingAdapter {
                 .dynamic_encoders_live
                 .saturating_add(snapshot.opens_in_flight),
             sessions_max: self.max_encoders,
+        })
+    }
+
+    /// §12.4 path of a crosspoint onto the output's video slot 0 (#342 B2):
+    /// P1 when an encoded bus with key (picture, format, settings) is live
+    /// (Program at the output's format is always its base key), P2 when the
+    /// picture is identity at the output's format, else P3 (+1 convert unless
+    /// that (picture, format) feed is already live). Wait-free: one snapshot
+    /// load and, for a source, one newest-tile load.
+    fn plan_slot(&self, output: &str, feed: &RoutedFeed) -> Result<SlotPlan, PlanRefusal> {
+        let cost = self.plan(output, feed)?;
+        let handle = self.handle().ok_or(PlanRefusal::OutputKindUnroutable)?;
+        let run_output = handle
+            .index_of(output)
+            .and_then(|index| handle.outputs().get(index).cloned())
+            .ok_or(PlanRefusal::OutputKindUnroutable)?;
+        if !cost.needs_encoder {
+            return Ok(SlotPlan {
+                path: PlanPath::P1,
+                cost,
+                converts: 0,
+            });
+        }
+        let identity = match feed {
+            RoutedFeed::Program => true,
+            // Clean is the canvas picture: identity whenever the output is
+            // canvas-sized (its key converts only at another size).
+            RoutedFeed::Clean => handle.pictures().is_none_or(|(_, canvas)| {
+                run_output
+                    .feed_format
+                    .is_none_or(|f| f.width == canvas.width && f.height == canvas.height)
+            }),
+            // Preview is composed from the PVW source tile: identity only
+            // when it is not composed at an output format.
+            RoutedFeed::Preview => run_output.feed_format.is_none(),
+            RoutedFeed::Source(id) => handle.pictures().is_some_and(|(stores, canvas)| {
+                let (w, h) = run_output
+                    .feed_format
+                    .map_or((canvas.width, canvas.height), |f| (f.width, f.height));
+                stores(id)
+                    .and_then(|store| store.slot().load())
+                    .is_some_and(|tile| {
+                        tile.width() == w
+                            && tile.height() == h
+                            && tile.alpha_plane().is_none()
+                            && tile.color() == canvas.color
+                    })
+            }),
+        };
+        if identity {
+            return Ok(SlotPlan {
+                path: PlanPath::P2,
+                cost,
+                converts: 0,
+            });
+        }
+        let feed_live = matches!(feed, RoutedFeed::Source(_) | RoutedFeed::Preview) && {
+            let name = crate::routing_aux::feed_name(&picture_bus(feed), run_output.feed_format);
+            handle.snapshot().live_keys.iter().any(|(b, _)| *b == name)
+        };
+        Ok(SlotPlan {
+            path: PlanPath::P3,
+            cost,
+            converts: u8::from(!feed_live),
         })
     }
 
