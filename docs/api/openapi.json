@@ -7979,6 +7979,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "`engine-busy`: an output slot's `{layout}` could not be read now (every layout-read slot is in use); retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
           }
         }
       }
@@ -8073,7 +8083,7 @@
             }
           },
           "503": {
-            "description": "`engine-busy` (the key and leases are released) or `idempotency-capacity`.",
+            "description": "`engine-busy` (the key and leases are released; or an output slot's `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9758,7 +9768,7 @@
             }
           },
           "503": {
-            "description": "`engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise).",
+            "description": "`engine-busy`: the take mailbox is full (the key is freed), or a `{layout}` feed could not be read now (every layout-read slot is in use; nothing reserved); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise).",
             "content": {
               "application/json": {
                 "schema": {
@@ -9810,6 +9820,16 @@
           },
           "403": {
             "description": "Not authorized to plan this crosspoint (an output target: object AND output axis).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`engine-busy`: an output target's `{layout}` feed could not be read now (every layout-read slot is in use); retry.",
             "content": {
               "application/json": {
                 "schema": {

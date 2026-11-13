@@ -194,6 +194,7 @@ pub(crate) fn plan(
     principal: &Principal,
     req: &PatchRequest,
     patch: &OutputPatch,
+    layout: Option<&super::output_routing::LayoutRead>,
 ) -> ControlResult<Result<PatchPlan, Response>> {
     let Some(control) = state.output_routing.as_ref() else {
         return Ok(Err(routing_unavailable()));
@@ -207,7 +208,7 @@ pub(crate) fn plan(
     let mut planned_path = "P1";
     let mut cost = None;
     let mut refused: Option<PatchRefusal> = None;
-    match resolve_feed(state, principal, &patch.video)? {
+    match resolve_feed(state, principal, &patch.video, layout)? {
         Err((_, "unknown-feed", _)) => {
             refused = Some(refusal(
                 "unknown-source",
@@ -291,6 +292,7 @@ pub(crate) fn take(
     principal: &Principal,
     idem: &IdempotencyKey,
     patch: &OutputPatch,
+    layout: Option<&super::output_routing::LayoutRead>,
 ) -> ControlResult<Result<String, Response>> {
     if idem.0.as_deref().is_none_or(|k| k.trim().is_empty()) {
         return Err(ControlError::Validation(
@@ -309,6 +311,7 @@ pub(crate) fn take(
             &patch.output,
             Some(&patch.video),
             patch.audio_follow.then_some(&AudioFeed::Follow),
+            layout,
         )? {
             SlotTake::Accepted(op) => Ok(op),
             SlotTake::Replay(replay) => Ok(replay.operation_id.to_string()),
