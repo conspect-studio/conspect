@@ -312,14 +312,19 @@ pub const MAX_LIMITED_OUTPUTS: usize = 1024;
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
 /// Operation-id prefix of EVERY take the engine issues itself at run start to
-/// re-apply persisted state (a start-up, or boot, take): `boot:<output config
-/// id>` for the video (or combined) take, [`BOOT_AUDIO_TAKE_PREFIX`] for an
+/// re-apply persisted state (a start-up, or boot, take): `boot:<output
+/// index>` for the video (or combined) take, [`BOOT_AUDIO_TAKE_PREFIX`] for an
 /// audio-only one. The one shared definition: the engine mints these ids and
 /// the outcome relay recognises them by [`is_boot_take`]. A boot outcome is
 /// never persisted, applied or not: the accepted row is the operator's intent.
+/// PR #352 round 2: the engine keys every boot id on the run's OUTPUT INDEX,
+/// never on a parsed config id — a config id (an HLS one is a path) can be
+/// arbitrarily long, so a config-id-derived id risked truncation collisions
+/// or outright rejection by the take-id length check. The relay here only
+/// ever matches the prefix, so it is unaffected either way.
 pub const BOOT_TAKE_PREFIX: &str = "boot:";
-/// Operation-id prefix of an audio-only boot take: `boot:audio:<output config
-/// id>` (itself under [`BOOT_TAKE_PREFIX`]).
+/// Operation-id prefix of an audio-only boot take: `boot:audio:<output
+/// index>` (itself under [`BOOT_TAKE_PREFIX`]).
 pub const BOOT_AUDIO_TAKE_PREFIX: &str = "boot:audio:";
 
 /// Whether `operation_id` names a start-up (boot) take the engine issued

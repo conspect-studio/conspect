@@ -980,13 +980,17 @@ encoded as frame T.
   at start-up (`outputs_carry_program` no longer refuses it). The run starts every output on
   `follow` and, right after its routing handle is published, issues one **audio-only boot take**
   per output whose persisted audio is not `follow` (`Pipeline::issue_boot_audio_takes`, operation
-  id `boot:audio:<output>`). An audio-only take has no fresh gate, so there is no retry: a boot take
+  id `boot:audio:<output index>`). An audio-only take has no fresh gate, so there is no retry: a boot take
   that cannot be enqueued or is refused (an output without a program-audio slot, a multi-track or
   undeclared-track feed) is logged, the output stays on `follow`, and the persisted value is kept.
   When the same row also persists a non-Program video feed, the audio rides that output's video
-  **boot take** instead (one combined take, `boot:<output>`, see Restart below), so the two never
-  supersede each other; if that boot take is given up, the router issues its audio alone as
-  `boot:audio:<output>` (no fresh gate), so a refused video never drops the persisted audio.
+  **boot take** instead (one combined take, `boot:<output index>`, see Restart below), so the two
+  never supersede each other; if that boot take is given up, the router issues its audio alone as
+  `boot:audio:<output index>` (no fresh gate), so a refused video never drops the persisted audio.
+  Every boot id is keyed on the run's OUTPUT INDEX, never parsed from the config id (PR #352 round
+  2): an HLS config id is a path and can be arbitrarily long, so a config-id-derived id risked
+  truncation collisions or outright rejection by the take-id length check; the index is always
+  short and fixed. Logs still name the config id for operators.
 
 ---
 
@@ -1034,7 +1038,7 @@ a last-good fallback (`crates/multiview-cli/src/boot.rs`, `splice_output_routing
 
 The engine itself always starts every output on Program. Right after the run's routing handle is
 published, before the clock starts, it enqueues one **boot take** per output whose persisted feed is not
-Program: `operation_id = "boot:<output config id>"`, principal `system:boot`. A boot take goes through
+Program: `operation_id = "boot:<output index>"`, principal `system:boot`. A boot take goes through
 the normal gate (fresh within 50 ticks, capacity), so a source that is not up yet is refused
 `feed-not-fresh`. The router on the bake consumer then re-issues it at most once every 2 s, for up to
 30 s after the run's first tick. This state is O(outputs), lives off the clock on the consumer that
@@ -1042,7 +1046,7 @@ already owns the take state machine, and needs no extra thread or timer. An oper
 output ends the boot take for good. After the window, or on a refusal that cannot clear (unroutable,
 format mismatch), the output stays on Program, a warning is logged, and the routing snapshot counts it
 (`boot_takes_given_up`). A refused or expired boot take never deletes the persisted feed: the operator's
-intent stays. An applied boot take is not persisted either: every boot id (`boot:<id>`, `boot:audio:<id>`) shares the one
+intent stays. An applied boot take is not persisted either: every boot id (`boot:<index>`, `boot:audio:<index>`) shares the one
 `BOOT_TAKE_PREFIX` in `multiview-control`, and the outcome relay skips persistence for `is_boot_take` ids.
 
 **What the operator sees when a boot take is refused.** `GET /routing` shows `video: {"bus":

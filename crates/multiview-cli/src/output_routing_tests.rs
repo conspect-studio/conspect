@@ -2322,25 +2322,34 @@ fn tone_and_back(x: &mut AudioHarness) -> (u64, u64, u64) {
 /// with a video feed AND an explicit audio feed boots as ONE combined boot
 /// take (so the audio-only boot take never supersedes the video one). When
 /// that take's video is refused for good, the boot take is given up but its
-/// audio is still applied, alone, as `boot:audio:<id>`.
+/// audio is still applied, alone, as `boot:audio:<output index>` — keyed on
+/// the OUTPUT INDEX, never by re-parsing the give-up take's `operation_id`
+/// (PR #352 round 2): the id below deliberately does NOT name the output
+/// index (an HLS config id is a path and can be arbitrarily long and
+/// unrelated to the index), yet the re-issued audio id is still
+/// `boot:audio:1`.
 #[test]
 fn a_given_up_combined_boot_take_still_applies_its_audio() {
     let mut x = audio_harness(2, NTSC, Box::new(|_| Err("no video".to_owned())));
     let t = x.run(0, 6);
-    // Preview on a run without a switcher: refused `unroutable` for good.
+    // Preview on a run without a switcher: refused `unroutable` for good. The
+    // operation id is a long, unrelated string (as a truncated HLS path
+    // would be, under the take-id length cap) to prove `boot_audio_alone`
+    // never parses it.
+    let long_config_id_take = format!("{BOOT_TAKE_PREFIX}{}", "z".repeat(100));
     x.h.try_take(OutputTake {
-        operation_id: format!("{BOOT_TAKE_PREFIX}o1"),
+        operation_id: long_config_id_take.clone(),
         output_index: 1,
         bus: Some(PictureBus::Preview),
         audio: Some(bars_src()),
         principal: BOOT_PRINCIPAL.to_owned(),
     })
     .unwrap();
-    let (o, t) = x.until(t, &format!("{BOOT_AUDIO_TAKE_PREFIX}o1"), 60);
+    let (o, t) = x.until(t, &format!("{BOOT_AUDIO_TAKE_PREFIX}1"), 60);
     assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
-    // The router-minted audio id is a boot take to the control plane (never
-    // persisted), with the shared `boot:` prefix.
-    assert_eq!(o.operation_id, "boot:audio:o1");
+    // The router-minted audio id is keyed on the output index (1), not on
+    // any substring of the give-up take's (unrelated) operation id.
+    assert_eq!(o.operation_id, "boot:audio:1");
     assert!(multiview_control::output_routing::is_boot_take(
         &o.operation_id
     ));
@@ -2348,7 +2357,7 @@ fn a_given_up_combined_boot_take_still_applies_its_audio() {
     let boot: Vec<_> = x
         .others
         .iter()
-        .filter(|o| o.operation_id == format!("{BOOT_TAKE_PREFIX}o1"))
+        .filter(|o| o.operation_id == long_config_id_take)
         .collect();
     assert_eq!(boot.len(), 1, "{:?}", x.others);
     assert_eq!(

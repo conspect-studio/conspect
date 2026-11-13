@@ -284,12 +284,19 @@ fn boot_output_feeds(config: &MultiviewConfig) -> Vec<(String, crate::routing_au
 }
 
 /// Enqueue one BOOT TAKE per output whose persisted feed is not Program
-/// (#329): `operation_id = "boot:<config id>"`, principal `system:boot`. The
-/// take rides the normal gate (fresh within the prime deadline, capacity); the
-/// router re-issues a refused one within its bounded retry window. Called once
-/// per run, right after the handle exists and before the clock starts; the
-/// mailbox (64) is far larger than the outputs of any run, and a refused
-/// enqueue only logs (the output stays on Program).
+/// (#329): `operation_id = "boot:<output index>"`, principal `system:boot`.
+/// PR #352 round 2: the id is keyed on the OUTPUT INDEX, never parsed from the
+/// config id — an HLS config id is a path and can be arbitrarily long, so
+/// truncating `boot:<config id>` to [`crate::output_routing::MAX_TAKE_ID_BYTES`]
+/// could collide with another output's truncated id or (for the audio-only
+/// take) be rejected by `try_take`'s own length check. `boot:<index>` is
+/// always well under the limit. The take rides the normal gate (fresh within
+/// the prime deadline, capacity); the router re-issues a refused one within
+/// its bounded retry window, matched on the output index (not by re-parsing
+/// the id). Called once per run, right after the handle exists and before the
+/// clock starts; the mailbox (64) is far larger than the outputs of any run,
+/// and a refused enqueue only logs (the output stays on Program). The config
+/// id is still named in the log line for operators.
 ///
 /// A persisted explicit audio feed on the same output rides this take (a
 /// combined take, when the output has a program-audio slot), so the
@@ -316,16 +323,9 @@ fn enqueue_boot_takes(
             tracing::warn!(output = %id, "routing: this output's kind cannot switch feeds live; it stays on Program");
             continue;
         }
-        // Bounded like every take id (an HLS config id is its path): cut on a
-        // char boundary; the router matches boot takes by prefix and op id.
-        let mut operation_id = format!("{}{id}", crate::output_routing::BOOT_TAKE_PREFIX);
-        let mut end = operation_id
-            .len()
-            .min(crate::output_routing::MAX_TAKE_ID_BYTES);
-        while !operation_id.is_char_boundary(end) {
-            end -= 1;
-        }
-        operation_id.truncate(end);
+        // Short and fixed: always well under MAX_TAKE_ID_BYTES, no matter how
+        // long the config id is (an HLS config id is its path).
+        let operation_id = format!("{}{output_index}", crate::output_routing::BOOT_TAKE_PREFIX);
         let audio = audio
             .iter()
             .find(|(output, _)| output == id)
@@ -3703,8 +3703,13 @@ impl Pipeline {
             if video_boot {
                 continue;
             }
+            // Keyed on the output index, not the config id (PR #352 round
+            // 2): an HLS config id is a path and can be arbitrarily long, and
+            // `try_take` rejects an id over MAX_TAKE_ID_BYTES outright, so
+            // parsing/truncating it here could silently drop a long-id
+            // output's boot audio.
             let take = crate::output_routing::OutputTake {
-                operation_id: format!("{}{output}", crate::output_routing::BOOT_AUDIO_TAKE_PREFIX),
+                operation_id: format!("{}{index}", crate::output_routing::BOOT_AUDIO_TAKE_PREFIX),
                 output_index: index,
                 bus: None,
                 audio: Some(choice.clone()),

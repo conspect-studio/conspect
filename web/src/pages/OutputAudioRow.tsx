@@ -87,16 +87,27 @@ function followCarries(video: unknown): string | undefined {
 /**
  * The current (on-air) select value of a routing row: the configured value
  * when it is what the output carries (so `follow` stays `follow`), else the
- * live `effective_audio`; the configured value when the live one is hidden.
+ * live `effective_audio`. A REDACTED `effective_audio` (the row's video is
+ * hidden too, ADR-0108 §6.3) never falls back to the configured value — that
+ * would leak it — so `hidden` is set and `key`/`configured` are both blank
+ * (PR #352 round 2 review). Only an ABSENT `effective_audio` (no live run)
+ * falls back to the configured value, as before.
  */
-function onAirKeyOf(route: OutputRouteState): { readonly key: string; readonly configured: string } {
+function onAirKeyOf(route: OutputRouteState): {
+  readonly key: string;
+  readonly configured: string;
+  readonly hidden: boolean;
+} {
   const configuredFeed = audioOf(route.audio);
   const configured = configuredFeed === undefined ? '' : audioKey(configuredFeed);
+  if (isRedacted(route.effective_audio)) return { key: '', configured: '', hidden: true };
   const live = effectiveKey(route.effective_audio);
-  if (live === undefined) return { key: configured, configured };
-  if (configured === live) return { key: configured, configured };
-  if (configured === 'follow' && followCarries(route.video) === live) return { key: 'follow', configured };
-  return { key: live, configured };
+  if (live === undefined) return { key: configured, configured, hidden: false };
+  if (configured === live) return { key: configured, configured, hidden: false };
+  if (configured === 'follow' && followCarries(route.video) === live) {
+    return { key: 'follow', configured, hidden: false };
+  }
+  return { key: live, configured, hidden: false };
 }
 
 interface Choice {
@@ -220,7 +231,11 @@ export function OutputAudioRow({
         })())
       : undefined;
   const selectedAudio = audioFromKey(selected);
-  const redacted = route !== undefined && isRedacted(route.audio);
+  // Hidden either because the configured audio itself is redacted, or
+  // because the live `effective_audio` is redacted (the row's video feed is
+  // hidden too): neither case may fall back to showing the configured value
+  // as current (PR #352 round 2 review).
+  const redacted = route !== undefined && (isRedacted(route.audio) || (onAir?.hidden ?? false));
   const refusal = plan?.refusals[0];
   const takeDisabledReason =
     selectedAudio === undefined

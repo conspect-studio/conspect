@@ -159,6 +159,27 @@ describe('OutputAudioRow', () => {
     }
   });
 
+  it('hides the current value when effective_audio is redacted, never falling back to the configured one (PR #352 round 2)', () => {
+    // Configured a readable `{source: x}`, but the engine's effective_audio
+    // is redacted (the row's video is also hidden to this caller): the
+    // select must be empty/disabled, the label "Hidden", and "x" must never
+    // appear as the current value.
+    const hidden: OutputRouteState = {
+      ...followRow,
+      audio: { source: 'secret' } as unknown as OutputRouteState['audio'],
+      effective_audio: { redacted: true } as unknown as OutputRouteState['effective_audio'],
+    };
+    renderWithProviders(
+      <OutputAudioRow output="out-1" outputName="Out 1" route={hidden} sources={sources} tracks={['eng']} />,
+    );
+    const select = screen.getByLabelText(/Audio feed for Out 1/);
+    expect(select).toBeDisabled();
+    expect(select).toHaveValue('');
+    expect(screen.getByTestId('output-audio')).toHaveTextContent('Hidden');
+    expect(screen.queryByTestId('output-configured-audio')).toBeNull();
+    expect(screen.queryByText('secret')).toBeNull();
+  });
+
   it('plans stream audio, shows the cost line, and posts the audio-only take', async () => {
     renderWithProviders(
       <OutputAudioRow output="out-1" outputName="Out 1" route={followRow} sources={sources} tracks={['eng']} />,

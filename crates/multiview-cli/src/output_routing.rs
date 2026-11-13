@@ -69,10 +69,12 @@ pub const REAPER_QUEUE: usize = 8;
 /// = 8 in the pipeline) on top of a full worker queue (`WORKER_QUEUE_TICKS` = 4)
 /// and the offers dropped meanwhile, so a transient stall never fails a key.
 pub const MAX_GAP_FILL_TICKS: u64 = 24;
-/// Operation-id prefixes of a start-up (boot) take — `boot:<output config id>`
-/// and the audio-only `boot:audio:<output config id>` — defined once in the
+/// Operation-id prefixes of a start-up (boot) take — `boot:<output index>`
+/// and the audio-only `boot:audio:<output index>` — defined once in the
 /// control plane, whose outcome relay never persists a boot outcome
-/// ([`multiview_control::output_routing::is_boot_take`]).
+/// ([`multiview_control::output_routing::is_boot_take`]). Every boot id is
+/// keyed on the OUTPUT INDEX, never parsed from the config id (PR #352 round
+/// 2): a config id (an HLS one is a path) can be arbitrarily long.
 pub use multiview_control::output_routing::{BOOT_AUDIO_TAKE_PREFIX, BOOT_TAKE_PREFIX};
 
 /// Whether `operation_id` is a video (or combined) boot take — the kind that
@@ -1191,7 +1193,11 @@ impl OutputRouter {
 
     /// A given-up boot take that also carried a persisted audio feed (a
     /// combined take): its audio is still applied, alone (audio-only takes
-    /// have no fresh gate), so the video's refusal never drops it.
+    /// have no fresh gate), so the video's refusal never drops it. Keyed on
+    /// the OUTPUT INDEX (PR #352 round 2), never by re-parsing the give-up
+    /// take's `operation_id`: a config id can be arbitrarily long (an HLS
+    /// config id is its path), so the audio id is minted fresh from the
+    /// index, always well under `MAX_TAKE_ID_BYTES`.
     fn boot_audio_alone(&mut self, take: &OutputTake) {
         let Some(audio) = take.audio.clone() else {
             return;
@@ -1199,12 +1205,8 @@ impl OutputRouter {
         if self.boot.audio_after.len() >= self.outputs.len().max(1) {
             return;
         }
-        let output = take
-            .operation_id
-            .strip_prefix(BOOT_TAKE_PREFIX)
-            .unwrap_or(&take.operation_id);
         self.boot.audio_after.push(OutputTake {
-            operation_id: format!("{BOOT_AUDIO_TAKE_PREFIX}{output}"),
+            operation_id: format!("{BOOT_AUDIO_TAKE_PREFIX}{}", take.output_index),
             output_index: take.output_index,
             bus: None,
             audio: Some(audio),
