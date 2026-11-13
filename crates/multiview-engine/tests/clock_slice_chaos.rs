@@ -12,10 +12,10 @@
 //! Asserted on every Linux host: every tick is emitted (exact count). Where
 //! the kernel applies the slice (EEVDF custom slices, 6.12+), with the slice:
 //! no tick is repeated, no wake is later than [`ONE_CORE_WAKE_CEILING_MS`] (the
-//! oversubscribed bound ADR-0109 §8 gives) nor than the default run's worst
-//! wake, and — when the default run was
+//! oversubscribed bound ADR-0109 §8 gives), and — when the default run was
 //! contended (mean wake above 0.5 ms) — the mean wake is under half the
-//! default run's. Measured on the build host (6.12): default mean 2.1–2.3 ms,
+//! default run's and fewer wakes are later than 1 ms (counts, not a single
+//! worst sample: two runs' maxima can tie on a CI runner). Measured on the build host (6.12): default mean 2.1–2.3 ms,
 //! max 11.9 ms; slice mean 0.2–0.5 ms, max 4.0–6.7 ms. Older kernels and hosts
 //! that forbid pinning only report (#321: no tight percentiles).
 #![cfg(target_os = "linux")]
@@ -39,6 +39,7 @@ use multiview_core::color::ColorInfo;
 use multiview_core::layout::{Canvas, Layout};
 use multiview_core::time::Rational;
 use multiview_engine::clock_thread::{self, CLOCK_SLICE};
+use multiview_engine::lateness::FINE_LATENESS_EDGES_NS;
 use multiview_engine::{
     CompositedFrame, CompositorDrive, EnginePublisher, EngineRuntime, MonotonicTimeSource,
     OutputClock, RealtimePacer, StopSignal, TimeSource,
@@ -104,6 +105,8 @@ struct Run {
     wake_mean_ms: f64,
     wake_p99_ms: f64,
     wake_max_ms: f64,
+    /// Wakes later than 1 ms (fine buckets above the 1 ms edge).
+    late_wakes: u64,
 }
 
 /// One run: `NEIGHBOURS` spinners and a clock thread on `cpu`; the clock
@@ -163,6 +166,13 @@ fn run(cpu: usize, custom: bool) -> Run {
             wake_mean_ms: wake.mean_ns().unwrap_or(0) as f64 / 1e6,
             wake_p99_ms: wake.fine_quantile_upper_ns(990).unwrap_or(u64::MAX) as f64 / 1e6,
             wake_max_ms: wake.max_ns as f64 / 1e6,
+            late_wakes: wake
+                .fine_buckets
+                .iter()
+                .zip(std::iter::once(&0).chain(FINE_LATENESS_EDGES_NS.iter()))
+                .filter(|(_, lower)| **lower >= 1_000_000)
+                .map(|(count, _)| *count)
+                .sum(),
         }
     })
     .unwrap();
@@ -184,8 +194,8 @@ fn a_short_slice_wakes_the_clock_through_cpu_bound_neighbours() {
     let short = run(cpu, true);
     for (name, r) in [("default", &default), ("short", &short)] {
         println!(
-            "slice chaos cpu {cpu} {name}: {:?} ticks {} repeats {} wake mean {:.3} ms p99 <= {:.3} ms max {:.3} ms",
-            r.slice, r.ticks, r.repeats, r.wake_mean_ms, r.wake_p99_ms, r.wake_max_ms
+            "slice chaos cpu {cpu} {name}: {:?} ticks {} repeats {} wake mean {:.3} ms p99 <= {:.3} ms max {:.3} ms, {} wakes > 1 ms",
+            r.slice, r.ticks, r.repeats, r.wake_mean_ms, r.wake_p99_ms, r.wake_max_ms, r.late_wakes
         );
     }
     assert_eq!(default.ticks, TICKS, "{default:?}");
@@ -206,14 +216,14 @@ fn a_short_slice_wakes_the_clock_through_cpu_bound_neighbours() {
         short.wake_max_ms < ONE_CORE_WAKE_CEILING_MS,
         "every wake within the one-core ceiling with the slice: {short:?}"
     );
-    assert!(
-        short.wake_max_ms < default.wake_max_ms,
-        "the slice lowers the worst wake against the same neighbours: {short:?} vs {default:?}"
-    );
     if default.wake_mean_ms > 0.5 {
         assert!(
             short.wake_mean_ms < default.wake_mean_ms / 2.0,
             "the slice at least halves the mean wake: {short:?} vs {default:?}"
+        );
+        assert!(
+            short.late_wakes < default.late_wakes,
+            "the slice leaves fewer wakes later than 1 ms: {short:?} vs {default:?}"
         );
     }
 }

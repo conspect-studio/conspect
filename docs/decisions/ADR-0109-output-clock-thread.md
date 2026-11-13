@@ -329,10 +329,12 @@ Changes:
 The R3 chaos test `crates/multiview-engine/tests/clock_slice_chaos.rs` pins a
 real clock thread (2 ms of work per tick) and six spinning threads to one core
 and asserts, where the kernel applies the slice: every tick emitted, 0 repeats,
-every wake under 10 ms (the one-core oversubscribed ceiling; measured 4–6.7 ms
-with the slice, 11.9 ms with the default request size), and the mean wake at
-most half the default run's when that run was contended (measured 0.2–0.5 ms
-vs 2.1–2.3 ms).
+every wake under 10 ms (the one-core oversubscribed ceiling; measured 4–8 ms
+with the slice, 9–12 ms with the default request size), and, when the default
+run was contended, a mean wake at most half the default run's (measured
+0.2–0.5 ms vs 1.9–2.6 ms; a GitHub runner: 0.17 vs 1.22 ms) and fewer wakes
+later than 1 ms. Single worst samples are not compared: on a GitHub runner the
+two runs' maxima tied (2.98 vs 2.96 ms).
 
 ## Rationale
 
