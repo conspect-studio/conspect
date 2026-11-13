@@ -120,8 +120,8 @@ output when one `[control] ui_dir` key changed (#367).
   value, an item the file removed is removed, every other accepted item stays (hash-indexed,
   linear in the list sizes). Smaller units where the operator edits parts of a section: the
   canvas's pinned signal (width, height, cadence) is one unit, pixel format and background are
-  each their own, and the colour block merges field by field; the switcher and its M/Es (by
-  id) and the IPTV publication (scalars, and each entry by kind + ref) merge field by field, so editing one key keeps the API-set others; a layout change takes the
+  each their own, and the colour block merges field by field; the switcher, its M/Es (by
+  id) and each M/E's mixer inputs (by number) and the IPTV publication (scalars, and each entry by kind + ref) merge field by field, so editing one key keeps the API-set others; a layout change takes the
   file's layout with its cells (cells name the layout's areas), while a cells-only edit merges
   cells by id; each routing crosspoint row (keyed by its destination) and each graphics item and channel (by
   id) merge field by field,

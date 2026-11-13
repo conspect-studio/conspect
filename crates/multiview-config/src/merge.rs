@@ -20,7 +20,8 @@
 //! file's section is taken whole, so a pure reorder still lands. Inside a
 //! few sections the unit is smaller: the canvas's pinned signal (width,
 //! height, cadence) is one unit and each other canvas axis its own; the
-//! switcher and the IPTV publication merge field by field (M/Es by id, IPTV
+//! switcher and the IPTV publication merge field by field (M/Es by id and
+//! their mixer inputs by number, IPTV
 //! entries by kind + ref); a layout change takes the file's layout with its
 //! cells (cells name the layout's areas), a cells-only edit merges cells by id.
 //!
@@ -37,7 +38,7 @@ use serde::Serialize;
 use crate::audio::AudioRouting;
 use crate::iptv::IptvConfig;
 use crate::routing::RoutingTable;
-use crate::switcher::SwitcherConfig;
+use crate::switcher::{MixEffectsConfig, SwitcherConfig};
 use crate::{Canvas, MultiviewConfig};
 
 /// Pick a whole section: the file's new value when the file changed it,
@@ -210,9 +211,28 @@ fn merge_switcher(
         &n.mix_effects,
         &a.mix_effects,
         |m| m.id.clone(),
-        fields,
+        merge_mix_effect,
     );
     Some(out)
+}
+
+/// One M/E: scalars field by field, and its mixer inputs per slot (by
+/// `number`, field by field), so a file label edit keeps an API-patched
+/// slot's video (`POST /patch/take` writes one slot).
+fn merge_mix_effect(
+    prev: &MixEffectsConfig,
+    next: &MixEffectsConfig,
+    accepted: &MixEffectsConfig,
+) -> MixEffectsConfig {
+    let mut out = fields(prev, next, accepted);
+    out.inputs = keyed_with(
+        &prev.inputs,
+        &next.inputs,
+        &accepted.inputs,
+        |i| i.number,
+        fields,
+    );
+    out
 }
 
 /// `[iptv]`: scalars one by one, entries keyed by `(kind, ref)`.

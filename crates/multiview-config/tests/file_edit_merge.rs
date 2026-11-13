@@ -446,3 +446,27 @@ fn a_graphics_channel_rename_keeps_the_api_set_rundown() {
     assert_eq!(channel.name, "New");
     assert_eq!(channel.rundown, ["a", "b"], "the API-set rundown stays");
 }
+
+/// Review L1 round 5: M/E mixer inputs merge per slot. A file label edit of
+/// input 1 keeps the API patch of input 2 (and the preview that follows it),
+/// so the merged document still validates.
+#[test]
+fn a_mixer_input_label_edit_keeps_the_api_patched_slot() {
+    let me = |label: &str, in2: &str, preview: &str| {
+        format!(
+            "[switcher]\n[[switcher.mix_effects]]\nid = \"me1\"\nprogram = \"main\"\nprogram_source = \"in_b\"\npreview_source = \"{preview}\"\nprogram_input = 1\npreview_input = 2\n[[switcher.mix_effects.inputs]]\nnumber = 1\nlabel = \"{label}\"\nvideo = {{ source = \"in_b\" }}\n[[switcher.mix_effects.inputs]]\nnumber = 2\nvideo = {{ source = \"{in2}\" }}\n"
+        )
+    };
+    let base = accepted();
+    let prev = parse(&format!("{base}{}", me("One", "in_c", "in_c")));
+    let next = parse(&format!("{base}{}", me("Camera 1", "in_c", "in_c")));
+    // The API patched input 2 to in_hls; preview follows it.
+    let accepted = parse(&format!("{base}{}", me("One", "in_hls", "in_hls")));
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    merged
+        .validate()
+        .expect("the merged document still validates");
+    let m = &merged.switcher.as_ref().unwrap().mix_effects[0];
+    assert_eq!(m.inputs[0].label.as_deref(), Some("Camera 1"));
+    assert_eq!(m.input_source(2), Some("in_hls"), "the API patch stays");
+}
