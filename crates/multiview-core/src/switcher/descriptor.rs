@@ -90,17 +90,95 @@ impl PixelRect {
     }
 }
 
-/// A closed-form SDF wipe mask family (ADR-0055 §3, wave 2).
+/// An 8-bit sRGB-coded solid colour (`"#rrggbb"` on the wire), converted into
+/// the canvas colour space exactly like a `solid` source (ADR-0027).
+///
+/// Used for the DIP colour and the WIPE border (ADR-0111). Serialises as a
+/// `#rrggbb` string; `#rgb` is accepted on input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Rgb8 {
+    /// Red code value.
+    pub r: u8,
+    /// Green code value.
+    pub g: u8,
+    /// Blue code value.
+    pub b: u8,
+}
+
+impl Rgb8 {
+    /// Black, the default dip colour.
+    pub const BLACK: Self = Self { r: 0, g: 0, b: 0 };
+
+    /// Build a colour from its three code values.
+    #[must_use]
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    /// Parse `#rgb` or `#rrggbb` (case-insensitive). `None` for anything else.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let hex = text.strip_prefix('#')?;
+        let digit = |c: u8| -> Option<u8> {
+            match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                b'A'..=b'F' => Some(c - b'A' + 10),
+                _ => None,
+            }
+        };
+        let bytes = hex.as_bytes();
+        match bytes {
+            [r, g, b] => {
+                let (r, g, b) = (digit(*r)?, digit(*g)?, digit(*b)?);
+                Some(Self::new(r * 17, g * 17, b * 17))
+            }
+            [r1, r0, g1, g0, b1, b0] => Some(Self::new(
+                digit(*r1)? * 16 + digit(*r0)?,
+                digit(*g1)? * 16 + digit(*g0)?,
+                digit(*b1)? * 16 + digit(*b0)?,
+            )),
+            _ => None,
+        }
+    }
+}
+
+impl core::fmt::Display for Rgb8 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
+}
+
+impl Serialize for Rgb8 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Rgb8 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        Self::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!("{text:?} is not a #rgb or #rrggbb colour"))
+        })
+    }
+}
+
+/// A closed-form SDF wipe mask family (ADR-0055 §3, wave 2; ADR-0111).
 ///
 /// The variants mirror the house per-pixel primitives (linear edge, box,
 /// circle); later patterns are additive because the enum is
-/// `#[non_exhaustive]`.
+/// `#[non_exhaustive]`. `linear_edge` is the horizontal (left-to-right) edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum WipePattern {
-    /// A straight edge sweeping across the canvas.
+    /// A straight vertical edge sweeping left to right (horizontal wipe).
     LinearEdge,
+    /// A straight horizontal edge sweeping top to bottom (vertical wipe).
+    Vertical,
+    /// A diagonal edge sweeping from the top-left to the bottom-right corner.
+    Diagonal,
     /// A rectangle growing from the pattern origin.
     Box,
     /// A circle/ring growing from the pattern origin.
@@ -139,12 +217,18 @@ pub enum TransitionDescriptor {
         /// Transition duration in output frames.
         rate: FrameCount,
     },
-    /// Two chained mixes through a third source.
+    /// Two chained mixes through a solid colour or a third source.
     Dip {
         /// Transition duration in output frames (at least 2; validated at arm).
         rate: FrameCount,
-        /// The bus-selectable source dipped through.
-        dip_source: SourceRef,
+        /// The bus-selectable source dipped through. Not rendered yet: the
+        /// engine refuses a dip through a source (ADR-0111); dip to a colour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dip_source: Option<SourceRef>,
+        /// The solid colour dipped through when no `dip_source` is named;
+        /// absent means black (ADR-0111).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Rgb8>,
         /// Where the outgoing/incoming swap happens under the dip: an exact
         /// rational in `(0, 1)`, defaulting to `1/2`.
         #[serde(default = "default_switch_point")]
@@ -162,9 +246,14 @@ pub enum TransitionDescriptor {
         /// Width of the optional border band (canvas-relative; `0` is none).
         #[serde(default)]
         border_width: f32,
-        /// Source filling the border band; absent means no band.
+        /// Source filling the border band. Not rendered yet (ADR-0111); use
+        /// `border_color`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         border_fill_source: Option<SourceRef>,
+        /// Solid colour filling the border band; absent (with no
+        /// `border_fill_source`) means no band even when `border_width > 0`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        border_color: Option<Rgb8>,
         /// Origin of origin-positionable patterns, normalized to the canvas.
         #[serde(default = "default_position_xy")]
         position_xy: [f32; 2],
