@@ -2466,6 +2466,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be"
+dependencies = [
+ "bytes",
+ "fastrand",
+ "futures-util",
+ "http 1.4.1",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "h3-datagram"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d2c9f77921668673721ae40f17c729fc48b9e38a663858097cea547484fdf0f"
+dependencies = [
+ "bytes",
+ "h3",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3852,7 +3877,10 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "hang",
+ "http 1.4.1",
+ "moq-noq",
  "multiview-audio",
+ "multiview-clocksys",
  "multiview-compositor",
  "multiview-config",
  "multiview-control",
@@ -3863,6 +3891,7 @@ dependencies = [
  "multiview-framestore",
  "multiview-frontdoor",
  "multiview-graphics",
+ "multiview-h3",
  "multiview-hal",
  "multiview-input",
  "multiview-licence",
@@ -3893,6 +3922,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "url",
+ "web-transport-trait",
  "wgpu",
 ]
 
@@ -3977,6 +4007,7 @@ dependencies = [
  "mdns-sd",
  "mime_guess",
  "moq-net",
+ "moq-noq",
  "moq-tokio",
  "multiview-cloudflare",
  "multiview-compositor",
@@ -3989,6 +4020,7 @@ dependencies = [
  "multiview-ffmpeg",
  "multiview-framestore",
  "multiview-graphics",
+ "multiview-h3",
  "multiview-input",
  "multiview-licence",
  "multiview-mesh",
@@ -4139,6 +4171,7 @@ dependencies = [
  "proptest",
  "rcgen",
  "rustls",
+ "smallvec",
  "socket2 0.6.4",
  "tokio",
  "tokio-rustls",
@@ -4153,6 +4186,27 @@ dependencies = [
  "multiview-config",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "multiview-h3"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "h3",
+ "h3-datagram",
+ "http 1.4.1",
+ "http-body 1.0.1",
+ "http-body-util",
+ "moq-noq",
+ "moq-tokio",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tracing",
+ "url",
+ "web-transport-trait",
 ]
 
 [[package]]
@@ -4244,6 +4298,7 @@ dependencies = [
  "hang",
  "moq-net",
  "moq-tokio",
+ "rcgen",
  "rustix",
  "serde_json",
  "tokio",

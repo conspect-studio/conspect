@@ -395,15 +395,12 @@ pub fn build_egress_registry(
     for output in &config.outputs {
         match output {
             Output::Webrtc {
-                max_viewers,
-                token,
-                audio,
-                ..
+                max_viewers, token, ..
             } => {
                 let id = output.id();
                 let sink = registry.register(
                     &id,
-                    audio.is_some(),
+                    output.effective_audio().is_some(),
                     OutputPolicy::Whep {
                         max_viewers: *max_viewers,
                         token: token.clone(),
@@ -411,13 +408,11 @@ pub fn build_egress_registry(
                 );
                 sinks.insert(id, sink);
             }
-            Output::WhipPush {
-                url, token, audio, ..
-            } => {
+            Output::WhipPush { url, token, .. } => {
                 let id = output.id();
                 let sink = registry.register(
                     &id,
-                    audio.is_some(),
+                    output.effective_audio().is_some(),
                     OutputPolicy::WhipPush {
                         url: url.clone(),
                         token: token.clone(),

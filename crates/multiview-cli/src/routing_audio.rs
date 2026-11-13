@@ -147,6 +147,13 @@ impl AudioSource {
         match bus {
             // Clean is the Program picture: it follows the program mix.
             PictureBus::Program | PictureBus::Clean => Self::Program,
+            // A routed layout carries its `audio` attribute (§5.1): the
+            // program mix by default, silence, or one bound cell's source.
+            PictureBus::Layout(layout) => match &layout.body.audio {
+                multiview_config::LayoutAudio::None => Self::Silence,
+                multiview_config::LayoutAudio::Source(id) => Self::Source(id.clone()),
+                _ => Self::Program,
+            },
             PictureBus::Preview => Self::Preview,
             PictureBus::Source(id) => Self::Source(id.clone()),
         }
@@ -1429,5 +1436,48 @@ mod tests {
             .iter()
             .all(|v| v.abs() < 1e-9));
         assert_eq!(pcm(AudioSource::Program, None).len(), 3840);
+    }
+
+    /// PR 2 (#306, §5.1): `follow` on a routed layout carries the layout's
+    /// `audio` attribute; an explicit choice is unaffected by it.
+    #[test]
+    fn follow_on_a_layout_resolves_its_audio_attribute() {
+        use multiview_config::LayoutAudio;
+        let bus = |audio: multiview_config::LayoutAudio| {
+            PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::new(
+                crate::aux_layout::RoutedLayout {
+                    id: "L".to_owned(),
+                    layout: multiview_core::layout::Layout {
+                        name: "L".to_owned(),
+                        canvas: multiview_core::layout::Canvas {
+                            width: 16,
+                            height: 16,
+                            fps_num: 25,
+                            fps_den: 1,
+                        },
+                        cells: Vec::new(),
+                    },
+                    slates: Vec::new(),
+                    audio,
+                    revision: 0,
+                },
+            )))
+        };
+        assert_eq!(
+            AudioChoice::Follow.resolve(&bus(LayoutAudio::Program)),
+            AudioSource::Program
+        );
+        assert_eq!(
+            AudioChoice::Follow.resolve(&bus(LayoutAudio::None)),
+            AudioSource::Silence
+        );
+        assert_eq!(
+            AudioChoice::Follow.resolve(&bus(LayoutAudio::Source("cam".into()))),
+            AudioSource::Source("cam".into())
+        );
+        assert_eq!(
+            AudioChoice::Program.resolve(&bus(LayoutAudio::None)),
+            AudioSource::Program
+        );
     }
 }

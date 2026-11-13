@@ -42,6 +42,8 @@ fn start_server(door: &mut FrontDoor) {
             socket: Box::new(lane),
             endpoint: multiview_frontdoor::quic::endpoint_config(),
             incoming: Some(multiview_frontdoor::quic::incoming_caps()),
+            retry_above_handshakes: None,
+            retry_counter: None,
         });
         let mut listener = server.init().unwrap().listen().await.unwrap();
         while let Some(request) = listener.accept().await {

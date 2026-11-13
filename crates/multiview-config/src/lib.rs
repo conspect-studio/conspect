@@ -50,6 +50,7 @@ pub mod multicast;
 pub mod network_diagnostics;
 pub mod network_tls;
 pub mod origin;
+pub mod output_format;
 pub mod placement;
 pub mod playback;
 pub mod probe;
@@ -101,7 +102,7 @@ pub use iptv::{
     IptvConfig, IptvEntry, IptvEntryKind, DEFAULT_GUIDE_REFRESH_MINUTES, MAX_GUIDE_REFRESH_MINUTES,
     MAX_IPTV_ENTRIES, MIN_GUIDE_REFRESH_MINUTES,
 };
-pub use layout_doc::{LayoutCanvas, LayoutDocument};
+pub use layout_doc::{LayoutAudio, LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
     MediaPlayerAudio,
@@ -117,10 +118,16 @@ pub use multicast::{
 };
 pub use network_diagnostics::NetworkDiagnosticsConfig;
 pub use network_tls::{
-    AcmeChallenge, CertificateAuthority, DnsProviderConfig, IceTcpConfig, NetworkConfig,
-    NetworkMode, NetworkTlsConfig, TrustedProxy,
+    AcmeChallenge, CertificateAuthority, DnsConfirm, DnsProviderConfig, IceTcpConfig,
+    NetworkConfig, NetworkMode, NetworkQuicConfig, NetworkTlsConfig, NetworkUdpConfig,
+    TrustedProxy,
 };
 pub use origin::{Origin, OriginParseError};
+pub use output_format::{
+    validate_output_format, Anchor, AudioSlot, CodecFamily, OutputFit, OutputFitMode, OutputFormat,
+    OutputSlots, Scan, SlotCapability, VideoSlot, MAX_SLOT_BITRATE_KBPS, SLOT_FORMAT_UNSUPPORTED,
+    SLOT_MEDIUM_MISMATCH,
+};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use playback::{
     hls_mount_segment, host_header_hostname, is_ip_literal, resolve_hls_mounts,
@@ -1494,14 +1501,42 @@ impl MultiviewConfig {
             ));
         }
         let mut seen_ids: HashSet<String> = HashSet::with_capacity(self.outputs.len());
+        let discrete: Vec<&str> = self
+            .selectable_tracks()
+            .into_iter()
+            .filter(|t| *t != PROGRAM_TRACK)
+            .collect();
         for output in &self.outputs {
             output.validate()?;
+            // Slice B (#342): the output's format and slots against the canvas
+            // and its medium's slot capability.
+            validate_output_format(output, &self.canvas, &discrete)?;
             let id = output.id();
             if !seen_ids.insert(id.clone()) {
                 return Err(ConfigError::Validation(format!(
                     "duplicate output id {id:?} (output ids must be unique)"
                 )));
             }
+        }
+        // #342 review A2: every distinct base video key is a real encoder
+        // (one per distinct format and slot settings): hold the per-program
+        // ceiling on the keys the engine will actually open. A document that
+        // declares no format and no slots validates exactly as before.
+        let declares = self
+            .outputs
+            .iter()
+            .any(|o| o.format().is_some() || o.slots().is_some());
+        let keys = if declares {
+            rendition::distinct_base_video_keys(self)
+        } else {
+            0
+        };
+        if keys > rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM {
+            return Err(ConfigError::Validation(format!(
+                "{SLOT_FORMAT_UNSUPPORTED}: the outputs need {keys} distinct video encoders \
+                 (one per distinct codec, format and settings); at most {} per program",
+                rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM
+            )));
         }
         Ok(())
     }
@@ -1527,7 +1562,8 @@ impl MultiviewConfig {
         }
 
         for output in &self.outputs {
-            if let Some(selection) = output.audio() {
+            // `slots.audio`, when declared, is the output's selection (#342).
+            if let Some(selection) = output.effective_audio().as_ref() {
                 // Cross-check the selection against the transport's verified
                 // capability matrix (ADR-R005 §4.2): reference consistency plus
                 // the discrete-track count the transport can actually deliver.
@@ -1711,8 +1747,8 @@ impl MultiviewConfig {
 
     /// Validate one output crosspoint's feed (ADR-0108 §6.1): the `bus` alias
     /// agrees with `video`; a switcher bus needs a declared M/E; a source feed
-    /// names a declared source; layout feeds are not routable yet and are
-    /// refused rather than silently ignored; an explicit audio feed is
+    /// names a declared source; a layout feed names a non-empty layout id
+    /// (resolved against the layouts library at take time); an explicit audio feed is
     /// checked by [`Self::validate_output_audio_feed`].
     fn validate_output_feed(&self, xp: &OutputCrosspoint) -> Result<(), ConfigError> {
         if let Some(video) = &xp.video {
@@ -1746,11 +1782,17 @@ impl MultiviewConfig {
                     )));
                 }
             }
+            // ADR-0108 slice 3: a stored layout. The layouts library lives
+            // beside the document (the control plane's accepted state), so
+            // existence and admissibility are checked where it is resolved:
+            // at plan/take time, against the library and the running canvas.
             VideoFeed::Layout(id) => {
-                return Err(ConfigError::Validation(format!(
-                    "output {:?}: a layout feed ({id:?}) cannot be routed to an output yet",
-                    xp.output
-                )));
+                if id.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "output {:?}: a layout feed needs a layout id",
+                        xp.output
+                    )));
+                }
             }
         }
         self.validate_output_audio_feed(xp)
@@ -1831,6 +1873,16 @@ impl MultiviewConfig {
                 Ok(())
             }
         }
+    }
+
+    /// `routing.max_aux_canvases` (ADR-0108 §7): routed layouts composed at
+    /// once; the default when the document sets none.
+    #[must_use]
+    pub fn max_aux_canvases(&self) -> usize {
+        self.routing.as_ref().map_or(
+            routing::DEFAULT_MAX_AUX_CANVASES,
+            RoutingTable::max_aux_canvases,
+        )
     }
 
     /// Every configured output's effective feed, in output order (ADR-0108):

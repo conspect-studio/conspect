@@ -357,3 +357,15 @@ Results (ffprobe and the run log):
   5. the matrix page and output salvos.
 - **Interactions.** None with ADR-0107. A future dedicated clock thread carries the one `try_send`
   unchanged.
+
+**Amendment (slice 3, #306).** Layout to an output ships on the CPU integer path in every build
+(no wgpu aux), with a translucent-cell refusal, control-plane resolution and the
+`max_aux_canvases` = 2 admission; details and the items left to the second slice-3 PR are in note
+§10.1.
+
+**Amendment (slice 3 part 2, #306).** A routed layout follows edits of its stored body live, at
+an IDR. A delete, or an edit that no longer routes, moves its outputs back to Program. Such an edit
+needs Write on the outputs the layout feeds (`routed-layout` 403). Stored layouts gain the `audio`
+attribute (`program` | `none` | a bound cell's source). `routing.max_aux_canvases` is a config key
+(default 2, 0..=8). Decodes size for routed cells (§2.4). The aux thread halves its cadence while
+Program's p99 lateness exceeds half the tick (§7). Details are in note §10.1.

@@ -323,6 +323,11 @@ async fn door_serves_bootstrap_answers_tls_alpn_and_swaps_on_install() {
     assert_eq!(status_json["state"], "setup");
     // Direct mode: no behind-proxy hint.
     assert_eq!(status_json["hints"], serde_json::json!([]));
+    // Slice 2: no QUIC in setup (the h3 endpoint waits for `serving`) and
+    // therefore no Alt-Svc advertisement on the TCP door.
+    let run = door.run.as_ref().unwrap();
+    assert!(!run.h3_running(), "no HTTP/3 endpoint while in setup");
+    assert!(!head.to_ascii_lowercase().contains("alt-svc"), "{head}");
 
     // (b) TLS-ALPN-01: ALPN only `acme-tls/1` for a published name gets the
     // challenge certificate with the acmeIdentifier extension.
@@ -388,6 +393,71 @@ async fn door_serves_bootstrap_answers_tls_alpn_and_swaps_on_install() {
     let (status, head, body) = http(door.tcp, None, "GET", "/api/v1/outputs", "").await;
     assert_ne!(status, 503, "the gate is open once serving: {head}{body}");
     assert!(!body.contains("tls-setup-required"), "{body}");
+
+    // Slice 2: `serving` starts the h3 endpoint on the QUIC lane with the
+    // ACME certificate; then the TCP door advertises it.
+    let run = door.run.as_ref().unwrap();
+    let started = std::time::Instant::now();
+    while !run.h3_running() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the h3 endpoint never started after serving"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let udp = run.local_addr().port();
+    let (tcp_status, head, _) = http(door.tcp, None, "GET", "/api/v1/outputs", "").await;
+    assert!(
+        head.to_ascii_lowercase()
+            .contains(&format!("alt-svc: h3=\":{udp}\"; ma=86400")),
+        "{head}"
+    );
+    let mut h3 = multiview_h3::client::Client::connect(
+        "[::1]:0".parse().unwrap(),
+        SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, udp)),
+        HOST,
+        multiview_h3::client::insecure_client_config(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            b"h3",
+        )
+        .unwrap(),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("h3 handshake with the ACME certificate");
+    let issued_on_quic = h3
+        .conn
+        .peer_identity()
+        .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok())
+        .map(|chain| chain[0].to_vec());
+    assert_eq!(
+        issued_on_quic,
+        Some(issued_der.clone()),
+        "QUIC serves the installed certificate"
+    );
+    let (resp, body) = h3
+        .fetch(
+            multiview_h3::client::request(
+                http::Method::GET,
+                &format!("{HOST}:{udp}"),
+                "/api/v1/outputs",
+            )
+            .unwrap(),
+            &[],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    // The same gated router answers over h3 exactly as over TCP (here: the
+    // auth gate, no token), never the setup 503.
+    assert_eq!(
+        resp.status().as_u16(),
+        tcp_status,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("tls-setup-required"));
+    drop(h3);
 
     door.stop().await;
 }

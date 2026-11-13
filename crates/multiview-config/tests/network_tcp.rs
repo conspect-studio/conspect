@@ -246,3 +246,13 @@ listen = "[::1]:8080"
     };
     assert!(err.contains("ui_dir"), "{err}");
 }
+
+#[test]
+fn alt_svc_defaults_on_and_can_be_switched_off() {
+    let on = net("https_port = 443\n");
+    assert_eq!(on.alt_svc, None);
+    assert!(on.alt_svc_enabled());
+    let off = net("https_port = 443\nalt_svc = false\n");
+    assert!(!off.alt_svc_enabled());
+    off.validate().unwrap();
+}

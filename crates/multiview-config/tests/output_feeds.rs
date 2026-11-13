@@ -144,11 +144,13 @@ fn bus_alias_must_agree_with_video() {
 }
 
 #[test]
-fn layout_is_refused_until_its_slice_and_explicit_audio_is_accepted() {
-    let err =
-        load("\n[[routing.output]]\noutput = \"srt-out\"\nvideo = { layout = \"NewsOne\" }\n")
-            .unwrap_err();
-    assert!(err.contains("layout feed"), "{err}");
+fn a_layout_feed_validates_an_empty_id_does_not_and_explicit_audio_is_accepted() {
+    // ADR-0108 slice 3 (#306): a layout feed is routable; its existence is
+    // checked against the layouts library at take time, not here.
+    load("\n[[routing.output]]\noutput = \"srt-out\"\nvideo = { layout = \"NewsOne\" }\n").unwrap();
+    let err = load("\n[[routing.output]]\noutput = \"srt-out\"\nvideo = { layout = \" \" }\n")
+        .unwrap_err();
+    assert!(err.contains("layout id"), "{err}");
     // ADR-0108 slice 2: explicit audio feeds validate (rules: tests below).
     load("\n[[routing.output]]\noutput = \"srt-out\"\naudio = \"none\"\n").unwrap();
     load("\n[[routing.output]]\noutput = \"srt-out\"\naudio = \"follow\"\n").unwrap();
@@ -330,7 +332,7 @@ fn start_up_accepts_an_explicit_audio_feed_it_re_applies_as_a_boot_take() {
     }
     // #329 F1 (behaviour intentionally changed): a directly routed source
     // video feed is accepted at start-up (the run issues it as a boot take);
-    // only a layout feed is still refused.
+    // a layout feed is accepted too (below).
     let cfg = load("\n[[routing.output]]\noutput = \"srt-out\"\nvideo = { source = \"bars\" }\n")
         .unwrap();
     multiview_config::outputs_carry_program(&cfg).unwrap();
@@ -338,7 +340,9 @@ fn start_up_accepts_an_explicit_audio_feed_it_re_applies_as_a_boot_take() {
         "{BASE}\n[[routing.output]]\noutput = \"srt-out\"\nvideo = {{ layout = \"L\" }}\n"
     ))
     .unwrap();
-    assert!(multiview_config::outputs_carry_program(&layout).is_err());
+    // ADR-0108 slice 3 (#306, behaviour intentionally changed): a persisted
+    // layout feed no longer refuses a start (it starts on Program).
+    multiview_config::outputs_carry_program(&layout).unwrap();
 }
 
 fn routing(tracks: &[(&str, &str)]) -> multiview_config::AudioRouting {
@@ -410,4 +414,20 @@ fn a_removed_track_is_dropped_and_an_emptied_feed_becomes_program() {
     assert_eq!(none, Vec::new());
     let first = multiview_config::propagate_routing_feed_change(None, &new, cfg.routing.as_mut());
     assert_eq!(first, Vec::new(), "no prior document: nothing to propagate");
+}
+
+/// PR 2 (#306): `routing.max_aux_canvases` is a config key (default 2, 0
+/// disables routed layouts, at most 8) and round-trips; absent, the document
+/// gains no key.
+#[test]
+fn max_aux_canvases_is_configurable_and_bounded() {
+    assert_eq!(load("").unwrap().max_aux_canvases(), 2);
+    for n in [0, 1, 8] {
+        let cfg = load(&format!("[routing]\nmax_aux_canvases = {n}\n")).unwrap();
+        assert_eq!(cfg.max_aux_canvases(), n);
+        let parsed = MultiviewConfig::load_from_json(&cfg.to_json().unwrap()).unwrap();
+        assert_eq!(parsed.max_aux_canvases(), n);
+    }
+    let err = load("[routing]\nmax_aux_canvases = 9\n").unwrap_err();
+    assert!(err.contains("max_aux_canvases"), "{err}");
 }

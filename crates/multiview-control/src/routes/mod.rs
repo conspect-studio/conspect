@@ -140,7 +140,7 @@ fn layout_response(status: StatusCode, versioned: &VersionedLayout) -> Response 
 /// Read the accepted layout library, not its replaceable SQLite projection.
 /// Review R3-03: the in-memory accepted snapshot, not a fresh
 /// `desired.json` read-parse-validate on every layout list/GET.
-fn authoritative_layouts(
+pub(crate) fn authoritative_layouts(
     state: &AppState,
 ) -> ControlResult<Option<std::sync::Arc<crate::boot_model::DesiredState>>> {
     let Some(model) = &state.boot_model else {
@@ -151,7 +151,7 @@ fn authoritative_layouts(
 
 /// Return a layout with the envelope-owned version. Older envelopes without
 /// explicit counters use version one until their next accepted mutation.
-fn authoritative_layout(
+pub(crate) fn authoritative_layout(
     desired: &crate::boot_model::DesiredState,
     id: &str,
 ) -> ControlResult<VersionedLayout> {
@@ -342,6 +342,9 @@ async fn update_layout(
         state.repository.get_layout(&id)?
     };
     if_match.require(LAYOUT_KIND, &id, current.version)?;
+    // §6.3: an edit of a layout on air on an output needs Write on those
+    // outputs and Read on every source the new body shows.
+    output_routing::authorize_routed_layout_edit(&state, &principal, &id, Some(&input.body))?;
     let versioned = if state.boot_model.is_some() {
         let mut layouts = crate::boot_model::layout_library(&state)?;
         let layout = layouts
@@ -363,6 +366,8 @@ async fn update_layout(
     } else {
         state.repository.update_layout(&id, input)?
     };
+    // Outputs routed to this layout follow the committed edit live.
+    output_routing::notify_layout_change(&state, &id, Some(&versioned.layout.body));
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -406,6 +411,9 @@ async fn delete_layout(
         state.repository.get_layout(&id)?
     };
     if_match.require(LAYOUT_KIND, &id, current.version)?;
+    // §6.3: deleting a layout on air moves its outputs to Program, so it
+    // needs Write on every output it feeds (403 `routed-layout`).
+    output_routing::authorize_routed_layout_edit(&state, &principal, &id, None)?;
     if state.boot_model.is_some() {
         let mut layouts = crate::boot_model::layout_library(&state)?;
         let config: multiview_config::MultiviewConfig =
@@ -431,6 +439,8 @@ async fn delete_layout(
     } else {
         state.repository.delete_layout(&id)?;
     }
+    // Outputs routed to the deleted layout fall back to Program.
+    output_routing::notify_layout_change(&state, &id, None);
     state.audit(
         &principal.key_id,
         AuditAction::Delete,
@@ -1374,6 +1384,7 @@ fn health_router() -> Router<AppState> {
 
 /// Build the `/api/v1` resource + command routes (without the realtime or docs
 /// routes, which are wired by [`crate::router()`]).
+#[allow(clippy::too_many_lines)] // One `.route()` line per endpoint; splitting it loses the single at-a-glance map.
 pub fn api_router() -> Router<AppState> {
     Router::new()
         .route("/cloudflare/credentials", post(cloudflare::save))
@@ -1446,6 +1457,10 @@ pub fn api_router() -> Router<AppState> {
         .route(
             "/metrics/program",
             get(crate::program_metrics::get_program_metrics),
+        )
+        .route(
+            "/metrics/frontdoor",
+            get(crate::frontdoor_metrics::get_frontdoor_metrics),
         )
         .route("/routing", get(routing::get_routing))
         .route("/routing/plan", post(routing::plan_route))

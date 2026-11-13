@@ -13,8 +13,8 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_control::output_routing::{
-    AudioPlanCost, OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost,
-    PlanRefusal, RoutedAudio, RoutedFeed, RoutingLive, TakeSubmitError,
+    AudioPlanCost, LayoutBody, OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest,
+    PlanCost, PlanRefusal, RoutedAudio, RoutedFeed, RoutingLive, TakeSubmitError,
 };
 
 use crate::output_routing::{
@@ -46,16 +46,26 @@ fn routed_feed(bus: &PictureBus) -> RoutedFeed {
         PictureBus::Preview => RoutedFeed::Preview,
         PictureBus::Clean => RoutedFeed::Clean,
         PictureBus::Source(id) => RoutedFeed::Source(id.clone()),
+        PictureBus::Layout(layout) => RoutedFeed::Layout(layout.id.clone()),
     }
 }
 
-fn picture_bus(feed: &RoutedFeed) -> PictureBus {
-    match feed {
+/// The engine bus of a take: a layout needs its resolved body (`None` for a
+/// layout take without one, refused as unroutable).
+fn picture_bus(
+    feed: &RoutedFeed,
+    layout: Option<&multiview_control::output_routing::LayoutBody>,
+) -> Option<PictureBus> {
+    Some(match feed {
         RoutedFeed::Program => PictureBus::Program,
         RoutedFeed::Preview => PictureBus::Preview,
         RoutedFeed::Clean => PictureBus::Clean,
         RoutedFeed::Source(id) => PictureBus::Source(id.clone()),
-    }
+        RoutedFeed::Layout(id) => {
+            let body = layout.filter(|b| b.0.id == *id)?;
+            PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::clone(&body.0)))
+        }
+    })
 }
 
 /// The engine audio choice of a control-plane audio feed.
@@ -218,6 +228,49 @@ impl OutputRouting for OutputRoutingAdapter {
         }
         let snapshot = handle.snapshot();
         let bus = feed.bus_name();
+        // §7 rule 1: a layout not composing for another output needs a free
+        // aux canvas; this output's own layout is replaced by the take.
+        let own = snapshot.outputs.get(index).map(|v| v.bus.as_str());
+        let held_by_others: Vec<&str> = snapshot
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .flat_map(|(_, v)| {
+                std::iter::once(v.bus.as_str()).chain(v.pending.as_ref().map(|p| p.bus.as_str()))
+            })
+            .filter(|b| b.starts_with("aux:"))
+            .collect();
+        let mut distinct = held_by_others.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let needs_aux_canvas = matches!(feed, RoutedFeed::Layout(_))
+            && own != Some(bus.as_str())
+            && !distinct.contains(&bus.as_str());
+        if matches!(feed, RoutedFeed::Layout(_))
+            && !distinct.contains(&bus.as_str())
+            && distinct.len() >= handle.max_aux_canvases()
+        {
+            return Err(PlanRefusal::AuxCapacity {
+                active: distinct.len(),
+                max: handle.max_aux_canvases(),
+            });
+        }
+        // #342: a routed source/PVW is encoded at the output's feed format,
+        // so its key is (bus@format, settings); Program/Clean stay the bus.
+        let routed = matches!(feed, RoutedFeed::Source(_) | RoutedFeed::Preview);
+        let key_name = |format: Option<crate::routing_aux::AuxFormat>| -> String {
+            if routed {
+                // Only a source/PVW feed is routed here; it never needs a body.
+                picture_bus(feed, None).map_or_else(
+                    || bus.clone(),
+                    |b| crate::routing_aux::feed_name(&b, format),
+                )
+            } else {
+                bus.clone()
+            }
+        };
+        let wanted = key_name(run_output.feed_format);
         // +0 when the feed is Program (the base encoder), another output
         // with the same settings already carries this bus, or a live encoder
         // for (bus, settings) still runs (a lingering one is reused by the
@@ -225,18 +278,20 @@ impl OutputRouting for OutputRoutingAdapter {
         let shared = *feed == RoutedFeed::Program
             || handle.outputs().iter().enumerate().any(|(i, o)| {
                 o.settings == run_output.settings
+                    && key_name(o.feed_format) == wanted
                     && snapshot.outputs.get(i).is_some_and(|v| v.bus == bus)
             })
             || snapshot
                 .live_keys
                 .iter()
-                .any(|(b, settings)| *b == bus && *settings == run_output.settings);
+                .any(|(b, settings)| *b == wanted && *settings == run_output.settings);
         Ok(PlanCost {
             needs_encoder: !shared,
             sessions_in_use: snapshot
                 .dynamic_encoders_live
                 .saturating_add(snapshot.opens_in_flight),
             sessions_max: self.max_encoders,
+            needs_aux_canvas,
         })
     }
 
@@ -269,6 +324,64 @@ impl OutputRouting for OutputRoutingAdapter {
         )
     }
 
+    fn plan_layout_audio(
+        &self,
+        output: &str,
+        video: &RoutedFeed,
+        layout_audio: &multiview_config::LayoutAudio,
+        audio: Option<&RoutedAudio>,
+    ) -> Result<AudioPlanCost, PlanRefusal> {
+        let Some(handle) = self.handle() else {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        };
+        let Some(index) = handle.index_of(output) else {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        };
+        let Some(run_output) = handle.outputs().get(index) else {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        };
+        if !run_output.routable {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        }
+        let snapshot = handle.snapshot();
+        let label = layout_follow_label(layout_audio);
+        audio_cost_following(
+            run_output.program_audio,
+            snapshot.outputs.get(index),
+            Some(video),
+            audio,
+            Some(&label),
+        )
+    }
+
+    fn layout_changed(&self, id: &str, body: Option<LayoutBody>) -> bool {
+        // No run: nothing composes the layout, nothing to tell.
+        let Some(handle) = self.handle() else {
+            return true;
+        };
+        let change = match body {
+            Some(body) if body.0.id == id => crate::output_routing::LayoutChange::Edited(
+                crate::routing_aux::LayoutRef::new(Arc::clone(&body.0)),
+            ),
+            Some(_) => return false,
+            None => crate::output_routing::LayoutChange::Removed {
+                id: id.to_owned(),
+                revision: crate::output_routing::next_layout_revision(),
+            },
+        };
+        handle.try_layout_change(change).is_ok()
+    }
+
+    fn routed_layouts(&self) -> Vec<String> {
+        self.handle().map_or_else(Vec::new, |handle| {
+            handle
+                .routed_layouts()
+                .into_iter()
+                .filter_map(|bus| bus.strip_prefix("aux:").map(str::to_owned))
+                .collect()
+        })
+    }
+
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
         let handle = self.handle().ok_or(TakeSubmitError::Busy)?;
         let index = handle
@@ -289,7 +402,12 @@ impl OutputRouting for OutputRoutingAdapter {
             // already answered `audio-unsupported` from the plan.
             return Err(TakeSubmitError::Unroutable);
         }
-        let bus = take.video.as_ref().map(picture_bus);
+        let bus = match take.video.as_ref() {
+            Some(feed) => {
+                Some(picture_bus(feed, take.layout.as_ref()).ok_or(TakeSubmitError::Unroutable)?)
+            }
+            None => None,
+        };
         if bus.is_none() && audio.is_none() {
             return Err(TakeSubmitError::Unroutable);
         }
@@ -354,6 +472,28 @@ fn audio_cost(
     video: Option<&RoutedFeed>,
     audio: Option<&RoutedAudio>,
 ) -> Result<AudioPlanCost, PlanRefusal> {
+    audio_cost_following(program_audio, view, video, audio, None)
+}
+
+/// The carried label `follow` resolves to on a routed layout whose `audio`
+/// attribute is `audio` (the engine's `AudioSource::follow`, §5.1).
+fn layout_follow_label(audio: &multiview_config::LayoutAudio) -> String {
+    match audio {
+        multiview_config::LayoutAudio::None => "none".to_owned(),
+        multiview_config::LayoutAudio::Source(id) => format!("src:{id}"),
+        _ => "program".to_owned(),
+    }
+}
+
+/// [`audio_cost`] where `follow` on the new video resolves to
+/// `follow_label` when given (a routed layout's attribute).
+fn audio_cost_following(
+    program_audio: bool,
+    view: Option<&crate::output_routing::OutputRouteView>,
+    video: Option<&RoutedFeed>,
+    audio: Option<&RoutedAudio>,
+    follow_label: Option<&str>,
+) -> Result<AudioPlanCost, PlanRefusal> {
     if take_audio(audio, program_audio).is_some() && !program_audio {
         return Err(PlanRefusal::AudioUnsupported);
     }
@@ -363,7 +503,11 @@ fn audio_cost(
     };
     let choice = audio.map_or_else(|| view.audio_choice.clone(), RoutedAudio::label);
     let bus = video.map_or_else(|| view.bus.clone(), RoutedFeed::bus_name);
-    let changes = carried_label(&choice, &bus) != view.audio;
+    let carried = match follow_label {
+        Some(label) if choice == "follow" => label.to_owned(),
+        _ => carried_label(&choice, &bus),
+    };
+    let changes = carried != view.audio;
     Ok(AudioPlanCost {
         needs_encoder: changes && !view.private_audio,
     })

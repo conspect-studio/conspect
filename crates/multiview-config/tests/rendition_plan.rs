@@ -478,3 +478,61 @@ mode = "auto"
         RenditionPlanError::TooManyAudioRenditions { limit: 32, .. }
     ));
 }
+
+#[test]
+fn an_output_format_and_slot_settings_are_part_of_the_video_key() {
+    let outputs = r#"
+[[outputs]]
+kind = "hls"
+id = "canvas"
+path = "/a"
+codec = "h264"
+[[outputs]]
+kind = "hls"
+id = "explicit-canvas"
+path = "/b"
+codec = "h264"
+[outputs.format]
+width = 1920
+height = 1080
+fit = { mode = "cover" }
+[[outputs]]
+kind = "hls"
+id = "tall"
+path = "/c"
+codec = "h264"
+[outputs.format]
+width = 1080
+height = 1920
+fit = { mode = "cover" }
+[[outputs]]
+kind = "hls"
+id = "tall-fast"
+path = "/d"
+codec = "h264"
+[outputs.format]
+width = 1080
+height = 1920
+fit = { mode = "cover" }
+[[outputs.slots.video]]
+codec = "h264_nvenc"
+bitrate_kbps = 9000
+"#;
+    let cfg = config(outputs, "");
+    let plan = plan_from_config(&cfg, &all_capabilities()).expect("plan");
+    assert_eq!(plan.video.len(), 3, "canvas, tall, tall at 9 Mb/s");
+    let key = |i: usize| plan.bindings[i].video.clone().unwrap();
+    assert_eq!(key(0), key(1), "a canvas-sized format is the canvas key");
+    assert_ne!(key(1), key(2));
+    assert_ne!(key(2), key(3));
+    assert_eq!((key(2).width, key(2).height), (1080, 1920));
+    assert_eq!(
+        key(3).codec,
+        RenditionVideoCodec::H264,
+        "nvenc slot token = h264"
+    );
+    assert_eq!(
+        multiview_config::rendition::distinct_base_video_keys(&cfg),
+        3
+    );
+}

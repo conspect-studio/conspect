@@ -68,6 +68,26 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     expect(commandCount).toBe(0);
   });
 
+  it('selects a wall tile to Preview by keyboard without a take confirmation, then guards repeated commands', async () => {
+    let body: unknown;
+    server.use(
+      http.get('*/api/v1/sources', () => HttpResponse.json([{ id: 'cam-3', name: 'CAM 3', body: { kind: 'bars' } }])),
+      http.post('*/api/v1/switcher/commands/select_preview', async ({ request }) => { body = await request.json(); commandCount += 1; return HttpResponse.json({ operation_id: 'op-wall', kind: 'select_preview' }, { status: 202 }); }),
+    );
+    page();
+    const tile = await screen.findByRole('button', { name: 'Preview CAM 3' });
+    await waitFor(() => { expect(tile).toHaveAttribute('aria-disabled', 'false'); }, { timeout: 6000 });
+    tile.focus();
+    await userEvent.keyboard('{Enter}');
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(body).toMatchObject({ action: 'select_preview', source: 'cam-3' });
+    expect(screen.queryByRole('button', { name: 'Confirm take' })).not.toBeInTheDocument();
+    expect(tile).toHaveAttribute('aria-disabled', 'true');
+    expect(tile).toHaveAccessibleDescription(/Signal unconfirmed/);
+    await userEvent.click(tile);
+    expect(commandCount).toBe(1);
+  });
+
   it('AUTO sends duration_frames from the rate field, after a passing plan', async () => {
     let body: unknown;
     server.use(http.post('*/api/v1/switcher/commands/auto', async ({ request }) => { body = await request.json(); commandCount += 1; return HttpResponse.json({ operation_id: 'op-auto', kind: 'auto' }, { status: 202 }); }));

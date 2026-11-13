@@ -49,6 +49,13 @@ pub const fn incoming_caps() -> (usize, u64) {
     (MAX_INCOMING, INCOMING_BUFFER_TOTAL)
 }
 
+/// Default `network.quic.retry_above_handshakes` (QUIC Retry, RFC 9000
+/// section 8.1.2): above this many handshakes in flight, an unvalidated
+/// `Incoming` that may still retry is sent a Retry instead of accepted,
+/// forcing a round trip that proves the source address before noq spends a
+/// handshake slot on it.
+pub const DEFAULT_RETRY_ABOVE_HANDSHAKES: usize = 8;
+
 /// The QUIC consumer's view of the shared socket. Give it to
 /// `noq::Endpoint::new_with_abstract_socket` (from inside the front door's
 /// runtime, so the endpoint driver and its connections run there).

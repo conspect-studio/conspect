@@ -36,6 +36,16 @@ implementation will build against.
 
 ### Added
 
+- **The site and MoQ over HTTP/3 on the front door's UDP port (front-door slice 2, #288)**:
+  with `[network] https_port`, the QUIC lane of the shared UDP socket is served by the new
+  `multiview-h3` endpoint: every site and API request answers over HTTP/3 through the same router
+  as the TCP door, and MoQ is a WebTransport session under `/moq/` on the same endpoint (single-use
+  ticket checked before the session, `401`/`429` otherwise). 0-RTT is off. The TCP door advertises
+  it with `alt-svc: h3=":<https_port>"; ma=86400` once the endpoint is up; `[network] alt_svc =
+  false` turns the advertisement off when UDP is known unreachable. With `[network.tls]` the
+  endpoint starts only once the certificate is serving. `MULTIVIEW_MOQ_ENDPOINT` must now point
+  under `/moq` (`https://<host>/moq`; a bare host is normalised with a warning). Runbook:
+  `docs/runbooks/front-door-cutover.md` ("HTTP/3 and Alt-Svc").
 - **The engine serves TCP 443, TCP 80 and UDP 443 itself; nginx is no longer needed (front-door
   slice 6, #292)**: systemd socket activation (`deploy/systemd/conspect.socket`: TCP 443, TCP 80
   and a `ReusePort=yes` UDP 443 pair, so validated-flow steering survives) keeps the sockets
@@ -80,6 +90,25 @@ implementation will build against.
   ARI renewal and expiry alarms, on its own thread and runtime away from the output clock. New
   `[network.tls] allow_private_directory` gates a private custom directory. Tested against Pebble
   in the new `acme-pebble` CI job (#291).
+
+- **Network front door: QUIC Retry, config wiring, capability + metrics, nft floor (ADR-0107
+  slice 3, issue #289).** `network.quic.retry_above_handshakes` sends a QUIC Retry (RFC 9000
+  §8.1.2) once that many handshakes are in flight, forcing an address-validation round trip before
+  the vendored `MoQ` server spends a handshake slot; `[network.udp]`/`[network.quic]` expose every
+  slice-3 limit (receive buffer, new-flow/STUN rates, validated-flow steering, retry threshold,
+  connection cap) as config, all optional with the existing crate defaults. `GET
+  /api/v1/system/capabilities` gains a `network` capability (steering mode, receive-buffer report,
+  kernel-drop support, the nft UDP-443 floor as read at startup; unscoped keys only); `GET /api/v1/metrics/frontdoor`
+  reports the live counters, steering gauges, the live nft-floor status and the QUIC retry count.
+  Deploy artefacts: `deploy/nftables/conspect-udp443-floor.nft` (a two-tier per-source/per-/64 floor
+  on UDP 443: new flows 2000/s, established flows 25 000/s, each packet charged to exactly one
+  tier, no unmetered established exemption, and a full per-source set fails closed for UDP 443
+  only; behaviour test `deploy/nftables/test-floor.sh`), the drop-in
+  `deploy/systemd/conspect.service.d/20-nft-floor.conf` for slice 6's `conspect.service` (its root
+  `ExecStartPre=+` writes the
+  floor status to the root-owned `/run/conspect-floor/nft-floor.json`, which the engine trusts only
+  as a root-owned, non-symlink, not group/other-writable file, as a report, never for enforcement),
+  `deploy/sysctl/90-conspect-udp.conf`, and `docs/runbooks/udp-443-flood.md`.
 
 - **Event journal.** Every raw SCTE-35, timed ID3 and HLS cue observation is recorded off-clock
   with its full decode, predicted wall-clock and on-air times, per source and day, with bounded

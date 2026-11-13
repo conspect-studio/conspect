@@ -128,33 +128,22 @@ pub fn switcher_canvas_admission(
     Ok(())
 }
 
-/// The single start-up rule for output feeds (ADR-0108 §6.1, #329): refuse
-/// only a feed the engine cannot carry at all — a layout (validation already
-/// refuses it until slice 3; this stays the one start-up rule). Program,
-/// Preview, Clean and a source are accepted: the engine starts every output
-/// on Program and then issues one BOOT TAKE per output whose persisted feed is
-/// not Program, through the normal take gate with a bounded retry window (the
-/// output stays on Program if it never becomes takeable). An explicit
-/// (non-`follow`) audio feed is accepted too: start-up re-applies it as an
-/// audio-only boot take (ADR-0108 slice 2 §6.1).
+/// The single start-up rule for output feeds (ADR-0108 §6.1, #329). Every
+/// feed is accepted: the engine starts every output on Program and then
+/// issues one BOOT TAKE per output whose persisted feed is not Program,
+/// through the normal take gate with a bounded retry window (the output stays
+/// on Program if it never becomes takeable). A persisted stored-layout feed
+/// (slice 3) starts on Program and is not re-taken at start-up yet: its body
+/// lives in the layouts library, which start-up does not resolve; the
+/// readback shows it as configured but not on air. It is never a reason to
+/// refuse a start (#317). An explicit (non-`follow`) audio feed is re-applied
+/// as an audio-only boot take (ADR-0108 slice 2 §6.1).
 ///
 /// # Errors
-/// The start-up refusal text naming the routed output.
+/// None today; the signature keeps the one start-up rule in one place.
+#[allow(clippy::unnecessary_wraps)] // The one start-up rule; it may refuse again.
 pub fn outputs_carry_program(config: &MultiviewConfig) -> Result<(), String> {
-    if let Some(routed) = config
-        .output_feeds()
-        .into_iter()
-        .find(|xp| matches!(xp.effective_video(), crate::VideoFeed::Layout(_)))
-    {
-        return Err(format!(
-            "output {:?} is routed to {:?}; this engine cannot carry a layout feed on an output yet",
-            routed.output,
-            routed.effective_video().picture_bus()
-        ));
-    }
-    // ADR-0108 slice 2: an explicit (non-`follow`) audio feed is accepted:
-    // the run starts the output on follow and re-applies the persisted feed
-    // as an audio-only boot take once its routing handle is published.
+    let _ = config;
     Ok(())
 }
 
@@ -168,7 +157,7 @@ pub enum BootAdmissionError {
     /// The document is valid but the declared switcher cannot drive its canvas.
     #[error(transparent)]
     SwitcherCanvas(#[from] SwitcherCanvasRefusal),
-    /// An output is routed to something this engine cannot carry (a layout).
+    /// An output is routed to something this engine cannot carry.
     #[error("{0}")]
     OutputRouting(String),
 }

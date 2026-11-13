@@ -151,10 +151,10 @@ class GateTests(unittest.TestCase):
                 gate.resources()
 
     def test_disk_floor_value_and_message(self):
-        self.assertEqual(gate.MIN_FREE, 300 * gate.GIB)
+        self.assertEqual(gate.MIN_FREE, 150 * gate.GIB)
         with patch.object(gate.shutil, 'disk_usage') as usage:
-            usage.return_value.free = 299 * gate.GIB
-            with self.assertRaisesRegex(RuntimeError, 'below 300 GiB floor'):
+            usage.return_value.free = 149 * gate.GIB
+            with self.assertRaisesRegex(RuntimeError, 'below 150 GiB floor'):
                 gate.resources()
 
     def test_large_target_fails_closed(self):

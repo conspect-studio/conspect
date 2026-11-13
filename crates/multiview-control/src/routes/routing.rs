@@ -558,6 +558,7 @@ pub(crate) async fn get_routing(
     let resources = crate::boot_model::accepted_resources(&state, "outputs")?
         .map_or_else(|| state.outputs.list(), Ok)?;
     let feeds = config.output_feeds();
+    let layouts = layout_sources(&state)?;
     let live = state
         .output_routing
         .as_ref()
@@ -583,9 +584,9 @@ pub(crate) async fn get_routing(
                 )
             });
         let live_output = live.as_ref().and_then(|l| l.outputs.get(&config_id));
-        let mut row = on_air_route_state(&principal, &feed, live_output, id);
+        let mut row = on_air_route_state(&principal, &layouts, &feed, live_output, id);
         if let Some(live) = live.as_ref() {
-            apply_live(&principal, &mut row, live.outputs.get(&config_id));
+            apply_live(&principal, &layouts, &mut row, live.outputs.get(&config_id));
         }
         redact_track_inputs(&principal, &config, &mut row);
         outputs.push(row);
@@ -621,6 +622,7 @@ pub(crate) fn api_id_of(state: &AppState, config_id: &str) -> Option<String> {
 /// bus the control plane cannot name keeps the configured view.
 fn on_air_route_state(
     principal: &Principal,
+    layouts: &LayoutSources,
     feed: &multiview_config::OutputCrosspoint,
     live: Option<&crate::output_routing::OutputLive>,
     output: String,
@@ -629,18 +631,18 @@ fn on_air_route_state(
         .and_then(|l| crate::output_routing::RoutedFeed::from_bus_name(&l.bus))
         .map(|bus| bus.video_feed())
     else {
-        return output_route_state(principal, feed, output);
+        return output_route_state(principal, layouts, feed, output);
     };
     // `video`, `tally` and `effective_audio`: the LIVE bus, by
     // `may_read_feed(live)` alone.
     let mut live_xp = feed.clone();
     live_xp.video = Some(on_air);
-    let mut row = output_route_state(principal, &live_xp, output);
+    let mut row = output_route_state(principal, layouts, &live_xp, output);
     // `configured_video`: the persisted feed, by `may_read_feed(configured)`
     // alone — never derived from the live row, so neither field's
     // readability can hide or disclose the other.
     let configured = feed.effective_video();
-    row.configured_video = if may_read_feed(principal, &configured) {
+    row.configured_video = if may_read_feed(principal, layouts, &configured) {
         serde_json::to_value(&configured)
             .unwrap_or_else(|_| serde_json::json!({ "redacted": true }))
     } else {
@@ -653,6 +655,7 @@ fn on_air_route_state(
 /// a pending feed the caller may not read becomes `{"redacted": true}`.
 fn apply_live(
     principal: &Principal,
+    layouts: &LayoutSources,
     row: &mut OutputRouteState,
     live: Option<&crate::output_routing::OutputLive>,
 ) {
@@ -677,7 +680,7 @@ fn apply_live(
     row.pending = live.pending.as_ref().map(|(bus, held)| {
         let video = crate::output_routing::RoutedFeed::from_bus_name(bus)
             .map(|feed| feed.video_feed())
-            .filter(|feed| may_read_feed(principal, feed))
+            .filter(|feed| may_read_feed(principal, layouts, feed))
             .and_then(|feed| serde_json::to_value(feed).ok())
             .unwrap_or_else(|| redacted.clone());
         PendingRoute {
@@ -797,12 +800,78 @@ fn may_read_audio(principal: &Principal, feed: &multiview_config::AudioFeed) -> 
     }
 }
 
-pub(crate) fn may_read_feed(principal: &Principal, feed: &multiview_config::VideoFeed) -> bool {
+/// The sources each stored layout's cells bind, by layout id (§6.3: a layout
+/// feed is readable only with Read on the layout AND on every source its
+/// cells bind). Built once per readback from the accepted library; a layout
+/// missing here (unknown, or a body that does not parse) is unreadable.
+pub(crate) type LayoutSources = std::collections::HashMap<String, LayoutReadback>;
+
+/// One stored layout as the readback needs it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LayoutReadback {
+    /// Every source its cells bind.
+    pub(crate) sources: Vec<String>,
+    /// Its `audio` attribute (what `follow` resolves to on it, §5.1).
+    pub(crate) audio: multiview_config::LayoutAudio,
+}
+
+impl From<Vec<String>> for LayoutReadback {
+    fn from(sources: Vec<String>) -> Self {
+        Self {
+            sources,
+            audio: multiview_config::LayoutAudio::default(),
+        }
+    }
+}
+
+/// [`LayoutSources`] for the accepted layouts library.
+pub(crate) fn layout_sources(state: &AppState) -> ControlResult<LayoutSources> {
+    let layouts = match crate::routes::authoritative_layouts(state)? {
+        Some(desired) => desired
+            .layouts
+            .iter()
+            .map(|l| (l.id.clone(), l.body.clone()))
+            .collect::<Vec<_>>(),
+        None => crate::repository::Repository::list_layouts(state.repository.as_ref())?
+            .into_iter()
+            .map(|v| (v.layout.id, v.layout.body))
+            .collect(),
+    };
+    Ok(layouts
+        .into_iter()
+        .filter_map(|(id, body)| {
+            let doc = multiview_config::LayoutDocument::from_body(&body).ok()?;
+            let sources = doc
+                .cells
+                .iter()
+                .filter_map(|c| c.source.input_id.clone())
+                .collect();
+            Some((
+                id,
+                LayoutReadback {
+                    sources,
+                    audio: doc.audio,
+                },
+            ))
+        })
+        .collect())
+}
+
+pub(crate) fn may_read_feed(
+    principal: &Principal,
+    layouts: &LayoutSources,
+    feed: &multiview_config::VideoFeed,
+) -> bool {
     use multiview_config::VideoFeed;
+    let readable = |id: &str| crate::auth::authorize_object(principal, id).is_ok();
     match feed {
         VideoFeed::Bus(_) => program_scope(principal),
-        VideoFeed::Source(id) | VideoFeed::Layout(id) => {
-            crate::auth::authorize_object(principal, id).is_ok()
+        VideoFeed::Source(id) => readable(id),
+        VideoFeed::Layout(id) => {
+            readable(id)
+                && layouts
+                    .get(id)
+                    .is_some_and(|layout| layout.sources.iter().all(|s| readable(s)))
         }
         _ => false,
     }
@@ -810,6 +879,7 @@ pub(crate) fn may_read_feed(principal: &Principal, feed: &multiview_config::Vide
 
 fn output_route_state(
     principal: &Principal,
+    layouts: &LayoutSources,
     feed: &multiview_config::OutputCrosspoint,
     output: String,
 ) -> OutputRouteState {
@@ -823,7 +893,7 @@ fn output_route_state(
     } else {
         redacted.clone()
     };
-    if !may_read_feed(principal, &video) {
+    if !may_read_feed(principal, layouts, &video) {
         return OutputRouteState {
             output,
             video: redacted.clone(),
@@ -851,6 +921,18 @@ fn output_route_state(
         match FollowAudio::of(&video) {
             FollowAudio::Source(id) => serde_json::json!({ "source": id }),
             FollowAudio::PreviewSource => serde_json::json!("preview_source"),
+            // A layout's `audio` attribute; its source is a bound cell's,
+            // which `may_read_feed` already required Read on.
+            FollowAudio::LayoutDefault => match &video {
+                VideoFeed::Layout(id) => match layouts.get(id).map(|l| &l.audio) {
+                    Some(multiview_config::LayoutAudio::None) => serde_json::json!("none"),
+                    Some(multiview_config::LayoutAudio::Source(source)) => {
+                        serde_json::json!({ "source": source })
+                    }
+                    _ => serde_json::json!("program"),
+                },
+                _ => serde_json::json!("program"),
+            },
             _ => serde_json::json!("program"),
         }
     } else {
@@ -872,6 +954,7 @@ fn output_route_state(
 
 #[cfg(test)]
 mod redaction_tests {
+    use super::LayoutSources;
     use super::{on_air_route_state, output_route_state, OutputTally};
     use crate::auth::{Principal, Role};
     use multiview_config::{AudioFeed, OutputCrosspoint, VideoFeed};
@@ -919,6 +1002,7 @@ mod redaction_tests {
         // Live bus readable (Program scope), persisted source not.
         let row = on_air_route_state(
             &program_scoped(&[]),
+            &LayoutSources::new(),
             &feed,
             Some(&live("program")),
             "o".into(),
@@ -932,6 +1016,7 @@ mod redaction_tests {
         feed.video = Some(VideoFeed::Source("bars".into()));
         let row = on_air_route_state(
             &scoped(&["o", "bars"]),
+            &LayoutSources::new(),
             &feed,
             Some(&live("src:secret-cam")),
             "o".into(),
@@ -949,6 +1034,7 @@ mod redaction_tests {
         feed.video = Some(VideoFeed::Source("secret-mic".into()));
         let row = on_air_route_state(
             &scoped(&["o"]),
+            &LayoutSources::new(),
             &feed,
             Some(&live("src:secret-cam")),
             "o".into(),
@@ -959,6 +1045,7 @@ mod redaction_tests {
         );
         let row = on_air_route_state(
             &scoped(&["o", "secret-mic", "secret-cam"]),
+            &LayoutSources::new(),
             &feed,
             Some(&live("src:secret-cam")),
             "o".into(),
@@ -976,14 +1063,78 @@ mod redaction_tests {
         let mut feed = OutputCrosspoint::program("o", "main");
         feed.video = Some(VideoFeed::Source("secret-cam".into()));
         feed.audio = AudioFeed::Source("secret-mic".into());
-        let row = output_route_state(&scoped(&["o"]), &feed, "o".into());
+        let row = output_route_state(&scoped(&["o"]), &LayoutSources::new(), &feed, "o".into());
         let json = serde_json::to_string(&row).unwrap_or_default();
         assert!(!json.contains("secret"), "{json}");
         assert_eq!(row.tally, OutputTally::Redacted);
         // Readable video, unreadable audio source: only the audio is redacted.
-        let row = output_route_state(&scoped(&["o", "secret-cam"]), &feed, "o".into());
+        let row = output_route_state(
+            &scoped(&["o", "secret-cam"]),
+            &LayoutSources::new(),
+            &feed,
+            "o".into(),
+        );
         let json = serde_json::to_string(&row).unwrap_or_default();
         assert!(!json.contains("secret-mic"), "{json}");
         assert!(json.contains("secret-cam"), "{json}");
+    }
+
+    /// #368 review (lens 2): a layout feed is readable only with Read on the
+    /// layout AND every source its cells bind; an unknown layout is hidden.
+    #[test]
+    fn a_layout_feed_is_redacted_unless_every_bound_source_is_readable() {
+        let mut layouts = LayoutSources::new();
+        layouts.insert("L".into(), vec!["bars".into(), "secret-cam".into()].into());
+        let mut feed = OutputCrosspoint::program("o", "main");
+        feed.video = Some(VideoFeed::Layout("L".into()));
+        let row = output_route_state(&scoped(&["o", "L", "bars"]), &layouts, &feed, "o".into());
+        assert_eq!(row.tally, OutputTally::Redacted);
+        let json = serde_json::to_string(&row).unwrap_or_default();
+        assert!(!json.contains("\"L\""), "{json}");
+        let row = output_route_state(
+            &scoped(&["o", "L", "bars", "secret-cam"]),
+            &layouts,
+            &feed,
+            "o".into(),
+        );
+        assert_eq!(row.video, serde_json::json!({ "layout": "L" }));
+        // A layout the library does not know is never shown.
+        feed.video = Some(VideoFeed::Layout("Gone".into()));
+        let row = output_route_state(&scoped(&["o", "Gone"]), &layouts, &feed, "o".into());
+        assert_eq!(row.tally, OutputTally::Redacted);
+    }
+
+    /// PR 2 (#306): `follow` on a layout feed resolves to the layout's
+    /// `audio` attribute in the configured readback.
+    #[test]
+    fn follow_on_a_layout_feed_reports_its_audio_attribute() {
+        let mut feed = OutputCrosspoint::program("o", "main");
+        feed.video = Some(VideoFeed::Layout("L".into()));
+        let who = scoped(&["o", "L", "bars"]);
+        for (audio, expected) in [
+            (
+                multiview_config::LayoutAudio::Program,
+                serde_json::json!("program"),
+            ),
+            (
+                multiview_config::LayoutAudio::None,
+                serde_json::json!("none"),
+            ),
+            (
+                multiview_config::LayoutAudio::Source("bars".into()),
+                serde_json::json!({ "source": "bars" }),
+            ),
+        ] {
+            let mut layouts = LayoutSources::new();
+            layouts.insert(
+                "L".into(),
+                super::LayoutReadback {
+                    sources: vec!["bars".into()],
+                    audio,
+                },
+            );
+            let row = output_route_state(&who, &layouts, &feed, "o".into());
+            assert_eq!(row.effective_audio, expected);
+        }
     }
 }

@@ -15,7 +15,8 @@ import type { components } from './types';
 /** An output video feed (externally tagged, never untagged). */
 export type OutputVideoFeed =
   | { readonly bus: 'program' | 'preview' | 'clean' }
-  | { readonly source: string };
+  | { readonly source: string }
+  | { readonly layout: string };
 
 /** An output audio feed (externally tagged like the config `audio`). */
 export type OutputAudioFeed =
@@ -202,12 +203,15 @@ export function feedOf(value: unknown): OutputVideoFeed | undefined {
     return { bus: value.bus };
   }
   if (typeof value.source === 'string') return { source: value.source };
+  if (typeof value.layout === 'string') return { layout: value.layout };
   return undefined;
 }
 
-/** The select value of a feed (`bus:program`, `src:<id>`). */
+/** The select value of a feed (`bus:program`, `src:<id>`, `aux:<layout>`). */
 export function feedKey(feed: OutputVideoFeed): string {
-  return 'bus' in feed ? `bus:${feed.bus}` : `src:${feed.source}`;
+  if ('bus' in feed) return `bus:${feed.bus}`;
+  if ('layout' in feed) return `aux:${feed.layout}`;
+  return `src:${feed.source}`;
 }
 
 /** Parse a select value back into a feed. */
@@ -216,5 +220,6 @@ export function feedFromKey(key: string): OutputVideoFeed | undefined {
   if (key === 'bus:preview') return { bus: 'preview' };
   if (key === 'bus:clean') return { bus: 'clean' };
   if (key.startsWith('src:') && key.length > 4) return { source: key.slice(4) };
+  if (key.startsWith('aux:') && key.length > 4) return { layout: key.slice(4) };
   return undefined;
 }

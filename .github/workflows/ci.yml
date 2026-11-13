@@ -206,6 +206,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      # The ubuntu runner has ~14 GiB free; the workspace test binaries plus the
+      # sqlite-feature rebuilds below exhausted it (ENOSPC in the runner, an `ld`
+      # SIGBUS mid-link, #381). Drop preinstalled toolchains this job never uses.
+      - name: free runner disk (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       # Default features are pure-Rust (no FFmpeg/GPU), so CI needs no native libs.
@@ -989,6 +998,26 @@ jobs:
           -p multiview-cli
           --features ffmpeg,aes67
           --lib audio
+      - name: test multiview-cli --features ffmpeg,aes67 (output routing lib tests)
+        # ADR-0108 output routing (the take state machine, live encoders, the
+        # routing-aux thread and the routed-layout compose) lives behind
+        # `ffmpeg`, so its chaos tests (take floods, wedged/panicking aux,
+        # held layout canvases, aux-canvas admission) and the end-to-end
+        # pipeline takes never ran in CI. Scoped to the three routing modules,
+        # NOT the full ffmpeg suite (issue #163). `--test-threads=2`: the
+        # router tests sleep per tick to let live workers encode; on a loaded
+        # runner full parallelism starves them into `EncoderNotReady`.
+        if: ${{ success() || steps.audio-lib-tests.outcome == 'failure' }}
+        timeout-minutes: 15
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features ffmpeg,aes67
+          --lib
+          --
+          output_routing routing_aux aux_layout
+          --test-threads=2
       - name: test multiview-cli --features ffmpeg,aes67 (hls_fetch lib tests)
         # Same gap as the audio step above, for the `hls_fetch`-module lib unit
         # tests (live/VOD playlist parsing, byte-range scheduling, 403/429 backoff,
@@ -1176,7 +1205,15 @@ jobs:
         # Mandatory chaos test for the invariant-#1 exit bound: the REAL binary
         # (with the env-armed `_chaos-test-seams`) is forced behind the clock
         # (fatal) and SIGTERMed, with source teardown held 10x past the bound.
-        # Every run must exit within 2 s + 0.5 s with valid HLS on disk.
+        # Every run: the watchdog fires 2 s after the decision (its own clock),
+        # late only by its reported wake latency, and the process is gone
+        # within 550 ms of the fire, with valid HLS on disk
+        # (docs/architecture/bounded-exit.md). This shared VM has woken a
+        # watchdog wait 92 and 106 ms late (one long wait) and, with 20 ms
+        # waits, 121-156 ms late in every run of two 40-run series, so its
+        # wake-latency bound is 200 ms (50 ms on a dedicated host).
+        env:
+          CHAOS_MAX_WAKE_LATE_MS: "200"
         run: |
           set -euo pipefail
           cargo build --locked --release -p multiview-cli --features apple,_chaos-test-seams
@@ -1391,6 +1428,35 @@ jobs:
       # preset since slice 5 PR B (#291): gate its advisories and licenses too.
       - name: cargo deny (acme closure)
         run: cargo deny --features multiview-cli/acme check
+
+  # ── HTTP/3 front-door fuzzing (#288) ─────────────────────────────────────────
+  # The multiview-h3 header-block guard, capsule parser and the real h3 server
+  # request path (in-memory transport) under libFuzzer, 30 s per target. The
+  # fuzz crate is its own workspace (excluded from the main one); cargo-fuzz
+  # needs nightly for the sanitizer flags, so only this job uses nightly.
+  fuzz-h3:
+    name: fuzz multiview-h3 (30 s per target)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-h3
+          workspaces: crates/multiview-h3/fuzz
+      - name: run fuzz targets
+        working-directory: crates/multiview-h3
+        run: |
+          set -euo pipefail
+          for target in header_guard capsule h3_request; do
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=30
+          done
 
   # ── release-artifact feature guard (task #109) ───────────────────────────────
   # A test-only Cargo feature (multiview-control's `_test-seams`, the config-watch
