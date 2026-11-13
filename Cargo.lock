@@ -3885,6 +3885,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "multiview-clocksys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "multiview-cloudflare"
 version = "0.1.0"
 dependencies = [
@@ -4042,6 +4049,7 @@ name = "multiview-engine"
 version = "0.1.0"
 dependencies = [
  "multiview-audio",
+ "multiview-clocksys",
  "multiview-compositor",
  "multiview-config",
  "multiview-core",
@@ -4107,6 +4115,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hashlink 0.11.1",
+ "libc",
  "moq-noq",
  "moq-tokio",
  "multiview-compositor",

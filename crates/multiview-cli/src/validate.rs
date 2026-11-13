@@ -51,6 +51,11 @@ pub struct StartCheck {
     /// With a refusal: whether a start would fall back to the last-good copy
     /// (`true`) or fail (`false`). Either way the preflight exits non-zero.
     pub falls_back: bool,
+    /// An earlier start fell back to the last-good copy and that warning has
+    /// not been acknowledged yet (#324): the warning text. Reported as a
+    /// `WARN` line; it does not change the exit code (the preflight judges
+    /// what a start WOULD do, which `refusal` already says).
+    pub pending_fallback: Option<String>,
 }
 
 /// Whether a config validated, and if not, the human-readable reason.
@@ -119,6 +124,12 @@ impl ValidationReport {
                 ),
             };
             out.push_str(&line);
+            if let Some(message) = &start.pending_fallback {
+                out.push_str(
+                    "\nWARN a start-up fallback is pending acknowledgement (`multiview acknowledge-fallback <config>` or POST /api/v1/health/accepted-state-rejected/ack): ",
+                );
+                out.push_str(message);
+            }
         }
         for warning in &self.warnings {
             out.push_str("\nWARN ");
@@ -215,11 +226,20 @@ fn start_check(boot: &MultiviewConfig, text: &str, path: &Path) -> StartCheck {
         Ok(()) => (None, false),
         Err(refusal) => (Some(refusal.reason), refusal.falls_back),
     };
+    // #324: a start that already fell back leaves a persisted marker; the
+    // preflight names it so a deploy check does not look clean while the
+    // running engine is on the last-good copy.
+    let pending_fallback = match multiview_control::boot_model::read_boot_fallback_marker(path) {
+        Ok(Some(marker)) => Some(marker.message),
+        Ok(None) => None,
+        Err(error) => Some(format!("(unreadable start-up fallback record: {error})")),
+    };
     StartCheck {
         source,
         accepted,
         refusal,
         falls_back,
+        pending_fallback,
     }
 }
 

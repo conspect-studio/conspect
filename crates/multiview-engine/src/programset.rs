@@ -20,7 +20,9 @@
 //!   invariant #1's "one program stalling never stalls another" **structural**:
 //!   each runtime awaits only its own pacer deadline (`runtime.rs` `run_inner`).
 //! * **`Program` is the supervised actor.** Each [`Program`] runs on its **own**
-//!   `tokio` task and implements [`Actor`], so the existing
+//!   dedicated, named output-clock OS thread ([`crate::clock_thread`], #311,
+//!   ADR-0109 — not a task on the control plane's runtime) and implements
+//!   [`Actor`], so the existing
 //!   [`Supervisor`] + [`RestartPolicy`]
 //!   restart a *crashed* program with capped backoff while every **other** program
 //!   keeps emitting. Failure is contained to one task.
@@ -56,6 +58,7 @@ use multiview_compositor::pipeline::Nv12Image;
 use multiview_config::ProgramSpec;
 
 use crate::clock::{OutputClock, TimeSource};
+use crate::clock_thread::ClockThread;
 use crate::drive::{CompositedFrame, CompositorDrive};
 use crate::error::{Error, Result};
 use crate::isolation::EnginePublisher;
@@ -85,35 +88,28 @@ const EVENT_CAP: usize = 8;
 /// the output clock (invariants #1 + #10).
 const PROGRAM_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Join one supervised program task with a bounded grace, then abort + detach it.
+/// Join one supervised program's clock thread with a bounded grace, then detach.
 ///
-/// Raises nothing itself (the caller raises `stop` first): it waits up to
-/// [`PROGRAM_JOIN_GRACE`] for the task to finish on its own (the clean path for a
-/// program that observes its stop within a tick). If it has not finished by then
-/// it is [`abort`](tokio::task::JoinHandle::abort)ed and detached — teardown is
-/// **bounded**, never an unbounded `await` on a task that cannot return. A join
-/// error (panic or the abort-cancellation) is logged, never propagated: stopping
-/// one program must never fail the supervisor.
-async fn join_program_task_bounded(pid: &ProgramId, task: tokio::task::JoinHandle<()>) {
-    // Capture an abort handle BEFORE moving `task` into the bounded wait: if the
-    // grace elapses we must actively `abort()`, because merely dropping a
-    // `JoinHandle` detaches the task (it keeps running) rather than cancelling it.
-    let abort = task.abort_handle();
-    match tokio::time::timeout(PROGRAM_JOIN_GRACE, task).await {
+/// Raises nothing itself (the caller raises `stop` first): it awaits (without
+/// blocking the caller's executor) up to [`PROGRAM_JOIN_GRACE`] for the thread to
+/// finish on its own (the clean path for a program that observes its stop within
+/// a tick, or [`STOP_POLL`](crate::clock_thread::STOP_POLL) while it sleeps). If
+/// it has not finished by then it is **detached** — teardown is bounded, never an
+/// unbounded wait on a thread that cannot return. An OS thread cannot be
+/// cancelled; a detached wedged clock thread owns only its own program and exits
+/// as soon as its loop reaches a stop check. A panic on the thread is logged,
+/// never propagated: stopping one program must never fail the supervisor.
+async fn join_program_task_bounded(pid: &ProgramId, task: ClockThread<()>) {
+    match tokio::time::timeout(PROGRAM_JOIN_GRACE, task.join()).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(program = %pid, %error, "program task join error on teardown");
+        Ok(Err(panic)) => {
+            tracing::warn!(program = %pid, %panic, "program clock thread panicked before teardown");
         }
         Err(_elapsed) => {
-            // The task did not return within the grace — its run loop cannot reach
-            // its stop check (a wedged pacer/clock). Abort it rather than block
-            // teardown forever (the PR #95 hang). The aborted task's resources are
-            // reclaimed by the runtime; the abort never stalls the caller.
-            abort.abort();
             tracing::warn!(
                 program = %pid,
                 grace_ms = PROGRAM_JOIN_GRACE.as_millis(),
-                "program task did not stop within grace; aborted and detached (bounded teardown)"
+                "program clock thread did not stop within grace; detached (bounded teardown)"
             );
         }
     }
@@ -238,6 +234,13 @@ impl<P: Pacer> Program<P> {
     {
         let stop = crate::runtime::StopSignal::new();
         let inner = MultiviewProgram::new(spec, clock, drive, time, pacer, stop)?;
+        Ok(Self::from_multiview(inner, egress))
+    }
+
+    fn from_multiview<F>(inner: MultiviewProgram<P>, egress: F) -> Self
+    where
+        F: FnMut(u64) + Send + 'static,
+    {
         let (egress_tx, egress_rx) = std::sync::mpsc::sync_channel::<u64>(EGRESS_QUEUE_CAP);
         // Spawn the dedicated egress consumer thread NOW: it drains tick indices
         // into the consumer until every sender drops (channel close). A wedged
@@ -253,7 +256,7 @@ impl<P: Pacer> Program<P> {
                 }
             })
             .ok();
-        Ok(Self {
+        Self {
             id,
             cadence: inner.cadence(),
             stop: inner.stop_signal(),
@@ -265,7 +268,31 @@ impl<P: Pacer> Program<P> {
                 egress_tx: Some(egress_tx),
                 egress_thread,
             },
-        })
+        }
+    }
+
+    /// Build a multiview program anchored to an explicit tick-0 `seed_nanos`
+    /// (the predecessor's, from [`ProgramSet::seed_nanos`]) with a no-op egress —
+    /// the NEW side of a [`ProgramSet::start_successor`] thread handoff.
+    ///
+    /// # Errors
+    ///
+    /// See [`Program::multiview`].
+    pub fn multiview_succeeding<F>(
+        spec: &ProgramSpec,
+        clock: OutputClock,
+        drive: CompositorDrive<Nv12Image>,
+        time: Arc<dyn TimeSource>,
+        pacer: P,
+        seed_nanos: i64,
+        egress: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(u64) + Send + 'static,
+    {
+        let stop = crate::runtime::StopSignal::new();
+        let inner = MultiviewProgram::with_seed(spec, clock, drive, time, pacer, stop, seed_nanos)?;
+        Ok(Self::from_multiview(inner, egress))
     }
 
     /// Register a **caller-supplied** program run as a first-class member of a
@@ -339,7 +366,29 @@ impl<P: Pacer> Program<P> {
             ticks: Arc::clone(&self.ticks),
             egress_dropped: Arc::clone(&self.egress_dropped),
             cadence: self.cadence,
+            handoff: match &self.runner {
+                Runner::Multiview { inner, .. } => Some(inner.handoff()),
+                Runner::External(_) => None,
+            },
+            seed_nanos: match &self.runner {
+                Runner::Multiview { inner, .. } => Some(inner.seed_nanos()),
+                Runner::External(_) => None,
+            },
             task: None,
+        }
+    }
+
+    /// Make this (multiview) program the **successor** of a running program on
+    /// the same timeline (#311 thread handoff): it waits for the predecessor's
+    /// cut and emits from exactly that tick. Build it with the predecessor's
+    /// seed ([`ProgramSet::seed_nanos`], via [`Program::multiview_succeeding`]).
+    fn succeed(&mut self, predecessor: Arc<crate::runtime::Handoff>) -> bool {
+        match &mut self.runner {
+            Runner::Multiview { inner, .. } => {
+                inner.succeed(predecessor);
+                true
+            }
+            Runner::External(_) => false,
         }
     }
 }
@@ -468,8 +517,14 @@ struct ProgramHandle {
     ticks: Arc<AtomicU64>,
     egress_dropped: Arc<AtomicU64>,
     cadence: multiview_core::time::Rational,
-    /// The spawned supervised task; `None` only transiently during teardown.
-    task: Option<tokio::task::JoinHandle<()>>,
+    /// The program's handoff cell (multiview programs only; see
+    /// [`crate::runtime::Handoff`]).
+    handoff: Option<Arc<crate::runtime::Handoff>>,
+    /// The program's tick-0 seed on the shared time source (multiview only).
+    seed_nanos: Option<i64>,
+    /// The program's dedicated clock thread; `None` only transiently during
+    /// teardown.
+    task: Option<ClockThread<()>>,
 }
 
 /// The **`ProgramSet`** supervisor: owns the `ProgramId → ProgramHandle` map and
@@ -523,15 +578,16 @@ impl<P: Pacer + Send + 'static> ProgramSet<P> {
         Arc::clone(&self.time)
     }
 
-    /// Admit + spawn a program on its **own** supervised `tokio` task — **without
-    /// touching** any other program (ADR-0030 §2.2). The program keeps its own
-    /// independent clock; the supervisor records a handle to sample its progress
-    /// and to stop it later.
+    /// Admit + start a program on its **own** dedicated output-clock thread
+    /// (`clock-<id>`, #311 / ADR-0109) — **without touching** any other program
+    /// (ADR-0030 §2.2). The program keeps its own independent clock; the
+    /// supervisor records a handle to sample its progress and to stop it later.
     ///
     /// # Errors
     ///
     /// Returns [`Error::DuplicateProgram`] if a program with the same id is
-    /// already running (ids are unique within a set).
+    /// already running (ids are unique within a set), or
+    /// [`Error::InvalidControlLoop`] if the OS refused to create the thread.
     pub fn start(&mut self, program: Program<P>) -> Result<()> {
         let id = program.id().clone();
         if self.programs.contains_key(&id) {
@@ -539,16 +595,107 @@ impl<P: Pacer + Send + 'static> ProgramSet<P> {
         }
         let mut handle = program.handle();
         let supervisor = Supervisor::new(self.policy);
-        // Spawn the per-program supervised task: the Supervisor drives the
-        // `Program` actor, restarting it with capped backoff on failure while every
-        // sibling keeps emitting. The task owns the program; nothing here blocks the
-        // caller or any other program.
-        let task = tokio::spawn(async move {
-            let _outcome = supervisor.supervise(program).await;
-        });
+        // The per-program clock thread: the Supervisor drives the `Program` actor
+        // (restarting it with capped backoff on failure while every sibling keeps
+        // emitting) under `block_on` on a thread of its own, so the tick loop
+        // shares no executor worker and no timer wheel with the control plane.
+        // The thread owns the program; nothing here blocks the caller or any
+        // other program.
+        let stop = handle.stop.clone();
+        let task = crate::clock_thread::spawn(&format!("clock-{}", id.as_str()), move || {
+            let _outcome =
+                crate::clock_thread::block_on(supervisor.supervise_until(program, Some(&stop)));
+        })
+        .map_err(|error| Error::InvalidControlLoop(format!("clock thread for {id}: {error}")))?;
         handle.task = Some(task);
         self.programs.insert(id, handle);
         Ok(())
+    }
+
+    /// The tick-0 seed of the running multiview program `id` on the shared time
+    /// source — what a successor is built with ([`Program::multiview_succeeding`]).
+    #[must_use]
+    pub fn seed_nanos(&self, id: &str) -> Option<i64> {
+        let pid = ProgramId::new(id).ok()?;
+        self.programs.get(&pid).and_then(|h| h.seed_nanos)
+    }
+
+    /// **Thread handoff** (#311, ADR-0109 §4): start `successor` on its own clock
+    /// thread so it continues the running program `predecessor`'s exact tick
+    /// timeline, then ask the predecessor to hand off. The predecessor emits
+    /// every tick below the cut and stops; the successor emits from the cut on —
+    /// no tick index is missed or emitted twice. The successor must have been
+    /// built with the predecessor's seed and cadence. Await
+    /// [`ProgramSet::stop`] on the predecessor afterwards to reap its thread.
+    ///
+    /// Returns the cut once the predecessor has chosen it (within a tick). If
+    /// it has not within [`PROGRAM_JOIN_GRACE`] (a wedged predecessor), the
+    /// request is withdrawn ([`Handoff::retract`](crate::runtime::Handoff::retract)),
+    /// the successor is stopped and removed again (rollback; the predecessor
+    /// keeps running untouched) and an [`Error::InvalidControlLoop`] is returned.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::DuplicateProgram`] for a duplicate successor id; an
+    /// [`Error::InvalidControlLoop`] if the predecessor is not a running
+    /// multiview program, the successor is not a multiview program, or the
+    /// cadences or seeds differ.
+    pub async fn start_successor(
+        &mut self,
+        predecessor: &str,
+        mut successor: Program<P>,
+    ) -> Result<u64> {
+        let pid = ProgramId::new(predecessor)
+            .map_err(|e| Error::InvalidControlLoop(format!("predecessor id: {e}")))?;
+        let (handoff, seed, cadence) = match self.programs.get(&pid) {
+            Some(ProgramHandle {
+                handoff: Some(handoff),
+                seed_nanos: Some(seed),
+                cadence,
+                ..
+            }) => (Arc::clone(handoff), *seed, *cadence),
+            _ => {
+                return Err(Error::InvalidControlLoop(format!(
+                    "{predecessor} is not a running multiview program"
+                )))
+            }
+        };
+        let successor_seed = match &successor.runner {
+            Runner::Multiview { inner, .. } => inner.seed_nanos(),
+            Runner::External(_) => seed.wrapping_add(1),
+        };
+        if successor.cadence != cadence || successor_seed != seed {
+            return Err(Error::InvalidControlLoop(format!(
+                "successor of {predecessor} must share its cadence and seed"
+            )));
+        }
+        if !successor.succeed(Arc::clone(&handoff)) {
+            return Err(Error::InvalidControlLoop(
+                "a successor must be a multiview program".to_owned(),
+            ));
+        }
+        let successor_id = successor.id().as_str().to_owned();
+        self.start(successor)?;
+        handoff.request();
+        let started = std::time::Instant::now();
+        while started.elapsed() < PROGRAM_JOIN_GRACE {
+            if let Some(cut) = handoff.cut() {
+                return Ok(cut);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // Rollback: the predecessor never reached a frame boundary (wedged).
+        // Withdraw the request atomically so the predecessor keeps running
+        // untouched when it unsticks; if it chose a cut in the meantime the
+        // handoff did happen and NEW must stay.
+        if let Err(cut) = handoff.retract() {
+            return Ok(cut);
+        }
+        self.stop(&successor_id).await;
+        Err(Error::InvalidControlLoop(format!(
+            "{predecessor} did not hand off within {} ms; successor rolled back",
+            PROGRAM_JOIN_GRACE.as_millis()
+        )))
     }
 
     /// Whether a program with `id` is currently in the set.

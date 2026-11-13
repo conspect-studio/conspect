@@ -67,7 +67,9 @@ door runs on its own Tokio runtime (`network.workers` OS threads), never on the 
 the output clock: today that clock is a `tokio::spawn`ed task on the main runtime
 (`crates/multiview-engine/src/programset.rs:546`, `runtime.rs:125`, `crates/multiview-cli/src/main.rs:124`).
 On Linux, validated flows are steered to their own socket in a `SO_REUSEPORT` group, so a flood of
-unvalidated traffic fills a kernel queue no paying viewer shares.
+unvalidated traffic fills a kernel queue no paying viewer shares. The steering program is classic BPF
+(`SO_ATTACH_REUSEPORT_CBPF`), not eBPF: it needs no `CAP_BPF`/`CAP_SYS_ADMIN` and works with
+`kernel.unprivileged_bpf_disabled=1` (slice 3, issue #289).
 
 B. **HTTP/3 for the site: the engine terminates TLS (shape 1).** One QUIC endpoint (ALPN `h3`, the
 same ACME certificate as TCP) serves both the site/API and MoQ. Browsers do not pool WebTransport

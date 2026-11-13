@@ -417,9 +417,12 @@ pub enum WarningCode {
     CatalogueLinkAttention,
     /// The saved accepted state (`desired.json`) could not start, so the engine
     /// started from the last state that started (#317). The message names the
-    /// reason and where the rejected state was kept. **Latched** until restart.
-    /// Remediation: fix or re-apply the configuration; the rejected file stays on
-    /// disk for inspection.
+    /// reason and where a copy of the rejected state was kept; `desired.json`
+    /// itself is unchanged (#324). **Persisted**: raised on every start that
+    /// still cannot use the saved configuration, cleared by a start that can;
+    /// acknowledging (`POST /api/v1/health/accepted-state-rejected/ack` or
+    /// `multiview acknowledge-fallback`) silences the current alarm only.
+    /// Remediation: fix or re-apply the configuration.
     AcceptedStateRejected,
     /// The front-door TLS certificate needs attention (ADR-0107 section 5a):
     /// renewal is failing and under 50 % (warning) or 25 % (critical) of the

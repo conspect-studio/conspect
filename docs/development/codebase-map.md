@@ -82,7 +82,7 @@ needed); `engine` depends on the media crates; `control`/`preview` depend on `en
 Off this spine sit the **control-plane leaves** (`multiview-licence`, `multiview-mesh` — neither has
 an engine dependency, by charter), the **shared WebRTC endpoint** (`multiview-webrtc`, over
 `preview` + `input`), and the four **`-sys`/FFI leaves** (`multiview-ndi-sys`,
-`multiview-rist-sys`, `multiview-srt-sys`, `multiview-ntpsys`, `multiview-i915pmu`) that isolate `unsafe` so their
+`multiview-rist-sys`, `multiview-srt-sys`, `multiview-ntpsys`, `multiview-clocksys`, `multiview-i915pmu`) that isolate `unsafe` so their
 consumers stay `forbid(unsafe_code)`.
 
 | Crate | Touch it when… | Key modules (`src/`) | Optional features | Brief(s) / ADRs to read first |
@@ -110,6 +110,7 @@ consumers stay `forbid(unsafe_code)`.
 | `multiview-srt-sys` | FFI leaf: runtime `dlopen` of **libsrt** for the dual-stack `[::]` SRT listener (`SRTO_IPV6ONLY = 0`), which FFmpeg's `srt://` cannot bind. Registers no callbacks. | `lib` | none (compiled with `ffmpeg` in its consumers) | srt-transport; ADR-0039 addendum |
 | `multiview-rist-sys` | FFI leaf: runtime `dlopen` of **librist** for RIST **link statistics** (FFmpeg's `rist://` exposes no stats callback). The callback runs on librist's thread and only `try_send`s on a bounded drop-oldest channel. | `raw` (hand-mirrored C ABI, size-checked) `session` | `session` (the dlopen + stats path; the pure C-ABI decode compiles without it) | rist-transport; ADR-0095 |
 | `multiview-ntpsys` | FFI leaf: minimal safe wrapper over Linux `adjtimex(2)` — the NTP clock-discipline read behind the wall-clock **reference** badge (a media-clock reference only, **never** a pacer). | `lib` (single-module leaf) | — (reached via `multiview-engine/ntp`) | wall-clock-sync; ADR-T012/0038 |
+| `multiview-clocksys` | FFI leaf: raises the output-clock thread to macOS QoS `USER_INTERACTIVE` (one `pthread_set_qos_class_self_np` call, `deny` + `// SAFETY:`); a no-op elsewhere ([ADR-0109](../decisions/ADR-0109-output-clock-thread.md)). |
 | `multiview-i915pmu` | FFI leaf: minimal safe wrapper over the Linux i915 PMU per-engine busy-ns counters (`perf_event_open(2)`) for the Intel GPU-load probe. | `lib` (single-module leaf) | — (reached via `multiview-hal/i915-pmu`) | gpu-monitoring-and-scheduling, system-stats-attribution; ADR-0017 |
 | `multiview-cli` | Binary `multiview`: wires engine + control, config load, run/validate. | `cli` (arg parse) `validate` `run` (`SoftwareEngine`, `run --software`) `pipeline` `licence` `frontdoor` `tls_boot` (ACME boot wiring) `tls_cli` (`multiview tls`) | aggregates every crate flag; umbrella presets `nvidia` / `apple` / `linux-vaapi` / `full` (everything non-GPL) | core-engine; conventions §7 (licensing) |
 | `web/` | React 19 SPA: shadcn/ui, TanStack, react-konva, dnd-kit, OpenAPI client. | `app` `pages` `components/ui` `layout/` (konva canvas + accessible `CellsForm`) `realtime/` `api` `i18n` + `locales/` (en/ar/pseudo) `theme` | n/a (npm only — `npm --prefix web …`) | web-api-stack, conventions §8; ADR-W001..W008 |
