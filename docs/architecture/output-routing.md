@@ -1695,6 +1695,16 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
 - **What the integer path does not draw.** A layout with a translucent cell (opacity below 1) is
   refused at plan and take (`422 layout-not-admissible`). A tile with an alpha plane or a colour
   tag other than the canvas tag shows its cell's slate (counted), never opaque or mislabelled.
+- **Authorization (§6.3).** A layout take or plan needs Read on the layout AND on every source its
+  cells bind (one generic 403 otherwise); the readback shows a layout feed only under the same
+  closure, computed from the accepted library (an unknown layout is redacted).
+- **Geometry corner cases** match the reference: a cell whose floored rect is zero wide or tall is
+  drawn at the source's own size, clipped to the canvas; a 2x2 chroma block takes the chroma of its
+  bottom-right pixel from the last cell covering it. All index arithmetic is overflow-free (a canvas
+  over 65534 composes and returns).
+- **A re-take of an edited layout** swaps the body the canvas composes and requests an IDR on that
+  layout's encoders (within the per-key force floor), so the edited picture starts on a clean
+  random-access point.
 - **Resolution on the control plane.** The take resolves the stored layout from the accepted
   library, solves it, and applies the `apply-layout` pinned-canvas gate (a layout authored for
   another canvas is `422 layout-not-admissible`; an unknown one `422 unknown-feed`). The engine
@@ -1713,7 +1723,7 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
 - **Not in PR 1, owed by PR 2:** aux sizing (§2.4: decode size follows the routed cell size; until
   then a routed cell scales the tile decoded for Program, or the 640x360 unbound decode), the
   Program-lateness back-off (halving the aux cadence), live propagation of layout edits, rename and
-  delete to a routed canvas (a re-take picks up an edit), and the layout `audio` attribute.
+  delete to a routed canvas (a re-take already picks up an edit, at an IDR), and the layout `audio` attribute.
   Start-up does not re-take a persisted layout feed (no boot take: its body lives in the layouts
   library, which start-up does not resolve). The output starts and stays on Program, and the
   readback shows the layout as configured but not on air. Unlike before slice 3, a persisted layout

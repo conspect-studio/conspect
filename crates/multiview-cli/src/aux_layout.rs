@@ -305,7 +305,7 @@ impl LayoutCanvas {
             self.pictures = pictures;
             return None;
         };
-        let (width, background) = (self.spec.width, self.spec.background);
+        let (canvas, background) = ((self.spec.width, self.spec.height), self.spec.background);
         let mut columns = std::mem::take(&mut self.columns);
         if let Some(image) = self.ring.get_mut(index).and_then(Arc::get_mut) {
             let (y_plane, uv_plane) = image.planes_mut();
@@ -315,7 +315,7 @@ impl LayoutCanvas {
                 pair.copy_from_slice(&chroma);
             }
             for (cell, picture) in self.cells.iter().zip(&pictures) {
-                draw_cell(picture, cell, width, y_plane, uv_plane, &mut columns);
+                draw_cell(picture, cell, canvas, y_plane, uv_plane, &mut columns);
             }
         }
         self.columns = columns;
@@ -327,30 +327,53 @@ impl LayoutCanvas {
     }
 }
 
-/// Draw `src` scaled (nearest neighbour) into `cell` of the canvas planes.
+/// Draw `src` scaled (nearest neighbour) into `cell` of the canvas planes,
+/// exactly as the reference compositor places a tile:
+///
+/// * a zero destination extent means the source's own extent
+///   (`Tile::eff_dst_w`/`eff_dst_h`);
+/// * the rectangle is clipped to the canvas;
+/// * luma is per pixel; a 2x2 chroma block takes the chroma of its
+///   bottom-right pixel, written by the last (highest) cell covering that
+///   pixel. That is the reference's last writer: its per-pixel `write_pixel`
+///   writes the block's chroma for all four pixels in raster order.
+///
+/// All index arithmetic is `usize` from `u32` (no wrap on any canvas size), and
+/// every walk is bounded by the plane, so a huge or odd geometry ends the walk
+/// instead of looping.
 fn draw_cell(
     src: &Nv12Image,
     cell: &CellPlan,
-    canvas_w: u32,
+    canvas: (u32, u32),
     y_plane: &mut [u8],
     uv_plane: &mut [u8],
     columns: &mut Vec<u32>,
 ) {
-    if cell.w == 0 || cell.h == 0 || src.width() == 0 || src.height() == 0 {
-        return;
-    }
     let to = |v: u32| usize::try_from(v).unwrap_or(usize::MAX);
     let (sw, sh) = (src.width(), src.height());
+    if sw == 0 || sh == 0 {
+        return;
+    }
+    let dst_w = if cell.w == 0 { sw } else { cell.w };
+    let dst_h = if cell.h == 0 { sh } else { cell.h };
+    let (cw, ch) = (to(canvas.0), to(canvas.1));
+    let (x0, y0) = (to(cell.x), to(cell.y));
+    // Clipped extents (pixels of the rect inside the canvas).
+    let vis_w = to(dst_w).min(cw.saturating_sub(x0));
+    let vis_h = to(dst_h).min(ch.saturating_sub(y0));
+    if vis_w == 0 || vis_h == 0 {
+        return;
+    }
     let (sy, suv) = (src.y_plane(), src.uv_plane());
-    let (sw_u, cw_u) = (to(sw), to(canvas_w));
+    let sw_u = to(sw);
     columns.clear();
-    columns.extend((0..cell.w).map(|dx| map_axis(dx, sw, cell.w)));
-    // Luma: every pixel of the rect.
-    for dy in 0..cell.h {
-        let src_row = to(map_axis(dy, sh, cell.h)) * sw_u;
-        let dst_row = to(cell.y + dy) * cw_u + to(cell.x);
+    columns.extend((0..dst_w).take(vis_w).map(|dx| map_axis(dx, sw, dst_w)));
+    // Luma: every visible pixel of the rect.
+    for (dy, row_index) in (0..dst_h).take(vis_h).zip(y0..) {
+        let src_row = to(map_axis(dy, sh, dst_h)) * sw_u;
+        let dst_row = row_index * cw + x0;
         let (Some(dst), Some(row)) = (
-            y_plane.get_mut(dst_row..dst_row + to(cell.w)),
+            y_plane.get_mut(dst_row..dst_row + vis_w),
             sy.get(src_row..src_row + sw_u),
         ) else {
             continue;
@@ -361,31 +384,36 @@ fn draw_cell(
             }
         }
     }
-    // Chroma: a 2x2 block is written by the cell covering its bottom-right
-    // pixel `(2bx + 1, 2by + 1)`; its value is the chroma the source samples
-    // at that pixel.
-    // The first block whose bottom-right pixel `2b + 1` lies at or after
-    // the cell's first pixel: `b = ceil((start - 1) / 2)` = `start / 2`.
-    let block_col0 = cell.x / 2;
-    let block_row0 = cell.y / 2;
-    let (end_x, end_y) = (cell.x + cell.w, cell.y + cell.h);
-    let mut by = block_row0;
-    while 2 * by + 1 < end_y {
-        let dy = 2 * by + 1 - cell.y;
-        let src_cy = to(map_axis(dy, sh, cell.h) / 2);
-        let dst_row = to(by) * cw_u;
-        let mut bx = block_col0;
-        while 2 * bx + 1 < end_x {
-            let dx = 2 * bx + 1 - cell.x;
-            let sx = columns.get(to(dx)).copied().unwrap_or(0);
+    // Chroma: blocks whose bottom-right pixel `(2bx + 1, 2by + 1)` lies in
+    // the visible rect. The first such block is `start / 2`; the last ends
+    // at the visible far edge.
+    let (end_x, end_y) = (x0 + vis_w, y0 + vis_h);
+    for by in (y0 / 2)..ch.div_ceil(2) {
+        let py = 2 * by + 1;
+        if py >= end_y {
+            break;
+        }
+        if py < y0 {
+            continue;
+        }
+        let dy = u32::try_from(py - y0).unwrap_or(u32::MAX);
+        let src_cy = to(map_axis(dy, sh, dst_h) / 2);
+        let dst_row = by * cw;
+        for bx in (x0 / 2)..cw.div_ceil(2) {
+            let px = 2 * bx + 1;
+            if px >= end_x {
+                break;
+            }
+            if px < x0 {
+                continue;
+            }
+            let sx = columns.get(px - x0).copied().unwrap_or(0);
             let s = src_cy * sw_u + to(sx / 2) * 2;
-            let d = dst_row + to(bx) * 2;
+            let d = dst_row + bx * 2;
             if let (Some(dst), Some(pair)) = (uv_plane.get_mut(d..d + 2), suv.get(s..s + 2)) {
                 dst.copy_from_slice(pair);
             }
-            bx += 1;
         }
-        by += 1;
     }
 }
 

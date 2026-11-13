@@ -1322,7 +1322,7 @@ impl OutputRouter {
             if let Some(PictureBus::Layout(layout)) = &take.bus {
                 // A re-take of a composing layout carries its latest body
                 // (an edited layout): the canvas follows it from this tick.
-                self.refresh_layout_body(layout);
+                self.refresh_layout_body(layout, tick);
                 if !self.admit_aux_canvas(layout, take.output_index, dispatcher) {
                     self.emit(
                         take.operation_id,
@@ -2497,8 +2497,10 @@ impl OutputRouter {
     }
 
     /// Point a composing layout bus at `layout`'s body when it changed
-    /// (rare: a re-take after an edit). One feed-list republish.
-    fn refresh_layout_body(&mut self, layout: &LayoutRef) {
+    /// (rare: a re-take after an edit). One feed-list republish, and an IDR
+    /// requested on every live key of that bus so the edited picture starts
+    /// on a clean random-access point (within the per-key force floor).
+    fn refresh_layout_body(&mut self, layout: &LayoutRef, tick: u64) {
         let bus = PictureBus::Layout(layout.clone());
         let Some(feed) = self.feeds.get_mut(&bus) else {
             return;
@@ -2508,7 +2510,16 @@ impl OutputRouter {
                 return;
             }
         }
-        feed.bus = bus;
+        feed.bus = bus.clone();
+        let keys: Vec<usize> = self
+            .dynamic
+            .iter()
+            .filter(|d| d.bus == bus)
+            .map(|d| d.key)
+            .collect();
+        for key in keys {
+            let _ = self.request_idr(key, tick.saturating_add(1));
+        }
         let list: Vec<AuxFeed> = self
             .feeds
             .values()

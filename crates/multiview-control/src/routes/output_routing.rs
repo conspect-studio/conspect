@@ -411,7 +411,17 @@ type FeedRefusal = (u16, &'static str, String);
 /// canvas (the Class-1 pinned-canvas gate of `apply-layout`), and be drawable
 /// by the aux integer path (every cell opaque). Pure CPU on the control
 /// plane; the engine only composes the result.
-fn resolve_layout(state: &AppState, id: &str) -> ControlResult<Result<RoutedLayout, FeedRefusal>> {
+///
+/// Authorization (§6.3, "Read on L AND on every source its cells bind"): the
+/// layout id is authorized before this runs; here every source the layout's
+/// cells bind is authorized too, so a principal cannot view a source it may
+/// not read by routing a layout that shows it. A refusal is a bare 403 that
+/// names nothing (the caller already holds Read on the layout body).
+fn resolve_layout(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> ControlResult<Result<RoutedLayout, FeedRefusal>> {
     let versioned = match crate::routes::authoritative_layouts(state)? {
         Some(desired) => crate::routes::authoritative_layout(&desired, id),
         None => state.repository.get_layout(id),
@@ -438,6 +448,7 @@ fn resolve_layout(state: &AppState, id: &str) -> ControlResult<Result<RoutedLayo
         }
         Err(other) => return Err(other),
     };
+    authorize_layout_sources(principal, &resolved.solved)?;
     let routed = RoutedLayout {
         id: id.to_owned(),
         slates: resolved.document.cell_slates(),
@@ -455,10 +466,31 @@ fn resolve_layout(state: &AppState, id: &str) -> ControlResult<Result<RoutedLayo
     Ok(Ok(routed))
 }
 
+/// Read on every source `layout`'s cells bind (§6.3). One generic 403 for
+/// any unreadable source: never which one, never whether it exists.
+pub(crate) fn authorize_layout_sources(
+    principal: &Principal,
+    layout: &multiview_core::layout::Layout,
+) -> ControlResult<()> {
+    let readable = layout
+        .cells
+        .iter()
+        .filter_map(|cell| cell.source.as_deref())
+        .all(|source| crate::auth::authorize_object(principal, source).is_ok());
+    if readable {
+        Ok(())
+    } else {
+        Err(ControlError::Forbidden(
+            "not authorized for every source this layout shows".to_owned(),
+        ))
+    }
+}
+
 /// The video feed as a routed feed (and, for a layout, its resolved body),
 /// after existence checks: `Err` is the typed refusal.
 fn resolve_feed(
     state: &AppState,
+    principal: &Principal,
     feed: &VideoFeed,
 ) -> ControlResult<Result<(RoutedFeed, Option<LayoutBody>), FeedRefusal>> {
     let Some(routed) = RoutedFeed::of(feed) else {
@@ -479,7 +511,7 @@ fn resolve_feed(
             }
         }
         RoutedFeed::Layout(id) => {
-            return Ok(resolve_layout(state, id)?.map(|layout| {
+            return Ok(resolve_layout(state, principal, id)?.map(|layout| {
                 (
                     routed.clone(),
                     Some(LayoutBody(std::sync::Arc::new(layout))),
@@ -543,7 +575,7 @@ pub(crate) fn plan_output(
     };
     let mut routed_video = None;
     if let Some(feed) = video {
-        match resolve_feed(state, feed)? {
+        match resolve_feed(state, principal, feed)? {
             Err((_, kind, detail)) => refusals.push(OutputPlanRefusal {
                 kind: kind.to_owned(),
                 detail: if kind == "unknown-feed" {
@@ -822,7 +854,7 @@ pub(crate) async fn take_output(
     }
     let (feed, layout) = match video {
         None => (None, None),
-        Some(video) => match resolve_feed(&state, video)? {
+        Some(video) => match resolve_feed(&state, &principal, video)? {
             Ok((feed, layout)) => (Some(feed), layout),
             Err((status, kind, detail)) => return Ok(refusal_problem(status, kind, detail)),
         },

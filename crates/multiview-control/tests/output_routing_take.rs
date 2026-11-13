@@ -124,6 +124,11 @@ fn keys() -> ApiKeyStore {
         },
     );
     keys.register(
+        "route-layout",
+        "route-layout-secret",
+        scoped("route-layout", &["output-1", "NewsOne", "a"], None),
+    );
+    keys.register(
         "route-other",
         "route-other-secret",
         scoped("route-other", &["output-0", "bars"], None),
@@ -1652,6 +1657,34 @@ async fn a_stored_layout_routes_to_an_output_with_typed_refusals() {
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{id}");
     }
+    // #368 review (lens 2): Read on the layout but not on every source its
+    // cells bind (`bars`) is a 403 at plan and take, naming nothing.
+    let resp = send(
+        &rig.router,
+        post(
+            "/api/v1/routing/plan",
+            "route-layout.route-layout-secret",
+            None,
+            &body("output-1", serde_json::json!({"layout": "NewsOne"})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let problem = body_json(resp).await.to_string();
+    assert!(!problem.contains("bars"), "{problem}");
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            "route-layout.route-layout-secret",
+            "partial-closure",
+            "output-1",
+            serde_json::json!({"layout": "NewsOne"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(rig.fake.takes().is_empty(), "nothing enqueued");
     // The take carries the resolved body.
     let resp = send(
         &rig.router,

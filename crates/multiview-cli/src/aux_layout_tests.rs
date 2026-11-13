@@ -307,3 +307,46 @@ fn a_1080p_layout_compose_costs_less_than_a_tick_on_one_core() {
         "p50 {p50:?} over {bound} ms"
     );
 }
+
+/// #368 review (lens 3): a canvas wider or taller than 65534 composes one
+/// frame and returns: no `u32` wrap, no endless block walk.
+#[test]
+fn a_huge_canvas_composes_and_returns() {
+    for (w, h) in [(65_536, 2), (2, 65_536), (65_538, 4)] {
+        let pts = MediaTime::from_nanos(0);
+        let stores = Stores::new(pts);
+        let mut layout = newsone(w, h);
+        layout.cells.truncate(3);
+        let mut canvas = LayoutCanvas::new(routed(layout), spec(w, h)).unwrap();
+        let started = Instant::now();
+        let frame = canvas.compose(&stores.lookup(), pts).expect("one frame");
+        assert_eq!((frame.width(), frame.height()), (w, h));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+}
+
+/// #368 review (lens 1): a cell whose floored rect is zero wide is drawn at
+/// the source's own size (clipped), as the reference compositor does; a
+/// one-row cell on an even row leaves the block chroma to the pixel below,
+/// as the reference's last writer does.
+#[test]
+fn sub_pixel_and_one_row_cells_match_program() {
+    let pts = MediaTime::from_nanos(0);
+    let stores = Stores::new(pts);
+    let mut layout = newsone(W, H);
+    layout.cells = vec![
+        cell(0.2, 0.1, 0.5 / 640.0, 0.3, 0, Some("b")),
+        cell(0.0, 0.25, 1.0, 0.0028, 1, Some("c")),
+        cell(0.6, 0.6, 0.3, 0.3, 0, Some("a")),
+    ];
+    let (_, _, w0, _) = cell_rect(&layout.cells[0], W, H);
+    assert_eq!(w0, 0, "the first cell really floors to zero width");
+    let (_, y1, _, h1) = cell_rect(&layout.cells[1], W, H);
+    assert_eq!((y1 % 2, h1), (0, 1), "a one-row cell on an even row");
+    let body = routed(layout.clone());
+    let mut canvas = LayoutCanvas::new(Arc::clone(&body), spec(W, H)).unwrap();
+    let ours = canvas.compose(&stores.lookup(), pts).unwrap();
+    let theirs = program_frame(&layout, &stores, body.slates.clone(), pts);
+    assert!(max_diff(ours.y_plane(), theirs.y_plane()) <= 1);
+    assert!(max_diff(ours.uv_plane(), theirs.uv_plane()) <= 1);
+}

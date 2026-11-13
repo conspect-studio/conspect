@@ -4097,3 +4097,54 @@ fn a_held_layout_canvas_degrades_then_falls_back() {
         "back on Program at a RAP"
     );
 }
+
+/// #368 review (lens 1 #3): a re-take of a composing layout with an edited
+/// body swaps the body the aux thread composes and requests an IDR on that
+/// layout's encoder, so the edited picture starts on a random-access point.
+#[test]
+fn a_re_take_of_an_edited_layout_swaps_the_body_and_requests_an_idr() {
+    let mut x = harness(2, 6, None);
+    let first = layout_bus("L1");
+    let mut t = 0;
+    x.tick_layouts(t, std::slice::from_ref(&first));
+    x.h.try_take(take("one", 1, first.clone())).unwrap();
+    while !x
+        .outcomes
+        .try_iter()
+        .any(|o| o.outcome == TakeResult::Applied)
+    {
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(&first));
+        assert!(t < 60);
+    }
+    // Past the per-key forced-IDR floor.
+    for _ in 0..FORCE_FLOOR_TICKS {
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(&first));
+    }
+    let edited = layout_bus("L1");
+    let (PictureBus::Layout(old), PictureBus::Layout(new)) = (&first, &edited) else {
+        panic!("layout buses");
+    };
+    assert!(!Arc::ptr_eq(&old.body, &new.body), "a new body");
+    x.h.try_take(take("edit", 1, edited.clone())).unwrap();
+    t += 1;
+    x.tick_layouts(t, std::slice::from_ref(&edited));
+    let composing = x.r.aux.feeds.load();
+    let body = composing
+        .iter()
+        .find_map(|f| match &f.bus {
+            PictureBus::Layout(l) => Some(Arc::clone(&l.body)),
+            _ => None,
+        })
+        .expect("the layout still composes");
+    assert!(
+        Arc::ptr_eq(&body, &new.body),
+        "the aux thread composes the edit"
+    );
+    assert_eq!(
+        x.r.last_forced.get(&x.r.dynamic[0].key).copied(),
+        Some(t + 1),
+        "an IDR is requested on the layout's encoder"
+    );
+}
