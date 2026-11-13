@@ -100,9 +100,10 @@ describe('OutputFormatFields', () => {
     expect(list.textContent).toContain('(spa)');
   });
 
-  it('warns of a live reset on HLS/SRT/RIST and of a restart elsewhere', () => {
+  it('warns of a live reset on HLS and of a restart elsewhere (SRT/RIST included)', () => {
     expect(resetsLive('hls')).toBe(true);
-    expect(resetsLive('srt')).toBe(true);
+    expect(resetsLive('srt')).toBe(false);
+    expect(resetsLive('rist')).toBe(false);
     expect(resetsLive('ll-hls')).toBe(false);
     expect(resetsLive('rtmp')).toBe(false);
     const { unmount } = renderWithProviders(

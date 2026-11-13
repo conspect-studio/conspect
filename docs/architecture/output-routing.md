@@ -1874,9 +1874,10 @@ non-canvas format on a kind slice B does not convert for: `webrtc`, `whip_push`,
 `slots` give exactly the previous behaviour and serialization.
 
 **As built in slice B (#342, part B3): live format reset of one output.**
-`PUT /api/v1/outputs/{id}` whose ONLY change is `format` and/or `slots.video[0].bitrate_kbps` on a
-running output whose container carries parameter sets in band (HLS with TS segments, SRT, RIST) is
-applied live as a Class-2 reset of that output only. The answer is `x-multiview-apply: live`, the note
+`PUT /api/v1/outputs/{id}` whose ONLY effective change is `format` and/or
+`slots.video[0].bitrate_kbps` on a running HLS output (TS segments) is applied live as a Class-2
+reset of that output only. SRT and RIST stay restart-pending in this slice: their single session
+muxer is never rebuilt, so a PAT/PMT bump there needs a session-muxer rebuild (follow-up #380). The answer is `x-multiview-apply: live`, the note
 "resets output <id> (about 1 s); Program and other outputs are not affected", and an operation id
 whose `route.output` outcome is `reset:applied` or `reset:refused:<reason>`.
 
@@ -1909,6 +1910,8 @@ What stays restart-pending, with today's `x-multiview-apply: restart` and why:
 - **Kinds that carry parameter sets out of band** (LL-HLS fMP4 init, RTMP FLV sequence header,
   RTSP/WebRTC SDP). A new configuration needs a new init/header that the running session cannot take
   without a reconnect; the router refuses `restart-required`.
+- **SRT and RIST** (in band, but one long-lived session muxer: no rebuild with a bumped
+  `tables_version` yet; follow-up #380).
 
 The Outputs page shows the format and slots editor with the matching warning: "Applying resets
 this output (about 1 s); Program and other outputs are not affected" or "Applies on the next

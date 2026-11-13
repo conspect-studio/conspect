@@ -40,12 +40,13 @@ export const FORMAT_PRESETS: readonly FormatPreset[] = [
 ];
 
 /**
- * Output kinds whose format/bitrate change resets the output live (in-band
- * parameter sets: TS segments, SRT, RIST). Everything else applies on the
- * next restart.
+ * Output kinds whose format/bitrate change resets the output live: HLS with
+ * TS segments only (its segment muxer is rebuilt at the discontinuity).
+ * Everything else — SRT, RIST included — applies on the next restart (a
+ * live reset there is follow-up #380).
  */
 export function resetsLive(kind: OutputKind): boolean {
-  return kind === 'hls' || kind === 'srt' || kind === 'rist';
+  return kind === 'hls';
 }
 
 /** Kinds without an encoded video slot (raw frames or audio only). */

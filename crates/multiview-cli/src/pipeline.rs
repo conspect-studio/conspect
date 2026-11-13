@@ -2412,6 +2412,9 @@ pub struct Pipeline {
     /// reads decoder configuration in band (MPEG-TS), so a routing move onto
     /// changed parameter sets may splice (output-routing.md §4.2 step 4).
     output_inband_sets: Vec<bool>,
+    /// Per runnable output (same order): a live format reset may reach it
+    /// (#342 B3 review M-1: HLS with TS segments only).
+    output_live_reset: Vec<bool>,
     output_audio_tracks: Vec<Vec<usize>>,
     /// Outputs that EXPLICITLY declared an audio selection (per output: the id
     /// and its full declared track list). Drives the run-time truthful binding:
@@ -3328,6 +3331,7 @@ impl Pipeline {
         };
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         let mut output_inband_sets = Vec::with_capacity(outputs.len());
+        let mut output_live_reset = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
@@ -3393,6 +3397,9 @@ impl Pipeline {
                 .find(|item| item.id() == output.id())
                 .is_some_and(|item| matches!(item, multiview_config::Output::LlHls { .. }));
             output_inband_sets.push(!ll_hls && inband_parameter_changes_ok(output));
+            // Only a TS-segment HLS sink rebuilds its muxer at a flagged
+            // change (#342 B3 review M-1).
+            output_live_reset.push(!ll_hls && matches!(output, RunnableOutput::Hls { .. }));
             let audio_selection = match output {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
@@ -3593,6 +3600,7 @@ impl Pipeline {
             output_formats,
             output_video_keys,
             output_inband_sets,
+            output_live_reset,
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
@@ -3876,6 +3884,7 @@ impl Pipeline {
                 max_per_principal: crate::output_routing::DEFAULT_MAX_PER_PRINCIPAL,
                 has_preview,
                 formats: self.output_formats.clone(),
+                live_reset: self.output_live_reset.clone(),
                 boot_retry: self.boot_retry,
             },
             crate::output_routing::AuxWiring {
@@ -4717,6 +4726,8 @@ impl Pipeline {
                 self.output_formats.insert(0, hls_format);
                 // The anchor is a `program.ts` file: MPEG-TS, in band.
                 self.output_inband_sets.insert(0, true);
+                // The internal `program.ts` anchor is a file: never reset.
+                self.output_live_reset.insert(0, false);
                 self.output_audio_tracks
                     .insert(0, hls_audio.unwrap_or_default());
             }

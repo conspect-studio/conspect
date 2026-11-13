@@ -697,6 +697,12 @@ pub struct RouterConfig {
     pub formats: Vec<Option<AuxFormat>>,
     /// The start-up take retry policy (#329).
     pub boot_retry: BootRetryPolicy,
+    /// Per output: whether a live format reset may reach it (#342 B3, review
+    /// M-1): HLS with TS segments only — its segment muxer is rebuilt with
+    /// the new parameters and a bumped TS `tables_version` at the
+    /// discontinuity. SRT/RIST (one session muxer) and every other kind are
+    /// restart-pending (follow-up #380). Missing = `false`.
+    pub live_reset: Vec<bool>,
 }
 
 /// How a refused start-up (boot) take is retried: re-issued at most once per

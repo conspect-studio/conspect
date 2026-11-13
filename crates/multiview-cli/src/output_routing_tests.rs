@@ -186,6 +186,7 @@ fn router(
             has_preview: false,
             formats: Vec::new(),
             boot_retry: BootRetryPolicy::default(),
+            live_reset: Vec::new(),
         },
         aux,
         open,
@@ -421,6 +422,7 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             has_preview,
             formats: Vec::new(),
             boot_retry: BootRetryPolicy::default(),
+            live_reset: Vec::new(),
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -2111,6 +2113,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             has_preview: false,
             formats: Vec::new(),
             boot_retry: BootRetryPolicy::default(),
+            live_reset: Vec::new(),
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -4414,6 +4417,7 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
             has_preview: false,
             formats: Vec::new(),
             boot_retry: BootRetryPolicy::default(),
+            live_reset: vec![true; outputs],
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -4662,6 +4666,26 @@ fn reformat_refusals_restart_required_and_capacity() {
     );
     assert_eq!(x.opened.load(Ordering::SeqCst), 0, "nothing opened");
     assert_eq!(x.d.binding_video_key(0), Some(0));
+}
+
+/// Review M-1: only an output the pipeline marks live-resettable (HLS with
+/// TS segments) resets live; any other (SRT, RIST, …: `live_reset` false)
+/// is `restart-required` even though its container is in band.
+#[test]
+fn a_reformat_of_a_non_hls_output_is_restart_required() {
+    let mut x = reformat_harness(2, 6, OpenMode::Ok);
+    x.r.cfg.live_reset = vec![true, false];
+    x.reformat("srt", 1);
+    x.tick(0);
+    assert_eq!(
+        x.results(),
+        vec![(
+            "srt".to_owned(),
+            TakeResult::ResetRefused(ReformatRefusal::RestartRequired),
+            0
+        )]
+    );
+    assert_eq!(x.opened.load(Ordering::SeqCst), 0);
 }
 
 /// A reformat whose open fails or wedges leaves the output on its old key

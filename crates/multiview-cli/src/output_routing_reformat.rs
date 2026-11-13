@@ -16,9 +16,10 @@
 //!
 //! Bounded: at most one reformat in flight per output (a newer one
 //! supersedes it), it counts against the global encoder cap, and it is
-//! refused at [`REFORMAT_DEADLINE_TICKS`]. Only outputs whose container
-//! carries parameter sets in band (MPEG-TS: HLS, SRT, RIST) reset live; any
-//! other is `restart-required`.
+//! refused at [`REFORMAT_DEADLINE_TICKS`]. Only HLS outputs with TS
+//! segments reset live (review M-1: their segment muxer is rebuilt at the
+//! discontinuity); SRT/RIST and every other kind are `restart-required`
+//! (follow-up #380).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{TryRecvError, TrySendError};
@@ -41,7 +42,11 @@ impl OutputRouter {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             };
             let index = req.output_index;
-            if index >= self.outputs.len() || !self.can_reformat || !dispatcher.inband_ok(index) {
+            if index >= self.outputs.len()
+                || !self.can_reformat
+                || !self.cfg.live_reset.get(index).copied().unwrap_or(false)
+                || !dispatcher.inband_ok(index)
+            {
                 self.emit(
                     req.operation_id,
                     index,
