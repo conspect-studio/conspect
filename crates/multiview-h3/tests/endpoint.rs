@@ -57,6 +57,10 @@ async fn per_source_and_global_caps_refuse() {
     let server = start(TestSite::new(), None, limits, None).await;
     let a = quic_connect(&server, b"h3").await.unwrap();
     let b = quic_connect(&server, b"h3").await.unwrap();
+    // The cap is charged when the SERVER side of the handshake completes,
+    // which can trail the client's; wait for it so the third attempt meets
+    // the pre-handshake refusal deterministically.
+    wait_accepted(&server, 2).await;
     assert!(
         quic_connect(&server, b"h3").await.is_err(),
         "per-source cap"
@@ -73,6 +77,7 @@ async fn per_source_and_global_caps_refuse() {
     };
     let server = start(TestSite::new(), None, limits, None).await;
     let held = quic_connect(&server, b"h3").await.unwrap();
+    wait_accepted(&server, 1).await;
     assert!(quic_connect(&server, b"h3").await.is_err(), "global cap");
     // Closing frees the slot.
     held.close(noq::VarInt::from_u32(0), b"");
@@ -83,6 +88,18 @@ async fn per_source_and_global_caps_refuse() {
         }
         assert!(tokio::time::Instant::now() < deadline, "slot never freed");
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Waits until the server has charged `n` connections against its caps.
+async fn wait_accepted(server: &Server, n: u64) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while Counters::get(&server.endpoint.counters().connections_accepted) < n {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server never charged the connection"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
