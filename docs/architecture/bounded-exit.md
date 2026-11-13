@@ -66,7 +66,9 @@ restarting.
    - A stop signal (SIGTERM or Ctrl-C).
    - Not armed: a failed non-run command, an offline render (every arm in the pipeline is gated
      on the live drop-on-overload policy), the in-process test seams.
-3. **The bound.** `EXIT_DEADLINE = 2 s` from the decision to the process exit.
+3. **The bound.** The deadline `EXIT_DEADLINE = 2 s` runs from the first exit decision to
+   the watchdog's fire. The process is then gone within the exit-path backstop
+   (`EXIT_PATH_GRACE`, 500 ms). The full ceiling is below (#350).
    - The measured useful teardown takes about 0.2 s: egress (encoder flush, muxer trailer, HLS
      `#EXT-X-ENDLIST`) and the ProgramSet shutdown. So 2 s is a 10× margin.
    - The sink wedge grace (`SINK_WEDGE_GRACE`, 2 s) still applies inside it: a wedged sink is
@@ -81,12 +83,13 @@ restarting.
        its own monotonic clock. It runs at the output clock's scheduling class (macOS QoS
        user-interactive; the class it got is logged). Its wake-up was 0–10 ms late on an idle
        host and on one loaded with 28 busy CPU loops. The chaos test requires at most 50 ms.
-     - **The exit path:** after the fire, the process exits through a 20 ms notice pause and
-       the C runtime exit. A backstop kills it if that blocks: at most 500 ms
+     - **The exit path:** after the fire, a backstop thread starts first; then the watchdog
+       writes the notice (a complete raw write to fd 2) and calls the C runtime exit. If
+       either blocks, the backstop kills the process: at most 500 ms
        (`EXIT_PATH_GRACE`).
      - **The ceiling:** decision → process gone is at most 2.55 s by construction (2 s + 50 ms
        wake + 500 ms backstop). It is a measured limit, not a hard real-time guarantee: QoS
-       and the backstop are themselves sleeping threads. Measured: about 2.05 s, idle or loaded.
+       and the backstop are themselves sleeping threads. Measured: 2.01–2.08 s, idle or loaded.
    - The hard-exit line carries `fired_after_decision_ms`, so every hard exit shows its own
      decision → fire time.
    - On a fatal, the bound starts at the fault, before the sinks begin to finalise (they see
@@ -191,14 +194,16 @@ change shortens dead output after a fault; it does not change the tick path.
   Every run asserts two bounds:
   - the watchdog's own decision → fire time (`fired_after_decision_ms`) is 2000–2050 ms;
   - the decision → process-gone time, as the shell observes it, is at most 2.6 s. That is the
-    2.55 s ceiling plus the observer's 1 ms poll. One helper process sends the signal and
-    polls; the first version used separate clock reads and 20 ms shell polls, and that
-    observation latency alone added up to 0.5 s on a loaded host.
+    2.55 s ceiling plus the observer's 1 ms poll. One helper process measures on one
+    monotonic clock: it sends the signal (or, for a fatal, sees the fatal line) and polls at
+    1 ms. The first version used separate clock reads, a wall-clock log timestamp and 20 ms
+    shell polls; that observation error alone added up to 0.5 s on a loaded host.
 
   On the Apple-silicon host:
   - 12 runs idle and 40 runs with 28 busy CPU loops, 0 failures;
   - decision → fire 2000–2011 ms in every run, with or without load;
-  - decision → process gone 2.035–2.046 s idle, 2.027–2.084 s loaded.
+  - decision → process gone 2.01–2.03 s idle, 2.01–2.05 s loaded (second series, after the
+    notice moved onto the watchdog thread; the first series gave 2.03–2.08 s).
 
   CI (macOS job) runs 10 × each mode.
 - The script also proves that the watchdog ended the process:

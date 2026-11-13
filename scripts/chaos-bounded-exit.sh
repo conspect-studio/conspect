@@ -8,11 +8,12 @@
 #   stop:  SIGTERM while source teardown is held;
 #   stopwedge: SIGTERM while the consumer is stalled (an output that cannot
 #          finalise during the stop): exit code 1 within the bound;
-#   falterstop: a short stall sheds frames (no fatal), then SIGTERM: the run
-#          faltered, so exit code 1 within the bound.
-# Asserts for every run: exit code (1 fatal, 0 stop), the time from the
-# decision (the fatal log line / the signal) to the process exit is within the
-# bound + slack, and the on-disk HLS manifest is valid and lists only complete
+#   falterstop: a deterministic seam (MULTIVIEW_CHAOS_SHED_AT) makes the hot
+#          queue refuse one tick, as a full queue does (no fatal); then SIGTERM:
+#          the run faltered, so exit code 1 within the bound.
+# Asserts for every run: exit code (1 fatal, 0 stop), the binary's own
+# decision -> fire time, the time from the decision (the fatal log line / the
+# signal) to the process exit, and the on-disk HLS manifest is valid and lists only complete
 # segments.
 #
 # Usage: scripts/chaos-bounded-exit.sh <multiview-binary> [runs=20] [mode=both]
@@ -28,7 +29,7 @@ BOUND_MS=2000
 # an idle and on a 28-busy-loop host; 50 ms leaves 5x margin.
 FIRE_SLACK_MS=50
 # Decision->process-gone as the shell observes it. The process exit after the
-# fire is the 20 ms notice pause plus the C runtime exit, at most the 500 ms
+# fire is the notice write plus the C runtime exit, at most the 500 ms
 # backstop (EXIT_PATH_GRACE): 2.55 s by construction. The observer adds a
 # 1 ms poll (and, for fatal, the log line's own write).
 SLACK_MS=600   # 2.6 s total
@@ -93,7 +94,7 @@ check_hls() {
 }
 
 run_once() {
-  local mode="$1" i="$2" log="${WORK}/run.log" rc t_exit t_decide pid
+  local mode="$1" i="$2" log="${WORK}/run.log" rc pid
   rm -rf "${WORK}/hls" "${WORK}/.multiview" && mkdir -p "${WORK}/hls"
   export MULTIVIEW_CHAOS_SLOW_TEARDOWN_MS="${HOLD_MS}"
   unset MULTIVIEW_CHAOS_SHED_AT
@@ -158,56 +159,63 @@ run_once() {
     fi
     kill -0 "${pid}" || { echo "run ${i} (stop): process died before the signal"; tail -20 "${log}"; return 1; }
   fi
-  # One helper measures decision -> process gone: it is already running when
-  # it reads its clock, sends the signal (signal modes) and polls at 1 ms.
-  # #350: separate python clock reads and 20 ms shell polls added up to
-  # 0.5 s of observation latency on a loaded host.
+  # One helper measures decision -> process gone on ONE monotonic clock, with a
+  # 1 ms poll. Signal modes: the decision is the signal it sends. Fatal: the
+  # decision is the moment it sees the fatal line in the log (the binary arms
+  # the deadline before it logs, so this instant is at or after the decision;
+  # the binary's own fired_after_decision_ms covers the decision side).
+  # #350: separate python clock reads, a wall-clock log timestamp and 20 ms
+  # shell polls added up to 0.5 s of observation error on a loaded host.
   local sig=0; [ "${mode}" = fatal ] || sig=1
-  python3 - "${pid}" "${sig}" > "${WORK}/gone" <<'PY'
+  python3 - "${pid}" "${sig}" "${log}" > "${WORK}/gone" <<'PY'
 import os, signal, sys, time
-pid, sig = int(sys.argv[1]), sys.argv[2] == "1"
-t0 = time.monotonic()
-if sig:
-    os.kill(pid, signal.SIGTERM)
-while True:
+pid, sig, log = int(sys.argv[1]), sys.argv[2] == "1", sys.argv[3]
+def alive():
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0); return True
     except ProcessLookupError:
-        break
+        return False
+start = time.monotonic(); t0 = None
+if sig:
+    try:
+        t0 = time.monotonic(); os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        print("gone-before-signal"); sys.exit(0)
+else:
+    pat = "fatal encoded-output consumer failure"
+    with open(log, errors="replace") as f:
+        buf = ""
+        while t0 is None:
+            buf = (buf + f.read())[-65536:]
+            if pat in buf and "ticks behind the clock" in buf:
+                t0 = time.monotonic(); break
+            if not alive():
+                print("no-fatal-line"); sys.exit(0)
+            if time.monotonic() - start > 60:
+                print("timeout"); sys.exit(0)
+            time.sleep(0.001)
+while alive():
     if time.monotonic() - t0 > 50:
         print("timeout"); sys.exit(0)
     time.sleep(0.001)
-# wall ms when gone (fatal: compared to the log line), decision->gone (signal)
-print(int(time.time() * 1000), int((time.monotonic() - t0) * 1000))
+print(int((time.monotonic() - t0) * 1000))
 PY
-  if [ "$(cat "${WORK}/gone")" = timeout ]; then
-    kill -KILL "${pid}" 2>/dev/null || true
-    echo "run ${i} (${mode}): did not exit within 50 s"; tail -20 "${log}"; return 1
-  fi
+  local took
+  took="$(cat "${WORK}/gone")"
+  case "${took}" in
+    timeout) kill -KILL "${pid}" 2>/dev/null || true
+             echo "run ${i} (${mode}): did not exit within 50 s"; tail -20 "${log}"; return 1 ;;
+    no-fatal-line) echo "run ${i} (${mode}): no fatal line"; tail -20 "${log}"; return 1 ;;
+    gone-before-signal) echo "run ${i} (${mode}): process died before the signal"; tail -20 "${log}"; return 1 ;;
+    ''|*[!0-9]*) kill -KILL "${pid}" 2>/dev/null || true
+             echo "  FAIL: observer produced no measurement (${took})"; return 1 ;;
+  esac
   set +e
   wait "${pid}"
   rc=$?
   set -e
-  local took
-  read -r t_exit took < "${WORK}/gone"
-  if [ "${mode}" = fatal ]; then
-    # The decision instant is the fatal log line's own timestamp (UTC).
-    t_decide="$(python3 - "${log}" <<'PY'
-import re,sys,datetime
-for line in open(sys.argv[1], errors="replace"):
-    if "fatal encoded-output consumer failure" in line and "ticks behind the clock" in line:
-        m = re.search(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.(\d+)Z", line)
-        if m:
-            base = datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
-            frac = float("0." + m.group(2))
-            print(int((base.timestamp() + frac) * 1000)); break
-PY
-)"
-    [ -n "${t_decide}" ] || { echo "run ${i} (${mode}): no fatal line"; tail -20 "${log}"; return 1; }
-  fi
-  if [ "${mode}" = fatal ]; then took=$((t_exit - t_decide)); fi
   local want=$([ "${mode}" = stop ] && echo 0 || echo 1)
-  # #350: the watchdog's own instants (wall clock, read inside the binary):
+  # #350: the watchdog's own monotonic clock, read inside the binary:
   # decision (first arm) -> deadline fired. This is the bound the design
   # promises; it excludes the shell's own observation latency.
   local fire_ms

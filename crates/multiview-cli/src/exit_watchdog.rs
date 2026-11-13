@@ -16,7 +16,9 @@ use std::sync::OnceLock;
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 
-/// The bound from the exit decision to the process exit.
+/// The deadline: the watchdog fires this long after the first exit decision.
+/// The process is then gone within [`EXIT_PATH_GRACE`] more
+/// (docs/architecture/bounded-exit.md).
 pub const EXIT_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Why the exit was decided; selects the exit code. A fatal cause overrides a
@@ -64,6 +66,11 @@ pub struct Watchdog {
     /// never moved: the bound is measured from the first exit decision. A later
     /// Fatal only upgrades the cause (the exit code), not the deadline.
     due_ns: AtomicU64,
+    /// The first arm's instant, in ns after `origin` (at least 1); 0 = not
+    /// armed. Whoever sets it sets `due_ns`.
+    armed_ns: AtomicU64,
+    /// First arm -> fire, in ms; set when the deadline fires.
+    fired_after_ms: AtomicU64,
     /// [`ExitCause::tag`] of the strongest cause armed so far; 0 = none.
     cause: AtomicU8,
     /// The watchdog thread to unpark on the first arm.
@@ -77,6 +84,8 @@ impl Watchdog {
         Self {
             origin: Instant::now(),
             due_ns: AtomicU64::new(0),
+            armed_ns: AtomicU64::new(0),
+            fired_after_ms: AtomicU64::new(0),
             cause: AtomicU8::new(0),
             thread: OnceLock::new(),
         }
@@ -86,14 +95,21 @@ impl Watchdog {
     /// deadline; a later Fatal upgrades a Stop cause. Returns `true` when this
     /// call set the deadline.
     pub fn arm(&self, cause: ExitCause, deadline: Duration) -> bool {
-        let due = u64::try_from(self.origin.elapsed().saturating_add(deadline).as_nanos())
+        let now = self.origin.elapsed();
+        let now_ns = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX).max(1);
+        let due = u64::try_from(now.saturating_add(deadline).as_nanos())
             .unwrap_or(u64::MAX)
             .max(1);
         self.cause.fetch_max(cause.tag(), Ordering::AcqRel);
+        // The first arm claims `armed_ns`, then publishes the deadline; a
+        // racing later arm only upgrades the cause.
         let set = self
-            .due_ns
-            .compare_exchange(0, due, Ordering::AcqRel, Ordering::Acquire)
+            .armed_ns
+            .compare_exchange(0, now_ns, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
+        if set {
+            self.due_ns.store(due, Ordering::Release);
+        }
         if let Some(thread) = self.thread.get() {
             thread.unpark();
         }
@@ -107,6 +123,12 @@ impl Watchdog {
         (due != 0).then(|| {
             (self.origin + Duration::from_nanos(due)).saturating_duration_since(Instant::now())
         })
+    }
+
+    /// First arm -> fire, in ms (0 until the deadline fired).
+    #[must_use]
+    pub fn fired_after_arm_ms(&self) -> u64 {
+        self.fired_after_ms.load(Ordering::Acquire)
     }
 
     /// The armed cause, if any.
@@ -131,19 +153,13 @@ impl Watchdog {
                 std::thread::park_timeout(due_at - now);
                 continue;
             }
-            // Decision -> fire on the monotonic clock (the armed offset is the
-            // deadline offset minus the deadline; both from `origin`).
-            FIRE_AFTER_ARM_MS.store(
-                u64::try_from(
-                    self.origin.elapsed().as_millis().saturating_sub(
-                        Duration::from_nanos(due)
-                            .saturating_sub(EXIT_DEADLINE)
-                            .as_millis(),
-                    ),
-                )
-                .unwrap_or(u64::MAX),
-                Ordering::Release,
-            );
+            // Decision (the first arm) -> fire, on the monotonic clock.
+            let armed = Duration::from_nanos(self.armed_ns.load(Ordering::Acquire));
+            let fired_after =
+                u64::try_from(self.origin.elapsed().saturating_sub(armed).as_millis())
+                    .unwrap_or(u64::MAX);
+            self.fired_after_ms.store(fired_after, Ordering::Release);
+            FIRE_AFTER_ARM_MS.store(fired_after, Ordering::Release);
             on_deadline(self.cause().unwrap_or(ExitCause::Fatal));
             return;
         }
@@ -189,11 +205,12 @@ pub const EXIT_PATH_GRACE: Duration = Duration::from_millis(500);
 #[allow(clippy::exit)]
 // reason: this IS the bounded hard exit (#309). It runs only after the deadline,
 // when teardown overran; `process::exit` ends the process without running the
-// destructors that overran. The message is best-effort on a helper thread
-// through its own /dev/stderr handle (no std stderr lock, no tracing: either may
-// be the stuck part). The C runtime exit path (atexit handlers, stdio flush)
-// could itself block, so a backstop thread kills the process with SIGKILL if
-// `exit` has not finished within EXIT_PATH_GRACE.
+// destructors that overran. The backstop thread starts FIRST: it kills the
+// process with SIGKILL if the notice write or the C runtime exit path (atexit
+// handlers, stdio flush) has not finished within EXIT_PATH_GRACE. The notice is
+// then written on this thread, completely, with a raw write to fd 2 (no std
+// stderr lock, no tracing: either may be the stuck part); a blocked stderr is
+// cut by the backstop.
 fn exit_process(cause: ExitCause) {
     // A stop whose outputs have not finalised by the deadline, or whose run
     // faltered, did not stop cleanly: report it as a failure (#309).
@@ -203,27 +220,21 @@ fn exit_process(cause: ExitCause) {
         RUN_FAILED.load(Ordering::Acquire),
     );
     let _ = std::thread::Builder::new()
-        .name("multiview-exit-notice".to_owned())
-        .spawn(move || {
-            let line = format!(
-                "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
-                 code {} (outputs finalised before the bound are valid; detached sinks may be \
-                 incomplete; the supervisor restarts the service) \
-                 [fired_after_decision_ms={}]\n",
-                EXIT_DEADLINE.as_millis(),
-                cause.code(),
-                FIRE_AFTER_ARM_MS.load(Ordering::Acquire)
-            );
-            write_stderr_raw(line.as_bytes());
-        });
-    let _ = std::thread::Builder::new()
         .name("multiview-exit-backstop".to_owned())
         .spawn(|| {
             std::thread::sleep(EXIT_PATH_GRACE);
             kill_self();
         });
-    // Give the notice a moment; never wait for it.
-    std::thread::sleep(Duration::from_millis(20));
+    let line = format!(
+        "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
+         code {} (outputs finalised before the bound are valid; detached sinks may be \
+         incomplete; the supervisor restarts the service) \
+         [fired_after_decision_ms={}]\n",
+        EXIT_DEADLINE.as_millis(),
+        cause.code(),
+        FIRE_AFTER_ARM_MS.load(Ordering::Acquire)
+    );
+    write_stderr_raw(line.as_bytes());
     std::process::exit(cause.code());
 }
 
@@ -241,8 +252,16 @@ pub const fn effective_cause(cause: ExitCause, outputs_open: bool, run_failed: b
 /// reopening its path (a socket stderr — systemd's journal default — cannot be
 /// reopened). Best effort.
 #[cfg(all(unix, feature = "ffmpeg"))]
-fn write_stderr_raw(bytes: &[u8]) {
-    let _ = rustix::io::write(rustix::stdio::stderr(), bytes);
+fn write_stderr_raw(mut bytes: &[u8]) {
+    // Loop on a short write; retry EINTR; give up on any other error.
+    while !bytes.is_empty() {
+        match rustix::io::write(rustix::stdio::stderr(), bytes) {
+            Ok(0) => return,
+            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// Without `rustix`: reopen the stderr path append-only (no socket support).
@@ -443,6 +462,13 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(400),
             "promptly at: {elapsed:?}"
+        );
+        // The reported decision -> fire time is measured from the arm, for any
+        // deadline (not derived from EXIT_DEADLINE).
+        let reported = w.fired_after_arm_ms();
+        assert!(
+            (150..400).contains(&reported),
+            "reported fired_after_arm_ms {reported}"
         );
     }
 
