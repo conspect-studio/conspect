@@ -88,6 +88,8 @@ pub async fn start(
         limits,
         peers,
         refuse_source: None,
+        retry_above_handshakes: None,
+        retry_counter: None,
     })
     .await
     .unwrap();
@@ -121,6 +123,42 @@ pub async fn start_with_filter(
         limits,
         peers,
         refuse_source: Some(refuse_source),
+        retry_above_handshakes: None,
+        retry_counter: None,
+    })
+    .await
+    .unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    Server {
+        endpoint,
+        addr,
+        cert,
+    }
+}
+
+/// Like [`start`], with the QUIC Retry policy set
+/// (`EndpointParts::retry_above_handshakes` / `retry_counter`).
+pub async fn start_with_retry(
+    limits: H3Limits,
+    retry_above_handshakes: Option<usize>,
+    retry_counter: Arc<std::sync::atomic::AtomicU64>,
+) -> Server {
+    let cert = cert();
+    let socket = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let socket = noq::Runtime::wrap_udp_socket(&noq::TokioRuntime, socket).unwrap();
+    let endpoint = H3Endpoint::start(EndpointParts {
+        socket,
+        endpoint: noq::EndpointConfig::default(),
+        incoming: (64, 4 * 1024 * 1024),
+        tls: Arc::new(server_tls(&cert)),
+        runtime: tokio::runtime::Handle::current(),
+        site: TestSite::new(),
+        wt: None,
+        limits,
+        peers: None,
+        refuse_source: None,
+        retry_above_handshakes,
+        retry_counter: Some(retry_counter),
     })
     .await
     .unwrap();

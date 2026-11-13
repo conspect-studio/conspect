@@ -7,7 +7,10 @@
 //! * the WebRTC lane is untouched: a STUN datagram on the same socket is
 //!   still classified to the WebRTC lane, never to QUIC;
 //! * the TCP door's responses carry `alt-svc: h3=":<port>"; ma=86400` once
-//!   the endpoint is up, and none with `[network] alt_svc = false`.
+//!   the endpoint is up, and none with `[network] alt_svc = false`;
+//! * the slice 3B QUIC Retry policy (`network.quic.retry_above_handshakes`)
+//!   applies to the h3 endpoint, and its Retries reach the front-door
+//!   metrics source (`quic_retries`).
 #![cfg(all(feature = "tls", unix))]
 #![allow(
     clippy::unwrap_used,
@@ -45,6 +48,31 @@ fn free_udp() -> u16 {
         .port()
 }
 
+/// Start the real `FrontDoorRun` on fresh ports. `free_tcp`/`free_udp` only
+/// pick a port that was free a moment ago; with many test processes in
+/// parallel another one can take it before the door binds (the door then
+/// runs without its TCP half, or fails to start), so retry with new ports.
+/// `set_tcp` writes the TCP door's port into the config.
+async fn start_run(
+    config: &mut MultiviewConfig,
+    set_tcp: impl Fn(&mut MultiviewConfig, u16),
+) -> multiview_cli::frontdoor::FrontDoorRun {
+    for _ in 0..10 {
+        set_tcp(config, free_tcp());
+        config.network.as_mut().unwrap().https_port = Some(free_udp());
+        if let Some(run) = multiview_cli::frontdoor::FrontDoorRun::start_with(
+            config,
+            multiview_frontdoor::ListenSockets::empty(),
+        ) {
+            if run.tcp_local_addr().is_some() {
+                return run;
+            }
+            run.shutdown().await;
+        }
+    }
+    panic!("the front door never started on free ports");
+}
+
 struct Door {
     _dir: tempfile::TempDir,
     run: Option<multiview_cli::frontdoor::FrontDoorRun>,
@@ -57,6 +85,12 @@ struct Door {
 /// on both TCP (with the Alt-Svc layer) and h3, as `attach_front_door_site`
 /// wires it.
 async fn start(alt_svc: Option<bool>) -> Door {
+    start_with_retry(alt_svc, None).await
+}
+
+/// [`start`] with `network.quic.retry_above_handshakes` overridden (`None`:
+/// the configured default).
+async fn start_with_retry(alt_svc: Option<bool>, retry_above_handshakes: Option<usize>) -> Door {
     let dir = tempfile::tempdir().unwrap();
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
@@ -93,12 +127,13 @@ key_file = "{key}"
         key = dir.path().join("key.pem").display(),
     ))
     .unwrap();
-    config.network.as_mut().unwrap().https_port = Some(free_udp());
-    let run = multiview_cli::frontdoor::FrontDoorRun::start_with(
-        &config,
-        multiview_frontdoor::ListenSockets::empty(),
-    )
-    .expect("front door starts");
+    if let Some(threshold) = retry_above_handshakes {
+        config.network.as_mut().unwrap().quic.retry_above_handshakes = threshold;
+    }
+    let run = start_run(&mut config, |config, port| {
+        config.network.as_mut().unwrap().tcp_port = Some(port);
+    })
+    .await;
     let udp = run.local_addr().port();
     let app = axum::Router::new().route(
         "/hello",
@@ -340,12 +375,10 @@ key_file = "{key}"
         key = dir.path().join("key.pem").display(),
     ))
     .unwrap();
-    config.network.as_mut().unwrap().https_port = Some(free_udp());
-    let run = multiview_cli::frontdoor::FrontDoorRun::start_with(
-        &config,
-        multiview_frontdoor::ListenSockets::empty(),
-    )
-    .expect("front door starts");
+    let run = start_run(&mut config, |config, port| {
+        config.network.as_mut().unwrap().proxy_listen = Some(format!("[::1]:{port}"));
+    })
+    .await;
     let udp = run.local_addr().port();
     let app = axum::Router::new().route(
         "/hello",
@@ -483,6 +516,57 @@ async fn alt_svc_false_keeps_the_advertisement_off() {
         !head.to_ascii_lowercase().contains("alt-svc"),
         "alt-svc must be absent:\n{head}"
     );
+    drop(c);
+    door.stop().await;
+}
+
+/// The slice 3B Retry policy on the lane's real consumer: with
+/// `network.quic.retry_above_handshakes = 0` every unvalidated Initial is
+/// Retried, the h3 client follows the Retry and is served, and the run's
+/// metrics source reports the Retry (`quic_retries`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_retry_policy_applies_to_the_h3_endpoint_and_reaches_the_metrics() {
+    let door = start_with_retry(None, Some(0)).await;
+    let run = door.run.as_ref().unwrap();
+    let metrics = run.metrics_source();
+    assert_eq!(metrics.read().unwrap().quic_retries, 0);
+    let mut c = h3(door.udp).await;
+    let auth = format!("localhost:{}", door.udp);
+    let (resp, body) = c
+        .fetch(
+            client::request(http::Method::GET, &auth, "/hello").unwrap(),
+            &[],
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body, b"hello from the site");
+    assert!(
+        metrics.read().unwrap().quic_retries >= 1,
+        "retry_above_handshakes = 0 must Retry the client's first Initial"
+    );
+    drop(c);
+    door.stop().await;
+}
+
+/// The default threshold (8) with one client in flight: no Retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_retry_below_the_default_threshold_sends_none() {
+    let door = start(None).await;
+    let run = door.run.as_ref().unwrap();
+    let mut c = h3(door.udp).await;
+    let auth = format!("localhost:{}", door.udp);
+    let (resp, _) = c
+        .fetch(
+            client::request(http::Method::GET, &auth, "/hello").unwrap(),
+            &[],
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(run.metrics_source().read().unwrap().quic_retries, 0);
     drop(c);
     door.stop().await;
 }

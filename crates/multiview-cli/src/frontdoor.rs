@@ -124,7 +124,6 @@ pub struct FrontDoorRun {
     retry_counter: Arc<AtomicU64>,
     /// `network.quic.retry_above_handshakes`, carried from config to the h3
     /// endpoint's Retry policy ([`start_h3`](Self::start_h3)).
-    #[allow(dead_code)] // MERGE-ONLY: wired onto the h3 endpoint in the next commit
     retry_above_handshakes: usize,
     /// The live nft-floor status (re-read every
     /// [`crate::nft_floor::NFT_FLOOR_REREAD_INTERVAL`] on the front-door
@@ -804,6 +803,8 @@ impl FrontDoorRun {
             limits: multiview_h3::H3Limits::default(),
             peers: Some(peers),
             refuse_source: self.h3.refuse_source.clone(),
+            retry_above_handshakes: Some(self.retry_above_handshakes),
+            retry_counter: Some(Arc::clone(&self.retry_counter)),
         };
         let slot = Arc::clone(&self.h3.endpoint);
         let alt_svc = Arc::clone(&self.h3.alt_svc);

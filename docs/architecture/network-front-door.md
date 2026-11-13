@@ -1067,6 +1067,15 @@ the bounds and their tests); the wiring PR puts it on the front door.
   `network.trusted_proxy_list()` (`TrustedProxies::contains`): a QUIC source that is a trusted
   proxy is refused (section 8's fail-closed rule for the h3/QUIC lane, matching the TCP door's
   PROXY v2 fail-closed behaviour). `direct` mode and no `network.mode` pass `None`.
+* **QUIC Retry (slice 3B on the h3 endpoint).** The slice 3B Retry policy ("Slice 3 as built,
+  part B") applies to this endpoint: `FrontDoorRun::start_h3` passes the same
+  `network.quic.retry_above_handshakes` and the run's retry counter (`quic_retries` on
+  `GET /api/v1/metrics/frontdoor`) as `EndpointParts::retry_above_handshakes` / `retry_counter`,
+  and the accept loop, after `refuse_source` and the connection-cap pre-check and before a
+  handshake slot is taken, answers an unvalidated, retryable `Incoming` with `incoming.retry()`
+  once the handshakes in flight (the held handshake slots) reach the threshold, with the semantics
+  of moq-tokio's `maybe_retry`; tested in `crates/multiview-h3/tests/endpoint.rs` (the
+  `retry.rs` scenarios on `H3Endpoint`).
 * **Deviations from the text above.** (1) Own WebTransport session layer instead of upstream
   `h3-webtransport`'s `WebTransportSession`, for the reason in section 5: the h3 connection must
   stay in the driver to serve pages and answer `429` while a session lives. (2) The bounds the
@@ -1416,6 +1425,10 @@ normal client then arriving is Retried too and still completes end to end; with 
 state and the counter stays 0. Under `Some(0)`, 8 stalled clients sent 24 real Initials (28 800 B)
 and got back 24 Retries (2 880 B), no Initial: no state and no amplification. Also: `Some(0)` with
 a single real `MoQ` client connects (counter >= 1); `None` never bumps the counter.
+Since slice 2's wiring PR (#371) the lane is served by `multiview_h3::H3Endpoint`, not the vendored
+`MoQ` listener: the same policy and counter are applied there (see "Slice 2 as built"), and
+`FrontDoorRun::take_moq_socket` is gone. The vendored support above is no longer wired by the front
+door (`multiview-moq`'s `SharedSocket` still carries the fields); `retry.rs` keeps testing it.
 
 **Config.** `multiview-config::network_tls` gains `NetworkUdpConfig` (`[network.udp]`) and
 `NetworkQuicConfig` (`[network.quic]`), both `#[serde(default)]` nested structs on `NetworkConfig`
