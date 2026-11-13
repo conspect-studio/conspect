@@ -56,9 +56,14 @@ impl WtHandler for EchoHandler {
             let token = *token.downcast::<String>().unwrap();
             assert!(req.uri.path().starts_with("/moq"));
             let _ = sessions.send((token, session.protocol().map(str::to_owned)));
-            let mut uni = session.open_uni().await.unwrap();
-            uni.write_all(b"hi").await.unwrap();
-            uni.finish().unwrap();
+            // The client may end the session (FIN on CONNECT) before this
+            // greeting stream opens; a closed session is then the expected
+            // outcome, reported below like any other end.
+            if let Ok(mut uni) = session.open_uni().await {
+                if uni.write_all(b"hi").await.is_ok() {
+                    let _ = uni.finish();
+                }
+            }
             let echo = {
                 let session = session.clone();
                 async move {
