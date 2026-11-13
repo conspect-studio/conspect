@@ -225,6 +225,9 @@ struct StreamStage {
     staged_bytes: usize,
     last_dts: Option<i128>,
     first_unproved: Option<Instant>,
+    /// Its staged windows were dropped (`clear`: a retired or failed key,
+    /// review V1): its watermark no longer proves a window it holds.
+    emptied: bool,
 }
 impl StreamStage {
     fn new() -> Self {
@@ -236,6 +239,7 @@ impl StreamStage {
             staged_bytes: 0,
             last_dts: None,
             first_unproved: None,
+            emptied: false,
         }
     }
     fn put(
@@ -360,6 +364,7 @@ impl StreamStage {
         })
     }
     fn clear(&mut self) {
+        self.emptied = true;
         self.windows.clear();
         self.staged_packets = 0;
         self.staged_bytes = 0;
@@ -1252,11 +1257,23 @@ impl RenditionDispatcher {
         };
         while let Some(head) = b.pending.front() {
             let end = head.end;
+            let head_index = head.index;
             if let Some(k) = b.video_key {
-                if self.video_meta.get(k).is_some_and(|m| m.dynamic)
-                    && !self.video.get(k).is_some_and(|s| s.complete(end))
-                {
-                    break;
+                if self.video_meta.get(k).is_some_and(|m| m.dynamic) {
+                    let Some(stage) = self.video.get(k) else {
+                        break;
+                    };
+                    if !stage.complete(end) {
+                        break;
+                    }
+                    // Review V1: an EMPTIED stage (cleared on retire/fail)
+                    // holding no window for this index is not complete for
+                    // it, whatever its watermark says: never an empty video
+                    // window from a key whose windows were dropped. Its
+                    // readers take the fallback path (`reconcile`).
+                    if stage.emptied && stage.peek(head_index).is_none() {
+                        break;
+                    }
                 }
             }
             // A dynamic audio stage this window reads (current, or a move
@@ -1814,6 +1831,12 @@ impl RenditionDispatcher {
             .filter(|m| m.dynamic)
             .ok_or(DispatchError::InvalidConfig)?;
         meta.retired = true;
+        // Review V1: a binding still READING the key (a move to it landed,
+        // e.g. a refused/abandoned reformat whose move the dispatcher had
+        // already applied) is routed through the fallback path first
+        // (`MoveOutcome::Fallback`, RAP-gated), never left to read an
+        // emptied stage whose watermark still proves windows complete.
+        self.reconcile();
         // No pending move may outlive the key it names: the slot can be
         // reused by a later `add_video_key`, and a move left here would then
         // land on an unrelated key.
@@ -3594,6 +3617,71 @@ mod tests {
         pop_all(&mut sink, 0, now);
         pop_all(&mut sink, 1, now);
         assert_eq!(sink.queues[1].take_discontinuity(), None);
+    }
+
+    /// Review V1: a key a binding still reads is retired (a refused reformat
+    /// whose move had landed) while its watermark already proves windows
+    /// ahead: the binding takes the fallback path (one `Fallback`, gated on
+    /// a RAP), and no video window is ever delivered empty from the emptied
+    /// stage.
+    #[test]
+    fn retiring_a_key_a_binding_reads_falls_back_and_never_delivers_an_empty_window() {
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(gated_cfg(vec![binding(0, 0, 1), binding(1, 1, 1)], 2, 1))
+                .unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let key = d
+            .add_video_key(DtsTimeBase { num: 1, den: 5 }, gate())
+            .unwrap();
+        d.rebind_video(1, key, 0, 10).unwrap();
+        for i in 0..3_i64 {
+            let m = Some(mark(TICK * i128::from(i + 1)));
+            let p = if i == 0 { rap77(i) } else { video(i, 8, false) };
+            d.dispatch(
+                ve(key, u64::try_from(i).unwrap(), vec![p], m),
+                now,
+                &mut sink,
+            )
+            .unwrap();
+            feed_base(&mut d, &mut sink, 2, i, now, plain(i)).unwrap();
+            pop_all(&mut sink, 0, now);
+            pop_all(&mut sink, 1, now);
+        }
+        assert_eq!(d.binding_video_key(1), Some(key));
+        let _ = d.take_move_outcomes();
+        // The live key has staged window 3 and proved well past it.
+        d.dispatch(
+            ve(key, 3, vec![video(3, 8, false)], Some(mark(TICK * 8))),
+            now,
+            &mut sink,
+        )
+        .unwrap();
+        d.retire_video_key(key).unwrap();
+        assert_eq!(
+            d.take_move_outcomes(),
+            vec![MoveOutcome::Fallback { output_index: 1 }],
+            "the reader is routed through the fallback before the clear"
+        );
+        assert_eq!(d.binding_video_key(1), Some(1));
+        // Window 3: no RAP on the fallback key: video withheld (gate pending),
+        // never an empty window from the emptied stage. Window 4 opens at
+        // the fallback key's RAP.
+        feed_base(&mut d, &mut sink, 2, 3, now, plain(3)).unwrap();
+        pop_all(&mut sink, 0, now);
+        let rap_on_1 = |k: usize| if k == 1 { rap77(4) } else { video(4, 8, false) };
+        feed_base(&mut d, &mut sink, 2, 4, now, rap_on_1).unwrap();
+        pop_all(&mut sink, 0, now);
+        let o1 = pop_all(&mut sink, 1, now);
+        assert_eq!(
+            o1.last(),
+            Some(&(77, 2)),
+            "window 4 opens at the RAP: {o1:?}"
+        );
+        assert!(
+            o1.iter().all(|&(len, _)| len == 77 || len == 8),
+            "no window from the emptied key: {o1:?}"
+        );
     }
 
     /// R (final-head media MED): a fallback cuts at the first gated RAP of

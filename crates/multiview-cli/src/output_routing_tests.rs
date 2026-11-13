@@ -4697,6 +4697,66 @@ fn a_source_take_after_a_reset_opens_at_the_reset_settings() {
     assert_ne!(x.d.binding_video_key(0), x.d.binding_video_key(1));
 }
 
+/// Review V1: a reformat whose forced move is pending (its key has sent
+/// events) is refused/superseded, so its key retires: the reset output keeps
+/// exactly one NON-EMPTY video window per tick (never an empty window from
+/// the emptied stage), and the superseding reformat still lands.
+#[test]
+fn a_refused_reformat_move_never_leaves_the_output_an_empty_window() {
+    let mut x = reformat_harness(2, 6, OpenMode::Ok);
+    let mut t = 0;
+    for _ in 0..5 {
+        x.tick(t);
+        t += 1;
+    }
+    x.reformat("a", 1);
+    let until = t + REFORMAT_DEADLINE_TICKS;
+    while t < until && x.d.pending_video_move(1).is_none() {
+        x.tick(t);
+        t += 1;
+    }
+    assert!(
+        x.d.pending_video_move(1).is_some(),
+        "the forced move is pending"
+    );
+    // Supersede it: the pending move is cancelled and its key retires.
+    x.reformat("b", 1);
+    let mut seen = Vec::new();
+    let until = t + REFORMAT_DEADLINE_TICKS;
+    while t < until
+        && !seen
+            .iter()
+            .any(|(o, r, _): &(String, TakeResult, u64)| o == "b" && *r == TakeResult::ResetApplied)
+    {
+        x.tick(t);
+        t += 1;
+        seen.extend(x.results());
+    }
+    assert!(
+        seen.iter().any(
+            |(o, r, _)| o == "a" && *r == TakeResult::ResetRefused(ReformatRefusal::Superseded)
+        ),
+        "{seen:?}"
+    );
+    for t2 in t..t + 10 {
+        x.tick(t2);
+    }
+    let windows: Vec<&Vec<(i64, bool)>> = x
+        .rec
+        .inner
+        .windows
+        .iter()
+        .filter(|w| w.0 == 1)
+        .map(|w| &w.1)
+        .collect();
+    assert!(
+        windows.iter().all(|w| !w.is_empty()),
+        "no empty video window on the reset output"
+    );
+    let firsts: Vec<i64> = windows.iter().map(|w| w[0].0).collect();
+    assert!(firsts.windows(2).all(|w| w[1] == w[0] + 1), "{firsts:?}");
+}
+
 /// A second reformat of the same output retires the first reformat's key
 /// once nothing uses it (it lingers out like any unused live key).
 #[test]

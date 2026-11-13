@@ -1756,7 +1756,7 @@ impl OutputRouter {
     }
 
     /// The picture bus a video key carries (`None`: unknown, e.g. closed).
-    /// The bus a key renders. A live key's own bus wins (review M-3): a
+    /// A live key's own bus wins (review M-3): a
     /// reformat key becomes an output's base key while rendering a source,
     /// PVW or Clean, so membership in `base_keys` alone must not report it
     /// as Program.
