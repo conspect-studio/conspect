@@ -19,6 +19,12 @@
 //! A routed stored layout (ADR-0108 slice 3) is an N-cell aux canvas composed
 //! here by the integer path of [`crate::aux_layout`], from the same stores.
 //!
+//! A feed may carry an output format (#342, [`AuxFormat`]): the tile is then
+//! composed directly at that size with that fit (contain, cover at an anchor,
+//! fill) — one convert per (picture, format), shared by every output with the
+//! same (bus, format). A tile already at the format is passed as the same
+//! `Arc`. A feed without a format is the canvas, exactly as before.
+//!
 //! A panic in a tick body, or any other exit, raises `failed`; the consumer
 //! then moves every output on an aux bus back to Program (§4.4).
 
@@ -31,13 +37,14 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use multiview_compositor::pipeline::Nv12Image;
-use multiview_config::{OutputBus, VideoFeed};
+use multiview_config::{OutputBus, OutputFit, VideoFeed};
 use multiview_control::preview::WallCell;
 use multiview_core::color::ColorInfo;
 use multiview_engine::AuxTick;
 use multiview_framestore::{SwapCell, TileStore};
 
-use crate::nv12_blit::blit_cell;
+use crate::nv12_blit::{blit_cell, blit_region};
+use crate::output_fit::{fit_rects, Rect};
 
 /// Reusable letterbox buffers per feed (§2.4). A buffer still held by an
 /// encoder is not reused; with none free the bus holds for that tick.
@@ -149,11 +156,56 @@ pub struct PictureBusSlot {
     pub composed: AtomicU64,
 }
 
+/// An output picture format a routed feed is composed at (#342): size and fit.
+/// Colour, rate, scan and pixel format always equal the canvas (config
+/// refuses anything else in slice B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuxFormat {
+    /// Width in pixels (even).
+    pub width: u32,
+    /// Height in pixels (even).
+    pub height: u32,
+    /// How a picture is brought to this size.
+    pub fit: OutputFit,
+}
+
+impl AuxFormat {
+    /// A format of `width × height` with `fit`.
+    #[must_use]
+    pub const fn new(width: u32, height: u32, fit: OutputFit) -> Self {
+        Self { width, height, fit }
+    }
+
+    /// The format of an output's BASE (Program) key: `None` whenever its size
+    /// is the canvas's. The Program canvas is identity there (the fit is
+    /// irrelevant for a canvas-sized picture, §12.4 P2), so such an output
+    /// shares the canvas key and its zero-copy path.
+    #[must_use]
+    pub fn base_of_output(output: &multiview_config::Output, canvas: AuxCanvas) -> Option<Self> {
+        let f = output.format()?;
+        (f.width != canvas.width || f.height != canvas.height)
+            .then(|| Self::new(f.width, f.height, f.fit))
+    }
+
+    /// The format a routed source/PVW FEED is composed at for an output:
+    /// `None` only when it is the canvas size with the default fit (contain,
+    /// centre) — exactly today's letterbox. A canvas-sized cover/fill or an
+    /// anchored contain is honoured (#342 review M3).
+    #[must_use]
+    pub fn feed_of_output(output: &multiview_config::Output, canvas: AuxCanvas) -> Option<Self> {
+        let f = output.format()?;
+        let format = Self::new(f.width, f.height, f.fit);
+        (format != Self::new(canvas.width, canvas.height, OutputFit::default())).then_some(format)
+    }
+}
+
 /// One active routed feed the aux thread composes.
 #[derive(Debug, Clone)]
 pub struct AuxFeed {
     /// The bus (Program entries are ignored: Program is not composed here).
     pub bus: PictureBus,
+    /// The output format composed (`None` = the canvas, as before #342).
+    pub format: Option<AuxFormat>,
     /// Stable per-feed key (the bus name), so the thread's per-feed state is
     /// found without allocating each tick.
     pub key: Arc<str>,
@@ -165,12 +217,36 @@ impl AuxFeed {
     /// Build a feed for `bus` with a fresh slot.
     #[must_use]
     pub fn new(bus: PictureBus) -> Self {
-        let key: Arc<str> = Arc::from(bus.as_str().as_ref());
+        Self::with_format(bus, None)
+    }
+
+    /// Build a feed for `bus` composed at `format` (`None` = the canvas).
+    #[must_use]
+    pub fn with_format(bus: PictureBus, format: Option<AuxFormat>) -> Self {
+        let key: Arc<str> = Arc::from(feed_name(&bus, format));
         Self {
             bus,
+            format,
             key,
             slot: Arc::new(PictureBusSlot::default()),
         }
+    }
+}
+
+/// The stable name of a (bus, format) feed: the bus name for the canvas
+/// format (exactly as before #342), else `bus@WxH/mode/anchor`.
+#[must_use]
+pub fn feed_name(bus: &PictureBus, format: Option<AuxFormat>) -> String {
+    match format {
+        None => bus.as_str().into_owned(),
+        Some(f) => format!(
+            "{}@{}x{}/{:?}/{:?}",
+            bus.as_str(),
+            f.width,
+            f.height,
+            f.fit.mode,
+            f.fit.anchor
+        ),
     }
 }
 
@@ -340,7 +416,7 @@ impl AuxState {
             let Some(tile) = read.frame() else {
                 continue; // never live: publish nothing (hold)
             };
-            let Some(picture) = entry.compose(tile, inputs.canvas) else {
+            let Some(picture) = entry.compose_at(tile, inputs.canvas, feed.format) else {
                 continue;
             };
             feed.slot.latest.store(Some(Arc::new(AuxFrame {
@@ -390,7 +466,18 @@ impl AuxState {
 }
 
 impl FeedState {
+    #[cfg(test)]
     fn compose(&mut self, tile: &Arc<Nv12Image>, canvas: AuxCanvas) -> Option<Arc<Nv12Image>> {
+        self.compose_at(tile, canvas, None)
+    }
+
+    /// Compose `tile` at `format` (`None` = the canvas, as before #342).
+    fn compose_at(
+        &mut self,
+        tile: &Arc<Nv12Image>,
+        canvas: AuxCanvas,
+        format: Option<AuxFormat>,
+    ) -> Option<Arc<Nv12Image>> {
         if tile.color() != canvas.color {
             if !self.warned_color {
                 tracing::warn!(
@@ -401,10 +488,20 @@ impl FeedState {
             }
             return None;
         }
-        if is_identity(tile, canvas) {
+        let Some(format) = format else {
+            if is_identity(tile, canvas) {
+                return Some(Arc::clone(tile));
+            }
+            return self.ring.letterbox(tile, canvas);
+        };
+        // Identity at the output's format: same size, opaque, same tag.
+        if tile.width() == format.width
+            && tile.height() == format.height
+            && tile.alpha_plane().is_none()
+        {
             return Some(Arc::clone(tile));
         }
-        self.ring.letterbox(tile, canvas)
+        self.ring.fit(tile, canvas, format)
     }
 }
 
@@ -446,6 +543,52 @@ struct BlitRing {
 }
 
 impl BlitRing {
+    /// A free buffer of `w × h` (allocating up to [`AUX_RING_BUFFERS`]);
+    /// `None` when every buffer is still held downstream.
+    fn free(&mut self, w: u32, h: u32, color: ColorInfo) -> Option<usize> {
+        match self
+            .buffers
+            .iter_mut()
+            .position(|b| Arc::get_mut(b).is_some())
+        {
+            Some(index) => Some(index),
+            None if self.buffers.len() < AUX_RING_BUFFERS => {
+                let image = Nv12Image::solid(w, h, 16, 128, 128, color).ok()?;
+                self.buffers.push(Arc::new(image));
+                Some(self.buffers.len() - 1)
+            }
+            None => None,
+        }
+    }
+
+    /// `tile` at `format` with its fit (#342): one crop/scale into a reusable
+    /// buffer of the format's size, tagged like the canvas.
+    fn fit(
+        &mut self,
+        tile: &Nv12Image,
+        canvas: AuxCanvas,
+        format: AuxFormat,
+    ) -> Option<Arc<Nv12Image>> {
+        let (crop, dst) = fit_rects(
+            tile.width(),
+            tile.height(),
+            format.width,
+            format.height,
+            format.fit.mode,
+            format.fit.anchor,
+        )?;
+        let index = self.free(format.width, format.height, canvas.color)?;
+        let buffer = self.buffers.get_mut(index)?;
+        let image = Arc::get_mut(buffer)?;
+        let (y_plane, uv_plane) = image.planes_mut();
+        if dst != Rect::full(format.width, format.height) {
+            y_plane.fill(16);
+            uv_plane.fill(128);
+        }
+        blit_region(tile, crop, format.width, y_plane, uv_plane, dst);
+        Some(Arc::clone(buffer))
+    }
+
     fn letterbox(&mut self, tile: &Nv12Image, canvas: AuxCanvas) -> Option<Arc<Nv12Image>> {
         if tile.width() < 2 || tile.height() < 2 {
             return None;
@@ -717,5 +860,192 @@ mod tests {
             wait_for(|| handle.failed.load(Ordering::Acquire)),
             "exit raises failed"
         );
+    }
+
+    fn vertical() -> AuxFormat {
+        AuxFormat::new(
+            1080,
+            1920,
+            OutputFit::new(
+                multiview_config::OutputFitMode::Cover,
+                multiview_config::Anchor::Center,
+            ),
+        )
+    }
+
+    #[test]
+    fn a_vertical_cover_feed_composes_at_its_format_with_the_cover_crop() {
+        let c = canvas();
+        let tile = Arc::new(gradient(1920, 1080, c.color));
+        let mut state = FeedState::default();
+        let out = state.compose_at(&tile, c, Some(vertical())).unwrap();
+        assert_eq!((out.width(), out.height()), (1080, 1920));
+        assert_eq!(out.color(), c.color);
+        let (crop, dst) = fit_rects(
+            1920,
+            1080,
+            1080,
+            1920,
+            multiview_config::OutputFitMode::Cover,
+            multiview_config::Anchor::Center,
+        )
+        .unwrap();
+        assert_eq!(crop, Rect::new(656, 0, 608, 1080));
+        let mut y = vec![0u8; 1080 * 1920];
+        let mut uv = vec![0u8; 1080 * 1920 / 2];
+        blit_region(&tile, crop, 1080, &mut y, &mut uv, dst);
+        assert!(out.y_plane().eq(y.as_slice()), "luma parity");
+        assert!(out.uv_plane().eq(uv.as_slice()), "chroma parity");
+    }
+
+    #[test]
+    fn a_tile_already_at_the_format_passes_the_same_arc() {
+        let c = canvas();
+        let tile = Arc::new(gradient(1080, 1920, c.color));
+        let mut state = FeedState::default();
+        let out = state.compose_at(&tile, c, Some(vertical())).unwrap();
+        assert!(
+            Arc::ptr_eq(&out, &tile),
+            "identity at the format allocates nothing"
+        );
+        // A tile with another colour tag is still held, at any format.
+        let other = ColorInfo::default().resolve_defaults(640, 480);
+        let odd = Arc::new(gradient(640, 480, other));
+        assert!(state.compose_at(&odd, c, Some(vertical())).is_none());
+    }
+
+    #[test]
+    fn the_aux_thread_publishes_a_formatted_feed_at_its_size() {
+        let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
+        let lookup_store = Arc::clone(&store);
+        let stores: StoreLookup =
+            Arc::new(move |id: &str| (id == "cam").then(|| Arc::clone(&lookup_store)));
+        let plain = AuxFeed::new(PictureBus::Source("cam".to_owned()));
+        let tall = AuxFeed::with_format(PictureBus::Source("cam".to_owned()), Some(vertical()));
+        assert_ne!(plain.key, tall.key, "per-feed state is per (bus, format)");
+        let (plain_slot, tall_slot) = (Arc::clone(&plain.slot), Arc::clone(&tall.slot));
+        let (tx, _handle) = spawn_with(stores, vec![plain, tall]);
+        store.publish(gradient(1920, 1080, canvas().color), tick(0).pts);
+        tx.offer(tick(0));
+        assert!(wait_for(|| tall_slot.composed.load(Ordering::Relaxed) == 1
+            && plain_slot.composed.load(Ordering::Relaxed) == 1));
+        let frame = tall_slot.latest.load().unwrap();
+        assert_eq!((frame.frame.width(), frame.frame.height()), (1080, 1920));
+        let canvas_frame = plain_slot.latest.load().unwrap();
+        assert_eq!(
+            (canvas_frame.frame.width(), canvas_frame.frame.height()),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn base_formats_collapse_at_canvas_size_and_feed_formats_keep_the_fit() {
+        let cfg = multiview_config::MultiviewConfig::load_from_toml(
+            r##"
+schema_version = 1
+[canvas]
+width = 1920
+height = 1080
+fps = "30000/1001"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "preset"
+preset = "2x2"
+[[sources]]
+id = "a"
+kind = "test"
+[[outputs]]
+kind = "hls"
+id = "same"
+path = "/x"
+codec = "h264"
+[outputs.format]
+width = 1920
+height = 1080
+[[outputs]]
+kind = "hls"
+id = "tall"
+path = "/y"
+codec = "h264"
+[outputs.format]
+width = 1080
+height = 1920
+fit = { mode = "cover" }
+[[outputs]]
+kind = "hls"
+id = "same-cover"
+path = "/w"
+codec = "h264"
+[outputs.format]
+width = 1920
+height = 1080
+fit = { mode = "cover", anchor = "top" }
+[[outputs]]
+kind = "hls"
+id = "none"
+path = "/z"
+codec = "h264"
+"##,
+        )
+        .unwrap();
+        let base: Vec<_> = cfg
+            .outputs
+            .iter()
+            .map(|o| AuxFormat::base_of_output(o, canvas()))
+            .collect();
+        assert_eq!(base, vec![None, Some(vertical()), None, None]);
+        // A routed feed honours a canvas-sized non-default fit (#342 M3).
+        let feeds: Vec<_> = cfg
+            .outputs
+            .iter()
+            .map(|o| AuxFormat::feed_of_output(o, canvas()))
+            .collect();
+        let canvas_cover_top = AuxFormat::new(
+            1920,
+            1080,
+            OutputFit::new(
+                multiview_config::OutputFitMode::Cover,
+                multiview_config::Anchor::Top,
+            ),
+        );
+        assert_eq!(
+            feeds,
+            vec![None, Some(vertical()), Some(canvas_cover_top), None]
+        );
+    }
+
+    #[test]
+    fn a_canvas_sized_cover_feed_fills_the_canvas_instead_of_letterboxing() {
+        let c = canvas();
+        let tile = Arc::new(gradient(640, 480, c.color));
+        let cover = AuxFormat::new(
+            1920,
+            1080,
+            OutputFit::new(
+                multiview_config::OutputFitMode::Cover,
+                multiview_config::Anchor::Center,
+            ),
+        );
+        let out = FeedState::default()
+            .compose_at(&tile, c, Some(cover))
+            .unwrap();
+        let (crop, dst) = fit_rects(
+            640,
+            480,
+            1920,
+            1080,
+            multiview_config::OutputFitMode::Cover,
+            multiview_config::Anchor::Center,
+        )
+        .unwrap();
+        assert_eq!(dst, Rect::full(1920, 1080), "no letterbox bars");
+        let mut y = vec![0u8; 1920 * 1080];
+        let mut uv = vec![0u8; 1920 * 1080 / 2];
+        blit_region(&tile, crop, 1920, &mut y, &mut uv, dst);
+        assert!(out.y_plane().eq(y.as_slice()), "luma parity");
+        assert!(out.uv_plane().eq(uv.as_slice()), "chroma parity");
     }
 }

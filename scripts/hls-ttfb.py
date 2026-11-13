@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import select
 import socket
 import ssl
 import statistics
@@ -47,6 +48,19 @@ def connect(url: urllib.parse.SplitResult, insecure: bool, timeout: float):
     conn.connect()
     conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     return conn
+
+
+def wait_readable(sock: socket.socket, timeout: float) -> None:
+    """Block until `sock` has response bytes to read, or raise TimeoutError.
+
+    A TLS socket may already hold decrypted bytes in its own buffer
+    (`pending()`), which `select` cannot see; otherwise wait on the fd.
+    """
+    if isinstance(sock, ssl.SSLSocket) and sock.pending() > 0:
+        return
+    readable, _, _ = select.select([sock], [], [], timeout)
+    if not readable:
+        raise TimeoutError(f"no response byte within {timeout} s")
 
 
 def path_of(url: urllib.parse.SplitResult) -> str:
@@ -87,8 +101,9 @@ class Target:
         conn.putheader("Accept-Encoding", "identity")
         conn.endheaders()
         t0 = time.perf_counter()
-        # Block for the first byte of the response, then parse it.
-        conn.sock.recv(1, socket.MSG_PEEK)
+        # Block until the first byte of the response is readable, then parse
+        # it. (`recv(..., MSG_PEEK)` raises ValueError on an ssl.SSLSocket.)
+        wait_readable(conn.sock, self.timeout)
         ttfb = (time.perf_counter() - t0) * 1000.0
         response = conn.getresponse()
         data = response.read()

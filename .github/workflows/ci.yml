@@ -1412,6 +1412,35 @@ jobs:
       - name: cargo deny (acme closure)
         run: cargo deny --features multiview-cli/acme check
 
+  # ── HTTP/3 front-door fuzzing (#288) ─────────────────────────────────────────
+  # The multiview-h3 header-block guard, capsule parser and the real h3 server
+  # request path (in-memory transport) under libFuzzer, 30 s per target. The
+  # fuzz crate is its own workspace (excluded from the main one); cargo-fuzz
+  # needs nightly for the sanitizer flags, so only this job uses nightly.
+  fuzz-h3:
+    name: fuzz multiview-h3 (30 s per target)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-h3
+          workspaces: crates/multiview-h3/fuzz
+      - name: run fuzz targets
+        working-directory: crates/multiview-h3
+        run: |
+          set -euo pipefail
+          for target in header_guard capsule h3_request; do
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=30
+          done
+
   # ── release-artifact feature guard (task #109) ───────────────────────────────
   # A test-only Cargo feature (multiview-control's `_test-seams`, the config-watch
   # test-interpose seam) must NEVER compile into a shipped/release artifact.
