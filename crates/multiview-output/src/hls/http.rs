@@ -443,7 +443,35 @@ async fn serve_media(
     method: Method,
     request_headers: HeaderMap,
 ) -> Response {
-    let Some(lexical) = resolve_media_path(&root, &relative) else {
+    serve_in_root(root, &relative, method, request_headers).await
+}
+
+/// Serve one file of the HLS directory `dir` with exactly the [`hls_router`]
+/// contract (extension allow-list, content types, cache tiers, validators,
+/// ranges, symlink confinement), without CORS. For a caller that picks the
+/// directory per request (the token-scoped cast media route). `dir` is
+/// canonicalised on the blocking pool; a directory that does not exist yet
+/// is a plain `404`.
+pub async fn serve_file(
+    dir: PathBuf,
+    relative: &str,
+    method: Method,
+    request_headers: HeaderMap,
+) -> Response {
+    let root = match tokio::task::spawn_blocking(move || std::fs::canonicalize(&dir)).await {
+        Ok(Ok(root)) => root,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    serve_in_root(Arc::new(root), relative, method, request_headers).await
+}
+
+async fn serve_in_root(
+    root: Arc<PathBuf>,
+    relative: &str,
+    method: Method,
+    request_headers: HeaderMap,
+) -> Response {
+    let Some(lexical) = resolve_media_path(&root, relative) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some((content_type, tier)) = lexical

@@ -23,6 +23,7 @@
 //! Isolation (invariant #10): one short `Mutex`, never held across an
 //! `.await`; nothing here touches an engine channel.
 
+pub mod lifecycle;
 mod registry;
 pub mod token;
 
@@ -121,6 +122,7 @@ pub fn bounded_user_agent(raw: Option<&str>) -> Option<String> {
 pub struct CastStreams {
     inner: Mutex<Registry>,
     clock: Clock,
+    sweeper: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for CastStreams {
@@ -151,11 +153,17 @@ impl CastStreams {
         Self {
             inner: Mutex::new(Registry::default()),
             clock,
+            sweeper: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `true` exactly once: the caller starts the sweep task.
+    pub(crate) fn claim_sweeper(&self) -> bool {
+        !self.sweeper.swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Now, in Unix ms, on this registry's clock.

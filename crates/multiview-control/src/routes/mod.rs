@@ -26,7 +26,9 @@ pub mod account;
 pub mod alarms;
 pub mod audio;
 pub mod audit;
+pub mod cast_public;
 pub mod cast_sessions;
+pub mod cast_streams;
 pub(crate) mod catalogue;
 pub mod cloudflare;
 pub mod config;
@@ -1268,6 +1270,17 @@ fn device_router() -> Router<AppState> {
         .route(
             "/cast/sessions/{id}/volume",
             post(cast_sessions::set_cast_volume),
+        )
+        // Cast stream tokens for the browser sender (ADR-0111): the cast
+        // config, and token-scoped streams of one cast output each.
+        .route("/cast/config", get(cast_streams::get_cast_config))
+        .route(
+            "/cast/streams",
+            get(cast_streams::list_cast_streams).post(cast_streams::create_cast_stream),
+        )
+        .route(
+            "/cast/streams/{id}",
+            get(cast_streams::get_cast_stream).delete(cast_streams::delete_cast_stream),
         )
         // mDNS device discovery (ADR-M008 §6 / ADR-0041): kick a time-bounded
         // browse (202 + device.discovered events) and read the untrusted

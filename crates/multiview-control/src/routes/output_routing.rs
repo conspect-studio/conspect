@@ -240,6 +240,27 @@ fn authorize_bus(principal: &Principal) -> ControlResult<()> {
     crate::auth::authorize_object(principal, ME_ID)
 }
 
+/// Authorize the video-feed end (§6.3): a source → Read on it; a layout →
+/// Read on the layout id and its whole source closure (from the request's
+/// one pre-read `layout`); a bus → Program scope + the M/E grant. Shared by
+/// the take route and the cast streams API (ADR-0111), so a cast stream is
+/// authorized exactly as a take of the same feed.
+///
+/// # Errors
+/// 403 for any end the principal may not read.
+pub(crate) fn authorize_video_feed(
+    principal: &Principal,
+    feed: &VideoFeed,
+    layout: Option<&LayoutRead>,
+) -> ControlResult<()> {
+    match feed {
+        VideoFeed::Source(id) => crate::auth::authorize_object(principal, id),
+        VideoFeed::Layout(id) => authorize_layout_feed(principal, id, layout),
+        VideoFeed::Bus(_) => authorize_bus(principal),
+        _ => Err(ControlError::Forbidden("unsupported feed kind".to_owned())),
+    }
+}
+
 /// Authorize both ends (§6.3), before any existence check: the output, the
 /// video feed when present, and the audio feed's own end (`source:x` → x;
 /// `program` → the bus rule; `tracks` → each track name, and each track's
@@ -251,12 +272,8 @@ fn authorize_ends(
     layout: Option<&LayoutRead>,
 ) -> ControlResult<()> {
     authorize_output_end(principal, req.output())?;
-    match &req.feed {
-        None => {}
-        Some(VideoFeed::Source(id)) => crate::auth::authorize_object(principal, id)?,
-        Some(VideoFeed::Layout(id)) => authorize_layout_feed(principal, id, layout)?,
-        Some(VideoFeed::Bus(_)) => authorize_bus(principal)?,
-        Some(_) => return Err(ControlError::Forbidden("unsupported feed kind".to_owned())),
+    if let Some(feed) = &req.feed {
+        authorize_video_feed(principal, feed, layout)?;
     }
     match &req.audio {
         None | Some(AudioFeed::Follow | AudioFeed::None) => {}
@@ -282,7 +299,7 @@ pub(crate) fn routing_unavailable() -> Response {
         .into_response()
 }
 
-fn refusal_problem(status: u16, kind: &str, detail: String) -> Response {
+pub(crate) fn refusal_problem(status: u16, kind: &str, detail: String) -> Response {
     Problem::new(status, kind, "Take refused")
         .with_detail(detail)
         .into_response()
@@ -1017,7 +1034,7 @@ fn replayed(replay: TakeReplay) -> Response {
 }
 
 /// `429` + `Retry-After` (whole seconds, at least 1).
-fn too_many(retry: std::time::Duration) -> Response {
+pub(crate) fn too_many(retry: std::time::Duration) -> Response {
     let secs = retry
         .as_secs()
         .saturating_add(u64::from(retry.subsec_nanos() > 0))
@@ -1031,7 +1048,7 @@ fn too_many(retry: std::time::Duration) -> Response {
     response
 }
 
-fn unroutable_kind() -> Response {
+pub(crate) fn unroutable_kind() -> Response {
     refusal_problem(
         409,
         "output-kind-unroutable",

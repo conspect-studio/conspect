@@ -191,6 +191,15 @@ pub enum StartMode {
     Resume,
 }
 
+/// A Cast receiver app id in its canonical form (8 upper-case hexadecimal
+/// characters), or `None` when `raw` (surrounding whitespace trimmed) is not
+/// one (ADR-0111).
+#[must_use]
+pub fn normalize_cast_app_id(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    (raw.len() == 8 && raw.bytes().all(|b| b.is_ascii_hexdigit())).then(|| raw.to_ascii_uppercase())
+}
+
 /// The management control-plane listener.
 ///
 /// When present, `multiview run` serves the REST + WebSocket + SSE API, the
@@ -229,6 +238,13 @@ pub struct ControlConfig {
     /// are refused).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_media_base: Option<String>,
+    /// The registered custom Cast receiver app id (ADR-0111): exactly 8
+    /// hexadecimal characters, as the Google Cast SDK Developer Console
+    /// issued it (case-insensitive; used upper-case). Absent = no custom
+    /// receiver: the browser sender uses Google's Default Media Receiver.
+    /// The environment variable `MULTIVIEW_CAST_APP_ID` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_app_id: Option<String>,
     /// The externally-reachable **hostname** (no scheme, no port) viewer
     /// playback URLs are derived against (`GET
     /// /api/v1/outputs/{id}/playback`): substituted for a wildcard/loopback
@@ -1163,6 +1179,15 @@ impl MultiviewConfig {
                     return Err(ConfigError::Validation(format!(
                         "control.cast_media_base {base:?} must be an http:// or https:// base \
                          URL (Cast receivers fetch HLS over HTTP)"
+                    )));
+                }
+            }
+            if let Some(app_id) = &control.cast_app_id {
+                if normalize_cast_app_id(app_id).is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "control.cast_app_id {app_id:?} must be the 8 hexadecimal characters of \
+                         a registered Cast receiver app id (omit it to use Google's Default \
+                         Media Receiver)"
                     )));
                 }
             }

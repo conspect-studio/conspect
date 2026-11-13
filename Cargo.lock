@@ -4025,6 +4025,7 @@ dependencies = [
  "multiview-licence",
  "multiview-mesh",
  "multiview-moq",
+ "multiview-output",
  "multiview-preview",
  "multiview-telemetry",
  "multiview-weather",

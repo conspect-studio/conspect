@@ -166,6 +166,21 @@ impl CastStreams {
         Some(Registry::view(&entry))
     }
 
+    /// Undo a claim whose output could not be prepared: the stream goes and,
+    /// when it was the output's only one, the output is forgotten without a
+    /// linger (`was_first`: the claim created the slot).
+    pub fn release_claim(&self, id: &str, was_first: bool) {
+        let mut inner = self.lock();
+        let Some(at) = inner.entries.iter().position(|e| e.id == id) else {
+            return;
+        };
+        let entry = inner.entries.remove(at);
+        inner.last_report_ms.remove(id);
+        if was_first && inner.streams_on(&entry.config_id) == 0 {
+            inner.slots.remove(&entry.config_id);
+        }
+    }
+
     /// Stream `id` and its token. `None` when unknown or expired.
     #[must_use]
     pub fn get(&self, id: &str) -> Option<(StreamView, String)> {
