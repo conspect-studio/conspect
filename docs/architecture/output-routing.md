@@ -2097,6 +2097,42 @@ boot the engine starts from it; `GET /patch` is built from the engine's live rea
 current source, path and state), never from the document. A persisted crosspoint the engine cannot
 honour at boot (source gone, slot removed) starts the slot on its default and raises an alarm.
 
+**As built in slice B (#342, part B2).**
+- **Output slots in `/patch`.** `GET /patch` gains `outputs: [ { output, format, video: [ { slot: 0,
+  source, path, pending, degraded } ], audio: [ { slot, track, language, source: "follow" } ] } ]`.
+  - The video slot comes from the engine's live readback (`RoutingLive`, the router snapshot), and
+    the audio slots from the accepted output config (`slots.audio`, else one program slot).
+  - An output is listed only if the caller passes the output axis that the patch route checks
+    (`ObjectAndOutput` + `authorize_output`). A feed it cannot read is `{redacted: true}`.
+- **Single-output takes.** `POST /patch/plan` and `/patch/take` accept the crosspoints of ONE output:
+  - video slot 0 with `{source}` or `{bus}`;
+  - optionally audio slot 0 with `"follow"`, which rides the video take.
+
+  Other requests are refused:
+  - video slot ≥ 1 → 422 `unknown-slot`;
+  - other audio slots → 422 `slot-medium-mismatch` (they are fixed by config in this slice);
+  - `subtitle` → 422 `slot-medium-mismatch` (#345);
+  - `{layout}` → 422 `unknown-source` (#306).
+
+  A request carries either mixer-input crosspoints or one output's crosspoints. Two outputs, or a
+  mixer input plus an output, → 422 `unknown-slot`: atomic multi-destination sets arrive with patch
+  salvos (slice E, #308).
+- **Plan.** The plan reports the §12.4 path (`P1` when an encoded bus with key (picture, format,
+  settings) is live, with Program at the output's format always its base key; `P2` when the picture
+  is identity at the output's format; else `P3`). It also reports `cost` = { `new_encoders`,
+  `converts`, `sessions_in_use`/`sessions_max` (whole-system principals only), `fits` } and the
+  existing plan refusals.
+- **`/routing/output/take` is the slot-0 alias.** An output take goes through exactly the same
+  machinery as that route:
+  - one shared function (`take_output_slot0`);
+  - the take-scoped idempotency store, under one shared key namespace, so a key replays across both
+    routes;
+  - the same per-output 2/s and per-principal 10/s limits;
+  - the bounded `try_send`, the `route.output` outcome, and persistence on `applied`.
+
+  The patch take answers `202 {operation_id, status: "accepted"}`; the alias keeps its own bodies.
+  The alias checks the output's object axis, as before; the patch route also checks the output axis.
+
 ### 12.9 The Routing page (#308)
 
 The Routing page becomes the patch matrix: **Video | Audio | Subtitle** tabs; rows are sources
