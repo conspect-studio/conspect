@@ -36,6 +36,16 @@ implementation will build against.
 
 ### Added
 
+- **Numbered mixer inputs and the mixer patch (patch panel, slice A).** An M/E may declare
+  `[[switcher.mix_effects.inputs]] { number, label, video = { source } }` with `program_input` /
+  `preview_input`; PGM/PVW then select input numbers and a CUT swaps inputs. The Switcher page
+  shows the input bank with tally and a per-input re-patch. `GET /api/v1/patch` reads the
+  engine's live table; `POST /api/v1/patch/plan|take` re-patch up to 64 inputs atomically on one
+  tick (Idempotency-Key, 202, outcome on `switcher.operation`). Re-patching the input on Program
+  is refused (`on-air-protected`) unless `on_air = "allow"`, and always during an AUTO on it. An
+  applied patch is persisted into the accepted state. `select_program`/`select_preview` accept
+  `input`. Without inputs, behaviour is unchanged (#341, ADR-0110).
+
 - **ACME certificate engine for the network front door (library, off by default)**: the
   `acme` feature of `multiview-control` issues and renews the front-door certificate over
   DNS-01 (Cloudflare token or global key) or TLS-ALPN-01 from Let's Encrypt, Google or a custom
