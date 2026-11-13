@@ -45,6 +45,27 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_config::{MultiviewConfig, NetworkMode};
+use multiview_frontdoor::ListenSockets;
+
+/// The sockets systemd passed (`LISTEN_FDS`), adopted by `main` before the
+/// runtime starts and claimed by [`FrontDoorRun::start`] (slice 6, #292).
+static INHERITED: Mutex<Option<ListenSockets>> = Mutex::new(None);
+
+/// Record the sockets the service manager passed. `main` calls this once with
+/// [`ListenSockets::from_env`], before any other thread exists.
+pub fn set_inherited_sockets(sockets: ListenSockets) {
+    *INHERITED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sockets);
+}
+
+fn take_inherited_sockets() -> ListenSockets {
+    INHERITED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_default()
+}
 
 /// Install (or clear) the running front door's capability snapshot and
 /// metrics source for the control plane, mirroring
@@ -149,11 +170,13 @@ pub fn tcp_config_from(config: &MultiviewConfig) -> Option<TcpPlan> {
             let bind = IpAddr::V6(network.bind_ip().ok()?);
             let port = network.effective_tcp_port()?;
             let redirect = network.effective_redirect_port().and_then(|redirect| {
-                Some(multiview_frontdoor::RedirectConfig::new(
+                let mut cfg = multiview_frontdoor::RedirectConfig::new(
                     SocketAddr::new(bind, redirect),
                     network.public_host.clone()?,
                     port,
-                ))
+                );
+                cfg.acme_webroot = network.acme_webroot.as_ref().map(std::path::PathBuf::from);
+                Some(cfg)
             });
             Some(TcpPlan {
                 door: multiview_frontdoor::TcpDoorConfig {
@@ -347,15 +370,33 @@ impl FrontDoorRun {
     /// logged and returns `None`: the run continues with WebRTC and `MoQ`
     /// unavailable rather than silently falling back to the legacy ports.
     ///
+    /// Sockets passed by systemd ([`set_inherited_sockets`]) are used for the
+    /// listeners whose type and port they match (UDP `https_port`, TCP door
+    /// port, redirect port); the rest bind their own (slice 6, #292).
+    ///
     /// Logs one line at start naming the steering mode, rcvbuf
     /// requested/granted/usable/clamped, kernel-drop support, and the nft
     /// floor (design note, "Slice 3 as built, part B"); starts the nft-floor re-reader on
     /// the front door's own runtime (never the program runtime).
     #[must_use]
     pub fn start(config: &MultiviewConfig) -> Option<Self> {
+        Self::start_with(config, take_inherited_sockets())
+    }
+
+    /// [`start`](Self::start) with explicit inherited sockets (tests).
+    #[must_use]
+    pub fn start_with(config: &MultiviewConfig, mut inherited: ListenSockets) -> Option<Self> {
+        inherited.log_summary();
         warn_deprecated(config);
-        let fd_config = config_from(config)?;
-        match multiview_frontdoor::FrontDoor::start(&fd_config) {
+        let Some(fd_config) = config_from(config) else {
+            inherited.report_unclaimed();
+            return None;
+        };
+        let udp = inherited.take_udp_all(SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            fd_config.port,
+        ));
+        let run = match multiview_frontdoor::FrontDoor::start_with(&fd_config, udp) {
             Ok(door) => {
                 let nft_path = nft_floor_status_file(config);
                 let initial_floor = crate::nft_floor::probe(&nft_path);
@@ -381,28 +422,31 @@ impl FrontDoorRun {
                     nft_floor,
                     ice_tcp: false,
                 };
-                run.start_tcp(config);
+                run.start_tcp(config, &mut inherited);
                 Some(run)
             }
             Err(error) => {
                 tracing::error!(%error, port = fd_config.port, "the front door failed to start; WebRTC and MoQ unavailable this run");
                 None
             }
-        }
+        };
+        inherited.report_unclaimed();
+        run
     }
 
     /// Start the TCP door and the redirect (slice 4). A bind failure is logged
     /// and the UDP door keeps running.
-    fn start_tcp(&mut self, config: &MultiviewConfig) {
+    fn start_tcp(&mut self, config: &MultiviewConfig, inherited: &mut ListenSockets) {
         let Some(plan) = tcp_config_from(config) else {
             return;
         };
         let listen = plan.door.listen;
         let ice_tcp = plan.door.ice_tcp;
-        let tcp = match self.door.start_tcp(
+        let tcp = match self.door.start_tcp_with(
             plan.door,
             multiview_frontdoor::TlsRouting::default(),
             None,
+            inherited.take_tcp(listen),
         ) {
             Ok(local) => local,
             Err(error) => {
@@ -412,7 +456,8 @@ impl FrontDoorRun {
         };
         let redirect = plan.redirect.and_then(|redirect| {
             let addr = redirect.listen;
-            match self.door.start_redirect(redirect) {
+            let socket = inherited.take_tcp(addr);
+            match self.door.start_redirect_with(redirect, socket) {
                 Ok(local) => Some(local),
                 Err(error) => {
                     tracing::error!(%error, %addr, "the port-80 redirect failed to start; unavailable this run");
@@ -421,6 +466,13 @@ impl FrontDoorRun {
             }
         });
         self.ice_tcp = ice_tcp;
+        // The site attaches once the control plane is built: hold site hellos
+        // that arrive before that (bounded by the handshake deadline) instead
+        // of closing them; `install_site` releases them.
+        // (No `[control]`: no control plane, no site; nothing is held.)
+        if config.control.is_some() {
+            let _ = self.door.set_site_pending(true);
+        }
         tracing::info!(
             %tcp,
             mode = ?plan.mode,
@@ -453,7 +505,8 @@ impl FrontDoorRun {
             return;
         };
         let Some(site) = tls_site else {
-            tracing::warn!(%tcp, "front-door TCP door: no site certificate ([network.tls] in an `acme` build, or [control.tls] static in a `tls` build, on unix), so TLS on the door is unavailable; ICE-TCP still runs");
+            let _ = self.door.set_site_pending(false);
+            tracing::warn!(%tcp, "front-door TCP door: no site certificate ([network.tls] in an `acme` build, or [network] cert_file/key_file or [control.tls] static in a `tls` build, on unix), so TLS on the door is unavailable; ICE-TCP still runs");
             return;
         };
         // Read-modify-write per half (#291): the site half here; the ACME

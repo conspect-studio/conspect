@@ -36,6 +36,17 @@ implementation will build against.
 
 ### Added
 
+- **The engine serves TCP 443, TCP 80 and UDP 443 itself; nginx is no longer needed (front-door
+  slice 6, #292)**: systemd socket activation (`deploy/systemd/conspect.socket`: TCP 443, TCP 80
+  and a `ReusePort=yes` UDP 443 pair, so validated-flow steering survives) keeps the sockets
+  open across engine restarts; without it the engine binds them itself. HLS delivery now
+  matches the nginx static contract (`ETag`/`Last-Modified`, `304`, `If-Range`, 64 KiB bounded
+  chunks, one blocking-pool hop per request); the embedded UI gets strong `ETag`s, `304`, gzip
+  and a `404` for a stale hashed chunk. New keys: `[network] cert_file`/`key_file` (the door's
+  own static certificate), `[network] acme_webroot` (HTTP-01 for certbot on port 80) and
+  `[control] ui_dir` (serve a UI build from disk). `[control.tls]` static certificates reload
+  without a restart. `scripts/hls-ttfb.py` measures segment TTFB against the nginx path; the
+  mda001 cutover and rollback are in `docs/runbooks/front-door-cutover.md`.
 - **Numbered mixer inputs and the mixer patch (patch panel, slice A).** An M/E may declare
   `[[switcher.mix_effects.inputs]] { number, label, video = { source } }` with `program_input` /
   `preview_input`; PGM/PVW then select input numbers and a CUT swaps inputs. The Switcher page
@@ -82,8 +93,9 @@ implementation will build against.
   Deploy artefacts: `deploy/nftables/conspect-udp443-floor.nft` (a two-tier per-source/per-/64 floor
   on UDP 443: new flows 2000/s, established flows 25 000/s, each packet charged to exactly one
   tier, no unmetered established exemption, and a full per-source set fails closed for UDP 443
-  only; behaviour test `deploy/nftables/test-floor.sh`), `deploy/systemd/conspect.service` (+ a
-  not-yet-wired `conspect.socket` placeholder for slice 6; its root `ExecStartPre=+` writes the
+  only; behaviour test `deploy/nftables/test-floor.sh`), the drop-in
+  `deploy/systemd/conspect.service.d/20-nft-floor.conf` for slice 6's `conspect.service` (its root
+  `ExecStartPre=+` writes the
   floor status to the root-owned `/run/conspect-floor/nft-floor.json`, which the engine trusts only
   as a root-owned, non-symlink, not group/other-writable file, as a report, never for enforcement),
   `deploy/sysctl/90-conspect-udp.conf`, and `docs/runbooks/udp-443-flood.md`.

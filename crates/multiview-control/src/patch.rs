@@ -25,7 +25,7 @@ pub(crate) fn spawn_persist_relay(state: &AppState) {
         return;
     };
     let state = state.clone();
-    // Boxed: the relay future holds an `AppState` (clippy::large_futures).
+    // Boxed: the relay owns an `AppState` (clippy::large_futures).
     runtime.spawn(Box::pin(persist_relay(state, control)));
 }
 

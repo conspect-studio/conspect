@@ -469,6 +469,12 @@ name = "site_connection"
 required-features = ["tls"]
 
 [[test]]
+# A renewed `[control.tls] static` certificate is served without a restart
+# (ADR-0107 slice 6, certbot renewing in place).
+name = "static_cert_reload"
+required-features = ["tls"]
+
+[[test]]
 # The output clock keeps its cadence while the ACME service hangs or is refused.
 name = "acme_cadence"
 required-features = ["acme"]

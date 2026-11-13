@@ -209,6 +209,89 @@ impl SharedSocket {
         )
     }
 
+    /// Adopt the UDP socket(s) passed by the service manager (systemd socket
+    /// activation, slice 6) in the current runtime's reactor.
+    ///
+    /// One socket: single-socket mode. Two sockets on the same port: the
+    /// `ReusePort=yes` pair of `deploy/systemd/conspect.socket`, listener
+    /// first (reuseport group index 0, bound first by systemd) and the
+    /// established socket second (index 1); steering is then attached exactly
+    /// as for a pair the engine bound itself. The kernel accepts both in one
+    /// group because the same owner (systemd) created both. The receive
+    /// buffers are left as the unit set them (`ReceiveBuffer=`) and reported.
+    pub(crate) fn from_inherited(mut sockets: Vec<std::net::UdpSocket>) -> io::Result<Self> {
+        let prepare =
+            |std_socket: std::net::UdpSocket| -> io::Result<(socket2::Socket, RecvBufferReport)> {
+                let socket = socket2::Socket::from(std_socket);
+                if !matches!(socket.local_addr()?.as_socket(), Some(SocketAddr::V6(_))) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "an inherited front-door UDP socket must be IPv6 (dual-stack [::]:443)",
+                    ));
+                }
+                if socket.only_v6().unwrap_or(false) {
+                    tracing::warn!(
+                        "front door: an inherited UDP socket is IPv6-only (BindIPv6Only=both \
+                     missing from the socket unit); IPv4 clients cannot reach it"
+                    );
+                }
+                socket.set_nonblocking(true)?;
+                let report = size_recv_buffer(&socket, 0);
+                Ok((socket, report))
+            };
+        if sockets.len() > 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "more than two inherited UDP sockets on the front-door port (expected one, or \
+                 the ReusePort=yes pair)",
+            ));
+        }
+        let established = if sockets.len() == 2 {
+            sockets.pop()
+        } else {
+            None
+        };
+        let Some(listener) = sockets.pop() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no inherited UDP socket",
+            ));
+        };
+        let (listener, l_report) = prepare(listener)?;
+        let Some(established) = established else {
+            return Self::from_listener(
+                listener.into(),
+                None,
+                SteeringMode::SingleSocket {
+                    reason: "socket-activated with one UDP socket (pass the ReusePort=yes pair \
+                             of deploy/systemd/conspect.socket for validated-flow steering)"
+                        .to_owned(),
+                },
+                l_report,
+            );
+        };
+        let (established, e_report) = prepare(established)?;
+        if listener.local_addr()?.as_socket().map(|a| a.port())
+            != established.local_addr()?.as_socket().map(|a| a.port())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the inherited UDP pair is on two ports",
+            ));
+        }
+        let established: std::net::UdpSocket = established.into();
+        let est = EstablishedSocket {
+            state: UdpSocketState::new((&established).into())?,
+            io: tokio::net::UdpSocket::from_std(established)?,
+        };
+        Self::from_listener(
+            listener.into(),
+            Some(est),
+            SteeringMode::ReuseportCbpf,
+            l_report.min(e_report),
+        )
+    }
+
     fn from_listener(
         std_socket: std::net::UdpSocket,
         established: Option<EstablishedSocket>,
@@ -228,6 +311,14 @@ impl SharedSocket {
             mode,
             buffers,
         })
+    }
+
+    /// An inherited pair that runs without a steering program: both sockets
+    /// stay open and are read, the mode says why.
+    #[must_use]
+    pub(crate) fn into_unsteered(mut self, reason: String) -> Self {
+        self.mode = SteeringMode::SingleSocket { reason };
+        self
     }
 
     /// Replace the single-socket reason (the caller knows better).

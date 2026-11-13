@@ -172,6 +172,9 @@ pub struct RedirectConfig {
     pub max_per_source: usize,
     /// Total deadline per connection.
     pub deadline: Duration,
+    /// HTTP-01 bridge: answer `/.well-known/acme-challenge/<token>` from
+    /// `<dir>/.well-known/acme-challenge/<token>` (certbot `--webroot`).
+    pub acme_webroot: Option<std::path::PathBuf>,
 }
 
 impl RedirectConfig {
@@ -185,6 +188,7 @@ impl RedirectConfig {
             max_connections: 256,
             max_per_source: 16,
             deadline: Duration::from_secs(5),
+            acme_webroot: None,
         }
     }
 }
@@ -319,6 +323,12 @@ impl Drop for ConnGuard {
 pub(crate) struct DoorRouting {
     pub(crate) tls: RwLock<TlsRouting>,
     pub(crate) site: RwLock<Option<Arc<dyn SiteService>>>,
+    /// `true` while a site is expected but not installed yet (start-up: the
+    /// door accepts before the control plane is built). A site hello then
+    /// waits, within its handshake deadline, instead of being closed: with
+    /// socket activation the connections queued during a restart arrive in
+    /// exactly that window (slice 6, #292).
+    pub(crate) site_pending: tokio::sync::watch::Sender<bool>,
 }
 
 impl DoorRouting {
@@ -334,6 +344,28 @@ impl DoorRouting {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         (tls, site)
+    }
+}
+
+/// The listener for `addr`: the inherited one when the service manager passed
+/// it (socket activation; made non-blocking and registered in the current
+/// runtime, its backlog is the unit's `Backlog=`), else a fresh bind.
+pub(crate) fn listener(
+    addr: SocketAddr,
+    inherited: Option<std::net::TcpListener>,
+) -> std::io::Result<TcpListener> {
+    match inherited {
+        Some(listener) => {
+            let socket = socket2::Socket::from(listener);
+            if socket.local_addr()?.is_ipv6() && socket.only_v6().unwrap_or(false) {
+                tracing::warn!(%addr, "front door: the inherited TCP socket is IPv6-only (BindIPv6Only=both missing from the socket unit); IPv4 clients cannot reach it");
+            }
+            socket.set_tcp_nodelay(true)?;
+            socket.set_nonblocking(true)?;
+            tracing::info!(%addr, local = ?socket.local_addr()?.as_socket(), "front door: TCP socket inherited from the service manager");
+            TcpListener::from_std(socket.into())
+        }
+        None => bind_listener(addr),
     }
 }
 
@@ -378,6 +410,7 @@ impl TcpDoorState {
         let routing = Arc::new(DoorRouting {
             tls: RwLock::new(tls),
             site: RwLock::new(site),
+            site_pending: tokio::sync::watch::Sender::new(false),
         });
         Arc::new(Self {
             admission: Admission::new(
@@ -532,8 +565,18 @@ async fn serve_tls(
             return;
         }
     };
-    let (routing, site) = state.routing.snapshot();
     let route = tls::route_hello(&start.client_hello(), state.config.turn_sni.as_deref());
+    if route == tls::HelloRoute::Site {
+        // Bounded by the handshake deadline; never waits when no site is
+        // pending (a door without a certificate closes at once, as before).
+        let mut pending = state.routing.site_pending.subscribe();
+        let ready = tokio::time::timeout_at(deadline, pending.wait_for(|p| !*p)).await;
+        if ready.is_err() {
+            Stats::bump(&counters.tcp_tls_handshake_timeout);
+            return;
+        }
+    }
+    let (routing, site) = state.routing.snapshot();
     let config = match route {
         tls::HelloRoute::TurnReserved => {
             Stats::bump(&counters.tcp_turn_reserved);
@@ -626,28 +669,87 @@ pub(crate) async fn redirect_loop(listener: TcpListener, state: Arc<RedirectStat
     }
 }
 
+/// After a complete request line, how long the port-80 listener waits for
+/// more of the head before answering from what it has.
+const REDIRECT_IDLE_AFTER_LINE: Duration = Duration::from_millis(300);
+
 async fn redirect_one(config: &RedirectConfig, mut stream: TcpStream) -> std::io::Result<()> {
     let mut head = vec![0u8; redirect::MAX_REQUEST_HEAD];
     let mut filled = 0usize;
+    let mut line_done = false;
     while let Some(slot) = head.get_mut(filled..) {
         if slot.is_empty() {
             break;
         }
-        let n = stream.read(slot).await?;
+        // Once the request line is complete, a client that stops sending
+        // (an HTTP/1.0-style `GET /x HTTP/1.0\r\n` and wait) is answered
+        // after a short idle gap instead of at the 5 s deadline.
+        let n = if line_done {
+            match tokio::time::timeout(REDIRECT_IDLE_AFTER_LINE, stream.read(slot)).await {
+                Ok(read) => read?,
+                Err(_) => break,
+            }
+        } else {
+            stream.read(slot).await?
+        };
         if n == 0 {
             break;
         }
-        let seen_from = filled.saturating_sub(1);
+        // Read to the end of the header block (`\r\n\r\n`), not the first
+        // `\r\n`: a request line split across segments (certbot's HTTP-01
+        // fetch) must be parsed whole (#353 review). Still bounded by
+        // MAX_REQUEST_HEAD and the per-connection deadline.
+        let seen_from = filled.saturating_sub(3);
         filled += n;
+        line_done = line_done
+            || head
+                .get(..filled)
+                .is_some_and(|h| h.windows(2).any(|p| p == b"\r\n"));
         if head
             .get(seen_from..filled)
-            .is_some_and(|w| w.windows(2).any(|p| p == b"\r\n"))
+            .is_some_and(|w| w.windows(4).any(|p| p == b"\r\n\r\n"))
         {
             break;
         }
     }
     let request = head.get(..filled).unwrap_or_default();
-    let response = redirect::redirect_response(&config.public_host, config.https_port, request);
+    let response = match (&config.acme_webroot, redirect::acme_token(request)) {
+        (Some(webroot), Some(token)) => {
+            let path = webroot
+                .join(".well-known")
+                .join("acme-challenge")
+                .join(token);
+            let head_only = request.starts_with(b"HEAD ");
+            match read_challenge(path).await {
+                Some(body) => redirect::acme_response(&body, head_only),
+                None => redirect::ACME_NOT_FOUND.to_vec(),
+            }
+        }
+        _ => redirect::redirect_response(&config.public_host, config.https_port, request),
+    };
     stream.write_all(&response).await?;
     stream.shutdown().await
+}
+
+/// Read one HTTP-01 key authorization file: a regular file (symlinks not
+/// followed) of at most [`redirect::MAX_ACME_RESPONSE`] bytes, on the
+/// blocking pool. Anything else is "no challenge" (404).
+async fn read_challenge(path: std::path::PathBuf) -> Option<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > redirect::MAX_ACME_RESPONSE {
+            return None;
+        }
+        let mut body = Vec::with_capacity(usize::try_from(meta.len()).ok()?);
+        std::fs::File::open(&path)
+            .ok()?
+            .take(redirect::MAX_ACME_RESPONSE)
+            .read_to_end(&mut body)
+            .ok()?;
+        Some(body)
+    })
+    .await
+    .ok()
+    .flatten()
 }

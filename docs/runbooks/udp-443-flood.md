@@ -42,11 +42,13 @@ it reads a status file a privileged systemd `ExecStartPre=+` writes at every sta
 ## Resource identity
 
 - **nftables table:** `inet conspect_floor` — `deploy/nftables/conspect-udp443-floor.nft`.
-- **systemd units (examples, not auto-installed):** `deploy/systemd/conspect.service`,
-  `deploy/systemd/conspect.socket` (placeholder only — socket activation is slice 6, not wired up).
+- **systemd:** slice 6's socket-activated `conspect.service` + `conspect.socket` (UDP 443 as a
+  `SO_REUSEPORT` pair for steering, `ReceiveBuffer=8M`; installed by
+  [front-door-cutover.md](front-door-cutover.md)), plus this runbook's drop-in
+  `deploy/systemd/conspect.service.d/20-nft-floor.conf` (the nft floor status writer).
 - **sysctl file:** `deploy/sysctl/90-conspect-udp.conf` → `/etc/sysctl.d/90-conspect-udp.conf`.
 - **Status file the engine reads:** `/run/conspect-floor/nft-floor.json` (or
-  `network.udp.nft_floor_status_file`), written by `conspect.service`'s `ExecStartPre=+` as root.
+  `network.udp.nft_floor_status_file`), written by the `20-nft-floor.conf` drop-in's `ExecStartPre=+` as root.
   The directory is created by that root step, `root:root 0755` (not a `RuntimeDirectory=`, which
   would belong to the service user); the file is `root:root 0644`, replaced by an atomic rename.
 - **Trust model:** the engine reads the file only if it is a regular file (a symlink is rejected,
@@ -72,7 +74,8 @@ it reads a status file a privileged systemd `ExecStartPre=+` writes at every sta
 
 ## Install
 
-1. **sysctl (raise the usable receive buffer):**
+1. **sysctl (raise the usable receive buffer; only needed when the engine runs without
+   `conspect.socket`, whose `ReceiveBuffer=8M` systemd sets past `rmem_max`):**
 
    ```bash
    sudo install -m 0644 deploy/sysctl/90-conspect-udp.conf /etc/sysctl.d/90-conspect-udp.conf
@@ -86,16 +89,18 @@ it reads a status file a privileged systemd `ExecStartPre=+` writes at every sta
    sudo nft -f deploy/nftables/conspect-udp443-floor.nft
    ```
 
-3. **systemd (adjust `User=`/paths for your host, then):**
+3. **systemd:** the engine units themselves come from
+   [front-door-cutover.md](front-door-cutover.md) (slice 6). Add the floor status drop-in:
 
    ```bash
-   sudo install -m 0644 deploy/systemd/conspect.service /etc/systemd/system/conspect.service
+   sudo install -D -m 0644 deploy/systemd/conspect.service.d/20-nft-floor.conf \
+       /etc/systemd/system/conspect.service.d/20-nft-floor.conf
    sudo systemctl daemon-reload
-   sudo systemctl enable --now conspect
+   sudo systemctl restart conspect   # restart, not stop/start: conspect.socket keeps the ports
    ```
 
-   `conspect.socket` is **not** enabled: socket activation is slice 6; the service binds its own
-   sockets today.
+   Before any restart of the engine on mda001, run the usual `multiview validate` preflight.
+   Rollback: remove the drop-in, `daemon-reload`, restart (the engine then reports `unknown`).
 
 ## Verify
 

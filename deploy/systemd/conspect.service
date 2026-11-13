@@ -1,64 +1,42 @@
-# Example systemd unit for a Linux host running the conspect engine with the
-# network front door (ADR-0107). NOT installed automatically — copy, adjust
-# the paths/user for your host, then `systemctl enable --now conspect`. See
-# docs/runbooks/udp-443-flood.md for the full install/verify/rollback story.
+# deploy/systemd/conspect.service: the engine, socket-activated by
+# conspect.socket (ADR-0107 section 9, issue #292).
+#
+# Requires=conspect.socket: the sockets are created before the engine starts
+# and survive `systemctl restart conspect` (only `systemctl stop
+# conspect.socket` closes them). Without the socket unit the engine binds the
+# ports itself; the capability below is that fallback.
+#
+# Paths match mda001 (user `operations`, binary built in ~/conspect, config
+# in ~/mv, control token in /etc/conspect/env). Adjust for another host.
+#
+# Install:  sudo install -m 644 deploy/systemd/conspect.service /etc/systemd/system/
+# Then:     docs/runbooks/front-door-cutover.md
+
 [Unit]
 Description=Conspect multiview engine
-After=network-online.target
+Documentation=file:///home/operations/conspect/docs/runbooks/front-door-cutover.md
+Requires=conspect.socket
+After=conspect.socket network-online.target
 Wants=network-online.target
 
 [Service]
-# Placeholder dedicated user: never run as root. The front door's validated-
-# flow steering (SO_REUSEPORT group membership, slice 3) only admits sockets
-# with the SAME effective uid as the group's first socket, so every process
-# that should share the steered pair must run as this one user.
+Type=simple
 User=operations
 Group=operations
-# Low ports (443) without CAP_NET_BIND_SERVICE need this ambient capability;
-# socket activation (slice 6, deploy/systemd/conspect.socket) removes the
-# need for it entirely, at which point this line can be dropped.
+WorkingDirectory=/home/operations/mv
+EnvironmentFile=-/etc/conspect/env
+ExecStart=/home/operations/conspect/target/release/multiview run /home/operations/mv/conspect.toml
+# Only needed when started without conspect.socket (the engine then binds
+# 443/80 itself). Harmless with the socket unit.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-
-# Writes the nft floor's state to the status file the engine reads
-# (network.udp.nft_floor_status_file, default
-# /run/conspect-floor/nft-floor.json; design note "Slice 3 as built, part
-# B"). `+` runs this as root regardless of User= (`nft list` needs
-# CAP_NET_ADMIN, which the engine does not get).
-# Trust: the directory is NOT a RuntimeDirectory= (that would be owned by
-# User=, letting the service user unlink/replace the file or plant a
-# symlink). This root step creates /run/conspect-floor itself, root:root
-# 0755, so only root can create, replace or delete files in it. nft's stdout
-# and stderr go to a temp file in that directory, which
-# `install -o root -g root -m 0644` copies to a second temp name and `mv`
-# renames over the status file, so the engine reads either the previous
-# complete file or the new one, never a partial (`$$` is systemd's escape for
-# a literal `$`). The engine additionally ignores the file (status
-# `unknown`) unless it is a regular file, not a symlink, owned by uid 0 and
-# not group/other-writable. Residual: a process running as root can still
-# forge it; the file is a report shown to operators, never an enforcement
-# input. The engine's parser reports:
-#   present  - nft JSON with table inet conspect_floor, the chains udp443_new
-#              and udp443_all and the four sets udp443_{new,all}_{v4,v6}
-#              with their exact key types,
-#   absent   - nft's exact "Error: No such file or directory" output for that
-#              missing table, or the literal word `absent`,
-#   unknown  - anything else (nft missing, another error, a partial floor,
-#              an untrusted file).
-ExecStartPre=+/bin/sh -c 'set -u; d=/run/conspect-floor; install -d -o root -g root -m 0755 "$$d" || exit 0; t=$$(mktemp "$$d/.nft-floor.XXXXXX") || exit 0; nft -j list table inet conspect_floor >"$$t" 2>&1; install -o root -g root -m 0644 "$$t" "$$d/.nft-floor.json.new" && mv -f "$$d/.nft-floor.json.new" "$$d/nft-floor.json"; rm -f "$$t"; exit 0'
-
-ExecStart=/usr/local/bin/conspect run --config /etc/conspect/conspect.toml
-Restart=on-failure
+Restart=always
 RestartSec=2
-
-# NOTE on receive-buffer sizing (design note section 9/"Slice 3 as built"):
-# this unit intentionally sets NOTHING for the UDP receive buffer. Without a
-# socket unit (deploy/systemd/conspect.socket is NOT wired up yet — socket
-# activation is slice 6), the engine binds its own socket and tries
-# SO_RCVBUFFORCE (needs CAP_NET_ADMIN, which this unit does not grant) before
-# falling back to plain SO_RCVBUF (capped by net.core.rmem_max). Until slice 6
-# ships ReceiveBuffer=8M on a real socket unit, raise net.core.rmem_max
-# instead — see deploy/sysctl/90-conspect-udp.conf and the runbook.
+# The engine's bounded exit after a fatal fault or a stop signal (#309).
+TimeoutStopSec=20
+KillMode=mixed
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
