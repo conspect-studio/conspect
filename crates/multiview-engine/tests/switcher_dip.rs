@@ -1,4 +1,4 @@
-//! ADR-0111 §2: DIP to a colour, rendered inside the one Program drive.
+//! ADR-0112 §2: DIP to a colour, rendered inside the one Program drive.
 //!
 //! Deterministic per-frame proof: the composited Program frame at the start,
 //! mid-way to the switch point, at the switch point, after it and at the end

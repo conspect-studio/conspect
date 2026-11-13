@@ -81,7 +81,7 @@ pub const REFUSE_NOT_AN_INPUT: &str =
 pub const REFUSE_UNSUPPORTED_TRANSITION: &str =
     "unsupported-transition: this engine renders cut, mix and dip to a colour";
 
-/// Is `descriptor` a transition the Program drive renders (ADR-0111)?
+/// Is `descriptor` a transition the Program drive renders (ADR-0112)?
 #[must_use]
 pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
     match descriptor {
@@ -116,9 +116,9 @@ pub enum SwitcherVerb {
     /// Atomically take PVW to PGM at the next frame boundary.
     Cut,
     /// Begin an exact-duration automatic take on the next frame boundary,
-    /// in the selected transition kind (ADR-0111 §3).
+    /// in the selected transition kind (ADR-0112 §3).
     Auto(FrameCount),
-    /// Select the transition the next AUTO uses (ADR-0111 §3). Refused
+    /// Select the transition the next AUTO uses (ADR-0112 §3). Refused
     /// during a take and for a kind this engine does not render.
     SetTransition(TransitionDescriptor),
     /// Re-patch numbered mixer inputs at one tick (all members or none).

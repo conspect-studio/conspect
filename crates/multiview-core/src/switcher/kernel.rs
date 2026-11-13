@@ -26,7 +26,7 @@ pub fn opacity(progress: Progress) -> f32 {
 }
 
 /// The two blend weights of a DIP at `elapsed` of `duration` frames, split at
-/// the exact rational `switch_point` in `(0, 1)` (ADR-0111 §2).
+/// the exact rational `switch_point` in `(0, 1)` (ADR-0112 §2).
 ///
 /// Returns `(dip, incoming)`: before the switch point the dip colour is drawn
 /// over the outgoing picture at `dip = t / s` and the incoming picture is not

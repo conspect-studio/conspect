@@ -422,7 +422,7 @@ impl SwitcherState {
     }
 
     /// The selected descriptor with its duration replaced by `rate`: an AUTO
-    /// carries its own rate and keeps the selected kind (ADR-0111 §3). A
+    /// carries its own rate and keeps the selected kind (ADR-0112 §3). A
     /// CUT selection becomes a MIX, as an AUTO always has a duration. Kinds
     /// without a single rate (stinger) are returned unchanged.
     #[must_use]

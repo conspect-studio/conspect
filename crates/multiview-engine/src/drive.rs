@@ -89,7 +89,7 @@ pub struct CompositedFrame {
 }
 
 /// How the incoming picture of an AUTO is drawn over the outgoing one
-/// (ADR-0104 §3, ADR-0111). `Copy` and allocation-free: it is re-derived from
+/// (ADR-0104 §3, ADR-0112). `Copy` and allocation-free: it is re-derived from
 /// the machine's transition descriptor on every tick of a flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -99,7 +99,7 @@ pub enum TransitionStyle {
     Mix,
     /// Dip through a solid colour: the colour fades up over the outgoing
     /// picture until `switch_point`, then the incoming picture fades up over
-    /// the colour (ADR-0111 §2).
+    /// the colour (ADR-0112 §2).
     Dip {
         /// The colour dipped through.
         color: Rgb8,
@@ -229,7 +229,7 @@ pub struct CompositorDrive<T> {
     /// drawn as one extra full-canvas tile above every layout cell in the SAME
     /// composite pass. `None` outside a dissolve (the steady state).
     mix_overlay: Option<MixOverlay>,
-    /// The style the next/active overlay is drawn in (ADR-0111).
+    /// The style the next/active overlay is drawn in (ADR-0112).
     transition_style: TransitionStyle,
     /// The DIP colour as a 2x2 canvas-coded solid image, scaled to the full
     /// canvas at composite time. Built once per distinct colour (never per
@@ -328,7 +328,7 @@ impl<T> CompositorDrive<T> {
         self.transition_fill_builds
     }
 
-    /// The active transition style (ADR-0111).
+    /// The active transition style (ADR-0112).
     #[must_use]
     pub fn transition_style(&self) -> TransitionStyle {
         self.transition_style
@@ -592,7 +592,7 @@ impl<T> CompositorDrive<T> {
 }
 
 impl CompositorDrive<Nv12Image> {
-    /// Select how the AUTO overlay is drawn (ADR-0111). A DIP colour is coded
+    /// Select how the AUTO overlay is drawn (ADR-0112). A DIP colour is coded
     /// into the canvas colour space once, as a 2x2 solid the compositor scales
     /// to the full canvas, and reused for every tick of every dip through that
     /// colour: a tick allocates nothing here, only a colour change does.
@@ -750,7 +750,7 @@ impl CompositorDrive<Nv12Image> {
     }
 
     /// Push the AUTO transition's full-canvas tiles above the layout cells, in
-    /// this same composite pass (ADR-0104 §3, ADR-0111): the DIP colour at its
+    /// this same composite pass (ADR-0104 §3, ADR-0112): the DIP colour at its
     /// weight, then the incoming picture at its weight. A missing incoming
     /// frame is skipped (the outgoing picture shows through), never a slate.
     fn push_transition_tiles(

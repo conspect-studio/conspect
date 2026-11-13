@@ -93,7 +93,7 @@ impl PixelRect {
 /// An 8-bit sRGB-coded solid colour (`"#rrggbb"` on the wire), converted into
 /// the canvas colour space exactly like a `solid` source (ADR-0027).
 ///
-/// Used for the DIP colour and the WIPE border (ADR-0111). Serialises as a
+/// Used for the DIP colour and the WIPE border (ADR-0112). Serialises as a
 /// `#rrggbb` string; `#rgb` is accepted on input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Rgb8 {
@@ -164,7 +164,7 @@ impl<'de> Deserialize<'de> for Rgb8 {
     }
 }
 
-/// A closed-form SDF wipe mask family (ADR-0055 §3, wave 2; ADR-0111).
+/// A closed-form SDF wipe mask family (ADR-0055 §3, wave 2; ADR-0112).
 ///
 /// The variants mirror the house per-pixel primitives (linear edge, box,
 /// circle); later patterns are additive because the enum is
@@ -222,11 +222,11 @@ pub enum TransitionDescriptor {
         /// Transition duration in output frames (at least 2; validated at arm).
         rate: FrameCount,
         /// The bus-selectable source dipped through. Not rendered yet: the
-        /// engine refuses a dip through a source (ADR-0111); dip to a colour.
+        /// engine refuses a dip through a source (ADR-0112); dip to a colour.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dip_source: Option<SourceRef>,
         /// The solid colour dipped through when no `dip_source` is named;
-        /// absent means black (ADR-0111).
+        /// absent means black (ADR-0112).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<Rgb8>,
         /// Where the outgoing/incoming swap happens under the dip: an exact
@@ -246,7 +246,7 @@ pub enum TransitionDescriptor {
         /// Width of the optional border band (canvas-relative; `0` is none).
         #[serde(default)]
         border_width: f32,
-        /// Source filling the border band. Not rendered yet (ADR-0111); use
+        /// Source filling the border band. Not rendered yet (ADR-0112); use
         /// `border_color`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         border_fill_source: Option<SourceRef>,
