@@ -126,8 +126,9 @@ output when one `[control] ui_dir` key changed (#367).
   variant switch (one of the schema's tag keys — `kind`, `target`, `mode`, `by`, `slate`,
   `provider` — changed) is merged per key too: a file switch lands the tag and the fields the
   file changed while shared fields it did not touch keep the accepted value; when only the
-  accepted state switched, the file's edits land on the fields the accepted variant has and a
-  field only the old variant had is never copied over; when both switched to different
+  accepted state switched, the file's edits land on the fields the accepted variant can carry
+  (decided by deserializing the result; if the accepted variant rejects an edited key, keys
+  the accepted object lacks are skipped as old-variant-only); when both switched to different
   variants, the file's wins. A merged item that does not
   deserialize falls back to the file's whole item. Deliberate whole units: the canvas's pinned signal (width, height, cadence),
   and a layout change, which takes the file's cells (cells name the layout's areas). When

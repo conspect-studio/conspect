@@ -19,7 +19,7 @@
 //! catalogue URL follow, an armed automation rule, a Program cell rebind, a
 //! propagated output track, a mixer patch) survives a file edit of another
 //! field of the same item, including across an enum variant switch on either
-//! side (see [`merge_value`]). When the accepted list still equals the previous file's list, the
+//! side (see [`merge_value_with`]). When the accepted list still equals the previous file's list, the
 //! new list is taken whole (a reorder lands). Exceptions by design: the
 //! canvas's pinned signal (width, height, cadence) is one unit, and a layout
 //! change takes the file's cells (cells name the layout's areas).
@@ -126,7 +126,7 @@ fn keyed_with<'a, T: PartialEq + Clone, K: Eq + Hash>(
 
 /// Merge one value as the edit `prev -> next` applied onto `accepted`, at
 /// every depth: a field the file changed takes the file's value, every other
-/// field keeps the accepted value (see [`merge_value`]). A field skipped on
+/// field keeps the accepted value (see [`merge_value_with`]). A field skipped on
 /// serialization (`skip_serializing_if`, its default) is absent on both sides
 /// alike, so "absent" compares as "the default": a file that resets a field to
 /// its default removes it from the result, which deserializes back to the
@@ -150,7 +150,21 @@ fn fields<T: PartialEq + Clone + Serialize + DeserializeOwned>(
     ) else {
         return next.clone();
     };
-    serde_json::from_value(merge_value(&p, &n, &a)).unwrap_or_else(|_| next.clone())
+    // Lenient first: on an API-only variant switch every key the file edited
+    // is applied, and the type decides (by deserializing) whether the
+    // accepted variant carries it. Only if that fails are keys the accepted
+    // object lacks treated as old-variant-only and skipped.
+    serde_json::from_value(merge_value_with(&p, &n, &a, Mode::Lenient))
+        .or_else(|_| serde_json::from_value(merge_value_with(&p, &n, &a, Mode::Strict)))
+        .unwrap_or_else(|_| next.clone())
+}
+
+/// How an API-only variant switch treats a file edit of a key the accepted
+/// object lacks: apply it (lenient) or skip it as old-variant-only (strict).
+#[derive(Clone, Copy)]
+enum Mode {
+    Lenient,
+    Strict,
 }
 
 /// The recursive three-way merge behind [`fields`].
@@ -161,17 +175,20 @@ fn fields<T: PartialEq + Clone + Serialize + DeserializeOwned>(
 ///   ordinary edit: the tag and the fields the file changed land, shared fields
 ///   it did not touch keep the accepted value. When only the accepted state
 ///   switched variant, the file's edits land on the fields the accepted
-///   variant has; a field only the old variant had is never copied over. When
+///   variant can carry (decided by deserializing: [`fields`] tries applying
+///   every edited key and, if the accepted variant rejects one, retries
+///   skipping keys the accepted object lacks). When
 ///   both switched to different variants, the file's variant wins and fields
 ///   only the accepted variant had are dropped;
 /// * arrays of objects that all carry a unique `id` (or `number`): per item,
 ///   recursively, accepted order kept and file additions appended — the same
 ///   rule as the top-level id-keyed lists;
 /// * anything else the file changed (a scalar, a plain array): the file's value.
-fn merge_value(
+fn merge_value_with(
     prev: &serde_json::Value,
     next: &serde_json::Value,
     accepted: &serde_json::Value,
+    mode: Mode,
 ) -> serde_json::Value {
     use serde_json::Value;
     if prev == next {
@@ -196,10 +213,10 @@ fn merge_value(
                         continue;
                     }
                     let only_old_variant = p.contains_key(k) && !a.contains_key(k);
-                    if only_old_variant {
+                    if only_old_variant && (matches!(mode, Mode::Strict) || !n.contains_key(k)) {
                         continue;
                     }
-                    merge_key(&mut out, k, p.get(k), n.get(k), a.get(k));
+                    merge_key(&mut out, k, p.get(k), n.get(k), a.get(k), mode);
                 }
                 return Value::Object(out);
             }
@@ -210,7 +227,7 @@ fn merge_value(
             let keys: HashSet<&String> = p.keys().chain(n.keys()).collect();
             for k in keys {
                 if p.get(k) != n.get(k) {
-                    merge_key(&mut out, k, p.get(k), n.get(k), a.get(k));
+                    merge_key(&mut out, k, p.get(k), n.get(k), a.get(k), mode);
                 }
             }
             if file_switched && api_switched && tag_changed(n, a) {
@@ -230,7 +247,7 @@ fn merge_value(
                     n,
                     a,
                     |item| item.get(k).map(ToString::to_string).unwrap_or_default(),
-                    merge_value,
+                    |x, y, z| merge_value_with(x, y, z, mode),
                 )),
                 None => next.clone(),
             }
@@ -260,13 +277,14 @@ fn merge_key(
     p: Option<&serde_json::Value>,
     n: Option<&serde_json::Value>,
     a: Option<&serde_json::Value>,
+    mode: Mode,
 ) {
     match (p, n, a) {
         (_, None, _) => {
             out.remove(key);
         }
         (Some(pv), Some(nv), Some(av)) => {
-            out.insert(key.to_owned(), merge_value(pv, nv, av));
+            out.insert(key.to_owned(), merge_value_with(pv, nv, av, mode));
         }
         (_, Some(nv), _) => {
             out.insert(key.to_owned(), nv.clone());

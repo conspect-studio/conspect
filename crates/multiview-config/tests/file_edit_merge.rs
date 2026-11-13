@@ -602,3 +602,30 @@ fn a_variant_switch_keeps_the_other_sides_untouched_fields() {
     assert_eq!(p.kind, accepted.probes[0].kind, "the API variant stays");
     assert!(p.latched, "the file's shared-field edit lands");
 }
+
+/// Review L1 round 9: when the API switched a source's kind, a file edit of a
+/// shared field the accepted variant omitted (a default-skipped
+/// `display_name`) still lands.
+#[test]
+fn an_api_variant_switch_keeps_a_file_edit_of_a_shared_omitted_field() {
+    let src = |body: &str| {
+        parse(&boot("/srv/ui-old").replace(
+            "id = \"in_hls\"\nkind = \"bars\"",
+            &format!("id = \"in_hls\"\n{body}"),
+        ))
+    };
+    let prev = src("display_name = \"Old\"\nkind = \"bars\"");
+    let next = src("display_name = \"New\"\nkind = \"bars\"");
+    let accepted = src("kind = \"solid\"\ncolor = \"#00ff00\"");
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    merged.validate().unwrap();
+    assert_eq!(
+        merged.sources[0].kind, accepted.sources[0].kind,
+        "API variant stays"
+    );
+    assert_eq!(
+        merged.sources[0].display_name.as_deref(),
+        Some("New"),
+        "file edit lands"
+    );
+}
