@@ -9054,7 +9054,7 @@ export interface components {
          *     Serde-equivalent: a unit enum rendered as its `kebab-case` variant name.
          * @enum {string}
          */
-        WarningCodeDoc: "gpu-present-no-vulkan-adapter" | "container-no-host-networking" | "catalogue-link-attention" | "accepted-state-rejected" | "tls-certificate";
+        WarningCodeDoc: "gpu-present-no-vulkan-adapter" | "container-no-host-networking" | "catalogue-link-attention" | "accepted-state-rejected" | "tls-certificate" | "config-file-removed-accepted";
         /**
          * @description `OpenAPI` mirror of [`multiview_events::WarningSeverity`] (SA-0).
          *

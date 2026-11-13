@@ -2341,6 +2341,86 @@ pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     })
 }
 
+/// The directory inside the state directory that keeps copies of states that
+/// were rejected at start (#324, `desired-*.json`) or replaced by a boot-file
+/// edit that removed accepted items (#367, `replaced-*.json`).
+pub const REJECTED_DIR: &str = "rejected";
+
+/// How many `replaced-*.json` copies a boot-file edit keeps (oldest pruned).
+pub const MAX_REPLACED: usize = 5;
+
+/// Keep a copy of a state about to be replaced (#367) as
+/// `<dir>/<prefix>-<13-digit ms>-<3-digit n>.json`: owner-only directory,
+/// atomic write, deduplicated (identical bytes already kept are reused) and
+/// bounded to the newest [`MAX_REPLACED`] files of that prefix. Blocking I/O:
+/// call from a blocking task, never the output clock.
+///
+/// # Errors
+/// The directory or the copy could not be written (an `AfterRename` whose
+/// bytes read back equal counts as written).
+pub fn keep_state_copy(
+    dir: &Path,
+    prefix: &str,
+    content: &str,
+    now_ms: i64,
+) -> Result<PathBuf, String> {
+    let lead = format!("{prefix}-");
+    let list = |dir: &Path| -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with(&lead)
+                        && Path::new(n)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                })
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let prune = |keep: &Path| {
+        let files = list(dir);
+        let excess = files.len().saturating_sub(MAX_REPLACED);
+        for path in files.into_iter().filter(|p| p != keep).take(excess) {
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::warn!(path = %path.display(), %error, "could not prune a kept state copy");
+            }
+        }
+    };
+    if let Some(existing) = list(dir)
+        .into_iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|kept| kept == content))
+    {
+        prune(&existing);
+        return Ok(existing);
+    }
+    create_state_dir(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let mut n = 0_u32;
+    let mut kept = dir.join(format!("{prefix}-{now_ms:013}-{n:03}.json"));
+    while kept.exists() {
+        n = n.saturating_add(1);
+        kept = dir.join(format!("{prefix}-{now_ms:013}-{n:03}.json"));
+    }
+    match write_atomic_commit(&kept, content) {
+        Ok(()) => {}
+        Err(AtomicWriteError::AfterRename(error))
+            if std::fs::read_to_string(&kept).is_ok_and(|now| now == content) =>
+        {
+            tracing::warn!(path = %kept.display(), %error, "written, but the directory sync failed");
+        }
+        Err(error) => return Err(format!("writing {}: {error}", kept.display())),
+    }
+    prune(&kept);
+    Ok(kept)
+}
+
 /// [`write_atomic`] that keeps the before/after-rename distinction (#324): the
 /// start-up fallback writes its kept copy and marker with this so an
 /// `AfterRename` (the bytes are visible, only the directory fsync failed) is

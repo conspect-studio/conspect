@@ -787,6 +787,13 @@ impl CommandSender {
         }
     }
 
+    /// Whether the engine side (the receiver) has gone away: the engine is
+    /// shutting down or gone, so nothing submitted now can apply (#367).
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// The shared routing ledger (ADR-0183 automation compare-and-restore).
     #[must_use]
     pub fn ledger(&self) -> &std::sync::Arc<RoutingLedger> {

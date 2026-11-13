@@ -1261,10 +1261,17 @@ async fn run_pipeline_until_ctrl_c(
     }
 
     let stop_for_signal = stop.clone();
+    // #367: the config-file watcher stops committing the moment an exit is
+    // decided, not at the late tenant teardown: a boot-file edit seen during
+    // shutdown must never be written over the accepted state.
+    let watch_for_signal = config_watch.clone();
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
         // #309: decide first, log second.
         stop_for_signal.stop();
+        if let Some(watch) = &watch_for_signal {
+            watch.stop();
+        }
         multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
@@ -1278,6 +1285,7 @@ async fn run_pipeline_until_ctrl_c(
     // (the persist writes the same Running state again; idempotent).
     let early_persist_state = running_persist.as_ref().map(|p| p.state.clone());
     let decided_drain = std::sync::Arc::clone(&early_drain);
+    let decided_watch = config_watch.clone();
     // A dedicated OS thread with its own small runtime: the main runtime's
     // workers can be busy with the synchronous pipeline teardown (a task parked
     // behind it would miss the bound), and this work must not depend on them.
@@ -1291,6 +1299,11 @@ async fn run_pipeline_until_ctrl_c(
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // #367: no config-file commit after an exit is decided (a fatal
+            // output fault as well as a stop signal).
+            if let Some(watch) = &decided_watch {
+                watch.stop();
             }
             // Begin the control plane's graceful drain now (the deadline cuts it).
             decided_drain.notify_one();
@@ -1760,10 +1773,17 @@ async fn run_software_until_ctrl_c(
     };
 
     let stop_for_signal = stop.clone();
+    // #367: the config-file watcher stops committing the moment an exit is
+    // decided, not at the late tenant teardown: a boot-file edit seen during
+    // shutdown must never be written over the accepted state.
+    let watch_for_signal = config_watch.clone();
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
         // #309: decide first, log second.
         stop_for_signal.stop();
+        if let Some(watch) = &watch_for_signal {
+            watch.stop();
+        }
         multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,

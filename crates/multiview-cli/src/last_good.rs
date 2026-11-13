@@ -51,7 +51,7 @@ use multiview_control::boot_model::{
 /// The last-good copy's file name inside the state directory.
 pub const LAST_GOOD_FILE: &str = "last-good.json";
 /// The directory (inside the state directory) that keeps rejected states.
-pub const REJECTED_DIR: &str = "rejected";
+pub const REJECTED_DIR: &str = multiview_control::boot_model::REJECTED_DIR;
 /// How many rejected accepted states are kept (oldest pruned first).
 pub const MAX_REJECTED: usize = 5;
 
