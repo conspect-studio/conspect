@@ -629,3 +629,31 @@ fn an_api_variant_switch_keeps_a_file_edit_of_a_shared_omitted_field() {
         "file edit lands"
     );
 }
+
+/// Review L1 round 10: a non-string field named like a tag (a display
+/// output's `mode` object) is data, not a discriminant. A file edit of it does
+/// not undo the API's switch of that output to another kind.
+#[test]
+fn a_display_mode_edit_does_not_undo_an_api_output_kind_switch() {
+    let out = |body: &str| {
+        parse(&boot("/srv/ui-old").replace(
+            "kind = \"hls\"\nid = \"restream\"\npath = \"/tmp/restream.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000",
+            body,
+        ))
+    };
+    let display = |w: u32, h: u32, fps: &str| {
+        format!(
+            "kind = \"display\"\nid = \"restream\"\nconnector = \"HDMI-A-1\"\nmode = {{ width = {w}, height = {h}, refresh = \"{fps}\" }}"
+        )
+    };
+    let prev = out(&display(1920, 1080, "50/1"));
+    let next = out(&display(1280, 720, "60/1"));
+    let accepted = out(
+        "kind = \"hls\"\nid = \"restream\"\npath = \"/tmp/restream.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000",
+    );
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    assert_eq!(
+        merged.outputs, accepted.outputs,
+        "the API's HLS output stays"
+    );
+}

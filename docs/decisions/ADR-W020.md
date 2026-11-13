@@ -123,8 +123,9 @@ output when one `[control] ui_dir` key changed (#367).
   `id`- or `number`-keyed objects per item), so an API write of one field — a catalogue URL
   follow, an armed automation rule, a Program cell rebind, a propagated output track, a mixer
   patch, a channel rundown — survives a file edit of another field of the same item. An enum
-  variant switch (one of the schema's tag keys — `kind`, `target`, `mode`, `by`, `slate`,
-  `provider` — changed) is merged per key too: a file switch lands the tag and the fields the
+  variant switch (the string value of one of the schema's tag keys — `kind`, `target`, `mode`, `by`,
+  `slate`, `provider` — changed; a same-named non-string field such as a display output's
+  `mode` object is ordinary data) is merged per key too: a file switch lands the tag and the fields the
   file changed while shared fields it did not touch keep the accepted value; when only the
   accepted state switched, the file's edits land on the fields the accepted variant can carry
   (decided by deserializing the result; if the accepted variant rejects an edited key, keys

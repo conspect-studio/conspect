@@ -259,15 +259,20 @@ fn merge_value_with(
 /// The keys this schema uses as internal enum tags (`#[serde(tag = ...)]`).
 const TAG_KEYS: [&str; 6] = ["kind", "target", "mode", "by", "slate", "provider"];
 
-/// Whether a tag key differs between two versions of one object (the object
-/// switched variant). A plain field that merely holds a tag-like string (a
+/// Whether a string-valued tag key differs between two versions of one object
+/// (the object switched variant). A plain field that merely holds a tag-like string (a
 /// cell source's inline `kind`) counts too; the rules applied on a switch are
 /// the ordinary per-key ones, so that is harmless.
 fn tag_changed(
     from: &serde_json::Map<String, serde_json::Value>,
     to: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {
-    TAG_KEYS.iter().any(|t| from.get(*t) != to.get(*t))
+    // A discriminant is a string; a same-named field holding anything else
+    // (a display output's `mode` object) is ordinary data.
+    let tag = |m: &serde_json::Map<String, serde_json::Value>, t: &str| {
+        m.get(t).filter(|v| v.is_string()).cloned()
+    };
+    TAG_KEYS.iter().any(|t| tag(from, t) != tag(to, t))
 }
 
 /// Apply one key's file edit `p -> n` onto the accepted object `out`.
