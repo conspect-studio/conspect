@@ -418,16 +418,13 @@ impl ConvertLive {
         if let Some(frame) = self.convert.convert(src) {
             return frame;
         }
-        let format = self.convert.format();
-        match self.black.as_ref() {
-            Some(black) => Arc::clone(black),
-            None => {
-                // Allocated once, on this worker, only if nothing ever drew.
-                let black = black_at(format, src.color()).unwrap_or_else(|| Arc::clone(src));
-                self.black = Some(Arc::clone(&black));
-                black
-            }
+        if let Some(black) = self.black.as_ref() {
+            return Arc::clone(black);
         }
+        // Allocated once, on this worker, only if nothing ever drew.
+        let black = black_at(self.convert.format(), src.color()).unwrap_or_else(|| Arc::clone(src));
+        self.black = Some(Arc::clone(&black));
+        black
     }
 }
 
@@ -584,7 +581,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1), "never blocks");
         let dropped = stage.slot().dropped.load(Ordering::Relaxed);
         assert!(
-            dropped >= 100 - 1 - CONVERT_QUEUE as u64,
+            dropped >= 100 - 1 - u64::try_from(CONVERT_QUEUE).unwrap(),
             "dropped {dropped}"
         );
         assert!(stage.slot().latest().is_none());

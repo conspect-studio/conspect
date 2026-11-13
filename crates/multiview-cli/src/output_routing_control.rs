@@ -169,7 +169,7 @@ impl OutputRouting for OutputRoutingAdapter {
             if routed {
                 crate::routing_aux::feed_name(&picture_bus(feed), format)
             } else {
-                bus.to_string()
+                bus.clone()
             }
         };
         let wanted = key_name(run_output.feed_format);

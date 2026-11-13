@@ -2571,7 +2571,7 @@ fn the_plan_counts_a_different_format_as_plus_one() {
 }
 
 /// #342 review A2: the format-keyed feed set is bounded by the dynamic-key
-/// caps (live keys + opens <= max_encoders) plus pending takes, whatever the
+/// caps (live keys + opens <= `max_encoders`) plus pending takes, whatever the
 /// number of distinct formats requested.
 #[test]
 fn format_keyed_feeds_are_bounded_by_the_encoder_cap() {
