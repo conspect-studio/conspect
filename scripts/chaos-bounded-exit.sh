@@ -23,18 +23,18 @@ BIN="${1:?usage: chaos-bounded-exit.sh <multiview-binary> [runs] [fatal|stop|bot
 RUNS="${2:-20}"
 MODE="${3:-both}"
 BOUND_MS=2000
-# The watchdog's own decision->fire time may exceed the deadline only by its
-# wake-up latency (it runs at the raised clock class).
-FIRE_SLACK_MS=150
-# Decision->process-gone as the shell observes it: the fire slack, plus the
-# 500 ms exit-path backstop (EXIT_PATH_GRACE) the design allows, plus the
-# shell's own observation (20 ms polls, a python clock read per sample).
-SLACK_MS=800
+# The watchdog's own decision->fire time (monotonic) may exceed the deadline
+# only by its wake-up latency at the raised clock class: measured 0-10 ms on
+# an idle and on a 28-busy-loop host; 50 ms leaves 5x margin.
+FIRE_SLACK_MS=50
+# Decision->process-gone as the shell observes it. The process exit after the
+# fire is the 20 ms notice pause plus the C runtime exit, at most the 500 ms
+# backstop (EXIT_PATH_GRACE): 2.55 s by construction. The observer adds a
+# 1 ms poll (and, for fatal, the log line's own write).
+SLACK_MS=600   # 2.6 s total
 HOLD_MS=20000   # teardown held 10x past the bound
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
-
-now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
 
 write_config() {
   cat > "${WORK}/cfg.toml" <<TOML
@@ -132,8 +132,13 @@ run_once() {
       [ "${waited}" -lt 300 ] || { echo "run ${i} (${mode}): pipeline never started"; tail -20 "${log}"; kill -KILL "${pid}" 2>/dev/null || true; return 1; }
     done
     if [ "${mode}" = falterstop ]; then
-      # Signal once the forced shed tick (60, ~2 s) has passed.
-      sleep 3
+      # Signal only after the forced shed happened (bounded wait).
+      local w3=0
+      until grep -q "chaos: forced shed" "${log}" 2>/dev/null; do
+        sleep 0.05; w3=$((w3 + 1))
+        [ "${w3}" -lt 400 ] || { echo "run ${i} (${mode}): forced shed never happened"; tail -20 "${log}"; kill -KILL "${pid}"; return 1; }
+      done
+      sleep 0.2
     elif [ "${mode}" = stopwedge ]; then
       local w2=0
       until grep -q "chaos: stalling the bake consumer" "${log}" 2>/dev/null; do
@@ -152,23 +157,39 @@ run_once() {
       sleep 2
     fi
     kill -0 "${pid}" || { echo "run ${i} (stop): process died before the signal"; tail -20 "${log}"; return 1; }
-    t_decide="$(now_ms)"
-    kill -TERM "${pid}"
   fi
-  # Bounded wait: a run that never exits is a failure, never a hang.
-  local polls=0
-  while kill -0 "${pid}" 2>/dev/null; do
-    sleep 0.02; polls=$((polls + 1))
-    if [ "${polls}" -gt 2500 ]; then   # 50 s
-      kill -KILL "${pid}" 2>/dev/null || true
-      echo "run ${i} (${mode}): did not exit within 50 s"; tail -20 "${log}"; return 1
-    fi
-  done
+  # One helper measures decision -> process gone: it is already running when
+  # it reads its clock, sends the signal (signal modes) and polls at 1 ms.
+  # #350: separate python clock reads and 20 ms shell polls added up to
+  # 0.5 s of observation latency on a loaded host.
+  local sig=0; [ "${mode}" = fatal ] || sig=1
+  python3 - "${pid}" "${sig}" > "${WORK}/gone" <<'PY'
+import os, signal, sys, time
+pid, sig = int(sys.argv[1]), sys.argv[2] == "1"
+t0 = time.monotonic()
+if sig:
+    os.kill(pid, signal.SIGTERM)
+while True:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        break
+    if time.monotonic() - t0 > 50:
+        print("timeout"); sys.exit(0)
+    time.sleep(0.001)
+# wall ms when gone (fatal: compared to the log line), decision->gone (signal)
+print(int(time.time() * 1000), int((time.monotonic() - t0) * 1000))
+PY
+  if [ "$(cat "${WORK}/gone")" = timeout ]; then
+    kill -KILL "${pid}" 2>/dev/null || true
+    echo "run ${i} (${mode}): did not exit within 50 s"; tail -20 "${log}"; return 1
+  fi
   set +e
   wait "${pid}"
   rc=$?
   set -e
-  t_exit="$(now_ms)"
+  local took
+  read -r t_exit took < "${WORK}/gone"
   if [ "${mode}" = fatal ]; then
     # The decision instant is the fatal log line's own timestamp (UTC).
     t_decide="$(python3 - "${log}" <<'PY'
@@ -184,14 +205,13 @@ PY
 )"
     [ -n "${t_decide}" ] || { echo "run ${i} (${mode}): no fatal line"; tail -20 "${log}"; return 1; }
   fi
-  local took=$((t_exit - t_decide)) want=$([ "${mode}" = stop ] && echo 0 || echo 1)
+  if [ "${mode}" = fatal ]; then took=$((t_exit - t_decide)); fi
+  local want=$([ "${mode}" = stop ] && echo 0 || echo 1)
   # #350: the watchdog's own instants (wall clock, read inside the binary):
   # decision (first arm) -> deadline fired. This is the bound the design
   # promises; it excludes the shell's own observation latency.
-  local armed fired fire_ms
-  armed="$(grep -o 'armed_wall_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2)"
-  fired="$(grep -o 'fired_wall_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2)"
-  fire_ms=$(( ${fired:-0} - ${armed:-0} ))
+  local fire_ms
+  fire_ms="$(grep -o 'fired_after_decision_ms=[0-9]*' "${log}" | head -1 | cut -d= -f2)"
   local extra=0
   echo "run ${i} (${mode}): rc=${rc} decision->exit=${took} ms (armed->fired ${fire_ms} ms)"
   if [ "${mode}" = falterstop ] && grep -q "ticks behind the clock" "${log}"; then
@@ -225,8 +245,13 @@ PY
     || { echo "  FAIL: the exit-time Running persist did not land"; grep -E "persist|armed|overran|control plane|stage=" "${log}" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-200 | tail -12; ls -la "${WORK}/.multiview" 2>&1 | head -5; return 1; }
   # The design bound: the watchdog fires within EXIT_DEADLINE + FIRE_SLACK of
   # the decision (its own clock).
-  [ -n "${armed}" ] && [ -n "${fired}" ] && [ "${fire_ms}" -ge "${BOUND_MS}" ] && [ "${fire_ms}" -le $((BOUND_MS + FIRE_SLACK_MS)) ] \
+  [ -n "${fire_ms}" ] || { echo "  FAIL: no fired_after_decision_ms in the hard-exit line"; return 1; }
+  [ "${fire_ms}" -ge "${BOUND_MS}" ] && [ "${fire_ms}" -le $((BOUND_MS + FIRE_SLACK_MS)) ] \
     || { echo "  FAIL: watchdog fired ${fire_ms} ms after the decision (want ${BOUND_MS}..$((BOUND_MS + FIRE_SLACK_MS)))"; return 1; }
+  grep -q "exit watchdog scheduling class" "${log}" || { echo "  FAIL: watchdog class not reported"; return 1; }
+  if [ "${mode}" = falterstop ]; then
+    grep -q "chaos: forced shed" "${log}" || { echo "  FAIL: forced shed not exercised"; return 1; }
+  fi
   # And the process was gone soon after, as the shell sees it (the exit path
   # plus the shell's own polling and clock reads).
   [ "${took}" -le $((BOUND_MS + SLACK_MS + extra)) ] || { echo "  FAIL: exit took ${took} ms > ${BOUND_MS}+${SLACK_MS}"; grep -E "teardown|exit|chaos" "${log}" | tail -12; return 1; }

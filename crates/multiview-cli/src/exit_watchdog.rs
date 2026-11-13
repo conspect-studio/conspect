@@ -131,6 +131,19 @@ impl Watchdog {
                 std::thread::park_timeout(due_at - now);
                 continue;
             }
+            // Decision -> fire on the monotonic clock (the armed offset is the
+            // deadline offset minus the deadline; both from `origin`).
+            FIRE_AFTER_ARM_MS.store(
+                u64::try_from(
+                    self.origin.elapsed().as_millis().saturating_sub(
+                        Duration::from_nanos(due)
+                            .saturating_sub(EXIT_DEADLINE)
+                            .as_millis(),
+                    ),
+                )
+                .unwrap_or(u64::MAX),
+                Ordering::Release,
+            );
             on_deadline(self.cause().unwrap_or(ExitCause::Fatal));
             return;
         }
@@ -145,11 +158,12 @@ impl Watchdog {
         match std::thread::Builder::new()
             .name("multiview-exit-watchdog".to_owned())
             .spawn(move || {
-                // #350: on a loaded host a normal-priority sleeper wakes late
-                // (measured 200-600 ms on hosted macOS runners); the watchdog
-                // runs at the same raised class as the output clock (macOS QoS
-                // user-interactive; no-op elsewhere). Best effort.
-                let _ = multiview_clocksys::raise_current_thread();
+                // #350: on a loaded host a normal-priority sleeper can wake
+                // late; the watchdog runs at the same raised class as the
+                // output clock (macOS QoS user-interactive; no-op elsewhere).
+                // Best effort, and reported.
+                let class = multiview_clocksys::raise_current_thread();
+                tracing::info!(class = ?class, "exit watchdog scheduling class");
                 self.run(on_deadline);
             }) {
             Ok(handle) => {
@@ -181,7 +195,6 @@ pub const EXIT_PATH_GRACE: Duration = Duration::from_millis(500);
 // could itself block, so a backstop thread kills the process with SIGKILL if
 // `exit` has not finished within EXIT_PATH_GRACE.
 fn exit_process(cause: ExitCause) {
-    let fired_wall_ms = wall_ms();
     // A stop whose outputs have not finalised by the deadline, or whose run
     // faltered, did not stop cleanly: report it as a failure (#309).
     let cause = effective_cause(
@@ -196,10 +209,10 @@ fn exit_process(cause: ExitCause) {
                 "multiview: teardown overran the {} ms exit bound ({cause:?}); exiting with \
                  code {} (outputs finalised before the bound are valid; detached sinks may be \
                  incomplete; the supervisor restarts the service) \
-                 [armed_wall_ms={} fired_wall_ms={fired_wall_ms}]\n",
+                 [fired_after_decision_ms={}]\n",
                 EXIT_DEADLINE.as_millis(),
                 cause.code(),
-                ARMED_WALL_MS.load(Ordering::Acquire)
+                FIRE_AFTER_ARM_MS.load(Ordering::Acquire)
             );
             write_stderr_raw(line.as_bytes());
         });
@@ -308,22 +321,13 @@ pub fn enable() {
 /// allocation-free: safe on the output clock. A no-op unless [`enable`] ran.
 pub fn arm(cause: ExitCause) {
     if let Some(watchdog) = WATCHDOG.get() {
-        if watchdog.arm(cause, EXIT_DEADLINE) {
-            // The decision instant on the wall clock, so the exit notice can
-            // state decision -> fire exactly (a clock read, no allocation).
-            ARMED_WALL_MS.store(wall_ms(), Ordering::Release);
-        }
+        watchdog.arm(cause, EXIT_DEADLINE);
     }
 }
 
-/// Wall-clock ms of the first arm (0 = not armed), reported in the notice.
-static ARMED_WALL_MS: AtomicU64 = AtomicU64::new(0);
-
-fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
+/// Monotonic ms from the first exit decision to the deadline firing,
+/// reported in the hard-exit notice (#350).
+static FIRE_AFTER_ARM_MS: AtomicU64 = AtomicU64::new(0);
 
 /// The armed state as a cheap poll: `Some(cause)` once any exit was decided.
 /// The binary's "exit decided" task polls this (every few ms, off the clock) to

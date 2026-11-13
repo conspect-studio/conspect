@@ -25992,9 +25992,11 @@ mod chaos {
         }
     }
 
-    /// Refuse the hot-queue send of exactly tick `MULTIVIEW_CHAOS_SHED_AT`
-    /// (once): a deterministic shed, independent of timing (#350). The seam
-    /// for the falter verdict: a shed frame must make the run exit 1.
+    /// Refuse ONE hot-queue send in the whole process, at the first tick at
+    /// or after `MULTIVIEW_CHAOS_SHED_AT`: a deterministic shed, independent
+    /// of timing (#350). One shed is enough for the falter verdict (any shed
+    /// makes the run exit 1); with several outputs only the first to reach
+    /// the tick sheds.
     pub(super) fn force_shed(tick: u64) -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
         static DONE: AtomicBool = AtomicBool::new(false);
@@ -26004,7 +26006,11 @@ mod chaos {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
         });
-        at.is_some_and(|at| tick >= at && !DONE.swap(true, Ordering::AcqRel))
+        let shed = at.is_some_and(|at| tick >= at && !DONE.swap(true, Ordering::AcqRel));
+        if shed {
+            tracing::warn!(tick, "chaos: forced shed of one hot-queue send");
+        }
+        shed
     }
 
     impl ConsumerStall {
