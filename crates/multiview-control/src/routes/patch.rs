@@ -433,7 +433,7 @@ fn validate_count(req: &PatchRequest) -> ControlResult<()> {
 /// The live patch (mixer plane), built from the engine's readback.
 #[cfg_attr(feature = "openapi", utoipa::path(get, path = "/api/v1/patch", tag = "patch",
     responses(
-        (status = 200, description = "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ] }` from the engine's live readback; a mixer the caller cannot read (M/E object + Program scope) is omitted, and a source it cannot read is `{\"redacted\": true}`.", body = Object),
+        (status = 200, description = "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, source: {source}|{bus}|{redacted:true}, path: P1|P2|P3, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source: \"follow\" } ] } ] }` from the engine's live readback; a mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a source it cannot read is `{\"redacted\": true}`.", body = Object),
         (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
         (status = 403, description = "Role lacks Read.", body = crate::problem::Problem),
     )))]
@@ -486,13 +486,15 @@ pub(crate) async fn get_patch(
         .into_response())
 }
 
-/// Plan 1..64 mixer crosspoints: path, on-air flag and refusals; no change.
+/// Plan 1..64 mixer crosspoints (path, on-air flag, refusals) or the slots of
+/// one output (§12.4 path P1/P2/P3 and cost); no change.
 #[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/patch/plan", tag = "patch", request_body = PatchRequest,
     responses(
         (status = 200, body = PatchPlan),
-        (status = 403, description = "Not authorized for a destination (M/E object + Program scope) or a source.", body = crate::problem::Problem),
-        (status = 409, description = "`switcher-unavailable`.", body = crate::problem::Problem),
-        (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, or not 1..=64 crosspoints.", body = crate::problem::Problem),
+        (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object + output axis) or a source.", body = crate::problem::Problem),
+        (status = 404, description = "Unknown output.", body = crate::problem::Problem),
+        (status = 409, description = "`switcher-unavailable` or `routing-unavailable`.", body = crate::problem::Problem),
+        (status = 422, description = "`slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout, #306), or not 1..=64 crosspoints.", body = crate::problem::Problem),
     )))]
 pub(crate) async fn plan_patch(
     State(state): State<AppState>,
@@ -525,13 +527,17 @@ pub(crate) async fn plan_patch(
     }
 }
 
-/// Take 1..64 mixer crosspoints atomically at one engine tick.
+/// Take 1..64 mixer crosspoints atomically at one engine tick, or one
+/// output's video slot 0 (+ audio slot 0 follow) through the same machinery
+/// as `POST /routing/output/take` (the slot-0 alias; shared idempotency
+/// store and limits; the outcome rides `route.output`).
 #[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/patch/take", tag = "patch", request_body = PatchRequest,
     params(("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")),
     responses(
         (status = 202, body = PatchAccepted),
         (status = 403, description = "Not authorized for a destination (M/E object + Program scope) or a source.", body = crate::problem::Problem),
-        (status = 409, description = "`on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, or no source lease.", body = crate::problem::Problem),
+        (status = 404, description = "Unknown output.", body = crate::problem::Problem),
+        (status = 409, description = "`on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, or no source lease.", body = crate::problem::Problem),
         (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, missing Idempotency-Key, or not 1..=64 crosspoints.", body = crate::problem::Problem),
         (status = 429, description = "Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After.", body = crate::problem::Problem),
         (status = 503, description = "`engine-busy` (the key and leases are released) or `idempotency-capacity`.", body = crate::problem::Problem),
