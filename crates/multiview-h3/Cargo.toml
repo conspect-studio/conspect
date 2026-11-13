@@ -14,6 +14,10 @@ default = []
 # Exposes `multiview_h3::testing` (the in-memory h3 transport the `h3_request`
 # fuzz target drives). Off in every shipped build.
 fuzzing = []
+# Exposes `multiview_h3::client`, a minimal native h3 client the wiring
+# crates' integration and chaos tests use (dev-dependency only). Off in every
+# shipped build.
+test-client = []
 
 [dependencies]
 # hyperium h3 (MIT). The opt-in feature exposes the transport-implementer API

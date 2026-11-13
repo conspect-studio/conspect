@@ -227,6 +227,52 @@ Run it on the host (both paths share the loopback), and once from the office aga
 name after the cutover. Record the table in issue #292. Remove the staging keys (or run the
 cutover, which replaces them) afterwards.
 
+## HTTP/3 and Alt-Svc (front-door slice 2, #288)
+
+From the engine build that contains slice 2, UDP `https_port` serves HTTP/3 for the whole site
+and MoQ (WebTransport under `/moq/`) from one endpoint; there is no separate MoQ listener on the
+front door any more. Nothing changes on the firewall (UDP 443 is already open).
+
+* `MULTIVIEW_MOQ_ENDPOINT` must be `https://<public host>/moq`. A bare `https://<host>` is
+  normalised to `/moq` with a warning; another path is refused (MoQ unavailable, the log says
+  why). Validate before the restart, as always (`<binary> validate conspect.toml` -> exit 0).
+* The endpoint's certificate is the door's: `[network.tls]` (starts only once the certificate is
+  `serving`; never in `setup`), else `[network] cert_file/key_file` or `[control.tls]`, else the
+  `MULTIVIEW_MOQ_CERTIFICATE`/`_PRIVATE_KEY` pair. With none, the log says "no certificate for the
+  HTTP/3 endpoint" and the site stays on TCP.
+* Check: the journal shows `front door: HTTP/3 endpoint up` with `alpn="h3" zero_rtt=false
+  alt_svc=true`. `curl -sI https://<host>/ | grep -i alt-svc` shows
+  `alt-svc: h3=":443"; ma=86400`. In Chrome, the second page load reports
+  `performance.getEntriesByType('navigation')[0].nextHopProtocol === "h3"`.
+* **`mode = "behind_proxy"`:** forward UDP 443 with a plain DNAT that preserves client source
+  addresses, never a source-NAT relay that rewrites every client to one address — the engine
+  refuses any QUIC connection whose source is in `trusted_proxies` (review #371 finding F1: that
+  source has lost the real client's address, same fail-closed rule as the TCP door's PROXY v2
+  check), so a source-NAT forward from an address not in `trusted_proxies` looks like one client
+  hammering the endpoint and gets self-DoSed by the per-source caps. The journal line
+  `behind_proxy: QUIC from trusted_proxies is refused ...` at h3 start only confirms the filter is
+  installed. `h3_counters().sources_refused` staying at 0 under real client traffic confirms the
+  forward preserves source addresses; a climbing counter means QUIC arrives from a
+  `trusted_proxies` address (a source-rewriting forward) and every such connection is refused —
+  fix the forward.
+
+**While nginx still serves TCP 443** (before the cutover above), the engine's TCP door is not on
+443, so the browser only learns about h3 if nginx advertises it. Add one line to the TLS
+`server { ... }` block, only once the slice-2 engine runs and UDP 443 reaches it (otherwise
+browsers try h3, fail, and fall back after a delay for each `ma` period):
+
+```nginx
+add_header Alt-Svc 'h3=":443"; ma=86400' always;
+```
+
+`nginx -t && systemctl reload nginx`. Rollback: remove the line and reload.
+
+**Switching Alt-Svc off** (UDP 443 known unreachable from clients, e.g. an upstream firewall
+drops it): set `alt_svc = false` under `[network]`, validate, restart. The engine keeps serving
+h3 to clients that already know it (until their `ma` expires) and stops advertising it; every
+page then loads over HTTP/1.1 on TCP without the fallback delay. Until the reachability prober
+(slice 9) exists this switch is manual. Rollback: remove the key (default `true`).
+
 ## Troubleshoot
 
 | Symptom | Cause / fix |

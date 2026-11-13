@@ -268,3 +268,8 @@ Chrome for Testing 149.0.7827.55, curl 8.14.1 (nghttp3), a native `web-transport
   [front-door-cutover.md](../runbooks/front-door-cutover.md) (slice 6, #292). As built, the socket
   unit passes UDP 443 as a `ReusePort=yes` pair so validated-flow steering survives socket
   activation (design note, "Slice 6 as built").
+- As built (slice 2, #288): the vendored `multiview-h3` adapter includes its own WebTransport
+  session layer (derived from h3-webtransport 0.1.2) instead of upstream's `WebTransportSession`,
+  which takes the whole h3 connection; ours leaves the connection in its driver, so pages keep
+  being served and a second CONNECT is answered `429` while a session lives (design note,
+  "Slice 2 as built").
