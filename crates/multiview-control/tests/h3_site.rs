@@ -224,6 +224,53 @@ async fn real_control_router_ws_over_h3_is_a_clean_4xx() {
     endpoint.shutdown().await;
 }
 
+#[tokio::test]
+async fn cast_routes_are_served_over_h3_by_the_real_router() {
+    // Routes merged into `router_with` (here the public cast surface,
+    // ADR-0111) reach the h3 site unchanged: it serves the SAME router.
+    let engine = Arc::new(multiview_engine::EnginePublisher::<
+        multiview_control::EngineStateSnapshot,
+        multiview_events::Event,
+    >::new(16));
+    let (tx, _rx) = multiview_control::command_bus(4);
+    let state = multiview_control::AppState::new(
+        engine,
+        tx,
+        Arc::new(multiview_control::InMemoryRepository::new()),
+        Arc::new(multiview_control::ApiKeyStore::new(
+            b"h3-site-test-pepper".to_vec(),
+        )),
+    );
+    let app = multiview_control::router(state);
+    let (_signal, watch) = tokio::sync::watch::channel(false);
+    let (endpoint, addr) = endpoint(Arc::new(H3Site::new(app, watch)), None).await;
+    let mut c = h3(addr).await;
+    let auth = format!("localhost:{}", addr.port());
+    let (resp, body) = c
+        .fetch(
+            client::request(http::Method::GET, &auth, "/cast/receiver/").unwrap(),
+            &[],
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().contains_key("content-security-policy"));
+    assert!(String::from_utf8(body).unwrap().contains("receiver.js"));
+    let path = format!("/cast/{}/master.m3u8", "Q".repeat(43));
+    let (resp, _) = c
+        .fetch(
+            client::request(http::Method::GET, &auth, &path).unwrap(),
+            &[],
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    drop(c);
+    endpoint.shutdown().await;
+}
+
 /// A single-rendition lease through the real `admit` path, with one frame
 /// published on its video track.
 fn admit_lease(runtime: &Runtime) -> (String, Arc<Fence>, tokio::sync::mpsc::Sender<()>) {
