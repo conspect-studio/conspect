@@ -247,10 +247,12 @@ front door any more. Nothing changes on the firewall (UDP 443 is already open).
   refuses any QUIC connection whose source is in `trusted_proxies` (review #371 finding F1: that
   source has lost the real client's address, same fail-closed rule as the TCP door's PROXY v2
   check), so a source-NAT forward from an address not in `trusted_proxies` looks like one client
-  hammering the endpoint and gets self-DoSed by the per-source caps; the journal line
-  `behind_proxy: QUIC from trusted_proxies is refused ...` at h3 start, and
-  `h3_counters().sources_refused` climbing, both confirm the forward preserves source addresses
-  correctly (it should stay at 0 for real client traffic).
+  hammering the endpoint and gets self-DoSed by the per-source caps. The journal line
+  `behind_proxy: QUIC from trusted_proxies is refused ...` at h3 start only confirms the filter is
+  installed. `h3_counters().sources_refused` staying at 0 under real client traffic confirms the
+  forward preserves source addresses; a climbing counter means QUIC arrives from a
+  `trusted_proxies` address (a source-rewriting forward) and every such connection is refused —
+  fix the forward.
 
 **While nginx still serves TCP 443** (before the cutover above), the engine's TCP door is not on
 443, so the browser only learns about h3 if nginx advertises it. Add one line to the TLS
