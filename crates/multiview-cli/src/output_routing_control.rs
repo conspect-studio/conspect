@@ -13,14 +13,15 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_control::output_routing::{
-    OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost, PlanRefusal, RoutedFeed,
-    RoutingLive, TakeSubmitError,
+    AudioPlanCost, OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost,
+    PlanRefusal, RoutedAudio, RoutedFeed, RoutingLive, TakeSubmitError,
 };
 
 use crate::output_routing::{
     FallbackReason, OutputRoutingHandle, OutputRoutingSlot, OutputTake, RefuseReason, TakeOutcome,
     TakeResult, DEFAULT_MAX_ENCODERS,
 };
+use crate::routing_audio::AudioChoice;
 use crate::routing_aux::PictureBus;
 
 /// The wire string of a take outcome (`route.output`).
@@ -54,6 +55,60 @@ fn picture_bus(feed: &RoutedFeed) -> PictureBus {
         RoutedFeed::Preview => PictureBus::Preview,
         RoutedFeed::Clean => PictureBus::Clean,
         RoutedFeed::Source(id) => PictureBus::Source(id.clone()),
+    }
+}
+
+/// The engine audio choice of a control-plane audio feed.
+fn audio_choice(audio: &RoutedAudio) -> AudioChoice {
+    match audio {
+        RoutedAudio::Follow => AudioChoice::Follow,
+        RoutedAudio::Program => AudioChoice::Program,
+        RoutedAudio::None => AudioChoice::Silence,
+        RoutedAudio::Source(id) => AudioChoice::Source(id.clone()),
+        RoutedAudio::Track { name, input } => AudioChoice::Track {
+            name: name.clone(),
+            input: input.clone(),
+        },
+    }
+}
+
+/// The control-plane audio feed of an engine audio choice.
+fn routed_audio(choice: &AudioChoice) -> RoutedAudio {
+    match choice {
+        AudioChoice::Follow => RoutedAudio::Follow,
+        AudioChoice::Program => RoutedAudio::Program,
+        AudioChoice::Silence => RoutedAudio::None,
+        AudioChoice::Source(id) => RoutedAudio::Source(id.clone()),
+        AudioChoice::Track { name, input } => RoutedAudio::Track {
+            name: name.clone(),
+            input: input.clone(),
+        },
+    }
+}
+
+/// The carried-audio label (`program`, `preview`, `none`, `src:<id>`,
+/// `track:<name>`) of choice label `choice` on picture bus `bus` — the
+/// engine's own resolution (§5.1), over snapshot labels.
+fn carried_label(choice: &str, bus: &str) -> String {
+    if choice != "follow" {
+        return choice.to_owned();
+    }
+    match bus {
+        "preview" => "preview".to_owned(),
+        b if b.starts_with("src:") => b.to_owned(),
+        // Program and Clean follow the program mix.
+        _ => "program".to_owned(),
+    }
+}
+
+/// The engine audio of a take: `None` keeps the output's choice. `follow`
+/// on an output without a program-audio slot is that output's only (and
+/// current) audio, so it is not sent (the engine would refuse an explicit
+/// audio there): a slice-1 body `audio: "follow"` keeps working.
+fn take_audio(audio: Option<&RoutedAudio>, program_audio: bool) -> Option<AudioChoice> {
+    match audio {
+        Some(RoutedAudio::Follow) if !program_audio => None,
+        other => other.map(audio_choice),
     }
 }
 
@@ -136,6 +191,7 @@ fn pump(rx: &Receiver<TakeOutcome>, ids: &[Option<String>], tx: &SyncSender<Outp
             tick: outcome.tick,
             outcome: outcome_str(outcome.outcome).to_owned(),
             feed: Some(routed_feed(&outcome.bus)),
+            audio: outcome.audio.as_ref().map(routed_audio),
         };
         if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) = tx.try_send(mapped) {
             return;
@@ -184,19 +240,65 @@ impl OutputRouting for OutputRoutingAdapter {
         })
     }
 
+    fn plan_audio(
+        &self,
+        output: &str,
+        video: Option<&RoutedFeed>,
+        audio: Option<&RoutedAudio>,
+    ) -> Result<AudioPlanCost, PlanRefusal> {
+        let Some(handle) = self.handle() else {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        };
+        let Some(index) = handle.index_of(output) else {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        };
+        let Some(run_output) = handle.outputs().get(index) else {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        };
+        // The same kind gate as a video take: an output the engine does not
+        // route (VAAPI/VideoToolbox, §4.2) takes no audio either.
+        if !run_output.routable {
+            return Err(PlanRefusal::OutputKindUnroutable);
+        }
+        let snapshot = handle.snapshot();
+        audio_cost(
+            run_output.program_audio,
+            snapshot.outputs.get(index),
+            video,
+            audio,
+        )
+    }
+
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
         let handle = self.handle().ok_or(TakeSubmitError::Busy)?;
         let index = handle
             .index_of(&take.output)
             .ok_or(TakeSubmitError::Unroutable)?;
+        let run_output = handle
+            .outputs()
+            .get(index)
+            .ok_or(TakeSubmitError::Unroutable)?;
+        // Every take — video, combined or audio-only — honours the kind gate.
+        if !run_output.routable {
+            return Err(TakeSubmitError::Unroutable);
+        }
+        let program_audio = run_output.program_audio;
+        let audio = take_audio(take.audio.as_ref(), program_audio);
+        if audio.is_some() && !program_audio {
+            // The engine would refuse it `unroutable`; the control plane
+            // already answered `audio-unsupported` from the plan.
+            return Err(TakeSubmitError::Unroutable);
+        }
+        let bus = take.video.as_ref().map(picture_bus);
+        if bus.is_none() && audio.is_none() {
+            return Err(TakeSubmitError::Unroutable);
+        }
         handle
             .try_take(OutputTake {
                 operation_id: take.operation_id,
                 output_index: index,
-                bus: Some(picture_bus(&take.feed)),
-                // Explicit audio over HTTP is the API PR (ADR-0108 slice 2
-                // part 3): today's take keeps the output's audio choice.
-                audio: None,
+                bus,
+                audio,
                 principal: take.principal,
             })
             .map_err(|_| TakeSubmitError::Busy)
@@ -215,6 +317,9 @@ impl OutputRouting for OutputRoutingAdapter {
                         since_tick: view.since_tick,
                         pending: view.pending.as_ref().map(|p| (p.bus.clone(), p.held_ticks)),
                         degraded: view.degraded,
+                        audio: run_output.program_audio.then(|| view.audio.clone()),
+                        pending_audio: view.pending.as_ref().and_then(|p| p.audio.clone()),
+                        private_audio: view.private_audio,
                     },
                 );
             }
@@ -236,6 +341,32 @@ impl OutputRouting for OutputRoutingAdapter {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
     }
+}
+
+/// The audio cost of a take on one output (§5.2, §7): +1 transient CPU AAC
+/// encode when the take changes what the output carries and it has no
+/// private audio bus yet; 0 when the target is what it carries or a private
+/// bus already runs. An explicit audio choice on an output without a
+/// program-audio slot is refused.
+fn audio_cost(
+    program_audio: bool,
+    view: Option<&crate::output_routing::OutputRouteView>,
+    video: Option<&RoutedFeed>,
+    audio: Option<&RoutedAudio>,
+) -> Result<AudioPlanCost, PlanRefusal> {
+    if take_audio(audio, program_audio).is_some() && !program_audio {
+        return Err(PlanRefusal::AudioUnsupported);
+    }
+    let Some(view) = view.filter(|_| program_audio) else {
+        // No program audio on this output: nothing to encode.
+        return Ok(AudioPlanCost::default());
+    };
+    let choice = audio.map_or_else(|| view.audio_choice.clone(), RoutedAudio::label);
+    let bus = video.map_or_else(|| view.bus.clone(), RoutedFeed::bus_name);
+    let changes = carried_label(&choice, &bus) != view.audio;
+    Ok(AudioPlanCost {
+        needs_encoder: changes && !view.private_audio,
+    })
 }
 
 fn installed() -> &'static Mutex<Option<OutputRoutingSlot>> {
@@ -298,6 +429,104 @@ pub fn installed_program_metrics() -> Option<crate::pipeline::ProgramMetricsSlot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(
+        bus: &str,
+        audio: &str,
+        choice: &str,
+        private: bool,
+    ) -> crate::output_routing::OutputRouteView {
+        crate::output_routing::OutputRouteView {
+            bus: bus.to_owned(),
+            key: String::new(),
+            since_tick: 0,
+            pending: None,
+            degraded: false,
+            audio: audio.to_owned(),
+            audio_choice: choice.to_owned(),
+            private_audio: private,
+        }
+    }
+
+    #[test]
+    fn a_track_maps_to_the_engine_track_choice_with_its_route_input() {
+        let track = RoutedAudio::Track {
+            name: "eng".into(),
+            input: "cam1".into(),
+        };
+        assert_eq!(
+            take_audio(Some(&track), true),
+            Some(AudioChoice::Track {
+                name: "eng".into(),
+                input: "cam1".into(),
+            })
+        );
+        assert_eq!(
+            take_audio(Some(&RoutedAudio::None), true),
+            Some(AudioChoice::Silence)
+        );
+        assert_eq!(routed_audio(&audio_choice(&track)), track);
+        // A slice-1 `follow` on an output without the slot changes nothing.
+        assert_eq!(take_audio(Some(&RoutedAudio::Follow), false), None);
+        assert_eq!(
+            take_audio(Some(&RoutedAudio::Follow), true),
+            Some(AudioChoice::Follow)
+        );
+    }
+
+    #[test]
+    fn program_audio_drives_the_audio_unsupported_refusal() {
+        let v = view("program", "program", "follow", false);
+        let src = RoutedAudio::Source("x".into());
+        assert_eq!(
+            audio_cost(false, Some(&v), None, Some(&src)),
+            Err(PlanRefusal::AudioUnsupported)
+        );
+        assert_eq!(
+            audio_cost(false, Some(&v), None, Some(&RoutedAudio::Follow)),
+            Ok(AudioPlanCost::default()),
+            "follow is what a slotless output carries"
+        );
+        assert_eq!(
+            audio_cost(true, Some(&v), None, Some(&src)),
+            Ok(AudioPlanCost {
+                needs_encoder: true
+            })
+        );
+    }
+
+    #[test]
+    fn audio_cost_is_zero_for_the_carried_audio_or_a_running_private_bus() {
+        let src = RoutedAudio::Source("x".into());
+        let on_x = view("program", "src:x", "src:x", true);
+        assert_eq!(
+            audio_cost(true, Some(&on_x), None, Some(&src)),
+            Ok(AudioPlanCost::default())
+        );
+        // A running private bus absorbs a change.
+        assert_eq!(
+            audio_cost(true, Some(&on_x), None, Some(&RoutedAudio::None)),
+            Ok(AudioPlanCost::default())
+        );
+        // Follow of a video take to a source changes the audio: +1.
+        let plain = view("program", "program", "follow", false);
+        assert_eq!(
+            audio_cost(
+                true,
+                Some(&plain),
+                Some(&RoutedFeed::Source("x".into())),
+                None
+            ),
+            Ok(AudioPlanCost {
+                needs_encoder: true
+            })
+        );
+        assert_eq!(
+            audio_cost(true, Some(&plain), Some(&RoutedFeed::Clean), None),
+            Ok(AudioPlanCost::default()),
+            "Clean follows the program mix it already carries"
+        );
+    }
 
     #[test]
     fn every_outcome_has_its_wire_string() {
