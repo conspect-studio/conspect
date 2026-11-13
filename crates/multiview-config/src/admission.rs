@@ -266,11 +266,13 @@ mod tests {
 
     #[test]
     fn table_of_canvas_and_switcher_combinations() {
+        // #307: a switcher with a multi-cell canvas starts (Program is the
+        // synthesized one-cell M/E bus); every combination is admissible.
         for (cells, switcher, ok) in [
             (ONE, false, true),
             (ONE, true, true),
             (TWO, false, true),
-            (TWO, true, false),
+            (TWO, true, true),
         ] {
             let config = doc(cells, switcher);
             let result = boot_admission(&config);
@@ -328,30 +330,16 @@ mod tests {
     }
 
     #[test]
-    fn multi_cell_refusal_names_the_operator_reason_and_keeps_the_log_text() {
-        let err = boot_admission(&doc(TWO, true)).unwrap_err();
-        let BootAdmissionError::SwitcherCanvas(refusal) = &err else {
-            panic!("expected a switcher refusal, got {err:?}");
-        };
-        assert_eq!(refusal, &SwitcherCanvasRefusal::CellCount(2));
-        assert!(refusal
-            .operator_message()
-            .starts_with("The switcher is on: a multi-cell layout cannot be the Program canvas."));
-        assert!(err
-            .to_string()
-            .starts_with("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced"));
+    fn one_cell_bound_to_another_source_synthesizes_the_program_cell() {
+        let config = doc(&ONE.replace("input_id = \"a\"", "input_id = \"b\""), true);
+        let program = config
+            .program_canvas(config.solve_layout().unwrap())
+            .unwrap();
+        assert!(program.synthesized);
+        assert_eq!(program.layout.cells.len(), 1);
+        assert_eq!(program.layout.cells[0].source.as_deref(), Some("a"));
     }
 
-    #[test]
-    fn one_cell_bound_to_another_source_is_refused() {
-        let config = doc(&ONE.replace("input_id = \"a\"", "input_id = \"b\""), true);
-        assert!(matches!(
-            boot_admission(&config),
-            Err(BootAdmissionError::SwitcherCanvas(
-                SwitcherCanvasRefusal::NotProgramSource { .. }
-            ))
-        ));
-    
     #[test]
     fn styled_or_windowed_one_cell_canvases_synthesize_the_program_cell() {
         for cells in [
