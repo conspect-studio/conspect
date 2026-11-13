@@ -28,6 +28,8 @@ const SPS: [u8; 27] = [
     0x67, 0x64, 0x00, 0x28, 0xAC, 0xD9, 0x40, 0x78, 0x02, 0x27, 0xE5, 0xC0, 0x44, 0x00, 0x00, 0x03,
     0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xF0, 0x3C, 0x60, 0xC6, 0x58,
 ];
+/// A second SPS: Main profile, level 3.1 (`avc1.4D401F`).
+const SPS_B: [u8; 10] = [0x67, 0x4D, 0x40, 0x1F, 0xEC, 0xA0, 0x50, 0x17, 0xFC, 0xB8];
 const PPS: [u8; 6] = [0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
 const VIDEO_TB: Rational = Rational::new(1001, 30_000);
 const AUDIO_TB: Rational = Rational::new(1, 48_000);
@@ -36,12 +38,12 @@ const GOP: i64 = 30;
 
 /// One Annex B access unit: AUD, on a keyframe SPS + PPS + IDR, else a
 /// non-IDR slice. The payload is ASCII so it never emulates a start code.
-fn frame_bytes(index: i64, key: bool, sets: bool) -> Vec<u8> {
+fn frame_bytes(index: i64, key: bool, sps: Option<&[u8]>) -> Vec<u8> {
     let tag = format!("{index:016x}").into_bytes();
     let mut nals: Vec<Vec<u8>> = vec![vec![0x09, 0xF0]];
     if key {
-        if sets {
-            nals.push(SPS.to_vec());
+        if let Some(sps) = sps {
+            nals.push(sps.to_vec());
             nals.push(PPS.to_vec());
         }
         let mut idr = vec![0x65, 0x88, 0x84];
@@ -99,6 +101,10 @@ struct Stream {
     /// Keyframes carry no SPS / PPS (with no extradata the packager then
     /// fails: it cannot build an init segment).
     no_sets: bool,
+    /// From this frame on the stream comes from another encoder (a routing
+    /// take): its keyframes carry [`SPS_B`] and the first one is flagged as
+    /// a decoder-configuration change.
+    other_encoder_from: Option<i64>,
     /// When set: the wall clock (Unix ns) of media time zero; each packet
     /// arrives at its media time on that clock.
     wall_at_zero: Option<i64>,
@@ -110,6 +116,7 @@ impl Stream {
             next_audio: 0,
             audio,
             no_sets: false,
+            other_encoder_from: None,
             wall_at_zero: None,
         }
     }
@@ -118,7 +125,10 @@ impl Stream {
     /// end of it.
     fn frame(&mut self, runner: &mut CastRunner, index: i64, now: Instant) {
         let key = index % GOP == 0;
-        let data = frame_bytes(index, key, !self.no_sets);
+        let moved = self.other_encoder_from.is_some_and(|from| index >= from);
+        let sps: &[u8] = if moved { &SPS_B } else { &SPS };
+        let data = frame_bytes(index, key, (!self.no_sets).then_some(sps));
+        let config_changed = self.other_encoder_from == Some(index);
         let unix_ns = self
             .wall_at_zero
             .map_or_else(unix_nanos, |zero| zero + frame_ns(index));
@@ -128,7 +138,7 @@ impl Stream {
                 pts: index,
                 dts: index,
                 keyframe: key,
-                config_changed: false,
+                config_changed,
                 data: &data,
             },
             now,
@@ -398,6 +408,11 @@ fn a_marked_directory_is_purged_of_stale_stream_files_only() {
     assert!(!late.join(CAST_DIR_MARKER).exists());
 }
 
+/// `nanos` as seconds (millisecond precision is plenty here).
+fn seconds(nanos: i64) -> f64 {
+    f64::from(i32::try_from(nanos / 1_000_000).unwrap()) / 1000.0
+}
+
 /// Nanoseconds of media at video frame `index`.
 fn frame_ns(index: i64) -> i64 {
     index * 1001 * 1_000_000_000 / 30_000
@@ -432,7 +447,7 @@ fn inactive_writes_nothing_and_a_preroll_activation_publishes_a_full_window_at_o
     assert_eq!(report.discontinuities, 0);
     assert_eq!(listed_generation(&dir), generation);
     // The window starts 20 to 21 s before the activation, at an IDR.
-    let behind = frame_ns(690) as f64 / 1e9 - report.first_video_start;
+    let behind = seconds(frame_ns(690)) - report.first_video_start;
     assert!((19.9..=21.1).contains(&behind), "{behind}");
     assert!(dir.join("master.m3u8").is_file() && dir.join(CAST_DIR_MARKER).is_file());
 
@@ -555,14 +570,16 @@ pub(crate) fn last_segment_pdt(dir: &Path, playlist: &str) -> (i64, i64) {
         .next_back()
         .map(pdt_unix_ms)
         .expect("a PDT line");
-    let extinf: f64 = text
+    // `#EXTINF:2.002000,` -> 2002 (whole milliseconds, no float).
+    let extinf = text
         .lines()
         .filter_map(|l| l.strip_prefix("#EXTINF:"))
         .next_back()
-        .and_then(|l| l.trim_end_matches(',').parse().ok())
+        .map(|l| l.trim_end_matches(','))
         .expect("an EXTINF line");
-    #[allow(clippy::cast_possible_truncation)]
-    (pdt, (extinf * 1000.0).round() as i64)
+    let (whole, fraction) = extinf.split_once('.').unwrap_or((extinf, "0"));
+    let millis: i64 = format!("{fraction:0<3}")[..3].parse().unwrap();
+    (pdt, whole.parse::<i64>().unwrap() * 1000 + millis)
 }
 
 #[test]
@@ -710,4 +727,51 @@ fn a_packager_error_restarts_a_new_generation_at_most_once_per_second() {
     assert_eq!(status.generation, generation, "the activation is the same");
     assert!(listed_generation(&dir) > generation, "new file names");
     assert_eq!(report.discontinuities, 0);
+}
+
+/// A routing take moves the output onto another encoder: the cut is a
+/// self-contained IDR (the dispatcher's move gate) whose in-band parameter
+/// sets differ. The packager must take the new sets from that IDR, write a
+/// new init segment and declare the discontinuity, in the same stream.
+#[test]
+fn a_move_onto_other_parameter_sets_writes_a_new_init_and_one_discontinuity() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("cast-1");
+    let gate = Arc::new(CastGate::new());
+    let mut runner = CastRunner::new(setup(&dir, &gate, SharedEpoch::new(), true));
+    let mut stream = Stream::new(true);
+    let now = Instant::now();
+    let generation = gate.activate(false).unwrap();
+    stream.other_encoder_from = Some(240);
+    stream.run(&mut runner, 0..480, now);
+    let report = validated(&dir);
+    assert_eq!(report.discontinuities, 1, "{report:?}");
+    assert_eq!(gate.status().restarts, 0);
+    assert_eq!(listed_generation(&dir), generation, "the same stream");
+    let video = std::fs::read_to_string(dir.join("video.m3u8")).unwrap();
+    let first_init = format!("#EXT-X-MAP:URI=\"init-v-{generation}-0.mp4\"");
+    let second_init = format!("#EXT-X-MAP:URI=\"init-v-{generation}-1.mp4\"");
+    let at_change = video.find(&second_init).expect("a second init segment");
+    assert!(video.find(&first_init).unwrap() < at_change, "{video}");
+    // The discontinuity is declared exactly where the new init starts.
+    let before_change = &video[..at_change];
+    assert!(
+        before_change.trim_end().ends_with("#EXT-X-DISCONTINUITY"),
+        "{video}"
+    );
+    // The segment at the cut is the one that starts at frame 240 (8.008 s),
+    // and the master names the new profile.
+    let cut_segment = video[at_change..]
+        .lines()
+        .find(|l| l.starts_with("seg-v-"))
+        .unwrap();
+    assert_eq!(cut_segment, format!("seg-v-{generation}-4.m4s"));
+    assert_eq!(report.codecs, "avc1.4D401F,mp4a.40.2");
+    // The audio playlist declares the same discontinuity at the same place.
+    let audio = std::fs::read_to_string(dir.join("audio.m3u8")).unwrap();
+    assert_eq!(
+        audio.matches("#EXT-X-DISCONTINUITY\n").count(),
+        1,
+        "{audio}"
+    );
 }

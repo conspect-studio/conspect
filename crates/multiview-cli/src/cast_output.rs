@@ -177,14 +177,16 @@ impl CastGate {
     /// [`CastGateError::Disabled`] when the output's directory is not usable
     /// (the text names the fix), [`CastGateError::Ended`] after the run.
     pub fn activate(&self, preroll: bool) -> Result<u64, CastGateError> {
+        // A run that has ended is the first answer: its gate is no longer
+        // anyone's to activate, whatever state it ended in.
+        if self.ended.load(Ordering::Acquire) {
+            return Err(CastGateError::Ended);
+        }
         if self.disabled.load(Ordering::Acquire) {
             return Err(CastGateError::Disabled(
                 self.last_error()
                     .unwrap_or_else(|| "cast output disabled".to_owned()),
             ));
-        }
-        if self.ended.load(Ordering::Acquire) {
-            return Err(CastGateError::Ended);
         }
         let mut current = self.state.load(Ordering::Acquire);
         loop {

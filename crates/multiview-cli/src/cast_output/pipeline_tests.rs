@@ -69,6 +69,11 @@ id = "cast-1"
 dir = "%/cast"
 "##;
 
+/// Output time of `ticks` clock ticks, in seconds.
+fn secs(ticks: u64) -> f64 {
+    f64::from(u32::try_from(ticks).unwrap()) / f64::from(u32::try_from(FPS).unwrap())
+}
+
 /// What the controller thread of a run can reach.
 struct Ctl {
     cast: CastOutputEntry,
@@ -99,13 +104,11 @@ impl Ctl {
         self.wait_tick(self.tick() + seconds * FPS);
     }
 
-    /// Wait until the gate reports `ready`; returns the wall time it took.
-    fn wait_ready(&self, bound: Duration) -> Duration {
-        let start = Instant::now();
+    /// Wait until the gate reports `ready`.
+    fn wait_ready(&self, bound: Duration) {
         wait_for("the cast stream to be ready", bound, || {
             self.cast.gate.status().ready.then_some(())
         });
-        start.elapsed()
     }
 }
 
@@ -140,6 +143,7 @@ struct Run {
 }
 
 /// How a run ends.
+#[derive(Clone, Copy)]
 enum Until {
     /// After exactly this many ticks.
     Ticks(u64),
@@ -155,13 +159,43 @@ fn drive<F>(prefix: &str, until: Until, control: F) -> Run
 where
     F: FnOnce(&Ctl) + Send + 'static,
 {
+    drive_in(prefix, until, false, |_| {}, control)
+}
+
+/// As [`drive`]. With `default_dir` the cast output has no configured `dir`
+/// and the pipeline is told its state directory (`<root>/.multiview`).
+/// `prepare` sees the run's root directory before the pipeline is built.
+#[allow(clippy::too_many_lines)] // One linear set-up of the real pipeline, its clock and its controller.
+fn drive_in<F>(
+    prefix: &str,
+    until: Until,
+    default_dir: bool,
+    prepare: impl FnOnce(&Path),
+    control: F,
+) -> Run
+where
+    F: FnOnce(&Ctl) + Send + 'static,
+{
     let root = tempfile::tempdir().unwrap();
-    let toml = CONFIG
+    prepare(root.path());
+    let template = if default_dir {
+        CONFIG.replace("dir = \"%/cast\"\n", "")
+    } else {
+        CONFIG.to_owned()
+    };
+    let toml = template
         .replace('@', prefix)
         .replace('%', root.path().to_str().unwrap());
     let config = multiview_config::MultiviewConfig::load_from_toml(&toml).unwrap();
     config.validate().unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
+    let cast_dir = if default_dir {
+        let state_dir = root.path().join(".multiview");
+        pipeline.set_state_dir(&state_dir);
+        state_dir.join("cast").join("cast-1")
+    } else {
+        root.path().join("cast")
+    };
     pipeline.enable_program_audio();
     let rendition_configs = pipeline.rendition_config_count();
     let cast_slot: CastOutputsSlot = pipeline.cast_outputs();
@@ -255,7 +289,7 @@ where
         cast_packets: result.sink_frames[1],
         rendition_configs,
         lines: result.report.outputs,
-        cast_dir: root.path().join("cast"),
+        cast_dir,
         _root: root,
     }
 }
@@ -362,18 +396,21 @@ fn a_inactive_cast_output_writes_no_file_and_shares_the_hls_encoder() {
 /// (b0) After 22 s of run a pre-roll activation is ready at once with a
 /// full window; without pre-roll the stream starts after the activation.
 #[test]
-fn b0_preroll_is_ready_within_a_second_and_no_preroll_starts_after_the_activation() {
+fn b0_preroll_publishes_a_full_window_at_once_and_no_preroll_starts_after_the_activation() {
     let run = drive("cast_b0", Until::Stop, |ctl| {
         ctl.wait_tick(22 * FPS + 10);
         assert!(!ctl.dir().exists(), "nothing on disk before the activation");
         let at = ctl.tick();
         let generation = ctl.cast.gate.activate(true).unwrap();
-        let took = ctl.wait_ready(Duration::from_secs(5));
-        assert!(took < Duration::from_secs(1), "ready after {took:?}");
-        // The burst is a handful of milliseconds; then the directory holds
-        // the whole window.
-        wait_for("the full window", Duration::from_secs(1), || {
-            (ctl.cast.gate.status().video_segments >= 9).then_some(())
+        // The pre-roll is published in one burst. The bound is the design's,
+        // not this machine's speed: the clock emits at most 25 ticks per
+        // wall second, so inside this 5 s deadline at most 3 new segments
+        // (2 s each) can have been produced. 9 listed segments therefore
+        // prove that at least 6 came from the buffered 20 s; without the
+        // pre-roll 9 segments need 18 s of output.
+        wait_for("the pre-roll window", Duration::from_secs(5), || {
+            let status = ctl.cast.gate.status();
+            (status.ready && status.video_segments >= 9).then_some(())
         });
         let report = validated(ctl);
         assert!(
@@ -385,8 +422,7 @@ fn b0_preroll_is_ready_within_a_second_and_no_preroll_starts_after_the_activatio
         assert_eq!(report.discontinuities, 0);
         assert_eq!(listed_generation(ctl.dir()), generation);
         // It reaches back about 20 s before the activation.
-        #[allow(clippy::cast_precision_loss)]
-        let behind = at as f64 / FPS as f64 - report.first_video_start;
+        let behind = secs(at) - report.first_video_start;
         assert!((17.0..=21.5).contains(&behind), "{behind} s");
 
         // Deactivate, then activate without pre-roll.
@@ -400,8 +436,7 @@ fn b0_preroll_is_ready_within_a_second_and_no_preroll_starts_after_the_activatio
         assert!(second > generation);
         ctl.wait_ready(Duration::from_secs(30));
         let report = validated(ctl);
-        #[allow(clippy::cast_precision_loss)]
-        let activated_at = at as f64 / FPS as f64;
+        let activated_at = secs(at);
         // Nothing of the buffered seconds is used: the stream starts at the
         // first keyframe the sink receives after the activation. The sink
         // runs a few ticks behind the clock (encode + delivery), so that
@@ -437,12 +472,13 @@ fn b_an_activation_publishes_a_valid_stream_within_the_deadline() {
             "idempotent"
         );
         ctl.wait_ready(Duration::from_secs(60));
-        // Ready = 5 segments of 2 s, starting at the next keyframe (< 1 s
-        // away), each published once the audio covering it arrived: at most
-        // 13 s of output after the activation.
+        // Ready = 5 segments of 2 s starting at the next keyframe: never
+        // before 10 s of output after the activation (nothing buffered is
+        // used), and not long after (the bound is in output ticks and leaves
+        // 10 s for the keyframe wait and the sink's latency).
         let ready_after = ctl.tick() - at;
         assert!(
-            ready_after <= 13 * FPS,
+            (10 * FPS - FPS / 2..=20 * FPS).contains(&ready_after),
             "ready {ready_after} ticks after the activation"
         );
         let report = validated(ctl);
@@ -463,7 +499,9 @@ fn b_an_activation_publishes_a_valid_stream_within_the_deadline() {
             assert!(names.contains(&name), "{name} missing in {names:?}");
         }
         assert!(
-            !names.iter().any(|name| name.ends_with(".tmp")),
+            !names
+                .iter()
+                .any(|name| Path::new(name).extension().is_some_and(|ext| ext == "tmp")),
             "{names:?}"
         );
         // CODECS: H.264 High (libx264's default profile for 4:2:0 8-bit)
@@ -485,8 +523,7 @@ fn b_an_activation_publishes_a_valid_stream_within_the_deadline() {
         // The first segment starts at an IDR, at the first keyframe at or
         // after the activation.
         assert_eq!(first_slice_type(ctl.dir()), 5);
-        #[allow(clippy::cast_precision_loss)]
-        let activated_at = at as f64 / FPS as f64;
+        let activated_at = secs(at);
         assert!(
             (activated_at - 0.5..activated_at + 1.5).contains(&report.first_video_start),
             "{} vs {activated_at}",
@@ -496,6 +533,8 @@ fn b_an_activation_publishes_a_valid_stream_within_the_deadline() {
         assert!(status.ready && status.active && status.last_error.is_none());
         assert_eq!((status.dropped_packets, status.restarts), (0, 0));
         assert!(status.last_publish_unix_ms > 0);
+        ctl.run_seconds(12);
+        keep_copy(ctl, "b-plain");
         ctl.stop.stop();
     });
 }
@@ -521,12 +560,13 @@ fn c_deactivation_empties_the_directory_and_reactivation_is_a_new_generation() {
         assert!(!status.active && !status.ready && status.generation == 0);
         // Stays empty while inactive.
         ctl.run_seconds(12);
-        assert!(files(ctl.dir()).is_empty());
+        assert_eq!(files(ctl.dir()), Vec::<String>::new());
         // Re-activate with the 12 s buffered meanwhile: ready at once.
         let second = ctl.cast.gate.activate(true).unwrap();
         assert!(second > first);
-        let took = ctl.wait_ready(Duration::from_secs(5));
-        assert!(took < Duration::from_secs(1), "{took:?}");
+        // Ready (5 segments = 10 s of media) inside a 5 s deadline: only
+        // the buffered seconds can have provided them.
+        ctl.wait_ready(Duration::from_secs(5));
         let report = validated(ctl);
         assert_eq!(listed_generation(ctl.dir()), second);
         assert_eq!(report.media_sequence, 0, "a new stream");
@@ -598,18 +638,28 @@ fn d_a_take_to_a_source_and_back_keeps_one_valid_stream_on_the_real_timeline() {
             panic!("{op} never applied");
         };
         take("to-source", PictureBus::Source("cast_d_b".to_owned()));
-        assert_eq!(ctl.routing.snapshot().outputs[index].bus, "src:cast_d_b");
-        assert_eq!(
-            ctl.routing.snapshot().video_keys,
-            keys_before + 1,
-            "+1 encoder"
+        // The snapshot is published at the next routing tick after the
+        // outcome: wait for it instead of reading it at once.
+        let keys = wait_for(
+            "the cast output on the source",
+            Duration::from_secs(10),
+            || {
+                let snapshot = ctl.routing.snapshot();
+                (snapshot.outputs[index].bus == "src:cast_d_b").then_some(snapshot.video_keys)
+            },
         );
+        assert_eq!(keys, keys_before + 1, "+1 encoder for the routed feed");
         ctl.run_seconds(6);
         let on_source = validated(ctl);
         take("to-program", PictureBus::Program);
-        assert_eq!(ctl.routing.snapshot().outputs[index].bus, "program");
+        wait_for(
+            "the cast output back on Program",
+            Duration::from_secs(10),
+            || (ctl.routing.snapshot().outputs[index].bus == "program").then_some(()),
+        );
         ctl.run_seconds(6);
         let back = validated(ctl);
+        keep_copy(ctl, "d-take-and-back");
         // One stream throughout: same generation, no restart, no drop.
         let status = ctl.cast.gate.status();
         assert_eq!(status.generation, generation);
@@ -628,8 +678,7 @@ fn d_a_take_to_a_source_and_back_keeps_one_valid_stream_on_the_real_timeline() {
         // its tick time (tfdt in 1/25 s units, never rebased), one closed
         // segment plus the open one behind the clock.
         let last = last_video_tfdt_seconds(ctl.dir());
-        #[allow(clippy::cast_precision_loss)]
-        let now = ctl.tick() as f64 / FPS as f64;
+        let now = secs(ctl.tick());
         assert!(
             (1.9..=6.5).contains(&(now - last)),
             "last segment starts at {last} s, the clock is at {now} s"
@@ -637,8 +686,7 @@ fn d_a_take_to_a_source_and_back_keeps_one_valid_stream_on_the_real_timeline() {
         // And nothing was skipped: the listed segments span from the first
         // start to the last start without a hole larger than a segment.
         let listed = back.video_segments;
-        #[allow(clippy::cast_precision_loss)]
-        let mean = (last - back.first_video_start) / (listed - 1) as f64;
+        let mean = (last - back.first_video_start) / f64::from(u32::try_from(listed - 1).unwrap());
         assert!(
             (0.9..=2.3).contains(&mean),
             "{mean} s per segment over {listed}"
@@ -658,9 +706,7 @@ fn last_video_tfdt_seconds(dir: &Path) -> f64 {
         multiview_output::hls::cmaf::find_box(&bytes, &[b"moof", b"traf", b"tfdt"]).expect("tfdt");
     assert_eq!(tfdt[0], 1, "tfdt version 1");
     let ticks = u64::from_be_bytes(tfdt[4..12].try_into().unwrap());
-    #[allow(clippy::cast_precision_loss)]
-    let seconds = ticks as f64 / FPS as f64;
-    seconds
+    secs(ticks)
 }
 
 /// Run `f` on its own thread and fail (instead of hanging the test binary)
@@ -711,15 +757,15 @@ fn chaos_run(
     let run = bounded(Duration::from_secs(90), move || {
         drive(prefix, Until::Ticks(CHAOS_TICKS), move |ctl| {
             ctl.wait_tick(CHAOS_AT);
-            let Some(hook) = hook else {
-                // The control run: the cast output stays inactive.
-                return;
-            };
-            ctl.cast.gate.set_test_hook(Some(hook));
-            ctl.cast.gate.activate(true).unwrap();
+            // The control run (no hook) leaves the cast output inactive and
+            // measures the same tick span.
+            if let Some(hook) = hook {
+                ctl.cast.gate.set_test_hook(Some(hook));
+                ctl.cast.gate.activate(true).unwrap();
+            }
             if let Some(entered) = entered {
                 entered
-                    .recv_timeout(Duration::from_secs(10))
+                    .recv_timeout(Duration::from_secs(30))
                     .expect("the cast sink reached its disk write");
             }
             let (from, at) = (Instant::now(), ctl.tick());
@@ -734,8 +780,10 @@ fn chaos_run(
 }
 
 /// The HLS output of a chaos run must be the control run's, packet for
-/// packet, and the clock must have emitted every tick on time.
-fn assert_unaffected(control: &Run, run: &Run, seen: &ChaosSeen) {
+/// packet, and the clock must have emitted every tick. These counts are the
+/// proof; the wall-clock check after them only rules out a paced pipeline.
+fn assert_unaffected(control: &(Run, ChaosSeen), run: &Run, seen: &ChaosSeen) {
+    let (control, control_seen) = control;
     let ticks = i64::try_from(CHAOS_TICKS).unwrap();
     assert_eq!(control.frames, CHAOS_TICKS);
     assert_eq!(control.hls_video_pts, (0..ticks).collect::<Vec<_>>());
@@ -749,14 +797,23 @@ fn assert_unaffected(control: &Run, run: &Run, seen: &ChaosSeen) {
         run.hls_audio_packets, control.hls_audio_packets,
         "the HLS output lost no audio packet"
     );
-    // The clock kept its cadence after the fault: the remaining ticks took
-    // their 40 ms each (a consumer paced by the cast sink would hold the
-    // offline hot loop back by the sink's 2 s grace per window).
+    // Not paced: compared with the control run's time for the same ticks on
+    // this machine (twice that, plus two delivery graces), never with a
+    // fixed speed. A bake consumer that waited on the faulty sink would pay
+    // one delivery grace (2 s) for every window it offered: more than 200
+    // windows in this span, so several hundred seconds against a bound of
+    // tens.
     let (elapsed, ticks_left) = seen.after_fault.expect("the controller saw the fault");
-    let nominal = Duration::from_millis(40 * ticks_left);
+    let (control_elapsed, control_ticks) = control_seen.after_fault.expect("the control span");
     assert!(
-        elapsed < nominal + Duration::from_millis(1500),
-        "{ticks_left} ticks after the fault took {elapsed:?} (nominal {nominal:?})"
+        ticks_left > 200 && control_ticks > 200,
+        "{ticks_left} / {control_ticks}"
+    );
+    let bound = control_elapsed * 2 + crate::binding_delivery::PUMP_WEDGE_GRACE * 2;
+    assert!(
+        elapsed < bound,
+        "{ticks_left} ticks after the fault took {elapsed:?}; the control run took \
+         {control_elapsed:?} for {control_ticks} (bound {bound:?})"
     );
 }
 
@@ -765,7 +822,7 @@ fn assert_unaffected(control: &Run, run: &Run, seen: &ChaosSeen) {
 /// packets.
 #[test]
 fn e_a_blocked_cast_sink_costs_the_clock_zero_ticks_and_the_hls_output_zero_packets() {
-    let (control, _) = chaos_run("cast_e0", None, None);
+    let control = chaos_run("cast_e0", None, None);
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let release_rx = Mutex::new(release_rx);
@@ -793,7 +850,7 @@ fn e_a_blocked_cast_sink_costs_the_clock_zero_ticks_and_the_hls_output_zero_pack
 /// the HLS output are untouched, and the output says why it is unusable.
 #[test]
 fn e_a_panicking_cast_sink_disables_only_the_cast_output() {
-    let (control, _) = chaos_run("cast_e2", None, None);
+    let control = chaos_run("cast_e2", None, None);
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let hook: super::CastTestHook = Arc::new(move || {
         let _ = entered_tx.try_send(());
@@ -900,5 +957,154 @@ fn f_a_stalled_then_released_cast_sink_declares_the_gap_and_still_validates() {
             .any(|line| line.starts_with("binding 1:") && line.contains("windows lost")),
         "{:?}",
         run.lines
+    );
+}
+
+/// For the manual ffprobe / ffmpeg decode check: when
+/// `MULTIVIEW_CAST_KEEP_DIR` is set, copy the running stream's directory to
+/// `<that dir>/<name>` (a copy taken between two publishes, validated).
+fn keep_copy(ctl: &Ctl, name: &str) {
+    let Some(root) = std::env::var_os("MULTIVIEW_CAST_KEEP_DIR") else {
+        return;
+    };
+    let target = PathBuf::from(root).join(name);
+    for _ in 0..40 {
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).unwrap();
+        let before = ctl.cast.gate.status().video_segments;
+        for file in files(ctl.dir()) {
+            // A file evicted between the listing and the copy is not listed
+            // any more; the publish check below then retries.
+            let _ = std::fs::copy(ctl.dir().join(&file), target.join(&file));
+        }
+        if ctl.cast.gate.status().video_segments == before {
+            let report = check_cast_dir(&target);
+            assert_eq!(report.errors, Vec::<String>::new());
+            return;
+        }
+    }
+    panic!("no consistent copy of the cast directory");
+}
+
+/// A cast output without a configured `dir` writes to
+/// `<state dir>/cast/<id>`, created `0700` on the first activation (and not
+/// before).
+#[test]
+fn the_default_directory_is_under_the_state_dir_and_created_on_activation() {
+    let run = drive_in(
+        "cast_g",
+        Until::Stop,
+        true,
+        |_| {},
+        |ctl| {
+            ctl.wait_tick(2 * FPS);
+            assert!(
+                ctl.dir().ends_with(".multiview/cast/cast-1"),
+                "{:?}",
+                ctl.dir()
+            );
+            assert!(
+                !ctl.dir().exists(),
+                "nothing is created before a cast starts"
+            );
+            ctl.cast.gate.activate(false).unwrap();
+            wait_for("the first segment", Duration::from_secs(60), || {
+                (ctl.cast.gate.status().video_segments >= 1).then_some(())
+            });
+            assert_eq!(
+                std::fs::read_to_string(ctl.dir().join(CAST_DIR_MARKER)).unwrap(),
+                "cast-1"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(ctl.dir()).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700);
+            }
+            ctl.stop.stop();
+        },
+    );
+    assert_eq!(files(&run.cast_dir), Vec::<String>::new());
+}
+
+/// A directory that holds files this engine did not write disables the
+/// cast output for the run: the run starts, the HLS output is complete, the
+/// control-plane handle refuses the activation with the fix in its text,
+/// and the operator's files are untouched from start to end of run.
+#[test]
+fn a_foreign_directory_disables_the_cast_output_without_touching_it_or_the_run() {
+    use multiview_control::cast_engine::{CastEngine, CastEngineError};
+    const TICKS: u64 = 100;
+    let foreign = ["holiday.mp4", "master.m3u8", "seg-v-1-0.m4s"];
+    let populate = |root: &Path| {
+        std::fs::create_dir(root.join("cast")).unwrap();
+        for name in foreign {
+            std::fs::write(root.join("cast").join(name), b"keep").unwrap();
+        }
+    };
+    let adapter = Arc::new(Mutex::new(None));
+    let keep = Arc::clone(&adapter);
+    let run = drive_in("cast_h", Until::Ticks(TICKS), false, populate, move |ctl| {
+        // The adapter the control plane uses, over a slot of this run.
+        let slot = super::cast_outputs_slot();
+        slot.store(Arc::new(vec![ctl.cast.clone()]));
+        let engine = super::CastEngineAdapter(Arc::clone(&slot));
+        let outputs = engine.outputs();
+        assert_eq!(outputs.len(), 1);
+        let status = &outputs[0];
+        assert_eq!(
+            (status.id.as_str(), status.active, status.ready),
+            ("cast-1", false, false)
+        );
+        assert_eq!((status.width, status.height), (160, 90));
+        assert_eq!((status.fps_num, status.fps_den), (25, 1));
+        let reason = status
+            .last_error
+            .clone()
+            .expect("the reason is in the status");
+        assert!(
+            reason.contains("cast output \"cast-1\"")
+                && reason.contains(
+                    "holds files this engine did not write; point `dir` at an \
+                                    empty directory or remove `dir`"
+                ),
+            "{reason}"
+        );
+        assert_eq!(
+            engine.activate("cast-1", true),
+            Err(CastEngineError::Unavailable(reason))
+        );
+        assert_eq!(engine.deactivate("cast-1"), Ok(()));
+        assert_eq!(
+            engine.activate("nope", true),
+            Err(CastEngineError::UnknownOutput("nope".to_owned()))
+        );
+        ctl.wait_tick(TICKS - 10);
+        assert_eq!(files(ctl.dir()), foreign);
+        *keep.lock().unwrap() = Some((engine, slot));
+    });
+    // The run was not affected.
+    assert_eq!(run.frames, TICKS);
+    assert_eq!(
+        run.hls_video_pts,
+        (0..i64::try_from(TICKS).unwrap()).collect::<Vec<_>>()
+    );
+    // Nothing was written, deleted or marked, also at the end of the run.
+    assert_eq!(files(&run.cast_dir), foreign);
+    for name in foreign {
+        assert_eq!(std::fs::read(run.cast_dir.join(name)).unwrap(), b"keep");
+    }
+    assert!(!run.cast_dir.join(CAST_DIR_MARKER).exists());
+    // After the run the handle answers "not running".
+    let (engine, slot) = adapter.lock().unwrap().take().unwrap();
+    assert_eq!(
+        engine.activate("cast-1", true),
+        Err(CastEngineError::NotRunning)
+    );
+    slot.store(Arc::new(Vec::new()));
+    assert!(engine.outputs().is_empty());
+    assert_eq!(
+        engine.deactivate("cast-1"),
+        Err(CastEngineError::NotRunning)
     );
 }

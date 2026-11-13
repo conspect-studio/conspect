@@ -9238,7 +9238,7 @@ fn run_one_output(
             default_dir: _,
             epoch,
         } => Ok(run_cast_output(
-            id, gate, dir, epoch, &rx, params, time_base, audio,
+            &id, gate, &dir, epoch, &rx, params, time_base, audio,
         )),
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { id: _, sink, label } => {
@@ -9590,9 +9590,9 @@ where
 /// canvas: an output with its own format is encoded at that format.
 #[allow(clippy::too_many_arguments)] // Each argument is one distinct input of the sink thread.
 fn run_cast_output(
-    id: String,
+    id: &str,
     gate: Arc<crate::cast_output::CastGate>,
-    dir: PathBuf,
+    dir: &Path,
     epoch: multiview_output::SharedEpoch,
     rx: &Receiver<LeasedPacket>,
     params: &StreamCodecParameters,
@@ -9633,8 +9633,8 @@ fn run_cast_output(
         })
     });
     let setup = crate::cast_output::CastSetup {
-        id: id.clone(),
-        dir: dir.clone(),
+        id: id.to_owned(),
+        dir: dir.to_path_buf(),
         gate,
         epoch,
         video,

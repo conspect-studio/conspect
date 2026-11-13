@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(videos, (25..80).collect::<Vec<_>>());
         // The ring is empty after a take.
         assert_eq!((ring.gops(), ring.bytes(), ring.span_nanos()), (0, 0, 0));
-        assert!(ring.take().packets.is_empty());
+        assert_eq!(ring.take().packets, Vec::new());
     }
 
     #[test]

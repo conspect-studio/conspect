@@ -1731,9 +1731,10 @@ pub enum OutputBodyDoc {
         orientation: Option<OutputOrientationDoc>,
     },
     /// Cast output (ADR-0111): an HLS + CMAF fMP4 stream for a Google Cast
-    /// receiver, written only while a cast stream is active. It consumes the
-    /// run's H.264 rendition (no encoder of its own), has no public playback
-    /// URL and needs a canvas of at most 1920x1080 at 30 fps.
+    /// receiver, written only while a cast stream is active. It carries an
+    /// H.264 picture of at most 1920x1080 at 30 fps (its `format`, else the
+    /// canvas), shares another H.264 output's encode when its format, codec
+    /// and bit rate are the same, and has no public playback URL.
     Cast {
         /// Stable operator id (required): 1 to 64 characters of
         /// `[A-Za-z0-9_-]`.

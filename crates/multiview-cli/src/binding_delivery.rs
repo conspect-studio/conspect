@@ -449,7 +449,7 @@ impl BindingDelivery {
                     while let Ok(lease) = lease_rx.recv() {
                         let step = pump_lease(
                             &packet_tx,
-                            Arc::new(lease),
+                            &Arc::new(lease),
                             drop_counter.as_deref(),
                             &mut stalled,
                         );
@@ -837,7 +837,7 @@ enum PumpStep {
 /// stalled (`stalled`) later packets are dropped without waiting at all.
 fn pump_lease(
     tx: &SyncSender<LeasedPacket>,
-    permit: Arc<BatchLease>,
+    permit: &Arc<BatchLease>,
     drop_counter: Option<&AtomicU64>,
     stalled: &mut bool,
 ) -> PumpStep {
@@ -848,7 +848,7 @@ fn pump_lease(
         };
         let leased = LeasedPacket {
             packet: shared,
-            permit: Arc::clone(&permit),
+            permit: Arc::clone(permit),
         };
         let Some(counter) = drop_counter else {
             if !send_bounded_packet(tx, leased) {
