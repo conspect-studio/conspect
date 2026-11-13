@@ -3877,6 +3877,8 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "hang",
+ "http 1.4.1",
+ "moq-noq",
  "multiview-audio",
  "multiview-compositor",
  "multiview-config",
@@ -3919,6 +3921,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "url",
+ "web-transport-trait",
  "wgpu",
 ]
 

@@ -143,6 +143,22 @@ impl Client {
     ) -> Result<Self, BoxError> {
         let endpoint = noq::Endpoint::client(bind)?;
         endpoint.set_default_client_config(config);
+        Self::connect_on(&endpoint, server, server_name, timeout).await
+    }
+
+    /// [`connect`](Self::connect) on an existing client endpoint (its
+    /// default client config), so many connections share one socket.
+    ///
+    /// # Errors
+    ///
+    /// As [`connect`](Self::connect).
+    pub async fn connect_on(
+        endpoint: &noq::Endpoint,
+        server: SocketAddr,
+        server_name: &str,
+        timeout: Duration,
+    ) -> Result<Self, BoxError> {
+        let endpoint = endpoint.clone();
         let connecting = endpoint.connect(server, server_name)?;
         let conn = tokio::time::timeout(timeout, connecting).await??;
         let quic = noq_adapter::Connection::new(conn.clone())

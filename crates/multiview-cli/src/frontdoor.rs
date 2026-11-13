@@ -525,6 +525,14 @@ impl FrontDoorRun {
         lock(&self.h3.endpoint).is_some()
     }
 
+    /// The h3 endpoint's counters, while it serves (telemetry, tests).
+    #[must_use]
+    pub fn h3_counters(&self) -> Option<Arc<multiview_h3::Counters>> {
+        lock(&self.h3.endpoint)
+            .as_ref()
+            .map(|e| Arc::clone(e.counters()))
+    }
+
     /// The h3 endpoint's local address, while it serves.
     #[must_use]
     pub fn h3_local_addr(&self) -> Option<SocketAddr> {
