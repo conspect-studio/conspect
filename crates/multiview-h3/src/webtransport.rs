@@ -1023,6 +1023,17 @@ mod tests {
             negotiate(&http::HeaderMap::new(), &supported),
             Selection::NoOffer
         );
+        // RFC 9110 section 5.3: an empty field line still takes its
+        // separator, so `, "moqt-15"` / `"moqt-15", ` are malformed and the
+        // whole field is ignored.
+        assert_eq!(
+            negotiate(&headers(&["", r#""moqt-15""#]), &supported),
+            Selection::NoOffer
+        );
+        assert_eq!(
+            negotiate(&headers(&[r#""moqt-15""#, ""]), &supported),
+            Selection::NoOffer
+        );
         // Legacy name only without the standard one.
         let mut legacy = http::HeaderMap::new();
         legacy.insert(
