@@ -150,6 +150,8 @@ where
     if audio {
         pipeline.enable_program_audio();
     }
+    // #342: a document without an M/E can still ask for decodable video.
+    let keep_video = switcher || template.contains("[outputs.format]");
     if switcher {
         crate::switcher_runtime::attach_first_slice(&mut pipeline, None)
             .unwrap()
@@ -165,7 +167,7 @@ where
         .zip(&seen_audio)
         .zip(&seen_video)
         .map(|((s, a), v)| {
-            if switcher {
+            if keep_video {
                 recorder_with_video(Arc::clone(s), Arc::clone(a), Some(Arc::clone(v)))
             } else {
                 recorder(Arc::clone(s), Arc::clone(a))
@@ -880,4 +882,163 @@ fn a_take_to_clean_carries_the_pre_bake_canvas_through_the_real_pipeline() {
             assert_eq!(differing, 0, "tick {t}: no bake in this build");
         }
     }
+}
+
+/// #342: two outputs at one non-canvas format (a vertical cover of the
+/// 64x64 canvas) share ONE base encoder; its worker converts the baked
+/// Program canvas, and the encoded pictures have that size.
+const VERTICAL_CONFIG: &str = r##"
+schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr"]
+areas = ["a b"]
+[[sources]]
+id = "@_a"
+kind = "test"
+[[sources]]
+id = "@_b"
+kind = "test"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "@_a"
+[[cells]]
+id = "cell_b"
+area = "b"
+[cells.source]
+input_id = "@_b"
+[[outputs]]
+id = "out0"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/a/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 32
+height = 64
+fit = { mode = "cover", anchor = "center" }
+[[outputs]]
+id = "out1"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/@/b/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 32
+height = 64
+fit = { mode = "cover" }
+"##;
+
+fn decode_size(packets: &[multiview_ffmpeg::EncodedPacket]) -> Option<(u32, u32)> {
+    let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::MPEG2VIDEO).unwrap();
+    let mut decoder = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+        .decoder()
+        .video()
+        .unwrap();
+    let mut frame = ffmpeg_next::frame::Video::empty();
+    for p in packets {
+        decoder.send_packet(&p.to_owned_packet()).unwrap();
+        if decoder.receive_frame(&mut frame).is_ok() {
+            return Some((frame.width(), frame.height()));
+        }
+    }
+    decoder.send_eof().unwrap();
+    decoder
+        .receive_frame(&mut frame)
+        .is_ok()
+        .then(|| (frame.width(), frame.height()))
+}
+
+#[test]
+fn outputs_at_one_format_share_a_base_encoder_at_that_size() {
+    const TICKS: u64 = 30;
+    let run = drive_full(
+        VERTICAL_CONFIG,
+        false,
+        false,
+        "route_vert",
+        TICKS,
+        |_slot| {},
+    );
+    assert_eq!(run.frames, TICKS);
+    assert_eq!(
+        run.rendition_configs, 1,
+        "one encoder for one (format, settings)"
+    );
+    assert_eq!(run.final_snapshot.video_keys, 1);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    for (i, output) in run.outputs.iter().enumerate() {
+        assert_eq!(pts_of(output), all, "output {i}: one frame per tick");
+    }
+    for (i, video) in run.video.iter().enumerate() {
+        assert_eq!(
+            decode_size(video),
+            Some((32, 64)),
+            "output {i} at its format"
+        );
+    }
+}
+
+/// #342: the base rendition key is (codec, width, height, bitrate, fit):
+/// equal formats and settings share, a different format or bit rate does not,
+/// and the canvas format declared explicitly is the canvas key.
+#[test]
+fn base_rendition_keys_follow_format_and_slot_settings() {
+    let doc = VERTICAL_CONFIG.replace('@', "route_keys")
+        + r#"
+[[outputs]]
+id = "out2"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/route_keys/c/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs]]
+id = "out3"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/route_keys/d/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 64
+height = 64
+[[outputs]]
+id = "out4"
+kind = "hls"
+path = "/tmp/multiview-routing-e2e/route_keys/e/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 32
+height = 64
+fit = { mode = "cover" }
+[[outputs.slots.video]]
+bitrate_kbps = 1500
+"#;
+    let config = multiview_config::MultiviewConfig::load_from_toml(&doc).unwrap();
+    config.validate().unwrap();
+    let pipeline = Pipeline::build(&config).unwrap();
+    let (keys, configs) = pipeline.rendition_keys_for_test();
+    assert_eq!(keys[0], keys[1], "same format and settings share (P1)");
+    assert_eq!(
+        keys[2], keys[3],
+        "an explicit canvas format is the canvas key"
+    );
+    assert_ne!(keys[0], keys[2], "another format: its own encoder");
+    assert_ne!(keys[0], keys[4], "another bit rate: its own encoder");
+    assert_eq!(configs.len(), 3);
+    assert_eq!((configs[keys[0]].0, configs[keys[0]].1), (32, 64));
+    assert_eq!((configs[keys[2]].0, configs[keys[2]].1), (64, 64));
+    assert_eq!(configs[keys[2]].2, 4_000_000, "default bit rate unchanged");
+    assert_eq!(configs[keys[4]].2, 1_500_000);
 }

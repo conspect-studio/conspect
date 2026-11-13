@@ -184,6 +184,7 @@ fn router(
             max_encoders: max,
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview: false,
+            formats: Vec::new(),
         },
         aux,
         open,
@@ -407,6 +408,7 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             max_encoders: max,
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview,
+            formats: Vec::new(),
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -487,6 +489,29 @@ impl Harness {
                             generation: 1,
                             frame: canvas(),
                         })));
+                }
+                // #342: feeds at an output format (none without formats).
+                for (feed_bus, format) in self.r.feed_keys() {
+                    let Some(format) = format.filter(|_| feed_bus == bus) else {
+                        continue;
+                    };
+                    if let Some(slot) = self.r.slot_at(&bus, Some(format)) {
+                        let frame = Nv12Image::solid(
+                            format.width,
+                            format.height,
+                            16,
+                            128,
+                            128,
+                            CanvasColor::default().output_tag(),
+                        )
+                        .unwrap();
+                        slot.latest
+                            .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                                tick: t,
+                                generation: 1,
+                                frame: Arc::new(frame),
+                            })));
+                    }
                 }
             }
         }
@@ -1055,6 +1080,7 @@ fn inject(
         .unwrap();
     r.dynamic.push(DynamicKey {
         bus,
+        format: None,
         settings: 0,
         key,
         worker: Some(w),
@@ -2377,4 +2403,122 @@ fn refused_substitutions_count_toward_starvation_across_accepted_survivors() {
     );
     assert!(x.h.snapshot().outputs[1].degraded, "the output is degraded");
     drop(seen);
+}
+
+// ---- #342: routed feeds at an output format ----
+
+fn vertical_format() -> crate::routing_aux::AuxFormat {
+    crate::routing_aux::AuxFormat::new(
+        1080,
+        1920,
+        multiview_config::OutputFit::new(
+            multiview_config::OutputFitMode::Cover,
+            multiview_config::Anchor::Center,
+        ),
+    )
+}
+
+fn take_until_applied(x: &mut Harness, ops: &[&str], from: u64) -> u64 {
+    let mut applied = 0;
+    let mut now = from;
+    while now < from + OPEN_DEADLINE_TICKS && applied < ops.len() {
+        x.tick(now);
+        for o in x.outcomes.try_iter() {
+            if o.outcome == TakeResult::Applied && ops.contains(&o.operation_id.as_str()) {
+                applied += 1;
+            }
+        }
+        now += 1;
+    }
+    assert_eq!(applied, ops.len(), "every take applied");
+    now
+}
+
+#[test]
+fn two_outputs_with_the_same_format_share_one_dynamic_key_and_one_feed() {
+    let mut x = harness(2, 6, None);
+    x.r.cfg.formats = vec![Some(vertical_format()); 2];
+    for t in 0..5 {
+        x.tick(t);
+    }
+    // (Takes landing in the same tick, before the first open completes, may
+    // open twice, exactly as for canvas-format outputs; a later take shares.)
+    x.h.try_take(take("a", 0, src())).unwrap();
+    let mut now = take_until_applied(&mut x, &["a"], 5);
+    // Past the key's forced-IDR floor, so the joining take gets its IDR.
+    for _ in 0..FORCE_FLOOR_TICKS {
+        x.tick(now);
+        now += 1;
+    }
+    x.h.try_take(take("b", 1, src())).unwrap();
+    take_until_applied(&mut x, &["b"], now);
+    assert_eq!(
+        x.r.feed_keys(),
+        vec![(src(), Some(vertical_format()))],
+        "one feed per (bus, format)"
+    );
+    let keys = x.r.dynamic_keys();
+    assert_eq!(keys.len(), 1, "one dynamic key: {keys:?}");
+    assert_eq!(keys[0].1, Some(vertical_format()));
+    assert_eq!(x.d.binding_video_key(0), Some(keys[0].3));
+    assert_eq!(x.d.binding_video_key(1), Some(keys[0].3));
+    assert!(
+        x.r.slot(&src()).is_none(),
+        "no canvas-format feed is composed for formatted outputs"
+    );
+}
+
+#[test]
+fn two_outputs_with_different_formats_get_two_feeds_and_two_keys() {
+    let mut x = harness(2, 6, None);
+    x.r.cfg.formats = vec![Some(vertical_format()), None];
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("a", 0, src())).unwrap();
+    x.h.try_take(take("b", 1, src())).unwrap();
+    take_until_applied(&mut x, &["a", "b"], 5);
+    assert_eq!(
+        x.r.feed_keys(),
+        vec![(src(), None), (src(), Some(vertical_format()))],
+        "one feed per format of the same source"
+    );
+    let keys = x.r.dynamic_keys();
+    assert_eq!(
+        keys.len(),
+        2,
+        "one key per (picture, format, settings): {keys:?}"
+    );
+    assert_ne!(x.d.binding_video_key(0), x.d.binding_video_key(1));
+    let formatted = keys.iter().find(|k| k.1.is_some()).unwrap();
+    assert_eq!(x.d.binding_video_key(0), Some(formatted.3));
+}
+
+#[test]
+fn a_formatted_output_falls_back_to_its_own_base_key() {
+    let mut x = harness(2, 6, None);
+    x.r.cfg.formats = vec![Some(vertical_format()), None];
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("a", 0, src())).unwrap();
+    let now = take_until_applied(&mut x, &["a"], 5);
+    // The routed feed stops: the lag rule moves the output to its base key.
+    x.aux_publishes = false;
+    let mut fell = None;
+    for t in now..now + FALLBACK_AFTER_TICKS + 20 {
+        x.tick(t);
+        if x.outcomes
+            .try_iter()
+            .any(|o| matches!(o.outcome, TakeResult::Fallback(_)))
+        {
+            fell = Some(t);
+            break;
+        }
+    }
+    let fell = fell.expect("a held formatted feed falls back");
+    for t in fell + 1..fell + 12 {
+        x.tick(t);
+    }
+    assert_eq!(x.d.binding_video_key(0), Some(x.r.cfg.base_keys[0]));
 }

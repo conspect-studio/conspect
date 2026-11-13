@@ -406,6 +406,8 @@ pub mod tls_cli;
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_unified;
 
+/// Per-output format convert with a shared per-tick cache (#342).
+pub mod format_convert;
 /// Pure-integer NV12 cell scaler (monitor wall, routing aux canvases).
 pub mod nv12_blit;
 /// Pure-integer fit maths for per-output formats (#342).

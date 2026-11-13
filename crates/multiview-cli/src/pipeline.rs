@@ -2213,6 +2213,11 @@ pub struct Pipeline {
     encode_cfg: EncodeConfig,
     /// Distinct concrete video encoders and one key per runnable output.
     rendition_configs: Vec<EncodeConfig>,
+    /// Per rendition key: the format its worker converts the Program canvas
+    /// to (#342); `None` = the canvas (zero-copy, as before).
+    rendition_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
+    /// Per runnable output (same order as `output_video_keys`): its format.
+    output_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
     output_video_keys: Vec<usize>,
     /// Per runnable output (same order as `output_video_keys`): its muxer
     /// reads decoder configuration in band (MPEG-TS), so a routing move onto
@@ -3113,32 +3118,64 @@ impl Pipeline {
             discrete_tracks.iter().map(|t| t.input_id.clone()).collect();
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
         let mut rendition_configs = Vec::<EncodeConfig>::new();
+        // #342: per rendition key, the picture format its worker converts the
+        // Program canvas to (`None` = the canvas, the zero-copy path).
+        let mut rendition_formats = Vec::<Option<crate::routing_aux::AuxFormat>>::new();
+        let mut output_formats = Vec::with_capacity(outputs.len());
+        let aux_canvas = crate::routing_aux::AuxCanvas {
+            width: config.canvas.width,
+            height: config.canvas.height,
+            color: canvas_color.output_tag(),
+        };
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         let mut output_inband_sets = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
-            let requested = config
-                .outputs
-                .iter()
-                .find(|item| item.id() == output.id())
-                .and_then(output_codec)
+            let declared = config.outputs.iter().find(|item| item.id() == output.id());
+            // #342: video slot 0's codec (absent = the output's `codec`).
+            let requested = declared
+                .and_then(|item| item.video_slot0().and_then(|v| v.codec.as_deref()))
+                .or_else(|| declared.and_then(output_codec))
                 .unwrap_or("mpeg2video");
             let concrete = resolve_encoder(requested)?;
+            // #342: the output's picture format (absent or the canvas = today)
+            // and video slot 0's bit rate (absent = today's).
+            let format = declared
+                .and_then(|item| crate::routing_aux::AuxFormat::of_output(item, aux_canvas));
+            let (width, height) = format.map_or((cfg.width, cfg.height), |f| (f.width, f.height));
+            let bit_rate = declared
+                .and_then(|item| item.video_slot0().and_then(|v| v.bitrate_kbps))
+                .map_or(cfg.bit_rate, |kbps| {
+                    usize::try_from(kbps).unwrap_or(usize::MAX / 1000) * 1000
+                });
+            // One base encoder per distinct (codec, width, height, bitrate,
+            // fit): outputs with equal format and settings share it (P1).
             let key = if let Some(index) = rendition_configs
                 .iter()
-                .position(|cfg| cfg.codec_name == concrete.name)
-            {
+                .zip(&rendition_formats)
+                .position(|(existing, existing_format)| {
+                    existing.codec_name == concrete.name
+                        && existing.width == width
+                        && existing.height == height
+                        && existing.bit_rate == bit_rate
+                        && *existing_format == format
+                }) {
                 index
             } else {
                 let mut video_cfg = cfg.clone();
                 video_cfg.codec_name = concrete.name;
                 video_cfg.format = concrete.format;
+                video_cfg.width = width;
+                video_cfg.height = height;
+                video_cfg.bit_rate = bit_rate;
                 video_cfg.audio = None;
                 rendition_configs.push(video_cfg);
+                rendition_formats.push(format);
                 rendition_configs.len() - 1
             };
             output_video_keys.push(key);
+            output_formats.push(format);
             let ll_hls = config
                 .outputs
                 .iter()
@@ -3340,6 +3377,8 @@ impl Pipeline {
             encoder,
             encode_cfg: cfg,
             rendition_configs,
+            rendition_formats,
+            output_formats,
             output_video_keys,
             output_inband_sets,
             output_audio_tracks,
@@ -3600,17 +3639,11 @@ impl Pipeline {
             .iter()
             .map(|_| crate::output_routing::force_cell())
             .collect();
-        let configs = self.rendition_configs.clone();
-        let open: crate::output_routing::OpenFn = Box::new(move |settings| {
-            let cfg = configs
-                .get(settings)
-                .ok_or_else(|| "unknown rendition settings".to_owned())?;
-            let encoder = VideoRenditionEncoder::new(cfg).map_err(|e| e.to_string())?;
-            let live: Box<dyn crate::output_routing::LiveEncoder> =
-                Box::new(PipelineVideoWorker(encoder));
-            Ok(live)
-        });
-        let (router, handle) = crate::output_routing::OutputRouter::new(
+        let open = live_opener(
+            self.rendition_configs.clone(),
+            self.rendition_formats.clone(),
+        );
+        let (router, handle) = crate::output_routing::OutputRouter::new_with_bus(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -3619,6 +3652,7 @@ impl Pipeline {
                 max_encoders: crate::output_routing::DEFAULT_MAX_ENCODERS,
                 max_per_principal: crate::output_routing::DEFAULT_MAX_PER_PRINCIPAL,
                 has_preview,
+                formats: self.output_formats.clone(),
             },
             crate::output_routing::AuxWiring {
                 feeds,
@@ -3653,6 +3687,7 @@ impl Pipeline {
                 router: Box::new(router),
                 base_force,
                 inband_sets: self.output_inband_sets.clone(),
+                base_formats: self.rendition_formats.clone(),
             },
             aux_tx,
             preview_selection,
@@ -3989,6 +4024,18 @@ impl Pipeline {
     #[cfg(test)]
     pub(crate) fn rendition_config_count(&self) -> usize {
         self.rendition_configs.len()
+    }
+
+    /// Test view (#342): per output its base key, per key (w, h, bit rate).
+    #[cfg(test)]
+    pub(crate) fn rendition_keys_for_test(&self) -> (Vec<usize>, Vec<(u32, u32, usize)>) {
+        (
+            self.output_video_keys.clone(),
+            self.rendition_configs
+                .iter()
+                .map(|cfg| (cfg.width, cfg.height, cfg.bit_rate))
+                .collect(),
+        )
     }
 
     /// The run's output-routing handle slot (ADR-0108 slice 1): empty until a
@@ -4357,6 +4404,9 @@ impl Pipeline {
         if !live {
             if let Some(hls_key) = hls_key {
                 self.output_video_keys.insert(0, hls_key);
+                let hls_format =
+                    hls_index.and_then(|i| self.output_formats.get(i).copied().flatten());
+                self.output_formats.insert(0, hls_format);
                 // The anchor is a `program.ts` file: MPEG-TS, in band.
                 self.output_inband_sets.insert(0, true);
                 self.output_audio_tracks
@@ -7229,12 +7279,47 @@ struct ConsumerRouting {
     base_force: Vec<Arc<AtomicU64>>,
     /// Per output: [`BindingConfig::inband_parameter_changes_ok`].
     inband_sets: Vec<bool>,
+    /// Per base video key: the format its worker converts the baked Program
+    /// canvas to (#342); `None` = the canvas, the unchanged zero-copy path.
+    base_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
 const ROUTING_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// The concrete encoder owned exclusively by one bounded rendition worker.
+/// The routing opener (ADR-0108, #342): opens a live encoder for a rendition
+/// settings index. A Program/Clean key at a non-canvas format converts on its
+/// own worker; keys at one format share one convert per tick. A routed
+/// source/PVW arrives already at the format (aux feed).
+fn live_opener(
+    configs: Vec<EncodeConfig>,
+    formats: Vec<Option<crate::routing_aux::AuxFormat>>,
+) -> crate::output_routing::BusOpenFn {
+    let mut caches = crate::format_convert::ConvertCaches::default();
+    Box::new(move |settings, bus| {
+        let cfg = configs
+            .get(settings)
+            .ok_or_else(|| "unknown rendition settings".to_owned())?;
+        let encoder = VideoRenditionEncoder::new(cfg).map_err(|e| e.to_string())?;
+        let live: Box<dyn crate::output_routing::LiveEncoder> =
+            Box::new(PipelineVideoWorker(encoder));
+        let canvas_bus = matches!(
+            bus,
+            crate::routing_aux::PictureBus::Program | crate::routing_aux::PictureBus::Clean
+        );
+        match formats.get(settings).copied().flatten() {
+            Some(format) if canvas_bus => {
+                let convert = crate::format_convert::FormatConvert::new(format, caches.get(format));
+                Ok(Box::new(crate::format_convert::ConvertLive::new(
+                    convert, live,
+                )))
+            }
+            _ => Ok(live),
+        }
+    })
+}
+
 struct PipelineVideoWorker(VideoRenditionEncoder);
 
 impl VideoEncodeWorker for PipelineVideoWorker {
@@ -7698,7 +7783,10 @@ fn consumer_main<D: WindowDelivery>(
         mut router,
         base_force,
         inband_sets,
+        base_formats,
     } = routing;
+    // #342: base keys at one format share one convert per tick.
+    let mut convert_caches = crate::format_convert::ConvertCaches::default();
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
     if video_encoders.is_empty() {
@@ -7745,14 +7833,21 @@ fn consumer_main<D: WindowDelivery>(
             .get(key)
             .cloned()
             .unwrap_or_else(crate::output_routing::force_cell);
+        // A base key at a non-canvas format converts the baked canvas on its
+        // own worker thread (never here, never on the clock); the canvas
+        // format keeps the zero-copy path untouched.
+        let encode: Box<dyn VideoEncodeWorker> = match base_formats.get(key).copied().flatten() {
+            Some(format) => Box::new(crate::format_convert::ConvertWorker::new(
+                crate::format_convert::FormatConvert::new(format, convert_caches.get(format)),
+                Box::new(PipelineVideoWorker(encoder)),
+            )),
+            None => Box::new(PipelineVideoWorker(encoder)),
+        };
         let worker = RenditionWorker::spawn(
             key,
             cadence,
             base,
-            Box::new(crate::output_routing::ForceAt::with_cell(
-                Box::new(PipelineVideoWorker(encoder)),
-                force,
-            )),
+            Box::new(crate::output_routing::ForceAt::with_cell(encode, force)),
             move |event| {
                 tx.send(event).map_err(|e| PipelineError::Output {
                     kind: "video-worker",

@@ -175,8 +175,9 @@ mod tests {
     #[test]
     fn every_anchor_places_at_its_edge() {
         let expect = |a: Anchor| -> (u32, u32) {
-            let (hx, hy) = a.halves();
-            (u32::from(hx) * 656, u32::from(hy) * 0)
+            // Height is fully used (crop 608x1080): only x moves.
+            let (hx, _) = a.halves();
+            (u32::from(hx) * 656, 0)
         };
         for anchor in Anchor::ALL {
             // Cover: the crop moves along the free width (1920 - 608 = 1312).
@@ -246,8 +247,9 @@ mod tests {
         // 180 * 108 / 192 = 101.25 → 102 wide, x = (320 - 102) / 2 = 109 → 108.
         assert_eq!(crop, Rect::new(108, 0, 102, 180));
         // Cut the expected crop out as its own image, then scale it whole.
-        let (cw, ch) = (crop.w as usize, crop.h as usize);
-        let (sx, sy, sw) = (crop.x as usize, crop.y as usize, 320usize);
+        let us = |v: u32| usize::try_from(v).unwrap();
+        let (cw, ch) = (us(crop.w), us(crop.h));
+        let (sx, sy, sw) = (us(crop.x), us(crop.y), 320usize);
         let mut cy = Vec::with_capacity(cw * ch);
         for r in 0..ch {
             cy.extend_from_slice(&src.y_plane()[(sy + r) * sw + sx..(sy + r) * sw + sx + cw]);
