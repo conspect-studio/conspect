@@ -323,6 +323,9 @@ fn openapi_mirrors_accept_what_the_config_types_accept() {
                 "audio": { "mode": "program" } }),
         json!({ "kind": "aes67", "label": "PGM AES67", "multicast": "[ff3e::1]:5004",
                 "depth": "L24", "ptime_ms": 1 }),
+        json!({ "kind": "cast", "id": "cast-1" }),
+        json!({ "kind": "cast", "id": "cast-2", "codec": "h264", "dir": "/var/lib/cast/2",
+                "audio": { "mode": "program" } }),
     ];
     for doc in &outputs {
         let real: Result<multiview_config::Output, _> = serde_json::from_value(doc.clone());

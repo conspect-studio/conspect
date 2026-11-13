@@ -167,6 +167,9 @@ pub enum OutputTransport {
     Aes67,
     /// Local DRM/KMS display head (a raw scanout tap).
     Display,
+    /// Cast output: HLS + CMAF fMP4 written while a cast stream is active
+    /// (consumes, never encodes).
+    Cast,
 }
 
 impl OutputTransport {
@@ -185,6 +188,7 @@ impl OutputTransport {
             Output::WhipPush { .. } => Self::WhipPush,
             Output::Aes67 { .. } => Self::Aes67,
             Output::Display { .. } => Self::Display,
+            Output::Cast { .. } => Self::Cast,
         }
     }
 
@@ -198,9 +202,13 @@ impl OutputTransport {
     pub const fn encoded_audio_codec(self) -> Option<RenditionAudioCodec> {
         match self {
             Self::Webrtc | Self::WhipPush => Some(RenditionAudioCodec::Opus),
-            Self::RtspServer | Self::LlHls | Self::Hls | Self::Rtmp | Self::Srt | Self::Rist => {
-                Some(RenditionAudioCodec::Aac)
-            }
+            Self::RtspServer
+            | Self::LlHls
+            | Self::Hls
+            | Self::Rtmp
+            | Self::Srt
+            | Self::Rist
+            | Self::Cast => Some(RenditionAudioCodec::Aac),
             Self::Ndi | Self::Aes67 | Self::Display => None,
         }
     }
@@ -607,7 +615,8 @@ fn video_key_for_output(
         | Output::Srt { codec, .. }
         | Output::Rist { codec, .. }
         | Output::Webrtc { codec, .. }
-        | Output::WhipPush { codec, .. } => codec.as_str(),
+        | Output::WhipPush { codec, .. }
+        | Output::Cast { codec, .. } => codec.as_str(),
         Output::Ndi { .. } | Output::Aes67 { .. } | Output::Display { .. } => return Ok(None),
     };
     let codec =

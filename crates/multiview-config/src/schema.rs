@@ -2871,7 +2871,66 @@ pub enum Output {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
     },
+    /// Cast output (ADR-0111): an HLS + CMAF fMP4 stream for a Google Cast
+    /// receiver, written to a private directory **only while a cast stream is
+    /// active**.
+    ///
+    /// Fixed at start like every output and routable like an HLS output
+    /// (`[[routing.output]]` rows are accepted). It **never encodes**: it
+    /// consumes the run's H.264 rendition (invariant #7), so next to an H.264
+    /// output on Program it costs no encoder. It has no public playback URL
+    /// and is never an `/hls` mount: the control plane serves its files
+    /// through a per-stream token.
+    Cast {
+        /// Stable operator id (required): 1 to 64 characters of
+        /// `[A-Za-z0-9_-]`. It names the output on the cast API and its
+        /// default directory.
+        id: String,
+        /// The rendition to consume. H.264 only (default `"h264"`).
+        #[serde(
+            default = "default_cast_codec",
+            skip_serializing_if = "is_default_cast_codec"
+        )]
+        codec: String,
+        /// Directory the stream is written to while active. Absent ⇒
+        /// `<state dir>/cast/<id>`. Created `0700`; its media files are
+        /// removed when the stream stops.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
+        /// Operator pin for the **encode stage of the rendition this output
+        /// consumes** to a stable GPU ([`DevicePin`], ADR-0018 §2.1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gpu_pin: Option<DevicePin>,
+        /// Per-output audio selection. A cast stream carries the program
+        /// audio only: discrete tracks are rejected at validation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio: Option<OutputAudio>,
+        /// Per-output declarative metadata intent (ADR-0088). A cast stream
+        /// has no metadata carrier, so every authored field is reported as
+        /// `Dropped` by [`Output::metadata_plan`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<OutputMetadata>,
+    },
 }
+
+/// Default codec of an [`Output::Cast`]: the run's H.264 rendition.
+fn default_cast_codec() -> String {
+    "h264".to_owned()
+}
+
+/// Skip-serializing predicate for the default cast codec (`"h264"`).
+fn is_default_cast_codec(codec: &str) -> bool {
+    codec == "h264"
+}
+
+/// The largest canvas an [`Output::Cast`] accepts until per-output formats
+/// exist: width in pixels.
+pub const CAST_MAX_WIDTH: u32 = 1920;
+/// The largest canvas height an [`Output::Cast`] accepts.
+pub const CAST_MAX_HEIGHT: u32 = 1080;
+/// The highest canvas frame rate an [`Output::Cast`] accepts (frames per
+/// second).
+pub const CAST_MAX_FPS: u32 = 30;
 
 /// A display mode requested for an [`Output::Display`] head: exact pixel
 /// geometry plus the refresh as an **exact rational** `"num/den"` string
@@ -2951,6 +3010,8 @@ impl Output {
             | Output::WhipPush { id, .. }
             | Output::Aes67 { id, .. }
             | Output::Display { id, .. } => id.as_deref(),
+            // A cast output's id is required, so it is always explicit.
+            Output::Cast { id, .. } => Some(id.as_str()),
         }
     }
 
@@ -2990,7 +3051,10 @@ impl Output {
             | Output::Aes67 { gpu_pin, .. }
             // Display has no encode stage either; its pin is a scanout-device
             // hint consumed by placement (ADR-0044 §3), matched uniformly.
-            | Output::Display { gpu_pin, .. } => gpu_pin.as_ref(),
+            | Output::Display { gpu_pin, .. }
+            // A cast output never encodes either: its pin targets the encode
+            // stage of the H.264 rendition it consumes.
+            | Output::Cast { gpu_pin, .. } => gpu_pin.as_ref(),
         }
     }
 
@@ -3009,7 +3073,8 @@ impl Output {
             | Output::Webrtc { audio, .. }
             | Output::WhipPush { audio, .. }
             | Output::Aes67 { audio, .. }
-            | Output::Display { audio, .. } => audio.as_ref(),
+            | Output::Display { audio, .. }
+            | Output::Cast { audio, .. } => audio.as_ref(),
         }
     }
 
@@ -3029,7 +3094,8 @@ impl Output {
             | Output::Webrtc { audio, .. }
             | Output::WhipPush { audio, .. }
             | Output::Aes67 { audio, .. }
-            | Output::Display { audio, .. } => audio,
+            | Output::Display { audio, .. }
+            | Output::Cast { audio, .. } => audio,
         }
     }
 
@@ -3049,7 +3115,8 @@ impl Output {
             | Output::Webrtc { metadata, .. }
             | Output::WhipPush { metadata, .. }
             | Output::Aes67 { metadata, .. }
-            | Output::Display { metadata, .. } => metadata.as_ref(),
+            | Output::Display { metadata, .. }
+            | Output::Cast { metadata, .. } => metadata.as_ref(),
         }
     }
 
@@ -3069,6 +3136,9 @@ impl Output {
             | Output::WhipPush { orientation, .. }
             | Output::Aes67 { orientation, .. }
             | Output::Display { orientation, .. } => orientation.as_ref(),
+            // A cast output has no orientation field (the receiver shows the
+            // canvas as composited).
+            Output::Cast { .. } => None,
         }
     }
 
@@ -3101,7 +3171,9 @@ impl Output {
             | Output::Webrtc { .. }
             | Output::WhipPush { .. }
             | Output::Aes67 { .. }
-            | Output::Display { .. } => OrientationTagCapability::None,
+            | Output::Display { .. }
+            // A cast output has no orientation field at all.
+            | Output::Cast { .. } => OrientationTagCapability::None,
         }
     }
 
@@ -3173,8 +3245,9 @@ impl Output {
                 service_id: None,
                 description: Some("AES67 SDP i="),
             },
-            // Local display head: no container, no metadata carrier.
-            Output::Display { .. } => MetadataCapability {
+            // Local display head: no container, no metadata carrier. A cast
+            // stream's CMAF init segments and playlists carry none either.
+            Output::Display { .. } | Output::Cast { .. } => MetadataCapability {
                 title: None,
                 provider: None,
                 language: None,
@@ -3266,7 +3339,12 @@ impl Output {
             // a discrete-track route is a capability error for any of them.
             // (HDMI/DP audio is the sink's ELD-gated LPCM channel map; multiple
             // program tracks would be multiple heads/senders/sessions.)
-            Output::Ndi { .. } | Output::Aes67 { .. } | Output::Display { .. } => {
+            // A cast stream has exactly one audio rendition (the program
+            // audio), so a discrete-track selection is a capability error too.
+            Output::Ndi { .. }
+            | Output::Aes67 { .. }
+            | Output::Display { .. }
+            | Output::Cast { .. } => {
                 OutputAudioCapability::new(TrackDelivery::None, TrackCapacity::AtMost(0))
             }
             // WebRTC (WHEP serve and WHIP push): one Opus m-line per session —
@@ -3311,6 +3389,7 @@ impl Output {
             Output::Webrtc { label, .. } | Output::Aes67 { label, .. } => label.clone(),
             // A display head is addressed by its KMS connector.
             Output::Display { connector, .. } => format!("display {connector}"),
+            Output::Cast { id, .. } => format!("cast {id}"),
         }
     }
 }

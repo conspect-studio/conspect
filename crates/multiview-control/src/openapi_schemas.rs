@@ -1730,6 +1730,33 @@ pub enum OutputBodyDoc {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientationDoc>,
     },
+    /// Cast output (ADR-0111): an HLS + CMAF fMP4 stream for a Google Cast
+    /// receiver, written only while a cast stream is active. It consumes the
+    /// run's H.264 rendition (no encoder of its own), has no public playback
+    /// URL and needs a canvas of at most 1920x1080 at 30 fps.
+    Cast {
+        /// Stable operator id (required): 1 to 64 characters of
+        /// `[A-Za-z0-9_-]`.
+        id: String,
+        /// The rendition to consume; `h264` (the default) is the only value.
+        #[serde(default)]
+        codec: Option<String>,
+        /// Directory the stream is written to while active; absent means
+        /// `<state dir>/cast/<id>`.
+        #[serde(default)]
+        dir: Option<String>,
+        /// Encode-stage GPU pin of the consumed rendition.
+        #[serde(default)]
+        gpu_pin: Option<DevicePinDoc>,
+        /// Per-output audio selection (program audio only; discrete tracks
+        /// are rejected).
+        #[serde(default)]
+        audio: Option<OutputAudioDoc>,
+        /// Per-output declarative metadata intent (ADR-0088); a cast stream
+        /// carries none of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<OutputMetadataDoc>,
+    },
 }
 
 /// `OpenAPI` mirror of `multiview_config::Overlay` — the body accepted by

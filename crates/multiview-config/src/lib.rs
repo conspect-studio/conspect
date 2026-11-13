@@ -1501,6 +1501,38 @@ impl MultiviewConfig {
                 )));
             }
         }
+        self.validate_cast_canvas()
+    }
+
+    /// A cast output consumes the program rendition as it is, so the canvas
+    /// itself must fit what a Cast receiver decodes: at most 1920x1080 at
+    /// 30 fps (compared exactly on the rational frame rate).
+    fn validate_cast_canvas(&self) -> Result<(), ConfigError> {
+        let Some(id) = self.outputs.iter().find_map(|output| match output {
+            Output::Cast { id, .. } => Some(id),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        let canvas = &self.canvas;
+        let fps = canvas.fps.rational();
+        let too_fast = fps.den <= 0
+            || i128::from(fps.num) > i128::from(schema::CAST_MAX_FPS) * i128::from(fps.den);
+        if canvas.width > schema::CAST_MAX_WIDTH
+            || canvas.height > schema::CAST_MAX_HEIGHT
+            || too_fast
+        {
+            return Err(ConfigError::Validation(format!(
+                "cast output {id:?}: the canvas is {}x{} at {} fps; a cast output needs a canvas \
+                 of at most {}x{} at {} fps until per-output formats exist",
+                canvas.width,
+                canvas.height,
+                canvas.fps,
+                schema::CAST_MAX_WIDTH,
+                schema::CAST_MAX_HEIGHT,
+                schema::CAST_MAX_FPS,
+            )));
+        }
         Ok(())
     }
 
@@ -1775,6 +1807,19 @@ impl MultiviewConfig {
                 }
             }
             AudioFeed::Tracks(tracks) => {
+                // A cast stream has one audio rendition, the program audio
+                // (or the routed feed's own audio): no discrete track.
+                let is_cast = self
+                    .outputs
+                    .iter()
+                    .any(|o| matches!(o, Output::Cast { id, .. } if *id == xp.output));
+                if is_cast {
+                    return Err(ConfigError::Validation(format!(
+                        "output {:?}: a cast output carries the program audio only; discrete \
+                         audio tracks cannot be routed to it",
+                        xp.output
+                    )));
+                }
                 if tracks.is_empty() {
                     return Err(ConfigError::Validation(format!(
                         "output {:?}: an audio `tracks` feed needs at least one track",
@@ -2247,7 +2292,8 @@ impl Output {
             | Output::Srt { codec, .. }
             | Output::Rist { codec, .. }
             | Output::Webrtc { codec, .. }
-            | Output::WhipPush { codec, .. } => Some(codec),
+            | Output::WhipPush { codec, .. }
+            | Output::Cast { codec, .. } => Some(codec),
             // NDI carries a channel-map, AES67 sends raw PCM, and a display
             // head scans out raw frames — none has a (video) codec to validate.
             Output::Ndi { .. } | Output::Aes67 { .. } | Output::Display { .. } => None,
@@ -2309,7 +2355,43 @@ impl Output {
         if let Some(orientation) = self.orientation() {
             orientation.validate(&self.label(), self.orientation_tag_capability())?;
         }
+        self.validate_cast_rules()?;
         self.validate_webrtc_rules()
+    }
+
+    /// The cast-kind-specific per-item rules (ADR-0111): the id is 1 to 64
+    /// characters of `[A-Za-z0-9_-]` (it names a directory and an API
+    /// resource), the codec is an H.264 token (the output consumes the run's
+    /// H.264 rendition, it never encodes), and an authored `dir` is not
+    /// empty. The canvas limit is a document-level rule
+    /// ([`MultiviewConfig::validate`]).
+    fn validate_cast_rules(&self) -> Result<(), ConfigError> {
+        let Output::Cast { id, codec, dir, .. } = self else {
+            return Ok(());
+        };
+        let id_ok = (1..=64).contains(&id.len())
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !id_ok {
+            return Err(ConfigError::Validation(format!(
+                "cast output id {id:?} must be 1 to 64 characters of letters, digits, '_' or '-'"
+            )));
+        }
+        if rendition::RenditionVideoCodec::parse(codec)
+            != Some(rendition::RenditionVideoCodec::H264)
+        {
+            return Err(ConfigError::Validation(format!(
+                "cast output {id:?}: codec {codec:?} is not supported: a cast output needs \"h264\""
+            )));
+        }
+        if matches!(dir.as_deref(), Some("")) {
+            return Err(ConfigError::Validation(format!(
+                "cast output {id:?}: dir, when set, must be non-empty (omit `dir` for the \
+                 default <state dir>/cast/{id})"
+            )));
+        }
+        Ok(())
     }
 
     /// The WebRTC-kind-specific rules (ADR-0049): `codec = "h264"` is the only
@@ -2350,7 +2432,8 @@ impl Output {
             | Output::Srt { .. }
             | Output::Rist { .. }
             | Output::Aes67 { .. }
-            | Output::Display { .. } => Ok(()),
+            | Output::Display { .. }
+            | Output::Cast { .. } => Ok(()),
         }
     }
 
