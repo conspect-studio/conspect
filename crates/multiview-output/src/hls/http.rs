@@ -458,9 +458,9 @@ pub async fn serve_file(
     method: Method,
     request_headers: HeaderMap,
 ) -> Response {
-    let root = match tokio::task::spawn_blocking(move || std::fs::canonicalize(&dir)).await {
-        Ok(Ok(root)) => root,
-        _ => return StatusCode::NOT_FOUND.into_response(),
+    let Ok(Ok(root)) = tokio::task::spawn_blocking(move || std::fs::canonicalize(&dir)).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
     };
     serve_in_root(Arc::new(root), relative, method, request_headers).await
 }

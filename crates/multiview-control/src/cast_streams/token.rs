@@ -86,13 +86,14 @@ impl std::fmt::Debug for Seed {
 #[must_use]
 pub fn derive(pepper: &Pepper, seed: &Seed) -> String {
     use hmac::{KeyInit, Mac};
-    let mac = <hmac::Hmac<Sha256> as KeyInit>::new_from_slice(&pepper.0)
-        .map(|mut mac| {
+    // HMAC accepts any key length; the fallback is unreachable (never panic).
+    let mac = <hmac::Hmac<Sha256> as KeyInit>::new_from_slice(&pepper.0).map_or_else(
+        |_| Sha256::digest(seed.0),
+        |mut mac| {
             mac.update(&seed.0);
             mac.finalize().into_bytes()
-        })
-        // HMAC accepts any key length; unreachable, but never panic.
-        .unwrap_or_else(|_| Sha256::digest(seed.0));
+        },
+    );
     URL_SAFE_NO_PAD.encode(mac)
 }
 

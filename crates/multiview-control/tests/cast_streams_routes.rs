@@ -238,9 +238,10 @@ impl OutputRouting for FakeRouting {
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
         self.takes.lock().unwrap().push(take.clone());
         let refused = self.refuse.lock().unwrap().clone();
-        let outcome = match refused {
-            Some(r) => r,
-            None => {
+        let outcome = if let Some(r) = refused {
+            r
+        } else {
+            {
                 let bus = take.video.as_ref().unwrap().bus_name();
                 self.live
                     .lock()
@@ -276,7 +277,7 @@ struct Rig {
     routing: Arc<FakeRouting>,
     now: Arc<AtomicU64>,
     state: AppState,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl Rig {
@@ -349,7 +350,7 @@ fn rig() -> Rig {
         routing,
         now,
         state,
-        _dir: tmp,
+        dir: tmp,
     }
 }
 
@@ -418,7 +419,7 @@ async fn create_answers_a_43_char_token_path_and_serves_the_output() {
     assert_eq!(doc["ready"], true);
     assert_eq!(doc["segments"], 9);
     // Program already on air: no take, pre-rolled activation.
-    assert!(rig.routing.takes().is_empty());
+    assert_eq!(rig.routing.takes(), Vec::new());
     assert_eq!(
         *rig.cast.activations.lock().unwrap(),
         vec![("cast-1".to_owned(), true)]
@@ -794,6 +795,7 @@ async fn the_33rd_stream_is_cast_capacity() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one walk through the whole media contract
 async fn media_types_cache_cors_range_head_and_scope() {
     let rig = rig();
     let (_, a) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
@@ -891,8 +893,8 @@ async fn media_types_cache_cors_range_head_and_scope() {
     assert!(String::from_utf8(body).unwrap().contains("#cast-1"));
     // Traversal, encoded traversal, absolute paths, symlink escape: 404.
     std::os::unix::fs::symlink(
-        rig._dir.path().join("secret.m3u8"),
-        rig._dir.path().join("cast-1").join("escape.m3u8"),
+        rig.dir.path().join("secret.m3u8"),
+        rig.dir.path().join("cast-1").join("escape.m3u8"),
     )
     .unwrap();
     for path in [

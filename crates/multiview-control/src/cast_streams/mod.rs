@@ -123,6 +123,8 @@ pub struct CastStreams {
     inner: Mutex<Registry>,
     clock: Clock,
     sweeper: std::sync::atomic::AtomicBool,
+    /// The registered custom receiver app id (8 upper-case hex characters).
+    app_id: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for CastStreams {
@@ -154,11 +156,26 @@ impl CastStreams {
             inner: Mutex::new(Registry::default()),
             clock,
             sweeper: std::sync::atomic::AtomicBool::new(false),
+            app_id: Mutex::new(None),
         }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Set the registered custom receiver app id (already validated).
+    pub fn set_receiver_app_id(&self, app_id: Option<String>) {
+        *self.app_id.lock().unwrap_or_else(PoisonError::into_inner) = app_id;
+    }
+
+    /// The registered custom receiver app id, if any.
+    #[must_use]
+    pub fn receiver_app_id(&self) -> Option<String> {
+        self.app_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// `true` exactly once: the caller starts the sweep task.

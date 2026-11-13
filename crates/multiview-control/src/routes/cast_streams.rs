@@ -211,7 +211,7 @@ pub(crate) async fn get_cast_config(
         });
     }
     Ok(Json(CastConfigDoc {
-        receiver_app_id: state.cast_app_id.clone(),
+        receiver_app_id: state.cast_streams.receiver_app_id(),
         receiver_path: RECEIVER_PATH.to_owned(),
         namespace: CAST_NAMESPACE.to_owned(),
         outputs,
@@ -373,15 +373,19 @@ enum Choice {
 /// The feed choice of design §3: an output that shows the feed and has
 /// streams; else a free output (one already showing the feed first) taken
 /// to it; else `cast-capacity`.
-fn choose(state: &AppState, principal: &Principal, feed: &RoutedFeed) -> Result<Choice, Response> {
+fn choose(
+    state: &AppState,
+    principal: &Principal,
+    feed: &RoutedFeed,
+) -> Result<Choice, Box<Response>> {
     let usable: Vec<Candidate> = candidates(state, principal)
         .into_iter()
         .filter(|(s, _)| s.last_error.is_none())
         .collect();
     if usable.is_empty() {
-        return Err(unavailable(
+        return Err(Box::new(unavailable(
             "No cast output can be used: add an output with kind = \"cast\" (or check that the engine is running)",
-        ));
+        )));
     }
     let slots = state.cast_streams.slots();
     let streams_on = |config_id: &str| {
@@ -407,11 +411,11 @@ fn choose(state: &AppState, principal: &Principal, feed: &RoutedFeed) -> Result<
     if let Some(found) = usable.iter().find(|(s, _)| free(s)) {
         return Ok(Choice::Take(found.clone()));
     }
-    Err(cast_problem(
+    Err(Box::new(cast_problem(
         409,
         "cast-capacity",
         "Every cast output is in use: add a cast output or stop a cast",
-    ))
+    )))
 }
 
 /// The take-time admission of a cast take (the take route's plan gate, with
@@ -436,7 +440,6 @@ fn cast_plan_gate(
             "Preview and Clean need a switcher (M/E) in this run".to_owned(),
         )),
         Err(PlanRefusal::OutputKindUnroutable) => Some(unroutable_kind()),
-        Err(PlanRefusal::AudioUnsupported) => None,
         Err(PlanRefusal::AuxCapacity { active, max }) => Some(refusal_problem(
             409,
             "aux-capacity",
@@ -447,7 +450,7 @@ fn cast_plan_gate(
             "cast-no-encoder",
             capacity_text(principal, cost.sessions_in_use, cost.sessions_max),
         )),
-        Ok(_) => None,
+        Err(PlanRefusal::AudioUnsupported) | Ok(_) => None,
     }
 }
 
@@ -518,14 +521,13 @@ pub(crate) async fn create_cast_stream(
     if state.cast_engine.is_none() {
         return Ok(unavailable("The engine is not running a cast output"));
     }
-    let (choice, feed, layout_body) = match chosen_output {
-        Some(output) => {
-            match by_output(&state, &principal, &output, wanted.as_ref(), layout).await? {
-                Ok(found) => found,
-                Err(response) => return Ok(response),
-            }
+    let (choice, feed, layout_body) = if let Some(output) = chosen_output {
+        match by_output(&state, &principal, &output, wanted.as_ref(), layout).await? {
+            Ok(found) => found,
+            Err(response) => return Ok(response),
         }
-        None => {
+    } else {
+        {
             let feed = wanted.unwrap_or(VideoFeed::PROGRAM);
             let (routed, body) = match crate::routes::output_routing::resolve_feed(
                 &state,
@@ -542,7 +544,7 @@ pub(crate) async fn create_cast_stream(
             };
             match choose(&state, &principal, &routed) {
                 Ok(choice) => (choice, routed, body),
-                Err(response) => return Ok(response),
+                Err(response) => return Ok(*response),
             }
         }
     };
@@ -577,9 +579,10 @@ async fn by_output(
         return Ok(Err(unavailable(error.clone())));
     }
     let shows = crate::cast_streams::lifecycle::live_feed(state, &candidate.0.id);
-    let (feed, layout) = match wanted {
-        Some(feed) => (feed.clone(), layout),
-        None => {
+    let (feed, layout) = if let Some(feed) = wanted {
+        (feed.clone(), layout)
+    } else {
+        {
             let Some(current) = shows.clone() else {
                 return Ok(Err(unavailable(
                     "The cast output has not reported what it shows yet; try again",

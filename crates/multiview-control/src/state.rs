@@ -742,9 +742,6 @@ pub struct AppState {
     /// The cast stream tokens (ADR-0111, design §3): bounded, shared by
     /// every router clone of this state.
     pub cast_streams: Arc<crate::cast_streams::CastStreams>,
-    /// The custom Cast receiver app id (8 upper-case hex characters), when
-    /// one is registered (`MULTIVIEW_CAST_APP_ID` or `[control] cast_app_id`).
-    pub cast_app_id: Option<String>,
     /// Program tick lateness / repeats (ADR-0108 §10); `None` = 404.
     pub program_metrics: Option<Arc<crate::program_metrics::ProgramMetrics>>,
     /// The network front door's live counters (ADR-0107 slice 3); `None` =
@@ -1023,6 +1020,7 @@ impl AppState {
     /// Assemble an [`AppState`] from its parts, with an in-memory alarm store and
     /// the system acknowledgement clock.
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one flat field-per-line struct literal
     pub fn new(
         engine: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
         commands: CommandSender,
@@ -1088,7 +1086,6 @@ impl AppState {
             output_routing: None,
             cast_engine: None,
             cast_streams: Arc::new(crate::cast_streams::CastStreams::new()),
-            cast_app_id: None,
             program_metrics: None,
             frontdoor_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
@@ -1491,8 +1488,8 @@ impl AppState {
 
     /// Set the registered custom Cast receiver app id (already validated).
     #[must_use]
-    pub fn with_cast_app_id(mut self, app_id: Option<String>) -> Self {
-        self.cast_app_id = app_id;
+    pub fn with_cast_app_id(self, app_id: Option<String>) -> Self {
+        self.cast_streams.set_receiver_app_id(app_id);
         self
     }
 

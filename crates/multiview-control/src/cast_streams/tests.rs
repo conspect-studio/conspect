@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unchecked_time_subtraction
+)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -115,12 +120,12 @@ fn first_shared_then_linger_and_end() {
         ClaimError::Taken
     );
     streams.remove(&a.id).unwrap();
-    assert!(streams.sweep().is_empty());
+    assert_eq!(streams.sweep(), Vec::<Ended>::new());
     streams.remove(&b.id).unwrap();
     assert!(streams.lookup(&b.token).is_none(), "revoked at once");
-    assert!(streams.sweep().is_empty(), "linger starts");
+    assert_eq!(streams.sweep(), Vec::<Ended>::new(), "linger starts");
     advance(&now, LINGER - Duration::from_millis(1));
-    assert!(streams.sweep().is_empty());
+    assert_eq!(streams.sweep(), Vec::<Ended>::new());
     advance(&now, Duration::from_millis(1));
     let ended = streams.sweep();
     assert_eq!(
