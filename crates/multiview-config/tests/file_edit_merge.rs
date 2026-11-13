@@ -497,10 +497,10 @@ fn a_file_edit_of_one_item_field_keeps_api_writes_to_other_fields() {
     let accepted = doc("News", "https://b.example/x.m3u8", "fill", "net");
     let merged = merge_file_edit(&prev, &next, &accepted);
     merged.validate().unwrap();
-    let net = merged.sources.iter().find(|s| s.id == "net").unwrap();
-    assert_eq!(net.display_name.as_deref(), Some("News HD"));
+    let net_source = merged.sources.iter().find(|s| s.id == "net").unwrap();
+    assert_eq!(net_source.display_name.as_deref(), Some("News HD"));
     assert_eq!(
-        net,
+        net_source,
         &{
             let mut want = accepted
                 .sources
@@ -519,4 +519,52 @@ fn a_file_edit_of_one_item_field_keeps_api_writes_to_other_fields() {
         Some("net"),
         "the API rebind stays"
     );
+}
+
+/// Review L1 round 7: a tag-like string that is a plain field (a cell source's
+/// inline `kind`) merges per key — the API rebind survives a file edit of it —
+/// and a caption `mode` variant switch by the API drops a file edit of the old
+/// variant's field.
+#[test]
+fn tag_like_fields_merge_per_key_and_variant_switches_are_whole() {
+    let doc = |kind: &str, input: &str| {
+        parse(
+            &boot("/srv/ui-old")
+                .replace(
+                    "id = \"in_hls\"\nkind = \"bars\"",
+                    "id = \"in_hls\"\nkind = \"bars\"\n[[sources]]\nid = \"in_b\"\nkind = \"bars\"",
+                )
+                .replace(
+                    "[cells.source]\ninput_id = \"in_hls\"",
+                    &format!("[cells.source]\ninput_id = \"{input}\"\nkind = \"{kind}\""),
+                ),
+        )
+    };
+    let merged = merge_file_edit(
+        &doc("hls", "in_hls"),
+        &doc("rtmp", "in_hls"),
+        &doc("hls", "in_b"),
+    );
+    assert_eq!(
+        merged.cells[0].source.input_id.as_deref(),
+        Some("in_b"),
+        "rebind stays"
+    );
+    assert_eq!(
+        merged.cells[0].source.kind.as_deref(),
+        Some("rtmp"),
+        "file edit lands"
+    );
+
+    let cap = |captions: &str| {
+        parse(&boot("/srv/ui-old").replace(
+            "id = \"in_hls\"\nkind = \"bars\"",
+            &format!("id = \"in_hls\"\nkind = \"bars\"\ncaptions = {captions}"),
+        ))
+    };
+    let prev = cap("{ mode = \"teletext_page\", page = 801 }");
+    let next = cap("{ mode = \"teletext_page\", page = 888 }");
+    let accepted = cap("{ mode = \"track\", id = \"eng\" }");
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    assert_eq!(merged.sources[0].captions, accepted.sources[0].captions);
 }

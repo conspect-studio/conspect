@@ -18,8 +18,9 @@
 //! number-keyed arrays per item too), so an API write of one field (a
 //! catalogue URL follow, an armed automation rule, a Program cell rebind, a
 //! propagated output track, a mixer patch) survives a file edit of another
-//! field of the same item. A file that changes an item's `kind` replaces the
-//! item. When the accepted list still equals the previous file's list, the
+//! field of the same item. A file that switches an object to another enum
+//! variant (a tag key changed and the field set with it) replaces that object;
+//! for a variant flattened into an item (a timer target) that is the item. When the accepted list still equals the previous file's list, the
 //! new list is taken whole (a reorder lands). Exceptions by design: the
 //! canvas's pinned signal (width, height, cadence) is one unit, and a layout
 //! change takes the file's cells (cells name the layout's areas).
@@ -156,10 +157,11 @@ fn fields<T: PartialEq + Clone + Serialize + DeserializeOwned>(
 /// The recursive three-way merge behind [`fields`].
 ///
 /// * unchanged by the file (`prev == next`): the accepted value;
-/// * objects: an object whose tag (`kind`) the file changed is the file's
-///   whole object (a different variant); one whose tag only the accepted
-///   state changed stays accepted (the file edited a variant that is gone);
-///   otherwise per key, recursively;
+/// * objects: an object the file switched to another enum variant (a tag
+///   key — `kind`, `target`, `mode`, `by`, `slate`, `provider` — changed and
+///   the field set changed with it) is the file's whole object; one only the
+///   accepted state switched stays accepted (the file edited a variant that
+///   is gone); otherwise per key, recursively;
 /// * arrays of objects that all carry a unique `id` (or `number`): per item,
 ///   recursively, accepted order kept and file additions appended — the same
 ///   rule as the top-level id-keyed lists;
@@ -178,11 +180,11 @@ fn merge_value(
     }
     match (prev, next, accepted) {
         (Value::Object(p), Value::Object(n), Value::Object(a)) => {
-            if p.get("kind") != n.get("kind") {
+            if variant_changed(p, n) {
                 // The file changed the variant: the file's whole object.
                 return next.clone();
             }
-            if a.get("kind") != n.get("kind") {
+            if variant_changed(p, a) {
                 // The API changed the variant and the file edited the old
                 // one: those fields no longer exist; the accepted object stays.
                 return accepted.clone();
@@ -222,6 +224,30 @@ fn merge_value(
         }
         _ => next.clone(),
     }
+}
+
+/// The keys this schema uses as internal enum tags (`#[serde(tag = ...)]`).
+const TAG_KEYS: [&str; 6] = ["kind", "target", "mode", "by", "slate", "provider"];
+
+/// Whether `from -> to` switched an internally tagged enum to another variant:
+/// a tag key changed AND the object's other fields changed shape (a variant
+/// has its own field set). A key that merely carries a string named like a
+/// tag (e.g. a cell source's inline `kind`) keeps its field set, so it merges
+/// per key like any other field.
+fn variant_changed(
+    from: &serde_json::Map<String, serde_json::Value>,
+    to: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let shape = |m: &serde_json::Map<String, serde_json::Value>| -> HashSet<String> {
+        m.keys()
+            .filter(|k| !TAG_KEYS.contains(&k.as_str()))
+            .cloned()
+            .collect()
+    };
+    TAG_KEYS
+        .iter()
+        .any(|t| from.get(*t).is_some() && to.get(*t).is_some() && from.get(*t) != to.get(*t))
+        && shape(from) != shape(to)
 }
 
 /// Whether every element of `list` is an object carrying a scalar `key`, and
