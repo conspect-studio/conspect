@@ -4170,7 +4170,6 @@ dependencies = [
  "http-body-util",
  "moq-noq",
  "moq-tokio",
- "pin-project-lite",
  "rcgen",
  "rustls",
  "tokio",

@@ -36,7 +36,6 @@ http-body-util = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing = { workspace = true }
-pin-project-lite = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
