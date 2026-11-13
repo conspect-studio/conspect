@@ -1459,3 +1459,44 @@ async fn explicit_follow_replays_across_the_patch_and_the_alias() {
     assert_eq!(again["operation_id"], first["operation_id"]);
     assert_eq!(rig.fake.takes().len(), 2, "one enqueue per key");
 }
+
+/// Review T-M2: with no live readback (the engine reports no snapshot),
+/// `GET /patch` never invents Program: video slot 0 is `live: false` with a
+/// null `source` and `path`; once a readback exists it is `live: true` with
+/// the readback's feed.
+#[tokio::test]
+async fn get_without_a_readback_reports_the_live_state_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    rig.fake.state.lock().unwrap().live = None;
+    let all = body_json(send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await).await;
+    for output in all["outputs"].as_array().unwrap() {
+        let slot = &output["video"][0];
+        assert_eq!(slot["live"], false, "{all}");
+        assert!(slot["source"].is_null(), "never an invented program: {all}");
+        assert!(slot["path"].is_null(), "{all}");
+        assert!(slot["pending"].is_null(), "{all}");
+    }
+    rig.fake.state.lock().unwrap().live = Some(RoutingLive {
+        outputs: HashMap::from([(
+            OUT_A.to_owned(),
+            OutputLive {
+                bus: "src:bars".to_owned(),
+                since_tick: 1,
+                pending: None,
+                degraded: false,
+                audio: None,
+                pending_audio: None,
+                private_audio: false,
+            },
+        )]),
+        ..RoutingLive::default()
+    });
+    let all = body_json(send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await).await;
+    let a = &all["outputs"][0]["video"][0];
+    assert_eq!(a["live"], true, "{all}");
+    assert_eq!(a["source"], json!({"source": "bars"}), "{all}");
+    let b = &all["outputs"][1]["video"][0];
+    assert_eq!(b["live"], false, "an output without a readback: {all}");
+    assert!(b["source"].is_null(), "{all}");
+}

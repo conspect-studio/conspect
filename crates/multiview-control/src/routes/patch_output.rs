@@ -355,15 +355,18 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
                 .and_then(|feed| serde_json::to_value(feed).ok())
                 .unwrap_or_else(|| redacted.clone())
         };
-        let video_source = readback.map_or_else(|| feed_view("program"), |r| feed_view(&r.bus));
+        // No readback (no running engine, routing unavailable or the output
+        // not in this run): the live state is unknown and reported as such
+        // (`source`/`path` null, `live: false`), never an invented Program
+        // P1 (#342 review T-M2).
+        let video_source = readback.map_or(Value::Null, |r| feed_view(&r.bus));
         let pending = readback
             .and_then(|r| r.pending.as_ref())
             .map(|(bus, held)| json!({ "source": feed_view(bus), "held_ticks": held }));
-        let path = state
-            .output_routing
-            .as_ref()
+        let path = readback
+            .and_then(|_| state.output_routing.as_ref())
             .and_then(|c| c.routing.current_path(&body.id()))
-            .map_or("P1", crate::output_routing::PlanPath::as_str);
+            .map(crate::output_routing::PlanPath::as_str);
         // Slot 0 carries the accepted audio feed (default `follow`, redacted
         // per GET /routing's rule); slots i > 0 their configured track.
         let accepted_audio =
@@ -395,6 +398,7 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
             "format": body.format(),
             "video": [{
                 "slot": 0,
+                "live": readback.is_some(),
                 "source": video_source,
                 "path": path,
                 "pending": pending,
