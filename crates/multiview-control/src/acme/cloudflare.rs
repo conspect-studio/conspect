@@ -609,10 +609,12 @@ fn query_wire(name: &str, record_type: u16, id: u16, recursion: bool) -> Option<
 }
 
 /// Whether a DNS answer (wire format) carries a TXT record whose
-/// concatenated character-strings equal `value` byte for byte.
+/// concatenated character-strings equal `value` byte for byte (owner
+/// unchecked; the classifier's own tests).
 #[cfg(test)]
 fn txt_answer_matches(wire: &[u8], value: &str) -> bool {
-    classify_doh_answer(wire, value) == DohOutcome::Seen
+    use hickory_resolver::proto::op::Message;
+    Message::from_vec(wire).is_ok_and(|m| classify_doh_answer(&m, None, value) == DohOutcome::Seen)
 }
 
 /// The result of one `DoH` poll. Every variant but [`Self::Seen`] is a
@@ -670,23 +672,16 @@ impl std::fmt::Display for DohOutcome {
 
 impl DohOutcome {
     /// A short stable class for log de-duplication (same class = same line).
-    fn class(&self) -> (u8, u16) {
+    fn class(&self) -> (u8, u16, &'static str) {
         match self {
-            Self::Seen => (0, 0),
-            Self::BadName => (1, 0),
-            Self::Egress(f) => (
-                2,
-                match f.error {
-                    super::egress::EgressError::Refused => 0,
-                    super::egress::EgressError::Transport => 1,
-                    super::egress::EgressError::TooLarge => 2,
-                },
-            ),
-            Self::Status(code) => (3, *code),
-            Self::Unparsable => (4, 0),
-            Self::Mismatched => (5, 0),
-            Self::NotSeen { rcode, .. } => (6, *rcode),
-            Self::Deadline => (7, 0),
+            Self::Seen => (0, 0, ""),
+            Self::BadName => (1, 0, ""),
+            Self::Egress(f) => (2, 0, f.reason),
+            Self::Status(code) => (3, *code, ""),
+            Self::Unparsable => (4, 0, ""),
+            Self::Mismatched => (5, 0, ""),
+            Self::NotSeen { rcode, .. } => (6, *rcode, ""),
+            Self::Deadline => (7, 0, ""),
         }
     }
 }
@@ -839,26 +834,33 @@ fn classify_doh_answer_for(wire: &[u8], fqdn: &str, value: &str) -> DohOutcome {
     {
         return DohOutcome::Mismatched;
     }
-    classify_doh_answer(wire, value)
+    classify_doh_answer(&message, expected.as_ref(), value)
 }
 
-/// Classify the answer section of a DNS message against `value`.
-fn classify_doh_answer(wire: &[u8], value: &str) -> DohOutcome {
-    use hickory_resolver::proto::op::Message;
-    use hickory_resolver::proto::rr::RData;
-    let Ok(message) = Message::from_vec(wire) else {
-        return DohOutcome::Unparsable;
-    };
+/// Classify the answer section of a DNS message against `value`. With
+/// `owner`, only an IN TXT record owned by exactly that name (case-insensitive)
+/// counts; a TXT at any other owner is counted but never "seen".
+fn classify_doh_answer(
+    message: &hickory_resolver::proto::op::Message,
+    owner: Option<&hickory_resolver::proto::rr::Name>,
+    value: &str,
+) -> DohOutcome {
+    use hickory_resolver::proto::rr::{DNSClass, RData};
     let mut txt = 0;
     for record in &message.answers {
         if let RData::TXT(data) = &record.data {
             txt += 1;
-            if data
-                .txt_data
-                .iter()
-                .flat_map(|part| part.iter())
-                .copied()
-                .eq(value.bytes())
+            let at_owner = owner.is_none_or(|expected| {
+                record.dns_class == DNSClass::IN
+                    && expected.to_lowercase() == record.name.to_lowercase()
+            });
+            if at_owner
+                && data
+                    .txt_data
+                    .iter()
+                    .flat_map(|part| part.iter())
+                    .copied()
+                    .eq(value.bytes())
             {
                 return DohOutcome::Seen;
             }
@@ -1209,6 +1211,39 @@ mod tests {
         assert_eq!(
             classify_doh_answer_for(b"junk", fqdn, "v"),
             DohOutcome::Unparsable
+        );
+    }
+
+    #[test]
+    fn a_doh_txt_counts_only_at_the_queried_owner() {
+        use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_resolver::proto::rr::rdata::TXT;
+        use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
+        let fqdn = "_acme-challenge.a.example.org";
+        let reply = |owner: &str| {
+            let mut m = Message::new(0, MessageType::Response, OpCode::Query);
+            m.add_query(Query::query(
+                Name::from_ascii(format!("{fqdn}.")).unwrap(),
+                RecordType::TXT,
+            ));
+            m.add_answer(Record::from_rdata(
+                Name::from_ascii(owner).unwrap(),
+                60,
+                RData::TXT(TXT::new(vec!["the-value".into()])),
+            ));
+            m.to_vec().unwrap()
+        };
+        assert_eq!(
+            classify_doh_answer_for(&reply("_ACME-Challenge.a.example.org."), fqdn, "the-value"),
+            DohOutcome::Seen
+        );
+        assert_eq!(
+            classify_doh_answer_for(&reply("elsewhere.example.org."), fqdn, "the-value"),
+            DohOutcome::NotSeen {
+                rcode: 0,
+                answers: 1,
+                txt: 1
+            }
         );
     }
 
