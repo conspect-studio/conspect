@@ -37,7 +37,29 @@ impl SourceRef {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A numbered mixer-input reference `in:<n>` (ADR-0110 §12.2). Only
+    /// meaningful on an M/E that declares inputs; the config layer refuses
+    /// source ids starting with `in:` there, so the spelling is unambiguous.
+    #[must_use]
+    pub fn input(number: u16) -> Self {
+        Self(format!("{INPUT_PREFIX}{number}"))
+    }
+
+    /// The input number if this is an `in:<n>` reference. Allocation-free
+    /// (a prefix strip and an integer parse), so it is safe on the clock.
+    #[must_use]
+    pub fn as_input(&self) -> Option<u16> {
+        let digits = self.0.strip_prefix(INPUT_PREFIX)?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    }
 }
+
+/// Prefix of a mixer-input [`SourceRef`] (`in:<n>`).
+pub const INPUT_PREFIX: &str = "in:";
 
 /// An integer-pixel rectangle in the key's destination space (ADR-0056 §3).
 ///
