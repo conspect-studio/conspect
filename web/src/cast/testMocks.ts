@@ -47,9 +47,15 @@ export interface MockCastSdk {
   readonly context: CastContext;
   readonly session: CastSession;
   readonly mediaSession: ChromeCastMedia;
-  /** Simulate the SDK firing SESSION_STATE_CHANGED with SESSION_ENDED. */
+  /**
+   * Simulate SESSION_STATE_CHANGED → SESSION_ENDED exactly as CAF builds it:
+   * `errorCode` is `null` on a clean end, a code string on a failure.
+   */
   emitSessionEnded: (errorCode?: string) => void;
-  /** Simulate the media session's update listener firing (e.g. after IDLE/FINISHED). */
+  /**
+   * Simulate a media status update as CAF delivers it: the properties change,
+   * then the listener is called with `isAlive` (false for every IDLE state).
+   */
   emitMediaUpdate: (status: { playerState: string; idleReason?: string }) => void;
   readonly requestSession: Mock<() => Promise<void>>;
   readonly loadMedia: Mock<(request: unknown) => Promise<void>>;
@@ -82,7 +88,13 @@ export function installMockCastSdk(options: { deviceName?: string } = {}): MockC
   const device: CastDevice = { friendlyName: deviceName };
 
   const loadMedia = vi.fn(() => Promise.resolve());
-  const endSession = vi.fn();
+  // Real CAF: endSession(true) stops the receiver, then the context fires
+  // SESSION_ENDED with errorCode null.
+  const endSession = vi.fn((stopCasting: boolean) => {
+    void stopCasting;
+    hasSession = false;
+    sessionStateHandler?.({ sessionState: 'SESSION_ENDED', errorCode: null });
+  });
 
   const session: CastSession = {
     sessionId: 'mock-session-1',
@@ -160,14 +172,14 @@ export function installMockCastSdk(options: { deviceName?: string } = {}): MockC
     emitSessionEnded: (errorCode?: string): void => {
       sessionStateHandler?.({
         sessionState: 'SESSION_ENDED',
-        ...(errorCode !== undefined ? { errorCode } : {}),
+        errorCode: errorCode ?? null,
       });
     },
     emitMediaUpdate: (status): void => {
       const mutable = mediaSession as { playerState?: string; idleReason?: string | null };
       mutable.playerState = status.playerState;
       mutable.idleReason = status.idleReason ?? null;
-      mediaUpdateListener?.();
+      mediaUpdateListener?.(status.playerState !== 'IDLE');
     },
     requestSession,
     loadMedia,

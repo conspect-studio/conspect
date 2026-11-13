@@ -77,7 +77,8 @@ export type CastSessionState =
 
 export interface CastSessionStateEventData {
   readonly sessionState: CastSessionState;
-  readonly errorCode?: CastErrorCode;
+  /** CAF sets this to `null` on a clean end; a code string on a failure. */
+  readonly errorCode?: CastErrorCode | null;
 }
 
 export interface CastContext {

@@ -106,6 +106,10 @@ export class CastController {
   private mediaSession: ChromeCastMedia | null = null;
   private mediaListener: ((isAlive?: boolean) => void) | null = null;
   private sessionStateHandler: ((event: CastSessionStateEventData) => void) | null = null;
+  /** Bumped by every start/stop: a stale async step never overwrites newer state. */
+  private generation = 0;
+  /** Set while our own `stop()` ends the session, so its SESSION_ENDED is ours. */
+  private stopping = false;
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -123,11 +127,22 @@ export class CastController {
     });
   }
 
+  /** Whether a connect or load is in flight (a new start is ignored then). */
+  get busy(): boolean {
+    return this.snapshot.status === 'connecting' || this.snapshot.status === 'loading' || this.stopping;
+  }
+
   /**
    * Start casting `target`'s HLS playlist. If already playing, replaces the
    * loaded media in the same Cast session rather than opening a second one.
+   * Ignored while another connect/load/stop is in flight.
    */
   async start(target: CastTarget): Promise<void> {
+    if (this.busy) {
+      return;
+    }
+    const generation = ++this.generation;
+    const current = (): boolean => generation === this.generation;
     const replacing = this.snapshot.status === 'playing' && this.session !== null;
     this.emit({
       status: replacing ? 'loading' : 'connecting',
@@ -145,8 +160,9 @@ export class CastController {
             await context.requestSession();
           } catch (error) {
             if (isUserCancellation(error)) {
-              this.detachSessionListeners();
-              this.emit(IDLE_SNAPSHOT);
+              if (current()) {
+                this.emit(IDLE_SNAPSHOT);
+              }
               return;
             }
             throw error;
@@ -155,6 +171,9 @@ export class CastController {
         }
         if (session === null) {
           throw new Error('No Cast session is available after requestSession.');
+        }
+        if (!current()) {
+          return;
         }
         this.session = session;
         this.attachSessionListeners(context, session);
@@ -166,12 +185,17 @@ export class CastController {
       }
       this.emit({ status: 'loading' });
       await this.loadMedia(activeSession, target);
-
+      if (!current()) {
+        return;
+      }
       this.emit({
         status: 'playing',
         deviceName: activeSession.getCastDevice?.()?.friendlyName ?? null,
       });
     } catch (error) {
+      if (!current()) {
+        return;
+      }
       if (!replacing) {
         this.detachSessionListeners();
         this.session = null;
@@ -180,32 +204,51 @@ export class CastController {
     }
   }
 
-  /** Operator-initiated stop: ends the Cast session. */
+  /** Operator-initiated stop: ends the Cast session (the TV stops too). */
   async stop(): Promise<void> {
-    const session = this.session;
-    const mediaSession = this.mediaSession;
-    if (mediaSession !== null) {
-      await new Promise<void>((resolve) => {
-        mediaSession.stop(
-          {},
-          () => {
-            resolve();
-          },
-          () => {
-            resolve();
-          },
-        );
-      });
-    }
-    session?.endSession(true);
-    this.detachSessionListeners();
-    this.session = null;
-    this.emit(IDLE_SNAPSHOT);
+    await this.end(null);
   }
 
-  /** Release resources on provider teardown (test/HMR hygiene); never calls the network. */
+  /** End the session; afterwards show `errorText`, or idle when `null`. */
+  private async end(errorText: string | null): Promise<void> {
+    this.generation += 1;
+    const session = this.session;
+    const mediaSession = this.mediaSession;
+    this.stopping = true;
+    this.detachMediaListener();
+    try {
+      if (mediaSession !== null) {
+        await new Promise<void>((resolve) => {
+          mediaSession.stop(
+            {},
+            () => {
+              resolve();
+            },
+            () => {
+              resolve();
+            },
+          );
+        });
+      }
+      session?.endSession(true);
+    } finally {
+      this.detachSessionListeners();
+      this.session = null;
+      this.stopping = false;
+    }
+    this.emit(errorText === null ? IDLE_SNAPSHOT : { ...IDLE_SNAPSHOT, status: 'error', errorText });
+  }
+
+  /**
+   * Provider teardown (the whole app unmounts): end the cast rather than
+   * leaving the TV playing with no owner in this tab.
+   */
   dispose(): void {
-    this.detachSessionListeners();
+    if (this.session !== null) {
+      void this.stop();
+    } else {
+      this.detachSessionListeners();
+    }
   }
 
   private async loadMedia(session: CastSession, target: CastTarget): Promise<void> {
@@ -223,44 +266,53 @@ export class CastController {
     metadata.title = target.name;
     media.metadata = metadata;
     const request = new chromeCast.media.LoadRequest(media);
+    // A replacing LOAD makes the old media report IDLE/INTERRUPTED; detach
+    // its listener first so that is never read as "the cast ended".
+    this.detachMediaListener();
+    // CAF resolves on success and rejects with a chrome.cast.ErrorCode string.
     await session.loadMedia(request);
-    this.attachMediaListeners(session);
+    this.attachMediaListener(session);
   }
 
-  private attachMediaListeners(session: CastSession): void {
-    const previous = this.mediaSession;
-    if (previous !== null && this.mediaListener !== null) {
-      previous.removeUpdateListener(this.mediaListener);
-    }
+  private attachMediaListener(session: CastSession): void {
+    this.detachMediaListener();
     const mediaSession = session.getMediaSession();
     this.mediaSession = mediaSession;
     if (mediaSession === null) {
-      this.mediaListener = null;
       return;
     }
-    const listener = (isAlive?: boolean): void => {
-      // `chrome.cast.media.Media` carries its state as properties; the update
-      // listener receives `isAlive` (false once the media session is gone).
-      const { playerState, idleReason } = mediaSession;
-      if (playerState === 'IDLE' && idleReason === 'ERROR') {
-        void this.stop().then(() => {
-          this.emit({
-            status: 'error',
-            errorText: describeCastError('media_error'),
-          });
-        });
-      } else if ((playerState === 'IDLE' && idleReason === 'FINISHED') || isAlive === false) {
-        void this.stop();
+    // CAF calls this as listener(isAlive), with isAlive false for EVERY idle
+    // state; only the idle reason says why. CANCELLED/INTERRUPTED (a stop or
+    // a replacing load from any sender) are not failures of this cast, so
+    // only ERROR and FINISHED end it here; a session that really ends is
+    // reported by SESSION_ENDED.
+    const listener = (): void => {
+      if (mediaSession.playerState !== 'IDLE') {
+        return;
+      }
+      if (mediaSession.idleReason === 'ERROR') {
+        void this.end(describeCastError('media_error'));
+      } else if (mediaSession.idleReason === 'FINISHED') {
+        void this.end(null);
       }
     };
     this.mediaListener = listener;
     mediaSession.addUpdateListener(listener);
   }
 
+  private detachMediaListener(): void {
+    if (this.mediaSession !== null && this.mediaListener !== null) {
+      this.mediaSession.removeUpdateListener(this.mediaListener);
+    }
+    this.mediaSession = null;
+    this.mediaListener = null;
+  }
+
   private attachSessionListeners(
     context: { addEventListener: (eventType: string, handler: (event: CastSessionStateEventData) => void) => void },
     session: CastSession,
   ): void {
+    this.detachSessionListeners();
     const eventType = window.cast?.framework.CastContextEventType.SESSION_STATE_CHANGED;
     if (eventType === undefined) {
       return;
@@ -276,11 +328,7 @@ export class CastController {
   }
 
   private detachSessionListeners(): void {
-    if (this.mediaSession !== null && this.mediaListener !== null) {
-      this.mediaSession.removeUpdateListener(this.mediaListener);
-    }
-    this.mediaSession = null;
-    this.mediaListener = null;
+    this.detachMediaListener();
     const eventType = window.cast?.framework.CastContextEventType.SESSION_STATE_CHANGED;
     if (eventType !== undefined && this.sessionStateHandler !== null) {
       // The session object owns no removeEventListener; the CastContext does.
@@ -289,13 +337,17 @@ export class CastController {
     this.sessionStateHandler = null;
   }
 
-  private handleSessionEnded(errorCode: string | undefined): void {
+  private handleSessionEnded(errorCode: string | null | undefined): void {
+    // Our own stop() provoked this event: it already decides the end state.
+    if (this.stopping) {
+      return;
+    }
+    this.generation += 1;
+    this.detachSessionListeners();
     this.session = null;
-    this.mediaSession = null;
-    this.mediaListener = null;
-    this.sessionStateHandler = null;
-    if (errorCode !== undefined && errorCode !== '') {
-      this.emit({ status: 'error', errorText: describeCastError({ code: errorCode }) });
+    // CAF sets errorCode to null on a clean end (TV stopped, other sender).
+    if (typeof errorCode === 'string' && errorCode !== '') {
+      this.emit({ ...IDLE_SNAPSHOT, status: 'error', errorText: describeCastError(errorCode) });
     } else {
       this.emit(IDLE_SNAPSHOT);
     }

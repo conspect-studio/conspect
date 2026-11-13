@@ -147,6 +147,71 @@ describe('CastController', () => {
     expect(sdk.endSession).toHaveBeenCalledWith(true);
   });
 
+  it('keeps casting through IDLE/INTERRUPTED and IDLE/CANCELLED (a replacing load), with isAlive=false', async () => {
+    const controller = new CastController();
+    await controller.start(TARGET);
+
+    sdk.emitMediaUpdate({ playerState: 'IDLE', idleReason: 'INTERRUPTED' });
+    sdk.emitMediaUpdate({ playerState: 'IDLE', idleReason: 'CANCELLED' });
+    sdk.emitMediaUpdate({ playerState: 'BUFFERING' });
+    await Promise.resolve();
+
+    expect(controller.getSnapshot().status).toBe('playing');
+    expect(sdk.endSession).not.toHaveBeenCalled();
+  });
+
+  it('stop ends in idle, not an error, although CAF reports the end with errorCode null', async () => {
+    const controller = new CastController();
+    await controller.start(TARGET);
+    await controller.stop();
+    // The mock's endSession fires SESSION_ENDED { errorCode: null } like CAF.
+    expect(controller.getSnapshot().status).toBe('idle');
+    expect(controller.getSnapshot().errorText).toBeNull();
+  });
+
+  it('ignores a second start while the first is connecting, and the first wins', async () => {
+    let release: () => void = () => undefined;
+    sdk.requestSession.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = (): void => {
+            sdk.context.getCurrentSession = (): typeof sdk.session => sdk.session;
+            resolve();
+          };
+        }),
+    );
+    const controller = new CastController();
+    const first = controller.start(TARGET);
+    await vi.waitFor(() => {
+      expect(sdk.requestSession).toHaveBeenCalledTimes(1);
+    });
+    await controller.start({ key: 'output:other', name: 'Other', path: '/hls/other/x.m3u8' });
+    expect(sdk.requestSession).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+    expect(controller.getSnapshot().status).toBe('playing');
+    expect(controller.getSnapshot().targetKey).toBe(TARGET.key);
+    expect(sdk.loadMedia).toHaveBeenCalledTimes(1);
+  });
+
+  it('removes its context listener when the TV ends the session', async () => {
+    const controller = new CastController();
+    await controller.start(TARGET);
+    const removeSpy = vi.spyOn(sdk.context, 'removeEventListener');
+    sdk.emitSessionEnded();
+    expect(removeSpy).toHaveBeenCalledTimes(1);
+    expect(controller.getSnapshot().status).toBe('idle');
+  });
+
+  it('dispose ends an active cast instead of leaving the TV without an owner', async () => {
+    const controller = new CastController();
+    await controller.start(TARGET);
+    controller.dispose();
+    await vi.waitFor(() => {
+      expect(sdk.endSession).toHaveBeenCalledWith(true);
+    });
+  });
+
   it('replaces the loaded media in the same session when starting a different target while playing', async () => {
     const controller = new CastController();
     await controller.start(TARGET);
