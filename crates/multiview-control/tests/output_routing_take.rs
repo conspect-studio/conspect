@@ -1484,6 +1484,116 @@ async fn an_applied_boot_take_never_rewrites_the_accepted_row() {
     );
 }
 
+/// ADR-0111: a take issued by the cast API (`cast:<id>`) is NEVER persisted,
+/// exactly like a boot take: a cast output shows a feed only while its cast
+/// stream lives, so the take may neither write nor delete a
+/// `[[routing.output]]` row. An operator's take on the same output persists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_applied_cast_take_is_never_persisted() {
+    use multiview_control::output_routing::{
+        is_boot_take, is_cast_take, persists_when_applied, CAST_TAKE_PREFIX,
+    };
+    assert_eq!(CAST_TAKE_PREFIX, "cast:");
+    assert!(is_cast_take("cast:0193b6c2") && !is_boot_take("cast:0193b6c2"));
+    assert!(!is_cast_take("boot:3") && !is_cast_take("0193b6c2") && !is_cast_take("xcast:1"));
+    assert!(!persists_when_applied("cast:0193b6c2") && !persists_when_applied("boot:3"));
+    assert!(persists_when_applied("0193b6c2"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    let mut events = SessionStream::new(rig.engine.subscribe(), "s", None);
+    // Send applied cast outcomes and wait until the relay has handled them
+    // (it handles outcomes in order and still publishes each one: only the
+    // persistence is skipped).
+    let mut relay_cast = async |ops: &[(&str, RoutedFeed)]| {
+        for (op, feed) in ops {
+            rig.fake
+                .tx
+                .send(OutputOutcome {
+                    operation_id: (*op).to_owned(),
+                    output: OUT_B_CONFIG_ID.to_owned(),
+                    tick: 90,
+                    outcome: "applied".to_owned(),
+                    feed: Some(feed.clone()),
+                    audio: None,
+                })
+                .unwrap();
+        }
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seen.len() < ops.len() {
+                if let Some(frame) = events.next_delta().await.unwrap() {
+                    if let Event::RouteOutput(e) = &frame.envelope.payload {
+                        if is_cast_take(&e.operation_id) {
+                            assert_eq!(e.outcome, "applied");
+                            seen.push(e.operation_id.clone());
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let expected: Vec<&str> = ops.iter().map(|(op, _)| *op).collect();
+        assert_eq!(seen, expected);
+    };
+
+    // 1. No row yet: a cast take to a source creates none.
+    relay_cast(&[("cast:move", RoutedFeed::Source("bars".into()))]).await;
+    assert_eq!(persisted_feed(&rig.state, OUT_B_CONFIG_ID), None);
+
+    // 2. An operator's take on the same output persists.
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "n1",
+            "output-1",
+            serde_json::json!({"source": "bars"}),
+        ),
+    )
+    .await;
+    let op = body_json(resp).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(persists_when_applied(&op));
+    rig.fake.emit_with_feed(
+        &op,
+        OUT_B_CONFIG_ID,
+        "applied",
+        RoutedFeed::Source("bars".into()),
+    );
+    wait_for(|| persisted_feed(&rig.state, OUT_B_CONFIG_ID).is_some()).await;
+    let accepted = || {
+        rig.state
+            .boot_model
+            .as_ref()
+            .unwrap()
+            .accepted()
+            .unwrap()
+            .unwrap()
+    };
+    let before = accepted();
+
+    // 3. Cast takes that would DELETE the operator's row (Program) or
+    // rewrite it (another source) leave the accepted store untouched.
+    relay_cast(&[
+        ("cast:back", RoutedFeed::Program),
+        ("cast:other", RoutedFeed::Source("a".into())),
+    ])
+    .await;
+    assert!(
+        Arc::ptr_eq(&before, &accepted()),
+        "nothing was committed to the accepted store"
+    );
+    assert_eq!(
+        persisted_feed(&rig.state, OUT_B_CONFIG_ID),
+        Some(serde_json::json!({"source": "bars"}))
+    );
+}
+
 /// PR #352 review (HIGH, abuse): `video` (the live bus) and
 /// `configured_video` (the persisted feed) are redacted each by its own rule
 /// over HTTP: a key that may read the output and the Program bus but not the

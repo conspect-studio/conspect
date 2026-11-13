@@ -736,6 +736,9 @@ pub struct AppState {
     /// Output feed routing (ADR-0108 slice 1); `None` until the binary installs
     /// the engine seam (routes answer 409 `routing-unavailable`).
     pub output_routing: Option<Arc<crate::output_routing::OutputRoutingControl>>,
+    /// The running engine's cast outputs (ADR-0111); `None` until the binary
+    /// installs the engine seam (no cast output can be used).
+    pub cast_engine: Option<crate::cast_engine::SharedCastEngine>,
     /// Program tick lateness / repeats (ADR-0108 §10); `None` = 404.
     pub program_metrics: Option<Arc<crate::program_metrics::ProgramMetrics>>,
     /// The network front door's live counters (ADR-0107 slice 3); `None` =
@@ -1071,6 +1074,7 @@ impl AppState {
             idempotency: Arc::new(IdempotencyStore::new()),
             switcher: None,
             output_routing: None,
+            cast_engine: None,
             program_metrics: None,
             frontdoor_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
@@ -1460,6 +1464,13 @@ impl AppState {
         self.output_routing = Some(Arc::new(crate::output_routing::OutputRoutingControl::new(
             routing,
         )));
+        self
+    }
+
+    /// Install the engine seam of the cast outputs (ADR-0111).
+    #[must_use]
+    pub fn with_cast_engine(mut self, engine: crate::cast_engine::SharedCastEngine) -> Self {
+        self.cast_engine = Some(engine);
         self
     }
 

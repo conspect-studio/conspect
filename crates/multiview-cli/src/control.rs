@@ -394,6 +394,14 @@ where
             crate::output_routing_control::OutputRoutingAdapter::new(slot),
         ));
     }
+    // The running engine's cast outputs (ADR-0111): activation gates behind
+    // a lock-free slot, so the control plane never waits on the engine.
+    #[cfg(feature = "ffmpeg")]
+    if let Some(slot) = crate::cast_output::installed_cast_outputs() {
+        state = state.with_cast_engine(std::sync::Arc::new(crate::cast_output::CastEngineAdapter(
+            slot,
+        )));
+    }
     // The network front door's live counters (ADR-0107 slice 3,
     // `GET /api/v1/metrics/frontdoor`); absent when `[network]` is not
     // configured this run (404, not an error).

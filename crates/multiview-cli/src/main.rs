@@ -499,6 +499,9 @@ async fn run_pipeline(
     // bake (a no-op without the `overlay` feature). The bake samples it off the
     // hot loop; it can never stall the output clock (invariant #1).
     let mut pipeline = built.with_watermark_signal(plane.signal.clone());
+    // A cast output without a configured `dir` writes under the state
+    // directory beside the boot file (nothing is created here).
+    pipeline.set_state_dir(&multiview_control::boot_model::state_dir_for(&args.config));
     if let Some(subs) = &args.subtitles {
         let track = load_subtitles(subs)
             .with_context(|| format!("loading subtitles {}", subs.display()))?;
@@ -1167,6 +1170,7 @@ async fn run_pipeline_until_ctrl_c(
         multiview_cli::output_routing_control::install_output_routing(Some(
             pipeline.output_routing(),
         ));
+        multiview_cli::cast_output::install_cast_outputs(Some(pipeline.cast_outputs()));
         multiview_cli::output_routing_control::install_program_metrics(Some(
             pipeline.program_metrics(),
         ));

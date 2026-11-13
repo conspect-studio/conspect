@@ -2027,6 +2027,26 @@ enum RunnableOutput {
         /// with the consumer's never-block fan-out and the status snapshot.
         link: Arc<multiview_output::push_link::PushLinkStatus>,
     },
+    /// A cast output (ADR-0111): HLS + CMAF fMP4 written by the pure-Rust
+    /// [`CastPackager`](multiview_output::hls::cast::CastPackager) on this
+    /// output's sink thread, only while its [`CastGate`](crate::cast_output::CastGate)
+    /// is active. Inactive, it writes nothing and keeps a bounded in-memory
+    /// pre-roll. Its delivery drops (and counts) instead of waiting, so a
+    /// stalled disk never paces the bake consumer (invariants #1/#10).
+    Cast {
+        /// The output's stable config id.
+        id: String,
+        /// The activation gate shared with the control plane.
+        gate: Arc<crate::cast_output::CastGate>,
+        /// The directory the stream is written to. For an output with no
+        /// configured `dir` this is the default under the state directory
+        /// (re-resolved by [`Pipeline::set_state_dir`]).
+        dir: PathBuf,
+        /// Whether `dir` is the default (no `dir` in the config).
+        default_dir: bool,
+        /// The pipeline's outbound epoch (`EXT-X-PROGRAM-DATE-TIME`).
+        epoch: multiview_output::SharedEpoch,
+    },
     /// A WebRTC program output (`webrtc` WHEP-serve / `whip_push`): a **mux-free**
     /// sink that re-stamps each coded [`EncodedPacket`] into an
     /// [`EgressSample`](multiview_webrtc::egress::EgressSample) and pushes it onto
@@ -2110,7 +2130,10 @@ impl RunnableOutput {
     /// lines) name the output.
     fn id(&self) -> &str {
         match self {
-            Self::File { id, .. } | Self::Hls { id, .. } | Self::Push { id, .. } => id,
+            Self::File { id, .. }
+            | Self::Hls { id, .. }
+            | Self::Push { id, .. }
+            | Self::Cast { id, .. } => id,
             #[cfg(feature = "webrtc-native")]
             Self::WebRtc { id, .. } => id,
             #[cfg(feature = "ndi-bindings")]
@@ -2250,6 +2273,9 @@ pub struct Pipeline {
     /// [`Pipeline::build_sink_runners`] and projected into the engine-state
     /// snapshot under `outputs.<id>.link` (read lock-free on the hot loop).
     push_links: PushLinkRegistry,
+    /// The current run's cast outputs (ADR-0111), published by
+    /// [`Pipeline::build_sink_runners`] and emptied when the run ends.
+    cast_outputs: crate::cast_output::CastOutputsSlot,
     /// Source-kind audio applicability, refreshed at frame-boundary live edits.
     /// Missing PCM from a decoded source is unknown, not proof of no audio.
     #[cfg(feature = "overlay")]
@@ -3400,10 +3426,13 @@ impl Pipeline {
                 .find(|item| item.id() == output.id())
                 .is_some_and(|item| matches!(item, multiview_config::Output::LlHls { .. }));
             output_inband_sets.push(!ll_hls && inband_parameter_changes_ok(output));
+            // A cast stream carries the program audio only (track 0).
+            let cast_audio = multiview_output::AudioSelection::default();
             let audio_selection = match output {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
                 | RunnableOutput::Push { sink, .. } => Some(sink.audio_selection()),
+                RunnableOutput::Cast { .. } => Some(&cast_audio),
                 #[cfg(feature = "webrtc-native")]
                 RunnableOutput::WebRtc { .. } => None,
                 #[cfg(feature = "ndi-bindings")]
@@ -3622,6 +3651,7 @@ impl Pipeline {
             #[cfg(feature = "overlay")]
             tile_spec_apply,
             push_links: Arc::new(multiview_framestore::SwapCell::new(Arc::new(Vec::new()))),
+            cast_outputs: crate::cast_output::cast_outputs_slot(),
             #[cfg(feature = "overlay")]
             audio_free_sources,
             #[cfg(feature = "overlay")]
@@ -4709,6 +4739,10 @@ impl Pipeline {
             .position(|output| matches!(output, RunnableOutput::Hls { .. }));
         let hls_key = hls_index.and_then(|index| self.output_video_keys.get(index).copied());
         let hls_audio = hls_index.and_then(|index| self.output_audio_tracks.get(index).cloned());
+        // Publish this run's cast outputs (off the clock, before any sink
+        // thread exists): the control plane activates them through the slot.
+        let cast = self.cast_entries(&configured, &self.output_video_keys);
+        self.cast_outputs.store(Arc::new(cast));
         let outputs = maybe_prepend_program_ts(configured, live);
         if !live {
             if let Some(hls_key) = hls_key {
@@ -4739,6 +4773,13 @@ impl Pipeline {
                         links.push((id.clone(), Arc::clone(link)));
                         SinkSendPolicy::DropWhenFull(Arc::clone(link))
                     }
+                    // A cast sink writes to disk only while a cast is
+                    // active and must never pace or fail anything else: its
+                    // delivery drops (counted in the gate) instead of
+                    // waiting, and survives a stalled disk.
+                    RunnableOutput::Cast { gate, .. } => {
+                        SinkSendPolicy::DropCounted(gate.dropped_counter())
+                    }
                     _ => SinkSendPolicy::Bounded,
                 };
                 let runner: SinkRunner = Box::new(move |rx, params, time_base, audio, tracks| {
@@ -4751,6 +4792,62 @@ impl Pipeline {
         // by the per-tick snapshot projection; replaced wholesale per run).
         self.push_links.store(Arc::new(links));
         (runners, binding_ids)
+    }
+
+    /// Where each run publishes its cast outputs (ADR-0111) for the control
+    /// plane: empty before the first run and after each run.
+    #[must_use]
+    pub fn cast_outputs(&self) -> crate::cast_output::CastOutputsSlot {
+        Arc::clone(&self.cast_outputs)
+    }
+
+    /// Tell the pipeline the engine's state directory: a cast output with no
+    /// configured `dir` writes to `<state dir>/cast/<id>`. Call before the
+    /// run starts (nothing is created here).
+    pub fn set_state_dir(&mut self, state_dir: &Path) {
+        for output in &mut self.outputs {
+            if let RunnableOutput::Cast {
+                id,
+                dir,
+                default_dir: true,
+                ..
+            } = output
+            {
+                *dir = crate::cast_output::default_cast_dir(state_dir, id);
+            }
+        }
+    }
+
+    /// This run's cast outputs: check each directory (an unusable one
+    /// disables that output only) and describe each for the control plane.
+    /// `keys` is the video key per configured output, in the same order.
+    fn cast_entries(
+        &self,
+        configured: &[RunnableOutput],
+        keys: &[usize],
+    ) -> Vec<crate::cast_output::CastOutputEntry> {
+        configured
+            .iter()
+            .enumerate()
+            .filter_map(|(index, output)| {
+                let RunnableOutput::Cast { id, gate, dir, .. } = output else {
+                    return None;
+                };
+                crate::cast_output::prepare_cast_dir(dir, id, gate);
+                let encode = keys
+                    .get(index)
+                    .and_then(|&key| self.rendition_configs.get(key));
+                Some(crate::cast_output::CastOutputEntry {
+                    id: id.clone(),
+                    dir: dir.clone(),
+                    gate: Arc::clone(gate),
+                    width: encode.map_or(0, |cfg| cfg.width),
+                    height: encode.map_or(0, |cfg| cfg.height),
+                    fps: self.cadence,
+                    codec: encode.map_or_else(String::new, |cfg| cfg.codec_name.clone()),
+                })
+            })
+            .collect()
     }
 
     /// Test seam: shorten the boot-take retry policy (wall-clock bound tests).
@@ -4874,6 +4971,99 @@ impl Pipeline {
         })
     }
 
+    /// **Test seam** (ADR-0111): as [`Self::drive_streaming_for_test`], but
+    /// every cast output keeps its REAL sink (packager, gate, directory) and
+    /// its real delivery policy; `params.runners` replace the other outputs,
+    /// in configured order. Bindings keep their config ids, so a routing
+    /// take addresses an output by the id it has in the document.
+    ///
+    /// # Errors
+    /// See [`Self::drive_streaming_for_test`].
+    #[cfg(test)]
+    pub(crate) async fn drive_streaming_with_cast_for_test<P: Pacer + Send>(
+        &mut self,
+        params: StreamTestParams<P>,
+        stop: &StopSignal,
+    ) -> Result<StreamTestResult, PipelineError> {
+        let StreamTestParams {
+            time,
+            pacer,
+            max_ticks,
+            policy,
+            runners: fakes,
+            consumer_fault_after_ticks,
+            shed_at_tick,
+            hot_tick_observer,
+        } = params;
+        let is_cast: Vec<bool> = self
+            .outputs
+            .iter()
+            .map(|output| matches!(output, RunnableOutput::Cast { .. }))
+            .collect();
+        // Live: no `program.ts` anchor, so runner index == configured index.
+        let (real, binding_ids) = self.build_sink_runners(true);
+        let mut fakes = fakes.into_iter();
+        let runners = real
+            .into_iter()
+            .zip(is_cast)
+            .map(|(real, cast)| {
+                if cast {
+                    return real;
+                }
+                let Some(fake) = fakes.next() else {
+                    return real;
+                };
+                let runner: SinkRunner = Box::new(move |rx, _params, _tb, _audio, _tracks| {
+                    let (tx, plain_rx) = std::sync::mpsc::sync_channel(1);
+                    let bridge = std::thread::spawn(move || {
+                        while let Ok(leased) = rx.recv() {
+                            if tx.send(leased.packet).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    let outcome = fake(plain_rx);
+                    let _ = bridge.join();
+                    Ok(SinkRunOutcome {
+                        line: format!("test sink: {} packet(s)", outcome.frames),
+                        playlist: None,
+                        frames: outcome.frames,
+                    })
+                });
+                (runner, SinkSendPolicy::Bounded)
+            })
+            .collect();
+        let capacity = policy.queue_cap();
+        let plan = StreamPlan {
+            policy,
+            runners,
+            consumer_fault_after_ticks,
+            shed_at_tick,
+            hot_tick_observer,
+            binding_ids,
+        };
+        let publisher = EnginePublisher::<EngineStateSnapshot, Event>::new(EVENT_CAPACITY);
+        let preview = crate::preview::program_slot();
+        let out = self
+            .drive_streaming(
+                time,
+                pacer,
+                stop,
+                max_ticks,
+                plan,
+                &publisher,
+                &preview,
+                |_: &mut CompositorDrive<Nv12Image>| {},
+            )
+            .await?;
+        Ok(StreamTestResult {
+            report: out.report,
+            peak_occupancy: out.peak_occupancy,
+            capacity,
+            sink_frames: out.sink_frames,
+        })
+    }
+
     /// The streaming core shared by `run_for`/`run_until`/the test seam: spawn the
     /// per-sink fan-out threads + the single bake consumer, drive the engine's
     /// protected output core (one composited canvas per tick), stream each tick
@@ -4909,6 +5099,8 @@ impl Pipeline {
         // never go on air silently receiving/emitting silence.
         #[cfg(feature = "aes67")]
         self.ensure_aes67_has_program_audio()?;
+        // The run's cast outputs are published until this function returns.
+        let _cast_run = crate::cast_output::CastRunGuard(Arc::clone(&self.cast_outputs));
         let StreamPlan {
             policy,
             runners,
@@ -6772,6 +6964,9 @@ impl StreamEgress {
             .iter()
             .map(|(_, send_policy)| match send_policy {
                 SinkSendPolicy::DropWhenFull(link) => BindingPolicy::Push(Arc::clone(link)),
+                SinkSendPolicy::DropCounted(counter) => {
+                    BindingPolicy::DropCounted(Arc::clone(counter))
+                }
                 SinkSendPolicy::Bounded => BindingPolicy::Bounded,
             })
             .collect();
@@ -8912,6 +9107,9 @@ enum SinkSendPolicy {
     /// Never wait ([`send_or_drop`]): a resilient live push drops + counts on
     /// a full queue (its link status records the drop).
     DropWhenFull(Arc<multiview_output::push_link::PushLinkStatus>),
+    /// Never wait and never abandon: a sink that stalls and comes back (the
+    /// cast packager's disk writes) loses packets, each added to the counter.
+    DropCounted(Arc<AtomicU64>),
 }
 // scatter the dispatch without reducing complexity.
 #[allow(clippy::too_many_lines)] // Each sink variant seeds its independent mux and transport state.
@@ -9032,6 +9230,15 @@ fn run_one_output(
             rx,
             multiview_output::MuxStream::new(params, time_base),
             (audio, &track_mux),
+        )),
+        RunnableOutput::Cast {
+            id,
+            gate,
+            dir,
+            default_dir: _,
+            epoch,
+        } => Ok(run_cast_output(
+            id, gate, dir, epoch, &rx, params, time_base, audio,
         )),
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { id: _, sink, label } => {
@@ -9372,6 +9579,78 @@ where
         line: format!("{label}: {sent} canvas frame(s) sent to NDI"),
         playlist: None,
         frames: sent,
+    }
+}
+
+/// Run a cast output's sink (ADR-0111) over its fan-out channel.
+/// **Infallible**: a cast output can never fail the run.
+///
+/// The packager's video rendition is described by the encoder that feeds
+/// this output (its real size, bit rate and parameter sets), never by the
+/// canvas: an output with its own format is encoded at that format.
+#[allow(clippy::too_many_arguments)] // Each argument is one distinct input of the sink thread.
+fn run_cast_output(
+    id: String,
+    gate: Arc<crate::cast_output::CastGate>,
+    dir: PathBuf,
+    epoch: multiview_output::SharedEpoch,
+    rx: &Receiver<LeasedPacket>,
+    params: &StreamCodecParameters,
+    time_base: Rational,
+    audio: Option<&(StreamCodecParameters, Rational)>,
+) -> SinkRunOutcome {
+    use multiview_output::hls::cast::{CastAudioConfig, CastVideoConfig};
+    let (width, height) = params.video_dimensions().unwrap_or((0, 0));
+    let video = CastVideoConfig {
+        time_base,
+        width,
+        height,
+        bit_rate: params.opened_bit_rate().or_else(|| params.bit_rate()),
+        extradata: params.codec_config_bytes(),
+    };
+    let audio = audio.and_then(|(audio_params, audio_tb)| {
+        // The audio time base is `1/sample_rate` (the AAC encoder's).
+        let sample_rate = (audio_tb.num == 1)
+            .then(|| u32::try_from(audio_tb.den).ok())
+            .flatten()?;
+        let asc = audio_params.codec_config_bytes();
+        // AudioSpecificConfig: 5 bits object type, 4 bits rate index, 4 bits
+        // channel configuration. Stereo (the program bus) when absent.
+        let channels = asc
+            .as_deref()
+            .and_then(|bytes| bytes.get(1))
+            .map(|byte| u16::from((byte >> 3) & 0x0F))
+            .filter(|channels| *channels > 0)
+            .unwrap_or(multiview_config::output_format::SLOT_AUDIO_CHANNELS);
+        Some(CastAudioConfig {
+            time_base: *audio_tb,
+            sample_rate,
+            channels,
+            bit_rate: audio_params
+                .opened_bit_rate()
+                .or_else(|| audio_params.bit_rate()),
+            audio_specific_config: asc,
+        })
+    });
+    let setup = crate::cast_output::CastSetup {
+        id: id.clone(),
+        dir: dir.clone(),
+        gate,
+        epoch,
+        video,
+        audio,
+    };
+    let report = crate::cast_output::run_cast_sink(setup, rx, params);
+    SinkRunOutcome {
+        line: format!(
+            "cast {id} ({}): {} packet(s), {} restart(s){}",
+            dir.display(),
+            report.packets,
+            report.restarts,
+            if report.panicked { " (disabled)" } else { "" }
+        ),
+        playlist: None,
+        frames: report.packets,
     }
 }
 
@@ -12359,7 +12638,9 @@ fn output_codec(output: &Output) -> Option<&str> {
         // codec they name (default h264). A webrtc-only config therefore selects
         // h264, not the mpeg2video fallback the SRTP packetizer cannot carry.
         | Output::Webrtc { codec, .. }
-        | Output::WhipPush { codec, .. } => Some(codec.as_str()),
+        | Output::WhipPush { codec, .. }
+        // A cast output consumes an H.264 rendition like an HLS output.
+        | Output::Cast { codec, .. } => Some(codec.as_str()),
         // NDI carries no codec token; a future output kind names none here until
         // explicitly wired (`Output` is `#[non_exhaustive]`).
         Output::Ndi { .. } | _ => None,
@@ -13131,6 +13412,22 @@ fn build_outputs(
             Output::Hls { path, .. } | Output::LlHls { path, .. } => {
                 runnable.push(build_hls_output(output, path, epoch)?);
             }
+            // A cast output (ADR-0111): nothing touches the disk here. Its
+            // directory is claimed when the run starts and written only
+            // while a cast stream is active.
+            Output::Cast { id, dir, .. } => {
+                let default_state = multiview_control::boot_model::state_dir_for(Path::new(""));
+                runnable.push(RunnableOutput::Cast {
+                    id: id.clone(),
+                    gate: Arc::new(crate::cast_output::CastGate::new()),
+                    dir: dir.as_ref().map_or_else(
+                        || crate::cast_output::default_cast_dir(&default_state, id),
+                        PathBuf::from,
+                    ),
+                    default_dir: dir.is_none(),
+                    epoch: epoch.clone(),
+                });
+            }
             Output::Rtmp { url, .. } => {
                 runnable.push(build_push_output(output, PushProtocol::Rtmp, url, "rtmp"));
             }
@@ -13646,7 +13943,11 @@ fn handle_ndi_output(
 /// sequence header, SDP, `moov`); raw-frame sinks carry no packets.
 fn inband_parameter_changes_ok(output: &RunnableOutput) -> bool {
     match output {
-        RunnableOutput::Hls { .. } => true,
+        // The cast packager is not a libav muxer with one fixed init: it
+        // reads the parameter sets of every IDR, and on a change it writes a
+        // new init segment and declares `EXT-X-DISCONTINUITY`, so a switch
+        // onto changed sets (always a self-contained RAP) is a clean splice.
+        RunnableOutput::Hls { .. } | RunnableOutput::Cast { .. } => true,
         // `srt` / `rist` mux MPEG-TS; `rtmp` muxes FLV (sequence header).
         RunnableOutput::Push { label, .. } => matches!(*label, "srt" | "rist"),
         RunnableOutput::File { path, .. } => path
@@ -13672,7 +13973,9 @@ fn maybe_prepend_program_ts(mut runnable: Vec<RunnableOutput>, live: bool) -> Ve
         }
         // A push / WebRTC output has no on-disk directory to derive a program
         // file from; only an HLS output anchors the self-contained `program.ts`.
-        RunnableOutput::File { .. } | RunnableOutput::Push { .. } => None,
+        RunnableOutput::File { .. } | RunnableOutput::Push { .. } | RunnableOutput::Cast { .. } => {
+            None
+        }
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { .. } => None,
         // The NDI sink is a raw-canvas consumer, not a packet/disk muxer — it
@@ -13810,6 +14113,8 @@ fn apply_output_audio_selections(
             RunnableOutput::File { id, sink, .. }
             | RunnableOutput::Hls { id, sink, .. }
             | RunnableOutput::Push { id, sink, .. } => (id.as_str(), sink),
+            // Program audio only: nothing to select.
+            RunnableOutput::Cast { .. } => continue,
             #[cfg(feature = "webrtc-native")]
             RunnableOutput::WebRtc { .. } => continue,
             #[cfg(feature = "ndi-bindings")]

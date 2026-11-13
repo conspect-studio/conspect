@@ -20,7 +20,7 @@
 //! [`BatchLease`], both counted by the carrier; the handoff to the existing
 //! per-sink packet channel is one packet deep.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -62,6 +62,13 @@ pub(crate) enum BindingPolicy {
     /// A resilient live push sink: losses are counted on its existing link
     /// status, preserving the `/status` counters the UI already reads.
     Push(Arc<PushLinkStatus>),
+    /// A sink that may stall and come back (the cast packager's disk writes):
+    /// every packet it does not receive is added to the counter, and a
+    /// stalled sink is never abandoned. Its pump waits one
+    /// [`PUMP_WEDGE_GRACE`] for a stalled sink, then drops (and counts)
+    /// without waiting until the sink takes a packet again. The sink reads
+    /// the counter and declares the gap in its own stream.
+    DropCounted(Arc<AtomicU64>),
 }
 
 /// Why a batch was not admitted, for status/telemetry.
@@ -427,30 +434,30 @@ impl BindingDelivery {
             let (lease_tx, lease_rx) = mpsc::sync_channel::<BatchLease>(HANDOFF_LEASES);
             let wedged = Arc::new(AtomicBool::new(false));
             let pump_wedged = Arc::clone(&wedged);
+            let drop_counter = match &policy {
+                BindingPolicy::DropCounted(counter) => Some(Arc::clone(counter)),
+                BindingPolicy::Bounded | BindingPolicy::Push(_) => None,
+            };
             let pump = thread::Builder::new()
                 .name("multiview-binding-pump".to_owned())
                 .spawn(move || {
+                    // Only a `DropCounted` binding survives a stalled sink.
+                    let mut stalled = false;
                     while let Ok(lease) = lease_rx.recv() {
-                        let permit = Arc::new(lease);
-                        for packet in permit.packets() {
-                            let Ok(shared) = packet.clone_shared_ref() else {
-                                pump_wedged.store(true, Ordering::Release);
-                                return;
-                            };
-                            if !send_bounded_packet(
-                                &packet_tx,
-                                LeasedPacket {
-                                    packet: shared,
-                                    permit: Arc::clone(&permit),
-                                },
-                            ) {
-                                // The sink hung up or stopped draining for the
-                                // whole grace: this binding is finished. Drop
-                                // the lease (releasing its reservation) and end
-                                // the pump; no other binding is affected.
-                                pump_wedged.store(true, Ordering::Release);
-                                return;
-                            }
+                        let step = pump_lease(
+                            &packet_tx,
+                            Arc::new(lease),
+                            drop_counter.as_deref(),
+                            &mut stalled,
+                        );
+                        if step == PumpStep::Abandon {
+                            // The sink hung up or (for a sink that must not
+                            // lose a packet) stopped draining for the whole
+                            // grace: this binding is finished. The lease is
+                            // dropped (releasing its reservation) and the
+                            // pump ends; no other binding is affected.
+                            pump_wedged.store(true, Ordering::Release);
+                            return;
                         }
                     }
                 })
@@ -642,10 +649,19 @@ impl BindingDelivery {
                     .rejected_bytes
                     .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
                 binding.last_rejection = Some(reason);
-                if let BindingPolicy::Push(link) = &binding.policy {
-                    for _ in &keyframes {
-                        link.shed_upstream();
+                match &binding.policy {
+                    BindingPolicy::Push(link) => {
+                        for _ in &keyframes {
+                            link.shed_upstream();
+                        }
                     }
+                    BindingPolicy::DropCounted(counter) => {
+                        counter.fetch_add(
+                            u64::try_from(packets).unwrap_or(u64::MAX),
+                            Ordering::AcqRel,
+                        );
+                    }
+                    BindingPolicy::Bounded => {}
                 }
                 // A wedged pump means this binding is over: report it and stop
                 // offering (its queue keeps draining until the lease expires).
@@ -712,7 +728,12 @@ impl BindingDelivery {
                 },
                 Ok(None) => return,
                 Err(error) => {
+                    // A stale queued window invalidated the backlog: media
+                    // this binding had admitted is lost.
                     binding.last_rejection = Some(RejectionReason::from_offer(error));
+                    if let BindingPolicy::DropCounted(counter) = &binding.policy {
+                        counter.fetch_add(1, Ordering::AcqRel);
+                    }
                     return;
                 }
             }
@@ -798,25 +819,97 @@ impl BindingDelivery {
     }
 }
 
-/// Send one packet to a sink, waiting at most [`PUMP_WEDGE_GRACE`] for a slot.
-/// Returns `false` when the sink hung up or stopped draining for the whole
-/// grace. This runs on the binding's own pump thread, so it can never pace the
-/// bake consumer or another binding.
-fn send_bounded_packet(tx: &SyncSender<LeasedPacket>, mut packet: LeasedPacket) -> bool {
-    let deadline = Instant::now() + PUMP_WEDGE_GRACE;
+/// What a binding pump does after handing one lease to its sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpStep {
+    /// Take the next lease.
+    Continue,
+    /// The binding is over (see the caller).
+    Abandon,
+}
+
+/// Hand every packet of one lease to the sink. With a `drop_counter` (a
+/// [`BindingPolicy::DropCounted`] binding) a sink that does not take a packet
+/// within the grace loses the rest of the lease, counted, and while it stays
+/// stalled (`stalled`) later packets are dropped without waiting at all.
+fn pump_lease(
+    tx: &SyncSender<LeasedPacket>,
+    permit: Arc<BatchLease>,
+    drop_counter: Option<&AtomicU64>,
+    stalled: &mut bool,
+) -> PumpStep {
+    let packets = permit.packets();
+    for (index, packet) in packets.iter().enumerate() {
+        let Ok(shared) = packet.clone_shared_ref() else {
+            return PumpStep::Abandon;
+        };
+        let leased = LeasedPacket {
+            packet: shared,
+            permit: Arc::clone(&permit),
+        };
+        let Some(counter) = drop_counter else {
+            if !send_bounded_packet(tx, leased) {
+                return PumpStep::Abandon;
+            }
+            continue;
+        };
+        let grace = if *stalled {
+            Duration::ZERO
+        } else {
+            PUMP_WEDGE_GRACE
+        };
+        match send_within(tx, leased, grace) {
+            Handoff::Sent => *stalled = false,
+            Handoff::Gone => return PumpStep::Abandon,
+            Handoff::Full => {
+                *stalled = true;
+                let lost = packets.len().saturating_sub(index);
+                counter.fetch_add(u64::try_from(lost).unwrap_or(u64::MAX), Ordering::AcqRel);
+                return PumpStep::Continue;
+            }
+        }
+    }
+    PumpStep::Continue
+}
+
+/// The outcome of offering one packet to a sink's handoff.
+enum Handoff {
+    /// The sink has (or will take) the packet.
+    Sent,
+    /// The handoff stayed full for the whole grace.
+    Full,
+    /// The sink hung up.
+    Gone,
+}
+
+/// Offer one packet to a sink, waiting at most `grace` for a slot.
+fn send_within(
+    tx: &SyncSender<LeasedPacket>,
+    mut packet: LeasedPacket,
+    grace: Duration,
+) -> Handoff {
+    let deadline = Instant::now() + grace;
     loop {
         match tx.try_send(packet) {
-            Ok(()) => return true,
+            Ok(()) => return Handoff::Sent,
             Err(TrySendError::Full(returned)) => {
                 if Instant::now() >= deadline {
-                    return false;
+                    return Handoff::Full;
                 }
                 packet = returned;
                 thread::sleep(Duration::from_millis(1));
             }
-            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Disconnected(_)) => return Handoff::Gone,
         }
     }
+}
+
+/// Send one packet to a sink, waiting at most [`PUMP_WEDGE_GRACE`] for a slot.
+/// Returns `false` when the sink hung up or stopped draining for the whole
+/// grace. This runs on the binding's own pump thread, so it can never pace the
+/// bake consumer or another binding.
+fn send_bounded_packet(tx: &SyncSender<LeasedPacket>, packet: LeasedPacket) -> bool {
+    matches!(send_within(tx, packet, PUMP_WEDGE_GRACE), Handoff::Sent)
 }
 
 #[cfg(test)]
