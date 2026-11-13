@@ -3747,8 +3747,25 @@ fn a_consumer_gap_on_clean_is_substituted_like_program_and_never_fails_the_key()
     let gap: u64 = 8;
     let surviving_tick = last_fed_tick + gap + 1;
     x.tick_after_clean_gap(last_fed_tick + 1, surviving_tick);
-    // Let the worker thread drain everything it was offered.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // The substitution offers fill the worker's bounded queue (4) faster
+    // than a starved worker drains it, so the surviving tick's own offer can
+    // be refused (dropped, never blocked); the key's `GapFill` then closes the
+    // hole with the last canvas at its next accepted offer. Keep ticking as
+    // the pipeline does, and wait (bounded) until the encoder passed the
+    // surviving tick. A fixed 50 ms sleep after one tick failed on a loaded
+    // runner (#368 CI): the worker had not run yet.
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let mut next = surviving_tick + 1;
+    while Instant::now() < deadline
+        && !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(t, _)| *t > surviving_tick)
+    {
+        x.tick(next);
+        next += 1;
+    }
     assert!(
         x.results()
             .iter()
