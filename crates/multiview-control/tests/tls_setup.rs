@@ -171,6 +171,17 @@ async fn setup_gate_refuses_everything_but_the_setup_surface() {
         ("POST", "/api/v1/tls/setup-code"),
         ("POST", "/api/v1/tls/credential"),
         ("GET", "/api/v1/auth/status"),
+        // Non-canonical forms never reach the inner router or the SPA
+        // fallback: the gate allows exact paths only.
+        ("GET", "/tls-setup/"),
+        ("GET", "/tls-setup/../api/v1/layouts"),
+        ("GET", "/api/v1/tls/status/"),
+        ("GET", "/%2e%2e/docs"),
+        ("GET", "/%74ls-setup"),
+        ("GET", "//docs"),
+        ("GET", "//tls-setup"),
+        ("OPTIONS", "/tls-setup"),
+        ("PUT", "/api/v1/tls/issue"),
     ] {
         let response = send(
             &router,
