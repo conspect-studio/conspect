@@ -979,9 +979,22 @@ pub(crate) async fn take_output(
     idem: IdempotencyKey,
     Json(req): Json<OutputRouteRequest>,
 ) -> ControlResult<Response> {
+    take_output_as(&state, &principal, &idem, &req)
+}
+
+/// The whole output take — authorization of both ends, the Idempotency-Key
+/// contract, limits, gates, reservation and enqueue — shared by
+/// `POST /routing/output/take` and its `apply-layout` alias
+/// (`target: {output}`, #307), so the alias can never authorize less.
+pub(crate) fn take_output_as(
+    state: &AppState,
+    principal: &Principal,
+    idem: &IdempotencyKey,
+    req: &OutputRouteRequest,
+) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
-    authorize_ends(&principal, &req)?;
-    authorize_track_inputs(&state, &principal, &req)?;
+    authorize_ends(principal, req)?;
+    authorize_track_inputs(state, principal, req)?;
     let video = req.shape()?;
     let Some(control) = state.output_routing.clone() else {
         return Ok(routing_unavailable());
@@ -996,7 +1009,7 @@ pub(crate) async fn take_output(
     if let Some(replay) = control.replay(key) {
         return Ok(replayed(replay));
     }
-    let Some(output) = output_of(&state, req.output())? else {
+    let Some(output) = output_of(state, req.output())? else {
         return Err(ControlError::NotFound {
             kind: "output",
             id: req.output().to_owned(),
@@ -1012,20 +1025,20 @@ pub(crate) async fn take_output(
     }
     let (feed, layout) = match video {
         None => (None, None),
-        Some(video) => match resolve_feed(&state, &principal, video)? {
+        Some(video) => match resolve_feed(state, principal, video)? {
             Ok((feed, layout)) => (Some(feed), layout),
             Err((status, kind, detail)) => return Ok(refusal_problem(status, kind, detail)),
         },
     };
     let audio = match &req.audio {
         None => None,
-        Some(audio) => match resolve_audio(&state, &output, audio)? {
+        Some(audio) => match resolve_audio(state, &output, audio)? {
             Ok(audio) => Some(audio),
             Err((response, _)) => return Ok(response),
         },
     };
     if let Some(feed) = &feed {
-        if let Some(refused) = plan_gate(&control, &principal, &config_id, feed) {
+        if let Some(refused) = plan_gate(&control, principal, &config_id, feed) {
             return Ok(refused);
         }
     }

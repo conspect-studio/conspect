@@ -17,7 +17,9 @@ fixes or replacing the reconciled output root.
 This is the reviewed opt-in first slice, not a full switcher implementation.
 AUTO remains an honest 422 when the production provider cannot admit it.
 A six-tile legacy canvas is not replaced: absent switcher config preserves the
-legacy path; unsupported opted-in multi-cell geometry fails closed.
+legacy path. (Originally, opted-in multi-cell geometry failed closed; since
+#307 it starts with Program as the one-cell M/E bus — see "One admission rule"
+below.)
 No final native-host acceptance run or deployment was performed. Those gates
 remain with the captain after independent integration review.
 
@@ -110,21 +112,32 @@ Resource check: local target reached 4.2 GiB, below the 10 GiB growth cap;
 filesystem free space stayed above 360 GiB (lowest sampled 420 GiB, final
 sample 474 GiB). No other worktree or gate-owner lane was edited.
 
-## One admission rule on the live and start paths (#317)
+## One admission rule on the live and start paths (#317, amended by #307)
 
-With a switcher M/E declared, the engine starts only from a canvas of exactly one
-full-canvas, opaque, unstyled cell bound to the M/E `program_source`, with no
-overlays. That rule lives in one function, `multiview_config::switcher_canvas_admission`
-(`boot_admission` adds `validate` + solve). It is called by:
+With a switcher M/E declared, the Program canvas IS the M/E bus: one
+full-canvas, opaque, `fill` cell bound to the M/E `program_source`. Until #307
+the engine refused to start from any other canvas. Since #307 it derives that
+canvas with one function, `MultiviewConfig::program_canvas`
+(`multiview_config::program_canvas`): a document that already is the bus is
+used unchanged (same cell id); any other document (a multi-cell wall, a styled
+or windowed cell, a cell bound to another source) starts with a synthesized
+Program cell (reserved id `me1.program`), and its own layout stays in the
+layouts library as a stored layout routable to outputs. Only overlays with an
+M/E are still refused (`SwitcherCanvasRefusal::Overlays`). `boot_admission` adds
+`validate` + solve. The function is called by:
 
-- `Pipeline::build` (start-up; the error text is unchanged);
+- `Pipeline::build` (start-up: the Program drive layout and the M/E cell id);
 - `boot_model::write_desired`, the single choke point every `desired.json` commit
   passes through, so no command can persist a state the engine cannot boot;
-- `POST /api/v1/commands/apply-layout`, before the commit and before the engine
-  command, answering `422` `/problems/layout-not-admissible-with-switcher` with
-  nothing applied or persisted;
-- the engine drain's `apply_stored_layout` (backstop, held with
-  `apply_layout_held`);
+- `POST /api/v1/commands/apply-layout`: with a switcher it answers `422`
+  `/problems/switcher-owns-program` before the idempotency reservation, with
+  nothing reserved, applied or persisted; `target: {output}` makes it an output
+  take of the layout;
+- the engine drain (`CommandDrain::switcher_program`): with an M/E the drive is
+  keyed by the Program cell alone; a stored layout, SwapSource, RouteVideo or
+  salvo recall changes only the document mirror (the stored layout), never the
+  Program drive, and never resets the M/E's Program binding (an
+  `apply_layout_held` outcome says so);
 - `multiview validate <config>`, which now also checks what `multiview run` will
   start from (`.multiview/desired.json` when it exists) and exits non-zero with
   start-up's reason. Run it as the deploy preflight. It also warns while an

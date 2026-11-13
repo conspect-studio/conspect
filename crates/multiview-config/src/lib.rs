@@ -77,8 +77,8 @@ use multiview_core::layout::{
 use multiview_core::stream::StreamKind as CoreStreamKind;
 
 pub use admission::{
-    boot_admission, outputs_carry_program, switcher_canvas_admission, BootAdmissionError,
-    SwitcherCanvasRefusal,
+    boot_admission, outputs_carry_program, program_canvas, BootAdmissionError, ProgramCanvas,
+    SwitcherCanvasRefusal, PROGRAM_CELL_SUFFIX,
 };
 pub use api::{ApiConfig, ApiKeyConfig, ApiKeyRole};
 use audio::PROGRAM_TRACK as PROGRAM_TRACK_NAME;

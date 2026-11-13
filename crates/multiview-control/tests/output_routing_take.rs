@@ -298,7 +298,11 @@ struct Rig {
 }
 
 fn rig(path: &Path, with_routing: bool) -> Rig {
-    let config = MultiviewConfig::load_from_toml(DOC).unwrap();
+    rig_doc(path, with_routing, DOC)
+}
+
+fn rig_doc(path: &Path, with_routing: bool, doc: &str) -> Rig {
+    let config = MultiviewConfig::load_from_toml(doc).unwrap();
     config.validate().unwrap();
     let seeded = multiview_control::seed_resources(&config).unwrap();
     let engine = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(256));
@@ -2076,4 +2080,178 @@ async fn layout_audio_and_live_edits_of_a_routed_layout() {
         .layout_changes
         .last()
         .is_some_and(|(id, body)| id == "NewsOne" && body.is_none()));
+}
+
+// ---------------------------------------------------------------------------
+// #307: apply-layout with a switcher, and its `target: {output}` alias
+// ---------------------------------------------------------------------------
+
+const SWITCHER_BLOCK: &str = "\n[switcher]\n[[switcher.mix_effects]]\nid = \"me1\"\nprogram = \"main\"\nprogram_source = \"a\"\npreview_source = \"bars\"\n";
+
+/// The take fixture with an M/E declared and a two-cell wall as its document
+/// layout: the shape the first slice refused to start and #307 admits.
+fn switcher_wall_doc() -> String {
+    let wall = DOC
+        .replace(
+            "columns = [\"1fr\"]\nrows = [\"1fr\"]\nareas = [\"a\"]",
+            "columns = [\"1fr\", \"1fr\"]\nrows = [\"1fr\"]\nareas = [\"a b\"]",
+        )
+        .replacen(
+            "[[outputs]]",
+            "[[cells]]\nid = \"cell_b\"\narea = \"b\"\n[cells.source]\ninput_id = \"bars\"\n[[outputs]]",
+            1,
+        );
+    format!("{wall}{SWITCHER_BLOCK}")
+}
+
+fn apply_layout(token: &str, key: Option<&str>, body: &serde_json::Value) -> Request<Body> {
+    post("/api/v1/commands/apply-layout", token, key, body)
+}
+
+/// #307: a switcher config with a multi-cell layout is accepted at start-up,
+/// and its configured layout (seeded as the working layout in the library) is
+/// routable to an output through the output-routing layout resolver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_switcher_wall_documents_layout_is_a_routable_stored_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = switcher_wall_doc();
+    let config = MultiviewConfig::load_from_toml(&doc).unwrap();
+    assert_eq!(config.cells.len(), 2, "fixture is a multi-cell wall");
+    multiview_config::boot_admission(&config).expect("a switcher wall starts");
+    let rig = rig_doc(&dir.path().join("boot.toml"), true, &doc);
+    let working = rig
+        .state
+        .working_layout_id
+        .clone()
+        .expect("seeded working layout");
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "wall-take",
+            "output-1",
+            serde_json::json!({"layout": working}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "{}",
+        body_json(resp).await
+    );
+    let takes = rig.fake.takes();
+    assert_eq!(takes.len(), 1);
+    assert_eq!(takes[0].video, Some(RoutedFeed::Layout(working.clone())));
+    let layout = takes[0].layout.as_ref().expect("resolved layout body");
+    assert_eq!(layout.0.layout.cells.len(), 2, "the wall, not the M/E bus");
+}
+
+/// #307: `apply-layout` without `target` while a switcher is declared is 422
+/// `switcher-owns-program`, refused before the idempotency reservation: no key
+/// is reserved and nothing is sent, so the same key then succeeds on the
+/// `target` alias. The detail names the two operations the operator means.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_layout_with_a_switcher_is_switcher_owns_program_and_reserves_no_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig_doc(&dir.path().join("boot.toml"), true, &switcher_wall_doc());
+    let working = rig.state.working_layout_id.clone().unwrap();
+    let reserved = rig.state.idempotency.usage().0;
+    let resp = send(
+        &rig.router,
+        apply_layout(
+            OPERATOR_TOKEN,
+            Some("same-key"),
+            &serde_json::json!({"layout": working}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let problem = body_json(resp).await;
+    assert_eq!(
+        problem["type"], "/problems/switcher-owns-program",
+        "{problem}"
+    );
+    let detail = problem["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("POST /api/v1/routing/output/take"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("POST /api/v1/switcher/commands/select_preview"),
+        "{detail}"
+    );
+    assert!(detail.contains("switcher source"), "{detail}");
+    assert_eq!(
+        rig.state.idempotency.usage().0,
+        reserved,
+        "nothing reserved by the refusal"
+    );
+    assert!(rig.fake.takes().is_empty(), "nothing sent");
+    // The same key is free: the alias with `target` takes the layout.
+    let resp = send(
+        &rig.router,
+        apply_layout(
+            OPERATOR_TOKEN,
+            Some("same-key"),
+            &serde_json::json!({"layout": working, "target": {"output": "output-1"}}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let accepted = body_json(resp).await;
+    assert_eq!(accepted["status"], "accepted", "a fresh take: {accepted}");
+    assert_eq!(rig.fake.takes().len(), 1);
+}
+
+/// #307: `apply-layout` with `target: {output}` is a thin alias for an output
+/// take of the layout (with or without a switcher): the take carries the
+/// layout feed, replays by Idempotency-Key, and runs the take's authorization
+/// (Write + output scope on the output, Read on the layout and its sources).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_layout_target_is_an_output_take_with_the_same_authorization() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    store_layout(&rig, "NewsOne", layout_body(640, 1.0));
+    let body = serde_json::json!({"layout": "NewsOne", "target": {"output": "output-1"}});
+    // Without Write on the output, or outside the output's scope, or without
+    // Read on every source the layout shows: 403, nothing enqueued.
+    for token in [
+        VIEWER_TOKEN,
+        OTHER_OUTPUT_TOKEN,
+        SCOPED_ROUTER_TOKEN,
+        "route-layout.route-layout-secret",
+    ] {
+        let resp = send(&rig.router, apply_layout(token, Some("authz"), &body)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{token}");
+    }
+    assert_eq!(rig.fake.takes(), Vec::new());
+    // The take's Idempotency-Key contract: required.
+    let resp = send(&rig.router, apply_layout(OPERATOR_TOKEN, None, &body)).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let resp = send(
+        &rig.router,
+        apply_layout(OPERATOR_TOKEN, Some("alias"), &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let first = body_json(resp).await;
+    let takes = rig.fake.takes();
+    assert_eq!(takes.len(), 1);
+    assert_eq!(takes[0].output, OUT_B_CONFIG_ID);
+    assert_eq!(
+        takes[0].video,
+        Some(RoutedFeed::Layout("NewsOne".to_owned()))
+    );
+    // A replay answers the same operation and never enqueues again.
+    let resp = send(
+        &rig.router,
+        apply_layout(OPERATOR_TOKEN, Some("alias"), &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let replay = body_json(resp).await;
+    assert_eq!(replay["operation_id"], first["operation_id"]);
+    assert_eq!(rig.fake.takes().len(), 1, "a replay never re-enqueues");
 }

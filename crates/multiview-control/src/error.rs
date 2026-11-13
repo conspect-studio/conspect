@@ -96,14 +96,23 @@ pub enum ControlError {
     Repository(String),
 
     /// The prospective accepted state is one the engine would refuse to start
-    /// from (issue #317): the declared switcher M/E cannot drive its canvas.
-    /// Nothing was applied or persisted.
+    /// from (issue #317): the declared switcher M/E cannot carry it (today:
+    /// overlays on the Program canvas). Nothing was applied or persisted.
     #[error("{0}")]
     NotAdmissibleWithSwitcher(multiview_config::SwitcherCanvasRefusal),
+
+    /// `apply-layout` without a `target` while a switcher M/E is declared
+    /// (#307): the M/E owns the Program canvas. Nothing was reserved,
+    /// persisted or sent.
+    #[error("the switcher M/E owns the Program canvas; layout {0:?} was not applied")]
+    SwitcherOwnsProgram(String),
 }
 
 /// The stable problem `type` slug for [`ControlError::NotAdmissibleWithSwitcher`].
 pub const LAYOUT_NOT_ADMISSIBLE_WITH_SWITCHER: &str = "layout-not-admissible-with-switcher";
+
+/// The stable problem `type` slug for [`ControlError::SwitcherOwnsProgram`].
+pub const SWITCHER_OWNS_PROGRAM: &str = "switcher-owns-program";
 
 impl ControlError {
     /// Map this error onto its RFC 9457 problem document.
@@ -173,6 +182,20 @@ impl ControlError {
                 "Not admissible while the switcher is on",
             )
             .with_detail(refusal.operator_message()),
+            Self::SwitcherOwnsProgram(layout) => Problem::new(
+                422,
+                SWITCHER_OWNS_PROGRAM,
+                "The switcher owns the Program canvas",
+            )
+            .with_detail(format!(
+                "The switcher is on: the Program canvas is the M/E bus, so layout {layout:?} \
+                 cannot replace it. To show the layout on an output, take it there with \
+                 POST /api/v1/routing/output/take (feed {{\"layout\":\"{layout}\"}}) or send \
+                 apply-layout with target {{\"output\":\"<id>\"}}; to cut it to Program, \
+                 select it as a switcher source with \
+                 POST /api/v1/switcher/commands/select_preview (layout:{layout}). \
+                 Nothing was changed."
+            )),
         }
     }
 }
