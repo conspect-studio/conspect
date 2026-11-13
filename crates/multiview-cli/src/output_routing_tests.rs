@@ -3721,8 +3721,12 @@ fn an_operator_take_ends_a_boot_take_retry_window() {
 /// own `MAX_GAP_FILL_TICKS` bound — and `GapFill::encode` would return an
 /// error (`tick gap ...`), ending the worker thread and failing the key
 /// (`Fallback`). The fix makes the Clean worker see every tick strictly
-/// consecutively (the substituted ticks, then the surviving tick), so
-/// `GapFill` never sees a gap at all and the key survives.
+/// consecutively (the substituted ticks, then the surviving tick) and the key
+/// survives. The test pins that substitution itself delivers the gap (the
+/// first four substituted ticks reach the encoder before anything new is
+/// published); on a loaded host the tail of a long substitution can be
+/// dropped by the bounded queue and is closed by `GapFill` at the next
+/// accepted offer (one extra tick at most), as `substitute_clean` documents.
 #[test]
 fn a_consumer_gap_on_clean_is_substituted_like_program_and_never_fails_the_key() {
     let (mut x, seen) = ptr_harness(2);
@@ -3737,6 +3741,16 @@ fn a_consumer_gap_on_clean_is_substituted_like_program_and_never_fails_the_key()
         t += 1;
     }
     let last_fed_tick = t;
+    // Bounded waits that publish NOTHING: only the worker thread advances.
+    let wait_for_encoded = |tick: u64| {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while Instant::now() < deadline && !seen.lock().unwrap().iter().any(|(s, _)| *s >= tick) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    // The worker has drained every pre-gap tick, so its bounded queue
+    // (`WORKER_QUEUE_TICKS` = 4) is empty when the gap is substituted.
+    wait_for_encoded(last_fed_tick - 1);
     // The genuine consumer gap: `FRAME_SUBSTITUTION_LIMIT` in `pipeline.rs`
     // is 8, matching `MAX_GAP_FILL_TICKS` — exactly the boundary where an
     // unfilled gap handed straight to the Clean worker (no
@@ -3747,24 +3761,33 @@ fn a_consumer_gap_on_clean_is_substituted_like_program_and_never_fails_the_key()
     let gap: u64 = 8;
     let surviving_tick = last_fed_tick + gap + 1;
     x.tick_after_clean_gap(last_fed_tick + 1, surviving_tick);
-    // The substitution offers fill the worker's bounded queue (4) faster
-    // than a starved worker drains it, so the surviving tick's own offer can
-    // be refused (dropped, never blocked); the key's `GapFill` then closes the
-    // hole with the last canvas at its next accepted offer. Keep ticking as
-    // the pipeline does, and wait (bounded) until the encoder passed the
-    // surviving tick. A fixed 50 ms sleep after one tick failed on a loaded
-    // runner (#368 CI): the worker had not run yet.
-    let deadline = Instant::now() + std::time::Duration::from_secs(10);
-    let mut next = surviving_tick + 1;
-    while Instant::now() < deadline
-        && !seen
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(t, _)| *t > surviving_tick)
+    // Substitution, not the GapFill backstop: with the queue empty, the
+    // first four substituted ticks are accepted whatever the scheduling, and
+    // they reach the encoder before any later tick is published.
+    let first_four = last_fed_tick + 4;
+    wait_for_encoded(first_four);
     {
-        x.tick(next);
-        next += 1;
+        let got: Vec<u64> = seen.lock().unwrap().iter().map(|(s, _)| *s).collect();
+        assert!(
+            (last_fed_tick + 1..=first_four).all(|s| got.contains(&s)),
+            "the substituted ticks reached the encoder before any new frame: {got:?}"
+        );
+    }
+    // On a loaded runner the worker may not keep up with the rest of the
+    // substitution: `substitute_clean` stops at the first refused offer, and
+    // the surviving tick's own offer can be dropped (never blocked). The
+    // key's `GapFill` then closes the rest at the next accepted offer, by
+    // design (its bound covers a full substitution gap plus a full queue).
+    // At most ONE further tick is published for that backstop.
+    wait_for_encoded(surviving_tick);
+    if !seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(s, _)| *s == surviving_tick)
+    {
+        x.tick(surviving_tick + 1);
+        wait_for_encoded(surviving_tick + 1);
     }
     assert!(
         x.results()
