@@ -512,8 +512,9 @@ https_port = {udp_port}
     );
     assert!(counters.0 > 0, "the header guard rejected oversized blocks");
     // #382: every long session lived to the end, past the header deadline,
-    // and kept receiving (one stream per 100 ms; a loaded runner may lag,
-    // a reset session stops at ~100 by 10 s).
+    // and kept receiving (one stream per 100 ms; a loaded runner may lag).
+    // `alive_at_end` requires streams in the last ~3 s: a session reset at
+    // 10 s fails it.
     let header_deadline = multiview_h3::H3Limits::default().header_deadline;
     assert!(
         long_held > header_deadline + Duration::from_secs(2),
@@ -524,8 +525,11 @@ https_port = {udp_port}
             r.alive_at_end,
             "a long session ended early: {long_results:?}"
         );
+        // At least half the nominal rate over the whole hold (~150 at 15 s):
+        // catches a session starved throughout; the tail check above catches
+        // one that stopped.
         assert!(
-            r.streams * 100 >= (long_held.as_millis() as u64) / 4,
+            r.streams * 200 >= long_held.as_millis() as u64,
             "a long session stopped receiving: {long_results:?}"
         );
     }
