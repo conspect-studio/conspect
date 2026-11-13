@@ -1,0 +1,633 @@
+//! The patch panel, mixer-input slice (ADR-0110, `docs/architecture/output-routing.md`
+//! §12.8, #341): `GET /api/v1/patch`, `POST /api/v1/patch/plan`,
+//! `POST /api/v1/patch/take`.
+//!
+//! Order of checks (plan and take), so nothing leaks and nothing is burned:
+//! role → crosspoint count → per crosspoint destination authorization
+//! (`authorize_object(me)` + Program scope; an output slot: the output axis)
+//! and source authorization (`authorize_object(source)`) — all **before**
+//! existence and before the `Idempotency-Key` is looked at. Then shape
+//! (plane, destination kind, source kind, duplicates), existence against the
+//! engine's live input table, the on-air guard, and only for a take the key
+//! (a replay answers its first 202), the rate limits (429), the reservation,
+//! the on-demand leases and the bounded `try_send` (full → 503, key and
+//! leases released). The outcome rides the existing `switcher.operation`
+//! event; an applied patch is persisted by [`crate::patch`].
+//!
+//! This slice accepts only `plane = "video"` crosspoints onto mixer inputs
+//! with a configured source or `"none"`; output slots, audio/subtitle planes,
+//! layouts and buses arrive in later slices and are refused with a typed 422.
+
+use std::time::Instant;
+
+use axum::extract::State;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use multiview_core::switcher::SourceRef;
+use multiview_engine::switcher_control::{
+    PatchSet, SwitcherCommand, SwitcherControl, SwitcherSnapshot,
+};
+use multiview_engine::switcher_inputs::{InputsReadback, MAX_PATCH_MEMBERS};
+use multiview_events::AuthzScope;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::auth::{authorize_object, authorize_output, authorize_scope, Action, Principal};
+use crate::concurrency::{IdempotencyKey, Reservation};
+use crate::error::{ControlError, ControlResult};
+use crate::problem::Problem;
+use crate::state::AppState;
+
+/// The first slice's one M/E and its program.
+const ME: &str = "me1";
+const PROGRAM: &str = "main";
+
+/// One crosspoint destination: a mixer input (`{"mixer","input"}`) or, in a
+/// later slice, an output slot (`{"output","slot"}`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PatchDestination {
+    /// M/E id (`me1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer: Option<String>,
+    /// Mixer input number, 1..=64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<u16>,
+    /// Output id (output slots arrive in a later slice; refused here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// Output slot index (later slice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+}
+
+/// One crosspoint `{ plane, destination, source }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PatchCrosspoint {
+    /// `video` (this slice), `audio` or `subtitle`.
+    pub plane: String,
+    /// Where the source is patched.
+    pub destination: PatchDestination,
+    /// `{"source": id}` or `"none"` (this slice); `{"layout": id}`,
+    /// `{"bus": ..}`, `"follow"` arrive in later slices.
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub source: Value,
+}
+
+/// `on_air`: whether a crosspoint may re-patch the input on Program.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OnAir {
+    /// Refuse (409 `on-air-protected`) — the default.
+    #[default]
+    Protect,
+    /// Apply it as a cut on Program.
+    Allow,
+}
+
+/// Plan/take body: 1..=64 crosspoints applied atomically at one tick.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PatchRequest {
+    /// The crosspoints.
+    pub crosspoints: Vec<PatchCrosspoint>,
+    /// On-air guard for the input on Program.
+    #[serde(default)]
+    pub on_air: OnAir,
+}
+
+/// A typed refusal (`type` suffix + detail).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PatchRefusal {
+    /// RFC 9457 `type` suffix, e.g. `on-air-protected`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Human-readable reason.
+    pub detail: String,
+}
+
+/// One planned crosspoint.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PlannedCrosspoint {
+    /// The destination as requested.
+    pub destination: PatchDestination,
+    /// The path this crosspoint takes (`mixer-input`).
+    pub path: &'static str,
+    /// Whether the destination input is on Program now.
+    pub on_air: bool,
+    /// `null` when the crosspoint can be taken.
+    pub refusal: Option<PatchRefusal>,
+}
+
+/// `POST /patch/plan` answer.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PatchPlan {
+    /// Change class (a mixer re-patch is Class-1, hot).
+    pub class: &'static str,
+    /// Per-crosspoint plan, request order.
+    pub crosspoints: Vec<PlannedCrosspoint>,
+    /// `true` when every crosspoint can be taken.
+    pub can_take: bool,
+}
+
+/// `POST /patch/take` 202 answer; the outcome arrives as `switcher.operation`.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PatchAccepted {
+    /// Correlates with `switcher.operation.operation_id`.
+    pub operation_id: String,
+    /// Always `accepted`; never `applied`.
+    pub status: &'static str,
+}
+
+fn problem(status: u16, kind: &str, detail: impl Into<String>) -> Response {
+    Problem::new(status, kind, "Patch refused")
+        .with_detail(detail)
+        .into_response()
+}
+
+fn too_many(retry: std::time::Duration) -> Response {
+    let secs = retry
+        .as_secs()
+        .saturating_add(u64::from(retry.subsec_nanos() > 0))
+        .max(1);
+    let mut response = Problem::new(429, "too-many-requests", "Too many takes")
+        .with_detail("too many patch takes for this destination or principal; retry shortly")
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// The source id named by a crosspoint, if it is `{"source": id}`.
+fn source_id(source: &Value) -> Option<&str> {
+    source.get("source").and_then(Value::as_str)
+}
+
+/// Authorize both ends of every crosspoint (BOLA), before any existence check.
+fn authorize(principal: &Principal, req: &PatchRequest) -> ControlResult<()> {
+    for xp in &req.crosspoints {
+        let destination = &xp.destination;
+        if let Some(mixer) = &destination.mixer {
+            authorize_object(principal, mixer)?;
+            authorize_scope(principal, AuthzScope::Program(PROGRAM))?;
+        }
+        if let Some(output) = &destination.output {
+            authorize_scope(
+                principal,
+                AuthzScope::ObjectAndOutput {
+                    object: output,
+                    output,
+                },
+            )?;
+            authorize_output(principal, output)?;
+        }
+        if let Some(object) = source_id(&xp.source)
+            .or_else(|| xp.source.get("layout").and_then(Value::as_str))
+        {
+            authorize_object(principal, object)?;
+        }
+        if xp.source.get("bus").is_some() {
+            authorize_object(principal, ME)?;
+            authorize_scope(principal, AuthzScope::Program(PROGRAM))?;
+        }
+    }
+    Ok(())
+}
+
+/// A validated mixer crosspoint.
+struct Member {
+    input: u16,
+    source: Option<String>,
+}
+
+/// Shape checks: this slice's plane/destination/source kinds, no duplicates.
+fn shape(req: &PatchRequest) -> Result<Vec<Member>, Response> {
+    let mut members = Vec::with_capacity(req.crosspoints.len());
+    for xp in &req.crosspoints {
+        if xp.plane != "video" {
+            return Err(problem(
+                422,
+                "slot-medium-mismatch",
+                format!(
+                    "plane {:?} is not patchable in this release; mixer inputs take video \
+                     (audio and subtitle slots arrive in a later slice)",
+                    xp.plane
+                ),
+            ));
+        }
+        let destination = &xp.destination;
+        if destination.output.is_some() || destination.slot.is_some() {
+            return Err(problem(
+                422,
+                "unknown-slot",
+                "output slots arrive in a later slice; this release patches mixer inputs only",
+            ));
+        }
+        let (Some(_), Some(input)) = (&destination.mixer, destination.input) else {
+            return Err(problem(
+                422,
+                "unknown-slot",
+                "a mixer destination needs both `mixer` and `input`",
+            ));
+        };
+        let source = match &xp.source {
+            Value::String(none) if none == "none" => None,
+            Value::Object(map) if map.len() == 1 && source_id(&xp.source).is_some() => {
+                source_id(&xp.source).map(str::to_owned)
+            }
+            _ => {
+                return Err(problem(
+                    422,
+                    "unknown-source",
+                    "a mixer input takes {\"source\": id} or \"none\"; layouts and buses as \
+                     mixer inputs arrive in a later slice",
+                ))
+            }
+        };
+        if members.iter().any(|m: &Member| m.input == input) {
+            return Err(problem(
+                422,
+                "unknown-slot",
+                format!("mixer input {input} appears twice in one patch"),
+            ));
+        }
+        members.push(Member { input, source });
+    }
+    Ok(members)
+}
+
+fn configured_sources(state: &AppState) -> ControlResult<Vec<String>> {
+    Ok(crate::boot_model::accepted_resources(state, "sources")?
+        .map_or_else(|| state.sources.list(), Ok)?
+        .into_iter()
+        .map(|v| v.resource.id)
+        .collect())
+}
+
+/// Live engine handle with numbered inputs, or the typed refusal.
+fn engine_with_inputs(
+    state: &AppState,
+) -> Result<(&SwitcherControl, std::sync::Arc<InputsReadback>), Response> {
+    let Some(handle) = state.switcher.as_ref() else {
+        return Err(problem(
+            409,
+            "switcher-unavailable",
+            "no real Program/Preview switcher is attached to this run",
+        ));
+    };
+    if !handle.is_ready() {
+        return Err(problem(
+            409,
+            "switcher-unavailable",
+            "no real paired Program/Preview frame has been published",
+        ));
+    }
+    let Some(inputs) = handle.inputs() else {
+        return Err(problem(
+            422,
+            "unknown-slot",
+            "this M/E declares no numbered mixer inputs",
+        ));
+    };
+    Ok((handle, inputs))
+}
+
+/// Everything after authorization and shape: existence and the on-air guard.
+struct Checked {
+    members: Vec<Member>,
+    plan: PatchPlan,
+    first_refusal: Option<PatchRefusal>,
+}
+
+fn check(
+    state: &AppState,
+    req: &PatchRequest,
+    inputs: &InputsReadback,
+    snapshot: Option<&SwitcherSnapshot>,
+) -> ControlResult<Result<Checked, Response>> {
+    let members = match shape(req) {
+        Ok(members) => members,
+        Err(response) => return Ok(Err(response)),
+    };
+    let sources = configured_sources(state)?;
+    let program_input = snapshot.and_then(|s| s.program_input);
+    let preview_input = snapshot.and_then(|s| s.preview_input);
+    let in_flight = snapshot.is_some_and(|s| s.in_flight);
+    let mut planned = Vec::with_capacity(members.len());
+    let mut first_refusal = None;
+    for (xp, member) in req.crosspoints.iter().zip(&members) {
+        if xp.destination.mixer.as_deref() != Some(ME) {
+            return Ok(Err(problem(
+                422,
+                "unknown-slot",
+                format!("unknown mixer {:?}", xp.destination.mixer),
+            )));
+        }
+        let Some(live) = inputs.inputs.iter().find(|i| i.number == member.input) else {
+            return Ok(Err(problem(
+                422,
+                "unknown-slot",
+                format!("mixer input {} is not declared", member.input),
+            )));
+        };
+        if let Some(source) = &member.source {
+            if !sources.iter().any(|id| id == source) {
+                return Ok(Err(problem(
+                    422,
+                    "unknown-source",
+                    "source is not in the running configuration",
+                )));
+            }
+        }
+        let on_program = program_input == Some(member.input);
+        let on_bus = on_program || preview_input == Some(member.input);
+        let refusal = if on_bus && in_flight {
+            Some(multiview_engine::switcher_control::REFUSE_PATCH_DURING_AUTO)
+        } else if on_bus && member.source.is_none() {
+            Some("on-air-protected: the input is on Program or Preview and cannot be unpatched")
+        } else if on_program
+            && req.on_air == OnAir::Protect
+            && member.source.as_deref() != live.source.as_ref().map(SourceRef::as_str)
+        {
+            Some(multiview_engine::switcher_control::REFUSE_ON_AIR_PROTECTED)
+        } else {
+            None
+        }
+        .map(|detail| PatchRefusal {
+            kind: crate::patch::refusal_kind(detail).to_owned(),
+            detail: detail.to_owned(),
+        });
+        if first_refusal.is_none() {
+            first_refusal.clone_from(&refusal);
+        }
+        planned.push(PlannedCrosspoint {
+            destination: xp.destination.clone(),
+            path: "mixer-input",
+            on_air: on_program,
+            refusal,
+        });
+    }
+    Ok(Ok(Checked {
+        members,
+        plan: PatchPlan {
+            class: "class1",
+            can_take: first_refusal.is_none(),
+            crosspoints: planned,
+        },
+        first_refusal,
+    }))
+}
+
+fn validate_count(req: &PatchRequest) -> ControlResult<()> {
+    if req.crosspoints.is_empty() || req.crosspoints.len() > MAX_PATCH_MEMBERS {
+        return Err(ControlError::Validation(format!(
+            "a patch carries 1..={MAX_PATCH_MEMBERS} crosspoints"
+        )));
+    }
+    Ok(())
+}
+
+/// The live patch (mixer plane), built from the engine's readback.
+#[cfg_attr(feature = "openapi", utoipa::path(get, path = "/api/v1/patch", tag = "patch",
+    responses(
+        (status = 200, description = "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ] }` from the engine's live readback; a mixer the caller cannot read (M/E object + Program scope) is omitted, and a source it cannot read is `{\"redacted\": true}`.", body = Object),
+        (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+        (status = 403, description = "Role lacks Read.", body = crate::problem::Problem),
+    )))]
+pub(crate) async fn get_patch(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Read)?;
+    let mut mixer = Vec::new();
+    let readable = authorize_object(&principal, ME).is_ok()
+        && authorize_scope(&principal, AuthzScope::Program(PROGRAM)).is_ok();
+    if let (true, Some(handle)) = (readable, state.switcher.as_ref()) {
+        if let Some(table) = handle.inputs() {
+            let snapshot = handle.snapshot();
+            let program_input = snapshot.as_ref().and_then(|s| s.program_input);
+            let preview_input = snapshot.as_ref().and_then(|s| s.preview_input);
+            let inputs: Vec<Value> = table
+                .inputs
+                .iter()
+                .map(|input| {
+                    let video = input.source.as_ref().map(|source| {
+                        if authorize_object(&principal, source.as_str()).is_ok() {
+                            json!({ "source": source.as_str() })
+                        } else {
+                            json!({ "redacted": true })
+                        }
+                    });
+                    json!({
+                        "number": input.number,
+                        "label": input.label,
+                        "video": video,
+                        "on_program": program_input == Some(input.number),
+                        "on_preview": preview_input == Some(input.number),
+                    })
+                })
+                .collect();
+            mixer.push(json!({
+                "me": ME,
+                "inputs": inputs,
+                "inputs_version": snapshot.as_ref().map_or(table.version, |s| s.inputs_version.max(table.version)),
+                "tick": handle.applied_tick(),
+            }));
+        }
+    }
+    Ok((StatusCode::OK, Json(json!({ "mixer": mixer }))).into_response())
+}
+
+/// Plan 1..64 mixer crosspoints: path, on-air flag and refusals; no change.
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/patch/plan", tag = "patch", request_body = PatchRequest,
+    responses(
+        (status = 200, body = PatchPlan),
+        (status = 403, description = "Not authorized for a destination (M/E object + Program scope) or a source.", body = crate::problem::Problem),
+        (status = 409, description = "`switcher-unavailable`.", body = crate::problem::Problem),
+        (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, or not 1..=64 crosspoints.", body = crate::problem::Problem),
+    )))]
+pub(crate) async fn plan_patch(
+    State(state): State<AppState>,
+    principal: Principal,
+    Json(req): Json<PatchRequest>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Write)?;
+    validate_count(&req)?;
+    authorize(&principal, &req)?;
+    let (handle, inputs) = match engine_with_inputs(&state) {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
+    };
+    let snapshot = handle.snapshot();
+    match check(&state, &req, &inputs, snapshot.as_deref())? {
+        Ok(checked) => Ok((StatusCode::OK, Json(checked.plan)).into_response()),
+        Err(response) => Ok(response),
+    }
+}
+
+/// Take 1..64 mixer crosspoints atomically at one engine tick.
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/patch/take", tag = "patch", request_body = PatchRequest,
+    params(("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")),
+    responses(
+        (status = 202, body = PatchAccepted),
+        (status = 403, description = "Not authorized for a destination (M/E object + Program scope) or a source.", body = crate::problem::Problem),
+        (status = 409, description = "`on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, or no source lease.", body = crate::problem::Problem),
+        (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, missing Idempotency-Key, or not 1..=64 crosspoints.", body = crate::problem::Problem),
+        (status = 429, description = "Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After.", body = crate::problem::Problem),
+        (status = 503, description = "`engine-busy` (the key and leases are released) or `idempotency-capacity`.", body = crate::problem::Problem),
+    )))]
+#[allow(clippy::too_many_lines)]
+// reason: one linear admission sequence whose order (authz → shape → existence
+// → key → limits → reserve → lease → enqueue) is the security contract.
+pub(crate) async fn take_patch(
+    State(state): State<AppState>,
+    principal: Principal,
+    idem: IdempotencyKey,
+    Json(req): Json<PatchRequest>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Write)?;
+    validate_count(&req)?;
+    authorize(&principal, &req)?;
+    let (handle, inputs) = match engine_with_inputs(&state) {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
+    };
+    let snapshot = handle.snapshot();
+    let checked = match check(&state, &req, &inputs, snapshot.as_deref())? {
+        Ok(checked) => checked,
+        Err(response) => return Ok(response),
+    };
+    if let Some(refusal) = checked.first_refusal {
+        return Ok(problem(409, &refusal.kind, refusal.detail));
+    }
+    let Some(key) = idem.0.as_deref().filter(|key| !key.trim().is_empty()) else {
+        return Err(ControlError::Validation(
+            "Idempotency-Key is required".into(),
+        ));
+    };
+    if let Some(op) = state.idempotency.peek(key) {
+        return Ok(accepted(op.to_string()));
+    }
+    let destinations: Vec<String> = checked
+        .members
+        .iter()
+        .map(|m| format!("{ME}.in{}", m.input))
+        .collect();
+    if let Err(retry) = state
+        .patch_limiter
+        .admit_set(&destinations, &principal.key_id, Instant::now())
+    {
+        return Ok(too_many(retry));
+    }
+    let op = match state.idempotency.reserve(Some(key)) {
+        Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
+        Reservation::Replay(op) => return Ok(accepted(op.to_string())),
+        Reservation::Fresh(op) => op,
+    };
+    let Some(scene_version) = handle.scene_version() else {
+        state.idempotency.release(Some(key), &op);
+        return Err(ControlError::Conflict("switcher has no active scene".into()));
+    };
+    // On-demand leases for a newly patched source landing on PGM or PVW, so
+    // an on-demand source starts before the engine needs its fresh frame.
+    let program_input = snapshot.as_ref().and_then(|s| s.program_input);
+    let preview_input = snapshot.as_ref().and_then(|s| s.preview_input);
+    let lease_for = |bus: Option<u16>, label: &str| {
+        let member = checked
+            .members
+            .iter()
+            .find(|m| Some(m.input) == bus && m.source.is_some())?;
+        let source = member.source.clone()?;
+        Some((source, label.to_owned()))
+    };
+    let wanted = [
+        lease_for(program_input, "switcher:me1:pgm:patch"),
+        lease_for(preview_input, "switcher:me1:pvw:patch"),
+    ];
+    let mut leases = [None, None];
+    if let Some(demand) = state.source_demand.as_ref() {
+        for (slot, want) in leases.iter_mut().zip(&wanted) {
+            if let Some((source, label)) = want {
+                let Some(lease) = demand.switcher_preview_lease(source, label) else {
+                    state.idempotency.release(Some(key), &op);
+                    return Ok(problem(
+                        409,
+                        "capacity",
+                        "source lease unavailable (unknown source or lease limit)",
+                    ));
+                };
+                *slot = Some((
+                    source.clone(),
+                    crate::source_demand::SwitcherPreviewLease::new(lease),
+                ));
+            }
+        }
+    }
+    let command = SwitcherCommand {
+        operation_id: op.to_string(),
+        scene_version,
+        verb: multiview_engine::switcher_control::SwitcherVerb::Patch(PatchSet {
+            members: checked
+                .members
+                .iter()
+                .map(|m| (m.input, m.source.as_deref().map(SourceRef::new)))
+                .collect(),
+            allow_on_air: req.on_air == OnAir::Allow,
+        }),
+    };
+    let [program_lease, preview_lease] = leases;
+    let owner = &state.switcher_preview_lease;
+    let enqueue = || {
+        handle.try_send(command).map_err(|_| ())?;
+        Ok(handle.composed_count())
+    };
+    // The first lease owns the enqueue (reserve-then-send under the owner's
+    // lock); a dropped lease value is released at once (refusal path).
+    let admitted = match (program_lease, preview_lease) {
+        (Some((target, lease)), preview) => {
+            let sent = owner
+                .admit_program(op.to_string(), target, lease, handle, enqueue)
+                .is_ok();
+            if sent {
+                if let Some((target, lease)) = preview {
+                    // Resolved by the off-clock sweep against the engine's PVW.
+                    let _ = owner.admit(format!("{op}:pvw"), target, lease, handle, || {
+                        Ok(handle.composed_count())
+                    });
+                }
+            }
+            sent
+        }
+        (None, Some((target, lease))) => owner
+            .admit(op.to_string(), target, lease, handle, enqueue)
+            .is_ok(),
+        (None, None) => enqueue().is_ok(),
+    };
+    if !admitted {
+        state.idempotency.release(Some(key), &op);
+        return Err(ControlError::EngineBusy);
+    }
+    Ok(accepted(op.to_string()))
+}
+
+fn accepted(operation_id: String) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(PatchAccepted {
+            operation_id,
+            status: "accepted",
+        }),
+    )
+        .into_response()
+}

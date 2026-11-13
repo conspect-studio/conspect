@@ -79,6 +79,7 @@ pub mod moq_startup;
 pub mod nmos;
 pub mod notify;
 pub mod output_routing;
+pub mod patch;
 pub mod pending_actions;
 pub mod preview;
 pub mod problem;
@@ -268,6 +269,7 @@ pub fn router(state: AppState) -> Router {
     if let Some(control) = state.output_routing.as_ref() {
         output_routing::spawn_outcome_relay(&state, control);
     }
+    patch::spawn_persist_relay(&state);
     if let Some(metrics) = state.program_metrics.as_ref() {
         program_metrics::spawn_sampler(metrics);
     }

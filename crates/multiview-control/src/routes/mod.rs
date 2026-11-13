@@ -44,6 +44,7 @@ pub mod moq;
 pub mod output_routing;
 pub mod outputs;
 pub mod overlays;
+pub mod patch;
 pub mod preview;
 pub mod probes;
 pub mod routing;
@@ -1432,6 +1433,10 @@ pub fn api_router() -> Router<AppState> {
         .route("/switcher/{me}", get(switcher::get_switcher))
         .route("/switcher/plan", post(switcher::plan_switcher))
         .route("/switcher/commands/{kind}", post(switcher::submit_switcher))
+        // The patch panel, mixer-input slice (ADR-0110 §12.8, #341).
+        .route("/patch", get(patch::get_patch))
+        .route("/patch/plan", post(patch::plan_patch))
+        .route("/patch/take", post(patch::take_patch))
         .route(
             "/metrics/program",
             get(crate::program_metrics::get_program_metrics),
