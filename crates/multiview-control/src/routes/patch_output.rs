@@ -9,7 +9,7 @@
 //! as `POST /routing/output/take` (that route is the slot-0 alias).
 
 use axum::response::Response;
-use multiview_config::{OutputBus, VideoFeed};
+use multiview_config::{AudioFeed, OutputBus, VideoFeed};
 use serde_json::{json, Value};
 
 use super::output_routing::{
@@ -31,14 +31,19 @@ pub(crate) fn may_patch_output(principal: &Principal, output: &str) -> bool {
     super::output_routing::authorize_output_end(principal, output).is_ok()
 }
 
-/// One validated output-slot request: the output and its video feed. Audio
-/// slot 0 `"follow"` (when named) rides the video take exactly as the alias's
-/// `audio: follow` does: the output keeps following its video.
+/// One validated output-slot request: the output, its video feed and
+/// whether audio slot 0 `"follow"` was named. Named, it rides the video take
+/// exactly as the alias's `audio: "follow"` does (the output's audio follows
+/// its video from then on, replacing an explicit choice); omitted, the
+/// output keeps its current audio choice, as the alias without `audio`
+/// (#342 review T-M1).
 pub(crate) struct OutputPatch {
     /// The output API id.
     pub output: String,
     /// Video slot 0's feed.
     pub video: VideoFeed,
+    /// Audio slot 0 `"follow"` was named in the patch.
+    pub audio_follow: bool,
 }
 
 /// Whether any crosspoint addresses an output slot.
@@ -83,6 +88,7 @@ fn video_feed(xp: &PatchCrosspoint) -> Result<VideoFeed, Box<Response>> {
 pub(crate) fn shape(req: &PatchRequest) -> Result<OutputPatch, Box<Response>> {
     let mut output: Option<&str> = None;
     let mut video: Option<VideoFeed> = None;
+    let mut audio_follow = false;
     for xp in &req.crosspoints {
         let d = &xp.destination;
         let Some(this) = d.output.as_deref() else {
@@ -136,6 +142,14 @@ pub(crate) fn shape(req: &PatchRequest) -> Result<OutputPatch, Box<Response>> {
                          only audio slot 0 with \"follow\" (it rides the video take) is patchable",
                     )));
                 }
+                if audio_follow {
+                    return Err(Box::new(problem(
+                        422,
+                        "unknown-slot",
+                        "audio slot 0 appears twice in one patch",
+                    )));
+                }
+                audio_follow = true;
             }
             "subtitle" => {
                 return Err(Box::new(problem(
@@ -163,6 +177,7 @@ pub(crate) fn shape(req: &PatchRequest) -> Result<OutputPatch, Box<Response>> {
     Ok(OutputPatch {
         output: output.to_owned(),
         video,
+        audio_follow,
     })
 }
 
@@ -283,15 +298,17 @@ pub(crate) fn take(
         ));
     }
     Ok(
-        // Audio slot 0 `follow` rides the video take: the output's audio
-        // choice is kept (`None`), exactly as the alias without `audio`.
+        // Audio slot 0 `follow`, when named, rides the video take as the
+        // alias's `audio: "follow"` (same engine request, same take record,
+        // so the two routes replay each other); omitted, the output's audio
+        // choice is kept (`None`), as the alias without `audio` (T-M1).
         match take_output_slot0(
             state,
             principal,
             idem,
             &patch.output,
             Some(&patch.video),
-            None,
+            patch.audio_follow.then_some(&AudioFeed::Follow),
         )? {
             SlotTake::Accepted(op) => Ok(op),
             SlotTake::Replay(replay) => Ok(replay.operation_id.to_string()),

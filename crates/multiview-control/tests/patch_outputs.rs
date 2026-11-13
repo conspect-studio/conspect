@@ -25,7 +25,7 @@ use multiview_config::{MultiviewConfig, StartMode};
 use multiview_control::auth::{ApiKeyStore, Principal, Role};
 use multiview_control::output_routing::{
     OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost, PlanPath, PlanRefusal,
-    RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
+    RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
 };
 use multiview_control::{
     boot_model::BootModel, command_bus, AppState, EngineStateSnapshot, InMemoryRepository,
@@ -153,7 +153,7 @@ struct Fake {
     /// Race seam: when armed, every take-time plan waits here, so two
     /// concurrent takes both pass the replay peek before either reserves.
     rendezvous: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
-    _tx: SyncSender<OutputOutcome>,
+    tx: SyncSender<OutputOutcome>,
     rx: Mutex<Option<Receiver<OutputOutcome>>>,
 }
 
@@ -163,7 +163,7 @@ impl Fake {
         Arc::new(Self {
             state: Mutex::new(FakeState::default()),
             rendezvous: Mutex::new(None),
-            _tx: tx,
+            tx,
             rx: Mutex::new(Some(rx)),
         })
     }
@@ -1320,4 +1320,142 @@ async fn a_denied_layout_closure_is_403_before_the_output_lookup_on_every_route(
         "identical answers: no existence oracle"
     );
     assert!(rig.fake.takes().is_empty(), "nothing reached the engine");
+}
+
+fn bars() -> Value {
+    json!({"source": "bars"})
+}
+
+fn audio_follow(output: &str) -> Value {
+    json!({ "plane": "audio", "destination": {"output": output, "slot": 0}, "source": "follow" })
+}
+
+/// The persisted `[[routing.output]]` row of an output's config id.
+fn persisted_row(rig: &Rig, output: &str) -> Option<Value> {
+    let config: MultiviewConfig = serde_json::from_value(
+        multiview_control::boot_model::current_desired_config(&rig.state).unwrap(),
+    )
+    .unwrap();
+    config
+        .routing
+        .as_ref()
+        .and_then(|t| t.output.iter().find(|xp| xp.output == output))
+        .map(|xp| serde_json::to_value(xp).unwrap())
+}
+
+async fn wait_for<F: Fn() -> bool>(f: F) {
+    for _ in 0..200 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("condition not reached");
+}
+
+/// Review T-M1: audio slot 0 `"follow"` rides the patch take as the alias's
+/// `audio: "follow"`. An output with an explicit audio choice
+/// (`secret-cam`), patched `{video, audio follow}`: the engine take request
+/// carries `Follow`, and once applied the persisted row's audio is follow
+/// (the explicit choice is gone). Without audio slot 0 the take keeps the
+/// output's choice (`audio: None`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audio_slot_zero_follow_rides_the_take_and_persists_follow() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = format!(
+        "{DOC}\n[[routing.output]]\noutput = \"{OUT_B}\"\nprogram = \"main\"\naudio = {{ source = \"secret-cam\" }}\n"
+    );
+    let rig = rig_with(&dir.path().join("boot.toml"), &doc);
+    assert_eq!(
+        persisted_row(&rig, OUT_B).unwrap()["audio"],
+        json!({"source": "secret-cam"})
+    );
+    // No audio slot: the output's choice is kept.
+    let (status, _) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "keep",
+        patch(vec![video("output-1", bars())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(rig.fake.takes()[0].audio, None, "omitted: keep the choice");
+    // Audio slot 0 follow: the engine take carries Follow.
+    let (status, accepted) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "follow",
+        patch(vec![video("output-1", bars()), audio_follow("output-1")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let takes = rig.fake.takes();
+    assert_eq!(takes[1].audio, Some(RoutedAudio::Follow));
+    rig.fake
+        .tx
+        .send(OutputOutcome {
+            operation_id: accepted["operation_id"].as_str().unwrap().to_owned(),
+            output: OUT_B.into(),
+            tick: 7,
+            outcome: "applied".into(),
+            feed: Some(RoutedFeed::Source("bars".into())),
+            audio: Some(RoutedAudio::Follow),
+        })
+        .unwrap();
+    wait_for(|| {
+        persisted_row(&rig, OUT_B).is_some_and(|r| r["video"] == json!({"source": "bars"}))
+    })
+    .await;
+    let row = persisted_row(&rig, OUT_B).unwrap();
+    assert!(
+        row.get("audio").is_none_or(|a| a == "follow"),
+        "the explicit choice is replaced by follow: {row}"
+    );
+}
+
+/// Review T-M1 addendum: an explicit audio follow is the SAME take on both
+/// slot-0 routes, so one Idempotency-Key replays across them in both
+/// directions (same operation id, never a 409 and never a second enqueue).
+#[tokio::test]
+async fn explicit_follow_replays_across_the_patch_and_the_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    let alias_follow = |output: &str| {
+        json!({
+            "target": {"kind": "output", "output": output, "stream": "video"},
+            "feed": bars(),
+            "audio": "follow",
+        })
+    };
+    let alias_send = |key: &'static str| {
+        let body = alias_follow("output-1");
+        let router = rig.router.clone();
+        async move {
+            let resp = send(
+                &router,
+                post(
+                    "/api/v1/routing/output/take",
+                    OPERATOR_TOKEN,
+                    Some(key),
+                    &body,
+                ),
+            )
+            .await;
+            (resp.status(), body_json(resp).await)
+        }
+    };
+    let patch_body = || patch(vec![video("output-1", bars()), audio_follow("output-1")]);
+    // Patch first, then the alias with the same key.
+    let (status, first) = take(&rig, OPERATOR_TOKEN, "x1", patch_body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    let (status, again) = alias_send("x1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{again}");
+    assert_eq!(again["operation_id"], first["operation_id"]);
+    // Alias first, then the patch with the same key.
+    let (status, first) = alias_send("x2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    let (status, again) = take(&rig, OPERATOR_TOKEN, "x2", patch_body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{again}");
+    assert_eq!(again["operation_id"], first["operation_id"]);
+    assert_eq!(rig.fake.takes().len(), 2, "one enqueue per key");
 }
