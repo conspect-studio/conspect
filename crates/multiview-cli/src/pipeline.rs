@@ -3969,7 +3969,7 @@ impl Pipeline {
         control: FC,
     ) -> Result<PipelineReport, PipelineError>
     where
-        FC: FnMut(&mut CompositorDrive<Nv12Image>),
+        FC: FnMut(&mut CompositorDrive<Nv12Image>) + Send,
     {
         self.run_until_serving_observed(stop, publisher, preview, control, None)
             .await
@@ -4000,7 +4000,7 @@ impl Pipeline {
         tick_observer: Option<Arc<AtomicU64>>,
     ) -> Result<PipelineReport, PipelineError>
     where
-        FC: FnMut(&mut CompositorDrive<Nv12Image>),
+        FC: FnMut(&mut CompositorDrive<Nv12Image>) + Send,
     {
         let time: Arc<dyn TimeSource> = Arc::new(MonotonicTimeSource::new());
         // Live daemon: drop-on-overload so a wedged encoder can never stall the
@@ -4264,7 +4264,7 @@ impl Pipeline {
     ///
     /// Returns a [`PipelineError`] if the clock/engine reject the canvas, the
     /// bake fails, or a sink runner returns an error.
-    pub async fn drive_streaming_for_test<P: Pacer>(
+    pub async fn drive_streaming_for_test<P: Pacer + Send>(
         &mut self,
         params: StreamTestParams<P>,
         stop: &StopSignal,
@@ -4370,8 +4370,8 @@ impl Pipeline {
         control: FC,
     ) -> Result<DriveStreamOutcome, PipelineError>
     where
-        P: Pacer,
-        FC: FnMut(&mut CompositorDrive<Nv12Image>),
+        P: Pacer + Send,
+        FC: FnMut(&mut CompositorDrive<Nv12Image>) + Send,
     {
         // #103: an AES67 source/output only functions on the program-audio bus, so
         // fail closed BEFORE the output clock starts if this run carries none —
@@ -5242,67 +5242,86 @@ impl Pipeline {
         // `EngineRuntime` path — the run methods no longer take `stop`; the same
         // bounded (`run_for`) vs forever (`run`) split + the same publisher /
         // state/event projections / per-frame control hook are threaded verbatim.
-        let outcome = if let Some(mut switcher_driver) = self.switcher_driver.take() {
-            switcher_driver.set_prime_stores(self.catalogue_stores());
-            let Some(preview_slot) = self.switcher_preview.clone() else {
-                return Err(PipelineError::Engine("switcher preview tap missing".into()));
-            };
-            let Some(cell_id) = self.switcher_cell_id.clone() else {
-                return Err(PipelineError::Engine(
-                    "switcher Program cell id missing".into(),
-                ));
-            };
-            let mut hook = multiview_engine::switcher_hook::SwitcherFrameHook::new(
-                switcher_driver,
-                cell_id,
-                control,
-            );
-            hook.preview_slot = Some(preview_slot);
-            hook.preview_stores = Some(self.catalogue_stores());
-            hook.preview_selection = preview_selection;
-            // The only clock-side routing duty: one non-blocking `try_send`
-            // after a fresh compose, and only while a routed feed is active.
-            // The engine run future is boxed (one allocation per run, never
-            // per tick) so the hook's state does not inflate this future.
-            let hook = multiview_engine::WithAuxTick {
-                inner: hook,
-                aux: aux_tx,
-            };
-            match max_ticks {
-                Some(max) => {
-                    Box::pin(
-                        program
-                            .run_for_with_frame_control(publisher, max, state_of, event_of, hook),
-                    )
-                    .await
+        let clock_thread_name = format!("clock-{}", self.program_spec.id.as_str());
+        let engine_loop =
+            async {
+                if let Some(mut switcher_driver) = self.switcher_driver.take() {
+                    switcher_driver.set_prime_stores(self.catalogue_stores());
+                    let Some(preview_slot) = self.switcher_preview.clone() else {
+                        return Err(PipelineError::Engine("switcher preview tap missing".into()));
+                    };
+                    let Some(cell_id) = self.switcher_cell_id.clone() else {
+                        return Err(PipelineError::Engine(
+                            "switcher Program cell id missing".into(),
+                        ));
+                    };
+                    let mut hook = multiview_engine::switcher_hook::SwitcherFrameHook::new(
+                        switcher_driver,
+                        cell_id,
+                        control,
+                    );
+                    hook.preview_slot = Some(preview_slot);
+                    hook.preview_stores = Some(self.catalogue_stores());
+                    hook.preview_selection = preview_selection;
+                    // The only clock-side routing duty: one non-blocking `try_send`
+                    // after a fresh compose, and only while a routed feed is active.
+                    // The engine run future is boxed (one allocation per run, never
+                    // per tick) so the hook's state does not inflate this future.
+                    let hook = multiview_engine::WithAuxTick {
+                        inner: hook,
+                        aux: aux_tx,
+                    };
+                    match max_ticks {
+                        Some(max) => {
+                            Box::pin(program.run_for_with_frame_control(
+                                publisher, max, state_of, event_of, hook,
+                            ))
+                            .await
+                        }
+                        None => {
+                            Box::pin(
+                                program.run_with_frame_control(publisher, state_of, event_of, hook),
+                            )
+                            .await
+                        }
+                    }
+                    .map_err(|e| PipelineError::Engine(e.to_string()))
+                } else {
+                    // `ClosureControl` calls `control` exactly as `run_with_control`'s
+                    // adapter does (before every compose and on every repeat).
+                    let hook = multiview_engine::WithAuxTick {
+                        inner: multiview_engine::ClosureControl(control),
+                        aux: aux_tx,
+                    };
+                    match max_ticks {
+                        Some(max) => {
+                            Box::pin(program.run_for_with_frame_control(
+                                publisher, max, state_of, event_of, hook,
+                            ))
+                            .await
+                        }
+                        None => {
+                            Box::pin(
+                                program.run_with_frame_control(publisher, state_of, event_of, hook),
+                            )
+                            .await
+                        }
+                    }
+                    .map_err(|e| PipelineError::Engine(e.to_string()))
                 }
-                None => {
-                    Box::pin(program.run_with_frame_control(publisher, state_of, event_of, hook))
-                        .await
-                }
-            }
-        } else {
-            // `ClosureControl` calls `control` exactly as `run_with_control`'s
-            // adapter does (before every compose and on every repeat).
-            let hook = multiview_engine::WithAuxTick {
-                inner: multiview_engine::ClosureControl(control),
-                aux: aux_tx,
             };
-            match max_ticks {
-                Some(max) => {
-                    Box::pin(
-                        program
-                            .run_for_with_frame_control(publisher, max, state_of, event_of, hook),
-                    )
-                    .await
-                }
-                None => {
-                    Box::pin(program.run_with_frame_control(publisher, state_of, event_of, hook))
-                        .await
-                }
-            }
-        }
-        .map_err(|e| PipelineError::Engine(e.to_string()));
+        // #311 / ADR-0109: the protected tick loop runs on a dedicated, named
+        // output-clock thread (precise absolute-deadline pacing, no shared
+        // executor worker or timer wheel with the control plane). This task's
+        // worker is handed back to the runtime while the loop runs.
+        // A thread that could not start is an engine error that still flows
+        // through the teardown below (ingest stop, egress join), never `?`.
+        let outcome =
+            multiview_engine::clock_thread::run_on_clock_thread(&clock_thread_name, engine_loop)
+                .await
+                .unwrap_or_else(|e| {
+                    Err(PipelineError::Engine(format!("output clock thread: {e}")))
+                });
 
         // #309: every teardown stage is timed from the moment the clock returned,
         // so a slow exit names its stage in the log.

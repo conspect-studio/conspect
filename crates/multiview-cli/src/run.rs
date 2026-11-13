@@ -734,7 +734,7 @@ impl SoftwareEngine {
         control: FC,
     ) -> Result<RunReport, RunError>
     where
-        FC: FnMut(&mut CompositorDrive<Nv12Image>),
+        FC: FnMut(&mut CompositorDrive<Nv12Image>) + Send,
     {
         let time = Arc::new(MonotonicTimeSource::new());
         let ts: Arc<dyn TimeSource> = time;
@@ -770,8 +770,13 @@ impl SoftwareEngine {
         // the run's `StopSignal` (Ctrl-C) returns from `drive`, after which they
         // are torn down and joined here.
         let generators = self.spawn_generators();
-        let report = self
-            .drive(
+        // #311 / ADR-0109: drive the tick loop on a dedicated output-clock thread.
+        let this = &*self;
+        // Boxed: the loop future (with its projections) lives on the heap, so
+        // the caller's future stays small (clippy::large_futures).
+        let report = multiview_engine::clock_thread::run_on_clock_thread(
+            "clock-main",
+            Box::pin(this.drive(
                 &mut runtime,
                 publisher,
                 stop,
@@ -809,8 +814,11 @@ impl SoftwareEngine {
                     None
                 },
                 control,
-            )
-            .await;
+            )),
+        )
+        .await
+        .map_err(|e| RunError::Engine(format!("output clock thread: {e}")))
+        .and_then(|report| report);
         generators.shutdown();
         report
     }
