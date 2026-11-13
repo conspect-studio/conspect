@@ -744,3 +744,52 @@ async fn an_audio_take_on_an_unroutable_output_is_409_before_reserve() {
         StatusCode::ACCEPTED
     );
 }
+
+/// #342 B2 review A1 with explicit audio: a take key is bound to the WHOLE
+/// take — output, video and audio. The same key with the same video but
+/// another audio (or an audio-only take where a video take was recorded) is
+/// 409 and enqueues nothing; the identical body replays its first operation.
+#[tokio::test]
+async fn a_reused_take_key_is_bound_to_its_audio_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), DOC);
+    let combined = |audio: serde_json::Value| {
+        serde_json::json!({
+            "target": {"kind": "output", "output": "output-1", "stream": "video"},
+            "feed": {"source": "bars"},
+            "audio": audio,
+        })
+    };
+    let first = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "bound",
+        combined(serde_json::json!("none")),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let op = body_json(first).await["operation_id"].clone();
+    for body in [
+        combined(serde_json::json!("program")),
+        combined(serde_json::json!({"tracks": ["deu"]})),
+        serde_json::json!({
+            "target": {"kind": "output", "output": "output-1", "stream": "video"},
+            "feed": {"source": "bars"},
+        }),
+        audio_body("output-1", serde_json::json!("none")),
+    ] {
+        let resp = take(&rig, OPERATOR_TOKEN, "bound", body.clone()).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{body}");
+    }
+    assert_eq!(rig.fake.takes().len(), 1, "a reused key never enqueues");
+    let replay = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "bound",
+        combined(serde_json::json!("none")),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(body_json(replay).await["operation_id"], op);
+    assert_eq!(rig.fake.takes().len(), 1);
+}

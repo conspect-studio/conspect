@@ -45,6 +45,8 @@ pub mod output_routing;
 pub mod outputs;
 pub mod overlays;
 pub mod patch;
+/// Output slots in the patch panel (#342 B2).
+pub(crate) mod patch_output;
 pub mod preview;
 pub mod probes;
 pub mod routing;
@@ -878,7 +880,7 @@ pub(crate) async fn cmd_apply_layout(
             feed: Some(multiview_config::VideoFeed::Layout(req.layout.clone())),
             audio: None,
         };
-        return output_routing::take_output_as(&state, &principal, &idem, &take);
+        return output_routing::take_output_as(&state, &principal, &idem, &take).await;
     }
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &req.layout)?;

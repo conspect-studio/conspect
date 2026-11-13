@@ -2220,7 +2220,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Plan 1..64 mixer crosspoints: path, on-air flag and refusals; no change. */
+        /**
+         * Plan 1..64 mixer crosspoints (path, on-air flag, refusals) or the slots of
+         *     one output (§12.4 path P1/P2/P3 and cost); no change.
+         */
         post: operations["plan_patch"];
         delete?: never;
         options?: never;
@@ -2237,7 +2240,12 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Take 1..64 mixer crosspoints atomically at one engine tick. */
+        /**
+         * Take 1..64 mixer crosspoints atomically at one engine tick, or one
+         *     output's video slot 0 (+ audio slot 0 follow) through the same machinery
+         *     as `POST /routing/output/take` (the slot-0 alias; shared idempotency
+         *     store and limits; the outcome rides `route.output`).
+         */
         post: operations["take_patch"];
         delete?: never;
         options?: never;
@@ -6933,8 +6941,9 @@ export interface components {
             /** @description `video` (this slice), `audio` or `subtitle`. */
             plane: string;
             /**
-             * @description `{"source": id}` or `"none"` (this slice); `{"layout": id}`,
-             *     `{"bus": ..}`, `"follow"` arrive in later slices.
+             * @description A mixer input: `{"source": id}` or `"none"`. An output video slot 0:
+             *     `{"source": id}`, `{"layout": id}` (a stored layout; Read on it AND on
+             *     every source its cells bind) or `{"bus": ..}`; audio slot 0: `"follow"`.
              */
             source: Record<string, never>;
         };
@@ -6950,11 +6959,11 @@ export interface components {
             input?: number | null;
             /** @description M/E id (`me1`). */
             mixer?: string | null;
-            /** @description Output id (output slots arrive in a later slice; refused here). */
+            /** @description Output API id (an output slot destination, with `slot`). */
             output?: string | null;
             /**
              * Format: int32
-             * @description Output slot index (later slice).
+             * @description Output slot index: video and audio slot 0 in this release.
              */
             slot?: number | null;
         };
@@ -7106,11 +7115,15 @@ export interface components {
         PipelineStage: "decode" | "composite" | "encode";
         /** @description One planned crosspoint. */
         PlannedCrosspoint: {
+            cost?: null | components["schemas"]["SlotCost"];
             /** @description The destination as requested. */
             destination: components["schemas"]["PatchDestination"];
-            /** @description Whether the destination input is on Program now. */
+            /** @description Whether the destination input is on Program now (mixer inputs). */
             on_air: boolean;
-            /** @description The path this crosspoint takes (`mixer-input`). */
+            /**
+             * @description The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`
+             *     (§12.4), or `follow` (an audio slot riding the video take).
+             */
             path: string;
             refusal?: null | components["schemas"]["PatchRefusal"];
         };
@@ -7990,6 +8003,26 @@ export interface components {
              * @description The one-time setup code (8 words) printed on the host.
              */
             code: string;
+        };
+        /** @description The cost of an output-slot crosspoint (§12.4, §12.10). */
+        SlotCost: {
+            /**
+             * Format: int32
+             * @description `1` when a P3 needs a convert whose (picture, format) feed is not
+             *     live yet, else `0`.
+             */
+            converts: number;
+            /** @description Whether the take fits the encoder budget now. */
+            fits: boolean;
+            /**
+             * Format: int32
+             * @description `0` (P1: an encoded bus already carries it) or `1`.
+             */
+            new_encoders: number;
+            /** @description Live-opened encoder sessions in use (whole-system principals only). */
+            sessions_in_use?: number | null;
+            /** @description The session limit (whole-system principals only). */
+            sessions_max?: number | null;
         };
         /**
          * @description The `202 Accepted` body of `POST /api/v1/diagnostics/snapshot`: the id to read
@@ -15827,7 +15860,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ] }` from the engine's live readback; a mixer the caller cannot read (M/E object + Program scope) is omitted, and a source it cannot read is `{"redacted": true}`. */
+            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ] } ] }`. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`"follow"` by default, else `"program"`, `"none"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{"redacted": true}`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -15847,6 +15880,15 @@ export interface operations {
             };
             /** @description Role lacks Read. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description engine-busy: every layout-read slot is in use (a layout on air on a visible output); retry */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -15877,7 +15919,7 @@ export interface operations {
                     "application/json": components["schemas"]["PatchPlan"];
                 };
             };
-            /** @description Not authorized for a destination (M/E object + Program scope) or a source. */
+            /** @description Not authorized for a destination (M/E object + Program scope; an output: object + output axis) or a source. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -15886,7 +15928,16 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `switcher-unavailable`. */
+            /** @description Unknown output. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `switcher-unavailable` or `routing-unavailable`. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -15895,8 +15946,17 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, or not 1..=64 crosspoints. */
+            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout or bus on a mixer input; an unknown feed), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy`: an output slot's `{layout}` could not be read now (every layout-read slot is in use); retry. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -15930,7 +15990,7 @@ export interface operations {
                     "application/json": components["schemas"]["PatchAccepted"];
                 };
             };
-            /** @description Not authorized for a destination (M/E object + Program scope) or a source. */
+            /** @description Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source; a replayed key is re-authorized. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -15939,7 +15999,16 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, or no source lease. */
+            /** @description Unknown output. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -15948,7 +16017,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, missing Idempotency-Key, or not 1..=64 crosspoints. */
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -15966,7 +16035,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy` (the key and leases are released) or `idempotency-capacity`. */
+            /** @description `engine-busy` (the key and leases are released; or an output slot's `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity`. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -17303,7 +17372,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized for the output or the feed. */
+            /** @description Not authorized for the output (object AND output axis) or the feed; a replayed key is re-authorized under the caller's current grants. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -17321,7 +17390,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track). */
+            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), `audio-unsupported` (the output has no program-audio slot for a routed audio feed, or its transport cannot select a discrete track), or `conflict` (the Idempotency-Key was first used for another output, feed or audio; nothing is enqueued). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -17348,7 +17417,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy`: the take mailbox is full (the key is freed); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise). */
+            /** @description `engine-busy`: the take mailbox is full (the key is freed), or a `{layout}` feed could not be read now (every layout-read slot is in use; nothing reserved); or `idempotency-capacity`: the caller's (or every) take record is still pending at its cap (fails closed; pending keys still replay; settled records are evicted oldest-first otherwise). */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -17390,8 +17459,17 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized to plan this crosspoint. */
+            /** @description Not authorized to plan this crosspoint (an output target: object AND output axis). */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy`: an output target's `{layout}` feed could not be read now (every layout-read slot is in use); retry. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

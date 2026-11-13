@@ -3842,6 +3842,41 @@ impl Pipeline {
         }
     }
 
+    /// The Program canvas the aux path composes routed pictures against.
+    fn aux_canvas(&self) -> crate::routing_aux::AuxCanvas {
+        crate::routing_aux::AuxCanvas {
+            width: self.encode_cfg.width,
+            height: self.encode_cfg.height,
+            color: self.canvas_color.output_tag(),
+        }
+    }
+
+    /// The router's run outputs: router index i = runner i — the id the
+    /// control plane addresses, the Program settings, the formats, and
+    /// whether slice 1 can cut that encoder family.
+    fn run_outputs(
+        &self,
+        binding_ids: &[Option<String>],
+        audio_tracks: &[Vec<usize>],
+    ) -> Vec<crate::output_routing::RunOutput> {
+        self.output_video_keys
+            .iter()
+            .enumerate()
+            .map(|(index, &settings)| crate::output_routing::RunOutput {
+                id: binding_ids.get(index).cloned().flatten(),
+                settings,
+                feed_format: self.output_formats.get(index).copied().flatten(),
+                base_format: self.rendition_formats.get(settings).copied().flatten(),
+                routable: self.rendition_configs.get(settings).is_some_and(|cfg| {
+                    !(cfg.codec_name.contains("vaapi") || cfg.codec_name.contains("videotoolbox"))
+                }),
+                // The routed audio rides the binding's program-audio slot
+                // (track 0, present only when this run encodes program audio).
+                program_audio: audio_tracks.get(index).is_some_and(|t| t.contains(&0)),
+            })
+            .collect()
+    }
+
     /// Build one run's output routing (ADR-0108 slice 1): the clock's aux tick
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
@@ -3871,6 +3906,8 @@ impl Pipeline {
             has_preview.then(|| Arc::new(multiview_framestore::SwapCell::new(None)));
         let feeds: crate::routing_aux::AuxFeeds =
             Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new()));
+        let aux_canvas = self.aux_canvas();
+        let plan_stores = Arc::clone(&stores);
         // Filled once this run's Program exists (§7 back-off input).
         let program_lateness: crate::routing_aux::ProgramLateness =
             Arc::new(multiview_framestore::SwapCell::empty());
@@ -3879,11 +3916,7 @@ impl Pipeline {
             feeds: Arc::clone(&feeds),
             stores: Arc::clone(&stores),
             preview_selection: preview_selection.clone(),
-            canvas: crate::routing_aux::AuxCanvas {
-                width: self.encode_cfg.width,
-                height: self.encode_cfg.height,
-                color: self.canvas_color.output_tag(),
-            },
+            canvas: aux_canvas,
             layout_canvas: self.layout_canvas_spec(),
             program_lateness: Some(Arc::clone(&program_lateness)),
             tick_ns: u64::try_from(self.encode_cfg.cadence.period_nanos()).unwrap_or(0),
@@ -3925,25 +3958,14 @@ impl Pipeline {
             open,
         )
         .map_err(spawn_err)?;
-        // Router index i = runner i: the id the control plane addresses, the
-        // Program settings, and whether slice 1 can cut that encoder family.
-        let run_outputs = self
-            .output_video_keys
-            .iter()
-            .enumerate()
-            .map(|(index, &settings)| crate::output_routing::RunOutput {
-                id: binding_ids.get(index).cloned().flatten(),
-                settings,
-                feed_format: self.output_formats.get(index).copied().flatten(),
-                routable: self.rendition_configs.get(settings).is_some_and(|cfg| {
-                    !(cfg.codec_name.contains("vaapi") || cfg.codec_name.contains("videotoolbox"))
-                }),
-                // The routed audio rides the binding's program-audio slot
-                // (track 0, present only when this run encodes program audio).
-                program_audio: audio_tracks.get(index).is_some_and(|t| t.contains(&0)),
-            })
-            .collect();
-        let handle = Arc::new(handle.with_outputs(run_outputs));
+        let run_outputs = self.run_outputs(binding_ids, audio_tracks);
+        let handle = Arc::new(handle.with_outputs(run_outputs).with_pictures(
+            crate::output_routing::PlanPictures {
+                stores: plan_stores,
+                canvas: aux_canvas,
+                preview_selection: preview_selection.clone(),
+            },
+        ));
         enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
         self.output_routing.store(Some(handle));
         Ok(RunRouting {

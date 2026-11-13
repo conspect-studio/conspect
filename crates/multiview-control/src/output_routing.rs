@@ -277,6 +277,43 @@ impl PlanCost {
     }
 }
 
+/// The cheapest path a crosspoint onto an output's video slot takes
+/// (ADR-0110, output-routing §12.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanPath {
+    /// An encoded bus with key (picture, format, settings) is already live:
+    /// +0 encoders.
+    P1,
+    /// The picture is identity at the output's format: + 1 encode.
+    P2,
+    /// Anything else: + 1 convert per distinct (picture, format), + 1 encode.
+    P3,
+}
+
+impl PlanPath {
+    /// The wire name (`P1`, `P2`, `P3`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::P1 => "P1",
+            Self::P2 => "P2",
+            Self::P3 => "P3",
+        }
+    }
+}
+
+/// The plan of one crosspoint onto an output's video slot 0 (#342 B2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotPlan {
+    /// The path (§12.4).
+    pub path: PlanPath,
+    /// The encoder cost, sessions and fit (as [`OutputRouting::plan`]).
+    pub cost: PlanCost,
+    /// `1` when a P3 needs a convert whose (picture, format) feed is not
+    /// live yet, else `0`.
+    pub converts: u8,
+}
+
 /// One output's live routing readback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputLive {
@@ -392,6 +429,32 @@ pub trait OutputRouting: Send + Sync {
     fn snapshot(&self) -> Option<RoutingLive>;
     /// The outcome stream; `Some` exactly once.
     fn subscribe_outcomes(&self) -> Option<std::sync::mpsc::Receiver<OutputOutcome>>;
+    /// The §12.4 path the output's video slot 0 is carried on now (#342 B2:
+    /// Program at the output's format is its base key, P1; a routed picture
+    /// identity at the output's format P2; else P3). `None` when unknown.
+    fn current_path(&self, _output: &str) -> Option<PlanPath> {
+        None
+    }
+
+    /// Plan a crosspoint onto the output's video slot 0 with its §12.4 path
+    /// (#342 B2). The default derives it from [`Self::plan`] alone: P1 when
+    /// no encoder is needed, else P3 (an implementor that cannot tell an
+    /// identity picture reports the conservative path).
+    ///
+    /// # Errors
+    /// The refusal the take would certainly meet.
+    fn plan_slot(&self, output: &str, feed: &RoutedFeed) -> Result<SlotPlan, PlanRefusal> {
+        let cost = self.plan(output, feed)?;
+        Ok(SlotPlan {
+            path: if cost.needs_encoder {
+                PlanPath::P3
+            } else {
+                PlanPath::P1
+            },
+            cost,
+            converts: u8::from(cost.needs_encoder),
+        })
+    }
 }
 
 /// Shared handle to an installed [`OutputRouting`].
@@ -480,8 +543,14 @@ struct TakeRecord {
 pub enum TakeReservation {
     /// The key was unseen: enqueue the take under this new operation id.
     Fresh(crate::command::OperationId),
-    /// The key already names a take: answer it, never enqueue again.
+    /// The key already names THIS take (the stored take equals the one being
+    /// reserved): answer it, never enqueue again.
     Replay(TakeReplay),
+    /// The key already names a DIFFERENT take (another output, video or
+    /// audio): refuse (409 `conflict`), never enqueue and never disclose the
+    /// other take's operation (#342 review A1-r2). Decided under the same
+    /// lock as the reservation, so two concurrent bodies cannot both miss it.
+    Conflict,
     /// No record can be made: the principal's records (or, globally, every
     /// record) are all pending. Fail closed (`idempotency-capacity`).
     Capacity,
@@ -576,8 +645,17 @@ impl TakeStore {
     }
 
     fn reserve(&mut self, key: &str, principal: &str, take: PendingTake) -> TakeReservation {
-        if let Some(replay) = self.replay(key) {
-            return TakeReservation::Replay(replay);
+        if let Some(record) = self.by_key.get(key) {
+            // The key is bound to the take it was first reserved for: the
+            // replay is answered only for that very take, atomically with the
+            // reservation.
+            if record.take != take {
+                return TakeReservation::Conflict;
+            }
+            return TakeReservation::Replay(TakeReplay {
+                operation_id: record.operation_id.clone(),
+                outcome: record.outcome.clone(),
+            });
         }
         // The reservation order is the eviction age: it must never wrap (a
         // wrapped seq would sort the NEWEST record first and evict it). A u64
@@ -827,6 +905,22 @@ impl OutputRoutingControl {
     #[must_use]
     pub fn replay(&self, key: &str) -> Option<TakeReplay> {
         self.records().replay(key)
+    }
+
+    /// The replay of `key` together with the take it recorded (output API id,
+    /// video feed and audio choice), so a replay can be bound to its request
+    /// (#342 review A1).
+    #[must_use]
+    pub fn replay_with_take(&self, key: &str) -> Option<(TakeReplay, PendingTake)> {
+        let records = self.records();
+        let record = records.by_key.get(key)?;
+        Some((
+            TakeReplay {
+                operation_id: record.operation_id.clone(),
+                outcome: record.outcome.clone(),
+            },
+            record.take.clone(),
+        ))
     }
 
     /// Reserve `key` for a take of `pending` charged to `principal` (the

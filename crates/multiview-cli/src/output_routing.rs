@@ -420,7 +420,24 @@ pub struct OutputRoutingHandle {
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
     outputs: Arc<[RunOutput]>,
     has_preview: bool,
+    /// What the plan needs to tell an identity picture (P2) from a convert
+    /// (P3), #342 B2: the run's store lookup and its canvas. `None` until
+    /// [`OutputRoutingHandle::with_pictures`].
+    pictures: Option<PlanPictures>,
     max_aux_canvases: usize,
+}
+
+/// What the plan reads to tell an identity picture (P2) from a convert
+/// (P3), #342 B2: the run's store lookup, its canvas and the M/E's PVW
+/// source id (all wait-free).
+#[derive(Clone)]
+pub struct PlanPictures {
+    /// Source id → its tile store.
+    pub stores: StoreLookup,
+    /// The canvas the aux pictures match.
+    pub canvas: crate::routing_aux::AuxCanvas,
+    /// The PVW source id, when the run has an M/E.
+    pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
 }
 
 /// One routable position of the run (the router's output index).
@@ -435,6 +452,9 @@ pub struct RunOutput {
     /// The format a routed source/PVW is composed at for this output (#342;
     /// `None` = the canvas with the default fit).
     pub feed_format: Option<AuxFormat>,
+    /// The format of the output's base key, which Program and Clean are
+    /// converted to (#342; `None` = canvas-sized: the zero-copy picture).
+    pub base_format: Option<AuxFormat>,
     /// Whether slice 1 can cut this output cleanly (its encoder family has
     /// the parameter-set RAP check; VAAPI/VideoToolbox do not, §4.2).
     pub routable: bool,
@@ -517,6 +537,20 @@ impl OutputRoutingHandle {
     pub fn with_outputs(mut self, outputs: Vec<RunOutput>) -> Self {
         self.outputs = outputs.into();
         self
+    }
+
+    /// Attach the run's store lookup and canvas (#342 B2: the plan's P2/P3
+    /// identity check reads a source's newest tile, wait-free).
+    #[must_use]
+    pub fn with_pictures(mut self, pictures: PlanPictures) -> Self {
+        self.pictures = Some(pictures);
+        self
+    }
+
+    /// The run's store lookup and canvas, when attached.
+    #[must_use]
+    pub fn pictures(&self) -> Option<&PlanPictures> {
+        self.pictures.as_ref()
     }
 
     /// The run's output map, by router index.
@@ -966,33 +1000,13 @@ impl OutputRouter {
     pub fn new_with_bus(
         cfg: RouterConfig,
         aux: AuxWiring,
-        mut open: BusOpenFn,
+        open: BusOpenFn,
     ) -> std::io::Result<(Self, OutputRoutingHandle)> {
         let (take_tx, takes) = mpsc::sync_channel(TAKE_MAILBOX);
         let layout_changes: LayoutInbox = Arc::new(Mutex::new(InboxState::default()));
         let layout_tx = Arc::clone(&layout_changes);
         let (outcomes, outcome_rx) = mpsc::sync_channel(OUTCOME_CAPACITY);
-        let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
-        let (open_res_tx, open_rx) = mpsc::sync_channel::<OpenResult>(OPEN_QUEUE);
-        std::thread::Builder::new()
-            .name("routing-open".to_owned())
-            .spawn(move || {
-                while let Ok(req) = open_req_rx.recv() {
-                    let encoder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        open(req.settings, &req.bus)
-                    }))
-                    .unwrap_or_else(|_| Err("encoder open panicked".to_owned()));
-                    if open_res_tx
-                        .send(OpenResult {
-                            id: req.id,
-                            encoder,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            })?;
+        let (open_tx, open_rx) = spawn_opener(open)?;
         let (reap_tx, reap_rx) = mpsc::sync_channel::<Reap>(REAPER_QUEUE);
         let reaper = std::thread::Builder::new()
             .name("routing-reaper".to_owned())
@@ -1031,6 +1045,7 @@ impl OutputRouter {
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
             outputs: Arc::from(Vec::new()),
             has_preview: cfg.has_preview,
+            pictures: None,
             max_aux_canvases: cfg.max_aux_canvases,
         };
         let mut router = Self {
@@ -3200,6 +3215,35 @@ fn feed_order(key: &FeedKey) -> (String, Option<(u32, u32, String)>) {
             )
         }),
     )
+}
+
+/// Spawn the `routing-open` thread: it opens live encoders off the consumer
+/// (a panicking open is an error result, never a dead thread).
+fn spawn_opener(
+    mut open: BusOpenFn,
+) -> std::io::Result<(SyncSender<OpenRequest>, Receiver<OpenResult>)> {
+    let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
+    let (open_res_tx, open_rx) = mpsc::sync_channel::<OpenResult>(OPEN_QUEUE);
+    std::thread::Builder::new()
+        .name("routing-open".to_owned())
+        .spawn(move || {
+            while let Ok(req) = open_req_rx.recv() {
+                let encoder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    open(req.settings, &req.bus)
+                }))
+                .unwrap_or_else(|_| Err("encoder open panicked".to_owned()));
+                if open_res_tx
+                    .send(OpenResult {
+                        id: req.id,
+                        encoder,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })?;
+    Ok((open_tx, open_rx))
 }
 
 /// Whether the `routing-aux` thread composes `bus` (Program and Clean come
