@@ -1397,13 +1397,20 @@ fn slot0_key_of(idem: &IdempotencyKey) -> ControlResult<String> {
 }
 
 /// The take-store key of a slot-0 take: the scoped `Idempotency-Key` with
-/// its request path replaced by one shared namespace, so `/routing/output/take`
-/// and an output crosspoint of `/patch/take` replay each other (the alias,
-/// #342 B2). The principal and raw key stay in the scope; only the path is
-/// unified.
+/// its request path replaced by one shared namespace, so `/routing/output/take`,
+/// an output crosspoint of `/patch/take` (the alias, #342 B2) and
+/// `/commands/apply-layout` with `target: {output}` (the alias, #307) replay
+/// each other — and a different body under the same key is the take store's
+/// 409, whichever route reserved it. The principal and raw key stay in the
+/// scope; only the path is unified. (Only the `target` form of apply-layout
+/// reaches the take store; its no-target form uses the global store.)
 #[must_use]
 pub(crate) fn slot0_take_key(scoped: &str) -> String {
-    const ALIASES: [&str; 2] = ["/routing/output/take", "/patch/take"];
+    const ALIASES: [&str; 3] = [
+        "/routing/output/take",
+        "/patch/take",
+        "/commands/apply-layout",
+    ];
     for path in ALIASES {
         let needle = format!(":{}:{path}:", path.len());
         if let Some(at) = scoped.find(&needle) {

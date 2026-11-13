@@ -2315,3 +2315,103 @@ async fn apply_layout_target_is_an_output_take_with_the_same_authorization() {
     assert_eq!(replay["operation_id"], first["operation_id"]);
     assert_eq!(rig.fake.takes().len(), 1, "a replay never re-enqueues");
 }
+
+/// #307 review A1: `apply-layout` with `target: {output}` shares the output
+/// take's slot-0 idempotency namespace in both directions. The same key and
+/// the equivalent body replay the one operation (one enqueue) whichever route
+/// came first; a different layout or output under that key is the take
+/// store's 409 conflict, nothing enqueued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_layout_target_and_the_output_take_share_one_idempotency_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    store_layout(&rig, "NewsOne", layout_body(640, 1.0));
+    store_layout(&rig, "NewsTwo", layout_body(640, 1.0));
+    let alias = |layout: &str, output: &str| serde_json::json!({"layout": layout, "target": {"output": output}});
+
+    // apply-layout(target) first, then the equivalent output take.
+    let resp = send(
+        &rig.router,
+        apply_layout(OPERATOR_TOKEN, Some("k1"), &alias("NewsOne", "output-1")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let first = body_json(resp).await;
+    assert_eq!(rig.fake.takes().len(), 1);
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "k1",
+            "output-1",
+            serde_json::json!({"layout": "NewsOne"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let replay = body_json(resp).await;
+    assert_eq!(replay["operation_id"], first["operation_id"], "{replay}");
+    assert_eq!(
+        rig.fake.takes().len(),
+        1,
+        "a cross-route replay never re-enqueues"
+    );
+    // A different body under the same key, on either route: 409, no enqueue.
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "k1",
+            "output-1",
+            serde_json::json!({"layout": "NewsTwo"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let resp = send(
+        &rig.router,
+        apply_layout(OPERATOR_TOKEN, Some("k1"), &alias("NewsTwo", "output-1")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(rig.fake.takes().len(), 1);
+
+    // The output take first, then the equivalent apply-layout(target).
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "k2",
+            "output-1",
+            serde_json::json!({"layout": "NewsTwo"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let second = body_json(resp).await;
+    assert_eq!(rig.fake.takes().len(), 2);
+    let resp = send(
+        &rig.router,
+        apply_layout(OPERATOR_TOKEN, Some("k2"), &alias("NewsTwo", "output-1")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let replay = body_json(resp).await;
+    assert_eq!(replay["operation_id"], second["operation_id"], "{replay}");
+    assert_eq!(
+        rig.fake.takes().len(),
+        2,
+        "a cross-route replay never re-enqueues"
+    );
+    // Another output under the same key: 409, nothing enqueued.
+    let resp = send(
+        &rig.router,
+        apply_layout(OPERATOR_TOKEN, Some("k2"), &alias("NewsTwo", "output-0")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(rig.fake.takes().len(), 2);
+}
