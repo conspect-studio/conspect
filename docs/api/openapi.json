@@ -19980,7 +19980,7 @@
               "string",
               "null"
             ],
-            "description": "The audio the output carries on this video feed when its audio\nfollows: `program` (the mix), `source` (the source's own) or `preview`\n(the PVW source's). A layout carries the program mix."
+            "description": "The audio the output carries on this video feed when its audio\nfollows: `program` (the mix), `source` (the source's own), `preview`\n(the PVW source's) or `none` (silence). A layout carries its `audio`\nattribute: the mix by default, `none`, or one cell's `source`."
           },
           "new_aux_canvases": {
             "type": "integer",

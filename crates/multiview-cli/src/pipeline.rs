@@ -2164,6 +2164,9 @@ pub struct Pipeline {
     /// The live layout the decodes size themselves from; the control drain
     /// publishes every applied change here.
     display_layout: DisplayLayoutSlot,
+    /// Aux sizing (ADR-0108 §2.4): the routed layouts' cells, written by the
+    /// output router, merged into every decode's size decision.
+    aux_sizing: crate::display_size::AuxSizingSlot,
     /// The fixed output cadence (exact rational).
     cadence: Rational,
     /// The single program this pipeline runs (ADR-0030 MP-0). The legacy
@@ -2507,6 +2510,8 @@ pub struct Pipeline {
     boot_output_feeds: Vec<(String, crate::routing_aux::PictureBus)>,
     /// The boot takes' retry policy (the defaults; a test shortens it).
     boot_retry: crate::output_routing::BootRetryPolicy,
+    /// `routing.max_aux_canvases` (ADR-0108 §7 rule 1).
+    max_aux_canvases: usize,
     /// Persisted non-`follow` output audio feeds `(output config id, choice)`
     /// (ADR-0108 slice 2 §6.1): each run issues them as audio-only boot takes
     /// right after its routing handle is published.
@@ -3037,6 +3042,7 @@ impl Pipeline {
             std::collections::BTreeMap::new();
         let display_layout: DisplayLayoutSlot =
             Arc::new(multiview_framestore::SwapCell::new(Arc::clone(&layout)));
+        let aux_sizing = crate::display_size::aux_sizing_slot();
         let mut source_handles: Vec<SourceHandle<Nv12Image>> =
             Vec::with_capacity(config.sources.len());
 
@@ -3127,6 +3133,7 @@ impl Pipeline {
                     Arc::clone(&display_layout),
                     Some(Arc::clone(&source_registry)),
                 )
+                .with_aux_sizing(Arc::clone(&aux_sizing))
             });
             // Reserve the authoritative epoch before either startup rail starts.
             // Old detached publishers from a previous run retain their old token.
@@ -3539,6 +3546,7 @@ impl Pipeline {
             source_events,
             layout,
             display_layout,
+            aux_sizing,
             cadence,
             program_spec,
             switcher_me,
@@ -3639,6 +3647,7 @@ impl Pipeline {
             output_routing: crate::output_routing::output_routing_slot(),
             boot_output_feeds: boot_output_feeds(config),
             boot_retry: crate::output_routing::BootRetryPolicy::default(),
+            max_aux_canvases: config.max_aux_canvases(),
             boot_audio_takes: boot_audio_choices(config),
             program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
@@ -3857,6 +3866,9 @@ impl Pipeline {
             has_preview.then(|| Arc::new(multiview_framestore::SwapCell::new(None)));
         let feeds: crate::routing_aux::AuxFeeds =
             Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new()));
+        // Filled once this run's Program exists (§7 back-off input).
+        let program_lateness: crate::routing_aux::ProgramLateness =
+            Arc::new(multiview_framestore::SwapCell::empty());
         let aux = crate::routing_aux::spawn_routing_aux(crate::routing_aux::AuxInputs {
             rx: aux_rx,
             feeds: Arc::clone(&feeds),
@@ -3868,6 +3880,8 @@ impl Pipeline {
                 color: self.canvas_color.output_tag(),
             },
             layout_canvas: self.layout_canvas_spec(),
+            program_lateness: Some(Arc::clone(&program_lateness)),
+            tick_ns: u64::try_from(self.encode_cfg.cadence.period_nanos()).unwrap_or(0),
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
@@ -3888,7 +3902,7 @@ impl Pipeline {
                 max_encoders: crate::output_routing::DEFAULT_MAX_ENCODERS,
                 max_per_principal: crate::output_routing::DEFAULT_MAX_PER_PRINCIPAL,
                 has_preview,
-                max_aux_canvases: crate::output_routing::DEFAULT_MAX_AUX_CANVASES,
+                max_aux_canvases: self.max_aux_canvases,
                 formats: self.output_formats.clone(),
                 boot_retry: self.boot_retry,
             },
@@ -3900,6 +3914,8 @@ impl Pipeline {
                 sent: aux_tx.sent_counter(),
                 stores,
                 preview_selection: preview_selection.clone(),
+                halved: Arc::clone(&aux.halved),
+                sizing: Some(Arc::clone(&self.aux_sizing)),
             },
             open,
         )
@@ -3936,6 +3952,7 @@ impl Pipeline {
             aux_tx,
             preview_selection,
             aux,
+            program_lateness,
         })
     }
 
@@ -4116,7 +4133,8 @@ impl Pipeline {
             display: DisplayFollow::new(
                 Arc::clone(&self.display_layout),
                 Some(Arc::clone(&self.source_registry)),
-            ),
+            )
+            .with_aux_sizing(Arc::clone(&self.aux_sizing)),
             canvas_color: self.canvas_color,
             cadence: self.cadence,
             output_origin: Arc::clone(&self.epoch_anchor),
@@ -5385,6 +5403,7 @@ impl Pipeline {
             aux_tx,
             preview_selection,
             aux: _routing_aux,
+            program_lateness,
         } = routing;
         demand.start();
         let (egress, hot_tx) = StreamEgress::spawn(
@@ -5443,6 +5462,7 @@ impl Pipeline {
                 })?;
         // Publish the Program's wait-free counters for the metrics route
         // (one store per run, never per tick).
+        program_lateness.store(Some(program.lateness()));
         self.program_metrics
             .store(Some(Arc::new(ProgramMetricsHandles {
                 lateness: program.lateness(),
@@ -7620,6 +7640,8 @@ struct RunRouting {
     /// The aux thread; dropping it never joins (the thread ends when the
     /// clock's sender drops).
     aux: crate::routing_aux::RoutingAuxHandle,
+    /// Where the run publishes Program's lateness for the aux back-off.
+    program_lateness: crate::routing_aux::ProgramLateness,
 }
 
 /// Output-routing state the bake consumer owns for one run (ADR-0108).

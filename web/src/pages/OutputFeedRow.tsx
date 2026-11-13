@@ -267,10 +267,14 @@ export function OutputFeedRow({
     cost?.follow_audio === 'program'
       ? t`Audio follows: program mix`
       : cost?.follow_audio === 'source'
-        ? t`Audio follows: this source's own audio`
+        ? selected.startsWith('aux:')
+          ? t`Audio follows: one cell's source audio (set by the layout)`
+          : t`Audio follows: this source's own audio`
         : cost?.follow_audio === 'preview'
           ? t`Audio follows: the preview source's audio`
-          : undefined;
+          : cost?.follow_audio === 'none'
+            ? t`Audio follows: silence (this layout carries no audio)`
+            : undefined;
   const feedLabel = allChoices.find((c) => c.key === selected)?.label ?? selected;
   const sessionsRaw = cost?.encoder_sessions ?? undefined;
   const sessions = (() => {

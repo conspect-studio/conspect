@@ -60,6 +60,31 @@ pub const MAX_CONCURRENT_HANDOVERS: usize = 2;
 /// The live layout, written at the frame boundary, read by the decode threads.
 pub type DisplayLayoutSlot = Arc<SwapCell<Arc<Layout>>>;
 
+/// Aux sizing (ADR-0108 §2.4): the cells of every routed layout composing
+/// now, on the running canvas. Written by the output router when its set of
+/// layout canvases changes, read by the decode threads. A source a routed
+/// cell binds decodes at the per-axis supremum over Program's cells AND
+/// these, so a routed layout's cells are drawn at their own size.
+pub type AuxSizingSlot = Arc<SwapCell<Arc<Vec<Cell>>>>;
+
+/// An empty [`AuxSizingSlot`].
+#[must_use]
+pub fn aux_sizing_slot() -> AuxSizingSlot {
+    Arc::new(SwapCell::from_pointee(Vec::new()))
+}
+
+/// `layout` plus the routed `extra` cells (the sizing layout of §2.4).
+/// `layout` itself when there are none (no allocation).
+#[must_use]
+pub fn sizing_layout(layout: &Arc<Layout>, extra: &[Cell]) -> Arc<Layout> {
+    if extra.is_empty() {
+        return Arc::clone(layout);
+    }
+    let mut sizing = Layout::clone(layout);
+    sizing.cells.extend_from_slice(extra);
+    Arc::new(sizing)
+}
+
 /// The decode size for `source_id`: the **per-axis supremum** of the pixel sizes
 /// of every cell that binds it, or [`None`] if no cell binds it.
 ///
@@ -142,6 +167,7 @@ pub fn frac_to_px(frac: f32, extent: u32) -> u32 {
 #[derive(Clone)]
 pub struct DisplayFollow {
     layout: DisplayLayoutSlot,
+    aux: Option<AuxSizingSlot>,
     registry: Option<Arc<SourceRegistry<Nv12Image>>>,
     #[cfg(test)]
     rehearsal: Option<Arc<Rehearsal>>,
@@ -166,10 +192,33 @@ impl DisplayFollow {
     ) -> Self {
         Self {
             layout,
+            aux: None,
             registry,
             #[cfg(test)]
             rehearsal: None,
         }
+    }
+
+    /// Also size for the routed layouts in `aux` (§2.4 aux sizing).
+    #[must_use]
+    pub fn with_aux_sizing(mut self, aux: AuxSizingSlot) -> Self {
+        self.aux = Some(aux);
+        self
+    }
+
+    /// The routed cells now (empty without aux sizing).
+    fn aux_cells(&self) -> Arc<Vec<Cell>> {
+        static NONE: std::sync::OnceLock<Arc<Vec<Cell>>> = std::sync::OnceLock::new();
+        self.aux.as_ref().map_or_else(
+            || Arc::clone(NONE.get_or_init(|| Arc::new(Vec::new()))),
+            |slot| slot.load(),
+        )
+    }
+
+    /// The layout every size decision uses: the live layout plus the routed
+    /// cells.
+    fn sizing(&self) -> Arc<Layout> {
+        sizing_layout(&self.layout.load(), &self.aux_cells())
     }
 
     /// Treat this decode as NVDEC, with software replacements, counting into
@@ -214,13 +263,13 @@ impl DisplayFollow {
     /// The size `source_id` wants under the live layout.
     #[must_use]
     pub fn size_for(&self, source_id: &str) -> (u32, u32) {
-        display_size(&self.layout.load(), source_id)
+        display_size(&self.sizing(), source_id)
     }
 
     /// [`fixed_size`] under the live layout.
     #[must_use]
     pub fn fixed_size_for(&self, source_id: &str) -> (u32, u32) {
-        fixed_size(&self.layout.load(), source_id)
+        fixed_size(&self.sizing(), source_id)
     }
 
     /// The height to pick an HLS variant for. An unbound source keeps the canvas
@@ -229,7 +278,7 @@ impl DisplayFollow {
     /// later routed to a large tile. NVDEC shrinks the high rung for free.
     #[must_use]
     pub fn variant_height(&self, source_id: &str) -> u32 {
-        let layout = self.layout.load();
+        let layout = self.sizing();
         cell_pixel_size(&layout, source_id).map_or(layout.canvas.height, |(_, h)| h)
     }
 
@@ -348,6 +397,7 @@ pub struct DisplayFollower {
     follow: DisplayFollow,
     id: String,
     seen: Arc<Layout>,
+    seen_aux: Arc<Vec<Cell>>,
     desired: (u32, u32),
     gate: SettleGate,
 }
@@ -357,11 +407,13 @@ impl DisplayFollower {
     #[must_use]
     pub fn new(follow: DisplayFollow, id: &str, applied: (u32, u32)) -> Self {
         let seen = follow.layout.load();
-        let desired = display_size(&seen, id);
+        let seen_aux = follow.aux_cells();
+        let desired = display_size(&sizing_layout(&seen, &seen_aux), id);
         Self {
             follow,
             id: id.to_owned(),
             seen,
+            seen_aux,
             desired,
             gate: SettleGate::new(applied),
         }
@@ -371,9 +423,11 @@ impl DisplayFollower {
     /// compare unless the layout changed, so this is cheap per packet.
     pub fn due(&mut self, now: Instant) -> Option<(u32, u32)> {
         let live = self.follow.layout.load();
-        if !Arc::ptr_eq(&live, &self.seen) {
-            self.desired = display_size(&live, &self.id);
+        let live_aux = self.follow.aux_cells();
+        if !Arc::ptr_eq(&live, &self.seen) || !Arc::ptr_eq(&live_aux, &self.seen_aux) {
+            self.desired = display_size(&sizing_layout(&live, &live_aux), &self.id);
             self.seen = live;
+            self.seen_aux = live_aux;
         }
         self.gate.observe(self.desired, now)
     }
@@ -1419,5 +1473,53 @@ mod tests {
         )));
         assert_eq!(follower.due(t0), None);
         assert_eq!(follower.due(t0 + DISPLAY_SETTLE), Some((640, 360)));
+    }
+
+    /// PR 2 (#306, §2.4 aux sizing): a source a routed layout binds decodes
+    /// at the per-axis supremum over Program's cells and the routed cells;
+    /// with no routed cells the follower sees Program's layout unchanged.
+    #[test]
+    fn aux_sizing_takes_the_supremum_over_program_and_routed_cells() {
+        let program = layout(1920, 1080, vec![cell(Some("cam"), 0.25, 0.25)]);
+        let slot: DisplayLayoutSlot = Arc::new(SwapCell::new(Arc::new(program)));
+        let aux = aux_sizing_slot();
+        let follow = DisplayFollow::new(Arc::clone(&slot), None).with_aux_sizing(Arc::clone(&aux));
+        let small = follow.size_for("cam");
+        let unbound = follow.size_for("other");
+        aux.store(Arc::new(vec![
+            Cell {
+                w: 1.0,
+                h: 1.0,
+                source: Some("cam".to_owned()),
+                ..Cell::default()
+            },
+            Cell {
+                w: 0.5,
+                h: 0.5,
+                source: Some("other".to_owned()),
+                ..Cell::default()
+            },
+        ]));
+        let canvas = (slot.load().canvas.width, slot.load().canvas.height);
+        assert_eq!(
+            follow.size_for("cam"),
+            canvas,
+            "the routed full-canvas cell wins"
+        );
+        assert!(
+            follow.size_for("other") != unbound,
+            "a routed-only source is sized"
+        );
+        assert_eq!(
+            follow.size_for("other"),
+            ((canvas.0 / 2) & !1, (canvas.1 / 2) & !1)
+        );
+        aux.store(Arc::new(Vec::new()));
+        assert_eq!(follow.size_for("cam"), small);
+        let base = slot.load();
+        assert!(
+            Arc::ptr_eq(&sizing_layout(&base, &[]), &base),
+            "no copy without routed cells"
+        );
     }
 }
