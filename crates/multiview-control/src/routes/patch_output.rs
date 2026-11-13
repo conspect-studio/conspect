@@ -319,14 +319,14 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
             .map_or("P1", crate::output_routing::PlanPath::as_str);
         // Slot 0 carries the accepted audio feed (default `follow`, redacted
         // per GET /routing's rule); slots i > 0 their configured track.
-        let slot0 = super::routing::audio_feed_view(principal, &feeds, &body.id());
+        let accepted_audio = super::routing::audio_feed_view(principal, &feeds, &body.id());
         let audio: Vec<Value> = match body.slots().map(|s| s.audio.as_slice()) {
             Some(slots) if !slots.is_empty() => slots
                 .iter()
                 .enumerate()
                 .map(|(i, slot)| {
                     let source = if i == 0 {
-                        slot0.clone()
+                        accepted_audio.clone()
                     } else {
                         json!({ "track": slot.track })
                     };
@@ -338,7 +338,9 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
                     })
                 })
                 .collect(),
-            _ => vec![json!({ "slot": 0, "track": null, "language": null, "source": slot0 })],
+            _ => vec![
+                json!({ "slot": 0, "track": null, "language": null, "source": accepted_audio }),
+            ],
         };
         out.push(json!({
             "output": api_id,

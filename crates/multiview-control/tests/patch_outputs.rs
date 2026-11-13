@@ -14,6 +14,7 @@
 mod support;
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -841,9 +842,10 @@ async fn one_principal_flooding_many_outputs_is_capped_at_ten_per_second() {
     let dir = tempfile::tempdir().unwrap();
     let mut doc = DOC.to_owned();
     for i in 0..10 {
-        doc.push_str(&format!(
+        let _ = write!(
+            doc,
             "[[outputs]]\nkind = \"hls\"\npath = \"/tmp/patch-outputs/m{i}/index.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n"
-        ));
+        );
     }
     let rig = rig_with(&dir.path().join("boot.toml"), &doc);
     let started = std::time::Instant::now();
