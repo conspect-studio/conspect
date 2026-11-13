@@ -415,3 +415,19 @@ fn a_removed_track_is_dropped_and_an_emptied_feed_becomes_program() {
     let first = multiview_config::propagate_routing_feed_change(None, &new, cfg.routing.as_mut());
     assert_eq!(first, Vec::new(), "no prior document: nothing to propagate");
 }
+
+/// PR 2 (#306): `routing.max_aux_canvases` is a config key (default 2, 0
+/// disables routed layouts, at most 8) and round-trips; absent, the document
+/// gains no key.
+#[test]
+fn max_aux_canvases_is_configurable_and_bounded() {
+    assert_eq!(load("").unwrap().max_aux_canvases(), 2);
+    for n in [0, 1, 8] {
+        let cfg = load(&format!("[routing]\nmax_aux_canvases = {n}\n")).unwrap();
+        assert_eq!(cfg.max_aux_canvases(), n);
+        let parsed = MultiviewConfig::load_from_json(&cfg.to_json().unwrap()).unwrap();
+        assert_eq!(parsed.max_aux_canvases(), n);
+    }
+    let err = load("[routing]\nmax_aux_canvases = 9\n").unwrap_err();
+    assert!(err.contains("max_aux_canvases"), "{err}");
+}

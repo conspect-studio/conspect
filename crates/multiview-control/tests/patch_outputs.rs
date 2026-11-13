@@ -1702,3 +1702,36 @@ async fn get_patch_reads_only_the_layouts_on_air_and_never_lists_the_library() {
     assert_eq!(gets(), 1, "the one layout on air is read once");
     assert_eq!(lists(), 0, "the library is never listed");
 }
+
+/// #383 x B2: a layout take through `/patch` (the shared slot-0 path and its
+/// one bounded layout read) carries #383's resolved body: the layout's
+/// `audio` attribute and a resolution revision taken BEFORE the read, so an
+/// edit committed after it (a higher revision) supersedes it in the engine.
+#[tokio::test]
+async fn a_patch_layout_take_carries_the_audio_attribute_and_a_pre_read_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "NewsOne", "bars");
+    let before = multiview_control::output_routing::next_layout_revision();
+    let (status, accepted) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "rev",
+        patch(vec![video("output-0", json!({"layout": "NewsOne"}))]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let after = multiview_control::output_routing::next_layout_revision();
+    let takes = rig.fake.takes();
+    let body = &takes[0]
+        .layout
+        .as_ref()
+        .expect("the resolved body rides the take")
+        .0;
+    assert_eq!(body.audio, multiview_config::LayoutAudio::default());
+    assert!(
+        body.revision > before && body.revision < after,
+        "taken during this request ({before} < {} < {after})",
+        body.revision
+    );
+}

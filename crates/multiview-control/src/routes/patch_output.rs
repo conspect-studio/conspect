@@ -468,7 +468,15 @@ async fn layouts_on_air(
                     .iter()
                     .filter_map(|c| c.source.input_id.clone())
                     .collect();
-                layouts.insert(id, sources);
+                // #306: the layout's `audio` attribute rides along (what
+                // `follow` resolves to on it), exactly as `layout_sources`.
+                layouts.insert(
+                    id,
+                    super::routing::LayoutReadback {
+                        sources,
+                        audio: doc.audio,
+                    },
+                );
             }
         }
     }

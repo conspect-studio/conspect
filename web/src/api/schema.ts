@@ -6698,8 +6698,9 @@ export interface components {
             fits: boolean;
             /**
              * @description The audio the output carries on this video feed when its audio
-             *     follows: `program` (the mix), `source` (the source's own) or `preview`
-             *     (the PVW source's). A layout carries the program mix.
+             *     follows: `program` (the mix), `source` (the source's own), `preview`
+             *     (the PVW source's) or `none` (silence). A layout carries its `audio`
+             *     attribute: the mix by default, `none`, or one cell's `source`.
              */
             follow_audio?: string | null;
             /**
