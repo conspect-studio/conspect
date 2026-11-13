@@ -4428,7 +4428,10 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
             stores: Arc::new(|_: &str| None),
             preview_selection: None,
         },
-        Box::new(|_, _| Err("no take opener in this harness".to_owned())),
+        Box::new(|_, _| {
+            let enc: Box<dyn LiveEncoder> = Box::new(ReformatEnc { forced: false });
+            Ok(enc)
+        }),
         Some(reformat_open),
     )
     .unwrap();
@@ -4574,6 +4577,45 @@ fn a_reformat_moves_only_that_output_at_a_flagged_idr_and_pins_its_new_key() {
     }
     assert_eq!(x.d.binding_video_key(1), Some(new_key));
     assert!(!x.d.is_key_failed(new_key));
+}
+
+/// Review M-3: a reformat of an output on Clean makes a key rendering Clean
+/// its base key. A fallback-style move landing on that key with no take
+/// pending must report Clean, not Program (`bus_of_key` resolves the live
+/// key's own bus before `base_keys`).
+#[test]
+fn a_reformatted_clean_key_reports_its_own_bus() {
+    let mut x = reformat_harness(1, 6, OpenMode::Ok);
+    x.r.cfg.has_preview = true;
+    let mut t = 0;
+    let mut seen = Vec::new();
+    let mut run = |x: &mut ReformatHarness, t: &mut u64, op: &str, want: &TakeResult| {
+        let until = *t + REFORMAT_DEADLINE_TICKS;
+        while *t < until
+            && !seen
+                .iter()
+                .any(|(o, r, _): &(String, TakeResult, u64)| o == op && r == want)
+        {
+            x.tick(*t);
+            *t += 1;
+            seen.extend(x.results());
+        }
+        assert!(
+            seen.iter().any(|(o, r, _)| o == op && r == want),
+            "{op}: {seen:?}"
+        );
+    };
+    x.h.try_take(take("clean", 0, PictureBus::Clean)).unwrap();
+    run(&mut x, &mut t, "clean", &TakeResult::Applied);
+    x.reformat("rf", 0);
+    run(&mut x, &mut t, "rf", &TakeResult::ResetApplied);
+    let key = x.d.binding_video_key(0).unwrap();
+    assert_eq!(
+        x.r.cfg.base_keys,
+        vec![key],
+        "the Clean key is the base key"
+    );
+    assert_eq!(x.r.bus_of_key(key), Some(PictureBus::Clean));
 }
 
 /// A second reformat of the same output retires the first reformat's key

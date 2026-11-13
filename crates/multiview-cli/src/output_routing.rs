@@ -1741,14 +1741,18 @@ impl OutputRouter {
     }
 
     /// The picture bus a video key carries (`None`: unknown, e.g. closed).
+    /// The bus a key renders. A live key's own bus wins (review M-3): a
+    /// reformat key becomes an output's base key while rendering a source,
+    /// PVW or Clean, so membership in `base_keys` alone must not report it
+    /// as Program.
     fn bus_of_key(&self, key: usize) -> Option<PictureBus> {
-        if self.cfg.base_keys.contains(&key) {
-            return Some(PictureBus::Program);
+        if let Some(d) = self.dynamic.iter().find(|d| d.key == key) {
+            return Some(d.bus.clone());
         }
-        self.dynamic
-            .iter()
-            .find(|d| d.key == key)
-            .map(|d| d.bus.clone())
+        self.cfg
+            .base_keys
+            .contains(&key)
+            .then_some(PictureBus::Program)
     }
 
     /// A pending take whose dispatcher move vanished without an Applied or
