@@ -3719,6 +3719,18 @@ impl Pipeline {
         Arc::new(self.live_spawner())
     }
 
+    /// The canvas a routed layout composes onto (ADR-0108 slice 3): Program's
+    /// size and colour, and Program's background encoded once here.
+    fn layout_canvas_spec(&self) -> crate::aux_layout::LayoutCanvasSpec {
+        crate::aux_layout::LayoutCanvasSpec {
+            width: self.encode_cfg.width,
+            height: self.encode_cfg.height,
+            color: self.canvas_color,
+            background: crate::aux_layout::background_codes(self.canvas_color, self.background)
+                .unwrap_or([16, 128, 128]),
+        }
+    }
+
     /// Build one run's output routing (ADR-0108 slice 1): the clock's aux tick
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
@@ -3758,14 +3770,7 @@ impl Pipeline {
                 height: self.encode_cfg.height,
                 color: self.canvas_color.output_tag(),
             },
-            // A routed layout's background is Program's, encoded once here.
-            layout_canvas: crate::aux_layout::LayoutCanvasSpec {
-                width: self.encode_cfg.width,
-                height: self.encode_cfg.height,
-                color: self.canvas_color,
-                background: crate::aux_layout::background_codes(self.canvas_color, self.background)
-                    .unwrap_or([16, 128, 128]),
-            },
+            layout_canvas: self.layout_canvas_spec(),
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
