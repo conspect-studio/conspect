@@ -4364,6 +4364,9 @@ impl LiveEncoder for ReformatEnc {
     }
 }
 
+/// Every open, in order: (bus, ad-hoc settings; `None` = the rendition's).
+type OpenLog = Arc<Mutex<Vec<(PictureBus, Option<ReformatSettings>)>>>;
+
 /// A router + dispatcher harness for reformats: base key 0 (Program), the
 /// given number of outputs, a reformat opener whose behaviour `mode` picks.
 struct ReformatHarness {
@@ -4376,7 +4379,7 @@ struct ReformatHarness {
     opened: Arc<AtomicUsize>,
     /// Every open, in order: the (bus, ad-hoc settings) the opener was
     /// asked for (`None` settings = the rendition's, review M-2).
-    opens: Arc<Mutex<Vec<(PictureBus, Option<ReformatSettings>)>>>,
+    opens: OpenLog,
     /// Source "cam", published every tick.
     store: Arc<TileStore<Nv12Image>>,
 }
@@ -4396,7 +4399,7 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
     // wedged open blocks until the run ends (never a disconnect).
     let (wedge_tx, wedge_rx) = mpsc::channel::<()>();
     let wedge_rx = Mutex::new(wedge_rx);
-    let opens: Arc<Mutex<Vec<(PictureBus, Option<ReformatSettings>)>>> = Arc::default();
+    let opens: OpenLog = Arc::default();
     let log = Arc::clone(&opens);
     let take_log = Arc::clone(&opens);
     let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));

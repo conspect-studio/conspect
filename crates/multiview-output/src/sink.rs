@@ -2251,6 +2251,10 @@ impl StreamSeed<'_> {
 /// [`Muxer::redirect_output`] doc for the libav-source cross-reference). The
 /// discrete per-rendition audio muxers ([`AudioRenditionState::current`])
 /// carry the identical one-muxer-per-rendition-for-the-run fix.
+#[allow(clippy::struct_excessive_bools)]
+// reason: each flag is an independent segmentation fact (recovering, a
+// pending decoder-config change, a pending rebuild, a failed publication,
+// two test-only fault injections); a state enum would conflate them.
 struct SegmentState<'a> {
     dir: &'a Path,
     prefix: &'a str,
