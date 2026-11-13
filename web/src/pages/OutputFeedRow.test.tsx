@@ -252,4 +252,45 @@ describe('OutputFeedRow', () => {
     expect(screen.getByTestId('output-tally')).toHaveTextContent('CLEAN');
     expect(screen.getByLabelText(/Video feed for Out 1/)).toHaveValue('bus:clean');
   });
+
+  it('lists layouts in their own group, plans one with its canvas and audio, and shows the layout tally', async () => {
+    planResponse = {
+      class: 'class1',
+      cost: { new_encoders: 1, fits: true, new_aux_canvases: 1, follow_audio: 'program' },
+      refusals: [],
+    };
+    const withLayout = [
+      ...choices,
+      { key: 'aux:NewsOne', label: 'NewsOne', group: 'layouts' as const },
+    ];
+    renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={programRow} choices={withLayout} />,
+    );
+    const group = screen.getByRole('group', { name: 'Layouts' });
+    expect(group).toHaveTextContent('NewsOne');
+    fireEvent.change(screen.getByLabelText(/Video feed for Out 1/), {
+      target: { value: 'aux:NewsOne' },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('output-plan-cost')).toHaveTextContent('+1 encoder, +1 layout canvas');
+    });
+    expect(planBody).toEqual({
+      target: { kind: 'output', output: 'out-1', stream: 'video' },
+      feed: { layout: 'NewsOne' },
+    });
+    expect(screen.getByTestId('output-plan-audio')).toHaveTextContent('Audio follows: program mix');
+  });
+
+  it('names an on-air layout in the tally', () => {
+    const layoutRow: OutputRouteState = {
+      ...programRow,
+      video: { layout: 'NewsOne' } as unknown as OutputRouteState['video'],
+      tally: 'direct',
+    };
+    renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={layoutRow} choices={choices} />,
+    );
+    expect(screen.getByTestId('output-tally')).toHaveTextContent('layout: NewsOne');
+    expect(screen.getByLabelText(/Video feed for Out 1/)).toHaveValue('aux:NewsOne');
+  });
 });

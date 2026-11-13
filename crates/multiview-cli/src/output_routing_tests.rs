@@ -184,6 +184,7 @@ fn router(
             max_encoders: max,
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview: false,
+            max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
         },
         aux,
         open,
@@ -417,6 +418,7 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             max_encoders: max,
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview,
+            max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -1520,6 +1522,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             operation_id: "op-1".into(),
             output: "renamed".into(),
             feed: RoutedFeed::Program,
+            layout: None,
             principal: "p".into(),
         })
         .unwrap();
@@ -1992,6 +1995,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             max_encoders: 6,
             max_per_principal: DEFAULT_MAX_PER_PRINCIPAL,
             has_preview: false,
+            max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -3726,4 +3730,187 @@ fn refused_substitutions_count_toward_starvation_across_accepted_survivors() {
     );
     assert!(x.h.snapshot().outputs[1].degraded, "the output is degraded");
     drop(seen);
+}
+
+fn layout_bus(id: &str) -> PictureBus {
+    use multiview_core::layout::{Canvas, Cell, Layout};
+    PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::new(
+        crate::aux_layout::RoutedLayout {
+            id: id.to_owned(),
+            layout: Layout {
+                name: id.to_owned(),
+                canvas: Canvas {
+                    width: 16,
+                    height: 16,
+                    fps_num: 5,
+                    fps_den: 1,
+                },
+                cells: vec![Cell {
+                    w: 1.0,
+                    h: 1.0,
+                    source: Some("cam".to_owned()),
+                    ..Cell::default()
+                }],
+            },
+            slates: vec![multiview_config::FailoverSlate::Black],
+        },
+    )))
+}
+
+impl Harness {
+    /// One tick with the aux thread "composing" every active layout bus.
+    fn tick_layouts(&mut self, t: u64, buses: &[PictureBus]) {
+        for bus in buses {
+            if let Some(slot) = self.r.slot(bus) {
+                slot.latest
+                    .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                        tick: t,
+                        generation: 1,
+                        frame: canvas(),
+                    })));
+            }
+        }
+        self.tick(t);
+    }
+}
+
+/// ADR-0108 slice 3 admission and failure (design §7, §4.4): with
+/// `max_aux_canvases = 1`, a second distinct layout is refused `Capacity`
+/// while the first composes; a second output on the SAME layout shares its
+/// canvas (and encoder: +0); the aux thread failing moves every output on a
+/// layout back to Program at once, and Program never misses a window.
+#[test]
+fn layout_canvases_are_admitted_shared_and_fall_back_when_aux_fails() {
+    let mut x = harness(3, 6, None);
+    x.r.cfg.max_aux_canvases = 1;
+    let (l1, l2) = (layout_bus("L1"), layout_bus("L2"));
+    let buses = [l1.clone(), l2.clone()];
+    let mut t = 0;
+    x.tick_layouts(t, &buses);
+    x.h.try_take(take("one", 1, l1.clone())).unwrap();
+    let mut got = Vec::new();
+    while !got
+        .iter()
+        .any(|(op, r)| op == "one" && *r == TakeResult::Applied)
+    {
+        t += 1;
+        x.tick_layouts(t, &buses);
+        got.extend(x.outcomes.try_iter().map(|o| (o.operation_id, o.outcome)));
+        assert!(t < 60, "{got:?}");
+    }
+    assert_eq!(x.h.snapshot().aux_canvases, vec!["aux:L1".to_owned()]);
+    assert!(
+        x.aux_active.load(Ordering::Acquire),
+        "the aux thread is woken"
+    );
+    // A second layout: refused at the cap, output 2 keeps Program.
+    x.h.try_take(take("two", 2, l2.clone())).unwrap();
+    t += 1;
+    x.tick_layouts(t, &buses);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Capacity)]
+    );
+    assert_eq!(x.d.binding_video_key(2), Some(0));
+    // The same layout on output 2 shares the canvas and the encoder (past
+    // the per-key forced-IDR floor: the fake encoder has no natural IDR).
+    for _ in 0..FORCE_FLOOR_TICKS {
+        t += 1;
+        x.tick_layouts(t, &buses);
+    }
+    let keys = x.d.video_key_count();
+    x.h.try_take(take("share", 2, l1.clone())).unwrap();
+    let mut shared = false;
+    let mut seen = Vec::new();
+    for _ in 0..60 {
+        t += 1;
+        x.tick_layouts(t, &buses);
+        seen.extend(x.outcomes.try_iter().map(|o| (o.operation_id, o.outcome)));
+        if seen
+            .iter()
+            .any(|(op, r)| op == "share" && *r == TakeResult::Applied)
+        {
+            shared = true;
+            break;
+        }
+    }
+    assert!(
+        shared,
+        "the second output joins the composing layout: {seen:?}"
+    );
+    assert_eq!(x.d.video_key_count(), keys, "+0 encoders");
+    assert_eq!(x.h.snapshot().aux_canvases, vec!["aux:L1".to_owned()]);
+    // Output 1 moving from L1 to L2 is still refused: output 2 holds L1.
+    x.h.try_take(take("swap", 1, l2.clone())).unwrap();
+    t += 1;
+    x.tick_layouts(t, &buses);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Capacity)]
+    );
+    // The aux thread dies: both layout outputs fall back to Program at once.
+    x.failed.store(true, Ordering::Release);
+    t += 1;
+    x.tick_layouts(t, &buses);
+    let fallen = x.results();
+    assert_eq!(
+        fallen,
+        vec![TakeResult::Fallback(FallbackReason::AuxFailed); 2],
+        "{fallen:?}"
+    );
+    for _ in 0..5 {
+        t += 1;
+        x.tick_layouts(t, &buses);
+    }
+    assert_eq!(x.d.binding_video_key(1), Some(0));
+    assert_eq!(x.d.binding_video_key(2), Some(0));
+    assert_eq!(
+        x.windows_of(0).len(),
+        usize::try_from(t).unwrap(),
+        "Program never missed a window"
+    );
+}
+
+/// A layout whose canvas stops publishing (every cell's tile store wedged is
+/// NOT this: dead cells show slates; this is the aux canvas itself holding)
+/// degrades at 60 held ticks and falls back at 150, like any aux bus.
+#[test]
+fn a_held_layout_canvas_degrades_then_falls_back() {
+    let mut x = harness(2, 6, None);
+    let l1 = layout_bus("L1");
+    let mut t = 0;
+    x.tick_layouts(t, std::slice::from_ref(&l1));
+    x.h.try_take(take("one", 1, l1.clone())).unwrap();
+    while !x
+        .outcomes
+        .try_iter()
+        .any(|o| o.outcome == TakeResult::Applied)
+    {
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(&l1));
+        assert!(t < 60);
+    }
+    let held_from = t + 1;
+    let mut fell = None;
+    for _ in 0..FALLBACK_AFTER_TICKS + 5 {
+        t += 1;
+        x.tick(t); // nothing composes the layout any more
+        if x.outcomes
+            .try_iter()
+            .any(|o| o.outcome == TakeResult::Fallback(FallbackReason::AuxFailed))
+        {
+            fell = Some(t);
+            break;
+        }
+    }
+    assert_eq!(fell.map(|f| f - held_from + 1), Some(FALLBACK_AFTER_TICKS));
+    for _ in 0..10 {
+        t += 1;
+        x.tick(t);
+    }
+    assert_eq!(
+        x.d.binding_video_key(1),
+        Some(0),
+        "back on Program at a RAP"
+    );
 }

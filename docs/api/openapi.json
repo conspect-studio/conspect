@@ -9657,7 +9657,7 @@
             }
           },
           "409": {
-            "description": "`routing-unavailable`, `switcher-required`, `output-kind-unroutable` or `capacity`.",
+            "description": "`routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` or `aux-capacity` (no free layout canvas).",
             "content": {
               "application/json": {
                 "schema": {
@@ -9667,7 +9667,7 @@
             }
           },
           "422": {
-            "description": "`unknown-feed`, missing Idempotency-Key, or an unsupported audio request.",
+            "description": "`unknown-feed` (including an unknown layout), `layout-not-admissible` (a layout authored for another canvas, one that does not solve, or one with a translucent cell), missing Idempotency-Key, or an unsupported audio request.",
             "content": {
               "application/json": {
                 "schema": {
@@ -19646,6 +19646,19 @@
             "type": "boolean",
             "description": "Whether the take fits the encoder budget now."
           },
+          "follow_audio": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The audio the output carries on this feed when its audio follows:\n`program` (the mix), `source` (the source's own) or `preview` (the\nPVW source's). A layout carries the program mix."
+          },
+          "new_aux_canvases": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`1` when the take starts a new layout canvas (`routing-aux`), else `0`.",
+            "minimum": 0
+          },
           "new_encoders": {
             "type": "integer",
             "format": "int32",
@@ -19668,7 +19681,7 @@
           },
           "type": {
             "type": "string",
-            "description": "`capacity` | `unknown-feed` | `switcher-required` | `output-kind-unroutable`."
+            "description": "`capacity` | `unknown-feed` | `switcher-required` | `output-kind-unroutable`\n| `layout-not-admissible` | `aux-capacity`."
           }
         }
       },
@@ -19727,7 +19740,7 @@
           },
           "feed": {
             "type": "object",
-            "description": "The feed: `{\"bus\":\"program\"|\"preview\"|\"clean\"}` or `{\"source\":\"vt1\"}`."
+            "description": "The feed: `{\"bus\":\"program\"|\"preview\"|\"clean\"}`, `{\"source\":\"vt1\"}` or\n`{\"layout\":\"NewsOne\"}` (a stored layout, ADR-0108 slice 3)."
           },
           "target": {
             "$ref": "#/components/schemas/OutputTargetKind",

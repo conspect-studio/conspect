@@ -6462,6 +6462,17 @@ export interface components {
             /** @description Whether the take fits the encoder budget now. */
             fits: boolean;
             /**
+             * @description The audio the output carries on this feed when its audio follows:
+             *     `program` (the mix), `source` (the source's own) or `preview` (the
+             *     PVW source's). A layout carries the program mix.
+             */
+            follow_audio?: string | null;
+            /**
+             * Format: int32
+             * @description `1` when the take starts a new layout canvas (`routing-aux`), else `0`.
+             */
+            new_aux_canvases?: number;
+            /**
              * Format: int32
              * @description `0` when an existing encoder carries the feed, `1` for a new one.
              */
@@ -6471,7 +6482,10 @@ export interface components {
         OutputPlanRefusal: {
             /** @description Operator-facing text (never names an encoder group). */
             detail: string;
-            /** @description `capacity` | `unknown-feed` | `switcher-required` | `output-kind-unroutable`. */
+            /**
+             * @description `capacity` | `unknown-feed` | `switcher-required` | `output-kind-unroutable`
+             *     | `layout-not-admissible` | `aux-capacity`.
+             */
             type: string;
         };
         /** @description `OpenAPI` mirror of the `GET /api/v1/outputs/{id}/playback` response body. */
@@ -6492,7 +6506,10 @@ export interface components {
         /** @description The body of an output plan / take. */
         OutputRouteRequest: {
             audio?: null | components["schemas"]["OutputTakeAudio"];
-            /** @description The feed: `{"bus":"program"|"preview"|"clean"}` or `{"source":"vt1"}`. */
+            /**
+             * @description The feed: `{"bus":"program"|"preview"|"clean"}`, `{"source":"vt1"}` or
+             *     `{"layout":"NewsOne"}` (a stored layout, ADR-0108 slice 3).
+             */
             feed: Record<string, never>;
             /** @description The output and stream. */
             target: components["schemas"]["OutputTargetKind"];
@@ -16871,7 +16888,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable` or `capacity`. */
+            /** @description `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` or `aux-capacity` (no free layout canvas). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -16880,7 +16897,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `unknown-feed`, missing Idempotency-Key, or an unsupported audio request. */
+            /** @description `unknown-feed` (including an unknown layout), `layout-not-admissible` (a layout authored for another canvas, one that does not solve, or one with a translucent cell), missing Idempotency-Key, or an unsupported audio request. */
             422: {
                 headers: {
                     [name: string]: unknown;

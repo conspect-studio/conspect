@@ -144,11 +144,13 @@ fn bus_alias_must_agree_with_video() {
 }
 
 #[test]
-fn layout_is_refused_until_its_slice_and_explicit_audio_is_accepted() {
-    let err =
-        load("\n[[routing.output]]\noutput = \"srt-out\"\nvideo = { layout = \"NewsOne\" }\n")
-            .unwrap_err();
-    assert!(err.contains("layout feed"), "{err}");
+fn a_layout_feed_validates_an_empty_id_does_not_and_explicit_audio_is_accepted() {
+    // ADR-0108 slice 3 (#306): a layout feed is routable; its existence is
+    // checked against the layouts library at take time, not here.
+    load("\n[[routing.output]]\noutput = \"srt-out\"\nvideo = { layout = \"NewsOne\" }\n").unwrap();
+    let err = load("\n[[routing.output]]\noutput = \"srt-out\"\nvideo = { layout = \" \" }\n")
+        .unwrap_err();
+    assert!(err.contains("layout id"), "{err}");
     // ADR-0108 slice 2: explicit audio feeds validate (rules: tests below).
     load("\n[[routing.output]]\noutput = \"srt-out\"\naudio = \"none\"\n").unwrap();
     load("\n[[routing.output]]\noutput = \"srt-out\"\naudio = \"follow\"\n").unwrap();

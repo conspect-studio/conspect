@@ -16,6 +16,9 @@
 //! under the canvas tag would mislabel them, invariant #8): the bus holds and
 //! the consumer's lag rule takes over.
 //!
+//! A routed stored layout (ADR-0108 slice 3) is an N-cell aux canvas composed
+//! here by the integer path of [`crate::aux_layout`], from the same stores.
+//!
 //! A panic in a tick body, or any other exit, raises `failed`; the consumer
 //! then moves every output on an aux bus back to Program (§4.4).
 
@@ -40,7 +43,43 @@ use crate::nv12_blit::blit_cell;
 /// encoder is not reused; with none free the bus holds for that tick.
 pub const AUX_RING_BUFFERS: usize = 4;
 
-/// The picture an output's encoder reads (slice 1 one-cell buses).
+/// A routed layout on a picture bus: its id and the body resolved by the
+/// control plane at take time. Two refs are the same bus when their ids are
+/// equal (the body is what that bus composes; a re-take may carry a newer one).
+#[derive(Debug, Clone)]
+pub struct LayoutRef {
+    /// The stored layout id.
+    pub id: String,
+    /// The resolved body.
+    pub body: Arc<crate::aux_layout::RoutedLayout>,
+}
+
+impl LayoutRef {
+    /// A ref to `body`.
+    #[must_use]
+    pub fn new(body: Arc<crate::aux_layout::RoutedLayout>) -> Self {
+        Self {
+            id: body.id.clone(),
+            body,
+        }
+    }
+}
+
+impl PartialEq for LayoutRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for LayoutRef {}
+
+impl std::hash::Hash for LayoutRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+/// The picture an output's encoder reads.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PictureBus {
     /// The Program canvas (the base encoders; not composed here).
@@ -52,11 +91,13 @@ pub enum PictureBus {
     Clean,
     /// One source as a one-cell canvas.
     Source(String),
+    /// A stored layout as an N-cell aux canvas (slice 3).
+    Layout(LayoutRef),
 }
 
 impl PictureBus {
     /// The picture-bus name, matching [`VideoFeed::picture_bus`]:
-    /// `program`, `preview`, `clean` or `src:<id>`.
+    /// `program`, `preview`, `clean`, `src:<id>` or `aux:<layout>`.
     #[must_use]
     pub fn as_str(&self) -> Cow<'_, str> {
         match self {
@@ -64,11 +105,13 @@ impl PictureBus {
             Self::Preview => Cow::Borrowed("preview"),
             Self::Clean => Cow::Borrowed("clean"),
             Self::Source(id) => Cow::Owned(format!("src:{id}")),
+            Self::Layout(layout) => Cow::Owned(format!("aux:{}", layout.id)),
         }
     }
 }
 
-/// A feed that cannot be routed onto an output (a layout).
+/// A feed that cannot be built from config alone (a layout needs its body,
+/// resolved by the control plane).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnroutableFeed;
 
@@ -171,6 +214,8 @@ pub struct AuxInputs {
     pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
     /// The canvas.
     pub canvas: AuxCanvas,
+    /// The canvas a routed layout composes onto (size, colour, background).
+    pub layout_canvas: crate::aux_layout::LayoutCanvasSpec,
 }
 
 /// Spawn the `routing-aux` thread.
@@ -245,6 +290,8 @@ struct FeedState {
     generation: u64,
     ring: BlitRing,
     warned_color: bool,
+    /// A routed layout's compose state (rebuilt when the body changes).
+    layout: Option<crate::aux_layout::LayoutCanvas>,
 }
 
 impl AuxState {
@@ -264,6 +311,10 @@ impl AuxState {
             let source: Arc<str> = match &feed.bus {
                 // Program and Clean come from the bake consumer, never here.
                 PictureBus::Program | PictureBus::Clean => continue,
+                PictureBus::Layout(layout) => {
+                    self.compose_layout(inputs, feed, layout, tick);
+                    continue;
+                }
                 PictureBus::Source(id) => match self.per_feed.get(&feed.key) {
                     Some(FeedState {
                         source: Some(s), ..
@@ -299,6 +350,42 @@ impl AuxState {
             })));
             feed.slot.composed.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+impl AuxState {
+    /// Compose one routed layout for `tick` into its slot (hold on `None`).
+    fn compose_layout(
+        &mut self,
+        inputs: &AuxInputs,
+        feed: &AuxFeed,
+        layout: &LayoutRef,
+        tick: AuxTick,
+    ) {
+        let entry = self.per_feed.entry(Arc::clone(&feed.key)).or_default();
+        let stale = entry
+            .layout
+            .as_ref()
+            .is_none_or(|c| !Arc::ptr_eq(c.layout(), &layout.body));
+        if stale {
+            entry.layout = crate::aux_layout::LayoutCanvas::new(
+                Arc::clone(&layout.body),
+                inputs.layout_canvas,
+            );
+            entry.generation = entry.generation.wrapping_add(1);
+        }
+        let Some(canvas) = entry.layout.as_mut() else {
+            return; // a layout for another canvas size: never composed (hold)
+        };
+        let Some(picture) = canvas.compose(&inputs.stores, tick.pts) else {
+            return;
+        };
+        feed.slot.latest.store(Some(Arc::new(AuxFrame {
+            tick: tick.index,
+            generation: entry.generation,
+            frame: picture,
+        })));
+        feed.slot.composed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -564,6 +651,12 @@ mod tests {
             stores,
             preview_selection: None,
             canvas: canvas(),
+            layout_canvas: crate::aux_layout::LayoutCanvasSpec {
+                width: 1920,
+                height: 1080,
+                color: CanvasColor::default(),
+                background: [16, 128, 128],
+            },
         })
         .unwrap();
         (tx, handle)

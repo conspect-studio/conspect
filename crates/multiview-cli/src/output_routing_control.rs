@@ -19,7 +19,7 @@ use multiview_control::output_routing::{
 
 use crate::output_routing::{
     FallbackReason, OutputRoutingHandle, OutputRoutingSlot, OutputTake, RefuseReason, TakeOutcome,
-    TakeResult, DEFAULT_MAX_ENCODERS,
+    TakeResult, DEFAULT_MAX_AUX_CANVASES, DEFAULT_MAX_ENCODERS,
 };
 use crate::routing_aux::PictureBus;
 
@@ -45,16 +45,26 @@ fn routed_feed(bus: &PictureBus) -> RoutedFeed {
         PictureBus::Preview => RoutedFeed::Preview,
         PictureBus::Clean => RoutedFeed::Clean,
         PictureBus::Source(id) => RoutedFeed::Source(id.clone()),
+        PictureBus::Layout(layout) => RoutedFeed::Layout(layout.id.clone()),
     }
 }
 
-fn picture_bus(feed: &RoutedFeed) -> PictureBus {
-    match feed {
+/// The engine bus of a take: a layout needs its resolved body (`None` for a
+/// layout take without one, refused as unroutable).
+fn picture_bus(
+    feed: &RoutedFeed,
+    layout: Option<&multiview_control::output_routing::LayoutBody>,
+) -> Option<PictureBus> {
+    Some(match feed {
         RoutedFeed::Program => PictureBus::Program,
         RoutedFeed::Preview => PictureBus::Preview,
         RoutedFeed::Clean => PictureBus::Clean,
         RoutedFeed::Source(id) => PictureBus::Source(id.clone()),
-    }
+        RoutedFeed::Layout(id) => {
+            let body = layout.filter(|b| b.0.id == *id)?;
+            PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::clone(&body.0)))
+        }
+    })
 }
 
 /// Outcomes buffered between the engine and the control relay.
@@ -64,6 +74,7 @@ const RELAY_CAPACITY: usize = 64;
 pub struct OutputRoutingAdapter {
     slot: OutputRoutingSlot,
     max_encoders: usize,
+    max_aux_canvases: usize,
     outcome_tx: SyncSender<OutputOutcome>,
     outcome_rx: Mutex<Option<Receiver<OutputOutcome>>>,
     /// The handle whose outcome stream the pump already took.
@@ -85,6 +96,7 @@ impl OutputRoutingAdapter {
         Self {
             slot,
             max_encoders: DEFAULT_MAX_ENCODERS,
+            max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             outcome_tx,
             outcome_rx: Mutex::new(Some(outcome_rx)),
             pumped: Mutex::new(None),
@@ -162,6 +174,34 @@ impl OutputRouting for OutputRoutingAdapter {
         }
         let snapshot = handle.snapshot();
         let bus = feed.bus_name();
+        // §7 rule 1: a layout not composing for another output needs a free
+        // aux canvas; this output's own layout is replaced by the take.
+        let own = snapshot.outputs.get(index).map(|v| v.bus.as_str());
+        let held_by_others: Vec<&str> = snapshot
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .flat_map(|(_, v)| {
+                std::iter::once(v.bus.as_str()).chain(v.pending.as_ref().map(|p| p.bus.as_str()))
+            })
+            .filter(|b| b.starts_with("aux:"))
+            .collect();
+        let mut distinct = held_by_others.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let needs_aux_canvas = matches!(feed, RoutedFeed::Layout(_))
+            && own != Some(bus.as_str())
+            && !distinct.contains(&bus.as_str());
+        if matches!(feed, RoutedFeed::Layout(_))
+            && !distinct.contains(&bus.as_str())
+            && distinct.len() >= self.max_aux_canvases
+        {
+            return Err(PlanRefusal::AuxCapacity {
+                active: distinct.len(),
+                max: self.max_aux_canvases,
+            });
+        }
         // +0 when the feed is Program (the base encoder), another output
         // with the same settings already carries this bus, or a live encoder
         // for (bus, settings) still runs (a lingering one is reused by the
@@ -181,6 +221,7 @@ impl OutputRouting for OutputRoutingAdapter {
                 .dynamic_encoders_live
                 .saturating_add(snapshot.opens_in_flight),
             sessions_max: self.max_encoders,
+            needs_aux_canvas,
         })
     }
 
@@ -189,11 +230,13 @@ impl OutputRouting for OutputRoutingAdapter {
         let index = handle
             .index_of(&take.output)
             .ok_or(TakeSubmitError::Unroutable)?;
+        let bus =
+            picture_bus(&take.feed, take.layout.as_ref()).ok_or(TakeSubmitError::Unroutable)?;
         handle
             .try_take(OutputTake {
                 operation_id: take.operation_id,
                 output_index: index,
-                bus: Some(picture_bus(&take.feed)),
+                bus: Some(bus),
                 // Explicit audio over HTTP is the API PR (ADR-0108 slice 2
                 // part 3): today's take keeps the output's audio choice.
                 audio: None,

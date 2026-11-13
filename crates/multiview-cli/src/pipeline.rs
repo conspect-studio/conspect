@@ -3594,6 +3594,14 @@ impl Pipeline {
                 height: self.encode_cfg.height,
                 color: self.canvas_color.output_tag(),
             },
+            // A routed layout's background is Program's, encoded once here.
+            layout_canvas: crate::aux_layout::LayoutCanvasSpec {
+                width: self.encode_cfg.width,
+                height: self.encode_cfg.height,
+                color: self.canvas_color,
+                background: crate::aux_layout::background_codes(self.canvas_color, self.background)
+                    .unwrap_or([16, 128, 128]),
+            },
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
@@ -3620,6 +3628,7 @@ impl Pipeline {
                 max_encoders: crate::output_routing::DEFAULT_MAX_ENCODERS,
                 max_per_principal: crate::output_routing::DEFAULT_MAX_PER_PRINCIPAL,
                 has_preview,
+                max_aux_canvases: crate::output_routing::DEFAULT_MAX_AUX_CANVASES,
             },
             crate::output_routing::AuxWiring {
                 feeds,

@@ -36,7 +36,7 @@ use crate::rendition_workers::{
 };
 pub use crate::routing_audio::AudioChoice;
 use crate::routing_audio::{AudioTakeProgress, AudioTakeStart};
-use crate::routing_aux::{AuxFeed, AuxFeeds, PictureBus, PictureBusSlot};
+use crate::routing_aux::{AuxFeed, AuxFeeds, LayoutRef, PictureBus, PictureBusSlot};
 
 /// Longest accepted `principal` / `operation_id`, in bytes.
 pub const MAX_TAKE_ID_BYTES: usize = 128;
@@ -60,6 +60,10 @@ pub const LINGER_TICKS: u64 = 300;
 pub const DEFAULT_MAX_ENCODERS: usize = 6;
 /// Default `routing.max_encoders_per_principal`.
 pub const DEFAULT_MAX_PER_PRINCIPAL: usize = 2;
+/// Default `routing.max_aux_canvases`: routed layouts composing at once
+/// (design §7 admission rule 1). One-cell feeds are not counted: they are
+/// the identity or a single blit.
+pub const DEFAULT_MAX_AUX_CANVASES: usize = 2;
 /// Open request queue capacity (§4.3).
 pub const OPEN_QUEUE: usize = 4;
 /// Reaper queue capacity; full = the handle is dropped unjoined (counted).
@@ -205,7 +209,8 @@ pub struct PendingView {
 /// One output's routing state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputRouteView {
-    /// Current bus name (`program`, `preview`, `clean`, `src:<id>`).
+    /// Current bus name (`program`, `preview`, `clean`, `src:<id>`,
+    /// `aux:<layout>`).
     pub bus: String,
     /// Internal encoding label.
     pub key: String,
@@ -264,6 +269,8 @@ pub struct RoutingSnapshot {
     /// the output's key (it was already failed/retired); the move was
     /// cancelled directly instead (#330 item 4).
     pub move_cancel_failures: u64,
+    /// Routed layouts composing now (`aux:<id>` buses in use).
+    pub aux_canvases: Vec<String>,
 }
 
 /// The control-plane handle (clone freely).
@@ -516,6 +523,8 @@ pub struct RouterConfig {
     pub max_per_principal: usize,
     /// Whether an M/E exists (Preview is routable).
     pub has_preview: bool,
+    /// `routing.max_aux_canvases` (routed layouts composing at once).
+    pub max_aux_canvases: usize,
 }
 
 /// Aux-side wiring the router drives.
@@ -1059,6 +1068,22 @@ impl OutputRouter {
             };
             let index = take.output_index;
             let needs_switcher = matches!(take.bus, Some(PictureBus::Preview | PictureBus::Clean));
+            // §7 rule 1, checked again here (the plan's answer can be stale):
+            // a layout not composing yet needs a free aux canvas.
+            if let Some(PictureBus::Layout(layout)) = &take.bus {
+                // A re-take of a composing layout carries its latest body
+                // (an edited layout): the canvas follows it from this tick.
+                self.refresh_layout_body(layout);
+                if !self.admit_aux_canvas(layout, take.output_index, dispatcher) {
+                    self.emit(
+                        take.operation_id,
+                        take.output_index,
+                        tick,
+                        TakeResult::Refused(RefuseReason::Capacity),
+                    );
+                    continue;
+                }
+            }
             // Audio rides the output's program-audio slot (§5.5): a run
             // without program audio, or an output without that slot (NDI,
             // AES67, display), cannot take an audio choice.
@@ -1615,6 +1640,11 @@ impl OutputRouter {
             PictureBus::Program | PictureBus::Clean => return true,
             PictureBus::Source(id) => Some(Arc::from(id.as_str())),
             PictureBus::Preview => self.aux.preview_selection.as_ref().and_then(|s| s.load()),
+            // A layout is fresh once its canvas is composing: a dead cell
+            // shows its slate, so a layout never waits on one source.
+            PictureBus::Layout(_) => {
+                return !self.aux.failed.load(Ordering::Acquire) && self.slot_fresh(bus, tick);
+            }
         };
         let live = source
             .and_then(|id| (self.aux.stores)(&id))
@@ -2193,11 +2223,101 @@ impl OutputRouter {
                 .unwrap_or_default(),
             live_keys: self.live_keys.clone(),
             move_cancel_failures: self.move_cancel_failures,
+            aux_canvases: self.layout_buses(),
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));
         }
         self.dirty = false;
+    }
+
+    /// The routed layouts composing now (bus names, sorted): every `aux:`
+    /// bus an output carries, a take is moving to, or a live key reads.
+    fn layout_buses(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .feeds
+            .keys()
+            .filter(|b| matches!(b, PictureBus::Layout(_)))
+            .map(|b| b.as_str().into_owned())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Point a composing layout bus at `layout`'s body when it changed
+    /// (rare: a re-take after an edit). One feed-list republish.
+    fn refresh_layout_body(&mut self, layout: &LayoutRef) {
+        let bus = PictureBus::Layout(layout.clone());
+        let Some(feed) = self.feeds.get_mut(&bus) else {
+            return;
+        };
+        if let PictureBus::Layout(current) = &feed.bus {
+            if Arc::ptr_eq(&current.body, &layout.body) {
+                return;
+            }
+        }
+        feed.bus = bus;
+        let list: Vec<AuxFeed> = self
+            .feeds
+            .values()
+            .filter(|f| aux_composed(&f.bus))
+            .cloned()
+            .collect();
+        self.aux.feeds.store(Arc::new(list));
+    }
+
+    /// The layout buses other outputs hold (on air, or as a pending take).
+    fn layouts_held_by_others(&self, index: usize) -> Vec<PictureBus> {
+        let mut held: Vec<PictureBus> = Vec::new();
+        for (i, o) in self.outputs.iter().enumerate() {
+            if i == index {
+                continue;
+            }
+            let pending = o.pending.as_ref().and_then(|p| p.take.bus.as_ref());
+            for bus in std::iter::once(&o.bus).chain(pending) {
+                if matches!(bus, PictureBus::Layout(_)) && !held.contains(bus) {
+                    held.push(bus.clone());
+                }
+            }
+        }
+        held
+    }
+
+    /// §7 admission rule 1 for a take of `layout` onto output `index`: the
+    /// layouts other outputs hold, plus this one, stay within
+    /// `max_aux_canvases`. The output's own current layout does not count
+    /// (the take replaces it). On admission, lingering live keys of layouts
+    /// nobody else holds are closed so their canvases stop composing: the
+    /// aux thread never composes more layouts than the limit for longer than
+    /// one take (while it primes, the output's old layout still airs).
+    fn admit_aux_canvas(
+        &mut self,
+        layout: &LayoutRef,
+        index: usize,
+        dispatcher: &mut RenditionDispatcher,
+    ) -> bool {
+        let wanted = PictureBus::Layout(layout.clone());
+        let held = self.layouts_held_by_others(index);
+        if !held.contains(&wanted) && held.len() >= self.cfg.max_aux_canvases {
+            return false;
+        }
+        let current = self.outputs.get(index).map(|o| o.bus.clone());
+        let lingering: Vec<usize> = self
+            .dynamic
+            .iter()
+            .filter(|d| {
+                matches!(d.bus, PictureBus::Layout(_))
+                    && d.bus != wanted
+                    && Some(&d.bus) != current.as_ref()
+                    && !held.contains(&d.bus)
+                    && d.linger_deadline.is_some()
+            })
+            .map(|d| d.key)
+            .collect();
+        for key in lingering {
+            self.close(key, dispatcher);
+        }
+        true
     }
 
     /// The picture-bus slot of an active feed (tests and diagnostics).
@@ -2255,7 +2375,10 @@ impl OutputRouter {
 /// Whether the `routing-aux` thread composes `bus` (Program and Clean come
 /// from the bake consumer).
 fn aux_composed(bus: &PictureBus) -> bool {
-    matches!(bus, PictureBus::Preview | PictureBus::Source(_))
+    matches!(
+        bus,
+        PictureBus::Preview | PictureBus::Source(_) | PictureBus::Layout(_)
+    )
 }
 
 #[cfg(test)]

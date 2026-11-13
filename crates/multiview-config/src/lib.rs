@@ -1709,8 +1709,8 @@ impl MultiviewConfig {
 
     /// Validate one output crosspoint's feed (ADR-0108 §6.1): the `bus` alias
     /// agrees with `video`; a switcher bus needs a declared M/E; a source feed
-    /// names a declared source; layout feeds are not routable yet and are
-    /// refused rather than silently ignored; an explicit audio feed is
+    /// names a declared source; a layout feed names a non-empty layout id
+    /// (resolved against the layouts library at take time); an explicit audio feed is
     /// checked by [`Self::validate_output_audio_feed`].
     fn validate_output_feed(&self, xp: &OutputCrosspoint) -> Result<(), ConfigError> {
         if let Some(video) = &xp.video {
@@ -1744,11 +1744,17 @@ impl MultiviewConfig {
                     )));
                 }
             }
+            // ADR-0108 slice 3: a stored layout. The layouts library lives
+            // beside the document (the control plane's accepted state), so
+            // existence and admissibility are checked where it is resolved:
+            // at plan/take time, against the library and the running canvas.
             VideoFeed::Layout(id) => {
-                return Err(ConfigError::Validation(format!(
-                    "output {:?}: a layout feed ({id:?}) cannot be routed to an output yet",
-                    xp.output
-                )));
+                if id.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "output {:?}: a layout feed needs a layout id",
+                        xp.output
+                    )));
+                }
             }
         }
         self.validate_output_audio_feed(xp)
