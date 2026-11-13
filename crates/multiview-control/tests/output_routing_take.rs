@@ -93,10 +93,16 @@ fn keys() -> ApiKeyStore {
         scoped_output_ids: outputs,
         scoped_discovery_domains: None,
     };
+    // #342 review A2: the alias checks the output axis too, so each scoped
+    // key also carries the output-axis grant for the output it may route.
     keys.register(
         "route-scoped",
         "route-scoped-secret",
-        scoped("route-scoped", &["output-1", "bars"], None),
+        scoped(
+            "route-scoped",
+            &["output-1", "bars"],
+            Some(vec!["output-1".to_owned()]),
+        ),
     );
     keys.register(
         "route-bus",
@@ -104,13 +110,17 @@ fn keys() -> ApiKeyStore {
         scoped(
             "route-bus",
             &["output-1", "me1"],
-            Some(vec!["program:main".to_owned()]),
+            Some(vec!["program:main".to_owned(), "output-1".to_owned()]),
         ),
     );
     keys.register(
         "route-other",
         "route-other-secret",
-        scoped("route-other", &["output-0", "bars"], None),
+        scoped(
+            "route-other",
+            &["output-0", "bars"],
+            Some(vec!["output-0".to_owned()]),
+        ),
     );
     keys
 }
