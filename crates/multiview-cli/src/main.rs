@@ -209,8 +209,25 @@ impl Drop for LeaseCleanup {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // Socket activation (slice 6, #292): adopt the sockets systemd passed and
+    // clear `LISTEN_FDS`/`LISTEN_PID` BEFORE the runtime starts any thread
+    // (mutating the environment is not thread-safe). The front door claims
+    // them when `run` starts it; without activation this is a no-op.
+    multiview_cli::frontdoor::set_inherited_sockets(multiview_frontdoor::ListenSockets::from_env());
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(async_main()),
+        Err(err) => {
+            eprintln!("multiview: failed to start the async runtime: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn async_main() -> ExitCode {
     if let Err(err) = init_tracing() {
         // Logging failed to initialize; report on stderr (tracing is unavailable)
         // and bail. This is startup code, not the data plane.

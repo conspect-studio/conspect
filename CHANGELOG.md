@@ -36,6 +36,17 @@ implementation will build against.
 
 ### Added
 
+- **The engine serves TCP 443, TCP 80 and UDP 443 itself; nginx is no longer needed (front-door
+  slice 6, #292)**: systemd socket activation (`deploy/systemd/conspect.socket`: TCP 443, TCP 80
+  and a `ReusePort=yes` UDP 443 pair, so validated-flow steering survives) keeps the sockets
+  open across engine restarts; without it the engine binds them itself. HLS delivery now
+  matches the nginx static contract (`ETag`/`Last-Modified`, `304`, `If-Range`, 64 KiB bounded
+  chunks, one blocking-pool hop per request); the embedded UI gets strong `ETag`s, `304`, gzip
+  and a `404` for a stale hashed chunk. New keys: `[network] cert_file`/`key_file` (the door's
+  own static certificate), `[network] acme_webroot` (HTTP-01 for certbot on port 80) and
+  `[control] ui_dir` (serve a UI build from disk). `[control.tls]` static certificates reload
+  without a restart. `scripts/hls-ttfb.py` measures segment TTFB against the nginx path; the
+  mda001 cutover and rollback are in `docs/runbooks/front-door-cutover.md`.
 - **Numbered mixer inputs and the mixer patch (patch panel, slice A).** An M/E may declare
   `[[switcher.mix_effects.inputs]] { number, label, video = { source } }` with `program_input` /
   `preview_input`; PGM/PVW then select input numbers and a CUT swaps inputs. The Switcher page

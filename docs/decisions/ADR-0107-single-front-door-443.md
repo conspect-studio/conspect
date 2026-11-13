@@ -265,4 +265,6 @@ Chrome for Testing 149.0.7827.55, curl 8.14.1 (nghttp3), a native `web-transport
 - Safari's ICE-TCP behaviour, Firefox behind a proxy, and TLS-intercepting proxies (N6) are
   unverified until the office matrix runs. N6 may end at stills, with an honest caption.
 - The operator-facing runbook for the mda001 cutover (nginx removal, socket unit, firewall) is
-  written with slice 6, when the change is made.
+  [front-door-cutover.md](../runbooks/front-door-cutover.md) (slice 6, #292). As built, the socket
+  unit passes UDP 443 as a `ReusePort=yes` pair so validated-flow steering survives socket
+  activation (design note, "Slice 6 as built").

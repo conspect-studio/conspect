@@ -25,7 +25,8 @@ pub(crate) fn spawn_persist_relay(state: &AppState) {
         return;
     };
     let state = state.clone();
-    runtime.spawn(async move { persist_relay(state, control).await });
+    // Boxed: the relay owns an `AppState` (clippy::large_futures).
+    runtime.spawn(Box::pin(persist_relay(state, control)));
 }
 
 async fn persist_relay(state: AppState, control: SwitcherControl) {

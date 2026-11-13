@@ -1,0 +1,42 @@
+# deploy/systemd/conspect.service: the engine, socket-activated by
+# conspect.socket (ADR-0107 section 9, issue #292).
+#
+# Requires=conspect.socket: the sockets are created before the engine starts
+# and survive `systemctl restart conspect` (only `systemctl stop
+# conspect.socket` closes them). Without the socket unit the engine binds the
+# ports itself; the capability below is that fallback.
+#
+# Paths match mda001 (user `operations`, binary built in ~/conspect, config
+# in ~/mv, control token in /etc/conspect/env). Adjust for another host.
+#
+# Install:  sudo install -m 644 deploy/systemd/conspect.service /etc/systemd/system/
+# Then:     docs/runbooks/front-door-cutover.md
+
+[Unit]
+Description=Conspect multiview engine
+Documentation=file:///home/operations/conspect/docs/runbooks/front-door-cutover.md
+Requires=conspect.socket
+After=conspect.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=operations
+Group=operations
+WorkingDirectory=/home/operations/mv
+EnvironmentFile=-/etc/conspect/env
+ExecStart=/home/operations/conspect/target/release/multiview run /home/operations/mv/conspect.toml
+# Only needed when started without conspect.socket (the engine then binds
+# 443/80 itself). Harmless with the socket unit.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Restart=always
+RestartSec=2
+# The engine's bounded exit after a fatal fault or a stop signal (#309).
+TimeoutStopSec=20
+KillMode=mixed
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
