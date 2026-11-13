@@ -965,6 +965,14 @@ under a 20k pps loopback flood (review PR 333). Why proportional, measured: on m
 43324610127) the witness and the clock thread were descheduled at slightly different moments
 (gaps 43.6 and 76.5 ms against repeats 50 and 103 ms late), which a whole-window cover rule
 blamed on the code; the proportional rule explains them and still fails every control.
+**Platform limit (measured).** The witness is judged on Linux only. On macOS CI (run 43331219140)
+it recorded 255-302 gaps of at least 5 ms in a 3 s run with no stall injected, and a 136 ms gap
+while another thread merely spun (headless processes there get coalesced timers), so it can
+neither prove nor excuse a stall. On macOS the chaos suite asserts what the design guarantees on
+any host (one frame per tick, consecutive indices, exact PTS from the tick, the viewer's >= 95 %,
+RSS) and reports repeats without judging them; the witness-judged controls are `cfg(linux)`. The
+production target (mda001) and the ubuntu CI runner are Linux, where the zero-unexplained-repeats
+assertion holds.
 
 ### Slice 4 as built (issue #290)
 

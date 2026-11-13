@@ -17,6 +17,11 @@
 //! * BLOCK UNDER FLOOD (review PR 333): a 100 ms program-runtime block while a
 //!   loopback flood keeps every other thread busy; the witness's own
 //!   scheduling noise must not excuse it.
+//!
+//! The witness-judged tests run on Linux only (`common::WITNESS_RELIABLE`):
+//! on macOS CI the witness records hundreds of 5 ms+ gaps per run with no
+//! stall at all (coalesced timers), so it can neither prove nor excuse a
+//! stall there. The RED record and the pure classifier test run everywhere.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::print_stderr)]
 
@@ -70,6 +75,7 @@ fn red_a_whole_process_stall_fails_the_slice_1_assertion() {
 }
 
 #[test]
+#[cfg(target_os = "linux")] // the witness is reliable here only: common::WITNESS_RELIABLE
 fn a_whole_process_stall_is_explained_by_the_witness() {
     let _serial = serial();
     let run = stalled_run();
@@ -87,6 +93,7 @@ fn a_whole_process_stall_is_explained_by_the_witness() {
 }
 
 #[test]
+#[cfg(target_os = "linux")] // the witness is reliable here only: common::WITNESS_RELIABLE
 fn a_starved_program_runtime_is_never_explained() {
     let _serial = serial();
     // Spin 150 ms inside tick 30's projection (on the program runtime): the
@@ -124,6 +131,7 @@ fn sigstop_at(after: Duration, stall: Duration) -> std::thread::JoinHandle<()> {
 }
 
 #[test]
+#[cfg(target_os = "linux")] // the witness is reliable here only: common::WITNESS_RELIABLE
 fn a_block_followed_by_a_stall_is_not_explained_by_the_stall() {
     let _serial = serial();
     // Tick 30 (deadline ~1 s): the projection spins 100 ms, and the stall is
@@ -155,6 +163,7 @@ fn a_block_followed_by_a_stall_is_not_explained_by_the_stall() {
 }
 
 #[test]
+#[cfg(target_os = "linux")] // the witness is reliable here only: common::WITNESS_RELIABLE
 fn a_block_under_flood_is_not_explained_by_witness_noise() {
     let _serial = serial();
     let target = std::net::UdpSocket::bind("[::1]:0").unwrap();

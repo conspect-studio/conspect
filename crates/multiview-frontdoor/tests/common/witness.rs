@@ -143,6 +143,18 @@ pub struct ClockRun {
     pub gaps: Vec<(i64, i64)>,
 }
 
+/// Whether the witness can attribute a stall on this platform. Linux: yes
+/// (build host and ubuntu CI record 0 gaps in an idle 3 s run, and the
+/// controls in `stall_witness.rs` show it never excuses a starved clock).
+/// macOS: no. On macOS CI (run 43331219140) the witness recorded 255-302 gaps
+/// of at least 5 ms in 3 s with no stall injected, and a 136 ms gap while
+/// another thread merely spun (headless processes there get coalesced
+/// timers), so it can neither prove nor excuse anything; there the suite
+/// asserts what the design guarantees on any host (one frame per tick,
+/// consecutive indices, exact PTS) and reports repeats without judging them.
+/// The production target (mda001) is Linux.
+pub const WITNESS_RELIABLE: bool = cfg!(target_os = "linux");
+
 /// The shortest witness sleep that counts as a gap: five times the 1 ms sleep.
 pub const MIN_GAP_NS: i64 = 5_000_000;
 
@@ -315,8 +327,9 @@ pub fn report(name: &str, r: &ClockRun) {
 }
 
 /// The issue #321 assertion: one frame per tick, the output PTS exactly
-/// `from_tick(index)` with consecutive indices (constant delta), and zero
-/// unexplained repeats or slips. Absolute, never relative to another arm.
+/// `from_tick(index)` with consecutive indices (constant delta), and (where
+/// [`WITNESS_RELIABLE`]) zero unexplained repeats. Absolute, never relative to
+/// another arm.
 pub fn assert_cadence(name: &str, r: &ClockRun) {
     let ticks = r.ticks.len() as u64;
     assert!(
@@ -340,6 +353,14 @@ pub fn assert_cadence(name: &str, r: &ClockRun) {
         );
     }
     let c = classify(r);
+    if !WITNESS_RELIABLE {
+        eprintln!(
+            "{name}: {} repeats not judged (the stall witness is unreliable on this platform; \
+             see WITNESS_RELIABLE)",
+            c.needing_explanation
+        );
+        return;
+    }
     assert!(
         c.unexplained.is_empty(),
         "{name}: {} repeats/slips not explained by a whole-process stall: {:?} (gaps {:?})",
