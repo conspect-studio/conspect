@@ -35,8 +35,8 @@ BOUND_MS=2000
 # and ms rounding); worst_wake_late <= MAX_WAKE_LATE_MS, the host's bound.
 # Measured worst single-wait lateness: <= 11 ms on a dedicated Apple-silicon
 # host (idle and 28 busy loops; the default 50 ms bound); on the shared macOS
-# CI VM 92 and 106 ms (one long wait), and with 20 ms waits 121-151 ms in
-# every one of 40 runs, so CI sets 200 ms.
+# CI VM 92 and 106 ms (one long wait), and with 20 ms waits 121-156 ms in
+# every run of two 40-run series, so CI sets 200 ms.
 MAX_WAIT_MS=20
 LOGIC_SLACK_MS=5
 MAX_WAKE_LATE_MS="${CHAOS_MAX_WAKE_LATE_MS:-50}"
