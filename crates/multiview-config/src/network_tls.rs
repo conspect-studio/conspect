@@ -676,6 +676,32 @@ impl NetworkConfig {
 }
 
 impl NetworkTlsConfig {
+    /// Every secret NAME this configuration references (EAB key id and HMAC,
+    /// DNS-provider credential), in config order. Names only, never values:
+    /// `multiview tls set-credential` accepts exactly these.
+    #[must_use]
+    pub fn secret_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for name in [&self.eab_kid_env, &self.eab_hmac_env]
+            .into_iter()
+            .flatten()
+        {
+            names.push(name);
+        }
+        if let Some(DnsProviderConfig::Cloudflare {
+            token_env,
+            email_env,
+            api_key_env,
+            ..
+        }) = &self.dns
+        {
+            for name in [token_env, email_env, api_key_env].into_iter().flatten() {
+                names.push(name);
+            }
+        }
+        names
+    }
+
     /// Resolve the selected CA directory, without making a network request.
     ///
     /// # Errors

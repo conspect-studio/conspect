@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conspect certificate setup</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem;color:#1b1b1f;background:#f6f6f8}
+h1{font-size:1.4rem}
+code,.fp{font-family:ui-monospace,monospace;word-break:break-all}
+.fp{background:#fff;border:1px solid #ccc;padding:.5rem;display:block}
+.warn{background:#fff4d6;border:1px solid #e0b84c;padding:.6rem}
+dt{font-weight:600;margin-top:.5rem}
+button{font:inherit;padding:.4rem 1rem;margin-top:.5rem}
+#msg{margin-top:.5rem}
+</style>
+</head>
+<body>
+<h1>Conspect: certificate setup</h1>
+<p class="warn">This engine has no trusted TLS certificate yet. It is serving a temporary self-generated
+certificate. <strong>Before you do anything here, compare the fingerprint below with the one your browser
+shows for this page</strong> (padlock / "certificate is not valid" &rarr; certificate details &rarr;
+SHA-256 fingerprint) and with the one printed in the engine log or by <code>multiview tls status</code>
+on the host. If they differ, someone is between you and the host: stop.</p>
+<dl>
+<dt>Bootstrap certificate SHA-256 fingerprint</dt><dd><span class="fp" id="fp">loading&hellip;</span></dd>
+<dt>State</dt><dd id="state">loading&hellip;</dd>
+<dt>CA / challenge</dt><dd id="ca"></dd>
+<dt>Names</dt><dd id="names"></dd>
+<dt>Last error</dt><dd id="err"></dd>
+<dt>Reasons</dt><dd><ul id="reasons"></ul></dd>
+</dl>
+<p>The CA, challenge and names come from the engine configuration (<code>[network.tls]</code>). Secrets
+(DNS API token, EAB key) are <strong>never</strong> entered here: set them on the host with
+<code>multiview tls set-credential NAME</code> or in the environment.</p>
+<h2>Start issuance</h2>
+<p>Paste the one-time setup code printed in the engine log (or from <code>multiview tls setup-code</code> on
+the host), then start issuance against the credentials already on the host.</p>
+<label>Setup code <input id="code" autocomplete="off" size="60"></label><br>
+<button id="login">Sign in with setup code</button>
+<button id="issue">Issue now</button>
+<div id="msg" role="status"></div>
+<script>
+const $=id=>document.getElementById(id);
+function text(id,v){$(id).textContent=v==null||v===""?"\u2014":String(v);}
+async function refresh(){
+  try{
+    const r=await fetch("/api/v1/tls/status",{credentials:"same-origin"});
+    const s=await r.json();
+    text("fp",s.bootstrap_fingerprint);text("state",s.state);
+    text("ca",(s.ca||"")+(s.staging?" (staging)":"")+" / "+(s.challenge||""));
+    text("names",(s.names||[]).join(", "));text("err",s.last_error);
+    const ul=$("reasons");ul.textContent="";
+    for(const x of (s.reasons||[])){const li=document.createElement("li");li.textContent=x;ul.appendChild(li);}
+    if(s.state==="serving"){text("msg","A certificate is installed. Reload this page over the new certificate.");}
+  }catch(e){text("msg","status unavailable");}
+}
+$("login").onclick=async()=>{
+  const r=await fetch("/api/v1/tls/setup/session",{method:"POST",credentials:"same-origin",
+    headers:{"content-type":"application/json"},body:JSON.stringify({code:$("code").value})});
+  $("code").value="";
+  text("msg",r.ok?"Signed in for one hour.":"Sign-in refused ("+r.status+").");
+};
+$("issue").onclick=async()=>{
+  const r=await fetch("/api/v1/tls/issue",{method:"POST",credentials:"same-origin"});
+  text("msg",r.ok?"Issuance started.":"Refused ("+r.status+"): sign in with the setup code first.");
+  setTimeout(refresh,2000);
+};
+refresh();setInterval(refresh,10000);
+</script>
+</body>
+</html>

@@ -187,8 +187,8 @@ only, bound by the engine as before). The binary stays: it runs the old state un
   refused and the old certificate keeps serving. `certbot.timer` stays enabled. Check after
   the cutover: `sudo certbot renew --dry-run` (step 4 did it once) and
   `systemctl list-timers certbot.timer`.
-* **Later, the engine's own ACME** (`[network.tls]`, PR #338 and its runbook
-  `docs/runbooks/acme-certificates.md`, once merged): DNS-01 through Cloudflare (recommended, no port dependency) or TLS-ALPN-01 on
+* **Later, the engine's own ACME** (`[network.tls]`, merged with #338, runbook
+  [acme-certificates](acme-certificates.md)): DNS-01 through Cloudflare (recommended, no port dependency) or TLS-ALPN-01 on
   TCP 443 (the door answers `acme-tls/1`). The switch, in this order:
   1. configure `[network.tls]` (and the Cloudflare token with `multiview tls set-credential`),
      **remove** `[network] cert_file`/`key_file` (the two are exclusive; validation says so) and

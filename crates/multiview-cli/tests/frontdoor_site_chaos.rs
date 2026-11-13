@@ -323,6 +323,7 @@ key_file = "{key}"
     door.install_site(
         multiview_control::ConnectionServer::new(app, &options, watch),
         Some(multiview_control::site_server_config(Arc::new(source)).unwrap()),
+        None,
     );
     let site: SocketAddr = format!("[::1]:{tcp_port}").parse().unwrap();
     let redirect: SocketAddr = format!("[::1]:{redirect_port}").parse().unwrap();
