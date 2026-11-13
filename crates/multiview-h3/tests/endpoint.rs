@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::*;
-use multiview_h3::{server_tls, Counters, H3Limits, PeersHook};
+use multiview_h3::{server_tls, Counters, H3Limits, PeersHook, SourceFilter};
 
 #[test]
 fn built_tls_config_is_h3_only_without_early_data() {
@@ -127,4 +127,55 @@ async fn peers_hook_sees_up_then_down() {
     assert!(events[0].1 && !events[1].1);
     assert_eq!(events[0].0, events[1].0);
     server.endpoint.shutdown().await;
+}
+
+/// `refuse_source` refuses a matching source before any cap check, and
+/// leaves a non-matching source untouched (design note §8: the forwarder
+/// hop a `behind_proxy` deployment must fail closed on).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuse_source_refuses_the_matched_address_only() {
+    let other: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
+    let filter: SourceFilter = Arc::new(move |addr: SocketAddr| addr.ip().is_loopback());
+    let server = start_with_filter(TestSite::new(), None, H3Limits::default(), None, filter).await;
+
+    assert!(
+        quic_connect(&server, b"h3").await.is_err(),
+        "a loopback source (the client in this test) is refused"
+    );
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        if Counters::get(&server.endpoint.counters().sources_refused) >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sources_refused never incremented"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        Counters::get(&server.endpoint.counters().connections_accepted),
+        0,
+        "the refused source never reaches the cap checks"
+    );
+
+    // A filter refusing a DIFFERENT address lets the real (loopback) client
+    // through normally.
+    let other_filter: SourceFilter = Arc::new(move |addr: SocketAddr| addr.ip() == other.ip());
+    let server = start_with_filter(
+        TestSite::new(),
+        None,
+        H3Limits::default(),
+        None,
+        other_filter,
+    )
+    .await;
+    assert!(
+        quic_connect(&server, b"h3").await.is_ok(),
+        "a non-matching filter admits the real client"
+    );
+    assert_eq!(
+        Counters::get(&server.endpoint.counters().sources_refused),
+        0
+    );
 }

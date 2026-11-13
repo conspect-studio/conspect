@@ -242,6 +242,15 @@ front door any more. Nothing changes on the firewall (UDP 443 is already open).
   alt_svc=true`. `curl -sI https://<host>/ | grep -i alt-svc` shows
   `alt-svc: h3=":443"; ma=86400`. In Chrome, the second page load reports
   `performance.getEntriesByType('navigation')[0].nextHopProtocol === "h3"`.
+* **`mode = "behind_proxy"`:** forward UDP 443 with a plain DNAT that preserves client source
+  addresses, never a source-NAT relay that rewrites every client to one address — the engine
+  refuses any QUIC connection whose source is in `trusted_proxies` (review #371 finding F1: that
+  source has lost the real client's address, same fail-closed rule as the TCP door's PROXY v2
+  check), so a source-NAT forward from an address not in `trusted_proxies` looks like one client
+  hammering the endpoint and gets self-DoSed by the per-source caps; the journal line
+  `behind_proxy: QUIC from trusted_proxies is refused ...` at h3 start, and
+  `h3_counters().sources_refused` climbing, both confirm the forward preserves source addresses
+  correctly (it should stay at 0 for real client traffic).
 
 **While nginx still serves TCP 443** (before the cutover above), the engine's TCP door is not on
 443, so the browser only learns about h3 if nginx advertises it. Add one line to the TLS

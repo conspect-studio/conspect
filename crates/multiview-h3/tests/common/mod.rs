@@ -87,6 +87,40 @@ pub async fn start(
         wt,
         limits,
         peers,
+        refuse_source: None,
+    })
+    .await
+    .unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    Server {
+        endpoint,
+        addr,
+        cert,
+    }
+}
+
+/// Like [`start`], but with an explicit per-source filter.
+pub async fn start_with_filter(
+    site: Arc<dyn Site>,
+    wt: Option<Arc<dyn WtHandler>>,
+    limits: H3Limits,
+    peers: Option<PeersHook>,
+    refuse_source: multiview_h3::SourceFilter,
+) -> Server {
+    let cert = cert();
+    let socket = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let socket = noq::Runtime::wrap_udp_socket(&noq::TokioRuntime, socket).unwrap();
+    let endpoint = H3Endpoint::start(EndpointParts {
+        socket,
+        endpoint: noq::EndpointConfig::default(),
+        incoming: (64, 4 * 1024 * 1024),
+        tls: Arc::new(server_tls(&cert)),
+        runtime: tokio::runtime::Handle::current(),
+        site,
+        wt,
+        limits,
+        peers,
+        refuse_source: Some(refuse_source),
     })
     .await
     .unwrap();

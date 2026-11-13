@@ -298,6 +298,169 @@ async fn site_over_h3_on_the_shared_socket_and_alt_svc_on_tcp() {
     door.stop().await;
 }
 
+/// Like [`start`], but `behind_proxy` mode with `proxy_listen` on
+/// `[::1]:0` and the given `trusted_proxies` list.
+async fn start_behind_proxy(trusted_proxies: &[&str]) -> Door {
+    let dir = tempfile::tempdir().unwrap();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    std::fs::write(dir.path().join("cert.pem"), cert.pem()).unwrap();
+    std::fs::write(dir.path().join("key.pem"), signing_key.serialize_pem()).unwrap();
+    let trusted = trusted_proxies
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let proxy_port = free_tcp();
+    let mut config = MultiviewConfig::load_from_toml(&format!(
+        r##"schema_version = 1
+[canvas]
+width = 64
+height = 36
+fps = "30/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[network]
+https_port = 443
+mode = "behind_proxy"
+proxy_listen = "[::1]:{proxy_port}"
+public_host = "localhost"
+trusted_proxies = [{trusted}]
+cert_file = "{cert}"
+key_file = "{key}"
+"##,
+        cert = dir.path().join("cert.pem").display(),
+        key = dir.path().join("key.pem").display(),
+    ))
+    .unwrap();
+    config.network.as_mut().unwrap().https_port = Some(free_udp());
+    let run = multiview_cli::frontdoor::FrontDoorRun::start_with(
+        &config,
+        multiview_frontdoor::ListenSockets::empty(),
+    )
+    .expect("front door starts");
+    let udp = run.local_addr().port();
+    let app = axum::Router::new().route(
+        "/hello",
+        axum::routing::get(|| async { "hello from the site" }),
+    );
+    let (signal, watch) = tokio::sync::watch::channel(false);
+    let source = multiview_control::static_certificate_source(
+        &config.network.as_ref().unwrap().static_site_tls().unwrap(),
+    )
+    .unwrap();
+    let site_tls = multiview_control::site_server_config(Arc::new(source)).unwrap();
+    run.start_h3(
+        Arc::new(multiview_control::h3_site::H3Site::new(
+            app.clone(),
+            watch.clone(),
+        )),
+        multiview_cli::frontdoor::H3Tls {
+            config: Some(Arc::clone(&site_tls)),
+            ready: None,
+            source: "test static certificate",
+        },
+    );
+    let options = multiview_control::ServeOptions::default();
+    let tcp_app = multiview_control::h3_site::alt_svc_layer(app, run.alt_svc());
+    run.install_site(
+        multiview_control::ConnectionServer::new(tcp_app, &options, watch),
+        Some(site_tls),
+        None,
+    );
+    let started = Instant::now();
+    while !run.h3_running() {
+        assert!(started.elapsed() < TIMEOUT, "the h3 endpoint never came up");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Door {
+        _dir: dir,
+        tcp: run.tcp_local_addr().unwrap(),
+        run: Some(run),
+        udp,
+        _signal: signal,
+    }
+}
+
+/// Design note §8 / review #371 finding F1: in `behind_proxy` mode a QUIC
+/// source that is a `trusted_proxies` address is a forwarder hop that has
+/// lost the real client's address (no PROXY header on QUIC), so it is
+/// refused before any cap check, failing closed like the TCP door.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn behind_proxy_refuses_quic_from_a_trusted_proxy_source() {
+    // The h3 client in this test connects from `[::1]`, which is listed as
+    // a trusted proxy: the QUIC connection must be refused.
+    let door = start_behind_proxy(&["::1"]).await;
+    let run = door.run.as_ref().unwrap();
+    let endpoint = noq::Endpoint::client("[::1]:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(
+        client::insecure_client_config(Arc::new(rustls::crypto::ring::default_provider()), b"h3")
+            .unwrap(),
+    );
+    let connecting = endpoint
+        .connect(
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, door.udp)),
+            "localhost",
+        )
+        .unwrap();
+    let result = tokio::time::timeout(TIMEOUT, connecting).await.unwrap();
+    assert!(
+        result.is_err(),
+        "a QUIC connection from a trusted-proxy source must be refused"
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let refused = run
+            .h3_counters()
+            .map_or(0, |c| multiview_h3::Counters::get(&c.sources_refused));
+        if refused >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sources_refused never incremented"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    door.stop().await;
+}
+
+/// The counterpart: `trusted_proxies` does NOT list the client's address
+/// (`2001:db8::1` is not `::1`), so the connection is served normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn behind_proxy_serves_a_source_not_in_trusted_proxies() {
+    let door = start_behind_proxy(&["2001:db8::1"]).await;
+    let udp = door.udp;
+    let mut c = h3(udp).await;
+    let auth = format!("localhost:{udp}");
+    let (resp, body) = c
+        .fetch(
+            client::request(http::Method::GET, &auth, "/hello").unwrap(),
+            &[],
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body, b"hello from the site");
+    let run = door.run.as_ref().unwrap();
+    assert_eq!(
+        run.h3_counters()
+            .map_or(0, |c| multiview_h3::Counters::get(&c.sources_refused)),
+        0,
+        "the client's own source must not be refused"
+    );
+    drop(c);
+    door.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn alt_svc_false_keeps_the_advertisement_off() {
     let door = start(Some(false)).await;

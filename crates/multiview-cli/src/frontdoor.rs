@@ -127,6 +127,39 @@ struct H3Slot {
     alt_svc_allowed: bool,
     endpoint: Arc<Mutex<Option<multiview_h3::H3Endpoint>>>,
     starter: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// `behind_proxy` mode only: refuses a QUIC source that is a trusted
+    /// proxy (see [`refuse_source_from`]). `None` in `direct` mode or with
+    /// no `network.mode`.
+    refuse_source: Option<multiview_h3::SourceFilter>,
+}
+
+/// Builds the h3 [`multiview_h3::SourceFilter`] for `behind_proxy` mode, or
+/// `None` in `direct` mode / with no `network.mode`.
+///
+/// Reason (design note §8): a plain UDP forward in `behind_proxy` mode
+/// delivers every QUIC datagram with the forwarder's own source address, so
+/// a QUIC connection whose source is a `trusted_proxies` address is a
+/// forwarder hop that has already lost the real client's address — QUIC has
+/// no PROXY header to recover it from, unlike the TCP door. That connection
+/// is refused, failing closed the same way the TCP door fails closed on a
+/// missing/untrusted PROXY v2 header. A source-preserving forward (DNAT,
+/// design note §8) delivers the real client address instead of the
+/// forwarder's, so it is not in `trusted_proxies` and is served normally,
+/// with `Alt-Svc` advertised as §8 describes.
+fn refuse_source_from(config: &MultiviewConfig) -> Option<multiview_h3::SourceFilter> {
+    let network = config.network.as_ref()?;
+    match network.mode? {
+        NetworkMode::BehindProxy => {
+            let trusted = network.trusted_proxy_list().ok()?;
+            let proxies = multiview_frontdoor::TrustedProxies::new(
+                trusted.iter().map(|t| (t.addr, t.prefix)),
+            );
+            let filter: multiview_h3::SourceFilter =
+                Arc::new(move |addr: SocketAddr| proxies.contains(addr.ip()));
+            Some(filter)
+        }
+        NetworkMode::Direct => None,
+    }
 }
 
 /// Locks, recovering from poisoning (the guarded values stay consistent:
@@ -329,6 +362,7 @@ impl FrontDoorRun {
                     .network
                     .as_ref()
                     .is_none_or(multiview_config::NetworkConfig::alt_svc_enabled);
+                let refuse_source = refuse_source_from(config);
                 let mut run = Self {
                     door,
                     ice_tcp: false,
@@ -339,6 +373,7 @@ impl FrontDoorRun {
                         alt_svc_allowed,
                         endpoint: Arc::new(Mutex::new(None)),
                         starter: Mutex::new(None),
+                        refuse_source,
                     },
                 };
                 run.start_tcp(config, &mut inherited);
@@ -582,6 +617,12 @@ impl FrontDoorRun {
             }
         });
         let runtime = self.door.handle();
+        if self.h3.refuse_source.is_some() {
+            tracing::info!(
+                "behind_proxy: QUIC from trusted_proxies is refused (forwarder hop, client \
+                 address lost); forward UDP with DNAT that preserves source addresses"
+            );
+        }
         let parts = multiview_h3::EndpointParts {
             socket: Box::new(lane),
             endpoint: multiview_frontdoor::quic::endpoint_config(),
@@ -592,6 +633,7 @@ impl FrontDoorRun {
             wt,
             limits: multiview_h3::H3Limits::default(),
             peers: Some(peers),
+            refuse_source: self.h3.refuse_source.clone(),
         };
         let slot = Arc::clone(&self.h3.endpoint);
         let alt_svc = Arc::clone(&self.h3.alt_svc);

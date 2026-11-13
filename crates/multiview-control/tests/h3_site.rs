@@ -73,6 +73,7 @@ async fn endpoint(
         wt,
         limits: H3Limits::default(),
         peers: None,
+        refuse_source: None,
     })
     .await
     .unwrap();

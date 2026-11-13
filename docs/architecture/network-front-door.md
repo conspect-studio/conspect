@@ -634,7 +634,15 @@ supported as `[network] mode = "behind_proxy"`:
   one-time warning when `ConnectInfo` is missing (`crates/multiview-control/src/limits.rs:591`);
   `behind_proxy` mode must not inherit that.
 * UDP 443 is forwarded untouched to the engine (a plain DNAT or a UDP port forward, never an
-  HTTP/3-terminating proxy), so MoQ and site HTTP/3 keep working.
+  HTTP/3-terminating proxy), so MoQ and site HTTP/3 keep working. The UDP forward MUST preserve
+  client source addresses (DNAT, not a source-NAT relay): a QUIC peer whose source is a configured
+  `trusted_proxies` address is a forwarder hop that has already lost the real client's address
+  (QUIC has no PROXY header to recover it from), and the engine's h3 endpoint refuses it before any
+  cap check, failing closed the same way the TCP door fails closed on a missing/untrusted PROXY v2
+  header. A source-NAT forwarder that rewrites every client to one address and is NOT listed in
+  `trusted_proxies` cannot be told apart from a real client by the engine; that is a
+  misconfiguration the runbook warns about (it silently collapses every QUIC peer's rate limits,
+  setup-code lockout and per-source caps onto one bucket, review #371 finding F1).
 * `Alt-Svc` is still sent by the engine. The proxy must pass it through.
 * ICE-TCP and TURN-TLS cannot pass through an HTTP reverse proxy. In this mode they are off unless
   the proxy forwards a dedicated TCP port at layer 4 (`stream` in nginx) to the engine's front-door
@@ -1010,6 +1018,13 @@ the bounds and their tests); the wiring PR puts it on the front door.
   `true`) allows; off again at shutdown.
 * **Shutdown.** Alt-Svc off, the endpoint closed and drained (its own 2 s bound, 3 s outer
   bound), then the front-door runtime as before.
+* **Source refusal (review #371 finding F1, follow-up to slice 4).** `EndpointParts::refuse_source`
+  (`multiview_h3::SourceFilter`): checked in the accept loop before any cap, so a refused source
+  never charges `connections_refused`/`handshakes_refused` and is counted separately
+  (`Counters::sources_refused`). In `behind_proxy` mode `FrontDoorRun::start_h3` builds it from
+  `network.trusted_proxy_list()` (`TrustedProxies::contains`): a QUIC source that is a trusted
+  proxy is refused (section 8's fail-closed rule for the h3/QUIC lane, matching the TCP door's
+  PROXY v2 fail-closed behaviour). `direct` mode and no `network.mode` pass `None`.
 * **Deviations from the text above.** (1) Own WebTransport session layer instead of upstream
   `h3-webtransport`'s `WebTransportSession`, for the reason in section 5: the h3 connection must
   stay in the driver to serve pages and answer `429` while a session lives. (2) The bounds the
@@ -1030,7 +1045,12 @@ the bounds and their tests); the wiring PR puts it on the front door.
   `tests/frontdoor_h3.rs` (the real `FrontDoorRun`: h3 GET through the shared socket, STUN still
   on the WebRTC lane, `alt-svc` present / absent with `alt_svc = false`), `tests/tls_door.rs`
   (no endpoint and no Alt-Svc in `setup`; after install the endpoint serves the issued certificate
-  and the gated router), and the R3 chaos test `tests/h3_chaos.rs` (the real tick loop on its
+  and the gated router), `tests/frontdoor_h3.rs`'s `behind_proxy_refuses_quic_from_a_trusted_proxy_source`
+  / `behind_proxy_serves_a_source_not_in_trusted_proxies` (F1: a `behind_proxy` config refuses a
+  QUIC client whose source is in `trusted_proxies` and `sources_refused` increments, while a
+  source not in that list is served normally), `multiview-h3`'s
+  `tests/endpoint.rs::refuse_source_refuses_the_matched_address_only` (the filter itself, isolated
+  from `behind_proxy` wiring), and the R3 chaos test `tests/h3_chaos.rs` (the real tick loop on its
   own runtime while 32 h3 clients loop GETs, 1 MiB POSTs, oversized header blocks and
   WebTransport CONNECTs with churn: every tick, exact PTS, 0 unexplained repeats, RSS growth after
   warm-up under 64 MiB, the endpoint answers afterwards). Pooling with a native client (GETs

@@ -19,6 +19,12 @@ pub const ALPN_H3: &[u8] = b"h3";
 /// when that connection ends (also on abort).
 pub type PeersHook = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
 
+/// Returns `true` when a QUIC source address must be refused before any cap
+/// check runs (design note §8: a forwarder hop that lost the client's real
+/// address must fail closed, the same way the TCP door fails closed on a
+/// missing/untrusted PROXY v2 header).
+pub type SourceFilter = Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>;
+
 /// Everything [`H3Endpoint::start`] needs.
 pub struct EndpointParts {
     /// The socket (the front door's QUIC lane, or a plain UDP socket).
@@ -40,6 +46,10 @@ pub struct EndpointParts {
     pub limits: H3Limits,
     /// Established-peer hook.
     pub peers: Option<PeersHook>,
+    /// Optional per-source refusal, checked before any cap in the accept
+    /// loop. `None` admits every source to the cap checks (direct mode, or
+    /// `behind_proxy` with a source-preserving forward).
+    pub refuse_source: Option<SourceFilter>,
 }
 
 /// The TLS config the endpoint actually uses: a clone of `tls` with ALPN
@@ -219,6 +229,7 @@ impl H3Endpoint {
             wt,
             limits,
             peers,
+            refuse_source,
         } = parts;
         let server = server_config(&tls, &limits, incoming)?;
         let counters = Arc::new(Counters::default());
@@ -240,6 +251,7 @@ impl H3Endpoint {
                     wt,
                     limits,
                     peers,
+                    refuse_source,
                     loop_counters,
                 ));
                 Ok::<_, Error>((endpoint, accept))
@@ -318,6 +330,7 @@ async fn accept_loop(
     wt: Option<Arc<dyn WtHandler>>,
     limits: H3Limits,
     peers: Option<PeersHook>,
+    refuse_source: Option<SourceFilter>,
     counters: Arc<Counters>,
 ) {
     let caps = Arc::new(Mutex::new(Caps {
@@ -330,6 +343,11 @@ async fn accept_loop(
     let runtime = tokio::runtime::Handle::current();
     while let Some(incoming) = endpoint.accept().await {
         let remote = incoming.remote_address();
+        if refuse_source.as_ref().is_some_and(|filter| filter(remote)) {
+            Counters::inc(&counters.sources_refused);
+            incoming.refuse();
+            continue;
+        }
         if Caps::full(&caps, remote) {
             Counters::inc(&counters.connections_refused);
             incoming.refuse();
