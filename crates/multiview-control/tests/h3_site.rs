@@ -278,6 +278,24 @@ async fn moq_over_h3_with_single_use_tickets() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
+    // #382: the admitted ticket offered without a protocol, or with only
+    // protocols the runtime does not speak, is refused with 400 before the
+    // ticket is claimed (the real client below still uses it).
+    for offer in [None, Some("\"moq-transport-16\", \"moq-00\"")] {
+        let (resp, _) = c
+            .open(
+                client::connect_request(&auth, &format!("/moq/?{query}"), offer).unwrap(),
+                TIMEOUT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "offer {offer:?}");
+    }
+    assert!(
+        !fence.revocation().is_revoked(),
+        "a refused offer kept the lease"
+    );
+
     // The real moq-tokio WebTransport client with the admitted ticket.
     let sub_origin = moq_tokio::origin::spawn();
     let consumer = sub_origin.consume();
