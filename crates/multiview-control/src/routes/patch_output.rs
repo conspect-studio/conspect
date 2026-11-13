@@ -279,6 +279,12 @@ pub(crate) fn take(
 pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlResult<Vec<Value>> {
     let resources = crate::boot_model::accepted_resources(state, "outputs")?
         .map_or_else(|| state.outputs.list(), Ok)?;
+    // The accepted crosspoints (#342 review M3): audio slot 0 reports the
+    // output's accepted audio feed exactly as `GET /routing` projects it.
+    let config: multiview_config::MultiviewConfig =
+        serde_json::from_value(crate::boot_model::current_desired_config(state)?)
+            .map_err(|e| ControlError::Repository(format!("desired configuration: {e}")))?;
+    let feeds = config.output_feeds();
     let live = state
         .output_routing
         .as_ref()
@@ -311,20 +317,28 @@ pub(crate) fn outputs_view(state: &AppState, principal: &Principal) -> ControlRe
             .as_ref()
             .and_then(|c| c.routing.current_path(&body.id()))
             .map_or("P1", crate::output_routing::PlanPath::as_str);
+        // Slot 0 carries the accepted audio feed (default `follow`, redacted
+        // per GET /routing's rule); slots i > 0 their configured track.
+        let slot0 = super::routing::audio_feed_view(principal, &feeds, &body.id());
         let audio: Vec<Value> = match body.slots().map(|s| s.audio.as_slice()) {
             Some(slots) if !slots.is_empty() => slots
                 .iter()
                 .enumerate()
                 .map(|(i, slot)| {
+                    let source = if i == 0 {
+                        slot0.clone()
+                    } else {
+                        json!({ "track": slot.track })
+                    };
                     json!({
                         "slot": i,
                         "track": slot.track,
                         "language": slot.language,
-                        "source": "follow",
+                        "source": source,
                     })
                 })
                 .collect(),
-            _ => vec![json!({ "slot": 0, "track": null, "language": null, "source": "follow" })],
+            _ => vec![json!({ "slot": 0, "track": null, "language": null, "source": slot0 })],
         };
         out.push(json!({
             "output": api_id,

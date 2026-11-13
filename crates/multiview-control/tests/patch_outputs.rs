@@ -883,3 +883,40 @@ async fn one_principal_flooding_many_outputs_is_capped_at_ten_per_second() {
         "takes spread over many outputs: {outputs:?}"
     );
 }
+
+/// Review M3: audio slot 0 reports the output's ACCEPTED audio feed exactly
+/// as `GET /routing` projects it (default `follow`), redacted for a caller
+/// who may not read it; audio slots i > 0 keep their configured track.
+#[tokio::test]
+async fn get_reports_the_accepted_audio_feed_of_slot_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = format!(
+        "{DOC}\n[[routing.output]]\noutput = \"{OUT_B}\"\nprogram = \"main\"\naudio = {{ source = \"secret-cam\" }}\n"
+    );
+    let rig = rig_with(&dir.path().join("boot.toml"), &doc);
+    let all = body_json(send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await).await;
+    let outputs = all["outputs"].as_array().unwrap();
+    assert_eq!(outputs[0]["audio"][0]["source"], "follow", "{all}");
+    assert_eq!(
+        outputs[1]["audio"][0]["source"],
+        json!({"source": "secret-cam"}),
+        "{all}"
+    );
+    // The routing readback agrees for the same caller.
+    let routing = body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await;
+    let row = routing["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["output"] == "output-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(row["audio"], outputs[1]["audio"][0]["source"], "{routing}");
+    // A caller who may not read secret-cam sees it redacted.
+    let scoped = body_json(send(&rig.router, get("/api/v1/patch", OUT1)).await).await;
+    assert_eq!(
+        scoped["outputs"][0]["audio"][0]["source"],
+        json!({"redacted": true}),
+        "{scoped}"
+    );
+}

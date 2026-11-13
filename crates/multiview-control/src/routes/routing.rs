@@ -644,6 +644,25 @@ fn program_scope(principal: &Principal) -> bool {
     .is_ok()
 }
 
+/// The accepted audio feed of `config_id`'s crosspoint as `GET /routing`
+/// shows it (#342 review M3): the feed (default `follow`), or
+/// `{"redacted": true}` when the caller may not read it.
+pub(crate) fn audio_feed_view(
+    principal: &Principal,
+    feeds: &[multiview_config::OutputCrosspoint],
+    config_id: &str,
+) -> serde_json::Value {
+    let audio = feeds
+        .iter()
+        .find(|xp| xp.output == config_id)
+        .map_or(multiview_config::AudioFeed::Follow, |xp| xp.audio.clone());
+    if may_read_audio(principal, &audio) {
+        serde_json::to_value(&audio).unwrap_or_else(|_| serde_json::json!({ "redacted": true }))
+    } else {
+        serde_json::json!({ "redacted": true })
+    }
+}
+
 /// Whether `principal` may read an audio feed: Read on a named source, the
 /// Program scope for the mix and `follow` of a bus, per-track ids as objects.
 fn may_read_audio(principal: &Principal, feed: &multiview_config::AudioFeed) -> bool {
