@@ -40,6 +40,10 @@ pub fn blit_region(
     uv_plane: &mut [u8],
     dst: Rect,
 ) {
+    // A zero-sized destination or crop draws nothing (and would divide by 0).
+    if dst.w == 0 || dst.h == 0 || crop.w == 0 || crop.h == 0 {
+        return;
+    }
     let sw = src.width();
     let (sy, suv) = (src.y_plane(), src.uv_plane());
     let to = |v: u32| usize::try_from(v).unwrap_or(0);
@@ -87,5 +91,28 @@ pub fn blit_region(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use multiview_compositor::pipeline::CanvasColor;
+
+    #[test]
+    fn a_zero_sized_crop_or_destination_draws_nothing_and_never_panics() {
+        let src =
+            Nv12Image::solid(16, 16, 200, 90, 60, CanvasColor::default().output_tag()).unwrap();
+        let (mut y, mut uv) = (vec![7u8; 16 * 16], vec![7u8; 16 * 8]);
+        for (crop, dst) in [
+            (Rect::new(0, 0, 16, 16), Rect::new(0, 0, 0, 8)),
+            (Rect::new(0, 0, 16, 16), Rect::new(0, 0, 8, 0)),
+            (Rect::new(0, 0, 0, 16), Rect::full(16, 16)),
+            (Rect::new(0, 0, 16, 0), Rect::full(16, 16)),
+        ] {
+            blit_region(&src, crop, 16, &mut y, &mut uv, dst);
+        }
+        assert!(y.iter().all(|&v| v == 7) && uv.iter().all(|&v| v == 7));
     }
 }
