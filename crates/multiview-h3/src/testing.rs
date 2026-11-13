@@ -124,7 +124,10 @@ mod mem {
 
     impl quic::RecvStream for Recv {
         type Buf = Bytes;
-        fn poll_data(&mut self, _: &mut Context<'_>) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+        fn poll_data(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
             match self.chunks.pop_front() {
                 Some(chunk) => Poll::Ready(Ok(Some(chunk))),
                 None if self.fin => Poll::Ready(Ok(None)),
@@ -162,7 +165,11 @@ mod mem {
     }
 
     impl<B: Buf> quic::SendStreamUnframed<B> for Send {
-        fn poll_send<D: Buf>(&mut self, _: &mut Context<'_>, buf: &mut D) -> Poll<Result<usize, StreamErrorIncoming>> {
+        fn poll_send<D: Buf>(
+            &mut self,
+            _: &mut Context<'_>,
+            buf: &mut D,
+        ) -> Poll<Result<usize, StreamErrorIncoming>> {
             let n = buf.remaining();
             buf.advance(n);
             Poll::Ready(Ok(n))
@@ -176,7 +183,10 @@ mod mem {
 
     impl quic::RecvStream for Bidi {
         type Buf = Bytes;
-        fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+        fn poll_data(
+            &mut self,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
             self.recv.poll_data(cx)
         }
         fn stop_sending(&mut self, code: u64) {
@@ -220,12 +230,18 @@ mod mem {
     impl<B: Buf> quic::OpenStreams<B> for Opener {
         type BidiStream = Bidi;
         type SendStream = Send;
-        fn poll_open_bidi(&mut self, _: &mut Context<'_>) -> Poll<Result<Bidi, StreamErrorIncoming>> {
+        fn poll_open_bidi(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Bidi, StreamErrorIncoming>> {
             Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: ConnectionErrorIncoming::InternalError("no server bidi".into()),
             }))
         }
-        fn poll_open_send(&mut self, _: &mut Context<'_>) -> Poll<Result<Send, StreamErrorIncoming>> {
+        fn poll_open_send(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Send, StreamErrorIncoming>> {
             let n = self.next_uni;
             self.next_uni = self.next_uni.saturating_add(4);
             Poll::Ready(Ok(Send { id: id(n) }))
@@ -265,10 +281,16 @@ mod mem {
     impl<B: Buf> quic::OpenStreams<B> for Conn {
         type BidiStream = Bidi;
         type SendStream = Send;
-        fn poll_open_bidi(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bidi, StreamErrorIncoming>> {
+        fn poll_open_bidi(
+            &mut self,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<Bidi, StreamErrorIncoming>> {
             quic::OpenStreams::<B>::poll_open_bidi(&mut self.opener, cx)
         }
-        fn poll_open_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<Send, StreamErrorIncoming>> {
+        fn poll_open_send(
+            &mut self,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<Send, StreamErrorIncoming>> {
             quic::OpenStreams::<B>::poll_open_send(&mut self.opener, cx)
         }
         fn close(&mut self, _: Code, _: &[u8]) {}
@@ -277,13 +299,19 @@ mod mem {
     impl<B: Buf> quic::Connection<B> for Conn {
         type RecvStream = Recv;
         type OpenStreams = Opener;
-        fn poll_accept_recv(&mut self, _: &mut Context<'_>) -> Poll<Result<Recv, ConnectionErrorIncoming>> {
+        fn poll_accept_recv(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Recv, ConnectionErrorIncoming>> {
             match self.control.take() {
                 Some(control) => Poll::Ready(Ok(control)),
                 None => Poll::Pending,
             }
         }
-        fn poll_accept_bidi(&mut self, _: &mut Context<'_>) -> Poll<Result<Bidi, ConnectionErrorIncoming>> {
+        fn poll_accept_bidi(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Bidi, ConnectionErrorIncoming>> {
             match self.request.take() {
                 Some(request) => Poll::Ready(Ok(request)),
                 None => Poll::Pending,
@@ -328,6 +356,7 @@ pub fn h3_request(data: &[u8]) {
 /// # Panics
 ///
 /// As [`h3_request`].
+#[must_use]
 pub fn h3_request_body_len(data: &[u8]) -> Option<usize> {
     use http_body_util::BodyExt;
 

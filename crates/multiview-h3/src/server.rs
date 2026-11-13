@@ -43,7 +43,10 @@ pub const CONNECTION_SPECIFIC: [&str; 5] = [
 /// does not name the transport (the fuzz harness uses an in-memory one).
 trait RecvSide: Send {
     fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, BoxError>>;
-    fn poll_trailers(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<http::HeaderMap>, BoxError>>;
+    fn poll_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<http::HeaderMap>, BoxError>>;
 }
 
 impl<S> RecvSide for RequestStream<S, Bytes>
@@ -58,8 +61,12 @@ where
         }
     }
 
-    fn poll_trailers(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<http::HeaderMap>, BoxError>> {
-        self.poll_recv_trailers(cx).map_err(|err| -> BoxError { Box::new(err) })
+    fn poll_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<http::HeaderMap>, BoxError>> {
+        self.poll_recv_trailers(cx)
+            .map_err(|err| -> BoxError { Box::new(err) })
     }
 }
 
@@ -510,7 +517,10 @@ async fn handle_request(shared: Arc<Shared>, req: http::Request<()>, mut stream:
 /// Converts the h3 request for the [`Site`]: `host` from `:authority` when
 /// absent (h3 already moved the pseudo-headers into method/uri/extensions),
 /// version HTTP/3.
-pub(crate) fn site_request(req: http::Request<()>, body: RequestBody) -> http::Request<RequestBody> {
+pub(crate) fn site_request(
+    req: http::Request<()>,
+    body: RequestBody,
+) -> http::Request<RequestBody> {
     let (mut parts, ()) = req.into_parts();
     if !parts.headers.contains_key(http::header::HOST) {
         if let Some(value) = parts
