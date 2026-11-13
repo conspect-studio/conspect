@@ -1,6 +1,6 @@
 # ADR-0108: Route anything to any output — picture buses and encoded buses; an output subscribes to one encoded bus and a take moves the subscription at an IDR; layout-as-a-source
 
-- **Status:** Accepted
+- **Status:** Accepted; decisions 1, 2, 7 and the salvo half of 9 superseded in part by [ADR-0110](ADR-0110-patch-panel.md) (the patch panel: typed output slots, per-output format, passthrough, mixer input patch, patch salvos)
 - **Area:** Core engine / Output / Audio / Web/API (invariants #1, #10, #9, #7)
 - **Date:** 2026-11-12
 - **Source:** operator requirement of 2026-11-12 (quoted under Context); issue #243
