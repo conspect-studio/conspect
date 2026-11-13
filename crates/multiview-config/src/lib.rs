@@ -49,6 +49,7 @@ pub mod multicast;
 pub mod network_diagnostics;
 pub mod network_tls;
 pub mod origin;
+pub mod output_format;
 pub mod placement;
 pub mod playback;
 pub mod probe;
@@ -119,6 +120,10 @@ pub use network_tls::{
     NetworkMode, NetworkTlsConfig, TrustedProxy,
 };
 pub use origin::{Origin, OriginParseError};
+pub use output_format::{
+    validate_output_format, Anchor, AudioSlot, CodecFamily, OutputFit, OutputFitMode, OutputFormat,
+    OutputSlots, Scan, SlotCapability, VideoSlot, SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
+};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use playback::{
     hls_mount_segment, host_header_hostname, is_ip_literal, resolve_hls_mounts,
@@ -1476,8 +1481,16 @@ impl MultiviewConfig {
             ));
         }
         let mut seen_ids: HashSet<String> = HashSet::with_capacity(self.outputs.len());
+        let discrete: Vec<&str> = self
+            .selectable_tracks()
+            .into_iter()
+            .filter(|t| *t != PROGRAM_TRACK)
+            .collect();
         for output in &self.outputs {
             output.validate()?;
+            // Slice B (#342): the output's format and slots against the canvas
+            // and its medium's slot capability.
+            validate_output_format(output, &self.canvas, &discrete)?;
             let id = output.id();
             if !seen_ids.insert(id.clone()) {
                 return Err(ConfigError::Validation(format!(
@@ -1509,7 +1522,8 @@ impl MultiviewConfig {
         }
 
         for output in &self.outputs {
-            if let Some(selection) = output.audio() {
+            // `slots.audio`, when declared, is the output's selection (#342).
+            if let Some(selection) = output.effective_audio().as_ref() {
                 // Cross-check the selection against the transport's verified
                 // capability matrix (ADR-R005 §4.2): reference consistency plus
                 // the discrete-track count the transport can actually deliver.

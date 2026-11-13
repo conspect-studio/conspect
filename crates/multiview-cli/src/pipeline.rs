@@ -3182,7 +3182,7 @@ impl Pipeline {
                 .outputs
                 .iter()
                 .find(|item| item.id() == output.id())
-                .and_then(multiview_config::Output::audio)
+                .and_then(multiview_config::Output::effective_audio)
                 .is_some();
             if explicit && !tracks.is_empty() {
                 declared_audio_outputs.push((output.id().to_owned(), tracks));
@@ -13302,7 +13302,8 @@ fn output_audio_selection(
     output: &Output,
     tracks: &[DeclaredTrack],
 ) -> multiview_output::AudioSelection {
-    let Some(selection) = output.audio() else {
+    // `slots.audio`, when declared, is the output's selection (#342).
+    let Some(selection) = output.effective_audio() else {
         return multiview_output::AudioSelection::default();
     };
     let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();

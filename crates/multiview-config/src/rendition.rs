@@ -776,8 +776,8 @@ fn audio_keys_for_output(
             codec,
         });
     }
-    let tracks = match output.audio() {
-        Some(selection) => context.resolve_selection(selection, output_index, output_id)?,
+    let tracks = match output.effective_audio() {
+        Some(selection) => context.resolve_selection(&selection, output_index, output_id)?,
         None => vec![AudioTrackId::ProgramBus],
     };
     let mut keys = Vec::with_capacity(tracks.len());
