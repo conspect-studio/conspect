@@ -1967,6 +1967,9 @@ struct AudioHarness {
     gain: Arc<AtomicU32>,
     bars_live: bool,
     feed_max: std::time::Duration,
+    /// The longest whole consumer step (router tick, routed-audio feed and
+    /// program-audio dispatch; the simulated encode sleep excluded).
+    step_max: std::time::Duration,
     store: Arc<TileStore<Nv12Image>>,
     base_force: Arc<AtomicU64>,
     tap: crate::routing_audio::AudioTapCell,
@@ -2054,6 +2057,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
         gain,
         bars_live: true,
         feed_max: std::time::Duration::ZERO,
+        step_max: std::time::Duration::ZERO,
         store,
         base_force,
         tap,
@@ -2082,6 +2086,7 @@ impl AudioHarness {
 
     /// One Program tick in the pipeline's order.
     fn tick(&mut self, t: u64) {
+        let step = Instant::now();
         self.r
             .drain_live_events(&mut self.d, &mut self.rec)
             .unwrap();
@@ -2146,6 +2151,7 @@ impl AudioHarness {
                 &mut self.rec,
             )
             .unwrap();
+        self.step_max = self.step_max.max(step.elapsed());
         // The private encode threads run within the tick period.
         std::thread::sleep(std::time::Duration::from_millis(3));
     }
@@ -2595,6 +2601,15 @@ fn stalled_or_crashing_worker(panic_worker: bool) {
     }
     let k = failed_at.expect("the bus failed");
     assert!(k <= depth + 1, "failed within the queue depth: {k}");
+    if !panic_worker {
+        // Mechanism (measured): the wedged worker emits nothing, so its
+        // dispatcher stage never proves a window; the output's pending FIFO
+        // (4 windows) fills and the dispatcher fails that stage alone
+        // (`AudioFallback`) at about 4 ticks — before the 8-slot PCM queue
+        // would fill (`TrySendError::Full`, the backstop). Either way the
+        // bus fails alone and the consumer never waits (timed below).
+        assert!(k >= 2, "the bus is not failed before the wedge bites: {k}");
+    }
     let t = x.run(t + k + 1, 4);
     let snap = x.h.snapshot();
     assert_eq!(snap.audio.failed, 1, "{snap:?}");
@@ -2604,7 +2619,23 @@ fn stalled_or_crashing_worker(panic_worker: bool) {
         "the consumer never waits: {:?}",
         x.feed_max
     );
+    assert!(
+        x.step_max < std::time::Duration::from_millis(100),
+        "the whole consumer step never waits on the wedged worker: {:?}",
+        x.step_max
+    );
     let _ = x.run(t, 4);
+    let o0: Vec<i64> = x
+        .rec
+        .windows
+        .iter()
+        .filter(|w| w.0 == 0)
+        .filter_map(|w| w.1.first().map(|p| p.0))
+        .collect();
+    assert!(
+        o0.windows(2).all(|w| w[1] == w[0] + 1),
+        "Program video keeps one window per tick through the wedge: {o0:?}"
+    );
     assert_pts_step(&x.audio_pts(0), "Program");
     assert_pts_step(&x.audio_pts(1), "output 1");
     drop(release);
