@@ -1200,7 +1200,7 @@ uid 0 and not group/other-writable (`mode & 0o022 == 0`); otherwise `Unknown`. I
 `Present` only for valid nft JSON listing `table inet conspect_floor` with the chains `udp443_new`
 and `udp443_all` and the four sets `udp443_{new,all}_v4` (`ipv4_addr`) and `udp443_{new,all}_v6`
 (`ipv6_addr`) by exact name and type, each bounded (`size`, flags `dynamic` + `timeout`), and the
-shipped verdicts (input jumps new UDP 443 to `udp443_new` and all UDP 443 to `udp443_all`; each tier
+shipped verdicts (input is exactly two rules, in order: new UDP 443 to `udp443_new`, then all UDP 443 to `udp443_all`; each tier
 is v4 `update`+limit then `accept`, v6 /64 `update`+limit then `accept`, then `drop`), so `Present`
 means the floor fails closed (rates are not checked: they are the operator's to tune); `Absent` only for nft 1.1.3's exact error for that missing table (first line `Error: No such
 file or directory`, second line `list table inet conspect_floor`) or the literal word `absent`;

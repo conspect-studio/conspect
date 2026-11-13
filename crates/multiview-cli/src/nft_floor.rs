@@ -221,21 +221,22 @@ fn lists_the_shipped_floor(value: &serde_json::Value) -> bool {
 /// `present` means the floor fails closed, not merely that its objects
 /// exist). Rates and bursts are the operator's to tune and are not checked;
 /// the structure is:
-/// * `input` jumps to `udp443_new` for UDP 443 in ct state new and then to
-///   `udp443_all` for every UDP 443 packet;
+/// * `input` is exactly two rules, in order: UDP 443 in ct state new jumps
+///   to `udp443_new`; then every UDP 443 packet jumps to `udp443_all`;
 /// * each tier chain is, in order: `update` of its v4 set with a `limit`
 ///   then `accept`; `update` of its v6 set (keyed on the /64) with a
 ///   `limit` then `accept`; and a final `drop`, so a packet over its rate,
 ///   or from a source the full set cannot take, is dropped.
 fn verdicts_are_the_shipped_ones(rules_of: &dyn Fn(&str) -> Vec<Vec<String>>) -> bool {
+    // The base chain is exactly the two jumps, in this order: the new tier
+    // first (a new flow pays 2000/s), then every UDP 443 packet to the all
+    // tier. Any other rule (an accept before the jumps, the jumps reversed)
+    // can let traffic skip a tier, so it is not the shipped floor.
     let input = rules_of("input");
-    let jumps = |target: &str, needs_new: bool| {
-        input.iter().any(|rule| {
-            rule.iter().any(|t| t == "dport443")
-                && rule.iter().any(|t| t == &format!("jump:{target}"))
-                && (!needs_new || rule.iter().any(|t| t == "ct:new"))
-        })
-    };
+    let new_jump: Vec<String> = ["dport443", "ct:new", "jump:udp443_new"]
+        .map(str::to_owned)
+        .to_vec();
+    let all_jump: Vec<String> = ["dport443", "jump:udp443_all"].map(str::to_owned).to_vec();
     let tier = |chain: &str, v4: &str, v6: &str| {
         let rules = rules_of(chain);
         let update =
@@ -247,8 +248,9 @@ fn verdicts_are_the_shipped_ones(rules_of: &dyn Fn(&str) -> Vec<Vec<String>>) ->
                 .get(2)
                 .is_some_and(|last| last.last().map(String::as_str) == Some("drop"))
     };
-    jumps("udp443_new", true)
-        && jumps("udp443_all", false)
+    input.len() == 2
+        && input.first() == Some(&new_jump)
+        && input.get(1) == Some(&all_jump)
         && tier("udp443_new", "udp443_new_v4", "udp443_new_v6")
         && tier("udp443_all", "udp443_all_v4", "udp443_all_v6")
 }
@@ -390,8 +392,48 @@ mod tests {
         // The v6 update is gone.
         let no_v6 = without_rules(|r| r.to_string().contains("@udp443_new_v6"));
         assert_eq!(parse(&no_v6), NftFloorStatus::Unknown);
+        // The two input jumps in the other order (a new flow would skip the
+        // new tier), and an accept placed before them: both fail open.
+        let mut reversed: serde_json::Value = serde_json::from_str(PRESENT_FIXTURE).unwrap();
+        {
+            let items = reversed["nftables"].as_array_mut().unwrap();
+            let idx: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.get("rule").is_some_and(|r| r["chain"] == "input"))
+                .map(|(n, _)| n)
+                .collect();
+            assert_eq!(idx.len(), 2);
+            items.swap(idx[0], idx[1]);
+        }
+        assert_eq!(parse(&reversed.to_string()), NftFloorStatus::Unknown);
+        let mut accept_first: serde_json::Value = serde_json::from_str(PRESENT_FIXTURE).unwrap();
+        {
+            let items = accept_first["nftables"].as_array_mut().unwrap();
+            let at = items
+                .iter()
+                .position(|i| i.get("rule").is_some_and(|r| r["chain"] == "input"))
+                .unwrap();
+            items.insert(
+                at,
+                serde_json::json!({"rule": {"family": "inet", "table": "conspect_floor", "chain": "input", "handle": 99, "expr": [
+                    {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 443}},
+                    {"accept": null}
+                ]}}),
+            );
+        }
+        assert_eq!(parse(&accept_first.to_string()), NftFloorStatus::Unknown);
         // No rules at all (objects only).
         assert_eq!(parse(&without_rules(|_| true)), NftFloorStatus::Unknown);
+    }
+
+    /// `nft -j list` (nft 1.1.3) of the shipped file with its two `input`
+    /// jumps swapped: a new flow then skips the new tier (review PR 349).
+    const REVERSED_FIXTURE: &str = r#"{"nftables": [{"metainfo": {"version": "1.1.3", "release_name": "Commodore Bullmoose #4", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "conspect_floor", "handle": 1}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "input", "handle": 1, "type": "filter", "hook": "input", "prio": -5, "policy": "accept"}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "udp443_new", "handle": 2}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "udp443_all", "handle": 3}}, {"set": {"family": "inet", "name": "udp443_new_v4", "table": "conspect_floor", "type": "ipv4_addr", "handle": 4, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_new_v6", "table": "conspect_floor", "type": "ipv6_addr", "handle": 5, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_all_v4", "table": "conspect_floor", "type": "ipv4_addr", "handle": 6, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_all_v6", "table": "conspect_floor", "type": "ipv6_addr", "handle": 7, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "input", "handle": 8, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 443}}, {"jump": {"target": "udp443_all"}}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "input", "handle": 9, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 443}}, {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["new", "untracked"]}}, {"jump": {"target": "udp443_new"}}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_new", "handle": 10, "expr": [{"set": {"op": "update", "elem": {"payload": {"protocol": "ip", "field": "saddr"}}, "set": "@udp443_new_v4", "stmt": [{"limit": {"rate": 2000, "burst": 1000, "per": "second"}}]}}, {"accept": null}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_new", "handle": 11, "expr": [{"set": {"op": "update", "elem": {"&": [{"payload": {"protocol": "ip6", "field": "saddr"}}, "ffff:ffff:ffff:ffff::"]}, "set": "@udp443_new_v6", "stmt": [{"limit": {"rate": 2000, "burst": 1000, "per": "second"}}]}}, {"accept": null}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_new", "handle": 12, "expr": [{"counter": {"packets": 0, "bytes": 0}}, {"drop": null}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_all", "handle": 13, "expr": [{"set": {"op": "update", "elem": {"payload": {"protocol": "ip", "field": "saddr"}}, "set": "@udp443_all_v4", "stmt": [{"limit": {"rate": 25000, "burst": 10000, "per": "second"}}]}}, {"accept": null}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_all", "handle": 14, "expr": [{"set": {"op": "update", "elem": {"&": [{"payload": {"protocol": "ip6", "field": "saddr"}}, "ffff:ffff:ffff:ffff::"]}, "set": "@udp443_all_v6", "stmt": [{"limit": {"rate": 25000, "burst": 10000, "per": "second"}}]}}, {"accept": null}]}}, {"rule": {"family": "inet", "table": "conspect_floor", "chain": "udp443_all", "handle": 15, "expr": [{"counter": {"packets": 0, "bytes": 0}}, {"drop": null}]}}]}"#;
+
+    #[test]
+    fn the_real_listing_with_the_input_jumps_reversed_is_not_present() {
+        assert_eq!(parse(REVERSED_FIXTURE), NftFloorStatus::Unknown);
     }
 
     #[test]

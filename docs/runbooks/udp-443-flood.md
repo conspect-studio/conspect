@@ -59,7 +59,7 @@ it reads a status file a privileged systemd `ExecStartPre=+` writes at every sta
 - **Parser:** `multiview_cli::nft_floor` (pure file parse, re-read every 10 minutes on the
   front-door runtime — never on the program/output-clock runtime). `present`: nft JSON with the
   table, all of the objects above (sets bounded: `size`, flags `dynamic` + `timeout`), and the
-  shipped verdicts: `input` jumps UDP 443 in ct state new to `udp443_new` and all UDP 443 to
+  shipped verdicts: `input` is exactly two rules, in order: UDP 443 in ct state new jumps to `udp443_new`, then all UDP 443 to
   `udp443_all`; each tier is `update` v4 set with a limit then `accept`, `update` v6 /64 set with a
   limit then `accept`, then `drop`. So `present` means the floor fails closed; rates and bursts
   are yours to tune and are not checked. `absent`: nft's exact missing-table error (`Error: No such
