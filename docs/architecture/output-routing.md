@@ -1712,8 +1712,9 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
 - **Per-output format (#342).** A routed layout is composed once at the canvas, like Program;
   an output with a non-canvas format converts it on its own key's worker (`ConvertLive`), so one
   layout canvas serves outputs of every format.
-- **Admission (§7 rule 1).** `routing.max_aux_canvases` is the constant 2
-  (`DEFAULT_MAX_AUX_CANVASES`); it is not a config key yet. It counts distinct layouts held by
+- **Admission (§7 rule 1).** `routing.max_aux_canvases` (`[routing] max_aux_canvases`, default 2,
+  0 disables routed layouts, at most 8; restart-only like the rest of `[routing]` outside its output
+  rows). It counts distinct layouts held by
   other outputs; the output's own current layout does not count (the take replaces it). The plan
   refuses `aux-capacity` (409 at take, with the counts for whole-system principals only) and
   reports `new_aux_canvases`; the router re-checks at adoption (`Refused(Capacity)`). Two outputs
@@ -1723,14 +1724,58 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
   shows its slate; it never makes the layout un-fresh.
 - **Cost, measured (build host, one core).** 1080p, 6 cells: see the PR for the release p50
   (`aux_layout::tests::a_1080p_layout_compose_costs_less_than_a_tick_on_one_core` prints it).
-- **Not in PR 1, owed by PR 2:** aux sizing (§2.4: decode size follows the routed cell size; until
-  then a routed cell scales the tile decoded for Program, or the 640x360 unbound decode), the
-  Program-lateness back-off (halving the aux cadence), live propagation of layout edits, rename and
-  delete to a routed canvas (a re-take already picks up an edit, at an IDR), and the layout `audio` attribute.
-  Start-up does not re-take a persisted layout feed (no boot take: its body lives in the layouts
-  library, which start-up does not resolve). The output starts and stays on Program, and the
-  readback shows the layout as configured but not on air. Unlike before slice 3, a persisted layout
-  feed no longer refuses a start (`outputs_carry_program` accepts every feed).
+- **Live edits (PR 2).** Every committed `PUT /layouts/{id}` is re-resolved on the control plane
+  and handed to the router (`LayoutChange::Edited`). The changes are coalesced per layout id in an
+  inbox of at most 64 ids, and the newest revision wins. A change for a layout that composes now is
+  never evicted. Another evicted change raises a watermark, so a take older than that change fails
+  closed. The router drains the inbox with `try_lock`, so it never blocks. It applies at most 8
+  changes per tick, and changes for composing layouts go first, so an on-air edit applies on the
+  next tick unless more than 8 composing layouts change at once. A take older than a change that
+  still waits in the inbox is refused too. The router swaps the body that every output and pending take on that layout composes,
+  from the next tick, and requests an IDR on its encoders (within the per-key force floor). Outputs
+  whose audio follows re-resolve the layout's `audio` attribute. An output whose move lands
+  after an edit follows the body that landed. An output whose move off an edited layout is refused
+  follows the layout's current body. It is not a take: no outcome, no
+  persistence change. Every resolved body carries a process-wide revision: a take takes it before
+  it reads the library, and an edit or delete takes it after its commit. A take queued with a body
+  older than a later edit or removal of its layout is refused (`refused:unroutable`), and so is a
+  take that races a commit. The router remembers the latest state of 64 layouts. When it forgets
+  one, a take that is not newer than the forgotten state fails closed. Such a take can neither revert an edit nor air content its taker
+  was not authorized for. Authorization (§6.3): such an edit or delete needs Write on every output
+  the layout feeds, and an edit also needs Read on every source the new body binds. Otherwise the
+  request gets a 403 `routed-layout` (one generic refusal, naming nothing).
+- **Delete, rename and an edit that no longer routes (PR 2).** A deleted layout, or an edit that
+  makes it unroutable here (another canvas, a translucent cell), sends `LayoutChange::Removed`: a
+  take priming onto it is refused (`refused:unroutable`), and every output on it falls back to
+  Program at an IDR (`fallback:aux-failed`, the same path as a failed aux feed). Its encoder lingers
+  and closes like any unused key. A layout id is immutable (`PUT` never renames); a rename is a new
+  layout plus a delete, so the delete moves the outputs to Program and the persisted `{layout = id}`
+  row is kept as the operator's intent (start-up shows it as configured, not on air).
+- **The layout `audio` attribute (PR 2, §5.1).** A stored layout body may carry
+  `"audio": "program" | "none" | {"source": "<id>"}` (`LayoutAudio`; absent = `program`, never
+  serialized, so existing bodies are unchanged). A source must be bound by one of the layout's cells
+  (validated at solve, so at apply, plan and take). `follow` on a routed layout resolves to it in the
+  engine (`AudioSource::follow`), the plan (`follow_audio`: `program`, `none` or `source`; the
+  audio cost uses it) and the configured readback (`effective_audio`).
+- **Aux sizing (PR 2, §2.4).** The router publishes the cells of every composing layout into an
+  `AuxSizingSlot` whenever its layout feed set or a body changes (never per tick). Every decode that
+  follows the Program layout sizes against the Program layout plus those cells (per-axis supremum),
+  through the existing settle/handover path (1.5 s settle, 5 s spacing, at most 2 handovers). So a
+  routed cell's source decodes at that cell's size; a routed-only source no longer decodes at the
+  640x360 unbound size. `routing.max_decode_escalations` is not separately enforced: the layout
+  canvas cap bounds the extra cells.
+- **Program-lateness back-off (PR 2, §7).** The aux thread reads Program's wait-free lateness
+  histogram (`ProgramMetricsSlot`) on each tick it receives. When the p99 of a 10 s window
+  exceeds half the tick, it composes only even ticks; every routed picture holds on odd ticks. A
+  window back under half restores the full cadence. While halved, a picture one tick old is fresh,
+  so routed outputs neither degrade nor fall back. A canvas that stops publishing still counts as
+  held every tick and falls back. Readback:
+  `RoutingSnapshot.aux_halved`. It never touches Program.
+- **Still not built:** a persisted layout feed is not re-taken at start-up (no boot take: its body
+  lives in the layouts library, which start-up does not resolve). The output starts and stays on
+  Program, and the readback shows the layout as configured but not on air. A persisted layout feed
+  does not refuse a start (`outputs_carry_program` accepts every feed). The wgpu aux path stays
+  behind §7's hard gate.
 - **Salvos** do not drive output takes on main (`Salvo` has no output recall); layout feeds in
   salvos belong to #308.
 
@@ -2257,6 +2302,72 @@ after `applied` only, under the config-mutation lock, and is never spliced from 
 boot the engine starts from it; `GET /patch` is built from the engine's live readback (each slot's
 current source, path and state), never from the document. A persisted crosspoint the engine cannot
 honour at boot (source gone, slot removed) starts the slot on its default and raises an alarm.
+
+**As built in slice B (#342, part B2).**
+- **Output slots in `/patch`.** `GET /patch` gains `outputs: [ { output, format, video: [ { slot: 0,
+  live, source, path, pending, degraded } ], audio: [ { slot, track, language, source: "follow" } ] } ]`.
+  - The video slot comes from the engine's live readback (`RoutingLive`, the router snapshot), and
+    the audio slots from the accepted output config (`slots.audio`, else one program slot).
+  - With no readback for the output (no running engine, routing unavailable, or the output not in
+    this run) the slot is `live: false` with `source` and `path` null: its live state is unknown and
+    is never reported as Program (review T-M2). With a readback it is `live: true`.
+  - An output is listed only if the caller passes the output axis that the patch route checks
+    (`ObjectAndOutput` + `authorize_output`). A feed it cannot read is `{redacted: true}`.
+- **Single-output takes.** `POST /patch/plan` and `/patch/take` accept the crosspoints of ONE output:
+  - video slot 0 with `{source}`, `{bus}` or `{layout}` (a stored layout, routable since #368);
+  - optionally audio slot 0 with `"follow"`. Named, it rides the video take exactly as the alias's
+    `audio: "follow"` does (the engine take carries Follow, an explicit audio choice is replaced and
+    the persisted row's audio becomes follow, and the two routes replay each other). Omitted, the
+    output keeps its current audio choice, as the alias without `audio` (review T-M1).
+
+  A layout on video slot 0 behaves as on the alias:
+  - its id AND its whole current source closure are authorized (one generic 403) in the shared
+    authorize step, before any output or feed existence answer, so a denied closure is never a
+    404-vs-403 oracle on the output (review T-A1); a replay re-authorizes the closure;
+  - an unknown layout is `unknown-source` in the plan (422 `unknown-feed` on take);
+  - a layout for another canvas, one that does not solve, or one with a translucent cell is
+    `layout-not-admissible` (a plan refusal, 422 on take);
+  - no free layout canvas is `aux-capacity` (a plan refusal, 409 on take);
+  - a layout is composed at the canvas size, so its path is P2 only on a canvas-sized base key and P3
+    (+1 convert on the key's worker) on a formatted one.
+
+  Other requests are refused:
+  - video slot ≥ 1 → 422 `unknown-slot`;
+  - other audio slots → 422 `slot-medium-mismatch` (they are fixed by config in this slice);
+  - `subtitle` → 422 `slot-medium-mismatch` (#345);
+  - a layout or bus on a mixer input → 422 `unknown-source` (#307).
+
+  A request carries either mixer-input crosspoints or one output's crosspoints. Two outputs, or a
+  mixer input plus an output, → 422 `unknown-slot`: atomic multi-destination sets arrive with patch
+  salvos (slice E, #308).
+- **Plan.** The plan reports the §12.4 path (`P1` when an encoded bus with key (picture, format,
+  settings) is live, with Program at the output's format always its base key; `P2` when the picture
+  is identity at the output's format; else `P3`). It also reports `cost` = { `new_encoders`,
+  `converts`, `sessions_in_use`/`sessions_max` (whole-system principals only), `fits` } and the
+  existing plan refusals.
+- **`/routing/output/take` is the slot-0 alias.** An output take goes through exactly the same
+  machinery as that route:
+  - one shared function (`take_output_slot0`);
+  - the take-scoped idempotency store, under one shared key namespace, so a key replays across both
+    routes;
+  - the same per-output 2/s and per-principal 10/s limits;
+  - the bounded `try_send`, the `route.output` outcome, and persistence on `applied`.
+
+  The patch take answers `202 {operation_id, status: "accepted"}`; the alias keeps its own bodies.
+- **Authorization (review round 1).** Both routes, and `GET /routing`, check the output end with
+  one function, `authorize_output_end` (object AND output axis, `ObjectAndOutput`). This is an
+  intentional change of the slice-1 contract of `/routing/output/take`, which checked the object
+  axis only. A take key is bound to the whole take it was first used for (output, video feed and
+  explicit audio feed), on either route:
+  - the same key with another output, feed or audio is 409 `conflict` and enqueues nothing;
+  - a matching replay is re-authorized under the caller's current grants, so a revoked axis is 403
+    before any operation id or outcome is returned.
+- **Plan identity.** The plan's P2 is the aux thread's own pass-through predicate
+  (`routing_aux::passes_through`), so plan and engine cannot drift. Program and Clean are P2 only on a
+  canvas-sized base key, and so is a routed layout. A source or the PVW source is P2 when its newest tile has the output's
+  size, is opaque and carries the canvas colour; any fit of an equal-size picture is the identity.
+- **Audio slot 0 in `GET /patch`.** It reports the output's accepted audio feed exactly as
+  `GET /routing` projects and redacts it (default `follow`).
 
 ### 12.9 The Routing page (#308)
 

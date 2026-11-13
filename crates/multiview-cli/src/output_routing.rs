@@ -116,6 +116,101 @@ pub struct OutputTake {
     pub principal: String,
 }
 
+/// A stored layout changed in the accepted library (ADR-0108 §10.1, PR 2):
+/// every output on that layout follows it live.
+#[derive(Debug, Clone)]
+pub enum LayoutChange {
+    /// The layout was edited: its newly resolved body (same id). Outputs on
+    /// it compose the new body from the next tick, at an IDR.
+    Edited(LayoutRef),
+    /// The layout was deleted or no longer routes (another canvas, a
+    /// translucent cell), at `revision` ([`next_layout_revision`] order):
+    /// outputs on it fall back to Program, and a take carrying an older body
+    /// is refused.
+    Removed {
+        /// The layout id.
+        id: String,
+        /// The revision of the removal.
+        revision: u64,
+    },
+}
+
+impl LayoutChange {
+    fn id(&self) -> &str {
+        match self {
+            Self::Edited(layout) => &layout.id,
+            Self::Removed { id, .. } => id,
+        }
+    }
+
+    fn revision(&self) -> u64 {
+        match self {
+            Self::Edited(layout) => layout.body.revision,
+            Self::Removed { revision, .. } => *revision,
+        }
+    }
+}
+
+pub use multiview_control::output_routing::next_layout_revision;
+
+/// Layout ids whose latest state the router remembers; removals are
+/// forgotten first, then the oldest revision. A take whose body is not newer
+/// than any forgotten state, and whose layout has no remembered state, is
+/// refused (fail closed).
+pub const LAYOUT_STATES: usize = 64;
+
+/// Layout changes the inbox holds at most (distinct ids).
+pub const LAYOUT_INBOX: usize = 64;
+/// Layout changes the router applies per tick at most (the rest wait).
+pub const LAYOUT_CHANGES_PER_TICK: usize = 8;
+
+/// Latest layout changes not yet applied, coalesced per id (the newest
+/// revision wins). Bounded at [`LAYOUT_INBOX`] ids: a change for a layout
+/// that composes now is never evicted (at most `max_aux_canvases` plus
+/// lingering ones, far below the bound); another evicted change raises
+/// `forgotten`, so a take older than it fails closed at the router.
+/// Written by the control plane, drained by the router with `try_lock` (never
+/// blocks the consumer; on contention it retries next tick).
+#[derive(Default)]
+struct InboxState {
+    changes: HashMap<String, LayoutChange>,
+    forgotten: u64,
+}
+
+type LayoutInbox = Arc<Mutex<InboxState>>;
+
+/// Insert `change` into a revision-ordered map (an older revision for the
+/// same id is ignored). At `bound` entries the oldest is evicted (removals
+/// first); returns the evicted revision, which the caller records as a
+/// watermark so a take older than a forgotten state fails closed.
+fn remember(
+    map: &mut HashMap<String, LayoutChange>,
+    change: LayoutChange,
+    bound: usize,
+    keep: &[String],
+) -> Option<u64> {
+    if map
+        .get(change.id())
+        .is_some_and(|known| known.revision() > change.revision())
+    {
+        return None;
+    }
+    let mut evicted = None;
+    if !map.contains_key(change.id()) && map.len() >= bound {
+        if let Some((oldest, revision)) = map
+            .iter()
+            .filter(|(id, _)| !keep.iter().any(|k| k == *id))
+            .min_by_key(|(_, c)| (matches!(c, LayoutChange::Edited(_)), c.revision()))
+            .map(|(id, c)| (id.clone(), c.revision()))
+        {
+            map.remove(&oldest);
+            evicted = Some(revision);
+        }
+    }
+    map.insert(change.id().to_owned(), change);
+    evicted
+}
+
 /// The take was not enqueued: the mailbox is full or the run ended (HTTP 503
 /// `engine-busy` in the later API PR), or the take's `principal` /
 /// `operation_id` exceeds [`MAX_TAKE_ID_BYTES`].
@@ -303,6 +398,9 @@ pub struct RoutingSnapshot {
     pub move_cancel_failures: u64,
     /// Routed layouts composing now (`aux:<id>` buses in use).
     pub aux_canvases: Vec<String>,
+    /// The aux thread composes every second tick because Program is late
+    /// (ADR-0108 §7 back-off).
+    pub aux_halved: bool,
 }
 
 /// The control-plane handle (clone freely).
@@ -317,10 +415,29 @@ pub struct OutputRoutingHandle {
     #[cfg(test)]
     pub(crate) audio_tap: crate::routing_audio::AudioTapCell,
     takes: SyncSender<OutputTake>,
+    layout_changes: LayoutInbox,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
     outputs: Arc<[RunOutput]>,
     has_preview: bool,
+    /// What the plan needs to tell an identity picture (P2) from a convert
+    /// (P3), #342 B2: the run's store lookup and its canvas. `None` until
+    /// [`OutputRoutingHandle::with_pictures`].
+    pictures: Option<PlanPictures>,
+    max_aux_canvases: usize,
+}
+
+/// What the plan reads to tell an identity picture (P2) from a convert
+/// (P3), #342 B2: the run's store lookup, its canvas and the M/E's PVW
+/// source id (all wait-free).
+#[derive(Clone)]
+pub struct PlanPictures {
+    /// Source id → its tile store.
+    pub stores: StoreLookup,
+    /// The canvas the aux pictures match.
+    pub canvas: crate::routing_aux::AuxCanvas,
+    /// The PVW source id, when the run has an M/E.
+    pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
 }
 
 /// One routable position of the run (the router's output index).
@@ -335,6 +452,9 @@ pub struct RunOutput {
     /// The format a routed source/PVW is composed at for this output (#342;
     /// `None` = the canvas with the default fit).
     pub feed_format: Option<AuxFormat>,
+    /// The format of the output's base key, which Program and Clean are
+    /// converted to (#342; `None` = canvas-sized: the zero-copy picture).
+    pub base_format: Option<AuxFormat>,
     /// Whether slice 1 can cut this output cleanly (its encoder family has
     /// the parameter-set RAP check; VAAPI/VideoToolbox do not, §4.2).
     pub routable: bool,
@@ -363,6 +483,40 @@ impl OutputRoutingHandle {
         self.takes.try_send(take).map_err(|_| TakeBusy)
     }
 
+    /// Tell the router a stored layout changed. Coalesced per id (the
+    /// newest revision wins) and bounded; never waits on the router.
+    ///
+    /// # Errors
+    /// [`TakeBusy`] when the id is longer than [`MAX_TAKE_ID_BYTES`].
+    pub fn try_layout_change(&self, change: LayoutChange) -> Result<(), TakeBusy> {
+        if change.id().len() > MAX_TAKE_ID_BYTES {
+            return Err(TakeBusy);
+        }
+        // Changes for layouts composing now are never evicted.
+        let keep: Vec<String> = self
+            .snapshot
+            .load()
+            .aux_canvases
+            .iter()
+            .filter_map(|bus| bus.strip_prefix("aux:").map(str::to_owned))
+            .collect();
+        let mut inbox = self
+            .layout_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(evicted) = remember(&mut inbox.changes, change, LAYOUT_INBOX, &keep) {
+            inbox.forgotten = inbox.forgotten.max(evicted);
+        }
+        Ok(())
+    }
+
+    /// The layouts on air or pending on any output (`aux:<id>` ids), from the
+    /// latest snapshot.
+    #[must_use]
+    pub fn routed_layouts(&self) -> Vec<String> {
+        self.snapshot.load().aux_canvases.clone()
+    }
+
     /// The latest routing snapshot.
     #[must_use]
     pub fn snapshot(&self) -> Arc<RoutingSnapshot> {
@@ -385,6 +539,20 @@ impl OutputRoutingHandle {
         self
     }
 
+    /// Attach the run's store lookup and canvas (#342 B2: the plan's P2/P3
+    /// identity check reads a source's newest tile, wait-free).
+    #[must_use]
+    pub fn with_pictures(mut self, pictures: PlanPictures) -> Self {
+        self.pictures = Some(pictures);
+        self
+    }
+
+    /// The run's store lookup and canvas, when attached.
+    #[must_use]
+    pub fn pictures(&self) -> Option<&PlanPictures> {
+        self.pictures.as_ref()
+    }
+
     /// The run's output map, by router index.
     #[must_use]
     pub fn outputs(&self) -> &[RunOutput] {
@@ -395,6 +563,12 @@ impl OutputRoutingHandle {
     #[must_use]
     pub const fn has_preview(&self) -> bool {
         self.has_preview
+    }
+
+    /// The run's `routing.max_aux_canvases` (the plan's admission bound).
+    #[must_use]
+    pub const fn max_aux_canvases(&self) -> usize {
+        self.max_aux_canvases
     }
 
     /// The router index of the output whose config id is `id`.
@@ -613,6 +787,11 @@ pub struct AuxWiring {
     pub stores: StoreLookup,
     /// The PVW source id.
     pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
+    /// Raised while the aux cadence is halved (§7 back-off).
+    pub halved: Arc<AtomicBool>,
+    /// Aux sizing (§2.4): the cells of every composing layout, for the
+    /// decoders (`None`: no decode follows them, e.g. tests).
+    pub sizing: Option<crate::display_size::AuxSizingSlot>,
 }
 
 /// What the opener receives: the rendition settings index (which already
@@ -733,6 +912,15 @@ pub struct OutputRouter {
     cfg: RouterConfig,
     aux: AuxWiring,
     takes: Receiver<OutputTake>,
+    layout_changes: LayoutInbox,
+    /// The latest known state of each layout seen (bounded): a take carrying
+    /// an older body than a later edit or removal is refused.
+    layout_states: HashMap<String, LayoutChange>,
+    /// The newest revision `layout_states` forgot (0: none).
+    layout_states_forgotten: u64,
+    /// Changes left in the inbox after this tick's budget, by id (at most
+    /// [`LAYOUT_INBOX`]): a take older than one is refused too.
+    layout_pending: HashMap<String, u64>,
     outcomes: SyncSender<TakeOutcome>,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outputs: Vec<OutputState>,
@@ -806,34 +994,19 @@ impl OutputRouter {
     ///
     /// # Errors
     /// The OS error if a helper thread cannot be spawned.
+    #[allow(clippy::too_many_lines)]
+    // reason: one constructor wiring three helper threads and every channel
+    // of the router; splitting it would only scatter the wiring.
     pub fn new_with_bus(
         cfg: RouterConfig,
         aux: AuxWiring,
-        mut open: BusOpenFn,
+        open: BusOpenFn,
     ) -> std::io::Result<(Self, OutputRoutingHandle)> {
         let (take_tx, takes) = mpsc::sync_channel(TAKE_MAILBOX);
+        let layout_changes: LayoutInbox = Arc::new(Mutex::new(InboxState::default()));
+        let layout_tx = Arc::clone(&layout_changes);
         let (outcomes, outcome_rx) = mpsc::sync_channel(OUTCOME_CAPACITY);
-        let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
-        let (open_res_tx, open_rx) = mpsc::sync_channel::<OpenResult>(OPEN_QUEUE);
-        std::thread::Builder::new()
-            .name("routing-open".to_owned())
-            .spawn(move || {
-                while let Ok(req) = open_req_rx.recv() {
-                    let encoder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        open(req.settings, &req.bus)
-                    }))
-                    .unwrap_or_else(|_| Err("encoder open panicked".to_owned()));
-                    if open_res_tx
-                        .send(OpenResult {
-                            id: req.id,
-                            encoder,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            })?;
+        let (open_tx, open_rx) = spawn_opener(open)?;
         let (reap_tx, reap_rx) = mpsc::sync_channel::<Reap>(REAPER_QUEUE);
         let reaper = std::thread::Builder::new()
             .name("routing-reaper".to_owned())
@@ -867,15 +1040,22 @@ impl OutputRouter {
             #[cfg(test)]
             audio_tap: Arc::clone(&audio_tap),
             takes: take_tx,
+            layout_changes: layout_tx,
             snapshot: Arc::clone(&snapshot),
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
             outputs: Arc::from(Vec::new()),
             has_preview: cfg.has_preview,
+            pictures: None,
+            max_aux_canvases: cfg.max_aux_canvases,
         };
         let mut router = Self {
             cfg,
             aux,
             takes,
+            layout_changes,
+            layout_states: HashMap::new(),
+            layout_states_forgotten: 0,
+            layout_pending: HashMap::new(),
             outcomes,
             snapshot,
             outputs,
@@ -1097,6 +1277,7 @@ impl OutputRouter {
             self.dirty = true;
         }
         self.first_tick.get_or_insert(tick);
+        self.drain_layout_changes(tick, dispatcher);
         self.drain_takes(tick, dispatcher);
         self.retry_boot_takes(tick);
         self.issue_boot_audio_after(tick, dispatcher);
@@ -1109,7 +1290,9 @@ impl OutputRouter {
         self.linger(tick, dispatcher);
         self.sync_feeds();
         self.sync_live_keys(dispatcher);
-        if self.dirty || self.outputs.iter().any(|o| o.pending.is_some()) {
+        let halved_changed =
+            self.aux.halved.load(Ordering::Relaxed) != self.snapshot.load().aux_halved;
+        if self.dirty || halved_changed || self.outputs.iter().any(|o| o.pending.is_some()) {
             self.publish_snapshot_at(tick);
         }
         Ok(())
@@ -1355,6 +1538,155 @@ impl OutputRouter {
         }
     }
 
+    /// Apply stored-layout changes (at most [`LAYOUT_STATES`]; O(outputs)
+    /// each). Never blocks: a contended inbox is retried next tick.
+    fn drain_layout_changes(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let changes: Vec<LayoutChange> = match self.layout_changes.try_lock() {
+            Ok(mut inbox) => {
+                self.layout_states_forgotten = self
+                    .layout_states_forgotten
+                    .max(std::mem::take(&mut inbox.forgotten));
+                if inbox.changes.is_empty() {
+                    self.layout_pending.clear();
+                    return;
+                }
+                // Changes for composing layouts first (they are on air), then
+                // the oldest revisions.
+                let mut ids: Vec<(bool, u64, String)> = inbox
+                    .changes
+                    .iter()
+                    .map(|(id, c)| (!self.composes_layout(id), c.revision(), id.clone()))
+                    .collect();
+                ids.sort_unstable();
+                ids.truncate(LAYOUT_CHANGES_PER_TICK);
+                let taken: Vec<LayoutChange> = ids
+                    .iter()
+                    .filter_map(|(_, _, id)| inbox.changes.remove(id))
+                    .collect();
+                // What is left waits; the stale-take check sees it now.
+                self.layout_pending = inbox
+                    .changes
+                    .iter()
+                    .map(|(id, c)| (id.clone(), c.revision()))
+                    .collect();
+                taken
+            }
+            Err(_) => return,
+        };
+        for change in changes {
+            if self
+                .layout_states
+                .get(change.id())
+                .is_some_and(|known| known.revision() >= change.revision())
+            {
+                continue;
+            }
+            self.remember_state(change.clone());
+            match change {
+                LayoutChange::Edited(layout) => {
+                    if self.refresh_layout_body(&layout, tick) {
+                        self.refollow_layout_audio(&layout, tick, dispatcher);
+                    }
+                }
+                LayoutChange::Removed { id, .. } => self.drop_layout(&id, tick, dispatcher),
+            }
+        }
+    }
+
+    /// Whether a take onto `layout` carries a body older than a later edit
+    /// or removal of that layout (it was authorized for content that is no
+    /// longer the layout's): such a take is refused.
+    fn layout_take_is_stale(&self, layout: &LayoutRef) -> bool {
+        // A change still waiting in the inbox (beyond this tick's budget)
+        // counts as known.
+        if self
+            .layout_pending
+            .get(&layout.id)
+            .is_some_and(|revision| *revision > layout.body.revision)
+        {
+            return true;
+        }
+        // Fail closed: any forgotten (evicted, never applied) change could be
+        // a newer state of this layout, so no take at or below it passes.
+        if layout.body.revision <= self.layout_states_forgotten {
+            return true;
+        }
+        self.layout_states
+            .get(&layout.id)
+            .is_some_and(|known| known.revision() > layout.body.revision)
+    }
+
+    /// Whether layout `id` composes now (an output on it, or a feed for it).
+    fn composes_layout(&self, id: &str) -> bool {
+        self.feeds
+            .keys()
+            .any(|(bus, _)| matches!(bus, PictureBus::Layout(l) if l.id == id))
+    }
+
+    /// Record a layout's latest state (bounded; an eviction raises the
+    /// fail-closed watermark).
+    fn remember_state(&mut self, change: LayoutChange) {
+        if let Some(evicted) = remember(&mut self.layout_states, change, LAYOUT_STATES, &[]) {
+            self.layout_states_forgotten = self.layout_states_forgotten.max(evicted);
+        }
+    }
+
+    /// Outputs whose audio follows a layout re-resolve it after its body
+    /// changed (its `audio` attribute may have).
+    fn refollow_layout_audio(
+        &mut self,
+        layout: &LayoutRef,
+        tick: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let bus = PictureBus::Layout(layout.clone());
+        let Some(audio) = self.audio.as_mut() else {
+            return;
+        };
+        for (index, o) in self.outputs.iter().enumerate() {
+            // An output mid-move settles its audio with the move (a refused
+            // move restores the choice, which then resolves on this body).
+            let moving = o
+                .pending
+                .as_ref()
+                .is_some_and(|p| matches!(p.phase, Phase::Moving(_) | Phase::AudioMoving { .. }));
+            if o.bus == bus && !moving {
+                audio.fallback(index, &bus, tick, None, dispatcher);
+            }
+        }
+    }
+
+    /// A layout left the library (or no longer routes): a pending take onto
+    /// it is refused, and every output on it falls back to Program at an IDR,
+    /// exactly like a failed aux feed.
+    fn drop_layout(&mut self, id: &str, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let is_it = |bus: &PictureBus| matches!(bus, PictureBus::Layout(l) if l.id == id);
+        for index in 0..self.outputs.len() {
+            let pending_onto = self
+                .outputs
+                .get(index)
+                .and_then(|o| o.pending.as_ref())
+                .and_then(|p| p.take.bus.as_ref())
+                .is_some_and(is_it);
+            if pending_onto {
+                self.refuse_pending(index, tick, RefuseReason::Unroutable, dispatcher);
+            }
+        }
+        let mut on_air: Vec<FeedKey> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| is_it(&o.bus))
+            .map(|(i, o)| self.feed_key(i, &o.bus))
+            .collect();
+        on_air.dedup();
+        for key in on_air {
+            self.fall_back_feed(&key, tick, dispatcher);
+        }
+        // Its encoders now carry no output: they linger and close like any
+        // unused key (never retired under a move still landing).
+    }
+
     fn drain_takes(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         loop {
             let take = match self.takes.try_recv() {
@@ -1381,9 +1713,19 @@ impl OutputRouter {
             // §7 rule 1, checked again here (the plan's answer can be stale):
             // a layout not composing yet needs a free aux canvas.
             if let Some(PictureBus::Layout(layout)) = &take.bus {
+                if self.layout_take_is_stale(layout) {
+                    self.emit(
+                        take.operation_id,
+                        take.output_index,
+                        tick,
+                        TakeResult::Refused(RefuseReason::Unroutable),
+                    );
+                    continue;
+                }
+                self.remember_state(LayoutChange::Edited(layout.clone()));
                 // A re-take of a composing layout carries its latest body
                 // (an edited layout): the canvas follows it from this tick.
-                self.refresh_layout_body(layout, tick);
+                let _ = self.refresh_layout_body(layout, tick);
                 if !self.admit_aux_canvas(layout, take.output_index, dispatcher) {
                     self.emit(
                         take.operation_id,
@@ -1483,6 +1825,11 @@ impl OutputRouter {
                 audio.finish_take(index, false, &bus, tick, dispatcher);
             } else {
                 audio.video_refused(index, tick, dispatcher);
+                // The output stays on a layout that may have been edited
+                // while the move was pending: follow its current body.
+                if matches!(bus, PictureBus::Layout(_)) {
+                    audio.fallback(index, &bus, tick, None, dispatcher);
+                }
             }
         }
     }
@@ -1755,6 +2102,30 @@ impl OutputRouter {
         }
     }
 
+    /// The video move of output `index` landed on `landed`. A layout edited
+    /// while the move was in flight: the audio scheduled with the move
+    /// followed the old body's attribute, so follow the body that landed (a
+    /// no-op when it resolves the same).
+    fn audio_applied(
+        &mut self,
+        index: usize,
+        scheduled: Option<&PictureBus>,
+        landed: &PictureBus,
+        at: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let Some(audio) = self.audio.as_mut() else {
+            return;
+        };
+        audio.video_applied(index);
+        if matches!(
+            (scheduled, landed),
+            (Some(PictureBus::Layout(_)), PictureBus::Layout(_))
+        ) {
+            audio.fallback(index, landed, at, None, dispatcher);
+        }
+    }
+
     fn drain_moves(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let mut superseded: Vec<usize> = Vec::new();
         for outcome in dispatcher.take_move_outcomes() {
@@ -1775,14 +2146,20 @@ impl OutputRouter {
                     let expected = matches!(out.pending.as_ref().map(|p| p.phase), Some(Phase::Moving(k)) if k == key);
                     if expected {
                         if let Some(p) = out.pending.take() {
+                            let scheduled = p.take.bus.clone();
                             if let Some(bus) = p.take.bus.clone() {
                                 out.bus = bus;
                             }
                             out.key = key;
                             out.since = at;
-                            if let Some(audio) = self.audio.as_mut() {
-                                audio.video_applied(output_index);
-                            }
+                            let landed = out.bus.clone();
+                            self.audio_applied(
+                                output_index,
+                                scheduled.as_ref(),
+                                &landed,
+                                at,
+                                dispatcher,
+                            );
                             self.emit(p.take.operation_id, output_index, at, TakeResult::Applied);
                         }
                     } else if out.key != key {
@@ -1879,41 +2256,48 @@ impl OutputRouter {
                 bus.clone()
             })
             .collect();
-        for (bus, format) in fallen {
-            for index in 0..self.outputs.len() {
-                let on_bus = self.outputs.get(index).is_some_and(|o| o.bus == bus)
-                    && self.feed_key(index, &bus).1 == format;
-                if !on_bus {
-                    continue;
+        for key in fallen {
+            self.fall_back_feed(&key, tick, dispatcher);
+        }
+    }
+
+    /// Move every output on `feed` back to Program at an IDR (an unrequested
+    /// fallback, outcome `fallback:aux-failed`).
+    fn fall_back_feed(&mut self, feed: &FeedKey, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        let (bus, format) = feed;
+        for index in 0..self.outputs.len() {
+            let on_bus = self.outputs.get(index).is_some_and(|o| o.bus == *bus)
+                && self.feed_key(index, bus).1 == *format;
+            if !on_bus {
+                continue;
+            }
+            let Some(&base) = self.cfg.base_keys.get(index) else {
+                continue;
+            };
+            // A take whose dispatcher move is in flight is settled first
+            // (Superseded, audio restored): the forced rebind replaces
+            // that move, which would otherwise strand it forever (#330
+            // item 3).
+            self.supersede_move(index, tick, dispatcher);
+            let windows = self.request_idr(base, tick);
+            // A fallback: the routed feed is gone, so it is never refused
+            // for a format mismatch (an out-of-band output takes a loss).
+            if dispatcher
+                .rebind_video_forced(index, base, tick, windows)
+                .is_ok()
+            {
+                if let Some(out) = self.outputs.get_mut(index) {
+                    out.bus = PictureBus::Program;
                 }
-                let Some(&base) = self.cfg.base_keys.get(index) else {
-                    continue;
-                };
-                // A take whose dispatcher move is in flight is settled first
-                // (Superseded, audio restored): the forced rebind replaces
-                // that move, which would otherwise strand it forever (#330
-                // item 3).
-                self.supersede_move(index, tick, dispatcher);
-                let windows = self.request_idr(base, tick);
-                // A fallback: the routed feed is gone, so it is never refused
-                // for a format mismatch (an out-of-band output takes a loss).
-                if dispatcher
-                    .rebind_video_forced(index, base, tick, windows)
-                    .is_ok()
-                {
-                    if let Some(out) = self.outputs.get_mut(index) {
-                        out.bus = PictureBus::Program;
-                    }
-                    if let Some(audio) = self.audio.as_mut() {
-                        audio.fallback(index, &PictureBus::Program, tick, Some(base), dispatcher);
-                    }
-                    self.emit(
-                        String::new(),
-                        index,
-                        tick,
-                        TakeResult::Fallback(FallbackReason::AuxFailed),
-                    );
+                if let Some(audio) = self.audio.as_mut() {
+                    audio.fallback(index, &PictureBus::Program, tick, Some(base), dispatcher);
                 }
+                self.emit(
+                    String::new(),
+                    index,
+                    tick,
+                    TakeResult::Fallback(FallbackReason::AuxFailed),
+                );
             }
         }
     }
@@ -1939,10 +2323,17 @@ impl OutputRouter {
     }
 
     fn slot_fresh(&self, feed: &FeedKey, tick: u64) -> bool {
+        // A halved aux cadence (§7 back-off) composes every second tick: a
+        // picture one tick older is still on time.
+        let lag = if self.aux.halved.load(Ordering::Relaxed) {
+            2
+        } else {
+            1
+        };
         self.feeds
             .get(feed)
             .and_then(|f| f.slot.latest.load())
-            .is_some_and(|frame| frame.tick.saturating_add(1) >= tick)
+            .is_some_and(|frame| frame.tick.saturating_add(lag) >= tick)
     }
 
     fn feed_fresh(&self, feed: &FeedKey, tick: u64, pts: MediaTime) -> bool {
@@ -2336,7 +2727,12 @@ impl OutputRouter {
             self.dead_encoders = self.dead_encoders.saturating_add(1);
             self.close(key, dispatcher);
         }
+        let halved = self.aux.halved.load(Ordering::Relaxed);
         for (bus, fresh) in fresh_buses {
+            // A tick the halved aux cadence skips by design is not a hold:
+            // only while the slot's latest picture is at most one tick old
+            // (a stalled canvas still counts every tick).
+            let fresh = fresh || (halved && aux_composed(&bus.0) && self.slot_fresh(&bus, tick));
             let health = self.health.entry(bus).or_insert(BusHealth {
                 held: 0,
                 fallen: false,
@@ -2440,8 +2836,8 @@ impl OutputRouter {
     /// Bounded (#342 review A2): every feed is wanted by a live key, an open
     /// or a pending take, so the set holds at most `max_encoders` (live keys
     /// plus opens, which `has_capacity` caps) plus one per output with a
-    /// pending take, whatever the formats. There is no separate
-    /// `routing.max_aux_canvases` setting to enforce. The aux thread is handed
+    /// pending take, whatever the formats; layout buses are further bounded
+    /// by `routing.max_aux_canvases` at admission. The aux thread is handed
     /// (and the clock's send gate raised for) only the buses it composes
     /// (Preview, sources): routing only Clean never wakes it.
     fn sync_feeds(&mut self) {
@@ -2489,7 +2885,28 @@ impl OutputRouter {
         let active = !list.is_empty();
         self.aux.feeds.store(Arc::new(list));
         self.aux.active.store(active, Ordering::Release);
+        self.publish_sizing();
         self.dirty = true;
+    }
+
+    /// Publish the composing layouts' cells for the decoders (§2.4 aux
+    /// sizing). Runs only when the feed set or a layout body changes; one
+    /// O(cells) allocation and a wait-free store, never per tick.
+    fn publish_sizing(&self) {
+        let Some(slot) = &self.aux.sizing else {
+            return;
+        };
+        let mut cells: Vec<multiview_core::layout::Cell> = Vec::new();
+        // The VALUE's bus: a live edit swaps the body there (the key keeps
+        // the id it hashes by).
+        for feed in self.feeds.values() {
+            if let PictureBus::Layout(layout) = &feed.bus {
+                cells.extend(layout.body.layout.cells.iter().cloned());
+            }
+        }
+        if *slot.load() != cells {
+            slot.store(Arc::new(cells));
+        }
     }
 
     /// Recompute `live_keys` (only while live keys exist or were published).
@@ -2574,6 +2991,7 @@ impl OutputRouter {
             boot_takes_given_up: self.boot.given_up,
             move_cancel_failures: self.move_cancel_failures,
             aux_canvases: self.layout_buses(),
+            aux_halved: self.aux.halved.load(Ordering::Relaxed),
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));
@@ -2595,24 +3013,39 @@ impl OutputRouter {
         names
     }
 
-    /// Point a composing layout bus at `layout`'s body when it changed
-    /// (rare: a re-take after an edit). One feed-list republish, and an IDR
-    /// requested on every live key of that bus so the edited picture starts
-    /// on a clean random-access point (within the per-key force floor).
-    fn refresh_layout_body(&mut self, layout: &LayoutRef, tick: u64) {
+    /// Point a composing layout bus at `layout`'s body when it changed (a
+    /// re-take after an edit, or a live edit of the stored layout). One
+    /// feed-list republish, every output and pending take on that layout
+    /// re-pointed (so its audio attribute follows too), and an IDR requested
+    /// on every live key of that bus so the edited picture starts on a clean
+    /// random-access point (within the per-key force floor). `true` when the
+    /// body changed.
+    fn refresh_layout_body(&mut self, layout: &LayoutRef, tick: u64) -> bool {
         let bus = PictureBus::Layout(layout.clone());
         // A layout is composed at the canvas (like Program; a non-canvas
         // output format converts on the key's worker), so its feed key has
         // no format.
         let Some(feed) = self.feeds.get_mut(&(bus.clone(), None)) else {
-            return;
+            return false;
         };
         if let PictureBus::Layout(current) = &feed.bus {
-            if Arc::ptr_eq(&current.body, &layout.body) {
-                return;
+            if Arc::ptr_eq(&current.body, &layout.body)
+                || current.body.revision > layout.body.revision
+            {
+                return false;
             }
         }
         feed.bus = bus.clone();
+        for o in &mut self.outputs {
+            if o.bus == bus {
+                o.bus = bus.clone();
+            }
+            if let Some(pending) = o.pending.as_mut() {
+                if pending.take.bus.as_ref() == Some(&bus) {
+                    pending.take.bus = Some(bus.clone());
+                }
+            }
+        }
         let keys: Vec<usize> = self
             .dynamic
             .iter()
@@ -2629,6 +3062,9 @@ impl OutputRouter {
             .cloned()
             .collect();
         self.aux.feeds.store(Arc::new(list));
+        self.publish_sizing();
+        self.dirty = true;
+        true
     }
 
     /// The layout buses other outputs hold (on air, or as a pending take).
@@ -2779,6 +3215,35 @@ fn feed_order(key: &FeedKey) -> (String, Option<(u32, u32, String)>) {
             )
         }),
     )
+}
+
+/// Spawn the `routing-open` thread: it opens live encoders off the consumer
+/// (a panicking open is an error result, never a dead thread).
+fn spawn_opener(
+    mut open: BusOpenFn,
+) -> std::io::Result<(SyncSender<OpenRequest>, Receiver<OpenResult>)> {
+    let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
+    let (open_res_tx, open_rx) = mpsc::sync_channel::<OpenResult>(OPEN_QUEUE);
+    std::thread::Builder::new()
+        .name("routing-open".to_owned())
+        .spawn(move || {
+            while let Ok(req) = open_req_rx.recv() {
+                let encoder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    open(req.settings, &req.bus)
+                }))
+                .unwrap_or_else(|_| Err("encoder open panicked".to_owned()));
+                if open_res_tx
+                    .send(OpenResult {
+                        id: req.id,
+                        encoder,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })?;
+    Ok((open_tx, open_rx))
 }
 
 /// Whether the `routing-aux` thread composes `bus` (Program and Clean come

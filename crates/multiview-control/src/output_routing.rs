@@ -107,6 +107,24 @@ pub struct RoutedLayout {
     pub layout: multiview_core::layout::Layout,
     /// Per cell, in `layout.cells` order: the slate a down cell shows.
     pub slates: Vec<multiview_config::FailoverSlate>,
+    /// The layout's `audio` attribute: what an output carries when it routes
+    /// this layout and its audio follows (§5.1).
+    pub audio: multiview_config::LayoutAudio,
+    /// Resolution order ([`next_layout_revision`]): a body resolved later
+    /// (after a later committed edit) has a higher revision, so the engine
+    /// never lets an older body replace a newer one.
+    pub revision: u64,
+}
+
+/// The next layout resolution revision (process-wide, monotonic). A take
+/// takes it BEFORE it reads the layouts library; an edit or a delete takes it
+/// AFTER its commit. So a take that read a body older than an edit always
+/// has a lower revision than that edit (a take racing a commit may be
+/// refused needlessly, never admitted wrongly).
+#[must_use]
+pub fn next_layout_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
 }
 
 impl RoutedLayout {
@@ -259,6 +277,43 @@ impl PlanCost {
     }
 }
 
+/// The cheapest path a crosspoint onto an output's video slot takes
+/// (ADR-0110, output-routing §12.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanPath {
+    /// An encoded bus with key (picture, format, settings) is already live:
+    /// +0 encoders.
+    P1,
+    /// The picture is identity at the output's format: + 1 encode.
+    P2,
+    /// Anything else: + 1 convert per distinct (picture, format), + 1 encode.
+    P3,
+}
+
+impl PlanPath {
+    /// The wire name (`P1`, `P2`, `P3`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::P1 => "P1",
+            Self::P2 => "P2",
+            Self::P3 => "P3",
+        }
+    }
+}
+
+/// The plan of one crosspoint onto an output's video slot 0 (#342 B2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotPlan {
+    /// The path (§12.4).
+    pub path: PlanPath,
+    /// The encoder cost, sessions and fit (as [`OutputRouting::plan`]).
+    pub cost: PlanCost,
+    /// `1` when a P3 needs a convert whose (picture, format) feed is not
+    /// live yet, else `0`.
+    pub converts: u8,
+}
+
 /// One output's live routing readback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputLive {
@@ -335,15 +390,71 @@ pub trait OutputRouting: Send + Sync {
         video: Option<&RoutedFeed>,
         audio: Option<&RoutedAudio>,
     ) -> Result<AudioPlanCost, PlanRefusal>;
+    /// [`Self::plan_audio`] for a take onto a routed layout whose `audio`
+    /// attribute is `layout_audio` (what `follow` resolves to on it, §5.1).
+    /// The default ignores the attribute (the program mix).
+    ///
+    /// # Errors
+    /// As [`Self::plan_audio`].
+    fn plan_layout_audio(
+        &self,
+        output: &str,
+        video: &RoutedFeed,
+        layout_audio: &multiview_config::LayoutAudio,
+        audio: Option<&RoutedAudio>,
+    ) -> Result<AudioPlanCost, PlanRefusal> {
+        let _ = layout_audio;
+        self.plan_audio(output, Some(video), audio)
+    }
     /// Enqueue an authorized take without waiting.
     ///
     /// # Errors
     /// [`TakeSubmitError`] when it cannot be enqueued.
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError>;
+    /// A stored layout changed in the accepted library (ADR-0108 §10.1):
+    /// `Some(body)` is its newly resolved body (outputs on it follow it live,
+    /// at an IDR); `None` means it was deleted or no longer routes (outputs
+    /// on it fall back to Program). Never waits; `false` when the engine
+    /// refused the change (with no run there is nothing to tell: `true`).
+    fn layout_changed(&self, id: &str, body: Option<LayoutBody>) -> bool {
+        let _ = (id, body);
+        false
+    }
+    /// The layout ids on air or pending on any output, from the latest
+    /// readback (empty with no run).
+    fn routed_layouts(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// The latest readback (`None` before a run published one).
     fn snapshot(&self) -> Option<RoutingLive>;
     /// The outcome stream; `Some` exactly once.
     fn subscribe_outcomes(&self) -> Option<std::sync::mpsc::Receiver<OutputOutcome>>;
+    /// The §12.4 path the output's video slot 0 is carried on now (#342 B2:
+    /// Program at the output's format is its base key, P1; a routed picture
+    /// identity at the output's format P2; else P3). `None` when unknown.
+    fn current_path(&self, _output: &str) -> Option<PlanPath> {
+        None
+    }
+
+    /// Plan a crosspoint onto the output's video slot 0 with its §12.4 path
+    /// (#342 B2). The default derives it from [`Self::plan`] alone: P1 when
+    /// no encoder is needed, else P3 (an implementor that cannot tell an
+    /// identity picture reports the conservative path).
+    ///
+    /// # Errors
+    /// The refusal the take would certainly meet.
+    fn plan_slot(&self, output: &str, feed: &RoutedFeed) -> Result<SlotPlan, PlanRefusal> {
+        let cost = self.plan(output, feed)?;
+        Ok(SlotPlan {
+            path: if cost.needs_encoder {
+                PlanPath::P3
+            } else {
+                PlanPath::P1
+            },
+            cost,
+            converts: u8::from(cost.needs_encoder),
+        })
+    }
 }
 
 /// Shared handle to an installed [`OutputRouting`].
@@ -432,8 +543,14 @@ struct TakeRecord {
 pub enum TakeReservation {
     /// The key was unseen: enqueue the take under this new operation id.
     Fresh(crate::command::OperationId),
-    /// The key already names a take: answer it, never enqueue again.
+    /// The key already names THIS take (the stored take equals the one being
+    /// reserved): answer it, never enqueue again.
     Replay(TakeReplay),
+    /// The key already names a DIFFERENT take (another output, video or
+    /// audio): refuse (409 `conflict`), never enqueue and never disclose the
+    /// other take's operation (#342 review A1-r2). Decided under the same
+    /// lock as the reservation, so two concurrent bodies cannot both miss it.
+    Conflict,
     /// No record can be made: the principal's records (or, globally, every
     /// record) are all pending. Fail closed (`idempotency-capacity`).
     Capacity,
@@ -528,8 +645,17 @@ impl TakeStore {
     }
 
     fn reserve(&mut self, key: &str, principal: &str, take: PendingTake) -> TakeReservation {
-        if let Some(replay) = self.replay(key) {
-            return TakeReservation::Replay(replay);
+        if let Some(record) = self.by_key.get(key) {
+            // The key is bound to the take it was first reserved for: the
+            // replay is answered only for that very take, atomically with the
+            // reservation.
+            if record.take != take {
+                return TakeReservation::Conflict;
+            }
+            return TakeReservation::Replay(TakeReplay {
+                operation_id: record.operation_id.clone(),
+                outcome: record.outcome.clone(),
+            });
         }
         // The reservation order is the eviction age: it must never wrap (a
         // wrapped seq would sort the NEWEST record first and evict it). A u64
@@ -781,6 +907,22 @@ impl OutputRoutingControl {
         self.records().replay(key)
     }
 
+    /// The replay of `key` together with the take it recorded (output API id,
+    /// video feed and audio choice), so a replay can be bound to its request
+    /// (#342 review A1).
+    #[must_use]
+    pub fn replay_with_take(&self, key: &str) -> Option<(TakeReplay, PendingTake)> {
+        let records = self.records();
+        let record = records.by_key.get(key)?;
+        Some((
+            TakeReplay {
+                operation_id: record.operation_id.clone(),
+                outcome: record.outcome.clone(),
+            },
+            record.take.clone(),
+        ))
+    }
+
     /// Reserve `key` for a take of `pending` charged to `principal` (the
     /// authenticated key id): fresh, replay of the key's own operation, or
     /// capacity. Under pressure the oldest settled record is evicted (the
@@ -1009,7 +1151,8 @@ pub async fn persist_route(
     let empty = table.output.is_empty()
         && table.video.is_empty()
         && table.audio.is_empty()
-        && table.subtitle.is_empty();
+        && table.subtitle.is_empty()
+        && table.max_aux_canvases.is_none();
     config.routing = (!empty).then_some(table);
     config
         .validate()

@@ -256,6 +256,30 @@ describe('OutputFeedRow', () => {
     expect(screen.getByLabelText(/Video feed for Out 1/)).toHaveValue('bus:clean');
   });
 
+  it.each([
+    ['none', 'Audio follows: silence (this layout carries no audio)'],
+    ['source', "Audio follows: one cell's source audio (set by the layout)"],
+  ])('says what a layout with audio %s carries when audio follows', async (followAudio, text) => {
+    planResponse = {
+      class: 'class1',
+      cost: { new_encoders: 0, fits: true, new_aux_canvases: 1, follow_audio: followAudio },
+      refusals: [],
+    };
+    const withLayout = [
+      ...choices,
+      { key: 'aux:NewsOne', label: 'NewsOne', group: 'layouts' as const },
+    ];
+    renderWithProviders(
+      <OutputFeedRow output="out-1" outputName="Out 1" route={programRow} choices={withLayout} />,
+    );
+    fireEvent.change(screen.getByLabelText(/Video feed for Out 1/), {
+      target: { value: 'aux:NewsOne' },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('output-plan-audio')).toHaveTextContent(text);
+    });
+  });
+
   it('lists layouts in their own group, plans one with its canvas and audio, and shows the layout tally', async () => {
     planResponse = {
       class: 'class1',

@@ -608,6 +608,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::patch::PatchPlan,
         crate::routes::patch::PlannedCrosspoint,
         crate::routes::patch::PatchRefusal,
+        crate::routes::patch::SlotCost,
         crate::routes::patch::PatchAccepted,
         crate::routes::output_routing::OutputTargetKind,
         crate::routes::output_routing::OutputTarget,

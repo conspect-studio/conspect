@@ -164,6 +164,8 @@ fn router(
         sent: Arc::new(AtomicU64::new(0)),
         stores: Arc::new(|_: &str| None),
         preview_selection: None,
+        halved: Arc::new(AtomicBool::new(false)),
+        sizing: None,
     };
     let aux = wiring();
     let mirror = AuxWiring {
@@ -174,6 +176,8 @@ fn router(
         sent: Arc::clone(&aux.sent),
         stores: Arc::clone(&aux.stores),
         preview_selection: None,
+        halved: Arc::new(AtomicBool::new(false)),
+        sizing: None,
     };
     let (r, h) = OutputRouter::new(
         RouterConfig {
@@ -436,6 +440,8 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
                 _ => None,
             }),
             preview_selection: None,
+            halved: Arc::new(AtomicBool::new(false)),
+            sizing: None,
         },
         open,
     )
@@ -1512,6 +1518,7 @@ fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
             id: Some("ok".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -1519,6 +1526,7 @@ fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
             id: Some("vaapi".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: false,
             program_audio: true,
         },
@@ -1577,6 +1585,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             id: None,
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -1584,6 +1593,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             id: Some("renamed".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -1591,6 +1601,7 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             id: Some("zz-first".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: false,
             program_audio: true,
         },
@@ -1969,6 +1980,7 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
             id: Some("a".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -1976,6 +1988,7 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
             id: Some("b".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -2107,6 +2120,8 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             sent: Arc::new(AtomicU64::new(0)),
             stores: Arc::new(move |id: &str| (id == "cam").then(|| Arc::clone(&lookup))),
             preview_selection: None,
+            halved: Arc::new(AtomicBool::new(false)),
+            sizing: None,
         },
         open,
     )
@@ -4119,6 +4134,7 @@ fn the_plan_counts_a_different_format_as_plus_one() {
             id: Some("tall".into()),
             settings: 0,
             feed_format: Some(vertical_format()),
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -4126,6 +4142,7 @@ fn the_plan_counts_a_different_format_as_plus_one() {
             id: Some("wide".into()),
             settings: 0,
             feed_format: None,
+            base_format: None,
             routable: true,
             program_audio: true,
         },
@@ -4190,6 +4207,126 @@ fn format_keyed_feeds_are_bounded_by_the_encoder_cap() {
     assert_eq!(x.r.dynamic_keys().len(), MAX);
 }
 
+/// #342 B2 (+ review M1/M2/M4): the plan's §12.4 path through the adapter,
+/// decided by the aux thread's own pass-through predicate. Program is P1
+/// (the base key); Clean is P2 on a canvas-sized base key and P3 on a
+/// formatted one; a source or the PVW source whose newest tile passes
+/// through at the output's feed format is P2 — a canvas-sized cover output
+/// included when the tile is canvas-sized — and any other tile is P3 with one
+/// convert; once a (picture, format) key is live a second output at that
+/// format is P1.
+#[test]
+fn plan_slot_reports_the_cheapest_path() {
+    use multiview_control::output_routing::{OutputRouting, PlanPath, RoutedFeed};
+    let mut x = harness_with(4, 6, None, true);
+    // The canvas below is 16x16; harness tiles are 16x16.
+    let canvas_cover = crate::routing_aux::AuxFormat::new(
+        16,
+        16,
+        multiview_config::OutputFit::new(
+            multiview_config::OutputFitMode::Cover,
+            multiview_config::Anchor::Center,
+        ),
+    );
+    x.r.cfg.formats = vec![
+        None,
+        Some(vertical_format()),
+        Some(vertical_format()),
+        Some(canvas_cover),
+    ];
+    let (s1, s2) = (Arc::clone(&x.store), Arc::clone(&x.store2));
+    let stores: crate::routing_aux::StoreLookup = Arc::new(move |id: &str| match id {
+        "cam" => Some(Arc::clone(&s1)),
+        "cam2" => Some(Arc::clone(&s2)),
+        _ => None,
+    });
+    let canvas = crate::routing_aux::AuxCanvas {
+        width: 16,
+        height: 16,
+        color: CanvasColor::default().output_tag(),
+    };
+    let pvw = Arc::new(SwapCell::new(Some(Arc::<str>::from("cam"))));
+    let run = |id: &str, feed_format, base_format| RunOutput {
+        id: Some(id.into()),
+        settings: 0,
+        feed_format,
+        base_format,
+        routable: true,
+        program_audio: true,
+    };
+    let h =
+        x.h.clone()
+            .with_outputs(vec![
+                run("wide", None, None),
+                run("tall", Some(vertical_format()), Some(vertical_format())),
+                run("tall2", Some(vertical_format()), Some(vertical_format())),
+                // Canvas-sized with a cover fit: its base key is the canvas.
+                run("cover", Some(canvas_cover), None),
+            ])
+            .with_pictures(crate::output_routing::PlanPictures {
+                stores,
+                canvas,
+                preview_selection: Some(Arc::clone(&pvw)),
+            });
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let cam = RoutedFeed::Source("cam".into());
+    let cam2 = RoutedFeed::Source("cam2".into());
+    for t in 0..5 {
+        x.tick(t);
+    }
+    // cam2's newest tile is 8x16: not the canvas size.
+    x.store2.publish(
+        Nv12Image::solid(8, 16, 16, 128, 128, CanvasColor::default().output_tag()).unwrap(),
+        pts(5),
+    );
+    let path = |output: &str, feed: &RoutedFeed| {
+        let p = adapter.plan_slot(output, feed).unwrap();
+        (p.path, p.converts, p.cost.needs_encoder)
+    };
+    assert_eq!(path("wide", &RoutedFeed::Program), (PlanPath::P1, 0, false));
+    assert_eq!(path("wide", &cam), (PlanPath::P2, 0, true));
+    assert_eq!(path("wide", &cam2), (PlanPath::P3, 1, true), "letterboxed");
+    // M4: a canvas-sized cover output. A canvas-sized tile passes through
+    // (any fit of an equal-size picture is the identity), another is P3.
+    assert_eq!(path("cover", &cam), (PlanPath::P2, 0, true));
+    assert_eq!(path("cover", &cam2), (PlanPath::P3, 1, true), "cover crop");
+    // M2: PVW at a matching size is P2 whatever the feed format; at a
+    // non-matching format P3.
+    assert_eq!(path("wide", &RoutedFeed::Preview), (PlanPath::P2, 0, true));
+    assert_eq!(path("cover", &RoutedFeed::Preview), (PlanPath::P2, 0, true));
+    assert_eq!(path("tall", &RoutedFeed::Preview), (PlanPath::P3, 1, true));
+    // Clean: the canvas picture; converted only on a formatted base key.
+    assert_eq!(path("cover", &RoutedFeed::Clean), (PlanPath::P2, 0, true));
+    assert_eq!(path("tall", &RoutedFeed::Clean), (PlanPath::P3, 1, true));
+    // #368 merge: a routed layout is composed at the CANVAS size (never per
+    // output format), so it is P2 exactly where Program/Clean are: a
+    // canvas-sized base key; a formatted base key converts it (P3).
+    let layout = RoutedFeed::Layout("L".into());
+    assert_eq!(path("wide", &layout), (PlanPath::P2, 0, true));
+    assert_eq!(path("cover", &layout), (PlanPath::P2, 0, true));
+    assert_eq!(path("tall", &layout), (PlanPath::P3, 1, true));
+    assert_eq!(path("tall", &cam), (PlanPath::P3, 1, true));
+    // Take `tall` to the source: its (src:cam@format, settings) key goes live.
+    x.h.try_take(take("t", 1, src())).unwrap();
+    let mut now = take_until_applied(&mut x, &["t"], 6);
+    assert_eq!(path("tall2", &cam), (PlanPath::P1, 0, false));
+    // Review M5: the readback agrees with the plan. `tall`, carried by its
+    // live (picture, format, settings) key, reads back P1 (not P3); a second
+    // output taken onto that live key reads back P1 too.
+    assert_eq!(adapter.current_path("tall"), Some(PlanPath::P1));
+    for _ in 0..FORCE_FLOOR_TICKS {
+        x.tick(now);
+        now += 1;
+    }
+    x.h.try_take(take("t2", 2, src())).unwrap();
+    take_until_applied(&mut x, &["t2"], now);
+    assert_eq!(adapter.current_path("tall2"), Some(PlanPath::P1));
+    // An output still on Program reads back P1 (its base key).
+    assert_eq!(adapter.current_path("wide"), Some(PlanPath::P1));
+}
+
 fn layout_bus(id: &str) -> PictureBus {
     use multiview_core::layout::{Canvas, Cell, Layout};
     PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::new(
@@ -4211,6 +4348,8 @@ fn layout_bus(id: &str) -> PictureBus {
                 }],
             },
             slates: vec![multiview_config::FailoverSlate::Black],
+            audio: multiview_config::LayoutAudio::default(),
+            revision: crate::output_routing::next_layout_revision(),
         },
     )))
 }
@@ -4421,5 +4560,646 @@ fn a_re_take_of_an_edited_layout_swaps_the_body_and_requests_an_idr() {
         x.r.last_forced.get(&x.r.dynamic[0].key).copied(),
         Some(t + 1),
         "an IDR is requested on the layout's encoder"
+    );
+}
+
+/// A layout taken onto output 1, ticked until applied. Returns the tick.
+fn on_layout(x: &mut Harness, bus: &PictureBus) -> u64 {
+    let mut t = 0;
+    x.tick_layouts(t, std::slice::from_ref(bus));
+    x.h.try_take(take("one", 1, bus.clone())).unwrap();
+    while !x
+        .outcomes
+        .try_iter()
+        .any(|o| o.outcome == TakeResult::Applied)
+    {
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(bus));
+        assert!(t < 60);
+    }
+    t
+}
+
+/// PR 2 (#306): an edit of a stored layout reaches the routed canvas live,
+/// with no take: the body swaps, the output stays on the layout, an IDR is
+/// requested, the decoders' aux sizing follows the new cells, and no take
+/// outcome is emitted.
+#[test]
+fn a_live_layout_edit_swaps_the_body_without_a_take() {
+    let mut x = harness(2, 6, None);
+    let sizing = crate::display_size::aux_sizing_slot();
+    x.r.aux.sizing = Some(Arc::clone(&sizing));
+    let first = layout_bus("L1");
+    let mut t = on_layout(&mut x, &first);
+    assert_eq!(sizing.load().len(), 1, "the routed cell sizes its decode");
+    for _ in 0..FORCE_FLOOR_TICKS {
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(&first));
+    }
+    let edited = layout_bus("L1");
+    let PictureBus::Layout(new) = &edited else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(new.clone()))
+        .unwrap();
+    t += 1;
+    x.tick_layouts(t, std::slice::from_ref(&edited));
+    let body =
+        x.r.aux
+            .feeds
+            .load()
+            .iter()
+            .find_map(|f| match &f.bus {
+                PictureBus::Layout(l) => Some(Arc::clone(&l.body)),
+                _ => None,
+            })
+            .expect("the layout still composes");
+    assert!(Arc::ptr_eq(&body, &new.body), "the edit is live");
+    assert_eq!(
+        *sizing.load(),
+        new.body.layout.cells,
+        "the decoders size for the edited cells"
+    );
+    assert_eq!(
+        x.r.last_forced.get(&x.r.dynamic[0].key).copied(),
+        Some(t + 1),
+        "an IDR is requested on the layout's encoder"
+    );
+    assert!(
+        x.outcomes.try_iter().next().is_none(),
+        "a live edit is not a take"
+    );
+    assert_eq!(x.h.snapshot().outputs[1].bus, "aux:L1");
+    // An edit of a layout nothing routes is a no-op.
+    let PictureBus::Layout(other) = layout_bus("Other") else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(other))
+        .unwrap();
+    t += 1;
+    x.tick_layouts(t, std::slice::from_ref(&edited));
+    assert_eq!(x.h.snapshot().aux_canvases, vec!["aux:L1".to_owned()]);
+}
+
+/// PR 2 (#306): a deleted (or no longer routable) layout moves every output
+/// on it back to Program at a RAP, refuses a take still priming onto it, and
+/// frees its canvas and its aux sizing.
+#[test]
+fn a_deleted_layout_falls_its_outputs_back_to_program() {
+    let mut x = harness(3, 6, None);
+    let sizing = crate::display_size::aux_sizing_slot();
+    x.r.aux.sizing = Some(Arc::clone(&sizing));
+    let l1 = layout_bus("L1");
+    let mut t = on_layout(&mut x, &l1);
+    // A second output starts a take onto L1 but has not landed yet: the
+    // canvas is not published this tick, so it stays priming.
+    x.h.try_take(take("two", 2, l1.clone())).unwrap();
+    t += 1;
+    x.tick(t);
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Removed {
+        id: "L1".to_owned(),
+        revision: crate::output_routing::next_layout_revision(),
+    })
+    .unwrap();
+    t += 1;
+    x.tick(t);
+    let mut results = x.results();
+    results.sort_by_key(|r| format!("{r:?}"));
+    assert_eq!(
+        results,
+        vec![
+            TakeResult::Fallback(FallbackReason::AuxFailed),
+            TakeResult::Refused(RefuseReason::Unroutable),
+        ],
+    );
+    for _ in 0..10 {
+        t += 1;
+        x.tick(t);
+    }
+    assert_eq!(x.d.binding_video_key(1), Some(0), "back on Program");
+    assert_eq!(x.h.snapshot().outputs[1].bus, "program");
+    // Its encoder lingers like any unused key, then closes: the canvas and
+    // its aux sizing go with it.
+    for _ in 0..LINGER_TICKS + 5 {
+        t += 1;
+        x.tick(t);
+    }
+    assert_eq!(x.h.snapshot().aux_canvases, Vec::<String>::new());
+    assert_eq!(sizing.load().len(), 0, "no routed cells left to size for");
+    assert_eq!(
+        x.windows_of(0).len(),
+        usize::try_from(t).unwrap(),
+        "Program never missed a window"
+    );
+}
+
+/// PR 2 (#306, §7): while the aux cadence is halved, a routed picture one
+/// tick old is still fresh and a skipped tick is not a hold, so a layout
+/// composed every second tick neither degrades nor falls back.
+#[test]
+fn a_halved_aux_cadence_neither_degrades_nor_falls_back() {
+    let mut x = harness(2, 6, None);
+    let l1 = layout_bus("L1");
+    let mut t = on_layout(&mut x, &l1);
+    x.r.aux.halved.store(true, Ordering::Relaxed);
+    for _ in 0..FALLBACK_AFTER_TICKS * 2 {
+        t += 1;
+        if t % 2 == 0 {
+            x.tick_layouts(t, std::slice::from_ref(&l1));
+        } else {
+            x.tick(t);
+        }
+        assert!(!x.h.snapshot().outputs[1].degraded, "tick {t}");
+    }
+    assert!(x.outcomes.try_iter().next().is_none(), "no fallback");
+    assert_eq!(x.h.snapshot().outputs[1].bus, "aux:L1");
+    assert!(x.h.snapshot().aux_halved);
+}
+
+/// #369 review (lens 1 #1/#2): a take queued with a body older than a later
+/// edit or removal of its layout is refused, never adopted: it can neither
+/// revert the edit nor air a deleted layout.
+#[test]
+fn a_take_carrying_a_stale_layout_body_is_refused() {
+    let mut x = harness(3, 6, None);
+    let old = layout_bus("L1");
+    let mut t = on_layout(&mut x, &old);
+    let edited = layout_bus("L1");
+    let PictureBus::Layout(new) = &edited else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(new.clone()))
+        .unwrap();
+    // Output 2's take was resolved before the edit (it carries `old`).
+    x.h.try_take(take("stale", 2, old.clone())).unwrap();
+    t += 1;
+    x.tick_layouts(t, std::slice::from_ref(&edited));
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Unroutable)]
+    );
+    let composing =
+        x.r.aux
+            .feeds
+            .load()
+            .iter()
+            .find_map(|f| match &f.bus {
+                PictureBus::Layout(l) => Some(Arc::clone(&l.body)),
+                _ => None,
+            })
+            .unwrap();
+    assert!(Arc::ptr_eq(&composing, &new.body), "the edit stands");
+    // A removal, then a take queued with the pre-removal body: refused.
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Removed {
+        id: "L1".to_owned(),
+        revision: crate::output_routing::next_layout_revision(),
+    })
+    .unwrap();
+    x.h.try_take(take("after-delete", 2, edited.clone()))
+        .unwrap();
+    t += 1;
+    x.tick(t);
+    let results = x.results();
+    assert!(
+        results.contains(&TakeResult::Refused(RefuseReason::Unroutable)),
+        "{results:?}"
+    );
+    assert_eq!(
+        x.d.binding_video_key(2),
+        Some(0),
+        "never on the deleted layout"
+    );
+    // A layout re-created later (a newer resolution) is not stale: it is
+    // admitted (whatever its encoder then does).
+    let PictureBus::Layout(recreated) = layout_bus("L1") else {
+        panic!("a layout bus");
+    };
+    assert!(!x.r.layout_take_is_stale(&recreated));
+    assert!(x.r.layout_take_is_stale(new));
+}
+
+/// #369 review (lens 1 #4, lens 3 #1): a halved cadence never hides a
+/// stalled canvas: with no new picture, the layout still falls back.
+#[test]
+fn a_stalled_canvas_falls_back_even_while_halved() {
+    let mut x = harness(2, 6, None);
+    let l1 = layout_bus("L1");
+    let mut t = on_layout(&mut x, &l1);
+    x.r.aux.halved.store(true, Ordering::Relaxed);
+    let mut fell = false;
+    for _ in 0..FALLBACK_AFTER_TICKS + 10 {
+        t += 1;
+        x.tick(t); // nothing composes
+        if x.results()
+            .contains(&TakeResult::Fallback(FallbackReason::AuxFailed))
+        {
+            fell = true;
+            break;
+        }
+    }
+    assert!(fell, "a stalled canvas falls back while halved");
+}
+
+/// #369 review (lens 3 #3): a burst of changes is coalesced per layout,
+/// newest revision first, and never loses the last one.
+#[test]
+fn layout_changes_coalesce_and_keep_the_newest() {
+    let mut x = harness(2, 6, None);
+    let first = layout_bus("L1");
+    let mut t = on_layout(&mut x, &first);
+    let mut last = None;
+    for _ in 0..100 {
+        let PictureBus::Layout(next) = layout_bus("L1") else {
+            panic!("a layout bus");
+        };
+        x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(next.clone()))
+            .unwrap();
+        last = Some(next);
+    }
+    for i in 0..100 {
+        x.h.try_layout_change(crate::output_routing::LayoutChange::Removed {
+            id: format!("other-{i}"),
+            revision: crate::output_routing::next_layout_revision(),
+        })
+        .unwrap();
+    }
+    // The inbox is bounded; the composing layout's change survives the
+    // flood, and a tick applies at most LAYOUT_CHANGES_PER_TICK changes.
+    let inbox = |x: &Harness| x.r.layout_changes.lock().unwrap().changes.len();
+    assert!(inbox(&x) <= crate::output_routing::LAYOUT_INBOX);
+    while inbox(&x) > 0 {
+        let before = inbox(&x);
+        t += 1;
+        x.tick_layouts(t, std::slice::from_ref(&first));
+        assert!(before - inbox(&x) <= crate::output_routing::LAYOUT_CHANGES_PER_TICK);
+        assert!(before > inbox(&x), "the inbox drains");
+    }
+    let composing =
+        x.r.aux
+            .feeds
+            .load()
+            .iter()
+            .find_map(|f| match &f.bus {
+                PictureBus::Layout(l) => Some(Arc::clone(&l.body)),
+                _ => None,
+            })
+            .unwrap();
+    assert!(Arc::ptr_eq(&composing, &last.unwrap().body));
+    assert!(x.r.layout_states.len() <= crate::output_routing::LAYOUT_STATES);
+    // States were forgotten: a take older than any forgotten state, onto a
+    // layout with no remembered state, fails closed; a newer one does not.
+    assert!(x.r.layout_states_forgotten > 0);
+    let mut old = crate::aux_layout::RoutedLayout::clone(&first_body(&first));
+    old.id = "other-0".to_owned();
+    old.revision = 1;
+    assert!(x
+        .r
+        .layout_take_is_stale(&crate::routing_aux::LayoutRef::new(Arc::new(old))));
+    let PictureBus::Layout(fresh) = layout_bus("other-0") else {
+        panic!("a layout bus");
+    };
+    assert!(!x.r.layout_take_is_stale(&fresh));
+}
+
+fn first_body(bus: &PictureBus) -> Arc<crate::aux_layout::RoutedLayout> {
+    let PictureBus::Layout(layout) = bus else {
+        panic!("a layout bus");
+    };
+    Arc::clone(&layout.body)
+}
+
+/// A layout bus with `audio` on the test canvas (one cell of `cam`).
+fn layout_bus_with_audio(id: &str, audio: multiview_config::LayoutAudio) -> PictureBus {
+    let PictureBus::Layout(base) = layout_bus(id) else {
+        panic!("a layout bus");
+    };
+    let mut body = crate::aux_layout::RoutedLayout::clone(&base.body);
+    body.audio = audio;
+    body.revision = crate::output_routing::next_layout_revision();
+    PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::new(body)))
+}
+
+impl AudioHarness {
+    /// Publish every active layout slot for tick `t` (the aux thread's job).
+    fn compose_layouts(&self, t: u64) {
+        for feed in self.r.aux.feeds.load().iter() {
+            if matches!(feed.bus, PictureBus::Layout(_)) {
+                feed.slot
+                    .latest
+                    .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                        tick: t,
+                        generation: 1,
+                        frame: canvas(),
+                    })));
+            }
+        }
+    }
+}
+
+/// #369 review (lens 1): an output whose audio follows a routed layout
+/// carries the layout's `audio` attribute, and a live edit of that attribute
+/// is followed on air, also when the edit lands while the take's move is in
+/// flight (the audio follows the body that landed).
+#[test]
+fn layout_audio_follows_live_edits_also_mid_move() {
+    use multiview_config::LayoutAudio;
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(2, CADENCE, open);
+    let silent = layout_bus_with_audio("L", LayoutAudio::None);
+    let mut t = x.run(0, 3);
+    x.h.try_take(OutputTake {
+        audio: Some(AudioChoice::Follow),
+        ..take("to-layout", 1, silent)
+    })
+    .unwrap();
+    // Edit as soon as the take is moving (the move's audio followed `none`).
+    let mut edited = false;
+    for _ in 0..60 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+        let moving =
+            x.r.outputs
+                .get(1)
+                .and_then(|o| o.pending.as_ref())
+                .is_some_and(|p| matches!(p.phase, Phase::Moving(_)));
+        if moving && !edited {
+            let PictureBus::Layout(next) =
+                layout_bus_with_audio("L", LayoutAudio::Source("bars".into()))
+            else {
+                panic!("a layout bus");
+            };
+            x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(next))
+                .unwrap();
+            edited = true;
+        }
+        if x.outcomes
+            .try_iter()
+            .any(|o| o.operation_id == "to-layout" && o.outcome == TakeResult::Applied)
+        {
+            break;
+        }
+    }
+    assert!(edited, "the take reached its move");
+    for _ in 0..40 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+    }
+    let view = &x.h.snapshot().outputs[1];
+    assert_eq!(view.bus, "aux:L");
+    assert_eq!(view.audio, "src:bars", "the edited attribute is on air");
+    // A later live edit to `none` is followed on air too.
+    let PictureBus::Layout(silent_again) = layout_bus_with_audio("L", LayoutAudio::None) else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(silent_again))
+        .unwrap();
+    for _ in 0..40 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(x.h.snapshot().outputs[1].audio, "none");
+}
+
+/// #369 review round 3 (lens 1): an output on an edited layout whose pending
+/// take to another bus is refused keeps the layout's picture AND its edited
+/// audio attribute (not the audio captured before the edit).
+#[test]
+fn a_refused_move_off_an_edited_layout_follows_its_current_audio() {
+    use multiview_config::LayoutAudio;
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(2, CADENCE, open);
+    let mut t = x.run(0, 3);
+    x.h.try_take(OutputTake {
+        audio: Some(AudioChoice::Follow),
+        ..take(
+            "to-layout",
+            1,
+            layout_bus_with_audio("L", LayoutAudio::None),
+        )
+    })
+    .unwrap();
+    for _ in 0..60 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+        if x.outcomes
+            .try_iter()
+            .any(|o| o.operation_id == "to-layout" && o.outcome == TakeResult::Applied)
+        {
+            break;
+        }
+    }
+    for _ in 0..20 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(x.h.snapshot().outputs[1].audio, "none");
+    // A take to a source that is never fresh: pending while the layout is
+    // edited, then refused.
+    x.h.try_take(take("nowhere", 1, PictureBus::Source("nowhere".to_owned())))
+        .unwrap();
+    x.compose_layouts(t);
+    x.tick(t);
+    t += 1;
+    let PictureBus::Layout(edited) = layout_bus_with_audio("L", LayoutAudio::Source("bars".into()))
+    else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(edited))
+        .unwrap();
+    let mut refused = false;
+    for _ in 0..TAKE_PRIME_DEADLINE_TICKS + 40 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+        refused |= x
+            .outcomes
+            .try_iter()
+            .any(|o| o.operation_id == "nowhere" && matches!(o.outcome, TakeResult::Refused(_)));
+    }
+    assert!(refused);
+    let view = &x.h.snapshot().outputs[1];
+    assert_eq!(view.bus, "aux:L");
+    assert_eq!(view.audio, "src:bars", "the edited attribute is on air");
+}
+
+/// #369 review round 4: beyond the per-tick budget, a change for a composing
+/// layout is applied first, and a take older than a change still waiting in
+/// the inbox is refused.
+#[test]
+fn deferred_layout_changes_still_gate_stale_takes_and_composing_goes_first() {
+    let mut x = harness(3, 6, None);
+    let first = layout_bus("L1");
+    let mut t = on_layout(&mut x, &first);
+    // A take for layout "Late", resolved before its deletion.
+    let late = layout_bus("Late");
+    // Many unrelated changes, then L1's edit and Late's removal (newest).
+    for i in 0..20 {
+        x.h.try_layout_change(crate::output_routing::LayoutChange::Removed {
+            id: format!("other-{i}"),
+            revision: crate::output_routing::next_layout_revision(),
+        })
+        .unwrap();
+    }
+    let PictureBus::Layout(edit) = layout_bus("L1") else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(edit.clone()))
+        .unwrap();
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Removed {
+        id: "Late".to_owned(),
+        revision: crate::output_routing::next_layout_revision(),
+    })
+    .unwrap();
+    x.h.try_take(take("late", 2, late)).unwrap();
+    t += 1;
+    x.tick_layouts(t, std::slice::from_ref(&first));
+    // The composing layout's edit went first.
+    let composing = first_body(
+        &x.r.aux
+            .feeds
+            .load()
+            .iter()
+            .find(|f| matches!(f.bus, PictureBus::Layout(_)))
+            .unwrap()
+            .bus,
+    );
+    assert!(Arc::ptr_eq(&composing, &edit.body));
+    // Late's removal is still waiting, yet the stale take is refused.
+    assert!(x
+        .r
+        .layout_changes
+        .lock()
+        .unwrap()
+        .changes
+        .contains_key("Late"));
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Unroutable)]
+    );
+}
+
+/// #369 review round 3 (lens 1): the audio of an output on an edited layout
+/// whose pending move (already Moving) to another bus is superseded follows
+/// the layout's current body.
+#[test]
+fn a_superseded_moving_take_off_an_edited_layout_follows_its_current_audio() {
+    use multiview_config::LayoutAudio;
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(2, CADENCE, open);
+    let mut t = x.run(0, 3);
+    let silent = layout_bus_with_audio("L", LayoutAudio::None);
+    x.h.try_take(OutputTake {
+        audio: Some(AudioChoice::Follow),
+        ..take("to-layout", 1, silent.clone())
+    })
+    .unwrap();
+    for _ in 0..60 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+        if x.outcomes
+            .try_iter()
+            .any(|o| o.operation_id == "to-layout" && o.outcome == TakeResult::Applied)
+        {
+            break;
+        }
+    }
+    for _ in 0..20 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+    }
+    // A take to the source: wait until its move is in flight.
+    x.h.try_take(take("to-src", 1, src())).unwrap();
+    let mut moving = false;
+    for _ in 0..OPEN_DEADLINE_TICKS {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+        if matches!(
+            x.r.outputs[1].pending.as_ref().map(|p| p.phase),
+            Some(Phase::Moving(_))
+        ) {
+            moving = true;
+            break;
+        }
+    }
+    assert!(moving, "the move is in flight");
+    // Edit the layout's audio, then supersede the move by a re-take of the
+    // layout (same body as now on air: no stale refusal, +0 move).
+    let PictureBus::Layout(edited) = layout_bus_with_audio("L", LayoutAudio::Source("bars".into()))
+    else {
+        panic!("a layout bus");
+    };
+    x.h.try_layout_change(crate::output_routing::LayoutChange::Edited(edited.clone()))
+        .unwrap();
+    x.h.try_take(take("back", 1, PictureBus::Layout(edited)))
+        .unwrap();
+    for _ in 0..40 {
+        x.compose_layouts(t);
+        x.tick(t);
+        t += 1;
+    }
+    let superseded: Vec<TakeResult> = x
+        .outcomes
+        .try_iter()
+        .chain(x.others.drain(..))
+        .filter(|o| o.operation_id == "to-src")
+        .map(|o| o.outcome)
+        .collect();
+    assert_eq!(superseded, vec![TakeResult::Superseded]);
+    let view = &x.h.snapshot().outputs[1];
+    assert_eq!(view.bus, "aux:L");
+    assert_eq!(view.audio, "src:bars", "the edited attribute is on air");
+}
+
+/// #369 review round 5 (lens 2): a forgotten change fails closed even when
+/// the router remembers an OLDER state of the same layout.
+#[test]
+fn a_forgotten_change_fails_closed_over_an_older_known_state() {
+    let mut x = harness(2, 6, None);
+    let PictureBus::Layout(known) = layout_bus("L") else {
+        panic!("a layout bus");
+    };
+    x.r.remember_state(crate::output_routing::LayoutChange::Edited(known.clone()));
+    let PictureBus::Layout(take_body) = layout_bus("L") else {
+        panic!("a layout bus");
+    };
+    assert!(!x.r.layout_take_is_stale(&take_body));
+    // A newer removal of L was evicted before the router applied it.
+    x.r.layout_states_forgotten = crate::output_routing::next_layout_revision();
+    assert!(x.r.layout_take_is_stale(&take_body), "fails closed");
+    let PictureBus::Layout(later) = layout_bus("L") else {
+        panic!("a layout bus");
+    };
+    assert!(
+        !x.r.layout_take_is_stale(&later),
+        "a later resolution passes"
     );
 }

@@ -276,6 +276,8 @@ pub struct RoutingAuxHandle {
     pub failed: Arc<AtomicBool>,
     /// The thread, for an optional bounded join at teardown (never on the consumer).
     pub join: Option<JoinHandle<()>>,
+    /// Raised while the aux cadence is halved (§7 back-off).
+    pub halved: Arc<AtomicBool>,
 }
 
 /// Everything the aux thread reads.
@@ -292,6 +294,92 @@ pub struct AuxInputs {
     pub canvas: AuxCanvas,
     /// The canvas a routed layout composes onto (size, colour, background).
     pub layout_canvas: crate::aux_layout::LayoutCanvasSpec,
+    /// Program's lateness, for the §7 back-off (filled once Program runs;
+    /// `None` in tests that do not exercise it).
+    pub program_lateness: Option<ProgramLateness>,
+    /// The output tick period in nanoseconds (the back-off threshold is half).
+    pub tick_ns: u64,
+}
+
+/// Program's lateness histogram, published once Program runs (the slot the
+/// pipeline fills; `None` inside before that).
+pub type ProgramLateness = Arc<SwapCell<Option<Arc<multiview_engine::lateness::TickLateness>>>>;
+
+/// Program-lateness window of the §7 back-off.
+pub const BACKOFF_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// ADR-0108 §7 "never degrade Program": when Program's tick lateness p99
+/// over a [`BACKOFF_WINDOW`] exceeds half the tick, the aux thread halves its
+/// cadence (composes even ticks only; picture buses hold) until a window
+/// recovers. Reads Program's wait-free histogram only; never touches Program.
+#[derive(Debug)]
+pub struct BackOff {
+    tick_ns: u64,
+    window: Option<(
+        std::time::Instant,
+        multiview_engine::lateness::LatenessSnapshot,
+    )>,
+    halved: bool,
+}
+
+impl BackOff {
+    /// A back-off for a tick of `tick_ns` nanoseconds (0 disables it).
+    #[must_use]
+    pub const fn new(tick_ns: u64) -> Self {
+        Self {
+            tick_ns,
+            window: None,
+            halved: false,
+        }
+    }
+
+    /// Whether the cadence is halved now.
+    #[must_use]
+    pub const fn halved(&self) -> bool {
+        self.halved
+    }
+
+    /// Feed the cumulative lateness `now_counts` at `now`; returns whether
+    /// the cadence is halved. A window decides only once it is
+    /// [`BACKOFF_WINDOW`] long and holds at least one tick.
+    pub fn observe(
+        &mut self,
+        now: std::time::Instant,
+        now_counts: multiview_engine::lateness::LatenessSnapshot,
+    ) -> bool {
+        let Some((start, earlier)) = self.window else {
+            self.window = Some((now, now_counts));
+            return self.halved;
+        };
+        if now.saturating_duration_since(start) < BACKOFF_WINDOW {
+            return self.halved;
+        }
+        let window = now_counts.since(&earlier);
+        if let Some(p99) = window.fine_quantile_upper_ns(990) {
+            let late = self.tick_ns > 0 && p99 > self.tick_ns / 2;
+            if late != self.halved {
+                if late {
+                    tracing::warn!(
+                        p99_ns = p99,
+                        "routing-aux: Program is late; routed pictures compose every second tick"
+                    );
+                } else {
+                    tracing::info!(
+                        "routing-aux: Program recovered; routed pictures compose every tick"
+                    );
+                }
+            }
+            self.halved = late;
+        }
+        self.window = Some((now, now_counts));
+        self.halved
+    }
+
+    /// Whether tick `index` is skipped (halved cadence: odd ticks).
+    #[must_use]
+    pub const fn skips(&self, index: u64) -> bool {
+        self.halved && index % 2 == 1
+    }
 }
 
 /// Spawn the `routing-aux` thread.
@@ -301,16 +389,19 @@ pub struct AuxInputs {
 pub fn spawn_routing_aux(inputs: AuxInputs) -> std::io::Result<RoutingAuxHandle> {
     let failed = Arc::new(AtomicBool::new(false));
     let thread_failed = Arc::clone(&failed);
+    let halved = Arc::new(AtomicBool::new(false));
+    let thread_halved = Arc::clone(&halved);
     let join = std::thread::Builder::new()
         .name("routing-aux".to_owned())
         .spawn(move || {
             let _guard = FailGuard(Arc::clone(&thread_failed));
             lower_priority();
-            run(&inputs, &thread_failed);
+            run(&inputs, &thread_failed, &thread_halved);
         })?;
     Ok(RoutingAuxHandle {
         failed,
         join: Some(join),
+        halved,
     })
 }
 
@@ -342,9 +433,21 @@ fn lower_priority() {
     tracing::info!("routing-aux: runs at normal priority (no priority control in this build)");
 }
 
-fn run(inputs: &AuxInputs, failed: &AtomicBool) {
+fn run(inputs: &AuxInputs, failed: &AtomicBool, halved: &AtomicBool) {
     let mut state = AuxState::default();
+    let mut backoff = BackOff::new(inputs.tick_ns);
     while let Ok(tick) = inputs.rx.recv() {
+        if let Some(metrics) = inputs
+            .program_lateness
+            .as_ref()
+            .and_then(|slot| slot.load())
+        {
+            let now = backoff.observe(std::time::Instant::now(), metrics.snapshot());
+            halved.store(now, Ordering::Relaxed);
+        }
+        if backoff.skips(tick.index) {
+            continue; // halved cadence: every routed picture holds this tick
+        }
         let body = std::panic::catch_unwind(AssertUnwindSafe(|| state.tick(inputs, tick)));
         if body.is_err() {
             failed.store(true, Ordering::Release);
@@ -488,20 +591,13 @@ impl FeedState {
             }
             return None;
         }
-        let Some(format) = format else {
-            if is_identity(tile, canvas) {
-                return Some(Arc::clone(tile));
-            }
-            return self.ring.letterbox(tile, canvas);
-        };
-        // Identity at the output's format: same size, opaque, same tag.
-        if tile.width() == format.width
-            && tile.height() == format.height
-            && tile.alpha_plane().is_none()
-        {
+        if passes_through(tile, canvas, format) {
             return Some(Arc::clone(tile));
         }
-        self.ring.fit(tile, canvas, format)
+        match format {
+            None => self.ring.letterbox(tile, canvas),
+            Some(format) => self.ring.fit(tile, canvas, format),
+        }
     }
 }
 
@@ -514,6 +610,25 @@ pub fn is_identity(tile: &Nv12Image, canvas: AuxCanvas) -> bool {
         && tile.height() == canvas.height
         && tile.alpha_plane().is_none()
         && tile.color() == canvas.color
+}
+
+/// Whether the aux thread passes `tile` to a feed at `format` as the SAME
+/// `Arc` (no copy, no convert): §12.4 P2. `None` = the canvas, the §2.4
+/// identity rule; `Some(format)`: the tile is exactly the format's size,
+/// opaque and tagged like the canvas — any fit of an equal-size picture is
+/// the identity. The one predicate the aux compose and the plan share
+/// (#342 review M1/M2), so they cannot drift.
+#[must_use]
+pub fn passes_through(tile: &Nv12Image, canvas: AuxCanvas, format: Option<AuxFormat>) -> bool {
+    match format {
+        None => is_identity(tile, canvas),
+        Some(f) => {
+            tile.width() == f.width
+                && tile.height() == f.height
+                && tile.alpha_plane().is_none()
+                && tile.color() == canvas.color
+        }
+    }
 }
 
 /// The centred, aspect-preserving rectangle for `(sw, sh)` inside the canvas,
@@ -800,6 +915,8 @@ mod tests {
                 color: CanvasColor::default(),
                 background: [16, 128, 128],
             },
+            program_lateness: None,
+            tick_ns: 0,
         })
         .unwrap();
         (tx, handle)
@@ -1047,5 +1164,38 @@ codec = "h264"
         blit_region(&tile, crop, 1920, &mut y, &mut uv, dst);
         assert!(out.y_plane().eq(y.as_slice()), "luma parity");
         assert!(out.uv_plane().eq(uv.as_slice()), "chroma parity");
+    }
+
+    /// PR 2 (#306, §7): Program's p99 lateness over a 10 s window above half
+    /// the tick halves the aux cadence (odd ticks skipped); a window under
+    /// half restores it. A window shorter than 10 s never decides.
+    #[test]
+    fn the_back_off_halves_on_late_program_windows_and_recovers() {
+        let tick_ns = 33_366_667; // 29.97
+        let lateness = multiview_engine::lateness::TickLateness::shared();
+        let mut backoff = BackOff::new(tick_ns);
+        let t0 = Instant::now();
+        assert!(!backoff.observe(t0, lateness.snapshot()));
+        // 100 ticks at 20 ms late (> 16.7 ms = half the tick), 5 s in: too
+        // early to decide.
+        for _ in 0..100 {
+            lateness.record(20_000_000, 0);
+        }
+        assert!(!backoff.observe(t0 + Duration::from_secs(5), lateness.snapshot()));
+        assert!(backoff.observe(t0 + Duration::from_secs(10), lateness.snapshot()));
+        assert!(backoff.skips(1) && !backoff.skips(2));
+        // A window on time recovers.
+        for _ in 0..300 {
+            lateness.record(1_000_000, 0);
+        }
+        assert!(!backoff.observe(t0 + Duration::from_secs(20), lateness.snapshot()));
+        assert!(!backoff.skips(1));
+        // A disabled back-off (no tick) never halves.
+        let mut off = BackOff::new(0);
+        off.observe(t0, multiview_engine::lateness::LatenessSnapshot::default());
+        for _ in 0..100 {
+            lateness.record(60_000_000, 0);
+        }
+        assert!(!off.observe(t0 + Duration::from_secs(11), lateness.snapshot()));
     }
 }

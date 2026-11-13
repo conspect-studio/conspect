@@ -100,7 +100,8 @@ const ROUTING_KIND: &str = "crosspoint";
         responses(
             (status = 200, description = "A crosspoint: the #11 classification (class1/reset_lite/class2 + coerced). An output target (`target.kind = output`): an `OutputPlan` with cost and refusals.", body = RoutingPlanResponseDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 403, description = "Not authorized to plan this crosspoint.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to plan this crosspoint (an output target: object AND output axis).", body = crate::problem::Problem),
+            (status = 503, description = "`engine-busy`: an output target's `{layout}` feed could not be read now (every layout-read slot is in use); retry.", body = crate::problem::Problem),
         ),
     )
 )]
@@ -119,7 +120,7 @@ pub(crate) async fn plan_route(
         principal.role.require(Action::Read)?;
         let req: super::output_routing::OutputRouteRequest = serde_json::from_value(body)
             .map_err(|e| ControlError::Validation(format!("output plan body: {e}")))?;
-        return super::output_routing::plan_output(&state, &principal, &req);
+        return super::output_routing::plan_output(&state, &principal, &req).await;
     }
     let req: RouteTakeRequest = serde_json::from_value(body)
         .map_err(|e| ControlError::Validation(format!("plan body: {e}")))?;
@@ -711,18 +712,7 @@ fn redact_track_inputs(
     config: &multiview_config::MultiviewConfig,
     row: &mut OutputRouteState,
 ) {
-    let readable = |value: &serde_json::Value| -> bool {
-        let Some(tracks) = value.get("tracks").and_then(serde_json::Value::as_array) else {
-            return true;
-        };
-        tracks
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .all(|track| {
-                super::output_routing::track_input(config, track)
-                    .is_none_or(|input| crate::auth::authorize_object(principal, &input).is_ok())
-            })
-    };
+    let readable = |value: &serde_json::Value| track_inputs_readable(principal, config, value);
     let redacted = serde_json::json!({ "redacted": true });
     if !readable(&row.audio) {
         row.audio = redacted.clone();
@@ -785,6 +775,54 @@ fn program_scope(principal: &Principal) -> bool {
     .is_ok()
 }
 
+/// The accepted audio feed of `config_id`'s crosspoint as `GET /routing`
+/// shows it (#342 review M3): the feed (default `follow`), or
+/// `{"redacted": true}` when the caller may not read it.
+pub(crate) fn audio_feed_view(
+    principal: &Principal,
+    config: &multiview_config::MultiviewConfig,
+    feeds: &[multiview_config::OutputCrosspoint],
+    config_id: &str,
+) -> serde_json::Value {
+    let redacted = serde_json::json!({ "redacted": true });
+    let audio = feeds
+        .iter()
+        .find(|xp| xp.output == config_id)
+        .map_or(multiview_config::AudioFeed::Follow, |xp| xp.audio.clone());
+    if !may_read_audio(principal, &audio) {
+        return redacted;
+    }
+    let value = serde_json::to_value(&audio).unwrap_or_else(|_| redacted.clone());
+    // The same route-input rule `GET /routing` applies to a track feed
+    // (#342 review M6), so both endpoints redact identically.
+    if track_inputs_readable(principal, config, &value) {
+        value
+    } else {
+        redacted
+    }
+}
+
+/// Whether every track of a `{"tracks": [..]}` audio value has a route input
+/// the caller may read (§6.3: a track carries its route input's audio); any
+/// other value is readable here (its own rule is [`may_read_audio`]). The one
+/// rule behind `GET /routing`'s and `GET /patch`'s track redaction.
+fn track_inputs_readable(
+    principal: &Principal,
+    config: &multiview_config::MultiviewConfig,
+    value: &serde_json::Value,
+) -> bool {
+    let Some(tracks) = value.get("tracks").and_then(serde_json::Value::as_array) else {
+        return true;
+    };
+    tracks
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .all(|track| {
+            super::output_routing::track_input(config, track)
+                .is_none_or(|input| crate::auth::authorize_object(principal, &input).is_ok())
+        })
+}
+
 /// Whether `principal` may read an audio feed: Read on a named source, the
 /// Program scope for the mix and `follow` of a bus, per-track ids as objects.
 fn may_read_audio(principal: &Principal, feed: &multiview_config::AudioFeed) -> bool {
@@ -804,7 +842,25 @@ fn may_read_audio(principal: &Principal, feed: &multiview_config::AudioFeed) -> 
 /// feed is readable only with Read on the layout AND on every source its
 /// cells bind). Built once per readback from the accepted library; a layout
 /// missing here (unknown, or a body that does not parse) is unreadable.
-pub(crate) type LayoutSources = std::collections::HashMap<String, Vec<String>>;
+pub(crate) type LayoutSources = std::collections::HashMap<String, LayoutReadback>;
+
+/// One stored layout as the readback needs it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LayoutReadback {
+    /// Every source its cells bind.
+    pub(crate) sources: Vec<String>,
+    /// Its `audio` attribute (what `follow` resolves to on it, §5.1).
+    pub(crate) audio: multiview_config::LayoutAudio,
+}
+
+impl From<Vec<String>> for LayoutReadback {
+    fn from(sources: Vec<String>) -> Self {
+        Self {
+            sources,
+            audio: multiview_config::LayoutAudio::default(),
+        }
+    }
+}
 
 /// [`LayoutSources`] for the accepted layouts library.
 pub(crate) fn layout_sources(state: &AppState) -> ControlResult<LayoutSources> {
@@ -828,7 +884,13 @@ pub(crate) fn layout_sources(state: &AppState) -> ControlResult<LayoutSources> {
                 .iter()
                 .filter_map(|c| c.source.input_id.clone())
                 .collect();
-            Some((id, sources))
+            Some((
+                id,
+                LayoutReadback {
+                    sources,
+                    audio: doc.audio,
+                },
+            ))
         })
         .collect())
 }
@@ -847,7 +909,7 @@ pub(crate) fn may_read_feed(
             readable(id)
                 && layouts
                     .get(id)
-                    .is_some_and(|sources| sources.iter().all(|s| readable(s)))
+                    .is_some_and(|layout| layout.sources.iter().all(|s| readable(s)))
         }
         _ => false,
     }
@@ -897,6 +959,18 @@ fn output_route_state(
         match FollowAudio::of(&video) {
             FollowAudio::Source(id) => serde_json::json!({ "source": id }),
             FollowAudio::PreviewSource => serde_json::json!("preview_source"),
+            // A layout's `audio` attribute; its source is a bound cell's,
+            // which `may_read_feed` already required Read on.
+            FollowAudio::LayoutDefault => match &video {
+                VideoFeed::Layout(id) => match layouts.get(id).map(|l| &l.audio) {
+                    Some(multiview_config::LayoutAudio::None) => serde_json::json!("none"),
+                    Some(multiview_config::LayoutAudio::Source(source)) => {
+                        serde_json::json!({ "source": source })
+                    }
+                    _ => serde_json::json!("program"),
+                },
+                _ => serde_json::json!("program"),
+            },
             _ => serde_json::json!("program"),
         }
     } else {
@@ -1048,7 +1122,7 @@ mod redaction_tests {
     #[test]
     fn a_layout_feed_is_redacted_unless_every_bound_source_is_readable() {
         let mut layouts = LayoutSources::new();
-        layouts.insert("L".into(), vec!["bars".into(), "secret-cam".into()]);
+        layouts.insert("L".into(), vec!["bars".into(), "secret-cam".into()].into());
         let mut feed = OutputCrosspoint::program("o", "main");
         feed.video = Some(VideoFeed::Layout("L".into()));
         let row = output_route_state(&scoped(&["o", "L", "bars"]), &layouts, &feed, "o".into());
@@ -1066,5 +1140,39 @@ mod redaction_tests {
         feed.video = Some(VideoFeed::Layout("Gone".into()));
         let row = output_route_state(&scoped(&["o", "Gone"]), &layouts, &feed, "o".into());
         assert_eq!(row.tally, OutputTally::Redacted);
+    }
+
+    /// PR 2 (#306): `follow` on a layout feed resolves to the layout's
+    /// `audio` attribute in the configured readback.
+    #[test]
+    fn follow_on_a_layout_feed_reports_its_audio_attribute() {
+        let mut feed = OutputCrosspoint::program("o", "main");
+        feed.video = Some(VideoFeed::Layout("L".into()));
+        let who = scoped(&["o", "L", "bars"]);
+        for (audio, expected) in [
+            (
+                multiview_config::LayoutAudio::Program,
+                serde_json::json!("program"),
+            ),
+            (
+                multiview_config::LayoutAudio::None,
+                serde_json::json!("none"),
+            ),
+            (
+                multiview_config::LayoutAudio::Source("bars".into()),
+                serde_json::json!({ "source": "bars" }),
+            ),
+        ] {
+            let mut layouts = LayoutSources::new();
+            layouts.insert(
+                "L".into(),
+                super::LayoutReadback {
+                    sources: vec!["bars".into()],
+                    audio,
+                },
+            );
+            let row = output_route_state(&who, &layouts, &feed, "o".into());
+            assert_eq!(row.effective_audio, expected);
+        }
     }
 }
