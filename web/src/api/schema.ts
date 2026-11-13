@@ -4585,6 +4585,23 @@ export interface components {
             /** @description A short commit message. */
             message?: string;
         };
+        /** @description The four parts of `compose_duration` (fresh ticks only). */
+        ComposePhases: {
+            /** @description `after_compose` (switcher commit, preview tap, routing aux offer). */
+            after_compose: components["schemas"]["PhaseHistogram"];
+            /** @description Sampling the sources and compositing the canvas. */
+            composite: components["schemas"]["PhaseHistogram"];
+            /**
+             * @description The frame-boundary control hook (`before_compose`: command drain,
+             *     switcher, routing).
+             */
+            hook: components["schemas"]["PhaseHistogram"];
+            /**
+             * @description The per-tick state projection (encode hand-off, taps, state snapshot)
+             *     plus `publish_state`.
+             */
+            project: components["schemas"]["PhaseHistogram"];
+        };
         /** @description The compositor's resolved acceleration tier. */
         CompositorCapability: {
             /** @description The composite-usability class. */
@@ -6768,6 +6785,47 @@ export interface components {
          */
         Phase: "disarmed" | "idle" | "in_break" | "restoring" | "manual_override";
         /**
+         * @description One per-tick histogram on the fine edges (`fine_bucket_edges_ms`), over
+         *     the ~10 s window plus run totals (#311).
+         */
+        PhaseHistogram: {
+            /** @description Cumulative per-fine-bucket counts. */
+            buckets_total: number[];
+            /** @description Per-fine-bucket counts in the window (fine edges, then overflow). */
+            buckets_window: number[];
+            /**
+             * Format: double
+             * @description Largest value since the run started, ms.
+             */
+            max_ms: number;
+            /**
+             * Format: double
+             * @description Mean over the window, ms (`null` when empty).
+             */
+            mean_ms?: number | null;
+            /**
+             * Format: double
+             * @description Mean since the run started, ms.
+             */
+            mean_total_ms?: number | null;
+            /**
+             * Format: double
+             * @description p50 over the window: the upper fine-bucket edge, ms (`null` when empty
+             *     or beyond the last edge).
+             */
+            p50_ms?: number | null;
+            /**
+             * Format: double
+             * @description p99 over the window: the upper fine-bucket edge, ms.
+             */
+            p99_ms?: number | null;
+            /**
+             * Format: int64
+             * @description Ticks recorded in the window.
+             */
+            window_ticks: number;
+        };
+        /**
          * @description `OpenAPI` mirror of `multiview_config::placement::PinVendor`.
          * @enum {string}
          */
@@ -6967,6 +7025,15 @@ export interface components {
             bucket_edges_ms: number[];
             /** @description Cumulative per-bucket counts (edges, then overflow). */
             buckets_total: number[];
+            /** @description Fresh-tick work: `before_compose` through `publish_state` (#311). */
+            compose_duration: components["schemas"]["PhaseHistogram"];
+            /** @description `compose_duration` split into its four parts. */
+            compose_phases: components["schemas"]["ComposePhases"];
+            /**
+             * @description Emit lateness (publish minus deadline, the value of the `lateness_*`
+             *     fields above) as one fine histogram, fresh and repeated ticks (#311).
+             */
+            emit_lateness: components["schemas"]["PhaseHistogram"];
             /**
              * @description The fine bucket upper edges, ms (0.05, 0.1, 0.25, then the coarse
              *     edges; a final overflow bucket follows).
@@ -7032,6 +7099,13 @@ export interface components {
              * @description Ticks emitted since the run started.
              */
             ticks_total: number;
+            /**
+             * @description Wake lateness: the pacer's wait returning minus the deadline, before any
+             *     compose work (#311). OS wake latency plus clock-thread CPU starvation.
+             *     When the previous tick's work overran this deadline the wait returns at
+             *     once and the value is that backlog, not a wake (fresh ticks only).
+             */
+            wake_lateness: components["schemas"]["PhaseHistogram"];
             /**
              * Format: int64
              * @description Ticks in the window (about the last 10 s).

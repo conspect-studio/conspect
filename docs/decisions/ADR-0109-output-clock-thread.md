@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Area:** Core engine (invariant #1, with #10)
 - **Date:** 2026-11-12
-- **Source:** issue #311 (follow-up of the front door, [ADR-0107](ADR-0107-single-front-door-443.md)); test-server measurement of 13 Nov
+- **Source:** issue #311 (follow-up of the front door, [ADR-0107](ADR-0107-single-front-door-443.md)); test-server measurement of 13 Nov; #311 reopen (§8)
 - **Amends:** [ADR-T001](ADR-T001.md) (pacing mechanism only; deadlines unchanged), [ADR-0030](ADR-0030.md) §2 (a `Program` runs on its own thread, not a task)
 
 ## Context
@@ -109,6 +109,8 @@ thread runs at the default priority; either way the start-up log line
 `output clock thread started` names the pacing mechanism, the timer slack and the
 priority outcome. `SCHED_FIFO` is deliberately **not** used: a real-time policy lets
 one bug that spins the loop starve the host, and the measurement does not need it.
+Since the #311 reopen the thread also asks for a short EEVDF request size
+(`CLOCK_SLICE`, 300 µs; no privilege; §8), also named in that log line.
 
 ### 3. Production wiring
 
@@ -216,12 +218,123 @@ load and front-door flood.
 
 ### 7. Measuring it
 
+Since the #311 reopen the same endpoint also reports, as separate histograms on
+the fine edges (each with `window_ticks`, `mean_ms`, `p50_ms`, `p99_ms`,
+`max_ms`, `mean_total_ms`, `buckets_window`, `buckets_total`):
+`emit_lateness` (the value of the `lateness_*` fields), `wake_lateness` (the
+pacer's wait returning minus the deadline, before any work), `compose_duration`
+(`before_compose` through `publish_state`, fresh ticks) and `compose_phases`
+(`hook`, `composite`, `after_compose`, `project`). A tick whose deadline
+passed while the previous tick's work ran records that backlog as its wake
+lateness, so `wake_lateness` isolates the scheduler only while
+`compose_duration` stays under a period. Each phase boundary is one
+time-source read and a few relaxed atomics on the clock thread.
+
+The original fields:
+
 `GET /api/v1/metrics/program` gains, without changing any existing field, the
 window and run **mean** (`lateness_mean_ms`, `lateness_mean_total_ms`), fine
 quantiles (`lateness_p50_fine_ms`, `lateness_p99_fine_ms`) and fine buckets with
 edges 0.05, 0.1, 0.25 ms below the original 0.5 ms (`fine_bucket_edges_ms`,
 `fine_buckets_total`, `fine_buckets_window`). The coarse buckets are derived from
 the fine ones, so recording still touches one atomic bucket.
+
+### 8. The #311 reopen: where the remaining lateness came from, and the bound
+
+The test server (10 cores, load 9, engine at 204 % CPU, 12 decoding sources, 2
+NVENC outputs) measured emit lateness idle mean 4.1 ms, none under 2 ms, and
+under control load (407 `GET /state`/s + 20 SSE clients) mean 8.6 ms with 86 of
+3,598 ticks past half a tick; 0 repeats. The old metric was recorded after
+`publish_state`, so it was wake **plus** the whole tick's work.
+
+Measured on the build host with a release build (12 looping H.264 TS sources
+decoded on the CPU, 4×4 grid, two HLS outputs, the CPU compositor because the
+host has no GPU), with the split metric:
+
+* **Idle wake lateness is not the problem.** Wake mean 0.02–0.05 ms, p99 ≤ 0.1 ms
+  whenever the clock's core was not contended. The idle floor on the test
+  server is the tick's own work (`compose_duration`), dominated by `composite`
+  (on the server: GPU upload, submit and readback of 1080p); the hook,
+  `after_compose` and `publish_state` are each ≤ 0.01 ms.
+* **Under load the wake is what degrades**: with CPU-bound neighbours on the
+  clock's core the wake tail grew to p99 8–33 ms. The clock thread is a
+  default-weight `SCHED_OTHER` thread and on EEVDF (Linux 6.6+) a waking thread
+  with the default ~3 ms request waits behind the running thread's slice.
+  A C rig isolates it: a 29.97 fps clock thread (`TIMER_ABSTIME`, 1 ns slack,
+  4 ms of work per tick) and 6 bursty CPU-bound threads (8 ms on, 3 ms off) on
+  the same 2 cores, 600 ticks per run. The "nice −10" rows were run unprivileged
+  as the equivalent relative weight (neighbours at +10):
+
+  | Clock thread | wake mean | wake p99 | emit p99 (4 ms work) | ticks > ½ period |
+  | --- | --- | --- | --- | --- |
+  | default | 2.5–2.9 ms | 12–14 ms | 19–22 ms | 13–52 |
+  | nice −10 (needs `CAP_SYS_NICE`) | 0.9–1.1 ms | 5.8–7.3 ms | 10–12 ms | 0 |
+  | slice 300 µs | 0.16 ms | 3.0–3.8 ms | 20 ms | 10–20 |
+  | slice 300 µs + nice −10 | 0.06–0.12 ms | 2.5–4.3 ms | 9–12 ms | 0 |
+
+  On one core with six pure spinners: default wake p99 12.4–12.7 ms, slice 2.2–2.3 ms.
+  (The first cut of this change never applied the slice: `sched_setattr` needs
+  `attr.size` set, and `sched_getattr` does not fill it. Fixed in review; the
+  read-back now must equal the clamped request to count as applied.)
+  The slice fixes the wake; niceness (weight) is what keeps the clock's *work*
+  from being time-shared with the neighbours.
+* **A per-tick 1080p canvas deep copy** sat on the clock thread: the projection
+  cloned the composited `Nv12Image` (3.1 MB, a fresh allocation) into the
+  `Arc` the encode hand-off and preview share. 0.2–0.4 ms mean, but a fresh
+  multi-megabyte allocation is an `mmap` + page faults that contend on the
+  process's memory map with every other thread (178 on the server); its max
+  was 27 ms under control load in the rig.
+* **Not causes** (measured): no lock is shared with the control plane on the
+  tick path; `publish_state` 0.02 ms; the routing aux hook and the switcher
+  hook ≤ 0.01 ms. Capping the control runtime at 3 workers made the wake tail
+  worse (fewer, busier workers); lowering the control workers' priority alone
+  was inside the host's noise.
+
+Changes:
+
+1. `CompositedFrame::canvas` is an `Arc<Nv12Image>`: the compositor's output is
+   shared by every consumer (encode hand-off, preview, display, NDI, the held
+   last-good frame and its repeats). No canvas copy runs on the clock thread.
+   Because consumers now release a canvas when the last of them lets go, the
+   CPU compositor's output-plane return cache keeps up to three spare planes
+   per kind (was one), so a steady run allocates no plane while up to three
+   canvases are outstanding; any surplus return is dropped (bounded memory).
+2. The clock thread asks for a 300 µs EEVDF request size
+   (`sched_setattr(SCHED_OTHER, sched_runtime)` through the FFI leaf
+   `multiview-clocksys`; it keeps `SCHED_OTHER` and the thread's weight, so it
+   cannot take more CPU than before; no privilege; read back and logged; older
+   kernels report `kernel has no custom slice`).
+3. Niceness −10 stays best effort. **The deployment should grant it**:
+   `AmbientCapabilities=CAP_SYS_NICE` in the systemd unit. It is the only lever
+   that protects the tick's work, not just its wake, from a saturated host.
+
+**Bound the design promises** (Linux ≥ 6.12, the clock thread with its slice):
+
+* **Wake lateness:** p99 < 1 ms while the host is not oversubscribed (runnable
+  threads ≤ cores most of the time, the test server's state: load 9 on 10
+  cores), because a waking clock thread with a 300 µs request preempts a fair
+  neighbour at its next scheduler tick instead of after the neighbour's slice.
+  On an oversubscribed host the wake is bounded by the run queue, not the
+  design: the rig above measured p99 2–4 ms.
+* **Emit lateness** = wake + the tick's own work (`compose_duration`), which the
+  design does not shrink: it is the compositor's cost at the canvas size (on
+  the server ~4 ms for the GPU round trip). The design promises that nothing
+  else is added: no wait on a lock, a client or the control plane, and no
+  per-tick canvas copy. With `CAP_SYS_NICE`, emit p99 < 8 ms and no tick past
+  half a period under control load on the test server; without it, the
+  compose can be time-shared with busy neighbours and the half-period bound
+  holds only while compose p99 stays under half a period minus the wake.
+* 0 repeats while compose p99 stays below one period (unchanged, ADR-T018).
+
+The R3 chaos test `crates/multiview-engine/tests/clock_slice_chaos.rs` pins a
+real clock thread (2 ms of work per tick) and six spinning threads to one core
+and asserts, where the kernel applies the slice: every tick emitted, 0 repeats,
+every wake under 10 ms (the one-core oversubscribed ceiling; measured 4–8 ms
+with the slice, 9–12 ms with the default request size), and, when the default
+run was contended, a mean wake at most half the default run's (measured
+0.2–0.5 ms vs 1.9–2.6 ms; a GitHub runner: 0.17 vs 1.22 ms) and fewer wakes
+later than 1 ms. Single worst samples are not compared: on a GitHub runner the
+two runs' maxima tied (2.98 vs 2.96 ms).
 
 ## Rationale
 
