@@ -142,6 +142,26 @@ impl ListenSockets {
         Some(socket)
     }
 
+    /// Take every UDP socket for `want`'s port, in the order the service
+    /// manager passed them (its bind order). Two sockets on one port are a
+    /// `ReusePort=yes` pair for validated-flow steering: the first joined the
+    /// reuseport group first, so it is group index 0 (the listener) and the
+    /// second index 1 (the established socket).
+    pub fn take_udp_all(&mut self, want: SocketAddr) -> Vec<UdpSocket> {
+        let mut taken = Vec::new();
+        while let Some(socket) = self.take_udp_in_order(want) {
+            taken.push(socket);
+        }
+        taken
+    }
+
+    fn take_udp_in_order(&mut self, want: SocketAddr) -> Option<UdpSocket> {
+        let i = position(self.udp.iter().map(|(a, _)| *a), want)?;
+        let (addr, socket) = self.udp.remove(i);
+        warn_if_moved(addr, want, "UDP");
+        Some(socket)
+    }
+
     /// Log every socket no listener claimed (its port is held by the service
     /// manager and nobody accepts on it: a configuration mismatch between the
     /// socket unit and `[network]`). The sockets are dropped here; systemd

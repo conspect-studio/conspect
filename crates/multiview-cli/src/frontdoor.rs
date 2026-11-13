@@ -235,7 +235,7 @@ impl FrontDoorRun {
             inherited.report_unclaimed();
             return None;
         };
-        let udp = inherited.take_udp(SocketAddr::new(
+        let udp = inherited.take_udp_all(SocketAddr::new(
             IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
             fd_config.port,
         ));

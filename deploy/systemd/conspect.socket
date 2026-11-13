@@ -1,0 +1,48 @@
+# deploy/systemd/conspect.socket: the engine's public front door sockets,
+# owned by systemd and handed to conspect.service as LISTEN_FDS (ADR-0107,
+# design note section 9, issue #292).
+#
+# systemd binds TCP 443, TCP 80 and UDP 443 (root, so no capability is needed
+# for ports below 1024) and keeps them open across engine restarts: while the
+# engine restarts the kernel queues TCP SYNs in the backlog and UDP datagrams
+# in the receive buffer, so a browser's retry reaches the new engine instead
+# of a refused port. The engine matches each socket by type and port to its
+# `[network]` listener (https_port / tcp_port / http_redirect_port); a port
+# here that matches no listener is logged at startup.
+#
+# Install:  sudo install -m 644 deploy/systemd/conspect.socket /etc/systemd/system/
+# Then:     docs/runbooks/front-door-cutover.md
+
+[Unit]
+Description=Conspect engine front door sockets (TCP 443, TCP 80, UDP 443)
+Documentation=file:///home/operations/conspect/docs/runbooks/front-door-cutover.md
+# nginx (or anything else) must not hold the ports first.
+Conflicts=nginx.service
+After=nginx.service
+
+[Socket]
+# Dual-stack [::] (IPv6-first; IPv4 clients arrive as ::ffff:a.b.c.d).
+BindIPv6Only=both
+ListenStream=[::]:443
+ListenStream=[::]:80
+# UDP 443 twice: a SO_REUSEPORT pair for validated-flow steering (slice 3a).
+# The first is the listener (every new flow, and every send), the second the
+# established socket the engine's CBPF program steers validated peers to. The
+# order matters (reuseport group index 0, then 1). With one line instead,
+# the engine runs single-socket and says so in /api/v1/system/capabilities.
+ListenDatagram=[::]:443
+ListenDatagram=[::]:443
+ReusePort=yes
+# One process gets all sockets (never one process per connection).
+Accept=no
+# The engine's own listen backlog (frontdoor tcp::BACKLOG).
+Backlog=1024
+# The UDP door's requested receive buffer (FrontDoorConfig::recv_buffer_bytes).
+# systemd sets it with SO_RCVBUFFORCE, so net.core.rmem_max does not clamp it.
+ReceiveBuffer=8M
+NoDelay=true
+# Restart of the service must not close the sockets.
+Service=conspect.service
+
+[Install]
+WantedBy=sockets.target

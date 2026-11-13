@@ -55,8 +55,8 @@ fn start_door(
     https: u16,
     redirect: u16,
 ) -> (FrontDoor, bool, bool, bool) {
-    let udp = inherited.take_udp(any(https));
-    let udp_inherited = udp.is_some();
+    let udp = inherited.take_udp_all(any(https));
+    let udp_inherited = !udp.is_empty();
     let mut door = FrontDoor::start_with(
         &FrontDoorConfig {
             port: https,
@@ -326,5 +326,66 @@ fn without_activation_the_door_binds_itself() {
     assert_eq!(door.local_addr().port(), https);
     assert_eq!(door.tcp_local_addr().unwrap().port(), https);
     assert_eq!(door.redirect_local_addr().unwrap().port(), redirect);
+    door.shutdown_blocking();
+}
+
+/// `conspect.socket` passes UDP 443 as a `ReusePort=yes` pair (two
+/// `ListenDatagram=` lines, listener first). The door adopts the pair and
+/// keeps slice 3a's validated-flow steering: an established peer's datagrams
+/// are read from the second socket, everyone else's from the first.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_inherited_reuseport_pair_keeps_validated_flow_steering() {
+    use multiview_frontdoor::{ReuseportGroup, SteeringMode};
+    // The "service manager": a reuseport pair bound in order, as systemd
+    // binds the two ListenDatagram= lines.
+    let group = ReuseportGroup::bind(any(0), 0).unwrap();
+    let port = group.listener().local_addr().unwrap().port();
+    let (listener, established, _) = group.into_parts();
+    let mut inherited = ListenSockets::empty();
+    inherited.push_udp(listener);
+    inherited.push_udp(established);
+    let pair = inherited.take_udp_all(any(port));
+    assert_eq!(pair.len(), 2);
+    let door = FrontDoor::start_with(
+        &FrontDoorConfig {
+            port,
+            workers: 1,
+            ..FrontDoorConfig::default()
+        },
+        pair,
+    )
+    .unwrap();
+    assert_eq!(door.steering(), SteeringMode::ReuseportCbpf);
+
+    let member = UdpSocket::bind("[::1]:0").unwrap();
+    let other = UdpSocket::bind("[::1]:0").unwrap();
+    let before = door.stats().snapshot();
+    assert!(door.quic_established().insert(member.local_addr().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while door.stats().snapshot().steered_peers != 1
+        || door.stats().snapshot().steering_updates <= before.steering_updates
+    {
+        assert!(Instant::now() < deadline, "the steering program never attached");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut short = vec![7u8; 60];
+    short[0] = 0x45;
+    for _ in 0..50 {
+        member.send_to(&short, ("::1", port)).unwrap();
+        other.send_to(&short, ("::1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = door.stats().snapshot();
+        if s.received >= before.received + 100 {
+            assert_eq!(s.received_established_socket - before.received_established_socket, 50, "{s:?}");
+            assert_eq!(s.received_listener_socket - before.received_listener_socket, 50, "{s:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "datagrams never arrived: {s:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     door.shutdown_blocking();
 }

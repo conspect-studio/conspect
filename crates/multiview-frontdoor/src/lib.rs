@@ -515,19 +515,21 @@ impl FrontDoor {
     ///
     /// [`Error::Runtime`] or [`Error::Socket`].
     pub fn start(config: &FrontDoorConfig) -> Result<Self, Error> {
-        Self::start_with(config, None)
+        Self::start_with(config, Vec::new())
     }
 
-    /// [`start`](Self::start) on an inherited UDP socket when `inherited` is
-    /// `Some` (systemd socket activation, design note section 9): the socket
-    /// is adopted instead of bound, so it survives an engine restart.
+    /// [`start`](Self::start) on inherited UDP sockets when `inherited` is
+    /// not empty (systemd socket activation, design note section 9): the
+    /// socket (or the `ReusePort=yes` pair, listener first, which keeps
+    /// validated-flow steering) is adopted instead of bound, so it survives
+    /// an engine restart.
     ///
     /// # Errors
     ///
     /// [`Error::Runtime`] or [`Error::Socket`].
     pub fn start_with(
         config: &FrontDoorConfig,
-        inherited: Option<std::net::UdpSocket>,
+        inherited: Vec<std::net::UdpSocket>,
     ) -> Result<Self, Error> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.workers.max(1))
@@ -549,13 +551,11 @@ impl FrontDoor {
             // The tokio socket registers with the reactor of the runtime it is
             // created in: the front door's, never the caller's.
             let _guard = runtime.enter();
-            match inherited {
-                Some(std_socket) => {
-                    tracing::info!(%addr, "front door: UDP socket inherited from the service manager");
-                    SharedSocket::from_inherited(std_socket)
-                        .map_err(|source| Error::Socket { addr, source })?
-                }
-                None => bind_socket(addr, config, &turn_servers)?,
+            if inherited.is_empty() {
+                bind_socket(addr, config, &turn_servers)?
+            } else {
+                tracing::info!(%addr, sockets = inherited.len(), "front door: UDP inherited from the service manager");
+                adopt_socket(inherited, addr, config, &turn_servers)?
             }
         };
         let socket = Arc::new(socket);
@@ -584,7 +584,7 @@ impl FrontDoor {
             turn_servers: turn_servers.clone(),
         };
         runtime.spawn(dispatcher.run());
-        if socket.has_established() {
+        if socket.has_established() && *socket.mode() == SteeringMode::ReuseportCbpf {
             stats.steering_updates.fetch_add(1, Ordering::Relaxed);
             runtime.spawn(steering_updater(
                 Arc::clone(&socket),
@@ -960,6 +960,38 @@ fn bind_socket(
         );
     }
     Ok(socket)
+}
+
+/// Adopt inherited UDP socket(s) (socket activation). A pair gets the first
+/// steering program like a self-bound pair; when the attach fails (or
+/// `steering` is off) both sockets stay open and are both read (the kernel
+/// then spreads datagrams across the group by hash), reported as single
+/// socket with the reason.
+fn adopt_socket(
+    inherited: Vec<std::net::UdpSocket>,
+    addr: SocketAddr,
+    config: &FrontDoorConfig,
+    turn_servers: &[SocketAddr],
+) -> Result<SharedSocket, Error> {
+    let socket =
+        SharedSocket::from_inherited(inherited).map_err(|source| Error::Socket { addr, source })?;
+    if !socket.has_established() {
+        return Ok(socket);
+    }
+    if !config.steering {
+        return Ok(socket.into_unsteered(
+            "disabled by configuration (steering = false); the inherited ReusePort pair is \
+             read as one socket"
+                .to_owned(),
+        ));
+    }
+    let first = ProgramSet::build(steering::random_salt(), turn_servers.iter().copied());
+    match socket.attach(&first) {
+        Ok(()) => Ok(socket),
+        Err(e) => Ok(socket.into_unsteered(format!(
+            "SO_ATTACH_REUSEPORT_CBPF failed on the inherited pair: {e}; both sockets are read"
+        ))),
+    }
 }
 
 /// Log the receive mode at start: info when steering is active (or off by
