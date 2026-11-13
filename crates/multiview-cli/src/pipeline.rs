@@ -7287,7 +7287,6 @@ struct ConsumerRouting {
 /// End-of-run bound for the routing reaper to finish closed live encoders.
 const ROUTING_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
-/// The concrete encoder owned exclusively by one bounded rendition worker.
 /// The routing opener (ADR-0108, #342): opens a live encoder for a rendition
 /// settings index. A Program/Clean key at a non-canvas format converts on its
 /// own worker; keys at one format share one convert per tick. A routed
@@ -7320,6 +7319,7 @@ fn live_opener(
     })
 }
 
+/// The concrete encoder owned exclusively by one bounded rendition worker.
 struct PipelineVideoWorker(VideoRenditionEncoder);
 
 impl VideoEncodeWorker for PipelineVideoWorker {
