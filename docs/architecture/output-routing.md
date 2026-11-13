@@ -1983,7 +1983,8 @@ operation id whose `route.output` outcome is `reset:applied` or `reset:refused:<
 
 "Effective" (review M-4): an absent `bitrate_kbps` is the run default (4000 kbit/s), and an explicit
 canvas-size format with the default fit is the same as an absent one. A PUT whose format/bitrate differ
-only raw is a no-op: committed and answered `apply: live` with no operation id and no reset.
+only raw is a no-op: committed and answered `apply: live` with no operation id and no reset. So is
+an identical PUT (nothing changed; review R2-M1), never a restart.
 
 The request order (review X2), so the store and the engine never silently disagree: validate → authz
 (both axes) → rate limit → commit → submit.

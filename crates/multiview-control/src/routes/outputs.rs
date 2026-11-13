@@ -200,7 +200,7 @@ pub(crate) async fn create_output(
         params(("id" = String, Path, description = "Output id.")),
         request_body = crate::openapi_schemas::OutputResourceInputDoc,
         responses(
-            (status = 200, description = "The replaced output (new ETag in the response header). `x-multiview-apply: live` when the change is ONLY the output's `format` and/or `slots.video[0].bitrate_kbps` on a running HLS output (TS segments): that output is reset live; with no `x-multiview-operation-id` when those settings are effectively unchanged (an absent bitrate = 4000 kbit/s, a canvas-size default-fit format = absent: nothing to reset) (about 1 s; Program and other outputs are not affected; `x-multiview-apply-note` says so, `x-multiview-operation-id` correlates the `route.output` outcome `reset:applied` or `reset:refused:<reason>`). Otherwise `x-multiview-apply: restart` (a codec, audio-slot or other change, or any other kind, SRT/RIST included: follow-up #380).", body = crate::resource_store::Resource),
+            (status = 200, description = "The replaced output (new ETag in the response header). `x-multiview-apply: live` when the change is ONLY the output's `format` and/or `slots.video[0].bitrate_kbps` on a running HLS output (TS segments): that output is reset live; with no `x-multiview-operation-id` when nothing changed (an identical PUT) or those settings are effectively unchanged (an absent bitrate = 4000 kbit/s, a canvas-size default-fit format = absent: nothing to reset) (about 1 s; Program and other outputs are not affected; `x-multiview-apply-note` says so, `x-multiview-operation-id` correlates the `route.output` outcome `reset:applied` or `reset:refused:<reason>`). Otherwise `x-multiview-apply: restart` (a codec, audio-slot or other change, or any other kind, SRT/RIST included: follow-up #380).", body = crate::resource_store::Resource),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to write (a live reset also needs the output axis).", body = crate::problem::Problem),
             (status = 404, description = "No output with that id.", body = crate::problem::Problem),
@@ -351,11 +351,12 @@ const RESET_NOTE_HEADER: header::HeaderName =
 /// What a PUT changes about an output's live-resettable settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormatChange {
-    /// Something other than `format` / video slot 0's bitrate changed (or
-    /// nothing did): today's restart-pending answer.
+    /// Something other than `format` / video slot 0's bitrate changed:
+    /// today's restart-pending answer.
     Other,
-    /// Only `format` / slot 0's bitrate changed, and their EFFECTIVE values
-    /// are equal (review M-4): no reset.
+    /// Nothing changed (an identical PUT, review R2-M1), or only `format` /
+    /// slot 0's bitrate changed with EQUAL effective values (review M-4): no
+    /// reset, no restart.
     NoOp,
     /// Only `format` / slot 0's bitrate changed, effectively: a reset.
     Reset,
@@ -405,7 +406,10 @@ fn classify_change(
         }
         v
     };
-    if current == next || strip(current) != strip(next) {
+    if current == next {
+        return FormatChange::NoOp;
+    }
+    if strip(current) != strip(next) {
         return FormatChange::Other;
     }
     let effective = |v: &serde_json::Value| -> serde_json::Value {

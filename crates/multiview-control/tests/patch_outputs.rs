@@ -2009,3 +2009,31 @@ async fn a_patch_layout_take_carries_the_audio_attribute_and_a_pre_read_revision
         body.revision
     );
 }
+
+/// Review R2-M1: an identical PUT (the body unchanged) is a no-op: committed
+/// and answered `apply: live` with no operation id; no reset is started and
+/// no restart is announced.
+#[tokio::test]
+async fn an_identical_put_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    for id in ["output-0", "output-1"] {
+        let (etag, name, body) = current_output(&rig, id).await;
+        let resp = send(
+            &rig.router,
+            put_output(OPERATOR_TOKEN, id, &etag, &name, &body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{id}");
+        assert_eq!(resp.headers()["x-multiview-apply"], "live", "{id}");
+        assert!(
+            resp.headers().get("x-multiview-operation-id").is_none(),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        rig.fake.state.lock().unwrap().reformats.len(),
+        0,
+        "no reset"
+    );
+}
