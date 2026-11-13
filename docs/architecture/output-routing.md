@@ -1729,7 +1729,9 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
   inbox of at most 64 ids, and the newest revision wins. A change for a layout that composes now is
   never evicted. Another evicted change raises a watermark, so a take older than that change fails
   closed. The router drains the inbox with `try_lock`, so it never blocks. It applies at most 8
-  changes per tick. The router swaps the body that every output and pending take on that layout composes,
+  changes per tick, and changes for composing layouts go first, so an on-air edit applies on the
+  next tick unless more than 8 composing layouts change at once. A take older than a change that
+  still waits in the inbox is refused too. The router swaps the body that every output and pending take on that layout composes,
   from the next tick, and requests an IDR on its encoders (within the per-key force floor). Outputs
   whose audio follows re-resolve the layout's `audio` attribute. An output whose move lands
   after an edit follows the body that landed. An output whose move off an edited layout is refused

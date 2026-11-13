@@ -884,6 +884,9 @@ pub struct OutputRouter {
     layout_states: HashMap<String, LayoutChange>,
     /// The newest revision `layout_states` forgot (0: none).
     layout_states_forgotten: u64,
+    /// Changes left in the inbox after this tick's budget, by id (at most
+    /// [`LAYOUT_INBOX`]): a take older than one is refused too.
+    layout_pending: HashMap<String, u64>,
     outcomes: SyncSender<TakeOutcome>,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outputs: Vec<OutputState>,
@@ -1037,6 +1040,7 @@ impl OutputRouter {
             layout_changes,
             layout_states: HashMap::new(),
             layout_states_forgotten: 0,
+            layout_pending: HashMap::new(),
             outcomes,
             snapshot,
             outputs,
@@ -1528,17 +1532,29 @@ impl OutputRouter {
                     .layout_states_forgotten
                     .max(std::mem::take(&mut inbox.forgotten));
                 if inbox.changes.is_empty() {
+                    self.layout_pending.clear();
                     return;
                 }
-                let ids: Vec<String> = inbox
+                // Changes for composing layouts first (they are on air), then
+                // the oldest revisions.
+                let mut ids: Vec<(bool, u64, String)> = inbox
                     .changes
-                    .keys()
-                    .take(LAYOUT_CHANGES_PER_TICK)
-                    .cloned()
+                    .iter()
+                    .map(|(id, c)| (!self.composes_layout(id), c.revision(), id.clone()))
                     .collect();
-                ids.iter()
-                    .filter_map(|id| inbox.changes.remove(id))
-                    .collect()
+                ids.sort_unstable();
+                ids.truncate(LAYOUT_CHANGES_PER_TICK);
+                let taken: Vec<LayoutChange> = ids
+                    .iter()
+                    .filter_map(|(_, _, id)| inbox.changes.remove(id))
+                    .collect();
+                // What is left waits; the stale-take check sees it now.
+                self.layout_pending = inbox
+                    .changes
+                    .iter()
+                    .map(|(id, c)| (id.clone(), c.revision()))
+                    .collect();
+                taken
             }
             Err(_) => return,
         };
@@ -1566,11 +1582,27 @@ impl OutputRouter {
     /// or removal of that layout (it was authorized for content that is no
     /// longer the layout's): such a take is refused.
     fn layout_take_is_stale(&self, layout: &LayoutRef) -> bool {
+        // A change still waiting in the inbox (beyond this tick's budget)
+        // counts as known.
+        if self
+            .layout_pending
+            .get(&layout.id)
+            .is_some_and(|revision| *revision > layout.body.revision)
+        {
+            return true;
+        }
         match self.layout_states.get(&layout.id) {
             Some(known) => known.revision() > layout.body.revision,
             // Unknown: stale only if a forgotten state could be newer.
             None => layout.body.revision <= self.layout_states_forgotten,
         }
+    }
+
+    /// Whether layout `id` composes now (an output on it, or a feed for it).
+    fn composes_layout(&self, id: &str) -> bool {
+        self.feeds
+            .keys()
+            .any(|(bus, _)| matches!(bus, PictureBus::Layout(l) if l.id == id))
     }
 
     /// Record a layout's latest state (bounded; an eviction raises the
