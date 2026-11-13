@@ -185,6 +185,10 @@ impl OutputRouter {
         if let Some(params) = encoder.parameter_sets() {
             let _ = dispatcher.set_parameter_sets(key, params);
         }
+        // The muxer rebuilt at the move is seeded from THIS encoder (V2).
+        if let Some(stream) = encoder.stream_params() {
+            let _ = dispatcher.set_stream_params(key, stream);
+        }
         let force_at = Arc::new(AtomicU64::new(NO_FORCE));
         let worker = GapFill {
             inner: encoder,

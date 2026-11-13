@@ -372,6 +372,9 @@ struct VideoMeta {
     failed: bool,
     gate: Option<MoveGate>,
     params: Option<ParameterSets>,
+    /// The key's video stream parameters (#342 B3 review V2): handed to an
+    /// output's delivery with a decoder-config change onto this key.
+    stream: Option<multiview_ffmpeg::StreamCodecParameters>,
     /// Bumped every time a dynamic slot is (re)assigned: a pending move
     /// names `(key, generation)`, so a reused slot never satisfies a move
     /// requested against the key that used to live there.
@@ -549,8 +552,13 @@ fn compose_audio(
 /// would reject the cut window itself. Slice 1 has no muxer re-init: an
 /// out-of-band output reaches this only through a forced fallback (a take is
 /// refused first), where staying on a dead feed is not an option.
-fn signal_sets_change<D: WindowDelivery>(delivery: &mut D, output_index: usize, _inband_ok: bool) {
-    delivery.mark_discontinuity(output_index, OfferError::DecoderConfigChanged);
+fn signal_sets_change<D: WindowDelivery>(
+    delivery: &mut D,
+    output_index: usize,
+    _inband_ok: bool,
+    stream: Option<multiview_ffmpeg::StreamCodecParameters>,
+) {
+    delivery.mark_config_change(output_index, stream);
 }
 
 fn push_outcome(outcomes: &mut VecDeque<MoveOutcome>, outcome: MoveOutcome) {
@@ -643,6 +651,7 @@ impl RenditionDispatcher {
                 failed: false,
                 gate: gates.next().flatten(),
                 params: None,
+                stream: None,
                 generation: 0,
             })
             .collect();
@@ -1347,7 +1356,14 @@ impl RenditionDispatcher {
                                 skip = at;
                                 let _ = decide_sets(&mut b.last_sets, cut_sets);
                                 if changed {
-                                    signal_sets_change(delivery, b.output_index, b.inband_ok);
+                                    let stream =
+                                        self.video_meta.get(m.key).and_then(|x| x.stream.clone());
+                                    signal_sets_change(
+                                        delivery,
+                                        b.output_index,
+                                        b.inband_ok,
+                                        stream,
+                                    );
                                 }
                                 b.video_key = Some(m.key);
                                 // An audio move following this video move
@@ -1439,7 +1455,10 @@ impl RenditionDispatcher {
                             .and_then(|f| packets.get(at).map(f))
                             .unwrap_or(RapParameterSets::Absent);
                         if decide_sets(&mut b.last_sets, cut) {
-                            signal_sets_change(delivery, b.output_index, b.inband_ok);
+                            let stream = cur
+                                .and_then(|k| self.video_meta.get(k))
+                                .and_then(|x| x.stream.clone());
+                            signal_sets_change(delivery, b.output_index, b.inband_ok, stream);
                         }
                     }
                     switched = true;
@@ -1750,6 +1769,7 @@ impl RenditionDispatcher {
                 failed: false,
                 gate: Some(gate),
                 params: None,
+                stream: None,
                 generation,
             };
             return Ok(index);
@@ -1763,6 +1783,7 @@ impl RenditionDispatcher {
             failed: false,
             gate: Some(gate),
             params: None,
+            stream: None,
             generation,
         });
         Ok(index)
@@ -1924,6 +1945,23 @@ impl RenditionDispatcher {
     ///
     /// # Errors
     /// `InvalidConfig` for an unknown key.
+    /// Install the video stream parameters of a key (#342 B3 review V2): a
+    /// decoder-config change onto it hands them to the output's delivery.
+    ///
+    /// # Errors
+    /// `InvalidConfig` for an unknown key.
+    pub(crate) fn set_stream_params(
+        &mut self,
+        key: usize,
+        stream: multiview_ffmpeg::StreamCodecParameters,
+    ) -> Result<(), DispatchError> {
+        let meta = self
+            .video_meta
+            .get_mut(key)
+            .ok_or(DispatchError::InvalidConfig)?;
+        meta.stream = Some(stream);
+        Ok(())
+    }
     pub(crate) fn set_parameter_sets(
         &mut self,
         key: usize,

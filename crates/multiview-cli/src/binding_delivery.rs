@@ -256,6 +256,18 @@ pub(crate) trait WindowDelivery {
     /// the window itself is admitted. Not counted as a rejection.
     fn mark_discontinuity(&mut self, output_index: usize, reason: OfferError);
 
+    /// [`Self::mark_discontinuity`] with `DecoderConfigChanged` carrying the
+    /// new configuration's video stream parameters (#342 B3 review V2), so
+    /// the output's muxer can be rebuilt from them. The default drops them.
+    fn mark_config_change(
+        &mut self,
+        output_index: usize,
+        params: Option<multiview_ffmpeg::StreamCodecParameters>,
+    ) {
+        let _ = params;
+        self.mark_discontinuity(output_index, OfferError::DecoderConfigChanged);
+    }
+
     /// Consume this binding's loss event (generation + flushed counters) so the
     /// mux can reset continuity. Exactly one consumer.
     fn take_discontinuity(&mut self, output_index: usize) -> Option<Discontinuity>;
@@ -330,6 +342,16 @@ impl WindowDelivery for BindingDelivery {
     fn mark_discontinuity(&mut self, output_index: usize, reason: OfferError) {
         if let Some(binding) = self.bindings.get_mut(output_index) {
             binding.queue.mark_discontinuity(reason);
+        }
+    }
+
+    fn mark_config_change(
+        &mut self,
+        output_index: usize,
+        params: Option<multiview_ffmpeg::StreamCodecParameters>,
+    ) {
+        if let Some(binding) = self.bindings.get_mut(output_index) {
+            binding.queue.mark_config_change(params);
         }
     }
 

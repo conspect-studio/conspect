@@ -146,6 +146,14 @@ pub trait PacketSource {
     fn take_decoder_config_change(&mut self) -> bool {
         false
     }
+
+    /// The new decoder configuration's video stream parameters, when the
+    /// change [`Self::take_decoder_config_change`] just reported came with
+    /// them (#342 B3, a live format reset): a segment muxer rebuilt at the
+    /// change is seeded from them instead of the run's original seed.
+    fn take_decoder_config_params(&mut self) -> Option<StreamCodecParameters> {
+        None
+    }
 }
 
 /// One muxer stream's registration: the `Send` codec-params snapshot it is
@@ -2208,6 +2216,7 @@ impl PacketMuxSink {
 /// the encoder-fed [`SegmentSink`] borrows its run's seed [`VideoEncoder`]; the
 /// packet-fed [`PacketMuxSink`] borrows the [`StreamCodecParameters`] snapshot
 /// the cli's single encoder produced (no encoder instance on this thread).
+#[derive(Clone, Copy)]
 enum StreamSeed<'a> {
     /// Seed a stream from a live encoder's codec context.
     Encoder(&'a VideoEncoder),
@@ -2268,6 +2277,9 @@ struct SegmentState<'a> {
     /// Inject one packet-write failure in the real segment driver (unit test only).
     #[cfg(test)]
     fail_packet_write_once: bool,
+    /// Test seam: fail the next segment-muxer rebuild once (review V2).
+    #[cfg(test)]
+    fail_rebuild_once: bool,
     /// Consecutive failed reopen attempts; terminal errors reach the supervisor.
     recovery_failures: u8,
     /// A close/playlist publication failure must reach the caller, not hide.
@@ -2292,6 +2304,17 @@ struct SegmentState<'a> {
     /// segment: that output's muxer is rebuilt with `tables_version`+1 so a
     /// receiver re-reads its tables (#342 B3). 0 = libav's default.
     tables_version: u8,
+    /// The video stream parameters a rebuilt segment muxer is seeded from
+    /// after a live format reset (#342 B3 review V2); `None` = the run's
+    /// original [`Self::seed`].
+    reseed: Option<StreamCodecParameters>,
+    /// A flagged change whose segment has not started yet (a failed rebuild
+    /// is retried at the next RAP by the recovery path, review V2): the
+    /// next keyframe rebuilds the muxer and marks the discontinuity.
+    change_pending: bool,
+    /// The muxer was released for a rebuild that has not opened yet: the
+    /// next build bumps `tables_version` exactly once.
+    rebuild_pending: bool,
     /// OUTMETA (ADR-0088/0089): the per-output metadata + tag-path display
     /// matrix applied to the long-lived video muxer ONCE, before its first
     /// `write_header` (the codec/stream layout is fixed for the run, invariant
@@ -2391,6 +2414,8 @@ impl<'a> SegmentState<'a> {
             recovering: false,
             #[cfg(test)]
             fail_packet_write_once: false,
+            #[cfg(test)]
+            fail_rebuild_once: false,
             recovery_failures: 0,
             publication_failed: false,
             #[cfg(test)]
@@ -2399,6 +2424,9 @@ impl<'a> SegmentState<'a> {
             live: None,
             seg_index: 0,
             tables_version: 0,
+            reseed: None,
+            change_pending: false,
+            rebuild_pending: false,
             meta: None,
             tracks: None,
             renditions: None,
@@ -2810,9 +2838,11 @@ impl<'a> SegmentState<'a> {
             if self.recovering
                 && !(packet.kind() == StreamKind::Video
                     && packet.is_keyframe()
-                    && match self.seed {
-                        StreamSeed::Params(params) => params.is_decoder_ready_rap(&packet),
-                        StreamSeed::Encoder(_) => false,
+                    && match (self.reseed.as_ref(), self.seed) {
+                        (Some(params), _) | (None, StreamSeed::Params(params)) => {
+                            params.is_decoder_ready_rap(&packet)
+                        }
+                        (None, StreamSeed::Encoder(_)) => false,
                     })
             {
                 continue;
@@ -2820,6 +2850,11 @@ impl<'a> SegmentState<'a> {
             let pts = pts_from_packet(packet.pts(), self.stats.packets, self.time_base);
             let boundary = packet.kind() == StreamKind::Video && packet.is_keyframe();
             let config_changed = boundary && source.take_decoder_config_change();
+            if config_changed {
+                if let Some(params) = source.take_decoder_config_params() {
+                    self.reseed = Some(params);
+                }
+            }
             if let Err(error) = self.write_packet_marking(packet, pts, config_changed) {
                 // A segment-boundary failure can be a playlist publication or
                 // file-system fault, not a damaged muxer. Let the supervisor
@@ -2832,9 +2867,11 @@ impl<'a> SegmentState<'a> {
                 // Unsupported codecs and encoder-seeded live sinks have no
                 // decoder-ready RAP classifier. Fail now rather than silently
                 // draining an unbounded live packet source forever.
-                let supported = match self.seed {
-                    StreamSeed::Params(params) => params.supports_decoder_ready_rap(),
-                    StreamSeed::Encoder(_) => false,
+                let supported = match (self.reseed.as_ref(), self.seed) {
+                    (Some(params), _) | (None, StreamSeed::Params(params)) => {
+                        params.supports_decoder_ready_rap()
+                    }
+                    (None, StreamSeed::Encoder(_)) => false,
                 };
                 if !supported {
                     return Err(Error::Output(format!(
@@ -2882,8 +2919,11 @@ impl<'a> SegmentState<'a> {
                 // invariant #7); the first packet is always a keyframe.
                 let is_key = packet.is_keyframe();
                 if is_key {
-                    self.start_segment_with(pts, config_changed)?;
-                    if config_changed {
+                    // Survives a failed start: the recovery path's next RAP
+                    // retries the rebuild and the mark (review V2).
+                    self.change_pending |= config_changed;
+                    self.start_segment_with(pts, self.change_pending)?;
+                    if std::mem::take(&mut self.change_pending) {
                         self.mark_started_segment_discontinuous();
                     }
                 }
@@ -3085,12 +3125,12 @@ impl<'a> SegmentState<'a> {
         };
         self.open_audio_segments(index)?;
         if config_changed {
+            self.rebuild_pending = true;
             if let Some(mut old) = self.current.take() {
                 // Flush and close the finished segment's file (already
                 // published by `close_current`); the muxer is then rebuilt.
                 old.muxer.release_output().map_err(ff)?;
             }
-            self.tables_version = (self.tables_version + 1) % 32;
         }
         if let Some(segment) = self.current.as_mut() {
             // Redirect the SAME long-lived muxer to the new file. Every
@@ -3107,6 +3147,15 @@ impl<'a> SegmentState<'a> {
             // First segment of the run: build the ONE long-lived muxer +
             // register its streams. Rebuilt for a later segment only at a
             // decoder-configuration change (with the next tables_version).
+            if std::mem::take(&mut self.rebuild_pending) {
+                self.tables_version = (self.tables_version + 1) % 32;
+            }
+            #[cfg(test)]
+            if self.tables_version > 0 && std::mem::take(&mut self.fail_rebuild_once) {
+                return Err(Error::Output(
+                    "injected segment muxer rebuild failure".to_owned(),
+                ));
+            }
             let mut muxer = if self.tables_version == 0 {
                 Muxer::create_as(&write_path, "mpegts").map_err(ff)?
             } else {
@@ -3121,7 +3170,12 @@ impl<'a> SegmentState<'a> {
             // Register video then audio BEFORE the header — every segment
             // carries the same pinned two-stream layout (ADR-R005 §3.3,
             // AUD-4).
-            let stream_index = self.seed.add_stream(&mut muxer, self.time_base)?;
+            let stream_index = match self.reseed.as_ref() {
+                Some(params) => muxer
+                    .add_stream_from_parameters(params, self.time_base)
+                    .map_err(ff)?,
+                None => self.seed.add_stream(&mut muxer, self.time_base)?,
+            };
             let audio_index = match self.audio {
                 Some(a) => Some(
                     muxer
@@ -3783,6 +3837,198 @@ mod tests {
             *next_uri, "seg2.ts",
             "the discontinuity precedes the segment starting at the flagged keyframe:\n{flagged}"
         );
+    }
+
+    /// Real MPEG-2 packets: `n` ticks from `start` encoded at `w`×`h`, every
+    /// third a keyframe, plus that encoder's stream parameters.
+    fn sized_packets(
+        w: u32,
+        h: u32,
+        start: u64,
+        n: u64,
+    ) -> (
+        Vec<multiview_ffmpeg::EncodedPacket>,
+        multiview_ffmpeg::StreamCodecParameters,
+    ) {
+        use multiview_core::frame::FrameMeta;
+        use multiview_core::pixel::PixelFormat;
+        use multiview_core::time::MediaTime;
+        let mut enc = super::VideoRenditionEncoder::new(&EncodeConfig::mpeg2(w, h)).unwrap();
+        enc.start_at(start);
+        let params = enc.codec_params().clone();
+        let mut out = Vec::new();
+        for tick in start..start + n {
+            if (tick - start) % 3 == 0 {
+                enc.force_next_keyframe();
+            }
+            let mut video = ffmpeg::util::frame::Video::new(ffmpeg::format::Pixel::YUV420P, w, h);
+            for plane in 0..3 {
+                video
+                    .data_mut(plane)
+                    .fill(if plane == 0 { 80 } else { 128 });
+            }
+            let frame = DecodedVideoFrame {
+                frame: video,
+                meta: FrameMeta {
+                    pts: MediaTime::ZERO,
+                    width: w,
+                    height: h,
+                    format: PixelFormat::Nv12,
+                    color: multiview_core::color::ColorInfo::default(),
+                },
+                raw_pts: None,
+                a53_cc: None,
+            };
+            out.extend(enc.encode_frame_at(frame, tick).unwrap());
+        }
+        out.extend(enc.finish().unwrap());
+        (out, params)
+    }
+
+    /// Width × height of the video stream a written `.ts` file declares: the
+    /// MPEG-2 sequence header (`00 00 01 B3`, 12-bit width, 12-bit height) of
+    /// its first video access unit, read from the TS payload bytes (segments
+    /// this short are below libavformat's probe threshold).
+    fn ts_video_size(path: &std::path::Path) -> (u32, u32) {
+        let bytes = std::fs::read(path).unwrap();
+        // Concatenate the payloads of the TS packets (skip header/adaptation).
+        let mut payload = Vec::new();
+        for p in bytes.chunks_exact(188) {
+            assert_eq!(p[0], 0x47, "TS sync");
+            let pid = (u16::from(p[1] & 0x1f) << 8) | u16::from(p[2]);
+            if pid == 0 || pid == 0x1fff || p[3] & 0x10 == 0 {
+                continue;
+            }
+            let mut at = 4;
+            if p[3] & 0x20 != 0 {
+                at += 1 + usize::from(p[4]);
+            }
+            payload.extend_from_slice(&p[at.min(188)..]);
+        }
+        let i = payload
+            .windows(4)
+            .position(|w| w == [0, 0, 1, 0xb3])
+            .unwrap_or_else(|| panic!("no MPEG-2 sequence header in {}", path.display()));
+        let h = &payload[i + 4..i + 7];
+        let width = (u32::from(h[0]) << 4) | (u32::from(h[1]) >> 4);
+        let height = (u32::from(h[1] & 0x0f) << 8) | u32::from(h[2]);
+        (width, height)
+    }
+
+    /// A source switching encoders at a flagged keyframe and handing the new
+    /// encoder's parameters with the change (as a live format reset does).
+    struct Switching {
+        packets: std::vec::IntoIter<multiview_ffmpeg::EncodedPacket>,
+        switch_pts: i64,
+        params: Option<multiview_ffmpeg::StreamCodecParameters>,
+        last_pts: Option<i64>,
+    }
+    impl super::PacketSource for Switching {
+        fn next_packet(&mut self) -> Result<Option<multiview_ffmpeg::EncodedPacket>> {
+            let next = self.packets.next();
+            self.last_pts = next.as_ref().and_then(multiview_ffmpeg::EncodedPacket::pts);
+            Ok(next)
+        }
+        fn take_decoder_config_change(&mut self) -> bool {
+            self.last_pts == Some(self.switch_pts)
+        }
+        fn take_decoder_config_params(
+            &mut self,
+        ) -> Option<multiview_ffmpeg::StreamCodecParameters> {
+            if self.last_pts == Some(self.switch_pts) {
+                self.params.take()
+            } else {
+                None
+            }
+        }
+    }
+
+    /// #342 B3 review V2: the segment muxer rebuilt at a live format reset is
+    /// seeded from the NEW encoder's parameters: segments before the switch
+    /// declare the old size, the switch segment and later the new one, with
+    /// one discontinuity and the bumped table version.
+    #[test]
+    fn a_rebuilt_segment_muxer_declares_the_new_encoders_size() {
+        use super::{SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        let _counter_guard = counter_guard();
+        let (mut packets, old_params) = sized_packets(160, 120, 0, 6);
+        let (new_packets, new_params) = sized_packets(80, 120, 6, 6);
+        packets.extend(new_packets);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&old_params),
+            Rational::new(1, 30),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 10));
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: 6,
+            params: Some(new_params),
+            last_pts: None,
+        };
+        state.drive_from_packets(&mut source).unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let sizes: Vec<(u32, u32)> = (0..4)
+            .map(|i| ts_video_size(&dir.path().join(format!("seg{i}.ts"))))
+            .collect();
+        assert_eq!(sizes, vec![(160, 120), (160, 120), (80, 120), (80, 120)]);
+        let playlist = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        assert_eq!(
+            playlist.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "{playlist}"
+        );
+        let (_, before) = ts_table_versions(&dir.path().join("seg1.ts"));
+        let (_, after) = ts_table_versions(&dir.path().join("seg2.ts"));
+        assert_eq!(after, (before + 1) % 32);
+    }
+
+    /// Review V2: a failed rebuild is not fatal: the segment is abandoned and
+    /// the sink recovers at the next RAP, where the rebuild and the
+    /// discontinuity happen (seeded from the new parameters).
+    #[test]
+    fn a_failed_rebuild_recovers_at_the_next_rap() {
+        use super::{SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        let _counter_guard = counter_guard();
+        let (mut packets, old_params) = sized_packets(160, 120, 0, 6);
+        let (new_packets, new_params) = sized_packets(80, 120, 6, 9);
+        packets.extend(new_packets);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&old_params),
+            Rational::new(1, 30),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 10));
+        state.fail_rebuild_once = true;
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: 6,
+            params: Some(new_params),
+            last_pts: None,
+        };
+        state
+            .drive_from_packets(&mut source)
+            .expect("recovered, not fatal");
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let playlist = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        // The segment at the switch was abandoned; the next RAP (pts 9)
+        // opened the rebuilt muxer at the new size.
+        let uris: Vec<&str> = playlist.lines().filter(|l| !l.starts_with('#')).collect();
+        let last = dir.path().join(uris.last().unwrap());
+        assert_eq!(ts_video_size(&last), (80, 120), "{playlist}");
+        let first = dir.path().join(uris[0]);
+        assert_eq!(ts_video_size(&first), (160, 120));
+        assert!(playlist.contains("#EXT-X-DISCONTINUITY\n"), "{playlist}");
     }
 
     /// The `version_number` of the PAT and of the PMT it points at, from the

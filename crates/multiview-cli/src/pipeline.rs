@@ -7753,6 +7753,10 @@ impl crate::output_routing::LiveEncoder for PipelineVideoWorker {
         let params = self.0.codec_params().clone();
         Some(Box::new(move |packet| params.rap_parameter_sets(packet)))
     }
+
+    fn stream_params(&self) -> Option<multiview_ffmpeg::StreamCodecParameters> {
+        Some(self.0.codec_params().clone())
+    }
 }
 
 /// The per-item frame-substitution limit: the maximum number of consecutive
@@ -13905,6 +13909,8 @@ struct StreamingPacketSource {
     /// The current window opened a decoder-configuration change not yet
     /// reported to the sink (reported once per lease).
     config_change_unreported: bool,
+    /// That change's new video stream parameters (#342 B3 review V2).
+    config_params_unreported: Option<multiview_ffmpeg::StreamCodecParameters>,
 }
 
 impl StreamingPacketSource {
@@ -13915,6 +13921,7 @@ impl StreamingPacketSource {
             delivered: 0,
             last_lease: std::sync::Weak::new(),
             config_change_unreported: false,
+            config_params_unreported: None,
         }
     }
 }
@@ -13933,6 +13940,7 @@ impl PacketSource for StreamingPacketSource {
         if !self.last_lease.ptr_eq(&lease) {
             self.last_lease = lease;
             self.config_change_unreported = leased.permit.decoder_config_changed();
+            self.config_params_unreported = leased.permit.decoder_config_params();
         }
         self.current_permit = Some(leased.permit);
         self.delivered = self.delivered.saturating_add(1);
@@ -13941,6 +13949,10 @@ impl PacketSource for StreamingPacketSource {
 
     fn take_decoder_config_change(&mut self) -> bool {
         std::mem::take(&mut self.config_change_unreported)
+    }
+
+    fn take_decoder_config_params(&mut self) -> Option<multiview_ffmpeg::StreamCodecParameters> {
+        self.config_params_unreported.take()
     }
 }
 

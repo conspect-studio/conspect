@@ -548,6 +548,11 @@ pub trait LiveEncoder: VideoEncodeWorker {
     fn parameter_sets(&self) -> Option<ParameterSets> {
         None
     }
+    /// The opened encoder's video stream parameters (#342 B3 review V2): a
+    /// live format reset hands them to the reset output's muxer.
+    fn stream_params(&self) -> Option<multiview_ffmpeg::StreamCodecParameters> {
+        None
+    }
 }
 
 /// Opens one encoder for a rendition settings index, on the opener thread.
