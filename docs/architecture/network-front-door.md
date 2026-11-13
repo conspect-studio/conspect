@@ -1125,24 +1125,32 @@ then at 10.07 s the session ends ("MoQ session ended" => `session-failed` => Web
   the next pending read re-created it from the fixed, by then past, instant. Every request stream
   still open 10 s after accept was reset with `H3_REQUEST_REJECTED`: a WebTransport CONNECT
   stream (which lives as long as its session), and a request body slower than 10 s. Fixed:
-  `RecvGuard::deadline_at` is an `Option` cleared together with the `Sleep`.
+  `RecvGuard::deadline_at` is an `Option` cleared together with the `Sleep`, and it is cleared
+  only by a complete **HEADERS** frame (`HeaderGuard::headers_complete`): a grease or unknown
+  frame before HEADERS, which h3 ignores, does not lift the deadline (review finding; a silent or
+  partial-HEADERS stream after grease is still reset).
 * **The subprotocol rows of the office matrix** ("Opening handshake failed" with `protocols`)
   were the single-use ticket: the matrix reused one lease URL, the first row claimed the ticket
   and every later CONNECT got `401`, which Chrome reports exactly so. Reproduced with Chrome 157.
   The response format was already the draft's (`wt-protocol` as an sf-string echoing one offered
   value; quiche ignores any other value instead of failing).
 * **Negotiation, now explicit** (draft-ietf-webtrans-http3 section 3.3: the server MAY reject a
-  request without a suitable protocol). The client's most preferred offered protocol the handler
-  supports is selected. An offer with none of them is refused `400`, and a CONNECT without any
+  request without a suitable protocol). The offer is parsed with a real RFC 8941 parser (`sfv`,
+  already in the graph): all `wt-available-protocols` field lines combined into one List; a field
+  that does not parse, has a non-String member or an inner list, or offers more than 32 entries is
+  ignored as a whole (treated as no offer), parameters are ignored structurally; the legacy
+  `sec-webtransport-protocol` is read only without the standard field. The client's most
+  preferred offered protocol the handler supports is selected. An offer with none of them is refused `400`, and a CONNECT without any
   offer is refused `400` when the handler `requires_protocol()` (`MoqWt` does: the external
   runtime speaks one `moqt-*` version, negotiated only through `wt-protocol`; a `200` without it
   was closed by the handler at once, which raced the browser's `ready`). Both are decided **before
   `admit`**, so a refused CONNECT never claims the single-use ticket.
 * **Every refused CONNECT is logged** (`WebTransport CONNECT refused`, `info`) with peer, path
   (no query: the ticket is never logged), status, reason, the offer and the supported list, at
-  most 20 lines per second endpoint-wide (the next logged line reports how many were suppressed);
-  every refusal is counted (`Counters::wt_refused`, `wt_refusal_logs_suppressed`). A `200` that
-  could not be sent is logged too.
+  most 20 lines per second endpoint-wide (the window only moves forward; a caller that sampled an
+  older second is charged to the current one; the next logged line reports how many were
+  suppressed); every refusal is counted (`Counters::wt_refused`, `wt_refusal_logs_suppressed`).
+  A `200` that could not be sent is counted and logged under the same budget.
 * **Invariants.** Sessions now live for as long as the viewer does, not at most 10 s. The R3 chaos
   test `crates/multiview-cli/tests/h3_chaos.rs` holds 8 sessions, each receiving one
   server-opened stream per 100 ms, across the idle and hammer runs (15 s, past the deadline): every
@@ -1150,8 +1158,10 @@ then at 10.07 s the session ends ("MoQ session ended" => `session-failed` => Web
   header-deadline reset. With the old guard the same test fails (the sessions stop at ~100
   streams, 10 s). No new queue; the per-session bounds of the table above are unchanged.
 * **Tests.** `crates/multiview-h3/tests/stream_deadlines.rs` (a session and a slow request body
-  outlive the header deadline; red before the fix), the unit test
-  `a_cleared_deadline_never_fires_again`, `tests/pooling.rs`
+  outlive the header deadline, red before the fix; grease before a silent or partial HEADERS is
+  still reset at the deadline), the unit tests `a_cleared_deadline_never_fires_again`,
+  `headers_complete_ignores_grease_and_partial_headers`, the limiter's ordering and concurrency
+  tests and the RFC 8941 negotiation cases in `webtransport.rs`, `tests/pooling.rs`
   (`offer_without_a_common_protocol_is_400_before_admit`), `multiview-control` `tests/h3_site.rs`
   (no offer / no common offer `400` and the ticket still plays). Real browser, CI job
   `h3-browser-webtransport`: `multiview-h3` `tests/chrome_webtransport.rs` (feature

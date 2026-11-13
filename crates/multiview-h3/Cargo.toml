@@ -39,6 +39,9 @@ noq = { package = "moq-noq", version = "=1.3.5", default-features = false, featu
 # No provider selected: the caller passes a ready `rustls::ServerConfig`.
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 web-transport-trait = "0.4.0"
+# RFC 8941 parsing of `wt-available-protocols` (already in the graph via
+# web-transport-proto; MIT OR Apache-2.0).
+sfv = { version = "0.15", default-features = false, features = ["parsed-types"] }
 bytes = "1"
 http = "1"
 http-body = "1"

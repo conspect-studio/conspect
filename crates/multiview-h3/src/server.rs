@@ -614,7 +614,16 @@ async fn handle_request(shared: Arc<Shared>, req: http::Request<()>, mut stream:
         }
     };
     if let Err(err) = send.send_response(response).await {
-        tracing::info!(peer = %shared.peer, %err, "WebTransport CONNECT: the 200 could not be sent");
+        // Peer-triggerable (reset before the 200): counted and rate-limited
+        // like a refusal.
+        if let Some(suppressed) = shared.counters.refusal(EPOCH.elapsed().as_secs()) {
+            tracing::info!(
+                peer = %shared.peer,
+                %err,
+                suppressed_since_last = suppressed,
+                "WebTransport CONNECT: the 200 could not be sent"
+            );
+        }
         shared.router.release();
         return;
     }

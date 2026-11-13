@@ -93,54 +93,52 @@ pub const BUFFERED_STREAM_REJECTED: u64 = 0x3994_bd84;
 /// `H3_WEBTRANSPORT_SESSION_GONE`.
 pub const SESSION_GONE: u64 = 0x170d_7b68;
 
-/// Parses the client's subprotocol offer: an RFC 8941 list of sf-strings,
-/// e.g. `"moq-lite-03", "moqt-15"`. Tokens are tolerated (legacy clients).
-/// Entries that are neither are skipped; parameters are ignored. At most 32
-/// entries are considered.
+/// Most offered protocols considered (Chrome sends what the page passes;
+/// `@moq/net` offers 13).
+pub const MAX_OFFERED: usize = 32;
+
+/// Parses one complete `wt-available-protocols` field value (all field
+/// lines already combined with `, `, RFC 9110 section 5.3) as an RFC 8941
+/// List with a real structured-field parser. Draft-ietf-webtrans-http3
+/// section 3.3: the only valid member type is String and "any value type
+/// other than String MUST be treated as an error that causes the entire
+/// field to be ignored"; parameters are ignored. So a field that does not
+/// parse, contains a non-String member or an inner list, or offers more
+/// than [`MAX_OFFERED`] protocols yields `None` (ignored), never a prefix.
 #[must_use]
-pub fn parse_protocol_list(value: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = value.trim_start();
-    while !rest.is_empty() && out.len() < 32 {
-        let (item, tail) = if let Some(body) = rest.strip_prefix('"') {
-            let mut item = String::new();
-            let mut escaped = false;
-            let mut end = None;
-            for (i, c) in body.char_indices() {
-                if escaped {
-                    item.push(c);
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    end = Some(i + 1);
-                    break;
-                } else {
-                    item.push(c);
-                }
-            }
-            let Some(end) = end else { break };
-            (Some(item), body.get(end..).unwrap_or_default())
-        } else {
-            let end = rest.find([',', ';']).unwrap_or(rest.len());
-            let token = rest.get(..end).unwrap_or_default().trim();
-            let ok = !token.is_empty()
-                && token
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~:/".contains(c));
-            (
-                ok.then(|| token.to_owned()),
-                rest.get(end..).unwrap_or_default(),
-            )
-        };
-        if let Some(item) = item {
-            out.push(item);
-        }
-        // Skip parameters up to the next list separator.
-        let Some(comma) = tail.find(',') else { break };
-        rest = tail.get(comma + 1..).unwrap_or_default().trim_start();
+pub fn parse_protocol_list(value: &str) -> Option<Vec<String>> {
+    let list = sfv::Parser::new(value).parse::<sfv::List>().ok()?;
+    if list.len() > MAX_OFFERED {
+        return None;
     }
-    out
+    list.iter()
+        .map(|entry| match entry {
+            sfv::ListEntry::Item(item) => item.bare_item.as_string().map(|s| s.as_str().to_owned()),
+            sfv::ListEntry::InnerList(_) => None,
+        })
+        .collect()
+}
+
+/// The client's offer: every `wt-available-protocols` field line combined;
+/// the legacy `sec-webtransport-protocol` name only when the standard one
+/// is absent. `None` when absent or ignored (see [`parse_protocol_list`]).
+fn offered_protocols(headers: &http::HeaderMap) -> Option<Vec<String>> {
+    let name = if headers.contains_key(AVAILABLE_PROTOCOLS) {
+        AVAILABLE_PROTOCOLS
+    } else {
+        AVAILABLE_PROTOCOLS_LEGACY
+    };
+    let mut lines = headers.get_all(name).iter().peekable();
+    lines.peek()?;
+    let mut combined = String::new();
+    for line in lines {
+        let line = line.to_str().ok()?;
+        if !combined.is_empty() {
+            combined.push_str(", ");
+        }
+        combined.push_str(line);
+    }
+    parse_protocol_list(&combined)
 }
 
 /// Encodes `value` as an RFC 8941 sf-string (`"..."` with `\` escapes).
@@ -165,9 +163,9 @@ pub fn encode_sf_string(value: &str) -> Option<String> {
 /// The outcome of subprotocol negotiation for one CONNECT.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
-    /// The client offered nothing usable (no offer header, or one that
-    /// does not parse: draft-ietf-webtrans-http3 section 3.3 says such a
-    /// field is ignored). The session is accepted without `wt-protocol`.
+    /// The client offered nothing usable (no offer header, an empty one, or
+    /// one that is ignored as malformed: draft-ietf-webtrans-http3 section
+    /// 3.3). The session gets no `wt-protocol`.
     NoOffer,
     /// The client's most preferred offer the server supports; echoed as
     /// `wt-protocol`.
@@ -192,12 +190,9 @@ impl Selection {
 /// the page passed `protocols`); the first entry the server supports wins.
 #[must_use]
 pub fn negotiate(headers: &http::HeaderMap, supported: &[&'static str]) -> Selection {
-    let offered: Vec<String> = [AVAILABLE_PROTOCOLS, AVAILABLE_PROTOCOLS_LEGACY]
-        .iter()
-        .flat_map(|name| headers.get_all(*name))
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(parse_protocol_list)
-        .collect();
+    let Some(offered) = offered_protocols(headers) else {
+        return Selection::NoOffer;
+    };
     if offered.is_empty() {
         return Selection::NoOffer;
     }
@@ -961,30 +956,91 @@ mod tests {
 
     #[test]
     fn protocol_list_parsing_and_selection() {
+        // Parameters are ignored structurally, also when they contain commas
+        // or protocol-looking strings.
         assert_eq!(
-            parse_protocol_list(r#""moq-lite-03";q=1, "moqt-15", tok"#),
-            vec!["moq-lite-03", "moqt-15", "tok"]
-        );
-        assert_eq!(parse_protocol_list(r#""a\"b""#), vec!["a\"b"]);
-        assert_eq!(
-            parse_protocol_list(r#""unterminated"#),
-            Vec::<String>::new()
-        );
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            AVAILABLE_PROTOCOLS,
-            http::HeaderValue::from_static(r#""x", "moqt-15""#),
+            parse_protocol_list(r#""moq-lite-03";q=1, "moqt-15""#),
+            Some(vec!["moq-lite-03".to_owned(), "moqt-15".to_owned()])
         );
         assert_eq!(
-            select_protocol(&headers, &["moq-lite-03", "moqt-15"]),
+            parse_protocol_list(r#""other";p=",moqt-16,""#),
+            Some(vec!["other".to_owned()])
+        );
+        assert_eq!(
+            parse_protocol_list(r#""a\"b""#),
+            Some(vec!["a\"b".to_owned()])
+        );
+        // Malformed or non-String members: the whole field is ignored.
+        for bad in [
+            r#""other", "unterminated"#,
+            r#""a", tok"#,
+            r#"("a" "b")"#,
+            "1",
+            "",
+        ] {
+            assert_eq!(
+                parse_protocol_list(bad).filter(|l| !l.is_empty()),
+                None,
+                "{bad}"
+            );
+        }
+        let many = vec!["\"x\""; MAX_OFFERED + 1].join(", ");
+        assert_eq!(parse_protocol_list(&many), None);
+
+        let headers = |lines: &[&'static str]| {
+            let mut h = http::HeaderMap::new();
+            for l in lines {
+                h.append(AVAILABLE_PROTOCOLS, http::HeaderValue::from_static(l));
+            }
+            h
+        };
+        let supported = ["moq-lite-03", "moqt-15"];
+        // The client's preference order wins.
+        assert_eq!(
+            negotiate(&headers(&[r#""x", "moqt-15", "moq-lite-03""#]), &supported),
+            Selection::Selected("moqt-15")
+        );
+        assert_eq!(
+            select_protocol(&headers(&[r#""x", "moqt-15""#]), &supported),
             Some("moqt-15")
         );
-        assert_eq!(select_protocol(&headers, &["none"]), None);
-        assert_eq!(negotiate(&headers, &["none"]), Selection::NoMatch);
         assert_eq!(
-            negotiate(&http::HeaderMap::new(), &["moqt-16"]),
+            negotiate(&headers(&[r#""x""#]), &supported),
+            Selection::NoMatch
+        );
+        // A value only inside a parameter is never selected.
+        assert_eq!(
+            negotiate(&headers(&[r#""other";p=",moqt-15,""#]), &supported),
+            Selection::NoMatch
+        );
+        // Several field lines form one list; a malformed line spoils the field.
+        assert_eq!(
+            negotiate(&headers(&[r#""x""#, r#""moqt-15""#]), &supported),
+            Selection::Selected("moqt-15")
+        );
+        assert_eq!(
+            negotiate(&headers(&[r#""moqt-15""#, r#""bad"#]), &supported),
             Selection::NoOffer
         );
+        assert_eq!(
+            negotiate(&http::HeaderMap::new(), &supported),
+            Selection::NoOffer
+        );
+        // Legacy name only without the standard one.
+        let mut legacy = http::HeaderMap::new();
+        legacy.insert(
+            AVAILABLE_PROTOCOLS_LEGACY,
+            http::HeaderValue::from_static(r#""moqt-15""#),
+        );
+        assert_eq!(
+            negotiate(&legacy, &supported),
+            Selection::Selected("moqt-15")
+        );
+        legacy.insert(
+            AVAILABLE_PROTOCOLS,
+            http::HeaderValue::from_static(r#""x""#),
+        );
+        assert_eq!(negotiate(&legacy, &supported), Selection::NoMatch);
         assert_eq!(encode_sf_string("moq"), Some("\"moq\"".into()));
         let resp = connect_response(Some("moqt-15")).unwrap();
         assert_eq!(resp.headers()[SELECTED_PROTOCOL], "\"moqt-15\"");

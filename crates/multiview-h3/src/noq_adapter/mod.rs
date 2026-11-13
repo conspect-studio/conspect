@@ -1389,7 +1389,7 @@ impl RecvStream {
         if let (Some(guard), Some(data)) = (self.guard.as_mut(), chunk.as_ref()) {
             match guard.guard.feed(data) {
                 Verdict::Continue => {
-                    if guard.guard.first_frame_complete() {
+                    if guard.guard.headers_complete() {
                         guard.clear_deadline();
                     }
                 }

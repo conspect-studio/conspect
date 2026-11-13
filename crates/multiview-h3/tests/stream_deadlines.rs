@@ -196,3 +196,48 @@ impl multiview_h3::WtHandler for Holder {
         &["moqt-16"]
     }
 }
+
+/// #382 review: a zero-length grease frame (which h3 ignores) before the
+/// HEADERS does not lift the header deadline: a stream that then stays
+/// silent, or sends only part of its HEADERS, is still reset at the
+/// deadline, and the connection keeps serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grease_before_headers_does_not_lift_the_deadline() {
+    let server = start(TestSite::new(), None, short_deadline(), None).await;
+    let mut client = h3_client(&server).await;
+    let mut streams = Vec::new();
+    for partial_headers in [false, true] {
+        let (mut send, recv) = client.conn.open_bi().await.unwrap();
+        let mut bytes = Vec::new();
+        multiview_h3::varint::encode(0x21, &mut bytes);
+        multiview_h3::varint::encode(0, &mut bytes);
+        if partial_headers {
+            multiview_h3::varint::encode(0x01, &mut bytes);
+            multiview_h3::varint::encode(64, &mut bytes);
+            bytes.extend([0u8; 8]);
+        }
+        send.write_all(&bytes).await.unwrap();
+        streams.push((send, recv));
+    }
+    let started = Instant::now();
+    let (resp, _) = fetch(&mut client.send, request(http::Method::GET, "/next")).await;
+    assert_eq!(resp.status(), 200);
+    for (send, _recv) in &streams {
+        let stopped = tokio::time::timeout(TIMEOUT, send.stopped())
+            .await
+            .expect("a greased stream escaped the header deadline")
+            .unwrap();
+        assert_eq!(stopped.map(noq::VarInt::into_inner), Some(0x10b));
+    }
+    assert!(
+        started.elapsed() >= Duration::from_millis(600),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        multiview_h3::Counters::get(&server.endpoint.counters().header_deadline_rejections),
+        2
+    );
+    let (resp, _) = fetch(&mut client.send, request(http::Method::GET, "/after")).await;
+    assert_eq!(resp.status(), 200);
+}
