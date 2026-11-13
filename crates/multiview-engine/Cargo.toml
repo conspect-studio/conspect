@@ -42,9 +42,23 @@ rustix = { version = "1.1.4", features = ["time"], optional = true }
 # this leaf crate (which is `unsafe_code = "deny"` + `// SAFETY:`), so there is no
 # `unsafe` in the engine. License: MIT OR Apache-2.0 (LGPL-clean).
 multiview-ntpsys = { workspace = true, optional = true }
+# Output clock thread scheduling on macOS (QoS user-interactive, #311): the one
+# FFI call lives in this leaf crate (deny + SAFETY), so the engine stays
+# `forbid(unsafe_code)`. A no-op that links nothing on every other target.
+multiview-clocksys = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+
+# Output clock thread (#311, ADR-0109): `clock_nanosleep(CLOCK_MONOTONIC,
+# TIMER_ABSTIME)`, `clock_gettime`, the per-thread timer slack (`prctl`) and the
+# optional niceness (`setpriority`) — all through rustix's safe wrappers, so the
+# engine stays `forbid(unsafe_code)` (rustix owns the FFI, linux_raw backend, no
+# libc/native deps). Linux only; macOS and Windows use the portable
+# sleep-then-spin fallback in `clock_thread.rs`. License: MIT OR Apache-2.0 OR
+# BSD-2-Clause (LGPL-clean).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["time", "thread", "process"] }
 
 [dev-dependencies]
 proptest = "1.11.0"

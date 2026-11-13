@@ -71,6 +71,10 @@ pub(crate) struct TrackedStream<S> {
     /// after an upgrade, since hyper moves this wrapper into its `Upgraded`. `None` when
     /// no population cap is configured. Released by `Drop` (RAII).
     _guard: Option<ConnectionGuard>,
+    /// An extra admission slot owned by the caller (the network front door's
+    /// accept-time guard), held for the same whole life. Released by `Drop`.
+    #[allow(dead_code)] // held only for its `Drop` (RAII)
+    extra: Option<Box<dyn Send>>,
     /// Shutdown waiter for the **read** half. Independent of the write half's waiter so a
     /// parked read wakes on the shutdown flip regardless of which half was polled last —
     /// robust even if the stream is `io::split`. See the module docs.
@@ -128,11 +132,20 @@ impl<S> TrackedStream<S> {
         Self {
             inner,
             _guard: guard,
+            extra: None,
             shutdown_read: wait_for_shutdown(shutdown.clone()),
             shutdown_write: wait_for_shutdown(shutdown),
             draining_read: false,
             draining_write: false,
         }
+    }
+}
+
+impl<S> TrackedStream<S> {
+    /// Also hold `extra` (an outer admission slot) for the stream's whole life.
+    pub(crate) fn with_extra(mut self, extra: Box<dyn Send>) -> Self {
+        self.extra = Some(extra);
+        self
     }
 }
 

@@ -63,6 +63,7 @@ pub fn spawn_unified_webrtc(
     demand: Option<multiview_control::SharedSourceDemand>,
     #[cfg(feature = "moq-output")] wall: Option<crate::preview::WallPictureSlot>,
     front_door: Option<(multiview_frontdoor::RtcLane, tokio::runtime::Handle)>,
+    ice_tcp: Option<multiview_frontdoor::IceTcpLane>,
 ) -> UnifiedWebrtc {
     let mut endpoint_config = endpoint_config_from(config);
     // With the front door (ADR-0107), WebRTC rides its shared socket: the
@@ -77,6 +78,12 @@ pub fn spawn_unified_webrtc(
                 }
             }
             endpoint_config.udp_port = lane.local_addr().port();
+            // ICE-TCP (slice 4): passive TCP candidates on the TCP door's port,
+            // on the same advertised IPs as UDP. Only with the door's lane
+            // (direct mode + `network.ice_tcp.enabled`).
+            endpoint_config.ice_tcp_port = ice_tcp
+                .as_ref()
+                .map(multiview_frontdoor::IceTcpLane::local_port);
             let built = lane
                 .send_socket()
                 .map_err(|source| multiview_webrtc::error::WebRtcError::Socket {
@@ -84,7 +91,7 @@ pub fn spawn_unified_webrtc(
                     source,
                 })
                 .and_then(|send| UnifiedEndpoint::with_shared_socket(endpoint_config, send));
-            (built, Some((lane, handle)))
+            (built, Some((lane, handle, ice_tcp)))
         }
         None => (UnifiedEndpoint::bind(endpoint_config), None),
     };
@@ -136,7 +143,13 @@ pub fn spawn_unified_webrtc(
 
     // 3. The native preview egress (always wired when the socket bound — preview is
     //    the always-available WebRTC surface).
-    let egress = Arc::new(WhepEgress::with_host_candidates(hosts));
+    let egress = Arc::new(WhepEgress::with_host_candidates_tcp(
+        hosts,
+        builder
+            .tcp_candidates()
+            .first()
+            .map(std::net::SocketAddr::port),
+    ));
     let preview_provider = crate::whep::CliWhepProvider::for_unified(
         Arc::clone(&egress),
         program_slot,
@@ -174,14 +187,17 @@ pub fn spawn_unified_webrtc(
     // Spawn the ONE driver task that owns the socket for the run's lifetime.
     let endpoint = builder.build();
     let stop = Arc::new(AtomicBool::new(false));
-    if let Some((lane, handle)) = shared {
+    if let Some((lane, handle, ice_tcp)) = shared {
         let local = lane.local_addr();
+        let ice_tcp_port = ice_tcp
+            .as_ref()
+            .map(multiview_frontdoor::IceTcpLane::local_port);
         handle.spawn(async move {
-            if let Err(err) = endpoint.run_shared(lane, stop).await {
+            if let Err(err) = endpoint.run_shared_with_tcp(lane, ice_tcp, stop).await {
                 tracing::warn!(%err, "unified WebRTC endpoint driver exited");
             }
         });
-        tracing::info!(%local, "unified WebRTC endpoint on the front-door socket (driver on the front-door runtime)");
+        tracing::info!(%local, ?ice_tcp_port, "unified WebRTC endpoint on the front-door socket (driver on the front-door runtime)");
     } else {
         tokio::spawn(async move {
             if let Err(err) = endpoint.run(stop).await {

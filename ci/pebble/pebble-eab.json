@@ -1,0 +1,22 @@
+{
+  "pebble": {
+    "listenAddress": ":14001",
+    "managementListenAddress": ":15001",
+    "certificate": "test/certs/localhost/cert.pem",
+    "privateKey": "test/certs/localhost/key.pem",
+    "httpPort": 5003,
+    "tlsPort": 5001,
+    "ocspResponderURL": "",
+    "externalAccountBindingRequired": true,
+    "externalAccountMACKeys": {
+      "kid-1": "zWNDZM6eQGHWpSRTPal5eIUYFTu7EajVIoguysqZ9wG44nMEtx3MUAsUDkMTQ12W"
+    },
+    "domainBlocklist": ["blocked-domain.example"],
+    "retryAfter": { "authz": 1, "order": 1 },
+    "keyAlgorithm": "ecdsa",
+    "profiles": {
+      "default": { "description": "The profile you know and love", "validityPeriod": 7776000 },
+      "shortlived": { "description": "A short-lived cert profile", "validityPeriod": 518400 }
+    }
+  }
+}

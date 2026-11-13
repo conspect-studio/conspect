@@ -33,7 +33,10 @@ pub(crate) mod whip_push;
 
 pub use ingest::{RtpRing, RtpRingEngine, MAX_INGRESS_RTP};
 pub use local_addr::resolve_local_destination;
-pub use unified::{InboundDatagram, SharedInbound, UnifiedBuilder, UnifiedEndpoint};
+pub use unified::{
+    Egress, InboundDatagram, InboundFrame, SharedInbound, SharedTcp, TcpSend, UnifiedBuilder,
+    UnifiedEndpoint,
+};
 pub use whep_serve::{WhepNegotiated, WhepServeEndpoint, WhepServeHandle};
 pub use whip_endpoint::{WhipEndpoint, WhipHandle, WhipNegotiated};
 pub use whip_push::{
@@ -53,7 +56,7 @@ use str0m::media::{Frequency, MediaKind as Str0mMediaKind, MediaTime, Mid};
 /// directly (a WHEP viewer offers [`Direction::RecvOnly`]; the `whip_push` client
 /// offers [`Direction::SendOnly`]).
 pub use str0m::media::Direction;
-use str0m::net::{Protocol, Receive};
+use str0m::net::{Protocol, Receive, TcpType};
 use str0m::{Candidate, Event, Input, Output, Rtc};
 
 use crate::config::EndpointConfig;
@@ -65,6 +68,66 @@ const VIDEO_CLOCK_HZ: Frequency = Frequency::NINETY_KHZ;
 /// The 48 kHz RTP clock for Opus audio (RFC 7587; ADR-P006 §6, ADR-0049 §6). Opus
 /// always rides a 48 kHz RTP clock regardless of the internal sample rate.
 const AUDIO_CLOCK_HZ: Frequency = Frequency::FORTY_EIGHT_KHZ;
+
+/// The transport a datagram travels on: plain UDP, or an ICE-TCP connection
+/// (RFC 6544, framed by RFC 4571 outside this crate). TCP and UDP candidates
+/// may share one `addr:port` (the front door's 443), so the transport, never the
+/// address, decides how an outbound datagram leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Transport {
+    /// UDP (the shared socket, or a TURN relay over UDP).
+    Udp,
+    /// ICE-TCP (one framed TCP connection per peer).
+    Tcp,
+}
+
+impl Transport {
+    const fn to_str0m(self) -> Protocol {
+        match self {
+            Self::Udp => Protocol::Udp,
+            Self::Tcp => Protocol::Tcp,
+        }
+    }
+
+    const fn from_str0m(proto: Protocol) -> Self {
+        match proto {
+            Protocol::Udp => Self::Udp,
+            // str0m only emits the protocols of our own candidates: UDP host /
+            // relay and the ICE-TCP passive host candidate.
+            Protocol::Tcp | Protocol::SslTcp | Protocol::Tls => Self::Tcp,
+        }
+    }
+}
+
+/// One datagram a session wants sent, with the transport it must use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outbound {
+    /// UDP or ICE-TCP. A TCP datagram must never be sent over UDP.
+    pub transport: Transport,
+    /// The local candidate base (a TURN relay address for relayed UDP).
+    pub source: SocketAddr,
+    /// The remote address.
+    pub destination: SocketAddr,
+    /// The datagram (unframed for TCP).
+    pub payload: Vec<u8>,
+}
+
+/// The passive ICE-TCP host candidates for `hosts` on `tcp_port`: one per
+/// concrete (non-unspecified) host IP, in the given (IPv6-first) order, deduped.
+#[must_use]
+pub fn tcp_passive_candidates(hosts: &[SocketAddr], tcp_port: Option<u16>) -> Vec<SocketAddr> {
+    let Some(port) = tcp_port else {
+        return Vec::new();
+    };
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for host in hosts.iter().filter(|h| !h.ip().is_unspecified()) {
+        let addr = SocketAddr::new(host.ip(), port);
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
+}
 
 /// The kind of media a session carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,7 +253,8 @@ pub struct Session {
     /// is the local candidate's base — for a **relay** candidate that base IS the
     /// allocated relay address, the signal the driver uses to frame the datagram as
     /// a TURN Send indication instead of a direct send (defect C, ADR-0048 §5.1).
-    outbound: VecDeque<(SocketAddr, SocketAddr, Vec<u8>)>,
+    /// The str0m `Transmit::proto` rides along as [`Outbound::transport`].
+    outbound: VecDeque<Outbound>,
     /// The next wake instant from the last drive pass.
     next_timeout: Option<Instant>,
     /// Decrypted media frames surfaced by the engine, oldest first (bounded) —
@@ -216,7 +280,10 @@ pub struct Session {
     /// connectivity-check round trip proved it), never on credentials alone. A
     /// STUN Binding request is accepted on MESSAGE-INTEGRITY from ANY source
     /// address, so it never sets this (review PR 315).
-    validated_peer: Option<SocketAddr>,
+    /// The transport rides along: only a UDP-validated peer is ever reported
+    /// (the shared socket's established set must never learn an address from
+    /// an ICE-TCP path).
+    validated_peer: Option<(SocketAddr, Transport)>,
 }
 
 /// A decrypted media frame surfaced from the remote peer.
@@ -338,12 +405,18 @@ impl Session {
         loop {
             match self.rtc.poll_output() {
                 Ok(Output::Transmit(transmit)) => {
+                    let transport = Transport::from_str0m(transmit.proto);
                     let bytes: Vec<u8> = transmit.contents.into();
                     // Carry the str0m source (local candidate base) so the driver
                     // can detect a relay-routed datagram (source == relay addr) and
-                    // frame it as a TURN Send indication (defect C).
-                    self.outbound
-                        .push_back((transmit.source, transmit.destination, bytes));
+                    // frame it as a TURN Send indication (defect C), and the
+                    // protocol so an ICE-TCP datagram never leaves over UDP.
+                    self.outbound.push_back(Outbound {
+                        transport,
+                        source: transmit.source,
+                        destination: transmit.destination,
+                        payload: bytes,
+                    });
                 }
                 Ok(Output::Timeout(t)) => {
                     self.next_timeout = Some(t.max(now));
@@ -370,6 +443,38 @@ impl Session {
     pub fn add_host_candidate(&mut self, addr: SocketAddr) -> Result<()> {
         let candidate = Candidate::host(addr, Protocol::Udp)
             .map_err(|e| WebRtcError::Transport(format!("host candidate {addr}: {e}")))?;
+        self.rtc.add_local_candidate(candidate);
+        Ok(())
+    }
+
+    /// Register a **passive ICE-TCP** host candidate (RFC 6544): the peer opens
+    /// a TCP connection to `addr` (the front door's TCP port). str0m's type
+    /// preference ranks a TCP host below every UDP host, so UDP stays preferred.
+    ///
+    /// # Errors
+    ///
+    /// [`WebRtcError::Transport`] if `addr` is not a valid host candidate.
+    pub fn add_tcp_passive_candidate(&mut self, addr: SocketAddr) -> Result<()> {
+        self.add_tcp_candidate(addr, TcpType::Passive)
+    }
+
+    /// Register an **active ICE-TCP** host candidate at `addr` (a client that
+    /// opens the TCP connection itself; tests and TCP-only peers).
+    ///
+    /// # Errors
+    ///
+    /// [`WebRtcError::Transport`] if `addr` is not a valid host candidate.
+    pub fn add_tcp_active_candidate(&mut self, addr: SocketAddr) -> Result<()> {
+        self.add_tcp_candidate(addr, TcpType::Active)
+    }
+
+    fn add_tcp_candidate(&mut self, addr: SocketAddr, tcptype: TcpType) -> Result<()> {
+        let candidate = Candidate::builder()
+            .tcp()
+            .host(addr)
+            .tcptype(tcptype)
+            .build()
+            .map_err(|e| WebRtcError::Transport(format!("tcp host candidate {addr}: {e}")))?;
         self.rtc.add_local_candidate(candidate);
         Ok(())
     }
@@ -526,6 +631,15 @@ impl Session {
     /// the engine is never polled twice per tick.
     #[must_use = "the returned datagram must actually be sent"]
     pub fn poll_transmit(&mut self, now: Instant) -> Option<(SocketAddr, SocketAddr, Vec<u8>)> {
+        self.poll_transmit_routed(now)
+            .map(|o| (o.source, o.destination, o.payload))
+    }
+
+    /// Pull the next datagram with its [`Transport`]. Every driver path uses
+    /// this, so an ICE-TCP datagram is routed to its TCP connection and never
+    /// sent over UDP (both candidates may share one `addr:port`).
+    #[must_use = "the returned datagram must actually be sent"]
+    pub fn poll_transmit_routed(&mut self, now: Instant) -> Option<Outbound> {
         let _ = now;
         self.outbound.pop_front()
     }
@@ -554,7 +668,25 @@ impl Session {
         payload: &[u8],
         now: Instant,
     ) -> Result<()> {
-        let receive = match Receive::new(Protocol::Udp, source, destination, payload) {
+        self.handle_datagram_proto(Transport::Udp, source, destination, payload, now)
+    }
+
+    /// [`handle_datagram`](Self::handle_datagram) for a datagram received on
+    /// `proto`: an ICE-TCP frame (deframed) is fed as [`Transport::Tcp`] with
+    /// the TCP door's local address as `destination`.
+    ///
+    /// # Errors
+    ///
+    /// As [`handle_datagram`](Self::handle_datagram).
+    pub fn handle_datagram_proto(
+        &mut self,
+        proto: Transport,
+        source: SocketAddr,
+        destination: SocketAddr,
+        payload: &[u8],
+        now: Instant,
+    ) -> Result<()> {
+        let receive = match Receive::new(proto.to_str0m(), source, destination, payload) {
             Ok(r) => r,
             // A datagram str0m can't even parse as STUN/DTLS/RTP is not for us.
             Err(_e) => return Ok(()),
@@ -575,7 +707,7 @@ impl Session {
         if !self.connected {
             self.validated_peer = None;
         } else if !stun {
-            self.validated_peer = Some(source);
+            self.validated_peer = Some((source, proto));
         }
         Ok(())
     }
@@ -584,13 +716,14 @@ impl Session {
     /// source of the last DTLS/SRTP datagram str0m accepted on this connected
     /// session (str0m accepts those only from an ICE-proven address). A STUN
     /// request, which str0m accepts on MESSAGE-INTEGRITY from any address, never
-    /// makes its source validated. `None` while not connected.
+    /// makes its source validated. `None` while not connected, and `None` when
+    /// that datagram came over ICE-TCP: the established set is the UDP
+    /// socket's, and a TCP path proves nothing about a UDP source.
     #[must_use]
     pub fn validated_peer(&self) -> Option<SocketAddr> {
-        if self.connected && self.rtc.is_alive() {
-            self.validated_peer
-        } else {
-            None
+        match self.validated_peer {
+            Some((peer, Transport::Udp)) if self.connected && self.rtc.is_alive() => Some(peer),
+            _ => None,
         }
     }
 

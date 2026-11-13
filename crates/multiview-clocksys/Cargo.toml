@@ -1,0 +1,51 @@
+[package]
+name = "multiview-clocksys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published (matches
+# multiview-ntpsys / xtask).
+publish = false
+description = "Minimal safe wrapper that raises the output-clock thread's scheduling class on macOS (QoS USER_INTERACTIVE)."
+
+[dependencies]
+# macOS only: `pthread_set_qos_class_self_np` + `qos_class_t`. Pure FFI
+# declarations; no transitive deps. License: MIT OR Apache-2.0 (LGPL-clean).
+# Every other target compiles this crate to a no-op and links nothing.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.186"
+
+# FFI crate exception (mirrors multiview-ntpsys): the workspace forbids
+# `unsafe_code` and a `forbid` cannot be relaxed downstream, so this crate
+# restates the workspace lint set with `unsafe_code` lowered to `deny`; the one
+# FFI call carries a `// SAFETY:` justification. Keep in sync with the root
+# Cargo.toml `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all      = { level = "deny",  priority = -2 }
+pedantic = { level = "warn",  priority = -1 }
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+get_unwrap       = "deny"
+indexing_slicing = "deny"
+as_conversions   = "deny"
+exit             = "deny"
+mem_forget       = "deny"
+dbg_macro        = "deny"
+print_stdout     = "deny"
+print_stderr     = "deny"
+str_to_string    = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"

@@ -39,6 +39,8 @@
 #![warn(missing_docs)]
 
 pub mod account_audit;
+#[cfg(all(feature = "acme", unix))]
+pub mod acme;
 pub mod alarm_ingest;
 pub mod alarm_store;
 pub mod audio_routing;
@@ -782,6 +784,248 @@ where
     Ok(())
 }
 
+/// A connection-level entry point to the control-plane serve floor, for
+/// listeners that accept (and terminate TLS) themselves: the network front
+/// door's TCP door (ADR-0107 slice 4, issue #290).
+///
+/// It reuses the **same** ADR-W031 floor as [`serve_router_with`]: the HTTP/1-only
+/// [`http1_builder`] with the header-read timeout, the shared [`drive_connection`]
+/// (the peer `SocketAddr` as `ConnectInfo`, `/api/v1/ws` upgrades), the
+/// [`ConnectionAdmission`](crate::limits::ConnectionAdmission) per-IP cap keyed on the
+/// real peer, and a [`TrackedStream`] that holds the admission guards for the
+/// connection's real life (including an upgraded WebSocket) and drains on the
+/// shutdown watch. A connection still running
+/// [`ServeOptions::graceful_shutdown_ceiling`] after shutdown is dropped.
+///
+/// Isolation (invariant #10): exactly the [`serve_router_with`] contract; the
+/// caller runs [`ConnectionServer::serve`] on its own runtime (the front door's).
+#[derive(Clone)]
+pub struct ConnectionServer {
+    app: Router,
+    builder: hyper::server::conn::http1::Builder,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    admission: Option<std::sync::Arc<crate::limits::ConnectionAdmission>>,
+    ceiling: std::time::Duration,
+}
+
+impl std::fmt::Debug for ConnectionServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionServer").finish_non_exhaustive()
+    }
+}
+
+impl ConnectionServer {
+    /// Build from the router, the same [`ServeOptions`] as the plain listener,
+    /// and a shutdown watch (`true`, or a dropped sender, starts the drain).
+    #[must_use]
+    pub fn new(
+        app: Router,
+        options: &ServeOptions,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            app,
+            builder: http1_builder(options),
+            shutdown,
+            admission: options.admission(),
+            ceiling: options.graceful_shutdown_ceiling,
+        }
+    }
+
+    /// Serve one accepted (already TLS-terminated) connection to its end.
+    /// `peer` is the real client; `extra_guard` (the caller's own admission
+    /// slot) rides the connection and is released when the socket finally
+    /// closes. Over the per-IP cap the connection is dropped immediately.
+    pub async fn serve<IO, G>(&self, io: IO, peer: std::net::SocketAddr, extra_guard: G)
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        G: Send + 'static,
+    {
+        use hyper_util::rt::TokioIo;
+        let guard = if let Some(admission) = self.admission.as_ref() {
+            let Some(guard) = admission.try_admit(peer.ip()) else {
+                tracing::debug!(%peer, "front-door site connection refused (population cap)");
+                return;
+            };
+            Some(guard)
+        } else {
+            None
+        };
+        if *self.shutdown.borrow() {
+            return;
+        }
+        let stream =
+            TrackedStream::new(io, guard, self.shutdown.clone()).with_extra(Box::new(extra_guard));
+        let drive = drive_connection(
+            self.builder.clone(),
+            TokioIo::new(stream),
+            self.app.clone(),
+            peer,
+            self.shutdown.clone(),
+        );
+        let mut shutdown = self.shutdown.clone();
+        let ceiling = self.ceiling;
+        tokio::select! {
+            () = drive => {}
+            () = async {
+                let _ = shutdown.wait_for(|signalled| *signalled).await;
+                tokio::time::sleep(ceiling).await;
+            } => {
+                tracing::debug!(%peer, "front-door site connection outlived the drain ceiling");
+            }
+        }
+    }
+}
+
+/// A rustls site [`ServerConfig`](rustls::ServerConfig) for the network front
+/// door's TCP door over a [`CertificateSource`](certificate_source::CertificateSource):
+/// the explicit `aws-lc-rs` provider (as [`load_tls_material`]), the
+/// certificate read from the source on every `ClientHello`
+/// ([`SourceResolver`](certificate_source::SourceResolver), so a renewed
+/// certificate applies to the next handshake), ALPN `http/1.1` only (ADR-W031).
+///
+/// # Errors
+/// [`TlsSetupError::Rustls`] if the provider rejects the protocol versions.
+#[cfg(all(feature = "tls", unix))]
+pub fn site_server_config(
+    source: std::sync::Arc<dyn certificate_source::CertificateSource>,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsSetupError> {
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(std::sync::Arc::new(certificate_source::SourceResolver(
+            source,
+        )));
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(std::sync::Arc::new(config))
+}
+
+/// A rustls [`ServerConfig`](rustls::ServerConfig) for the TLS-ALPN-01
+/// challenge responder (RFC 8737) on the network front door's TCP door: the
+/// explicit `aws-lc-rs` provider (as [`load_tls_material`] / [`site_server_config`]),
+/// safe default protocol versions (TLS 1.3; RFC 8737 only requires TLS 1.2+),
+/// a private challenge-only cert resolver over `resolver`
+/// ([`ChallengeResolver::challenge`](certificate_source::ChallengeResolver::challenge)):
+/// it answers only when the `ClientHello`'s ALPN is exactly `acme-tls/1`, SNI
+/// is present and a challenge is published for that name; otherwise it returns
+/// no certificate and rustls aborts the handshake, so this route never presents
+/// the site or bootstrap key. ALPN `acme-tls/1` only.
+///
+/// This configuration never serves application data: a successful handshake
+/// is immediately followed by the front door closing the connection (slice 4,
+/// design note section 4) once the challenge certificate has been presented.
+///
+/// # Errors
+/// [`TlsSetupError::Rustls`] if the provider rejects the protocol versions.
+#[cfg(all(feature = "tls", unix))]
+pub fn acme_challenge_server_config(
+    resolver: std::sync::Arc<certificate_source::ChallengeResolver>,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsSetupError> {
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(std::sync::Arc::new(ChallengeOnly(resolver)));
+    config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
+    Ok(std::sync::Arc::new(config))
+}
+
+/// The ACME route's resolver: a published TLS-ALPN-01 challenge or nothing.
+/// Unlike [`ChallengeResolver`](certificate_source::ChallengeResolver)'s own
+/// `resolve`, it never falls back to the site certificate source.
+#[cfg(all(feature = "tls", unix))]
+struct ChallengeOnly(std::sync::Arc<certificate_source::ChallengeResolver>);
+
+#[cfg(all(feature = "tls", unix))]
+impl std::fmt::Debug for ChallengeOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChallengeOnly([redacted])")
+    }
+}
+
+#[cfg(all(feature = "tls", unix))]
+impl rustls::server::ResolvesServerCert for ChallengeOnly {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+        let mut alpn = hello.alpn()?;
+        if alpn.next() != Some(b"acme-tls/1".as_slice()) || alpn.next().is_some() {
+            return None;
+        }
+        let name = hello.server_name()?;
+        self.0.challenge(name)
+    }
+}
+
+/// A [`StaticCertificateSource`](certificate_source::StaticCertificateSource) from
+/// the `[control.tls] mode = "static"` PEM files, with the same loading and
+/// errors as [`load_tls_material`] (the key is checked against the leaf).
+///
+/// # Errors
+/// [`TlsSetupError`] as [`load_tls_material`].
+#[cfg(all(feature = "tls", unix))]
+pub fn static_certificate_source(
+    tls: &multiview_config::TlsConfig,
+) -> Result<certificate_source::StaticCertificateSource, TlsSetupError> {
+    let (certs, key_der) = load_pem_pair(tls)?;
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let key = rustls::sign::CertifiedKey::from_der(certs, key_der, &provider)?;
+    Ok(certificate_source::StaticCertificateSource::new(
+        std::sync::Arc::new(key),
+    ))
+}
+
+/// Read the `[control.tls] static` PEM chain + key (shared by
+/// [`load_tls_material`] and [`static_certificate_source`]).
+#[cfg(feature = "tls")]
+fn load_pem_pair(
+    tls: &multiview_config::TlsConfig,
+) -> Result<
+    (
+        Vec<rustls_pki_types::CertificateDer<'static>>,
+        rustls_pki_types::PrivateKeyDer<'static>,
+    ),
+    TlsSetupError,
+> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    // `TlsConfig` is `#[non_exhaustive]` cross-crate; TLS-0 has only `static`. A
+    // future `mode` (e.g. ACME) fed to this build is rejected, never panicked.
+    let multiview_config::TlsConfig::Static {
+        cert_file: cert,
+        key_file: key,
+    } = tls
+    else {
+        return Err(TlsSetupError::UnsupportedMode);
+    };
+
+    // Certificate chain (leaf first, then intermediates).
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert)
+        .map_err(|source| TlsSetupError::Certificate {
+            path: cert.clone(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| TlsSetupError::Certificate {
+            path: cert.clone(),
+            source,
+        })?;
+    if certs.is_empty() {
+        return Err(TlsSetupError::NoCertificates(cert.clone()));
+    }
+
+    // Private key (PKCS#8 / PKCS#1 / SEC1). `from_pem_file` errors if none found.
+    let key_der =
+        PrivateKeyDer::from_pem_file(key).map_err(|source| TlsSetupError::PrivateKey {
+            path: key.clone(),
+            source,
+        })?;
+    Ok((certs, key_der))
+}
+
 /// Loaded, ready-to-serve rustls TLS material for the control plane (TLS-0,
 /// [ADR-W029](../../docs/decisions/ADR-W029.md)).
 ///
@@ -857,41 +1101,8 @@ pub enum TlsSetupError {
 pub fn load_tls_material(
     tls: &multiview_config::TlsConfig,
 ) -> Result<RustlsMaterial, TlsSetupError> {
-    use rustls_pki_types::pem::PemObject;
-    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-
-    // `TlsConfig` is `#[non_exhaustive]` cross-crate; TLS-0 has only `static`. A
-    // future `mode` (e.g. ACME) fed to this build is rejected, never panicked.
-    // Rebind the `cert_file`/`key_file` paths to short locals for the loader body.
-    let multiview_config::TlsConfig::Static {
-        cert_file: cert,
-        key_file: key,
-    } = tls
-    else {
-        return Err(TlsSetupError::UnsupportedMode);
-    };
-
-    // Certificate chain (leaf first, then intermediates).
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert)
-        .map_err(|source| TlsSetupError::Certificate {
-            path: cert.clone(),
-            source,
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| TlsSetupError::Certificate {
-            path: cert.clone(),
-            source,
-        })?;
-    if certs.is_empty() {
-        return Err(TlsSetupError::NoCertificates(cert.clone()));
-    }
-
-    // Private key (PKCS#8 / PKCS#1 / SEC1). `from_pem_file` errors if none found.
-    let key_der =
-        PrivateKeyDer::from_pem_file(key).map_err(|source| TlsSetupError::PrivateKey {
-            path: key.clone(),
-            source,
-        })?;
+    // PEM chain (leaf first) + key; a non-`static` mode is rejected, never panicked.
+    let (certs, key_der) = load_pem_pair(tls)?;
 
     // Build the ServerConfig with an EXPLICIT aws-lc-rs provider (never the
     // process default — see the function doc). Propagate any rustls error
