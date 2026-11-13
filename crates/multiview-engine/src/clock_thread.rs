@@ -26,6 +26,9 @@
 //!
 //! The thread optionally lowers its niceness ([`CLOCK_NICE`]) where the process
 //! is permitted to (`CAP_SYS_NICE`); it never requires it and logs the outcome.
+//! On Linux it also asks the fair scheduler for a short request size
+//! ([`CLOCK_SLICE`], no privilege needed): the measured cause of the wake
+//! lateness on a loaded host (#311 reopen, ADR-0109 §8).
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +53,16 @@ pub const SPIN_MARGIN: Duration = Duration::from_micros(500);
 /// priority and says so in the log. Never `SCHED_FIFO`: a real-time policy can
 /// starve the host if a bug ever made the loop spin.
 pub const CLOCK_NICE: i32 = -10;
+
+/// The EEVDF request size the clock thread asks for (Linux 6.12+, no
+/// privilege). With the default ~3 ms request a clock thread waking on a core
+/// that a CPU-bound decoder or control-plane worker holds waits for that
+/// worker's slice; a 0.3 ms request gives the waking clock an earlier virtual
+/// deadline so it runs first. It does not change the thread's weight, so the
+/// clock cannot take more than its fair share (unlike `SCHED_FIFO`).
+/// Measured on a 2-core contention rig (6 bursty CPU-bound neighbours):
+/// wake p99 13 ms → 3 ms (#311 reopen, ADR-0109 §8).
+pub const CLOCK_SLICE: Duration = Duration::from_micros(300);
 
 thread_local! {
     static ON_CLOCK_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -353,7 +366,11 @@ fn tune_current_thread() -> String {
         Ok(()) => format!("nice {CLOCK_NICE}"),
         Err(error) => format!("default priority (nice {CLOCK_NICE} not permitted: {error})"),
     };
-    format!("clock_nanosleep(TIMER_ABSTIME), {slack}, {nice}")
+    // After the niceness: `sched_setattr` keeps whatever nice value is current.
+    let slice = multiview_clocksys::set_current_thread_slice(
+        u64::try_from(CLOCK_SLICE.as_nanos()).unwrap_or(u64::MAX),
+    );
+    format!("clock_nanosleep(TIMER_ABSTIME), {slack}, {nice}, {slice}")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -430,6 +447,26 @@ mod tests {
             getpriority_process(None).ok(),
             Some(before),
             "process unchanged"
+        );
+    }
+
+    /// #311 reopen: a clock thread asks for the short EEVDF request size and
+    /// says so in its scheduling line; a kernel without custom slices is
+    /// reported, never an error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_clock_thread_requests_the_short_slice() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().ok();
+        let Some(rt) = rt else { return };
+        let line = spawn("clock-slice", tune_current_thread)
+            .ok()
+            .map(|h| rt.block_on(h.join()));
+        let Some(Ok(line)) = line else {
+            panic!("clock thread failed: {line:?}");
+        };
+        assert!(
+            line.contains("EEVDF slice 300 µs") || line.contains("kernel has no custom slice"),
+            "{line}"
         );
     }
 

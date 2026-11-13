@@ -9,13 +9,17 @@ authors.workspace = true
 # Workspace-internal implementation crate; never published (matches
 # multiview-ntpsys / xtask).
 publish = false
-description = "Minimal safe wrapper that raises the output-clock thread's scheduling class on macOS (QoS USER_INTERACTIVE)."
+description = "Minimal safe wrappers for the output-clock thread's scheduling: macOS QoS USER_INTERACTIVE, Linux EEVDF request size."
 
 [dependencies]
 # macOS only: `pthread_set_qos_class_self_np` + `qos_class_t`. Pure FFI
 # declarations; no transitive deps. License: MIT OR Apache-2.0 (LGPL-clean).
 # Every other target compiles this crate to a no-op and links nothing.
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.186"
+# Linux: `sched_setattr`/`sched_getattr` (#311 reopen: the clock thread's
+# EEVDF request size). Same crate, same licence; pure FFI declarations.
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.186"
 
 # FFI crate exception (mirrors multiview-ntpsys): the workspace forbids
