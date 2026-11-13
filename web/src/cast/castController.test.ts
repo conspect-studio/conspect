@@ -212,6 +212,32 @@ describe('CastController', () => {
     });
   });
 
+  it('a controller disposed while the picker is open never loads media or keeps listeners', async () => {
+    let release: () => void = () => undefined;
+    sdk.requestSession.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = (): void => {
+            sdk.context.getCurrentSession = (): typeof sdk.session => sdk.session;
+            resolve();
+          };
+        }),
+    );
+    const addSpy = vi.spyOn(sdk.context, 'addEventListener');
+    const controller = new CastController();
+    const pending = controller.start(TARGET);
+    await vi.waitFor(() => {
+      expect(sdk.requestSession).toHaveBeenCalledTimes(1);
+    });
+    controller.dispose();
+    release();
+    await pending;
+    expect(sdk.loadMedia).not.toHaveBeenCalled();
+    expect(addSpy).not.toHaveBeenCalled();
+    await controller.start(TARGET);
+    expect(sdk.requestSession).toHaveBeenCalledTimes(1);
+  });
+
   it('replaces the loaded media in the same session when starting a different target while playing', async () => {
     const controller = new CastController();
     await controller.start(TARGET);

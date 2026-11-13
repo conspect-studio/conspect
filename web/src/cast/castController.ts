@@ -110,6 +110,8 @@ export class CastController {
   private generation = 0;
   /** Set while our own `stop()` ends the session, so its SESSION_ENDED is ours. */
   private stopping = false;
+  /** Set by `dispose()` until the provider mounts again (`activate()`). */
+  private disposed = false;
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -138,7 +140,7 @@ export class CastController {
    * Ignored while another connect/load/stop is in flight.
    */
   async start(target: CastTarget): Promise<void> {
-    if (this.busy) {
+    if (this.busy || this.disposed) {
       return;
     }
     const generation = ++this.generation;
@@ -240,10 +242,22 @@ export class CastController {
   }
 
   /**
-   * Provider teardown (the whole app unmounts): end the cast rather than
-   * leaving the TV playing with no owner in this tab.
+   * Provider mount: (re-)arm the controller. React StrictMode keeps the same
+   * controller across its dev unmount/re-mount, so `dispose()` is not final.
+   */
+  activate(): void {
+    this.disposed = false;
+  }
+
+  /**
+   * Provider teardown (the app unmounts, or React StrictMode's dev
+   * re-mount): invalidate any in-flight start so it can never attach
+   * listeners or load media on behalf of a dead controller, and end an
+   * active cast rather than leaving the TV playing with no owner here.
    */
   dispose(): void {
+    this.disposed = true;
+    this.generation += 1;
     if (this.session !== null) {
       void this.stop();
     } else {

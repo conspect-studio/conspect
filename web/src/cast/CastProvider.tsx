@@ -16,6 +16,7 @@ export function CastProvider({ children }: { readonly children: ReactNode }): JS
   // controller for the lifetime of this provider, surviving route changes.
   const [controller] = useState<CastController>(() => new CastController());
   useEffect(() => {
+    controller.activate();
     return (): void => {
       controller.dispose();
     };
