@@ -85,6 +85,8 @@ import { useMediaPlayers } from '../api/media-playersQueries';
 import { useSources } from '../resources/queries';
 import { OutputFeedRow } from './OutputFeedRow';
 import { OutputAudioRow } from './OutputAudioRow';
+import { OutputFormatFields } from './OutputFormatFields';
+import { formatError, resetsLive } from '../resources/outputFormat';
 import type { FeedChoice } from './OutputFeedRow';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
@@ -1347,9 +1349,10 @@ export function OutputsSurface({
     }
     const found = validateOutputForm(form, creating);
     setErrors(found);
-    if (Object.keys(found).length > 0) {
+    if (Object.keys(found).length > 0 || formatError(form) !== undefined) {
       return;
     }
+    const liveReset = !creating && resetsLive(form.kind);
     save.mutate(
       {
         id: creating ? form.id.trim() : form.id,
@@ -1360,7 +1363,9 @@ export function OutputsSurface({
         onSuccess: (): void => {
           toast({
             title: creating ? t`Created` : t`Saved`,
-            description: t`Stored. It goes live via config export + restart; the running engine is unchanged until then.`,
+            description: liveReset
+              ? t`Stored. A format or bitrate change resets this output (about 1 s); Program and other outputs are not affected. Any other change applies on the next restart.`
+              : t`Stored. It goes live via config export + restart; the running engine is unchanged until then.`,
           });
           closeForm();
         },
@@ -1570,6 +1575,7 @@ export function OutputsSurface({
                 <RunnabilityNote kind={form.kind} />
                 <OutputKindFields form={form} setForm={setForm} errors={errors} />
                 <CodecFields form={form} setForm={setForm} errors={errors} />
+                <OutputFormatFields form={form} setForm={setForm} editing={!creating} />
                 <OutputAdvancedFields
                   form={form}
                   setForm={setForm}
