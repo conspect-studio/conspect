@@ -289,6 +289,13 @@ impl FrontDoorRun {
             }
         });
         self.ice_tcp = ice_tcp;
+        // The site attaches once the control plane is built: hold site hellos
+        // that arrive before that (bounded by the handshake deadline) instead
+        // of closing them; `install_site` releases them.
+        // (No `[control]`: no control plane, no site; nothing is held.)
+        if config.control.is_some() {
+            let _ = self.door.set_site_pending(true);
+        }
         tracing::info!(
             %tcp,
             mode = ?plan.mode,
@@ -318,6 +325,7 @@ impl FrontDoorRun {
             return;
         };
         let Some(site) = tls_site else {
+            let _ = self.door.set_site_pending(false);
             tracing::warn!(%tcp, "front-door TCP door: no site certificate ([network] cert_file/key_file or [control.tls] static, a `tls` build on unix), so TLS on the door is unavailable; ICE-TCP still runs");
             return;
         };

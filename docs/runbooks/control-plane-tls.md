@@ -82,9 +82,15 @@ TLS accept loop) — this is covered by the `tls_serve` end-to-end test.
 
 ## Rotate / renew
 
-TLS-0 has **no hot-reload**: replace the `cert_file`/`key_file` PEMs and
-**restart** the daemon. Plan rotation before expiry; monitor `NotAfter` (the `openssl x509
--dates` output above).
+Since slice 6 (#292, unix `tls` builds) the engine **reloads** the pair without a restart:
+it checks both files every 30 s (the resolved symlink target, size, mtime and inode, so a
+certbot renewal that re-points `live/<host>/*.pem` at new `archive/` files is seen), parses the
+new pair, checks the key against the leaf, and serves it from the next TLS handshake on, on
+both `[control] listen` and the front door. A broken or half-written pair is logged
+(`does not load; the previous certificate keeps serving`) and the old certificate keeps
+serving until the pair loads. The log line `static certificate changed on disk` confirms a
+reload. Plan rotation before expiry; monitor `NotAfter` (the `openssl x509 -dates` output
+above). On Windows (no reload) replace the PEMs and restart.
 
 ## Troubleshoot
 
@@ -98,7 +104,9 @@ TLS-0 has **no hot-reload**: replace the `cert_file`/`key_file` PEMs and
 
 ## Scope / limits
 
-- **No ACME / auto-renew** in TLS-0 (a later phase); rotation is manual + restart.
+- **No ACME / auto-renew** in this mode (ACME is `[network.tls]`, see
+  [acme-certificates](acme-certificates.md) once merged); renewal is external (certbot or the
+  operator), and the engine picks the renewed files up without a restart (above).
 - **Slowloris** (half-open slow-header floods) remain out of scope for the
   in-process floor (as for plain HTTP, [ADR-W028](../decisions/ADR-W028.md)); front
   the plane with a reverse proxy if that is a concern (tracked as follow-up #126).

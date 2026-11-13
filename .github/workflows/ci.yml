@@ -1544,6 +1544,36 @@ jobs:
         working-directory: web
         run: npm run build
 
+  # ── embedded UI serving (ADR-0107 slice 6, #292) ─────────────────────────────
+  # The engine serves the UI itself on TCP 443 (nginx removed): hashed assets
+  # immutable, index no-cache, strong ETag + 304, gzip, 404 for a stale chunk.
+  # Those tests need the real `web/dist` (embed-web inlines it at compile
+  # time), so this job builds the UI first. No other job compiles embed-web.
+  embed-web:
+    name: embedded UI serving (multiview-control --features embed-web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: build the UI (web/dist)
+        working-directory: web
+        run: npm ci && npm run build
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: embed-web
+      - name: test the embedded UI serving
+        run: >
+          cargo test --locked -p multiview-control --features embed-web
+          --test embed_web --lib spa
+
   # ── web Playwright end-to-end (real browser) ─────────────────────────────────
   # Drives the REAL built SPA in a real Chromium (the failure class these specs
   # guard — e.g. the ResourceTable re-render-loop renderer OOM — only reproduces

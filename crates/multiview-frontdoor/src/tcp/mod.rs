@@ -323,6 +323,12 @@ impl Drop for ConnGuard {
 pub(crate) struct DoorRouting {
     pub(crate) tls: RwLock<TlsRouting>,
     pub(crate) site: RwLock<Option<Arc<dyn SiteService>>>,
+    /// `true` while a site is expected but not installed yet (start-up: the
+    /// door accepts before the control plane is built). A site hello then
+    /// waits, within its handshake deadline, instead of being closed: with
+    /// socket activation the connections queued during a restart arrive in
+    /// exactly that window (slice 6, #292).
+    pub(crate) site_pending: tokio::sync::watch::Sender<bool>,
 }
 
 impl DoorRouting {
@@ -404,6 +410,7 @@ impl TcpDoorState {
         let routing = Arc::new(DoorRouting {
             tls: RwLock::new(tls),
             site: RwLock::new(site),
+            site_pending: tokio::sync::watch::Sender::new(false),
         });
         Arc::new(Self {
             admission: Admission::new(
@@ -558,8 +565,18 @@ async fn serve_tls(
             return;
         }
     };
-    let (routing, site) = state.routing.snapshot();
     let route = tls::route_hello(&start.client_hello(), state.config.turn_sni.as_deref());
+    if route == tls::HelloRoute::Site {
+        // Bounded by the handshake deadline; never waits when no site is
+        // pending (a door without a certificate closes at once, as before).
+        let mut pending = state.routing.site_pending.subscribe();
+        let ready = tokio::time::timeout_at(deadline, pending.wait_for(|p| !*p)).await;
+        if ready.is_err() {
+            Stats::bump(&counters.tcp_tls_handshake_timeout);
+            return;
+        }
+    }
+    let (routing, site) = state.routing.snapshot();
     let config = match route {
         tls::HelloRoute::TurnReserved => {
             Stats::bump(&counters.tcp_turn_reserved);

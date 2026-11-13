@@ -16,9 +16,9 @@
 [Unit]
 Description=Conspect engine front door sockets (TCP 443, TCP 80, UDP 443)
 Documentation=file:///home/operations/conspect/docs/runbooks/front-door-cutover.md
-# nginx (or anything else) must not hold the ports first.
-Conflicts=nginx.service
-After=nginx.service
+# nginx (or anything else) must not hold TCP 443/80 when this starts: the
+# runbook stops and disables nginx first. (No Conflicts=nginx.service: an
+# accidental `systemctl start nginx` must not stop the engine through it.)
 
 [Socket]
 # Dual-stack [::] (IPv6-first; IPv4 clients arrive as ::ffff:a.b.c.d).
@@ -29,7 +29,7 @@ ListenStream=[::]:80
 # The first is the listener (every new flow, and every send), the second the
 # established socket the engine's CBPF program steers validated peers to. The
 # order matters (reuseport group index 0, then 1). With one line instead,
-# the engine runs single-socket and says so in /api/v1/system/capabilities.
+# the engine runs single-socket and says so in its startup log.
 ListenDatagram=[::]:443
 ListenDatagram=[::]:443
 ReusePort=yes

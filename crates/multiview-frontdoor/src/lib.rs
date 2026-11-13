@@ -860,6 +860,21 @@ impl FrontDoor {
         Ok(())
     }
 
+    /// Mark a site as expected (`true`) until [`set_site`](Self::set_site)
+    /// installs one: site hellos that arrive meanwhile wait within their
+    /// handshake deadline instead of being closed (start-up, and the
+    /// connections a socket-activated restart queued). `false` releases the
+    /// waiters (they then close if no site was installed).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoTcpDoor`] when the TCP door is not running.
+    pub fn set_site_pending(&self, pending: bool) -> Result<(), Error> {
+        let (_, state) = self.tcp.as_ref().ok_or(Error::NoTcpDoor)?;
+        state.routing.site_pending.send_replace(pending);
+        Ok(())
+    }
+
     /// Install (or replace) the site service; applies to the next connection.
     ///
     /// # Errors
@@ -872,6 +887,7 @@ impl FrontDoor {
             .site
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = site;
+        state.routing.site_pending.send_replace(false);
         Ok(())
     }
 
