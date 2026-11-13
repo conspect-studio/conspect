@@ -1459,7 +1459,7 @@ pub fn cast_delivery(
             .outputs
             .iter()
             .find(|output| output.id() == mount.output_id)
-            .and_then(multiview_config::Output::audio)
+            .and_then(multiview_config::Output::effective_audio)
             .is_some_and(|selection| {
                 let names: Vec<&str> = config
                     .audio
