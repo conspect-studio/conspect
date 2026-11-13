@@ -1021,6 +1021,63 @@ pub struct SharedSocket {
     pub peers: Option<PeerHook>,
 }
 
+/// A rustls server configuration (TLS 1.3, `ring`, the provider the MoQ
+/// listener already uses) from the `MULTIVIEW_MOQ_CERTIFICATE` /
+/// `_PRIVATE_KEY` PEM files, for the front door's HTTP/3 endpoint when no
+/// site certificate is configured (slice 2). The files are opened with the
+/// same checks as the listener (`O_NOFOLLOW`, regular files, the key not
+/// readable by group/other) and read through the opened descriptors.
+///
+/// # Errors
+///
+/// A file check, an unparsable PEM, or a key rustls rejects; on platforms
+/// without the secure loader always.
+pub fn server_tls_from_files(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> anyhow::Result<moq_tokio::rustls::ServerConfig> {
+    #[cfg(target_os = "linux")]
+    {
+        use moq_tokio::rustls;
+        use rustix::fs::{Mode, OFlags, open};
+        use rustls::pki_types::pem::PemObject;
+        use std::io::Read;
+        let read = |path: &std::path::Path, private: bool| -> anyhow::Result<Vec<u8>> {
+            let fd = open(
+                path,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?;
+            let stat = rustix::fs::fstat(&fd)?;
+            anyhow::ensure!(
+                (stat.st_mode & 0o170000) == 0o100000 && (!private || stat.st_mode & 0o077 == 0),
+                "certificate files must be regular, the key private"
+            );
+            let mut bytes = Vec::new();
+            std::fs::File::from(fd)
+                .take(1024 * 1024)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        let chain = rustls::pki_types::CertificateDer::pem_slice_iter(&read(cert, false)?)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| anyhow::anyhow!("unparsable certificate chain"))?;
+        anyhow::ensure!(!chain.is_empty(), "empty certificate chain");
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&read(key, true)?)
+            .map_err(|_| anyhow::anyhow!("unparsable private key"))?;
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        Ok(rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_no_client_auth()
+            .with_single_cert(chain, key)?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (cert, key);
+        anyhow::bail!("secure MoQ certificate loader unavailable on this platform")
+    }
+}
+
 /// See [`SharedSocket::peers`].
 pub type PeerHook = Arc<dyn Fn(std::net::SocketAddr, bool) + Send + Sync>;
 
@@ -1721,6 +1778,33 @@ mod tests {
         );
         drop(claims);
         assert_eq!(runtime.state.external_sessions.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pem_files_load_with_the_listener_checks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("moq-pem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, ck.cert.pem()).unwrap();
+        std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            server_tls_from_files(&cert, &key).is_err(),
+            "a public key file is refused"
+        );
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        server_tls_from_files(&cert, &key).unwrap();
+        let link = dir.join("link.pem");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        assert!(
+            server_tls_from_files(&cert, &link).is_err(),
+            "symlinks are refused"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

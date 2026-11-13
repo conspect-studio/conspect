@@ -4292,6 +4292,7 @@ dependencies = [
  "hang",
  "moq-net",
  "moq-tokio",
+ "rcgen",
  "rustix",
  "serde_json",
  "tokio",
