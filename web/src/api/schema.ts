@@ -6760,6 +6760,15 @@ export interface components {
             /** @description Cumulative per-bucket counts (edges, then overflow). */
             buckets_total: number[];
             /**
+             * @description The fine bucket upper edges, ms (0.05, 0.1, 0.25, then the coarse
+             *     edges; a final overflow bucket follows).
+             */
+            fine_bucket_edges_ms: number[];
+            /** @description Cumulative per-fine-bucket counts (fine edges, then overflow). */
+            fine_buckets_total: number[];
+            /** @description Per-fine-bucket counts in the window. */
+            fine_buckets_window: number[];
+            /**
              * Format: int64
              * @description Last-good repeats since the run started (`frames_repeated`).
              */
@@ -6775,16 +6784,36 @@ export interface components {
              */
             lateness_max_ms: number;
             /**
+             * Format: double
+             * @description Mean lateness over the window, ms (`null` when the window is empty).
+             */
+            lateness_mean_ms?: number | null;
+            /**
+             * Format: double
+             * @description Mean lateness since the run started, ms.
+             */
+            lateness_mean_total_ms?: number | null;
+            /**
              * Format: int64
              * @description Window ticks later than the last bucket edge (66.8 ms).
              */
             lateness_over_max_bucket: number;
             /**
              * Format: double
+             * @description p50 lateness over the window on the fine edges, ms.
+             */
+            lateness_p50_fine_ms?: number | null;
+            /**
+             * Format: double
              * @description p50 lateness over the window: the upper edge of its bucket, ms
              *     (`null` when empty or beyond the last edge).
              */
             lateness_p50_ms?: number | null;
+            /**
+             * Format: double
+             * @description p99 lateness over the window on the fine edges, ms.
+             */
+            lateness_p99_fine_ms?: number | null;
             /**
              * Format: double
              * @description p99 lateness over the window: the upper edge of its bucket, ms.

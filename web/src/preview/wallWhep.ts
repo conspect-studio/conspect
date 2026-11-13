@@ -1,15 +1,18 @@
 // One video-only WHEP wall session for the whole production desk.
 import { defaultPcFactory } from './pcFactory';
 import { postWhepOffer, releaseWhepSession } from './whepSession';
+import { pairLabel, safeStats } from './diagnostics';
 
 export interface WallWhepOptions {
   signal: AbortSignal;
   onFrame: (video: HTMLVideoElement) => void;
   onActive: () => void;
+  /** The selected ICE pair label (`tcp/host-host`...), reported when it changes. */
+  onPair?: ((pair: string) => void) | undefined;
 }
 
 /** One off-DOM video: present each decoded frame to the store's shared canvas. */
-export async function playWallWhep({ signal, onFrame, onActive }: WallWhepOptions): Promise<void> {
+export async function playWallWhep({ signal, onFrame, onActive, onPair }: WallWhepOptions): Promise<void> {
   if (signal.aborted) return;
   const pc = defaultPcFactory({});
   const video = document.createElement('video');
@@ -23,6 +26,8 @@ export async function playWallWhep({ signal, onFrame, onActive }: WallWhepOption
   let watchdog: ReturnType<typeof setInterval> | undefined;
   let lastFrame = performance.now();
   let trackAttached = false;
+  let statsPending = false;
+  let lastPair = 'none';
   let done = false;
   // Keep a visual video element in the DOM so every target browser presents
   // frames to requestVideoFrameCallback (a detached video may be throttled).
@@ -104,6 +109,14 @@ export async function playWallWhep({ signal, onFrame, onActive }: WallWhepOption
     onActive();
     watchdog = setInterval(() => {
       if (!aborted() && performance.now() - lastFrame > 6000) fail(new Error('wall WebRTC frame stalled'));
+      if (onPair && !statsPending && !aborted()) {
+        statsPending = true;
+        void pc.getStats().then((report) => {
+          if (aborted() || done) return;
+          const pair = pairLabel(safeStats(report).selectedPair);
+          if (pair !== lastPair) { lastPair = pair; onPair(pair); }
+        }).catch(() => undefined).finally(() => { statsPending = false; });
+      }
     }, 1000);
     await ended;
   } finally {

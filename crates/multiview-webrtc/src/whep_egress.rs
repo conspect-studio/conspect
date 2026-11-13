@@ -53,7 +53,7 @@ use multiview_preview::whep::transport::{
 };
 use multiview_preview::whep::{PreviewCodec, WhepError};
 
-use crate::transport::{Session, SessionConfig};
+use crate::transport::{Outbound, Session, SessionConfig, Transport};
 
 /// The structured ICE/DTLS attributes parsed out of str0m's answer SDP, plus the
 /// candidate lines, mirroring the preview-core [`TransportAnswer`] (minus the
@@ -185,6 +185,9 @@ pub struct WhepEgress {
     /// The host candidate to gather on each session (the bound socket's reachable
     /// address). `None` for the socket-free shuttle transport.
     host_candidates: Vec<SocketAddr>,
+    /// Passive ICE-TCP candidates (the front door's TCP port), gathered after
+    /// the UDP host candidates; empty without ICE-TCP.
+    tcp_candidates: Vec<SocketAddr>,
     /// Relay candidates (TURN-allocated) to register on each session, with the
     /// local socket the relayed traffic egresses from (ADR-0048 §5.1).
     ///
@@ -223,6 +226,7 @@ impl WhepEgress {
         Self {
             sessions: Mutex::new(HashMap::new()),
             host_candidates: Vec::new(),
+            tcp_candidates: Vec::new(),
             relay_candidates: Mutex::new(Vec::new()),
             next_id: Mutex::new(0),
         }
@@ -235,6 +239,7 @@ impl WhepEgress {
         Self {
             sessions: Mutex::new(HashMap::new()),
             host_candidates: vec![host],
+            tcp_candidates: Vec::new(),
             relay_candidates: Mutex::new(Vec::new()),
             next_id: Mutex::new(0),
         }
@@ -249,6 +254,18 @@ impl WhepEgress {
                 .filter(|host| !host.ip().is_unspecified())
                 .collect(),
             ..Self::new()
+        }
+    }
+
+    /// [`with_host_candidates`](Self::with_host_candidates), plus one passive
+    /// ICE-TCP candidate per concrete host IP on `tcp_port` (the front door's TCP
+    /// port), gathered after the UDP candidates. `None`: no ICE-TCP.
+    #[must_use]
+    pub fn with_host_candidates_tcp(hosts: Vec<SocketAddr>, tcp_port: Option<u16>) -> Self {
+        let tcp_candidates = crate::transport::tcp_passive_candidates(&hosts, tcp_port);
+        Self {
+            tcp_candidates,
+            ..Self::with_host_candidates(hosts)
         }
     }
 
@@ -275,6 +292,7 @@ impl WhepEgress {
         Self {
             sessions: Mutex::new(HashMap::new()),
             host_candidates: vec![host],
+            tcp_candidates: Vec::new(),
             relay_candidates: Mutex::new(relay_candidates),
             next_id: Mutex::new(0),
         }
@@ -341,6 +359,14 @@ impl WhepEgress {
                 .add_host_candidate(*host)
                 .map_err(|_| WhepError::MalformedOffer {
                     reason: "egress could not gather a host candidate",
+                })?;
+        }
+        // Passive ICE-TCP after UDP (str0m ranks a TCP host below a UDP host).
+        for host in &self.tcp_candidates {
+            session
+                .add_tcp_passive_candidate(*host)
+                .map_err(|_| WhepError::MalformedOffer {
+                    reason: "egress could not gather an ICE-TCP candidate",
                 })?;
         }
         // Offer every TURN relay the driver has learned so far (a snapshot taken
@@ -430,6 +456,24 @@ impl WhepEgress {
         id: &SessionId,
         now: Instant,
     ) -> Result<Vec<(SocketAddr, SocketAddr, Vec<u8>)>, WhepError> {
+        Ok(self
+            .drive_egress_routed(id, now)?
+            .into_iter()
+            .map(|o| (o.source, o.destination, o.payload))
+            .collect())
+    }
+
+    /// [`drive_egress`](Self::drive_egress) returning each datagram with its
+    /// [`Transport`], so the driver never sends an ICE-TCP datagram over UDP.
+    ///
+    /// # Errors
+    ///
+    /// As [`drive_egress`](Self::drive_egress).
+    pub fn drive_egress_routed(
+        &self,
+        id: &SessionId,
+        now: Instant,
+    ) -> Result<Vec<Outbound>, WhepError> {
         let mut map = self
             .sessions
             .lock()
@@ -505,7 +549,7 @@ impl WhepEgress {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        while let Some(dg) = session.poll_transmit(now) {
+        while let Some(dg) = session.poll_transmit_routed(now) {
             out.push(dg);
         }
         // Reflect the str0m connection state onto the lifecycle handle (best
@@ -537,6 +581,24 @@ impl WhepEgress {
         payload: &[u8],
         now: Instant,
     ) -> Result<(), WhepError> {
+        self.handle_datagram_proto(id, Transport::Udp, source, destination, payload, now)
+    }
+
+    /// [`handle_datagram`](Self::handle_datagram) for a datagram received on
+    /// `proto` (an ICE-TCP frame is [`Transport::Tcp`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`handle_datagram`](Self::handle_datagram).
+    pub fn handle_datagram_proto(
+        &self,
+        id: &SessionId,
+        proto: Transport,
+        source: SocketAddr,
+        destination: SocketAddr,
+        payload: &[u8],
+        now: Instant,
+    ) -> Result<(), WhepError> {
         let mut map = self
             .sessions
             .lock()
@@ -553,7 +615,7 @@ impl WhepEgress {
         };
         // A datagram str0m cannot ingest disconnects nothing — it is silently
         // ignored (preview is best-effort).
-        let _ = session.handle_datagram(source, destination, payload, now);
+        let _ = session.handle_datagram_proto(proto, source, destination, payload, now);
         Ok(())
     }
 
@@ -653,8 +715,25 @@ impl WhepEgress {
         payload: &[u8],
         now: Instant,
     ) -> Result<(), WhepError> {
+        self.handle_datagram_broadcast_proto(Transport::Udp, source, destination, payload, now)
+    }
+
+    /// [`handle_datagram_broadcast`](Self::handle_datagram_broadcast) for a
+    /// datagram received on `proto`.
+    ///
+    /// # Errors
+    ///
+    /// As [`handle_datagram_broadcast`](Self::handle_datagram_broadcast).
+    pub fn handle_datagram_broadcast_proto(
+        &self,
+        proto: Transport,
+        source: SocketAddr,
+        destination: SocketAddr,
+        payload: &[u8],
+        now: Instant,
+    ) -> Result<(), WhepError> {
         for id in self.session_ids() {
-            self.handle_datagram(&id, source, destination, payload, now)?;
+            self.handle_datagram_proto(&id, proto, source, destination, payload, now)?;
         }
         Ok(())
     }
@@ -688,6 +767,20 @@ impl WhepEgress {
         let mut out = Vec::new();
         for id in self.session_ids() {
             out.extend(self.drive_egress(&id, now)?);
+        }
+        Ok(out)
+    }
+
+    /// [`drive_all`](Self::drive_all) returning each datagram with its
+    /// [`Transport`] (the unified driver's path).
+    ///
+    /// # Errors
+    ///
+    /// As [`drive_all`](Self::drive_all).
+    pub fn drive_all_routed(&self, now: Instant) -> Result<Vec<Outbound>, WhepError> {
+        let mut out = Vec::new();
+        for id in self.session_ids() {
+            out.extend(self.drive_egress_routed(&id, now)?);
         }
         Ok(out)
     }

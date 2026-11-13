@@ -36,6 +36,14 @@ implementation will build against.
 
 ### Added
 
+- **ACME certificate engine for the network front door (library, off by default)**: the
+  `acme` feature of `multiview-control` issues and renews the front-door certificate over
+  DNS-01 (Cloudflare token or global key) or TLS-ALPN-01 from Let's Encrypt, Google or a custom
+  directory, with SSRF-screened egress, a private 0700 state directory, crash-safe TXT cleanup,
+  ARI renewal and expiry alarms, on its own thread and runtime away from the output clock. New
+  `[network.tls] allow_private_directory` gates a private custom directory. Tested against Pebble
+  in the new `acme-pebble` CI job (#291).
+
 - **Event journal.** Every raw SCTE-35, timed ID3 and HLS cue observation is recorded off-clock
   with its full decode, predicted wall-clock and on-air times, per source and day, with bounded
   retention (`[events]`). Read it in the Events dialog's Journal tab, or through

@@ -1081,6 +1081,8 @@ fn inject(
         generation,
         silent: 0,
         starved: 0,
+        refused_this_tick: false,
+        reported_degraded: false,
     });
     key
 }
@@ -1968,6 +1970,9 @@ struct AudioHarness {
     gain: Arc<AtomicU32>,
     bars_live: bool,
     feed_max: std::time::Duration,
+    /// The longest whole consumer step (router tick, routed-audio feed and
+    /// program-audio dispatch; the simulated encode sleep excluded).
+    step_max: std::time::Duration,
     store: Arc<TileStore<Nv12Image>>,
     base_force: Arc<AtomicU64>,
     tap: crate::routing_audio::AudioTapCell,
@@ -2056,6 +2061,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
         gain,
         bars_live: true,
         feed_max: std::time::Duration::ZERO,
+        step_max: std::time::Duration::ZERO,
         store,
         base_force,
         tap,
@@ -2084,6 +2090,7 @@ impl AudioHarness {
 
     /// One Program tick in the pipeline's order.
     fn tick(&mut self, t: u64) {
+        let step = Instant::now();
         self.r
             .drain_live_events(&mut self.d, &mut self.rec)
             .unwrap();
@@ -2148,6 +2155,7 @@ impl AudioHarness {
                 &mut self.rec,
             )
             .unwrap();
+        self.step_max = self.step_max.max(step.elapsed());
         // The private encode threads run within the tick period.
         std::thread::sleep(std::time::Duration::from_millis(3));
     }
@@ -2636,6 +2644,15 @@ fn stalled_or_crashing_worker(panic_worker: bool) {
     }
     let k = failed_at.expect("the bus failed");
     assert!(k <= depth + 1, "failed within the queue depth: {k}");
+    if !panic_worker {
+        // Mechanism (measured): the wedged worker emits nothing, so its
+        // dispatcher stage never proves a window; the output's pending FIFO
+        // (4 windows) fills and the dispatcher fails that stage alone
+        // (`AudioFallback`) at about 4 ticks — before the 8-slot PCM queue
+        // would fill (`TrySendError::Full`, the backstop). Either way the
+        // bus fails alone and the consumer never waits (timed below).
+        assert!(k >= 2, "the bus is not failed before the wedge bites: {k}");
+    }
     let t = x.run(t + k + 1, 4);
     let snap = x.h.snapshot();
     assert_eq!(snap.audio.failed, 1, "{snap:?}");
@@ -2645,7 +2662,23 @@ fn stalled_or_crashing_worker(panic_worker: bool) {
         "the consumer never waits: {:?}",
         x.feed_max
     );
+    assert!(
+        x.step_max < std::time::Duration::from_millis(100),
+        "the whole consumer step never waits on the wedged worker: {:?}",
+        x.step_max
+    );
     let _ = x.run(t, 4);
+    let o0: Vec<i64> = x
+        .rec
+        .windows
+        .iter()
+        .filter(|w| w.0 == 0)
+        .filter_map(|w| w.1.first().map(|p| p.0))
+        .collect();
+    assert!(
+        o0.windows(2).all(|w| w[1] == w[0] + 1),
+        "Program video keeps one window per tick through the wedge: {o0:?}"
+    );
     assert_pts_step(&x.audio_pts(0), "Program");
     assert_pts_step(&x.audio_pts(1), "output 1");
     drop(release);
@@ -3269,6 +3302,10 @@ struct BlockedEnc {
     forced: bool,
     block: Arc<AtomicBool>,
     gate: Mutex<Receiver<()>>,
+    /// The production encoder's contract (`encode_frame_at`): after
+    /// `start_at(t0)` it accepts only its next tick, and any other tick is an
+    /// error that ends the worker. Enforced here so gap-fill is tested against it.
+    next: Option<u64>,
 }
 
 impl VideoEncodeWorker for BlockedEnc {
@@ -3282,6 +3319,18 @@ impl VideoEncodeWorker for BlockedEnc {
             let _ = gate.recv_timeout(std::time::Duration::from_millis(5));
         }
         drop(gate);
+        if let Some(next) = self.next {
+            if item.tick != next {
+                return Err(PipelineError::Output {
+                    kind: "encode",
+                    reason: format!(
+                        "video tick discontinuity: expected {next}, got {}",
+                        item.tick
+                    ),
+                });
+            }
+        }
+        self.next = Some(item.tick + 1);
         let key = std::mem::take(&mut self.forced);
         Ok(vec![pkt(item.tick, key)])
     }
@@ -3297,8 +3346,9 @@ impl VideoEncodeWorker for BlockedEnc {
 }
 
 impl LiveEncoder for BlockedEnc {
-    fn start_at(&mut self, _t0: u64) {
+    fn start_at(&mut self, t0: u64) {
         self.forced = true;
+        self.next = Some(t0);
     }
     fn time_base(&self) -> Rational {
         Rational::new(1, 5)
@@ -3323,6 +3373,7 @@ fn blocked_harness(outputs: usize) -> (Harness, Arc<AtomicBool>, SyncSender<()>)
             forced: false,
             block: Arc::clone(&b),
             gate: Mutex::new(gate.take().expect("opened once")),
+            next: None,
         });
         Ok(e)
     });
@@ -3747,4 +3798,36 @@ fn a_consumer_gap_on_a_full_clean_queue_never_fails_the_key() {
     assert!(!x.d.is_key_failed(1), "the Clean key's worker did not end");
     assert_eq!(x.d.binding_video_key(1), Some(1), "still on the Clean key");
     drop(release);
+}
+
+/// PR #326 round 4: a key that refuses every substitution offer but accepts
+/// every surviving tick is still starved: the accepted survivor after a
+/// refused substitution never resets the count, so repeated consumer gaps
+/// reach the degraded bound.
+#[test]
+fn refused_substitutions_count_toward_starvation_across_accepted_survivors() {
+    let (mut x, seen) = ptr_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    x.tick(now);
+    let key = x.d.binding_video_key(1).unwrap();
+    // Model "refuse the substitution, accept the survivor" directly on the
+    // key's bookkeeping: each round, a substitution offer is refused.
+    for round in 0..=DEGRADED_AFTER_TICKS {
+        if let Some(d) = x.r.dynamic.iter_mut().find(|d| d.key == key) {
+            d.starved = d.starved.saturating_add(1);
+            d.refused_this_tick = true;
+        }
+        x.tick(now + 1 + round);
+    }
+    let starved = x.r.dynamic.iter().find(|d| d.key == key).map(|d| d.starved);
+    assert!(
+        starved.is_some_and(|s| s > DEGRADED_AFTER_TICKS),
+        "accepted survivors did not reset the refusals: {starved:?}"
+    );
+    assert!(x.h.snapshot().outputs[1].degraded, "the output is degraded");
+    drop(seen);
 }

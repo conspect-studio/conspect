@@ -342,6 +342,12 @@ jobs:
             feature: tls
           - crate: multiview-cli
             feature: tls
+          # The front-door ACME engine (slice 5, #291): clippy + the egress,
+          # Cloudflare-fake and output-clock cadence tests (`acme_*`, in-process
+          # on [::1]); the Pebble flows are #[ignore]d here and run in the
+          # dedicated `acme-pebble` job below.
+          - crate: multiview-control
+            feature: acme
           # multiview-hal off-by-default features
           - crate: multiview-hal
             feature: i915-pmu
@@ -496,6 +502,64 @@ jobs:
   # gain real run-time coverage of the libass-gated path. The crate is pure Rust
   # here (the native libass/HarfBuzz/FriBidi toolchain is wired downstream), so
   # both steps run on the bare runner.
+  acme-pebble:
+    name: ACME flows against Pebble (#291)
+    runs-on: ubuntu-latest
+    # Target < 10 min warm: download + verify Pebble, one feature build, ~1 min of flows.
+    timeout-minutes: 15
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    env:
+      PEBBLE_VERSION: v2.10.3
+      PEBBLE_WORK: ${{ github.workspace }}/.pebble
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: acme-pebble
+      - name: download and verify Pebble + challtestsrv
+        run: |
+          set -euo pipefail
+          mkdir -p "$PEBBLE_WORK/test/certs/localhost"
+          cd "$PEBBLE_WORK"
+          base="https://github.com/letsencrypt/pebble/releases/download/$PEBBLE_VERSION"
+          curl -fsSLO "$base/pebble-linux-amd64.tar.gz"
+          curl -fsSLO "$base/pebble-challtestsrv-linux-amd64.tar.gz"
+          raw="https://raw.githubusercontent.com/letsencrypt/pebble/$PEBBLE_VERSION"
+          curl -fsSL -o test/certs/pebble.minica.pem "$raw/test/certs/pebble.minica.pem"
+          curl -fsSL -o test/certs/localhost/cert.pem "$raw/test/certs/localhost/cert.pem"
+          curl -fsSL -o test/certs/localhost/key.pem "$raw/test/certs/localhost/key.pem"
+          cat > SHA256SUMS <<'SUMS'
+          7e33cf3e426b67e9e647c44e8cc91683caa8ab331f7a99e5e27fcee291c4c7e2  pebble-linux-amd64.tar.gz
+          00b2c5ef525cd8ad56cda898a7cac6169a10b0fd3f2a7456fe0cec92e7b36cb6  pebble-challtestsrv-linux-amd64.tar.gz
+          0c502e52627ff7de972c7e9e065640103b4589b4e2d23d3fcf21bef1e3c8c67c  test/certs/pebble.minica.pem
+          c87fb918d9bac8db11aa54493b5f0cf6e0725a3fe73f617d1c64737e1ab4caf9  test/certs/localhost/cert.pem
+          0977979255b0e0721c17335c056b627f66a43cf56e5a52f3cda81fb111ecf00e  test/certs/localhost/key.pem
+          SUMS
+          sed -i 's/^ *//' SHA256SUMS
+          sha256sum -c SHA256SUMS
+          tar -xzf pebble-linux-amd64.tar.gz
+          tar -xzf pebble-challtestsrv-linux-amd64.tar.gz
+          # The release tarballs do not carry the exec bit.
+          chmod +x pebble-linux-amd64/linux/amd64/pebble pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv
+          echo "PEBBLE_BIN=$PEBBLE_WORK/pebble-linux-amd64/linux/amd64/pebble" >> "$GITHUB_ENV"
+          echo "CHALLTESTSRV_BIN=$PEBBLE_WORK/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv" >> "$GITHUB_ENV"
+      - name: build the ACME tests
+        run: cargo test --locked -p multiview-control --features acme --test acme_pebble --no-run
+      - name: start Pebble (standard, EAB, nonce-reject) + challtestsrv
+        run: |
+          ci/pebble/run-local.sh start
+          cat "$PEBBLE_WORK/pebble.env" >> "$GITHUB_ENV"
+      - name: test (acme_pebble)
+        run: cargo test --locked -p multiview-control --features acme --test acme_pebble -- --ignored --test-threads=1
+      - name: Pebble logs
+        if: failure()
+        run: tail -n 200 "$PEBBLE_WORK"/*.log || true
+      - name: stop Pebble
+        if: always()
+        run: ci/pebble/run-local.sh stop
+
   feature-clippy-overlay-libass:
     name: feature-gated clippy + test (multiview-overlay, libass)
     runs-on: ubuntu-latest
@@ -1103,6 +1167,15 @@ jobs:
           otool -L "$bin" | grep libavformat
           otool -L "$bin" | grep -q "${FF_PREFIX}/lib/libavformat" \
             || { echo "::error::test binary is not linked against ${FF_PREFIX}"; exit 1; }
+      - name: Chaos — bounded exit after a fatal output fault and SIGTERM (#309)
+        # Mandatory chaos test for the invariant-#1 exit bound: the REAL binary
+        # (with the env-armed `_chaos-test-seams`) is forced behind the clock
+        # (fatal) and SIGTERMed, with source teardown held 10x past the bound.
+        # Every run must exit within 2 s + 0.5 s with valid HLS on disk.
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p multiview-cli --features apple,_chaos-test-seams
+          bash scripts/chaos-bounded-exit.sh target/release/multiview 10 both
       - name: Release bundle check (apple preset, deploy/macos-bundle.sh, ad-hoc signed)
         # The release workflow only runs on tags; this proves on every PR that
         # the apple binary bundles into a self-contained, signed directory that

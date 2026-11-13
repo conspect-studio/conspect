@@ -41,6 +41,8 @@ export interface WallSnapshot {
   /** Why surfaces show stills (undefined while live or still connecting). */
   readonly reason?: string | undefined;
   readonly transport: 'moq' | 'webrtc' | 'stills';
+  /** The selected ICE pair of the WebRTC rung (`tcp/host-host`...), else undefined. */
+  readonly icePair?: string | undefined;
 }
 
 export function isAborted(s: AbortSignal): boolean { return s.aborted; }
@@ -76,6 +78,7 @@ export class WallStore {
   private failures = 0;
   private reason: string | undefined;
   private transport: 'moq' | 'webrtc' | 'stills' = 'stills';
+  private icePair: string | undefined;
   private moqFailed = false;
   private moqReason: string | undefined;
   readonly stats: WallStats = { frames: 0, lastFrameAt: 0, sessions: 0, decoders: 0, gapsOver500ms: 0, maxGapMs: 0 };
@@ -157,8 +160,9 @@ export class WallStore {
     const geometry = live ? this.geometry : undefined;
     const reason = live ? undefined : this.reason;
     const transport = geometry ? this.transport : 'stills';
-    if (geometry === this.snapshot.geometry && reason === this.snapshot.reason && transport === this.snapshot.transport) return;
-    this.snapshot = { geometry, reason, transport };
+    const icePair = transport === 'webrtc' ? this.icePair : undefined;
+    if (geometry === this.snapshot.geometry && reason === this.snapshot.reason && transport === this.snapshot.transport && icePair === this.snapshot.icePair) return;
+    this.snapshot = { geometry, reason, transport, icePair };
     for (const listener of [...this.stateListeners]) listener();
   }
 
@@ -259,6 +263,7 @@ export class WallStore {
         } else {
           await (this.deps.playWhep ?? playWallWhep)({
             signal: aborted, onFrame: sessionFrame,
+            onPair: (pair) => { if (this.session === session) { this.icePair = pair; this.publish(); } },
             onActive: () => { this.stats.sessions += 1; this.stats.decoders += 1; },
           });
         }
@@ -272,6 +277,7 @@ export class WallStore {
       }
       this.session = undefined;
       this.playingGeneration = undefined;
+      this.icePair = undefined;
       if (isAborted(signal)) return;
       if (failed || !this.isAborted(session)) {
         // First MoQ failure falls through immediately; later WHEP failures back off.
