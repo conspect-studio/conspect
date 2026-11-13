@@ -741,6 +741,9 @@ pub struct AppState {
     /// Bounded sustained PVW lease retained across requests; the previous lease
     /// is released only after a new source lease is acquired.
     pub switcher_preview_lease: Arc<crate::source_demand::SwitcherPreviewLeases>,
+    /// Mixer patch take limits (ADR-0110 §12.8: 2/s per destination, 10/s
+    /// per principal; one request = one take). Control-plane only.
+    pub patch_limiter: Arc<crate::output_routing::TakeLimiter>,
     /// The command-outcome correlation registry: pairs each accepted command's
     /// [`OperationId`](crate::command::OperationId) with the realtime outcome
     /// event it will produce, so the outcome's envelope echoes the op id as
@@ -1067,6 +1070,7 @@ impl AppState {
             output_routing: None,
             program_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
+            patch_limiter: Arc::new(crate::output_routing::TakeLimiter::default()),
             // Bound the in-flight correlations: a generous ceiling for pending
             // command outcomes (drop-oldest beyond it, invariant #10). A backlog
             // this deep means outcomes are not being consumed; the oldest

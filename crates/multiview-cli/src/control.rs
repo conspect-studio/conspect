@@ -4158,6 +4158,9 @@ input_id = "in_b"
                 program_source: "in_a".into(),
                 preview_source: "in_b".into(),
                 flip_flop: true,
+                inputs: vec![],
+                program_input: None,
+                preview_input: None,
             }],
             extra: serde_json::Map::new(),
         });

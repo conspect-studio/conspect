@@ -208,3 +208,93 @@ fn failed_rebind_rolls_back_selection_and_never_airs_later() {
         );
     }
 }
+
+/// #341: a re-patch of the input on PGM (`on_air = allow`) rebinds the Program
+/// cell to the new source on the patch tick itself, with no machine take.
+#[test]
+fn repatching_the_program_input_rebinds_the_program_cell_on_the_same_tick() {
+    use multiview_engine::runtime::FrameControl;
+    use multiview_engine::switcher_control::PatchSet;
+    use multiview_engine::switcher_inputs::MixerInputs;
+    let color = ColorInfo::default().resolve_defaults(64, 64);
+    let a = Arc::new(TileStore::<Nv12Image>::with_defaults("a"));
+    let b = Arc::new(TileStore::<Nv12Image>::with_defaults("b"));
+    a.publish(
+        Nv12Image::solid(64, 64, 200, 128, 128, color).unwrap(),
+        multiview_core::time::MediaTime::ZERO,
+    );
+    b.publish(
+        Nv12Image::solid(64, 64, 60, 128, 128, color).unwrap(),
+        multiview_core::time::MediaTime::ZERO,
+    );
+    let stores = HashMap::from([("a".into(), a), ("b".into(), b)]);
+    let mut drive = CompositorDrive::new(
+        layout("a"),
+        stores.clone(),
+        Nv12Image::solid(64, 64, 16, 128, 128, color).unwrap(),
+        CanvasColor::default(),
+        LinearRgba::TRANSPARENT,
+    )
+    .unwrap()
+    .with_cell_ids(vec![Some("pgm".into())]);
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::input(1),
+        SourceRef::input(2),
+        vec![],
+    ));
+    driver.set_prime_stores(stores);
+    driver.set_inputs(
+        MixerInputs::new([
+            (1, None, Some(SourceRef::new("a"))),
+            (2, None, Some(SourceRef::new("b"))),
+        ])
+        .unwrap(),
+    );
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: layout("a"),
+            preview: layout("b"),
+        })
+        .unwrap();
+    let mut hook = SwitcherFrameHook::new(
+        driver,
+        "pgm".into(),
+        |_: &mut CompositorDrive<Nv12Image>| {},
+    );
+    let mut outcomes = handle.outcomes();
+    let mut luma = Vec::new();
+    for index in 0..3 {
+        if index == 1 {
+            handle
+                .try_send(SwitcherCommand {
+                    operation_id: "repatch".into(),
+                    scene_version: 1,
+                    verb: SwitcherVerb::Patch(PatchSet {
+                        members: vec![(1, Some(SourceRef::new("b")))],
+                        allow_on_air: true,
+                    }),
+                })
+                .unwrap();
+        }
+        let tick = multiview_engine::clock::Tick {
+            index,
+            pts: multiview_core::time::MediaTime::ZERO,
+        };
+        hook.before_compose(&mut drive, tick);
+        let frame = drive.compose(tick).unwrap();
+        luma.push(frame.canvas.sample(8, 8).unwrap().0);
+        hook.after_compose(&frame);
+    }
+    assert!(luma[0] > 150, "input 1 = a before the patch: {luma:?}");
+    assert!(
+        luma[1] < 100 && luma[2] < 100,
+        "b from the patch tick on: {luma:?}"
+    );
+    let outcome = outcomes.try_recv().unwrap().event;
+    assert_eq!((outcome.tick, outcome.completed), (1, true));
+    let snapshot = handle.snapshot().unwrap();
+    assert_eq!(snapshot.program.as_str(), "b");
+    assert_eq!(snapshot.program_input, Some(1));
+    assert_eq!(snapshot.completion_count, 0, "a patch is not a faked take");
+}
