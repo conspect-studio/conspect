@@ -202,7 +202,7 @@ Supply a secret in one of two ways:
   With the engine running, it sends the value to the loopback admin listener, which writes
   `<state_dir>/secrets/CLOUDFLARE_API_TOKEN` (0600, atomic). It then starts issuance at once; no
   restart is needed, because the credential is re-read at every attempt. With the engine stopped,
-  it writes the file directly. Only names referenced by `[network.tls]` are accepted. The value is
+  it writes the file directly, but only when `--config` is given. Only names referenced by `[network.tls]` are accepted. The value is
   never logged, echoed or returned by any route.
 
 The CLI talks to `[control] listen` over loopback only (`[::]` is dialled as `[::1]`). It
@@ -259,7 +259,10 @@ Without `--config`, every `multiview tls` command uses the config of the one run
 `multiview run <CONFIG>` engine (found through `/proc`, a relative path resolved against the
 engine's working directory), else `/etc/multiview/multiview.toml` if it exists. The first status
 line says which (`config  <path> (running engine pid N)` or `(default path)`). With several engines
-running it lists their configs and asks for `--config`.
+running it lists their configs and asks for `--config`. Only engines that run as the same user as
+the CLI are considered, and only if their config path is absolute and contains no control
+characters. `set-credential` writes offline (engine not reachable) only to a config named with
+`--config`. With a discovered or default config it refuses and asks for `--config`.
 
 `last error detail` is the human reason behind the token: the CA's problem type and text (with
 subproblems and the challenge's own error, for example `unauthorized: Failed to connect to

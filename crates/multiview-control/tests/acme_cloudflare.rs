@@ -338,3 +338,34 @@ async fn auto_with_a_silent_probe_uses_the_authoritative_servers() {
     let detail = dns.propagation_detail().unwrap();
     assert!(detail.contains("authoritative"), "{detail}");
 }
+
+/// Review C2: only a reply to THIS probe query (QR=response, same id) from a
+/// probe target counts as interception. A stray datagram with another id, or
+/// a correct-looking reply from a peer that is not a probe target, leaves the
+/// verdict at "authoritative" (no `DoH` query at all).
+#[tokio::test]
+async fn a_probe_reply_with_the_wrong_id_or_from_elsewhere_is_not_interception() {
+    for mode in [FakeDns::WrongId, FakeDns::ReplyFromElsewhere] {
+        let label = format!("{mode:?}");
+        let (probe, _p) = fake_dns(mode).await;
+        let state = doh_state();
+        let (auth, _a) = fake_dns(FakeDns::Authoritative(state.clone())).await;
+        let (dns, _t) = fake_with_confirm(&state, DnsConfirm::Auto, vec![probe], vec![auth]).await;
+        dns.publish_txt(FQDN, "the-value").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            dns.confirm_at_authoritative(FQDN, "the-value", Duration::from_secs(5)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            state.lock().unwrap().doh_queries,
+            0,
+            "{label}: DoH never asked"
+        );
+        let detail = dns.propagation_detail().unwrap();
+        assert!(detail.contains("authoritative"), "{label}: {detail}");
+        assert!(!detail.contains("intercepted"), "{label}: {detail}");
+    }
+}

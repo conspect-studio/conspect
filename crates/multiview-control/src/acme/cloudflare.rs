@@ -629,9 +629,27 @@ fn txt_answer_matches(wire: &[u8], value: &str) -> bool {
     })
 }
 
+/// Whether `wire`, received from `from`, is an answer to the probe query
+/// `id`: a DNS message with QR=response and the same id, sent from one of the
+/// `probe` targets (address compared in canonical form, so a v4-mapped sender
+/// matches its IPv4 target).
+fn is_probe_reply(wire: &[u8], from: SocketAddr, id: u16, probe: &[SocketAddr]) -> bool {
+    use hickory_resolver::proto::op::{Message, MessageType};
+    let from = SocketAddr::new(from.ip().to_canonical(), from.port());
+    if !probe
+        .iter()
+        .any(|t| SocketAddr::new(t.ip().to_canonical(), t.port()) == from)
+    {
+        return false;
+    }
+    Message::from_vec(wire)
+        .is_ok_and(|m| m.metadata.message_type == MessageType::Response && m.metadata.id == id)
+}
+
 /// Whether port 53 is intercepted: one SOA query for `zone` (random id) to
-/// every probe target, where nothing listens; ANY reply within
-/// [`PROBE_TIMEOUT`] means a middlebox answered on their behalf.
+/// every probe target, where nothing listens; a reply to that query (QR set,
+/// same id, from a probe target) within [`PROBE_TIMEOUT`] means a middlebox
+/// answered on their behalf.
 async fn port53_intercepted(probe: &[SocketAddr], zone: &str) -> bool {
     let id = u16::try_from(uuid::Uuid::new_v4().as_u128() & 0xffff).unwrap_or(0);
     let Some(wire) = query_wire(zone, SOA_TYPE, id, true) else {
@@ -659,9 +677,13 @@ async fn port53_intercepted(probe: &[SocketAddr], zone: &str) -> bool {
         let mut buf = [0_u8; 512];
         loop {
             // A transient receive error (e.g. a reported ICMP unreachable) is
-            // not an answer: keep listening until the deadline.
-            if socket.recv_from(&mut buf).await.is_ok() {
-                return true;
+            // not an answer, nor is a datagram that is not a reply to THIS
+            // query from one of the probe targets (stray or spoofed traffic):
+            // keep listening until the deadline.
+            if let Ok((len, from)) = socket.recv_from(&mut buf).await {
+                if is_probe_reply(buf.get(..len).unwrap_or_default(), from, id, probe) {
+                    return true;
+                }
             }
         }
     };

@@ -53,6 +53,17 @@ pub const RESPONDER_WAIT: Duration = Duration::from_secs(60);
 /// Deadline of each best-effort call after a failure (authorization refresh
 /// for the problem detail, deactivation of a stale pending authorization).
 const AFTERMATH_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total of the TXT removals after one attempt (each call also keeps
+/// [`CLEANUP_CALL_TIMEOUT`]); what is not removed stays in the ledger.
+const AFTERMATH_TXT_TOTAL: Duration = Duration::from_secs(30);
+/// Total of the deactivation of a failed order's pending authorizations.
+const AFTERMATH_DEACTIVATE_TOTAL: Duration = Duration::from_secs(30);
+/// Total deadline of everything after an attempt (TXT removal, then
+/// deactivation): the sum of the two caps above, enforced on its own.
+pub const AFTERMATH_TOTAL: Duration = Duration::from_secs(60);
+/// On `Shutdown` during an attempt: the most spent removing published TXT
+/// records (under the 2 s `AcmeHandle` drop budget).
+const SHUTDOWN_CLEANUP: Duration = Duration::from_secs(1);
 /// Longest human failure detail kept (bytes, cut on a char boundary).
 pub const DETAIL_CAP: usize = 512;
 /// Fallback-renewal jitter cap.
@@ -245,43 +256,127 @@ fn short_type(kind: Option<&str>) -> &str {
     })
 }
 
+/// An identifier as text, cut at [`DETAIL_FIELD_CAP`] bytes (CA-supplied).
 fn identifier_text(identifier: &Identifier) -> String {
     match identifier {
-        Identifier::Dns(name) => name.clone(),
+        Identifier::Dns(name) => prefix_within(name, DETAIL_FIELD_CAP).to_owned(),
         Identifier::Ip(ip) => ip.to_string(),
         _ => "identifier".to_owned(),
     }
 }
 
-/// Human text of a CA problem document: `type: detail`, then every
-/// subproblem as `[identifier] type: detail`. Unsanitized: callers pass the
+/// Append an authorization's identifier (`*.` for a wildcard), bounded.
+fn write_identifier(out: &mut DetailBuf, authz: &instant_acme::AuthorizationState) {
+    if authz.wildcard {
+        out.push("*.");
+    }
+    out.field(&identifier_text(authz.identifier().identifier));
+}
+
+/// Longest single CA-supplied field (type, detail, identifier) copied into a
+/// failure detail (bytes, cut on a char boundary).
+const DETAIL_FIELD_CAP: usize = 200;
+/// Most subproblems / authorizations / challenges formatted into one detail.
+const DETAIL_ITEMS_CAP: usize = 8;
+
+/// A string builder that never holds more than [`DETAIL_CAP`] bytes: every
+/// append is cut at the remaining room on a char boundary and appends after
+/// the cap are no-ops. CA text (problem documents, authorizations) is only
+/// ever formatted through it, so a hostile or broken CA cannot make us
+/// allocate more than [`DETAIL_CAP`] bytes per detail, whatever it sends.
+#[derive(Debug, Default)]
+struct DetailBuf {
+    out: String,
+}
+
+impl DetailBuf {
+    fn new() -> Self {
+        Self {
+            out: String::with_capacity(DETAIL_CAP),
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.out.len() >= DETAIL_CAP
+    }
+
+    /// Append `text`, cut at the room left (char boundary).
+    fn push(&mut self, text: &str) {
+        let room = DETAIL_CAP.saturating_sub(self.out.len());
+        self.out.push_str(prefix_within(text, room));
+    }
+
+    /// Append one CA-supplied field, first cut at [`DETAIL_FIELD_CAP`].
+    fn field(&mut self, text: &str) {
+        self.push(prefix_within(text, DETAIL_FIELD_CAP));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.out.is_empty()
+    }
+
+    fn finish(self) -> String {
+        self.out
+    }
+}
+
+/// The longest prefix of `text` of at most `max` bytes ending on a char boundary.
+fn prefix_within(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Append a CA problem document to `out` (see [`describe_problem`]).
+fn write_problem(out: &mut DetailBuf, problem: &instant_acme::Problem) {
+    let kind = short_type(problem.r#type.as_deref());
+    out.field(if kind.is_empty() { "problem" } else { kind });
+    if let Some(detail) = problem.detail.as_deref().filter(|d| !d.is_empty()) {
+        out.push(": ");
+        out.field(detail);
+    }
+    for (index, sub) in problem.subproblems.iter().enumerate() {
+        if out.is_full() {
+            return;
+        }
+        if index == DETAIL_ITEMS_CAP {
+            out.push(&format!(
+                "; and {} more subproblems",
+                problem.subproblems.len() - DETAIL_ITEMS_CAP
+            ));
+            return;
+        }
+        out.push("; [");
+        match &sub.identifier {
+            Some(identifier) => out.field(&identifier_text(identifier)),
+            None => out.push("?"),
+        }
+        out.push("] ");
+        let kind = short_type(sub.r#type.as_deref());
+        out.field(if kind.is_empty() { "problem" } else { kind });
+        if let Some(detail) = sub.detail.as_deref().filter(|d| !d.is_empty()) {
+            out.push(": ");
+            out.field(detail);
+        }
+    }
+}
+
+/// Human text of a CA problem document: `type: detail`, then up to
+/// [`DETAIL_ITEMS_CAP`] subproblems as `[identifier] type: detail`; each
+/// field cut at [`DETAIL_FIELD_CAP`] and the whole at [`DETAIL_CAP`] bytes
+/// (built in a [`DetailBuf`], never larger). Unsanitized: callers pass the
 /// result through [`sanitize_detail`]. CA problem text never carries our
 /// credentials; our requests and headers are never formatted.
 #[must_use]
 pub fn describe_problem(problem: &instant_acme::Problem) -> String {
-    let mut out = String::new();
-    let kind = short_type(problem.r#type.as_deref());
-    out.push_str(if kind.is_empty() { "problem" } else { kind });
-    if let Some(detail) = problem.detail.as_deref().filter(|d| !d.is_empty()) {
-        out.push_str(": ");
-        out.push_str(detail);
-    }
-    for sub in &problem.subproblems {
-        out.push_str("; [");
-        out.push_str(
-            &sub.identifier
-                .as_ref()
-                .map_or_else(|| "?".to_owned(), identifier_text),
-        );
-        out.push_str("] ");
-        let kind = short_type(sub.r#type.as_deref());
-        out.push_str(if kind.is_empty() { "problem" } else { kind });
-        if let Some(detail) = sub.detail.as_deref().filter(|d| !d.is_empty()) {
-            out.push_str(": ");
-            out.push_str(detail);
-        }
-    }
-    out
+    let mut out = DetailBuf::new();
+    write_problem(&mut out, problem);
+    out.finish()
 }
 
 /// Human text of an instant-acme error: the CA's problem, else a short
@@ -299,21 +394,109 @@ fn describe_error(error: &instant_acme::Error) -> Option<String> {
     }
 }
 
-/// Describe an authorization that is not pending/valid, with any challenge errors.
-fn describe_authorization(authz: &instant_acme::AuthorizationState) -> String {
-    let mut out = format!(
-        "authorization for {} is {:?}",
-        authz.identifier(),
-        authz.status
-    )
-    .to_ascii_lowercase();
-    for challenge in &authz.challenges {
+/// The lowercase name of a challenge type (`tls-alpn-01`, …), bounded.
+fn challenge_name(kind: &ChallengeType) -> String {
+    match kind {
+        ChallengeType::Http01 => "http-01".to_owned(),
+        ChallengeType::Dns01 => "dns-01".to_owned(),
+        ChallengeType::TlsAlpn01 => "tls-alpn-01".to_owned(),
+        ChallengeType::DeviceAttest01 => "device-attest-01".to_owned(),
+        ChallengeType::Unknown(other) => prefix_within(other, DETAIL_FIELD_CAP).to_owned(),
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// Append an authorization that is not pending/valid, with up to
+/// [`DETAIL_ITEMS_CAP`] challenge errors.
+fn write_authorization(out: &mut DetailBuf, authz: &instant_acme::AuthorizationState) {
+    out.push("authorization for ");
+    write_identifier(out, authz);
+    out.push(&format!(" is {:?}", authz.status).to_ascii_lowercase());
+    for challenge in authz
+        .challenges
+        .iter()
+        .filter(|c| c.error.is_some())
+        .take(DETAIL_ITEMS_CAP)
+    {
+        if out.is_full() {
+            return;
+        }
         if let Some(problem) = &challenge.error {
-            out.push_str(&format!("; {:?} challenge: ", challenge.r#type).to_ascii_lowercase());
-            out.push_str(&describe_problem(problem));
+            out.push("; ");
+            out.push(&challenge_name(&challenge.r#type));
+            out.push(" challenge: ");
+            write_problem(out, problem);
         }
     }
-    out
+}
+
+/// Describe an authorization that is not pending/valid, with any challenge
+/// errors (bounded like [`describe_problem`]).
+fn describe_authorization(authz: &instant_acme::AuthorizationState) -> String {
+    let mut out = DetailBuf::new();
+    write_authorization(&mut out, authz);
+    out.finish()
+}
+
+/// The failure detail when `authz` offers no challenge of the `wanted` type
+/// (`None` when it does): the attempt cannot proceed for that identifier.
+fn missing_challenge_detail(
+    authz: &instant_acme::AuthorizationState,
+    wanted: &ChallengeType,
+) -> Option<String> {
+    if authz.challenges.iter().any(|c| c.r#type == *wanted) {
+        return None;
+    }
+    let mut out = DetailBuf::new();
+    out.push("the CA offers no ");
+    out.push(&challenge_name(wanted));
+    out.push(" challenge for ");
+    write_identifier(&mut out, authz);
+    let offered: Vec<String> = authz
+        .challenges
+        .iter()
+        .take(DETAIL_ITEMS_CAP)
+        .map(|c| challenge_name(&c.r#type))
+        .collect();
+    if offered.is_empty() {
+        out.push(" (it offers none)");
+    } else {
+        out.push(" (offered: ");
+        out.push(&offered.join(", "));
+        out.push(")");
+    }
+    Some(out.finish())
+}
+
+/// Append the `wanted` challenge's errors of one authorization (`; `
+/// separated), or the authorization itself when it is neither valid nor
+/// pending and nothing was written yet. Bounded by `out`.
+fn write_challenge_errors(
+    out: &mut DetailBuf,
+    state: &instant_acme::AuthorizationState,
+    wanted: &ChallengeType,
+) {
+    for challenge in state
+        .challenges
+        .iter()
+        .filter(|c| c.r#type == *wanted)
+        .take(DETAIL_ITEMS_CAP)
+    {
+        if let Some(problem) = &challenge.error {
+            if !out.is_empty() {
+                out.push("; ");
+            }
+            write_identifier(out, state);
+            out.push(": ");
+            write_problem(out, problem);
+        }
+    }
+    if state.status != AuthorizationStatus::Valid
+        && state.status != AuthorizationStatus::Pending
+        && out.is_empty()
+    {
+        write_authorization(out, state);
+    }
 }
 
 /// The reverse-DNS SNI name RFC 8738 §6 uses for an IP identifier.
@@ -494,6 +677,14 @@ enum Published {
     Alpn(String),
 }
 
+/// What an attempt leaves behind for its aftermath.
+#[derive(Default)]
+struct Leftovers {
+    published: Vec<Published>,
+    /// The placed order (account + order URL), once one exists.
+    placed: Option<(Account, String)>,
+}
+
 /// The ACME engine for one `[network.tls]` configuration.
 pub struct AcmeEngine {
     config: NetworkTlsConfig,
@@ -513,6 +704,8 @@ pub struct AcmeEngine {
     last_detail: Mutex<Option<String>>,
     /// How long TLS-ALPN-01 waits for the responder ([`RESPONDER_WAIT`]).
     responder_wait: Duration,
+    /// Total deadline of the post-attempt work ([`AFTERMATH_TOTAL`]).
+    aftermath_total: Duration,
 }
 
 impl std::fmt::Debug for AcmeEngine {
@@ -561,6 +754,7 @@ impl AcmeEngine {
             bootstrap_rotation: None,
             last_detail: Mutex::new(None),
             responder_wait: RESPONDER_WAIT,
+            aftermath_total: AFTERMATH_TOTAL,
         })
     }
 
@@ -569,6 +763,14 @@ impl AcmeEngine {
     #[must_use]
     pub fn with_responder_wait(mut self, wait: Duration) -> Self {
         self.responder_wait = wait;
+        self
+    }
+
+    /// Override the total deadline of the post-attempt work (default
+    /// [`AFTERMATH_TOTAL`]; tests shorten it).
+    #[must_use]
+    pub fn with_aftermath_total(mut self, total: Duration) -> Self {
+        self.aftermath_total = total;
         self
     }
 
@@ -856,12 +1058,27 @@ impl AcmeEngine {
         &self,
         replaces: Option<CertificateIdentifier<'static>>,
     ) -> Result<Issued, AcmeError> {
+        let mut leftovers = Leftovers::default();
+        let result = self.bounded_attempt(replaces, &mut leftovers).await;
+        self.aftermath(leftovers, result.is_err()).await;
+        if result.is_ok() {
+            self.set_detail(None);
+        }
+        result
+    }
+
+    /// The attempt itself under [`Self::attempt_timeout`]; what it leaves
+    /// behind (published TXT/ALPN, the placed order) is recorded in
+    /// `leftovers` for [`Self::aftermath`].
+    async fn bounded_attempt(
+        &self,
+        replaces: Option<CertificateIdentifier<'static>>,
+        leftovers: &mut Leftovers,
+    ) -> Result<Issued, AcmeError> {
         self.set_detail(None);
-        let mut published = Vec::new();
-        let mut placed: Option<(Account, String)> = None;
-        let result = tokio::time::timeout(
+        tokio::time::timeout(
             self.attempt_timeout,
-            self.attempt(replaces, &mut published, &mut placed),
+            self.attempt(replaces, &mut leftovers.published, &mut leftovers.placed),
         )
         .await
         .unwrap_or_else(|_| {
@@ -872,17 +1089,73 @@ impl AcmeEngine {
                 )));
             }
             Err(AcmeError::Timeout)
-        });
-        self.cleanup(published).await;
-        match &result {
-            Ok(_) => self.set_detail(None),
-            Err(_) => {
+        })
+    }
+
+    /// After the attempt (outside its timeout): ALPN challenges are removed at
+    /// once; then published TXT records are removed and, after a failure, the
+    /// placed order's pending authorizations are deactivated, all under ONE
+    /// total deadline ([`AFTERMATH_TOTAL`]; each step also keeps its own
+    /// cap). A TXT record not removed in time stays in the ledger and is
+    /// retried by [`Self::cleanup_pending`] at the next start. The service
+    /// loop additionally cuts this short on `Shutdown`.
+    async fn aftermath(&self, leftovers: Leftovers, failed: bool) {
+        let Leftovers { published, placed } = leftovers;
+        let published = self.remove_alpn(published);
+        let work = async {
+            if tokio::time::timeout(AFTERMATH_TXT_TOTAL, self.cleanup(published))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "acme: TXT cleanup timed out; left in the ledger for the next start"
+                );
+            }
+            if failed {
                 if let Some((account, url)) = placed {
                     self.deactivate_pending(&account, url).await;
                 }
             }
+        };
+        if tokio::time::timeout(self.aftermath_total, work)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "acme: post-attempt cleanup exceeded its {} s total; the rest is left",
+                self.aftermath_total.as_secs()
+            );
         }
-        result
+    }
+
+    /// On `Shutdown` during an attempt: remove ALPN challenges and try the
+    /// published TXT records for at most [`SHUTDOWN_CLEANUP`] (the ledger
+    /// keeps whatever is left for the next start). No CA call is made.
+    async fn shutdown_cleanup(&self, leftovers: Leftovers) {
+        let published = self.remove_alpn(leftovers.published);
+        if published.is_empty() {
+            return;
+        }
+        if tokio::time::timeout(SHUTDOWN_CLEANUP, self.cleanup(published))
+            .await
+            .is_err()
+        {
+            tracing::warn!("acme: TXT cleanup cut short by shutdown; left in the ledger");
+        }
+    }
+
+    /// Remove every ALPN challenge (local, instant); returns the TXT items.
+    fn remove_alpn(&self, published: Vec<Published>) -> Vec<Published> {
+        published
+            .into_iter()
+            .filter(|item| match item {
+                Published::Alpn(name) => {
+                    self.resolver.remove(name);
+                    false
+                }
+                Published::Txt(_) => true,
+            })
+            .collect()
     }
 
     /// After a failed attempt that created an order: deactivate its
@@ -923,7 +1196,7 @@ impl AcmeEngine {
                 }
             }
         };
-        if tokio::time::timeout(AFTERMATH_CALL_TIMEOUT * 3, work)
+        if tokio::time::timeout(AFTERMATH_DEACTIVATE_TOTAL, work)
             .await
             .is_err()
         {
@@ -931,45 +1204,34 @@ impl AcmeEngine {
         }
     }
 
-    /// The wanted challenge's own error from every authorization of `order`
-    /// (each refreshed, bounded): why the CA rejected the challenge.
+    /// The wanted challenge's own error from (up to [`DETAIL_ITEMS_CAP`])
+    /// authorizations of `order` (each refreshed, bounded): why the CA
+    /// rejected the challenge. Built in one [`DetailBuf`] (≤ [`DETAIL_CAP`]).
     async fn challenge_errors(
         &self,
         order: &mut instant_acme::Order,
         wanted: &ChallengeType,
     ) -> Option<String> {
-        let mut parts = Vec::new();
+        let mut out = DetailBuf::new();
         let work = async {
             let mut authorizations = order.authorizations();
+            let mut seen = 0_usize;
             while let Some(next) = authorizations.next().await {
+                if seen == DETAIL_ITEMS_CAP || out.is_full() {
+                    break;
+                }
+                seen += 1;
                 let Ok(mut authz) = next else { break };
                 let Ok(Ok(state)) =
                     tokio::time::timeout(AFTERMATH_CALL_TIMEOUT, authz.refresh()).await
                 else {
                     continue;
                 };
-                for challenge in &state.challenges {
-                    if challenge.r#type != *wanted {
-                        continue;
-                    }
-                    if let Some(problem) = &challenge.error {
-                        parts.push(format!(
-                            "{}: {}",
-                            state.identifier(),
-                            describe_problem(problem)
-                        ));
-                    }
-                }
-                if state.status != AuthorizationStatus::Valid
-                    && state.status != AuthorizationStatus::Pending
-                    && parts.is_empty()
-                {
-                    parts.push(describe_authorization(state));
-                }
+                write_challenge_errors(&mut out, state, wanted);
             }
         };
         let _ = tokio::time::timeout(AFTERMATH_CALL_TIMEOUT * 3, work).await;
-        (!parts.is_empty()).then(|| parts.join("; "))
+        (!out.is_empty()).then(|| out.finish())
     }
 
     async fn cleanup(&self, published: Vec<Published>) {
@@ -1090,11 +1352,9 @@ impl AcmeEngine {
                     return Err(AcmeError::Challenge);
                 }
             }
-            if !authz.challenges.iter().any(|c| c.r#type == wanted) {
-                self.set_detail(Some(format!(
-                    "the CA offers no {wanted:?} challenge for {}",
-                    authz.identifier()
-                )));
+            if let Some(detail) = missing_challenge_detail(&authz, &wanted) {
+                self.set_detail(Some(detail));
+                return Err(AcmeError::Unsupported);
             }
             let mut challenge = authz
                 .challenge(wanted.clone())
@@ -1512,10 +1772,24 @@ async fn run(engine: AcmeEngine, mut receiver: mpsc::Receiver<AcmeCommand>) {
                 .as_ref()
                 .and_then(|m| m.ari_cert_id.clone())
                 .and_then(|id| parse_cert_id(&id));
-            let Some(result) = unless_shutdown(engine.issue_once(replaces), &mut receiver).await
-            else {
+            // The attempt, then its aftermath, each cut short by `Shutdown`:
+            // on shutdown during the attempt only a short local/TXT cleanup
+            // runs (no CA call), so the 2 s drop budget holds.
+            let mut leftovers = Leftovers::default();
+            let attempt = engine.bounded_attempt(replaces, &mut leftovers);
+            let Some(result) = unless_shutdown(attempt, &mut receiver).await else {
+                engine.shutdown_cleanup(leftovers).await;
                 return;
             };
+            if unless_shutdown(engine.aftermath(leftovers, result.is_err()), &mut receiver)
+                .await
+                .is_none()
+            {
+                return;
+            }
+            if result.is_ok() {
+                engine.set_detail(None);
+            }
             match result {
                 Ok(issued) => {
                     tracing::info!(not_after = issued.not_after, "acme: certificate installed");
@@ -1711,6 +1985,131 @@ mod tests {
             describe_error(&instant_acme::Error::Api(connection)).as_deref(),
             Some("connection: 203.0.113.7: Connection refused")
         );
+    }
+
+    fn authz(value: serde_json::Value) -> instant_acme::AuthorizationState {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// Review C1: an authorization without the wanted challenge yields the
+    /// `ca-offers-no-supported-challenge` detail (and the attempt returns
+    /// `Unsupported` right after setting it: see `tests/acme_cadence.rs`
+    /// `clock_keeps_cadence_while_deactivation_hangs` for the engine path).
+    #[test]
+    fn a_missing_challenge_type_is_described() {
+        let offered = authz(serde_json::json!({
+            "identifier": {"type": "dns", "value": "a.example.org"},
+            "status": "pending",
+            "wildcard": true,
+            "challenges": [
+                {"type": "http-01", "url": "https://ca/c/1", "token": "t", "status": "pending"},
+                {"type": "dns-01", "url": "https://ca/c/2", "token": "t", "status": "pending"}
+            ]
+        }));
+        assert_eq!(
+            missing_challenge_detail(&offered, &ChallengeType::TlsAlpn01).as_deref(),
+            Some(
+                "the CA offers no tls-alpn-01 challenge for *.a.example.org \
+                 (offered: http-01, dns-01)"
+            )
+        );
+        assert_eq!(
+            missing_challenge_detail(&offered, &ChallengeType::Dns01),
+            None
+        );
+        let none = authz(serde_json::json!({
+            "identifier": {"type": "ip", "value": "2001:db8::1"},
+            "status": "pending",
+            "challenges": []
+        }));
+        assert_eq!(
+            missing_challenge_detail(&none, &ChallengeType::Dns01).as_deref(),
+            Some("the CA offers no dns-01 challenge for 2001:db8::1 (it offers none)")
+        );
+        assert_eq!(
+            AcmeError::Unsupported.as_reason(),
+            "ca-offers-no-supported-challenge"
+        );
+    }
+
+    /// Review S1: CA text is only formatted through a builder capped at
+    /// `DETAIL_CAP`, whatever the CA sends (1 MiB details, 10 000 subproblems,
+    /// huge identifiers, many challenges).
+    #[test]
+    fn ca_text_is_formatted_into_a_bounded_builder() {
+        let huge = "é".repeat(512 * 1024); // 1 MiB of 2-byte chars
+        let long = "d".repeat(4096);
+        let subproblems: Vec<serde_json::Value> = (0..10_000)
+            .map(|i| {
+                serde_json::json!({
+                    "type": format!("urn:ietf:params:acme:error:{}", "x".repeat(1000)),
+                    "detail": long,
+                    "identifier": {"type": "dns", "value": format!("{i}.{}", "n".repeat(500))}
+                })
+            })
+            .collect();
+        let problem: instant_acme::Problem = serde_json::from_value(serde_json::json!({
+            "type": "urn:ietf:params:acme:error:rejectedIdentifier",
+            "detail": huge,
+            "subproblems": subproblems
+        }))
+        .unwrap();
+        let text = describe_problem(&problem);
+        assert!(text.len() <= DETAIL_CAP, "{}", text.len());
+        assert!(text.starts_with("rejectedIdentifier: é"));
+        // The first field alone is cut at DETAIL_FIELD_CAP (char boundary).
+        let first = text.strip_prefix("rejectedIdentifier: ").unwrap();
+        let detail_part = first.split(';').next().unwrap();
+        assert!(detail_part.len() <= DETAIL_FIELD_CAP);
+        assert!(sanitize_detail(&text).unwrap().len() <= DETAIL_CAP);
+
+        // Few short subproblems: the item cap names how many were left out.
+        let many: Vec<serde_json::Value> = (0..20)
+            .map(|i| serde_json::json!({"type": "caa", "identifier": {"type": "dns", "value": format!("{i}.x")}}))
+            .collect();
+        let short: instant_acme::Problem =
+            serde_json::from_value(serde_json::json!({"type": "t", "subproblems": many})).unwrap();
+        let text = describe_problem(&short);
+        assert_eq!(text.matches("] caa").count(), DETAIL_ITEMS_CAP, "{text}");
+        assert!(text.ends_with("; and 12 more subproblems"), "{text}");
+
+        // An authorization with 10 000 failed challenges carrying 4 KiB each.
+        let challenges: Vec<serde_json::Value> = (0..10_000)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "tls-alpn-01", "url": format!("https://ca/c/{i}"), "token": "t",
+                    "status": "invalid",
+                    "error": {"type": "urn:ietf:params:acme:error:tls", "detail": long}
+                })
+            })
+            .collect();
+        let state = authz(serde_json::json!({
+            "identifier": {"type": "dns", "value": "n".repeat(100_000)},
+            "status": "invalid",
+            "challenges": challenges
+        }));
+        let text = describe_authorization(&state);
+        assert!(text.len() <= DETAIL_CAP, "{}", text.len());
+        let mut out = DetailBuf::new();
+        write_challenge_errors(&mut out, &state, &ChallengeType::TlsAlpn01);
+        assert!(out.out.len() <= DETAIL_CAP);
+        // Appends after the cap are no-ops: the builder never grows past it.
+        let capacity = out.out.capacity();
+        for _ in 0..1000 {
+            write_challenge_errors(&mut out, &state, &ChallengeType::TlsAlpn01);
+            out.push(&huge);
+        }
+        assert!(out.out.len() <= DETAIL_CAP);
+        assert_eq!(out.out.capacity(), capacity, "no reallocation past the cap");
+        assert!(out.finish().is_char_boundary(0));
+        assert!(
+            missing_challenge_detail(&state, &ChallengeType::Dns01)
+                .unwrap()
+                .len()
+                <= DETAIL_CAP
+        );
+        assert_eq!(prefix_within("aé", 2), "a");
+        assert_eq!(prefix_within("aé", 3), "aé");
     }
 
     #[test]
