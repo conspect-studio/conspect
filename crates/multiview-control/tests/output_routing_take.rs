@@ -151,6 +151,7 @@ impl Fake {
                 tick: 77,
                 outcome: outcome.to_owned(),
                 feed: None,
+                audio: None,
             })
             .unwrap();
     }
@@ -163,6 +164,7 @@ impl Fake {
                 tick: 78,
                 outcome: outcome.to_owned(),
                 feed: Some(feed),
+                audio: None,
             })
             .unwrap();
     }
@@ -179,6 +181,14 @@ impl OutputRouting for Fake {
             sessions_in_use: s.in_use,
             sessions_max: 6,
         })
+    }
+    fn plan_audio(
+        &self,
+        _output: &str,
+        _video: Option<&RoutedFeed>,
+        _audio: Option<&multiview_control::output_routing::RoutedAudio>,
+    ) -> Result<multiview_control::output_routing::AudioPlanCost, PlanRefusal> {
+        Ok(multiview_control::output_routing::AudioPlanCost::default())
     }
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
         let mut s = self.state.lock().unwrap();
@@ -312,7 +322,7 @@ async fn take_is_202_replays_with_its_outcome_and_persists_only_after_applied() 
         takes[0].output, OUT_B_CONFIG_ID,
         "API id mapped to the config id"
     );
-    assert_eq!(takes[0].feed, RoutedFeed::Source("bars".into()));
+    assert_eq!(takes[0].video, Some(RoutedFeed::Source("bars".into())));
     assert_eq!(takes[0].principal, "operator-key", "charged to the key id");
     // Replay before the outcome: same op id, no outcome, nothing re-enqueued.
     let replay = body_json(
@@ -703,6 +713,9 @@ async fn readback_carries_live_state_and_redacts_unreadable_pending_feeds() {
             since_tick: 900,
             pending: Some(("src:secret-cam".into(), 12)),
             degraded: false,
+            audio: None,
+            pending_audio: None,
+            private_audio: false,
         },
     );
     rig.fake.state.lock().unwrap().live = Some(RoutingLive {
@@ -906,7 +919,8 @@ fn fill_take_store(
             &format!("{prefix}-{i}"),
             multiview_control::output_routing::PendingTake {
                 api_id: "output-0".to_owned(),
-                feed: RoutedFeed::Program,
+                feed: Some(RoutedFeed::Program),
+                audio: None,
             },
         );
         assert!(

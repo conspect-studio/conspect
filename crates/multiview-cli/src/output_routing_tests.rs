@@ -1507,7 +1507,8 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
         .try_take(OutputTakeRequest {
             operation_id: "op-1".into(),
             output: "renamed".into(),
-            feed: RoutedFeed::Program,
+            video: Some(RoutedFeed::Program),
+            audio: None,
             principal: "p".into(),
         })
         .unwrap();

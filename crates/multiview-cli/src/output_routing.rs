@@ -218,6 +218,9 @@ pub struct OutputRouteView {
     /// The output's audio choice: `follow`, `program`, `none`, `src:<id>`,
     /// `track:<name>`.
     pub audio_choice: String,
+    /// Whether the output runs a private encoded audio bus now (a take that
+    /// changes its audio then costs no new audio encode).
+    pub private_audio: bool,
 }
 
 /// Wait-free routing state, written by the consumer only on change.
@@ -2067,6 +2070,7 @@ impl OutputRouter {
                     .audio
                     .as_ref()
                     .map_or_else(|| "follow".to_owned(), |a| a.choice(i).label()),
+                private_audio: self.audio.as_ref().is_some_and(|a| a.has_private_bus(i)),
             })
             .collect();
         let next = RoutingSnapshot {
