@@ -567,7 +567,7 @@ new_flow_global_pps = 50_000     # cap on all unvalidated datagrams per second
 validated_steering = true        # Linux: SO_REUSEPORT + BPF, validated flows on their own queue
 stun_pps_per_source = 50         # well-formed STUN from an unvalidated source, per source key
 stun_global_pps = 5_000          # same, summed over every unvalidated source
-nft_floor_status_file = "/run/conspect/nft-floor.json"  # written by the systemd unit's ExecStartPre=+ (section 10.1)
+nft_floor_status_file = "/run/conspect/nft-floor.json"  # written by the systemd unit's ExecStartPre=+ ("Slice 3 as built, part B")
 
 [network.quic]
 retry_above_handshakes = 8       # send Retry (address validation) once this many handshakes are open
@@ -706,8 +706,9 @@ What S6 and S7 mean for the design:
      of unvalidated traffic then fills the listener queue, not the one paying viewers use. This is
      the only layer that also works against spoofed and distributed floods. Linux only; other
      platforms keep one queue (stated as a platform limit).
-  2. **Pre-socket per-source limits** (nftables `meter` on UDP 443 for packets not in conntrack
-     state `established`). Required before UDP 443 is opened to the internet, and checked by the
+  2. **Pre-socket per-source limits** (nftables meters on UDP 443; as built in slice 3 there are
+     two tiers, new flows and all traffic, with no conntrack `established` exemption, see "Slice 3
+     as built, part B"). Required before UDP 443 is opened to the internet, and checked by the
      engine at startup where it can read the ruleset (a warning in the capability report when
      absent). Honest limit: it stops a real source, not a spoofed one (it depends on BCP 38 at the
      attacker's network) and not a botnet.
@@ -1161,10 +1162,18 @@ the threshold and, for an `Incoming` that is not yet address-validated and may s
 (every caller before this field existed) returns the `Incoming` unchanged — byte for byte identical
 to the pre-slice-3 path. `multiview_frontdoor::quic::DEFAULT_RETRY_ABOVE_HANDSHAKES` is 8;
 `multiview-moq::provider::SharedSocket` carries the same two fields through to the injected socket.
-Tested in `crates/multiview-frontdoor/tests/retry.rs`: a real `MoQ` client still connects end to
-end through a Retry round trip with `Some(0)` (the counter bumps >= 1), the counter stays 0 with
-`None`, and a flood of random-key Initials under `Some(0)` never makes total reply bytes exceed
-total sent bytes (no amplification from the Retry path itself).
+Why `self.accept.len()` is the right count: the accept loop takes every `Incoming` out of noq as
+soon as it arrives (so noq's own pending queue, capped at `MAX_INCOMING` = 64, stays near empty)
+and pushes one future per `Incoming` that runs `conn.accept()`, the handshake and the MoQ SETUP;
+the future leaves `self.accept` only when that finishes or the setup deadline fires. A peer that
+never completes (a spoofed source, a stalled client) therefore stays counted. Tested in
+`crates/multiview-frontdoor/tests/retry.rs` with real noq clients whose socket discards every
+received datagram (they send real Initials, retransmit, never complete): with `Some(4)` and 8
+stalled clients the server created connection state for exactly 4 and Retried the other 4, and a
+normal client then arriving is Retried too and still completes end to end; with `None` all 8 get
+state and the counter stays 0. Under `Some(0)`, 8 stalled clients sent 24 real Initials (28 800 B)
+and got back 24 Retries (2 880 B), no Initial: no state and no amplification. Also: `Some(0)` with
+a single real `MoQ` client connects (counter >= 1); `None` never bumps the counter.
 
 **Config.** `multiview-config::network_tls` gains `NetworkUdpConfig` (`[network.udp]`) and
 `NetworkQuicConfig` (`[network.quic]`), both `#[serde(default)]` nested structs on `NetworkConfig`
@@ -1184,18 +1193,20 @@ kernel-drop support, and the nft floor read at that moment.
 
 **nft floor probe.** `crates/multiview-cli/src/nft_floor.rs` is a pure, panic-free parser (no
 sockets, no `nft` invocation from the engine — it runs unprivileged and cannot list the ruleset
-itself). It reads `network.udp.nft_floor_status_file`: JSON containing a `set` (nft's JSON reports
-a meter as a `set` with `dynamic`/`timeout` flags) named `conspect_udp443_new` (or a name starting
-with it, covering the shipped file's separate IPv4/IPv6 meters) inside `table inet conspect_floor`
-→ `Present`; the literal content `absent`, or nft's own "No such file or directory" error text
-(what `nft -j list` prints for a table that was never installed) → `Absent`; a missing, unreadable
-or unparsable file → `Unknown`. Re-read every 10 minutes
-(`multiview_cli::nft_floor::NFT_FLOOR_REREAD_INTERVAL`) on the front-door runtime via
-`tokio::task::spawn_blocking` (a plain file read, never the program runtime).
+itself). It reads `network.udp.nft_floor_status_file` and reports `Present` only for valid nft JSON
+listing `table inet conspect_floor` with all four shipped meters by their exact names
+(`conspect_udp443_{new,all}_{v4,v6}`; nft's JSON reports a meter as a `set` with `dynamic`/`timeout`
+flags); `Absent` only for nft 1.1.3's exact error for that missing table (first line `Error: No such
+file or directory`, second line `list table inet conspect_floor`) or the literal word `absent`;
+anything else (missing/unreadable file, another error, a partial or renamed floor) is `Unknown`.
+**Re-read interval:** every 10 minutes (`multiview_cli::nft_floor::NFT_FLOOR_REREAD_INTERVAL`) on
+the front-door runtime via `tokio::task::spawn_blocking` (a plain file read, never the program
+runtime).
 
 **Capability report and metric.** `multiview_control::system::SystemCapabilities` gains `network:
 Option<NetworkCapability>` (`{udp443_steering, steering_reason, recv_buffer, kernel_drops_supported,
-nft_floor}`), filled once at startup by `FrontDoorRun::capability()` and installed into a
+nft_floor}`; omitted for a scoped principal, since it is whole-system host posture), filled once
+at startup by `FrontDoorRun::capability()` and installed into a
 process-global slot (`multiview_cli::frontdoor::install`, mirroring the existing Program-metrics
 and output-routing slots) before the control plane's capability snapshot is built — `nft_floor`
 here is the **startup** read only, named as such in the field doc. `GET /api/v1/metrics/frontdoor`
@@ -1206,16 +1217,28 @@ unscoped whole-system principals) reports the live `StatsSnapshot` counters, the
 process. Registered in `openapi.rs`; `cargo xtask gen-openapi` regenerated `docs/api/openapi.json`.
 
 **Deploy artefacts.** `deploy/systemd/conspect.service` (example unit, `User=operations`
-placeholder, `AmbientCapabilities=CAP_NET_BIND_SERVICE`, `RuntimeDirectory=conspect`, and an
-`ExecStartPre=+` writing `nft -j list table inet conspect_floor`'s output — success or nft's own
-error text — to `/run/conspect/nft-floor.json`); `deploy/systemd/conspect.socket` (explicitly
-marked not-yet-wired: socket activation is slice 6, and it carries the `ReceiveBuffer=8M` target
-value so it is documented and true once that slice lands, rather than only promised in prose);
+placeholder, `AmbientCapabilities=CAP_NET_BIND_SERVICE`, `RuntimeDirectory=conspect` (owned by
+`User=`, mode 0755, so other users cannot write there), and an `ExecStartPre=+` (root) that writes
+`nft -j list table inet conspect_floor`'s stdout+stderr to a temp file and moves it into place as
+`/run/conspect/nft-floor.json` (`install -o root -g root -m 0644`, then `mv`, so a reader never
+sees a partial file)); `deploy/systemd/conspect.socket` (explicitly marked not-yet-wired: socket
+activation is slice 6, and it carries the `ReceiveBuffer=8M` target value);
 `deploy/sysctl/90-conspect-udp.conf` (`net.core.rmem_max = 8388608`, the knob that actually raises
-the usable buffer until slice 6's socket unit exists); `deploy/nftables/conspect-udp443-floor.nft`
-(table `inet conspect_floor`, `filter hook input priority -5`, `ct state established,related
-accept` for UDP 443 first, then two `meter` statements — IPv4 per address, IPv6 per /64 via `ip6
-saddr and ffff:ffff:ffff:ffff::` — each `limit rate over 2000/second burst 1000 packets`, `size
-65536`, `timeout 2m`). Validated with `sudo unshare -Urn nft -c -f -` (piped via stdin; this
-container's `nft -c` needs a netlink cache init that `sudo nft -c -f <path>` alone cannot get past,
-even for a syntax-only check) — see `docs/runbooks/udp-443-flood.md` for the exact command and why.
+the usable buffer until slice 6's socket unit exists).
+
+**nft floor, two tiers.** `deploy/nftables/conspect-udp443-floor.nft`: table `inet
+conspect_floor`, `filter hook input priority -5`, four `meter` statements, each per IPv4 address or
+per IPv6 /64 (`ip6 saddr and ffff:ffff:ffff:ffff::`), `size 65536`, `timeout 2m`, `counter drop`:
+* **new** (`ct state new,untracked`): `conspect_udp443_new_v4`/`_v6`, over 2000/s burst 1000;
+* **all** (every UDP 443 packet, established or not): `conspect_udp443_all_v4`/`_v6`, over 25 000/s
+  burst 10 000, above the engine's per-established-peer bucket (20 000/s) so a real viewer is never
+  hit by it.
+There is no `ct state established accept`: the first draft had one, and review measured that a
+single server reply (a QUIC Retry/Initial or a STUN error) makes a source "established" to
+conntrack, after which it could flood UDP 443 unmetered. `deploy/nftables/test-floor.sh` (bash +
+python3 in a `unshare -Urn` network namespace; skips when nft/unshare is missing; not in CI, the
+runners have no nft) proves the tiers. Measured here, nft 1.1.3, 2 s per scenario, ~200-240k pps
+offered: (a) one-way flood from one source → 5000 delivered (2500 pps: burst + new-tier rate), IPv4
+and IPv6; (b) one server reply, then flood → 60 000 delivered (30 000 pps: all tier), where the
+previous ruleset delivered all 451 457; (c) two addresses in one /64 → 5000 delivered together (one
+bucket); in two /64s → 9998 (two buckets). Validate syntax with `unshare -Urn nft -c -f - < file`.

@@ -333,7 +333,7 @@ impl FrontDoorRun {
     ///
     /// Logs one line at start naming the steering mode, rcvbuf
     /// requested/granted/usable/clamped, kernel-drop support, and the nft
-    /// floor (design note section 10.1); starts the nft-floor re-reader on
+    /// floor (design note, "Slice 3 as built, part B"); starts the nft-floor re-reader on
     /// the front door's own runtime (never the program runtime).
     #[must_use]
     pub fn start(config: &MultiviewConfig) -> Option<Self> {
@@ -548,7 +548,7 @@ impl FrontDoorRun {
     }
 
     /// The startup capability snapshot (`GET /api/v1/system/capabilities`,
-    /// design note section 10.1): steering mode, rcvbuf report, kernel-drop
+    /// design note "Slice 3 as built, part B"): steering mode, rcvbuf report, kernel-drop
     /// support, and the nft floor **as read at startup** (the live value is
     /// `/api/v1/metrics/frontdoor`).
     #[must_use]

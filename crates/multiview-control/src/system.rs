@@ -259,11 +259,14 @@ pub struct SystemCapabilities {
     /// `None` when `[network]` is not configured this run (the front door
     /// did not start). A one-shot startup snapshot — `nft_floor` reflects
     /// the startup read only; the live value is `/api/v1/metrics/frontdoor`.
+    /// Whole-system host posture: omitted from the response for a scoped
+    /// principal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkCapability>,
 }
 
-/// The front door's capability snapshot (design note section 10.1), filled
+/// The front door's capability snapshot (design note section 10.1 and "Slice
+/// 3 as built, part B"), filled
 /// at startup by the CLI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -280,9 +283,9 @@ pub struct NetworkCapability {
     /// Whether the kernel-drop gauges are sampled on this platform (Linux
     /// `/proc/net/udp6` only).
     pub kernel_drops_supported: bool,
-    /// Whether the nftables UDP-443 floor was seen at startup (section
-    /// 10.1): `"present"`, `"absent"`, or `"unknown"` (the status file was
-    /// missing, unreadable, or unparsable).
+    /// Whether the nftables UDP-443 floor was seen at startup (design note,
+    /// "Slice 3 as built, part B"): `"present"`, `"absent"`, or `"unknown"`
+    /// (see [`NftFloorStatus`]).
     pub nft_floor: NftFloorStatus,
 }
 
@@ -311,17 +314,19 @@ pub struct RecvBufferCapability {
     pub clamped: bool,
 }
 
-/// [`NetworkCapability::nft_floor`] (design note section 10.1).
+/// [`NetworkCapability::nft_floor`] (design note, "Slice 3 as built, part B").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NftFloorStatus {
-    /// The expected meter/set was found in `table inet conspect_floor`.
+    /// The status file is nft JSON listing `table inet conspect_floor` with
+    /// all four shipped meters, by their exact names.
     Present,
-    /// The status file said the table or meter is absent (or does not
-    /// exist).
+    /// The status file holds nft's exact "No such file or directory" error
+    /// for that table, or the literal word `absent`.
     Absent,
-    /// The status file was missing, unreadable, or unparsable.
+    /// Anything else: missing, unreadable, unparsable, another error, or a
+    /// partial/renamed floor.
     Unknown,
 }
 

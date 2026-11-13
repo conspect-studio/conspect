@@ -350,7 +350,7 @@ impl NetworkUdpConfig {
     /// Returns a field-specific validation error.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.recv_buffer_bytes == 0 || self.recv_buffer_bytes > MAX_RECV_BUFFER_BYTES {
-            return Err(fail(
+            return Err(network_fail(
                 "udp.recv_buffer_bytes",
                 "must be between 1 and 256 MiB",
             ));
@@ -363,7 +363,7 @@ impl NetworkUdpConfig {
             ("udp.stun_global_pps", self.stun_global_pps),
         ] {
             if value == 0 {
-                return Err(fail(field, "must be non-zero"));
+                return Err(network_fail(field, "must be non-zero"));
             }
         }
         Ok(())
@@ -404,7 +404,10 @@ impl NetworkQuicConfig {
     /// Returns a validation error when `max_connections` is out of range.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.max_connections == 0 || self.max_connections > MAX_MAX_CONNECTIONS {
-            return Err(fail("quic.max_connections", "must be between 1 and 65536"));
+            return Err(network_fail(
+                "quic.max_connections",
+                "must be between 1 and 65536",
+            ));
         }
         Ok(())
     }
@@ -504,6 +507,12 @@ const fn default_propagation_timeout() -> u64 {
 
 fn fail(field: &str, message: &str) -> ConfigError {
     ConfigError::Validation(format!("network.tls.{field}: {message}"))
+}
+
+/// A validation error for a `[network]` sub-table other than `tls`:
+/// `path` is relative to `network.` (e.g. `udp.new_flow_burst`).
+fn network_fail(path: &str, message: &str) -> ConfigError {
+    ConfigError::Validation(format!("network.{path}: {message}"))
 }
 
 fn env_name(field: &str, value: &str) -> Result<(), ConfigError> {
@@ -1098,19 +1107,48 @@ mod socket_tests {
 
     #[test]
     fn rejects_bad_udp_and_quic_values_and_unknown_keys() {
-        for bad in [
-            "[udp]\nrecv_buffer_bytes = 0",
-            "[udp]\nrecv_buffer_bytes = 300000000",
-            "[udp]\nnew_flow_pps_per_source = 0",
-            "[udp]\nnew_flow_burst = 0",
-            "[udp]\nnew_flow_global_pps = 0",
-            "[udp]\nstun_pps_per_source = 0",
-            "[udp]\nstun_global_pps = 0",
-            "[quic]\nmax_connections = 0",
-            "[quic]\nmax_connections = 100000",
+        for (bad, message) in [
+            (
+                "[udp]\nrecv_buffer_bytes = 0",
+                "network.udp.recv_buffer_bytes: must be between 1 and 256 MiB",
+            ),
+            (
+                "[udp]\nrecv_buffer_bytes = 300000000",
+                "network.udp.recv_buffer_bytes: must be between 1 and 256 MiB",
+            ),
+            (
+                "[udp]\nnew_flow_pps_per_source = 0",
+                "network.udp.new_flow_pps_per_source: must be non-zero",
+            ),
+            (
+                "[udp]\nnew_flow_burst = 0",
+                "network.udp.new_flow_burst: must be non-zero",
+            ),
+            (
+                "[udp]\nnew_flow_global_pps = 0",
+                "network.udp.new_flow_global_pps: must be non-zero",
+            ),
+            (
+                "[udp]\nstun_pps_per_source = 0",
+                "network.udp.stun_pps_per_source: must be non-zero",
+            ),
+            (
+                "[udp]\nstun_global_pps = 0",
+                "network.udp.stun_global_pps: must be non-zero",
+            ),
+            (
+                "[quic]\nmax_connections = 0",
+                "network.quic.max_connections: must be between 1 and 65536",
+            ),
+            (
+                "[quic]\nmax_connections = 100000",
+                "network.quic.max_connections: must be between 1 and 65536",
+            ),
         ] {
             let n: NetworkConfig = toml::from_str(bad).unwrap();
-            assert!(n.validate().is_err(), "{bad}");
+            let err = n.validate().unwrap_err().to_string();
+            assert!(err.contains(message), "{bad}: {err}");
+            assert!(!err.contains("network.tls."), "{bad}: {err}");
         }
         assert!(toml::from_str::<NetworkConfig>("[udp]\nbogus = 1").is_err());
         assert!(toml::from_str::<NetworkConfig>("[quic]\nbogus = 1").is_err());

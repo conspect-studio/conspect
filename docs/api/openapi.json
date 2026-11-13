@@ -12082,7 +12082,7 @@
         "tags": [
           "system"
         ],
-        "summary": "`GET /api/v1/system/capabilities` — the build's codec/compositor backend\navailability, compositor classification, effective build-profile licence, and\nNDI attribution (ADR-W030). Role: read.",
+        "summary": "`GET /api/v1/system/capabilities` — the build's codec/compositor backend\navailability, compositor classification, effective build-profile licence, and\nNDI attribution (ADR-W030). Role: read. The `network` section (front-door\nhost posture) is included only for an unscoped principal; a scoped key\ngets the response without it.",
         "operationId": "system_capabilities",
         "responses": {
           "200": {
@@ -18415,7 +18415,7 @@
       },
       "NetworkCapability": {
         "type": "object",
-        "description": "The front door's capability snapshot (design note section 10.1), filled\nat startup by the CLI.",
+        "description": "The front door's capability snapshot (design note section 10.1 and \"Slice\n3 as built, part B\"), filled\nat startup by the CLI.",
         "required": [
           "udp443_steering",
           "recv_buffer",
@@ -18429,7 +18429,7 @@
           },
           "nft_floor": {
             "$ref": "#/components/schemas/NftFloorStatus",
-            "description": "Whether the nftables UDP-443 floor was seen at startup (section\n10.1): `\"present\"`, `\"absent\"`, or `\"unknown\"` (the status file was\nmissing, unreadable, or unparsable)."
+            "description": "Whether the nftables UDP-443 floor was seen at startup (design note,\n\"Slice 3 as built, part B\"): `\"present\"`, `\"absent\"`, or `\"unknown\"`\n(see [`NftFloorStatus`])."
           },
           "recv_buffer": {
             "$ref": "#/components/schemas/RecvBufferCapability",
@@ -18450,7 +18450,7 @@
       },
       "NftFloorStatus": {
         "type": "string",
-        "description": "[`NetworkCapability::nft_floor`] (design note section 10.1).",
+        "description": "[`NetworkCapability::nft_floor`] (design note, \"Slice 3 as built, part B\").",
         "enum": [
           "present",
           "absent",
@@ -23668,7 +23668,7 @@
               },
               {
                 "$ref": "#/components/schemas/NetworkCapability",
-                "description": "The network front door's capability snapshot (ADR-0107 slice 3):\nsteering mode, receive-buffer report, kernel-drop support, nft floor.\n`None` when `[network]` is not configured this run (the front door\ndid not start). A one-shot startup snapshot — `nft_floor` reflects\nthe startup read only; the live value is `/api/v1/metrics/frontdoor`."
+                "description": "The network front door's capability snapshot (ADR-0107 slice 3):\nsteering mode, receive-buffer report, kernel-drop support, nft floor.\n`None` when `[network]` is not configured this run (the front door\ndid not start). A one-shot startup snapshot — `nft_floor` reflects\nthe startup read only; the live value is `/api/v1/metrics/frontdoor`.\nWhole-system host posture: omitted from the response for a scoped\nprincipal."
               }
             ]
           },

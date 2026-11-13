@@ -51,10 +51,11 @@ implementation will build against.
   slice-3 limit (receive buffer, new-flow/STUN rates, validated-flow steering, retry threshold,
   connection cap) as config, all optional with the existing crate defaults. `GET
   /api/v1/system/capabilities` gains a `network` capability (steering mode, receive-buffer report,
-  kernel-drop support, the nft UDP-443 floor as read at startup); `GET /api/v1/metrics/frontdoor`
+  kernel-drop support, the nft UDP-443 floor as read at startup; unscoped keys only); `GET /api/v1/metrics/frontdoor`
   reports the live counters, steering gauges, the live nft-floor status and the QUIC retry count.
-  Deploy artefacts: `deploy/nftables/conspect-udp443-floor.nft` (a per-source/per-/64 floor on new
-  UDP 443 traffic), `deploy/systemd/conspect.service` (+ a not-yet-wired `conspect.socket`
+  Deploy artefacts: `deploy/nftables/conspect-udp443-floor.nft` (a two-tier per-source/per-/64 floor
+  on UDP 443: new flows 2000/s, all traffic 25 000/s, no established exemption; behaviour test
+  `deploy/nftables/test-floor.sh`), `deploy/systemd/conspect.service` (+ a not-yet-wired `conspect.socket`
   placeholder for slice 6), `deploy/sysctl/90-conspect-udp.conf`, and
   `docs/runbooks/udp-443-flood.md`.
 

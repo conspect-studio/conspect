@@ -20,24 +20,28 @@ Group=operations
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 
-# `RuntimeDirectory=conspect` creates (and on stop removes) /run/conspect
-# 0755 root:root, world-readable — exactly what an unprivileged engine
-# process needs to read the nft-floor status file below.
+# `RuntimeDirectory=conspect` creates /run/conspect before ExecStartPre= and
+# removes it on stop. systemd makes it owned by this unit's User=/Group=
+# (operations:operations) with mode 0755: other users cannot create, replace
+# or delete files in it; the owning service user can. The status file below
+# is therefore written as root, mode 0644, by an atomic rename, so the engine
+# reads either the previous complete file or the new one, never a partial.
 RuntimeDirectory=conspect
 RuntimeDirectoryMode=0755
 
-# Writes the nft floor's current ruleset state to the status file the engine
-# reads (network.udp.nft_floor_status_file, default
-# /run/conspect/nft-floor.json; design note section 10.1). `ExecStartPre=+`
-# runs as root (the `+` prefix) regardless of the service's own User=, which
-# is required here: `nft list` needs CAP_NET_ADMIN, which this unit does NOT
-# grant the engine itself. On success this writes the table's JSON; on a
-# missing table (the floor was never installed, or was removed) `nft`
-# writes its own "No such file or directory" error text instead (captured
-# via `2>&1`) — the engine's parser recognises that text as "absent". Any
-# other failure (nft itself missing, a permissions problem) leaves the file
-# empty or stale, which the parser honestly reports as "unknown".
-ExecStartPre=+/bin/sh -c 'nft -j list table inet conspect_floor > /run/conspect/nft-floor.json 2>&1 || true'
+# Writes the nft floor's state to the status file the engine reads
+# (network.udp.nft_floor_status_file, default /run/conspect/nft-floor.json;
+# design note "Slice 3 as built, part B"). `+` runs this as root regardless
+# of User= (`nft list` needs CAP_NET_ADMIN, which the engine does not get).
+# nft's stdout and stderr both go to a temp file in the same directory, which
+# `install -o root -g root -m 0644` copies into place under a second temp name
+# and `mv` renames over the status file (`$$` is systemd's escape for a
+# literal `$`). The engine's parser reports:
+#   present  - nft JSON with table inet conspect_floor and all four meters,
+#   absent   - nft's exact "Error: No such file or directory" output for that
+#              missing table, or the literal word `absent`,
+#   unknown  - anything else (nft missing, another error, a partial floor).
+ExecStartPre=+/bin/sh -c 'set -u; d=/run/conspect; t=$$(mktemp "$$d/.nft-floor.XXXXXX") || exit 0; nft -j list table inet conspect_floor >"$$t" 2>&1; install -o root -g root -m 0644 "$$t" "$$d/.nft-floor.json.new" && mv -f "$$d/.nft-floor.json.new" "$$d/nft-floor.json"; rm -f "$$t"; exit 0'
 
 ExecStart=/usr/local/bin/conspect run --config /etc/conspect/conspect.toml
 Restart=on-failure

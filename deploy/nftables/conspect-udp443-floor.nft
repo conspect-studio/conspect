@@ -13,56 +13,64 @@
 # Verify:    sudo nft list table inet conspect_floor
 # Uninstall: sudo nft delete table inet conspect_floor
 # Validate without installing (no CAP_NET_ADMIN / inside a container):
-#            sudo nft -c -f deploy/nftables/conspect-udp443-floor.nft
-#            (or, lacking `nft` at all: pipe the file into
-#            `unshare -Urn nft -c -f -`, which validated this exact file
-#            during development — see docs/runbooks/udp-443-flood.md).
+#            unshare -Urn nft -c -f - < deploy/nftables/conspect-udp443-floor.nft
+# Behaviour test (netns, not CI): deploy/nftables/test-floor.sh
 #
 # The engine (running unprivileged, without CAP_NET_ADMIN) cannot list this
 # ruleset itself; the shipped systemd unit's `ExecStartPre=+` runs
 # `nft -j list table inet conspect_floor` as root and writes the JSON to
 # `network.udp.nft_floor_status_file` for the engine to read as a plain file
-# parse (design note section 10.1; `deploy/systemd/conspect.service`). The
-# parser looks for a meter literally named `conspect_udp443_new` (either
-# family's rule below) inside `table inet conspect_floor`.
+# parse (design note "Slice 3 as built, part B"; `deploy/systemd/conspect.service`).
+# The parser reports `present` only when ALL FOUR meters below exist, by these
+# exact names, inside `table inet conspect_floor`:
+#   conspect_udp443_new_v4  conspect_udp443_new_v6
+#   conspect_udp443_all_v4  conspect_udp443_all_v6
+# Rename one and the status becomes `unknown`.
+#
+# Two tiers, both per IPv4 address and per IPv6 /64:
+#   * new  (ct state new/untracked): 2000/s burst 1000 per source;
+#   * all  (every UDP 443 packet, established or not): 25000/s burst 10000
+#     per source, above the engine's own per-established-peer bucket
+#     (20000/s), so a real viewer is never hit by it.
+# There is deliberately NO `ct state established accept`: one reply from the
+# server (a QUIC Retry/Initial, a STUN error) makes a source "established" to
+# conntrack, and an unconditional accept would then let that one real source
+# flood UDP 443 unmetered. Proven by deploy/nftables/test-floor.sh.
+#
+# `size` bounds each dynamic set (a distributed flood of distinct sources
+# cannot grow it past 65536 entries); `timeout` expires an idle source's
+# bucket. `counter` on each drop lets an operator see which tier fires
+# (`nft list table inet conspect_floor`).
 
 table inet conspect_floor {
 	chain input {
-		# Hooked at the standard `filter` input priority, one step before the
-		# default priority 0 (the design note's "use filter priority -5 with
-		# ct state established,related accept for UDP 443 first"), so this
-		# table's own established-traffic fast path runs ahead of anything
-		# else this host's `filter` hook does for the same priority class.
+		# One step ahead of the default filter priority 0.
 		type filter hook input priority -5; policy accept;
 
-		# Established/related UDP 443 traffic never touches the floor: the
-		# engine's own validated-flow steering (layer 1) already isolates
-		# these peers from a flood at the kernel-queue level, and conntrack
-		# has already proven the 4-tuple corresponds to a flow this host
-		# itself observed traffic for.
-		udp dport 443 ct state established,related accept
-
-		# New (not established/related) UDP 443 from an IPv4 source: one
-		# bucket per source address. `size` bounds the dynamic set itself (a
-		# distributed flood of distinct sources cannot grow it past 65536
-		# entries); `timeout` expires an idle source's bucket so the set
-		# does not grow without bound over a long run.
-		udp dport 443 meta nfproto ipv4 \
-			meter conspect_udp443_new size 65536 { \
+		# Tier 1, new flows, IPv4: one bucket per source address.
+		udp dport 443 meta nfproto ipv4 ct state new,untracked \
+			meter conspect_udp443_new_v4 size 65536 { \
 				ip saddr timeout 2m limit rate over 2000/second burst 1000 packets \
-			} drop
+			} counter drop
 
-		# New UDP 443 from an IPv6 source, keyed per /64 (the design note's
-		# "IPv6 per /64"): `ip6 saddr and ffff:ffff:ffff:ffff::` masks the
-		# address down to its /64 prefix before it enters the meter, so
-		# every address in the same /64 shares one bucket (a single host
-		# cannot get a fresh budget per address within its own /64). A
-		# separate meter (still matched by the shared name prefix the
-		# status-file parser looks for) because its key type differs from
-		# the IPv4 rule's.
-		udp dport 443 meta nfproto ipv6 \
+		# Tier 1, new flows, IPv6: one bucket per /64 (`ip6 saddr and
+		# ffff:ffff:ffff:ffff::` masks to the prefix, so a host cannot get a
+		# fresh budget per address inside its own /64).
+		udp dport 443 meta nfproto ipv6 ct state new,untracked \
 			meter conspect_udp443_new_v6 size 65536 { \
 				ip6 saddr and ffff:ffff:ffff:ffff:: timeout 2m limit rate over 2000/second burst 1000 packets \
-			} drop
+			} counter drop
+
+		# Tier 2, every UDP 443 packet, IPv4, per source address.
+		udp dport 443 meta nfproto ipv4 \
+			meter conspect_udp443_all_v4 size 65536 { \
+				ip saddr timeout 2m limit rate over 25000/second burst 10000 packets \
+			} counter drop
+
+		# Tier 2, every UDP 443 packet, IPv6, per /64.
+		udp dport 443 meta nfproto ipv6 \
+			meter conspect_udp443_all_v6 size 65536 { \
+				ip6 saddr and ffff:ffff:ffff:ffff:: timeout 2m limit rate over 25000/second burst 10000 packets \
+			} counter drop
 	}
 }
