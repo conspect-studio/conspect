@@ -388,3 +388,42 @@ fn a_canvas_colour_profile_edit_keeps_the_other_colour_axes() {
     assert_eq!(merged.canvas.color.profile, next.canvas.color.profile);
     assert_eq!(merged.canvas.color.transfer.as_deref(), Some("bt709"));
 }
+
+/// Review L1 round 3: an output crosspoint is merged field by field. A file
+/// that resets `bus` to its skipped default (Program) keeps the API-set audio
+/// feed of the same row, and a file `bus` change keeps it too.
+#[test]
+fn a_routing_row_bus_edit_keeps_the_api_set_audio_feed() {
+    use multiview_config::routing::{AudioFeed, OutputBus, RoutingTable};
+    let row = |bus: OutputBus, audio: AudioFeed| {
+        let mut table: RoutingTable =
+            toml::from_str("[[output]]\noutput = \"restream\"\n").unwrap();
+        table.output[0].bus = bus;
+        table.output[0].audio = audio;
+        table
+    };
+    let base = parse(&accepted());
+    let with = |table: RoutingTable| {
+        let mut c = base.clone();
+        c.routing = Some(table);
+        c
+    };
+    let api_audio = AudioFeed::Source("in_b".to_owned());
+    // Reset to the skipped default.
+    let prev = with(row(OutputBus::Preview, AudioFeed::Follow));
+    let next = with(row(OutputBus::Program, AudioFeed::Follow));
+    let accepted = with(row(OutputBus::Preview, api_audio.clone()));
+    let merged = merge_file_edit(&prev, &next, &accepted);
+    let out = &merged.routing.as_ref().unwrap().output[0];
+    assert_eq!(out.bus, OutputBus::Program, "the file's reset lands");
+    assert_eq!(out.audio, api_audio, "the API-set audio feed stays");
+    // Default -> Preview.
+    let merged = merge_file_edit(
+        &next,
+        &prev,
+        &with(row(OutputBus::Program, api_audio.clone())),
+    );
+    let out = &merged.routing.as_ref().unwrap().output[0];
+    assert_eq!(out.bus, OutputBus::Preview);
+    assert_eq!(out.audio, api_audio);
+}

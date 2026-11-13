@@ -270,7 +270,7 @@ fn merge_audio(
 }
 
 /// `[routing]`: each crosspoint table keyed by its destination (cell, audio
-/// target, subtitle layer, output). A routing table with every list empty is
+/// target, subtitle layer, output), each row merged field by field. A routing table with every list empty is
 /// `None` (the same "absent" the boot splice uses).
 fn merge_routing(
     prev: Option<&RoutingTable>,
@@ -287,10 +287,24 @@ fn merge_routing(
         accepted.unwrap_or(&empty),
     );
     let merged = RoutingTable {
-        video: keyed(&p.video, &n.video, &a.video, |x| x.cell.clone()),
-        audio: keyed(&p.audio, &n.audio, &a.audio, |x| x.target.clone()),
-        subtitle: keyed(&p.subtitle, &n.subtitle, &a.subtitle, |x| x.layer.clone()),
-        output: keyed(&p.output, &n.output, &a.output, |x| x.output.clone()),
+        video: keyed_with(&p.video, &n.video, &a.video, |x| x.cell.clone(), fields),
+        audio: keyed_with(&p.audio, &n.audio, &a.audio, |x| x.target.clone(), fields),
+        subtitle: keyed_with(
+            &p.subtitle,
+            &n.subtitle,
+            &a.subtitle,
+            |x| x.layer.clone(),
+            fields,
+        ),
+        // An output row carries the program/bus AND the API-set video/audio
+        // feeds: merged field by field so a `bus` edit keeps the feeds.
+        output: keyed_with(
+            &p.output,
+            &n.output,
+            &a.output,
+            |x| x.output.clone(),
+            fields,
+        ),
     };
     let none = merged.video.is_empty()
         && merged.audio.is_empty()

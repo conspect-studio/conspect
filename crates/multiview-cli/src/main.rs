@@ -1874,9 +1874,27 @@ async fn run_software_until_ctrl_c(
         stop.clone(),
     );
 
+    // #367: the software run has no exit-durable thread; freeze the accepted
+    // state the moment ANY exit is decided (a stop, or a fatal arm anywhere),
+    // not only once the engine loop has returned and its teardown finished.
+    // Off the clock: a 5 ms poll of two atomics on a control-plane task.
+    let decided = {
+        let freeze = ExitFreeze::new(
+            config_watch.as_ref(),
+            running_persist.as_ref().map(|p| &p.state),
+        );
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            while !stop.is_stopped() && multiview_cli::exit_watchdog::armed().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            freeze.freeze();
+        })
+    };
     let report = engine
         .run_until_stopped_with_control(&stop, publisher.as_ref(), drain)
         .await;
+    decided.abort();
     // #367: the engine loop returned (a stop or an error): the run is exiting,
     // so no config-file commit may write the accepted state from here on.
     ExitFreeze::new(

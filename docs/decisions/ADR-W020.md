@@ -123,7 +123,8 @@ output when one `[control] ui_dir` key changed (#367).
   each their own, and the colour block merges field by field; the switcher and its M/Es (by
   id) and the IPTV publication (scalars, and each entry by kind + ref) merge field by field, so editing one key keeps the API-set others; a layout change takes the
   file's layout with its cells (cells name the layout's areas), while a cells-only edit merges
-  cells by id. When the accepted list still equals the previous file's list, the new list is
+  cells by id; each routing crosspoint row (keyed by its destination) merges field by field,
+  so a `bus` edit keeps an API-set audio/video feed. When the accepted list still equals the previous file's list, the new list is
   taken whole (a reorder lands). The function destructures `MultiviewConfig` exhaustively, so a new section is a
   compile error until the merge decides how an edit carries it.
 * A file whose document did not change (a touch, a reformat, the unchanged boot file at start)
@@ -149,7 +150,9 @@ is closed`).
 * Every exit decision **freezes the accepted state** (`AppState::freeze_accepted_state`) and
   stops the watcher: the stop-signal task, the exit-durable thread (#309, any armed exit on
   the pipeline path), and the return of either drive loop (stop, fatal fault or error, on both
-  the pipeline and the software path), before tenant teardown and the final persist.
+  the pipeline and the software path), before tenant teardown and the final persist. The
+  software path, which has no exit-durable thread, runs a small control-plane task that
+  freezes as soon as the stop signal is raised or any exit is armed.
 * The durable write (`write_desired`, which every accepted-state commit goes through: the
   watcher, the REST mutations and revert-to-start) prepares and fsyncs its temp file outside
   the write serial, then re-checks the freeze **under the serial, immediately before the
