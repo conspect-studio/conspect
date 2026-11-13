@@ -4668,6 +4668,40 @@ fn reformat_refusals_restart_required_and_capacity() {
     assert_eq!(x.d.binding_video_key(0), Some(0));
 }
 
+/// Review X1: reformats count against the principal's own encoder budget
+/// (`max_per_principal`, 2) like takes, and a landed reformat key stays
+/// charged to it: one principal cannot pin more encoders than its budget by
+/// resetting several outputs.
+#[test]
+fn reformats_count_against_the_principals_budget() {
+    let mut x = reformat_harness(3, 6, OpenMode::Ok);
+    let mut t = 0;
+    let outcome = |x: &mut ReformatHarness, op: &str, output: usize, t: &mut u64| {
+        x.reformat(op, output);
+        let until = *t + REFORMAT_DEADLINE_TICKS;
+        while *t < until {
+            x.tick(*t);
+            *t += 1;
+            if let Some((_, r, _)) = x.results().into_iter().find(|(o, _, _)| o == op) {
+                return r;
+            }
+        }
+        panic!("{op}: no outcome");
+    };
+    assert_eq!(outcome(&mut x, "a", 0, &mut t), TakeResult::ResetApplied);
+    assert_eq!(outcome(&mut x, "b", 1, &mut t), TakeResult::ResetApplied);
+    // Two pinned reformat keys: the principal's budget (2) is spent.
+    assert_eq!(
+        outcome(&mut x, "c", 2, &mut t),
+        TakeResult::ResetRefused(ReformatRefusal::Capacity)
+    );
+    assert_eq!(
+        x.d.binding_video_key(2),
+        Some(0),
+        "output 2 kept its format"
+    );
+}
+
 /// Review M-1: only an output the pipeline marks live-resettable (HLS with
 /// TS segments) resets live; any other (SRT, RIST, …: `live_reset` false)
 /// is `restart-required` even though its container is in band.

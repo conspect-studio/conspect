@@ -57,14 +57,16 @@ impl OutputRouter {
             }
             // At most one reformat per output: a newer one supersedes it.
             self.abandon_reformat(index, tick, ReformatRefusal::Superseded, dispatcher);
-            // Admission: the global cap (a reformat's key is one more encoder
-            // until the old key retires), after closing 0-subscriber lingers.
-            while self.dynamic.len() + self.opens.len() >= self.cfg.max_encoders {
+            // Admission (review X1): the global cap AND the principal's own
+            // budget, exactly as a take's (`has_capacity`), after closing
+            // 0-subscriber lingers. A landed reformat key stays charged to
+            // its principal (its `principal` is never re-attributed).
+            while !self.has_capacity(&req.principal) {
                 if !self.close_oldest_linger(dispatcher, None) {
                     break;
                 }
             }
-            if self.dynamic.len() + self.opens.len() >= self.cfg.max_encoders {
+            if !self.has_capacity(&req.principal) {
                 self.emit(
                     req.operation_id,
                     index,

@@ -2396,7 +2396,8 @@ impl OutputRouter {
                 // stays with its holder: the newcomer rides it at +0 and is
                 // never able to move the holder's attribution or cap.
                 if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
-                    if !held_by_other {
+                    // A reformat key stays charged to its principal (X1).
+                    if !held_by_other && !d.reformat {
                         principal.clone_into(&mut d.principal);
                     }
                     d.linger_deadline = None;
