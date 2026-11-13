@@ -75,6 +75,70 @@ pub fn run(command: &TlsCommand) -> anyhow::Result<String> {
             let config = load(&resolve_config(args)?.path)?;
             issue(&AdminClient::from_config(&config)?)
         }
+        TlsCommand::DohCheck(_) => {
+            anyhow::bail!("tls doh-check needs a build with the `acme` feature (unix)")
+        }
+    }
+}
+
+/// `multiview tls doh-check <fqdn> <value> [--wait S]`: run the engine's
+/// DNS-01 `DoH` confirmation query and report what it sees. Returns the
+/// report and whether the value was seen. Never prints secrets (none used).
+#[cfg(all(feature = "acme", unix))]
+pub async fn doh_check(args: &crate::cli::TlsDohCheckArgs) -> (String, bool) {
+    use multiview_control::acme::cloudflare::{
+        doh_host_screen, doh_lookup, production_doh_client, DohOutcome, DOH_URL,
+    };
+    let mut out = String::new();
+    let _ = writeln!(out, "endpoint  {DOH_URL}");
+    match doh_host_screen().await {
+        Ok(addrs) => {
+            for (ip, refused) in addrs {
+                let verdict =
+                    refused.map_or_else(|| "admitted".to_owned(), |r| format!("REFUSED ({r})"));
+                let _ = writeln!(out, "address   {ip}  {verdict}");
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "address   resolution failed: {e}");
+        }
+    }
+    let client = match production_doh_client() {
+        Ok(client) => client,
+        Err(e) => {
+            let _ = writeln!(out, "result    client could not be built: {e}");
+            return (out, false);
+        }
+    };
+    let started = std::time::Instant::now();
+    let deadline = Duration::from_secs(args.wait);
+    let mut poll = 0_u32;
+    let mut last: Option<String> = None;
+    loop {
+        poll += 1;
+        let outcome = doh_lookup(&client, DOH_URL, &args.fqdn, &args.value).await;
+        let line = outcome.to_string();
+        if outcome == DohOutcome::Seen {
+            let _ = writeln!(
+                out,
+                "result    SEEN at poll {poll} (+{} s)",
+                started.elapsed().as_secs()
+            );
+            return (out, true);
+        }
+        if last.as_deref() != Some(line.as_str()) {
+            let _ = writeln!(
+                out,
+                "poll {poll:<4} +{:>3} s  not seen: {line}",
+                started.elapsed().as_secs()
+            );
+            last = Some(line);
+        }
+        if started.elapsed() + Duration::from_secs(2) > deadline {
+            let _ = writeln!(out, "result    NOT SEEN after {poll} poll(s)");
+            return (out, false);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 

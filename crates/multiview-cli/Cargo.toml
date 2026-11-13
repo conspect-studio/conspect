@@ -81,6 +81,9 @@ multiview-webrtc = { workspace = true, optional = true }
 # own runtime. Pure Rust in the default build; its WebRTC adapter (str0m) is
 # enabled only by `webrtc-native`.
 multiview-frontdoor = { workspace = true }
+# The HTTP/3 + WebTransport endpoint on the front door's QUIC lane (slice 2,
+# #288): the site and MoQ over one QUIC endpoint.
+multiview-h3 = { path = "../multiview-h3" }
 # The `whip_push` output's HTTP signalling (ADR-0049 §5.2): the WHIP `POST`
 # offer->answer against the remote origin (Bearer, https-only 307/308 redirects).
 # OPTIONAL, pulled in ONLY by `webrtc-native`; pinned to the `rustls-tls` backend
@@ -224,6 +227,13 @@ rcgen = "0.14"
 # `tests/frontdoor_site_chaos.rs` mounts the HLS router on the door (already
 # in the graph via multiview-control / multiview-output).
 axum = { version = "0.8.9", default-features = false, features = ["tokio"] }
+# `tests/frontdoor_h3.rs` / `tests/h3_chaos.rs` (front-door slice 2): the
+# native h3 client, and `http` for its request types (both already in the
+# graph via multiview-h3 / axum).
+multiview-h3 = { path = "../multiview-h3", features = ["test-client"] }
+http = "1"
+web-transport-trait = "0.4.0"
+noq = { package = "moq-noq", version = "=1.3.5", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 
 # The pipeline-ingest integration test needs the `ffmpeg` feature (a libav*
 # build + the `ffmpeg`/`ffprobe` CLIs at runtime).
@@ -236,6 +246,12 @@ required-features = ["ffmpeg"]
 # `StaticCertificateSource`, unix only).
 [[test]]
 name = "acme_tls_alpn_resolver"
+required-features = ["tls"]
+
+# Front-door slice 2 (#288): the site over h3 on the shared socket and the
+# TCP door's Alt-Svc, through the real FrontDoorRun with a static certificate.
+[[test]]
+name = "frontdoor_h3"
 required-features = ["tls"]
 
 # Invariants #1/#10 with the site (HLS, redirect) served by the front door

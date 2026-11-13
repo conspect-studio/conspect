@@ -243,11 +243,28 @@ HTTP/3 to an upstream, and has no extended CONNECT / WebTransport
 UDP 443 with nginx's own HTTP/3 listener either. So the engine owns UDP 443, and for HTTP/3 to
 cover the site too, the engine must answer the site's HTTP/3 requests on that endpoint.
 
+**As built (slice 2, #288; details in "Slice 2 as built" below).** Two departures from the text
+above. (1) The session layer is our own (`multiview-h3::webtransport`, derived from
+h3-webtransport 0.1.2), not upstream `WebTransportSession`: upstream moves the h3 connection
+into the session, so the connection could serve neither page requests nor a `429` once a
+session existed. Ours never takes the connection: the noq adapter classifies every peer stream
+by its first varint (`0x41` bidi / `0x54` uni = WebTransport) before h3 sees it and routes
+WebTransport streams to the session's bounded queues, so the **h3 connection stays in the
+connection driver** for its whole life (pages before, during and after the session; a second
+CONNECT `429`). (2) The site and MoQ endpoint is `multiview_h3::H3Endpoint` on the QUIC lane;
+`MoQ` is admitted by the endpoint's `WtHandler` (`multiview_control::moq_startup::MoqWt`), which
+checks the single-use `?ticket=` **before** the `200` (`401` unknown/reused/revoked, `429` over
+the 16-session cap, `503` shutting down), so a refused ticket never creates a session. The
+lease URL is therefore under `/moq`: `MULTIVIEW_MOQ_ENDPOINT` must be `https://<host>/moq` (a bare
+`https://<host>` or `https://<host>/` is normalised to `/moq` with a warning; any other path is
+refused). `/api/v1/ws` over h3 (no Upgrade in HTTP/3) is a clean `4xx` from the router (auth
+gate, then axum's upgrade rejection); the realtime stream stays on HTTP/1.1 over TCP.
+
 Headers and policies:
 
 | Item | Decision |
 | --- | --- |
-| `Alt-Svc` | `h3=":443"; ma=86400` on every TCP response unless `udp443 = unreachable` (section 10.1). One rule everywhere: `unverified` still advertises, because Alt-Svc is advice the browser verifies per connection (RFC 7838 section 2.4) and a passive proof from one network says nothing about another viewer's network |
+| `Alt-Svc` | `h3=":443"; ma=86400` on every TCP response unless `udp443 = unreachable` (section 10.1). One rule everywhere: `unverified` still advertises, because Alt-Svc is advice the browser verifies per connection (RFC 7838 section 2.4) and a passive proof from one network says nothing about another viewer's network. As built (slice 2): a lock-free switch (`multiview_control::h3_site::AltSvc`, an `AtomicBool`) read by a layer on the **TCP door's** site router only (never the `[control] listen` listener, not on h3 responses); on once the h3 endpoint is up (with `[network.tls]`: once `serving`) and `[network] alt_svc` (default `true`) allows. `alt_svc = false` is the operator's manual "udp443 = unreachable" until the slice-9 prober drives `AltSvc::set` |
 | HTTPS DNS record | documented in the runbook (`alpn="h3,http/1.1"`); optional, the engine does not manage DNS |
 | 0-RTT | off (`max_early_data_size = 0`). Every API mutation is non-idempotent, and the API is authenticated per request, so the replay risk (RFC 9001 section 9.2, RFC 8470) buys no measurable latency. Revisit only with a measured need and a `425 Too Early` gate for non-GET |
 | HSTS | `Strict-Transport-Security: max-age=31536000` in `serving` only. Never in `setup` (section 5a) |
@@ -258,7 +275,7 @@ Headers and policies:
 | WebSocket / SSE | `/api/v1/ws` stays HTTP/1.1 Upgrade on TCP. HTTP/3 has no Upgrade, and RFC 9220 WebSocket-over-h3 has no browser that needs it here; browsers open the WS over TCP when the page came over h3. SSE `/api/v1/events` works over h3 as an ordinary streaming response. `?ticket=` stays single-use; access logs drop the query string |
 | HLS | served by the engine's existing `/hls/{output}/` route. Playlists `max-age=1`, segments immutable (contract already in `deploy/hls-nginx.conf`). Range/206 required. Slice 5 measures TTFB against the nginx path (memory note: nginx adds about 5 ms per segment) with a zero-copy body (file chunks from a bounded pool) |
 | Body limits | the existing per-route limits apply unchanged on h3 (`DefaultBodyLimit` on the shared router). Header blocks are capped by the explicit `max_field_section_size(16384)` above |
-| Per-IP limiter | keyed on the real peer address for direct connections: QUIC remote address on h3, TCP peer on TCP. Behind a proxy (section 8) it uses the PROXY protocol v2 source, never `X-Forwarded-For` from an untrusted hop |
+| Per-IP limiter | keyed on the real peer address for direct connections: QUIC remote address on h3, TCP peer on TCP. Behind a proxy (section 8) it uses the PROXY protocol v2 source, never `X-Forwarded-For` from an untrusted hop. As built: `H3Site` installs the QUIC remote as `ConnectInfo` (the SEC-14 key), exactly as the HTTP/1.1 driver does. The per-TCP-connection population cap (`ConnectionAdmission`) is not applied to h3; the endpoint's own caps bound the h3 population (1024 connections, 64 per IPv4 address / IPv6 /64, 128 requests in flight per connection), so nothing is admitted twice |
 | Static UI | the `embed-web` build is the default for appliance builds (no web root to deploy). A directory override stays for development |
 
 ## 5a. Certificates: TLS is required, and it is ACME
@@ -652,7 +669,15 @@ supported as `[network] mode = "behind_proxy"`:
   one-time warning when `ConnectInfo` is missing (`crates/multiview-control/src/limits.rs:591`);
   `behind_proxy` mode must not inherit that.
 * UDP 443 is forwarded untouched to the engine (a plain DNAT or a UDP port forward, never an
-  HTTP/3-terminating proxy), so MoQ and site HTTP/3 keep working.
+  HTTP/3-terminating proxy), so MoQ and site HTTP/3 keep working. The UDP forward MUST preserve
+  client source addresses (DNAT, not a source-NAT relay): a QUIC peer whose source is a configured
+  `trusted_proxies` address is a forwarder hop that has already lost the real client's address
+  (QUIC has no PROXY header to recover it from), and the engine's h3 endpoint refuses it before any
+  cap check, failing closed the same way the TCP door fails closed on a missing/untrusted PROXY v2
+  header. A source-NAT forwarder that rewrites every client to one address and is NOT listed in
+  `trusted_proxies` cannot be told apart from a real client by the engine; that is a
+  misconfiguration the runbook warns about (it silently collapses every QUIC peer's rate limits,
+  setup-code lockout and per-source caps onto one bucket, review #371 finding F1).
 * `Alt-Svc` is still sent by the engine. The proxy must pass it through.
 * ICE-TCP and TURN-TLS cannot pass through an HTTP reverse proxy. In this mode they are off unless
   the proxy forwards a dedicated TCP port at layer 4 (`stream` in nginx) to the engine's front-door
@@ -683,6 +708,8 @@ trusted_proxies = []             # PROXY v2 sources (behind_proxy mode)
 proxy_listen = "[::1]:8443"      # behind_proxy mode TCP listener
 
 workers = 2                      # OS threads of the front door's own Tokio runtime (never the program runtime)
+alt_svc = true                   # as built (slice 2): advertise h3 on the TCP door once the h3 endpoint is up;
+                                 # false = UDP https_port known unreachable (manual until the slice-9 prober)
 
 [network.udp]
 recv_buffer_bytes = 8_388_608    # SO_RCVBUF request; startup warns when the kernel clamps it (rmem_max)
@@ -690,12 +717,17 @@ new_flow_pps_per_source = 500
 new_flow_burst = 200
 new_flow_global_pps = 50_000     # cap on all unvalidated datagrams per second
 validated_steering = true        # Linux: SO_REUSEPORT + BPF, validated flows on their own queue
+stun_pps_per_source = 50         # well-formed STUN from an unvalidated source, per source key
+stun_global_pps = 5_000          # same, summed over every unvalidated source
+nft_floor_status_file = "/run/conspect-floor/nft-floor.json"  # written by the systemd unit's ExecStartPre=+ ("Slice 3 as built, part B")
 
 [network.quic]
 retry_above_handshakes = 8       # send Retry (address validation) once this many handshakes are open
 max_connections = 1024
-idle_timeout_secs = 30
-min_reset_interval_ms = 200      # endpoint-wide (noq), not per peer
+# idle_timeout_secs and min_reset_interval_ms are future slice-3 follow-ups, not read by this
+# slice: idle_timeout_secs is not wired into the noq transport config yet, and
+# min_reset_interval_ms is fixed at 200 ms in code (multiview_frontdoor::quic::MIN_RESET_INTERVAL),
+# not yet config-driven. Removed here rather than left as a key that silently does nothing.
 
 [network.ice_tcp]
 enabled = true
@@ -826,8 +858,10 @@ What S6 and S7 mean for the design:
      of unvalidated traffic then fills the listener queue, not the one paying viewers use. This is
      the only layer that also works against spoofed and distributed floods. Linux only; other
      platforms keep one queue (stated as a platform limit).
-  2. **Pre-socket per-source limits** (nftables `meter` on UDP 443 for packets not in conntrack
-     state `established`). Required before UDP 443 is opened to the internet, and checked by the
+  2. **Pre-socket per-source limits** (nftables per-source buckets on UDP 443; as built in slice 3
+     there are two tiers, new flows and established flows, each packet charged to exactly one, no
+     unmetered conntrack `established` exemption, and a full bucket set fails closed; see "Slice 3
+     as built, part B"). Required before UDP 443 is opened to the internet, and checked by the
      engine at startup where it can read the ruleset (a warning in the capability report when
      absent). Honest limit: it stops a real source, not a spoofed one (it depends on BCP 38 at the
      attacker's network) and not a botnet.
@@ -904,7 +938,12 @@ How the UI skips a dead rung fast:
   established-set caps); one steering program at a time (at most 1 244 peers, 4 096 instructions);
   the sender-waker list (1 024, overflow wakes every held waker); ICE-TCP
   per-connection out queue (256) and read buffer (one RFC 4571 frame, 65 535 bytes); TCP per-IP and
-  global connection caps at accept; QUIC `max_connections` and per-connection stream limits; h3
+  global connection caps at accept; QUIC `max_connections` and per-connection stream limits; the h3
+  endpoint's caps (slice 2, `multiview-h3` bounds table: 1024 connections / 64 per source, 64
+  handshakes / 16 per source with a 5 s deadline, 128 requests in flight per connection, header
+  block guard at 16 384 + 1 KiB, header and SETTINGS deadlines 10 s, response head 30 s and write
+  stall 30 s, one WebTransport session per connection, WT stream queues 64 + 16 early, WT close
+  grace 5 s; `MoQ` sessions over h3 at most 16 with a 10 s SETUP deadline); h3
   `max_field_section_size`; TURN allocations (one per lease, 4 per source, global cap). Nothing
   awaits a client: UDP sends are non-blocking (`try_send_to` / noq's `UdpSender`); TCP writes run in
   the per-connection task, fed by a bounded queue with `try_send`.
@@ -920,7 +959,7 @@ How the UI skips a dead rung fast:
 | --- | --- | --- |
 | Demux unit | every first byte 0-255 has exactly one class; 64-79 depends only on the TURN-server set | `multiview-frontdoor` unit test (spike version: `every_first_byte_has_exactly_one_class`) |
 | Demux property | random datagrams never reach noq as a new connection unless they are valid Initials; never reach str0m unless STUN/DTLS/RTP | proptest |
-| Fuzz | `cargo fuzz` targets: UDP classifier + str0m `Receive::new`; TCP first-byte + RFC 4571 deframer; TURN server request parser (slice 8); the vendored h3 adapter and h3 request path (slice 2) | `fuzz/` (nightly job, not the PR gate) |
+| Fuzz | `cargo fuzz` targets: UDP classifier + str0m `Receive::new`; TCP first-byte + RFC 4571 deframer; TURN server request parser (slice 8); slice 2 as built: `header_guard`, `capsule` and `h3_request` (the real h3 server request path over an in-memory transport) | `fuzz/`; `crates/multiview-h3/fuzz` runs 30 s per target in the PR CI job `fuzz multiview-h3` |
 | Integration, unprivileged | the front door on `[::1]:0` (TCP and UDP): h3 GET via a native h3 client, WebTransport MoQ subscribe via `web-transport-moq`, str0m-to-str0m WebRTC over UDP and over ICE-TCP, TLS h1 on the same TCP port | `cargo test -p multiview-frontdoor`; the existing str0m loopback harness in `multiview-webrtc` |
 | Browser, CI | headless Chrome on loopback: S3/S8 above as a test (WT + DC + h3); a native pooling client sends GETs around one WT session on one connection; a second CONNECT gets 429 | web e2e job (puppeteer-core is already used by lead probes) |
 | Flood/chaos (#1, #10) | S5 floods from one source, from many spoofed sources and from rotating IPv6 /64s (garbage, Initial, unsupported-version Initial, short header with well-formed CIDs, STUN, RTP, ICE-TCP SYN flood, slowloris on TCP 443, half-open TLS, TURN Allocate flood) against a running engine with a live output: assert 0 "ticks behind", output PTS delta constant (`ffprobe`), an established WebRTC viewer keeps >= 95% of frames, RSS bounded | `crates/multiview-engine/tests/` chaos suite + a scripted soak |
@@ -984,6 +1023,92 @@ does not block 1-3. Public UDP 443 opens only after slice 3. 6, 7, 8 depend on 4
 * Shutdown: the daemon drops the front door last, after the control-plane drain, with a
   bounded `shutdown_timeout` (2 s) on a blocking-pool thread, so the socket is closed when
   teardown returns.
+
+### Slice 2 as built (issue #288)
+
+Two PRs: #358 adds `crates/multiview-h3` (the endpoint, the vendored adapter, the session layer,
+the bounds and their tests); the wiring PR puts it on the front door.
+
+* **Endpoint.** `multiview_h3::H3Endpoint` on the front door's QUIC lane with the lane's endpoint
+  config (`grease_quic_bit` off) and `incoming_caps()` unchanged; the noq driver, the accept loop,
+  every connection and request task, the WebTransport sessions and the `MoQ` driver run on the
+  front-door runtime (`FrontDoorRun::start_h3`). ALPN exactly `h3`, TLS 1.3 only, 0-RTT off
+  (`max_early_data_size = 0`, no half-RTT data), no key log, forced by the crate whatever TLS
+  config it is given. The established-set hook marks a peer once its handshake completes, as
+  slice 1 did for `MoQ`. The moq-tokio `web-transport-moq` listener is no longer on the front
+  door; the legacy `MULTIVIEW_MOQ_BIND` listener (no `[network]`) is unchanged.
+* **Site.** `multiview_control::h3_site::H3Site`: the SAME router as the TCP door (with
+  `[network.tls]` the setup-gated front-door router) over h3, request bodies streamed on demand,
+  `ConnectInfo` = the QUIC peer, the router's own `DefaultBodyLimit`, rate and concurrency caps
+  unchanged, `503` for new requests once the door's shutdown watch flips. Started also when
+  `mode` is absent (no TCP door): the site is then reachable over h3 only on UDP.
+* **Certificate** (first that applies): `[network.tls]` (the ACME `SourceResolver`; the endpoint
+  is **not started in `setup`** and starts when the source turns `serving`, as `MoQ` did); the
+  door's static certificate (`[network] cert_file/key_file`, else `[control.tls]`, reloaded per
+  handshake); the `MULTIVIEW_MOQ_CERTIFICATE`/`_PRIVATE_KEY` pair (same file checks as the
+  listener); none: no endpoint, a warning, the site stays on TCP, no Alt-Svc, `MoQ` unavailable.
+* **MoQ.** `multiview_moq::provider::Runtime::external` (no listener), `claim_ticket`
+  (synchronous, the listener's ticket lookup shared through one helper, the 16-session cap as an
+  atomic slot count released by the claim's drop) and `serve_external` (`moq_net::Server` with
+  exactly the configured version, SETUP bounded by 10 s, the viewer select shared with the
+  listener path, the fence revoked at the end). `MoqWt::protocols()` is the configured version's
+  ALPN only (`moqt-16` / `moqt-18`). The provider is installed (`DeferredProvider`) once the
+  endpoint is up, so leases answer `503` until then. WebTransport datagrams: our framing uses the
+  RFC quarter stream id; moq-transport-16/18 carries media on streams, so nothing depends on it.
+* **Alt-Svc.** `AltSvc` switch (`AtomicBool`; `arc-swap` is not used in this repository), layer
+  on the TCP door's site only, on when the endpoint is up and `[network] alt_svc` (default
+  `true`) allows; off again at shutdown.
+* **Shutdown.** Alt-Svc off, the endpoint closed and drained (its own 2 s bound, 3 s outer
+  bound), then the front-door runtime as before.
+* **Source refusal (review #371 finding F1, follow-up to slice 4).** `EndpointParts::refuse_source`
+  (`multiview_h3::SourceFilter`): checked in the accept loop before any cap, so a refused source
+  never charges `connections_refused`/`handshakes_refused` and is counted separately
+  (`Counters::sources_refused`). In `behind_proxy` mode `FrontDoorRun::start_h3` builds it from
+  `network.trusted_proxy_list()` (`TrustedProxies::contains`): a QUIC source that is a trusted
+  proxy is refused (section 8's fail-closed rule for the h3/QUIC lane, matching the TCP door's
+  PROXY v2 fail-closed behaviour). `direct` mode and no `network.mode` pass `None`.
+* **QUIC Retry (slice 3B on the h3 endpoint).** The slice 3B Retry policy ("Slice 3 as built,
+  part B") applies to this endpoint: `FrontDoorRun::start_h3` passes the same
+  `network.quic.retry_above_handshakes` and the run's retry counter (`quic_retries` on
+  `GET /api/v1/metrics/frontdoor`) as `EndpointParts::retry_above_handshakes` / `retry_counter`,
+  and the accept loop, after `refuse_source` and the connection-cap pre-check and before a
+  handshake slot is taken, answers an unvalidated, retryable `Incoming` with `incoming.retry()`
+  once the handshakes in flight (the held handshake slots) reach the threshold, with the semantics
+  of moq-tokio's `maybe_retry`; tested in `crates/multiview-h3/tests/endpoint.rs` (the
+  `retry.rs` scenarios on `H3Endpoint`).
+* **Deviations from the text above.** (1) Own WebTransport session layer instead of upstream
+  `h3-webtransport`'s `WebTransportSession`, for the reason in section 5: the h3 connection must
+  stay in the driver to serve pages and answer `429` while a session lives. (2) The bounds the
+  reviews of #358 added beyond section 5's list (handshake slots per source, header and SETTINGS
+  deadlines, control-stream byte caps, QPACK stream caps, response-head and write-stall timeouts,
+  WT close grace, early-stream cap); the full table is in `crates/multiview-h3/src/lib.rs` and
+  section 13. (3) The endpoint's `Counters` are exported (`FrontDoorRun::h3_counters`) for
+  telemetry; not yet on the metrics endpoint. (4) "Alt-Svc gated on reachability" (section 15):
+  there is no prober until slice 9; `[network] alt_svc` is the manual gate. (5) The chaos test
+  does not assert a lateness percentile (issue #321 retired that class): measured with 20
+  parallel copies, the hammer's p99 rose up to 15 ms over idle while every tick was emitted on
+  time-stamped cadence with 0 repeats.
+* **Tests.** `multiview-moq` (claim cap/reuse/release, PEM loader checks); `multiview-control`
+  `tests/h3_site.rs` (router over h3 with `ConnectInfo`, `/api/v1/ws` `4xx`, `503` after
+  shutdown, `501` without a handler; `MoQ` over h3 with moq-tokio's own WebTransport client: an
+  admitted ticket subscribes and reads the catalog, a wrong ticket and a reused ticket `401` before
+  any session, the same connection keeps serving pages after the `401`); `multiview-cli`
+  `tests/frontdoor_h3.rs` (the real `FrontDoorRun`: h3 GET through the shared socket, STUN still
+  on the WebRTC lane, `alt-svc` present / absent with `alt_svc = false`), `tests/tls_door.rs`
+  (no endpoint and no Alt-Svc in `setup`; after install the endpoint serves the issued certificate
+  and the gated router), `tests/frontdoor_h3.rs`'s `behind_proxy_refuses_quic_from_a_trusted_proxy_source`
+  / `behind_proxy_serves_a_source_not_in_trusted_proxies` (F1: a `behind_proxy` config refuses a
+  QUIC client whose source is in `trusted_proxies` and `sources_refused` increments, while a
+  source not in that list is served normally), `multiview-h3`'s
+  `tests/endpoint.rs::refuse_source_refuses_the_matched_address_only` (the filter itself, isolated
+  from `behind_proxy` wiring), and the R3 chaos test `tests/h3_chaos.rs` (the real tick loop on its
+  own runtime while 32 h3 clients loop GETs, 1 MiB POSTs, oversized header blocks and
+  WebTransport CONNECTs with churn: every tick, exact PTS, 0 unexplained repeats, RSS growth after
+  warm-up under 64 MiB, the endpoint answers afterwards). Pooling with a native client (GETs
+  around one session, second CONNECT `429`) is `crates/multiview-h3/tests/pooling.rs`; the
+  moq-tokio client does not pool.
+* **Not in this slice**: the office acceptance (Chrome `nextHopProtocol=h3`, the WebTransport
+  browser matrix, UDP blocked falls to h1), which the lead runs; the reachability prober (slice 9).
 
 ### Slice 3 as built, part A: flood hardening in `multiview-frontdoor` (issues #289, #321, #325)
 
@@ -1268,6 +1393,144 @@ the engine's own TLS. The str0m ICE-TCP consumer and the browser ladder are PR2 
   no SNI fail the handshake with no certificate presented; the published name still works).
 * **Not in this PR**: a real-browser ICE-TCP check (browsers gather active TCP candidates
   themselves); the deferred items above other than the str0m consumer.
+
+### Slice 3 as built, part B: Retry policy, config wiring, capability + metrics, deploy artefacts (issue #289)
+
+**UDP 443 during ACME `setup` (slices 3 and 5 together).** With `[network.tls]` the QUIC lane is taken
+at boot and held, with no noq endpoint, until the certificate is `serving` (section 5a: "QUIC listener
+not started"). In that window the port answers no QUIC datagram at all: no Version Negotiation, no Retry,
+no stateless reset, so it cannot amplify; the dispatcher still applies every new-flow budget and the held
+lane's bounded queues (1024 established + 256 new) fill and then drop (`dropped_queue_full`). The Retry
+policy below applies from the moment the endpoint starts. WebRTC on the same socket is unaffected.
+
+**QUIC Retry policy.** Vendored `vendor/moq-tokio`: `noq::Injected` gains `retry_above_handshakes:
+Option<usize>` and `retry_counter: Option<Arc<AtomicU64>>`. In `Server::accept_next`'s `noq_accept`
+arm, `self.accept.len()` (the `FuturesUnordered` of accepted `Incoming`s whose handshake + SETUP
+has not finished) is the handshake-in-flight count; `NoqServer::maybe_retry` compares it against
+the threshold and, for an `Incoming` that is not yet address-validated and may still retry, calls
+`incoming.retry()` (bumping the counter) instead of handing it to the accept pipeline. A failed
+`retry()` (the `Incoming` already carries a validated token) falls through to `ignore()`. `None`
+(every caller before this field existed) returns the `Incoming` unchanged — byte for byte identical
+to the pre-slice-3 path. `multiview_frontdoor::quic::DEFAULT_RETRY_ABOVE_HANDSHAKES` is 8;
+`multiview-moq::provider::SharedSocket` carries the same two fields through to the injected socket.
+Why `self.accept.len()` is the right count: the accept loop takes every `Incoming` out of noq as
+soon as it arrives (so noq's own pending queue, capped at `MAX_INCOMING` = 64, stays near empty)
+and pushes one future per `Incoming` that runs `conn.accept()`, the handshake and the MoQ SETUP;
+the future leaves `self.accept` only when that finishes or the setup deadline fires. A peer that
+never completes (a spoofed source, a stalled client) therefore stays counted. Tested in
+`crates/multiview-frontdoor/tests/retry.rs` with real noq clients whose socket discards every
+received datagram (they send real Initials, retransmit, never complete): with `Some(4)` and 8
+stalled clients the server created connection state for exactly 4 and Retried the other 4, and a
+normal client then arriving is Retried too and still completes end to end; with `None` all 8 get
+state and the counter stays 0. Under `Some(0)`, 8 stalled clients sent 24 real Initials (28 800 B)
+and got back 24 Retries (2 880 B), no Initial: no state and no amplification. Also: `Some(0)` with
+a single real `MoQ` client connects (counter >= 1); `None` never bumps the counter.
+Since slice 2's wiring PR (#371) the lane is served by `multiview_h3::H3Endpoint`, not the vendored
+`MoQ` listener: the same policy and counter are applied there (see "Slice 2 as built"), and
+`FrontDoorRun::take_moq_socket` is gone. The vendored support above is no longer wired by the front
+door (`multiview-moq`'s `SharedSocket` still carries the fields); `retry.rs` keeps testing it.
+
+**Config.** `multiview-config::network_tls` gains `NetworkUdpConfig` (`[network.udp]`) and
+`NetworkQuicConfig` (`[network.quic]`), both `#[serde(default)]` nested structs on `NetworkConfig`
+so an old `[network]` section with neither sub-table parses unchanged. Every field name matches
+section 10's TOML block above; `deny_unknown_fields` on both; validation rejects a zero rate, a
+`recv_buffer_bytes` outside `1..=256 MiB`, and a `max_connections` outside `1..=65536`.
+`retry_above_handshakes` has no invalid value (0 is a legitimate, if aggressive, "retry everything"
+choice).
+
+**CLI wiring.** `crates/multiview-cli/src/frontdoor.rs::config_from` maps every `[network.udp]` key
+onto `FrontDoorConfig`/`NewFlowLimits` and `validated_steering` onto `FrontDoorConfig::steering`;
+`network.quic.max_connections` onto `max_quic_peers`. `network.quic.retry_above_handshakes` and
+`network.udp.nft_floor_status_file` are not `FrontDoorConfig` fields (they feed the `MoQ` socket
+wiring and the nft-floor probe respectively) and are read by their own small accessors. At start,
+one `tracing::info!` names the steering mode, the rcvbuf requested/granted/usable/clamped report,
+kernel-drop support, and the nft floor read at that moment.
+
+**nft floor probe.** `crates/multiview-cli/src/nft_floor.rs` is a pure, panic-free parser (no
+sockets, no `nft` invocation from the engine — it runs unprivileged and cannot list the ruleset
+itself). It reads `network.udp.nft_floor_status_file` only if that path is a regular file (a
+symlink is rejected via `symlink_metadata`, and the opened file must be the same inode), owned by
+uid 0 and not group/other-writable (`mode & 0o022 == 0`); otherwise `Unknown`. It reports
+`Present` only for valid nft JSON listing `table inet conspect_floor` with the chains `udp443_new`
+and `udp443_all` and the four sets `udp443_{new,all}_v4` (`ipv4_addr`) and `udp443_{new,all}_v6`
+(`ipv6_addr`) by exact name and type, each bounded (`size`, flags `dynamic` + `timeout`), and the
+shipped verdicts (input is exactly two rules, in order: new UDP 443 to `udp443_new`, then all UDP 443 to `udp443_all`; each tier
+is v4 `update`+limit then `accept`, v6 /64 `update`+limit then `accept`, then `drop`), so `Present`
+means the floor fails closed (rates are not checked: they are the operator's to tune); `Absent` only for nft 1.1.3's exact error for that missing table (first line `Error: No such
+file or directory`, second line `list table inet conspect_floor`) or the literal word `absent`;
+anything else (missing/unreadable/untrusted file, another error, a partial or renamed floor) is
+`Unknown`. Trust model: the file is a report, never an enforcement input; the ownership checks stop
+the unprivileged service user from forging `present`, but a process running as root still can.
+**Re-read interval:** every 10 minutes (`multiview_cli::nft_floor::NFT_FLOOR_REREAD_INTERVAL`) on
+the front-door runtime via `tokio::task::spawn_blocking` (a plain file read, never the program
+runtime).
+
+**Capability report and metric.** `multiview_control::system::SystemCapabilities` gains `network:
+Option<NetworkCapability>` (`{udp443_steering, steering_reason, recv_buffer, kernel_drops_supported,
+nft_floor}`; omitted for a scoped principal, since it is whole-system host posture), filled once
+at startup by `FrontDoorRun::capability()` and installed into a
+process-global slot (`multiview_cli::frontdoor::install`, mirroring the existing Program-metrics
+and output-routing slots) before the control plane's capability snapshot is built — `nft_floor`
+here is the **startup** read only, named as such in the field doc. `GET /api/v1/metrics/frontdoor`
+(new `multiview_control::frontdoor_metrics` module, same auth as `/metrics/program`: Read +
+unscoped whole-system principals) reports the live `StatsSnapshot` counters, the steering mode, the
+**live** (periodically re-read) nft floor, and the QUIC retry counter, through a
+`FrontDoorMetricsSource` trait the CLI installs the same way; 404 when no front door runs this
+process. Registered in `openapi.rs`; `cargo xtask gen-openapi` regenerated `docs/api/openapi.json`.
+
+**Deploy artefacts.** The nft status writer is the drop-in
+`deploy/systemd/conspect.service.d/20-nft-floor.conf`, added to slice 6's socket-activated
+`conspect.service`: an `ExecStartPre=+` (root) that creates `/run/conspect-floor` itself
+(`install -d -o root -g root -m 0755`; deliberately not a `RuntimeDirectory=`, which systemd would
+hand to `User=`, letting the service user unlink, replace or symlink the status file), writes
+`nft -j list table inet conspect_floor`'s stdout+stderr to a temp file there and moves it into
+place as `/run/conspect-floor/nft-floor.json` (`install -o root -g root -m 0644`, then `mv`, so a
+reader never sees a partial file). Receive buffer: with slice 6's `conspect.socket`
+(`ReceiveBuffer=8M`, set by systemd with `SO_RCVBUFFORCE`) `net.core.rmem_max` no longer clamps
+the inherited sockets; `deploy/sysctl/90-conspect-udp.conf` (`net.core.rmem_max = 8388608`) is
+for a host that runs the engine without the socket unit (the engine binds and can only use
+`SO_RCVBUF`). The front-door cutover script installs the drop-in and the rollback script removes it.
+
+**Inherited sockets and slice 3 settings.** For sockets systemd passes, the engine never re-requests
+the buffer (`ReceiveBuffer=` is the unit's); it reads the grant back and reports it against
+`network.udp.recv_buffer_bytes`, so `clamped` (and the startup warning) fires when the unit gives
+less than the configured target, e.g. a unit without `ReceiveBuffer=`.
+`network.udp.validated_steering = false` with the inherited `ReusePort=yes` pair closes the
+established member, so the listener is the group's only socket and every datagram shares its one
+queue, exactly as a self-bound single socket. Tests: `tests/socket_activation.rs`
+`an_inherited_socket_reports_its_buffer_against_the_configured_target`,
+`steering_off_closes_the_inherited_established_socket`.
+
+**nft floor, two tiers.** `deploy/nftables/conspect-udp443-floor.nft`: table `inet
+conspect_floor`, base chain `filter hook input priority -5; policy accept`, which sends UDP 443 to
+exactly one sub-chain: `ct state new,untracked` → `udp443_new`, everything else → `udp443_all`.
+Each sub-chain is `update @set { key limit rate R burst B packets } accept` for IPv4 and for IPv6
+(key = source address, or source /64 via `ip6 saddr and ffff:ffff:ffff:ffff::`), then `counter
+drop`. Every sub-chain ends in a verdict, so **each packet pays exactly one tier**:
+* **new** (`udp443_new`, sets `udp443_new_v4`/`_v6`): 2000/s burst 1000;
+* **all** (`udp443_all`, sets `udp443_all_v4`/`_v6`; established flows): 25 000/s burst 10 000,
+  above the engine's per-established-peer bucket (20 000/s) so a real viewer is never hit by it.
+Sets are named, `flags dynamic,timeout`, `size 65536`, `timeout 2m`. Measured on nft 1.1.3: the
+first datagrams of a flow are `ct state new` and, after the server's first reply, `established`
+(never `untracked` without notrack); `update` with a `limit` keeps one bucket per element; when the
+set is full, `update` cannot add a new source and does not match, so the packet reaches the
+sub-chain's `drop` — **a full set fails closed, for UDP 443 only** (other traffic never enters the
+sub-chains). Two rejected forms, both measured: round 1's `meter ... limit rate over ... drop` fails
+OPEN when full (a full meter matches nothing and `policy accept` passes the packet; reviewer:
+111 900 of 111 900 delivered for a third source with `size 2`), and stacking both meters in one
+chain charged established packets to the new tier as well. A separate `ip saddr @set` lookup is
+not used as an "in the set" test: on these sets the lookup evaluates the element's `limit` too and
+consumes a token. There is no `ct state established accept`: a single server reply (a QUIC
+Retry/Initial or a STUN error) makes a source "established" to conntrack, so an exemption would let
+it flood unmetered. `deploy/nftables/test-floor.sh` (bash + python3 in a `unshare -Urn` network
+namespace; skips when nft/unshare is missing; not in CI, the runners have no nft) proves it.
+Measured here, nft 1.1.3, ~160-240k pps offered: (a) one-way flood from one source, 2 s → 5000
+delivered (burst + new-tier rate), IPv4 and IPv6, and the all-tier sets stay empty (charged once);
+(b) one server reply, then a 3 s flood → ~85 000 delivered (~28 300 pps: all tier only; double
+charging would cap it near 7000); (c) two addresses in one /64 → 5000 together (one bucket), two
+/64s → 10 000; (d) the file with `size 2`, two sources fill it, a third source floods → 0
+delivered, IPv4 and IPv6 (round 1's meters: 5000); (e) an established flow paced at 10 000 pps for
+3 s → 30 001 of 30 001 delivered. Validate syntax with `unshare -Urn nft -c -f - < file`.
 
 ### Slice 6 as built (issue #292)
 

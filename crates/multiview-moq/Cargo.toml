@@ -17,3 +17,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+# A throwaway certificate for the PEM loader test (already in the lock).
+rcgen = "0.14"

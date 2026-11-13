@@ -738,6 +738,9 @@ pub struct AppState {
     pub output_routing: Option<Arc<crate::output_routing::OutputRoutingControl>>,
     /// Program tick lateness / repeats (ADR-0108 §10); `None` = 404.
     pub program_metrics: Option<Arc<crate::program_metrics::ProgramMetrics>>,
+    /// The network front door's live counters (ADR-0107 slice 3); `None` =
+    /// 404 (no front door running this process).
+    pub frontdoor_metrics: Option<Arc<dyn crate::frontdoor_metrics::FrontDoorMetricsSource>>,
     /// Bounded sustained PVW lease retained across requests; the previous lease
     /// is released only after a new source lease is acquired.
     pub switcher_preview_lease: Arc<crate::source_demand::SwitcherPreviewLeases>,
@@ -1069,6 +1072,7 @@ impl AppState {
             switcher: None,
             output_routing: None,
             program_metrics: None,
+            frontdoor_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
             patch_limiter: Arc::new(crate::output_routing::TakeLimiter::default()),
             // Bound the in-flight correlations: a generous ceiling for pending
@@ -1431,6 +1435,18 @@ impl AppState {
         self.program_metrics = Some(Arc::new(crate::program_metrics::ProgramMetrics::new(
             source,
         )));
+        self
+    }
+
+    /// Install the front-door metrics source (ADR-0107 slice 3): wait-free
+    /// counters, no sampler (unlike Program metrics, nothing here needs a
+    /// window).
+    #[must_use]
+    pub fn with_frontdoor_metrics(
+        mut self,
+        source: Arc<dyn crate::frontdoor_metrics::FrontDoorMetricsSource>,
+    ) -> Self {
+        self.frontdoor_metrics = Some(source);
         self
     }
 

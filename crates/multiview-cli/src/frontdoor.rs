@@ -41,7 +41,8 @@
 //!   loopback admin listener and is not gated.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_config::{MultiviewConfig, NetworkMode};
 use multiview_frontdoor::ListenSockets;
@@ -66,11 +67,165 @@ fn take_inherited_sockets() -> ListenSockets {
         .unwrap_or_default()
 }
 
+/// Install (or clear) the running front door's capability snapshot and
+/// metrics source for the control plane, mirroring
+/// `output_routing_control::install_program_metrics`: `main.rs` calls this
+/// once, right after [`FrontDoorRun::start`] and before the front door
+/// (which owns the data these borrow from) is moved into `RunningPersist`.
+pub fn install(
+    installed: Option<(
+        multiview_control::system::NetworkCapability,
+        Arc<dyn multiview_control::frontdoor_metrics::FrontDoorMetricsSource>,
+    )>,
+) {
+    *slot().lock().unwrap_or_else(PoisonError::into_inner) = installed;
+}
+
+/// The installed capability snapshot, if a front door is running this
+/// process.
+#[must_use]
+pub fn installed_capability() -> Option<multiview_control::system::NetworkCapability> {
+    slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|(cap, _)| cap.clone())
+}
+
+/// The installed metrics source, if a front door is running this process.
+#[must_use]
+pub fn installed_metrics_source(
+) -> Option<Arc<dyn multiview_control::frontdoor_metrics::FrontDoorMetricsSource>> {
+    slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|(_, source)| Arc::clone(source))
+}
+
+type InstalledSlot = Mutex<
+    Option<(
+        multiview_control::system::NetworkCapability,
+        Arc<dyn multiview_control::frontdoor_metrics::FrontDoorMetricsSource>,
+    )>,
+>;
+
+fn slot() -> &'static InstalledSlot {
+    static SLOT: OnceLock<InstalledSlot> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
 /// The running front door and the lanes its consumers have not taken yet.
 pub struct FrontDoorRun {
     door: multiview_frontdoor::FrontDoor,
+    /// QUIC Retries sent on the lane (bumped by the h3 endpoint's accept
+    /// loop through `multiview_h3::EndpointParts::retry_counter`; `0` until
+    /// [`start_h3`](Self::start_h3) serves the lane).
+    retry_counter: Arc<AtomicU64>,
+    /// `network.quic.retry_above_handshakes`, carried from config to the h3
+    /// endpoint's Retry policy ([`start_h3`](Self::start_h3)).
+    retry_above_handshakes: usize,
+    /// The live nft-floor status (re-read every
+    /// [`crate::nft_floor::NFT_FLOOR_REREAD_INTERVAL`] on the front-door
+    /// runtime, never the program runtime), plus the path to read.
+    nft_floor: Arc<NftFloorCell>,
     /// The TCP door runs with ICE-TCP on (direct mode, `network.ice_tcp`).
     ice_tcp: bool,
+    /// The HTTP/3 endpoint on the QUIC lane (slice 2).
+    h3: H3Slot,
+}
+
+/// `MoQ` over the h3 endpoint, installed by the run before the control plane
+/// binds ([`FrontDoorRun::set_h3_moq`]).
+pub struct H3Moq {
+    /// The WebTransport handler (`MoqWt`).
+    pub wt: Arc<dyn multiview_h3::WtHandler>,
+    /// Called once the endpoint is up (installs the real `MoQ` provider, so
+    /// leases are issued only while the endpoint serves them).
+    pub on_up: Box<dyn FnOnce() + Send>,
+    /// The endpoint certificate when no site certificate is configured (the
+    /// `MULTIVIEW_MOQ_CERTIFICATE` pair).
+    pub fallback_tls: Option<multiview_frontdoor::SiteTlsConfig>,
+}
+
+impl std::fmt::Debug for H3Moq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H3Moq")
+            .field("fallback_tls", &self.fallback_tls.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The certificate the h3 endpoint serves, and when it may start.
+pub struct H3Tls {
+    /// The site TLS configuration (ALPN is overridden to `h3`, 0-RTT off).
+    /// `None`: the `MoQ` fallback pair, else no endpoint.
+    pub config: Option<multiview_frontdoor::SiteTlsConfig>,
+    /// With `[network.tls]`: resolves `true` once the certificate is
+    /// `serving` (`false`: never, e.g. shutdown). No QUIC in `setup`.
+    pub ready: Option<std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>>,
+    /// Why this certificate (for the startup log).
+    pub source: &'static str,
+}
+
+impl std::fmt::Debug for H3Tls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H3Tls")
+            .field("config", &self.config.is_some())
+            .field("deferred", &self.ready.is_some())
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// The h3 endpoint's state inside the run.
+struct H3Slot {
+    lane: Mutex<Option<multiview_frontdoor::QuicLane>>,
+    moq: Mutex<Option<H3Moq>>,
+    alt_svc: Arc<multiview_control::h3_site::AltSvc>,
+    /// `[network] alt_svc` (the operator's "UDP reachable").
+    alt_svc_allowed: bool,
+    endpoint: Arc<Mutex<Option<multiview_h3::H3Endpoint>>>,
+    starter: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// `behind_proxy` mode only: refuses a QUIC source that is a trusted
+    /// proxy (see [`refuse_source_from`]). `None` in `direct` mode or with
+    /// no `network.mode`.
+    refuse_source: Option<multiview_h3::SourceFilter>,
+}
+
+/// Builds the h3 [`multiview_h3::SourceFilter`] for `behind_proxy` mode, or
+/// `None` in `direct` mode / with no `network.mode`.
+///
+/// Reason (design note §8): a plain UDP forward in `behind_proxy` mode
+/// delivers every QUIC datagram with the forwarder's own source address, so
+/// a QUIC connection whose source is a `trusted_proxies` address is a
+/// forwarder hop that has already lost the real client's address — QUIC has
+/// no PROXY header to recover it from, unlike the TCP door. That connection
+/// is refused, failing closed the same way the TCP door fails closed on a
+/// missing/untrusted PROXY v2 header. A source-preserving forward (DNAT,
+/// design note §8) delivers the real client address instead of the
+/// forwarder's, so it is not in `trusted_proxies` and is served normally,
+/// with `Alt-Svc` advertised as §8 describes.
+fn refuse_source_from(config: &MultiviewConfig) -> Option<multiview_h3::SourceFilter> {
+    let network = config.network.as_ref()?;
+    match network.mode? {
+        NetworkMode::BehindProxy => {
+            let trusted = network.trusted_proxy_list().ok()?;
+            let proxies = multiview_frontdoor::TrustedProxies::new(
+                trusted.iter().map(|t| (t.addr, t.prefix)),
+            );
+            let filter: multiview_h3::SourceFilter =
+                Arc::new(move |addr: SocketAddr| proxies.contains(addr.ip()));
+            Some(filter)
+        }
+        NetworkMode::Direct => None,
+    }
+}
+
+/// Locks, recovering from poisoning (the guarded values stay consistent:
+/// every critical section is a single take/insert).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The TCP door settings derived from `[network]` (slice 4): `None` unless
@@ -158,12 +313,51 @@ impl multiview_frontdoor::SiteService for ControlSite {
     }
 }
 
+/// Upper bound on the h3 endpoint's shutdown (its own drain is 2 s).
+const H3_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl std::fmt::Debug for FrontDoorRun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrontDoorRun")
             .field("local_addr", &self.door.local_addr())
             .field("ice_tcp", &self.ice_tcp)
-            .finish()
+            .field("h3_running", &self.h3_running())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A wait-free cell for the nft-floor status, re-read periodically on the
+/// front-door runtime. 3 states fit `u8`; `Relaxed` is enough (telemetry,
+/// not a correctness gate).
+struct NftFloorCell(std::sync::atomic::AtomicU8);
+
+impl NftFloorCell {
+    fn new(initial: crate::nft_floor::NftFloorStatus) -> Self {
+        Self(AtomicU8::new(encode(initial)))
+    }
+
+    fn store(&self, status: crate::nft_floor::NftFloorStatus) {
+        self.0.store(encode(status), Ordering::Relaxed);
+    }
+
+    fn load(&self) -> crate::nft_floor::NftFloorStatus {
+        decode(self.0.load(Ordering::Relaxed))
+    }
+}
+
+const fn encode(status: crate::nft_floor::NftFloorStatus) -> u8 {
+    match status {
+        crate::nft_floor::NftFloorStatus::Present => 0,
+        crate::nft_floor::NftFloorStatus::Absent => 1,
+        crate::nft_floor::NftFloorStatus::Unknown => 2,
+    }
+}
+
+const fn decode(value: u8) -> crate::nft_floor::NftFloorStatus {
+    match value {
+        0 => crate::nft_floor::NftFloorStatus::Present,
+        1 => crate::nft_floor::NftFloorStatus::Absent,
+        _ => crate::nft_floor::NftFloorStatus::Unknown,
     }
 }
 
@@ -188,13 +382,50 @@ pub fn config_from(config: &MultiviewConfig) -> Option<multiview_frontdoor::Fron
         .collect();
     #[cfg(not(feature = "webrtc-native"))]
     let turn_servers = Vec::new();
+    let udp = &network.udp;
+    let max_quic = usize::try_from(network.quic.max_connections).unwrap_or(usize::MAX);
     Some(multiview_frontdoor::FrontDoorConfig {
         port,
         workers: usize::from(network.workers.max(1)),
+        recv_buffer_bytes: usize::try_from(udp.recv_buffer_bytes).unwrap_or(usize::MAX),
+        limits: multiview_frontdoor::NewFlowLimits {
+            per_source_pps: udp.new_flow_pps_per_source,
+            per_source_burst: udp.new_flow_burst,
+            global_pps: udp.new_flow_global_pps,
+            stun_per_source_pps: udp.stun_pps_per_source,
+            // The config schema (section 10) exposes one stun burst knob
+            // (`stun_pps_per_source`); the per-source burst mirrors it, same
+            // as the crate default's own 1:1 ratio.
+            stun_per_source_burst: udp.stun_pps_per_source,
+            stun_global_pps: udp.stun_global_pps,
+            ..multiview_frontdoor::NewFlowLimits::default()
+        },
         max_rtc_peers: max_rtc,
+        max_quic_peers: max_quic,
         turn_servers,
-        ..multiview_frontdoor::FrontDoorConfig::default()
+        steering: udp.validated_steering,
     })
+}
+
+/// `network.quic.retry_above_handshakes` and `network.udp.nft_floor_status_file`
+/// are not part of [`multiview_frontdoor::FrontDoorConfig`] (they wire into
+/// the h3 endpoint's Retry policy and the nft-floor probe respectively, not the front
+/// door itself); read them straight from `[network]` where needed.
+#[must_use]
+pub fn retry_above_handshakes(config: &MultiviewConfig) -> usize {
+    config.network.as_ref().map_or(
+        multiview_frontdoor::quic::DEFAULT_RETRY_ABOVE_HANDSHAKES,
+        |n| n.quic.retry_above_handshakes,
+    )
+}
+
+/// [`retry_above_handshakes`]'s sibling for the nft-floor status file path.
+#[must_use]
+pub fn nft_floor_status_file(config: &MultiviewConfig) -> std::path::PathBuf {
+    config.network.as_ref().map_or_else(
+        || std::path::PathBuf::from(multiview_config::network_tls::DEFAULT_NFT_FLOOR_STATUS_FILE),
+        |n| n.udp.nft_floor_status_file.clone(),
+    )
 }
 
 /// Warn about the legacy keys `[network]` deprecates (one release, then
@@ -237,6 +468,11 @@ impl FrontDoorRun {
     /// Sockets passed by systemd ([`set_inherited_sockets`]) are used for the
     /// listeners whose type and port they match (UDP `https_port`, TCP door
     /// port, redirect port); the rest bind their own (slice 6, #292).
+    ///
+    /// Logs one line at start naming the steering mode, rcvbuf
+    /// requested/granted/usable/clamped, kernel-drop support, and the nft
+    /// floor (design note, "Slice 3 as built, part B"); starts the nft-floor re-reader on
+    /// the front door's own runtime (never the program runtime).
     #[must_use]
     pub fn start(config: &MultiviewConfig) -> Option<Self> {
         Self::start_with(config, take_inherited_sockets())
@@ -256,10 +492,46 @@ impl FrontDoorRun {
             fd_config.port,
         ));
         let run = match multiview_frontdoor::FrontDoor::start_with(&fd_config, udp) {
-            Ok(door) => {
+            Ok(mut door) => {
+                let lane = door.take_quic_lane().ok();
+                let port = door.local_addr().port();
+                let alt_svc_allowed = config
+                    .network
+                    .as_ref()
+                    .is_none_or(multiview_config::NetworkConfig::alt_svc_enabled);
+                let refuse_source = refuse_source_from(config);
+                let nft_path = nft_floor_status_file(config);
+                let initial_floor = crate::nft_floor::probe(&nft_path);
+                let buffers = door.buffer_report();
+                tracing::info!(
+                    local = %door.local_addr(),
+                    steering = ?door.steering(),
+                    rcvbuf_requested = buffers.requested,
+                    rcvbuf_granted = buffers.granted,
+                    rcvbuf_usable = buffers.usable,
+                    rcvbuf_clamped = buffers.clamped,
+                    kernel_drops_supported = door.kernel_drops_supported(),
+                    nft_floor = ?initial_floor,
+                    "front door: started"
+                );
+                let nft_floor = Arc::new(NftFloorCell::new(initial_floor));
+                door.handle()
+                    .spawn(reread_nft_floor(nft_path, Arc::clone(&nft_floor)));
                 let mut run = Self {
                     door,
+                    retry_counter: Arc::new(AtomicU64::new(0)),
+                    retry_above_handshakes: retry_above_handshakes(config),
+                    nft_floor,
                     ice_tcp: false,
+                    h3: H3Slot {
+                        lane: Mutex::new(lane),
+                        moq: Mutex::new(None),
+                        alt_svc: Arc::new(multiview_control::h3_site::AltSvc::new(port)),
+                        alt_svc_allowed,
+                        endpoint: Arc::new(Mutex::new(None)),
+                        starter: Mutex::new(None),
+                        refuse_source,
+                    },
                 };
                 run.start_tcp(config, &mut inherited);
                 Some(run)
@@ -440,31 +712,162 @@ impl FrontDoorRun {
         self.door.take_ice_tcp_lane().ok()
     }
 
-    /// Take the QUIC lane, wrapped for the `MoQ` listener.
-    #[cfg(feature = "moq-output")]
-    pub fn take_moq_socket(&mut self) -> Option<multiview_moq::provider::SharedSocket> {
-        let lane = self.door.take_quic_lane().ok()?;
+    /// Install `MoQ` on the h3 endpoint (before [`start_h3`](Self::start_h3)).
+    pub fn set_h3_moq(&self, moq: H3Moq) {
+        *lock(&self.h3.moq) = Some(moq);
+    }
+
+    /// The `Alt-Svc` switch the TCP door's site layer reads.
+    #[must_use]
+    pub fn alt_svc(&self) -> Arc<multiview_control::h3_site::AltSvc> {
+        Arc::clone(&self.h3.alt_svc)
+    }
+
+    /// Whether the h3 endpoint is serving.
+    #[must_use]
+    pub fn h3_running(&self) -> bool {
+        lock(&self.h3.endpoint).is_some()
+    }
+
+    /// The h3 endpoint's counters, while it serves (telemetry, tests).
+    #[must_use]
+    pub fn h3_counters(&self) -> Option<Arc<multiview_h3::Counters>> {
+        lock(&self.h3.endpoint)
+            .as_ref()
+            .map(|e| Arc::clone(e.counters()))
+    }
+
+    /// The h3 endpoint's local address, while it serves.
+    #[must_use]
+    pub fn h3_local_addr(&self) -> Option<SocketAddr> {
+        lock(&self.h3.endpoint)
+            .as_ref()
+            .and_then(|e| e.local_addr().ok())
+    }
+
+    /// Start the HTTP/3 endpoint on the QUIC lane (slice 2, design note
+    /// section 5): `site` answers every request, `MoQ` ([`set_h3_moq`](Self::set_h3_moq))
+    /// every WebTransport CONNECT under `/moq/`. Everything (the noq driver,
+    /// the accept loop, each connection, this starter) runs on the front
+    /// door's runtime. With `tls.ready` the endpoint starts only once it
+    /// resolves `true` (ACME: `serving`); `Alt-Svc` turns on once the endpoint
+    /// is up, unless `[network] alt_svc = false`. Without any certificate no
+    /// endpoint starts (a warning says so) and `MoQ` stays unavailable.
+    /// A second call does nothing.
+    pub fn start_h3(&self, site: Arc<dyn multiview_h3::Site>, tls: H3Tls) {
+        let Some(lane) = lock(&self.h3.lane).take() else {
+            return;
+        };
+        let moq = lock(&self.h3.moq).take();
+        let (wt, on_up, fallback) = match moq {
+            Some(m) => (Some(m.wt), Some(m.on_up), m.fallback_tls),
+            None => (None, None, None),
+        };
+        let (config, source) = match (tls.config, fallback) {
+            (Some(config), _) => (config, tls.source),
+            (None, Some(config)) => (config, "MULTIVIEW_MOQ_CERTIFICATE"),
+            (None, None) => {
+                tracing::warn!(
+                    udp = %self.door.local_addr(),
+                    "front door: no certificate for the HTTP/3 endpoint ([network.tls], \
+                     [network] cert_file/key_file or [control.tls] in a `tls` build, or the \
+                     MULTIVIEW_MOQ_CERTIFICATE pair); QUIC is not served, the site stays on \
+                     TCP, MoQ is unavailable, no Alt-Svc"
+                );
+                return;
+            }
+        };
         let established = self.door.quic_established();
-        let peers: multiview_moq::provider::PeerHook = Arc::new(move |peer, up| {
+        let peers: multiview_h3::PeersHook = Arc::new(move |peer, up| {
             if up {
                 established.insert(peer);
             } else {
                 established.remove(peer);
             }
         });
-        Some(multiview_moq::provider::SharedSocket {
+        let runtime = self.door.handle();
+        if self.h3.refuse_source.is_some() {
+            tracing::info!(
+                "behind_proxy: QUIC from trusted_proxies is refused (forwarder hop, client \
+                 address lost); forward UDP with DNAT that preserves source addresses"
+            );
+        }
+        let parts = multiview_h3::EndpointParts {
             socket: Box::new(lane),
             endpoint: multiview_frontdoor::quic::endpoint_config(),
-            incoming: Some(multiview_frontdoor::quic::incoming_caps()),
-            runtime: self.door.handle(),
+            incoming: multiview_frontdoor::quic::incoming_caps(),
+            tls: config,
+            runtime: runtime.clone(),
+            site,
+            wt,
+            limits: multiview_h3::H3Limits::default(),
             peers: Some(peers),
-        })
+            refuse_source: self.h3.refuse_source.clone(),
+            retry_above_handshakes: Some(self.retry_above_handshakes),
+            retry_counter: Some(Arc::clone(&self.retry_counter)),
+        };
+        let slot = Arc::clone(&self.h3.endpoint);
+        let alt_svc = Arc::clone(&self.h3.alt_svc);
+        let alt_allowed = self.h3.alt_svc_allowed;
+        let ready = tls.ready;
+        let starter = runtime.spawn(async move {
+            if let Some(ready) = ready {
+                tracing::info!("front door: QUIC/HTTP/3 held until the ACME certificate is serving");
+                if !ready.await {
+                    return;
+                }
+            }
+            let moq = parts.wt.is_some();
+            match multiview_h3::H3Endpoint::start(parts).await {
+                Ok(endpoint) => {
+                    let udp = endpoint.local_addr().ok();
+                    *lock(&slot) = Some(endpoint);
+                    if let Some(on_up) = on_up {
+                        on_up();
+                    }
+                    alt_svc.set(alt_allowed);
+                    tracing::info!(
+                        udp = ?udp,
+                        alpn = "h3",
+                        zero_rtt = false,
+                        moq,
+                        certificate = source,
+                        alt_svc = alt_allowed,
+                        alt_svc_why = if alt_allowed {
+                            "endpoint up, [network] alt_svc on"
+                        } else {
+                            "[network] alt_svc = false (UDP declared unreachable)"
+                        },
+                        "front door: HTTP/3 endpoint up (site over h3, MoQ over WebTransport under /moq/)"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, "front door: the HTTP/3 endpoint failed to start; the site stays on TCP, MoQ unavailable, no Alt-Svc");
+                }
+            }
+        });
+        *lock(&self.h3.starter) = Some(starter);
     }
 
     /// Shut the front door down: its runtime (dispatcher, QUIC and WebRTC
     /// tasks) stops and the socket is closed, waiting at most
     /// [`multiview_frontdoor::SHUTDOWN_TIMEOUT`] on a blocking-pool thread.
     pub async fn shutdown(self) {
+        // The h3 endpoint first (Alt-Svc off, connections closed, bounded by
+        // its shutdown timeout), then the runtime it runs on.
+        self.h3.alt_svc.set(false);
+        if let Some(starter) = lock(&self.h3.starter).take() {
+            starter.abort();
+        }
+        let endpoint = lock(&self.h3.endpoint).take();
+        if let Some(endpoint) = endpoint {
+            if tokio::time::timeout(H3_SHUTDOWN_BOUND, endpoint.shutdown())
+                .await
+                .is_err()
+            {
+                tracing::warn!("front door: the HTTP/3 endpoint did not drain in time");
+            }
+        }
         let door = self.door;
         if tokio::task::spawn_blocking(move || door.shutdown_blocking())
             .await
@@ -479,6 +882,139 @@ impl FrontDoorRun {
     pub fn stats(&self) -> Arc<multiview_frontdoor::Stats> {
         self.door.stats()
     }
+
+    /// The startup capability snapshot (`GET /api/v1/system/capabilities`,
+    /// design note "Slice 3 as built, part B"): steering mode, rcvbuf report, kernel-drop
+    /// support, and the nft floor **as read at startup** (the live value is
+    /// `/api/v1/metrics/frontdoor`).
+    #[must_use]
+    pub fn capability(&self) -> multiview_control::system::NetworkCapability {
+        network_capability(&self.door, self.nft_floor.load())
+    }
+
+    /// A [`multiview_control::frontdoor_metrics::FrontDoorMetricsSource`]
+    /// over this run's live counters, steering mode and nft floor.
+    #[must_use]
+    pub fn metrics_source(
+        &self,
+    ) -> Arc<dyn multiview_control::frontdoor_metrics::FrontDoorMetricsSource> {
+        Arc::new(LiveFrontDoorMetrics {
+            stats: self.door.stats(),
+            mode: self.door.steering(),
+            retry_counter: Arc::clone(&self.retry_counter),
+            nft_floor: Arc::clone(&self.nft_floor),
+        })
+    }
+}
+
+/// Map the door's steering mode + a resolved nft-floor status onto the
+/// capability DTO (shared by [`FrontDoorRun::capability`] and
+/// [`LiveFrontDoorMetrics`]).
+fn network_capability(
+    door: &multiview_frontdoor::FrontDoor,
+    nft_floor: crate::nft_floor::NftFloorStatus,
+) -> multiview_control::system::NetworkCapability {
+    use multiview_control::system::{NftFloorStatus, RecvBufferCapability, Udp443Steering};
+    let buffers = door.buffer_report();
+    let (udp443_steering, steering_reason) = match door.steering() {
+        multiview_frontdoor::SteeringMode::ReuseportCbpf => (Udp443Steering::ReuseportCbpf, None),
+        multiview_frontdoor::SteeringMode::SingleSocket { reason } => {
+            (Udp443Steering::SingleSocket, Some(reason))
+        }
+    };
+    multiview_control::system::NetworkCapability {
+        udp443_steering,
+        steering_reason,
+        recv_buffer: RecvBufferCapability {
+            requested: u64::try_from(buffers.requested).unwrap_or(u64::MAX),
+            granted: u64::try_from(buffers.granted).unwrap_or(u64::MAX),
+            usable: u64::try_from(buffers.usable).unwrap_or(u64::MAX),
+            clamped: buffers.clamped,
+        },
+        kernel_drops_supported: door.kernel_drops_supported(),
+        nft_floor: match nft_floor {
+            crate::nft_floor::NftFloorStatus::Present => NftFloorStatus::Present,
+            crate::nft_floor::NftFloorStatus::Absent => NftFloorStatus::Absent,
+            crate::nft_floor::NftFloorStatus::Unknown => NftFloorStatus::Unknown,
+        },
+    }
+}
+
+/// [`FrontDoorRun::metrics_source`]'s implementation: every field is a
+/// wait-free atomic load (invariant #10), never an engine channel.
+struct LiveFrontDoorMetrics {
+    stats: Arc<multiview_frontdoor::Stats>,
+    mode: multiview_frontdoor::SteeringMode,
+    retry_counter: Arc<AtomicU64>,
+    nft_floor: Arc<NftFloorCell>,
+}
+
+impl multiview_control::frontdoor_metrics::FrontDoorMetricsSource for LiveFrontDoorMetrics {
+    fn read(&self) -> Option<multiview_control::frontdoor_metrics::FrontDoorMetricsReport> {
+        use multiview_control::system::{NftFloorStatus, Udp443Steering};
+        let s = self.stats.snapshot();
+        let udp443_steering = match self.mode {
+            multiview_frontdoor::SteeringMode::ReuseportCbpf => Udp443Steering::ReuseportCbpf,
+            multiview_frontdoor::SteeringMode::SingleSocket { .. } => Udp443Steering::SingleSocket,
+        };
+        let nft_floor = match self.nft_floor.load() {
+            crate::nft_floor::NftFloorStatus::Present => NftFloorStatus::Present,
+            crate::nft_floor::NftFloorStatus::Absent => NftFloorStatus::Absent,
+            crate::nft_floor::NftFloorStatus::Unknown => NftFloorStatus::Unknown,
+        };
+        Some(
+            multiview_control::frontdoor_metrics::FrontDoorMetricsReport {
+                received: s.received,
+                to_quic: s.to_quic,
+                to_rtc: s.to_rtc,
+                dropped_classify: s.dropped_classify,
+                dropped_per_source: s.dropped_per_source,
+                dropped_global: s.dropped_global,
+                dropped_vn: s.dropped_vn,
+                dropped_initial: s.dropped_initial,
+                dropped_queue_full: s.dropped_queue_full,
+                dropped_no_consumer: s.dropped_no_consumer,
+                recv_errors: s.recv_errors,
+                tracked_sources: s.tracked_sources,
+                received_established_socket: s.received_established_socket,
+                received_listener_socket: s.received_listener_socket,
+                steered_unverified: s.steered_unverified,
+                steering_overflow: s.steering_overflow,
+                steering_updates: s.steering_updates,
+                steering_update_errors: s.steering_update_errors,
+                steered_peers: s.steered_peers,
+                kernel_drops_listener: s.kernel_drops_listener,
+                kernel_drops_established: s.kernel_drops_established,
+                dropped_stun_per_source: s.dropped_stun_per_source,
+                dropped_stun_global: s.dropped_stun_global,
+                dropped_established_peer: s.dropped_established_peer,
+                quic_retries: self.retry_counter.load(Ordering::Relaxed),
+                udp443_steering,
+                nft_floor,
+            },
+        )
+    }
+}
+
+/// Re-read the nft-floor status file every
+/// [`crate::nft_floor::NFT_FLOOR_REREAD_INTERVAL`] into `cell`. Runs on the
+/// front-door runtime (never the program runtime, invariant #1): a plain
+/// file read every 10 minutes is cheap and never blocks a data-plane path.
+async fn reread_nft_floor(path: std::path::PathBuf, cell: Arc<NftFloorCell>) {
+    let mut tick = tokio::time::interval(crate::nft_floor::NFT_FLOOR_REREAD_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick fires immediately; the caller already probed once at
+    // startup, so skip it to avoid a redundant duplicate read.
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let path = path.clone();
+        if let Ok(status) =
+            tokio::task::spawn_blocking(move || crate::nft_floor::probe(&path)).await
+        {
+            cell.store(status);
+        }
+    }
 }
 
 /// The run's TLS-ALPN-01 challenge resolver (ACME certificate, with
@@ -489,39 +1025,6 @@ impl FrontDoorRun {
 #[must_use]
 pub fn front_door_tls() -> Option<Arc<multiview_control::certificate_source::ChallengeResolver>> {
     crate::tls_boot::installed_tls_context().map(|tls| Arc::clone(&tls.resolver))
-}
-
-/// Hold the front-door QUIC lane until the ACME source is serving, then start
-/// `MoQ` on it with the ACME certificate and install the real provider into
-/// `deferred`. Bounded by `shutdown`; a control-plane task, never on the
-/// output clock (it only awaits a watch channel).
-#[cfg(all(feature = "acme", unix, feature = "moq-output"))]
-pub async fn start_moq_when_serving(
-    tls: Arc<multiview_control::tls_setup::TlsContext>,
-    shutdown: impl std::future::Future<Output = ()>,
-    endpoint: String,
-    protocol: String,
-    factory: Option<Arc<dyn multiview_control::moq_provider::AuthorizedFeedFactory>>,
-    socket: multiview_moq::provider::SharedSocket,
-    deferred: Arc<multiview_control::moq_startup::DeferredProvider>,
-) {
-    tracing::info!("front door: QUIC/MoQ held until the ACME certificate is serving");
-    if !crate::tls_boot::wait_serving(Arc::clone(&tls.certificates), shutdown).await {
-        return;
-    }
-    let resolver: Arc<dyn multiview_moq::moq_tokio_rustls::server::ResolvesServerCert> = Arc::new(
-        multiview_control::certificate_source::SourceResolver(Arc::clone(&tls.certificates)),
-    );
-    if let Ok(provider) = multiview_control::moq_startup::start_shared_resolver(
-        endpoint, protocol, factory, socket, resolver,
-    )
-    .await
-    {
-        deferred.set(provider);
-        tracing::info!("front door: certificate serving; QUIC/MoQ started");
-    } else {
-        tracing::error!("front door: MoQ listener failed to start on the QUIC lane");
-    }
 }
 
 #[cfg(test)]

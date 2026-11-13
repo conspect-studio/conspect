@@ -112,6 +112,27 @@ pub enum TlsCommand {
     SetCredential(TlsSetCredentialArgs),
     /// Start an issuance attempt now (recovery).
     Issue(TlsConfigArg),
+    /// Ask Cloudflare's DNS-over-HTTPS resolver for a TXT record exactly as
+    /// the ACME engine's DNS-01 confirmation does (same screened client,
+    /// query and answer check) and print whether the value is seen and, if
+    /// not, why. Exit status 0 when seen, 1 otherwise. Needs no config,
+    /// credential or running engine.
+    DohCheck(TlsDohCheckArgs),
+}
+
+/// Arguments for `multiview tls doh-check`.
+#[derive(Debug, Args)]
+#[non_exhaustive]
+pub struct TlsDohCheckArgs {
+    /// The record name, e.g. `_acme-challenge.example.org`.
+    #[arg(value_name = "FQDN")]
+    pub fqdn: String,
+    /// The expected TXT value (the key authorization digest).
+    #[arg(value_name = "VALUE")]
+    pub value: String,
+    /// Poll every 2 s for up to this many seconds (0 = one query).
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=600))]
+    pub wait: u64,
 }
 
 /// `--config` for `multiview tls` subcommands.
