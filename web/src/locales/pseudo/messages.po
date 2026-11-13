@@ -449,7 +449,7 @@ msgstr ""
 msgid "△ PREVIEW — unconfirmed"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "○ Dark — neither bus"
 msgstr ""
 
@@ -457,7 +457,7 @@ msgstr ""
 msgid "○ PROGRAM — unconfirmed"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "● Amber — PREVIEW"
 msgstr ""
 
@@ -477,7 +477,7 @@ msgstr ""
 msgid "● RED — on air"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "● Red — PROGRAM"
 msgstr ""
 
@@ -913,11 +913,11 @@ msgstr ""
 msgid "Active only"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Active system alarm summary"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Active system alarms only"
 msgstr ""
 
@@ -1121,7 +1121,7 @@ msgstr ""
 msgid "Alarm policy (dwell, severity, latching)"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Alarm summary unavailable"
 msgstr ""
 
@@ -1147,7 +1147,7 @@ msgstr ""
 msgid "Alarms — {alarmCount} active system"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Alarms & engine health"
 msgstr ""
 
@@ -1625,10 +1625,6 @@ msgstr ""
 msgid "AUTO mix over {frames} frames"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:211
-msgid "AUTO rate · transition options"
-msgstr ""
-
 #: src/pages/RelayManagementPage.tsx:66
 #: src/pages/RelayManagementPage.tsx:78
 msgid "Automatic"
@@ -1949,7 +1945,7 @@ msgid "Camera 1"
 msgstr ""
 
 #: src/components/broadcast/BroadcastShell.tsx:45
-#: src/components/broadcast/ProductionDesk.tsx:216
+#: src/components/broadcast/ProductionDesk.tsx:215
 #: src/components/switcher/MixerInputBank.tsx:75
 #: src/events/AutomationPanel.tsx:135
 #: src/iptv/AddSourceDialog.tsx:79
@@ -2699,11 +2695,11 @@ msgstr ""
 msgid "Confirm on-air re-patch"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:216
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Confirm program change"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:216
+#: src/components/broadcast/ProductionDesk.tsx:215
 #: src/pages/OutputFeedRow.tsx:407
 #: src/pages/RoutingPage.tsx:662
 msgid "Confirm take"
@@ -5988,7 +5984,7 @@ msgid "Layout saved, not applied: the switcher is on"
 msgstr ""
 
 #: src/app/navigation.tsx:53
-#: src/components/broadcast/ProductionDesk.tsx:207
+#: src/components/broadcast/ProductionDesk.tsx:213
 #: src/docs/registry.ts:227
 #: src/pages/DashboardPage.tsx:58
 #: src/pages/docs/FeaturesPage.tsx:25
@@ -6266,7 +6262,7 @@ msgstr ""
 msgid "Loading"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Loading alarm summary"
 msgstr ""
 
@@ -6886,10 +6882,6 @@ msgstr ""
 msgid "More"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:212
-msgid "More keys — unavailable"
-msgstr ""
-
 #: src/pages/approved/MediaSurface.tsx:102
 msgid "Most recent"
 msgstr ""
@@ -7203,7 +7195,7 @@ msgstr ""
 msgid "No active stream."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "No active system alarms reported"
 msgstr ""
 
@@ -7815,7 +7807,7 @@ msgstr ""
 msgid "Observed {0} at {1}: {2} (feels like {3}), humidity {4}, wind {5} {6}, pressure {7}."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:207
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Observed tiles"
 msgstr ""
 
@@ -7958,7 +7950,7 @@ msgstr ""
 msgid "Open a ticket to read and reply to its thread."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Open alarms"
 msgstr ""
 
@@ -7975,7 +7967,7 @@ msgstr ""
 msgid "Open in VLC"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:207
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Open live monitoring"
 msgstr ""
 
@@ -8539,6 +8531,11 @@ msgstr ""
 #. placeholder {0}: props.id
 #: src/pages/MonitoringPage.tsx:376
 msgid "Preview — input {0}"
+msgstr ""
+
+#. placeholder {0}: source.name
+#: src/components/broadcast/ProductionDesk.tsx:207
+msgid "Preview {0}"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:183
@@ -9470,6 +9467,10 @@ msgstr ""
 msgid "Route {row}"
 msgstr ""
 
+#: src/components/broadcast/ProductionDesk.tsx:207
+msgid "Route / patch"
+msgstr ""
+
 #: src/pages/AudioPage.tsx:1522
 msgid "Route each input's audio: program-mix membership and discrete tracks."
 msgstr ""
@@ -9839,6 +9840,10 @@ msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:768
 msgid "Select {name} for bulk add"
+msgstr ""
+
+#: src/components/broadcast/ProductionDesk.tsx:207
+msgid "Select a source to Preview"
 msgstr ""
 
 #. placeholder {0}: String(catalogue.entries.length)
@@ -10589,10 +10594,6 @@ msgstr ""
 msgid "Switch"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:202
-msgid "Switch PGM/PVW, watch the wall, feel the tally."
-msgstr ""
-
 #: src/pages/SettingsPage.tsx:175
 msgid "Switch the interface language and text direction."
 msgstr ""
@@ -10768,19 +10769,23 @@ msgstr ""
 msgid "Tally"
 msgstr ""
 
+#: src/components/broadcast/ProductionDesk.tsx:213
+msgid "Tally & engine status"
+msgstr ""
+
 #: src/pages/OverlaysPage.tsx:134
 msgid "Tally binding (optional)"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:207
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Tally follows the engine bus IDs; source presence does not prove signal."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Tally is separate from signal and output transmission."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "Tally legend"
 msgstr ""
 
@@ -11279,7 +11284,7 @@ msgstr ""
 msgid "The production rundown is unavailable: no show-control contract exists. No video switch occurs here; the Desk PROGRAM monitor is the only truth for what viewers see."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:216
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "The program bus changes what viewers see. Acceptance is not completion."
 msgstr ""
 
@@ -11925,7 +11930,7 @@ msgstr ""
 msgid "unavailable"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:207
+#: src/components/broadcast/ProductionDesk.tsx:213
 #: src/pages/approved/MediaSurface.tsx:30
 msgid "Unavailable"
 msgstr ""
@@ -11981,8 +11986,8 @@ msgstr ""
 
 #: src/components/broadcast/library/MetadataInspector.tsx:201
 #: src/components/broadcast/ProducerStatus.tsx:72
-#: src/components/broadcast/ProductionDesk.tsx:216
-#: src/components/broadcast/ProductionDesk.tsx:216
+#: src/components/broadcast/ProductionDesk.tsx:215
+#: src/components/broadcast/ProductionDesk.tsx:215
 #: src/pages/approved/RoutingSurface.tsx:44
 #: src/pages/approved/SourcesSurface.tsx:326
 #: src/pages/MediaPlayersPage.tsx:355
@@ -12642,7 +12647,7 @@ msgstr ""
 msgid "WIPE and DIP have no supported control contract"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:212
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "WIPE, DIP, USK, DSK and AUX have no supported control contract."
 msgstr ""
 
