@@ -114,25 +114,41 @@ pub fn set_current_thread_slice(slice_ns: u64) -> Slice {
     let Some(mut attr) = current_attr(size) else {
         return Slice::Refused(last_errno());
     };
+    // The ABI version this struct is (VER0, 48 bytes: no `sched_util_*`, and
+    // no SCHED_FLAG_UTIL_* flag is passed). Set explicitly, never inherited.
+    attr.size = size;
     attr.sched_policy = 0; // SCHED_OTHER
     attr.sched_flags = 0;
     attr.sched_priority = 0;
     attr.sched_runtime = slice_ns;
     attr.sched_deadline = 0;
     attr.sched_period = 0;
-    // SAFETY: `attr` is a fully initialised `sched_attr` whose `size` field
-    // is its own size; pid 0 targets the calling thread only; flags 0. The
-    // kernel only reads `attr`. A syscall returns a value, it cannot unwind.
+    // SAFETY: `attr` is a fully initialised `sched_attr` whose `size` field is
+    // set just above to its own size (the VER0 layout libc declares); pid 0
+    // targets the calling thread only; flags 0. The kernel only reads `attr`.
+    // A syscall returns a value, it cannot unwind.
     let rc = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, std::ptr::addr_of!(attr), 0_u32) };
     if rc != 0 {
         return Slice::Refused(last_errno());
     }
+    // The kernel clamps a custom request to 0.1..100 ms and otherwise reports
+    // its base slice, so only an exact read-back of the clamped request means
+    // the request is in force (a kernel that ignores the field reads back its
+    // default).
+    let expected = slice_ns.clamp(SLICE_MIN_NS, SLICE_MAX_NS);
     match current_attr(size) {
-        Some(now) if now.sched_runtime > 0 => Slice::Applied(now.sched_runtime),
+        Some(now) if now.sched_runtime == expected => Slice::Applied(now.sched_runtime),
         Some(_) => Slice::Unsupported,
         None => Slice::Refused(last_errno()),
     }
 }
+
+/// The kernel's clamp on a custom fair-class request size (Linux 6.12
+/// `sched/syscalls.c`: 0.1 ms .. 100 ms).
+#[cfg(target_os = "linux")]
+const SLICE_MIN_NS: u64 = 100_000;
+#[cfg(target_os = "linux")]
+const SLICE_MAX_NS: u64 = 100_000_000;
 
 /// The calling thread's current `sched_attr`, `None` on error (see errno).
 #[cfg(target_os = "linux")]
@@ -140,6 +156,7 @@ pub fn set_current_thread_slice(slice_ns: u64) -> Slice {
 fn current_attr(size: u32) -> Option<libc::sched_attr> {
     // SAFETY: an all-zero `sched_attr` is a valid value (plain integers).
     let mut attr: libc::sched_attr = unsafe { std::mem::zeroed() };
+    attr.size = size;
     // SAFETY: `attr` is a writable, correctly sized `sched_attr` and `size`
     // is its size; pid 0 is the calling thread; flags 0. The kernel writes at
     // most `size` bytes into it. A syscall cannot unwind.
@@ -183,12 +200,17 @@ mod tests {
         let outcome = std::thread::spawn(move || {
             let before = current_attr(size).map(|a| a.sched_nice);
             let slice = set_current_thread_slice(300_000);
-            let after = current_attr(size).map(|a| a.sched_nice);
-            (slice, before, after)
+            let after = current_attr(size);
+            (
+                slice,
+                before,
+                after.map(|a| a.sched_nice),
+                after.map(|a| a.sched_runtime),
+            )
         })
         .join()
         .ok();
-        let Some((slice, before, after)) = outcome else {
+        let Some((slice, before, after, runtime)) = outcome else {
             panic!("the probe thread panicked");
         };
         assert!(
@@ -196,6 +218,9 @@ mod tests {
             "{slice:?}"
         );
         assert!(before.is_some());
+        if matches!(slice, Slice::Applied(_)) {
+            assert_eq!(runtime, Some(300_000), "the kernel reads back the request");
+        }
         assert_eq!(before, after, "the nice value is unchanged");
         if matches!(slice, Slice::Applied(_)) {
             let here = current_attr(size).map(|a| a.sched_runtime);

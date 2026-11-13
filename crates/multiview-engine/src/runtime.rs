@@ -939,11 +939,11 @@ impl<P: Pacer> EngineRuntime<P> {
                     stop: RunStop::Stopped,
                 });
             }
-            // Wake lateness (#311): the wait's return minus the deadline,
-            // apart from the compose that follows. One time read + atomics.
-            self.phases
-                .wake
-                .record(self.time_source.now_nanos(), deadline);
+            // Wake lateness (#311): the instant the wait returned, recorded
+            // below against the deadline of the tick that is composed fresh
+            // (after any cadence-hold repeats), so a fresh tick's emit
+            // lateness is its wake plus its compose. One time read.
+            let t_wake = self.time_source.now_nanos();
 
             // 1.5 DROP/REPEAT-TO-CADENCE (ADR-T018). If compose has fallen behind
             //     wall-clock (a CPU/GPU-contended host), re-emit the held last-good
@@ -1069,6 +1069,10 @@ impl<P: Pacer> EngineRuntime<P> {
             //     Each phase boundary below is one time-source read feeding the
             //     wait-free phase histograms (#311), so the cost of a tick is
             //     attributable without a profiler.
+            self.phases.wake.record(
+                t_wake,
+                self.clock.deadline_nanos(tick.index, self.seed_nanos),
+            );
             let t_hook = self.time_source.now_nanos();
             control.before_compose(&mut self.drive, tick);
             repeats_since_control = 0;

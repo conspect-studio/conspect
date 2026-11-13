@@ -373,3 +373,59 @@ fn forced_parallel_matches_forced_serial_byte_for_byte() {
         "parallel UV plane must equal the serial reference byte-for-byte"
     );
 }
+
+/// #311 reopen (review L3): the composited canvas is shared, so consumers (the
+/// encode queue, the preview, the held last-good frame) keep a few recent
+/// canvases alive past the tick and return their planes in bursts. With up to
+/// three canvases outstanding at any time the steady state still allocates no
+/// output plane.
+#[test]
+fn output_planes_are_reused_while_consumers_hold_recent_canvases() {
+    let backend = RunBackend::cpu();
+    let img = flat_tile(96, 96, TransferCharacteristic::Bt709);
+    let tiles = [Tile::placed(&img, 8, 8, 1.0)];
+    let compose = || {
+        std::sync::Arc::new(
+            backend
+                .composite(
+                    SERIAL.0,
+                    SERIAL.1,
+                    CanvasColor::default(),
+                    LinearRgba::TRANSPARENT,
+                    &tiles,
+                )
+                .expect("composite"),
+        )
+    };
+    let mut held = std::collections::VecDeque::new();
+    // Warm up to the steady depth (three canvases held at once).
+    for _ in 0..4 {
+        held.push_back(compose());
+        if held.len() > 3 {
+            held.pop_front();
+        }
+    }
+    let warm = backend.scratch_alloc_count();
+    for tick in 0..TICKS {
+        held.push_back(compose());
+        // Consumers let go irregularly: sometimes two at once, sometimes none.
+        let release = if tick % 3 == 0 {
+            0
+        } else {
+            1 + usize::from(tick % 2 == 0)
+        };
+        for _ in 0..release {
+            if held.len() > 1 {
+                held.pop_front();
+            }
+        }
+        while held.len() > 3 {
+            held.pop_front();
+        }
+    }
+    assert_eq!(
+        backend.scratch_alloc_count(),
+        warm,
+        "no output plane is allocated per tick while up to three canvases are held"
+    );
+}

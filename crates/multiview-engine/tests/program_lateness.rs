@@ -244,3 +244,28 @@ async fn the_canvas_is_shared_by_every_consumer_and_by_its_repeats() {
         }
     }
 }
+
+/// Review L1 (#357): with cadence-hold repeats between fresh ticks, the wake
+/// lateness is charged to the tick that is composed fresh (the freshest due
+/// tick), never to an older tick the repeat walk already emitted. So a fresh
+/// tick's wake stays under one period however far behind the loop is, and
+/// the backlog shows up as repeats and emit lateness, not as wake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wake_lateness_is_charged_to_the_fresh_tick_after_repeats() {
+    // 100 ms per compose at 40 ms ticks: every fresh tick follows repeats.
+    let (runtime, ticks) = run_with_compose_cost(Duration::from_millis(100), 60).await;
+    let p = runtime.phases().snapshot();
+    let emit = runtime.lateness().snapshot();
+    assert!(runtime.frames_repeated() > 0);
+    assert_eq!(emit.count, ticks);
+    assert_eq!(
+        p.wake.count + runtime.frames_repeated(),
+        ticks,
+        "one wake per fresh tick"
+    );
+    assert!(
+        p.wake.max_ns < 40_000_000,
+        "a fresh tick is the freshest due tick: its wake is under one period: {p:?}"
+    );
+    assert_eq!(p.compose.max_ns, 100_000_000);
+}

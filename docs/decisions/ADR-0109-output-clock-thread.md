@@ -273,6 +273,9 @@ host has no GPU), with the split metric:
   | slice 300 µs + nice −10 | 0.06–0.12 ms | 2.5–4.3 ms | 9–12 ms | 0 |
 
   On one core with six pure spinners: default wake p99 12.4–12.7 ms, slice 2.2–2.3 ms.
+  (The first cut of this change never applied the slice: `sched_setattr` needs
+  `attr.size` set, and `sched_getattr` does not fill it. Fixed in review; the
+  read-back now must equal the clamped request to count as applied.)
   The slice fixes the wake; niceness (weight) is what keeps the clock's *work*
   from being time-shared with the neighbours.
 * **A per-tick 1080p canvas deep copy** sat on the clock thread: the projection
@@ -292,6 +295,10 @@ Changes:
 1. `CompositedFrame::canvas` is an `Arc<Nv12Image>`: the compositor's output is
    shared by every consumer (encode hand-off, preview, display, NDI, the held
    last-good frame and its repeats). No canvas copy runs on the clock thread.
+   Because consumers now release a canvas when the last of them lets go, the
+   CPU compositor's output-plane return cache keeps up to three spare planes
+   per kind (was one), so a steady run allocates no plane while up to three
+   canvases are outstanding; any surplus return is dropped (bounded memory).
 2. The clock thread asks for a 300 µs EEVDF request size
    (`sched_setattr(SCHED_OTHER, sched_runtime)` through the FFI leaf
    `multiview-clocksys`; it keeps `SCHED_OTHER` and the thread's weight, so it
@@ -320,9 +327,12 @@ Changes:
 * 0 repeats while compose p99 stays below one period (unchanged, ADR-T018).
 
 The R3 chaos test `crates/multiview-engine/tests/clock_slice_chaos.rs` pins a
-real clock thread and six spinning threads to one core and asserts, where the
-kernel applies the slice: every tick emitted, 0 repeats, every wake within half
-a period; the default-slice run is reported beside it.
+real clock thread (2 ms of work per tick) and six spinning threads to one core
+and asserts, where the kernel applies the slice: every tick emitted, 0 repeats,
+every wake under 10 ms (the one-core oversubscribed ceiling; measured 4–6.7 ms
+with the slice, 11.9 ms with the default request size), and the mean wake at
+most half the default run's when that run was contended (measured 0.2–0.5 ms
+vs 2.1–2.3 ms).
 
 ## Rationale
 
