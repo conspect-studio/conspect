@@ -36,6 +36,16 @@ implementation will build against.
 
 ### Added
 
+- **The site and MoQ over HTTP/3 on the front door's UDP port (front-door slice 2, #288)**:
+  with `[network] https_port`, the QUIC lane of the shared UDP socket is served by the new
+  `multiview-h3` endpoint: every site and API request answers over HTTP/3 through the same router
+  as the TCP door, and MoQ is a WebTransport session under `/moq/` on the same endpoint (single-use
+  ticket checked before the session, `401`/`429` otherwise). 0-RTT is off. The TCP door advertises
+  it with `alt-svc: h3=":<https_port>"; ma=86400` once the endpoint is up; `[network] alt_svc =
+  false` turns the advertisement off when UDP is known unreachable. With `[network.tls]` the
+  endpoint starts only once the certificate is serving. `MULTIVIEW_MOQ_ENDPOINT` must now point
+  under `/moq` (`https://<host>/moq`; a bare host is normalised with a warning). Runbook:
+  `docs/runbooks/front-door-cutover.md` ("HTTP/3 and Alt-Svc").
 - **The engine serves TCP 443, TCP 80 and UDP 443 itself; nginx is no longer needed (front-door
   slice 6, #292)**: systemd socket activation (`deploy/systemd/conspect.socket`: TCP 443, TCP 80
   and a `ReusePort=yes` UDP 443 pair, so validated-flow steering survives) keeps the sockets
