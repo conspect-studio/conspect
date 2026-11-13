@@ -1496,16 +1496,19 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
         RunOutput {
             id: None,
             settings: 0,
+            feed_format: None,
             routable: true,
         },
         RunOutput {
             id: Some("renamed".into()),
             settings: 0,
+            feed_format: None,
             routable: true,
         },
         RunOutput {
             id: Some("zz-first".into()),
             settings: 0,
+            feed_format: None,
             routable: false,
         },
     ]);
@@ -1880,11 +1883,13 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
         RunOutput {
             id: Some("a".into()),
             settings: 0,
+            feed_format: None,
             routable: true,
         },
         RunOutput {
             id: Some("b".into()),
             settings: 0,
+            feed_format: None,
             routable: true,
         },
     ]);
@@ -2521,4 +2526,85 @@ fn a_formatted_output_falls_back_to_its_own_base_key() {
         x.tick(t);
     }
     assert_eq!(x.d.binding_video_key(0), Some(x.r.cfg.base_keys[0]));
+}
+
+/// #342 review A2: the published live key carries the output format, and the
+/// plan counts a take at a different format onto the same source as +1.
+#[test]
+fn the_plan_counts_a_different_format_as_plus_one() {
+    use multiview_control::output_routing::{OutputRouting, RoutedFeed};
+    let mut x = harness(2, 6, None);
+    x.r.cfg.formats = vec![Some(vertical_format()), None];
+    let h = x.h.clone().with_outputs(vec![
+        RunOutput {
+            id: Some("tall".into()),
+            settings: 0,
+            feed_format: Some(vertical_format()),
+            routable: true,
+        },
+        RunOutput {
+            id: Some("wide".into()),
+            settings: 0,
+            feed_format: None,
+            routable: true,
+        },
+    ]);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let cam = RoutedFeed::Source("cam".into());
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("a", 0, src())).unwrap();
+    take_until_applied(&mut x, &["a"], 5);
+    let name = crate::routing_aux::feed_name(&src(), Some(vertical_format()));
+    assert_eq!(x.h.snapshot().live_keys, vec![(name, 0)]);
+    assert!(
+        adapter.plan("wide", &cam).unwrap().needs_encoder,
+        "same settings index, other format: +1"
+    );
+    assert!(
+        !adapter.plan("tall", &cam).unwrap().needs_encoder,
+        "same (bus, format, settings): +0"
+    );
+}
+
+/// #342 review A2: the format-keyed feed set is bounded by the dynamic-key
+/// caps (live keys + opens <= max_encoders) plus pending takes, whatever the
+/// number of distinct formats requested.
+#[test]
+fn format_keyed_feeds_are_bounded_by_the_encoder_cap() {
+    const OUTPUTS: usize = 6;
+    const MAX: usize = 2;
+    let mut x = harness(OUTPUTS, MAX, None);
+    x.r.cfg.max_per_principal = OUTPUTS;
+    x.r.cfg.formats = (0..OUTPUTS)
+        .map(|i| {
+            Some(crate::routing_aux::AuxFormat::new(
+                64 + 16 * u32::try_from(i).unwrap(),
+                64,
+                multiview_config::OutputFit::default(),
+            ))
+        })
+        .collect();
+    for t in 0..5 {
+        x.tick(t);
+    }
+    for i in 0..OUTPUTS {
+        x.h.try_take(take(&i.to_string(), i, src())).unwrap();
+    }
+    let mut max_feeds = 0;
+    for t in 5..5 + OPEN_DEADLINE_TICKS {
+        x.tick(t);
+        max_feeds = max_feeds.max(x.r.feed_keys().len());
+        assert!(x.r.dynamic_keys().len() <= MAX, "encoder cap holds");
+    }
+    assert!(
+        max_feeds <= MAX + OUTPUTS,
+        "feeds <= max_encoders + pending takes: {max_feeds}"
+    );
+    // Once the takes settle (refused beyond the cap), only live keys hold feeds.
+    assert!(x.r.feed_keys().len() <= MAX, "{:?}", x.r.feed_keys());
+    assert_eq!(x.r.dynamic_keys().len(), MAX);
 }

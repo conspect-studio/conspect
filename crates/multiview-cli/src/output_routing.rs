@@ -240,9 +240,11 @@ pub struct RoutingSnapshot {
     pub audio_buses_live: usize,
     /// Routed-audio counters (opened, failed, refused, faded back).
     pub audio: crate::routing_audio::AudioRoutingCounters,
-    /// Live-opened encoder keys as `(bus name, settings index)`, sorted,
+    /// Live-opened encoder keys as `(feed name, settings index)`, sorted,
     /// lingering ones included and failed ones excluded: a take onto one of
-    /// these reuses it (+0 encoders).
+    /// these reuses it (+0 encoders). The feed name is the bus name for the
+    /// canvas format and `bus@WxH/mode/anchor` for an output format (#342):
+    /// a different format is a different key (+1).
     pub live_keys: Vec<(String, usize)>,
 }
 
@@ -270,8 +272,12 @@ pub struct RunOutput {
     /// The output's config id (`None` for an internal sink, e.g. the
     /// `program.ts` anchor).
     pub id: Option<String>,
-    /// The base (Program) encoder settings index.
+    /// The base (Program) encoder settings index (names its codec settings
+    /// AND its base format, #342).
     pub settings: usize,
+    /// The format a routed source/PVW is composed at for this output (#342;
+    /// `None` = the canvas with the default fit).
+    pub feed_format: Option<AuxFormat>,
     /// Whether slice 1 can cut this output cleanly (its encoder family has
     /// the parameter-set RAP check; VAAPI/VideoToolbox do not, §4.2).
     pub routable: bool,
@@ -1826,7 +1832,13 @@ impl OutputRouter {
         }
     }
 
-    /// Keep the feed set equal to the buses in use. The aux thread is handed
+    /// Keep the feed set equal to the buses in use.
+    ///
+    /// Bounded (#342 review A2): every feed is wanted by a live key, an open
+    /// or a pending take, so the set holds at most `max_encoders` (live keys
+    /// plus opens, which `has_capacity` caps) plus one per output with a
+    /// pending take, whatever the formats. There is no separate
+    /// `routing.max_aux_canvases` setting to enforce. The aux thread is handed
     /// (and the clock's send gate raised for) only the buses it composes
     /// (Preview, sources): routing only Clean never wakes it.
     fn sync_feeds(&mut self) {
@@ -1881,7 +1893,7 @@ impl OutputRouter {
             .dynamic
             .iter()
             .filter(|d| !dispatcher.is_key_failed(d.key))
-            .map(|d| (d.bus.as_str().into_owned(), d.settings))
+            .map(|d| (crate::routing_aux::feed_name(&d.bus, d.format), d.settings))
             .collect();
         keys.sort_unstable();
         keys.dedup();

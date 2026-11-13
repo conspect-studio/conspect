@@ -616,3 +616,49 @@ codec = "{codec}"
         );
     }
 }
+
+fn sized_output(i: u32) -> String {
+    format!(
+        r#"
+[[outputs]]
+kind = "hls"
+id = "o{i}"
+path = "/srv/hls/{i}"
+codec = "h264"
+[outputs.format]
+width = {w}
+height = 720
+"#,
+        w = 640 + 16 * i
+    )
+}
+
+#[test]
+fn more_than_eight_distinct_base_formats_are_refused() {
+    let eight: String = (0..8).map(sized_output).collect();
+    parse(&eight)
+        .validate()
+        .expect("eight distinct base keys fit");
+    // A ninth distinct format is a ninth encoder.
+    let nine: String = (0..9).map(sized_output).collect();
+    assert_code(&nine, SLOT_FORMAT_UNSUPPORTED, "9 distinct video encoders");
+    // Repeating a format shares its key: still eight.
+    let shared = eight.clone()
+        + &sized_output(3)
+            .replace("id = \"o3\"", "id = \"again\"")
+            .replace("/srv/hls/3", "/srv/hls/again");
+    parse(&shared)
+        .validate()
+        .expect("a repeated format shares a key");
+    // A different bit rate on the same format is another key.
+    let bitrate = eight
+        + &sized_output(3)
+            .replace("id = \"o3\"", "id = \"fast\"")
+            .replace("/srv/hls/3", "/srv/hls/fast")
+        + "[[outputs.slots.video]]\nbitrate_kbps = 9000\n";
+    assert_code(
+        &bitrate,
+        SLOT_FORMAT_UNSUPPORTED,
+        "9 distinct video encoders",
+    );
+}

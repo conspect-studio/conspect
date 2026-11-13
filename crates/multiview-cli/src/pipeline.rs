@@ -3728,6 +3728,7 @@ impl Pipeline {
             .map(|(index, &settings)| crate::output_routing::RunOutput {
                 id: binding_ids.get(index).cloned().flatten(),
                 settings,
+                feed_format: self.output_formats.get(index).copied().flatten(),
                 routable: self.rendition_configs.get(settings).is_some_and(|cfg| {
                     !(cfg.codec_name.contains("vaapi") || cfg.codec_name.contains("videotoolbox"))
                 }),

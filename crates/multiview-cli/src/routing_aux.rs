@@ -180,23 +180,30 @@ impl AuxFeed {
     /// Build a feed for `bus` composed at `format` (`None` = the canvas).
     #[must_use]
     pub fn with_format(bus: PictureBus, format: Option<AuxFormat>) -> Self {
-        let key: Arc<str> = match format {
-            None => Arc::from(bus.as_str().as_ref()),
-            Some(f) => Arc::from(format!(
-                "{}@{}x{}/{:?}/{:?}",
-                bus.as_str(),
-                f.width,
-                f.height,
-                f.fit.mode,
-                f.fit.anchor
-            )),
-        };
+        let key: Arc<str> = Arc::from(feed_name(&bus, format));
         Self {
             bus,
             format,
             key,
             slot: Arc::new(PictureBusSlot::default()),
         }
+    }
+}
+
+/// The stable name of a (bus, format) feed: the bus name for the canvas
+/// format (exactly as before #342), else `bus@WxH/mode/anchor`.
+#[must_use]
+pub fn feed_name(bus: &PictureBus, format: Option<AuxFormat>) -> String {
+    match format {
+        None => bus.as_str().into_owned(),
+        Some(f) => format!(
+            "{}@{}x{}/{:?}/{:?}",
+            bus.as_str(),
+            f.width,
+            f.height,
+            f.fit.mode,
+            f.fit.anchor
+        ),
     }
 }
 

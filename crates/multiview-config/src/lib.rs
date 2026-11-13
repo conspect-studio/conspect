@@ -1515,6 +1515,26 @@ impl MultiviewConfig {
                 )));
             }
         }
+        // #342 review A2: every distinct base video key is a real encoder
+        // (one per distinct format and slot settings): hold the per-program
+        // ceiling on the keys the engine will actually open. A document that
+        // declares no format and no slots validates exactly as before.
+        let declares = self
+            .outputs
+            .iter()
+            .any(|o| o.format().is_some() || o.slots().is_some());
+        let keys = if declares {
+            rendition::distinct_base_video_keys(self)
+        } else {
+            0
+        };
+        if keys > rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM {
+            return Err(ConfigError::Validation(format!(
+                "{SLOT_FORMAT_UNSUPPORTED}: the outputs need {keys} distinct video encoders \
+                 (one per distinct codec, format and settings); at most {} per program",
+                rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM
+            )));
+        }
         Ok(())
     }
 
