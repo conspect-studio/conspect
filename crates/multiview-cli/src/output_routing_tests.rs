@@ -1068,6 +1068,7 @@ fn inject(
         lost,
         generation,
         silent: 0,
+        starved: 0,
     });
     key
 }
@@ -2124,8 +2125,9 @@ fn a_transient_offer_stall_within_the_gap_fill_horizon_never_degrades() {
         t += 1;
     }
     block.store(true, Ordering::SeqCst);
-    // A stall shorter than MAX_GAP_FILL_TICKS: well under the degraded bound.
-    let stall_ticks = MAX_GAP_FILL_TICKS.saturating_sub(2).max(1);
+    // A short stall (6 ticks, as when this test was written against the old
+    // 8-tick gap-fill bound): well under the degraded bound.
+    let stall_ticks: u64 = 6;
     for _ in 0..stall_ticks {
         x.tick(t);
         t += 1;
@@ -2219,4 +2221,108 @@ fn a_consumer_gap_on_clean_is_substituted_like_program_and_never_fails_the_key()
             .is_some_and(|&first| first <= last_fed_tick),
         "the sequence covers back through the last healthy tick: {ticks:?}"
     );
+}
+
+/// PR #326 round 3 (invariants + abuse lenses): starvation is counted per
+/// KEY. A second, healthy key on the same picture bus (another output with
+/// other encoder settings) accepts its offers every tick; that must not hide
+/// the starved key the output rides: the output is marked degraded at about
+/// `DEGRADED_AFTER_TICKS` refused offers, before any fallback.
+#[test]
+fn a_healthy_sibling_key_never_hides_a_starved_key_on_the_same_bus() {
+    let (mut x, block, release) = blocked_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    assert_eq!(x.d.binding_video_key(1), Some(1), "on the Clean key");
+    // A healthy sibling on Clean (as a second output with other settings).
+    let live = Arc::new(AtomicUsize::new(0));
+    let sibling = inject(
+        &mut x.r,
+        &mut x.d,
+        PictureBus::Clean,
+        Counted::boxed(&live, 0),
+    );
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    block.store(true, Ordering::SeqCst);
+    let wedged_at = t;
+    let mut degraded_at = None;
+    for _ in 0..FALLBACK_AFTER_TICKS + 20 {
+        x.tick(t);
+        let fell_back = x
+            .results()
+            .iter()
+            .any(|r| matches!(r, TakeResult::Fallback(_)));
+        if x.h.snapshot().outputs[1].degraded {
+            degraded_at = Some(t);
+            break;
+        }
+        assert!(
+            !fell_back,
+            "the starved key fell back before it was ever reported degraded"
+        );
+        t += 1;
+    }
+    let degraded_at = degraded_at.expect("the starved key's output is marked degraded");
+    assert!(
+        degraded_at - wedged_at < DEGRADED_AFTER_TICKS + 20,
+        "degraded near the 60-refused-offer bound: {} ticks after the wedge",
+        degraded_at - wedged_at
+    );
+    assert!(
+        x.r.dynamic.iter().any(|d| d.key == sibling),
+        "the healthy sibling key is untouched"
+    );
+    drop(release);
+}
+
+/// PR #326 round 3: a consumer gap while the Clean worker's queue is already
+/// full. Substitution offers are refused; the refused ticks must stay a gap
+/// the key's own `GapFill` closes once the encoder drains, never a jump that
+/// fails the key.
+#[test]
+fn a_consumer_gap_on_a_full_clean_queue_never_fails_the_key() {
+    let (mut x, block, release) = blocked_harness(2);
+    for t in 0..5 {
+        x.tick(t);
+    }
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let (_, now) = apply(&mut x, 5, "c");
+    let mut t = now;
+    for _ in 0..3 {
+        x.tick(t);
+        t += 1;
+    }
+    // Fill the worker's queue (and its in-flight slot).
+    block.store(true, Ordering::SeqCst);
+    for _ in 0..6 {
+        x.tick(t);
+        t += 1;
+    }
+    // A full consumer gap of 8 ticks while the queue is full.
+    let surviving = t + 8;
+    x.tick_after_clean_gap(t, surviving);
+    t = surviving + 1;
+    block.store(false, Ordering::SeqCst);
+    for _ in 0..20 {
+        x.tick(t);
+        t += 1;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let results = x.results();
+    assert!(
+        results
+            .iter()
+            .all(|r| !matches!(r, TakeResult::Fallback(_))),
+        "the Clean key survives the gap: {results:?}"
+    );
+    assert!(!x.d.is_key_failed(1), "the Clean key's worker did not end");
+    assert_eq!(x.d.binding_video_key(1), Some(1), "still on the Clean key");
+    drop(release);
 }
