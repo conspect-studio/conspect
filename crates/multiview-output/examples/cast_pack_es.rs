@@ -3,7 +3,8 @@
 //!
 //! Run: `cargo run -p multiview-output --example cast_pack_es -- <v.h264>
 //! <a.aac|-> <out-dir> [--fps N/D] [--size WxH] [--rate HZ] [--channels N]
-//! [--window N] [--extradata] [--drop-video A-B] [--drop-audio A-B]`
+//! [--window N] [--extradata] [--drop-video A-B] [--drop-audio A-B]
+//! [--loops N] [--realtime]`
 //!
 //! The video stream is split into access units (at AUD NAL units, or at a
 //! slice with `first_mb_in_slice == 0`), the audio stream into ADTS frames;
@@ -11,6 +12,9 @@
 //! order. `--extradata` strips the in-band SPS/PPS and hands them to the
 //! packager as `avcC` extradata (the NVENC shape). `--drop-video` /
 //! `--drop-audio` leave out an index range (inclusive) to exercise gaps.
+//! `--loops N` repeats the input N times on one continuous timeline and
+//! `--realtime` paces the feed at the frame rate, so the directory is a live
+//! stream a player can follow (the Shaka / Cast receiver proof).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -104,6 +108,7 @@ fn main() {
         ((30_000, 1001), (1280, 720), 48_000u32, 2u16);
     let (mut window, mut extradata) = (10usize, false);
     let (mut drop_video, mut drop_audio) = (None, None);
+    let (mut loops, mut realtime) = (1usize, false);
     let mut options = args[3..].iter();
     while let Some(option) = options.next() {
         let mut value = || options.next().expect("option value").as_str();
@@ -116,6 +121,8 @@ fn main() {
             "--extradata" => extradata = true,
             "--drop-video" => drop_video = Some(pair(value(), '-')),
             "--drop-audio" => drop_audio = Some(pair(value(), '-')),
+            "--loops" => loops = value().parse().unwrap(),
+            "--realtime" => realtime = true,
             other => panic!("unknown option {other}"),
         }
     }
@@ -164,15 +171,28 @@ fn main() {
         range.is_some_and(|(from, to)| (from..=to).contains(&index))
     };
     let mut next_audio = 0i64;
-    for (index, unit) in units.iter().enumerate() {
-        let index = i64::try_from(index).unwrap();
+    let started = std::time::Instant::now();
+    let total_units = units.len() * loops.max(1);
+    let total_frames = frames.len() * loops.max(1);
+    for position in 0..total_units {
+        let unit = &units[position % units.len()];
+        let index = i64::try_from(position).unwrap();
+        if realtime {
+            // Frame `index` is due `index * den / num` seconds after the start.
+            let due_ns = u64::try_from(index * fps.1).unwrap() * 1_000_000_000
+                / u64::try_from(fps.0).unwrap();
+            let due = std::time::Duration::from_nanos(due_ns);
+            if let Some(wait) = due.checked_sub(started.elapsed()) {
+                std::thread::sleep(wait);
+            }
+        }
         // Audio that starts before this video frame goes first.
         let limit = i128::from(index) * i128::from(fps.1) * i128::from(rate);
-        while usize::try_from(next_audio).unwrap() < frames.len()
+        while usize::try_from(next_audio).unwrap() < total_frames
             && i128::from(next_audio) * 1024 * i128::from(fps.0) < limit
         {
             if !dropped(drop_audio, next_audio) {
-                let data = frames[usize::try_from(next_audio).unwrap()];
+                let data = frames[usize::try_from(next_audio).unwrap() % frames.len()];
                 packager
                     .push_audio(AudioUnit {
                         pts: next_audio * 1024,
@@ -201,8 +221,8 @@ fn main() {
     let progress = packager.published();
     println!(
         "access units {}, adts frames {}, published video {} audio {} master {} ready {}",
-        units.len(),
-        frames.len(),
+        total_units,
+        total_frames,
         progress.video_segments,
         progress.audio_segments,
         progress.master,
