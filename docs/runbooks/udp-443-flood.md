@@ -11,10 +11,21 @@ clock's own cadence. The design counters this in three independent layers (desig
    second `SO_REUSEPORT` socket by a kernel CBPF program, so a flood fills the listener's queue,
    never the paying viewers'. Already built (slice 3 part A); nothing here configures it.
 2. **This runbook's layer: an nftables per-source floor on UDP 443**, applied *before* a packet
-   reaches the engine's socket. Two tiers, each per IPv4 address and per IPv6 /64:
-   * **new** flows (`ct state new,untracked`): over 2000/s, burst 1000, dropped;
-   * **all** UDP 443 packets, established or not: over 25 000/s, burst 10 000, dropped. That is
-     above the engine's own per-established-peer bucket (20 000/s), so a real viewer never hits it.
+   reaches the engine's socket. Two tiers, each per IPv4 address and per IPv6 /64, and **each
+   packet is charged to exactly one tier** (the base chain jumps to one sub-chain, which ends in
+   `accept` or `drop`):
+   * **new** (`udp443_new`; `ct state new,untracked`, i.e. a flow's datagrams before the server
+     has answered): 2000/s, burst 1000;
+   * **all** (`udp443_all`; every other UDP 443 packet, i.e. established flows): 25 000/s, burst
+     10 000. That is above the engine's own per-established-peer bucket (20 000/s), so a real
+     viewer never hits it.
+
+   Each tier keeps its buckets in a named dynamic set (`size 65536`, `timeout 2m`). When a set is
+   full, a source that is not already in it cannot get a bucket and is **dropped** (fail closed,
+   measured: with `size 2`, a third source delivers 0). That applies to UDP 443 only; the base
+   chain is `policy accept`, so no other traffic on the host is touched. Consequence: during a
+   flood from more than 65 536 distinct sources (per tier) inside 2 minutes, new sources are
+   refused until entries expire — that is beyond this layer anyway (see below).
 
    There is no conntrack "established" exemption. One server reply (a QUIC Retry or Initial, a STUN
    error) is enough for conntrack to call a source established, so an exemption would let that
@@ -26,7 +37,7 @@ clock's own cadence. The design counters this in three independent layers (desig
 
 The engine runs unprivileged (no `CAP_NET_ADMIN`) and cannot list the nftables ruleset itself, so
 it reads a status file a privileged systemd `ExecStartPre=+` writes at every start
-(`network.udp.nft_floor_status_file`, default `/run/conspect/nft-floor.json`).
+(`network.udp.nft_floor_status_file`, default `/run/conspect-floor/nft-floor.json`).
 
 ## Resource identity
 
@@ -34,14 +45,22 @@ it reads a status file a privileged systemd `ExecStartPre=+` writes at every sta
 - **systemd units (examples, not auto-installed):** `deploy/systemd/conspect.service`,
   `deploy/systemd/conspect.socket` (placeholder only — socket activation is slice 6, not wired up).
 - **sysctl file:** `deploy/sysctl/90-conspect-udp.conf` → `/etc/sysctl.d/90-conspect-udp.conf`.
-- **Status file the engine reads:** `/run/conspect/nft-floor.json` (or
-  `network.udp.nft_floor_status_file`), written by `conspect.service`'s `ExecStartPre=+`.
-- **Meters (exact names, all four required for `present`):** `conspect_udp443_new_v4`,
-  `conspect_udp443_new_v6`, `conspect_udp443_all_v4`, `conspect_udp443_all_v6`.
+- **Status file the engine reads:** `/run/conspect-floor/nft-floor.json` (or
+  `network.udp.nft_floor_status_file`), written by `conspect.service`'s `ExecStartPre=+` as root.
+  The directory is created by that root step, `root:root 0755` (not a `RuntimeDirectory=`, which
+  would belong to the service user); the file is `root:root 0644`, replaced by an atomic rename.
+- **Trust model:** the engine reads the file only if it is a regular file (a symlink is rejected,
+  not followed), owned by uid 0 and not group/other-writable; otherwise the status is `unknown`.
+  So the service user cannot forge `present`. A process running as root still can; the file is a
+  report for operators, never an input to enforcement.
+- **Objects (exact names, all required for `present`):** chains `udp443_new`, `udp443_all`; sets
+  `udp443_new_v4` and `udp443_all_v4` (`ipv4_addr`), `udp443_new_v6` and `udp443_all_v6`
+  (`ipv6_addr`, holding the source /64).
 - **Parser:** `multiview_cli::nft_floor` (pure file parse, re-read every 10 minutes on the
   front-door runtime — never on the program/output-clock runtime). `present`: nft JSON with the
-  table and all four meters. `absent`: nft's exact missing-table error (`Error: No such file or
-  directory` / `list table inet conspect_floor`) or the word `absent`. Anything else: `unknown`.
+  table and all of the objects above. `absent`: nft's exact missing-table error (`Error: No such
+  file or directory` / `list table inet conspect_floor`) or the word `absent`. Anything else:
+  `unknown`.
 - **Floor behaviour test:** `deploy/nftables/test-floor.sh` (not run in CI; see Verify).
 - **Flood tool:** `cargo run --release -p multiview-frontdoor --example udp443_flood -- ...`.
 - **Chaos suite:** `cargo test --release -p multiview-frontdoor --test chaos_flood`
@@ -81,7 +100,8 @@ it reads a status file a privileged systemd `ExecStartPre=+` writes at every sta
 sudo nft list table inet conspect_floor
 
 # What the engine itself saw at its last (re-)read:
-cat /run/conspect/nft-floor.json
+sudo ls -l /run/conspect-floor/   # expect root root, -rw-r--r-- nft-floor.json
+cat /run/conspect-floor/nft-floor.json
 
 # Validate the nft file without installing it (useful in a container without
 # full CAP_NET_ADMIN, or before touching a live host). `sudo nft -c -f <path>`
@@ -98,14 +118,17 @@ deploy/nftables/test-floor.sh   # exit 0 = every scenario PASS
 `test-floor.sh` needs `nft`, `unshare` (user namespaces), `python3` and `ip`. It skips, exiting 0,
 when any of them is missing. It is **not** part of CI, because the runners have no nft. Run it after
 any edit to the nft file. A separate probe table hooked after the floor counts what got through.
-Results with nft 1.1.3, 2 s per scenario, about 200-240k pps offered from one source:
+Results with nft 1.1.3 (about 160-240k pps offered from one source; 2 s per scenario, 3 s for
+(b) and (e)):
 
-| Scenario | Delivered | Before this fix (`ct state established accept`) |
+| Scenario | Delivered | Round-1 ruleset (meters) |
 |---|---|---|
-| (a) one-way flood, one IPv4 or IPv6 source | 5000 (2500 pps: new tier) | 5000 |
-| (b) one server reply, then flood | 60 000 (30 000 pps: all tier) | all 451 457 (unmetered) |
+| (a) one-way flood, one IPv4 or IPv6 source | 5000 (2500 pps: new tier); all-tier sets stay empty | 5000, but each packet also charged to the all tier |
+| (b) one server reply, then 3 s flood | ~85 000 (28 300 pps: all tier only) | 85 000 |
 | (c) two addresses in one /64 | 5000 together (one bucket) | 5000 |
-| (c) control: two different /64s | 9998 (two buckets) | — |
+| (c) control: two different /64s | 10 000 (two buckets) | — |
+| (d) set full (`size 2`, filled by two sources), third source floods | **0** | 5000 (full meter fails open) |
+| (e) established flow paced at 10 000 pps for 3 s | 30 001 of 30 001 (100 %) | 30 001 |
 
 Read the engine's own view of the floor and the rest of the front door's health:
 
@@ -132,9 +155,9 @@ volumetric attack is beyond what this host can filter for itself. During one:
    layer (design note §11, layer 3) — this host cannot out-buffer a line-rate flood alone.
 3. Escalate to the network/hosting provider's DDoS mitigation for anything that outruns the floor
    and buffer (a spoofed or sufficiently distributed source set). Do **not** attempt to raise the
-   nftables meters' rates as a response to an attack already past them. They are sized to a
+   nftables floor's rates as a response to an attack already past them. They are sized to a
    single legitimate source's traffic pattern, not as an incident-response knob. If you do edit
-   them, rerun `deploy/nftables/test-floor.sh` and keep the exact meter names, or the engine
+   them, rerun `deploy/nftables/test-floor.sh` and keep the exact chain and set names, or the engine
    reports the floor as `unknown`.
 4. The chaos suite's flood tool (below) is for **pre-incident** capacity testing on a controlled
    target, never pointed at a host you do not own.

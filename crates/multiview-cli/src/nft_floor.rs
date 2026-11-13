@@ -5,10 +5,16 @@
 //! nftables ruleset itself. The shipped systemd unit's `ExecStartPre=+`
 //! (root) runs `nft -j list table inet conspect_floor` and writes the result
 //! to `network.udp.nft_floor_status_file` (default
-//! `/run/conspect/nft-floor.json`); this module is a **pure file parser**
-//! over that file — a cheap read on the front-door runtime, never on the
-//! program runtime (invariant #1), re-read every
-//! [`NFT_FLOOR_REREAD_INTERVAL`].
+//! `/run/conspect-floor/nft-floor.json`, a root-owned directory the service
+//! user cannot modify); this module is a **pure file parser** over that
+//! file — a cheap read on the front-door runtime, never on the program
+//! runtime (invariant #1), re-read every [`NFT_FLOOR_REREAD_INTERVAL`].
+//!
+//! Trust model: the file is a *report*, never an enforcement input. [`probe`]
+//! only believes a regular file (no symlink) owned by root and not writable
+//! by group or other; anything else is [`NftFloorStatus::Unknown`]. That
+//! stops the unprivileged service user (or any other non-root user) from
+//! forging `present`; a process running as root can still forge it.
 
 use std::path::Path;
 use std::time::Duration;
@@ -17,15 +23,23 @@ use std::time::Duration;
 /// (design note, "Slice 3 as built, part B").
 pub const NFT_FLOOR_REREAD_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
-/// The meters `deploy/nftables/conspect-udp443-floor.nft` creates, by their
-/// exact names. nft's JSON listing reports each `meter` as a `set` with
-/// `dynamic`/`timeout` flags in `table inet conspect_floor`.
-pub const FLOOR_METERS: [&str; 4] = [
-    "conspect_udp443_new_v4",
-    "conspect_udp443_new_v6",
-    "conspect_udp443_all_v4",
-    "conspect_udp443_all_v6",
+/// The named dynamic sets `deploy/nftables/conspect-udp443-floor.nft`
+/// declares, by their exact names, with the exact nft key `type` each must
+/// carry (IPv6 sets hold the source /64 as an `ipv6_addr`).
+pub const FLOOR_METERS: [(&str, &str); 4] = [
+    ("udp443_new_v4", "ipv4_addr"),
+    ("udp443_new_v6", "ipv6_addr"),
+    ("udp443_all_v4", "ipv4_addr"),
+    ("udp443_all_v6", "ipv6_addr"),
 ];
+
+/// The per-tier sub-chains of the shipped floor, by exact name. Each one
+/// meters a packet against its tier's sets and ends in a verdict, so every
+/// UDP 443 packet is charged to exactly one tier.
+pub const FLOOR_CHAINS: [&str; 2] = ["udp443_new", "udp443_all"];
+
+/// The owner uid [`probe`] requires of the status file in production: root.
+pub const STATUS_FILE_OWNER_UID: u32 = 0;
 
 /// The floor status this probe reports (mirrors
 /// `multiview_control::system::NftFloorStatus`; kept as its own type here so
@@ -33,25 +47,64 @@ pub const FLOOR_METERS: [&str; 4] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NftFloorStatus {
     /// Valid nft JSON listing `table inet conspect_floor` with every one of
-    /// [`FLOOR_METERS`] in it.
+    /// [`FLOOR_METERS`] (name and type) and [`FLOOR_CHAINS`] in it.
     Present,
     /// nft's own error for a table that does not exist (see
     /// [`is_missing_table_error`]), or the literal word `absent`.
     Absent,
-    /// Anything else: a missing, unreadable or empty file, unparsable
-    /// content, another error, or a listing without the exact table and
-    /// meters (a partial or renamed floor is not reported as present).
+    /// Anything else: a missing, unreadable or empty file, a file that is
+    /// not trusted (see [`probe`]), unparsable content, another error, or a
+    /// listing without the exact table, sets and chains (a partial or
+    /// renamed floor is not reported as present).
     Unknown,
 }
 
-/// Read and parse `path` (see module docs). Never panics: any I/O or parse
-/// failure is [`NftFloorStatus::Unknown`].
+/// Read and parse `path` (see module docs), trusting it only when it is a
+/// regular file (not a symlink) owned by [`STATUS_FILE_OWNER_UID`] (root)
+/// and not writable by group or other. Never panics: any I/O, trust or
+/// parse failure is [`NftFloorStatus::Unknown`].
 #[must_use]
 pub fn probe(path: &Path) -> NftFloorStatus {
-    match std::fs::read_to_string(path) {
-        Ok(content) => parse(&content),
-        Err(_) => NftFloorStatus::Unknown,
+    probe_owned_by(path, STATUS_FILE_OWNER_UID)
+}
+
+/// [`probe`] with the required owner uid as a parameter (tests run as a
+/// non-root uid; production always passes [`STATUS_FILE_OWNER_UID`]).
+#[must_use]
+pub fn probe_owned_by(path: &Path, owner_uid: u32) -> NftFloorStatus {
+    read_trusted(path, owner_uid).map_or(NftFloorStatus::Unknown, |content| parse(&content))
+}
+
+/// The content of `path` if it passes the trust checks, else `None`.
+/// `lstat` first (a symlink is rejected, never followed), then the opened
+/// file's own metadata must be the same inode with the same checks, so a
+/// swap between the two calls cannot slip a different file in.
+#[cfg(unix)]
+fn read_trusted(path: &Path, owner_uid: u32) -> Option<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let trusted = |meta: &std::fs::Metadata| {
+        meta.file_type().is_file() && meta.uid() == owner_uid && meta.mode() & 0o022 == 0
+    };
+    let link = std::fs::symlink_metadata(path).ok()?;
+    if !trusted(&link) {
+        return None;
     }
+    let mut file = std::fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !trusted(&opened) || opened.dev() != link.dev() || opened.ino() != link.ino() {
+        return None;
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content).ok()?;
+    Some(content)
+}
+
+/// Non-unix builds have no nft and no ownership model: never trusted.
+#[cfg(not(unix))]
+fn read_trusted(_path: &Path, _owner_uid: u32) -> Option<String> {
+    None
 }
 
 /// Parse the nft-floor status file's content (see [`probe`]). Exposed for
@@ -89,8 +142,9 @@ fn is_missing_table_error(content: &str) -> bool {
         && lines.next().map(str::trim) == Some("list table inet conspect_floor")
 }
 
-/// `{"nftables": [...]}` containing `table inet conspect_floor` and a `set`
-/// named each of [`FLOOR_METERS`] in that table.
+/// `{"nftables": [...]}` containing `table inet conspect_floor`, a `set`
+/// named each of [`FLOOR_METERS`] with that exact `type`, and a `chain`
+/// named each of [`FLOOR_CHAINS`], all in that table.
 fn lists_the_shipped_floor(value: &serde_json::Value) -> bool {
     let Some(items) = value.get("nftables").and_then(serde_json::Value::as_array) else {
         return false;
@@ -106,16 +160,26 @@ fn lists_the_shipped_floor(value: &serde_json::Value) -> bool {
                 && str_of(t, "name").as_deref() == Some("conspect_floor")
         })
     });
-    let has_meter = |name: &str| {
+    let in_table = |v: &serde_json::Value, name: &str| {
+        str_of(v, "family").as_deref() == Some("inet")
+            && str_of(v, "table").as_deref() == Some("conspect_floor")
+            && str_of(v, "name").as_deref() == Some(name)
+    };
+    let has_set = |name: &str, ty: &str| {
         items.iter().any(|item| {
             item.get("set").is_some_and(|set| {
-                str_of(set, "family").as_deref() == Some("inet")
-                    && str_of(set, "table").as_deref() == Some("conspect_floor")
-                    && str_of(set, "name").as_deref() == Some(name)
+                in_table(set, name) && str_of(set, "type").as_deref() == Some(ty)
             })
         })
     };
-    has_table && FLOOR_METERS.iter().all(|name| has_meter(name))
+    let has_chain = |name: &str| {
+        items
+            .iter()
+            .any(|item| item.get("chain").is_some_and(|chain| in_table(chain, name)))
+    };
+    has_table
+        && FLOOR_METERS.iter().all(|(name, ty)| has_set(name, ty))
+        && FLOOR_CHAINS.iter().all(|name| has_chain(name))
 }
 
 #[cfg(test)]
@@ -124,9 +188,9 @@ mod tests {
     use super::*;
 
     /// `nft -j list table inet conspect_floor` (nft 1.1.3) after loading
-    /// the shipped file in a `unshare -Urn` namespace, verbatim up to the
-    /// rules (rule objects omitted: the parser does not read them).
-    const PRESENT_FIXTURE: &str = r#"{"nftables": [{"metainfo": {"version": "1.1.3", "release_name": "Commodore Bullmoose #4", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "conspect_floor", "handle": 1}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "input", "handle": 1, "type": "filter", "hook": "input", "prio": -5, "policy": "accept"}}, {"set": {"family": "inet", "name": "conspect_udp443_new_v4", "table": "conspect_floor", "type": "ipv4_addr", "handle": 2, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "conspect_udp443_new_v6", "table": "conspect_floor", "type": "ipv6_addr", "handle": 4, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "conspect_udp443_all_v4", "table": "conspect_floor", "type": "ipv4_addr", "handle": 6, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "conspect_udp443_all_v6", "table": "conspect_floor", "type": "ipv6_addr", "handle": 8, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}]}"#;
+    /// the shipped file in a `unshare -Urn` namespace, verbatim except that
+    /// the rule objects are omitted (the parser does not read them).
+    const PRESENT_FIXTURE: &str = r#"{"nftables": [{"metainfo": {"version": "1.1.3", "release_name": "Commodore Bullmoose #4", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "conspect_floor", "handle": 1}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "input", "handle": 1, "type": "filter", "hook": "input", "prio": -5, "policy": "accept"}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "udp443_new", "handle": 2}}, {"chain": {"family": "inet", "table": "conspect_floor", "name": "udp443_all", "handle": 3}}, {"set": {"family": "inet", "name": "udp443_new_v4", "table": "conspect_floor", "type": "ipv4_addr", "handle": 4, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_new_v6", "table": "conspect_floor", "type": "ipv6_addr", "handle": 5, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_all_v4", "table": "conspect_floor", "type": "ipv4_addr", "handle": 6, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}, {"set": {"family": "inet", "name": "udp443_all_v6", "table": "conspect_floor", "type": "ipv6_addr", "handle": 7, "size": 65536, "flags": ["timeout", "dynamic"], "timeout": 120}}]}"#;
 
     /// nft 1.1.3's stderr for the same command with no such table (observed).
     const MISSING_TABLE: &str =
@@ -182,9 +246,81 @@ mod tests {
         );
     }
 
+    /// The current (test) uid and a status file it owns, mode 0644.
+    #[cfg(unix)]
+    fn owned_status_file(dir: &Path, content: &str) -> (std::path::PathBuf, u32) {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let path = dir.join("nft-floor.json");
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let uid = std::fs::metadata(&path).unwrap().uid();
+        (path, uid)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_trusted_file_owned_by_the_expected_uid_is_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, uid) = owned_status_file(dir.path(), PRESENT_FIXTURE);
+        assert_eq!(probe_owned_by(&path, uid), NftFloorStatus::Present);
+        std::fs::write(&path, MISSING_TABLE).unwrap();
+        assert_eq!(probe_owned_by(&path, uid), NftFloorStatus::Absent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_not_owned_by_the_expected_uid_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, uid) = owned_status_file(dir.path(), PRESENT_FIXTURE);
+        assert_eq!(
+            probe_owned_by(&path, uid.wrapping_add(1)),
+            NftFloorStatus::Unknown
+        );
+        if uid != STATUS_FILE_OWNER_UID {
+            // Production: a file the (non-root) service user wrote itself.
+            assert_eq!(probe(&path), NftFloorStatus::Unknown);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_writable_file_is_unknown() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, uid) = owned_status_file(dir.path(), PRESENT_FIXTURE);
+        for mode in [0o666, 0o646, 0o664, 0o620, 0o602] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                probe_owned_by(&path, uid),
+                NftFloorStatus::Unknown,
+                "mode {mode:o}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_unknown_even_to_a_trusted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, uid) = owned_status_file(dir.path(), PRESENT_FIXTURE);
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(probe_owned_by(&target, uid), NftFloorStatus::Present);
+        assert_eq!(probe_owned_by(&link, uid), NftFloorStatus::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_is_unknown() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let uid = std::fs::metadata(dir.path()).unwrap().uid();
+        assert_eq!(probe_owned_by(dir.path(), uid), NftFloorStatus::Unknown);
+    }
+
     #[test]
     fn each_meter_is_required_by_its_exact_name() {
-        for missing in FLOOR_METERS {
+        for (missing, _) in FLOOR_METERS {
             // Dropped entirely.
             let dropped = PRESENT_FIXTURE.replace(&format!("\"{missing}\""), "\"x\"");
             assert_eq!(parse(&dropped), NftFloorStatus::Unknown, "{missing} absent");
@@ -197,7 +333,41 @@ mod tests {
                 "{missing} renamed"
             );
         }
-        // The previous (single-tier) meter names are not the shipped floor.
+        // Each set must carry its exact key type.
+        for (name, ty) in FLOOR_METERS {
+            let other = if ty == "ipv4_addr" {
+                "ipv6_addr"
+            } else {
+                "ipv4_addr"
+            };
+            let retyped = PRESENT_FIXTURE.replace(
+                &format!("\"name\": \"{name}\", \"table\": \"conspect_floor\", \"type\": \"{ty}\""),
+                &format!(
+                    "\"name\": \"{name}\", \"table\": \"conspect_floor\", \"type\": \"{other}\""
+                ),
+            );
+            assert_ne!(retyped, PRESENT_FIXTURE, "{name}");
+            assert_eq!(parse(&retyped), NftFloorStatus::Unknown, "{name} retyped");
+        }
+        // Each per-tier chain is required by its exact name.
+        for chain in FLOOR_CHAINS {
+            let renamed = PRESENT_FIXTURE.replace(
+                &format!("\"name\": \"{chain}\", \"handle\""),
+                &format!("\"name\": \"{chain}_x\", \"handle\""),
+            );
+            assert_ne!(renamed, PRESENT_FIXTURE, "{chain}");
+            assert_eq!(parse(&renamed), NftFloorStatus::Unknown, "{chain} renamed");
+        }
+        // The previous meter-based floors (round 1's four meters, the
+        // single-tier one) are not the shipped floor.
+        let round1 = r#"{"nftables": [
+            {"table": {"family": "inet", "name": "conspect_floor", "handle": 1}},
+            {"set": {"family": "inet", "name": "conspect_udp443_new_v4", "table": "conspect_floor", "type": "ipv4_addr"}},
+            {"set": {"family": "inet", "name": "conspect_udp443_new_v6", "table": "conspect_floor", "type": "ipv6_addr"}},
+            {"set": {"family": "inet", "name": "conspect_udp443_all_v4", "table": "conspect_floor", "type": "ipv4_addr"}},
+            {"set": {"family": "inet", "name": "conspect_udp443_all_v6", "table": "conspect_floor", "type": "ipv6_addr"}}
+        ]}"#;
+        assert_eq!(parse(round1), NftFloorStatus::Unknown);
         let old = r#"{"nftables": [
             {"table": {"family": "inet", "name": "conspect_floor", "handle": 1}},
             {"set": {"family": "inet", "name": "conspect_udp443_new", "table": "conspect_floor", "type": "ipv4_addr"}},

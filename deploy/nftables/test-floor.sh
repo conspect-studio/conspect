@@ -3,14 +3,22 @@
 #
 # Loads the shipped file into a throwaway network namespace (`unshare -Urn`:
 # an unprivileged user namespace, root inside it, nothing touches the host
-# ruleset) and floods UDP 443 on loopback from chosen source addresses:
+# ruleset) and sends UDP 443 on loopback from chosen source addresses:
 #   (a) one-way flood from one source: capped by the NEW tier
-#       (2000/s burst 1000);
-#   (b) the server replies once, then the same source floods: conntrack now
-#       says "established", yet the source is still capped by the ALL tier
-#       (25000/s burst 10000) — one reply does not lift the floor;
+#       (2000/s burst 1000), and charged to it ONLY (the all-tier sets stay
+#       empty);
+#   (b) the server replies once, then the same source floods for 3 s (past
+#       the new bucket's refill): conntrack now says "established" and the
+#       source is capped by the ALL tier (25000/s burst 10000) — and ONLY by
+#       it: delivery must reach the all-tier rate, proving established
+#       packets are not also charged to the new tier;
 #   (c) two addresses in the same IPv6 /64 share one bucket; an address in
-#       another /64 gets its own.
+#       another /64 gets its own;
+#   (d) a FULL set fails closed: the shipped file with `size 65536`
+#       substituted to `size 2` (temp copy), two sources fill the new-tier
+#       set, a third source then delivers 0 (IPv4 and IPv6);
+#   (e) a legitimate established flow paced at 10000 pps for 3 s (one viewer
+#       household) is delivered >= 99 %.
 # Delivered is counted by a separate probe table hooked AFTER the floor
 # (`inet floor_probe`, priority 100, `udp dport 443 counter`): what the floor
 # let through, independent of the receiver's socket buffer and of whether the
@@ -41,14 +49,15 @@ fi
 
 duration="${DURATION:-2}"
 ip link set lo up
-for addr in 2001:db8:1::a 2001:db8:1::b 2001:db8:2::c 2001:db8:ff::1; do
+for addr in 2001:db8:1::a 2001:db8:1::b 2001:db8:2::c 2001:db8:3::d 2001:db8:ff::1; do
 	ip -6 addr add "${addr}/128" dev lo nodad
 done
 
+# reload [RULES]: load RULES (default: the shipped file) plus the probe.
 reload() {
 	nft delete table inet conspect_floor 2>/dev/null || true
 	nft delete table inet floor_probe 2>/dev/null || true
-	nft -f "$rules"
+	nft -f "${1:-$rules}"
 	nft -f - <<'NFT'
 table inet floor_probe {
 	chain input {
@@ -71,14 +80,16 @@ for item in json.load(sys.stdin)["nftables"]:
 print(total)'
 }
 
-# flood SERVER SRC... : send as fast as possible for $duration s from each
-# source (round robin); print "sent elapsed". REPLY_FIRST=1 first sends one
-# datagram from each source and has the server answer it (conntrack then
-# marks the flow established), outside the measured window.
+# flood SERVER SRC... : send as fast as possible for $duration s (or $SECS)
+# from each source (round robin); print "sent elapsed". REPLY_FIRST=1 first
+# sends one datagram from each source and has the server answer it
+# (conntrack then marks the flow established); those warm-up datagrams are
+# counted in "sent". COUNT=n sends exactly n per source instead. PPS=n paces the total send rate to n packets/s.
 flood() {
-	python3 - "$duration" "$@" <<'PY'
+	python3 - "${SECS:-$duration}" "$@" <<'PY'
 import os, socket, sys, time
 duration = float(sys.argv[1]); server = sys.argv[2]; sources = sys.argv[3:]
+pps = float(os.environ.get("PPS", "0"))
 fam = socket.AF_INET6 if ":" in server else socket.AF_INET
 srv = socket.socket(fam, socket.SOCK_DGRAM)
 srv.bind((server, 443))
@@ -100,10 +111,22 @@ if os.environ.get("REPLY_FIRST") == "1":
         s.setblocking(True); s.settimeout(2); s.recvfrom(64); s.setblocking(False)
 payload = b"x" * 64
 sent = 0
-start = time.monotonic(); end = start + duration
-while time.monotonic() < end:
+if os.environ.get("COUNT"):
     for s in socks:
-        for _ in range(64):
+        for _ in range(int(os.environ["COUNT"])):
+            s.sendto(payload, (server, 443)); sent += 1
+    print(sent + warm, 0.0)
+    sys.exit(0)
+start = time.monotonic(); end = start + duration
+while True:
+    now = time.monotonic()
+    if now >= end:
+        break
+    if pps and sent >= pps * (now - start):
+        time.sleep(0.0005)
+        continue
+    for s in socks:
+        for _ in range(64 if not pps else 10):
             try:
                 s.sendto(payload, (server, 443)); sent += 1
             except BlockingIOError:
@@ -138,14 +161,41 @@ for pair in "127.0.0.1 127.0.0.2" "2001:db8:ff::1 2001:db8:1::a"; do
 	reload
 	read -r sent elapsed < <(flood "$1" "$2")
 	check "(a) one-way flood $2 -> new tier" "$sent" "$elapsed" "$(delivered)" 1000 2000
+	# Exactly one tier: no packet of this flood (all ct state new) may have
+	# been charged to the all tier, so the all-tier sets hold no element.
+	all_elems=$(nft -j list table inet conspect_floor | python3 -c '
+import json, sys
+n = 0
+for item in json.load(sys.stdin)["nftables"]:
+    s = item.get("set")
+    if s and s["name"] in ("udp443_all_v4", "udp443_all_v6"):
+        n += len(s.get("elem", [])) + 1
+print(n)')
+	if (( all_elems == 2 )); then
+		echo "PASS (a) $2 new-flow packets charged to the new tier only (all-tier sets empty)"
+	else
+		echo "FAIL (a) $2 all-tier sets missing or charged: $(( all_elems - 2 )) element(s) or sets absent"
+		fail=1
+	fi
 done
 
-# (b) one reply, then flood: still capped, by the all tier.
+# (b) one reply, then flood for 3 s: capped by the all tier only. The upper
+# bound is the all tier's; the lower bound (80 % of burst + rate * elapsed)
+# fails if established packets were ALSO charged to the new tier (which
+# would cap them near 1000 + 2000 * elapsed).
 for pair in "127.0.0.1 127.0.0.3" "2001:db8:ff::1 2001:db8:1::a"; do
 	set -- $pair
 	reload
-	read -r sent elapsed < <(REPLY_FIRST=1 flood "$1" "$2")
-	check "(b) reply then flood $2 -> all tier" "$sent" "$elapsed" "$(delivered)" 10000 25000
+	read -r sent elapsed < <(SECS=3 REPLY_FIRST=1 flood "$1" "$2")
+	got="$(delivered)"
+	check "(b) reply then flood $2 -> all tier" "$sent" "$elapsed" "$got" 10000 25000
+	lower=$(python3 -c "print(int((10000 + 25000 * $elapsed) * 0.8))")
+	if (( got >= lower )); then
+		echo "PASS (b) $2 not double-charged: delivered ${got} >= ${lower}"
+	else
+		echo "FAIL (b) $2 double-charged: delivered ${got} < ${lower}"
+		fail=1
+	fi
 done
 
 # (c) /64 siblings share one new-tier bucket; another /64 does not.
@@ -162,5 +212,41 @@ else
 	echo "FAIL (c) control, two /64s -> two buckets: delivered ${got} < ${lower}"
 	fail=1
 fi
+
+# (d) a full set fails closed: size 2, two sources fill the new-tier set
+# (one datagram each, both delivered), then a third source floods.
+small="$(mktemp)"
+trap 'rm -f "$small"' EXIT
+sed 's/size 65536;/size 2;/' "$rules" >"$small"
+for trio in "127.0.0.1 127.0.0.4 127.0.0.5 127.0.0.6" \
+	"2001:db8:ff::1 2001:db8:1::a 2001:db8:2::c 2001:db8:3::d"; do
+	set -- $trio
+	reload "$small"
+	COUNT=1 flood "$1" "$2" >/dev/null
+	COUNT=1 flood "$1" "$3" >/dev/null
+	filled="$(delivered)"
+	read -r sent elapsed < <(flood "$1" "$4")
+	got=$(( $(delivered) - filled ))
+	if (( filled == 2 && got == 0 && sent > 0 )); then
+		echo "PASS (d) full set (size 2) fails closed for $4: fill delivered ${filled}, then sent ${sent}, delivered ${got}"
+	else
+		echo "FAIL (d) full set (size 2) for $4: fill delivered ${filled}, then sent ${sent}, delivered ${got}"
+		fail=1
+	fi
+done
+
+# (e) a legitimate established flow at 10000 pps for 3 s: >= 99 % delivered.
+for pair in "127.0.0.1 127.0.0.7" "2001:db8:ff::1 2001:db8:1::b"; do
+	set -- $pair
+	reload
+	read -r sent elapsed < <(SECS=3 PPS=10000 REPLY_FIRST=1 flood "$1" "$2")
+	got="$(delivered)"
+	if python3 -c "import sys; sys.exit(0 if $got >= 0.99 * $sent else 1)"; then
+		echo "PASS (e) established $2 at ~10000 pps: sent ${sent} in $(printf %.2f "$elapsed")s, delivered ${got}"
+	else
+		echo "FAIL (e) established $2 at ~10000 pps: sent ${sent} in $(printf %.2f "$elapsed")s, delivered ${got} (< 99 %)"
+		fail=1
+	fi
+done
 
 exit "$fail"

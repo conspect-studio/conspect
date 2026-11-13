@@ -34,8 +34,11 @@ pub const DEFAULT_STUN_GLOBAL_PPS: u32 = 5_000;
 /// Default `network.udp.nft_floor_status_file`: where the shipped systemd
 /// unit's `ExecStartPre=+` writes `nft -j list table inet conspect_floor`
 /// (`deploy/systemd/conspect.service`), for the engine (running unprivileged,
-/// unable to list the ruleset itself) to read as a pure file parse.
-pub const DEFAULT_NFT_FLOOR_STATUS_FILE: &str = "/run/conspect/nft-floor.json";
+/// unable to list the ruleset itself) to read as a pure file parse. The
+/// directory is created root-owned (0755) by that root step, so the service
+/// user cannot replace or redirect the file; the engine also only trusts a
+/// root-owned regular file that is not group/other-writable.
+pub const DEFAULT_NFT_FLOOR_STATUS_FILE: &str = "/run/conspect-floor/nft-floor.json";
 /// Default `network.quic.retry_above_handshakes` (QUIC Retry, RFC 9000
 /// section 8.1.2).
 pub const DEFAULT_RETRY_ABOVE_HANDSHAKES: usize = 8;
@@ -322,7 +325,10 @@ pub struct NetworkUdpConfig {
     pub stun_global_pps: u32,
     /// Where the shipped systemd unit's `ExecStartPre=+` writes
     /// `nft -j list table inet conspect_floor` for the engine to read (it
-    /// runs unprivileged and cannot list the ruleset itself).
+    /// runs unprivileged and cannot list the ruleset itself). Default
+    /// `/run/conspect-floor/nft-floor.json`; only a root-owned regular file
+    /// that is not group/other-writable is trusted (a status report, never
+    /// an enforcement input).
     #[serde(default = "default_nft_floor_status_file")]
     pub nft_floor_status_file: PathBuf,
 }

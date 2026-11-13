@@ -54,10 +54,13 @@ implementation will build against.
   kernel-drop support, the nft UDP-443 floor as read at startup; unscoped keys only); `GET /api/v1/metrics/frontdoor`
   reports the live counters, steering gauges, the live nft-floor status and the QUIC retry count.
   Deploy artefacts: `deploy/nftables/conspect-udp443-floor.nft` (a two-tier per-source/per-/64 floor
-  on UDP 443: new flows 2000/s, all traffic 25 000/s, no established exemption; behaviour test
-  `deploy/nftables/test-floor.sh`), `deploy/systemd/conspect.service` (+ a not-yet-wired `conspect.socket`
-  placeholder for slice 6), `deploy/sysctl/90-conspect-udp.conf`, and
-  `docs/runbooks/udp-443-flood.md`.
+  on UDP 443: new flows 2000/s, established flows 25 000/s, each packet charged to exactly one
+  tier, no unmetered established exemption, and a full per-source set fails closed for UDP 443
+  only; behaviour test `deploy/nftables/test-floor.sh`), `deploy/systemd/conspect.service` (+ a
+  not-yet-wired `conspect.socket` placeholder for slice 6; its root `ExecStartPre=+` writes the
+  floor status to the root-owned `/run/conspect-floor/nft-floor.json`, which the engine trusts only
+  as a root-owned, non-symlink, not group/other-writable file, as a report, never for enforcement),
+  `deploy/sysctl/90-conspect-udp.conf`, and `docs/runbooks/udp-443-flood.md`.
 
 - **Event journal.** Every raw SCTE-35, timed ID3 and HLS cue observation is recorded off-clock
   with its full decode, predicted wall-clock and on-air times, per source and day, with bounded

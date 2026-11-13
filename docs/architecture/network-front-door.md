@@ -567,7 +567,7 @@ new_flow_global_pps = 50_000     # cap on all unvalidated datagrams per second
 validated_steering = true        # Linux: SO_REUSEPORT + BPF, validated flows on their own queue
 stun_pps_per_source = 50         # well-formed STUN from an unvalidated source, per source key
 stun_global_pps = 5_000          # same, summed over every unvalidated source
-nft_floor_status_file = "/run/conspect/nft-floor.json"  # written by the systemd unit's ExecStartPre=+ ("Slice 3 as built, part B")
+nft_floor_status_file = "/run/conspect-floor/nft-floor.json"  # written by the systemd unit's ExecStartPre=+ ("Slice 3 as built, part B")
 
 [network.quic]
 retry_above_handshakes = 8       # send Retry (address validation) once this many handshakes are open
@@ -706,8 +706,9 @@ What S6 and S7 mean for the design:
      of unvalidated traffic then fills the listener queue, not the one paying viewers use. This is
      the only layer that also works against spoofed and distributed floods. Linux only; other
      platforms keep one queue (stated as a platform limit).
-  2. **Pre-socket per-source limits** (nftables meters on UDP 443; as built in slice 3 there are
-     two tiers, new flows and all traffic, with no conntrack `established` exemption, see "Slice 3
+  2. **Pre-socket per-source limits** (nftables per-source buckets on UDP 443; as built in slice 3
+     there are two tiers, new flows and established flows, each packet charged to exactly one, no
+     unmetered conntrack `established` exemption, and a full bucket set fails closed; see "Slice 3
      as built, part B"). Required before UDP 443 is opened to the internet, and checked by the
      engine at startup where it can read the ruleset (a warning in the capability report when
      absent). Honest limit: it stops a real source, not a spoofed one (it depends on BCP 38 at the
@@ -1193,12 +1194,16 @@ kernel-drop support, and the nft floor read at that moment.
 
 **nft floor probe.** `crates/multiview-cli/src/nft_floor.rs` is a pure, panic-free parser (no
 sockets, no `nft` invocation from the engine — it runs unprivileged and cannot list the ruleset
-itself). It reads `network.udp.nft_floor_status_file` and reports `Present` only for valid nft JSON
-listing `table inet conspect_floor` with all four shipped meters by their exact names
-(`conspect_udp443_{new,all}_{v4,v6}`; nft's JSON reports a meter as a `set` with `dynamic`/`timeout`
-flags); `Absent` only for nft 1.1.3's exact error for that missing table (first line `Error: No such
+itself). It reads `network.udp.nft_floor_status_file` only if that path is a regular file (a
+symlink is rejected via `symlink_metadata`, and the opened file must be the same inode), owned by
+uid 0 and not group/other-writable (`mode & 0o022 == 0`); otherwise `Unknown`. It reports
+`Present` only for valid nft JSON listing `table inet conspect_floor` with the chains `udp443_new`
+and `udp443_all` and the four sets `udp443_{new,all}_v4` (`ipv4_addr`) and `udp443_{new,all}_v6`
+(`ipv6_addr`) by exact name and type; `Absent` only for nft 1.1.3's exact error for that missing table (first line `Error: No such
 file or directory`, second line `list table inet conspect_floor`) or the literal word `absent`;
-anything else (missing/unreadable file, another error, a partial or renamed floor) is `Unknown`.
+anything else (missing/unreadable/untrusted file, another error, a partial or renamed floor) is
+`Unknown`. Trust model: the file is a report, never an enforcement input; the ownership checks stop
+the unprivileged service user from forging `present`, but a process running as root still can.
 **Re-read interval:** every 10 minutes (`multiview_cli::nft_floor::NFT_FLOOR_REREAD_INTERVAL`) on
 the front-door runtime via `tokio::task::spawn_blocking` (a plain file read, never the program
 runtime).
@@ -1217,28 +1222,43 @@ unscoped whole-system principals) reports the live `StatsSnapshot` counters, the
 process. Registered in `openapi.rs`; `cargo xtask gen-openapi` regenerated `docs/api/openapi.json`.
 
 **Deploy artefacts.** `deploy/systemd/conspect.service` (example unit, `User=operations`
-placeholder, `AmbientCapabilities=CAP_NET_BIND_SERVICE`, `RuntimeDirectory=conspect` (owned by
-`User=`, mode 0755, so other users cannot write there), and an `ExecStartPre=+` (root) that writes
-`nft -j list table inet conspect_floor`'s stdout+stderr to a temp file and moves it into place as
-`/run/conspect/nft-floor.json` (`install -o root -g root -m 0644`, then `mv`, so a reader never
-sees a partial file)); `deploy/systemd/conspect.socket` (explicitly marked not-yet-wired: socket
+placeholder, `AmbientCapabilities=CAP_NET_BIND_SERVICE`, and an `ExecStartPre=+` (root) that
+creates `/run/conspect-floor` itself (`install -d -o root -g root -m 0755`; deliberately not a
+`RuntimeDirectory=`, which systemd would hand to `User=`, letting the service user unlink, replace
+or symlink the status file), writes `nft -j list table inet conspect_floor`'s stdout+stderr to a
+temp file there and moves it into place as `/run/conspect-floor/nft-floor.json` (`install -o root
+-g root -m 0644`, then `mv`, so a reader never sees a partial file)); `deploy/systemd/conspect.socket` (explicitly marked not-yet-wired: socket
 activation is slice 6, and it carries the `ReceiveBuffer=8M` target value);
 `deploy/sysctl/90-conspect-udp.conf` (`net.core.rmem_max = 8388608`, the knob that actually raises
 the usable buffer until slice 6's socket unit exists).
 
 **nft floor, two tiers.** `deploy/nftables/conspect-udp443-floor.nft`: table `inet
-conspect_floor`, `filter hook input priority -5`, four `meter` statements, each per IPv4 address or
-per IPv6 /64 (`ip6 saddr and ffff:ffff:ffff:ffff::`), `size 65536`, `timeout 2m`, `counter drop`:
-* **new** (`ct state new,untracked`): `conspect_udp443_new_v4`/`_v6`, over 2000/s burst 1000;
-* **all** (every UDP 443 packet, established or not): `conspect_udp443_all_v4`/`_v6`, over 25 000/s
-  burst 10 000, above the engine's per-established-peer bucket (20 000/s) so a real viewer is never
-  hit by it.
-There is no `ct state established accept`: the first draft had one, and review measured that a
-single server reply (a QUIC Retry/Initial or a STUN error) makes a source "established" to
-conntrack, after which it could flood UDP 443 unmetered. `deploy/nftables/test-floor.sh` (bash +
-python3 in a `unshare -Urn` network namespace; skips when nft/unshare is missing; not in CI, the
-runners have no nft) proves the tiers. Measured here, nft 1.1.3, 2 s per scenario, ~200-240k pps
-offered: (a) one-way flood from one source → 5000 delivered (2500 pps: burst + new-tier rate), IPv4
-and IPv6; (b) one server reply, then flood → 60 000 delivered (30 000 pps: all tier), where the
-previous ruleset delivered all 451 457; (c) two addresses in one /64 → 5000 delivered together (one
-bucket); in two /64s → 9998 (two buckets). Validate syntax with `unshare -Urn nft -c -f - < file`.
+conspect_floor`, base chain `filter hook input priority -5; policy accept`, which sends UDP 443 to
+exactly one sub-chain: `ct state new,untracked` → `udp443_new`, everything else → `udp443_all`.
+Each sub-chain is `update @set { key limit rate R burst B packets } accept` for IPv4 and for IPv6
+(key = source address, or source /64 via `ip6 saddr and ffff:ffff:ffff:ffff::`), then `counter
+drop`. Every sub-chain ends in a verdict, so **each packet pays exactly one tier**:
+* **new** (`udp443_new`, sets `udp443_new_v4`/`_v6`): 2000/s burst 1000;
+* **all** (`udp443_all`, sets `udp443_all_v4`/`_v6`; established flows): 25 000/s burst 10 000,
+  above the engine's per-established-peer bucket (20 000/s) so a real viewer is never hit by it.
+Sets are named, `flags dynamic,timeout`, `size 65536`, `timeout 2m`. Measured on nft 1.1.3: the
+first datagrams of a flow are `ct state new` and, after the server's first reply, `established`
+(never `untracked` without notrack); `update` with a `limit` keeps one bucket per element; when the
+set is full, `update` cannot add a new source and does not match, so the packet reaches the
+sub-chain's `drop` — **a full set fails closed, for UDP 443 only** (other traffic never enters the
+sub-chains). Two rejected forms, both measured: round 1's `meter ... limit rate over ... drop` fails
+OPEN when full (a full meter matches nothing and `policy accept` passes the packet; reviewer:
+111 900 of 111 900 delivered for a third source with `size 2`), and stacking both meters in one
+chain charged established packets to the new tier as well. A separate `ip saddr @set` lookup is
+not used as an "in the set" test: on these sets the lookup evaluates the element's `limit` too and
+consumes a token. There is no `ct state established accept`: a single server reply (a QUIC
+Retry/Initial or a STUN error) makes a source "established" to conntrack, so an exemption would let
+it flood unmetered. `deploy/nftables/test-floor.sh` (bash + python3 in a `unshare -Urn` network
+namespace; skips when nft/unshare is missing; not in CI, the runners have no nft) proves it.
+Measured here, nft 1.1.3, ~160-240k pps offered: (a) one-way flood from one source, 2 s → 5000
+delivered (burst + new-tier rate), IPv4 and IPv6, and the all-tier sets stay empty (charged once);
+(b) one server reply, then a 3 s flood → ~85 000 delivered (~28 300 pps: all tier only; double
+charging would cap it near 7000); (c) two addresses in one /64 → 5000 together (one bucket), two
+/64s → 10 000; (d) the file with `size 2`, two sources fill it, a third source floods → 0
+delivered, IPv4 and IPv6 (round 1's meters: 5000); (e) an established flow paced at 10 000 pps for
+3 s → 30 001 of 30 001 delivered. Validate syntax with `unshare -Urn nft -c -f - < file`.

@@ -20,28 +20,32 @@ Group=operations
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 
-# `RuntimeDirectory=conspect` creates /run/conspect before ExecStartPre= and
-# removes it on stop. systemd makes it owned by this unit's User=/Group=
-# (operations:operations) with mode 0755: other users cannot create, replace
-# or delete files in it; the owning service user can. The status file below
-# is therefore written as root, mode 0644, by an atomic rename, so the engine
-# reads either the previous complete file or the new one, never a partial.
-RuntimeDirectory=conspect
-RuntimeDirectoryMode=0755
-
 # Writes the nft floor's state to the status file the engine reads
-# (network.udp.nft_floor_status_file, default /run/conspect/nft-floor.json;
-# design note "Slice 3 as built, part B"). `+` runs this as root regardless
-# of User= (`nft list` needs CAP_NET_ADMIN, which the engine does not get).
-# nft's stdout and stderr both go to a temp file in the same directory, which
-# `install -o root -g root -m 0644` copies into place under a second temp name
-# and `mv` renames over the status file (`$$` is systemd's escape for a
-# literal `$`). The engine's parser reports:
-#   present  - nft JSON with table inet conspect_floor and all four meters,
+# (network.udp.nft_floor_status_file, default
+# /run/conspect-floor/nft-floor.json; design note "Slice 3 as built, part
+# B"). `+` runs this as root regardless of User= (`nft list` needs
+# CAP_NET_ADMIN, which the engine does not get).
+# Trust: the directory is NOT a RuntimeDirectory= (that would be owned by
+# User=, letting the service user unlink/replace the file or plant a
+# symlink). This root step creates /run/conspect-floor itself, root:root
+# 0755, so only root can create, replace or delete files in it. nft's stdout
+# and stderr go to a temp file in that directory, which
+# `install -o root -g root -m 0644` copies to a second temp name and `mv`
+# renames over the status file, so the engine reads either the previous
+# complete file or the new one, never a partial (`$$` is systemd's escape for
+# a literal `$`). The engine additionally ignores the file (status
+# `unknown`) unless it is a regular file, not a symlink, owned by uid 0 and
+# not group/other-writable. Residual: a process running as root can still
+# forge it; the file is a report shown to operators, never an enforcement
+# input. The engine's parser reports:
+#   present  - nft JSON with table inet conspect_floor, the chains udp443_new
+#              and udp443_all and the four sets udp443_{new,all}_{v4,v6}
+#              with their exact key types,
 #   absent   - nft's exact "Error: No such file or directory" output for that
 #              missing table, or the literal word `absent`,
-#   unknown  - anything else (nft missing, another error, a partial floor).
-ExecStartPre=+/bin/sh -c 'set -u; d=/run/conspect; t=$$(mktemp "$$d/.nft-floor.XXXXXX") || exit 0; nft -j list table inet conspect_floor >"$$t" 2>&1; install -o root -g root -m 0644 "$$t" "$$d/.nft-floor.json.new" && mv -f "$$d/.nft-floor.json.new" "$$d/nft-floor.json"; rm -f "$$t"; exit 0'
+#   unknown  - anything else (nft missing, another error, a partial floor,
+#              an untrusted file).
+ExecStartPre=+/bin/sh -c 'set -u; d=/run/conspect-floor; install -d -o root -g root -m 0755 "$$d" || exit 0; t=$$(mktemp "$$d/.nft-floor.XXXXXX") || exit 0; nft -j list table inet conspect_floor >"$$t" 2>&1; install -o root -g root -m 0644 "$$t" "$$d/.nft-floor.json.new" && mv -f "$$d/.nft-floor.json.new" "$$d/nft-floor.json"; rm -f "$$t"; exit 0'
 
 ExecStart=/usr/local/bin/conspect run --config /etc/conspect/conspect.toml
 Restart=on-failure
