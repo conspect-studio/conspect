@@ -5,7 +5,7 @@
 use super::*;
 use multiview_ffmpeg::idr::CodecKind;
 use multiview_output::passthrough::match_rules::{ColourTags, PassCodec, Scan};
-use multiview_output::passthrough::{CompressedTap, SlotSpec, SourceTraits, TapAu};
+use multiview_output::passthrough::{CompressedTap, MatchMiss, SlotSpec, SourceTraits, TapAu};
 
 use crate::passthrough_live::{FormatSlate, PassthroughLive, PassthroughSpec, PassthroughState};
 
@@ -74,7 +74,7 @@ fn slot() -> SlotSpec {
         colour: tags(),
         bit_depth: 8,
         chroma: 1,
-        bitrate_ceiling_kbps: 100_000,
+        bitrate_ceiling_kbps: 100,
         max_gop_ticks: 2 * GOP,
         b_frames_allowed: true,
     }
@@ -95,6 +95,9 @@ struct Script {
     stall: Option<std::ops::Range<u64>>,
     change: Option<u64>,
     silent: bool,
+    /// Frames padded to this many extra bytes (a bitrate above the slot's
+    /// ceiling), from this frame on.
+    heavy: Option<(u64, usize)>,
 }
 
 impl Script {
@@ -102,6 +105,7 @@ impl Script {
         if self.silent || self.stall.as_ref().is_some_and(|s| s.contains(&k)) {
             return None;
         }
+        let pad = self.heavy.filter(|(from, _)| k >= *from).map_or(0, |h| h.1);
         let (sps, gen) = if self.change.is_some_and(|c| k >= c) {
             (SPS_B, 2)
         } else {
@@ -109,11 +113,12 @@ impl Script {
         };
         let key = k % GOP == 0;
         let tag = u8::try_from(k % 200).unwrap();
-        let data = if key {
+        let mut data = if key {
             annexb(&[sps, PPS, &[0x65, 0x88, tag]])
         } else {
             annexb(&[&[0x41, 0x9a, tag]])
         };
+        data.extend(std::iter::repeat_n(0x55_u8, pad));
         let dts = i64::try_from(k).unwrap() * 18_000;
         Some(TapAu {
             data: Arc::from(data),
@@ -1054,4 +1059,30 @@ impl LiveEncoder for Wedgeable {
     fn parameter_sets(&self) -> Option<ParameterSets> {
         self.inner.parameter_sets()
     }
+}
+
+/// Review R2-M-1b: a source that stops matching while an output is on P0
+/// (its bitrate rises above the slot's ceiling) takes the output off P0:
+/// the key bridges onto its slate on the tick the verdict fails, the
+/// router brings in the picture bridge, and the output's path is no longer
+/// P0; one packet per tick throughout.
+#[test]
+fn a_source_that_stops_matching_takes_the_output_off_p0() {
+    let mut p = P0::new(1, 6, Script::default(), true);
+    p.step();
+    p.take_cam(0);
+    p.run_until(200, |p| p.on_p0(0)).expect("on P0");
+    let from = p.t;
+    // 100 kbit/s ceiling at 5 fps: 4 kB frames are 160 kbit/s.
+    p.src.script.lock().unwrap().heavy = Some((from, 4_000));
+    p.run_until(200, |p| !p.on_p0(0))
+        .expect("leaves P0 when the source stops matching");
+    assert_eq!(p.view(0).bus, "src:cam", "onto the picture bridge");
+    let v = p.view(0).passthrough.unwrap();
+    assert_eq!(v.state, "bridging", "{v:?}");
+    assert_eq!(p.status(0).verdict(), Some(Err(MatchMiss::BitrateAbove)));
+    assert_eq!(p.status(0).state(), PassthroughState::Slate);
+    p.run_until(60, |_| false);
+    assert!(!p.on_p0(0), "never back while it does not match");
+    p.assert_one_packet_per_tick(0);
 }

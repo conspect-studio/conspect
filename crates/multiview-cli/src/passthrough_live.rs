@@ -786,6 +786,13 @@ impl PassthroughLive {
                 if verdict.is_ok() && m.matched_gen.is_none() {
                     m.matched_gen = m.meter_gen;
                 }
+                // Review R2-M-1b: a source that stops matching while a run
+                // is on air ends the run onto the slate on this tick (the
+                // gate keeps it off runs until it matches again).
+                if verdict.is_err() && self.clock.state() == ClockState::Passthrough {
+                    self.clock.disarm();
+                    self.clock.arm();
+                }
                 self.gate.verdict_ok = verdict.is_ok();
                 let code = verdict.map_or_else(miss_code, |()| 1);
                 self.status.verdict.store(code, Ordering::Release);
@@ -868,6 +875,12 @@ impl PassthroughLive {
                 if au.keyframe && self.slate_raps {
                     self.raps.record(au.dts);
                 }
+                // While the verdict fails, that is why it bridges.
+                let reason = if self.gate.verdict_ok {
+                    reason
+                } else {
+                    BridgeReason::ParametersNoLongerMatch
+                };
                 (
                     Self::packet(&au.data, au.dts, au.pts, au.keyframe),
                     PassthroughState::Slate,
@@ -1700,6 +1713,41 @@ mod tests {
             feed_tick(&tap, &mut live, &now, k, (0, false, 2));
         }
         assert_eq!(status.verdict(), Some(Err(MatchMiss::NotEnoughHistory)));
+    }
+
+    /// Review R2-M-1b: a verdict that fails while a run is on air ends the
+    /// run onto the slate on the same tick (never keeps passing a source
+    /// that no longer matches); the run returns only once it matches again.
+    #[test]
+    fn a_failing_verdict_ends_the_run_onto_the_slate() {
+        let (tap, mut live, now) = matched_key();
+        let status = live.status();
+        for k in 0..300 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.state(), PassthroughState::Passthrough);
+        let mut failed_at = None;
+        for k in 300..700 {
+            feed_tick(&tap, &mut live, &now, k, (4_000, false, 1));
+            if failed_at.is_none() && status.verdict().is_some_and(|v| v.is_err()) {
+                failed_at = Some(k);
+                assert_eq!(
+                    status.state(),
+                    PassthroughState::Slate,
+                    "tick {k}: the slate on the tick the verdict failed"
+                );
+                assert_eq!(status.reason(), Some(BridgeReason::ParametersNoLongerMatch));
+            } else if failed_at.is_some() {
+                assert_eq!(status.state(), PassthroughState::Slate, "tick {k}");
+            }
+        }
+        assert!(failed_at.is_some(), "the bitrate rule failed");
+        // Back under the ceiling: it matches again and a new run starts.
+        for k in 700..1100 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.verdict(), Some(Ok(())));
+        assert_eq!(status.state(), PassthroughState::Passthrough);
     }
 
     /// Review R2-M-1a: after a stall gap (the window is not CFR), a source
