@@ -2475,7 +2475,7 @@ pub struct Pipeline {
     /// outside the Program egress. Taken by the run.
     rate_outputs: Vec<output_lanes::LaneOutputSpec>,
     /// Test seams of the rate lanes (empty in production).
-    lane_hooks: output_lanes::LaneHooks,
+    lane_hooks: Box<output_lanes::LaneHooks>,
     /// Test seam (review INV2-1): run in teardown after the egress join
     /// (the bake consumer has exited) and before ingest teardown.
     #[cfg(test)]
@@ -3718,7 +3718,7 @@ impl Pipeline {
             rendition_formats,
             convert_hook: None,
             rate_outputs,
-            lane_hooks: output_lanes::LaneHooks::default(),
+            lane_hooks: Box::default(),
             #[cfg(test)]
             teardown_hook: None,
             output_formats,
@@ -4650,7 +4650,7 @@ impl Pipeline {
     /// Test seam (#343): the rate lanes' hooks and fake sinks.
     #[cfg(test)]
     pub(crate) fn set_lane_hooks(&mut self, hooks: output_lanes::LaneHooks) {
-        self.lane_hooks = hooks;
+        *self.lane_hooks = hooks;
     }
 
     /// How many distinct video rendition configs (= Program encoder keys)
@@ -5907,7 +5907,7 @@ impl Pipeline {
                     .as_ref()
                     .map_or_else(Vec::new, AudioRenditionEncoder::track_streams),
             },
-            std::mem::take(&mut self.lane_hooks),
+            *std::mem::take(&mut self.lane_hooks),
         );
         let prepared_lanes = lanes.map(|(prepared, taps)| {
             consumer_routing.lane_taps = taps;
