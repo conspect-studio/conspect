@@ -286,6 +286,42 @@ pub fn h264_nal_of_type(au: &[u8], framing: NalFraming, nal_type: u8) -> Option<
     found
 }
 
+/// `au` re-framed as Annex B (a 4-byte start code before each NAL), for a
+/// muxer that carries H.264/HEVC in band (MPEG-TS). `None` when `framing`
+/// is OBU, or a length-prefixed `au` is malformed (a length past the
+/// buffer). An Annex-B `au` is returned unchanged.
+#[must_use]
+pub fn to_annex_b(au: &[u8], framing: NalFraming) -> Option<Vec<u8>> {
+    match framing {
+        NalFraming::AnnexB => Some(au.to_vec()),
+        NalFraming::Obu => None,
+        NalFraming::LengthPrefixed { nal_length_size } => {
+            let size = usize::from(nal_length_size);
+            if !(1..=4).contains(&size) {
+                return None;
+            }
+            let mut out = Vec::with_capacity(au.len().saturating_add(16));
+            let mut offset = 0_usize;
+            while offset < au.len() {
+                let len_bytes = au.get(offset..offset.checked_add(size)?)?;
+                let nal_len = len_bytes
+                    .iter()
+                    .fold(0_usize, |acc, &b| (acc << 8) | usize::from(b));
+                let start = offset + size;
+                let end = start.checked_add(nal_len)?;
+                let nal = au.get(start..end)?;
+                if nal_len == 0 {
+                    return None;
+                }
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                out.extend_from_slice(nal);
+                offset = end;
+            }
+            Some(out)
+        }
+    }
+}
+
 /// Every NAL unit of `au` under `framing` (empty NALs skipped).
 fn collect_nals<'a>(au: &'a [u8], framing: NalFraming, out: &mut Vec<&'a [u8]>) {
     for_each_nal(au, framing, |nal| {
@@ -503,7 +539,7 @@ mod tests {
 
     use super::{
         h264_is_reference, h264_nal_of_type, is_idr, is_self_contained_idr, mpeg2_sequence_header,
-        parameter_sets, read_leb128, CodecKind, NalFraming,
+        parameter_sets, read_leb128, to_annex_b, CodecKind, NalFraming,
     };
 
     #[test]
@@ -774,5 +810,23 @@ mod tests {
             Some(&[0x68, 0xAA][..])
         );
         assert_eq!(h264_nal_of_type(&a, NalFraming::AnnexB, 6), None);
+    }
+
+    #[test]
+    fn length_prefixed_access_units_reframe_as_annex_b() {
+        let lp = NalFraming::LengthPrefixed { nal_length_size: 4 };
+        let au = [0, 0, 0, 2, 0x67, 0xAA, 0, 0, 0, 1, 0x65];
+        assert_eq!(
+            to_annex_b(&au, lp),
+            Some(vec![0, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x65])
+        );
+        assert_eq!(to_annex_b(&[0, 0, 0, 9, 0x65], lp), None, "past the end");
+        assert_eq!(
+            to_annex_b(&[0, 0, 1, 0x65], NalFraming::AnnexB)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(to_annex_b(&[1], NalFraming::Obu), None);
     }
 }

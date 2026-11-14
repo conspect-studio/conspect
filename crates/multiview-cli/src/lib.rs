@@ -295,6 +295,9 @@ pub mod output_routing;
 pub mod output_routing_control;
 #[cfg(feature = "ffmpeg")]
 pub mod output_window_registry;
+/// The passthrough routing key (`PassthroughLive`, output-routing §12.5, #344).
+#[cfg(feature = "ffmpeg")]
+pub mod passthrough_live;
 /// Passthrough ingest tap registry and writer (output-routing §12.5, #344).
 #[cfg(feature = "ffmpeg")]
 pub mod passthrough_tap;

@@ -40,7 +40,8 @@ pub struct TapStream {
     pub connection: u64,
     /// The stream's codec.
     pub codec: CodecKind,
-    /// The NAL framing of the stream's access units.
+    /// The NAL framing of the source stream. Tap AUs are always re-framed
+    /// as Annex B ([`TapAu::data`]), whatever this says.
     pub framing: NalFraming,
     /// The stream time base.
     pub time_base: Rational,
@@ -56,7 +57,8 @@ pub struct SourceTap {
     params_gen: AtomicU64,
     /// Packets skipped before the copy because they exceed `MAX_AU_BYTES`.
     oversize: AtomicU64,
-    /// Packets skipped because they carried no DTS/PTS or no run clock existed.
+    /// Packets skipped because they carried no DTS/PTS, no run clock existed,
+    /// or a length-prefixed packet was malformed.
     unstamped: AtomicU64,
 }
 
@@ -400,7 +402,19 @@ impl TapWriter {
         };
         let pts = pts.unwrap_or(dts);
         let codec = self.facts.codec;
-        let framing = self.facts.framing;
+        // Every tap AU is Annex B (the one copy re-frames a length-prefixed
+        // packet), so a reader never depends on a connection's framing and
+        // the bytes go straight into an MPEG-TS muxer.
+        let bytes: Arc<[u8]> = if self.facts.framing == NalFraming::AnnexB {
+            Arc::from(data)
+        } else if let Some(v) = idr::to_annex_b(data, self.facts.framing) {
+            Arc::from(v)
+        } else {
+            self.tap.unstamped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let data = &bytes[..];
+        let framing = NalFraming::AnnexB;
         let strict_idr = idr::is_self_contained_idr(data, codec, framing);
         if key || strict_idr {
             match owned_sets(data, codec, framing) {
@@ -432,7 +446,7 @@ impl TapWriter {
             _ => true,
         };
         self.tap.tap.offer(TapAu {
-            data: Arc::from(data),
+            data: bytes,
             dts,
             pts,
             time_base: self.facts.time_base,
@@ -636,5 +650,23 @@ mod tests {
         let t = source_traits(&f, None);
         assert_eq!(t.scan, Scan::Interlaced);
         assert_eq!(t.constraint_flags, 0);
+    }
+
+    #[test]
+    fn length_prefixed_packets_reach_the_reader_as_annex_b() {
+        let tap = Arc::new(SourceTap::new());
+        let reader = tap.tap().subscribe().unwrap();
+        let mut f = facts();
+        f.framing = NalFraming::LengthPrefixed { nal_length_size: 4 };
+        let mut w = TapWriter::connect(Arc::clone(&tap), f, clock());
+        let mut lp = Vec::new();
+        for nal in [SPS, PPS, &[0x65, 0x88, 0x80][..]] {
+            lp.extend_from_slice(&u32::try_from(nal.len()).unwrap().to_be_bytes());
+            lp.extend_from_slice(nal);
+        }
+        w.on_packet(&lp, Some(0), Some(0), true);
+        let au = reader.try_recv().unwrap();
+        assert_eq!(&au.data[..], &idr_au(SPS)[..]);
+        assert!(au.strict_idr);
     }
 }
