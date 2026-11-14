@@ -1,7 +1,8 @@
 //! Owned frame hook for a first-slice one-cell Program scene. No shared mutex
 //! crosses between the frame boundary and completion callbacks.
 use crate::clock::Tick;
-use crate::drive::{CompositedFrame, CompositorDrive, TransitionStyle};
+use crate::drive::{CompositedFrame, CompositorDrive, MixOverlay, TransitionStyle};
+use crate::keyer::{KeyerDraw, MAX_DSK};
 use crate::runtime::FrameControl;
 use crate::switcher_control::SwitcherTickDriver;
 use multiview_compositor::pipeline::Nv12Image;
@@ -33,6 +34,10 @@ pub struct SwitcherFrameHook<C> {
     last_preview: Option<Arc<str>>,
     fps_num: i64,
     fps_den: i64,
+    /// Fixed exchange buffer for this tick's keyer draws (ADR-0113): filled
+    /// by the driver, swapped into the drive, so the previous tick's `Arc`s
+    /// come back here and drop on the next resolve. No per-tick allocation.
+    keyer_buf: [Option<KeyerDraw>; MAX_DSK],
 }
 
 impl<C> SwitcherFrameHook<C> {
@@ -55,6 +60,7 @@ impl<C> SwitcherFrameHook<C> {
             last_preview: None,
             fps_num: 0,
             fps_den: 0,
+            keyer_buf: [const { None }; MAX_DSK],
         }
     }
 }
@@ -122,6 +128,15 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             self.failed_tick = Some(tick.index);
             self.driver.reject_composed_tick(tick, &error);
             let _ = drive.set_mix_overlay(None);
+            // No keyer is drawn on a rejected frame's restored state: swap
+            // an empty buffer in, then drop what came back.
+            for draw in &mut self.keyer_buf {
+                *draw = None;
+            }
+            drive.set_keyer_draws(&mut self.keyer_buf);
+            for draw in &mut self.keyer_buf {
+                *draw = None;
+            }
             // Keep the drive coherent with the restored machine (SW2-03): if
             // this tick re-pointed the cell before failing, point it back.
             let (restored, _) = self.driver.resolved_selections();
@@ -130,7 +145,16 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             {
                 self.last_program = Some(restored.clone());
             }
+            return;
         }
+        // Downstream keyers (ADR-0113), only on a frame that will commit:
+        // tied keyers follow the same envelope the transition tiles use (MIX
+        // opacity, DIP weights), then one buffer swap into the drive (the
+        // previous tick's `Arc`s come back and drop on the next resolve).
+        let envelope = drive.mix_overlay().map(MixOverlay::tie_envelope);
+        self.driver
+            .resolve_keyers(tick, envelope, &mut self.keyer_buf);
+        drive.set_keyer_draws(&mut self.keyer_buf);
     }
 
     fn after_compose(&mut self, frame: &CompositedFrame) {
