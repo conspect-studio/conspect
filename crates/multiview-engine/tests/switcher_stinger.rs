@@ -584,6 +584,18 @@ fn a_blocking_or_panicking_roll_never_affects_the_tick() {
             started.elapsed() < std::time::Duration::from_secs(30),
             "nothing waited for the roll"
         );
+        // The worker has taken the first roll (test-side bounded wait, off the
+        // tick), so the second cannot coalesce with it (review): two callbacks
+        // prove the panicking worker survived and the blocked one resumes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while calls.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "first roll taken, blocking={blocking}"
+        );
         // A second stinger still rolls (the panicking worker survived) or is
         // queued behind the blocked one, never waiting either way.
         rig.send(
