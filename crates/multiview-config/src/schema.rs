@@ -3011,7 +3011,7 @@ pub enum Output {
         /// The output's media slots (ADR-0110 / §12.3): at most one H.264
         /// video slot, any number of audio slots (one CMAF audio rendition
         /// each) and up to [`MAX_SUBTITLE_SLOTS`](crate::MAX_SUBTITLE_SLOTS)
-        /// `webvtt` subtitle slots (one WebVTT rendition each). Absent ⇒ one
+        /// `webvtt` subtitle slots (one `WebVTT` rendition each). Absent ⇒ one
         /// video slot with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
