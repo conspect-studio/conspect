@@ -208,34 +208,7 @@ impl SwitcherState {
         if self.flight.is_some() {
             return Err(SwitcherError::InFlight);
         }
-        let valid = match &descriptor {
-            TransitionDescriptor::Dip {
-                rate, switch_point, ..
-            } => {
-                rate.get() >= 2
-                    && switch_point.num > 0
-                    && switch_point.den > 0
-                    && switch_point.num < switch_point.den
-            }
-            TransitionDescriptor::Wipe {
-                softness,
-                border_width,
-                position_xy,
-                ..
-            } => [*softness, *border_width, position_xy[0], position_xy[1]]
-                .iter()
-                .all(|x| x.is_finite() && (0.0..=1.0).contains(x)),
-            TransitionDescriptor::Stinger {
-                trigger_point,
-                mix_rate,
-                clip_duration,
-                ..
-            } => trigger_point
-                .get()
-                .checked_add(mix_rate.get())
-                .is_some_and(|sum| sum <= clip_duration.get()),
-            _ => true,
-        };
+        let valid = descriptor.is_valid();
         if !valid {
             return Err(SwitcherError::InvalidTransition);
         }

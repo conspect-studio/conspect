@@ -84,16 +84,7 @@ pub const REFUSE_UNSUPPORTED_TRANSITION: &str =
 /// Is `descriptor` a transition the Program drive renders (ADR-0112)?
 #[must_use]
 pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
-    match descriptor {
-        TransitionDescriptor::Cut | TransitionDescriptor::Mix { .. } => true,
-        TransitionDescriptor::Dip { dip_source, .. } => dip_source.is_none(),
-        TransitionDescriptor::Wipe {
-            border_fill_source,
-            flip_flop,
-            ..
-        } => border_fill_source.is_none() && !flip_flop,
-        _ => false,
-    }
+    descriptor.is_rendered()
 }
 
 /// Typed refusal: a select names an undeclared or unpatched input.
@@ -143,7 +134,7 @@ pub struct SwitcherCommand {
 }
 
 /// Engine-owned bus selection projected at a real output frame boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SwitcherSnapshot {
     /// Output tick on which this snapshot was published.
     pub tick: u64,
@@ -161,6 +152,10 @@ pub struct SwitcherSnapshot {
     pub in_flight: bool,
     /// Number of completed takes, monotonic within one runtime.
     pub completion_count: u64,
+    /// The selected transition (frozen during a flight), as the machine
+    /// holds it after this tick (ADR-0112 §4). An AUTO's own rate replaces
+    /// the selected rate when it starts.
+    pub transition: TransitionDescriptor,
 }
 
 /// Definitive command result after the engine has processed it at a tick.
@@ -1009,6 +1004,9 @@ impl SwitcherTickDriver {
                 || previous.inputs_version != self.inputs_version
                 || previous.in_flight != self.machine.is_in_flight()
                 || previous.completion_count != self.machine.completion_count()
+                // A comparison, never a clone: the descriptor is cloned only
+                // below, on a tick whose published state actually changed.
+                || previous.transition != *self.machine.transition()
         });
         if changed {
             self.snapshots.publish(SwitcherSnapshot {
@@ -1020,6 +1018,7 @@ impl SwitcherTickDriver {
                 inputs_version: self.inputs_version,
                 in_flight: self.machine.is_in_flight(),
                 completion_count: self.machine.completion_count(),
+                transition: self.machine.transition().clone(),
             });
         }
         // Readback only on a committed patch tick (allocates; never steady state).

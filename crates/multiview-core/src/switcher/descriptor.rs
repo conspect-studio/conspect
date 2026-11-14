@@ -294,6 +294,91 @@ pub enum TransitionDescriptor {
     },
 }
 
+impl TransitionDescriptor {
+    /// Whether the descriptor's numbers are admissible (ADR-0055 §3,
+    /// ADR-0112): a dip of at least 2 frames with its switch point strictly
+    /// inside `(0, 1)`; a wipe's softness, border width and origin finite and
+    /// in `[0, 1]`; a stinger's mix window inside its clip. The one rule the
+    /// value machine, the control API and the config loader share.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Dip {
+                rate, switch_point, ..
+            } => {
+                rate.get() >= 2
+                    && switch_point.num > 0
+                    && switch_point.den > 0
+                    && switch_point.num < switch_point.den
+            }
+            Self::Wipe {
+                softness,
+                border_width,
+                position_xy,
+                ..
+            } => [*softness, *border_width, position_xy[0], position_xy[1]]
+                .iter()
+                .all(|x| x.is_finite() && (0.0..=1.0).contains(x)),
+            Self::Stinger {
+                trigger_point,
+                mix_rate,
+                clip_duration,
+                ..
+            } => trigger_point
+                .get()
+                .checked_add(mix_rate.get())
+                .is_some_and(|sum| sum <= clip_duration.get()),
+            _ => true,
+        }
+    }
+
+    /// Whether the Program drive renders this kind with these options
+    /// (ADR-0112): cut, mix, dip to a colour and a colour-bordered wipe
+    /// without flip-flop. A dip through a source, a source-filled border,
+    /// flip-flop, DVE and stinger are not rendered yet.
+    #[must_use]
+    pub fn is_rendered(&self) -> bool {
+        match self {
+            Self::Cut | Self::Mix { .. } => true,
+            Self::Dip { dip_source, .. } => dip_source.is_none(),
+            Self::Wipe {
+                border_fill_source,
+                flip_flop,
+                ..
+            } => border_fill_source.is_none() && !flip_flop,
+            _ => false,
+        }
+    }
+
+    /// The source id this descriptor references (a dip source, a border
+    /// fill source, a stinger's player), for per-object authorization.
+    #[must_use]
+    pub fn source_ref(&self) -> Option<&SourceRef> {
+        match self {
+            Self::Dip { dip_source, .. } => dip_source.as_ref(),
+            Self::Wipe {
+                border_fill_source, ..
+            } => border_fill_source.as_ref(),
+            Self::Stinger { player, .. } => Some(player),
+            _ => None,
+        }
+    }
+
+    /// The transition duration in frames, for the kinds that carry one.
+    #[must_use]
+    pub fn rate(&self) -> Option<FrameCount> {
+        match self {
+            Self::Mix { rate }
+            | Self::Dip { rate, .. }
+            | Self::Wipe { rate, .. }
+            | Self::DvePush { rate, .. }
+            | Self::DveSqueeze { rate, .. } => Some(*rate),
+            Self::Stinger { clip_duration, .. } => Some(*clip_duration),
+            _ => None,
+        }
+    }
+}
+
 /// The default dip split point: half the window (ADR-0055 §3).
 fn default_switch_point() -> Rational {
     Rational::new(1, 2)
