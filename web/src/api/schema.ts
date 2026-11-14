@@ -2321,8 +2321,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Plan 1..64 mixer crosspoints (path, on-air flag, refusals) or the slots of
-         *     one output (§12.4 path P1/P2/P3 and cost); no change.
+         * Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the
+         *     slots of one output (§12.4 path P1/P2/P3 and cost), or an atomic set
+         *     over many destinations (#308: every member planned, `can_take` only when
+         *     all can and the set's new encoders fit the caller's caps); no change.
          */
         post: operations["plan_patch"];
         delete?: never;
@@ -2341,10 +2343,11 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Take 1..64 mixer crosspoints atomically at one engine tick, or one
-         *     output's video slot 0 (+ audio slot 0 follow) through the same machinery
-         *     as `POST /routing/output/take` (the slot-0 alias; shared idempotency
-         *     store and limits; the outcome rides `route.output`).
+         * Take 1..64 mixer crosspoints atomically at one engine tick, one output's
+         *     video slot 0 (+ audio slot 0 follow) through the same machinery as
+         *     `POST /routing/output/take` (the slot-0 alias; shared idempotency store
+         *     and limits; the outcome rides `route.output`), or an atomic set over many
+         *     destinations (#308; outcome `patch.take`).
          */
         post: operations["take_patch"];
         delete?: never;
@@ -2916,6 +2919,28 @@ export interface paths {
          *     strip + the audit trail).
          */
         post: operations["fire_salvo"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/salvos/{id}/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/salvos/{id}/plan` — plan a patch salvo's crosspoints
+         *     (#308): the `POST /patch/plan` answer for the stored crosspoints and
+         *     `on_air`, authorized like the take; no change. `arm` keeps its legacy
+         *     meaning.
+         */
+        post: operations["plan_salvo"];
         delete?: never;
         options?: never;
         head?: never;
@@ -7307,10 +7332,19 @@ export interface components {
             /** @description The tally target the override applies to. */
             target: components["schemas"]["TallyTargetDoc"];
         };
-        /** @description `POST /patch/take` 202 answer; the outcome arrives as `switcher.operation`. */
+        /**
+         * @description `POST /patch/take` 202 answer. The outcome arrives as `switcher.operation`
+         *     (mixer inputs), `route.output` (one output) or, for a set of two or more
+         *     destinations, `patch.take` (#308).
+         */
         PatchAccepted: {
             /** @description Correlates with `switcher.operation.operation_id`. */
             operation_id: string;
+            /**
+             * @description A patch salvo that also recalls layout/sources/tally/UMD: the
+             *     operation id of that recall (its outcome rides `salvo.taken`).
+             */
+            recall_operation_id?: string | null;
             /** @description Always `accepted`; never `applied`. */
             status: string;
         };
@@ -7358,6 +7392,8 @@ export interface components {
             /** @description Per-crosspoint plan, request order. */
             crosspoints: components["schemas"]["PlannedCrosspoint"][];
         };
+        /** @description A `PatchPlan` for mixer inputs or one output, or a `SetPlan` (with `set: {new_encoders, fits}`) for an atomic set of two or more destinations. */
+        PatchPlanResponseDoc: components["schemas"]["PatchPlan"] | components["schemas"]["SetPlan"];
         /** @description A typed refusal (`type` suffix + detail). */
         PatchRefusal: {
             /** @description Human-readable reason. */
@@ -8290,6 +8326,13 @@ export interface components {
             id: string;
             /** @description Recall a named layout (preset or head layout name). */
             layout?: string | null;
+            /** @description The patch crosspoints' on-air guard (default `protect`). */
+            on_air?: components["schemas"]["OnAir"];
+            /**
+             * @description Patch crosspoints taken atomically at one tick through the
+             *     `POST /patch/take` set path (#308); the `/patch` crosspoint shape.
+             */
+            patch?: components["schemas"]["PatchCrosspoint"][];
             /** @description Source rebindings. */
             sources?: components["schemas"]["SourceRecallDoc"][];
             /** @description Forced tally states. */
@@ -8297,6 +8340,8 @@ export interface components {
             /** @description UMD label changes. */
             umd?: components["schemas"]["UmdRecallDoc"][];
         };
+        /** @description `AcceptedBody` for a salvo with only legacy recalls; `PatchAccepted` for a patch salvo (#308). */
+        SalvoTakeAcceptedDoc: components["schemas"]["AcceptedBody"] | components["schemas"]["PatchAccepted"];
         /** @description The `POST /api/v1/cast/sessions/{id}/save` request body. */
         SaveCastSessionRequest: {
             /** @description The device id to register the promoted device under. */
@@ -8367,6 +8412,18 @@ export interface components {
             transport: string;
         };
         /**
+         * @description The aggregate cost of a set (`POST /patch/plan`, #308): its NEW encoder
+         *     delta, deduplicated per identical engine encoder identity (feed at the
+         *     output's format, encoder settings, live reset settings), against the
+         *     caller's per-principal cap and the global sessions.
+         */
+        SetCost: {
+            /** @description Whether that delta fits the caller's cap and the global sessions now. */
+            fits: boolean;
+            /** @description New encoder sessions the whole set opens. */
+            new_encoders: number;
+        };
+        /**
          * @description The `202 Accepted` body for `set-mode`: the operation id, the **declared**
          *     pre-apply impact class, and the human-readable impact statement (ADR-M009 —
          *     the API surfaces the impact BEFORE applying).
@@ -8413,6 +8470,11 @@ export interface components {
             ack_impact?: string | null;
             /** @description The desired converged work mode (driver vocabulary, e.g. `encoder`). */
             mode: string;
+        };
+        /** @description The plan body of a set: the [`PatchPlan`] plus its aggregate cost. */
+        SetPlan: components["schemas"]["PatchPlan"] & {
+            /** @description The whole set's encoder delta and fit (sets only). */
+            set: components["schemas"]["SetCost"];
         };
         /** @description `POST /api/v1/tls/setup-code` response: the new code, returned once. */
         SetupCodeBody: {
@@ -16710,12 +16772,13 @@ export interface operations {
             };
         };
         responses: {
+            /** @description The plan: a `PatchPlan`, or for an atomic set of two or more destinations a `SetPlan` that adds `set: {new_encoders, fits}` (#308). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PatchPlan"];
+                    "application/json": components["schemas"]["PatchPlanResponseDoc"];
                 };
             };
             /** @description Not authorized for a destination (M/E object + Program scope; an output: object + output axis) or a source. */
@@ -16745,7 +16808,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; two outputs, mixer + output, or subtitle crosspoints mixed with video/audio ones: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout or bus on a mixer input; an unknown feed), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A subtitle slot (`{"source": id}` or `"none"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track). */
+            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; subtitle crosspoints mixed with video/audio ones or naming two outputs), `unknown-source` (a layout or bus on a mixer input; an unknown feed; more than 4 distinct layouts in one set), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A subtitle slot (`{"source": id}` or `"none"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -16781,6 +16844,7 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Accepted. A set of two or more destinations (#308) settles on `patch.take` (one delivery per destination, scoped by it); mixer inputs alone on `switcher.operation`; one output on `route.output`. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -16789,7 +16853,7 @@ export interface operations {
                     "application/json": components["schemas"]["PatchAccepted"];
                 };
             };
-            /** @description Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source; a replayed key is re-authorized. */
+            /** @description Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source (a layout: its id and whole source closure) of ANY member; nothing is enqueued and no key is burned; a replayed key is re-authorized. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -16807,7 +16871,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `conflict` (an output take's Idempotency-Key first used for another output, feed or subtitle slot map; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or no source lease. */
+            /** @description `conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions), `aux-capacity` (no free layout canvas), or no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -16816,7 +16880,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run`, after an applied one is persisted as the slots' `source` (in swap order). `subtitle:applied` means the route table was swapped. The outcome's `tick` is a completed-tick lower bound observed before the swap: the subtitle sampler had completed that tick (`0`: possibly none yet) before the swap; it is not a landing tick. A sample already in flight finishes on the old table; the first table read that starts after the swap sees the new route, unless a later take supersedes it first (then this one is never sampled) or the run ends first. */
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run` (see the subtitle design note). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -16825,7 +16889,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After. */
+            /** @description Over 2 takes/s per destination or 10/s per principal (one request = one take, whatever its crosspoint count; a set counts once per destination); see Retry-After. */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -16834,7 +16898,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy` (the key and leases are released; a subtitle take between engine runs or after the run ended, or while the bounded subtitle persistence queue is full: nothing changed, the key freed and the rate slot refunded; or an output slot's `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity`. */
+            /** @description `engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity` (also: 256 sets already await their outcome). */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -18449,7 +18513,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized to write. */
+            /** @description Not authorized to write, or (a patch salvo, #308) not authorized for a patch member's destination or source: every member's both ends are authorized at store time. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -18467,8 +18531,17 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The salvo failed validation. */
+            /** @description The salvo failed validation (a patch salvo: more than 64 crosspoints, a destination twice, an unknown source, mixer input, output or layout, or an unsupported crosspoint shape). */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy`: a patch member's `{layout}` could not be read now; retry. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -18670,28 +18743,25 @@ export interface operations {
             };
         };
     };
-    take_salvo: {
+    plan_salvo: {
         parameters: {
-            query?: {
-                /** @description The output head this recall targets, if scoped to one head. */
-                head?: string | null;
-            };
+            query?: never;
             header?: never;
             path: {
-                /** @description Salvo id to take. */
+                /** @description Salvo id to plan. */
                 id: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Take accepted; outcome on the realtime stream. */
-            202: {
+            /** @description The patch plan of the salvo's crosspoints (as `POST /patch/plan`): a `PatchPlan`, or a `SetPlan` with `set: {new_encoders, fits}` for two or more destinations. */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AcceptedBody"];
+                    "application/json": components["schemas"]["PatchPlanResponseDoc"];
                 };
             };
             /** @description Missing or invalid credentials. */
@@ -18703,7 +18773,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized to take. */
+            /** @description Not authorized for the salvo or for a patch member's destination or source. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -18721,8 +18791,106 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description As `POST /patch/plan`. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The salvo has no patch crosspoints, or as `POST /patch/plan`. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy`: a `{layout}` could not be read now. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    take_salvo: {
+        parameters: {
+            query?: {
+                /** @description The output head this recall targets, if scoped to one head. */
+                head?: string | null;
+            };
+            header?: never;
+            path: {
+                /** @description Salvo id to take. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Take accepted; outcome on the realtime stream. A salvo with only legacy recalls answers `AcceptedBody` (outcome `salvo.taken`). A patch salvo (#308) answers `{operation_id, status: "accepted", recall_operation_id?}`: its crosspoints are taken atomically through the `POST /patch/take` set path (outcome `patch.take`, for one destination too) and a legacy recall, when present, is submitted too (`recall_operation_id`). */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SalvoTakeAcceptedDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to take (a patch salvo: every member's both ends are re-authorized under the caller's current grants). */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No salvo with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A patch salvo: as `POST /patch/take` (`conflict`, `capacity`, `on-air-protected`, ...). */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description `switcher-owns-program`: a switcher M/E is declared and the salvo recalls a layout or cell sources (Program is the M/E bus; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Refused before the Idempotency-Key is reserved. A salvo of only tally/UMD recalls is unaffected. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A patch salvo: as `POST /patch/take`. */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
