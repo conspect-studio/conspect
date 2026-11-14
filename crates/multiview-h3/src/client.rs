@@ -93,15 +93,18 @@ pub fn insecure_client_config(
     Ok(noq::ClientConfig::new(Arc::new(crypto)))
 }
 
-/// Admits every request stream; ignores server-opened WebTransport streams.
-struct Router(Arc<Semaphore>);
+/// Admits every request stream; counts and drops server-opened
+/// WebTransport unidirectional streams (their payload is not read).
+struct Router(Arc<Semaphore>, Arc<std::sync::atomic::AtomicU64>);
 
 impl StreamRouter for Router {
     fn admit_request(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.0).try_acquire_owned().ok()
     }
     fn webtransport_bi(&self, _: u64, _: noq::SendStream, _: noq_adapter::RecvStream) {}
-    fn webtransport_uni(&self, _: u64, _: noq_adapter::RecvStream) {}
+    fn webtransport_uni(&self, _: u64, _: noq_adapter::RecvStream) {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// One h3 connection.
@@ -112,6 +115,7 @@ pub struct Client {
     pub send: SendRequest,
     driver: tokio::task::JoinHandle<()>,
     _endpoint: noq::Endpoint,
+    wt_uni: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for Client {
@@ -161,8 +165,11 @@ impl Client {
         let endpoint = endpoint.clone();
         let connecting = endpoint.connect(server, server_name)?;
         let conn = tokio::time::timeout(timeout, connecting).await??;
-        let quic = noq_adapter::Connection::new(conn.clone())
-            .with_router(Arc::new(Router(Arc::new(Semaphore::new(1024)))));
+        let wt_uni = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let quic = noq_adapter::Connection::new(conn.clone()).with_router(Arc::new(Router(
+            Arc::new(Semaphore::new(1024)),
+            Arc::clone(&wt_uni),
+        )));
         let (mut driver, send) = tokio::time::timeout(
             timeout,
             h3::client::builder()
@@ -179,7 +186,15 @@ impl Client {
             send,
             driver,
             _endpoint: endpoint,
+            wt_uni,
         })
+    }
+
+    /// WebTransport unidirectional streams the server opened on this
+    /// connection so far.
+    #[must_use]
+    pub fn webtransport_uni_streams(&self) -> u64 {
+        self.wt_uni.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Sends `req` with `body` (sent in 16 KiB DATA frames; empty: none),

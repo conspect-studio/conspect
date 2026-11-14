@@ -31,7 +31,11 @@
 //! * RSS grows by less than [`RSS_BOUND_KB`] while the hammer runs (from the
 //!   warmed-up baseline: churned connections and sessions are released);
 //! * the hammer really ran (requests, 429s and guard rejections counted) and
-//!   the endpoint answers a fresh GET afterwards.
+//!   the endpoint answers a fresh GET afterwards;
+//! * #382: [`LONG_SESSIONS`] WebTransport sessions opened before the idle
+//!   run stay up through idle and hammer (past the 10 s header deadline that
+//!   used to reset every CONNECT stream), each receiving the handler's
+//!   server-opened streams the whole time, with no header-deadline reset.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -64,6 +68,8 @@ use common::{assert_cadence, report, run_clock, ClockRun};
 
 /// Concurrent hammer connections.
 const CLIENTS: usize = 32;
+/// Long-lived sessions held across the idle and hammer runs (#382).
+const LONG_SESSIONS: usize = 8;
 /// Every this many rounds a client drops its connection and opens a new one.
 const CHURN_EVERY: u64 = 4;
 /// RSS growth bound during the hammer.
@@ -115,8 +121,26 @@ impl WtHandler for HoldWt {
         _: SocketAddr,
     ) -> BoxFuture<'static, ()> {
         Box::pin(async move {
-            use web_transport_trait::Session as _;
-            let _ = session.closed().await;
+            use web_transport_trait::{SendStream as _, Session as _};
+            // Like a MoQ viewer: one server-opened stream per 100 ms while
+            // the session lives, never awaiting more than a write's flow
+            // control (a slow client only ever slows its own task).
+            let feed = async {
+                let mut tick = tokio::time::interval(Duration::from_millis(100));
+                loop {
+                    tick.tick().await;
+                    let Ok(mut uni) = session.open_uni().await else {
+                        return;
+                    };
+                    if uni.write(b"chaos-media").await.is_err() || uni.finish().is_err() {
+                        return;
+                    }
+                }
+            };
+            tokio::select! {
+                () = feed => {}
+                _ = session.closed() => {}
+            }
         })
     }
     fn protocols(&self) -> &[&'static str] {
@@ -361,7 +385,14 @@ https_port = {udp_port}
         assert_eq!(r.status(), 200);
     });
 
-    // 1. Idle: the endpoint up, no clients.
+    // Long-lived sessions (#382): opened now, read for the whole test.
+    let long_stop = Arc::new(AtomicBool::new(false));
+    let long_opened = std::time::Instant::now();
+    let long: Vec<_> = (0..LONG_SESSIONS)
+        .map(|_| client_rt.spawn(long_session(udp, Arc::clone(&long_stop))))
+        .collect();
+
+    // 1. Idle: the endpoint up, no hammer clients.
     let idle = run_clock(duration, |_| {});
     report("h3 idle", &idle);
 
@@ -391,6 +422,8 @@ https_port = {udp_port}
     let loaded = run_clock(duration, |_| {});
     let rss_after = rss_kb();
     stop.store(true, Ordering::Relaxed);
+    long_stop.store(true, Ordering::Relaxed);
+    let long_held = long_opened.elapsed();
     let samples = rss_thread.join().unwrap();
     eprintln!("h3 chaos: RSS samples (kB, every 500 ms): {samples:?}");
     client_rt.block_on(async {
@@ -398,8 +431,24 @@ https_port = {udp_port}
             let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
         }
     });
+    let long_results: Vec<LongResult> = client_rt.block_on(async {
+        let mut out = Vec::new();
+        for task in long {
+            out.push(
+                tokio::time::timeout(Duration::from_secs(30), task)
+                    .await
+                    .expect("a long session task hung")
+                    .unwrap(),
+            );
+        }
+        out
+    });
+    eprintln!("h3 chaos: long sessions held {long_held:?}: {long_results:?}");
     report("h3 hammer", &loaded);
     let counters = run_counters(&run);
+    let deadline_resets = run
+        .h3_counters()
+        .map_or(0, |c| Counters::get(&c.header_deadline_rejections));
     if let Some(c) = run.h3_counters() {
         eprintln!("h3 chaos: endpoint counters {c:?}");
     }
@@ -462,6 +511,79 @@ https_port = {udp_port}
         "connections churned"
     );
     assert!(counters.0 > 0, "the header guard rejected oversized blocks");
+    // #382: every long session lived to the end, past the header deadline,
+    // and kept receiving (one stream per 100 ms; a loaded runner may lag).
+    // `alive_at_end` requires streams in the last ~3 s: a session reset at
+    // 10 s fails it.
+    let header_deadline = multiview_h3::H3Limits::default().header_deadline;
+    assert!(
+        long_held > header_deadline + Duration::from_secs(2),
+        "{long_held:?}"
+    );
+    for r in &long_results {
+        assert!(
+            r.alive_at_end,
+            "a long session ended early: {long_results:?}"
+        );
+        // At least half the nominal rate over the whole hold (~150 at 15 s):
+        // catches a session starved throughout; the tail check above catches
+        // one that stopped.
+        assert!(
+            r.streams * 200 >= long_held.as_millis() as u64,
+            "a long session stopped receiving: {long_results:?}"
+        );
+    }
+    assert_eq!(
+        deadline_resets, 0,
+        "no stream was reset by the header deadline"
+    );
+}
+
+#[derive(Debug)]
+struct LongResult {
+    /// The connection stayed up and streams kept arriving in the last 3 s.
+    alive_at_end: bool,
+    streams: u64,
+}
+
+/// One WebTransport session held until `stop`, counting the server's
+/// streams; `alive_at_end` is false if the session or connection ended
+/// before `stop`.
+async fn long_session(udp: u16, stop: Arc<AtomicBool>) -> LongResult {
+    let auth = format!("localhost:{udp}");
+    let mut c = connect(udp).await.expect("long session connect");
+    let (r, connect_stream) = c
+        .open(
+            client::connect_request(&auth, "/moq/?ticket=long", Some("\"moqt-16\"")).unwrap(),
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // The session is alive while its server-opened streams keep arriving:
+    // a reset CONNECT stream ends the session, not the connection.
+    let mut alive = true;
+    let mut recent = std::collections::VecDeque::new();
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if c.conn.close_reason().is_some() {
+            alive = false;
+            break;
+        }
+        recent.push_back(c.webtransport_uni_streams());
+        if recent.len() > 15 {
+            recent.pop_front();
+        }
+    }
+    let streams = c.webtransport_uni_streams();
+    // Streams in the last 3 s (15 samples of 200 ms; 30 expected).
+    let tail = streams - recent.front().copied().unwrap_or(0);
+    alive &= tail > 0;
+    drop(connect_stream);
+    LongResult {
+        alive_at_end: alive,
+        streams,
+    }
 }
 
 /// `(header_guard_rejections, wt_429, connections_accepted)` while the

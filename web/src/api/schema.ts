@@ -15331,7 +15331,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The replaced output (new ETag in the response header). */
+            /** @description The replaced output (new ETag in the response header). `x-multiview-apply: live` when the change is ONLY the output's `format` and/or `slots.video[0].bitrate_kbps` on a running HLS output (TS segments): that output is reset live; with no `x-multiview-operation-id` when nothing changed (an identical PUT) or those settings are effectively unchanged (an absent bitrate = 4000 kbit/s, a canvas-size default-fit format = absent: nothing to reset) (about 1 s; Program and other outputs are not affected; `x-multiview-apply-note` says so, `x-multiview-operation-id` correlates the `route.output` outcome `reset:applied` or `reset:refused:<reason>`). Otherwise `x-multiview-apply: restart` (a codec, audio-slot or other change, or any other kind, SRT/RIST included: follow-up #380). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -15349,7 +15349,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized to write. */
+            /** @description Not authorized to write (a live reset also needs the output axis). */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -15369,6 +15369,24 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A live reset over 2/s for this output or 10/s for the principal (one reset = one take); nothing committed. See Retry-After. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy`: a live reset could not be handed to the engine; the previous output is restored (nothing changed). Retry. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
