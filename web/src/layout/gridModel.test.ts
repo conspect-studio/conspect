@@ -151,6 +151,23 @@ describe('body <-> model round-trip', () => {
     expect(toGridLayoutBody(model)).toEqual(body);
   });
 
+  // PR-B: `overlays` is an unknown root key to the grid editor too (the
+  // engine owns it, see ./overlays.ts); it must round-trip via rootExtra.
+  it('preserves a root-level overlays object verbatim', () => {
+    const body = frigateBody();
+    body.overlays = {
+      labels: true,
+      meters: false,
+      flags: true,
+      tally: true,
+      clock: true,
+      safe_area: false,
+    };
+    const model = load(body);
+    expect(model.rootExtra.overlays).toEqual(body.overlays);
+    expect(toGridLayoutBody(model)).toEqual(body);
+  });
+
   it('keeps non-area (absolute rect) cells under a grid layout verbatim and in order', () => {
     const body = frigateBody();
     const cells = body.cells as Record<string, unknown>[];

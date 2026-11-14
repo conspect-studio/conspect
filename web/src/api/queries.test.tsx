@@ -154,6 +154,22 @@ describe('useSaveLayout', () => {
     expect(readEtags(qc).a).toBe('"v2"');
   });
 
+  it('refuses an empty explicit ifMatch instead of sending an unconditional PUT', async () => {
+    const qc = newClient();
+    qc.setQueryData(queryKeys.etags, { a: '"cached"' });
+    store = [{ id: 'a', name: 'Old', body: {} }];
+    lastIfMatch = 'untouched';
+    const api = createApiClient({ baseUrl: BASE });
+    const { result } = renderHook(() => useSaveLayout({ api }), {
+      wrapper: wrapper(qc),
+    });
+    await expect(
+      result.current.mutateAsync({ id: 'a', create: false, ifMatch: ' ', input: { name: 'X', body: {} } }),
+    ).rejects.toThrow('Missing ETag');
+    expect(lastIfMatch).toBe('untouched');
+    expect(store[0]?.name).toBe('Old');
+  });
+
   it('updates an existing layout whose ETag is not cached (after a reload) using the server ETag', async () => {
     // A fresh session: the layout exists on the server (listed) but this
     // client never wrote it, so no ETag is cached. Save must UPDATE with the
