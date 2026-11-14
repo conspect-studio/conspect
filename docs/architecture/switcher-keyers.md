@@ -961,6 +961,20 @@ keyers.
     `MAX_TICK_ATTEMPTS` and counted (it spun 1 001 attempts before the fix); the bounded
     entry points keep the exclusion, and releases leave the other field and the defined bit
     intact.
+- **Concern: tick refusals allocate once per command (review round 2 J3, investigated, not
+  redesigned).** A tick-side `keyer_set` refusal (`keyer-set-deadline`,
+  `clean-unavailable-with-dsk`, `clean-gate-contended`) builds its `String` reason and
+  `EventStream::publish` wraps the outcome in an `Arc`. Every existing tick-side switcher
+  refusal on main does the same through the same paths: `publish_outcome`
+  (`switcher_control.rs` on main: 1539) for `REFUSE_LOST_DURING_AUTO.into()` (1003) and
+  `REFUSE_NO_FRESH_FRAME.into()` (1024, 1048, and `refuse_armed` 1216 from 1246/1300), and the
+  K2a keyer `refuse` (`keyer.rs` on main: 653 `reason.to_owned()`) for `keyer-rate` (945) and the
+  repeat deadline (1144); `EventStream::publish` (`isolation.rs` 223, `Arc::new`). The K4
+  refusals sit in the same mailbox drain and consume their command, so it is the existing
+  per-command outcome pattern: bounded by the 64-slot mailbox and `MAX_COMMANDS_PER_TICK`,
+  one event per refused command, never steady-state (no K4 verb is held across ticks).
+  `keyers_set` asserts one outcome per refused command and nothing on later steady ticks.
+  Making outcome publication allocation-free is a cross-switcher change, out of K4.
 - **Concern.** The GET/events parity test drives the driver without the frame hook, so its
   `tally` is the background roles only. Keyer tally resolution is covered by the lib unit
   test on a constructed snapshot.

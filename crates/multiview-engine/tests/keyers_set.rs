@@ -385,3 +385,54 @@ fn a_rejected_definition_releases_the_tick_reservation() {
         Some("compose failed")
     );
 }
+
+/// Review J3: the tick-side `keyer_set` refusals (`keyer-set-deadline`,
+/// `clean-unavailable-with-dsk`) follow the switcher's existing per-command
+/// outcome pattern: exactly one outcome when the command is drained, and
+/// nothing on any later steady tick (no refusal is re-published per tick
+/// while a command is held; these verbs are never held).
+#[test]
+fn a_tick_refusal_publishes_once_per_command_and_never_on_steady_ticks() {
+    use multiview_engine::switcher_control::KEYER_SET_DEADLINE_TICKS;
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[], 9.0, "a", "b");
+    let mut outcomes = handle.outcomes();
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    let gate = handle.clean_gate();
+    let clean = gate.try_reserve_clean().unwrap();
+    let verb = || {
+        handle.keyer_set_verb(
+            &handle.keyer_definitions().unwrap(),
+            0,
+            handle.resolve_keyer(&dsk("dsk1", "gfx", None, 1)).unwrap(),
+            false,
+        )
+    };
+    handle.try_send(cmd("late", verb())).unwrap();
+    handle.try_send(cmd("while-clean", verb())).unwrap();
+    // Both share the admission base, so both are drained at their deadline
+    // tick: one `keyer-set-deadline` outcome each, never re-published.
+    let at = KEYER_SET_DEADLINE_TICKS;
+    fresh(&rig, at);
+    step(&mut hook, &mut drive, at);
+    let first = drain(&mut outcomes).0;
+    assert_eq!(first.len(), 2, "{first:?}");
+    assert!(first
+        .iter()
+        .all(|o| !o.completed && o.error.as_deref() == Some(REFUSE_KEYER_SET_DEADLINE)));
+    // A fresh command refused by the Clean backstop: one outcome.
+    handle.try_send(cmd("clean", verb())).unwrap();
+    fresh(&rig, at + 1);
+    step(&mut hook, &mut drive, at + 1);
+    let second = drain(&mut outcomes).0;
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(second[0].error.as_deref(), Some(REFUSE_KEYER_CLEAN));
+    // Steady ticks with no command publish nothing, Clean still held.
+    for index in at + 2..at + 12 {
+        fresh(&rig, index);
+        step(&mut hook, &mut drive, index);
+    }
+    assert!(drain(&mut outcomes).0.is_empty(), "a steady tick published");
+    drop(clean);
+}
