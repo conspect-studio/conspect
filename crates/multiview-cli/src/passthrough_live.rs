@@ -1440,7 +1440,15 @@ mod tests {
             ])
             .arg("testsrc2=size=160x120:rate=25")
             .args(["-frames:v", &frames.to_string(), "-pix_fmt", "yuv420p"])
-            .args(["-c:v", "libx264", "-preset", "veryfast", "-x264-params"])
+            .args([
+                "-threads",
+                "1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-x264-params",
+            ])
             .arg("aud=1:keyint=10:min-keyint=10:scenecut=0:bframes=0:repeat-headers=1")
             .args(["-f", "h264"])
             .arg(&path)
@@ -1831,7 +1839,7 @@ mod tests {
             ])
             .arg("testsrc2=size=160x120:rate=30000/1001:duration=30")
             .args([
-                "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast",
+                "-pix_fmt", "yuv420p", "-threads", "1", "-c:v", "libx264", "-preset", "veryfast",
             ])
             .args([
                 "-x264-params",
