@@ -51,7 +51,8 @@ use crate::epoch::SharedEpoch;
 use crate::error::{Error, Result};
 use crate::hls::{
     media_segment_references, media_segment_uris, AudioRendition, BackgroundFile, LivePlaylist,
-    MasterPlaylist, MediaPlaylist, Segment, SegmentType, VariantStream,
+    MasterPlaylist, MediaPlaylist, Segment, SegmentType, SubtitleFeedReceiver, SubtitleMedia,
+    SubtitleRendition, SubtitleStats, VariantStream,
 };
 use crate::metadata::{DisplayMatrix, MetadataScope, MuxMetadata};
 
@@ -1875,6 +1876,10 @@ pub struct PacketMuxSink {
     /// The rendition-master writer (production: fenced atomic publish). A test
     /// seam to inject a failing master write; see `with_master_writer`.
     master_writer: Option<crate::hls::ManifestWriter>,
+    /// `WebVTT` subtitle renditions (slice F #345) and the cue feed they are
+    /// filled from; empty ⇒ none (the master is unchanged).
+    subtitles: Vec<SubtitleRendition>,
+    subtitle_feed: Option<SubtitleFeedReceiver>,
 }
 
 /// The two `PacketMuxSink` flavours (private; the public surface is the
@@ -1919,6 +1924,8 @@ impl PacketMuxSink {
             display_matrix: None,
             audio_selection: AudioSelection::default(),
             master_writer: None,
+            subtitles: Vec::new(),
+            subtitle_feed: None,
         }
     }
 
@@ -1935,6 +1942,8 @@ impl PacketMuxSink {
             display_matrix: None,
             audio_selection: AudioSelection::default(),
             master_writer: None,
+            subtitles: Vec::new(),
+            subtitle_feed: None,
         }
     }
 
@@ -1956,6 +1965,8 @@ impl PacketMuxSink {
             display_matrix: None,
             audio_selection: AudioSelection::default(),
             master_writer: None,
+            subtitles: Vec::new(),
+            subtitle_feed: None,
         }
     }
 
@@ -1999,6 +2010,8 @@ impl PacketMuxSink {
             display_matrix: None,
             audio_selection: AudioSelection::default(),
             master_writer: None,
+            subtitles: Vec::new(),
+            subtitle_feed: None,
         }
     }
 
@@ -2017,6 +2030,29 @@ impl PacketMuxSink {
         self.metadata = metadata;
         self.display_matrix = display_matrix;
         self
+    }
+
+    /// Attach `WebVTT` subtitle renditions (slice F #345, segment-live sink
+    /// only): one `subs<i>-g<gen>.m3u8` media playlist per rendition, one
+    /// `.vtt` per video segment (same index, duration and media sequence),
+    /// listed in the master's `"subs"` group. Cues arrive on `feed` (bounded,
+    /// drop-and-count on the engine side) and are drained at each segment
+    /// close. A builder; without it the sink is unchanged.
+    #[must_use]
+    pub fn with_subtitles(
+        mut self,
+        renditions: Vec<SubtitleRendition>,
+        feed: SubtitleFeedReceiver,
+    ) -> Self {
+        self.subtitles = renditions;
+        self.subtitle_feed = Some(feed);
+        self
+    }
+
+    /// The subtitle drop/write counters, when subtitle renditions are attached.
+    #[must_use]
+    pub fn subtitle_stats(&self) -> Option<std::sync::Arc<SubtitleStats>> {
+        self.subtitle_feed.as_ref().map(SubtitleFeedReceiver::stats)
     }
 
     /// Select which audio this sink carries (#151/#152): the program bus and/or
@@ -2192,6 +2228,7 @@ impl PacketMuxSink {
                 live.enable_background_publish()?;
                 state.seg_index = next;
                 state.live = Some(live);
+                state.subtitle_feed = self.subtitle_feed.as_ref();
                 state.set_audio_renditions(
                     playlist_path,
                     *window,
@@ -2199,6 +2236,7 @@ impl PacketMuxSink {
                     video,
                     audio,
                     track_streams,
+                    &self.subtitles,
                 )?;
                 let driven = state.drive_from_packets(source);
                 finish_segments(state, driven, video.time_base)
@@ -2337,6 +2375,16 @@ struct SegmentState<'a> {
     tracks: Option<(&'a AudioSelection, &'a [MuxStream<'a>])>,
     /// The rendition-master writer (production default; tests may inject one).
     master_writer: crate::hls::ManifestWriter,
+    /// The subtitle cue feed (slice F #345), drained at each segment close.
+    subtitle_feed: Option<&'a SubtitleFeedReceiver>,
+}
+
+/// One `WebVTT` subtitle rendition's state: its media playlist, its `.vtt`
+/// file prefix and the cues held between segment closes (slice F #345).
+struct SubtitleSlotState {
+    live: LivePlaylist,
+    prefix: String,
+    held: crate::hls::subtitle::SlotCues,
 }
 
 /// One audio-only MPEG-TS muxer, opened ONCE at the run's first video keyframe
@@ -2380,6 +2428,11 @@ struct AudioRenditions<'a> {
     /// The off-packet-path writer for the master (spawned on first publish).
     master_writer: Option<BackgroundFile>,
     retention_window: usize,
+    /// The subtitle renditions (slice F #345): their master entries, states
+    /// and the shared counters. Empty ⇒ none.
+    subtitle_entries: Vec<SubtitleMedia>,
+    subtitles: Vec<SubtitleSlotState>,
+    subtitle_stats: std::sync::Arc<SubtitleStats>,
 }
 
 /// The one long-lived segment muxer's state: its (never rebuilt) `Muxer`, its
@@ -2404,6 +2457,8 @@ struct OpenSegment {
     /// it equals `path` (mux in place, byte-identical to before).
     write_path: PathBuf,
     start_pts: MediaTime,
+    /// The segment's filename index (the subtitle `.vtt` reuses it).
+    index: u64,
 }
 
 impl<'a> SegmentState<'a> {
@@ -2449,11 +2504,12 @@ impl<'a> SegmentState<'a> {
             tracks: None,
             renditions: None,
             master_writer: crate::hls::default_writer(),
+            subtitle_feed: None,
         }
     }
 
     /// Build independent audio-only renditions from the same encoded packets.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     // reason: initialization joins rendition selection, video metadata, and the
     // master; keep these states together so publication order stays coherent.
     fn set_audio_renditions(
@@ -2464,6 +2520,7 @@ impl<'a> SegmentState<'a> {
         video: MuxStream<'a>,
         audio: Option<MuxStream<'a>>,
         tracks: &'a [MuxStream<'a>],
+        subtitles: &[SubtitleRendition],
     ) -> Result<()> {
         let default_selection = AudioSelection::default();
         let selection = self
@@ -2528,6 +2585,33 @@ impl<'a> SegmentState<'a> {
                 current: None,
             });
         }
+        // Slice F (#345): one WebVTT media playlist per subtitle slot, kept
+        // aligned with the video playlist (same sequence, same segments).
+        let mut subtitle_entries = Vec::with_capacity(subtitles.len());
+        let mut sub_slots = Vec::with_capacity(subtitles.len());
+        for (i, rendition) in subtitles.iter().enumerate() {
+            let uri = format!("subs{i}-g{generation}.m3u8");
+            let mut subs_live = LivePlaylist::new(parent.join(&uri), window);
+            subs_live.set_epoch_source(epoch.clone());
+            subs_live.enable_background_publish()?;
+            subs_live.set_media_sequence(self.seg_index);
+            if self.seg_index != 0 {
+                subs_live.set_initial_discontinuity();
+            }
+            subtitle_entries.push(SubtitleMedia {
+                name: rendition.name.clone(),
+                uri,
+                language: rendition.language.clone(),
+            });
+            sub_slots.push(SubtitleSlotState {
+                live: subs_live,
+                prefix: format!("subs{i}-"),
+                held: crate::hls::subtitle::SlotCues::default(),
+            });
+        }
+        let sub_counters = self
+            .subtitle_feed
+            .map_or_else(std::sync::Arc::default, SubtitleFeedReceiver::stats);
         let video_uri = format!("video-g{generation}.m3u8");
         let mut video_live = LivePlaylist::new(parent.join(&video_uri), window);
         video_live.set_epoch_source(epoch);
@@ -2539,6 +2623,7 @@ impl<'a> SegmentState<'a> {
         let audio_entries = master.audio_renditions().to_vec();
         let master_text = render_master(
             &audio_entries,
+            &subtitle_entries,
             &video_uri,
             video.params,
             video.time_base,
@@ -2562,6 +2647,9 @@ impl<'a> SegmentState<'a> {
             pending_master: None,
             master_writer: None,
             retention_window: window,
+            subtitle_entries,
+            subtitles: sub_slots,
+            subtitle_stats: sub_counters,
         });
         Ok(())
     }
@@ -2646,6 +2734,7 @@ impl<'a> SegmentState<'a> {
             if let Some(params) = reseed {
                 renditions.pending_master = render_master(
                     &renditions.audio_entries,
+                    &renditions.subtitle_entries,
                     &renditions.video_uri,
                     params,
                     renditions.video.stream.time_base,
@@ -3025,6 +3114,9 @@ impl<'a> SegmentState<'a> {
             {
                 state.live.set_initial_discontinuity();
             }
+            for sub in &mut renditions.subtitles {
+                sub.live.set_initial_discontinuity();
+            }
         }
         if let Some(live) = self.live.as_mut() {
             live.set_initial_discontinuity();
@@ -3061,6 +3153,9 @@ impl<'a> SegmentState<'a> {
                 }
                 state.live.set_initial_discontinuity();
             }
+            for sub in &mut renditions.subtitles {
+                sub.live.set_initial_discontinuity();
+            }
         }
         if let Some(live) = self.live.as_mut() {
             live.set_initial_discontinuity();
@@ -3085,6 +3180,9 @@ impl<'a> SegmentState<'a> {
                 .chain(std::iter::once(&mut renditions.video))
             {
                 state.live.flush_best_effort(left());
+            }
+            for sub in &mut renditions.subtitles {
+                sub.live.flush_best_effort(left());
             }
             // The master is queued only once every media playlist exists, so
             // landing it after them keeps the ordering; without this a failed
@@ -3197,6 +3295,7 @@ impl<'a> SegmentState<'a> {
             segment.path = path;
             segment.write_path = write_path;
             segment.start_pts = start_pts;
+            segment.index = index;
         } else {
             // First segment of the run: build the ONE long-lived muxer +
             // register its streams. Rebuilt for a later segment only at a
@@ -3254,6 +3353,7 @@ impl<'a> SegmentState<'a> {
                 path,
                 write_path,
                 start_pts,
+                index,
             });
         }
         // Both muxers are built: the change (if any) is complete.
@@ -3302,6 +3402,68 @@ impl<'a> SegmentState<'a> {
     /// `.ts`). The batch flavour leaves the muxed-in-place file untouched and
     /// only records it for the finalize-time playlist render — byte-identical
     /// to before.
+    /// Slice F (#345): write one `.vtt` per subtitle slot for the video
+    /// segment `[start, end)` just closed (same `index`, `duration`, start
+    /// PTS — so the subtitle playlists stay aligned with the video ones) and
+    /// push it into the slot's media playlist. The `X-TIMESTAMP-MAP` maps
+    /// LOCAL zero (= `start`) to the 90 kHz PTS the segment's first video PES
+    /// actually carries in the written TS (the muxer adds its own offset),
+    /// read back from the file. Cues are drained from the feed first
+    /// (non-blocking). A slot with no cue still gets a header-only `.vtt`.
+    fn close_subtitle_segments(
+        &mut self,
+        start: MediaTime,
+        end: MediaTime,
+        duration: f64,
+        index: u64,
+        main_ts: &Path,
+    ) -> Result<()> {
+        let Some(renditions) = self.renditions.as_mut() else {
+            return Ok(());
+        };
+        if renditions.subtitles.is_empty() {
+            return Ok(());
+        }
+        if let Some(feed) = self.subtitle_feed {
+            for cue in feed.drain() {
+                if let Some(sub) = renditions.subtitles.get_mut(usize::from(cue.slot)) {
+                    sub.held.push(cue, &renditions.subtitle_stats);
+                }
+            }
+        }
+        // Prefer the master variant's own (video rendition) segment: it is
+        // what a player pairs the subtitles with.
+        let video_ts = self
+            .dir
+            .join(format!("{}{index}.ts", renditions.video.prefix));
+        let mpegts = read_first_video_pts(&video_ts)
+            .or_else(|| read_first_video_pts(main_ts))
+            .unwrap_or_else(|| crate::hls::subtitle::pts_90k_of(start));
+        for sub in &mut renditions.subtitles {
+            let text = crate::hls::subtitle::render_vtt(
+                &sub.held.overlapping(start, end),
+                start,
+                end,
+                mpegts,
+            );
+            let path = self.dir.join(format!("{}{index}.vtt", sub.prefix));
+            let tmp = segment_temp_path(&path);
+            std::fs::write(&tmp, text.as_bytes())
+                .and_then(|()| std::fs::rename(&tmp, &path))
+                .map_err(|e| Error::Output(format!("publishing subtitle segment: {e}")))?;
+            let uri = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| Error::Output("subtitle segment lacks filename".to_owned()))?
+                .to_owned();
+            sub.live
+                .push_closed_segment(uri, path, duration, start.as_nanos())?;
+            sub.held.retire_before(end);
+            renditions.subtitle_stats.note_segment_written();
+        }
+        Ok(())
+    }
+
     /// Publish (or, after a live reset, republish) the rendition master,
     /// LAST: after video and every audio media playlist exist (review R3-1).
     ///
@@ -3336,6 +3498,10 @@ impl<'a> SegmentState<'a> {
                     .states
                     .iter()
                     .all(|state| state.live.playlist_path().exists())
+                && renditions
+                    .subtitles
+                    .iter()
+                    .all(|sub| sub.live.playlist_path().exists())
                 && renditions.video.live.playlist_path().exists()
             {
                 // Ordering is preserved: every media playlist exists before
@@ -3417,6 +3583,10 @@ impl<'a> SegmentState<'a> {
                 segment.start_pts.as_nanos(),
             )?;
         }
+        let (seg_start, seg_index, seg_path) =
+            (segment.start_pts, segment.index, segment.path.clone());
+        let seg_end = seg_start.saturating_add(MediaTime::from_nanos(span_ns.max(frame_ns)));
+        self.close_subtitle_segments(seg_start, seg_end, duration, seg_index, &seg_path)?;
         self.publish_master()?;
         if let Some(renditions) = self.renditions.as_ref() {
             // Never reap a file named by the still-advertised master when its
@@ -3495,6 +3665,9 @@ impl<'a> SegmentState<'a> {
             {
                 state.live.finalize()?;
             }
+            for sub in &mut renditions.subtitles {
+                sub.live.finalize()?;
+            }
             // Every media playlist is durable now (finalize joined each
             // publisher). Publish the master if a close has not queued it yet
             // (short runs close before the background media writes land).
@@ -3505,6 +3678,10 @@ impl<'a> SegmentState<'a> {
                         .states
                         .iter()
                         .all(|state| state.live.playlist_path().exists())
+                        && renditions
+                            .subtitles
+                            .iter()
+                            .all(|sub| sub.live.playlist_path().exists())
                         && renditions.video.live.playlist_path().exists() =>
                     {
                         Some(BackgroundFile::spawn_with(
@@ -3560,6 +3737,7 @@ fn bound_live_report(done: &mut Vec<(PathBuf, f64)>, window: usize) {
 /// and for a live reset's new parameters (review R3-1).
 fn render_master(
     audio_entries: &[AudioRendition],
+    subtitle_entries: &[SubtitleMedia],
     video_uri: &str,
     video: &StreamCodecParameters,
     time_base: Rational,
@@ -3609,6 +3787,9 @@ fn render_master(
     for audio in audio_entries {
         master.push_audio(audio.clone());
     }
+    for subtitle in subtitle_entries {
+        master.push_subtitle(subtitle.clone());
+    }
     master.push_variant(variant);
     Some(master.render())
 }
@@ -3631,6 +3812,12 @@ fn prune_prior_rendition_manifests(dir: &Path, renditions: &AudioRenditions<'_>,
         .iter()
         .chain(std::iter::once(&renditions.video))
         .map(|state| state.live.playlist_path())
+        .chain(
+            renditions
+                .subtitles
+                .iter()
+                .map(|sub| sub.live.playlist_path()),
+        )
         .collect();
     prune_prior_rendition_manifests_inactive(dir, &active, oldest);
 }
@@ -3648,6 +3835,7 @@ fn prune_prior_rendition_manifests_inactive(dir: &Path, active: &[&Path], oldest
             || !(name.starts_with("video-")
                 || name.starts_with("audio-program-")
                 || name.starts_with("audio-track")
+                || name.starts_with("subs")
                 || matches!(name, "video.m3u8" | "audio-program.m3u8"))
             || active.contains(&entry.path().as_path())
         {
@@ -3683,7 +3871,22 @@ fn segment_grace(window: usize) -> u64 {
 }
 
 fn segment_number(uri: &str) -> Option<u64> {
-    uri.strip_suffix(".ts")?.rsplit('-').next()?.parse().ok()
+    uri.strip_suffix(".ts")
+        .or_else(|| uri.strip_suffix(".vtt"))?
+        .rsplit('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The 90 kHz PTS of the first video PES of a written TS segment (slice F
+/// #345), reading at most its first MiB.
+fn read_first_video_pts(path: &Path) -> Option<u64> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::new();
+    file.take(1 << 20).read_to_end(&mut head).ok()?;
+    crate::hls::subtitle::first_video_pts_90k(&head)
 }
 
 fn prune_prior_live_segments(dir: &Path, prefix: &str, next: u64, window: usize) {
@@ -3699,6 +3902,23 @@ fn prune_prior_live_segments(dir: &Path, prefix: &str, next: u64, window: usize)
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
+        // Slice F (#345): a prior run's subtitle `.vtt` ages out with its TS.
+        if let Some(stem) = name.strip_suffix(".vtt") {
+            let number = stem.strip_prefix("subs").and_then(|s| {
+                s.split_once('-')
+                    .and_then(|(slot, index)| slot.parse::<u8>().ok().map(|_| index))
+            });
+            if !references.contains(std::ffi::OsStr::new(name))
+                && number
+                    .and_then(|index| index.parse::<u64>().ok())
+                    .is_some_and(|index| index < oldest)
+            {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) | Err(_) => {}
+                }
+            }
+            continue;
+        }
         let Some(stem) = name.strip_suffix(".ts") else {
             continue;
         };
@@ -4215,6 +4435,7 @@ mod tests {
                 crate::epoch::SharedEpoch::new(),
                 MuxStream::new(params, Rational::new(1, 30)),
                 None,
+                &[],
                 &[],
             )
             .unwrap();
@@ -5357,5 +5578,241 @@ mod tests {
             }
             assert!(pts.iter().all(|p| p.rem_euclid(1024) == 0), "on the grid");
         }
+    }
+
+    /// Slice F (#345): a live `SegmentState` with the master/rendition
+    /// layout plus `subtitles` `WebVTT` renditions fed by `feed`.
+    fn subtitle_state<'a>(
+        dir: &'a std::path::Path,
+        params: &'a multiview_ffmpeg::StreamCodecParameters,
+        feed: &'a crate::hls::SubtitleFeedReceiver,
+        subtitles: &[crate::hls::SubtitleRendition],
+    ) -> super::SegmentState<'a> {
+        use super::{MuxStream, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        let mut state = SegmentState::new(
+            StreamSeed::Params(params),
+            Rational::new(1, 30),
+            None,
+            dir,
+            "seg",
+        );
+        let playlist = dir.join("index.m3u8");
+        state.live = Some(LivePlaylist::new(playlist.clone(), 10));
+        state.subtitle_feed = Some(feed);
+        state
+            .set_audio_renditions(
+                &playlist,
+                10,
+                crate::epoch::SharedEpoch::new(),
+                MuxStream::new(params, Rational::new(1, 30)),
+                None,
+                &[],
+                subtitles,
+            )
+            .unwrap();
+        state
+    }
+
+    /// `(media sequence, [(EXTINF, uri)])` of a media playlist.
+    fn playlist_entries(path: &std::path::Path) -> (String, Vec<(String, String)>) {
+        let text = std::fs::read_to_string(path).unwrap();
+        let sequence = text
+            .lines()
+            .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+            .unwrap()
+            .to_owned();
+        let mut entries = Vec::new();
+        let mut extinf = None;
+        for line in text.lines() {
+            if let Some(d) = line.strip_prefix("#EXTINF:") {
+                extinf = Some(d.to_owned());
+            } else if !line.starts_with('#') && !line.is_empty() {
+                entries.push((extinf.take().unwrap(), line.to_owned()));
+            }
+        }
+        (sequence, entries)
+    }
+
+    fn named_playlist(dir: &std::path::Path, prefix: &str) -> std::path::PathBuf {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().is_some_and(|x| x == "m3u8")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(prefix))
+            })
+            .unwrap_or_else(|| panic!("no {prefix}* playlist"))
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    // reason: one end-to-end run checked across master, playlists and files.
+    fn subtitle_renditions_align_with_video_and_map_the_real_ts_pts() {
+        use crate::hls::subtitle::{first_video_pts_90k, pts_90k_of};
+        use crate::hls::{subtitle_feed, SubtitleCue, SubtitleRendition};
+        use multiview_core::time::MediaTime;
+        let _counter_guard = counter_guard();
+        // 12 ticks at 1/30, a keyframe every 3: segments of 100 ms.
+        let (packets, params) = sized_packets(160, 120, 0, 12);
+        let dir = tempfile::tempdir().unwrap();
+        let (feed, rx) = subtitle_feed();
+        let ms = |v: i64| MediaTime::from_nanos(v * 1_000_000);
+        // Spans segments 0 and 1; escaped text; slot 1 gets nothing.
+        assert!(feed.offer(SubtitleCue {
+            slot: 0,
+            start: ms(50),
+            end: ms(150),
+            lines: vec!["Fish & <chips>".to_owned()],
+        }));
+        assert!(feed.offer(SubtitleCue {
+            slot: 0,
+            start: ms(250),
+            end: ms(280),
+            lines: vec!["third".to_owned()],
+        }));
+        let renditions = [
+            SubtitleRendition {
+                name: "English".to_owned(),
+                language: Some("en".to_owned()),
+            },
+            SubtitleRendition {
+                name: "Deutsch".to_owned(),
+                language: Some("de".to_owned()),
+            },
+        ];
+        let mut state = subtitle_state(dir.path(), &params, &rx, &renditions);
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: -1,
+            params: None,
+            last_pts: None,
+        };
+        state.drive_from_packets(&mut source).unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+
+        let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+        assert!(master.contains(
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,URI=\"subs0-g0.m3u8\""
+        ), "{master}");
+        assert!(master.contains("URI=\"subs1-g0.m3u8\""), "{master}");
+        assert!(master.contains(",SUBTITLES=\"subs\""), "{master}");
+
+        let (video_seq, video) = playlist_entries(&named_playlist(dir.path(), "video-g"));
+        assert_eq!(video.len(), 4, "{video:?}");
+        for slot in 0..2 {
+            let (seq, subs) = playlist_entries(&dir.path().join(format!("subs{slot}-g0.m3u8")));
+            assert_eq!(seq, video_seq, "same media sequence");
+            assert_eq!(subs.len(), video.len());
+            for ((vd, vuri), (sd, suri)) in video.iter().zip(&subs) {
+                assert_eq!(vd, sd, "same EXTINF");
+                let index = vuri
+                    .strip_prefix("video-")
+                    .unwrap()
+                    .strip_suffix(".ts")
+                    .unwrap();
+                assert_eq!(*suri, format!("subs{slot}-{index}.vtt"), "same index");
+            }
+        }
+        let mut offsets = Vec::new();
+        for (i, (_, vuri)) in video.iter().enumerate() {
+            let index = vuri
+                .strip_prefix("video-")
+                .unwrap()
+                .strip_suffix(".ts")
+                .unwrap();
+            let ts = std::fs::read(dir.path().join(vuri)).unwrap();
+            let carried = first_video_pts_90k(&ts).expect("a video PES PTS");
+            let vtt =
+                std::fs::read_to_string(dir.path().join(format!("subs0-{index}.vtt"))).unwrap();
+            assert!(
+                vtt.starts_with(&format!(
+                    "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{carried},LOCAL:00:00:00.000\n"
+                )),
+                "the map names the PTS the TS carries: {vtt}"
+            );
+            let start = ms(100 * i64::try_from(i).unwrap());
+            offsets.push(i128::from(carried) - i128::from(pts_90k_of(start)));
+            let empty =
+                std::fs::read_to_string(dir.path().join(format!("subs1-{index}.vtt"))).unwrap();
+            assert_eq!(
+                empty,
+                format!("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{carried},LOCAL:00:00:00.000\n"),
+                "an empty slot still gets a valid header-only segment"
+            );
+        }
+        assert!(
+            offsets.windows(2).all(|w| w[0] == w[1]),
+            "one constant muxer offset: {offsets:?}"
+        );
+        let vtt = |i: usize| {
+            let index = video[i]
+                .1
+                .strip_prefix("video-")
+                .unwrap()
+                .strip_suffix(".ts")
+                .unwrap()
+                .to_owned();
+            std::fs::read_to_string(dir.path().join(format!("subs0-{index}.vtt"))).unwrap()
+        };
+        assert!(
+            vtt(0).contains("00:00:00.050 --> 00:00:00.100\nFish &amp; &lt;chips&gt;\n"),
+            "{}",
+            vtt(0)
+        );
+        assert!(
+            vtt(1).contains("00:00:00.000 --> 00:00:00.050\nFish &amp; &lt;chips&gt;\n"),
+            "{}",
+            vtt(1)
+        );
+        assert!(
+            vtt(2).contains("00:00:00.050 --> 00:00:00.080\nthird\n"),
+            "{}",
+            vtt(2)
+        );
+        assert!(!vtt(3).contains("-->"), "{}", vtt(3));
+        assert_eq!(rx.stats().segments_written(), 8);
+    }
+
+    #[test]
+    fn subtitle_files_and_playlists_retire_with_the_ts_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["subs0-1.vtt", "subs0-50.vtt", "subs3-2.vtt", "subsX-1.vtt"] {
+            std::fs::write(dir.path().join(name), "WEBVTT\n").unwrap();
+        }
+        // next 60, window 3: grace 12, so index < 48 retires.
+        prune_prior_live_segments(dir.path(), "seg", 60, 3);
+        assert!(!dir.path().join("subs0-1.vtt").exists());
+        assert!(!dir.path().join("subs3-2.vtt").exists());
+        assert!(dir.path().join("subs0-50.vtt").exists());
+        assert!(dir.path().join("subsX-1.vtt").exists(), "not ours");
+        // A prior run's subtitle playlist listing an aged-out vtt retires; one
+        // still listing fresh segments stays.
+        std::fs::write(dir.path().join("subs0-50.vtt"), "WEBVTT\n").unwrap();
+        std::fs::write(
+            dir.path().join("subs0-g0.m3u8"),
+            "#EXTM3U\n#EXTINF:1.0,\nsubs0-1.vtt\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("subs0-g40.m3u8"),
+            "#EXTM3U\n#EXTINF:1.0,\nsubs0-50.vtt\n",
+        )
+        .unwrap();
+        prune_prior_rendition_manifests_inactive(dir.path(), &[], 48);
+        assert!(!dir.path().join("subs0-g0.m3u8").exists());
+        assert!(dir.path().join("subs0-g40.m3u8").exists());
+        // A vtt still listed by a manifest is never reaped.
+        std::fs::write(dir.path().join("subs0-3.vtt"), "WEBVTT\n").unwrap();
+        std::fs::write(
+            dir.path().join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:1.0,\nsubs0-3.vtt\n",
+        )
+        .unwrap();
+        prune_prior_live_segments(dir.path(), "seg", 60, 3);
+        assert!(dir.path().join("subs0-3.vtt").exists());
     }
 }
