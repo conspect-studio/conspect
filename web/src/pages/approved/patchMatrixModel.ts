@@ -388,13 +388,22 @@ export interface PlannedMember {
 export const ON_AIR_REFUSAL = 'on-air-protected';
 
 /**
+ * Readback states that outrank a plan overlay (E3-12): the engine's evidence
+ * (fresh-gate `pending` with held ticks, `on-air`) and the absence of it
+ * (`unknown`: stale or no readback) are never hidden behind `planned`.
+ */
+const EVIDENCE_STATES: ReadonlySet<CellState> = new Set<CellState>(['pending', 'on-air', 'unknown']);
+
+/**
  * Merge an armed cell with its plan member (§8): `planned` (with the plan's
  * path glyph) once planned, `planned` + needs-confirmation when only the
  * on-air guard refused it, `disabled` with the typed refusal otherwise. An
- * armed cell with no plan yet keeps its readback state.
+ * armed cell with no plan yet keeps its readback state, and so does one whose
+ * readback is pending, on air or unknown (E3-12).
  */
 export function displayCell(base: MatrixCell, armed: boolean, member: PlannedMember | undefined): MatrixCell {
   if (!armed || member === undefined) return base;
+  if (EVIDENCE_STATES.has(base.state)) return base;
   const path = pathGlyph(member.path);
   const withPath = path !== undefined ? { path } : {};
   if (member.refusal !== null && member.refusal.type !== ON_AIR_REFUSAL) {

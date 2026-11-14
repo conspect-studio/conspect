@@ -228,6 +228,12 @@ describe('E3-09 displayCell: armed selection + plan member', () => {
     expect(displayCell(base, true, { path: 'mixer-input', refusal: { type: 'on-air-protected', detail: 'on Program' } }))
       .toEqual({ state: 'planned', needsConfirm: true });
   });
+  it('E3-12: readback evidence (pending, on air) and unknown outrank the plan overlay', () => {
+    const member = { path: 'P3', refusal: null };
+    expect(displayCell({ state: 'pending', heldTicks: 7 }, true, member)).toEqual({ state: 'pending', heldTicks: 7 });
+    expect(displayCell({ state: 'on-air', path: 'passthrough' }, true, member)).toEqual({ state: 'on-air', path: 'passthrough' });
+    expect(displayCell({ state: 'unknown' }, true, member)).toEqual({ state: 'unknown' });
+  });
   it('keeps the readback state for an unarmed cell or an armed one with no plan yet', () => {
     expect(displayCell(base, false, { path: 'P1', refusal: null })).toEqual(base);
     expect(displayCell(base, true, undefined)).toEqual(base);
