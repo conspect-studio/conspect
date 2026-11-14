@@ -506,6 +506,9 @@ pub(crate) async fn plan_salvo(
     // crosspoints (#345 routes them on their own): plan answers the take's
     // refusal instead of a subtitle plan that could never be taken.
     if crate::routes::patch_subtitle::has_subtitle(&req) {
+        // Both ends of every member are authorized before this shape answer
+        // (the T-A1 order; a subtitle request reads no layout).
+        crate::routes::patch::authorize(&principal, &req, &[])?;
         return Ok(crate::routes::patch::problem(
             422,
             "slot-medium-mismatch",

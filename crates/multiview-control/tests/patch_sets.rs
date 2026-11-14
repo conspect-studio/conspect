@@ -1491,3 +1491,41 @@ async fn a_config_salvo_with_a_subtitle_crosspoint_is_refused_by_plan_and_take_a
     );
     assert!(rig.fake.sets().is_empty(), "nothing enqueued");
 }
+
+/// Merge review F2: the subtitle refusal of a salvo plan comes after every
+/// member's authorization: a writer denied the subtitle output gets 403 from
+/// plan exactly as from take, never the shape answer.
+#[tokio::test]
+async fn a_subtitle_salvo_is_authorized_before_plan_refuses_its_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    // output-2 declares a subtitle slot; LIMITED may use the salvo id `wide`
+    // but is not granted output-2.
+    let mut doc = doc();
+    let third = doc.match_indices("segment_ms = 1000\n").nth(2).unwrap().0;
+    doc.insert_str(
+        third + "segment_ms = 1000\n".len(),
+        "[[outputs.slots.subtitle]]\nlanguage = \"en\"\n",
+    );
+    let doc = format!(
+        "{doc}\n[[salvos]]\nid = \"wide\"\n[[salvos.patch]]\nplane = \"subtitle\"\ndestination = {{ output = \"output-2\", slot = 0 }}\nsource = {{ source = \"bars\" }}\n"
+    );
+    let rig = rig_with(&dir.path().join("boot.toml"), &doc);
+    let resp = send(
+        &rig.router,
+        post("/api/v1/salvos/wide/plan", LIMITED, None, &json!({})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "plan");
+    let resp = send(
+        &rig.router,
+        post(
+            "/api/v1/salvos/wide/take",
+            LIMITED,
+            Some("subs-l"),
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "take");
+    assert!(rig.fake.sets().is_empty(), "nothing enqueued");
+}
