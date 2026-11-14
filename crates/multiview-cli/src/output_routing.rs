@@ -489,6 +489,12 @@ pub struct RoutingSnapshot {
     /// Sets whose mixer half committed but whose output members were then
     /// refused (an encoder died after the commit, §12.8 residual fault).
     pub set_partial: u64,
+    /// Encoder sessions charged per principal (live keys, opens in flight
+    /// and set reservations), sorted by principal; principals holding none
+    /// are absent. Read by the control plane's set admission (§12.8 rule 1).
+    pub principals_held: Vec<(String, usize)>,
+    /// `routing.max_encoders_per_principal`.
+    pub max_per_principal: usize,
 }
 
 /// The control-plane handle (clone freely).
@@ -3462,6 +3468,8 @@ impl OutputRouter {
             aux_halved: self.aux.halved.load(Ordering::Relaxed),
             sets_pending: self.sets.active.len(),
             set_partial: self.sets.partial,
+            principals_held: self.principals_held(),
+            max_per_principal: self.cfg.max_per_principal,
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));

@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_control::output_routing::{
     AudioPlanCost, LayoutBody, OutputLive, OutputOutcome, OutputReformatRequest, OutputRouting,
-    OutputTakeRequest, OutputTakeSet, PlanCost, PlanPath, PlanRefusal, ReformatSubmitError,
-    RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
+    OutputTakeRequest, OutputTakeSet, PlanCost, PlanPath, PlanRefusal, PrincipalSessions,
+    ReformatSubmitError, RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
 };
 
 use crate::output_routing::{
@@ -648,6 +648,20 @@ impl OutputRouting for OutputRoutingAdapter {
                 arm: set.arm,
             })
             .map_err(|_| TakeSubmitError::Busy)
+    }
+
+    fn principal_sessions(&self, principal: &str) -> Option<PrincipalSessions> {
+        let handle = self.handle()?;
+        let snapshot = handle.snapshot();
+        let held = snapshot
+            .principals_held
+            .iter()
+            .find(|(p, _)| p == principal)
+            .map_or(0, |(_, held)| *held);
+        Some(PrincipalSessions {
+            held,
+            max: snapshot.max_per_principal,
+        })
     }
 
     fn snapshot(&self) -> Option<RoutingLive> {

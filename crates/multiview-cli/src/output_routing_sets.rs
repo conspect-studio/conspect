@@ -177,6 +177,32 @@ impl OutputRouter {
         })
     }
 
+    /// Every principal holding encoders, with [`Self::principal_held`]
+    /// (sorted; bounded by the keys, opens and sets the router holds).
+    pub(super) fn principals_held(&self) -> Vec<(String, usize)> {
+        let mut principals: Vec<&str> = self
+            .dynamic
+            .iter()
+            .map(|d| d.principal.as_str())
+            .chain(self.opens.values().map(|o| o.principal.as_str()))
+            .chain(
+                self.sets
+                    .active
+                    .iter()
+                    .filter(|s| s.reserved > 0)
+                    .map(|s| s.principal.as_str()),
+            )
+            .filter(|p| !p.is_empty())
+            .collect();
+        principals.sort_unstable();
+        principals.dedup();
+        principals
+            .into_iter()
+            .map(|p| (p.to_owned(), self.principal_held(p)))
+            .filter(|(_, held)| *held > 0)
+            .collect()
+    }
+
     /// Encoders charged to `principal`: live keys, opens in flight and its
     /// sets' unissued reservations.
     fn principal_held(&self, principal: &str) -> usize {

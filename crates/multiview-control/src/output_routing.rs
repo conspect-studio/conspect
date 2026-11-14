@@ -236,6 +236,17 @@ pub struct OutputTakeSet {
     pub arm: Option<Arc<multiview_engine::patch_set::SetArm>>,
 }
 
+/// Encoder sessions charged to one principal and its cap
+/// (`routing.max_encoders_per_principal`, §4.3), for the set admission of
+/// output-routing §12.8 rule 1 (#308).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrincipalSessions {
+    /// Live-opened keys, opens in flight and set reservations charged to it.
+    pub held: usize,
+    /// Its cap.
+    pub max: usize,
+}
+
 /// Why a take could not be enqueued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TakeSubmitError {
@@ -469,6 +480,15 @@ pub trait OutputRouting: Send + Sync {
     fn try_take_set(&self, set: OutputTakeSet) -> Result<(), TakeSubmitError> {
         let _ = set;
         Err(TakeSubmitError::Unroutable)
+    }
+    /// The encoder sessions charged to `principal` now and its cap, from the
+    /// latest readback (§12.8 admission rule 1, #308). `None` when unknown
+    /// (no run, or an engine without per-principal accounting): the set
+    /// admission then checks the global sessions only and the engine's own
+    /// admission still refuses an over-cap set whole.
+    fn principal_sessions(&self, principal: &str) -> Option<PrincipalSessions> {
+        let _ = principal;
+        None
     }
     /// A stored layout changed in the accepted library (ADR-0108 §10.1):
     /// `Some(body)` is its newly resolved body (outputs on it follow it live,
