@@ -88,6 +88,9 @@ pub struct GpuCompositor {
     /// Frames the run backend re-composited on the CPU after a genuine GPU
     /// failure (observability; see `RunBackend::gpu_cpu_fallback_frames`).
     cpu_fallback_frames: std::sync::atomic::AtomicU64,
+    /// The persistent CPU reference a GPU-failure frame is composited on (its
+    /// LUTs and band scratch survive across fallback frames, #395 INV-1).
+    cpu_fallback: crate::backend::CpuBackend,
     /// The bounded-readback state machine (issue #395): the per-frame deadline,
     /// the held stalled readback, and the miss counter. Never waits longer than
     /// the deadline; never waits at all while a readback is stalled.
@@ -355,6 +358,7 @@ impl GpuCompositor {
             #[cfg(feature = "overlay")]
             overlay,
             cpu_fallback_frames: std::sync::atomic::AtomicU64::new(0),
+            cpu_fallback: crate::backend::CpuBackend::default(),
             readback: ReadbackGate::default(),
         })
     }
@@ -384,6 +388,11 @@ impl GpuCompositor {
         self.cpu_fallback_frames
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .saturating_add(1)
+    }
+
+    /// The persistent CPU backend GPU-failure frames are composited on.
+    pub(crate) fn cpu_fallback_backend(&self) -> &crate::backend::CpuBackend {
+        &self.cpu_fallback
     }
 
     /// Frames re-composited on the CPU after a genuine GPU failure.
@@ -444,13 +453,17 @@ impl GpuCompositor {
         // are synchronous — so it cannot back-pressure the engine (invariant
         // #10).
         //
-        // A stalled earlier readback is checked first, without waiting: while
-        // its buffers are mid-map no GPU work is recorded (issue #395).
-        self.readback.admit()?;
+        // A stalled earlier readback is checked first (under the lock, below),
+        // without waiting: while its buffers are mid-map no GPU work is
+        // recorded (issue #395).
         let mut pool = self
             .pool
             .lock()
             .map_err(|_| Error::GpuRuntime("surface pool lock poisoned".to_owned()))?;
+        // Admission is checked UNDER the pool lock, so a concurrent composite
+        // can never pass admission and then reuse buffers another call left
+        // mid-map (#395 review MC-1).
+        self.readback.admit()?;
         let device = self.ctx.device();
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -519,12 +532,15 @@ impl GpuCompositor {
         // into the pooled linear canvas. The lock is never held across an
         // `.await` (these methods are synchronous), so it cannot back-pressure
         // the engine (invariant #10). A stalled earlier readback is checked
-        // first, without waiting (issue #395).
-        self.readback.admit()?;
+        // first, under the lock, without waiting (issue #395).
         let mut pool = self
             .pool
             .lock()
             .map_err(|_| Error::GpuRuntime("surface pool lock poisoned".to_owned()))?;
+        // Admission is checked UNDER the pool lock, so a concurrent composite
+        // can never pass admission and then reuse buffers another call left
+        // mid-map (#395 review MC-1).
+        self.readback.admit()?;
         let device = self.ctx.device();
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });

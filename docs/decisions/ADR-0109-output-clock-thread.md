@@ -354,9 +354,11 @@ last-good repeat.
   (`MAX_READBACK_DEADLINE` = 10 ms; also used for a degenerate zero period): 10 ms
   at 25/29.97/30/50 fps, 8.33 ms at 60, 4.17 ms at 120. The 1080p GPU round trip
   on the test server is ~4 ms (§8), so 10 ms is 2.5× healthy headroom; half a
-  period leaves the other half for wake + hook + project, so a miss never makes
-  the tick itself late by more than half a period and never cascades into
-  ADR-T018 catch-up. `CompositorDrive::with_backend` / `set_layout` set it from
+  period leaves the other half for wake + hook + upload + submit + project. The
+  deadline bounds only the readback wait after `queue.submit`: the readback
+  alone can use at most half a period, but the rest of the tick's work is not
+  bounded by it, so a tick that is already slow elsewhere can still go late and
+  be absorbed by ADR-T018 repeats-to-cadence like any other slow compose. `CompositorDrive::with_backend` / `set_layout` set it from
   the canvas cadence (`RunBackend::set_frame_period`), so Program always runs
   under it. A compositor whose period was never set (an off-clock caller: a
   test, a one-shot render) uses `UNCLOCKED_READBACK_DEADLINE` = 2 s instead,
@@ -371,7 +373,8 @@ last-good repeat.
   `FrameControl::on_compose_failed` so a switcher take staged for the tick is
   rolled back (the same rollback as its own rejected-frame path). With no
   last-good (the very first tick) the tick is composed on the CPU reference, so
-  the first frame always exists. Other compose errors keep their behaviour.
+  the first frame always exists; it is not counted as a miss (it is not a
+  repeat). Other compose errors keep their behaviour.
 * **Stall, fail fast, CPU after `STALL_HOLD` (500 ms), automatic recovery.** The
   missed readback (buffers, map receivers, submission index, start instant) is
   held. Every later frame first does a non-blocking `PollType::Poll` +
@@ -379,7 +382,14 @@ last-good repeat.
   GPU work and without touching the mid-map buffers; outstanding ≥ 500 ms ⇒
   `GpuRuntime`, which the run backend composites on the CPU reference (counted
   in `cpu_fallback_frames`), so a GPU that never answers freezes the picture for
-  at most half a second; completed or failed ⇒ unmap, clear, log `info` and
+  at most half a second. The fallback runs on the clock thread through a
+  persistent CPU backend owned by the GPU compositor (memoized LUTs, reused
+  band scratch, the auto worker fan-out), so each fallback frame costs what a
+  CPU-backend Program frame costs (ADR-0105: 7 ms for a 9-tile 1080p
+  composite). It is NOT bounded by the deadline: on a host where the CPU
+  composite is slower than a tick, ADR-T018 emits last-good repeats to keep
+  cadence (and resyncs past `MAX_REPEATS_PER_TICK`), exactly as for a slow
+  CPU-backend Program. The chaos test covers a 50 ms fallback at 30 fps; completed or failed ⇒ unmap, clear, log `info` and
   compose on the GPU again. Entering a stall logs `warn` once (rate-limited to
   power-of-two stall counts), never per tick.
 * **Counters.** Compositor `readback_deadline_misses`
@@ -399,7 +409,8 @@ last-good repeat.
   while stalled, CPU after the hold, recovery). The R3 chaos test
   `crates/multiview-engine/tests/gpu_readback_chaos.rs` runs a real clock thread
   at 30 fps over `RunBackend::simulated_gpu` (the same state machine with a fake
-  device): healthy ⇒ hung 40 ticks ⇒ slow (60 ms) 10 ticks ⇒ healthy, and
+  device): healthy ⇒ hung 40 ticks ⇒ slow (60 ms) 10 ticks ⇒ healthy, once
+  with an instant CPU fallback and once with a 50 ms one (slower than a tick), and
   asserts every tick emitted with contiguous indices and increasing PTS, misses
   counted and repeated, CPU fallback during the hang, and fresh GPU frames after
   recovery — counts and design bounds only.

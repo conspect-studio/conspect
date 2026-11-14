@@ -58,9 +58,9 @@ pub const STALL_HOLD: Duration = Duration::from_millis(500);
 
 /// The readback deadline for an output `period`: `min(10 ms, period / 2)`.
 ///
-/// Half a period leaves the other half for wake + hook + project, so a miss
-/// never makes the tick itself late by more than half a period and never
-/// cascades into catch-up repeats (ADR-T018). A zero (unknown) period yields
+/// Half a period leaves the other half for wake + hook + upload + submit +
+/// project. This bounds only the readback wait; the rest of the tick is not
+/// bounded by it (ADR-0109 §9). A zero (unknown) period yields
 /// [`MAX_READBACK_DEADLINE`].
 #[must_use]
 pub fn readback_deadline(period: Duration) -> Duration {
@@ -342,6 +342,13 @@ pub struct SimulatedGpu {
     gate: ReadbackGate<SimPending>,
     gpu_frames: AtomicU64,
     cpu_fallback_frames: AtomicU64,
+    /// Extra time each CPU-fallback frame costs (the chaos seam for a fallback
+    /// slower than a tick, #395 INV-1); zero by default.
+    cpu_fallback_cost_nanos: AtomicU64,
+    cpu_fallback: crate::backend::CpuBackend,
+    /// Stands in for the GPU compositor's surface-pool lock: admission and the
+    /// readback of one frame happen under it (review MC-1).
+    pool: Mutex<()>,
 }
 
 impl SimulatedGpu {
@@ -357,6 +364,9 @@ impl SimulatedGpu {
             gate: ReadbackGate::default(),
             gpu_frames: AtomicU64::new(0),
             cpu_fallback_frames: AtomicU64::new(0),
+            cpu_fallback_cost_nanos: AtomicU64::new(0),
+            cpu_fallback: crate::backend::CpuBackend::default(),
+            pool: Mutex::new(()),
         })
     }
 
@@ -384,9 +394,17 @@ impl SimulatedGpu {
     }
 
     pub(crate) fn record_cpu_fallback(&self) -> u64 {
+        let cost = self.cpu_fallback_cost_nanos.load(Ordering::Relaxed);
+        if cost > 0 {
+            std::thread::sleep(Duration::from_nanos(cost));
+        }
         self.cpu_fallback_frames
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1)
+    }
+
+    pub(crate) fn cpu_fallback_backend(&self) -> &crate::backend::CpuBackend {
+        &self.cpu_fallback
     }
 
     /// One "GPU" composite: admit, compose (CPU reference), "submit", then the
@@ -403,6 +421,10 @@ impl SimulatedGpu {
         background: LinearRgba,
         tiles: &[Tile<'_>],
     ) -> Result<Nv12Image> {
+        let _pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.gate.admit()?;
         let image = crate::pipeline::composite(canvas_w, canvas_h, canvas, background, tiles)?;
         let submitted = Instant::now();
@@ -430,6 +452,14 @@ impl SimulatedGpuControl {
             .device
             .latency_nanos
             .store(nanos_u64(latency), Ordering::Relaxed);
+    }
+
+    /// Make every CPU-fallback frame cost `cost` extra on the calling thread
+    /// (a fallback slower than a tick).
+    pub fn set_cpu_fallback_cost(&self, cost: Duration) {
+        self.0
+            .cpu_fallback_cost_nanos
+            .store(nanos_u64(cost), Ordering::Relaxed);
     }
 
     /// Hang the device: no readback completes until [`Self::release`].
@@ -577,6 +607,38 @@ mod tests {
         device.hung.store(false, Ordering::Release);
         submit(&gate, &device).unwrap();
         assert!(!gate.is_stalled());
+    }
+
+    /// Review MC-1: two concurrent composites on one hung device. Admission
+    /// is checked under the pool lock, so the second never submits while the
+    /// first's readback is held: exactly one readback ever waits out the
+    /// deadline, the other fails fast.
+    #[test]
+    fn concurrent_composites_never_pass_admission_past_a_held_readback() {
+        let sim = SimulatedGpu::new(Duration::from_millis(1));
+        sim.set_frame_period(Duration::from_millis(40));
+        sim.device.hung.store(true, Ordering::Release);
+        let canvas = CanvasColor::default();
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<Nv12Image>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        sim.composite(16, 16, canvas, LinearRgba::TRANSPARENT, &[])
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(results
+            .iter()
+            .all(|r| matches!(r, Err(Error::GpuDeadline(_)))));
+        // One held readback, two misses (one waited, one failed fast), and the
+        // stall was entered exactly once: no second submit replaced it.
+        assert_eq!(sim.deadline_misses(), 2);
+        assert_eq!(sim.gate.stalls.load(Ordering::Relaxed), 1);
+        assert!(sim.gate.is_stalled());
     }
 
     #[test]

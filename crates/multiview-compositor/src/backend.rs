@@ -539,6 +539,7 @@ impl RunBackend {
                 tiles,
             ),
             Self::SimulatedGpu(sim) => frame_fallback(
+                sim.cpu_fallback_backend(),
                 || sim.record_cpu_fallback(),
                 sim.composite(canvas_w, canvas_h, canvas, background, tiles),
                 canvas_w,
@@ -608,6 +609,7 @@ impl RunBackend {
             Self::SimulatedGpu(sim) => {
                 let _ = n_threads;
                 frame_fallback(
+                    sim.cpu_fallback_backend(),
                     || sim.record_cpu_fallback(),
                     sim.composite(canvas_w, canvas_h, canvas, background, tiles),
                     canvas_w,
@@ -648,6 +650,7 @@ fn gpu_or_frame_fallback(
     tiles: &[Tile<'_>],
 ) -> Result<Nv12Image> {
     frame_fallback(
+        gpu.cpu_fallback_backend(),
         || gpu.record_cpu_fallback(),
         result,
         canvas_w,
@@ -660,7 +663,9 @@ fn gpu_or_frame_fallback(
 
 /// The backend-independent body of [`gpu_or_frame_fallback`]: `record` counts
 /// one CPU-fallback frame and returns the new total.
+#[allow(clippy::too_many_arguments)]
 fn frame_fallback(
+    cpu: &CpuBackend,
     record: impl FnOnce() -> u64,
     result: Result<Nv12Image>,
     canvas_w: u32,
@@ -670,18 +675,20 @@ fn frame_fallback(
     tiles: &[Tile<'_>],
 ) -> Result<Nv12Image> {
     match result {
-        Err(err @ crate::error::Error::GpuRuntime(_)) => {
-            fallback(record, &err, canvas_w, canvas_h, canvas, background, tiles)
-        }
+        Err(err @ crate::error::Error::GpuRuntime(_)) => fallback(
+            cpu, record, &err, canvas_w, canvas_h, canvas, background, tiles,
+        ),
         #[cfg(feature = "wgpu")]
-        Err(err @ crate::error::Error::GpuLimit(_)) => {
-            fallback(record, &err, canvas_w, canvas_h, canvas, background, tiles)
-        }
+        Err(err @ crate::error::Error::GpuLimit(_)) => fallback(
+            cpu, record, &err, canvas_w, canvas_h, canvas, background, tiles,
+        ),
         other => other,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fallback(
+    cpu: &CpuBackend,
     record: impl FnOnce() -> u64,
     err: &crate::error::Error,
     canvas_w: u32,
@@ -698,7 +705,10 @@ fn fallback(
             "GPU composite failed; compositing this frame on the CPU reference"
         );
     }
-    crate::pipeline::composite(canvas_w, canvas_h, canvas, background, tiles)
+    // The persistent CPU backend (memoized LUTs, reused band scratch, the
+    // auto worker fan-out): the same per-tick cost as a CPU-backend Program,
+    // never the from-scratch free function (#395 review INV-1).
+    cpu.composite(canvas_w, canvas_h, canvas, background, tiles)
 }
 
 #[cfg(test)]

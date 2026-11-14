@@ -1118,8 +1118,10 @@ impl<P: Pacer> EngineRuntime<P> {
                 Err(crate::Error::ComposeDeadline(reason)) => {
                     // The GPU missed this tick's readback deadline: never end
                     // the run and never slip — the tick is still emitted.
-                    self.compose_deadline_misses.fetch_add(1, Ordering::AcqRel);
                     if let Some(last) = last_good.as_mut() {
+                        // Counted here only: a miss on the very first tick is
+                        // composed on the CPU below, not repeated (review MC-2).
+                        self.compose_deadline_misses.fetch_add(1, Ordering::AcqRel);
                         // The staged scene never reaches the output: let the
                         // hook roll a staged take back.
                         control.on_compose_failed(&mut self.drive, tick, &reason);

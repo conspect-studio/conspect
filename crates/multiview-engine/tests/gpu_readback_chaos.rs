@@ -55,6 +55,19 @@ struct Seen {
 
 #[test]
 fn hung_and_slow_gpu_readback_never_stalls_program_and_recovers() {
+    run_chaos(Duration::ZERO);
+}
+
+/// Review INV-1: the CPU fallback after the stall hold is itself slower than a
+/// tick (50 ms per frame against a 33 ms period). The clock still emits every
+/// tick (ADR-T018 repeats-to-cadence absorbs the slow compose, as for any slow
+/// CPU-backend Program), stamps stay contiguous, and the GPU path recovers.
+#[test]
+fn slower_than_a_tick_cpu_fallback_still_keeps_every_tick() {
+    run_chaos(Duration::from_millis(50));
+}
+
+fn run_chaos(fallback_cost: Duration) {
     let cadence = Rational::new(30, 1);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -64,6 +77,7 @@ fn hung_and_slow_gpu_readback_never_stalls_program_and_recovers() {
     let handle = rt.block_on(async {
         clock_thread::spawn("gpu-chaos", move || {
             let (backend, gpu) = RunBackend::simulated_gpu(Duration::from_millis(1));
+            gpu.set_cpu_fallback_cost(fallback_cost);
             let drive = CompositorDrive::new(
                 Arc::new(Layout {
                     name: "gpu-chaos".to_owned(),
