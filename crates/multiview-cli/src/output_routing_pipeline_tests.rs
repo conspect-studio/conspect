@@ -1763,7 +1763,7 @@ fn half_mean(plane: &[u8], x0: usize) -> i64 {
 /// Program's picture is the sources' luma: asserted on the full window in a
 /// build without `overlay`, and in an `overlay` build on rows 56..64, below
 /// the program-wide clock chrome (its readout at y 6, the reference badge at
-/// y 36, ending above row 52 on this canvas). Cells this small (32 px) draw
+/// y 36, its backing ending before row 55 on this canvas). Cells this small (32 px) draw
 /// no per-tile chrome (`MIN_TILE_PX`).
 fn assert_program_is_the_sources(t: i64, plane: &[u8]) {
     let rows = if cfg!(feature = "overlay") {
