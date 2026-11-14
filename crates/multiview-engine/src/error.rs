@@ -43,6 +43,14 @@ pub enum Error {
     #[error("compositor rejected canvas geometry: {0}")]
     Canvas(String),
 
+    /// The compositor's GPU readback missed its per-frame deadline, or an
+    /// earlier missed readback is still outstanding (issue #395, ADR-0109 §9).
+    /// Not a run failure: the runtime repeats last-good under the tick
+    /// (counted in `compose_deadline_misses` and `frames_repeated`) and keeps
+    /// ticking; the GPU recovers by itself once the readback completes.
+    #[error("compose missed its GPU readback deadline: {0}")]
+    ComposeDeadline(String),
+
     /// A live cell re-point ([`crate::CompositorDrive::rebind_cell`]) targeted an
     /// unknown cell id or an unknown/undeclared source. The binding is held
     /// unchanged — never a panic, never a silent mis-route (RT-6 / ADR-0034).

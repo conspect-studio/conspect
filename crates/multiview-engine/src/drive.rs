@@ -463,9 +463,15 @@ impl<T> CompositorDrive<T> {
     /// reference (invariant #1 — a missing/failed GPU never stalls or crashes the
     /// run). The default backend is the CPU reference, so callers that never call
     /// this keep the prior behaviour exactly.
+    ///
+    /// The backend's GPU readback deadline is bounded by the canvas cadence
+    /// here (and again on every [`CompositorDrive::set_layout`]): `min(10 ms,
+    /// period / 2)` (issue #395).
     #[must_use]
     pub fn with_backend(mut self, backend: RunBackend) -> Self {
         self.backend = backend;
+        self.backend
+            .set_frame_period(frame_period(self.layout.canvas.cadence()));
         self
     }
 
@@ -494,6 +500,8 @@ impl<T> CompositorDrive<T> {
         layout
             .validate()
             .map_err(|e| Error::InvalidLayout(e.to_string()))?;
+        self.backend
+            .set_frame_period(frame_period(layout.canvas.cadence()));
         self.layout = layout;
         self.layout_generation = self.layout_generation.wrapping_add(1);
         Ok(())
@@ -650,9 +658,30 @@ impl CompositorDrive<Nv12Image> {
     /// # Errors
     ///
     /// Returns [`Error::Canvas`] only for a structurally impossible canvas the
-    /// compositor rejects (e.g. odd dimensions). Input health is *never* an
-    /// error: a dead source yields its held frame or the slate, not a failure.
+    /// compositor rejects (e.g. odd dimensions), and
+    /// [`Error::ComposeDeadline`] when a GPU backend's readback missed its
+    /// per-frame deadline (or an earlier one is still outstanding): the
+    /// runtime then repeats last-good under this tick (issue #395). Input
+    /// health is *never* an error: a dead source yields its held frame or the
+    /// slate, not a failure.
     pub fn compose(&self, tick: Tick) -> Result<CompositedFrame> {
+        self.compose_with(tick, &self.backend)
+    }
+
+    /// As [`CompositorDrive::compose`], but on a fresh CPU reference backend
+    /// regardless of the configured one: the runtime's path for a GPU
+    /// deadline miss on the very first tick, when there is no last-good frame
+    /// to repeat (issue #395). Cold LUT caches: used at most once per run in
+    /// practice.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Canvas`] for a canvas the CPU compositor rejects.
+    pub fn compose_on_cpu(&self, tick: Tick) -> Result<CompositedFrame> {
+        self.compose_with(tick, &RunBackend::cpu())
+    }
+
+    fn compose_with(&self, tick: Tick, backend: &RunBackend) -> Result<CompositedFrame> {
         let now = tick.pts;
         let canvas = &self.layout.canvas;
 
@@ -747,8 +776,10 @@ impl CompositorDrive<Nv12Image> {
         // path a submit/readback failure surfaces as a typed error here, which
         // becomes `Error::Canvas` — the drive returns rather than stalling the
         // clock, and the caller holds last-good (safety rule §3, invariant #1).
-        let canvas_image = self
-            .backend
+        // The GPU readback wait is bounded (issue #395): a miss is
+        // `Error::ComposeDeadline`, which the runtime turns into a counted
+        // last-good repeat of this tick.
+        let canvas_image = backend
             .composite(
                 canvas.width,
                 canvas.height,
@@ -756,7 +787,10 @@ impl CompositorDrive<Nv12Image> {
                 self.background,
                 tiles.as_slice(),
             )
-            .map_err(|e| Error::Canvas(e.to_string()))?;
+            .map_err(|e| match e {
+                multiview_compositor::Error::GpuDeadline(why) => Error::ComposeDeadline(why),
+                other => Error::Canvas(other.to_string()),
+            })?;
 
         // Drop the borrowing tiles, then release the held `Arc`s now (rather than
         // pinning them until the next tick's `begin`), keeping the pooled
@@ -1056,6 +1090,12 @@ impl ComposeScratch {
             self.reservations = self.reservations.saturating_add(1);
         }
     }
+}
+
+/// The output frame period for `cadence` (zero for a degenerate cadence; the
+/// backend then keeps its default readback deadline).
+fn frame_period(cadence: multiview_core::time::Rational) -> std::time::Duration {
+    std::time::Duration::from_nanos(u64::try_from(cadence.period_nanos()).unwrap_or(0))
 }
 
 /// Map a cell's normalized rectangle to a canvas **pixel rectangle**
