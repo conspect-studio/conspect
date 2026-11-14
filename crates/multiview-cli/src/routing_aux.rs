@@ -25,8 +25,17 @@
 //! same (bus, format). A tile already at the format is passed as the same
 //! `Arc`. A feed without a format is the canvas, exactly as before.
 //!
+//! A stored layout registered as an M/E source (#307, [`MeLayoutCompose`]) is
+//! composed here too, after the routed feeds, with its own [`LayoutCanvas`]
+//! and published into its `layout:<id>` [`TileStore`] at the tick's pts; the
+//! Program drive samples that store like any source, one tick later.
+//!
 //! A panic in a tick body, or any other exit, raises `failed`; the consumer
-//! then moves every output on an aux bus back to Program (§4.4).
+//! then moves every output on an aux bus back to Program (§4.4). An M/E layout
+//! store then simply stops being fed and ages to STALE, then NO_SIGNAL (its
+//! slate) on Program; the output clock never waits for it.
+//!
+//! [`LayoutCanvas`]: crate::aux_layout::LayoutCanvas
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -253,6 +262,21 @@ pub fn feed_name(bus: &PictureBus, format: Option<AuxFormat>) -> String {
 /// The active feed set, replaced whole by the consumer when it changes.
 pub type AuxFeeds = Arc<SwapCell<Arc<Vec<AuxFeed>>>>;
 
+/// One stored layout registered as an M/E source (#307): its engine key
+/// (`layout:<id>`), its resolved body and the store the aux thread feeds.
+#[derive(Debug, Clone)]
+pub struct MeLayoutCompose {
+    /// The engine source key, `layout:<id>`.
+    pub key: Arc<str>,
+    /// The resolved body (swapped whole on a live edit).
+    pub body: Arc<crate::aux_layout::RoutedLayout>,
+    /// The composed-picture store the Program drive samples.
+    pub store: Arc<TileStore<Nv12Image>>,
+}
+
+/// The registered M/E layout sources, replaced whole by the registry.
+pub type MeLayoutComposeSet = Arc<SwapCell<Arc<Vec<MeLayoutCompose>>>>;
+
 /// Resolve a source id to its store. Must see sources added at runtime and must
 /// never take a lock the clock holds (the pipeline passes a closure over the
 /// catalogue `SwapCell`).
@@ -299,6 +323,9 @@ pub struct AuxInputs {
     pub program_lateness: Option<ProgramLateness>,
     /// The output tick period in nanoseconds (the back-off threshold is half).
     pub tick_ns: u64,
+    /// Stored layouts registered as M/E sources (#307); `None` without a
+    /// switcher.
+    pub me_layouts: Option<MeLayoutComposeSet>,
 }
 
 /// Program's lateness histogram, published once Program runs (the slot the
@@ -461,6 +488,9 @@ fn run(inputs: &AuxInputs, failed: &AtomicBool, halved: &AtomicBool) {
 struct AuxState {
     feeds_seen: Option<Arc<Vec<AuxFeed>>>,
     per_feed: HashMap<Arc<str>, FeedState>,
+    me_seen: Option<Arc<Vec<MeLayoutCompose>>>,
+    /// Per M/E layout key: its compose state (rebuilt when the body changes).
+    per_me_layout: HashMap<Arc<str>, Option<crate::aux_layout::LayoutCanvas>>,
 }
 
 #[derive(Default)]
@@ -529,10 +559,57 @@ impl AuxState {
             })));
             feed.slot.composed.fetch_add(1, Ordering::Relaxed);
         }
+        self.compose_me_layouts(inputs, tick);
     }
 }
 
 impl AuxState {
+    /// Compose every stored layout registered as an M/E source into its
+    /// store at `tick.pts` (#307). Per-key state is forgotten for keys that
+    /// left the set; a body swap (another `Arc`) rebuilds that key's canvas.
+    fn compose_me_layouts(&mut self, inputs: &AuxInputs, tick: AuxTick) {
+        let Some(set) = inputs.me_layouts.as_ref() else {
+            return;
+        };
+        let set = set.load();
+        let changed = self
+            .me_seen
+            .as_ref()
+            .is_none_or(|seen| !Arc::ptr_eq(seen, &set));
+        if changed {
+            self.per_me_layout
+                .retain(|key, _| set.iter().any(|entry| entry.key == *key));
+            self.me_seen = Some(Arc::clone(&set));
+        }
+        for entry in set.iter() {
+            let canvas = self
+                .per_me_layout
+                .entry(Arc::clone(&entry.key))
+                .or_default();
+            let stale = canvas
+                .as_ref()
+                .is_none_or(|c| !Arc::ptr_eq(c.layout(), &entry.body));
+            if stale {
+                *canvas = crate::aux_layout::LayoutCanvas::new(
+                    Arc::clone(&entry.body),
+                    inputs.layout_canvas,
+                );
+            }
+            let Some(canvas) = canvas.as_mut() else {
+                continue; // another canvas size: never composed (the store ages)
+            };
+            let Some(picture) = canvas.compose(&inputs.stores, tick.pts) else {
+                continue; // every buffer in use downstream: the store holds
+            };
+            entry.store.publish_arc(picture, tick.pts);
+            // Latch our own frame: a registered layout that no bus reads yet
+            // (patched to an input only) still lets the store prune its ring,
+            // so the canvas's four buffers keep recycling. Program reads at a
+            // later tick and never needs an older frame.
+            let _ = entry.store.state_at(tick.pts);
+        }
+    }
+
     /// Compose one routed layout for `tick` into its slot (hold on `None`).
     fn compose_layout(
         &mut self,
@@ -917,9 +994,95 @@ mod tests {
             },
             program_lateness: None,
             tick_ns: 0,
+            me_layouts: None,
         })
         .unwrap();
         (tx, handle)
+    }
+
+    /// A stored layout registered as an M/E source (#307) is composed into
+    /// its `layout:<id>` store at the tick's pts with no routed feed; a body
+    /// swap rebuilds its canvas; a key that leaves the set is no longer fed.
+    #[test]
+    fn me_layouts_compose_into_their_store_at_the_tick_pts() {
+        let cam = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
+        let lookup_store = Arc::clone(&cam);
+        let stores: StoreLookup =
+            Arc::new(move |id: &str| (id == "cam").then(|| Arc::clone(&lookup_store)));
+        let body = |revision: u64| {
+            Arc::new(crate::aux_layout::RoutedLayout {
+                id: "wall".to_owned(),
+                layout: multiview_core::layout::Layout {
+                    name: "wall".into(),
+                    canvas: multiview_core::layout::Canvas {
+                        width: 1920,
+                        height: 1080,
+                        fps_num: 30,
+                        fps_den: 1,
+                    },
+                    cells: vec![multiview_core::layout::Cell {
+                        x: 0.,
+                        y: 0.,
+                        w: 0.5,
+                        h: 0.5,
+                        source: Some("cam".into()),
+                        ..multiview_core::layout::Cell::default()
+                    }],
+                },
+                slates: vec![multiview_config::FailoverSlate::Black],
+                audio: multiview_config::LayoutAudio::default(),
+                revision,
+            })
+        };
+        let store = Arc::new(TileStore::<Nv12Image>::with_defaults("layout:wall"));
+        let set: MeLayoutComposeSet = Arc::new(SwapCell::from_pointee(vec![MeLayoutCompose {
+            key: Arc::from("layout:wall"),
+            body: body(1),
+            store: Arc::clone(&store),
+        }]));
+        let (tx, rx) = aux_tick_channel();
+        // Only the M/E flag: no routed feed is active.
+        tx.me_layout_flag().store(true, Ordering::Release);
+        let handle = spawn_routing_aux(AuxInputs {
+            rx,
+            feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
+            stores,
+            preview_selection: None,
+            canvas: canvas(),
+            layout_canvas: crate::aux_layout::LayoutCanvasSpec {
+                width: 1920,
+                height: 1080,
+                color: CanvasColor::default(),
+                background: [16, 128, 128],
+            },
+            program_lateness: None,
+            tick_ns: 0,
+            me_layouts: Some(Arc::clone(&set)),
+        })
+        .unwrap();
+        cam.publish(gradient(1920, 1080, canvas().color), tick(0).pts);
+        tx.offer(tick(0));
+        assert!(wait_for(|| store.sequence() == 1));
+        let read = store.read_at(tick(0).pts);
+        let frame = read.frame().expect("composed at the tick pts").clone();
+        assert_eq!((frame.width(), frame.height()), (1920, 1080));
+        assert!(store.state_at(tick(0).pts).is_live());
+        // A body swap (a live edit) keeps composing into the same store.
+        set.store(Arc::new(vec![MeLayoutCompose {
+            key: Arc::from("layout:wall"),
+            body: body(2),
+            store: Arc::clone(&store),
+        }]));
+        tx.offer(tick(1));
+        assert!(wait_for(|| store.sequence() == 2));
+        assert!(store.state_at(tick(1).pts).is_live());
+        // Unregistered: the store is no longer fed (it ages on Program).
+        set.store(Arc::new(Vec::new()));
+        tx.offer(tick(2));
+        tx.offer(tick(3));
+        drop(tx);
+        assert!(wait_for(|| handle.failed.load(Ordering::Acquire)));
+        assert_eq!(store.sequence(), 2, "a removed key is not fed");
     }
 
     fn wait_for(cond: impl Fn() -> bool) -> bool {

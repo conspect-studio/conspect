@@ -31,7 +31,16 @@ pub struct SwitcherRequest {
     /// §12.8); exactly one of `source`/`input`. Requires declared inputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<u16>,
-    /// Referenced stored layout, when selecting an authored scene.
+    /// A stored layout as the selected source (#307), for
+    /// `select_program`/`select_preview`: exactly one of
+    /// `source`/`input`/`layout`. Needs Read on the layout AND on every source
+    /// its cells bind (one generic 403); it must exist, solve on the running
+    /// canvas, have opaque cells and bind no other layout or bus (422
+    /// `unknown-source` / `layout-not-admissible`). With numbered inputs it
+    /// must be patched to an input (`not-on-an-input`). The engine source id
+    /// is `layout:<id>`; at most 4 layouts are M/E sources at once (409
+    /// `capacity`). Refused on `cut`/`auto`. A `source` of `layout:<id>` means
+    /// the same.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<String>,
     /// Referenced output to bind; all output reads/writes require output BOLA.
@@ -82,6 +91,10 @@ pub struct SwitcherStateResponse {
     pub in_flight: bool,
 }
 
+/// How long a select naming a newly registered layout waits for the output
+/// clock to adopt its store (#307); on timeout 503 `engine-busy`, key released.
+const ME_LAYOUT_ADOPT_WAIT: std::time::Duration = std::time::Duration::from_millis(1_000);
+
 fn engine(state: &AppState) -> ControlResult<&SwitcherControl> {
     let handle = state.switcher.as_ref().ok_or_else(|| {
         ControlError::Conflict(
@@ -115,32 +128,45 @@ pub fn authorize_refs(principal: &Principal, req: &SwitcherRequest) -> ControlRe
     Ok(())
 }
 
+/// `source: "layout:<id>"` is the same request as `layout: "<id>"` (#307):
+/// normalized before authorization, so the layout id (not the engine key) is
+/// what is authorized and `validate_source_configured` never sees it.
+fn normalize_layout_source(req: &mut SwitcherRequest) {
+    if let Some(id) = req
+        .source
+        .as_deref()
+        .and_then(|s| s.strip_prefix("layout:"))
+    {
+        if req.layout.is_none() {
+            req.layout = Some(id.to_owned());
+            req.source = None;
+        }
+    }
+}
+
 fn validate_first_slice(req: &SwitcherRequest, kind: &str) -> ControlResult<()> {
     if req.me != "me1" || req.program != "main" {
         return Err(ControlError::Validation(
             "first-slice runtime admits only me1 in main".into(),
         ));
     }
-    if req.layout.is_some() || req.output.is_some() {
-        return Err(ControlError::Validation("layout selection and output binding are not yet attached to the switcher frame provider".into()));
+    if req.output.is_some() {
+        return Err(ControlError::Validation(
+            "output binding is not attached to the switcher frame provider; route an output with \
+             POST /api/v1/routing/output/take"
+                .into(),
+        ));
     }
+    let named = usize::from(req.source.as_ref().is_some_and(|id| !id.is_empty()))
+        + usize::from(req.input.is_some())
+        + usize::from(req.layout.as_ref().is_some_and(|id| !id.is_empty()));
+    let nothing = req.source.is_none() && req.input.is_none() && req.layout.is_none();
     match kind {
-        "select_program" | "select_preview"
-            if (req.source.as_ref().is_some_and(|id| !id.is_empty()) != req.input.is_some())
-                && req.duration_frames.is_none() =>
-        {
+        "select_program" | "select_preview" if named == 1 && req.duration_frames.is_none() => {
             Ok(())
         }
-        "cut" if req.source.is_none() && req.input.is_none() && req.duration_frames.is_none() => {
-            Ok(())
-        }
-        "auto"
-            if req.source.is_none()
-                && req.input.is_none()
-                && req.duration_frames.is_some_and(|duration| duration > 0) =>
-        {
-            Ok(())
-        }
+        "cut" if nothing && req.duration_frames.is_none() => Ok(()),
+        "auto" if nothing && req.duration_frames.is_some_and(|duration| duration > 0) => Ok(()),
         _ => Err(ControlError::Validation(
             "invalid switcher verb or references".into(),
         )),
@@ -172,7 +198,9 @@ fn verb(req: &SwitcherRequest, kind: &str, target: Option<&Target>) -> ControlRe
 }
 
 /// What a select names: the engine ref (`in:<n>` with numbered inputs, else
-/// the source id) and the SOURCE behind it, which takes the bus lease.
+/// the source id) and the SOURCE behind it, which takes the bus lease (a
+/// `layout:<id>` source takes none: the M/E layout registry leases its
+/// bound sources).
 struct Target {
     engine_ref: SourceRef,
     source: String,
@@ -196,6 +224,12 @@ fn resolve_target(
     if !matches!(req.action.as_str(), "select_program" | "select_preview") {
         return Ok(None);
     }
+    // A layout select names the engine source `layout:<id>` (#307).
+    let named = req
+        .layout
+        .as_deref()
+        .map(crate::me_layouts::source_key)
+        .or_else(|| req.source.clone());
     let Some(table) = handle.inputs() else {
         if req.input.is_some() {
             return Err(Box::new(typed(
@@ -203,7 +237,7 @@ fn resolve_target(
                 "this M/E declares no numbered inputs; select a source",
             )));
         }
-        return Ok(req.source.clone().map(|source| Target {
+        return Ok(named.map(|source| Target {
             engine_ref: SourceRef::new(&source),
             source,
         }));
@@ -222,7 +256,7 @@ fn resolve_target(
             })?;
         (number, source.as_str().to_owned())
     } else {
-        let Some(source) = req.source.clone() else {
+        let Some(source) = named else {
             return Ok(None);
         };
         let number = table
@@ -246,11 +280,62 @@ fn resolve_target(
 
 /// The input-resolved source a select puts on a bus must still be readable:
 /// `authorize_refs` checked a named `source`; an `input` names one indirectly.
-fn authorize_target(principal: &Principal, target: Option<&Target>) -> ControlResult<()> {
-    match target {
-        Some(target) => authorize_object(principal, &target.source),
+/// A `layout:<id>` source (#307) needs Read on the layout and on every source
+/// its current stored body binds (one generic 403).
+async fn authorize_target(
+    state: &AppState,
+    principal: &Principal,
+    req: &SwitcherRequest,
+    target: Option<&Target>,
+) -> ControlResult<()> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    match target.source.strip_prefix("layout:") {
+        // A named `layout` was authorized (id + closure) by `resolve_layout_select`.
+        Some(id) if req.layout.as_deref() == Some(id) => Ok(()),
+        Some(id) => super::output_routing::authorize_me_layout(state, principal, id).await,
+        None => authorize_object(principal, &target.source),
+    }
+}
+
+/// A CUT/AUTO whose Preview is `layout:<id>` takes that layout to Program
+/// (#307): the caller needs Read on the layout and on every source it binds
+/// (one generic 403), re-read now.
+async fn authorize_take_of_layout(
+    state: &AppState,
+    principal: &Principal,
+    handle: &SwitcherControl,
+    req: &SwitcherRequest,
+) -> ControlResult<()> {
+    if !matches!(req.action.as_str(), "cut" | "auto") {
+        return Ok(());
+    }
+    let Some(snapshot) = handle.snapshot() else {
+        return Ok(());
+    };
+    match snapshot.preview.as_str().strip_prefix("layout:") {
+        Some(id) => super::output_routing::authorize_me_layout(state, principal, id).await,
         None => Ok(()),
     }
+}
+
+/// A `layout` select (#307): read the stored layout once, authorize its
+/// source closure, and resolve it as an M/E source. `Ok(Err(..))` is the
+/// typed 422 response. `None` for any other request.
+async fn resolve_layout_select(
+    state: &AppState,
+    principal: &Principal,
+    req: &SwitcherRequest,
+) -> ControlResult<Option<Result<crate::output_routing::LayoutBody, Response>>> {
+    let Some(id) = req.layout.as_deref() else {
+        return Ok(None);
+    };
+    let read = super::output_routing::read_layout(state, id).await?;
+    Ok(Some(
+        super::output_routing::resolve_me_layout(state, principal, id, Some(&read))?
+            .map_err(super::output_routing::me_refusal),
+    ))
 }
 
 /// ADR-0104 §1: a referenced source must be a source of the running
@@ -343,6 +428,8 @@ pub(crate) async fn plan_switcher(
     Json(req): Json<SwitcherRequest>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
+    let mut req = req;
+    normalize_layout_source(&mut req);
     authorize_refs(&principal, &req)?;
     validate_source_configured(&state, &req)?;
     validate_first_slice(&req, &req.action)?;
@@ -352,11 +439,17 @@ pub(crate) async fn plan_switcher(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
         ));
     }
+    // A plan resolves a layout select exactly like a submit, but never
+    // registers it.
+    if let Some(Err(response)) = resolve_layout_select(&state, &principal, &req).await? {
+        return Ok(response);
+    }
+    authorize_take_of_layout(&state, &principal, handle, &req).await?;
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
     };
-    authorize_target(&principal, target.as_ref())?;
+    authorize_target(&state, &principal, &req, target.as_ref()).await?;
     validate_buses(handle, &req, target.as_ref())?;
     let version = handle
         .scene_version()
@@ -373,7 +466,7 @@ pub(crate) async fn plan_switcher(
 }
 
 /// Enqueue a checked verb; a 202 never asserts frame application.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path)), request_body = SwitcherRequest, responses((status = 202, body = SwitcherAccepted), (status = 403, body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, body = crate::problem::Problem), (status = 503, body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path)), request_body = SwitcherRequest, responses((status = 202, body = SwitcherAccepted), (status = 403, description = "Not authorized for the M/E, Program scope, a referenced object, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal.", body = crate::problem::Problem), (status = 409, description = "Switcher unavailable; `capacity` (a fifth stored layout as an M/E source, or a source it shows cannot be leased; key released); no source lease.", body = crate::problem::Problem), (status = 422, description = "Invalid verb or references (exactly one of `source`/`input`/`layout` on a select; none on cut/auto), `not-on-an-input`, `unknown-slot`, `unknown-source` (no such stored layout), `layout-not-admissible` (another canvas, a translucent cell, or a nested layout/bus cell).", body = crate::problem::Problem), (status = 503, description = "`engine-busy`: the mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key released).", body = crate::problem::Problem))))]
 #[allow(clippy::too_many_lines)]
 // reason: one linear admission sequence (authz → resolve input → buses → key →
 // lease → enqueue); the input resolution added the lines, not new branches.
@@ -385,6 +478,8 @@ pub(crate) async fn submit_switcher(
     Json(req): Json<SwitcherRequest>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
+    let mut req = req;
+    normalize_layout_source(&mut req);
     authorize_refs(&principal, &req)?;
     validate_source_configured(&state, &req)?;
     if req.action != kind {
@@ -399,11 +494,25 @@ pub(crate) async fn submit_switcher(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
         ));
     }
+    let layout_body = match resolve_layout_select(&state, &principal, &req).await? {
+        Some(Ok(body)) => Some(body),
+        Some(Err(response)) => return Ok(response),
+        None => None,
+    };
+    let registry = match (&layout_body, state.me_layouts.as_ref()) {
+        (Some(_), None) => {
+            return Err(ControlError::Conflict(
+                "stored layouts as M/E sources are not available in this run".into(),
+            ))
+        }
+        (_, registry) => registry,
+    };
+    authorize_take_of_layout(&state, &principal, handle, &req).await?;
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
     };
-    authorize_target(&principal, target.as_ref())?;
+    authorize_target(&state, &principal, &req, target.as_ref()).await?;
     validate_buses(handle, &req, target.as_ref())?;
     let scene_version = handle
         .scene_version()
@@ -422,8 +531,33 @@ pub(crate) async fn submit_switcher(
         Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => op,
         Reservation::Fresh(op) => {
+            // A layout select registers the layout as an M/E source first
+            // (the registry leases its bound sources; no per-select lease).
+            if let (Some(body), Some(registry)) = (layout_body, registry) {
+                if let Err(error) =
+                    registry.ensure(body, demand.as_ref(), std::time::Instant::now())
+                {
+                    state.idempotency.release(Some(key), &op);
+                    return Ok(
+                        crate::problem::Problem::new(409, "capacity", "Selection refused")
+                            .with_detail(error.detail())
+                            .into_response(),
+                    );
+                }
+                // The command is drained after the frame hook adopted the
+                // store (bounded wait, off the clock), so PVW shows it at once.
+                if !registry.adopted_within(ME_LAYOUT_ADOPT_WAIT).await {
+                    state.idempotency.release(Some(key), &op);
+                    return Err(ControlError::EngineBusy);
+                }
+            }
+            let layout_target = target
+                .as_ref()
+                .is_some_and(|t| t.source.starts_with("layout:"));
             let program_bus = req.action == "select_program";
-            let lease = if req.action == "select_preview" || program_bus {
+            let lease = if layout_target {
+                None
+            } else if req.action == "select_preview" || program_bus {
                 // The lease is on the RESOLVED source (the input's patch).
                 match (demand.as_ref(), target.as_ref().map(|t| &t.source)) {
                     (Some(demand), Some(source)) => {

@@ -115,6 +115,16 @@ pub enum ControlError {
     /// reserved or sent.
     #[error("the switcher M/E owns the Program canvas; {0} was not applied")]
     SwitcherOwnsCells(&'static str),
+
+    /// A stored layout the M/E has on Program, Preview or a mixer input
+    /// cannot be deleted (#307): 409 `layout-on-air`.
+    #[error("layout {0:?} is on the M/E")]
+    LayoutOnAir(String),
+
+    /// A stored layout (an M/E source, #307) is not admissible: 422
+    /// `layout-not-admissible`.
+    #[error("layout not admissible: {0}")]
+    LayoutNotAdmissible(String),
 }
 
 /// The stable problem `type` slug for [`ControlError::NotAdmissibleWithSwitcher`].
@@ -200,7 +210,10 @@ impl ControlError {
                 "The switcher is on: the Program canvas is the M/E bus, so layout {layout:?} \
                  cannot replace it. To show the layout on an output, take it there with \
                  POST /api/v1/routing/output/take (feed {{\"layout\":\"{layout}\"}}) or send \
-                 apply-layout with target {{\"output\":\"<id>\"}}. Nothing was changed."
+                 apply-layout with target {{\"output\":\"<id>\"}}. To put the layout on the M/E \
+                 as a source, select it with POST /api/v1/switcher/commands/select_preview \
+                 {{\"layout\":\"{layout}\"}} (or patch it to a mixer input), then CUT or AUTO. \
+                 Nothing was changed."
             )),
             Self::SwitcherOwnsCells(operation) => Problem::new(
                 422,
@@ -215,6 +228,18 @@ impl ControlError {
                  (POST /api/v1/switcher/commands/select_preview or select_program). \
                  Nothing was changed."
             )),
+            Self::LayoutOnAir(layout) => {
+                Problem::new(409, "layout-on-air", "Layout is on the M/E").with_detail(format!(
+                    "layout {layout:?} is on the switcher M/E (Program, Preview or a mixer \
+                     input); take it off the M/E before deleting it"
+                ))
+            }
+            Self::LayoutNotAdmissible(detail) => Problem::new(
+                422,
+                "layout-not-admissible",
+                "Layout not admissible as an M/E source",
+            )
+            .with_detail(detail),
         }
     }
 }

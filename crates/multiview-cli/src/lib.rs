@@ -411,6 +411,8 @@ pub mod webrtc_unified;
 pub mod aux_layout;
 /// Per-output format convert with a shared per-tick cache (#342).
 pub mod format_convert;
+/// Stored layouts as M/E sources (#307): the engine side of the registry.
+pub mod me_layouts;
 /// Pure-integer NV12 cell scaler (monitor wall, routing aux canvases).
 pub mod nv12_blit;
 /// Pure-integer fit maths for per-output formats (#342).

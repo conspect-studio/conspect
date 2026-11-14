@@ -353,6 +353,47 @@ async fn create_layout(
     Ok(layout_response(StatusCode::CREATED, &versioned))
 }
 
+/// The #307 guard of [`update_layout`]: `Ok(true)` when `id` is a
+/// registered M/E layout source and the edit is allowed, `Ok(false)` when it
+/// is not registered.
+fn authorize_me_layout_edit(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+    body: &serde_json::Value,
+) -> ControlResult<bool> {
+    let Some(registry) = state.me_layouts.as_ref() else {
+        return Ok(false);
+    };
+    if !registry.contains(id) {
+        return Ok(false);
+    }
+    let forbidden = || {
+        ControlError::Forbidden(
+            "routed-layout: this layout is an M/E source; changing it needs the Program scope, \
+             the M/E and Read on every source it shows"
+                .to_owned(),
+        )
+    };
+    let allowed =
+        crate::auth::authorize_scope(principal, multiview_events::AuthzScope::Program("main"))
+            .is_ok()
+            && crate::auth::authorize_object(principal, "me1").is_ok()
+            && multiview_config::LayoutDocument::from_body(body).is_ok_and(|document| {
+                document
+                    .cells
+                    .iter()
+                    .filter_map(|cell| cell.source.input_id.as_deref())
+                    .all(|source| crate::auth::authorize_object(principal, source).is_ok())
+            });
+    if !allowed {
+        return Err(forbidden());
+    }
+    output_routing::resolve_me_layout_body(state, id, body)
+        .map_err(ControlError::LayoutNotAdmissible)?;
+    Ok(true)
+}
+
 /// `PUT /api/v1/layouts/{id}` — replace a layout (role: write; If-Match → 412).
 #[cfg_attr(
     feature = "openapi",
@@ -363,11 +404,12 @@ async fn create_layout(
         params(("id" = String, Path, description = "Layout id.")),
         request_body = LayoutInput,
         responses(
-            (status = 200, description = "The replaced layout (new ETag in the response header).", body = Layout),
+            (status = 200, description = "The replaced layout (new ETag in the response header). A layout registered as an M/E source (#307) swaps its body at the next tick.", body = Layout),
             (status = 401, description = "Missing or invalid credentials.", body = Problem),
-            (status = 403, description = "Not authorized to write.", body = Problem),
+            (status = 403, description = "Not authorized to write; or `routed-layout`: the layout is on air on an output, or registered as an M/E source and the caller lacks the Program scope, the M/E or Read on every source the new body shows.", body = Problem),
             (status = 404, description = "No layout with that id.", body = Problem),
             (status = 412, description = "If-Match precondition failed.", body = Problem),
+            (status = 422, description = "`layout-not-admissible`: the layout is registered as an M/E source and the new body would no longer be one (another canvas, a translucent cell, or a nested layout/bus cell); nothing was committed.", body = Problem),
         ),
     )
 )]
@@ -393,6 +435,11 @@ async fn update_layout(
     // §6.3: an edit of a layout on air on an output needs Write on those
     // outputs and Read on every source the new body shows.
     output_routing::authorize_routed_layout_edit(&state, &principal, &id, Some(&input.body))?;
+    // #307: an edit of a layout registered as an M/E source changes what the
+    // M/E can put on air: Program scope + the M/E object + Read on every
+    // source the NEW body binds (one generic 403), and the new body must
+    // stay admissible (422, checked before the commit).
+    let me_registered = authorize_me_layout_edit(&state, &principal, &id, &input.body)?;
     let versioned = if state.boot_model.is_some() {
         let mut layouts = crate::boot_model::layout_library(&state)?;
         let layout = layouts
@@ -416,6 +463,15 @@ async fn update_layout(
     };
     // Outputs routed to this layout follow the committed edit live.
     output_routing::notify_layout_change(&state, &id, Some(&versioned.layout.body));
+    // The M/E layout source swaps its body at the next tick (its revision is
+    // taken after the commit, like `notify_layout_change`).
+    if let (Some(registry), true) = (state.me_layouts.as_ref(), me_registered) {
+        if let Ok(body) =
+            output_routing::resolve_me_layout_body(&state, &id, &versioned.layout.body)
+        {
+            registry.update_body(body, state.source_demand.as_ref());
+        }
+    }
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -435,10 +491,11 @@ async fn update_layout(
         tag = "layouts",
         params(("id" = String, Path, description = "Layout id.")),
         responses(
-            (status = 204, description = "The layout was deleted."),
+            (status = 204, description = "The layout was deleted (and, if it was registered as an M/E source but off the M/E, unregistered first)."),
             (status = 401, description = "Missing or invalid credentials.", body = Problem),
             (status = 403, description = "Not authorized to administer.", body = Problem),
             (status = 404, description = "No layout with that id.", body = Problem),
+            (status = 409, description = "`layout-on-air`: the switcher M/E has this layout on Program, Preview or a mixer input (#307).", body = Problem),
             (status = 412, description = "If-Match precondition failed.", body = Problem),
         ),
     )
@@ -462,6 +519,15 @@ async fn delete_layout(
     // §6.3: deleting a layout on air moves its outputs to Program, so it
     // needs Write on every output it feeds (403 `routed-layout`).
     output_routing::authorize_routed_layout_edit(&state, &principal, &id, None)?;
+    // #307: a layout the M/E has on Program, Preview or a patched input
+    // cannot be deleted (409 `layout-on-air`); a merely registered one is
+    // unregistered first.
+    if let Some(registry) = state.me_layouts.as_ref() {
+        if output_routing::me_layout_on_air(&state, &id) {
+            return Err(ControlError::LayoutOnAir(id));
+        }
+        registry.remove(&id);
+    }
     if state.boot_model.is_some() {
         let mut layouts = crate::boot_model::layout_library(&state)?;
         let config: multiview_config::MultiviewConfig =
@@ -879,7 +945,7 @@ fn merge_selected_layout_key(
             (status = 403, description = "Not authorized to apply a layout.", body = Problem),
             (status = 404, description = "With `target`: unknown output (as `POST /routing/output/take`).", body = Problem),
             (status = 409, description = "With `target`: the output take's 409s (`routing-unavailable`, `output-kind-unroutable`, `capacity`, `aux-capacity`, …).", body = Problem),
-            (status = 422, description = "The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and a layout as a switcher source). With `target`: the output take's 422s.", body = Problem),
+            (status = 422, description = "The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and `POST /switcher/commands/select_preview` with `{\"layout\": id}`, a stored layout as an M/E source). With `target`: the output take's 422s.", body = Problem),
             (status = 429, description = "With `target`: over the output take rate limits; see Retry-After.", body = Problem),
             (status = 503, description = "Engine command bus at capacity; shed.", body = Problem),
         ),

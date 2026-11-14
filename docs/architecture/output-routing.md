@@ -425,6 +425,58 @@ drain (debug afterwards) and does **not** touch the working-config mirror, so th
 diverges from the accepted state. Without a switcher every route behaves as before. Tally and audio-follow-video read the one bound Program
 source as before; removing the source on Program still slates the Program cell (fail-closed).
 
+*As built (#307 PR 2): a stored layout as an M/E source.* Scope: `layout:<id>` on PVW/PGM and on
+numbered mixer inputs, taken with CUT/AUTO/DIP through the unchanged engine path. Not in this PR:
+`bus:program`/`bus:preview` cells and the feed-cycle check (PR 3), audio-follow-video for a layout
+source (PR 4), the UI (PR 5), and the overlay bake on layout sources (lane layout-overlays).
+
+- **API.** `select_preview`/`select_program` take exactly one of `source`/`input`/`layout`
+  (`source: "layout:<id>"` is the same request); `layout` on `cut`/`auto` and `output` stay 422.
+  `POST /patch/take` takes a mixer crosspoint `{"layout": id}` (engine source `layout:<id>`); one
+  request names at most one stored layout; `{"bus": …}` on a mixer input stays 422
+  `unknown-source`. With numbered inputs a layout select must name a layout already patched to an
+  input (`not-on-an-input`), exactly like a source. A layout patched to an input is not written
+  to `desired.json` (it is a runtime registration; the input keeps its configured source there).
+- **Admission.** The routing rule of `resolve_layout` (exists, parses, solves, running-canvas gate,
+  every cell opaque) plus: no cell binds `layout:*` or `bus:*` (422 `layout-not-admissible`,
+  "nested layouts and buses are not M/E sources"). An unknown layout is 422 `unknown-source`.
+- **Authorization (§6.3).** A layout select or patch needs Read on the layout AND on every source
+  its stored body binds (one generic 403, before any 422 detail, before the Idempotency-Key). A
+  CUT/AUTO (plan and submit) whose current Preview is `layout:X` re-reads X and needs the same
+  closure. A select of an input patched to `layout:X` needs it too. A plan registers nothing.
+- **Registry.** `MeLayoutRegistry` (control, one std mutex, never touched by the clock) holds at
+  most **4** layouts (409 `capacity` for a fifth; the key is released), one demand lease per
+  bound source (label `switcher:me1:layout:<id>`; a select of a layout takes no per-select
+  source lease), and the instant the M/E last referenced each. A sweep every second drops an
+  entry not referenced by the M/E (Program, Preview or a patched input, from the engine snapshot
+  and readback) for **10 s** (`ME_LAYOUT_LINGER`).
+- **Engine adoption.** The binary's adapter publishes the compose set to the routing-aux thread
+  first, then a `LayoutSourceSet` (`LayoutSources`: `SwapCell` + generation `AtomicU64`). The frame
+  hook does one Acquire load per fresh tick, after the legacy control and before `drain_at_tick`;
+  only on a generation change does it insert/replace the `layout:*` stores in the drive, the
+  driver's primed stores and the preview stores (allocation only then) and acknowledge the
+  generation. A removal of a key the M/E still references (PGM, PVW, a patched input, or the held
+  take) is deferred and re-checked every tick (O(≤4), no allocation) until released. Repeat ticks
+  do not adopt. A select/patch naming a newly registered layout waits (≤ 1 s, off the clock) for
+  that acknowledgement before it is enqueued, so the drain that sees the command has the store;
+  otherwise 503 `engine-busy`, key released.
+- **Compose.** The routing-aux thread composes each registered layout after the routed feeds with
+  its own `LayoutCanvas` (rebuilt when the body `Arc` changes) and `publish_arc(frame, T.pts)`
+  into the `layout:<id>` store. The clock offers ticks while a routed feed **or** an M/E layout is
+  active (second gate flag, `AuxTickSender::me_layout_flag`, owned by the registry). The halved-
+  cadence back-off applies unchanged. Latency is one tick, as above.
+- **Failure.** If the aux thread panics or wedges, the layout stores are simply no longer fed and
+  age LIVE → STALE → NO_SIGNAL (slate) on Program; the clock never waits
+  (`crates/multiview-engine/tests/switcher_layout_source_chaos.rs`).
+- **Edit/delete.** Editing a registered layout needs `program:main` scope, the `me1` object and
+  Read on every source of the NEW body (403 `routed-layout`); the new body must stay admissible
+  (422 `layout-not-admissible`, checked before the commit). After the commit the body swaps at the
+  next tick (revision taken after the commit, like `notify_layout_change`). Deleting a layout the
+  M/E has on Program, Preview or an input is 409 `layout-on-air`; a merely registered one is
+  unregistered, then deleted.
+- **Audio.** A layout on the M/E's Program is **silent** on the Program audio bus until PR 4:
+  `audio.rs` `select_program_source` finds no channel named `layout:<id>`.
+
 **`apply-layout` in the new model.** It means "route layout X to the feed `program`'s canvas".
 
 - **No switcher declared.** It keeps today's meaning exactly: the Program canvas swaps to X at the
@@ -434,8 +486,9 @@ source as before; removing the source on Program still slates the Program cell (
   422 `switcher-owns-program`. The detail names the two operations that do what the operator means:
   `POST /routing/output/take` (layout to an output) and `POST /switcher/commands/select_preview`
   with `layout:<id>`. It never silently changes something else. *As built (#307 PR 1):* the check
-  runs before the idempotency reservation (nothing reserved, persisted or sent); the detail
-  describes the second operation as "a layout as a switcher source" until it lands in PR 2. The
+  runs before the idempotency reservation (nothing reserved, persisted or sent). Since #307 PR 2
+  the detail names the real M/E-source operation: `select_preview` with `{"layout": id}` (or a
+  mixer patch `{"layout": id}`), then CUT or AUTO. The
   old `layout-not-admissible-with-switcher` problem is no longer returned by apply-layout; its
   slug remains only for the overlays refusal on persisting commands.
 - An optional body field `target: {output: id}` makes `apply-layout` a thin alias for an output

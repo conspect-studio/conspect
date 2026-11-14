@@ -750,6 +750,9 @@ pub struct AppState {
     /// Output feed routing (ADR-0108 slice 1); `None` until the binary installs
     /// the engine seam (routes answer 409 `routing-unavailable`).
     pub output_routing: Option<Arc<crate::output_routing::OutputRoutingControl>>,
+    /// Stored layouts registered as M/E sources (#307); `None` until the
+    /// binary installs the engine side (a layout select then answers 409).
+    pub me_layouts: Option<Arc<crate::me_layouts::MeLayoutRegistry>>,
     /// Program tick lateness / repeats (ADR-0108 §10); `None` = 404.
     pub program_metrics: Option<Arc<crate::program_metrics::ProgramMetrics>>,
     /// The network front door's live counters (ADR-0107 slice 3); `None` =
@@ -1097,6 +1100,7 @@ impl AppState {
             idempotency: Arc::new(IdempotencyStore::new()),
             switcher: None,
             output_routing: None,
+            me_layouts: None,
             program_metrics: None,
             frontdoor_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
@@ -1550,6 +1554,13 @@ impl AppState {
         self.output_routing = Some(Arc::new(crate::output_routing::OutputRoutingControl::new(
             routing,
         )));
+        self
+    }
+
+    /// Install the engine side of stored layouts as M/E sources (#307).
+    #[must_use]
+    pub fn with_me_layouts(mut self, sources: crate::me_layouts::SharedMeLayoutSources) -> Self {
+        self.me_layouts = Some(Arc::new(crate::me_layouts::MeLayoutRegistry::new(sources)));
         self
     }
 

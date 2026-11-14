@@ -372,6 +372,12 @@ where
     }
     if let Some(switcher) = switcher {
         state = state.with_switcher(switcher);
+        // Stored layouts as M/E sources (#307): installed by the run only
+        // when a switcher is attached.
+        #[cfg(feature = "ffmpeg")]
+        if let Some(sources) = crate::me_layouts::installed_me_layouts() {
+            state = state.with_me_layouts(sources);
+        }
     }
     // Output feed routing (ADR-0108 slice 1): the run installs its routing
     // slot before the control plane starts; without one the routes answer

@@ -2188,6 +2188,10 @@ pub struct Pipeline {
     /// Live control handle published only when the paired bus provider starts.
     switcher_control: Option<multiview_engine::switcher_control::SwitcherControl>,
     switcher_driver: Option<multiview_engine::switcher_control::SwitcherTickDriver>,
+    /// Stored layouts registered as M/E sources (#307): one registry per
+    /// pipeline, shared by every run (the frame hook adopts its engine set,
+    /// the routing-aux thread composes its compose set).
+    me_layouts: Arc<crate::me_layouts::MeLayoutAdapter>,
     /// Separate PVW JPEG tap: never silently copy the PGM canvas here.
     switcher_preview: Option<crate::preview::ProgramSlot>,
     /// Per-source native caption cue stores, keyed by source id. Each store is
@@ -3565,6 +3569,7 @@ impl Pipeline {
             switcher_cell_id,
             switcher_control: None,
             switcher_driver: None,
+            me_layouts: Arc::new(crate::me_layouts::MeLayoutAdapter::new()),
             switcher_preview: None,
             stores,
             source_registry,
@@ -3909,6 +3914,9 @@ impl Pipeline {
         let spawn_err =
             |source: std::io::Error| PipelineError::thread_spawn("output routing", source);
         let (aux_tx, aux_rx) = multiview_engine::aux_tick_channel();
+        // The M/E layout-source gate is the registry's own flag, shared by
+        // every run of this pipeline (#307).
+        let aux_tx = aux_tx.with_me_layout_flag(self.me_layouts.active_flag());
         let catalogue = Arc::clone(&self.catalogue);
         let boot = self.stores.clone();
         let stores: crate::routing_aux::StoreLookup = Arc::new(move |id: &str| {
@@ -3937,6 +3945,7 @@ impl Pipeline {
             layout_canvas: self.layout_canvas_spec(),
             program_lateness: Some(Arc::clone(&program_lateness)),
             tick_ns: u64::try_from(self.encode_cfg.cadence.period_nanos()).unwrap_or(0),
+            me_layouts: has_preview.then(|| self.me_layouts.compose_set()),
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
@@ -4420,6 +4429,12 @@ impl Pipeline {
     #[must_use]
     pub fn output_routing(&self) -> crate::output_routing::OutputRoutingSlot {
         Arc::clone(&self.output_routing)
+    }
+
+    /// The pipeline's stored-layout M/E source registry (#307).
+    #[must_use]
+    pub fn me_layouts(&self) -> Arc<crate::me_layouts::MeLayoutAdapter> {
+        Arc::clone(&self.me_layouts)
     }
 
     /// The running Program's metric handles (empty until a run starts).
@@ -5867,6 +5882,7 @@ impl Pipeline {
                     hook.preview_slot = Some(preview_slot);
                     hook.preview_stores = Some(self.catalogue_stores());
                     hook.preview_selection = preview_selection;
+                    hook.layout_sources = Some(self.me_layouts.engine());
                     // The only clock-side routing duty: one non-blocking `try_send`
                     // after a fresh compose, and only while a routed feed is active.
                     // The engine run future is boxed (one allocation per run, never

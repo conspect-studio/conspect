@@ -1221,6 +1221,8 @@ async fn run_pipeline_until_ctrl_c(
             &publisher,
             &stop,
         )? {
+            // Stored layouts as M/E sources (#307): only with a switcher.
+            multiview_cli::me_layouts::install_me_layouts(Some(pipeline.me_layouts()));
             lease_cleanup.0 = Some(Arc::clone(&attached.leases));
             switcher_leases = Some(Arc::clone(&attached.leases));
             switcher_preview_slot = Some(Arc::clone(&attached.preview_slot));
