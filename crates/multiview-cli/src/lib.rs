@@ -295,6 +295,12 @@ pub mod output_routing;
 pub mod output_routing_control;
 #[cfg(feature = "ffmpeg")]
 pub mod output_window_registry;
+/// The passthrough routing key (`PassthroughLive`, output-routing §12.5, #344).
+#[cfg(feature = "ffmpeg")]
+pub mod passthrough_live;
+/// Passthrough ingest tap registry and writer (output-routing §12.5, #344).
+#[cfg(feature = "ffmpeg")]
+pub mod passthrough_tap;
 /// The full libav\* end-to-end `multiview run` pipeline (ingest → composite →
 /// encode-once → fan out to file/HLS sinks). Behind the off-by-default `ffmpeg`
 /// feature so the baseline build stays pure-Rust; software H.264/H.265 needs
