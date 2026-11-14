@@ -1134,6 +1134,8 @@ mod tests {
         block: Arc<AtomicBool>,
         panic: AtomicBool,
         panic_after_block: AtomicBool,
+        /// Jobs that ENTERED `compose_tiles` (the start acknowledgement).
+        started: AtomicU64,
         runs: AtomicU64,
         dropped_on: Arc<Mutex<Option<String>>>,
     }
@@ -1148,6 +1150,7 @@ mod tests {
             tiles: &[Tile<'_>],
         ) -> Result<Nv12Image> {
             self.runs.fetch_add(1, Ordering::Relaxed);
+            self.started.fetch_add(1, Ordering::AcqRel);
             assert!(!self.panic.load(Ordering::Acquire), "probe panic");
             while self.block.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(1));
@@ -1163,6 +1166,16 @@ mod tests {
     impl Drop for Probe {
         fn drop(&mut self) {
             *self.dropped_on.lock().unwrap() = std::thread::current().name().map(str::to_owned);
+        }
+    }
+
+    /// Wait (bounded) until `n` jobs have entered the probe: a timed-out
+    /// job may still be queued on a loaded runner (review MC-R3-1).
+    fn await_started(probe: &Probe, n: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while probe.started.load(Ordering::Acquire) < n {
+            assert!(Instant::now() < deadline, "probe job never started");
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -1219,6 +1232,7 @@ mod tests {
             worker.run(&job(), Duration::from_millis(5)),
             Outcome::TimedOut
         ));
+        await_started(&probe, 2);
         // Busy: returns at once and hands nothing over.
         let runs = probe.runs.load(Ordering::Relaxed);
         let t = Instant::now();
@@ -1251,6 +1265,7 @@ mod tests {
             worker.run(&job(), Duration::from_millis(5)),
             Outcome::TimedOut
         ));
+        await_started(&probe, 1);
         // Still running: the next frame waits its own bound, then gives up.
         assert!(matches!(
             worker.run(&job(), Duration::from_millis(5)),
@@ -1295,12 +1310,13 @@ mod tests {
         let dropped_on = Arc::clone(&probe.dropped_on);
         let block = Arc::clone(&probe.block);
         let worker = spawn_probe("probe-c", &probe, WorkerOptions::default());
-        drop(probe);
         block.store(true, Ordering::Release);
         assert!(matches!(
             worker.run(&job(), Duration::from_millis(5)),
             Outcome::TimedOut
         ));
+        await_started(&probe, 1);
+        drop(probe);
         let t = Instant::now();
         drop(worker);
         assert!(t.elapsed() < Duration::from_millis(500), "drop waited");
@@ -1327,6 +1343,7 @@ mod tests {
             worker.run(&job_in(7), Duration::from_millis(5)),
             Outcome::TimedOut
         ));
+        await_started(&probe, 1);
         block.store(false, Ordering::Release);
         while worker.is_busy() {
             std::thread::sleep(Duration::from_millis(1));
@@ -1353,6 +1370,7 @@ mod tests {
             worker.run(&job_in(1), Duration::from_millis(5)),
             Outcome::TimedOut
         ));
+        await_started(&probe, 1);
         // Running, other scene: busy at once, no wait for it.
         assert!(matches!(
             worker.run(&job_in(2), Duration::from_secs(5)),
@@ -1393,6 +1411,7 @@ mod tests {
             worker.run(&job(), Duration::from_millis(5)),
             Outcome::TimedOut
         ));
+        await_started(&probe, 1);
         // The blocked call ends in a panic nobody waits for.
         probe.panic_after_block.store(true, Ordering::Release);
         block.store(false, Ordering::Release);
@@ -1466,6 +1485,7 @@ mod tests {
             worker.run(&job_in(3), Duration::from_millis(5)),
             Outcome::TimedOut
         ));
+        await_started(&probe, 1);
         // The GPU recovered and delivered: invalidate.
         worker.invalidate();
         // Still running: not adoptable, fail fast.
@@ -1505,6 +1525,7 @@ mod tests {
             worker.run(&with_meta(1), Duration::from_millis(5)),
             Outcome::TimedOut
         ));
+        await_started(&probe, 1);
         block.store(false, Ordering::Release);
         match worker.run(&with_meta(2), Duration::from_secs(5)) {
             Outcome::Adopted(_, Some(JobMeta(meta))) => {
@@ -1531,12 +1552,13 @@ mod tests {
                 ..WorkerOptions::default()
             },
         );
-        drop(probe);
         block.store(true, Ordering::Release);
         assert!(matches!(
             worker.run(&job(), Duration::from_millis(5)),
             Outcome::TimedOut
         ));
+        await_started(&probe, 1);
+        drop(probe);
         drop(worker);
         // The handle is gone but the thread is wedged: still at the cap.
         std::thread::sleep(Duration::from_millis(20));
