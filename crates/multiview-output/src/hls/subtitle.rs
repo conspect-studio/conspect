@@ -756,16 +756,17 @@ mod tests {
     }
 
     #[test]
-    fn an_open_cue_spans_segments_until_its_close_replaces_it() {
+    fn an_open_cue_is_published_as_contiguous_pieces_until_its_close() {
         let stats = SubtitleStats::default();
         let mut open = cue(0, 500, 0, &["long"]);
         open.end = SubtitleCue::OPEN_END;
         let mut held = SlotCues::default();
         held.push(open.clone(), &stats);
-        // Segment [0, 1000) closes with the cue still open (end unknown): it
-        // is ended at the segment end ...
+        // Segment [0, 1000) is published with the cue still open (end
+        // unknown): it carries the piece [500, 1000) ...
+        let pieces = held.publish(ms(0), ms(1_000));
         let text = render_vtt(
-            &held.overlapping(ms(0), ms(1_000)),
+            &pieces.iter().collect::<Vec<_>>(),
             ms(0),
             ms(1_000),
             ms(0),
@@ -777,33 +778,38 @@ mod tests {
         );
         held.retire_before(ms(1_000));
         assert_eq!(held.len(), 1, "an open cue is kept");
-        // ... and re-emitted with the same start, extended, while still open.
+        // ... the next segment, still open, the non-overlapping [1000, 2000).
+        let pieces = held.publish(ms(1_000), ms(2_000));
         let text = render_vtt(
-            &held.overlapping(ms(1_000), ms(2_000)),
+            &pieces.iter().collect::<Vec<_>>(),
             ms(1_000),
             ms(2_000),
             ms(0),
             90_000,
         );
         assert!(
-            text.contains("00:00:00.500 --> 00:00:02.000\nlong\n"),
+            text.contains("00:00:01.000 --> 00:00:02.000\nlong\n"),
             "{text}"
         );
-        // Its close arrives: the closed cue replaces the open one and carries
-        // its total interval (same start as in every earlier segment).
-        held.push(cue(0, 500, 1_200, &["long"]), &stats);
+        held.retire_before(ms(2_000));
+        // Its close arrives: the closed cue replaces the open one and the
+        // segment holding the close carries [2000, 2400), never a copy that
+        // overlaps an already-published piece.
+        held.push(cue(0, 500, 2_400, &["long"]), &stats);
         assert_eq!(held.len(), 1);
+        let pieces = held.publish(ms(2_000), ms(3_000));
         let text = render_vtt(
-            &held.overlapping(ms(1_000), ms(2_000)),
-            ms(1_000),
+            &pieces.iter().collect::<Vec<_>>(),
             ms(2_000),
+            ms(3_000),
             ms(0),
-            90_000,
+            180_000,
         );
         assert!(
-            text.contains("00:00:00.500 --> 00:00:01.200\nlong\n"),
+            text.contains("00:00:02.000 --> 00:00:02.400\nlong\n"),
             "{text}"
         );
+        assert_eq!(text.matches("-->").count(), 1, "{text}");
         // A lost close: the next cue closes the open one at its start.
         held = SlotCues::default();
         held.push(open, &stats);
