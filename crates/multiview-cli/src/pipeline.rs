@@ -5917,7 +5917,9 @@ impl Pipeline {
                 all.extend(links);
                 self.push_links.store(Arc::new(all));
             }
-            prepared
+            // Boxed: this state lives across the run's awaits; inline it
+            // would grow the run future (clippy::large_futures).
+            Box::new(prepared)
         });
         #[cfg(feature = "overlay")]
         {
@@ -5985,7 +5987,7 @@ impl Pipeline {
         // #343: the rate lanes' clocks start on Program's seed (tick 0 of
         // every output clock is aligned with Program tick 0).
         let running_lanes =
-            prepared_lanes.map(|lanes| lanes.start(&ts_for_lanes, program.seed_nanos()));
+            prepared_lanes.map(|lanes| Box::new(lanes.start(&ts_for_lanes, program.seed_nanos())));
         self.program_metrics
             .store(Some(Arc::new(ProgramMetricsHandles {
                 lateness: program.lateness(),
@@ -5993,7 +5995,7 @@ impl Pipeline {
                 frames_repeated: program.frames_repeated_counter(),
                 compose_deadline_misses: program.compose_deadline_misses_counter(),
                 output_clocks: running_lanes
-                    .as_ref()
+                    .as_deref()
                     .map_or_else(Vec::new, output_lanes::RunningLanes::metrics),
             })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
@@ -6454,7 +6456,7 @@ impl Pipeline {
         stage("egress-joined");
         // #343: the rate lanes end after Program's egress (every Program frame
         // is latched by now); bounded, and a lane failure is a report line.
-        let lane_lines = running_lanes.map_or_else(Vec::new, output_lanes::RunningLanes::shutdown);
+        let lane_lines = running_lanes.map_or_else(Vec::new, |lanes| lanes.shutdown());
         stage("rate-lanes-joined");
         #[cfg(test)]
         if let Some(hook) = self.teardown_hook.as_ref() {
