@@ -14,6 +14,7 @@ mod rig;
 
 use multiview_engine::keyer::{
     KeyerReason, REFUSE_KEYER_CAPACITY, REFUSE_KEYER_DEFINITION, REFUSE_KEYER_ON_AIR_PROTECTED,
+    REFUSE_KEYER_STALE,
 };
 use multiview_engine::switcher_control::SwitcherVerb;
 use rig::{cmd, drain, dsk, probe, step, tick, Rig, LUMA_A, LUMA_B, LUMA_FILL, SIDE};
@@ -45,11 +46,7 @@ fn keyer_set_defines_a_new_keyer_at_one_tick_and_publishes_definitions_on_change
     handle
         .try_send(cmd(
             "set",
-            SwitcherVerb::KeyerSet {
-                keyer: 0,
-                def,
-                allow_on_air: false,
-            },
+            handle.keyer_set_verb(&handle.keyer_definitions().unwrap(), 0, def, false),
         ))
         .unwrap();
     fresh(&rig, 1);
@@ -92,11 +89,7 @@ fn keyer_set_over_budget_is_refused_at_the_tick_and_changes_nothing() {
     handle
         .try_send(cmd(
             "set",
-            SwitcherVerb::KeyerSet {
-                keyer: 1,
-                def,
-                allow_on_air: false,
-            },
+            handle.keyer_set_verb(&handle.keyer_definitions().unwrap(), 1, def, false),
         ))
         .unwrap();
     fresh(&rig, 1);
@@ -126,11 +119,7 @@ fn changing_the_fill_of_an_on_air_keyer_needs_allow() {
     handle
         .try_send(cmd(
             "protect",
-            SwitcherVerb::KeyerSet {
-                keyer: 0,
-                def: def.clone(),
-                allow_on_air: false,
-            },
+            handle.keyer_set_verb(&handle.keyer_definitions().unwrap(), 0, def.clone(), false),
         ))
         .unwrap();
     fresh(&rig, 2);
@@ -144,11 +133,7 @@ fn changing_the_fill_of_an_on_air_keyer_needs_allow() {
     handle
         .try_send(cmd(
             "allow",
-            SwitcherVerb::KeyerSet {
-                keyer: 0,
-                def,
-                allow_on_air: true,
-            },
+            handle.keyer_set_verb(&handle.keyer_definitions().unwrap(), 0, def, true),
         ))
         .unwrap();
     fresh(&rig, 3);
@@ -174,11 +159,7 @@ fn a_rejected_frame_restores_the_previous_definition() {
     handle
         .try_send(cmd(
             "set",
-            SwitcherVerb::KeyerSet {
-                keyer: 0,
-                def,
-                allow_on_air: false,
-            },
+            handle.keyer_set_verb(&handle.keyer_definitions().unwrap(), 0, def, false),
         ))
         .unwrap();
     hook.driver.drain_at_tick(tick(1));
@@ -208,11 +189,7 @@ fn a_definition_never_replaces_a_different_keyer_or_shares_a_z() {
         handle
             .try_send(cmd(
                 op,
-                SwitcherVerb::KeyerSet {
-                    keyer,
-                    def,
-                    allow_on_air: false,
-                },
+                handle.keyer_set_verb(&handle.keyer_definitions().unwrap(), keyer, def, false),
             ))
             .unwrap();
     }
@@ -224,4 +201,77 @@ fn a_definition_never_replaces_a_different_keyer_or_shares_a_z() {
         .iter()
         .all(|o| o.error.as_deref() == Some(REFUSE_KEYER_DEFINITION)));
     assert_eq!(handle.keyer_definitions().unwrap().version, 0);
+}
+
+/// Review H6: a committed `keyer_set` tick builds no `KeyerDefinitions` on
+/// the clock (the odometer stays at the attach build).
+#[test]
+fn a_definition_changing_tick_builds_no_readback_on_the_clock() {
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[], 3.0, "a", "b");
+    let mut outcomes = handle.outcomes();
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    let builds = hook.driver.definition_builds();
+    let def = handle.resolve_keyer(&dsk("dsk1", "gfx", None, 1)).unwrap();
+    handle
+        .try_send(cmd(
+            "set",
+            handle.keyer_set_verb(&handle.keyer_definitions().unwrap(), 0, def, false),
+        ))
+        .unwrap();
+    fresh(&rig, 1);
+    step(&mut hook, &mut drive, 1);
+    assert!(drain(&mut outcomes).0[0].completed);
+    assert_eq!(handle.keyer_definitions().unwrap().version, 1);
+    assert_eq!(
+        hook.driver.definition_builds(),
+        builds,
+        "the committed tick built no readback"
+    );
+}
+
+/// Review H6: the readback a `keyer_set` carries is prepared against the
+/// committed definitions it was admitted on; a second set admitted on the
+/// same base is refused `keyer-definitions-changed` at the tick (nothing
+/// changes), and the published readback is exactly the first one's `Arc`.
+#[test]
+fn a_keyer_set_admitted_on_a_stale_base_is_refused() {
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[], 9.0, "a", "b");
+    let mut outcomes = handle.outcomes();
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    let base = handle.keyer_definitions().unwrap();
+    let first = handle.keyer_set_verb(
+        &base,
+        0,
+        handle.resolve_keyer(&dsk("dsk1", "gfx", None, 1)).unwrap(),
+        false,
+    );
+    let multiview_engine::switcher_control::SwitcherVerb::KeyerSet { readback, .. } = &first
+    else {
+        panic!("a keyer_set verb");
+    };
+    let prepared = std::sync::Arc::clone(&readback.0);
+    let second = handle.keyer_set_verb(
+        &base,
+        1,
+        handle.resolve_keyer(&dsk("dsk2", "gfx2", None, 2)).unwrap(),
+        false,
+    );
+    handle.try_send(cmd("first", first)).unwrap();
+    handle.try_send(cmd("second", second)).unwrap();
+    fresh(&rig, 1);
+    step(&mut hook, &mut drive, 1);
+    let outcomes = drain(&mut outcomes).0;
+    let by = |op: &str| outcomes.iter().find(|o| o.operation_id == op).unwrap();
+    assert!(by("first").completed);
+    assert_eq!(by("second").error.as_deref(), Some(REFUSE_KEYER_STALE));
+    let published = handle.keyer_definitions().unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&published, &prepared),
+        "the tick published the prepared readback"
+    );
+    assert!(published.defs[1].is_none());
 }

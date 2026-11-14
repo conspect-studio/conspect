@@ -776,7 +776,15 @@ keyers.
   - **Rejected frames.** A rejected frame restores the previous definitions, the reserved cost,
     the draw order and the version (`DefUndo`, `Arc` refcounts only).
   - **Publication.** Definitions are published in a `LatestState<KeyerDefinitions>` at attach
-    and then only on a committed `keyer_set` tick, before that tick's keyer events.
+    and then only on a committed `keyer_set` tick, before that tick's keyer events. The clock
+    allocates nothing for it (review round 1 H6). The control plane builds the readback off
+    the clock with the request (`SwitcherControl::keyer_set_verb`,
+    `KeyerDefinitions::with_definition`: the admitted base, the slot replaced, version + 1)
+    and the verb carries it as `KeyerReadback`. At the tick `define` checks that readback by
+    pointer identity against the result (O(MAX_DSK) compares). The commit then publishes that
+    `Arc` (`publish_arc`). A readback whose base changed meanwhile (two sets admitted on the
+    same definitions) is refused `keyer-definitions-changed` and nothing changes. Odometer:
+    `SwitcherTickDriver::definition_builds` stays at the attach build.
 - **Admission (§7).** The plan reports `KeyerCost {delta, fits}` for every caller.
   `reserved`, `budget` and `holders` (keyer object ids) go to unscoped principals only
   (`Principal::is_global`, ADR-0108 decision 8). A scoped caller's 409 `capacity` detail is
@@ -853,9 +861,11 @@ keyers.
   - **No per-principal fairness** on the switcher routes and the shared idempotency store. It
     is still tracked in #394.
 - **Tests.**
-  - `multiview-engine` `tests/keyers_set.rs` (5): define at one tick and publish on change,
+  - `multiview-engine` `tests/keyers_set.rs`: define at one tick and publish on change,
     refusal over budget, on-air guard with protect and allow, a rejected frame restoring the
-    definition, and id/z clashes.
+    definition, and id/z clashes; a definition-changing tick builds no readback on the clock,
+    and a set admitted on a stale base is refused while the published readback is the
+    prepared `Arc` (H6).
   - `multiview-control` `tests/switcher_keyers.rs` (9):
     - the BOLA matrix for each verb on plan and command, for the M/E, program, keyer and
       source grants and a viewer, with no key burned;

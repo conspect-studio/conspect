@@ -74,6 +74,12 @@ pub const REFUSE_KEYER_ON_AIR_PROTECTED: &str =
 /// Typed refusal: a `keyer_set` that would duplicate another keyer's id or z.
 pub const REFUSE_KEYER_DEFINITION: &str =
     "keyer-definition: another keyer already has this id or z";
+/// Typed refusal: a `keyer_set` admitted against committed definitions that
+/// changed before its tick (its prepared readback no longer describes the
+/// result). Nothing changes; the caller re-plans.
+pub const REFUSE_KEYER_STALE: &str =
+    "keyer-definitions-changed: the committed keyer definitions changed since this keyer_set \
+     was admitted; re-plan it";
 /// Typed refusal: a held keyer command expired while Program repeated.
 pub const REFUSE_KEYER_REPEAT_DEADLINE: &str =
     "keyer take deadline expired while program repeated last-good";
@@ -345,6 +351,18 @@ impl PartialEq for KeyerDefinition {
     }
 }
 
+/// The readback a `keyer_set` publishes when it commits, prepared off the
+/// clock ([`KeyerDefinitions::with_definition`]) so the tick allocates
+/// nothing (review H6). Compared by identity.
+#[derive(Debug, Clone)]
+pub struct KeyerReadback(pub Arc<KeyerDefinitions>);
+
+impl PartialEq for KeyerReadback {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// The committed keyer definitions (published by the driver only when they
 /// change, K4): what `GET /api/v1/switcher/{me}` lists and what the control
 /// plane persists after `applied`.
@@ -361,6 +379,24 @@ pub struct KeyerDefinitions {
 }
 
 impl KeyerDefinitions {
+    /// The readback a `keyer_set` of `def` at `keyer` produces from `self`
+    /// (version + 1, slot replaced). Built off the clock by the control
+    /// plane; the tick only checks it by pointer identity and publishes it
+    /// (review H6: a committed `keyer_set` tick allocates nothing).
+    #[must_use]
+    pub fn with_definition(&self, keyer: u8, def: &Arc<KeyerDef>) -> Self {
+        let mut defs = self.defs.clone();
+        if let Some(slot) = defs.get_mut(usize::from(keyer)) {
+            *slot = Some(Arc::clone(def));
+        }
+        Self {
+            version: self.version.saturating_add(1),
+            defs,
+            canvas: self.canvas,
+            budget: self.budget,
+        }
+    }
+
     /// The index and definition of the keyer whose config id is `id`.
     #[must_use]
     pub fn find(&self, id: &str) -> Option<(u8, &Arc<KeyerDef>)> {
@@ -1490,10 +1526,14 @@ impl KeyerRuntime {
     /// change. A fill or key change of an engaged keyer (`allow`) needs the
     /// new sources fresh now, else it is refused (never held). The tick only
     /// moves `Arc`s; a rejected frame restores the previous definitions.
+    #[allow(clippy::too_many_arguments)]
+    // reason: the verb's fields plus the tick's sink; bundling them would
+    // only move the same values through a one-use struct.
     pub(crate) fn define(
         &mut self,
         keyer: u8,
         def: Arc<KeyerDef>,
+        readback: &KeyerDefinitions,
         allow_on_air: bool,
         operation_id: String,
         tick: Tick,
@@ -1502,6 +1542,13 @@ impl KeyerRuntime {
         let index = usize::from(keyer);
         if index >= MAX_DSK {
             sink.refused(operation_id, REFUSE_KEYER_UNKNOWN);
+            return;
+        }
+        // The readback the control plane prepared must describe exactly the
+        // result (pointer identity, no allocation): otherwise the base it
+        // was admitted against changed meanwhile.
+        if !self.readback_matches(index, &def, readback) {
+            sink.refused(operation_id, REFUSE_KEYER_STALE);
             return;
         }
         let clash = self.slots.iter().enumerate().any(|(i, s)| {
@@ -1589,6 +1636,31 @@ impl KeyerRuntime {
             );
         }
         sink.applied(operation_id);
+    }
+
+    /// Whether `readback` is exactly the definitions after `def` lands at
+    /// `index`: version + 1, the same canvas, and every slot the same `Arc`
+    /// (O(MAX_DSK) pointer compares; no allocation).
+    fn readback_matches(&self, index: usize, def: &Arc<KeyerDef>, readback: &KeyerDefinitions) -> bool {
+        readback.version == self.def_version.saturating_add(1)
+            && readback.canvas == self.canvas
+            && self
+                .slots
+                .iter()
+                .zip(readback.defs.iter())
+                .enumerate()
+                .all(|(i, (slot, theirs))| {
+                    let ours = if i == index {
+                        Some(def)
+                    } else {
+                        slot.as_ref().map(|s| &s.def)
+                    };
+                    match (ours, theirs.as_ref()) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        _ => false,
+                    }
+                })
     }
 
     /// The snapshot rows (change-only publication by the driver).

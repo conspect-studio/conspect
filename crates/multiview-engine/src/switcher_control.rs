@@ -18,6 +18,7 @@ use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::keyer::{
     KeyerAction, KeyerCounters, KeyerDef, KeyerDefinition, KeyerDefinitions, KeyerDraw, KeyerEvent,
+    KeyerReadback,
     KeyerRuntime, KeyerSnapshot, KeyerTally, OpSink, TieEnvelope, MAX_DSK,
 };
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
@@ -167,6 +168,11 @@ pub enum SwitcherVerb {
         keyer: u8,
         /// The resolved definition (moved in; never cloned per tick).
         def: KeyerDefinition,
+        /// The committed definitions after this change, built off the clock
+        /// ([`SwitcherControl::keyer_set_verb`]); the tick checks it by
+        /// pointer identity and publishes it, allocating nothing (review
+        /// H6). A stale one (the base changed) refuses the verb.
+        readback: KeyerReadback,
         /// `on_air = "allow"`: the fill or key of a keyer on air may change.
         allow_on_air: bool,
     },
@@ -368,6 +374,8 @@ impl SwitcherControl {
             keyer_counters: Arc::clone(&handle.keyer_counters),
             keyer_defs: handle.keyer_defs.clone(),
             published_def_version: 0,
+            staged_readback: None,
+            definition_builds: 0,
             stores: handle.stores.clone(),
             dsk_defined: Arc::clone(&handle.dsk_defined),
         };
@@ -525,6 +533,26 @@ impl SwitcherControl {
         KeyerDef::from_config(config, &stores, w, h).map(|def| KeyerDefinition(Arc::new(def)))
     }
 
+    /// Build the [`SwitcherVerb::KeyerSet`] for `def` at `keyer`, admitted
+    /// against the committed definitions `base`: prepares the readback the
+    /// committing tick publishes (off the clock, review H6).
+    #[must_use]
+    pub fn keyer_set_verb(
+        &self,
+        base: &KeyerDefinitions,
+        keyer: u8,
+        def: KeyerDefinition,
+        allow_on_air: bool,
+    ) -> SwitcherVerb {
+        let readback = KeyerReadback(Arc::new(base.with_definition(keyer, &def.0)));
+        SwitcherVerb::KeyerSet {
+            keyer,
+            def,
+            readback,
+            allow_on_air,
+        }
+    }
+
     /// The shared "a downstream keyer is defined" cell (the output router
     /// refuses Clean while it is set). Set at attach; the control plane sets
     /// it before enqueueing a `keyer_set` that defines the first DSK and
@@ -581,6 +609,12 @@ pub struct SwitcherTickDriver {
     keyer_counters: Arc<KeyerCounters>,
     keyer_defs: LatestState<KeyerDefinitions>,
     published_def_version: u64,
+    /// The readback of this tick's applied `keyer_set` (published at the
+    /// commit, dropped by a reject).
+    staged_readback: Option<Arc<KeyerDefinitions>>,
+    /// Odometer: `KeyerDefinitions` readbacks the clock built itself (an
+    /// allocation on the clock); review H6 pins it at the attach build.
+    definition_builds: u64,
     stores: LatestState<HashMap<String, Arc<TileStore<Nv12Image>>>>,
     dsk_defined: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -606,11 +640,20 @@ impl SwitcherTickDriver {
         // The attach-time definitions (K4 readback); later only on a
         // committed `keyer_set` tick.
         self.keyer_defs.publish(self.keyers.definitions());
+        self.definition_builds += 1;
         self.published_def_version = self.keyers.def_version();
         self.dsk_defined.store(
             !self.keyers.is_empty(),
             std::sync::atomic::Ordering::Release,
         );
+    }
+
+    /// Odometer: committed-definition readbacks built on the clock (one at
+    /// attach; a committed `keyer_set` publishes the readback the control
+    /// plane prepared off the clock, so it never moves).
+    #[must_use]
+    pub fn definition_builds(&self) -> u64 {
+        self.definition_builds
     }
 
     /// The keyer runtime (read-only: flags, last-good pair, tally).
@@ -1161,12 +1204,15 @@ impl SwitcherTickDriver {
             if let SwitcherVerb::KeyerSet {
                 keyer,
                 def,
+                readback,
                 allow_on_air,
             } = command.verb
             {
+                let before = self.keyers.def_version();
                 self.keyers.define(
                     keyer,
                     def.0,
+                    &readback.0,
                     allow_on_air,
                     command.operation_id,
                     tick,
@@ -1176,6 +1222,11 @@ impl SwitcherTickDriver {
                         tick: tick.index,
                     },
                 );
+                if self.keyers.def_version() != before {
+                    // Applied: its prepared readback is what the commit
+                    // publishes (a move; a later set this tick replaces it).
+                    self.staged_readback = Some(readback.0);
+                }
                 continue;
             }
             if let Some((keyer, action)) = KeyerAction::of(&command.verb) {
@@ -1584,13 +1635,25 @@ impl SwitcherTickDriver {
                 tally,
             });
         }
-        // Definitions only on a committed `keyer_set` tick (allocates one
-        // Arc; never in steady state), before the tick's keyer events, so an
-        // event relay always resolves a keyer index against its definition.
+        // Definitions only on a committed `keyer_set` tick, before the
+        // tick's keyer events, so an event relay always resolves a keyer
+        // index against its definition. The readback was built off the clock
+        // with the request (review H6): publishing it moves an `Arc`.
         if self.keyers.def_version() != self.published_def_version {
-            self.keyer_defs.publish(self.keyers.definitions());
+            match self.staged_readback.take() {
+                Some(readback) => {
+                    self.keyer_defs.publish_arc(readback);
+                }
+                None => {
+                    // Unreachable (every applied set carries its readback);
+                    // fail-safe: build it here and count the build.
+                    self.keyer_defs.publish(self.keyers.definitions());
+                    self.definition_builds += 1;
+                }
+            }
             self.published_def_version = self.keyers.def_version();
         }
+        self.staged_readback = None;
         self.keyers.commit(&self.keyer_events);
         // Readback only on a committed patch tick (allocates; never steady state).
         if self.inputs_version != self.published_inputs_version {
@@ -1618,6 +1681,7 @@ impl SwitcherTickDriver {
         // that moved this tick, drop queued events. Applied keyer ops sit in
         // `staged_success` and are refused below with everything else.
         self.keyers.reject(tick.index, reason, &self.outcomes);
+        self.staged_readback = None;
         // The armed patch applied on this tick is restored with the table
         // below and goes back to the router (never committed).
         if let Some(armed) = self.armed.as_mut() {

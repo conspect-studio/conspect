@@ -608,11 +608,7 @@ fn check_set(
         .chain(cfg.key.clone())
         .collect();
     Ok(Ok(Checked {
-        verb: SwitcherVerb::KeyerSet {
-            keyer: index,
-            def,
-            allow_on_air: allow,
-        },
+        verb: handle.keyer_set_verb(defs, index, def, allow),
         plan: ctx.plan(found.map(|(i, _)| i), Some(cost), refused),
         defines_first,
         sources,
