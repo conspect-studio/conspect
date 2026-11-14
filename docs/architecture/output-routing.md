@@ -2608,7 +2608,116 @@ Deferred to D2b: the router's P0 decision and eligibility, the passthrough opene
 (`MAX_PASSTHROUGH_KEYS`, no encoder-cap charge), fault handling with the
 on-demand picture bridge, return-to-P0 moves, the readback and plan `path`/`passthrough`
 fields, audio by source time, `/metrics` counters, and the `ffmpeg`
-end-to-end test.
+end-to-end test (all but the last landed in D2b, below).
+
+**As built in slice D, part D2b (#344).** The router's P0 decision, in
+`crates/multiview-cli/src/output_routing_passthrough.rs` (behind `ffmpeg`):
+- *Eligibility* (`PassEligibility`, decided once per run in the pipeline): an
+  HLS output with TS segments whose slot-0 codec is H.264 or HEVC (HEVC has
+  no repeat AU: an underrun goes to the slate). The slot is the output's own
+  format (canvas or `[outputs.format]`), the run cadence, the canvas colour
+  (all four tags, untagged never matches), 8-bit 4:2:0 progressive, the
+  slot-0 bit rate as the ceiling, High 5.1 / Main 5.1 as the profile and
+  level ceilings, and `segment_ms` (default 2 s) in ticks as the longest
+  GOP. Every other output is `passthrough-not-supported-on-medium` (LL-HLS,
+  SRT, RIST, RTMP, file, WebRTC, NDI, MoQ: one follow-up per medium).
+- *Candidate.* When an eligible output settles on `{source}` (the take
+  lands exactly as before on the encoded source key, the picture bridge)
+  and the source's declared traits pass `evaluate_traits` (the static half
+  of `evaluate`, split out so plan and engine share it), the router sends a
+  passthrough open to the same `routing-open` thread. The opener subscribes
+  the source's tap, bakes the format slate with the output's own rendition
+  `EncodeConfig` (`bake_slate`; the encoder is dropped, no session is held)
+  and returns the key with its status. A failed bake (for example no H.264
+  encoder in the linked FFmpeg) leaves the output on its encoded path with
+  `passthrough: {state: unavailable, reason: "slate-bake-failed: …"}` and is
+  not retried until the next take. Candidates hold no encoder session and
+  are not counted against `max_encoders` or a principal; they have their own
+  cap `MAX_PASSTHROUGH_KEYS` = 8 (a candidate counts from creation, so
+  opens and retries are bounded too). The key shares the dispatcher's eight
+  dynamic slots with live encoders; no slot means a retry 30 ticks later.
+- *Metering on the key.* The key meters its own tap (`StreamMeter` fed by
+  every drained AU) and re-runs `evaluate` at most every 5 ticks on its own
+  worker; the verdict is an atomic on `PassthroughStatus`. Once the measured
+  rules passed they are latched: later only `evaluate_traits` is re-checked
+  (a stall leaves a DTS gap in the 10 s window that would read `not-cfr` for
+  10 s; the clock's 30 / 300 on-time ticks decide the return instead).
+- *Move in.* A key's run start is its only move point
+  (`with_slate_move_points(false)`: a slate IDR is not one). A key starts no
+  run until the router allows it (`allow_runs_from`): when the verdict
+  passes, the router asks the dispatcher for an ordinary unforced
+  `rebind_video` onto the key at `tick + 1` (window budget: the slot's
+  longest GOP + target depth + 3), then re-arms the key (`request_rearm`) and
+  allows runs from that tick, so the run-start strict IDR is the cut. The
+  encoded key then has no subscriber and lingers out (`LINGER_TICKS`) and
+  closes: 0 encoder sessions for that output. A refused or superseded move
+  drops the key's run and retries after 30 ticks.
+- *Faults.* While an output reads the key and the key emits its slate (a
+  stall, a parameter change, a non-strict RAP; the slate is entered on the
+  same tick by D1/D2a), the router brings in the on-demand picture bridge:
+  the encoded source key, reused when it still lingers, else opened like a
+  take and charged to the principal whose take patched the output
+  (`OutputState::principal`). Its cut is forced; on a key nobody reads yet
+  the IDR skips the force floor (as a take's warm-up). At the cap (or a full
+  open queue) the output stays on the key's slate with
+  `passthrough: {state: slate, reason: "bridging on slate: no encoder
+  session"}`, and the key returns by itself when the source does. Once on
+  the bridge the key is held off runs; when its probe shows 30 on-time ticks
+  (300 when the run's parameter generation changed) and it still matches,
+  the router moves back exactly as for the first move in. A parameter set
+  change at a move is the dispatcher's ordinary decision (HLS
+  `EXT-X-DISCONTINUITY`, TS `tables_version`).
+- *Move out.* Any other take is an ordinary move away; the candidate ends
+  and its key closes as soon as no output reads or moves to it (no
+  linger: it costs no session). Closing the key reaps its worker, which
+  drops its tap reader: the tap is unsubscribed. A key whose worker ends,
+  wedges (`WEDGED_ENCODER_TICKS`) or drops an event is closed like a live
+  key; its outputs fall back to Program through the dispatcher.
+- *Readback and plan.* `OutputRouteView.path` is `"P0"` while the output
+  reads its key, and `passthrough: {state, reason}` (`opening`, `metering`,
+  `moving`, `passthrough`, `slate`, `bridging`, `returning`, `unavailable`).
+  `GET /patch` slots carry `path: P0` and `passthrough`; `/patch/plan` is P0
+  with `new_encoders: 0, converts: 0` when the static predicate passes and
+  the output's live candidate on that source has passed its meter; else the
+  normal path with `passthrough: <first miss>` (a source with no candidate
+  yet: `not-enough-history`). Reasons are rule names or bridge reasons,
+  never a source id; redaction rules are unchanged.
+- *Audio by source time.* The key publishes the exact source-time delay of
+  the emitted AU (its own `arrival_ns` versus the tick, a repeat keeps the
+  last AU's; D2a used the clock's depth). An output on its passthrough key
+  with `follow` audio reads its source's PCM of tick `t − d` (`d` clamped
+  to 0..=8) from a bounded per-output ring of 9 blocks in `routing_audio`.
+  A step in `d` repeats or skips one tick of PCM at that tick boundary,
+  counted as `source_delay_steps` (no crossfade: a one-tick step).
+- *Counters.* `RoutingSnapshot.passthrough`: keys live, AUs, repeats,
+  drift drops, stalls, slate ticks, bridges, refused bridges, moves in,
+  open failures; `GET /routing` `buses.passthrough` (whole-system principals
+  only).
+- *Isolation.* The router never reads a tap: the key's worker drains it
+  with `try_recv`; opens are `try_send` to the bounded open queue; the
+  status is atomics; the key is offered with `offer` (full = dropped,
+  `GapFill` emits the missed ticks). Chaos test: a tap that never sends
+  never moves the output onto P0, bounds the router's tick and leaves
+  Program's one packet per tick unchanged.
+
+Deviations from the D2 spec:
+- The router does not compute the match verdict itself: the key meters its
+  own tap on its worker (the router never touches the tap), and the router
+  reads the verdict atomically. The static half of the same predicate runs
+  in the router before a candidate opens and in the plan.
+- The slate is not a move point on router keys; only a run start is. The
+  router controls when a run may start, so a move always cuts at a fresh
+  strict IDR and never before the slate is baked (the key does not exist
+  before).
+- Return is decided by the router from the key's probe (`stable_ticks`)
+  plus the run's parameter generation, because the key is held off runs
+  while the output is away (a run nobody reads is not a move point).
+
+Deferred: `bridge = "warm"` (on demand only), P0 on media other than TS
+HLS, the matched slate (GP-4, the format slate is used), P0 through an
+atomic set (a set member lands on the encoded key; the candidate follows
+when it settles), `/metrics` Prometheus lines (the counters are on the
+routing readback).
 
 **Audio with passthrough video.** Audio is always decoded and re-encoded on the global AAC grid
 (ADR-0108 §5.2). For lip sync, the audio of a passthrough slot is read at the source time of the
