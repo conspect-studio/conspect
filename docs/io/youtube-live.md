@@ -88,7 +88,8 @@ fallback = "offline_card"
 
 [cells.source.youtube]
 # Resolver behaviour (all optional; sensible defaults shown)
-player_client   = "web_safari"   # pinned default; see §5 (avoid "ios" for live HLS)
+# player_client: not configurable; yt-dlp defaults first, then one fallback
+#                attempt with "default,web_safari,tv" (never "ios"); see §5
 prefer          = "hls"          # hls (live edge, default) | dash
 reresolve_lead_s = 900           # re-resolve this many seconds before the URL's expiry (§4)
 yt_dlp_path     = "yt-dlp"       # binary name/path; resolved on PATH if unset (§6)
@@ -241,8 +242,9 @@ actively changes the player surface and adds anti-automation friction.
   for HLS on `web_safari` / `tv_simply` is `required = false, recommended = true`. So a **live YouTube
   HLS master from the default `web_safari` client is typically obtainable and fetchable without a PO
   token** — which is precisely why Conspect should:
-  - **Pin `player_client = "web_safari"`** (a current default client that yields PO-token-free live
-    HLS), and
+  - **Use yt-dlp's default clients first** (they track what YouTube serves; a pinned `web_safari`
+    stopped returning formats on 2026-11-14, issue #420), with one fallback attempt on
+    `default,web_safari,tv`, and
   - **avoid the `ios` client** for live HLS — `ios` is the documented exception (`required = true`,
     with a comment that HLS livestreams require a PO token ~30 s in).
 - **A JavaScript runtime helps.** yt-dlp's default clients are `android_vr,web_safari`, but if no JS

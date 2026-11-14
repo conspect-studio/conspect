@@ -18236,7 +18236,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file) on a full-engine run — `restart` otherwise (ndi/youtube/aes67, or a run without the decoder; ADR-W018). */
+            /** @description The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file, and youtube on a build with the `youtube` feature) on a full-engine run — `restart` otherwise (ndi/aes67, or a run without the decoder; ADR-W018). */
             201: {
                 headers: {
                     [name: string]: unknown;
@@ -18447,7 +18447,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description This run cannot start sources. */
+            /** @description This run cannot start sources, or the source is saved but applies on restart (the detail says which). */
             409: {
                 headers: {
                     [name: string]: unknown;

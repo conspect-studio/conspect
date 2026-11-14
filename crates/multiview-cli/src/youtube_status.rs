@@ -55,6 +55,71 @@ pub fn last_errors() -> HashMap<String, String> {
         .clone()
 }
 
+/// The latest resolved HLS master per source id, with the watch URL it was
+/// resolved from (issue #420): the video rail writes it after every successful
+/// resolve (inline or the proactive re-resolution loop), and the audio rail
+/// reads it so audio opens the SAME master as video without a second `yt-dlp`
+/// run. Keyed by the watch URL too, so an edit to a new URL never hands audio
+/// the previous stream's master.
+fn masters() -> &'static Mutex<HashMap<String, (String, String)>> {
+    static MASTERS: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+    MASTERS.get_or_init(Default::default)
+}
+
+/// Record `master` as the current resolved HLS master of source `id`, resolved
+/// from `watch_url`.
+pub fn record_master(id: &str, watch_url: &str, master: &str) {
+    masters()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(id.to_owned(), (watch_url.to_owned(), master.to_owned()));
+}
+
+/// The current resolved master of source `id`, only when it was resolved from
+/// `watch_url`.
+#[must_use]
+pub fn master(id: &str, watch_url: &str) -> Option<String> {
+    masters()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(id)
+        .filter(|(watch, _)| watch == watch_url)
+        .map(|(_, master)| master.clone())
+}
+
+/// Forget every record of source `id` (it was removed).
+pub fn forget(id: &str) {
+    masters()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(id);
+    record(id, None);
+}
+
+/// The run's explicit `yt-dlp` path (`MULTIVIEW_YOUTUBE_YT_DLP_PATH`, else
+/// `[system.youtube] yt_dlp_path`), set when the pipeline is built so a source
+/// added live and the audio rail resolve with the same binary as startup.
+fn resolver_path_slot() -> &'static Mutex<Option<String>> {
+    static PATH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    PATH.get_or_init(Default::default)
+}
+
+/// Set the run's explicit `yt-dlp` path (`None` resolves `yt-dlp` on `PATH`).
+pub fn set_resolver_path(path: Option<String>) {
+    *resolver_path_slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = path;
+}
+
+/// The run's explicit `yt-dlp` path, if one is configured.
+#[must_use]
+pub fn resolver_path() -> Option<String> {
+    resolver_path_slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +140,21 @@ mod tests {
         record(id, Some("yt-dlp not found on the server"));
         assert!(last_error(id).is_some());
         record(id, None);
+        assert_eq!(last_error(id), None);
+    }
+
+    #[test]
+    fn a_master_is_only_handed_out_for_the_watch_url_it_came_from() {
+        let id = "youtube-status-test-master";
+        record_master(id, "https://youtu.be/a", "https://g.test/a.m3u8");
+        assert_eq!(
+            master(id, "https://youtu.be/a"),
+            Some("https://g.test/a.m3u8".to_owned())
+        );
+        assert_eq!(master(id, "https://youtu.be/b"), None);
+        record(id, Some("failed"));
+        forget(id);
+        assert_eq!(master(id, "https://youtu.be/a"), None);
         assert_eq!(last_error(id), None);
     }
 
