@@ -371,3 +371,12 @@ needs Write on the outputs the layout feeds (`routed-layout` 403). Stored layout
 attribute (`program` | `none` | a bound cell's source). `routing.max_aux_canvases` is a config key
 (default 2, 0..=8). Decodes size for routed cells (§2.4). The aux thread halves its cadence while
 Program's p99 lateness exceeds half the tick (§7). Details are in note §10.1.
+
+**Amendment (routed-layout overlays).** A routed layout bakes the multiview overlay layers
+(source names, meters, state and fault flags, tally borders, clock, safe area) on its aux canvas,
+on the `routing-aux` thread after the integer compose, with Program's overlay baker. Stored layouts
+gain the `overlays` attribute (per-layer booleans; absent = every layer except safe area; all off =
+no bake). Two or more baking layouts bake in parallel on scoped threads, so the aux tick costs one
+layout's compose and bake, not the sum. Meters, faults and tally reach the aux thread through one
+wait-free snapshot the bake consumer publishes; nothing new runs on the clock. Details, cost and
+limits are in note §10.2.
