@@ -454,3 +454,39 @@ fn routing_plan_200_is_route_plan_or_output_plan() {
         ]
     );
 }
+
+/// #389 review H5: `POST /switcher/plan` answers a background `SwitcherPlan`
+/// or a `KeyerPlan` (keyer verbs); the `200` schema says both.
+#[test]
+fn switcher_plan_200_is_switcher_plan_or_keyer_plan() {
+    use multiview_control::openapi::ApiDoc;
+    use utoipa::OpenApi;
+
+    let json = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+    let schema = &json["paths"]["/api/v1/switcher/plan"]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    let name = schema["$ref"]
+        .as_str()
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .expect("the 200 references a component schema");
+    let refs: Vec<&str> = json["components"]["schemas"][name]["oneOf"]
+        .as_array()
+        .expect("the plan response is a oneOf")
+        .iter()
+        .filter_map(|arm| arm["$ref"].as_str())
+        .collect();
+    assert_eq!(
+        refs,
+        [
+            "#/components/schemas/SwitcherPlan",
+            "#/components/schemas/KeyerPlan"
+        ]
+    );
+    for arm in refs {
+        let component = arm.trim_start_matches("#/components/schemas/");
+        assert!(
+            json["components"]["schemas"][component].is_object(),
+            "{component} is registered"
+        );
+    }
+}

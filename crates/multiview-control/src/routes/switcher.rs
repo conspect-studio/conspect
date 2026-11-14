@@ -363,8 +363,30 @@ pub(crate) async fn get_switcher(
         .into_response())
 }
 
+/// `OpenAPI` shape of a `POST /switcher/plan` `200`: a background-verb
+/// [`SwitcherPlan`], or a `KeyerPlan` for a keyer verb (#389 review H5).
+#[cfg(feature = "openapi")]
+pub struct SwitcherPlanResponseDoc;
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for SwitcherPlanResponseDoc {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{OneOfBuilder, Ref};
+        OneOfBuilder::new()
+            .item(Ref::from_schema_name("SwitcherPlan"))
+            .item(Ref::from_schema_name("KeyerPlan"))
+            .description(Some(
+                "A `SwitcherPlan` for a background verb, or a `KeyerPlan` for `keyer_cut`, `keyer_auto`, `keyer_tie` and `keyer_set`.",
+            ))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for SwitcherPlanResponseDoc {}
+
 /// Dry-run command admission, including BOLA on every referenced object.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, description = "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).", body = SwitcherPlan), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer` (a keyer the caller may read is not defined).", body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, description = "Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`.", body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, description = "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).", body = SwitcherPlanResponseDoc), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer` (a keyer the caller may read is not defined).", body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, description = "Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`.", body = crate::problem::Problem))))]
 pub(crate) async fn plan_switcher(
     State(state): State<AppState>,
     principal: Principal,

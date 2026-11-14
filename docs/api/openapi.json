@@ -12228,13 +12228,13 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SwitcherPlan"
+                  "$ref": "#/components/schemas/SwitcherPlanResponseDoc"
                 }
               }
             }
           },
           "403": {
-            "description": "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer).",
+            "description": "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.",
             "content": {
               "application/json": {
                 "schema": {
@@ -25592,6 +25592,17 @@
             "minimum": 0
           }
         }
+      },
+      "SwitcherPlanResponseDoc": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/SwitcherPlan"
+          },
+          {
+            "$ref": "#/components/schemas/KeyerPlan"
+          }
+        ],
+        "description": "A `SwitcherPlan` for a background verb, or a `KeyerPlan` for `keyer_cut`, `keyer_auto`, `keyer_tie` and `keyer_set`."
       },
       "SwitcherRequest": {
         "allOf": [

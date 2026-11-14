@@ -729,7 +729,9 @@ keyers.
   `clip`, `gain`, `invert`, `mask`, `fly`, `max_source`, `rate`, `loss`, `loss_trigger`, `z`,
   `on_at_start` and `on_air`. `keyer_auto` takes its optional rate override in the existing
   `duration_frames` (1..=300). The handlers dispatch keyer verbs to `routes::switcher_keyers`
-  right after BOLA. The background verbs are unchanged and refuse keyer fields.
+  right after BOLA. The background verbs are unchanged and refuse keyer fields. The plan's
+  `200` is documented as `oneOf [SwitcherPlan, KeyerPlan]` (`SwitcherPlanResponseDoc`; review
+  round 1 H5), since keyer plans answer a `KeyerPlan`, which has no `scene_version`.
   - Commands use the same `Idempotency-Key` store (a replay answers the first 202), resolved
     right after authorization and the stateless request shape and **before** any
     state-dependent admission (review round 1 H2): a retry of a `keyer_auto` whose ramp has
@@ -872,6 +874,7 @@ keyers.
     - persistence and a restart.
   - Lib unit tests: tally resolution, row filtering and redaction, and the `Keyer` scope.
   - `multiview-events` `authz_scope` (switcher.keyer).
+  - `multiview-control` `tests/openapi.rs`: the plan `200` is `SwitcherPlan | KeyerPlan` (H5).
   - `multiview-cli` `output_routing` (a Clean take refused at the drain once the shared cell is
     set).
 - **Concern.** The GET/events parity test drives the driver without the frame hook, so its
