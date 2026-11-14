@@ -115,6 +115,11 @@ pub struct StagedClip {
     /// The primed first frame at [`PlayoutGeometry::in_point`], decoded on the
     /// opener; retained for tests and future exact-frame resume.
     pub first_frame: DecodedVideoFrame,
+    /// Canonical-ns PTS of source frame 0 (the first decoded picture while
+    /// priming from the container start). Source frame indices after a seek are
+    /// `(pts - source_origin_ns) / frame_period`; a container may start at a
+    /// nonzero PTS.
+    pub source_origin_ns: i64,
     /// First image already tile-sized, tagged in the canvas colour space;
     /// conversion runs on the opener, never on ingest at commit.
     pub first_image: Arc<Nv12Image>,
@@ -583,7 +588,7 @@ fn open_one(
         stop,
     );
     demuxer.disarm_deadline();
-    let first_frame = primed?;
+    let (first_frame, source_origin_ns) = primed?;
     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
         return Err(OpenAbort::Abandoned);
     }
@@ -618,6 +623,7 @@ fn open_one(
         then: request.spec.then,
         probed,
         first_frame,
+        source_origin_ns,
         first_image,
         audio,
         audio_lease,
@@ -847,8 +853,9 @@ fn probe_facts(demuxer: &Demuxer) -> Result<VideoFacts, OpenAbort> {
 }
 
 /// Seek to the in-point (when it is not the first frame) and decode forward to
-/// it, returning the frame at the in-point. Checks the generation and `stop`
-/// between every packet.
+/// it, returning the frame at the in-point and the canonical-ns PTS of source
+/// frame 0 (the PTS origin). Checks the generation and `stop` between every
+/// packet.
 #[allow(clippy::too_many_arguments)] // Demux, decode, budget and cancellation owners must remain explicit.
 fn prime(
     demuxer: &mut Demuxer,
@@ -859,12 +866,13 @@ fn prime(
     generation: Generation,
     coordinator: &LoadCoordinator<StagedClip>,
     stop: &Arc<AtomicBool>,
-) -> Result<DecodedVideoFrame, OpenAbort> {
+) -> Result<(DecodedVideoFrame, i64), OpenAbort> {
     // Decode from the beginning for exact integer-frame positioning. Seeking to
     // a timestamp may land on a preceding keyframe, making a plain `in_point`
     // discard from that position silently choose the wrong frame. This bounded
     // prime rejects an in-point beyond the declared clip window at probe.
     let mut discarded: u64 = 0;
+    let mut origin_ns: Option<i64> = None;
     let phase_started = Instant::now();
     loop {
         check_prime_budget(phase_started.elapsed(), phase_timeout)?;
@@ -889,8 +897,9 @@ fn prime(
                     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
                         return Err(OpenAbort::Abandoned);
                     }
+                    let origin = *origin_ns.get_or_insert(frame.meta.pts.as_nanos());
                     if discarded >= in_point {
-                        return Ok(frame);
+                        return Ok((frame, origin));
                     }
                     discarded += 1;
                 }

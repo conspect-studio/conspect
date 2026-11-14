@@ -16156,6 +16156,82 @@ pub(crate) mod seek_barrier {
 #[cfg(feature = "ffmpeg")]
 const PRECOMMIT_MAX_ATTEMPTS: u32 = 3;
 
+/// Container seek position (`AV_TIME_BASE` microseconds) of source frame
+/// `frame`, offset by the clip's source PTS origin (a container may start its
+/// PTS at a nonzero value, and libav seeks on the absolute timeline).
+#[cfg(feature = "ffmpeg")]
+fn runtime_seek_micros(frame: u64, cadence: Rational, source_origin_ns: i64) -> i64 {
+    multiview_core::time::rescale(
+        i64::try_from(frame).unwrap_or(i64::MAX),
+        Rational::new(cadence.den, cadence.num),
+        Rational::new(1, 1_000_000),
+    )
+    .saturating_add(source_origin_ns.div_euclid(1_000))
+}
+
+/// Frame-accurate preroll after a runtime player seek / cue / lap wrap.
+///
+/// `Demuxer::seek` lands on the keyframe at-or-before the target, so after
+/// every seek the decoded pictures are offered here, labelled by their actual
+/// source index (`(pts - origin) / period`), and discarded until the target is
+/// reached. Runs only on the player's decode worker, never on the output clock.
+/// Bounded by a frame count and the shared read budget: once exceeded, the
+/// next decoded picture is adopted (best effort) and playback continues —
+/// preroll never blocks or spins forever.
+#[cfg(feature = "ffmpeg")]
+#[derive(Debug, Default)]
+struct SeekPreroll {
+    target: Option<u64>,
+    bound: u64,
+    discarded: u64,
+    started: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "ffmpeg")]
+impl SeekPreroll {
+    /// Arm a pending source-frame target after a successful seek + flush.
+    fn arm(&mut self, target: u64, bound: u64) {
+        self.target = Some(target);
+        self.bound = bound;
+        self.discarded = 0;
+        self.started = None;
+    }
+
+    /// Drop any pending target (a fresh clip commit starts frame-exact).
+    fn clear(&mut self) {
+        self.target = None;
+        self.discarded = 0;
+        self.started = None;
+    }
+
+    /// Offer one decoded picture whose actual source index is `index`.
+    /// `None`: discard it (pre-target preroll, no stamp advance). `Some(i)`:
+    /// publish it labelled as source frame `i`; `next` is the sequential index
+    /// used when no seek is pending.
+    fn admit(&mut self, index: u64, next: u64) -> Option<u64> {
+        let Some(target) = self.target else {
+            return Some(next);
+        };
+        if index < target {
+            self.discarded = self.discarded.saturating_add(1);
+            let started = *self.started.get_or_insert_with(std::time::Instant::now);
+            if self.discarded <= self.bound
+                && started.elapsed() < crate::player::OpenerConfig::READ_TIMEOUT
+            {
+                return None;
+            }
+            tracing::warn!(
+                target,
+                landed = index,
+                discarded = self.discarded,
+                "player seek preroll budget exhausted; landing on best frame"
+            );
+        }
+        self.clear();
+        Some(index)
+    }
+}
+
 #[cfg(feature = "ffmpeg")]
 #[allow(clippy::too_many_lines)]
 fn player_runtime_body(
@@ -16193,6 +16269,8 @@ fn player_runtime_body(
     };
     let mut last: Arc<Nv12Image> = Arc::clone(na);
     let mut frame_index = 0_u64;
+    // Pending frame-accurate seek target (decode-and-discard after a seek).
+    let mut preroll = SeekPreroll::default();
     let mut eof_draining = false;
     let mut eof_drained_frames = 0_u64;
     let mut first = true;
@@ -16334,11 +16412,7 @@ fn player_runtime_body(
                     if let Some(clip) = current.as_mut() {
                         #[cfg(test)]
                         seek_barrier::pause_before_seek(runtime);
-                        let micros = multiview_core::time::rescale(
-                            i64::try_from(target).unwrap_or(i64::MAX),
-                            Rational::new(cadence.den, cadence.num),
-                            Rational::new(1, 1_000_000),
-                        );
+                        let micros = runtime_seek_micros(target, cadence, clip.source_origin_ns);
                         let _seek_budget = clip
                             .demuxer
                             .phase_deadline(crate::player::OpenerConfig::READ_TIMEOUT);
@@ -16348,6 +16422,7 @@ fn player_runtime_body(
                             warmup_packets = 0;
                             warmup_started = None;
                             frame_index = target;
+                            preroll.arm(target, clip.geometry.out_point().saturating_add(256));
                         } else {
                             tracing::warn!(player = %plan.id, target, "player cue seek failed; held until next load");
                             player.pause();
@@ -16362,11 +16437,7 @@ fn player_runtime_body(
                     if let Some(clip) = current.as_mut() {
                         #[cfg(test)]
                         seek_barrier::pause_before_seek(runtime);
-                        let micros = multiview_core::time::rescale(
-                            i64::try_from(frame).unwrap_or(i64::MAX),
-                            Rational::new(cadence.den, cadence.num),
-                            Rational::new(1, 1_000_000),
-                        );
+                        let micros = runtime_seek_micros(frame, cadence, clip.source_origin_ns);
                         let _seek_budget = clip
                             .demuxer
                             .phase_deadline(crate::player::OpenerConfig::READ_TIMEOUT);
@@ -16376,6 +16447,7 @@ fn player_runtime_body(
                             warmup_packets = 0;
                             warmup_started = None;
                             frame_index = frame;
+                            preroll.arm(frame, clip.geometry.out_point().saturating_add(256));
                         } else {
                             tracing::warn!(player = %plan.id, frame, "player seek failed; held until next load");
                             player.pause();
@@ -16633,6 +16705,8 @@ fn player_runtime_body(
                         if let Some(clip) = current.as_ref() {
                             last = Arc::clone(&clip.first_image);
                             frame_index = clip.geometry.in_point();
+                            // The opener primed exactly the in-point frame.
+                            preroll.clear();
                             eof_draining = false;
                             eof_drained_frames = 0;
                             warmup_packets = 0;
@@ -16772,8 +16846,17 @@ fn player_runtime_body(
                                 Ok(Some(decoded)) => {
                                     warmup_packets = 0;
                                     warmup_started = None;
-                                    let index = frame_index;
-                                    frame_index = frame_index.saturating_add(1);
+                                    let actual = frame_index_of(
+                                        &decoded,
+                                        clip.source_origin_ns,
+                                        clip.geometry.frame_period_ns(),
+                                    );
+                                    // Pre-target keyframe preroll: discard, no
+                                    // stamp advance and no stale republish.
+                                    let Some(index) = preroll.admit(actual, frame_index) else {
+                                        continue;
+                                    };
+                                    frame_index = index.saturating_add(1);
                                     match player.on_decoded(index) {
                                         PlayerAction::Publish { at } => {
                                             if let Ok(image) = clip.scaler.convert(
@@ -16787,14 +16870,18 @@ fn player_runtime_body(
                                         PlayerAction::SeekFlushTo { frame } => {
                                             // libav seek and flush are on the ingest thread only for
                                             // the already-open current clip; never on the output clock.
-                                            let micros = multiview_core::time::rescale(
-                                                i64::try_from(frame).unwrap_or(i64::MAX),
-                                                Rational::new(cadence.den, cadence.num),
-                                                Rational::new(1, 1_000_000),
+                                            let micros = runtime_seek_micros(
+                                                frame,
+                                                cadence,
+                                                clip.source_origin_ns,
                                             );
                                             if clip.demuxer.seek(micros).is_ok() {
                                                 let _ = clip.decoder.flush();
                                                 frame_index = frame;
+                                                preroll.arm(
+                                                    frame,
+                                                    clip.geometry.out_point().saturating_add(256),
+                                                );
                                             } else {
                                                 player.pause();
                                             }
@@ -16847,8 +16934,15 @@ fn player_runtime_body(
                         match clip.decoder.receive_frame() {
                             Ok(Some(decoded)) if player.is_playing_state() => {
                                 eof_drained_frames = eof_drained_frames.saturating_add(1);
-                                let index = frame_index;
-                                frame_index = frame_index.saturating_add(1);
+                                let actual = frame_index_of(
+                                    &decoded,
+                                    clip.source_origin_ns,
+                                    clip.geometry.frame_period_ns(),
+                                );
+                                let Some(index) = preroll.admit(actual, frame_index) else {
+                                    continue;
+                                };
+                                frame_index = index.saturating_add(1);
                                 match player.on_decoded(index) {
                                     PlayerAction::Publish { at } => {
                                         if let Ok(image) = clip
@@ -16887,15 +16981,14 @@ fn player_runtime_body(
                                     let _lap_deadline = clip
                                         .demuxer
                                         .phase_deadline(crate::player::OpenerConfig::READ_TIMEOUT);
-                                    let micros = multiview_core::time::rescale(
-                                        i64::try_from(target).unwrap_or(i64::MAX),
-                                        Rational::new(cadence.den, cadence.num),
-                                        Rational::new(1, 1_000_000),
-                                    );
+                                    let micros =
+                                        runtime_seek_micros(target, cadence, clip.source_origin_ns);
                                     if clip.demuxer.seek(micros).is_ok()
                                         && clip.decoder.flush().is_ok()
                                     {
                                         frame_index = target;
+                                        let bound = clip.geometry.out_point().saturating_add(256);
+                                        preroll.arm(target, bound);
                                         // Re-prime one frame in this SAME output
                                         // tick. A seek-only heartbeat repeats the
                                         // last picture and loses a frame at every
@@ -16905,14 +16998,28 @@ fn player_runtime_body(
                                         // through each per-read arm/disarm. A
                                         // malicious 64-packet stream cannot turn
                                         // 2 s reads into a 128 s tile stall.
-                                        for _ in 0..64 {
+                                        // Pre-target keyframe preroll is decoded
+                                        // and discarded here too (bounded by the
+                                        // preroll budget and the same deadline).
+                                        for _ in 0..64_u64.saturating_add(bound) {
                                             if stop.load(Ordering::Acquire) {
                                                 break;
                                             }
                                             match clip.decoder.receive_frame() {
                                                 Ok(Some(decoded)) => {
-                                                    primed = Some(decoded);
-                                                    break;
+                                                    let actual = frame_index_of(
+                                                        &decoded,
+                                                        clip.source_origin_ns,
+                                                        clip.geometry.frame_period_ns(),
+                                                    );
+                                                    if let Some(index) =
+                                                        preroll.admit(actual, frame_index)
+                                                    {
+                                                        frame_index = index;
+                                                        primed = Some(decoded);
+                                                        break;
+                                                    }
+                                                    continue;
                                                 }
                                                 Ok(None) => {}
                                                 Err(error) => {
@@ -28723,6 +28830,15 @@ loop_default = true
 
     impl Rig {
         fn start(config: &MultiviewConfig, state: Option<&std::path::Path>) -> Option<Self> {
+            Self::start_observed(config, state, None)
+        }
+
+        /// As [`Rig::start`], wiring the worker's test-only publication observer.
+        fn start_observed(
+            config: &MultiviewConfig,
+            state: Option<&std::path::Path>,
+            observer: Option<std::sync::mpsc::SyncSender<(MediaTime, MediaTime, Arc<Nv12Image>)>>,
+        ) -> Option<Self> {
             let layout = config.solve_layout().unwrap();
             let cadence = config.canvas.fps.rational();
             let boot = build_media_player_boot_with_state(
@@ -28732,7 +28848,16 @@ loop_default = true
                 CanvasColor::default(),
                 state,
             );
-            let plan = boot.plans.into_iter().next()?;
+            let mut plan = boot.plans.into_iter().next()?;
+            if let Some(observer) = observer {
+                plan.player
+                    .as_mut()
+                    .unwrap()
+                    .runtime
+                    .as_mut()
+                    .unwrap()
+                    .observer = Some(observer);
+            }
             let handle = plan.player.as_ref().unwrap().clone();
             let runtime = handle.runtime.as_ref().unwrap().clone();
             let clock = Arc::new(ManualTimeSource::new());
@@ -28909,6 +29034,172 @@ loop_default = true
             rig.shutdown().is_none(),
             "clean handoff after barrier release"
         );
+    }
+
+    /// An inter-frame (GOP > 1) FFV1 clip: frame `i` has centre luma
+    /// `spec.luma_of(i)`; only every `gop`-th packet is a keyframe. Frame 0 is
+    /// presented at `pts_offset` frame periods (a nonzero source PTS origin).
+    fn gop_clip(
+        dir: &std::path::Path,
+        name: &str,
+        gop: u32,
+        pts_offset: u32,
+    ) -> (PathBuf, PlayerClipSpec) {
+        let path = dir.join(name);
+        let mut spec = PlayerClipSpec::ffv1(Rational::new(25, 1), 40, 30);
+        spec.gop = gop;
+        spec.pts_offset_frames = pts_offset;
+        generate_player_clip(&path, &spec).unwrap();
+        // The fixture must really exercise the bug: non-keyframe packets exist
+        // and (when requested) the container PTS origin is nonzero.
+        let mut demux = multiview_ffmpeg::demux::Demuxer::open(&path).unwrap();
+        let mut keys = Vec::new();
+        let mut first_pts = None;
+        let mut i = 0_u32;
+        while let Some(packet) = demux.read_packet_for(0).unwrap() {
+            first_pts.get_or_insert(packet.packet.pts());
+            if packet.packet.is_key() {
+                keys.push(i);
+            }
+            i += 1;
+        }
+        assert_eq!(i, 40, "fixture frame count");
+        assert_eq!(
+            keys,
+            (0..40)
+                .step_by(usize::try_from(gop).unwrap())
+                .collect::<Vec<_>>()
+        );
+        let first_pts = first_pts.flatten().unwrap();
+        if pts_offset == 0 {
+            assert_eq!(first_pts, 0);
+        } else {
+            assert!(first_pts > 0, "nonzero source PTS origin: {first_pts}");
+        }
+        (path, spec)
+    }
+
+    type Observed = std::sync::mpsc::Receiver<(MediaTime, MediaTime, Arc<Nv12Image>)>;
+
+    fn centre_luma(image: &Nv12Image) -> u8 {
+        let (w, h) = (image.width(), image.height());
+        *image
+            .y_plane()
+            .get(usize::try_from(h / 2 * w + w / 2).unwrap())
+            .expect("tile centre pixel")
+    }
+
+    /// Advance the manual run clock one output tick at a time (the pacer
+    /// releases only `LEAD` ticks ahead of it) and collect the worker's
+    /// published tile pictures as a run-length-collapsed centre-luma list,
+    /// starting at the first picture whose luma is `from` (earlier NA heartbeat
+    /// publishes are skipped), until `want` distinct runs were observed.
+    fn published_lumas(rig: &Rig, rx: &Observed, from: u8, want: usize) -> Vec<u8> {
+        let period = MediaTime::from_tick(1, rig.cadence).as_nanos();
+        let mut now = 1_000_000_000_i64;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut out: Vec<u8> = Vec::new();
+        let mut last_at = None;
+        while out.len() < want {
+            assert!(Instant::now() < deadline, "hang deadline: got {out:?}");
+            now += period;
+            rig.clock.set(now);
+            while let Ok((at, _, image)) = rx.recv_timeout(Duration::from_millis(5)) {
+                if let Some(prev) = last_at {
+                    assert!(at > prev, "stamps strictly monotone");
+                }
+                last_at = Some(at);
+                let luma = centre_luma(&image);
+                if out.is_empty() && luma != from {
+                    continue;
+                }
+                if out.last() != Some(&luma) {
+                    out.push(luma);
+                }
+            }
+        }
+        out.truncate(want);
+        out
+    }
+
+    fn start_with_clip(spec: ClipSpec) -> (Rig, Observed) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(16_384);
+        let rig = Rig::start_observed(&plain_config(), None, Some(tx)).unwrap();
+        rig.runtime.opener.request(spec).unwrap();
+        wait("clip committed", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1 && rig.runtime.native.load().is_some()
+        });
+        (rig, rx)
+    }
+
+    /// Finding A: a runtime-path seek to a NON-keyframe (13; keyframes every
+    /// 10) must show exactly source frame 13, then 14, 15, ... — never the
+    /// preceding keyframe's pictures relabelled as the target.
+    #[test]
+    fn runtime_seek_to_non_keyframe_shows_exact_target_frame() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "gop.mov", 10, 0);
+        let (rig, rx) = start_with_clip(ClipSpec::new(&path, LoadThen::Cue));
+        rig.handle.mailbox.submit(TransportVerb::Seek { frame: 13 });
+        rig.handle.mailbox.submit(TransportVerb::Play);
+        let got = published_lumas(&rig, &rx, spec.luma_of(0), 6);
+        let want: Vec<u8> = [0_u32, 13, 14, 15, 16, 17]
+            .iter()
+            .map(|i| spec.luma_of(*i))
+            .collect();
+        assert_eq!(
+            got, want,
+            "primed frame 0, then exactly 13.. after the seek"
+        );
+        assert!(rig.runtime.status.load().fault.is_none());
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Finding A: a vamp lap whose in-point is a non-keyframe replays exactly
+    /// [13, 17) on every lap (in-band `SeekFlushTo` wrap).
+    #[test]
+    fn runtime_vamp_lap_with_non_keyframe_in_point_replays_exact_interval() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "gop.mov", 10, 0);
+        let mut clip = ClipSpec::new(&path, LoadThen::Cue);
+        clip.vamp_in = Some(13);
+        clip.vamp_out = Some(17);
+        let (rig, rx) = start_with_clip(clip);
+        rig.handle.mailbox.submit(TransportVerb::Vamp);
+        // frame 0 (primed), 1..=16 of the first pass, then three exact laps.
+        let got = published_lumas(&rig, &rx, spec.luma_of(0), 17 + 12);
+        let mut want: Vec<u8> = (0_u32..=16).map(|i| spec.luma_of(i)).collect();
+        for _ in 0..3 {
+            want.extend((13_u32..17).map(|i| spec.luma_of(i)));
+        }
+        assert_eq!(got, want, "every vamp lap is exactly source frames 13..17");
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Finding A: nonzero source PTS origin. Seek and the EOF lap (`vamp_out`
+    /// = clip end) both land on the exact non-keyframe source frame, measured
+    /// from the clip's first presentation time, not from PTS zero.
+    #[test]
+    fn runtime_seek_and_eof_lap_respect_nonzero_source_pts_origin() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "offset.mov", 10, 7);
+        let mut clip = ClipSpec::new(&path, LoadThen::Cue);
+        clip.vamp_in = Some(23);
+        let (rig, rx) = start_with_clip(clip);
+        rig.handle.mailbox.submit(TransportVerb::Seek { frame: 33 });
+        rig.handle.mailbox.submit(TransportVerb::Vamp);
+        // 0 (primed), 33..=39, EOF lap to 23..=39, then a second lap start.
+        let got = published_lumas(&rig, &rx, spec.luma_of(0), 1 + 7 + 17 + 3);
+        let mut want: Vec<u8> = vec![spec.luma_of(0)];
+        want.extend((33_u32..40).map(|i| spec.luma_of(i)));
+        want.extend((23_u32..40).map(|i| spec.luma_of(i)));
+        want.extend((23_u32..26).map(|i| spec.luma_of(i)));
+        assert_eq!(got, want, "origin-relative exact seek and EOF lap");
+        assert!(rig.runtime.status.load().fault.is_none());
+        assert!(rig.shutdown().is_none());
     }
 
     /// 10k load requests against the actual opener + worker while the output
