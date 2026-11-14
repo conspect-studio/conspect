@@ -679,7 +679,7 @@ mod tests {
     /// #307 review r2 (one store per body revision): a body edit publishes a
     /// NEW, already primed store with the new revision for the same key. On
     /// the adoption tick the Program cell samples the new store (its
-    /// pixels, never a NoSignal tick), and the driver holds the new
+    /// pixels, never a `NoSignal` tick), and the driver holds the new
     /// revision with it: store and revision swap together.
     #[test]
     fn a_store_swap_with_a_new_revision_rebinds_program_on_the_adoption_tick() {

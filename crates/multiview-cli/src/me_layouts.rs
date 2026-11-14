@@ -232,36 +232,33 @@ impl MeLayoutSources for MeLayoutAdapter {
         let key: Arc<str> = Arc::from(source_key(&body.0.id));
         let shared = &self.shared;
         let mut writer = shared.lock();
-        let index = match writer.slots.iter().position(|s| s.compose.key == key) {
-            Some(index) => {
-                if writer.slots[index].compose.body.revision == body.0.revision {
-                    // The same revision is the same content: nothing to swap.
-                    return Ok(());
-                }
-                index
+        if let Some(existing) = writer.slots.iter().find(|s| s.compose.key == key) {
+            if existing.compose.body.revision == body.0.revision {
+                // The same revision is the same content: nothing to swap.
+                return Ok(());
             }
-            None => {
-                if writer.slots.len() >= MAX_ME_LAYOUT_SOURCES {
-                    return Err(MeLayoutRefusal::Capacity);
-                }
-                writer.slots.push(Slot {
-                    compose: MeLayoutCompose {
-                        key: Arc::clone(&key),
-                        body: Arc::clone(&body.0),
-                        store: Arc::new(TileStore::with_defaults(Arc::clone(&key))),
-                    },
-                    engine: None,
-                    pending_since: None,
-                });
-                writer.slots.len() - 1
-            }
-        };
+        } else if writer.slots.len() >= MAX_ME_LAYOUT_SOURCES {
+            return Err(MeLayoutRefusal::Capacity);
+        }
         // One store per body revision: a body change never reuses a store.
-        let slot = &mut writer.slots[index];
-        slot.compose = MeLayoutCompose {
+        let compose = MeLayoutCompose {
             key: Arc::clone(&key),
             body: Arc::clone(&body.0),
-            store: Arc::new(TileStore::with_defaults(key)),
+            store: Arc::new(TileStore::with_defaults(Arc::clone(&key))),
+        };
+        let slot = if let Some(slot) = writer.slots.iter_mut().find(|s| s.compose.key == key) {
+            slot.compose = compose;
+            slot
+        } else {
+            writer.slots.push(Slot {
+                compose,
+                engine: None,
+                pending_since: None,
+            });
+            let Some(slot) = writer.slots.last_mut() else {
+                return Err(MeLayoutRefusal::Capacity);
+            };
+            slot
         };
         slot.pending_since = Some(Instant::now());
         // Aux first; the engine set follows once the new store primed.
@@ -419,9 +416,9 @@ mod tests {
     /// fake aux and the hook's adoption are delayed independently.
     #[test]
     fn me_layouts_a_body_change_gets_a_new_store_published_after_it_primed() {
+        const KEY: &str = "layout:a";
         let adapter = MeLayoutAdapter::new();
         let engine = adapter.engine();
-        const KEY: &str = "layout:a";
         // First registration: compose set first, engine set after prime.
         adapter.register(body("a", 1)).unwrap();
         let first = compose_store(&adapter, KEY);
@@ -477,9 +474,9 @@ mod tests {
     /// published anyway after the prime wait, and ages to slate.
     #[test]
     fn me_layouts_an_unprimed_body_is_published_after_the_bound() {
+        const KEY: &str = "layout:a";
         let wait = Duration::from_millis(200);
         let adapter = MeLayoutAdapter::with_prime_wait(wait);
-        const KEY: &str = "layout:a";
         let started = Instant::now();
         adapter.register(body("a", 1)).unwrap();
         let store = compose_store(&adapter, KEY);
