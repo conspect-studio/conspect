@@ -546,9 +546,10 @@ impl SwitcherTickDriver {
             .resolve(tick, auto_p, incoming_drawn, out, &self.outcomes);
     }
 
-    /// After [`Self::reject_composed_tick`]: bring the committed keyer draws
-    /// in line with the restored state (a cancelled tied transition draws its
-    /// keyers at their resting weight). Pictures are never replaced.
+    /// After [`Self::reject_composed_tick`]: rebuild the installed keyer
+    /// draws as the committed resting state (an on-air keyer draws its
+    /// restored last-good pair at weight 1, even where the committed tick
+    /// drew it at weight 0; review round 2 G1).
     pub fn settle_keyer_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
         self.keyers.settle_draws(draws);
     }
@@ -1397,8 +1398,12 @@ impl SwitcherTickDriver {
     /// (ADR-0113 §6). `None` when no store map is installed.
     fn take_fresh(&self, verb: &SwitcherVerb, tick: Tick) -> Option<bool> {
         let incoming = self.fresh_at(self.incoming(verb), tick)?;
+        // A CUT during the background AUTO completes that flight: it puts on
+        // only the flight's surviving going-on participants (review round 2
+        // G2), the same set `stage_take` lands.
+        let in_flight = matches!(verb, SwitcherVerb::Cut) && self.active_auto.is_some();
         let tied = !matches!(verb, SwitcherVerb::Cut | SwitcherVerb::Auto(_))
-            || self.keyers.tied_going_on_fresh(tick);
+            || self.keyers.tied_going_on_fresh(tick, in_flight);
         Some(incoming && tied)
     }
 

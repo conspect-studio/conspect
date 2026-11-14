@@ -397,6 +397,39 @@ impl KeyerSlot {
         self.last_good = None;
         self.flags.stale = false;
     }
+
+    /// Whether the next background take puts this keyer on: during a
+    /// background AUTO only a surviving going-on participant
+    /// (`flight == Some(true)`), otherwise a tied keyer that is off and not
+    /// in its own AUTO. The CUT fresh gate and the Preview tally share it,
+    /// so neither re-derives participation from `tie` and `on_air` mid-flight.
+    fn going_on(&self, auto_in_flight: bool) -> bool {
+        if auto_in_flight {
+            self.flags.flight == Some(true) && self.flags.ramp.is_none()
+        } else {
+            self.flags.tie && !self.flags.on_air && self.flags.ramp.is_none()
+        }
+    }
+
+    /// The draw of this keyer at `weight` from its last-good pair and its
+    /// definition (two `Arc` clones, `Copy` parameters, no heap); `None`
+    /// without a pair (never a slate).
+    fn draw_at(&self, keyer: u8, weight: f32, canvas: (u32, u32)) -> Option<KeyerDraw> {
+        let (fill, key) = self.last_good.as_ref()?;
+        Some(KeyerDraw {
+            keyer,
+            fill: Arc::clone(fill),
+            key: key.clone(),
+            rect: self.def.fly.unwrap_or(KeyerFly {
+                x: 0,
+                y: 0,
+                w: canvas.0,
+                h: canvas.1,
+            }),
+            weight,
+            params: self.def.params,
+        })
+    }
 }
 
 /// One keyer's contribution to this tick's composite: two `Arc` clones and
@@ -503,6 +536,19 @@ impl TallySet {
         }
         if let Some(free) = self.roles.iter_mut().find(|r| r.is_none()) {
             *free = Some(role);
+        }
+    }
+
+    /// Remove `role`, keeping the rest in insertion order with no hole (so
+    /// `Eq` compares sets built the same way equal).
+    fn remove(&mut self, role: TallyRole) {
+        if let Some(at) = self.roles.iter().position(|r| *r == Some(role)) {
+            if let Some(tail) = self.roles.get_mut(at..) {
+                tail.rotate_left(1);
+            }
+            if let Some(last) = self.roles.last_mut() {
+                *last = None;
+            }
         }
     }
 
@@ -985,11 +1031,18 @@ impl KeyerRuntime {
 
     /// Whether every tied keyer that a background take would put on has a
     /// fresh fill and key now (a CUT or AUTO is held until it does).
-    pub(crate) fn tied_going_on_fresh(&self, tick: Tick) -> bool {
+    ///
+    /// `auto_in_flight`: the take is a CUT completing the background AUTO in
+    /// flight. It puts on only the surviving going-on participants
+    /// (`flight == Some(true)`, review round 2 G2); a keyer whose
+    /// participation a loss or an operator verb cancelled, or that was tied
+    /// during the flight, does not move on it and is never waited for. A new
+    /// take puts on every tied keyer that is off and not in its own AUTO.
+    pub(crate) fn tied_going_on_fresh(&self, tick: Tick, auto_in_flight: bool) -> bool {
         self.slots
             .iter()
             .flatten()
-            .filter(|s| s.flags.tie && !s.flags.on_air && s.flags.ramp.is_none())
+            .filter(|s| s.going_on(auto_in_flight))
             .all(|s| live_now(&s.def, tick))
     }
 
@@ -1040,27 +1093,41 @@ impl KeyerRuntime {
         }
     }
 
-    /// After a rejected frame: bring the committed draws in line with the
-    /// restored state where a background AUTO was cancelled. A keyer neither
-    /// in its own AUTO nor in a tied one draws weight 1 on air and nothing
-    /// off; its pictures are the committed pair, untouched.
+    /// After a rejected frame: rebuild the installed draws as the committed
+    /// resting state, in ascending z, in the same fixed array (review round
+    /// 2 G1). A keyer still in its own AUTO (unchanged from an earlier tick)
+    /// keeps its committed draw. Every other keyer draws its restored
+    /// last-good pair at weight 1 when on air and nothing when off, whether
+    /// or not the committed tick drew it: a tied keyer going off through a
+    /// DIP draws weight 0 past the switch point, so its committed draw is
+    /// absent while it is still on air, and the cancelled transition puts it
+    /// back at rest. No heap: `Arc` refcounts and a stack array only.
     pub(crate) fn settle_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
-        for entry in draws.iter_mut() {
-            let Some(draw) = entry.as_mut() else {
+        let mut committed: [Option<KeyerDraw>; MAX_DSK] = [const { None }; MAX_DSK];
+        std::mem::swap(&mut committed, draws);
+        let mut next = draws.iter_mut();
+        for &index in &self.draw_order {
+            let Some(slot) = self.slots.get(index).and_then(Option::as_ref) else {
                 continue;
             };
-            let Some(flags) = self.flags(usize::from(draw.keyer)) else {
-                *entry = None;
-                continue;
-            };
-            if flags.ramp.is_some() || flags.flight.is_some() {
-                continue;
-            }
-            if flags.on_air {
-                draw.weight = 1.0;
+            let keyer = index_u8(index);
+            let draw = if slot.flags.ramp.is_some() || slot.flags.flight.is_some() {
+                committed
+                    .iter_mut()
+                    .find(|d| d.as_ref().is_some_and(|d| d.keyer == keyer))
+                    .and_then(Option::take)
+            } else if slot.flags.on_air {
+                slot.draw_at(keyer, 1.0, self.canvas)
             } else {
-                *entry = None;
+                None
+            };
+            if draw.is_none() {
+                continue;
             }
+            let Some(target) = next.next() else {
+                break;
+            };
+            *target = draw;
         }
     }
 
@@ -1117,7 +1184,10 @@ impl KeyerRuntime {
             };
             let keyer = index_u8(index);
             let has_key = slot.def.key.is_some();
-            if slot.flags.tie && !slot.flags.on_air && slot.flags.ramp.is_none() {
+            // Mid-flight, only the surviving going-on participants are
+            // tallied as coming (review round 2 G2 re-scan): a keyer whose
+            // participation a loss cancelled is not put on by this flight.
+            if slot.going_on(auto_p.is_some()) {
                 preview.insert(TallyRole::Fill(keyer));
                 if has_key {
                     preview.insert(TallyRole::Key(keyer));
@@ -1174,6 +1244,11 @@ impl KeyerRuntime {
                         // never puts it back on (review F1).
                         slot.flags.flight = None;
                         slot.release();
+                        if !slot.going_on(auto_p.is_some()) {
+                            // The flight no longer puts it on: not coming.
+                            preview.remove(TallyRole::Fill(keyer));
+                            preview.remove(TallyRole::Key(keyer));
+                        }
                         if let Some(op) = slot.ramp_op.take() {
                             refuse(outcomes, op, tick.index, REFUSE_KEYER_SOURCE_LOST);
                         }
@@ -1199,7 +1274,7 @@ impl KeyerRuntime {
             if weight <= 0.0 || weight.is_nan() {
                 continue;
             }
-            let Some((fill, key)) = &slot.last_good else {
+            let Some(draw) = slot.draw_at(keyer, weight.min(1.0), canvas) else {
                 // No pair yet: the keyer contributes nothing (never a slate).
                 continue;
             };
@@ -1207,22 +1282,10 @@ impl KeyerRuntime {
                 break;
             };
             program.insert(TallyRole::Fill(keyer));
-            if key.is_some() {
+            if draw.key.is_some() {
                 program.insert(TallyRole::Key(keyer));
             }
-            *target = Some(KeyerDraw {
-                keyer,
-                fill: Arc::clone(fill),
-                key: key.clone(),
-                rect: slot.def.fly.unwrap_or(KeyerFly {
-                    x: 0,
-                    y: 0,
-                    w: canvas.0,
-                    h: canvas.1,
-                }),
-                weight: weight.min(1.0),
-                params: slot.def.params,
-            });
+            *target = Some(draw);
         }
         self.tally = KeyerTally { program, preview };
     }
@@ -1393,6 +1456,12 @@ mod tests {
         set.insert(TallyRole::Key(1));
         assert_eq!(set.roles().count(), 2);
         assert!(set.contains(TallyRole::Key(1)));
+        set.insert(TallyRole::Program);
+        set.remove(TallyRole::Key(1));
+        let mut expected = TallySet::default();
+        expected.insert(TallyRole::Fill(0));
+        expected.insert(TallyRole::Program);
+        assert_eq!(set, expected, "removal leaves no hole");
     }
 
     #[test]

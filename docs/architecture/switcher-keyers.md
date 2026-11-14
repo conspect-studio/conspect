@@ -596,7 +596,13 @@ keyers.
     (`keyers_dsk::a_tied_dsk_on_a_wipe_cuts_at_the_terminal_tick`). The exact WIPE envelope is K3
     (#388).
   - **Gate.** A CUT or AUTO is also gated on the fill and key of every tied keyer it would put on
-    (`take_fresh`).
+    (`take_fresh`). For a new take that is every tied keyer that is off and not in its own AUTO.
+    A CUT during a background AUTO completes that flight, so it waits only for the surviving
+    going-on participants (`flight == Some(true)`, review round 2 G2): a keyer whose
+    participation a loss cancelled is never waited for, the CUT completes at once, and a
+    recovery after the terminal tick neither swaps the background again nor keys the DSK.
+  - **Preview tally.** During the flight the same rule names the keyers coming on: a loss
+    that cancels participation removes the keyer's fill and key from `preview` on that tick.
   - **Abort.** An AUTO aborted by SW2-02, interrupted by a punch or rolled back by a rejected
     frame cancels participation (`cancel_tied`), and tied keyers keep their
     state.
@@ -608,9 +614,13 @@ keyers.
   that released the pair gets it back. The hook never resolves keyers on a rejected frame and
   no longer clears the drive's draws: the last committed draws stay installed (an on-air DSK
   stays in the frame, with stale sources too). `on_compose_failed` swaps the committed draws
-  back from `keyer_buf`. In both paths `settle_keyer_draws` sets a keyer whose tied
-  transition the reject cancelled to its resting weight (1 on air, nothing off), pictures
-  untouched.
+  back from `keyer_buf`. In both paths `settle_keyer_draws` rebuilds the installed draws as the
+  committed resting state, in ascending z, in the same fixed array (review round 2 G1): a
+  keyer still in its own AUTO keeps its committed draw; every other keyer draws its restored
+  last-good pair at weight 1 on air and nothing off, whether or not the committed tick drew
+  it. A tied keyer going off through a DIP draws weight 0 past the switch point, so its last
+  committed draw is absent while it is still on air; the reject cancels the flight and the
+  rejected frame shows it at rest. Pictures are the restored pair (`Arc` clones, no heap).
   `reject_composed_tick` also refuses slot-held ops that moved this tick, and discards
   queued events. Applied keyer ops sit in `staged_success` and are refused with everything else.
   `Staged` is untouched. `repeat_tick` expires held keyer commands past their deadline.
@@ -684,6 +694,10 @@ keyers.
   - `tests/keyers_gate_loss.rs`: refusal at exactly +50 with 0 lost ticks, `keyer-pending`,
     tied loss and recovery during a MIX and a DIP in both directions (stays off), a rejected
     take with an on-air DSK, with stale sources and with a staged off, and a failed compose,
+    both reject paths after a committed zero-weight tick of a tied DIP going off (pixels on
+    the rejection tick, weight, pair identity, z order under a second DSK), a CUT during an
+    AUTO after a tied loss (completes at once, one swap, stays off), the Preview tally
+    dropping a lost participant,
     fill-only and key-only death mid-ramp (`Arc::ptr_eq` frozen pair, drop at the trigger, stays
     off), `hold_last_good`, slate never keyed, oversize, going off never gated.
   - `tests/keyers_chaos.rs`:
