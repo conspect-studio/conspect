@@ -17,6 +17,8 @@
 //     10-segment window (k1, engine pre-roll); 3 segments (k0) is informational. [--k-segments 3,5,10]
 //  l  a PAUSE sent although not advertised pauses, PLAY resumes; a stream left paused closes the app
 //  m  the server becomes unreachable -> 3 retries, then "The TV cannot reach the Conspect server."
+//  o  stream A's master probe is delayed 2 s then answered 404 while B is LOADed meanwhile -> B reaches PLAYING
+//     and stays (MEDIA-2: A's late probe completion must not call endCast() / stop B)
 // Cases run in the order given; all but k start on a full 10-segment window.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,9 +27,10 @@ import { startFakePlatform, NS_CONSPECT, NS_MEDIA } from './fake-cast-platform.m
 import { parseArgs, openReceiver, startGenerator, waitForSegments, watchPlaylist, senderMedia, check, finish, save, sleep, waitUntil, outDir, here } from './lib.mjs';
 import { execFileSync } from 'node:child_process';
 
-const args = parseArgs(process.argv.slice(2), { cases: 'a,b,c,d,e,f,g,h,i,j,k,l,m,n', 'k-segments': '3,5,10' });
+const args = parseArgs(process.argv.slice(2), { cases: 'a,b,c,d,e,f,g,h,i,j,k,l,m,n,o', 'k-segments': '3,5,10' });
 const wanted = String(args.cases).split(',');
 const TOKEN = 'faultAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const TOKEN_B = 'faultBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';   // case o: a second stream, same directory, different token
 const streamDir = path.join(outDir, 'streams', 'faults');
 const hardStop = setTimeout(() => { console.error('hard timeout'); process.exit(3); }, 24 * 60 * 1000);
 
@@ -555,13 +558,49 @@ async function caseN() {
   } finally { await ctx.close(); await server3.close().catch(() => {}); }
 }
 
-const CASES = { a: caseA, b: caseB, c: caseC, d: caseD, e: caseE, f: caseF, g: caseG, h: caseH, i: caseI, j: caseJ, k: caseK, l: caseL, m: caseM, n: caseN };
+async function caseO() {
+  // MEDIA-2: stream A is LOADed first, which fires its own-LOAD master probe (onLoad's `probe(...)` call). The
+  // server holds that GET for 2 s then answers 404. While it is in flight, the sender LOADs stream B (a fresh
+  // `current`, a bumped loadGeneration). A's probe completion must be dropped: it must not call endCast() and
+  // must not stop B. B must reach PLAYING and keep playing with no endCast/app-stop.
+  const ctx = await openReceiver(server.secureOrigin + '/cast/receiver/', startFakePlatform);
+  try {
+    const checks = []; const m = {};
+    server.setFault({ mode: 'delay404', seconds: 2, token: TOKEN });
+    const t0 = Date.now();
+    ctx.platform.load(senderMedia(`${server.secureOrigin}/cast/${TOKEN}/master.m3u8`));
+    await sleep(300);                                        // A's own-load probe is now in flight, held by the server
+    const t1 = Date.now();
+    ctx.platform.load(senderMedia(`${server.secureOrigin}/cast/${TOKEN_B}/master.m3u8`));
+    let first = null; try { first = await ctx.platform.waitForMediaStatus((x) => x.playerState === 'PLAYING', 15000, t1); } catch { /* reported */ }
+    m.to_playing_ms = first ? first.at - t1 : null;
+    checks.push(check('B reaches PLAYING within 15 s of its LOAD', !!first, first ? `${m.to_playing_ms} ms` : 'no PLAYING', '<= 15000 ms'));
+    // Wait past A's delayed 404 (at t0 + 2000) plus the receiver's 3 s probe-completion handling margin.
+    await sleep(Math.max(0, t0 + 2000 - Date.now()) + 3000);
+    const after = await ctx.last();
+    const a1 = await ctx.last();
+    await sleep(8000);
+    const a2 = await ctx.last();
+    checks.push(check('B still PLAYING after A\'s delayed 404 resolves, no endCast', after && after.extra.state === 'PLAYING' && after.extra.overlay === 'playing', after ? `${after.extra.state} / ${after.extra.overlay}` : 'none', 'PLAYING'));
+    checks.push(check('B keeps advancing 8 s later (not stopped)', a2 && a1 && a2.ct > a1.ct && a2.extra.state === 'PLAYING', a2 ? `${a2.extra.state}, advanced ${Math.round((a2.ct - a1.ct) * 10) / 10} s` : 'none', 'PLAYING, advancing'));
+    m.end_cast_lines = receiverLines(ctx, /token gone/).length;
+    m.closed = ctx.platform.state.closedAt > 0;
+    checks.push(check('no endCast (token gone) fired for the stale A probe', m.end_cast_lines === 0 && !m.closed, `${m.end_cast_lines} endCast line(s), closed=${m.closed}`, '0, not closed'));
+    // IDLE at/just after the LOAD request itself (before the first PLAYING) is CAF's normal transient status, not
+    // a stop; only an IDLE after B is already PLAYING would mean the stale A probe tore B down.
+    const idleAfterB = first ? ctx.platform.mediaStatuses(first.at).filter((s) => s.playerState === 'IDLE').length : -1;
+    checks.push(check('no IDLE / app stop after B reaches PLAYING', idleAfterB === 0, idleAfterB, '0'));
+    return { name: 'o-stale-probe-during-another-load', checks, metrics: m, detail: await trace(ctx, t0) };
+  } finally { server.setFault({ mode: 'none' }); await ctx.close(); }
+}
+
+const CASES = { a: caseA, b: caseB, c: caseC, d: caseD, e: caseE, f: caseF, g: caseG, h: caseH, i: caseI, j: caseJ, k: caseK, l: caseL, m: caseM, n: caseN, o: caseO };
 let failures = 1;
 try {
   execFileSync(path.join(here, 'make-cert.sh'), [path.join(outDir, 'tls')]);
   const upstream = args.upstream && args.upstream !== 'true' ? String(args.upstream) : null;
   if (!upstream) { generator = newGenerator(false); await waitForSegments(streamDir, 10, 60000, generator.tag); }
-  server = await startServer({ tokens: { [TOKEN]: upstream || streamDir }, tls: { key: path.join(outDir, 'tls', 'key.pem'), cert: path.join(outDir, 'tls', 'cert.pem') } });
+  server = await startServer({ tokens: { [TOKEN]: upstream || streamDir, [TOKEN_B]: upstream || streamDir }, tls: { key: path.join(outDir, 'tls', 'key.pem'), cert: path.join(outDir, 'tls', 'cert.pem') } });
   const parts = [];
   for (const id of wanted) {
     if (!CASES[id]) continue;

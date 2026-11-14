@@ -106,6 +106,10 @@
   var lastProbeAt = 0;
   var stalls = 0;                // BUFFERING entered after the first PLAYING of a load
   var hadPlaying = false;
+  // Bumped on every accepted LOAD that is not our own retry, and on stop/finish. An in-flight probe (token check,
+  // retry, buffering watchdog) or report POST started under an older generation must not act on `current`: it may
+  // have been replaced (a new LOAD) or cleared (stop/finish) by the time an old XMLHttpRequest answers.
+  var loadGeneration = 0;
 
   function info() {
     var a = Array.prototype.slice.call(arguments);
@@ -247,6 +251,7 @@
   /** POST the report to <token base>report: at most one per second, dropped (not queued) when too soon. */
   function post(report) {
     if (!current || terminal) { return; }
+    var generation = loadGeneration;
     var t = now();
     if (t - lastPostAt < POST_MIN_GAP_MS) { return; }
     lastPostAt = t;
@@ -259,6 +264,8 @@
       xhr.setRequestHeader('Content-Type', 'application/json');
       xhr.timeout = 4000;
       xhr.onload = function () {
+        // Obsolete: a LOAD replaced `current`, or stop/finish cleared it, since this request was sent (MEDIA-2).
+        if (generation !== loadGeneration) { return; }
         // The token no longer exists on the server: confirm on master.m3u8 and end the cast.
         if (xhr.status === 404 || xhr.status === 403 || xhr.status === 410) { checkToken('report ' + xhr.status); }
       };
@@ -279,14 +286,20 @@
 
   // ---------------------------------------------------------------- token probe
 
-  /** GET master.m3u8. cb(status, text): status 0 = unreachable. Also learns the H.264 profile/level for messages. */
+  /**
+   * GET master.m3u8. cb(status, text): status 0 = unreachable. Also learns the H.264 profile/level for messages.
+   * The completion is dropped (cb is never called) once `loadGeneration` has moved on since the call: a LOAD
+   * replacing `current`, or a stop/finish clearing it, invalidates every probe still in flight (MEDIA-2).
+   */
   function probe(cb) {
     if (!current) { cb(0, ''); return; }
     var target = current;
+    var generation = loadGeneration;
     var done = false;
     var finish = function (status, text) {
       if (done) { return; }
       done = true;
+      if (generation !== loadGeneration) { return; }
       if (status === 200) {
         var m = /avc1\.([0-9A-Fa-f]{2})[0-9A-Fa-f]{2}([0-9A-Fa-f]{2})/.exec(text || '');
         if (m) {
@@ -480,6 +493,7 @@
     current = null;
     lastError = null;
     retryTimer = clear(retryTimer);
+    loadGeneration += 1;    // invalidates every probe/report in flight for the stream that just stopped (MEDIA-2)
     setState('idle', 'stopped');
     report('finished');
     armIdleStop();
@@ -661,6 +675,7 @@
       info('LOAD rejected: not a Conspect cast stream URL:', redact(String(raw).slice(0, 120)));
       rejectedAt = now();
       current = null;
+      loadGeneration += 1;    // invalidates every probe/report in flight for the stream just dropped (MEDIA-2)
       terminal = false;
       retryTimer = clear(retryTimer);
       bufferingTimer = clear(bufferingTimer);
@@ -685,6 +700,10 @@
       liveSeekAt = 0;
       lastError = null;
       current = { at: now(), codec: '' };
+      // A new load (not our own retry of the same stream): any probe or report POST still in flight for the
+      // previous `current` must be ignored once it answers (MEDIA-2). A retry keeps the generation: it is the
+      // same stream, still current, and its own in-flight probe below must be allowed to complete.
+      if (!mine) { loadGeneration += 1; }
     }
     terminal = false;
     retryTimer = clear(retryTimer);

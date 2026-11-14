@@ -6,8 +6,9 @@
 //   GET  /cast/receiver/...            receiver app (CSP + Cache-Control: no-cache)
 //   GET  /cast/<token>/<file>          media from the mapped directory or proxied from the mapped base URL
 //   POST /cast/<token>/report          receiver report (<= 2 KiB JSON, 1/s per token); GET /_reports lists them
-//   POST /_fault {mode:'none'|'404'|'stall'|'slow'|'corrupt', seconds?, bps?, token?}   (corrupt: .m4s bodies are
-//                                      replaced by noise for `seconds`: a decode failure, fatal in the player)
+//   POST /_fault {mode:'none'|'404'|'stall'|'slow'|'corrupt'|'delay404', seconds?, bps?, token?}   (corrupt: .m4s
+//                 bodies are replaced by noise for `seconds`: a decode failure, fatal in the player; delay404:
+//                 master.m3u8 alone is held for `seconds` then answered 404, everything else serves normally)
 //   POST /_map {token, target}         add or replace a token mapping;  GET /_requests  request log per token
 //   --tls-port N --tls-key F --tls-cert F : the same routes over HTTPS as well (self-signed, see make-cert.sh).
 //   The engine serves the receiver over HTTPS; CAF loads Shaka from a protocol-relative URL
@@ -91,6 +92,13 @@ export async function startServer(opts = {}) {
     const ext = path.extname(file);
     const f = faultFor(token);
     if (!target || !tokens.has(token) || !TYPES[ext] || (f && f.mode === '404')) { note(token, file, 404); res.writeHead(404, cors); return res.end(); }
+    // delay404: only master.m3u8 is held, then answered 404 (a stuck/slow master probe for one stream while
+    // another stream's LOAD and playback must be unaffected). Everything else (segments, other files) is normal.
+    if (f && f.mode === 'delay404' && file === 'master.m3u8') {
+      const delayMs = Math.max(0, f.until - Date.now());
+      setTimeout(() => { note(token, file, 404); if (!res.headersSent) { res.writeHead(404, cors); res.end(); } }, delayMs);
+      return;
+    }
     const isPlaylist = ext === '.m3u8';
     const headers = { ...cors, 'content-type': TYPES[ext], 'cache-control': isPlaylist ? 'max-age=1' : 'public, max-age=3600, immutable' };
     const hold = f && !isPlaylist ? f : null;                // stall and slow act on segments and init files
