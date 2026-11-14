@@ -3887,6 +3887,22 @@ fn is_generated_subtitle_manifest(name: &str) -> bool {
         })
 }
 
+/// The segment index of a subtitle segment this sink generates:
+/// `subs<slot>-<index>.vtt` with all-ASCII-digit slot and index (ABU2-2).
+/// Anything else (`subs+1-1.vtt`, `subs1-+1.vtt`, …) is not ours: `None`.
+fn generated_subtitle_segment_index(name: &str) -> Option<u64> {
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (slot, index) = name
+        .strip_prefix("subs")?
+        .strip_suffix(".vtt")?
+        .split_once('-')?;
+    if !decimal(slot) || !decimal(index) {
+        return None;
+    }
+    slot.parse::<u8>().ok()?;
+    index.parse().ok()
+}
+
 /// Reap prior-run TS files after the new manifests have advanced beyond them.
 /// Keep three playlist windows plus three segment closes for an old client.
 fn segment_grace(window: usize) -> u64 {
@@ -3929,15 +3945,9 @@ fn prune_prior_live_segments(dir: &Path, prefix: &str, next: u64, window: usize)
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         // Slice F (#345): a prior run's subtitle `.vtt` ages out with its TS.
-        if let Some(stem) = name.strip_suffix(".vtt") {
-            let number = stem.strip_prefix("subs").and_then(|s| {
-                s.split_once('-')
-                    .and_then(|(slot, index)| slot.parse::<u8>().ok().map(|_| index))
-            });
+        if name.strip_suffix(".vtt").is_some() {
             if !references.contains(std::ffi::OsStr::new(name))
-                && number
-                    .and_then(|index| index.parse::<u64>().ok())
-                    .is_some_and(|index| index < oldest)
+                && generated_subtitle_segment_index(name).is_some_and(|index| index < oldest)
             {
                 match std::fs::remove_file(entry.path()) {
                     Ok(()) | Err(_) => {}
@@ -5842,6 +5852,42 @@ mod tests {
         .unwrap();
         prune_prior_live_segments(dir.path(), "seg", 60, 3);
         assert!(dir.path().join("subs0-3.vtt").exists());
+    }
+
+    #[test]
+    fn only_generated_subtitle_segments_are_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = [
+            "subs+1-1.vtt",
+            "subs1-+1.vtt",
+            "subs-1-1.vtt",
+            "subs1--1.vtt",
+            "subs1-1-1.vtt",
+            "subs1-.vtt",
+            "subs-1.vtt",
+            "subs999-1.vtt",
+            "subs 1-1.vtt",
+            "subs1-1 .vtt",
+            "subtitles-1.vtt",
+        ];
+        for name in foreign.iter().chain(&["subs1-1.vtt", "subs12-0.vtt"]) {
+            std::fs::write(dir.path().join(name), "WEBVTT\n").unwrap();
+        }
+        // next 60, window 3: grace 12, so index < 48 retires.
+        prune_prior_live_segments(dir.path(), "seg", 60, 3);
+        for name in foreign {
+            assert!(dir.path().join(name).exists(), "{name} is not ours");
+        }
+        assert!(!dir.path().join("subs1-1.vtt").exists());
+        assert!(!dir.path().join("subs12-0.vtt").exists());
+        assert_eq!(
+            super::generated_subtitle_segment_index("subs3-47.vtt"),
+            Some(47)
+        );
+        assert_eq!(
+            super::generated_subtitle_segment_index("subs+3-47.vtt"),
+            None
+        );
     }
 
     #[test]

@@ -41,6 +41,11 @@ pub const MAX_HELD_CUES_PER_SLOT: usize = 64;
 pub const MAX_CUE_TEXT_BYTES: usize = 512;
 /// Most lines a cue keeps.
 pub const MAX_CUE_LINES: usize = 4;
+/// Most source bytes [`bound_cue_lines`] examines (whitespace included), so
+/// projecting a hostile cue costs a fixed amount of work per tick.
+pub const MAX_INSPECTED_BYTES: usize = 4096;
+/// Most source lines [`bound_cue_lines`] examines (blank lines included).
+pub const MAX_INSPECTED_LINES: usize = 16;
 
 /// A cue's display lines after [`bound_cue_lines`] (the only constructor, so
 /// the bound is an invariant of the type).
@@ -52,6 +57,10 @@ pub struct BoundedLines {
     lines: Vec<String>,
     /// Whether anything was cut.
     truncated: bool,
+    /// Source bytes examined (≤ [`MAX_INSPECTED_BYTES`]).
+    inspected_bytes: usize,
+    /// Source lines examined, blank ones included (≤ [`MAX_INSPECTED_LINES`]).
+    inspected_lines: usize,
 }
 
 impl BoundedLines {
@@ -78,34 +87,70 @@ impl BoundedLines {
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }
+
+    /// Source bytes the projection examined (its work bound).
+    #[must_use]
+    pub const fn inspected_bytes(&self) -> usize {
+        self.inspected_bytes
+    }
+
+    /// Source lines the projection examined, blank ones included.
+    #[must_use]
+    pub const fn inspected_lines(&self) -> usize {
+        self.inspected_lines
+    }
 }
 
 /// Project `lines` onto a compact, bounded copy: blank lines dropped, at most
 /// [`MAX_CUE_LINES`] lines and [`MAX_CUE_TEXT_BYTES`] bytes (one byte per
 /// separating newline), cut on a UTF-8 char boundary. Only the kept bytes are
-/// copied (never the source allocation), so its work and memory are bounded
-/// whatever the source size.
+/// copied (never the source allocation). The **work** is bounded too: at most
+/// [`MAX_INSPECTED_LINES`] source lines and [`MAX_INSPECTED_BYTES`] source
+/// bytes are examined (blank lines and whitespace included; the budget is
+/// checked before each next line, and whitespace is classified only within
+/// the inspected prefix), whatever the source size.
 #[must_use]
 pub fn bound_cue_lines<S: AsRef<str>>(lines: &[S]) -> BoundedLines {
     let mut kept: Vec<&str> = Vec::with_capacity(MAX_CUE_LINES);
     let mut truncated = false;
     let mut budget = MAX_CUE_TEXT_BYTES;
+    let mut inspected_bytes = 0usize;
+    let mut inspected_lines = 0usize;
     for line in lines.iter().map(AsRef::as_ref) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if kept.len() == MAX_CUE_LINES || budget == 0 {
+        // The inspection budget is checked BEFORE looking at the next line
+        // (INV2-1/ABU2-1): blank lines and whitespace consume it too, so the
+        // work is bounded whatever the source holds.
+        if kept.len() == MAX_CUE_LINES
+            || budget == 0
+            || inspected_lines == MAX_INSPECTED_LINES
+            || inspected_bytes == MAX_INSPECTED_BYTES
+        {
             truncated = true;
             break;
         }
-        let mut at = line.len().min(budget);
-        while !line.is_char_boundary(at) {
+        inspected_lines += 1;
+        // Only a bounded, UTF-8-safe prefix of the line is ever examined.
+        let mut look = line.len().min(MAX_INSPECTED_BYTES - inspected_bytes);
+        while !line.is_char_boundary(look) {
+            look -= 1;
+        }
+        let prefix = &line[..look];
+        inspected_bytes += prefix.len();
+        if prefix.trim().is_empty() {
+            if prefix.len() < line.len() {
+                // Content (if any) lies beyond what may be inspected.
+                truncated = true;
+            }
+            continue;
+        }
+        let mut at = prefix.len().min(budget);
+        while !prefix.is_char_boundary(at) {
             at -= 1;
         }
         if at < line.len() {
             truncated = true;
         }
-        let part = &line[..at];
+        let part = &prefix[..at];
         if part.is_empty() {
             break;
         }
@@ -118,6 +163,8 @@ pub fn bound_cue_lines<S: AsRef<str>>(lines: &[S]) -> BoundedLines {
     BoundedLines {
         lines: out,
         truncated,
+        inspected_bytes,
+        inspected_lines,
     }
 }
 
@@ -936,5 +983,54 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len());
+    }
+
+    #[test]
+    fn projection_work_is_bounded_for_whitespace_heavy_text() {
+        // 256 KiB of leading whitespace before one character.
+        let padded = format!("{}x", " ".repeat(256 * 1024));
+        let b = bound_cue_lines(&[padded.as_str()]);
+        assert!(
+            b.inspected_bytes() <= MAX_INSPECTED_BYTES,
+            "{}",
+            b.inspected_bytes()
+        );
+        assert!(b.is_empty() && b.truncated());
+        // 100k blank lines before real text.
+        let mut blanks = vec![String::new(); 100_000];
+        blanks.push("late".to_owned());
+        let b = bound_cue_lines(&blanks);
+        assert!(
+            b.inspected_lines() <= MAX_INSPECTED_LINES,
+            "{}",
+            b.inspected_lines()
+        );
+        assert!(b.is_empty() && b.truncated());
+        // 1000 whitespace-only lines of 4 KiB each.
+        let wide = vec![" ".repeat(4096); 1_000];
+        let b = bound_cue_lines(&wide);
+        assert!(b.inspected_bytes() <= MAX_INSPECTED_BYTES);
+        assert!(b.inspected_lines() <= MAX_INSPECTED_LINES);
+        // Huge whitespace suffixes: kept text is cut, inspection bounded.
+        let suffixed: Vec<String> = (0..50)
+            .map(|i| format!("line {i}{}", " ".repeat(100_000)))
+            .collect();
+        let b = bound_cue_lines(&suffixed);
+        assert!(b.inspected_bytes() <= MAX_INSPECTED_BYTES);
+        assert!(b.inspected_lines() <= MAX_INSPECTED_LINES);
+        assert!(b.truncated());
+        assert!(b.lines()[0].starts_with("line 0"));
+        // Output budget exhausted, then a huge line: not scanned.
+        let mut tail: Vec<String> = (0..4).map(|i| format!("l{i}")).collect();
+        tail.push(" ".repeat(1 << 20));
+        let b = bound_cue_lines(&tail);
+        assert_eq!(b.lines(), ["l0", "l1", "l2", "l3"]);
+        assert_eq!(b.inspected_lines(), 4);
+        assert!(b.truncated());
+        // Normal cues are unaffected.
+        let b = bound_cue_lines(&["  Hello ", "", "world"]);
+        assert_eq!(b.lines(), ["  Hello ", "world"]);
+        assert!(!b.truncated());
+        assert_eq!(b.inspected_lines(), 3);
     }
 }

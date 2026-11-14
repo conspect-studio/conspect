@@ -2086,11 +2086,17 @@ restart".
   with `&`, `<`, `>` escaped. A cue whose end is not known yet (still open at the segment close)
   is ended at the segment end and re-emitted with the same start, extended, in the next segment
   (with its real end once the close arrives). An empty segment gets a header-only file. Old
-  `.vtt` files retire with the TS grace (`prune_prior_*`); rendition cleanup removes only
+  `.vtt` files retire with the TS grace (`prune_prior_*`) only when named exactly
+  `subs<slot>-<index>.vtt` (all-digit fields, so e.g. `subs+1-1.vtt` is never touched); rendition
+  cleanup removes only
   manifests matching the exact generated grammar `subs<slot>-g<generation>.m3u8` (parsed
   numbers), so e.g. `subtitles.m3u8` or `subscriptions.m3u8` are never touched.
 - **Bounds.** Cue text is bounded to 4 lines and 512 bytes (`bound_cue_lines`: UTF-8 boundary
-  safe, blank lines dropped, a fresh exact-size allocation, never the source's capacity)
+  safe, blank lines dropped, a fresh exact-size allocation, never the source's capacity). Its
+  work is bounded too: it examines at most 16 source lines (blank ones included) and 4 KiB of
+  source bytes (whitespace included), checking that budget before each next line and classifying
+  whitespace only within the inspected prefix, so a hostile cue (256 KiB of padding, 100k blank
+  lines) costs a fixed amount of work per tick (`BoundedLines::inspected_*`). The bound applies
   **before** the engine retains, compares or enqueues it: the resolver projects the active cue
   while borrowing it from the cue-store snapshot (`CaptionCueStore::with_active_at_generation`,
   `subtitle_slots::text_cue_lines`), so a bitmap cue is skipped without copying its pixels and
