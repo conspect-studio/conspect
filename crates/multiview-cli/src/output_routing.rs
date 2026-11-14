@@ -1669,6 +1669,21 @@ impl OutputRouter {
         }
     }
 
+    /// Test observation (#461): the progress of every encode thread this
+    /// router owns (live video workers and private audio buses).
+    #[cfg(test)]
+    pub(crate) fn worker_progress(&self) -> Vec<Arc<crate::rendition_workers::WorkerProgress>> {
+        let video = self
+            .dynamic
+            .iter()
+            .filter_map(|d| d.worker.as_ref().map(|w| Arc::clone(w.progress())));
+        let audio = self
+            .audio
+            .iter()
+            .flat_map(crate::routing_audio::RoutedAudio::worker_progress);
+        video.chain(audio).collect()
+    }
+
     /// Test seam: inject the private-bus encode thread's per-job hook.
     #[cfg(test)]
     pub(crate) fn set_audio_worker_hook(&mut self, hook: crate::routing_audio::WorkerHook) {

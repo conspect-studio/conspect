@@ -278,11 +278,39 @@ pub fn next_frame_lower_bound_ns(
     })
 }
 
+/// Test observation of one encode worker (#461): how many items it was
+/// handed and how many it has fully processed (its event sent). A test
+/// harness that drives the clock by tick count waits on these, bounded by
+/// wall time, instead of assuming a worker thread kept up within a fixed
+/// sleep. Never read by the data plane.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct WorkerProgress {
+    /// Items accepted into the worker's input queue.
+    pub offered: std::sync::atomic::AtomicU64,
+    /// Items the worker has processed (its event delivered or dropped).
+    pub done: std::sync::atomic::AtomicU64,
+    /// `done + 1` when a harness judged the worker stuck at that count (0:
+    /// never); a harness stops waiting on it until `done` moves again.
+    pub stuck_at: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl WorkerProgress {
+    /// Whether the worker still holds accepted, unprocessed items.
+    pub fn behind(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.done.load(Ordering::Acquire) < self.offered.load(Ordering::Acquire)
+    }
+}
+
 /// Bounded input and owned worker lifecycle for one distinct video key.
 pub struct RenditionWorker {
     key_index: usize,
     input: SyncSender<BakedTick>,
     thread: JoinHandle<Result<(), PipelineError>>,
+    #[cfg(test)]
+    progress: Arc<WorkerProgress>,
 }
 
 impl RenditionWorker {
@@ -303,6 +331,10 @@ impl RenditionWorker {
         mut on_event: impl FnMut(DispatchEvent) -> Result<(), PipelineError> + Send + 'static,
     ) -> Result<Self, PipelineError> {
         let (input, receiver) = mpsc::sync_channel::<BakedTick>(WORKER_QUEUE_TICKS);
+        #[cfg(test)]
+        let progress = Arc::new(WorkerProgress::default());
+        #[cfg(test)]
+        let worker_progress = Arc::clone(&progress);
         let thread = thread::Builder::new()
             .name(format!("multiview-video-rendition-{key_index}"))
             .spawn(move || {
@@ -351,6 +383,10 @@ impl RenditionWorker {
                         packets,
                         watermark,
                     })?;
+                    #[cfg(test)]
+                    worker_progress
+                        .done
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
                 }
                 // EOF: flush the encoder and publish the complete tail. The
                 // event is terminal and absolute regardless of the reorder
@@ -369,7 +405,22 @@ impl RenditionWorker {
             key_index,
             input,
             thread,
+            #[cfg(test)]
+            progress,
         })
+    }
+
+    /// Test observation of this worker's progress (see [`WorkerProgress`]).
+    #[cfg(test)]
+    pub fn progress(&self) -> &Arc<WorkerProgress> {
+        &self.progress
+    }
+
+    #[cfg(test)]
+    fn accepted(&self) {
+        self.progress
+            .offered
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// The rendition key index this worker encodes.
@@ -394,7 +445,10 @@ impl RenditionWorker {
         self.input.try_send(item).map_err(|err| match err {
             TrySendError::Full(_) => OfferRejection::Overloaded,
             TrySendError::Disconnected(_) => OfferRejection::Ended,
-        })
+        })?;
+        #[cfg(test)]
+        self.accepted();
+        Ok(())
     }
 
     /// Offer one baked tick, waiting up to `bound` for the worker to take it.
@@ -425,7 +479,11 @@ impl RenditionWorker {
         let deadline = std::time::Instant::now() + bound;
         loop {
             match self.input.try_send(item) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    #[cfg(test)]
+                    self.accepted();
+                    return Ok(());
+                }
                 Err(TrySendError::Full(returned)) => {
                     item = returned;
                     if std::time::Instant::now() >= deadline {
@@ -453,10 +511,9 @@ impl RenditionWorker {
     /// either way no thread outlives its key with a live input.
     #[must_use]
     pub fn close_input(self) -> ClosingWorker {
-        drop(self.input);
-        ClosingWorker {
-            thread: self.thread,
-        }
+        let Self { input, thread, .. } = self;
+        drop(input);
+        ClosingWorker { thread }
     }
 }
 
