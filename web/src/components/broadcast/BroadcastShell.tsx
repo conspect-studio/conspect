@@ -32,6 +32,7 @@ export function BroadcastShell({ children, managementLabel }: { readonly childre
   const tabs: readonly (readonly [string, string])[] = [
     ['/', t`Desk`], ['/show', t`Show`], ['/sources', t`Sources`],
     ['/audio', t`Audio`], ['/routing', t`Routing`], ['/media-players', t`Media`],
+    ['/cast', t`Cast`],
   ];
   const current = tabs.find(([path]) => (path === '/' ? pathname === '/' : pathname === path || pathname.startsWith(`${path}/`)))?.[1];
   return <TakeLock.Provider value={{ locked }}><div className="broadcast-shell dark">

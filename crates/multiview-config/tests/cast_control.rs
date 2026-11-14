@@ -116,3 +116,19 @@ fn cast_media_base_must_not_be_empty() {
         "names the field: {err}"
     );
 }
+
+#[test]
+fn cast_app_id_is_eight_hex_characters_used_upper_case() {
+    assert_eq!(
+        multiview_config::normalize_cast_app_id(" 1a2b3c4d "),
+        Some("1A2B3C4D".to_owned())
+    );
+    for bad in ["", "1A2B3C4", "1A2B3C4D5", "GGGGGGGG", "1A2B-C4D"] {
+        assert_eq!(multiview_config::normalize_cast_app_id(bad), None, "{bad}");
+    }
+    let ok = MultiviewConfig::load_from_toml(&base("cast_app_id = \"cc1ad845\"\n")).unwrap();
+    ok.validate().unwrap();
+    let bad = MultiviewConfig::load_from_toml(&base("cast_app_id = \"nope\"\n")).unwrap();
+    let err = bad.validate().unwrap_err().to_string();
+    assert!(err.contains("cast_app_id"), "{err}");
+}

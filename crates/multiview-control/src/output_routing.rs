@@ -575,6 +575,26 @@ pub fn is_boot_take(operation_id: &str) -> bool {
     operation_id.starts_with(BOOT_TAKE_PREFIX)
 }
 
+/// Operation-id prefix of a take the cast API issues on a cast output
+/// (ADR-0111): `cast:<minted id>`. Such a take is never persisted: a cast
+/// output shows what a cast stream asked for only while that stream lives,
+/// and is back on Program when idle. An operator's take on the Routing page
+/// carries a plain minted id and persists like any other.
+pub const CAST_TAKE_PREFIX: &str = "cast:";
+
+/// Whether `operation_id` names a take issued by the cast API.
+#[must_use]
+pub fn is_cast_take(operation_id: &str) -> bool {
+    operation_id.starts_with(CAST_TAKE_PREFIX)
+}
+
+/// Whether an applied take with this operation id is written to the desired
+/// config: every take except the engine's boot takes and the cast API's.
+#[must_use]
+pub fn persists_when_applied(operation_id: &str) -> bool {
+    !is_boot_take(operation_id) && !is_cast_take(operation_id)
+}
+
 /// A recorded terminal outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedOutcome {
@@ -1122,13 +1142,20 @@ async fn relay_one(
     let Some(api_id) = api_id else {
         return;
     };
+    // ABUSE-1: whatever moved the output (a take, an engine fallback), its
+    // cast tokens must still be readable by their owners.
+    // Relayed at once (not on the 5 s sweep): a feed the gate did not clear
+    // moves the output's generation and re-authorizes its tokens first.
+    crate::cast_streams::reauth::on_outcome(state, &outcome);
     // The feed to persist rides the outcome itself, so an `applied` persists
     // whether or not this process still holds the take's record. An
     // audio-only take (its record says so) keeps the persisted video.
     // A boot take (operation id `boot:…`, see [`is_boot_take`]) re-applies the
     // persisted state at run start: its outcome is NEVER persisted (applied or
-    // not), so it can neither rewrite nor delete the operator's row.
-    if outcome.outcome == "applied" && !is_boot_take(&outcome.operation_id) {
+    // not), so it can neither rewrite nor delete the operator's row. A take
+    // by the cast API (`cast:…`, see [`is_cast_take`]) is not persisted
+    // either: it lasts as long as its cast stream.
+    if outcome.outcome == "applied" && persists_when_applied(&outcome.operation_id) {
         let audio_only = settled.as_ref().is_some_and(|p| p.feed.is_none());
         let feed = if audio_only {
             None

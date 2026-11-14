@@ -145,6 +145,14 @@ impl CastMediaBase {
         &self.0
     }
 
+    /// Whether the base is `https://` (what a cast stream needs: the
+    /// receiver page is served over https and a Cast device refuses mixed
+    /// content).
+    #[must_use]
+    pub fn is_https(&self) -> bool {
+        self.0.starts_with("https://")
+    }
+
     /// Join a DEV-D1 mount route (e.g. `/hls/program`) and a playlist file
     /// name into the device-reachable media URL.
     #[must_use]
@@ -251,6 +259,9 @@ pub struct CastDelivery {
     /// Output ids in declaration order (the `{ program = true }` default is
     /// the FIRST declared rendition).
     order: Vec<String>,
+    /// The validated `control.cast_media_base` the map was built from (the
+    /// absolute origin a cast stream URL is joined onto).
+    base: Option<CastMediaBase>,
 }
 
 impl CastDelivery {
@@ -258,6 +269,19 @@ impl CastDelivery {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the validated media base (cast stream URLs are joined onto it).
+    #[must_use]
+    pub fn with_base(mut self, base: CastMediaBase) -> Self {
+        self.base = Some(base);
+        self
+    }
+
+    /// The validated media base, when the binary recorded one.
+    #[must_use]
+    pub fn base(&self) -> Option<&CastMediaBase> {
+        self.base.as_ref()
     }
 
     /// Register a rendition for `output_id` (declaration order preserved; a

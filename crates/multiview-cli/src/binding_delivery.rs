@@ -20,7 +20,7 @@
 //! [`BatchLease`], both counted by the carrier; the handoff to the existing
 //! per-sink packet channel is one packet deep.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -62,6 +62,13 @@ pub(crate) enum BindingPolicy {
     /// A resilient live push sink: losses are counted on its existing link
     /// status, preserving the `/status` counters the UI already reads.
     Push(Arc<PushLinkStatus>),
+    /// A sink that may stall and come back (the cast packager's disk writes):
+    /// every packet it does not receive is added to the counter, and a
+    /// stalled sink is never abandoned. Its pump waits one
+    /// [`PUMP_WEDGE_GRACE`] for a stalled sink, then drops (and counts)
+    /// without waiting until the sink takes a packet again. The sink reads
+    /// the counter and declares the gap in its own stream.
+    DropCounted(Arc<AtomicU64>),
 }
 
 /// Why a batch was not admitted, for status/telemetry.
@@ -336,6 +343,7 @@ impl WindowDelivery for BindingDelivery {
             binding.queue.report_loss(reason);
             binding.rejected_batches = binding.rejected_batches.saturating_add(1);
             binding.last_rejection = Some(RejectionReason::from_offer(reason));
+            sync_drop_counted_flushed(binding);
         }
     }
 
@@ -380,6 +388,7 @@ impl WindowDelivery for BindingDelivery {
             binding.staged.clear();
             binding.queue.report_loss(OfferError::ProducerLoss);
             binding.queue.close();
+            sync_drop_counted_flushed(binding);
             binding.failed = true;
             binding.last_rejection = Some(RejectionReason::NeedsRecoveryPoint);
         }
@@ -415,6 +424,42 @@ struct Binding {
     rejected_bytes: u64,
     last_rejection: Option<RejectionReason>,
     failed: bool,
+    /// Last value of `queue.flushed_packets_total()` already folded into this
+    /// binding's `DropCounted` counter (INV-1, review-lens3): a monotonic
+    /// high-water mark so every queue-flushed packet is added exactly once,
+    /// independent of how many separate loss events produced it.
+    drop_counted_flushed_seen: u64,
+}
+
+/// For a `DropCounted` binding, add every packet the carrier's monotonic
+/// `flushed_packets_total()` has newly flushed from the queued backlog since
+/// the last call (admission `OldestAge`/`Occupied`, a stale `pop_at`,
+/// `report_loss`, or `close`) to the external counter, exactly once. A no-op
+/// for `Bounded`/`Push` bindings, whose paths are unchanged.
+fn sync_drop_counted_flushed(binding: &mut Binding) {
+    if let BindingPolicy::DropCounted(counter) = &binding.policy {
+        let total = binding.queue.flushed_packets_total();
+        let delta = total.saturating_sub(binding.drop_counted_flushed_seen);
+        if delta > 0 {
+            counter.fetch_add(delta, Ordering::AcqRel);
+        }
+        binding.drop_counted_flushed_seen = total;
+    }
+}
+
+/// A whole lease discarded at a real ownership boundary WITHOUT any of its
+/// packets having been handed to the sink: count it exactly once for a
+/// `DropCounted` binding. Call this only at an actual discard point (a
+/// popped-but-never-pumped lease, a lease still owned by a failed/abandoned
+/// pump) — never infer a loss from reservation occupancy (INV-1,
+/// review-lens3 round 2: a reservation also covers delivered packets a sink
+/// is still retaining, and inferring loss from it both misses real losses
+/// and double-counts ones already counted elsewhere).
+fn count_discarded_lease(policy: &BindingPolicy, lease: &BatchLease) {
+    if let BindingPolicy::DropCounted(counter) = policy {
+        let lost = u64::try_from(lease.packets().len()).unwrap_or(u64::MAX);
+        counter.fetch_add(lost, Ordering::AcqRel);
+    }
 }
 
 /// Atomic delivery for every binding of one program.
@@ -449,30 +494,30 @@ impl BindingDelivery {
             let (lease_tx, lease_rx) = mpsc::sync_channel::<BatchLease>(HANDOFF_LEASES);
             let wedged = Arc::new(AtomicBool::new(false));
             let pump_wedged = Arc::clone(&wedged);
+            let drop_counter = match &policy {
+                BindingPolicy::DropCounted(counter) => Some(Arc::clone(counter)),
+                BindingPolicy::Bounded | BindingPolicy::Push(_) => None,
+            };
             let pump = thread::Builder::new()
                 .name("multiview-binding-pump".to_owned())
                 .spawn(move || {
+                    // Only a `DropCounted` binding survives a stalled sink.
+                    let mut stalled = false;
                     while let Ok(lease) = lease_rx.recv() {
-                        let permit = Arc::new(lease);
-                        for packet in permit.packets() {
-                            let Ok(shared) = packet.clone_shared_ref() else {
-                                pump_wedged.store(true, Ordering::Release);
-                                return;
-                            };
-                            if !send_bounded_packet(
-                                &packet_tx,
-                                LeasedPacket {
-                                    packet: shared,
-                                    permit: Arc::clone(&permit),
-                                },
-                            ) {
-                                // The sink hung up or stopped draining for the
-                                // whole grace: this binding is finished. Drop
-                                // the lease (releasing its reservation) and end
-                                // the pump; no other binding is affected.
-                                pump_wedged.store(true, Ordering::Release);
-                                return;
-                            }
+                        let step = pump_lease(
+                            &packet_tx,
+                            &Arc::new(lease),
+                            drop_counter.as_deref(),
+                            &mut stalled,
+                        );
+                        if step == PumpStep::Abandon {
+                            // The sink hung up or (for a sink that must not
+                            // lose a packet) stopped draining for the whole
+                            // grace: this binding is finished. The lease is
+                            // dropped (releasing its reservation) and the
+                            // pump ends; no other binding is affected.
+                            pump_wedged.store(true, Ordering::Release);
+                            return;
                         }
                     }
                 })
@@ -502,6 +547,7 @@ impl BindingDelivery {
                 rejected_bytes: 0,
                 last_rejection: None,
                 failed: false,
+                drop_counted_flushed_seen: 0,
             });
             receivers.push(packet_rx);
         }
@@ -664,11 +710,28 @@ impl BindingDelivery {
                     .rejected_bytes
                     .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
                 binding.last_rejection = Some(reason);
-                if let BindingPolicy::Push(link) = &binding.policy {
-                    for _ in &keyframes {
-                        link.shed_upstream();
+                match &binding.policy {
+                    BindingPolicy::Push(link) => {
+                        for _ in &keyframes {
+                            link.shed_upstream();
+                        }
                     }
+                    BindingPolicy::DropCounted(counter) => {
+                        // The rejected incoming window's own packets never
+                        // entered the queue, so `flushed_packets_total` does
+                        // not (and must not) include them: count them here.
+                        counter.fetch_add(
+                            u64::try_from(packets).unwrap_or(u64::MAX),
+                            Ordering::AcqRel,
+                        );
+                        // This same `offer_emitted` call may ALSO have
+                        // invalidated (flushed) an already-admitted queued
+                        // backlog (OldestAge/Occupied): add that delta too,
+                        // exactly once (INV-1, review-lens3).
+                    }
+                    BindingPolicy::Bounded => {}
                 }
+                sync_drop_counted_flushed(binding);
                 // A wedged pump means this binding is over: report it and stop
                 // offering (its queue keeps draining until the lease expires).
                 if binding.wedged.load(Ordering::Acquire) {
@@ -703,7 +766,13 @@ impl BindingDelivery {
     /// handoff leaves the window queued (and age-bounded) rather than blocking.
     fn pump_binding(binding: &mut Binding, now: Instant) {
         if binding.failed {
-            while binding.queue.pop_at(now).ok().flatten().is_some() {}
+            // The pump is gone (abandoned or disconnected): every window
+            // popped here is discarded without ever reaching the sink. Count
+            // each one exactly once at this real discard boundary.
+            while let Some(lease) = binding.queue.pop_at(now).ok().flatten() {
+                count_discarded_lease(&binding.policy, &lease);
+            }
+            sync_drop_counted_flushed(binding);
             return;
         }
         if let Some(lease) = binding.pending.take() {
@@ -713,7 +782,10 @@ impl BindingDelivery {
                     binding.pending = Some(lease);
                     return;
                 }
-                Err(TrySendError::Disconnected(_)) => {
+                Err(TrySendError::Disconnected(lease)) => {
+                    // The pump thread exited without this lease: it never
+                    // reached the sink, so it is a real, uncounted loss.
+                    count_discarded_lease(&binding.policy, &lease);
                     binding.failed = true;
                     return;
                 }
@@ -727,14 +799,21 @@ impl BindingDelivery {
                         binding.pending = Some(lease);
                         return;
                     }
-                    Err(TrySendError::Disconnected(_)) => {
+                    Err(TrySendError::Disconnected(lease)) => {
+                        count_discarded_lease(&binding.policy, &lease);
                         binding.failed = true;
                         return;
                     }
                 },
                 Ok(None) => return,
                 Err(error) => {
+                    // A stale queued window invalidated the backlog: media
+                    // this binding had admitted is lost. `pop_at`'s
+                    // `invalidate` call already flushed the exact packet
+                    // count into `flushed_packets_total`; fold the delta in
+                    // (INV-1, review-lens3), not a fixed per-event count of 1.
                     binding.last_rejection = Some(RejectionReason::from_offer(error));
+                    sync_drop_counted_flushed(binding);
                     return;
                 }
             }
@@ -765,30 +844,53 @@ impl BindingDelivery {
             }
             thread::sleep(Duration::from_millis(1));
         }
-        for binding in &mut self.bindings {
+        for (index, binding) in self.bindings.iter_mut().enumerate() {
+            // Anything still queued here was never handed to the pump within
+            // the trailer deadline (or the binding had already failed and
+            // `pump_binding`'s failed branch already drained it, so this is
+            // a no-op). It will never reach the sink: count it now, at this
+            // real discard boundary, before it is dropped and its
+            // reservation silently released.
+            while let Some(lease) = binding.queue.pop_at(Instant::now()).ok().flatten() {
+                count_discarded_lease(&binding.policy, &lease);
+            }
+            // Fold in any flush `invalidate` performed above (a stale
+            // `pop_at` during this drain) exactly once.
+            sync_drop_counted_flushed(binding);
+            // A lease already popped but not yet handed to the pump (its
+            // handoff stayed full past the trailer deadline) also never
+            // reached the sink.
+            if let Some(lease) = binding.pending.take() {
+                count_discarded_lease(&binding.policy, &lease);
+                binding.rejected_batches = binding.rejected_batches.saturating_add(1);
+                binding.last_rejection = Some(RejectionReason::Occupied);
+                tracing::warn!(
+                    binding = index,
+                    "a pending lease never reached the sink before teardown (counted as a loss)"
+                );
+            }
             // Replace the sender with a closed one so the pump's `recv()` ends
             // once it has forwarded every lease it already owns.
             let (closed, _) = mpsc::sync_channel::<BatchLease>(0);
             let sender = std::mem::replace(&mut binding.lease_tx, closed);
             drop(sender);
-            drop(binding.pending.take());
             if let Some(pump) = binding.pump.take() {
                 let _ = pump.join();
             }
         }
-        // Truthful teardown: after the pumps exit, every admitted window must
-        // have been owned and released. A residue means real media was lost at
-        // close, which must be reported rather than swallowed.
-        for (index, binding) in self.bindings.iter_mut().enumerate() {
+        // Truthful teardown: a residual reservation here is never a loss by
+        // itself — it covers a whole lease that a delivered `LeasedPacket`
+        // the sink still holds keeps alive (INV-1, review-lens3 round 2).
+        // Never infer a drop from occupancy; only log it for diagnosis.
+        for (index, binding) in self.bindings.iter().enumerate() {
             if !binding.queue.is_drained() {
                 let (packets, bytes) = binding.queue.reserved();
-                binding.rejected_batches = binding.rejected_batches.saturating_add(1);
-                binding.last_rejection = Some(RejectionReason::Occupied);
                 tracing::warn!(
                     binding = index,
                     packets,
                     bytes,
-                    "binding still owned encoded windows at close (counted as a loss)"
+                    "binding still holds a reservation at close (the sink may still be \
+                     retaining delivered packets; not counted as a loss)"
                 );
             }
         }
@@ -820,38 +922,126 @@ impl BindingDelivery {
     }
 }
 
-/// Send one packet to a sink, waiting at most [`PUMP_WEDGE_GRACE`] for a slot.
-/// Returns `false` when the sink hung up or stopped draining for the whole
-/// grace. This runs on the binding's own pump thread, so it can never pace the
-/// bake consumer or another binding.
-fn send_bounded_packet(tx: &SyncSender<LeasedPacket>, mut packet: LeasedPacket) -> bool {
-    let deadline = Instant::now() + PUMP_WEDGE_GRACE;
+/// What a binding pump does after handing one lease to its sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpStep {
+    /// Take the next lease.
+    Continue,
+    /// The binding is over (see the caller).
+    Abandon,
+}
+
+/// Hand every packet of one lease to the sink. With a `drop_counter` (a
+/// [`BindingPolicy::DropCounted`] binding) a sink that does not take a packet
+/// within the grace loses the rest of the lease, counted, and while it stays
+/// stalled (`stalled`) later packets are dropped without waiting at all.
+fn pump_lease(
+    tx: &SyncSender<LeasedPacket>,
+    permit: &Arc<BatchLease>,
+    drop_counter: Option<&AtomicU64>,
+    stalled: &mut bool,
+) -> PumpStep {
+    let packets = permit.packets();
+    for (index, packet) in packets.iter().enumerate() {
+        let Ok(shared) = packet.clone_shared_ref() else {
+            // The remainder of this lease, starting at this packet, never
+            // reaches the sink (real discard boundary — count it, never the
+            // reservation it still holds).
+            if let Some(counter) = drop_counter {
+                let lost = packets.len().saturating_sub(index);
+                counter.fetch_add(u64::try_from(lost).unwrap_or(u64::MAX), Ordering::AcqRel);
+            }
+            return PumpStep::Abandon;
+        };
+        let leased = LeasedPacket {
+            packet: shared,
+            permit: Arc::clone(permit),
+        };
+        let Some(counter) = drop_counter else {
+            if !send_bounded_packet(tx, leased) {
+                return PumpStep::Abandon;
+            }
+            continue;
+        };
+        let grace = if *stalled {
+            Duration::ZERO
+        } else {
+            PUMP_WEDGE_GRACE
+        };
+        match send_within(tx, leased, grace) {
+            Handoff::Sent => *stalled = false,
+            Handoff::Gone => {
+                // The sink hung up with this packet (and every later one in
+                // the lease) never handed off: count the real remainder.
+                let lost = packets.len().saturating_sub(index);
+                counter.fetch_add(u64::try_from(lost).unwrap_or(u64::MAX), Ordering::AcqRel);
+                return PumpStep::Abandon;
+            }
+            Handoff::Full => {
+                *stalled = true;
+                let lost = packets.len().saturating_sub(index);
+                counter.fetch_add(u64::try_from(lost).unwrap_or(u64::MAX), Ordering::AcqRel);
+                return PumpStep::Continue;
+            }
+        }
+    }
+    PumpStep::Continue
+}
+
+/// The outcome of offering one packet to a sink's handoff.
+enum Handoff {
+    /// The sink has (or will take) the packet.
+    Sent,
+    /// The handoff stayed full for the whole grace.
+    Full,
+    /// The sink hung up.
+    Gone,
+}
+
+/// Offer one packet to a sink, waiting at most `grace` for a slot.
+fn send_within(
+    tx: &SyncSender<LeasedPacket>,
+    mut packet: LeasedPacket,
+    grace: Duration,
+) -> Handoff {
+    let deadline = Instant::now() + grace;
     loop {
         match tx.try_send(packet) {
-            Ok(()) => return true,
+            Ok(()) => return Handoff::Sent,
             Err(TrySendError::Full(returned)) => {
                 if Instant::now() >= deadline {
-                    return false;
+                    return Handoff::Full;
                 }
                 packet = returned;
                 thread::sleep(Duration::from_millis(1));
             }
-            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Disconnected(_)) => return Handoff::Gone,
         }
     }
+}
+
+/// Send one packet to a sink, waiting at most [`PUMP_WEDGE_GRACE`] for a slot.
+/// Returns `false` when the sink hung up or stopped draining for the whole
+/// grace. This runs on the binding's own pump thread, so it can never pace the
+/// bake consumer or another binding.
+fn send_bounded_packet(tx: &SyncSender<LeasedPacket>, packet: LeasedPacket) -> bool {
+    matches!(send_within(tx, packet, PUMP_WEDGE_GRACE), Handoff::Sent)
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::{
-        tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, RejectionReason, HANDOFF_LEASES,
-        PUMP_WEDGE_GRACE,
+        tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, DeliveryWindow, RejectionReason,
+        WindowDelivery, HANDOFF_LEASES, PUMP_WEDGE_GRACE,
     };
     use multiview_core::time::Rational;
     use multiview_ffmpeg::{CodecKind, EncodedPacket, NalFraming};
-    use multiview_output::batch::RecoveryGate;
+    use multiview_output::batch::{OfferError, RecoveryGate};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::Receiver;
+    use std::sync::Arc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     fn packet(size: usize) -> EncodedPacket {
@@ -889,6 +1079,100 @@ mod tests {
             drop(packet.permit);
         }
         out
+    }
+
+    /// ADR-0111 (invariants #1/#10): a `DropCounted` binding whose sink
+    /// stalls is never abandoned and never grows. Every packet the sink
+    /// did not receive is counted; the retained packets never exceed the
+    /// queue cap; when the sink takes packets again, delivery resumes at a
+    /// keyframe.
+    #[test]
+    fn a_drop_counted_binding_survives_a_stalled_sink_and_stays_at_its_cap() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        const CAP: usize = 8;
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            limits(CAP),
+            vec![Some(gate())],
+        );
+        let rx = receivers.pop().unwrap();
+        let start = Instant::now();
+        // The sink takes nothing for 3 s (longer than the pump's grace)
+        // while one window per 40 ms is offered, an IDR every 25th.
+        let mut offered = 0_u64;
+        let mut peak = 0;
+        let offer = |delivery: &mut BindingDelivery, index: u64, now: Instant| {
+            let nal = if index % 25 == 0 { 5 } else { 1 };
+            delivery.stage(&[h264_packet(nal)]);
+            delivery.flush_tick(now, Duration::from_millis(40));
+        };
+        while start.elapsed() < Duration::from_secs(3) {
+            let began = Instant::now();
+            offer(&mut delivery, offered, began);
+            offered += 1;
+            // The consumer side never waits on the stalled sink.
+            assert!(
+                began.elapsed() < Duration::from_millis(100),
+                "{:?}",
+                began.elapsed()
+            );
+            let status = delivery.statuses()[0];
+            peak = peak.max(status.reserved_packets);
+            assert!(status.reserved_packets <= CAP, "{status:?}");
+            assert!(!status.failed, "a stalled cast sink is never abandoned");
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        assert!(peak > 0 && peak <= CAP, "{peak}");
+        let lost = dropped.load(Ordering::Acquire);
+        assert!(lost > 0, "the stalled sink's packets are counted");
+        // The sink comes back: it drains what was handed off, and new
+        // windows flow again from the next IDR.
+        let mut received = 0_u64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut idr_after_stall = false;
+        while Instant::now() < deadline && !idr_after_stall {
+            offer(&mut delivery, offered, Instant::now());
+            offered += 1;
+            while let Ok(leased) = rx.recv_timeout(Duration::from_millis(40)) {
+                received += 1;
+                let payload = leased.packet.payload().unwrap();
+                if received > 2 && payload[4] & 0x1F == 5 {
+                    idr_after_stall = true;
+                }
+            }
+        }
+        assert!(
+            idr_after_stall,
+            "delivery resumed at a keyframe after the stall"
+        );
+        let status = delivery.statuses()[0];
+        assert!(
+            !status.failed && status.reserved_packets <= CAP,
+            "{status:?}"
+        );
+        // Drain whatever remains while `finish` hands off the rest of the
+        // backlog, then STRENGTHENED (review-lens3 INV-1; was a `+ CAP`
+        // allowance that could hide a real missing packet inside the cap):
+        // every offered packet is received, counted as dropped, or both
+        // never happens — received + dropped must equal offered exactly.
+        let collector = thread::spawn(move || {
+            let mut tail = 0_u64;
+            while rx.recv().is_ok() {
+                tail += 1;
+            }
+            tail
+        });
+        delivery.finish();
+        received += collector.join().expect("collector");
+        let lost = dropped.load(Ordering::Acquire);
+        assert_eq!(
+            received + lost,
+            offered,
+            "received {received} + dropped {lost} must equal offered {offered} exactly"
+        );
+        assert!(received < offered);
     }
 
     #[test]
@@ -1176,5 +1460,269 @@ mod tests {
         assert_eq!(status.admitted_batches, 1);
         delivery.finish();
         assert_eq!(collector.join().expect("collector").len(), 1);
+    }
+
+    /// Offer multi-packet windows to a `DropCounted` binding whose sink never
+    /// drains, long enough for a real queued backlog to exist (the pump's
+    /// in-flight pipeline — one held lease plus the bounded lease/packet
+    /// handoffs — fills up and further admitted windows pile up in the
+    /// queue itself), then return however many packets were offered.
+    fn offer_until_backlog_builds(
+        delivery: &mut BindingDelivery,
+        deadline: Instant,
+        packets_per_window: usize,
+    ) -> u64 {
+        let span = Duration::from_millis(5);
+        let mut offered = 0_u64;
+        let mut index = 0_u64;
+        while Instant::now() < deadline {
+            let mut packets: Vec<EncodedPacket> = Vec::with_capacity(packets_per_window);
+            for slot in 0..packets_per_window {
+                // An IDR opens every window so a strict-RAP gate (armed by a
+                // prior loss) never blocks the next admission.
+                packets.push(if slot == 0 { h264_packet(5) } else { packet(2) });
+            }
+            let now = Instant::now();
+            let _ = delivery.try_offer(
+                DeliveryWindow {
+                    output_index: 0,
+                    packets,
+                    media_span: span,
+                },
+                now,
+            );
+            offered += u64::try_from(packets_per_window).unwrap_or(u64::MAX);
+            index += 1;
+            if index % 8 == 0 {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        offered
+    }
+
+    /// INV-1 (review-lens3): offer multi-packet windows to a `DropCounted`
+    /// binding with a tiny packet cap and a sink that never drains, so a
+    /// real backlog of already-admitted queued windows piles up and later
+    /// `Occupied` admission failures flush it. Drain the sink and `finish`,
+    /// then assert EXACT conservation: every offered packet was received by
+    /// the sink, counted as dropped, or both never happens.
+    #[test]
+    fn drop_counted_occupied_with_backlog_conserves_every_packet_exactly() {
+        const CAP: usize = 6;
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            limits(CAP),
+            vec![Some(gate())],
+        );
+        let rx = receivers.pop().unwrap();
+        let offered = offer_until_backlog_builds(
+            &mut delivery,
+            Instant::now() + Duration::from_millis(600),
+            3,
+        );
+        assert!(
+            delivery.statuses()[0].queued_windows > 0
+                || dropped.load(Ordering::Acquire) > 0
+                || delivery.statuses()[0].reserved_packets > 0,
+            "the never-draining sink must have produced backlog, drops, or both"
+        );
+        let collector = thread::spawn(move || {
+            let mut received = 0_u64;
+            while rx.recv().is_ok() {
+                received += 1;
+            }
+            received
+        });
+        delivery.finish();
+        let received = collector.join().expect("collector");
+        let lost = dropped.load(Ordering::Acquire);
+        assert_eq!(
+            received + lost,
+            offered,
+            "received {received} + dropped {lost} must equal offered {offered} exactly"
+        );
+    }
+
+    /// INV-1 (review-lens3): a tiny `max_age` with a never-draining sink ages
+    /// out queued backlog windows (both when the next offer discovers the
+    /// stale entry, and when `finish`'s own drain loop calls `pop_at` at a
+    /// later `now` with no new offer in between). Drain and `finish`, then
+    /// assert EXACT conservation.
+    #[test]
+    fn drop_counted_oldest_age_with_backlog_conserves_every_packet_exactly() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            DeliveryLimits {
+                max_packets: 64,
+                max_bytes: 1024 * 1024,
+                max_age: Duration::from_millis(15),
+            },
+            vec![Some(gate())],
+        );
+        let rx = receivers.pop().unwrap();
+        let offered = offer_until_backlog_builds(
+            &mut delivery,
+            Instant::now() + Duration::from_millis(600),
+            2,
+        );
+        let collector = thread::spawn(move || {
+            let mut received = 0_u64;
+            while rx.recv().is_ok() {
+                received += 1;
+            }
+            received
+        });
+        delivery.finish();
+        let received = collector.join().expect("collector");
+        let lost = dropped.load(Ordering::Acquire);
+        assert_eq!(
+            received + lost,
+            offered,
+            "received {received} + dropped {lost} must equal offered {offered} exactly"
+        );
+    }
+
+    /// INV-1 (review-lens3): build a real queued backlog on a `DropCounted`
+    /// binding with a never-draining sink, then declare an explicit
+    /// `report_loss` (the assembler's "I discarded real media before
+    /// admission" path), which must flush and count that backlog. Drain and
+    /// `finish`, then assert EXACT conservation.
+    #[test]
+    fn drop_counted_report_loss_with_backlog_conserves_every_packet_exactly() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            limits(64),
+            vec![Some(gate())],
+        );
+        let rx = receivers.pop().unwrap();
+        let mut offered = offer_until_backlog_builds(
+            &mut delivery,
+            Instant::now() + Duration::from_millis(400),
+            2,
+        );
+        // The assembler now discards a real emission before admission: it
+        // must declare the loss explicitly. This flushes and must count the
+        // entire queued backlog that existed at that moment, exactly.
+        WindowDelivery::report_loss(&mut delivery, 0, OfferError::ProducerLoss);
+        // Keep offering a little more (now past the loss, requiring a fresh
+        // RAP, which `offer_until_backlog_builds` always supplies) so the
+        // conservation check also covers packets offered after the loss.
+        offered += offer_until_backlog_builds(
+            &mut delivery,
+            Instant::now() + Duration::from_millis(200),
+            2,
+        );
+        let collector = thread::spawn(move || {
+            let mut received = 0_u64;
+            while rx.recv().is_ok() {
+                received += 1;
+            }
+            received
+        });
+        delivery.finish();
+        let received = collector.join().expect("collector");
+        let lost = dropped.load(Ordering::Acquire);
+        assert_eq!(
+            received + lost,
+            offered,
+            "received {received} + dropped {lost} must equal offered {offered} exactly"
+        );
+    }
+
+    /// INV-1 (review-lens3, round 2): a `LeasedPacket` the sink has received
+    /// AND retains across `finish()` still holds the whole lease's
+    /// reservation (`permit: Arc<BatchLease>`). `finish` must never infer a
+    /// drop from that reservation: a delivered packet is never a loss, no
+    /// matter how long the sink keeps its `Arc` alive.
+    #[test]
+    fn a_retained_delivered_packet_is_never_double_counted_as_dropped_at_finish() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            limits(64),
+            vec![Some(gate())],
+        );
+        let rx = receivers.pop().unwrap();
+        delivery.stage(&[h264_packet(5)]);
+        delivery.flush_tick(Instant::now(), Duration::from_millis(33));
+        // The sink receives the one packet and keeps the `LeasedPacket`
+        // (and its reservation-holding permit) alive across `finish()`,
+        // exactly like a real mux write still in flight.
+        let retained = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        delivery.finish();
+        let lost = dropped.load(Ordering::Acquire);
+        assert_eq!(lost, 0, "a delivered, still-retained packet is not a drop");
+        drop(retained);
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            0,
+            "dropping the retained packet after finish must not count it either"
+        );
+    }
+
+    /// INV-1 (review-lens3, round 2): a three-packet lease where the first
+    /// packet is received and retained by the sink, the second occupies the
+    /// one-slot handoff (so it is also delivered once the sink drains it),
+    /// and the third times out past the pump's wedge grace (counted once by
+    /// `pump_lease`). After `finish()`, `received + dropped` must equal
+    /// `offered` exactly: no double count from the lease's residual
+    /// reservation (the first packet's `Arc` keeps it alive) and no missed
+    /// count either.
+    #[test]
+    fn a_partially_delivered_lease_conserves_packets_exactly_at_finish() {
+        const CAP: usize = 64;
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            limits(CAP),
+            vec![Some(gate())],
+        );
+        let rx = receivers.pop().unwrap();
+        // One window carrying three packets, keyed so the strict RAP gate
+        // admits it. The handoff is one packet deep (`HANDOFF_PACKETS`), so
+        // the pump sends packet 1 immediately, then blocks offering packet 2
+        // until packet 1 is taken.
+        delivery.stage(&[h264_packet(5), packet(2), packet(2)]);
+        delivery.flush_tick(Instant::now(), Duration::from_millis(33));
+        let offered = 3_u64;
+        // Receive and retain the first packet. This frees the handoff slot,
+        // so the pump immediately sends packet 2 into it — buffered there,
+        // not yet taken by anything.
+        let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // The pump now offers packet 3 into the still-full handoff (packet 2
+        // sits there unconsumed) and times out after `PUMP_WEDGE_GRACE`,
+        // counting exactly packet 3 as lost.
+        let deadline = Instant::now() + PUMP_WEDGE_GRACE + Duration::from_secs(1);
+        while dropped.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            1,
+            "only the un-handed-off third packet is counted as lost"
+        );
+        // Now take the second packet out of the handoff: it was buffered,
+        // not lost, and retain it too.
+        let second = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        delivery.finish();
+        // Both delivered packets stay retained by "the sink" through finish
+        // and beyond: their reservations must never be read as drops.
+        let received = 2_u64;
+        let lost = dropped.load(Ordering::Acquire);
+        assert_eq!(
+            received + lost,
+            offered,
+            "received {received} + dropped {lost} must equal offered {offered} exactly"
+        );
+        drop(first);
+        drop(second);
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            lost,
+            "releasing retained packets after finish must not add further drops"
+        );
     }
 }

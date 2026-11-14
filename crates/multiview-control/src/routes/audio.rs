@@ -423,6 +423,9 @@ pub(crate) async fn put_audio_routing(
             None,
         );
     }
+    // ABUSE-1: a re-pointed track can carry another input's audio on an
+    // output a cast token watches: re-check them before the bus hears.
+    crate::cast_streams::reauth::recheck_all(&state, &principal.key_id);
     // Hand the new table to the running bus's bounded mailbox (wait-free; the
     // bake consumer applies it at its next tick). Never touches the bus here.
     let mode = match state
