@@ -326,6 +326,10 @@ fn unroutable_and_unfresh_takes_are_refused_and_the_mailbox_bounds_floods() {
 struct Rec {
     windows: Vec<(usize, Vec<(i64, bool)>)>,
     audio: Vec<(usize, EncodedPacket)>,
+    /// Per delivered window: (output, its video packets' DTS) (#344 D2b).
+    dts: Vec<(usize, Vec<i64>)>,
+    /// Losses / discontinuities signalled, per output (#344 D2b).
+    losses: Vec<usize>,
 }
 impl WindowDelivery for Rec {
     fn offer_window(
@@ -347,11 +351,21 @@ impl WindowDelivery for Rec {
         {
             self.audio.push((o, a.clone_shared_ref().unwrap()));
         }
+        let d = p
+            .iter()
+            .filter(|p| p.kind() == multiview_ffmpeg::StreamKind::Video)
+            .map(|p| p.dts().unwrap_or(i64::MIN))
+            .collect();
+        self.dts.push((o, d));
         self.windows.push((o, v));
         Ok(())
     }
-    fn report_loss(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
-    fn mark_discontinuity(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
+    fn report_loss(&mut self, o: usize, _r: multiview_output::batch::OfferError) {
+        self.losses.push(o);
+    }
+    fn mark_discontinuity(&mut self, o: usize, _r: multiview_output::batch::OfferError) {
+        self.losses.push(o);
+    }
     fn take_discontinuity(&mut self, _o: usize) -> Option<multiview_output::batch::Discontinuity> {
         None
     }

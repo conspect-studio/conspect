@@ -260,6 +260,40 @@ impl P0 {
         self.x.r.passthrough_status(o).expect("a passthrough key")
     }
 
+    /// Invariant #1 on output `o`: every delivered window carries exactly
+    /// one video packet and the DTS run is exactly one per tick, with no
+    /// gap and no repeat, across every move (Program, picture bridge, P0,
+    /// slate, fallback). The dispatcher closes a window once its tick is
+    /// complete, so the last window is at most a few ticks behind `self.t`.
+    fn assert_one_packet_per_tick(&self, o: usize) {
+        let dts: Vec<&Vec<i64>> = self
+            .x
+            .rec
+            .dts
+            .iter()
+            .filter(|w| w.0 == o)
+            .map(|w| &w.1)
+            .collect();
+        assert!(dts.len() > 10, "output {o}: windows delivered");
+        for (i, w) in dts.iter().enumerate() {
+            assert_eq!(w.len(), 1, "output {o} window {i}: one packet {w:?}");
+        }
+        let run: Vec<i64> = dts.iter().map(|w| w[0]).collect();
+        for pair in run.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "output {o}: DTS one per tick {pair:?}"
+            );
+        }
+        let last = u64::try_from(*run.last().unwrap()).unwrap();
+        assert!(
+            last + 8 >= self.t,
+            "output {o}: windows keep closing ({last} vs {})",
+            self.t
+        );
+    }
+
     /// The windows output `o` received: per window, its (pts, len) packets.
     fn packets(&self, o: usize) -> Vec<(i64, bool)> {
         self.x
@@ -336,6 +370,8 @@ fn a_matching_source_moves_onto_p0_after_metering_and_the_encoder_lingers_out() 
     // The other output stayed on Program.
     assert_eq!(p.view(0).bus, "program");
     assert!(p.view(0).passthrough.is_none());
+    p.assert_one_packet_per_tick(0);
+    p.assert_one_packet_per_tick(1);
 }
 
 /// A key bridging on its slate while an output reads it brings in the
@@ -386,6 +422,7 @@ fn a_stall_bridges_on_the_picture_bridge_and_returns_after_30_stable_ticks() {
         "not before 30 on-time ticks: stall {stall_at}, away {away}, back {back}"
     );
     assert_eq!(p.x.h.snapshot().passthrough.moves_in, 2);
+    p.assert_one_packet_per_tick(0);
 }
 
 /// At the encoder cap the output stays on the slate (0 sessions) and the
@@ -420,6 +457,7 @@ fn at_the_encoder_cap_a_fault_stays_on_the_slate_with_the_reason() {
     })
     .expect("passes through again");
     assert!(p.status(0).slate_ticks.load(Ordering::Relaxed) >= 10);
+    p.assert_one_packet_per_tick(0);
 }
 
 /// A parameter change on the key: the output goes to the picture bridge
@@ -443,6 +481,7 @@ fn a_parameter_change_returns_not_before_300_ticks() {
     );
     assert_eq!(p.status(0).run_gen(), 2, "the run carries the new sets");
     assert!(p.x.h.snapshot().parameter_set_changes >= 1);
+    p.assert_one_packet_per_tick(0);
 }
 
 /// A take of another feed out of P0 is an ordinary move away; the
@@ -475,6 +514,7 @@ fn a_take_out_of_p0_closes_the_key_and_unsubscribes_the_tap() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(gone, "the tap is unsubscribed");
+    p.assert_one_packet_per_tick(0);
 }
 
 /// A failing slate bake (no H.264 encoder linked) opens no candidate key:
@@ -502,6 +542,7 @@ fn a_failed_slate_bake_leaves_the_output_on_its_encoded_path_with_the_reason() {
     assert_eq!(p.src.opens.load(Ordering::Relaxed), 1, "not retried");
     assert_eq!(p.x.h.snapshot().passthrough.open_failures, 1);
     assert_eq!(p.x.h.snapshot().passthrough.keys_live, 0);
+    p.assert_one_packet_per_tick(0);
 }
 
 /// An output that is not eligible never gets a candidate.
@@ -542,11 +583,10 @@ fn a_silent_tap_never_blocks_the_router_or_reaches_p0() {
     assert!(!p.on_p0(1));
     let v = p.view(1).passthrough.unwrap();
     assert_eq!(v.state, "metering");
-    assert!(
-        p.x.max_router < std::time::Duration::from_millis(50),
-        "router tick bounded: {:?}",
-        p.x.max_router
-    );
+    // Program and the candidate's output: one packet per tick throughout
+    // (the router never waits on the key's tap).
+    p.assert_one_packet_per_tick(0);
+    p.assert_one_packet_per_tick(1);
     let program: Vec<i64> = p.packets(0).iter().map(|x| x.0).collect();
     assert!(
         program.windows(2).all(|w| w[1] == w[0] + 1),
@@ -704,6 +744,7 @@ fn a_set_take_off_p0_retires_the_candidate() {
     });
     assert!(p.view(0).passthrough.is_none(), "candidate retired");
     assert_eq!(p.x.h.snapshot().passthrough.keys_live, 0);
+    p.assert_one_packet_per_tick(0);
 }
 
 fn take_by(op: &str, output: usize, principal: &str) -> OutputTake {
@@ -884,4 +925,133 @@ fn a_live_reset_disables_passthrough_for_that_output() {
     assert!(!p.on_p0(0));
     assert!(p.view(0).passthrough.is_none());
     assert_eq!(p.x.h.snapshot().passthrough.keys_live, 0);
+    p.assert_one_packet_per_tick(0);
+}
+
+/// Review R1-I-2: a passthrough key whose worker wedges (never returns from
+/// `encode`) is closed after `WEDGED_ENCODER_TICKS`: the output falls back
+/// to Program at a RAP, every output keeps one packet per tick, and the
+/// router never waits on the wedged worker.
+#[test]
+fn a_wedged_passthrough_worker_falls_back_and_never_stalls_the_router() {
+    let src = FakeSource::new(Script::default());
+    let wedge = Arc::new(AtomicBool::new(false));
+    let w = Arc::clone(&wedge);
+    let mut hooks = src.hooks(true);
+    let mut inner = std::mem::replace(&mut hooks.open, Box::new(|_| Err(String::new())));
+    hooks.open = Box::new(move |req| {
+        let (live, status) = inner(req)?;
+        let live: Box<dyn LiveEncoder> = Box::new(Wedgeable {
+            inner: live,
+            wedge: Arc::clone(&w),
+        });
+        Ok((live, status))
+    });
+    let x = harness_full(2, 6, None, false, Some(hooks), vec![eligible(); 2], None);
+    let mut p = P0 { x, src, t: 0 };
+    p.step();
+    p.take_cam(1);
+    p.run_until(200, |p| p.on_p0(1)).expect("on P0");
+    wedge.store(true, Ordering::Release);
+    p.run_until(u64::from(WEDGED_ENCODER_TICKS) + 60, |p| {
+        p.view(1).bus == "program"
+    })
+    .expect("falls back to Program");
+    p.run_until(20, |_| false);
+    assert_eq!(
+        p.x.h.snapshot().passthrough.keys_live,
+        0,
+        "the wedged key is closed"
+    );
+    assert!(p.x.h.snapshot().dead_encoders >= 1);
+    p.assert_one_packet_per_tick(0);
+    // The wedged key's own output: the pre-existing ADR-0108 wedged-key
+    // rule (any live key) holds its windows until the key is closed at
+    // WEDGED_ENCODER_TICKS; the hole is bounded by it, signalled as a loss,
+    // and one packet per tick resumes on Program.
+    let run: Vec<i64> =
+        p.x.rec
+            .dts
+            .iter()
+            .filter(|w| w.0 == 1)
+            .flat_map(|w| w.1.iter().copied())
+            .collect();
+    let holes: Vec<i64> = run
+        .windows(2)
+        .map(|w| w[1] - w[0] - 1)
+        .filter(|&h| h != 0)
+        .collect();
+    assert!(holes.len() <= 1, "{holes:?}");
+    assert!(
+        holes
+            .iter()
+            .all(|&h| h > 0 && h <= i64::from(WEDGED_ENCODER_TICKS) + 8),
+        "bounded hole {holes:?}"
+    );
+    assert!(p.x.rec.losses.contains(&1), "the hole is signalled");
+    wedge.store(false, Ordering::Release);
+}
+
+/// Review R1-I-2: an opener thread that never returns (a wedged bake)
+/// never delays the router: the candidate times out, the output stays on
+/// its picture bridge with one packet per tick, Program is untouched.
+#[test]
+fn a_wedged_passthrough_open_never_stalls_the_router() {
+    let src = FakeSource::new(Script::default());
+    let (_hold, wait) = mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let hooks = PassHooks {
+        open: Box::new(move |_| {
+            let _ = wait.lock().unwrap().recv(); // never returns while the test runs
+            Err("unreachable".to_owned())
+        }),
+        traits: Arc::new(|id: &str| (id == "cam").then(traits)),
+    };
+    let x = harness_full(2, 6, None, false, Some(hooks), vec![eligible(); 2], None);
+    let mut p = P0 { x, src, t: 0 };
+    p.step();
+    p.take_cam(1);
+    p.run_until(crate::output_routing::PASS_OPEN_DEADLINE_TICKS + 40, |_| {
+        false
+    });
+    assert!(!p.on_p0(1));
+    assert_eq!(p.view(1).bus, "src:cam", "still on the picture bridge");
+    p.assert_one_packet_per_tick(0);
+    p.assert_one_packet_per_tick(1);
+}
+
+/// A live encoder that blocks in `encode` while `wedge` is set.
+struct Wedgeable {
+    inner: Box<dyn LiveEncoder>,
+    wedge: Arc<AtomicBool>,
+}
+
+impl VideoEncodeWorker for Wedgeable {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        while self.wedge.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.inner.encode(item)
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        self.inner.reorder_bound()
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        self.inner.finish()
+    }
+}
+
+impl LiveEncoder for Wedgeable {
+    fn start_at(&mut self, t0: u64) {
+        self.inner.start_at(t0);
+    }
+    fn time_base(&self) -> Rational {
+        self.inner.time_base()
+    }
+    fn move_gate(&self) -> MoveGate {
+        self.inner.move_gate()
+    }
+    fn parameter_sets(&self) -> Option<ParameterSets> {
+        self.inner.parameter_sets()
+    }
 }
