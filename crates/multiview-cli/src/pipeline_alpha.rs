@@ -77,7 +77,7 @@ impl MediaAlpha {
         }
         // Different size: decoded alpha -> GRAY8 at decoded size, then the
         // luma's scaler geometry to the tile size.
-        let decoded = reuse(&mut self.decoded, in_w, in_h);
+        let decoded = reuse(&mut self.decoded, in_w, in_h)?;
         let stride = decoded.stride(0);
         source
             .copy_to(decoded.data_mut(0), stride)
@@ -166,14 +166,24 @@ fn geometry(e: impl std::fmt::Display) -> multiview_compositor::error::Error {
 }
 
 /// The reused `GRAY8` frame in `slot`, reallocated only on a size change.
-fn reuse(slot: &mut Option<Video>, w: u32, h: u32) -> &mut Video {
+///
+/// The allocation is checked ([`multiview_ffmpeg::frame::alloc_video`]): a
+/// failed or oversized allocation is an error here, before `stride(0)` or
+/// `data_mut(0)` could touch a frame without planes.
+fn reuse(slot: &mut Option<Video>, w: u32, h: u32) -> Result<&mut Video, String> {
     if slot
         .as_ref()
         .is_some_and(|f| f.width() != w || f.height() != h)
     {
         *slot = None;
     }
-    slot.get_or_insert_with(|| Video::new(Pixel::GRAY8, w, h))
+    if slot.is_none() {
+        *slot = Some(
+            multiview_ffmpeg::frame::alloc_video(Pixel::GRAY8, w, h).map_err(|e| e.to_string())?,
+        );
+    }
+    slot.as_mut()
+        .ok_or_else(|| "alpha scratch frame unexpectedly absent".to_owned())
 }
 
 #[cfg(test)]
@@ -357,6 +367,19 @@ mod tests {
             assert!(row[..6].iter().all(|&v| v <= 8), "left {row:?}");
             assert!(row[9..].iter().all(|&v| v >= 247), "right {row:?}");
         }
+    }
+
+    /// PB-2: an alpha scratch frame whose size cannot be allocated is an
+    /// error before any plane is touched (`Video::new` ignored the failed
+    /// `av_frame_get_buffer`, so `stride(0)` panicked on a planeless frame).
+    #[test]
+    fn an_unallocatable_scratch_frame_is_an_error_not_a_panic() {
+        let mut slot = None;
+        assert!(reuse(&mut slot, u32::MAX, 1).is_err());
+        assert!(slot.is_none());
+        assert!(reuse(&mut slot, 0, 4).is_err());
+        let frame = reuse(&mut slot, 7, 5).unwrap();
+        assert_eq!((frame.width(), frame.height(), frame.planes()), (7, 5, 1));
     }
 
     #[test]
