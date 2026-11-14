@@ -65,6 +65,11 @@ impl SourceDemandProvider for FakeDemand {
         Some(SourceDemandPhase::Starting)
     }
     fn start_source(&self, id: &str) -> bool {
+        // `stored-only` models a source saved as a restart-only change: the
+        // running engine's catalogue does not know it.
+        if id == "stored-only" {
+            return false;
+        }
         self.started.lock().unwrap().push(id.to_owned());
         true
     }
@@ -196,6 +201,39 @@ async fn start_is_operator_audited_and_returns_the_state() {
     assert_eq!(newest["action"], "command");
     assert_eq!(newest["object_id"], "idle");
     assert_eq!(newest["detail"]["command"], "start");
+}
+
+/// Issue #420: Start on a source the running engine does not know (saved as
+/// a restart-only change) says it applies on restart, not "cannot start".
+#[tokio::test]
+async fn start_on_a_stored_not_running_source_says_it_applies_on_restart() {
+    let demand = Arc::new(FakeDemand::default());
+    let mut doc = base_document();
+    doc["sources"].as_array_mut().unwrap().push(
+        json!({"id": "stored-only", "kind": "youtube", "url": "https://www.youtube.com/watch?v=x"}),
+    );
+    let config: multiview_config::MultiviewConfig = serde_json::from_value(doc).unwrap();
+    let seeded = multiview_control::seed_resources(&config).expect("seed");
+    let provider = Arc::clone(&demand);
+    let h = harness_with(move |state| {
+        state
+            .with_source_demand(provider)
+            .with_seeded_resources(seeded)
+    });
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/stored-only/start",
+            OPERATOR_TOKEN,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let detail = body_json(resp).await["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("applies on restart"), "{detail}");
+    assert!(!detail.contains("cannot start"), "{detail}");
+    assert!(demand.started.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -383,6 +383,19 @@ pub trait FrameControl {
     fn after_compose(&mut self, frame: &CompositedFrame);
     /// A catch-up repeat re-emits old pixels; expire holds but do not apply.
     fn on_repeat(&mut self, _drive: &mut CompositorDrive<Nv12Image>, _tick: Tick) {}
+    /// The fresh compose of `tick` (staged by [`FrameControl::before_compose`])
+    /// failed — a GPU readback deadline miss (issue #395) — and the runtime
+    /// re-emitted last-good under `tick` instead (not called for the very
+    /// first tick, which is composed on the CPU reference and committed). A hook that staged a take
+    /// must roll it back: the staged scene never reached the output.
+    /// `after_compose` is not called for this tick.
+    fn on_compose_failed(
+        &mut self,
+        _drive: &mut CompositorDrive<Nv12Image>,
+        _tick: Tick,
+        _reason: &str,
+    ) {
+    }
 }
 
 struct LegacyControl<F>(F);
@@ -419,6 +432,10 @@ pub struct EngineRuntime<P> {
     /// Mirrors `ticks_emitted`; the overload signal for telemetry / the
     /// degradation loop (a rising rate means compose is not fitting the budget).
     frames_repeated: Arc<AtomicU64>,
+    /// Cumulative count of fresh ticks whose compose missed its GPU readback
+    /// deadline (issue #395) and were re-emitted as last-good instead (each
+    /// also counted in `frames_repeated`). Zero on the CPU backend.
+    compose_deadline_misses: Arc<AtomicU64>,
     /// Program tick lateness (emit − deadline) at each publish, fresh or
     /// repeat (ADR-0108 §10). Wait-free atomics only.
     lateness: Arc<crate::lateness::TickLateness>,
@@ -468,6 +485,7 @@ impl<P: Pacer> EngineRuntime<P> {
             seed_nanos,
             ticks_emitted: Arc::new(AtomicU64::new(0)),
             frames_repeated: Arc::new(AtomicU64::new(0)),
+            compose_deadline_misses: Arc::new(AtomicU64::new(0)),
             lateness: crate::lateness::TickLateness::shared(),
             phases: crate::lateness::TickPhases::shared(),
             handoff_out: Handoff::shared(),
@@ -527,6 +545,21 @@ impl<P: Pacer> EngineRuntime<P> {
     #[must_use]
     pub fn frames_repeated_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.frames_repeated)
+    }
+
+    /// Total fresh ticks whose compose missed its GPU readback deadline and
+    /// were re-emitted as last-good (issue #395). Read wait-free.
+    #[must_use]
+    pub fn compose_deadline_misses(&self) -> u64 {
+        self.compose_deadline_misses.load(Ordering::Acquire)
+    }
+
+    /// A clone of the wait-free compose-deadline-miss counter, for an
+    /// off-thread telemetry sampler (mirrors
+    /// [`EngineRuntime::frames_repeated_counter`]).
+    #[must_use]
+    pub fn compose_deadline_misses_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.compose_deadline_misses)
     }
 
     /// The shared Program tick-lateness histogram (read off-thread).
@@ -1079,8 +1112,41 @@ impl<P: Pacer> EngineRuntime<P> {
             let t_composite = self.time_source.now_nanos();
 
             // 3. Sample + compose exactly one frame (lock-free, never blocks on
-            //    an input).
-            let frame = self.drive.compose(tick)?;
+            //    an input; a GPU readback wait is bounded, issue #395).
+            let frame = match self.drive.compose(tick) {
+                Ok(frame) => frame,
+                Err(crate::Error::ComposeDeadline(reason)) => {
+                    // The GPU missed this tick's readback deadline: never end
+                    // the run and never slip — the tick is still emitted.
+                    if let Some(last) = last_good.as_mut() {
+                        // Counted here only: a miss on the very first tick is
+                        // composed on the CPU below, not repeated (review MC-2).
+                        self.compose_deadline_misses.fetch_add(1, Ordering::AcqRel);
+                        // The staged scene never reaches the output: let the
+                        // hook roll a staged take back.
+                        control.on_compose_failed(&mut self.drive, tick, &reason);
+                        // Re-emit last-good under THIS tick, exactly like the
+                        // cadence-hold repeat path (fresh pts, counted).
+                        last.tick = tick;
+                        last.repeat = true;
+                        publisher.publish_state(state_of(&*last));
+                        if let Some(event) = event_of(&*last) {
+                            publisher.publish_event(event);
+                        }
+                        self.record_lateness(tick.index);
+                        emitted = emitted.saturating_add(1);
+                        self.ticks_emitted.fetch_add(1, Ordering::AcqRel);
+                        self.frames_repeated.fetch_add(1, Ordering::AcqRel);
+                        continue;
+                    }
+                    // The very first tick has nothing to repeat: compose it on
+                    // the CPU reference so the first frame always exists. The
+                    // staged scene IS composed here, so `after_compose`
+                    // commits it as for any fresh frame.
+                    self.drive.compose_on_cpu(tick)?
+                }
+                Err(other) => return Err(other),
+            };
             let t_after = self.time_source.now_nanos();
             control.after_compose(&frame);
             let t_project = self.time_source.now_nanos();

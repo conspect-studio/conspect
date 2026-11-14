@@ -50,17 +50,64 @@ pub struct PlaylistJournal {
     pub dropped: usize,
 }
 
-/// Remove the query, fragment and userinfo from a segment URI.
+/// Path segments that name a credential in a `key/value` style path (a
+/// `YouTube` googlevideo URL carries `/signature/<sig>/` and `/lsig/<sig>/`).
+const PATH_CREDENTIAL_KEYS: &[&str] = &["signature", "sig", "lsig", "token", "pot"];
+
+/// Remove the query, fragment and userinfo from a segment URI. A URI whose
+/// path carries credentials (a googlevideo host, or a `/signature/`-style
+/// key segment) keeps only its final path segment: `…/<last>`.
 #[must_use]
 pub fn sanitize_uri(uri: &str) -> String {
     let end = uri.find(['?', '#']).unwrap_or(uri.len());
     let path = uri.get(..end).unwrap_or(uri);
-    if let Some((scheme, rest)) = path.split_once("://") {
-        let (authority, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-        let host = authority.rsplit('@').next().unwrap_or(authority);
-        return format!("{scheme}://{host}{tail}");
+    let (prefix, tail) = match path.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            (Some((format!("{scheme}://{host}"), host.to_owned())), tail)
+        }
+        None => (None, path),
+    };
+    let signed_host = prefix
+        .as_ref()
+        .is_some_and(|(_, host)| host.to_ascii_lowercase().ends_with(".googlevideo.com"));
+    let signed_path = tail.split('/').any(|segment| {
+        PATH_CREDENTIAL_KEYS
+            .iter()
+            .any(|key| segment.eq_ignore_ascii_case(key))
+    });
+    let tail = if signed_host || signed_path {
+        // Keep the final segment only when it is not itself a credential
+        // value (the segment after a credential key, or a googlevideo path
+        // with no file name).
+        let mut segments = tail.rsplit('/');
+        let last = segments.next().unwrap_or_default();
+        let after_key = segments.next().is_some_and(|prev| {
+            PATH_CREDENTIAL_KEYS
+                .iter()
+                .any(|key| prev.eq_ignore_ascii_case(key))
+        });
+        let is_key = PATH_CREDENTIAL_KEYS
+            .iter()
+            .any(|key| last.eq_ignore_ascii_case(key));
+        let last = if after_key || is_key || (signed_host && !last.contains('.')) {
+            "<redacted>"
+        } else {
+            last
+        };
+        if prefix.is_some() {
+            format!("/…/{last}")
+        } else {
+            format!("…/{last}")
+        }
+    } else {
+        tail.to_owned()
+    };
+    match prefix {
+        Some((origin, _)) => format!("{origin}{tail}"),
+        None => tail,
     }
-    path.to_owned()
 }
 
 fn is_cue_tag(line: &str) -> bool {
@@ -424,6 +471,31 @@ mod tests {
             "https://cdn.example/a/1.ts"
         );
         assert_eq!(sanitize_uri("a/2.ts#frag"), "a/2.ts");
+        // Signed path segments never survive (issue #420 review ABUSE-06).
+        let yt = sanitize_uri(
+            "https://rr3.googlevideo.com/videoplayback/id/x/itag/96/source/yt_live_broadcast/expire/1/sparams/a/signature/PATHSIG/lsig/LSIG/sq/42/file/seg.ts?sig=Q",
+        );
+        assert_eq!(yt, "https://rr3.googlevideo.com/…/seg.ts");
+        for secret in ["PATHSIG", "LSIG", "Q"] {
+            assert!(!yt.contains(secret), "{secret} leaked: {yt}");
+        }
+        assert_eq!(
+            sanitize_uri("https://cdn.example/live/token/SECRET/1.ts"),
+            "https://cdn.example/…/1.ts"
+        );
+        assert_eq!(sanitize_uri("seg/signature/SECRET/2.ts"), "…/2.ts");
+        // A terminal credential value is never kept (review round 7).
+        for uri in [
+            "https://cdn.example/live/token/SECRET",
+            "https://rr3.googlevideo.com/videoplayback/lsig/SECRET",
+            "https://rr3.googlevideo.com/videoplayback/signature/SECRET",
+            "https://rr3.googlevideo.com/videoplayback/sq/42/SECRET",
+            "seg/signature/SECRET",
+        ] {
+            let clean = sanitize_uri(uri);
+            assert!(!clean.contains("SECRET"), "{uri} -> {clean}");
+            assert!(clean.ends_with("<redacted>"), "{uri} -> {clean}");
+        }
     }
 
     #[test]

@@ -88,8 +88,12 @@ async function openCreateDialog(): Promise<HTMLElement> {
   return screen.findByRole('dialog');
 }
 
-/** Pick a kind in the Kind <Select> (Radix listbox). */
-async function pickKind(name: string): Promise<void> {
+/**
+ * Pick a kind in the Kind <Select> (Radix listbox) by its raw wire id. #419:
+ * options now show a human label with the raw id as secondary text (e.g.
+ * "Clock (clock)"), so match on that suffix rather than the bare id.
+ */
+async function pickKind(rawKind: string): Promise<void> {
   // The Kind select is the first combobox in the dialog.
   const triggers = screen.getAllByRole('combobox');
   const kindTrigger = triggers[0];
@@ -97,7 +101,9 @@ async function pickKind(name: string): Promise<void> {
     throw new Error('no Kind select trigger found');
   }
   await userEvent.click(kindTrigger);
-  await userEvent.click(await screen.findByRole('option', { name }));
+  await userEvent.click(
+    await screen.findByRole('option', { name: new RegExp(`\\(${rawKind}\\)$`) }),
+  );
 }
 
 describe('Clock source form (ADR-0047)', () => {

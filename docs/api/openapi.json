@@ -10825,7 +10825,7 @@
         },
         "responses": {
           "201": {
-            "description": "The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file) on a full-engine run — `restart` otherwise (ndi/youtube/aes67, or a run without the decoder; ADR-W018).",
+            "description": "The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file, and youtube on a build with the `youtube` feature) on a full-engine run — `restart` otherwise (ndi/aes67, or a run without the decoder; ADR-W018).",
             "content": {
               "application/json": {
                 "schema": {
@@ -11071,7 +11071,7 @@
             }
           },
           "409": {
-            "description": "This run cannot start sources.",
+            "description": "This run cannot start sources, or the source is saved but applies on restart (the detail says which).",
             "content": {
               "application/json": {
                 "schema": {
@@ -21268,6 +21268,8 @@
           "ticks_total",
           "frames_repeated_total",
           "frames_repeated_window",
+          "compose_deadline_misses_total",
+          "compose_deadline_misses_window",
           "bucket_edges_ms",
           "buckets_total",
           "fine_bucket_edges_ms",
@@ -21295,6 +21297,18 @@
               "minimum": 0
             },
             "description": "Cumulative per-bucket counts (edges, then overflow)."
+          },
+          "compose_deadline_misses_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks whose GPU readback missed its deadline since the run started,\nre-emitted as last-good (also counted in `frames_repeated_total`).",
+            "minimum": 0
+          },
+          "compose_deadline_misses_window": {
+            "type": "integer",
+            "format": "int64",
+            "description": "GPU readback deadline misses in the window.",
+            "minimum": 0
           },
           "compose_duration": {
             "$ref": "#/components/schemas/PhaseHistogram",
