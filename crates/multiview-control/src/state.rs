@@ -585,6 +585,8 @@ struct AcceptedFence {
 pub struct AppState {
     /// Optional real background browser capture service.
     pub web_capture: crate::web_capture::Provider,
+    /// Off-clock native artifact-load executor, unavailable by default.
+    pub player_load: Arc<dyn crate::player_load::PlayerLoadProvider>,
     /// The engine's outbound publisher (state slot + event broadcast).
     pub engine: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     /// The inbound, bounded, non-blocking command bus sender.
@@ -1154,6 +1156,7 @@ impl AppState {
             moq: Arc::new(crate::moq::MoqRegistry::default()),
             #[allow(clippy::default_constructed_unit_structs)] // unit on non-unix
             web_capture: crate::web_capture::Provider::default(),
+            player_load: Arc::new(crate::player_load::UnavailablePlayerLoad),
             cloudflare: None,
             #[cfg(all(feature = "acme", unix))]
             tls: None,

@@ -43,7 +43,7 @@ use std::sync::Arc;
 use multiview_compositor::backend::{RunBackend, RunBackendKind};
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::mask::{MaskShape, WipeMask};
-use multiview_compositor::offclock::{FrameJob, JobMeta, SharedTile};
+use multiview_compositor::offclock::{FrameJob, JobMeta, SharedKey, SharedTile};
 
 /// The source metadata of one composite, carried with its job so an adopted
 /// late frame reports the sources it actually shows (issue #415).
@@ -62,7 +62,12 @@ use multiview_framestore::TileStore;
 
 use crate::clock::Tick;
 use crate::error::{Error, Result};
+use crate::keyer::{KeyerDraw, KeyerFly, KeyerParams, TieEnvelope, MAX_DSK};
 use crate::slate::{failover_slate_image, FailoverSlate};
+
+/// Scratch slots reserved for keyer tiles on every compose (fill and key per
+/// downstream keyer), so `scratch_reservations` never depends on keyer state.
+const KEYER_TILES: usize = 2 * MAX_DSK;
 
 /// A frame composited for one output tick: the tagged canvas image, its
 /// presentation timestamp, and the per-source states sampled this tick.
@@ -165,6 +170,59 @@ impl MixOverlay {
             duration,
         ))
     }
+
+    /// The weight of the incoming (Preview) picture on this step: the MIX
+    /// opacity, the DIP incoming contribution `i` (0 before the switch
+    /// point), or the WIPE edge position (0 covers nothing). Zero means the
+    /// incoming source does not contribute to the frame (tally, review F4).
+    #[must_use]
+    pub fn incoming_weight(&self) -> f32 {
+        match self.style {
+            TransitionStyle::Mix | TransitionStyle::Wipe { .. } => self.opacity(),
+            TransitionStyle::Dip { switch_point, .. } => {
+                multiview_core::switcher::kernel::dip_weights(
+                    self.elapsed,
+                    self.duration,
+                    switch_point,
+                )
+                .1
+            }
+        }
+    }
+
+    /// The weights a tied downstream keyer draws on this step (ADR-0113 §4):
+    /// MIX `p` going on and `1 − p` going off, with `p` the same opacity the
+    /// incoming tile uses; DIP the incoming contribution `i` going on and
+    /// `1 − d` going off, with the same `dip_weights` the transition tiles use;
+    /// WIPE (until K3) `0` going on and `1` going off, a CUT at the terminal
+    /// tick.
+    #[must_use]
+    pub fn tie_envelope(&self) -> TieEnvelope {
+        match self.style {
+            TransitionStyle::Mix => TieEnvelope::mix(self.opacity()),
+            TransitionStyle::Dip { switch_point, .. } => {
+                let (dip, incoming) = multiview_core::switcher::kernel::dip_weights(
+                    self.elapsed,
+                    self.duration,
+                    switch_point,
+                );
+                TieEnvelope {
+                    going_on: incoming,
+                    going_off: 1.0 - dip,
+                }
+            }
+            // K2a deviation (design note §14, K3): the per-pixel WIPE
+            // envelope (`m(x, y)` on, `1 − m(x, y)` off) needs a complement
+            // mask the compositor does not have yet. Until K3 a tied keyer
+            // on a WIPE behaves like a CUT at the transition end: it keeps
+            // its current state through the flight and flips on the
+            // terminal tick.
+            TransitionStyle::Wipe { .. } => TieEnvelope {
+                going_on: 0.0,
+                going_off: 1.0,
+            },
+        }
+    }
 }
 
 impl CompositedFrame {
@@ -264,9 +322,14 @@ pub struct CompositorDrive<T> {
     transition_fill: Option<(Rgb8, Arc<Nv12Image>)>,
     /// Odometer of `transition_fill` builds (the no-per-tick-allocation gate).
     transition_fill_builds: u64,
+    /// ADR-0113: this tick's downstream keyer draws (ascending z), set by the
+    /// switcher frame hook. Drawn above the layout and the transition tiles
+    /// in the same pass. All `None` without keyers (the steady state).
+    /// Boxed once at construction (never per tick) to keep the drive small.
+    keyers: Box<[Option<KeyerDraw>; MAX_DSK]>,
     /// Bumped by every change to what a composite draws other than the
     /// source frames' contents (layout, bindings, stores, slates, transition
-    /// step and style). A GPU backend's CPU fallback hands a late result to a
+    /// step and style, downstream keyer draws). A GPU backend's CPU fallback hands a late result to a
     /// later frame only under the same epoch (issue #415 review MC-1), so a
     /// scene a hook staged and then rolled back never reaches the output.
     scene_epoch: u64,
@@ -308,6 +371,7 @@ impl<T> CompositorDrive<T> {
             transition_style: TransitionStyle::Mix,
             transition_fill: None,
             transition_fill_builds: 0,
+            keyers: Box::new([const { None }; MAX_DSK]),
             scene_epoch: 0,
         })
     }
@@ -372,6 +436,79 @@ impl<T> CompositorDrive<T> {
     #[must_use]
     pub fn mix_overlay(&self) -> Option<&MixOverlay> {
         self.mix_overlay.as_ref()
+    }
+
+    /// Install this tick's downstream keyer draws (ADR-0113 §3) by swapping
+    /// them with `draws`; the previous draws come back in `draws`, so the
+    /// caller drops their `Arc`s (refcount decrements, no allocation).
+    ///
+    /// A change of what the keyers draw (a keyer on or off, its weight,
+    /// rectangle or parameters, a key source gained or lost) bumps the scene
+    /// epoch (issue #415 review MC-1): a late off-clock result composed under
+    /// other keyer draws is never adopted. A new fill/key frame alone is
+    /// source content and keeps the epoch, as a cell's new frame does.
+    /// Allocation-free.
+    pub fn set_keyer_draws(&mut self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
+        std::mem::swap(&mut *self.keyers, draws);
+        let changed = self
+            .keyers
+            .iter()
+            .zip(draws.iter())
+            .any(|(new, old)| !same_keyer_scene(new.as_ref(), old.as_ref()));
+        if changed {
+            self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        }
+    }
+
+    /// The installed keyer draws.
+    #[must_use]
+    pub fn keyer_draws(&self) -> &[Option<KeyerDraw>; MAX_DSK] {
+        &self.keyers
+    }
+
+    /// Settle the installed keyer draws in place after a rejected frame
+    /// (`settle` changes weights or rebuilds resting draws; no allocation).
+    ///
+    /// Bumps the scene epoch (issue #415) only when the settled draws differ
+    /// from the installed ones: a late off-clock result of a scene the settle
+    /// changed is never adopted, while a deadline miss that changes nothing
+    /// (the steady state, or no keyers at all) keeps the epoch, so a slow
+    /// CPU-fallback job can still be adopted (#443 review INV-MC-1).
+    pub fn settle_keyer_draws_with(
+        &mut self,
+        settle: impl FnOnce(&mut [Option<KeyerDraw>; MAX_DSK]),
+    ) {
+        let before: [Option<KeyerSceneKey>; MAX_DSK] = self
+            .keyers
+            .each_ref()
+            .map(|d| d.as_ref().map(KeyerSceneKey::of));
+        settle(&mut self.keyers);
+        let changed = before
+            .iter()
+            .zip(self.keyers.iter())
+            .any(|(old, new)| *old != new.as_ref().map(KeyerSceneKey::of));
+        if changed {
+            self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        }
+    }
+
+    /// Whether the transition's incoming tile contributes to the frame
+    /// composed at `now`: an overlay with incoming weight > 0 whose source
+    /// reads live (the same test `push_transition_tiles` applies). One
+    /// wait-free `read_at`; `false` without an overlay.
+    #[must_use]
+    pub fn transition_incoming_drawn(&self, now: MediaTime) -> bool {
+        let Some(mix) = self.mix_overlay.as_ref() else {
+            return false;
+        };
+        let weight = mix.incoming_weight();
+        if weight.is_nan() || weight <= 0.0 {
+            return false;
+        }
+        self.stores.get(&mix.source).is_some_and(|store| {
+            let read = store.read_at(now);
+            read.state().is_live() && read.frame().is_some()
+        })
     }
 
     /// The cumulative number of times the per-tick resolve **scratch pool** has
@@ -469,6 +606,14 @@ impl<T> CompositorDrive<T> {
     pub fn effective_cell_source(&self, cell_id: &str) -> Option<String> {
         let index = *self.cell_index.get(cell_id)?;
         self.layout.cells.get(index).and_then(|c| c.source.clone())
+    }
+
+    /// The scene epoch (issue #415): bumped by every change to what a
+    /// composite draws other than source frame contents. Test seam.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn scene_epoch(&self) -> u64 {
+        self.scene_epoch
     }
 
     /// Replace the compositor backend the per-tick composite dispatches through.
@@ -754,8 +899,11 @@ impl CompositorDrive<Nv12Image> {
         let mut scratch = self.scratch.borrow_mut();
         let cell_count = self.layout.cells.len();
         // A transition adds at most two full-canvas tiles (the DIP colour and
-        // the incoming picture), so the pool is sized once for both.
-        scratch.begin(cell_count + 2 * usize::from(self.mix_overlay.is_some()));
+        // the incoming picture, or the WIPE incoming picture and its border
+        // band), so the pool is sized once for both. The
+        // keyer slots are always reserved (ADR-0113), so the pool never grows
+        // when a keyer goes on air.
+        scratch.begin(cell_count + 2 * usize::from(self.mix_overlay.is_some()) + KEYER_TILES);
         let ComposeScratch {
             held,
             placements,
@@ -793,6 +941,7 @@ impl CompositorDrive<Nv12Image> {
                 dst_h,
                 opacity: cell.opacity,
                 mask: None,
+                key: None,
             });
         }
         // The AUTO dissolve's incoming picture: one full-canvas tile on top, in
@@ -801,6 +950,9 @@ impl CompositorDrive<Nv12Image> {
         if let Some(mix) = &self.mix_overlay {
             self.push_transition_tiles(mix, now, canvas.width, canvas.height, held, placements);
         }
+        // Downstream keyers above everything, the transition included
+        // (ADR-0113 §3, render list 4).
+        self.push_keyer_tiles(held, placements);
 
         // Hand the compositor the held images as owned `Arc`s plus each cell's
         // DESTINATION rect (no pixel copy): a GPU backend composites the frame
@@ -819,19 +971,7 @@ impl CompositorDrive<Nv12Image> {
             background: self.background,
             tiles: placements
                 .iter()
-                .filter_map(|p| {
-                    held.get(p.image_index).map(|img| SharedTile {
-                        image: Arc::clone(img),
-                        dst_x: p.dst_x,
-                        dst_y: p.dst_y,
-                        dst_w: p.dst_w,
-                        dst_h: p.dst_h,
-                        opacity: p.opacity,
-                        mask: p.mask,
-                        key: None,
-                        group: multiview_compositor::key::TileGroup::Top,
-                    })
-                })
+                .filter_map(|p| shared_tile(p, held))
                 .collect(),
             scene: self.scene_key(),
             // Only a GPU backend can hand back an earlier job's pixels (its
@@ -916,6 +1056,7 @@ impl CompositorDrive<Nv12Image> {
                 dst_h: height,
                 opacity,
                 mask,
+                key: None,
             });
         };
         // Only a fresh incoming frame is blended (SW2-02): a held stale frame
@@ -1000,6 +1141,37 @@ impl CompositorDrive<Nv12Image> {
         }
         if let Some((fill, band_mask)) = band {
             full_canvas(fill, 1.0, Some(band_mask));
+        }
+    }
+
+    /// Append the keyer tiles (fill, then its key) to the pooled scratch, in
+    /// the ascending-z order the hook resolved. Refcount increments only; the
+    /// capacity was reserved by `begin` (`KEYER_TILES`), so this never grows
+    /// the pool. A zero or NaN weight contributes nothing.
+    fn push_keyer_tiles(&self, held: &mut Vec<Arc<Nv12Image>>, placements: &mut Vec<Placement>) {
+        for draw in self.keyers.iter().flatten() {
+            if draw.weight.is_nan() || draw.weight <= 0.0 {
+                continue;
+            }
+            held.push(Arc::clone(&draw.fill));
+            let image_index = held.len().saturating_sub(1);
+            let key_image = draw.key.as_ref().map(|key| {
+                held.push(Arc::clone(key));
+                held.len().saturating_sub(1)
+            });
+            placements.push(Placement {
+                image_index,
+                dst_x: draw.rect.x,
+                dst_y: draw.rect.y,
+                dst_w: draw.rect.w,
+                dst_h: draw.rect.h,
+                opacity: draw.weight,
+                mask: None,
+                key: Some(PlacedKey {
+                    params: draw.params,
+                    key_image,
+                }),
+            });
         }
     }
 
@@ -1096,7 +1268,16 @@ struct SlateCache {
     builds: u64,
 }
 
+/// Internal: a keyer placement's key block, referencing the key picture in
+/// the `held` vec.
+#[derive(Clone, Copy)]
+struct PlacedKey {
+    params: KeyerParams,
+    key_image: Option<usize>,
+}
+
 /// Internal: a resolved tile placement referencing an entry in the `held` vec.
+#[derive(Clone, Copy)]
 struct Placement {
     image_index: usize,
     dst_x: u32,
@@ -1110,6 +1291,83 @@ struct Placement {
     opacity: f32,
     /// A wipe mask for a transition tile (ADR-0112 §3); `None` for a cell.
     mask: Option<WipeMask>,
+    /// A keyer's key block (ADR-0113 §3); `None` for an ordinary tile.
+    key: Option<PlacedKey>,
+}
+
+/// Whether two keyer draws draw the same scene (issue #415): the same keyer,
+/// rectangle, weight, parameters and key presence. The fill and key frames
+/// themselves are source content, as a cell's frame is.
+fn same_keyer_scene(a: Option<&KeyerDraw>, b: Option<&KeyerDraw>) -> bool {
+    a.map(KeyerSceneKey::of) == b.map(KeyerSceneKey::of)
+}
+
+/// What of a keyer draw changes the composed scene (issue #415 epoch): all
+/// but the fill and key frame contents, which are source content. `Copy`, so
+/// a before/after comparison allocates nothing.
+/// Floats compare by bits, so a NaN parameter never reads as a change on
+/// every tick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct KeyerSceneKey {
+    keyer: u8,
+    rect: KeyerFly,
+    weight_bits: u32,
+    /// `KeyKind` as (luma?, clip bits, gain bits).
+    kind: (bool, u32, u32),
+    invert: bool,
+    mask: Option<multiview_compositor::key::KeyMask>,
+    has_key: bool,
+}
+
+impl KeyerSceneKey {
+    fn of(d: &KeyerDraw) -> Self {
+        let kind = match d.params.kind {
+            multiview_compositor::key::KeyKind::Luma { clip, gain } => {
+                (true, clip.to_bits(), gain.to_bits())
+            }
+            _ => (false, 0, 0),
+        };
+        Self {
+            keyer: d.keyer,
+            rect: d.rect,
+            weight_bits: d.weight.to_bits(),
+            kind,
+            invert: d.params.invert,
+            mask: d.params.mask,
+            has_key: d.key.is_some(),
+        }
+    }
+}
+
+/// The owned compositor tile for one placement: `Arc` clones of its
+/// pictures in `held` (no pixel copy). A transition tile carries its wipe
+/// mask (ADR-0112 §3); a keyer tile carries its key block (ADR-0113 §3), so it
+/// keeps its key on the CPU and the off-clock GPU path alike.
+fn shared_tile(p: &Placement, held: &[Arc<Nv12Image>]) -> Option<SharedTile> {
+    held.get(p.image_index).map(|img| SharedTile {
+        image: Arc::clone(img),
+        dst_x: p.dst_x,
+        dst_y: p.dst_y,
+        dst_w: p.dst_w,
+        dst_h: p.dst_h,
+        opacity: p.opacity,
+        mask: p.mask,
+        key: p.key.map(|placed| shared_key(placed, held)),
+        group: multiview_compositor::key::TileGroup::Top,
+    })
+}
+
+/// The owned key block of a keyer placement (ADR-0113 §3) for its
+/// [`SharedTile`]: the key picture is an `Arc` clone of its entry in `held`
+/// (no pixel copy), so a keyed tile keeps its key on every backend path. A
+/// key picture missing from `held` degrades to a self key, never a panic.
+fn shared_key(placed: PlacedKey, held: &[Arc<Nv12Image>]) -> SharedKey {
+    SharedKey {
+        kind: placed.params.kind,
+        source: placed.key_image.and_then(|i| held.get(i)).map(Arc::clone),
+        invert: placed.params.invert,
+        mask: placed.params.mask,
+    }
 }
 
 /// The per-tick resolve **scratch pool**: reusable buffers cleared-and-refilled
@@ -1154,18 +1412,22 @@ impl ComposeScratch {
         // One bounded reservation per new high-water cell count. `capacity()` only
         // grows, so once it covers the layout this is a no-op for every later tick
         // — the steady-state per-tick allocation is zero.
+        // The vectors were just cleared (`len() == 0`), and `reserve(n)`
+        // guarantees `capacity() >= len() + n`, so `reserve(cell_count)` is
+        // the exact request. (Reserving `cell_count - capacity()` is a no-op
+        // on a cleared non-empty-capacity vector and re-counted a growth on
+        // every tick above the high-water mark.)
         let mut grew = false;
         if self.held.capacity() < cell_count {
-            self.held.reserve(cell_count - self.held.capacity());
+            self.held.reserve(cell_count);
             grew = true;
         }
         if self.placements.capacity() < cell_count {
-            self.placements
-                .reserve(cell_count - self.placements.capacity());
+            self.placements.reserve(cell_count);
             grew = true;
         }
         if self.order.capacity() < cell_count {
-            self.order.reserve(cell_count - self.order.capacity());
+            self.order.reserve(cell_count);
             grew = true;
         }
         if grew {

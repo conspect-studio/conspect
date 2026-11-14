@@ -359,6 +359,12 @@ fn engine_take(
         // already answered `audio-unsupported` from the plan.
         return Err(TakeSubmitError::Unroutable);
     }
+    // ADR-0113 / K2a: never route DSK pixels as Clean (the plan gate
+    // already refused; this covers a caller that skipped it). Here, so a
+    // single take and every member of a take set pass the same rule.
+    if take.video == Some(RoutedFeed::Clean) && handle.dsk_defined() {
+        return Err(TakeSubmitError::Unroutable);
+    }
     let bus = match take.video.as_ref() {
         Some(feed) => {
             Some(picture_bus(feed, take.layout.as_ref()).ok_or(TakeSubmitError::Unroutable)?)
@@ -393,6 +399,9 @@ impl OutputRouting for OutputRoutingAdapter {
         }
         if matches!(feed, RoutedFeed::Preview | RoutedFeed::Clean) && !handle.has_preview() {
             return Err(PlanRefusal::SwitcherRequired);
+        }
+        if *feed == RoutedFeed::Clean && handle.dsk_defined() {
+            return Err(PlanRefusal::CleanUnavailableWithDsk);
         }
         let snapshot = handle.snapshot();
         let bus = feed.bus_name();
@@ -886,6 +895,30 @@ impl multiview_control::program_metrics::ProgramMetricsSource for ProgramMetrics
             compose_deadline_misses: handles
                 .compose_deadline_misses
                 .load(std::sync::atomic::Ordering::Acquire),
+            // #343: one entry per per-output clock (wait-free loads).
+            output_clocks: handles
+                .output_clocks
+                .iter()
+                .map(
+                    |clock| multiview_control::program_metrics::OutputClockCounters {
+                        fps: format!("{}/{}", clock.cadence.num, clock.cadence.den),
+                        outputs: clock.outputs.clone(),
+                        lateness: clock.stats.lateness().snapshot(),
+                        skipped_ticks: clock.stats.skipped_ticks(),
+                        dropped_offers: clock
+                            .dropped_offers
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        late_latches: clock
+                            .late_latches
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        dropped_audio: clock
+                            .dropped_audio
+                            .iter()
+                            .map(|d| d.load(std::sync::atomic::Ordering::Relaxed))
+                            .sum(),
+                    },
+                )
+                .collect(),
         })
     }
 }
