@@ -571,3 +571,66 @@ fn passthrough_keys_are_capped_separately_from_encoders() {
         MAX_PASSTHROUGH_KEYS
     );
 }
+
+/// The plan and the readback share the engine's predicate (#344 D2b): a
+/// source onto an eligible output is not P0 before the key's meter matched
+/// (`not-enough-history`), P0 with 0 encoders / 0 converts once it did;
+/// an output that is not eligible says `passthrough-not-supported-on-medium`;
+/// `GET /patch`'s `current_path` reports P0 while the output is on the key.
+#[test]
+fn the_plan_reports_p0_from_the_engines_own_predicate() {
+    use multiview_control::output_routing::{OutputRouting, PlanPath, RoutedFeed};
+    let src = FakeSource::new(Script::default());
+    let x = harness_full(
+        2,
+        6,
+        None,
+        false,
+        Some(src.hooks(true)),
+        vec![eligible(), PassEligibility::NotSupported],
+    );
+    let mut p = P0 { x, src, t: 0 };
+    let run = |id: &str| RunOutput {
+        id: Some(id.into()),
+        settings: 0,
+        feed_format: None,
+        base_format: None,
+        routable: true,
+        program_audio: false,
+        codec_name: String::new(),
+    };
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(
+        p.x.h.clone().with_outputs(vec![run("hls"), run("file")]),
+    )));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let cam = RoutedFeed::Source("cam".into());
+    p.step();
+    let before = adapter.plan_slot("hls", &cam).unwrap();
+    assert_ne!(before.path, PlanPath::P0);
+    assert_eq!(before.passthrough.as_deref(), Some("not-enough-history"));
+    let other = adapter.plan_slot("file", &cam).unwrap();
+    assert_eq!(
+        other.passthrough.as_deref(),
+        Some(crate::output_routing::NOT_SUPPORTED_ON_MEDIUM)
+    );
+    // A non-source feed carries no passthrough miss.
+    assert_eq!(
+        adapter
+            .plan_slot("hls", &RoutedFeed::Program)
+            .unwrap()
+            .passthrough,
+        None
+    );
+    p.take_cam(0);
+    p.run_until(200, |p| p.on_p0(0)).expect("on P0");
+    let now = adapter.plan_slot("hls", &cam).unwrap();
+    assert_eq!(now.path, PlanPath::P0);
+    assert!(!now.cost.needs_encoder);
+    assert_eq!(now.converts, 0);
+    assert_eq!(now.passthrough, None);
+    assert_eq!(adapter.current_path("hls"), Some(PlanPath::P0));
+    let live = adapter.current_passthrough("hls").unwrap();
+    assert_eq!(live.state, "passthrough");
+    assert_eq!(adapter.current_passthrough("file"), None);
+}
