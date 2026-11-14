@@ -366,7 +366,10 @@ pub(crate) fn media_segment_uris(text: &str) -> Option<Vec<String>> {
             return None;
         }
         match Path::new(&name).extension() {
-            Some(ext) if ext.eq_ignore_ascii_case("ts") => uris.push(name),
+            // Slice F (#345): WebVTT subtitle segments are media too.
+            Some(ext) if ext.eq_ignore_ascii_case("ts") || ext.eq_ignore_ascii_case("vtt") => {
+                uris.push(name);
+            }
             // Master playlists list media playlists, not media segments.
             Some(ext) if ext.eq_ignore_ascii_case("m3u8") => {}
             _ => return None,
