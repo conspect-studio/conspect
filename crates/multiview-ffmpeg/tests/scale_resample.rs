@@ -187,7 +187,17 @@ fn identity_copies_a_bottom_up_frame_in_display_order() {
         let expected: Vec<u8> = (0..cols)
             .map(|x| u8::try_from(10 * (3 - y) + x).unwrap())
             .collect();
-        assert_eq!(&out.data(0)[y * d..y * d + cols], &expected[..], "row {y}");
+        // Active bytes only (review PB-18): `out` is a plain `alloc_video`
+        // frame whose stride padding libav never wrote, so never a
+        // whole-plane `data(0)` slice.
+        #[allow(unsafe_code)]
+        // SAFETY: `out` is a live top-down GRAY8 frame of `rows` rows (the
+        // `run` output, `d > 0`); row `y < rows` starts at `data[0] + y * d`
+        // inside its buffer and its first `cols` (= width) bytes were all
+        // written by the identity `av_frame_copy` from a fully written
+        // source. `out` outlives the slice.
+        let row = unsafe { core::slice::from_raw_parts((*out.as_ptr()).data[0].add(y * d), cols) };
+        assert_eq!(row, &expected[..], "row {y}");
     }
 }
 
