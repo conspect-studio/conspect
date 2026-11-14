@@ -97,7 +97,15 @@ cast API's own take and take-back, a layout edit or delete, the audio-routing PU
 output against its owner's current grants for the new feed's whole closure (source, layout cells and audio,
 audio routes) before the change is published. A token whose owner may not read the new feed, or whose owner no
 longer resolves, is revoked first: its next request is 404, and the owner's `GET` shows `cast-stream-revoked` with
-the reason. Engine fallbacks and a 5 s sweep (which also catches a revoked or re-scoped API key) are backstops.
+the reason. Tokens are bound to a per-output **authorization generation** held under the token registry's lock:
+a feed change bumps it and re-authorizes tokens in one critical section, a token serves only at its output's
+current generation (otherwise a plain 404), and a create arms its token only at the generation it authorized
+against (it re-checks up to 3 times, then answers 403, or 409 `cast-feed-changed`). Engine outcomes are relayed
+at once; every `/cast` request first compares the engine's routing readback with the authorized feeds and
+re-authorizes synchronously on a difference, so an engine fallback is never served to an owner who may not read
+it after the readback (published every tick) shows it. The owner's authentication provenance (native API key,
+JWT, local admin with auth off) is recorded at issuance: a native key always re-resolves from the key store and a
+revoked key fails closed. A 5 s sweep catches re-scoped or revoked keys and re-pointed audio tracks.
 
 **Diagnosis without a device log.** The engine records, per stream and for the receiver page, the last fetch
 time and User-Agent (a Cast device contains `CrKey`). No fetch from a Cast device after a cast starts means the
