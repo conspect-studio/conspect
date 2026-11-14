@@ -41,6 +41,7 @@ use multiview_core::time::Rational;
 use multiview_ffmpeg::h264_repeat::RepeatAuBuilder;
 use multiview_ffmpeg::idr::{self, CodecKind, NalFraming, ParameterSetScan, RapParameterSets};
 use multiview_ffmpeg::EncodedPacket;
+use multiview_output::passthrough::clock::MAX_DRAIN_PER_TICK;
 use multiview_output::passthrough::{
     BridgeReason, ClockState, Emission, PassthroughClock, RepeatSource, SlateLoop, SlotGate, TapAu,
     TapReader, MAX_AU_BYTES,
@@ -341,10 +342,47 @@ impl SlotGate for KeyGate {
 }
 
 /// One [`RepeatAuBuilder`] per parameter generation, built once.
+///
+/// Primed from the generation's sets as its AUs pass the key
+/// ([`Repeats::observe`], called for every AU the clock drains): the clock
+/// asks for a repeat after the last emitted AU, which in a GOP longer than
+/// one frame is a P picture without sets. A new generation drops the old
+/// builder at once (never a repeat built from another generation's sets).
 #[derive(Default)]
 struct Repeats {
     codec: Option<CodecKind>,
+    /// The generation the cached builder (or its absence) belongs to.
     built: Option<(u64, Option<RepeatAuBuilder>)>,
+}
+
+impl Repeats {
+    /// Prime from `au`'s in-band SPS/PPS (cheap when it carries none).
+    fn observe(&mut self, au: &TapAu) {
+        if self.codec != Some(CodecKind::H264) {
+            return;
+        }
+        let have = self
+            .built
+            .as_ref()
+            .is_some_and(|(g, b)| *g == au.params_gen && b.is_some());
+        if have || !au.strict_idr {
+            if self
+                .built
+                .as_ref()
+                .is_some_and(|(g, _)| *g != au.params_gen)
+            {
+                self.built = Some((au.params_gen, None));
+            }
+            return;
+        }
+        let sps = idr::h264_nal_of_type(&au.data, NalFraming::AnnexB, 7);
+        let pps = idr::h264_nal_of_type(&au.data, NalFraming::AnnexB, 8);
+        let builder = match (sps, pps) {
+            (Some(sps), Some(pps)) => RepeatAuBuilder::new(sps, pps),
+            _ => None,
+        };
+        self.built = Some((au.params_gen, builder));
+    }
 }
 
 impl RepeatSource for Repeats {
@@ -352,32 +390,30 @@ impl RepeatSource for Repeats {
         if self.codec != Some(CodecKind::H264) {
             return None;
         }
-        // The builder needs this generation's SPS/PPS; the generation's IDR
-        // carries them in band (a strict IDR). Built from the first AU of the
-        // generation that has both, then reused.
-        let rebuild = self
-            .built
-            .as_ref()
-            .is_none_or(|(g, b)| *g != prev.params_gen || b.is_none());
-        if rebuild {
-            let sps = idr::h264_nal_of_type(&prev.data, NalFraming::AnnexB, 7);
-            let pps = idr::h264_nal_of_type(&prev.data, NalFraming::AnnexB, 8);
-            match (sps, pps) {
-                (Some(sps), Some(pps)) => {
-                    self.built = Some((prev.params_gen, RepeatAuBuilder::new(sps, pps)));
-                }
-                _ if self
-                    .built
-                    .as_ref()
-                    .is_some_and(|(g, _)| *g == prev.params_gen) => {}
-                _ => self.built = Some((prev.params_gen, None)),
-            }
+        // Only the builder of `prev`'s own generation.
+        let (gen, builder) = self.built.as_ref()?;
+        if *gen != prev.params_gen {
+            return None;
         }
-        let (_, builder) = self.built.as_ref()?;
         builder
             .as_ref()?
             .repeat_after(&prev.data, NalFraming::AnnexB)
             .map(Arc::from)
+    }
+}
+
+/// The reader's non-blocking drain, priming the repeat builder per AU.
+struct PrimedDrain<'a> {
+    reader: &'a TapReader,
+    repeats: &'a mut Repeats,
+}
+
+impl Iterator for PrimedDrain<'_> {
+    type Item = TapAu;
+    fn next(&mut self) -> Option<TapAu> {
+        let au = self.reader.try_recv()?;
+        self.repeats.observe(&au);
+        Some(au)
     }
 }
 
@@ -495,10 +531,23 @@ impl PassthroughLive {
     /// One tick: exactly one packet stamped `dts == tick`.
     fn tick(&mut self, tick: u64) -> Result<EncodedPacket, PipelineError> {
         let now = (self.now_ns)();
+        // Every drained AU primes the repeat builder of its generation first
+        // (bounded: the clock takes at most MAX_DRAIN_PER_TICK per tick).
+        let mut primed = PrimedDrain {
+            reader: &self.reader,
+            repeats: &mut self.repeats,
+        };
+        let mut drained: [Option<TapAu>; MAX_DRAIN_PER_TICK] = std::array::from_fn(|_| None);
+        let mut n = 0_usize;
+        for slot in &mut drained {
+            let Some(au) = primed.next() else { break };
+            *slot = Some(au);
+            n += 1;
+        }
         let emission = self.clock.on_tick(
             tick,
             now,
-            self.reader.drain(),
+            drained.iter_mut().take(n).filter_map(Option::take),
             &self.gate,
             &mut self.repeats,
         );
@@ -1071,5 +1120,161 @@ mod tests {
             CodecKind::H264,
             NalFraming::AnnexB
         )));
+    }
+
+    /// x264 Annex B, P-only, GOP 10, AUD on every AU, SPS/PPS only on IDRs.
+    fn x264_aus(frames: u32) -> Vec<Vec<u8>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.h264");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg("testsrc2=size=160x120:rate=25")
+            .args(["-frames:v", &frames.to_string(), "-pix_fmt", "yuv420p"])
+            .args(["-c:v", "libx264", "-preset", "veryfast", "-x264-params"])
+            .arg("aud=1:keyint=10:min-keyint=10:scenecut=0:bframes=0:repeat-headers=1")
+            .args(["-f", "h264"])
+            .arg(&path)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+        let data = std::fs::read(&path).unwrap();
+        // Split at each AUD (00 00 00 01 09).
+        let starts: Vec<usize> = data
+            .windows(5)
+            .enumerate()
+            .filter(|(_, w)| w[..4] == [0, 0, 0, 1] && w[4] & 0x1F == 9)
+            .map(|(i, _)| i)
+            .collect();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(n, &a)| data[a..starts.get(n + 1).copied().unwrap_or(data.len())].to_vec())
+            .collect()
+    }
+
+    /// Frames libav decodes from `aus` (any send/receive error panics).
+    fn decoded_frames<'a>(aus: impl Iterator<Item = &'a [u8]>) -> usize {
+        let mut dec = multiview_ffmpeg::H264PacketDecoder::new(Rational::new(1, 25)).unwrap();
+        let mut frames = 0;
+        for (i, au) in aus.enumerate() {
+            dec.push(au, Some(i64::try_from(i).unwrap())).unwrap();
+            while dec.receive_frame().unwrap().is_some() {
+                frames += 1;
+            }
+        }
+        dec.send_eof().unwrap();
+        while dec.receive_frame().unwrap().is_some() {
+            frames += 1;
+        }
+        frames
+    }
+
+    /// #344 D2a review R1-M-2 / R1-I-1: with a GOP longer than one frame the
+    /// repeat builder is primed from the generation's IDR sets as they pass
+    /// (the clock asks for a repeat after a P, which carries no sets). A
+    /// source 2 % slow drives slow-drift corrections: a NONZERO number of
+    /// repeat AUs, one packet per tick, DTS = tick throughout, and the whole
+    /// emitted sequence (source AUs and repeats) decodes.
+    #[test]
+    fn slow_drift_repeats_with_sets_only_on_idrs_and_decodes() {
+        multiview_ffmpeg::ensure_initialized().unwrap();
+        let aus = x264_aus(300);
+        assert_eq!(aus.len(), 300);
+        assert!(aus.iter().skip(1).take(9).all(|a| idr::h264_nal_of_type(
+            a,
+            NalFraming::AnnexB,
+            7
+        )
+        .is_none()));
+        let tap = CompressedTap::new();
+        let reader = tap.subscribe().unwrap();
+        let now = Arc::new(AtomicU64::new(0));
+        let clock_now = Arc::clone(&now);
+        let slate = slate();
+        let mut live = PassthroughLive::new(
+            PassthroughSpec {
+                cadence: CADENCE,
+                codec: CodecKind::H264,
+                stream_params: None,
+            },
+            reader,
+            &slate,
+            Box::new(move || clock_now.load(Ordering::Acquire)),
+        )
+        .unwrap();
+        let status = live.status();
+        live.start_at(0);
+        // Frame k arrives at k * 1.02 ticks (the source runs 2 % slow).
+        let arrival = |k: usize| u64::try_from(k).unwrap() * TICK_NS * 102 / 100;
+        let canvas = Arc::new(
+            Nv12Image::solid(
+                2,
+                2,
+                16,
+                128,
+                128,
+                multiview_core::color::ColorInfo::default(),
+            )
+            .unwrap(),
+        );
+        let mut next = 0_usize;
+        let mut emitted: Vec<(PassthroughState, Vec<u8>)> = Vec::new();
+        for tick in 0..300_u64 {
+            now.store(tick * TICK_NS, Ordering::Release);
+            while next < aus.len() && arrival(next) <= tick * TICK_NS {
+                let a = &aus[next];
+                let dts = i64::try_from(next).unwrap() * FRAME;
+                tap.offer(TapAu {
+                    data: Arc::from(a.as_slice()),
+                    dts,
+                    pts: dts,
+                    time_base: Rational::new(1, 90_000),
+                    strict_idr: idr::is_self_contained_idr(a, CodecKind::H264, NalFraming::AnnexB),
+                    reference: true,
+                    params_gen: 1,
+                    arrival_ns: arrival(next),
+                });
+                next += 1;
+            }
+            let out = live
+                .encode(BakedTick {
+                    tick,
+                    canvas: Arc::clone(&canvas),
+                })
+                .unwrap();
+            assert_eq!(out.len(), 1, "tick {tick}: one packet");
+            assert_eq!(
+                out[0].dts(),
+                Some(i64::try_from(tick).unwrap()),
+                "DTS = tick"
+            );
+            emitted.push((status.state(), out[0].payload().unwrap().to_vec()));
+        }
+        let repeats = status.repeats.load(Ordering::Relaxed);
+        assert!(repeats > 0, "slow drift corrected with repeats");
+        let first = emitted
+            .iter()
+            .position(|(s, _)| *s == PassthroughState::Passthrough)
+            .unwrap();
+        let run: Vec<&(PassthroughState, Vec<u8>)> = emitted[first..]
+            .iter()
+            .take_while(|(s, _)| *s != PassthroughState::Slate)
+            .collect();
+        assert!(
+            run.len() > 200,
+            "one run through the corrections: {}",
+            run.len()
+        );
+        assert!(run.iter().any(|(s, _)| *s == PassthroughState::Repeat));
+        let frames = decoded_frames(run.iter().map(|(_, au)| au.as_slice()));
+        assert_eq!(frames, run.len(), "every AU and repeat decodes");
     }
 }
