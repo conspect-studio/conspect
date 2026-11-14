@@ -121,7 +121,9 @@ pub(crate) fn signals() -> AuxOverlaySignals {
         .insert("s0".to_owned(), MeterChannels::from_db(&[-3.0, -9.0]));
     out.meters
         .insert("s5".to_owned(), MeterChannels::from_db(&[-20.0]));
-    out.faults.insert("s2".to_owned(), TileFault::Frozen);
+    // The consumer reports faults only for Program's sources (its detector
+    // samples Program's cells): s1 is on Program and FROZEN there.
+    out.faults.insert("s1".to_owned(), TileFault::Frozen);
     out.program.insert("s1".to_owned());
     out
 }
@@ -241,7 +243,10 @@ fn a_newsone_layout_bakes_one_label_meter_flag_and_tally_per_cell() {
     // Flags: the store state compose read (s7's store is missing).
     assert_eq!(d["s0"].state, SourceState::Live);
     assert_eq!(d["s7"].state, SourceState::NoSignal);
-    assert_eq!(d["s2"].fault, TileFault::Frozen);
+    // Program's verdict for its own source; a source off Program shows the
+    // layout's (here clean after one frame).
+    assert_eq!(d["s1"].fault, TileFault::Frozen);
+    assert_eq!(d["s2"].fault, TileFault::None);
     assert_eq!(d["s0"].fault, TileFault::None);
     // Tally: s1 is on Program, nobody else.
     assert_eq!(d["s1"].tally, TileTally::Program);
@@ -523,8 +528,6 @@ fn an_aux_only_black_source_shows_black_after_the_dwell() {
     let mut remote = AuxOverlaySignals::default();
     remote.faults.insert("s5".to_owned(), TileFault::Silent);
     let mut black_at = None;
-    // 60 ticks = 2.4 s: past the 2 s after which the layout's own "clear"
-    // verdict is trusted over the consumer's.
     for i in 0..60i64 {
         let pts = MediaTime::from_nanos(i * 40_000_000);
         for (n, store) in all.iter().enumerate() {
@@ -560,8 +563,9 @@ fn an_aux_only_black_source_shows_black_after_the_dwell() {
         "silence from the snapshot"
     );
 
-    // Once warm, the layout's own picture verdict wins over the snapshot for
-    // a source that is also on Program.
+    // A source NOT on Program shows the layout's own picture verdict, even
+    // over a stale snapshot fault (MR2-1: the snapshot speaks only for
+    // Program's sources, plus silence).
     let mut stale = AuxOverlaySignals::default();
     stale.faults.insert("s1".to_owned(), TileFault::Frozen);
     let pts = MediaTime::from_nanos(61 * 40_000_000);
