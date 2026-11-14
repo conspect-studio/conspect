@@ -192,6 +192,7 @@ fn router(
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
             live_reset: Vec::new(),
+            passthrough: Vec::new(),
         },
         aux,
         open,
@@ -429,6 +430,7 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
             live_reset: Vec::new(),
+            passthrough: Vec::new(),
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -2126,6 +2128,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
             live_reset: Vec::new(),
+            passthrough: Vec::new(),
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -4498,6 +4501,7 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
             formats: Vec::new(),
             boot_retry: BootRetryPolicy::default(),
             live_reset: vec![true; outputs],
+            passthrough: Vec::new(),
             max_aux_canvases: crate::output_routing::DEFAULT_MAX_AUX_CANVASES,
         },
         AuxWiring {

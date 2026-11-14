@@ -485,6 +485,18 @@ pub fn evaluate(
     meter: &StreamMeter,
     slot: &SlotSpec,
 ) -> Result<(), MatchMiss> {
+    evaluate_traits(traits, slot)?;
+    evaluate_measured(meter, slot)
+}
+
+/// The static half of [`evaluate`]: every rule decided by the stream's
+/// declared traits alone (codec .. depth/chroma), in [`evaluate`]'s order.
+/// A plan without 10 s of history uses exactly this (#344 D2b: one
+/// predicate for plan and engine).
+///
+/// # Errors
+/// The first static [`MatchMiss`].
+pub fn evaluate_traits(traits: &SourceTraits, slot: &SlotSpec) -> Result<(), MatchMiss> {
     if traits.codec != slot.codec {
         return Err(MatchMiss::CodecDiffers);
     }
@@ -514,6 +526,12 @@ pub fn evaluate(
     if traits.bit_depth != slot.bit_depth || traits.chroma != slot.chroma {
         return Err(MatchMiss::DepthOrChroma);
     }
+    Ok(())
+}
+
+/// The measured half of [`evaluate`] (GOP, CFR, strict RAPs, bitrate,
+/// B-frames over the meter's window).
+fn evaluate_measured(meter: &StreamMeter, slot: &SlotSpec) -> Result<(), MatchMiss> {
     // A GOP already longer than allowed is decisive with any history.
     if meter.since_last_idr() > slot.max_gop_ticks {
         return Err(MatchMiss::GopTooLong);

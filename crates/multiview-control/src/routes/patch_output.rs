@@ -206,6 +206,7 @@ pub(crate) fn plan(
         });
     };
     let mut planned_path = "P1";
+    let mut passthrough: Option<String> = None;
     let mut cost = None;
     let mut refused: Option<PatchRefusal> = None;
     match resolve_feed(state, principal, &patch.video, layout)? {
@@ -220,6 +221,7 @@ pub(crate) fn plan(
         Ok((feed, _)) => match control.routing.plan_slot(&config_id, &feed) {
             Ok(planned) => {
                 planned_path = planned.path.as_str();
+                passthrough.clone_from(&planned.passthrough);
                 let fits = planned.cost.fits();
                 let global = principal.is_global();
                 cost = Some(SlotCost {
@@ -272,6 +274,7 @@ pub(crate) fn plan(
         crosspoints.push(PlannedCrosspoint {
             destination: xp.destination.clone(),
             path: if video { planned_path } else { "follow" },
+            passthrough: if video { passthrough.clone() } else { None },
             on_air: false,
             cost: if video { cost.clone() } else { None },
             refusal: if video { refused.clone() } else { None },
@@ -378,6 +381,12 @@ pub(crate) async fn outputs_view(
             .and(state.output_routing.as_ref())
             .and_then(|c| c.routing.current_path(&body.id()))
             .map(crate::output_routing::PlanPath::as_str);
+        // #344 D2b: the output's passthrough state (its reasons never name
+        // a source, so no redaction is needed beyond the output axis).
+        let passthrough = readback
+            .and(state.output_routing.as_ref())
+            .and_then(|c| c.routing.current_passthrough(&body.id()))
+            .map(|p| json!({ "state": p.state, "reason": p.reason }));
         // Slot 0 carries the accepted audio feed (default `follow`, redacted
         // per GET /routing's rule); slots i > 0 their configured track.
         let accepted_audio =
@@ -412,6 +421,7 @@ pub(crate) async fn outputs_view(
                 "live": readback.is_some(),
                 "source": video_source,
                 "path": path,
+                "passthrough": passthrough,
                 "pending": pending,
                 "degraded": readback.is_some_and(|r| r.degraded),
             }],

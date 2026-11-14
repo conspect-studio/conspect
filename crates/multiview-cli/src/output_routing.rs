@@ -37,6 +37,11 @@ use crate::rendition_workers::{
 pub use crate::routing_audio::AudioChoice;
 use crate::routing_audio::{AudioTakeProgress, AudioTakeStart};
 use crate::routing_aux::{AuxFeed, AuxFeeds, AuxFormat, LayoutRef, PictureBus, PictureBusSlot};
+pub use passthrough::{
+    static_verdict, PassEligibility, PassHooks, PassOpenFn, PassRequest, PassthroughCounters,
+    PassthroughView, TraitsLookup, MAX_PASSTHROUGH_KEYS, NOT_SUPPORTED_ON_MEDIUM,
+    NO_BRIDGE_SESSION, PASS_OPEN_DEADLINE_TICKS, PASS_RETRY_TICKS,
+};
 pub use sets::{TakeSet, MAX_SET_MEMBERS};
 
 /// Longest accepted `principal` / `operation_id`, in bytes.
@@ -430,6 +435,12 @@ pub struct OutputRouteView {
     /// Whether the output runs a private encoded audio bus now (a take that
     /// changes its audio then costs no new audio encode).
     pub private_audio: bool,
+    /// The §12.4 path the engine knows by itself: `Some("P0")` while the
+    /// output is on a passthrough key (#344 D2b); `None` = an encoded path
+    /// (the control plane tells P1/P2/P3).
+    pub path: Option<String>,
+    /// The output's passthrough state (`None`: no candidate, not eligible).
+    pub passthrough: Option<PassthroughView>,
 }
 
 /// Wait-free routing state, written by the consumer only on change.
@@ -489,6 +500,10 @@ pub struct RoutingSnapshot {
     /// Sets whose mixer half committed but whose output members were then
     /// refused (an encoder died after the commit, §12.8 residual fault).
     pub set_partial: u64,
+    /// Passthrough (P0) keys and their counters (#344 D2b): keys live, AUs,
+    /// repeats, drift drops, stalls, slate ticks, bridges. A passthrough key
+    /// is never an encoder session (not in `dynamic_encoders_live`).
+    pub passthrough: PassthroughCounters,
 }
 
 /// The control-plane handle (clone freely).
@@ -519,6 +534,11 @@ pub struct OutputRoutingHandle {
     /// [`OutputRoutingHandle::with_pictures`].
     pictures: Option<PlanPictures>,
     max_aux_canvases: usize,
+    /// Per output: its passthrough eligibility (#344 D2b), the plan's half
+    /// of the one shared predicate.
+    passthrough: Arc<[PassEligibility]>,
+    /// The source traits lookup the plan's static match reads (#344 D2b).
+    pass_traits: Option<TraitsLookup>,
 }
 
 /// What the plan reads to tell an identity picture (P2) from a convert
@@ -697,6 +717,27 @@ impl OutputRoutingHandle {
     #[must_use]
     pub fn outputs(&self) -> &[RunOutput] {
         &self.outputs
+    }
+
+    /// Output `index`'s passthrough eligibility (#344 D2b).
+    #[must_use]
+    pub fn passthrough(&self, index: usize) -> &PassEligibility {
+        self.passthrough
+            .get(index)
+            .unwrap_or(&PassEligibility::NotSupported)
+    }
+
+    /// The static half of the passthrough predicate for `source` onto
+    /// output `index` (#344 D2b; wait-free): the router runs the same
+    /// [`static_verdict`] before it opens a candidate.
+    ///
+    /// # Errors
+    /// The first miss as its readback string.
+    pub fn passthrough_static(&self, index: usize, source: &str) -> Result<(), &'static str> {
+        static_verdict(
+            self.passthrough(index),
+            self.pass_traits.as_ref().and_then(|t| t(source)),
+        )
     }
 
     /// Whether the run has an M/E (Preview is routable).
@@ -904,6 +945,9 @@ pub struct RouterConfig {
     /// discontinuity. SRT/RIST (one session muxer) and every other kind are
     /// restart-pending (follow-up #380). Missing = `false`.
     pub live_reset: Vec<bool>,
+    /// Per output: its passthrough (P0) eligibility (#344 D2b). Missing =
+    /// not supported on its medium.
+    pub passthrough: Vec<PassEligibility>,
 }
 
 /// How a refused start-up (boot) take is retried: re-issued at most once per
@@ -963,11 +1007,16 @@ pub struct OpenRequest {
     /// Ad-hoc settings of a live format reset (#342 B3): opened instead of
     /// the rendition at `settings`.
     pub reformat: Option<ReformatSettings>,
+    /// A passthrough key's open (#344 D2b): opened by the passthrough
+    /// opener instead of an encoder.
+    pub passthrough: Option<PassRequest>,
 }
 
 struct OpenResult {
     id: u64,
     encoder: Result<Box<dyn LiveEncoder>, String>,
+    /// A passthrough key's status (its open only).
+    status: Option<Arc<crate::passthrough_live::PassthroughStatus>>,
 }
 
 enum Reap {
@@ -1038,6 +1087,9 @@ struct PendingOpen {
     principal: String,
     deadline: u64,
     waiter: Option<usize>,
+    /// An on-demand picture bridge for this output's passthrough key
+    /// (#344 D2b): registered with no take waiting.
+    bridge_for: Option<usize>,
 }
 
 /// One message on the take mailbox.
@@ -1089,6 +1141,9 @@ struct OutputState {
     pending: Option<Pending>,
     /// A live format reset in flight (at most one per output, #342 B3).
     reformat: Option<ReformatState>,
+    /// The principal whose take patched the output's current feed (#344
+    /// D2b: an on-demand picture bridge is charged to it).
+    principal: Option<String>,
 }
 
 /// One live format reset's progress.
@@ -1198,6 +1253,8 @@ pub struct OutputRouter {
     /// concurrent producer refills the mailbox from here).
     #[cfg(test)]
     drain_hook: Option<Box<dyn FnMut() + Send>>,
+    /// Passthrough (P0) candidates and keys (#344 D2b).
+    pass: passthrough::PassState,
 }
 
 /// The router's start-up (boot) take state, O(outputs).
@@ -1252,13 +1309,33 @@ impl OutputRouter {
         open: BusOpenFn,
         reformat_open: Option<ReformatOpenFn>,
     ) -> std::io::Result<(Self, OutputRoutingHandle)> {
+        Self::new_with_passthrough(cfg, aux, open, reformat_open, None)
+    }
+
+    /// [`Self::new_with_openers`] plus the passthrough key opener (#344 D2b;
+    /// `None`: no output is ever put on P0). It runs on the same
+    /// `routing-open` thread (the format slate is baked there).
+    ///
+    /// # Errors
+    /// The OS error if a helper thread cannot be spawned.
+    #[allow(clippy::too_many_lines)]
+    pub fn new_with_passthrough(
+        cfg: RouterConfig,
+        aux: AuxWiring,
+        open: BusOpenFn,
+        reformat_open: Option<ReformatOpenFn>,
+        pass: Option<PassHooks>,
+    ) -> std::io::Result<(Self, OutputRoutingHandle)> {
         let (take_tx, takes) = mpsc::sync_channel(TAKE_MAILBOX);
         let (reformat_tx, reformats) = mpsc::sync_channel(REFORMAT_MAILBOX);
         let layout_changes: LayoutInbox = Arc::new(Mutex::new(InboxState::default()));
         let layout_tx = Arc::clone(&layout_changes);
         let (outcomes, outcome_rx) = mpsc::sync_channel(OUTCOME_CAPACITY);
         let can_reformat = reformat_open.is_some();
-        let (open_tx, open_rx) = spawn_opener(open, reformat_open)?;
+        let (pass_open, pass_traits) =
+            pass.map_or((None, None), |h| (Some(h.open), Some(h.traits)));
+        let can_pass = pass_open.is_some();
+        let (open_tx, open_rx) = spawn_opener(open, reformat_open, pass_open)?;
         let (reap_tx, reap_rx) = mpsc::sync_channel::<Reap>(REAPER_QUEUE);
         let reaper = std::thread::Builder::new()
             .name("routing-reaper".to_owned())
@@ -1286,6 +1363,7 @@ impl OutputRouter {
                 since: 0,
                 pending: None,
                 reformat: None,
+                principal: None,
             })
             .collect();
         let snapshot = Arc::new(SwapCell::from_pointee(RoutingSnapshot::default()));
@@ -1305,7 +1383,14 @@ impl OutputRouter {
             has_preview: cfg.has_preview,
             pictures: None,
             max_aux_canvases: cfg.max_aux_canvases,
+            passthrough: Arc::from(if can_pass {
+                cfg.passthrough.clone()
+            } else {
+                Vec::new()
+            }),
+            pass_traits: pass_traits.clone(),
         };
+        let pass = passthrough::PassState::new(pass_traits);
         let mut router = Self {
             cfg,
             aux,
@@ -1354,6 +1439,7 @@ impl OutputRouter {
             takes_drained: 0,
             #[cfg(test)]
             drain_hook: None,
+            pass,
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -1583,7 +1669,9 @@ impl OutputRouter {
         self.advance_takes(tick, pts, dispatcher);
         self.advance_sets(tick, dispatcher);
         self.advance_reformats(tick, dispatcher);
+        self.advance_passthrough(tick, dispatcher);
         self.feed(tick, dispatcher);
+        self.feed_passthrough(tick, dispatcher);
         self.check_aux(tick, dispatcher);
         self.linger(tick, dispatcher);
         self.sync_feeds();
@@ -1624,6 +1712,7 @@ impl OutputRouter {
         for key in lost {
             self.close(key, dispatcher);
         }
+        self.close_lost_passthrough(dispatcher);
         if let Some(audio) = self.audio.as_mut() {
             let before = (audio.private_buses(), audio.counters());
             audio.drain(dispatcher, delivery)?;
@@ -1642,20 +1731,22 @@ impl OutputRouter {
                 | DispatchEvent::FinishVideo { key_index, .. } => Some(*key_index),
                 DispatchEvent::Audio { .. } | DispatchEvent::FinishAudio { .. } => None,
             };
-            let Some(d) = self
+            let video = matches!(event, DispatchEvent::Video { .. });
+            if let Some(d) = self
                 .dynamic
                 .iter_mut()
                 .find(|d| d.generation == generation && Some(d.key) == key_index)
-            else {
+            {
+                if video {
+                    d.seen_event = true;
+                }
+                d.silent = 0;
+            } else if !self.pass.saw_event(generation, key_index, video) {
                 // A closed worker's late event (its slot may be reused), or an
                 // event whose key index does not match its worker's key.
                 self.dyn_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
-            };
-            if matches!(event, DispatchEvent::Video { .. }) {
-                d.seen_event = true;
             }
-            d.silent = 0;
             if let Err(e) = dispatcher.dispatch(event, Instant::now(), delivery) {
                 if !matches!(e, DispatchError::Admission { .. }) {
                     return Err(e);
@@ -2104,6 +2195,9 @@ impl OutputRouter {
             }
         }
         self.supersede(index, tick, dispatcher);
+        if let Some(bus) = take.bus.as_ref() {
+            self.pass_take_started(index, bus);
+        }
         let audio_only = take.bus.is_none();
         let Some(out) = self.outputs.get_mut(index) else {
             return;
@@ -2257,6 +2351,9 @@ impl OutputRouter {
         if let Some(d) = self.dynamic.iter().find(|d| d.key == key) {
             return Some(d.bus.clone());
         }
+        if let Some(bus) = self.pass.bus_of_key(key) {
+            return Some(bus);
+        }
         self.cfg
             .base_keys
             .contains(&key)
@@ -2291,6 +2388,10 @@ impl OutputRouter {
 
     fn drain_opens(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         while let Ok(result) = self.open_rx.try_recv() {
+            if self.pass.owns_open(result.id) {
+                self.passthrough_opened(result.id, result.encoder, result.status, tick, dispatcher);
+                continue;
+            }
             let Some(open) = self.opens.remove(&result.id) else {
                 // Late (deadline passed): never used.
                 if let Ok(encoder) = result.encoder {
@@ -2303,17 +2404,30 @@ impl OutputRouter {
                 self.reformat_opened(result.id, &open, result.encoder, tick, dispatcher);
                 continue;
             }
+            if let Some(index) = open.bridge_for {
+                let key = match result.encoder {
+                    Ok(encoder) if tick < open.deadline => {
+                        self.register_live_key(&open, encoder, tick, dispatcher)
+                    }
+                    Ok(encoder) => {
+                        self.reap(Reap::Encoder(encoder));
+                        None
+                    }
+                    Err(_) => None,
+                };
+                self.bridge_opened(index, key, tick);
+                continue;
+            }
             let waiter = open.waiter;
             let refuse = |router: &mut Self, dispatcher: &mut RenditionDispatcher| {
                 if let Some(index) = waiter {
                     router.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                 }
             };
-            let Ok(mut encoder) = result.encoder else {
+            let Ok(encoder) = result.encoder else {
                 refuse(self, dispatcher);
                 continue;
             };
-            let tb = encoder.time_base();
             // Register the key only while the take still waits for exactly
             // this open within its deadline; otherwise the encoder never
             // takes a dispatcher slot.
@@ -2330,63 +2444,10 @@ impl OutputRouter {
                 }
                 continue;
             };
-            encoder.start_at(tick);
-            let gate = encoder.move_gate();
-            let Ok(key) = dispatcher.add_video_key(
-                DtsTimeBase {
-                    num: tb.num,
-                    den: tb.den,
-                },
-                gate,
-            ) else {
-                self.reap(Reap::Encoder(encoder));
+            let Some(key) = self.register_live_key(&open, encoder, tick, dispatcher) else {
                 refuse(self, dispatcher);
                 continue;
             };
-            if let Some(params) = encoder.parameter_sets() {
-                let _ = dispatcher.set_parameter_sets(key, params);
-            }
-            let force_at = Arc::new(AtomicU64::new(NO_FORCE));
-            let worker = GapFill {
-                inner: encoder,
-                force_at: Arc::clone(&force_at),
-                next: None,
-                last: None,
-            };
-            let lost = Arc::new(AtomicBool::new(false));
-            let generation = self.next_generation;
-            self.next_generation = self.next_generation.wrapping_add(1);
-            let spawned =
-                self.spawn_live_worker(key, generation, tb, Box::new(worker), Arc::clone(&lost));
-            let Ok(worker) = spawned else {
-                let _ = dispatcher.retire_video_key(key);
-                refuse(self, dispatcher);
-                continue;
-            };
-            self.last_forced.insert(key, tick);
-            self.dynamic.push(DynamicKey {
-                bus: open.bus,
-                format: open.format,
-                settings: open.settings,
-                reset: open.reset,
-                reformat: false,
-                pinned_for: None,
-                key,
-                worker: Some(worker),
-                force_at,
-                principal: open.principal,
-                linger_deadline: None,
-                lingering_since: tick,
-                last_fed: None,
-                last_aux_tick: None,
-                seen_event: false,
-                lost,
-                generation,
-                silent: 0,
-                starved: 0,
-                refused_this_tick: false,
-                reported_degraded: false,
-            });
             // The first offer (frame T, an IDR) is made by `feed` this same
             // tick, after the key exists. The move is requested once the key's
             // first window has been dispatched (see `Phase::Warming`).
@@ -2397,6 +2458,75 @@ impl OutputRouter {
                 };
             }
         }
+    }
+
+    /// Register an opened live encoder as a dynamic key (dispatcher key,
+    /// worker, linger state) and return its dispatcher key; `None` when it
+    /// could not be registered (the encoder is reaped).
+    fn register_live_key(
+        &mut self,
+        open: &PendingOpen,
+        mut encoder: Box<dyn LiveEncoder>,
+        tick: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) -> Option<usize> {
+        let tb = encoder.time_base();
+        encoder.start_at(tick);
+        let gate = encoder.move_gate();
+        let Ok(key) = dispatcher.add_video_key(
+            DtsTimeBase {
+                num: tb.num,
+                den: tb.den,
+            },
+            gate,
+        ) else {
+            self.reap(Reap::Encoder(encoder));
+            return None;
+        };
+        if let Some(params) = encoder.parameter_sets() {
+            let _ = dispatcher.set_parameter_sets(key, params);
+        }
+        let force_at = Arc::new(AtomicU64::new(NO_FORCE));
+        let worker = GapFill {
+            inner: encoder,
+            force_at: Arc::clone(&force_at),
+            next: None,
+            last: None,
+        };
+        let lost = Arc::new(AtomicBool::new(false));
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let spawned =
+            self.spawn_live_worker(key, generation, tb, Box::new(worker), Arc::clone(&lost));
+        let Ok(worker) = spawned else {
+            let _ = dispatcher.retire_video_key(key);
+            return None;
+        };
+        self.last_forced.insert(key, tick);
+        self.dynamic.push(DynamicKey {
+            bus: open.bus.clone(),
+            format: open.format,
+            settings: open.settings,
+            reset: open.reset.clone(),
+            reformat: false,
+            pinned_for: None,
+            key,
+            worker: Some(worker),
+            force_at,
+            principal: open.principal.clone(),
+            linger_deadline: None,
+            lingering_since: tick,
+            last_fed: None,
+            last_aux_tick: None,
+            seen_event: false,
+            lost,
+            generation,
+            silent: 0,
+            starved: 0,
+            refused_this_tick: false,
+            reported_degraded: false,
+        });
+        Some(key)
     }
 
     /// An open whose take was superseded (no waiter) and whose result never
@@ -2512,6 +2642,9 @@ impl OutputRouter {
         if self.reformat_move_refused(output_index, tick, dispatcher) {
             return;
         }
+        if self.passthrough_move_refused(output_index, tick) {
+            return;
+        }
         let moving = self
             .outputs
             .get(output_index)
@@ -2543,6 +2676,9 @@ impl OutputRouter {
                     if self.reformat_applied(output_index, key, at, dispatcher) {
                         continue;
                     }
+                    if self.passthrough_applied(output_index, key, at, dispatcher) {
+                        continue;
+                    }
                     let Some(out) = self.outputs.get_mut(output_index) else {
                         continue;
                     };
@@ -2552,6 +2688,7 @@ impl OutputRouter {
                             let scheduled = p.take.bus.clone();
                             if let Some(bus) = p.take.bus.clone() {
                                 out.bus = bus;
+                                out.principal = Some(p.take.principal.clone());
                             }
                             out.key = key;
                             out.since = at;
@@ -2594,6 +2731,7 @@ impl OutputRouter {
                     self.dirty = true;
                 }
                 MoveOutcome::Fallback { output_index } => {
+                    self.pass_fell_back(output_index, dispatcher);
                     if let Some(out) = self.outputs.get_mut(output_index) {
                         out.bus = PictureBus::Program;
                         out.key = self
@@ -3066,6 +3204,7 @@ impl OutputRouter {
             settings,
             bus: bus.clone(),
             reformat: reset.clone(),
+            passthrough: None,
         }) {
             Ok(()) => {
                 self.opens.insert(
@@ -3079,6 +3218,7 @@ impl OutputRouter {
                         principal: principal.to_owned(),
                         deadline: tick.saturating_add(OPEN_DEADLINE_TICKS),
                         waiter: Some(index),
+                        bridge_for: None,
                     },
                 );
                 if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.as_mut()) {
@@ -3438,6 +3578,8 @@ impl OutputRouter {
                     .as_ref()
                     .map_or_else(|| "follow".to_owned(), |a| a.choice(i).label()),
                 private_audio: self.audio.as_ref().is_some_and(|a| a.has_private_bus(i)),
+                path: self.pass.on_key(i, o.key).then(|| "P0".to_owned()),
+                passthrough: self.pass.view(i),
             })
             .collect();
         let next = RoutingSnapshot {
@@ -3469,6 +3611,7 @@ impl OutputRouter {
             aux_halved: self.aux.halved.load(Ordering::Relaxed),
             sets_pending: self.sets.active.len(),
             set_partial: self.sets.partial,
+            passthrough: self.pass.counters(),
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));
@@ -3647,6 +3790,7 @@ impl OutputRouter {
         for key in keys {
             self.close(key, dispatcher);
         }
+        self.close_all_passthrough(dispatcher);
         if let Some(audio) = self.audio.as_mut() {
             audio.shutdown(dispatcher);
         }
@@ -3699,6 +3843,7 @@ fn feed_order(key: &FeedKey) -> (String, Option<(u32, u32, String)>) {
 fn spawn_opener(
     mut open: BusOpenFn,
     mut reformat_open: Option<ReformatOpenFn>,
+    mut pass_open: Option<PassOpenFn>,
 ) -> std::io::Result<(SyncSender<OpenRequest>, Receiver<OpenResult>)> {
     let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
     let (open_res_tx, open_rx) = mpsc::sync_channel::<OpenResult>(OPEN_QUEUE);
@@ -3706,6 +3851,30 @@ fn spawn_opener(
         .name("routing-open".to_owned())
         .spawn(move || {
             while let Ok(req) = open_req_rx.recv() {
+                if let Some(pass) = req.passthrough.as_ref() {
+                    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        pass_open.as_mut().map_or_else(
+                            || Err("no passthrough opener".to_owned()),
+                            |open| open(pass),
+                        )
+                    }))
+                    .unwrap_or_else(|_| Err("passthrough open panicked".to_owned()));
+                    let (encoder, status) = match opened {
+                        Ok((encoder, status)) => (Ok(encoder), Some(status)),
+                        Err(e) => (Err(e), None),
+                    };
+                    if open_res_tx
+                        .send(OpenResult {
+                            id: req.id,
+                            encoder,
+                            status,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 let encoder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     match (&req.reformat, reformat_open.as_mut()) {
                         (Some(settings), Some(reformat_open)) => reformat_open(settings, &req.bus),
@@ -3718,6 +3887,7 @@ fn spawn_opener(
                     .send(OpenResult {
                         id: req.id,
                         encoder,
+                        status: None,
                     })
                     .is_err()
                 {
@@ -3743,6 +3913,9 @@ mod sets;
 #[path = "output_routing_reformat.rs"]
 mod reformat;
 
+#[path = "output_routing_passthrough.rs"]
+mod passthrough;
+
 #[cfg(test)]
 #[path = "output_routing_tests.rs"]
 mod tests;
@@ -3750,3 +3923,7 @@ mod tests;
 #[cfg(test)]
 #[path = "output_routing_pipeline_tests.rs"]
 mod pipeline_tests;
+
+#[cfg(test)]
+#[path = "output_routing_passthrough_tests.rs"]
+mod passthrough_tests;

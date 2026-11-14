@@ -580,6 +580,7 @@ impl OutputRouter {
             settings,
             bus: bus.clone(),
             reformat: reset.clone(),
+            passthrough: None,
         }) {
             Ok(()) => {
                 if let Some(s) = self.sets.active.iter_mut().find(|s| s.id == group) {
@@ -596,6 +597,7 @@ impl OutputRouter {
                         principal: principal.to_owned(),
                         deadline: tick.saturating_add(OPEN_DEADLINE_TICKS),
                         waiter: Some(index),
+                        bridge_for: None,
                     },
                 );
                 if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.as_mut()) {

@@ -43,8 +43,8 @@ use multiview_ffmpeg::idr::{self, CodecKind, NalFraming, ParameterSetScan, RapPa
 use multiview_ffmpeg::EncodedPacket;
 use multiview_output::passthrough::clock::MAX_DRAIN_PER_TICK;
 use multiview_output::passthrough::{
-    BridgeReason, ClockState, Emission, PassthroughClock, RepeatSource, SlateLoop, SlotGate, TapAu,
-    TapReader, MAX_AU_BYTES,
+    evaluate, BridgeReason, ClockState, Emission, MatchMiss, PassthroughClock, RepeatSource,
+    SlateLoop, SlotGate, SlotSpec, SourceTraits, StreamMeter, TapAu, TapReader, MAX_AU_BYTES,
 };
 
 use crate::output_routing::LiveEncoder;
@@ -160,6 +160,66 @@ pub struct PassthroughStatus {
     pub param_changes: AtomicU64,
     /// AUs dropped by drift corrections.
     pub drift_drops: AtomicU64,
+    /// The match verdict of the key's meter (D2b): 0 = not evaluated (no
+    /// matcher), 1 = matches, else a [`MatchMiss`] code ([`miss_code`]).
+    verdict: AtomicU8,
+    /// Runs may start only at a tick at or after this one (D2b router
+    /// control; 0 = always, `u64::MAX` = never). A run start is a move
+    /// point, so the router lets one happen only after it asked the
+    /// dispatcher for the move (a run that started earlier is never one).
+    allow_from: AtomicU64,
+    /// Consecutive on-time ticks seen by the clock's stability probe.
+    stable: AtomicU32,
+    /// The parameter generation of the last run (0 = none yet).
+    run_gen: AtomicU64,
+    /// The parameter generation of the newest AU drained.
+    latest_gen: AtomicU64,
+    /// Re-arm requests (D2b): the key drops a run nobody reads so that the
+    /// next strict IDR starts a new run (a move point).
+    rearm: AtomicU64,
+}
+
+/// The wire code of a [`MatchMiss`] on [`PassthroughStatus`] (2..).
+#[must_use]
+pub const fn miss_code(miss: MatchMiss) -> u8 {
+    match miss {
+        MatchMiss::NotCfr => 2,
+        MatchMiss::CodecDiffers => 3,
+        MatchMiss::ProfileAbove => 4,
+        MatchMiss::LevelAbove => 5,
+        MatchMiss::SizeDiffers => 6,
+        MatchMiss::RateDiffers => 7,
+        MatchMiss::ScanDiffers => 8,
+        MatchMiss::ColourDiffers => 9,
+        MatchMiss::DepthOrChroma => 10,
+        MatchMiss::GopTooLong => 11,
+        MatchMiss::BitrateAbove => 12,
+        MatchMiss::BFramesNotAllowed => 13,
+        MatchMiss::NoStrictRap => 14,
+        MatchMiss::NotEnoughHistory => 15,
+    }
+}
+
+/// The [`MatchMiss`] of a [`miss_code`].
+#[must_use]
+pub const fn miss_from_code(code: u8) -> Option<MatchMiss> {
+    Some(match code {
+        2 => MatchMiss::NotCfr,
+        3 => MatchMiss::CodecDiffers,
+        4 => MatchMiss::ProfileAbove,
+        5 => MatchMiss::LevelAbove,
+        6 => MatchMiss::SizeDiffers,
+        7 => MatchMiss::RateDiffers,
+        8 => MatchMiss::ScanDiffers,
+        9 => MatchMiss::ColourDiffers,
+        10 => MatchMiss::DepthOrChroma,
+        11 => MatchMiss::GopTooLong,
+        12 => MatchMiss::BitrateAbove,
+        13 => MatchMiss::BFramesNotAllowed,
+        14 => MatchMiss::NoStrictRap,
+        15 => MatchMiss::NotEnoughHistory,
+        _ => return None,
+    })
 }
 
 impl PassthroughStatus {
@@ -185,6 +245,55 @@ impl PassthroughStatus {
     #[must_use]
     pub fn last_tick(&self) -> u64 {
         self.last_tick.load(Ordering::Acquire)
+    }
+
+    /// The meter's verdict: `None` before the first evaluation (or with no
+    /// matcher), `Some(Ok(()))` when the source matches the slot.
+    #[must_use]
+    pub fn verdict(&self) -> Option<Result<(), MatchMiss>> {
+        match self.verdict.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(Ok(())),
+            code => Some(Err(
+                miss_from_code(code).unwrap_or(MatchMiss::NotEnoughHistory)
+            )),
+        }
+    }
+
+    /// Let runs start from tick `tick` on (`u64::MAX`: none).
+    pub fn allow_runs_from(&self, tick: u64) {
+        self.allow_from.store(tick, Ordering::Release);
+    }
+
+    /// Ask the key to end its current run and wait for the next strict IDR
+    /// (a fresh run start, i.e. a move point). Only for a key no output
+    /// reads: the router never re-arms a subscribed key.
+    pub fn request_rearm(&self) {
+        self.rearm.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The tick runs may start from.
+    #[must_use]
+    pub fn runs_allowed_from(&self) -> u64 {
+        self.allow_from.load(Ordering::Acquire)
+    }
+
+    /// Consecutive on-time ticks of the source (the clock's probe).
+    #[must_use]
+    pub fn stable_ticks(&self) -> u32 {
+        self.stable.load(Ordering::Acquire)
+    }
+
+    /// The parameter generation of the last run (0 = none).
+    #[must_use]
+    pub fn run_gen(&self) -> u64 {
+        self.run_gen.load(Ordering::Acquire)
+    }
+
+    /// The parameter generation of the newest AU the key drained.
+    #[must_use]
+    pub fn latest_gen(&self) -> u64 {
+        self.latest_gen.load(Ordering::Acquire)
     }
 }
 
@@ -326,15 +435,29 @@ pub struct PassthroughSpec {
 /// The slot gate a key uses until D2b's router supplies the match verdict:
 /// parameters match when the key is told so ([`PassthroughLive::set_matching`]),
 /// and the matched slate is the format slate, ready from open.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct KeyGate {
     /// `params_gen` values that match the slot (`None` = every generation).
     matching: Option<u64>,
+    /// This tick's meter verdict (`true` with no matcher).
+    verdict_ok: bool,
+    /// Whether a run may start this tick ([`PassthroughStatus::allow_runs_from`]).
+    allowed: bool,
+}
+
+impl Default for KeyGate {
+    fn default() -> Self {
+        Self {
+            matching: None,
+            verdict_ok: true,
+            allowed: true,
+        }
+    }
 }
 
 impl SlotGate for KeyGate {
     fn matches(&self, gen: u64) -> bool {
-        self.matching.is_none_or(|m| m == gen)
+        self.allowed && self.verdict_ok && self.matching.is_none_or(|m| m == gen)
     }
     fn matched_slate_ready(&self, _gen: u64) -> bool {
         true
@@ -420,6 +543,23 @@ impl Iterator for PrimedDrain<'_> {
 /// A source of monotonic nanoseconds for the clock (the run's time source).
 pub type NowNs = Box<dyn Fn() -> u64 + Send>;
 
+/// The current stream traits of the key's source (wait-free; `None` while
+/// the source has no connection).
+pub type TraitsFn = Box<dyn Fn() -> Option<SourceTraits> + Send>;
+
+/// The D2b match rules on the key's own worker: every drained AU feeds the
+/// meter, and the shared predicate [`evaluate`] is re-run at most once per
+/// [`VERDICT_EVERY`] ticks (bounded work per tick).
+struct Matcher {
+    slot: SlotSpec,
+    traits: TraitsFn,
+    meter: StreamMeter,
+    last_eval: Option<u64>,
+}
+
+/// Ticks between two verdict evaluations.
+pub const VERDICT_EVERY: u64 = 5;
+
 /// The passthrough routing key. See the [module docs](self).
 pub struct PassthroughLive {
     cadence: Rational,
@@ -436,6 +576,13 @@ pub struct PassthroughLive {
     stream_params: Option<multiview_ffmpeg::StreamCodecParameters>,
     /// The next tick `encode` must see (strictly increasing).
     next: Option<u64>,
+    /// The match rules (D2b; `None` = the gate's `matching` only).
+    matcher: Option<Matcher>,
+    /// Whether a slate IDR is a move point (D2a default `true`; the router's
+    /// keys move only at run starts).
+    slate_raps: bool,
+    /// The last re-arm request served.
+    rearm_seen: u64,
 }
 
 impl std::fmt::Debug for PassthroughLive {
@@ -497,7 +644,31 @@ impl PassthroughLive {
             now_ns,
             stream_params: spec.stream_params,
             next: None,
+            matcher: None,
+            slate_raps: true,
+            rearm_seen: 0,
         })
+    }
+
+    /// Evaluate the §12.5 match rules on this key's own meter against `slot`
+    /// (D2b): a run starts only while they pass. The verdict is published
+    /// on the status ([`PassthroughStatus::verdict`]).
+    #[must_use]
+    pub fn with_matcher(mut self, slot: SlotSpec, traits: TraitsFn) -> Self {
+        self.matcher = Some(Matcher {
+            slot,
+            traits,
+            meter: StreamMeter::new(),
+            last_eval: None,
+        });
+        self
+    }
+
+    /// Whether the slate's IDR is a move point (default `true`).
+    #[must_use]
+    pub fn with_slate_move_points(mut self, on: bool) -> Self {
+        self.slate_raps = on;
+        self
     }
 
     /// The key's lock-free status.
@@ -531,6 +702,12 @@ impl PassthroughLive {
     /// One tick: exactly one packet stamped `dts == tick`.
     fn tick(&mut self, tick: u64) -> Result<EncodedPacket, PipelineError> {
         let now = (self.now_ns)();
+        let rearm = self.status.rearm.load(Ordering::Acquire);
+        if rearm != self.rearm_seen {
+            self.rearm_seen = rearm;
+            self.clock.disarm();
+            self.clock.arm();
+        }
         // Every drained AU primes the repeat builder of its generation first
         // (bounded: the clock takes at most MAX_DRAIN_PER_TICK per tick).
         let mut primed = PrimedDrain {
@@ -544,6 +721,29 @@ impl PassthroughLive {
             *slot = Some(au);
             n += 1;
         }
+        if let Some(last) = drained.iter().take(n).filter_map(Option::as_ref).last() {
+            self.status
+                .latest_gen
+                .store(last.params_gen, Ordering::Release);
+        }
+        if let Some(m) = self.matcher.as_mut() {
+            for au in drained.iter().take(n).filter_map(Option::as_ref) {
+                m.meter
+                    .push(au.dts, au.pts, au.data.len(), au.strict_idr, au.time_base);
+            }
+            if m.last_eval
+                .is_none_or(|t| tick.saturating_sub(t) >= VERDICT_EVERY)
+            {
+                m.last_eval = Some(tick);
+                let verdict = (m.traits)().map_or(Err(MatchMiss::NotEnoughHistory), |traits| {
+                    evaluate(&traits, &m.meter, &m.slot)
+                });
+                self.gate.verdict_ok = verdict.is_ok();
+                let code = verdict.map_or_else(miss_code, |()| 1);
+                self.status.verdict.store(code, Ordering::Release);
+            }
+        }
+        self.gate.allowed = tick >= self.status.allow_from.load(Ordering::Acquire);
         let emission = self.clock.on_tick(
             tick,
             now,
@@ -557,6 +757,7 @@ impl PassthroughLive {
         s.stalls.store(c.stalls, Ordering::Relaxed);
         s.param_changes.store(c.param_changes, Ordering::Relaxed);
         s.drift_drops.store(c.drift_drops, Ordering::Relaxed);
+        s.stable.store(self.clock.stable_ticks(), Ordering::Release);
         s.last_tick.store(tick, Ordering::Release);
         let depth = u32::try_from(self.clock.last_depth()).unwrap_or(u32::MAX);
         let (packet, state, reason, delay) = match emission {
@@ -566,7 +767,7 @@ impl PassthroughLive {
                 pts,
                 keyframe,
                 run_start,
-                ..
+                params_gen,
             } => {
                 self.on_slate = false;
                 if run_start
@@ -574,6 +775,9 @@ impl PassthroughLive {
                     && idr::is_self_contained_idr(&data, self.codec, NalFraming::AnnexB)
                 {
                     self.raps.record(dts);
+                }
+                if run_start {
+                    s.run_gen.store(params_gen, Ordering::Release);
                 }
                 s.aus.fetch_add(1, Ordering::Relaxed);
                 (
@@ -607,7 +811,7 @@ impl PassthroughLive {
                         reason: "slate stamp".to_owned(),
                     })?;
                 s.slate_ticks.fetch_add(1, Ordering::Relaxed);
-                if au.keyframe {
+                if au.keyframe && self.slate_raps {
                     self.raps.record(au.dts);
                 }
                 (

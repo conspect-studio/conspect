@@ -231,6 +231,7 @@ impl OutputRouting for Fake {
                 ..cost
             },
             converts,
+            passthrough: None,
         })
     }
     fn plan_audio(

@@ -99,6 +99,7 @@ impl OutputRouter {
                 settings,
                 bus: bus.clone(),
                 reformat: Some(req.settings.clone()),
+                passthrough: None,
             }) {
                 Ok(()) => {
                     self.opens.insert(
@@ -114,6 +115,7 @@ impl OutputRouter {
                             // A reformat's open is waited for by the
                             // reformat, not a take.
                             waiter: None,
+                            bridge_for: None,
                         },
                     );
                     if let Some(out) = self.outputs.get_mut(index) {
