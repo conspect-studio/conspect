@@ -283,11 +283,23 @@ mod tests {
         assert_eq!((to_tile_size(to_tile)), tile);
         let image = to_tile.convert(&nv12, tag()).unwrap();
         let layout = alpha_layout(frame.format()).expect("alpha format");
-        let source = AlphaSource {
-            frame: frame.clone(),
-            layout,
-        };
-        alpha.attach(image, &source).unwrap()
+        alpha.attach(image, &checked_source(frame, layout)).unwrap()
+    }
+
+    /// The decoder's alpha frame as an [`AlphaSource`]. Outside
+    /// `multiview-ffmpeg` an `AlphaSource` can only wrap a checked
+    /// [`ScratchFrame`] (review PB-14: an arbitrary `Video`'s geometry may
+    /// have been widened over unwritten bytes), so copy the test frame into
+    /// one with libav (`Scaler` identity, `av_frame_copy`): the same pixels
+    /// at the same format and size a decoder would hand over.
+    fn checked_source(frame: &Video, layout: AlphaLayout) -> AlphaSource {
+        let spec = ScaleSpec::new(frame.format(), frame.width(), frame.height());
+        let mut scratch = ScratchFrame::alloc(spec.format, spec.width, spec.height).unwrap();
+        Scaler::new(spec, spec)
+            .unwrap()
+            .run_into(frame, &mut scratch)
+            .unwrap();
+        AlphaSource::from_checked(scratch, layout)
     }
 
     fn to_tile_size(t: &super::super::TileScaler) -> (u32, u32) {
