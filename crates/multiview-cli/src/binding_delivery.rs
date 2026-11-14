@@ -513,10 +513,68 @@ impl BindingDelivery {
                         if step == PumpStep::Abandon {
                             // The sink hung up or (for a sink that must not
                             // lose a packet) stopped draining for the whole
-                            // grace: this binding is finished. The lease is
-                            // dropped (releasing its reservation) and the
-                            // pump ends; no other binding is affected.
+                            // grace: this binding is finished. Mark it wedged
+                            // immediately so every subsequent `admit`/
+                            // `pump_binding` call observes `failed` and stops
+                            // handing this pump any further lease (see
+                            // `pump_binding`'s `binding.failed` branch).
                             pump_wedged.store(true, Ordering::Release);
+                            if let Some(counter) = drop_counter.as_deref() {
+                                // INV-1-R3 (review3-lens3-invariants.md): a
+                                // lease may already have been accepted into
+                                // the bounded `lease_tx`/`lease_rx` channel
+                                // (by a racing `admit` call that read
+                                // `wedged` as false just before the store
+                                // above) before this abandon is visible to
+                                // any caller. Simply returning here would
+                                // drop `lease_rx`, and every such
+                                // already-queued (and any still-racing)
+                                // lease would be destroyed — releasing its
+                                // reservation — without ever being counted:
+                                // a silent, uncounted loss of whole
+                                // `BatchLease`s this carrier had already
+                                // admitted.
+                                //
+                                // For `DropCounted` only, keep draining
+                                // `lease_rx` (this pump thread alone; no
+                                // other binding, no producer, is blocked by
+                                // this) until the sender side closes. The
+                                // sender closes in two cases: `finish()`
+                                // replaces `lease_tx` with a closed channel
+                                // and drops the real one once every lease it
+                                // already owns has been forwarded, and
+                                // `pump_binding` stops calling `try_send` on
+                                // this binding once `wedged` (stored above)
+                                // makes a later `admit`/`pump_binding` call
+                                // observe `binding.failed` — so no new lease
+                                // is offered into this channel after that
+                                // point. Every packet of every lease
+                                // received here is counted as dropped and
+                                // the lease is dropped at once, releasing
+                                // its reservation, so no lease that ever
+                                // entered this channel is lost uncounted.
+                                // The sink is already gone (or permanently
+                                // wedged for a `DropCounted` binding, which
+                                // never otherwise reaches `Abandon`), so
+                                // none of these packets could have been
+                                // delivered anyway: counting them here
+                                // cannot race a successful send.
+                                while let Ok(lease) = lease_rx.recv() {
+                                    let lost =
+                                        u64::try_from(lease.packets().len()).unwrap_or(u64::MAX);
+                                    counter.fetch_add(lost, Ordering::AcqRel);
+                                    drop(lease);
+                                }
+                            }
+                            // Bounded/Push: unchanged. Their failure is
+                            // already surfaced via `binding.failed`
+                            // (Bounded) or the link status's own counters
+                            // (Push), and nothing in this file infers a
+                            // `DropCounted`-style packet-loss count for
+                            // them, so draining further would not add any
+                            // accounting value; dropping `lease_rx` now
+                            // matches their existing, already-reviewed
+                            // semantics.
                             return;
                         }
                     }
@@ -1723,6 +1781,90 @@ mod tests {
             dropped.load(Ordering::Acquire),
             lost,
             "releasing retained packets after finish must not add further drops"
+        );
+    }
+
+    /// INV-1-R3 (review3-lens3-invariants.md): lease A's handoff to the sink
+    /// fails (the sink has already disconnected) while lease B sits fully
+    /// admitted in the bounded `lease_tx`/`lease_rx` channel (`HANDOFF_LEASES`
+    /// = 2, so both A and B fit there at once, never touched by the pump
+    /// until it is ready for each in turn). `pump_lease` returns `Abandon`
+    /// for A via `Handoff::Gone`, counting A's own packet. Before this fix,
+    /// the pump's caller then returned immediately, dropping `lease_rx` and
+    /// destroying lease B outright (releasing its reservation) without ever
+    /// counting its packets — a silent loss of a whole lease already
+    /// accepted into the channel. After the fix, the pump keeps draining
+    /// `lease_rx` until `finish()` closes the sender, counting every packet
+    /// of lease B as dropped too.
+    ///
+    /// The sink's receiver is dropped *before* either lease is admitted, so
+    /// every `try_send`/`send_within` call the pump makes is deterministically
+    /// `Disconnected` from the first attempt: nothing is ever buffered
+    /// ambiguously in the one-packet handoff, so this test needs no timing
+    /// window or retry/backoff loop to be exact.
+    ///
+    /// After `finish()`, `received + dropped` must equal `offered` exactly.
+    #[test]
+    fn a_lease_queued_behind_an_abandoned_lease_is_counted_not_lost() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            limits(64),
+            vec![Some(gate())],
+        );
+        // Drop the sink's packet receiver immediately: every later handoff
+        // attempt from the pump is `Disconnected` from its very first
+        // `try_send`, so nothing can ever land in the capacity-1 handoff
+        // buffer and this test has no race window at all.
+        drop(receivers.pop().unwrap());
+        let span = Duration::from_millis(33);
+
+        // Lease A: a single-packet window, admitted first.
+        delivery
+            .try_offer(
+                DeliveryWindow {
+                    output_index: 0,
+                    packets: vec![h264_packet(5)],
+                    media_span: span,
+                },
+                Instant::now(),
+            )
+            .expect("lease A is admitted");
+        // Lease B: a two-packet window, admitted second. `admit`'s own
+        // `pump_binding` call hands each lease straight into `lease_tx`
+        // (capacity `HANDOFF_LEASES` = 2) rather than leaving it queued, so
+        // both A and B are owned by the lease channel before the pump
+        // thread has necessarily processed either.
+        delivery
+            .try_offer(
+                DeliveryWindow {
+                    output_index: 0,
+                    packets: vec![packet(2), packet(2)],
+                    media_span: span,
+                },
+                Instant::now(),
+            )
+            .expect("lease B is admitted");
+        let offered = 3_u64; // 1 (lease A) + 2 (lease B)
+
+        // `finish()` replaces `lease_tx` with a closed sender and joins the
+        // pump thread, which blocks until the pump has drained `lease_rx`
+        // down to disconnection — i.e. until it has processed both A
+        // (Abandon via `Handoff::Gone`) and, with the fix, B as well. No
+        // polling is needed: by the time `finish()` returns, the pump
+        // thread has necessarily finished.
+        delivery.finish();
+        let received = 0_u64; // the sink's receiver was never alive to take anything
+        let lost = dropped.load(Ordering::Acquire);
+        assert_eq!(
+            received + lost,
+            offered,
+            "received {received} + dropped {lost} must equal offered {offered} exactly \
+             (lease B must not vanish uncounted behind abandoned lease A)"
+        );
+        assert_eq!(
+            lost, offered,
+            "every packet of both leases must be counted as dropped"
         );
     }
 }
