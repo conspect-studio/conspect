@@ -3919,7 +3919,7 @@ impl Pipeline {
         let aux_tx = aux_tx.with_me_layout_flag(self.me_layouts.active_flag());
         let catalogue = Arc::clone(&self.catalogue);
         let boot = self.stores.clone();
-        let stores: crate::routing_aux::StoreLookup = Arc::new(move |id: &str| {
+        let base: crate::routing_aux::StoreLookup = Arc::new(move |id: &str| {
             catalogue
                 .load()
                 .get(id)
@@ -3927,6 +3927,13 @@ impl Pipeline {
                 .or_else(|| boot.get(id).cloned())
         });
         let has_preview = self.switcher_driver.is_some();
+        // #307 review M2: the routed Preview (and `src:`) lookup also sees
+        // the stored layouts registered as M/E sources, so a PVW of
+        // `layout:<id>` publishes the composed layout.
+        let stores = crate::routing_aux::with_me_layouts(
+            base,
+            has_preview.then(|| self.me_layouts.compose_set()),
+        );
         let preview_selection: Option<Arc<multiview_framestore::SwapCell<Option<Arc<str>>>>> =
             has_preview.then(|| Arc::new(multiview_framestore::SwapCell::new(None)));
         let feeds: crate::routing_aux::AuxFeeds =

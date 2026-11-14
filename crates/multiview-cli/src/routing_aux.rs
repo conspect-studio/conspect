@@ -282,6 +282,30 @@ pub type MeLayoutComposeSet = Arc<SwapCell<Arc<Vec<MeLayoutCompose>>>>;
 /// catalogue `SwapCell`).
 pub type StoreLookup = Arc<dyn Fn(&str) -> Option<Arc<TileStore<Nv12Image>>> + Send + Sync>;
 
+/// `base`, falling back to the stores of the stored layouts registered as
+/// M/E sources (#307 review M2), so `PictureBus::Preview` (and a routed
+/// `src:` lookup) resolves `layout:<id>`. Wait-free: one `SwapCell` load
+/// and a linear find over at most four entries, and only for an id `base`
+/// does not know.
+#[must_use]
+pub fn with_me_layouts(base: StoreLookup, me_layouts: Option<MeLayoutComposeSet>) -> StoreLookup {
+    let Some(set) = me_layouts else {
+        return base;
+    };
+    Arc::new(move |id: &str| {
+        base(id).or_else(|| {
+            id.starts_with("layout:")
+                .then(|| {
+                    set.load()
+                        .iter()
+                        .find(|entry| entry.key.as_ref() == id)
+                        .map(|entry| Arc::clone(&entry.store))
+                })
+                .flatten()
+        })
+    })
+}
+
 /// The output canvas the aux pictures match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuxCanvas {
@@ -1083,6 +1107,180 @@ mod tests {
         drop(tx);
         assert!(wait_for(|| handle.failed.load(Ordering::Acquire)));
         assert_eq!(store.sequence(), 2, "a removed key is not fed");
+    }
+
+    fn wall_body(
+        revision: u64,
+        cells: Vec<multiview_core::layout::Cell>,
+    ) -> Arc<crate::aux_layout::RoutedLayout> {
+        Arc::new(crate::aux_layout::RoutedLayout {
+            id: "wall".to_owned(),
+            layout: multiview_core::layout::Layout {
+                name: "wall".into(),
+                canvas: multiview_core::layout::Canvas {
+                    width: 1920,
+                    height: 1080,
+                    fps_num: 30,
+                    fps_den: 1,
+                },
+                cells,
+            },
+            slates: vec![multiview_config::FailoverSlate::Black],
+            audio: multiview_config::LayoutAudio::default(),
+            revision,
+        })
+    }
+
+    fn cell(x: f32, y: f32, w: f32, h: f32, source: &str) -> multiview_core::layout::Cell {
+        multiview_core::layout::Cell {
+            x,
+            y,
+            w,
+            h,
+            source: Some(source.into()),
+            ..multiview_core::layout::Cell::default()
+        }
+    }
+
+    fn me_inputs(
+        rx: std::sync::mpsc::Receiver<multiview_engine::routing_aux::AuxTick>,
+        feeds: Vec<AuxFeed>,
+        stores: StoreLookup,
+        preview: Option<Arc<SwapCell<Option<Arc<str>>>>>,
+        set: &MeLayoutComposeSet,
+    ) -> AuxInputs {
+        AuxInputs {
+            rx,
+            feeds: Arc::new(SwapCell::from_pointee(feeds)),
+            stores: with_me_layouts(stores, Some(Arc::clone(set))),
+            preview_selection: preview,
+            canvas: canvas(),
+            layout_canvas: crate::aux_layout::LayoutCanvasSpec {
+                width: 1920,
+                height: 1080,
+                color: CanvasColor::default(),
+                background: [16, 128, 128],
+            },
+            program_lateness: None,
+            tick_ns: 0,
+            me_layouts: Some(Arc::clone(set)),
+        }
+    }
+
+    /// #307 review M2: a routed Preview feed whose M/E selection goes cam ->
+    /// `layout:wall` -> cam publishes cam pixels, then the composed layout's
+    /// pixels, then cam again (the lookup falls back to the M/E layout set).
+    #[test]
+    fn a_routed_preview_of_a_layout_publishes_the_composed_layout() {
+        let cam = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
+        let lookup_store = Arc::clone(&cam);
+        let stores: StoreLookup =
+            Arc::new(move |id: &str| (id == "cam").then(|| Arc::clone(&lookup_store)));
+        let wall = Arc::new(TileStore::<Nv12Image>::with_defaults("layout:wall"));
+        let set: MeLayoutComposeSet = Arc::new(SwapCell::from_pointee(vec![MeLayoutCompose {
+            key: Arc::from("layout:wall"),
+            body: wall_body(1, vec![cell(0., 0., 0.5, 0.5, "cam")]),
+            store: Arc::clone(&wall),
+        }]));
+        let preview: Arc<SwapCell<Option<Arc<str>>>> =
+            Arc::new(SwapCell::new(Some(Arc::from("cam"))));
+        let feed = AuxFeed::new(PictureBus::Preview);
+        let slot = Arc::clone(&feed.slot);
+        let (tx, rx) = aux_tick_channel();
+        tx.active_flag().store(true, Ordering::Release);
+        tx.me_layout_flag().store(true, Ordering::Release);
+        let _handle = spawn_routing_aux(me_inputs(
+            rx,
+            vec![feed],
+            stores,
+            Some(Arc::clone(&preview)),
+            &set,
+        ))
+        .unwrap();
+        let cam_frame = gradient(1920, 1080, canvas().color);
+        let cam_luma = cam_frame.y_plane().to_vec();
+        let mut published = |i: u64| {
+            cam.publish(cam_frame.clone(), tick(i).pts);
+            tx.offer(tick(i));
+            assert!(wait_for(
+                || slot.latest.load().is_some_and(|f| f.tick == i) && wall.sequence() > i
+            ));
+            slot.latest.load().unwrap()
+        };
+        let first = published(0);
+        assert_eq!(first.frame.y_plane(), cam_luma.as_slice(), "cam pixels");
+        preview.store(Some(Arc::from("layout:wall")));
+        let layout = published(1);
+        assert_ne!(layout.frame.y_plane(), cam_luma.as_slice());
+        assert!(layout.generation > first.generation);
+        // The composed layout: the background outside the cell, the cam
+        // inside it (top-left quarter).
+        let y = layout.frame.y_plane();
+        let w = 1920_usize;
+        assert_eq!(y[1079 * w + 1919], 16, "background luma bottom-right");
+        let (cell_y, cell_x) = (100_usize, 100_usize);
+        assert_ne!(y[cell_y * w + cell_x], 16, "the cam is drawn in its cell");
+        let composed = wall.read_at(tick(0).pts);
+        assert_eq!(
+            composed.frame().unwrap().y_plane(),
+            y,
+            "exactly the layout store's composed picture"
+        );
+        preview.store(Some(Arc::from("cam")));
+        let back = published(2);
+        assert_eq!(back.frame.y_plane(), cam_luma.as_slice(), "cam again");
+        assert!(back.generation > layout.generation);
+    }
+
+    /// #307 review M4: an edited body that changes geometry produces
+    /// different composed pixels in the same store.
+    #[test]
+    fn an_edited_body_changes_the_composed_pixels() {
+        let cam = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
+        let lookup_store = Arc::clone(&cam);
+        let stores: StoreLookup =
+            Arc::new(move |id: &str| (id == "cam").then(|| Arc::clone(&lookup_store)));
+        let wall = Arc::new(TileStore::<Nv12Image>::with_defaults("layout:wall"));
+        let set: MeLayoutComposeSet = Arc::new(SwapCell::from_pointee(vec![MeLayoutCompose {
+            key: Arc::from("layout:wall"),
+            body: wall_body(1, vec![cell(0., 0., 0.5, 0.5, "cam")]),
+            store: Arc::clone(&wall),
+        }]));
+        let (tx, rx) = aux_tick_channel();
+        tx.me_layout_flag().store(true, Ordering::Release);
+        let _handle = spawn_routing_aux(me_inputs(rx, Vec::new(), stores, None, &set)).unwrap();
+        let cam_frame = gradient(1920, 1080, canvas().color);
+        cam.publish(cam_frame.clone(), tick(0).pts);
+        tx.offer(tick(0));
+        assert!(wait_for(|| wall.sequence() == 1));
+        let before = wall
+            .read_at(tick(0).pts)
+            .frame()
+            .unwrap()
+            .y_plane()
+            .to_vec();
+        let w = 1920_usize;
+        // Top-left drawn, bottom-right background.
+        assert_ne!(before[100 * w + 100], 16);
+        assert_eq!(before[1000 * w + 1800], 16);
+        // The edit moves the cell to the bottom-right quarter.
+        set.store(Arc::new(vec![MeLayoutCompose {
+            key: Arc::from("layout:wall"),
+            body: wall_body(2, vec![cell(0.5, 0.5, 0.5, 0.5, "cam")]),
+            store: Arc::clone(&wall),
+        }]));
+        cam.publish(cam_frame, tick(1).pts);
+        tx.offer(tick(1));
+        assert!(wait_for(|| wall.sequence() == 2));
+        let after = wall
+            .read_at(tick(1).pts)
+            .frame()
+            .unwrap()
+            .y_plane()
+            .to_vec();
+        assert_ne!(before, after, "the edit changed the composed pixels");
+        assert_eq!(after[100 * w + 100], 16, "top-left is background now");
+        assert_ne!(after[1000 * w + 1800], 16, "the cam is drawn bottom-right");
     }
 
     fn wait_for(cond: impl Fn() -> bool) -> bool {
