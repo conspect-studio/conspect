@@ -376,7 +376,7 @@ Program's p99 lateness exceeds half the tick (§7). Details are in note §10.1.
 (source names, meters, state and fault flags, tally borders, clock, safe area) on its aux canvas,
 on the `routing-aux` thread after the integer compose, with Program's overlay baker. Stored layouts
 gain the `overlays` attribute (per-layer booleans; absent = every layer except safe area; all off =
-no bake). Two or more baking layouts bake in parallel on scoped threads, so the aux tick costs one
-layout's compose and bake, not the sum. Meters, faults and tally reach the aux thread through one
+no bake). Two or more baking layouts bake in parallel on scoped threads, so the aux tick costs the
+sum of the composes plus the slowest bake, not the sum of the bakes. Meters, faults and tally reach the aux thread through one
 wait-free snapshot the bake consumer publishes; nothing new runs on the clock. Details, cost and
 limits are in note §10.2.

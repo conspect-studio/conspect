@@ -1837,8 +1837,9 @@ border, the clock, and optional safe-area markers.
   made this tick. Meters, content faults and the Program source set come from one
   `SwapCell` snapshot the bake consumer publishes after its own bake, only while some routed layout
   bakes (one relaxed load otherwise). Preview tally comes from the M/E PVW selection slot. The aux
-  thread reads the newest snapshot; it never waits for the consumer, so meters and tally are at
-  most one tick behind Program's.
+  thread reads the newest snapshot; it never waits for the consumer. Meters and tally are
+  normally one tick behind Program's; while the consumer falls behind, the snapshot ages with it
+  (no bound is claimed — the picture never waits for it).
 - **Tally.** Red border for a source on Program, green for a source on Preview; with flags on,
   the state chip also reads `PGM` / `PVW` (meaning is never colour alone).
 - **Failure.** A bake error publishes the un-overlaid picture (counted, warned once); it never
@@ -1849,7 +1850,8 @@ border, the clock, and optional safe-area markers.
   bakes on the aux thread itself; two or more bake in a `std::thread::scope`, one scoped thread
   (`routing-aux-bake`) per layout beyond the first, at most `MAX_AUX_CANVASES_LIMIT` (8). The
   scope joins before anything is published, so each layout still publishes exactly one frame per
-  tick. A panic in a scoped bake propagates out of the scope and raises `failed` (§4.4).
+  tick. Composes stay sequential, so an aux tick costs the sum of the composes plus the slowest
+  bake plus the scope's spawn overhead. A panic in a scoped bake propagates out of the scope and raises `failed` (§4.4).
 - **Cost, measured** (release build, shared and loaded 56-core host, 1920x1080, a 1+8 NewsOne
   layout, every default layer): compose 3.7–5.8 ms, bake 17.6–26.5 ms (mostly the region blend of
   `apply_overlays_to_nv12`). Two such layouts, parallel: mean 21–26 ms per aux tick, worst
