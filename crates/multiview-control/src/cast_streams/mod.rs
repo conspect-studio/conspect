@@ -221,19 +221,22 @@ impl CastStreams {
             .unwrap_or_else(PoisonError::into_inner) = hook;
     }
 
+    #[cfg(any(test, feature = "_test-seams"))]
     pub(crate) fn run_before_arm(&self) {
-        #[cfg(any(test, feature = "_test-seams"))]
-        {
-            let hook = self
-                .before_arm
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            if let Some(hook) = hook {
-                hook();
-            }
+        let hook = self
+            .before_arm
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
+
+    /// The test seam is compiled out of production builds.
+    #[cfg(not(any(test, feature = "_test-seams")))]
+    #[allow(clippy::unused_self)] // Same signature as the test-seam build.
+    pub(crate) const fn run_before_arm(&self) {}
 
     /// `true` exactly once: the caller starts the sweep task.
     pub(crate) fn claim_sweeper(&self) -> bool {
