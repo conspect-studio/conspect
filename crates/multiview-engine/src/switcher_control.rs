@@ -529,8 +529,8 @@ impl SwitcherTickDriver {
     /// applying the fresh gate, the loss policy and the last-good pair, and
     /// recording the tally. `auto_p` is the background AUTO's tie envelope
     /// while one is in flight (MIX: `p` going on, `1 − p` going off; DIP: `i`
-    /// going on, `1 − d` going off). Called by the frame hook after the background is staged.
-    /// Wait-free; allocation-free.
+    /// going on, `1 − d` going off). Called by the frame hook after the
+    /// background is staged. Wait-free; allocation-free.
     pub fn resolve_keyers(
         &mut self,
         tick: Tick,
@@ -538,6 +538,13 @@ impl SwitcherTickDriver {
         out: &mut [Option<KeyerDraw>; MAX_DSK],
     ) {
         self.keyers.resolve(tick, auto_p, out, &self.outcomes);
+    }
+
+    /// After [`Self::reject_composed_tick`]: bring the committed keyer draws
+    /// in line with the restored state (a cancelled tied transition draws its
+    /// keyers at their resting weight). Pictures are never replaced.
+    pub fn settle_keyer_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
+        self.keyers.settle_draws(draws);
     }
 
     /// Install the numbered mixer-input table before the clock starts (like
@@ -815,13 +822,25 @@ impl SwitcherTickDriver {
         tick: Tick,
     ) {
         if matches!(verb, SwitcherVerb::Auto(_)) && !next.completed {
+            // Tied DSKs take part in this flight in a direction fixed now
+            // (review F1).
+            self.keyers.begin_tied_transition();
             self.active_auto_scenes = scenes;
             self.active_auto = Some(operation_id);
             return;
         }
         if matches!(verb, SwitcherVerb::Cut) && next.completed {
-            // ADR-0113 §5: tied DSKs flip on the CUT tick.
-            self.keyers.toggle_tied(tick);
+            // ADR-0113 §5: tied DSKs flip on the CUT tick. A CUT during an
+            // AUTO completes that flight's participants; otherwise every
+            // tied keyer takes part from its current state.
+            if self.active_auto.is_none() {
+                self.keyers.begin_tied_transition();
+            }
+            self.keyers.complete_tied(tick);
+        }
+        if matches!(verb, SwitcherVerb::SelectProgram(_)) && self.active_auto.is_some() {
+            // A punch ends the flight without a take: tied keyers stay put.
+            self.keyers.cancel_tied();
         }
         if matches!(verb, SwitcherVerb::Cut | SwitcherVerb::SelectProgram(_)) {
             if let Some(old) = self.active_auto.take() {
@@ -964,6 +983,8 @@ impl SwitcherTickDriver {
             let (_, preview) = self.resolved_selections();
             if terminal && self.fresh_at(preview.as_str(), tick) == Some(false) {
                 self.machine.abort();
+                // Aborted: tied keyers keep their state.
+                self.keyers.cancel_tied();
                 if let Some(operation_id) = self.active_auto.take() {
                     self.active_auto_scenes = None;
                     // Already terminal: a rejected frame must not refuse it twice.
@@ -979,9 +1000,9 @@ impl SwitcherTickDriver {
         }
         let mut projection = self.machine.sample(tick);
         if projection.completed {
-            // The MIX terminal tick: tied DSKs flip (their envelope is at its
-            // end value). An aborted AUTO never gets here, so it restores them.
-            self.keyers.toggle_tied(tick);
+            // The AUTO terminal tick: tied participants land (their envelope
+            // is at its end value). An aborted AUTO cancelled them above.
+            self.keyers.complete_tied(tick);
         }
         if let Some((command, deadline)) = self.pending_take.take() {
             if let SwitcherVerb::Patch(set) = &command.verb {
@@ -1485,6 +1506,9 @@ impl SwitcherTickDriver {
         if self.machine.is_in_flight() {
             self.machine.abort();
         }
+        // ... and with it any tied keyer participation: they keep their
+        // committed state.
+        self.keyers.cancel_tied();
         let restored_auto = self.active_auto.take();
         self.active_auto_scenes = None;
         self.spare_success.clear();

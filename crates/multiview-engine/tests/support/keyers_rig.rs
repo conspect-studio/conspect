@@ -163,9 +163,40 @@ impl Rig {
         preview: &str,
         cell: &str,
     ) -> (SwitcherControl, Hook, CompositorDrive<Nv12Image>) {
+        self.build_inner(keyers, budget, program, preview, cell, None)
+    }
+
+    /// Like [`Self::build`], but the drive has no store for `hidden`, while
+    /// the driver's prime gate does: a take onto `hidden` passes the gate,
+    /// then its Program rebind fails and the frame is rejected (the
+    /// `failed_rebind` pattern), on any tick the test chooses.
+    pub(crate) fn build_hiding(
+        &self,
+        keyers: &[DownstreamKeyerConfig],
+        budget: f32,
+        program: &str,
+        preview: &str,
+        hidden: &str,
+    ) -> (SwitcherControl, Hook, CompositorDrive<Nv12Image>) {
+        self.build_inner(keyers, budget, program, preview, "pgm", Some(hidden))
+    }
+
+    fn build_inner(
+        &self,
+        keyers: &[DownstreamKeyerConfig],
+        budget: f32,
+        program: &str,
+        preview: &str,
+        cell: &str,
+        hidden: Option<&str>,
+    ) -> (SwitcherControl, Hook, CompositorDrive<Nv12Image>) {
+        let mut drive_stores = self.stores.clone();
+        if let Some(hidden) = hidden {
+            drive_stores.remove(hidden);
+        }
         let drive = CompositorDrive::new(
             layout(program),
-            self.stores.clone(),
+            drive_stores,
             Self::solid(LUMA_BG, SIDE, SIDE),
             CanvasColor::default(),
             LinearRgba::TRANSPARENT,

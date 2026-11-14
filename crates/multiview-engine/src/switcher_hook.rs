@@ -156,15 +156,11 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             self.failed_tick = Some(tick.index);
             self.driver.reject_composed_tick(tick, &error);
             let _ = drive.set_mix_overlay(None);
-            // No keyer is drawn on a rejected frame's restored state: swap
-            // an empty buffer in, then drop what came back.
-            for draw in &mut self.keyer_buf {
-                *draw = None;
-            }
-            drive.set_keyer_draws(&mut self.keyer_buf);
-            for draw in &mut self.keyer_buf {
-                *draw = None;
-            }
+            // Review F2: the drive still holds the last committed keyer
+            // draws (this tick never resolved), so an on-air DSK stays in
+            // the frame exactly as committed. Only a tied keyer whose
+            // transition the reject cancelled goes to its resting weight.
+            self.driver.settle_keyer_draws(drive.keyer_draws_mut());
             // Keep the drive coherent with the restored machine (SW2-03): if
             // this tick re-pointed the cell before failing, point it back.
             let (restored, _) = self.driver.resolved_selections();
@@ -257,6 +253,11 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         }
         self.driver.reject_composed_tick(tick, reason);
         let _ = drive.set_mix_overlay(None);
+        // Review F2: this tick's `before_compose` swapped its draws in and
+        // the committed ones out into `keyer_buf`; swap them back, then
+        // settle them against the restored state.
+        drive.set_keyer_draws(&mut self.keyer_buf);
+        self.driver.settle_keyer_draws(drive.keyer_draws_mut());
         let (restored, _) = self.driver.resolved_selections();
         if self.last_program.as_ref() != Some(restored)
             && drive.rebind_cell(&self.cell_id, restored.as_str()).is_ok()

@@ -415,6 +415,12 @@ impl<T> CompositorDrive<T> {
         &self.keyers
     }
 
+    /// The installed keyer draws, for the hook to settle them in place after
+    /// a rejected frame (weights only; no allocation).
+    pub fn keyer_draws_mut(&mut self) -> &mut [Option<KeyerDraw>; MAX_DSK] {
+        &mut self.keyers
+    }
+
     /// The cumulative number of times the per-tick resolve **scratch pool** has
     /// reserved backing capacity (grown), across the lifetime of this drive.
     ///

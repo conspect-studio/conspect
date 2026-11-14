@@ -367,14 +367,23 @@ pub struct KeyerFlags {
     pub pending: Option<Pending>,
     /// `hold_last_good` is drawing a frozen pair past the trigger.
     pub stale: bool,
+    /// Participation in the background AUTO in flight, fixed when it starts
+    /// (design note §3.2): `Some(true)` going on, `Some(false)` going off.
+    /// Only participants flip on the terminal tick; a source loss under
+    /// `drop_to_off_air` or an operator keyer CUT/AUTO cancels it, so a
+    /// recovery never re-keys the keyer without an operator command.
+    pub flight: Option<bool>,
 }
+
+/// A keyer's `(fill, key)` last-good pair.
+type Pair = (Arc<Nv12Image>, Option<Arc<Nv12Image>>);
 
 #[derive(Debug)]
 struct KeyerSlot {
     def: KeyerDef,
     flags: KeyerFlags,
     /// `(fill, key)` replaced only on a tick where both reads are live.
-    last_good: Option<(Arc<Nv12Image>, Option<Arc<Nv12Image>>)>,
+    last_good: Option<Pair>,
     pending_op: Option<String>,
     ramp_op: Option<String>,
 }
@@ -674,14 +683,14 @@ fn weight_of(flags: KeyerFlags, tick: Tick, auto_p: Option<TieEnvelope>) -> f32 
         let p = kernel::opacity(Progress::new(elapsed, ramp.rate));
         return if ramp.to_on { p } else { 1.0 - p };
     }
-    if flags.tie {
-        if let Some(envelope) = auto_p {
-            return if flags.on_air {
-                envelope.going_off
-            } else {
-                envelope.going_on
-            };
-        }
+    if let (Some(to_on), Some(envelope)) = (flags.flight, auto_p) {
+        // The direction fixed when the background AUTO started, never
+        // re-derived from `on_air` (review F1).
+        return if to_on {
+            envelope.going_on
+        } else {
+            envelope.going_off
+        };
     }
     if flags.on_air {
         1.0
@@ -702,6 +711,11 @@ pub struct KeyerRuntime {
     draw_order: [usize; MAX_DSK],
     /// Flags at the start of this tick, restored by a rejected frame.
     staged: [KeyerFlags; MAX_DSK],
+    /// Last-good pairs at the start of this tick (refcounts only), restored
+    /// by a rejected frame (review F2).
+    staged_pairs: [Option<Pair>; MAX_DSK],
+    /// The tally at the start of this tick, restored by a rejected frame.
+    staged_tally: KeyerTally,
     events: [Option<KeyerEvent>; MAX_QUEUED_KEYER_EVENTS],
     tally: KeyerTally,
     canvas: (u32, u32),
@@ -717,6 +731,8 @@ impl Default for KeyerRuntime {
             slots: Default::default(),
             draw_order: [0, 1],
             staged: [KeyerFlags::default(); MAX_DSK],
+            staged_pairs: [const { None }; MAX_DSK],
+            staged_tally: KeyerTally::default(),
             events: [None; MAX_QUEUED_KEYER_EVENTS],
             tally: KeyerTally::default(),
             canvas: (0, 0),
@@ -761,7 +777,7 @@ impl KeyerRuntime {
 
     /// The last-good pair of keyer `index` (for `Arc::ptr_eq` assertions).
     #[must_use]
-    pub fn last_good(&self, index: usize) -> Option<(Arc<Nv12Image>, Option<Arc<Nv12Image>>)> {
+    pub fn last_good(&self, index: usize) -> Option<Pair> {
         self.slots.get(index)?.as_ref()?.last_good.clone()
     }
 
@@ -769,11 +785,19 @@ impl KeyerRuntime {
         self.counters = counters;
     }
 
-    /// Stage the `Copy` flags a rejected frame restores. Once per tick.
+    /// Stage the `Copy` flags, the last-good pairs (refcount increments, no
+    /// allocation) and the tally a rejected frame restores. Once per tick.
     pub(crate) fn begin_tick(&mut self) {
-        for (staged, slot) in self.staged.iter_mut().zip(self.slots.iter()) {
+        for ((staged, pair), slot) in self
+            .staged
+            .iter_mut()
+            .zip(self.staged_pairs.iter_mut())
+            .zip(self.slots.iter())
+        {
             *staged = slot.as_ref().map(|s| s.flags).unwrap_or_default();
+            *pair = slot.as_ref().and_then(|s| s.last_good.clone());
         }
+        self.staged_tally = self.tally;
     }
 
     /// Complete ramps whose terminal tick is now and resolve held commands
@@ -806,6 +830,9 @@ impl KeyerRuntime {
             };
             if live_now(&slot.def, tick) {
                 slot.flags.pending = None;
+                // A held command that lands takes the keyer out of a tied
+                // transition: the operator's verb wins.
+                slot.flags.flight = None;
                 let op = slot.pending_op.take();
                 match pending.action {
                     PendingAction::Cut => {
@@ -871,9 +898,15 @@ impl KeyerRuntime {
         match action {
             KeyerAction::Tie(tie) => {
                 slot.flags.tie = tie;
+                if !tie && slot.flags.flight.take().is_some() && !slot.flags.on_air {
+                    // Untied mid-flight: it keeps its state (off stays off).
+                    slot.release();
+                }
                 sink.applied(operation_id);
             }
             KeyerAction::Cut(on) => {
+                // An operator CUT takes the keyer out of a tied transition.
+                slot.flags.flight = None;
                 let interrupted = slot.flags.ramp.take().is_some();
                 if let Some(old) = slot.ramp_op.take() {
                     sink.refused(old, REFUSE_KEYER_AUTO_INTERRUPTED);
@@ -909,6 +942,9 @@ impl KeyerRuntime {
                     sink.refused(operation_id, REFUSE_KEYER_RAMPING);
                     return;
                 }
+                // An operator AUTO takes the keyer out of a tied transition,
+                // the no-op toward the current state included (it stays put).
+                slot.flags.flight = None;
                 if on == slot.flags.on_air {
                     // Already there: an applied no-op, never a second ramp.
                     sink.applied(operation_id);
@@ -944,18 +980,31 @@ impl KeyerRuntime {
             .all(|s| live_now(&s.def, tick))
     }
 
-    /// A background take completed on this tick (CUT, or the MIX terminal
-    /// tick): every tied keyer that is not in its own AUTO flips.
-    pub(crate) fn toggle_tied(&mut self, tick: Tick) {
+    /// A background AUTO started on this tick: fix each tied keyer's
+    /// participation and direction (design note §3.2, review F1). A keyer in
+    /// its own AUTO does not take part.
+    pub(crate) fn begin_tied_transition(&mut self) {
+        for slot in self.slots.iter_mut().flatten() {
+            slot.flags.flight =
+                (slot.flags.tie && slot.flags.ramp.is_none()).then_some(!slot.flags.on_air);
+        }
+    }
+
+    /// A background take completed on this tick (the AUTO terminal tick, or
+    /// a CUT): every participant lands in the direction fixed at the start.
+    /// A keyer whose participation was cancelled (source lost, operator
+    /// verb) or that was tied during the flight does not move. A CUT outside
+    /// an AUTO calls [`Self::begin_tied_transition`] first.
+    pub(crate) fn complete_tied(&mut self, tick: Tick) {
         for (index, entry) in self.slots.iter_mut().enumerate() {
             let Some(slot) = entry.as_mut() else {
                 continue;
             };
-            if !slot.flags.tie || slot.flags.ramp.is_some() {
+            let Some(to_on) = slot.flags.flight.take() else {
                 continue;
-            }
-            slot.flags.on_air = !slot.flags.on_air;
-            if !slot.flags.on_air {
+            };
+            slot.flags.on_air = to_on;
+            if !to_on {
                 slot.release();
             }
             queue_event(
@@ -963,6 +1012,42 @@ impl KeyerRuntime {
                 &self.counters,
                 event_of(tick.index, index_u8(index), slot.flags, KeyerReason::Tie),
             );
+        }
+    }
+
+    /// The background AUTO ended without completing (aborted, interrupted
+    /// by a punch, or a rejected frame): participants keep their state. A
+    /// keyer that was going on and is still off releases its pair.
+    pub(crate) fn cancel_tied(&mut self) {
+        for slot in self.slots.iter_mut().flatten() {
+            if slot.flags.flight.take().is_some() && !slot.flags.on_air && slot.flags.ramp.is_none()
+            {
+                slot.release();
+            }
+        }
+    }
+
+    /// After a rejected frame: bring the committed draws in line with the
+    /// restored state where a background AUTO was cancelled. A keyer neither
+    /// in its own AUTO nor in a tied one draws weight 1 on air and nothing
+    /// off; its pictures are the committed pair, untouched.
+    pub(crate) fn settle_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
+        for entry in draws.iter_mut() {
+            let Some(draw) = entry.as_mut() else {
+                continue;
+            };
+            let Some(flags) = self.flags(usize::from(draw.keyer)) else {
+                *entry = None;
+                continue;
+            };
+            if flags.ramp.is_some() || flags.flight.is_some() {
+                continue;
+            }
+            if flags.on_air {
+                draw.weight = 1.0;
+            } else {
+                *entry = None;
+            }
         }
     }
 
@@ -983,9 +1068,9 @@ impl KeyerRuntime {
     }
 
     /// Resolve this tick's keyer draws (in ascending z), the loss policy, the
-    /// last-good pair and the tally. `auto_p` is the background MIX progress
-    /// (`kernel::opacity`) while an AUTO is in flight. Wait-free: atomic
-    /// loads, `Arc` refcounts and fixed arrays only.
+    /// last-good pair and the tally. `auto_p` is the background AUTO's tie
+    /// envelope while one is in flight. Wait-free: atomic loads, `Arc`
+    /// refcounts and fixed arrays only.
     #[allow(clippy::too_many_lines)]
     // reason: one linear per-keyer pass (read, pair, loss, weight, tally);
     // splitting it would thread the same borrowed slot through helpers.
@@ -1021,9 +1106,13 @@ impl KeyerRuntime {
                 }
             }
             let weight = weight_of(slot.flags, tick, auto_p);
-            let engaged = slot.flags.on_air || slot.flags.ramp.is_some();
+            // A tied participant is engaged for the whole background AUTO,
+            // weight 0 included (a DIP before its switch point): its loss
+            // policy applies on every tick of the flight (review F1).
+            let engaged =
+                slot.flags.on_air || slot.flags.ramp.is_some() || slot.flags.flight.is_some();
             if !engaged && weight <= 0.0 {
-                // Off and not riding a tied MIX: reads nothing.
+                // Off and not in a transition: reads nothing.
                 continue;
             }
             let max = slot.def.max_source;
@@ -1063,6 +1152,9 @@ impl KeyerRuntime {
                     LossPolicy::DropToOffAir if engaged => {
                         slot.flags.on_air = false;
                         slot.flags.ramp = None;
+                        // Loss cancels tied participation: the terminal tick
+                        // never puts it back on (review F1).
+                        slot.flags.flight = None;
                         slot.release();
                         if let Some(op) = slot.ramp_op.take() {
                             refuse(outcomes, op, tick.index, REFUSE_KEYER_SOURCE_LOST);
@@ -1132,16 +1224,24 @@ impl KeyerRuntime {
     /// survives; one that started, ended or changed this tick is refused
     /// (its op either sits in the driver's staged list, which the driver
     /// refuses, or in this slot, refused here). The boot intent survives.
+    /// Every last-good pair and the tally go back to their tick-start values
+    /// (review F2): a staged off never loses the committed pair.
     pub(crate) fn reject(
         &mut self,
         tick: u64,
         reason: &str,
         outcomes: &EventStream<SwitcherOutcome>,
     ) {
-        for (slot, staged) in self.slots.iter_mut().zip(self.staged.iter()) {
+        for ((slot, staged), pair) in self
+            .slots
+            .iter_mut()
+            .zip(self.staged.iter())
+            .zip(self.staged_pairs.iter_mut())
+        {
             let Some(slot) = slot.as_mut() else {
                 continue;
             };
+            slot.last_good = pair.take();
             let current = slot.flags;
             slot.flags = *staged;
             if staged.ramp != current.ramp {
@@ -1156,10 +1256,14 @@ impl KeyerRuntime {
                     refuse(outcomes, op, tick, reason);
                 }
             }
-            if !slot.flags.on_air && slot.flags.ramp.is_none() {
+            // A ramp on that started or ended this tick was refused above
+            // and left the keyer off: it holds no pair. A keyer committed
+            // on air keeps its committed pair.
+            if !slot.flags.on_air && slot.flags.ramp.is_none() && slot.flags.flight.is_none() {
                 slot.release();
             }
         }
+        self.tally = self.staged_tally;
         self.events.fill(None);
     }
 
@@ -1234,8 +1338,14 @@ mod tests {
             assert!((weight_of(on, tick, None) - expected).abs() < 1e-6);
             assert!((weight_of(off, tick, None) - (1.0 - expected)).abs() < 1e-6);
         }
+        // Review F1 changed this expectation: the tied direction is the one
+        // fixed when the background AUTO started (`flight`), no longer
+        // re-derived from `tie` and `on_air` each tick. A tied keyer that is
+        // not a participant (its participation was cancelled by a loss)
+        // draws its resting weight, never the envelope.
         let tied = KeyerFlags {
             tie: true,
+            flight: Some(true),
             ..KeyerFlags::default()
         };
         let tick = Tick {
@@ -1245,10 +1355,16 @@ mod tests {
         assert!((weight_of(tied, tick, Some(TieEnvelope::mix(0.25))) - 0.25).abs() < 1e-6);
         let tied_on = KeyerFlags {
             on_air: true,
+            flight: Some(false),
             ..tied
         };
         assert!((weight_of(tied_on, tick, Some(TieEnvelope::mix(0.25))) - 0.75).abs() < 1e-6);
         assert!((weight_of(tied_on, tick, None) - 1.0).abs() < 1e-6);
+        let cancelled = KeyerFlags {
+            flight: None,
+            ..tied
+        };
+        assert!(weight_of(cancelled, tick, Some(TieEnvelope::mix(0.25))).abs() < 1e-6);
     }
 
     #[test]
