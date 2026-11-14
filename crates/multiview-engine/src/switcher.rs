@@ -421,6 +421,25 @@ impl SwitcherState {
         }
     }
 
+    /// The selected descriptor with its duration replaced by `rate`: an AUTO
+    /// carries its own rate and keeps the selected kind (ADR-0112 §3). A
+    /// CUT selection becomes a MIX, as an AUTO always has a duration. Kinds
+    /// without a single rate (stinger) are returned unchanged.
+    #[must_use]
+    pub fn transition_with_rate(&self, rate: FrameCount) -> TransitionDescriptor {
+        let mut next = self.transition.clone();
+        match &mut next {
+            TransitionDescriptor::Mix { rate: r }
+            | TransitionDescriptor::Dip { rate: r, .. }
+            | TransitionDescriptor::Wipe { rate: r, .. }
+            | TransitionDescriptor::DvePush { rate: r, .. }
+            | TransitionDescriptor::DveSqueeze { rate: r, .. } => *r = rate,
+            TransitionDescriptor::Cut => next = TransitionDescriptor::Mix { rate },
+            _ => {}
+        }
+        next
+    }
+
     fn rate(&self) -> FrameCount {
         match &self.transition {
             TransitionDescriptor::Mix { rate }

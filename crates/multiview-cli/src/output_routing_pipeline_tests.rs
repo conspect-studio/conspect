@@ -2081,3 +2081,115 @@ fn an_audio_only_boot_take_with_a_300_byte_config_id_is_enqueued() {
     );
     assert_eq!(run.frames, TICKS);
 }
+
+/// #342 B3 end to end: two HLS outputs on the 64x64 canvas; out1 is reformatted
+/// live to 32x64 cover. out0 keeps every tick on the base key (PTS 0..T, one
+/// per tick); out1's PTS stays one per tick across the move (make-before-
+/// break); its decoded size is 64x64 before and 32x64 after; the move is one
+/// flagged decoder-config change (a parameter-set change counted by the
+/// router) on out1 only.
+#[test]
+fn a_live_reformat_resets_one_output_and_leaves_the_other_untouched() {
+    const TICKS: u64 = 300;
+    let applied_at = Arc::new(Mutex::new(None::<u64>));
+    let record = Arc::clone(&applied_at);
+    // CONFIG with out1 declaring the canvas format explicitly (identity:
+    // the same base key; the `[outputs.format]` marker also makes the
+    // harness record every output's video packets for decoding).
+    let config = CONFIG.replace(
+        "path = \"/tmp/multiview-routing-e2e/@/b/index.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n",
+        "path = \"/tmp/multiview-routing-e2e/@/b/index.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n[outputs.format]\nwidth = 64\nheight = 64\n",
+    );
+    assert!(config.contains("[outputs.format]"));
+    let run = drive_full(
+        &config,
+        false,
+        false,
+        "route_reformat",
+        TICKS,
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            let outcomes = handle.outcomes().expect("one outcome reader");
+            wait_for("the first routing tick", Duration::from_secs(10), || {
+                (handle.snapshot().video_keys > 0).then_some(())
+            });
+            std::thread::sleep(Duration::from_millis(600));
+            let cover = crate::routing_aux::AuxFormat::new(
+                32,
+                64,
+                multiview_config::OutputFit::new(
+                    multiview_config::OutputFitMode::Cover,
+                    multiview_config::Anchor::Center,
+                ),
+            );
+            handle
+                .try_reformat(super::Reformat {
+                    operation_id: "rf".to_owned(),
+                    output_index: 1,
+                    settings: super::ReformatSettings {
+                        codec_name: "mpeg2video".to_owned(),
+                        width: 32,
+                        height: 64,
+                        bit_rate: 1_000_000,
+                        base_format: Some(cover),
+                    },
+                    feed_format: Some(cover),
+                    principal: "operator".to_owned(),
+                })
+                .unwrap();
+            let o = wait_for("the reformat outcome", Duration::from_secs(10), || {
+                outcomes.try_recv().ok()
+            });
+            assert_eq!(o.operation_id, "rf");
+            assert_eq!(o.outcome, TakeResult::ResetApplied, "{o:?}");
+            *record.lock().unwrap() = Some(o.tick);
+        },
+    );
+    let at = applied_at.lock().unwrap().expect("applied");
+    assert_eq!(run.frames, TICKS);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(
+        pts_of(&run.outputs[0]),
+        all,
+        "out0: one frame per tick, untouched"
+    );
+    // out1 ends the run on its live-opened key: the router retires live
+    // keys at end of run before their last in-flight windows close (the
+    // same for any routed output still on a live key), so its stream is a
+    // contiguous prefix of the ticks, reaching past the move by far.
+    let out1 = pts_of(&run.outputs[1]);
+    assert_eq!(
+        out1[..],
+        all[..out1.len()],
+        "out1: one frame per tick across the reset"
+    );
+    assert!(
+        out1.len() + 3 >= all.len() && out1.len() > usize::try_from(at).unwrap() + 100,
+        "out1 kept emitting after the move: {} of {}",
+        out1.len(),
+        all.len()
+    );
+    assert_eq!(
+        run.final_snapshot.parameter_set_changes, 1,
+        "one flagged change"
+    );
+    // out1's first packet at the move is a keyframe with a sequence header.
+    let at_pkt = run.outputs[1]
+        .iter()
+        .find(|(pts, _, _)| *pts == i64::try_from(at).unwrap())
+        .unwrap();
+    assert!(
+        at_pkt.1 && at_pkt.2,
+        "the move lands on a self-contained IDR"
+    );
+    // Decoded sizes: before the move the canvas, after it the new format.
+    let at_index = run.video[1]
+        .iter()
+        .position(|p| p.pts() == Some(i64::try_from(at).unwrap()))
+        .unwrap();
+    assert_eq!(decode_size(&run.video[1][..at_index]), Some((64, 64)));
+    assert_eq!(decode_size(&run.video[1][at_index..]), Some((32, 64)));
+    assert_eq!(decode_size(&run.video[0]), Some((64, 64)));
+}
