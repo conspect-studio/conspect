@@ -507,6 +507,14 @@ pub struct OutputRoutingHandle {
     // reason: only the overlay-gated layout-bake pipeline tests read it.
     #[cfg_attr(not(feature = "overlay"), allow(dead_code))]
     pub(crate) aux_feeds: AuxFeeds,
+    /// One past the last tick the router ran (test observation, #461: the
+    /// pipeline tests pace their synthetic clock on it).
+    #[cfg(test)]
+    pub(crate) ticked: Arc<AtomicU64>,
+    /// The largest backlog (items accepted, not yet encoded) of any live
+    /// worker at the router's last tick (test observation, #461).
+    #[cfg(test)]
+    pub(crate) worker_lag: Arc<AtomicU64>,
     takes: SyncSender<RouterMsg>,
     reformats: SyncSender<Reformat>,
     layout_changes: LayoutInbox,
@@ -1474,6 +1482,12 @@ pub struct OutputRouter {
     /// concurrent producer refills the mailbox from here).
     #[cfg(test)]
     drain_hook: Option<Box<dyn FnMut() + Send>>,
+    /// Shared with [`OutputRoutingHandle::ticked`].
+    #[cfg(test)]
+    ticked: Arc<AtomicU64>,
+    /// Shared with [`OutputRoutingHandle::worker_lag`].
+    #[cfg(test)]
+    worker_lag: Arc<AtomicU64>,
 }
 
 /// The router's start-up (boot) take state, O(outputs).
@@ -1567,7 +1581,15 @@ impl OutputRouter {
         let snapshot = Arc::new(SwapCell::from_pointee(RoutingSnapshot::default()));
         #[cfg(test)]
         let audio_tap = crate::routing_audio::AudioTapCell::default();
+        #[cfg(test)]
+        let ticked = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let worker_lag = Arc::new(AtomicU64::new(0));
         let handle = OutputRoutingHandle {
+            #[cfg(test)]
+            ticked: Arc::clone(&ticked),
+            #[cfg(test)]
+            worker_lag: Arc::clone(&worker_lag),
             #[cfg(test)]
             audio_tap: Arc::clone(&audio_tap),
             #[cfg(test)]
@@ -1632,6 +1654,10 @@ impl OutputRouter {
             takes_drained: 0,
             #[cfg(test)]
             drain_hook: None,
+            #[cfg(test)]
+            ticked,
+            #[cfg(test)]
+            worker_lag,
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -1891,6 +1917,22 @@ impl OutputRouter {
                 .any(|o| o.pending.is_some() || o.reformat.is_some())
         {
             self.publish_snapshot_at(tick);
+        }
+        #[cfg(test)]
+        {
+            let lag = self
+                .worker_progress()
+                .iter()
+                .map(|p| {
+                    p.offered
+                        .load(Ordering::Acquire)
+                        .saturating_sub(p.done.load(Ordering::Acquire))
+                })
+                .max()
+                .unwrap_or(0);
+            self.worker_lag.store(lag, Ordering::Release);
+            self.ticked
+                .fetch_max(tick.saturating_add(1), Ordering::Release);
         }
         Ok(())
     }
