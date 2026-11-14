@@ -7310,6 +7310,17 @@ export interface components {
             bucket_edges_ms: number[];
             /** @description Cumulative per-bucket counts (edges, then overflow). */
             buckets_total: number[];
+            /**
+             * Format: int64
+             * @description Ticks whose GPU readback missed its deadline since the run started,
+             *     re-emitted as last-good (also counted in `frames_repeated_total`).
+             */
+            compose_deadline_misses_total: number;
+            /**
+             * Format: int64
+             * @description GPU readback deadline misses in the window.
+             */
+            compose_deadline_misses_window: number;
             /** @description Fresh-tick work: `before_compose` through `publish_state` (#311). */
             compose_duration: components["schemas"]["PhaseHistogram"];
             /** @description `compose_duration` split into its four parts. */

@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use multiview_compositor::backend::{RunBackend, RunBackendKind};
 use multiview_compositor::blend::LinearRgba;
+use multiview_compositor::mask::{MaskShape, WipeMask};
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image, Tile};
 use multiview_core::layout::Layout;
 use multiview_core::switcher::Rgb8;
@@ -91,7 +92,7 @@ pub struct CompositedFrame {
 /// How the incoming picture of an AUTO is drawn over the outgoing one
 /// (ADR-0104 §3, ADR-0112). `Copy` and allocation-free: it is re-derived from
 /// the machine's transition descriptor on every tick of a flight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[non_exhaustive]
 pub enum TransitionStyle {
     /// A dissolve: the incoming picture at `elapsed / duration`.
@@ -106,11 +107,27 @@ pub enum TransitionStyle {
         /// Where the outgoing/incoming swap happens, in `(0, 1)`.
         switch_point: Rational,
     },
+    /// A wipe: the incoming picture drawn through a moving mask, with an
+    /// optional solid border band just outside the edge (ADR-0112 §3).
+    Wipe {
+        /// The mask shape.
+        shape: MaskShape,
+        /// The pattern origin, normalised to the canvas.
+        origin: [f32; 2],
+        /// Mirror the travel direction.
+        reverse: bool,
+        /// Soft-edge width, a fraction of the canvas height.
+        softness: f32,
+        /// Border band width, a fraction of the canvas height (`0` is none).
+        border_width: f32,
+        /// The border band's colour; `None` is no band.
+        border_color: Option<Rgb8>,
+    },
 }
 
 /// One AUTO transition step: `source` drawn full-canvas at `elapsed /
 /// duration`, in the given [`TransitionStyle`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MixOverlay {
     /// The incoming (Preview) source.
     pub source: String,
@@ -446,9 +463,15 @@ impl<T> CompositorDrive<T> {
     /// reference (invariant #1 — a missing/failed GPU never stalls or crashes the
     /// run). The default backend is the CPU reference, so callers that never call
     /// this keep the prior behaviour exactly.
+    ///
+    /// The backend's GPU readback deadline is bounded by the canvas cadence
+    /// here (and again on every [`CompositorDrive::set_layout`]): `min(10 ms,
+    /// period / 2)` (issue #395).
     #[must_use]
     pub fn with_backend(mut self, backend: RunBackend) -> Self {
         self.backend = backend;
+        self.backend
+            .set_frame_period(frame_period(self.layout.canvas.cadence()));
         self
     }
 
@@ -477,6 +500,8 @@ impl<T> CompositorDrive<T> {
         layout
             .validate()
             .map_err(|e| Error::InvalidLayout(e.to_string()))?;
+        self.backend
+            .set_frame_period(frame_period(layout.canvas.cadence()));
         self.layout = layout;
         self.layout_generation = self.layout_generation.wrapping_add(1);
         Ok(())
@@ -601,7 +626,12 @@ impl CompositorDrive<Nv12Image> {
     /// [`Error::Canvas`] if the colour cannot be coded for this canvas; the
     /// style is then left unchanged.
     pub fn set_transition_style(&mut self, style: TransitionStyle) -> Result<()> {
-        if let TransitionStyle::Dip { color, .. } = style {
+        let fill_color = match style {
+            TransitionStyle::Dip { color, .. } => Some(color),
+            TransitionStyle::Wipe { border_color, .. } => border_color,
+            TransitionStyle::Mix => None,
+        };
+        if let Some(color) = fill_color {
             if self.transition_fill.as_ref().map(|(c, _)| *c) != Some(color) {
                 let fill = Nv12Image::solid_rgb(2, 2, color.r, color.g, color.b, self.canvas_color)
                     .map_err(|e| Error::Canvas(e.to_string()))?;
@@ -628,9 +658,30 @@ impl CompositorDrive<Nv12Image> {
     /// # Errors
     ///
     /// Returns [`Error::Canvas`] only for a structurally impossible canvas the
-    /// compositor rejects (e.g. odd dimensions). Input health is *never* an
-    /// error: a dead source yields its held frame or the slate, not a failure.
+    /// compositor rejects (e.g. odd dimensions), and
+    /// [`Error::ComposeDeadline`] when a GPU backend's readback missed its
+    /// per-frame deadline (or an earlier one is still outstanding): the
+    /// runtime then repeats last-good under this tick (issue #395). Input
+    /// health is *never* an error: a dead source yields its held frame or the
+    /// slate, not a failure.
     pub fn compose(&self, tick: Tick) -> Result<CompositedFrame> {
+        self.compose_with(tick, &self.backend)
+    }
+
+    /// As [`CompositorDrive::compose`], but on a fresh CPU reference backend
+    /// regardless of the configured one: the runtime's path for a GPU
+    /// deadline miss on the very first tick, when there is no last-good frame
+    /// to repeat (issue #395). Cold LUT caches: used at most once per run in
+    /// practice.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Canvas`] for a canvas the CPU compositor rejects.
+    pub fn compose_on_cpu(&self, tick: Tick) -> Result<CompositedFrame> {
+        self.compose_with(tick, &RunBackend::cpu())
+    }
+
+    fn compose_with(&self, tick: Tick, backend: &RunBackend) -> Result<CompositedFrame> {
         let now = tick.pts;
         let canvas = &self.layout.canvas;
 
@@ -680,6 +731,7 @@ impl CompositorDrive<Nv12Image> {
                 dst_w,
                 dst_h,
                 opacity: cell.opacity,
+                mask: None,
             });
         }
         // The AUTO dissolve's incoming picture: one full-canvas tile on top, in
@@ -708,7 +760,12 @@ impl CompositorDrive<Nv12Image> {
             .iter()
             .filter_map(|p| {
                 held.get(p.image_index).map(|img| {
-                    Tile::scaled(img.as_ref(), p.dst_x, p.dst_y, p.dst_w, p.dst_h, p.opacity)
+                    let tile =
+                        Tile::scaled(img.as_ref(), p.dst_x, p.dst_y, p.dst_w, p.dst_h, p.opacity);
+                    match p.mask {
+                        Some(mask) => tile.with_mask(mask),
+                        None => tile,
+                    }
                 })
             })
             .collect();
@@ -719,8 +776,10 @@ impl CompositorDrive<Nv12Image> {
         // path a submit/readback failure surfaces as a typed error here, which
         // becomes `Error::Canvas` — the drive returns rather than stalling the
         // clock, and the caller holds last-good (safety rule §3, invariant #1).
-        let canvas_image = self
-            .backend
+        // The GPU readback wait is bounded (issue #395): a miss is
+        // `Error::ComposeDeadline`, which the runtime turns into a counted
+        // last-good repeat of this tick.
+        let canvas_image = backend
             .composite(
                 canvas.width,
                 canvas.height,
@@ -728,7 +787,10 @@ impl CompositorDrive<Nv12Image> {
                 self.background,
                 tiles.as_slice(),
             )
-            .map_err(|e| Error::Canvas(e.to_string()))?;
+            .map_err(|e| match e {
+                multiview_compositor::Error::GpuDeadline(why) => Error::ComposeDeadline(why),
+                other => Error::Canvas(other.to_string()),
+            })?;
 
         // Drop the borrowing tiles, then release the held `Arc`s now (rather than
         // pinning them until the next tick's `begin`), keeping the pooled
@@ -762,7 +824,7 @@ impl CompositorDrive<Nv12Image> {
         held: &mut Vec<Arc<Nv12Image>>,
         placements: &mut Vec<Placement>,
     ) {
-        let mut full_canvas = |image: Arc<Nv12Image>, opacity: f32| {
+        let mut full_canvas = |image: Arc<Nv12Image>, opacity: f32, mask: Option<WipeMask>| {
             held.push(image);
             placements.push(Placement {
                 image_index: held.len().saturating_sub(1),
@@ -771,8 +833,20 @@ impl CompositorDrive<Nv12Image> {
                 dst_w: width,
                 dst_h: height,
                 opacity,
+                mask,
             });
         };
+        // Only a fresh incoming frame is blended (SW2-02): a held stale frame
+        // or a slate never fades into Program.
+        let fresh = self.stores.get(&mix.source).and_then(|store| {
+            let read = store.read_at(now);
+            match (read.state().is_live(), read.frame()) {
+                (true, Some(frame)) => Some(Arc::clone(frame)),
+                _ => None,
+            }
+        });
+        let mut mask = None;
+        let mut band = None;
         let incoming = match mix.style {
             TransitionStyle::Mix => mix.opacity(),
             TransitionStyle::Dip {
@@ -790,21 +864,60 @@ impl CompositorDrive<Nv12Image> {
                     if let Some((_, fill)) =
                         self.transition_fill.as_ref().filter(|(c, _)| *c == color)
                     {
-                        full_canvas(Arc::clone(fill), dip);
+                        full_canvas(Arc::clone(fill), dip, None);
                     }
                 }
                 incoming
             }
+            TransitionStyle::Wipe {
+                shape,
+                origin,
+                reverse,
+                softness,
+                border_width,
+                border_color,
+            } => {
+                let edge = WipeMask::new(
+                    shape,
+                    mix.opacity(),
+                    width,
+                    height,
+                    origin,
+                    reverse,
+                    softness,
+                    if border_color.is_some() {
+                        border_width
+                    } else {
+                        0.0
+                    },
+                );
+                // The border band (review MED-03): the colour drawn ABOVE the
+                // incoming picture through its own intrinsic mask (the edge
+                // grown by the border width, attenuated by the edge's own
+                // coverage), so it never depends on the incoming alpha and is
+                // soft on both sides. It is drawn only with a fresh incoming
+                // frame: without one the wipe shows the outgoing picture,
+                // never a colour fill.
+                if let (Some(color), true, true) =
+                    (border_color, border_width > 0.0, fresh.is_some())
+                {
+                    band = self
+                        .transition_fill
+                        .as_ref()
+                        .filter(|(c, _)| *c == color)
+                        .map(|(_, fill)| (Arc::clone(fill), edge.expanded(border_width)));
+                }
+                mask = Some(edge);
+                1.0
+            }
         };
         if incoming > 0.0 {
-            if let Some(store) = self.stores.get(&mix.source) {
-                // Only a fresh incoming frame is blended (SW2-02): a held
-                // stale frame or a slate never fades into Program.
-                let read = store.read_at(now);
-                if let (true, Some(frame)) = (read.state().is_live(), read.frame()) {
-                    full_canvas(Arc::clone(frame), incoming);
-                }
+            if let Some(frame) = fresh {
+                full_canvas(frame, incoming, mask);
             }
+        }
+        if let Some((fill, band_mask)) = band {
+            full_canvas(fill, 1.0, Some(band_mask));
         }
     }
 
@@ -913,6 +1026,8 @@ struct Placement {
     dst_h: u32,
     /// The cell's per-tile opacity (straight alpha), carried to the compositor.
     opacity: f32,
+    /// A wipe mask for a transition tile (ADR-0112 §3); `None` for a cell.
+    mask: Option<WipeMask>,
 }
 
 /// The per-tick resolve **scratch pool**: reusable buffers cleared-and-refilled
@@ -975,6 +1090,12 @@ impl ComposeScratch {
             self.reservations = self.reservations.saturating_add(1);
         }
     }
+}
+
+/// The output frame period for `cadence` (zero for a degenerate cadence; the
+/// backend then keeps its default readback deadline).
+fn frame_period(cadence: multiview_core::time::Rational) -> std::time::Duration {
+    std::time::Duration::from_nanos(u64::try_from(cadence.period_nanos()).unwrap_or(0))
 }
 
 /// Map a cell's normalized rectangle to a canvas **pixel rectangle**

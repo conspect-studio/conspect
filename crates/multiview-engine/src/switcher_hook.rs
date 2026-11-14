@@ -5,8 +5,9 @@ use crate::drive::{CompositedFrame, CompositorDrive, TransitionStyle};
 use crate::runtime::FrameControl;
 use crate::switcher_control::SwitcherTickDriver;
 use crate::switcher_layouts::LayoutSources;
+use multiview_compositor::mask::MaskShape;
 use multiview_compositor::pipeline::Nv12Image;
-use multiview_core::switcher::{Rgb8, SourceRef, TransitionDescriptor};
+use multiview_core::switcher::{Rgb8, SourceRef, TransitionDescriptor, WipePattern};
 use multiview_framestore::{SwapCell, TileStore};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,6 +47,17 @@ pub struct SwitcherFrameHook<C> {
     deferred: bool,
     fps_num: i64,
     fps_den: i64,
+}
+
+/// The compositor's mask shape for a switcher wipe pattern.
+fn mask_shape(pattern: WipePattern) -> MaskShape {
+    match pattern {
+        WipePattern::Vertical => MaskShape::Vertical,
+        WipePattern::Diagonal => MaskShape::Diagonal,
+        WipePattern::Box => MaskShape::Box,
+        WipePattern::Circle => MaskShape::Circle,
+        _ => MaskShape::Horizontal,
+    }
 }
 
 impl<C> SwitcherFrameHook<C> {
@@ -192,6 +204,22 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
                 color: color.unwrap_or(Rgb8::BLACK),
                 switch_point: *switch_point,
             },
+            TransitionDescriptor::Wipe {
+                pattern,
+                softness,
+                border_width,
+                border_color,
+                position_xy,
+                reverse,
+                ..
+            } => TransitionStyle::Wipe {
+                shape: mask_shape(*pattern),
+                origin: *position_xy,
+                reverse: *reverse,
+                softness: *softness,
+                border_width: *border_width,
+                border_color: *border_color,
+            },
             _ => TransitionStyle::Mix,
         };
         if mix.is_some() && drive.transition_style() != style {
@@ -282,6 +310,30 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
     fn on_repeat(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
         (self.legacy)(drive);
         self.driver.repeat_tick(tick);
+    }
+
+    /// The compose of `tick` missed its GPU readback deadline (#395) and was
+    /// re-emitted as last-good: roll the staged take back exactly as the
+    /// rebind-failure path above does.
+    fn on_compose_failed(
+        &mut self,
+        drive: &mut CompositorDrive<Nv12Image>,
+        tick: Tick,
+        reason: &str,
+    ) {
+        // `before_compose` already rejected and rolled back this tick: never
+        // publish a second terminal outcome for it.
+        if self.failed_tick.take() == Some(tick.index) {
+            return;
+        }
+        self.driver.reject_composed_tick(tick, reason);
+        let _ = drive.set_mix_overlay(None);
+        let (restored, _) = self.driver.resolved_selections();
+        if self.last_program.as_ref() != Some(restored)
+            && drive.rebind_cell(&self.cell_id, restored.as_str()).is_ok()
+        {
+            self.last_program = Some(restored.clone());
+        }
     }
 }
 

@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
+use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
 use crate::switcher::{SwitcherProjection, SwitcherState};
 use crate::switcher_inputs::{InputsReadback, MixerInputs, INPUT_SLOTS, MAX_PATCH_MEMBERS};
 
@@ -79,7 +80,7 @@ pub const REFUSE_NOT_AN_INPUT: &str =
     "not-on-an-input: this M/E selects numbered inputs; select an input, not a source";
 /// Typed refusal: the transition kind or one of its options is not rendered.
 pub const REFUSE_UNSUPPORTED_TRANSITION: &str =
-    "unsupported-transition: this engine renders cut, mix and dip to a colour";
+    "unsupported-transition: this engine renders cut, mix, dip to a colour and wipe";
 
 /// Is `descriptor` a transition the Program drive renders (ADR-0112)?
 #[must_use]
@@ -87,6 +88,11 @@ pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
     match descriptor {
         TransitionDescriptor::Cut | TransitionDescriptor::Mix { .. } => true,
         TransitionDescriptor::Dip { dip_source, .. } => dip_source.is_none(),
+        TransitionDescriptor::Wipe {
+            border_fill_source,
+            flip_flop,
+            ..
+        } => border_fill_source.is_none() && !flip_flop,
         _ => false,
     }
 }
@@ -126,6 +132,13 @@ pub struct PatchSet {
     pub allow_on_air: bool,
 }
 
+/// Whether a patch set names `id` as a member source. Allocation-free.
+fn patch_names(set: &PatchSet, id: &str) -> bool {
+    set.members
+        .iter()
+        .any(|(_, source)| source.as_ref().is_some_and(|s| s.as_str() == id))
+}
+
 /// An operator verb, already authorized and reference-validated on admission.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SwitcherVerb {
@@ -145,6 +158,39 @@ pub enum SwitcherVerb {
     SetTransition(TransitionDescriptor),
     /// Re-patch numbered mixer inputs at one tick (all members or none).
     Patch(PatchSet),
+    /// The mixer half of an atomic multi-crosspoint set (ADR-0110 §12.8,
+    /// #308): validated and primed here, then applied only at the adoption
+    /// tick the router proposes through `arm`, never on its own. Held in its
+    /// own slot, so an armed set never blocks a Cut or AUTO.
+    PatchArmed {
+        /// The mixer-input members.
+        set: PatchSet,
+        /// The handshake cell shared with the router.
+        arm: Arc<SetArm>,
+    },
+}
+
+/// Ticks past [`SET_ADOPT_DEADLINE_TICKS`] the switcher waits for a ready
+/// set's router half before it refuses the set `deadline` itself: the
+/// router admits the set later than the clock (it runs on the bake
+/// consumer) and owns the set's first cause, so its refusal normally lands
+/// first.
+pub const SET_SWITCHER_GRACE_TICKS: u64 = 16;
+
+/// Typed refusal: a second armed set while one is held.
+pub const REFUSE_SET_ARMED: &str =
+    "engine-busy: a salvo is already armed on this M/E; retry when it settled";
+
+/// The armed mixer half of a set (one slot, separate from the held take).
+#[derive(Debug)]
+struct ArmedSet {
+    operation_id: String,
+    set: PatchSet,
+    arm: Arc<SetArm>,
+    /// Refused `feed-not-fresh` when still not ready at this tick.
+    deadline: u64,
+    /// The tick whose drain applied the patch (commit/reject resolves it).
+    applied_at: Option<u64>,
 }
 
 /// One correlated command; `operation_id` is opaque and never interpreted by
@@ -286,6 +332,7 @@ impl SwitcherControl {
             primed_stores: None,
             source_revisions: Vec::with_capacity(crate::switcher_layouts::MAX_ME_LAYOUT_SOURCES),
             pending_take: None,
+            armed: None,
             last_tick: 0,
             staged_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
             spare_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
@@ -352,6 +399,14 @@ impl SwitcherControl {
     #[must_use]
     pub fn applied_tick(&self) -> u64 {
         self.applied_tick.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The shared cell behind [`Self::applied_tick`]: the router reads the
+    /// clock's last composed tick from it (wait-free) to pick a set's
+    /// adoption tick (#308).
+    #[must_use]
+    pub fn applied_tick_cell(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.applied_tick)
     }
 
     /// Real paired-bus publication status, or `None` before the first frame.
@@ -421,6 +476,8 @@ pub struct SwitcherTickDriver {
     /// when a key is first adopted).
     source_revisions: Vec<(String, u64)>,
     pending_take: Option<(SwitcherCommand, u64)>,
+    /// The armed mixer half of an atomic set (#308), if any.
+    armed: Option<ArmedSet>,
     last_tick: u64,
     staged_success: Vec<String>,
     spare_success: Vec<String>,
@@ -678,7 +735,9 @@ impl SwitcherTickDriver {
                 }
                 resolved
             }
-            SwitcherVerb::SetTransition(_) | SwitcherVerb::Patch(_) => return false,
+            SwitcherVerb::SetTransition(_)
+            | SwitcherVerb::Patch(_)
+            | SwitcherVerb::PatchArmed { .. } => return false,
         };
         guard
             .layout_revision
@@ -702,15 +761,19 @@ impl SwitcherTickDriver {
             return true;
         }
         match self.pending_take.as_ref().map(|(command, _)| &command.verb) {
-            Some(SwitcherVerb::SelectProgram(target) | SwitcherVerb::SelectPreview(target)) => {
-                self.resolve(target).as_str() == id
+            Some(SwitcherVerb::SelectProgram(target) | SwitcherVerb::SelectPreview(target))
+                if self.resolve(target).as_str() == id =>
+            {
+                return true;
             }
-            Some(SwitcherVerb::Patch(set)) => set
-                .members
-                .iter()
-                .any(|(_, source)| source.as_ref().is_some_and(|s| s.as_str() == id)),
-            _ => false,
+            Some(SwitcherVerb::Patch(set)) if patch_names(set, id) => return true,
+            _ => {}
         }
+        // An armed salvo set (#308) holds its own slot; its members are
+        // references until it settles.
+        self.armed
+            .as_ref()
+            .is_some_and(|armed| patch_names(&armed.set, id))
     }
 
     /// Advertise AUTO. Called only by the frame hook that renders the
@@ -804,6 +867,7 @@ impl SwitcherTickDriver {
             }
             SwitcherVerb::SelectPreview(_)
             | SwitcherVerb::Patch(_)
+            | SwitcherVerb::PatchArmed { .. }
             | SwitcherVerb::SetTransition(_) => Err("not a take".into()),
         }
     }
@@ -872,6 +936,17 @@ impl SwitcherTickDriver {
     /// expire off the clock as a refusal; successful takes wait for a fresh tick.
     pub fn repeat_tick(&mut self, tick: Tick) {
         self.last_tick = tick.index;
+        // A repeated tick never composes the armed patch: a proposal at or
+        // before it is missed and goes back to the router.
+        if let Some(armed) = self.armed.as_ref() {
+            if armed.arm.state() == ArmState::Proposed && armed.arm.tick() <= tick.index {
+                let _ = armed.arm.unpropose();
+            }
+        }
+        // Sustained repeats (no fresh drain) still bound the armed set: its
+        // deadlines expire here too (review C-2). `Applying`/`Committed`
+        // belong to the composed-tick path and are never touched here.
+        self.expire_armed(tick);
         if self
             .pending_take
             .as_ref()
@@ -1014,6 +1089,10 @@ impl SwitcherTickDriver {
             let Ok(command) = self.rx.try_recv() else {
                 break;
             };
+            if let SwitcherVerb::PatchArmed { .. } = &command.verb {
+                self.admit_armed(command, tick);
+                continue;
+            }
             let scenes = self.scenes.latest();
             self.stage();
             let take = matches!(
@@ -1108,7 +1187,203 @@ impl SwitcherTickDriver {
                 }
             }
         }
+        // After the commands: a Cut on this tick is seen by the armed set's
+        // re-validation at its adoption tick.
+        self.drive_armed(tick);
         projection
+    }
+
+    /// Admit the mixer half of a set into the armed slot (validated now; a
+    /// failure refuses the whole set through its arm).
+    fn admit_armed(&mut self, command: SwitcherCommand, tick: Tick) {
+        let SwitcherVerb::PatchArmed { set, arm } = command.verb else {
+            return;
+        };
+        let scenes = self.scenes.latest();
+        let error = if self.armed.is_some() {
+            Some((SetRefusal::Busy, REFUSE_SET_ARMED.to_owned()))
+        } else if scenes.as_ref().map(|pair| pair.version) != Some(command.scene_version) {
+            Some((
+                SetRefusal::Invalid,
+                "scene version changed before the frame boundary; re-plan the operation".into(),
+            ))
+        } else {
+            self.validate_patch(&set)
+                .err()
+                .map(|e| (SetRefusal::from_switcher_error(&e), e))
+        };
+        if let Some((reason, error)) = error {
+            let _ = arm.refuse(reason);
+            self.publish_outcome(command.operation_id, tick.index, false, Some(error));
+            return;
+        }
+        self.armed = Some(ArmedSet {
+            operation_id: command.operation_id,
+            set,
+            arm,
+            deadline: tick.index.saturating_add(SET_ADOPT_DEADLINE_TICKS),
+            applied_at: None,
+        });
+    }
+
+    /// Refuse the armed set (first terminal write wins) and free the slot.
+    fn refuse_armed(&mut self, tick: Tick, reason: SetRefusal, error: String) {
+        if let Some(armed) = self.armed.take() {
+            let _ = armed.arm.refuse(reason);
+            let error = match armed.arm.reason() {
+                Some(won) if won != reason => format!("refused:{}", won.code()),
+                _ => error,
+            };
+            self.publish_outcome(armed.operation_id, tick.index, false, Some(error));
+        }
+    }
+
+    /// Deadline expiry of the armed slot without a fresh drain (a repeat
+    /// tick): O(1), never validates or applies. A router refusal frees the
+    /// slot; a `Pending` set expires `feed-not-fresh` at its deadline, a
+    /// `SwitcherReady` one `deadline` at the grace backstop. `Applying` and
+    /// `Committed` are owned by the commit/reject path and left alone.
+    fn expire_armed(&mut self, tick: Tick) {
+        let Some(armed) = self.armed.as_ref() else {
+            return;
+        };
+        if armed.applied_at.is_some() {
+            return;
+        }
+        let deadline = armed.deadline;
+        match armed.arm.state() {
+            ArmState::Refused => {
+                let code = armed.arm.reason().map_or("invalid", SetRefusal::code);
+                self.refuse_armed(tick, SetRefusal::Invalid, format!("refused:{code}"));
+            }
+            ArmState::Pending if tick.index >= deadline => {
+                self.refuse_armed(tick, SetRefusal::FeedNotFresh, REFUSE_NO_FRESH_FRAME.into());
+            }
+            ArmState::SwitcherReady
+                if tick.index >= deadline.saturating_add(SET_SWITCHER_GRACE_TICKS) =>
+            {
+                self.refuse_armed(
+                    tick,
+                    SetRefusal::Deadline,
+                    "refused:deadline: the set was not adopted in time".into(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// One fresh drain of the armed slot: O(1) except on the adoption tick
+    /// (one validation, O(members)). Never waits.
+    #[allow(clippy::too_many_lines)]
+    // reason: one flat match over the handshake states; each arm is the
+    // switcher's single move for that state.
+    fn drive_armed(&mut self, tick: Tick) {
+        let Some(armed) = self.armed.as_mut() else {
+            return;
+        };
+        // A patch applied on a drain that was neither committed nor rejected
+        // stayed in the table: it was composed, so it is committed there.
+        if let Some(at) = armed.applied_at.take() {
+            if armed.arm.commit(at) {
+                if let Some(armed) = self.armed.take() {
+                    self.publish_outcome(armed.operation_id, at, true, None);
+                }
+                return;
+            }
+        }
+        let arm = Arc::clone(&armed.arm);
+        let deadline = armed.deadline;
+        match arm.state() {
+            // Applying is resolved by this tick's commit/reject only.
+            ArmState::Committed | ArmState::Applying => {
+                if arm.state() == ArmState::Committed {
+                    self.armed = None;
+                }
+            }
+            ArmState::Refused => {
+                // The router refused the set (superseded, capacity, an
+                // output member's cause): nothing was applied here.
+                let code = arm.reason().map_or("invalid", SetRefusal::code);
+                self.refuse_armed(tick, SetRefusal::Invalid, format!("refused:{code}"));
+            }
+            ArmState::Pending => match self.armed_ready(tick) {
+                Ok(true) => {
+                    let _ = arm.switcher_ready();
+                }
+                Ok(false) if tick.index >= deadline => {
+                    self.refuse_armed(tick, SetRefusal::FeedNotFresh, REFUSE_NO_FRESH_FRAME.into());
+                }
+                Ok(false) => {}
+                Err((reason, error)) => self.refuse_armed(tick, reason, error),
+            },
+            ArmState::SwitcherReady => {
+                if tick.index >= deadline.saturating_add(SET_SWITCHER_GRACE_TICKS) {
+                    self.refuse_armed(
+                        tick,
+                        SetRefusal::Deadline,
+                        "refused:deadline: the set was not adopted in time".into(),
+                    );
+                }
+            }
+            ArmState::Proposed => {
+                let at = arm.tick();
+                if at > tick.index {
+                    return;
+                }
+                if at < tick.index {
+                    // Missed (a skipped or late drain): back to the router.
+                    let _ = arm.unpropose();
+                    if tick.index >= deadline.saturating_add(SET_SWITCHER_GRACE_TICKS) {
+                        self.refuse_armed(
+                            tick,
+                            SetRefusal::Deadline,
+                            "refused:deadline: the set was not adopted in time".into(),
+                        );
+                    }
+                    return;
+                }
+                // The adoption tick: re-validate (a Cut may have moved PGM).
+                match self.armed_ready(tick) {
+                    // Claimed before the table changes: a refusal racing in
+                    // from the router either wins first (nothing applied) or
+                    // loses (the patch lands and commits at T).
+                    Ok(true) if arm.begin_apply(at) => {
+                        if let Some(set) = self.armed.as_ref().map(|a| a.set.clone()) {
+                            self.apply_patch(&set);
+                        }
+                        if let Some(armed) = self.armed.as_mut() {
+                            armed.applied_at = Some(tick.index);
+                        }
+                    }
+                    // The router refused it meanwhile: settled next drain.
+                    Ok(true) => {}
+                    // The new PGM source lost its fresh frame: re-propose.
+                    Ok(false) => {
+                        let _ = arm.unpropose();
+                    }
+                    Err((reason, error)) => self.refuse_armed(tick, reason, error),
+                }
+            }
+        }
+    }
+
+    /// Whether the armed set validates now and its new Program source (if
+    /// any) has a fresh frame; a validation failure is its typed refusal.
+    fn armed_ready(&self, tick: Tick) -> Result<bool, (SetRefusal, String)> {
+        let Some(armed) = self.armed.as_ref() else {
+            return Ok(false);
+        };
+        match self.validate_patch(&armed.set) {
+            Err(error) => Err((SetRefusal::from_switcher_error(&error), error)),
+            Ok(None) => Ok(true),
+            Ok(Some(source)) => match self.fresh_at(source.as_str(), tick) {
+                Some(fresh) => Ok(fresh),
+                None => Err((
+                    SetRefusal::Invalid,
+                    "switcher source prime provider is unavailable".into(),
+                )),
+            },
+        }
     }
 
     /// Apply a take now if its incoming source is fresh, else hold it (one slot,
@@ -1144,6 +1419,17 @@ impl SwitcherTickDriver {
     /// call this; failure calls `reject_composed_tick` instead.
     pub fn commit_composed_tick(&mut self, tick: Tick) {
         self.before_staged = None;
+        // The armed patch composed on this tick: the set is committed at T
+        // (its outcome rides this tick's applied receipts).
+        if self
+            .armed
+            .as_ref()
+            .is_some_and(|a| a.applied_at == Some(tick.index) && a.arm.commit(tick.index))
+        {
+            if let Some(armed) = self.armed.take() {
+                self.staged_success.push(armed.operation_id);
+            }
+        }
         self.applied_tick
             .store(tick.index, std::sync::atomic::Ordering::Release);
         let (program, preview) = self.resolved_selections();
@@ -1198,6 +1484,13 @@ impl SwitcherTickDriver {
         // The AUTO admitted or running on this tick, if any: it gets exactly
         // one terminal refusal, never a later second outcome (SW2-03).
         let staged_auto = self.active_auto.take();
+        // The armed patch applied on this tick is restored with the table
+        // below and goes back to the router (never committed).
+        if let Some(armed) = self.armed.as_mut() {
+            if armed.applied_at.take() == Some(tick.index) {
+                let _ = armed.arm.abort_apply();
+            }
+        }
         if let Some(previous) = self.before_staged.take() {
             self.machine = previous.machine;
             self.active_auto = previous.active_auto;
