@@ -6,7 +6,7 @@ use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use multiview_core::switcher::{FrameCount, SourceRef, TransitionDescriptor};
+use multiview_core::switcher::{FrameCount, SourceRef, TransitionDescriptor, MAX_STINGER_FRAMES};
 use multiview_engine::switcher_control::{SwitcherCommand, SwitcherControl, SwitcherVerb};
 use multiview_events::AuthzScope;
 use serde::{Deserialize, Serialize};
@@ -52,11 +52,15 @@ pub struct SwitcherRequest {
     /// (rate >= 2, switch point strictly inside (0, 1)); `{"kind":"wipe",
     /// "pattern":"linear_edge"|"vertical"|"diagonal"|"box"|"circle","rate":N,
     /// "reverse":bool,"softness":0..1,"border_width":0..1,"border_color":"#rrggbb",
-    /// "position_xy":[0..1,0..1]}`. `rate` is 1..=1000 frames; AUTO replaces it
-    /// with its own `duration_frames`. Refused with `unsupported-transition`:
-    /// `stinger`, DVE kinds, a dip through a source, `flip_flop` and
-    /// `border_fill_source`; with `invalid-transition`: anything that does not
-    /// parse or is out of range.
+    /// "position_xy":[0..1,0..1]}`; `{"kind":"stinger","player":"<media player>",
+    /// "pre_roll":N,"clip_duration":N,"trigger_point":N,"mix_rate":N}`
+    /// (`trigger_point + mix_rate <= clip_duration`, ADR-0112 §5). `rate` and
+    /// every stinger count are 1..=1000 frames; AUTO replaces `rate` with its
+    /// own `duration_frames` (a stinger keeps its own timing). Refused with
+    /// `unsupported-transition`: DVE kinds, a dip through a source, `flip_flop`
+    /// and `border_fill_source`; with `unknown-media-player`: a stinger whose
+    /// player is not a configured media player; with `invalid-transition`:
+    /// anything that does not parse or is out of range.
     ///
     /// Parsed from raw JSON so a malformed descriptor is a typed 422; the
     /// documented shape is [`crate::openapi_schemas::TransitionDescriptorDoc`].
@@ -164,13 +168,36 @@ pub fn authorize_refs(principal: &Principal, req: &SwitcherRequest) -> ControlRe
 /// rules (ADR-0112): typed 422 `invalid-transition` for a shape or number
 /// the machine refuses, `unsupported-transition` for a kind or option the
 /// Program drive does not render. The engine re-checks at the tick.
-fn parse_transition(req: &SwitcherRequest) -> Result<Option<TransitionDescriptor>, Box<Response>> {
+fn parse_transition(
+    state: &AppState,
+    req: &SwitcherRequest,
+) -> Result<Option<TransitionDescriptor>, Box<Response>> {
     let Some(value) = req.transition.as_ref() else {
         return Ok(None);
     };
     let invalid = |detail: String| Box::new(typed("invalid-transition", detail));
     let descriptor: TransitionDescriptor =
         serde_json::from_value(value.clone()).map_err(|e| invalid(e.to_string()))?;
+    if let TransitionDescriptor::Stinger { player, .. } = &descriptor {
+        // ADR-0112 §5: a stinger is rendered when its numbers are valid, so
+        // its numbers are checked first; its player must be a configured
+        // media player (the id was authorized in `authorize_refs`).
+        if !descriptor.is_valid() {
+            return Err(invalid(format!(
+                "a stinger needs trigger_point + mix_rate <= clip_duration and every \
+                 frame count at most {MAX_STINGER_FRAMES}"
+            )));
+        }
+        if state.media_players.get(player.as_str()).is_err() {
+            return Err(Box::new(typed(
+                "unknown-media-player",
+                format!(
+                    "stinger player {:?} is not a configured media player",
+                    player.as_str()
+                ),
+            )));
+        }
+    }
     if !descriptor.is_rendered() {
         return Err(Box::new(typed(
             "unsupported-transition",
@@ -492,7 +519,7 @@ pub(crate) async fn plan_switcher(
     authorize_refs(&principal, &req)?;
     validate_source_configured(&state, &req)?;
     validate_first_slice(&req, &req.action)?;
-    if let Err(response) = parse_transition(&req) {
+    if let Err(response) = parse_transition(&state, &req) {
         return Ok(*response);
     }
     let handle = engine(&state)?;
@@ -542,7 +569,7 @@ pub(crate) async fn submit_switcher(
         ));
     }
     validate_first_slice(&req, &kind)?;
-    let transition = match parse_transition(&req) {
+    let transition = match parse_transition(&state, &req) {
         Ok(transition) => transition,
         Err(response) => return Ok(*response),
     };

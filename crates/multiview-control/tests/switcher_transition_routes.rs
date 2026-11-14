@@ -130,14 +130,36 @@ fn tick(driver: &mut SwitcherTickDriver, index: u64) {
     driver.commit_composed_tick(tick);
 }
 
+fn configured_players(ids: &[&str]) -> Arc<dyn multiview_control::ResourceRepository> {
+    let store = multiview_control::InMemoryMediaPlayerStore::new();
+    for id in ids {
+        multiview_control::ResourceRepository::create(
+            &store,
+            id,
+            multiview_control::ResourceInput {
+                name: (*id).to_owned(),
+                body: json!({ "id": id }),
+            },
+        )
+        .unwrap();
+    }
+    Arc::new(store)
+}
+
 fn rig() -> (Harness, SwitcherControl, SwitcherTickDriver) {
     let (handle, driver) = runtime();
     let h = harness_with(|state| {
         state
             .with_sources_store(configured_sources(&["a", "b"]))
+            .with_media_player_store(configured_players(&["vt1"]))
             .with_switcher(handle.clone())
     });
     (h, handle, driver)
+}
+
+fn stinger(player: &str) -> Value {
+    json!({"kind": "stinger", "player": player, "pre_roll": 2, "clip_duration": 30,
+        "trigger_point": 8, "mix_rate": 6})
 }
 
 fn set(transition: Value) -> Value {
@@ -262,7 +284,6 @@ async fn unrendered_kinds_and_options_are_typed_unsupported_transition_422s() {
     let (h, handle, mut driver) = rig();
     let mut outcomes = handle.outcomes();
     for (n, transition) in [
-        json!({"kind": "stinger", "player": "a", "pre_roll": 1, "clip_duration": 30, "trigger_point": 5, "mix_rate": 10}),
         json!({"kind": "dve_push", "direction": "left", "rate": 10}),
         json!({"kind": "wipe", "pattern": "box", "rate": 10, "flip_flop": true}),
         json!({"kind": "wipe", "pattern": "box", "rate": 10, "border_fill_source": "a"}),
@@ -273,7 +294,11 @@ async fn unrendered_kinds_and_options_are_typed_unsupported_transition_422s() {
     {
         let plan = send(
             &h.router,
-            post_json("/api/v1/switcher/plan", OPERATOR_TOKEN, &set(transition.clone())),
+            post_json(
+                "/api/v1/switcher/plan",
+                OPERATOR_TOKEN,
+                &set(transition.clone()),
+            ),
         )
         .await;
         assert!(problem_type(plan).await.ends_with("unsupported-transition"));
@@ -857,4 +882,121 @@ async fn a_replay_during_an_auto_returns_the_original_operation() {
         !ids.iter().any(|id| id == &op),
         "the replay queued nothing: {ids:?}"
     );
+}
+
+/// ADR-0112 §5: a stinger through a configured media player plans, queues
+/// with 202 and the engine applies it at a tick; GET reports it.
+#[tokio::test]
+async fn a_stinger_through_a_configured_player_plans_and_queues_with_202() {
+    let (h, handle, mut driver) = rig();
+    let mut outcomes = handle.outcomes();
+    let plan = send(
+        &h.router,
+        post_json(
+            "/api/v1/switcher/plan",
+            OPERATOR_TOKEN,
+            &set(stinger("vt1")),
+        ),
+    )
+    .await;
+    assert_eq!(plan.status(), StatusCode::OK);
+    let response = send(
+        &h.router,
+        command(&set(stinger("vt1")), OPERATOR_TOKEN, "s1"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let op = body_json(response).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tick(&mut driver, 1);
+    let outcome = outcomes.try_recv().unwrap().event;
+    assert_eq!(outcome.operation_id, op);
+    assert!(outcome.completed && outcome.error.is_none(), "{outcome:?}");
+    let state = body_json(send(&h.router, get("/api/v1/switcher/me1", OPERATOR_TOKEN)).await).await;
+    assert_eq!(state["transition"], stinger("vt1"));
+}
+
+/// ADR-0112 §5: a stinger whose player is not a configured media player
+/// (a source id, or nothing at all) is a typed 422 on plan and command and
+/// queues nothing; an out-of-range stinger is `invalid-transition`.
+#[tokio::test]
+async fn a_stinger_through_an_unknown_player_is_a_typed_422() {
+    let (h, handle, mut driver) = rig();
+    let mut outcomes = handle.outcomes();
+    for (n, (transition, kind)) in [
+        (stinger("ghost"), "unknown-media-player"),
+        (stinger("a"), "unknown-media-player"),
+        (
+            json!({"kind": "stinger", "player": "vt1", "pre_roll": 2, "clip_duration": 10,
+                "trigger_point": 8, "mix_rate": 6}),
+            "invalid-transition",
+        ),
+        (
+            json!({"kind": "stinger", "player": "vt1", "pre_roll": 1001, "clip_duration": 30,
+                "trigger_point": 8, "mix_rate": 6}),
+            "invalid-transition",
+        ),
+        (
+            json!({"kind": "stinger", "player": "vt1", "pre_roll": 0, "clip_duration": 30,
+                "trigger_point": 8, "mix_rate": 6}),
+            "invalid-transition",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let plan = send(
+            &h.router,
+            post_json(
+                "/api/v1/switcher/plan",
+                OPERATOR_TOKEN,
+                &set(transition.clone()),
+            ),
+        )
+        .await;
+        assert!(problem_type(plan).await.ends_with(kind), "{transition}");
+        let take = send(
+            &h.router,
+            command(&set(transition.clone()), OPERATOR_TOKEN, &format!("x{n}")),
+        )
+        .await;
+        assert!(problem_type(take).await.ends_with(kind), "{transition}");
+    }
+    tick(&mut driver, 1);
+    assert!(outcomes.try_recv().is_err(), "a refusal queues nothing");
+}
+
+/// ADR-0112 §5 BOLA: the stinger's player is authorized like any reference,
+/// before the body is parsed or the player looked up, on both routes.
+#[tokio::test]
+async fn a_stinger_player_is_authorized_before_it_is_looked_up() {
+    let (h, handle, mut driver) = rig();
+    let mut outcomes = handle.outcomes();
+    for body in [set(stinger("vt1")), set(stinger("ghost"))] {
+        let plan = send(
+            &h.router,
+            post_json("/api/v1/switcher/plan", SCOPED_TOKEN, &body),
+        )
+        .await;
+        assert_eq!(plan.status(), StatusCode::FORBIDDEN);
+        let take = send(&h.router, command(&body, SCOPED_TOKEN, "b1")).await;
+        assert_eq!(take.status(), StatusCode::FORBIDDEN);
+    }
+    tick(&mut driver, 1);
+    assert!(outcomes.try_recv().is_err(), "nothing was queued");
+    let principal = |objects: &[&str]| Principal {
+        key_id: "case".into(),
+        role: Role::Operator,
+        scoped_object_ids: Some(objects.iter().map(|o| (*o).to_owned()).collect()),
+        scoped_output_ids: Some(vec!["program:main".into()]),
+        scoped_discovery_domains: None,
+    };
+    let req: SwitcherRequest = serde_json::from_value(set(stinger("vt1"))).unwrap();
+    assert!(matches!(
+        authorize_refs(&principal(&["me1"]), &req),
+        Err(ControlError::Forbidden(_))
+    ));
+    authorize_refs(&principal(&["me1", "vt1"]), &req).unwrap();
 }

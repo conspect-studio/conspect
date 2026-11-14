@@ -24619,7 +24619,7 @@
               },
               {
                 "$ref": "#/components/schemas/TransitionDescriptorDoc",
-                "description": "The transition `set_transition` selects for the next AUTO (ADR-0112\n§4), required by it and refused on every other action. Tagged on\n`kind`: `{\"kind\":\"cut\"}`; `{\"kind\":\"mix\",\"rate\":N}`;\n`{\"kind\":\"dip\",\"rate\":N,\"color\":\"#rrggbb\",\"switch_point\":{\"num\":1,\"den\":2}}`\n(rate >= 2, switch point strictly inside (0, 1)); `{\"kind\":\"wipe\",\n\"pattern\":\"linear_edge\"|\"vertical\"|\"diagonal\"|\"box\"|\"circle\",\"rate\":N,\n\"reverse\":bool,\"softness\":0..1,\"border_width\":0..1,\"border_color\":\"#rrggbb\",\n\"position_xy\":[0..1,0..1]}`. `rate` is 1..=1000 frames; AUTO replaces it\nwith its own `duration_frames`. Refused with `unsupported-transition`:\n`stinger`, DVE kinds, a dip through a source, `flip_flop` and\n`border_fill_source`; with `invalid-transition`: anything that does not\nparse or is out of range.\n\nParsed from raw JSON so a malformed descriptor is a typed 422; the\ndocumented shape is [`crate::openapi_schemas::TransitionDescriptorDoc`]."
+                "description": "The transition `set_transition` selects for the next AUTO (ADR-0112\n§4), required by it and refused on every other action. Tagged on\n`kind`: `{\"kind\":\"cut\"}`; `{\"kind\":\"mix\",\"rate\":N}`;\n`{\"kind\":\"dip\",\"rate\":N,\"color\":\"#rrggbb\",\"switch_point\":{\"num\":1,\"den\":2}}`\n(rate >= 2, switch point strictly inside (0, 1)); `{\"kind\":\"wipe\",\n\"pattern\":\"linear_edge\"|\"vertical\"|\"diagonal\"|\"box\"|\"circle\",\"rate\":N,\n\"reverse\":bool,\"softness\":0..1,\"border_width\":0..1,\"border_color\":\"#rrggbb\",\n\"position_xy\":[0..1,0..1]}`; `{\"kind\":\"stinger\",\"player\":\"<media player>\",\n\"pre_roll\":N,\"clip_duration\":N,\"trigger_point\":N,\"mix_rate\":N}`\n(`trigger_point + mix_rate <= clip_duration`, ADR-0112 §5). `rate` and\nevery stinger count are 1..=1000 frames; AUTO replaces `rate` with its\nown `duration_frames` (a stinger keeps its own timing). Refused with\n`unsupported-transition`: DVE kinds, a dip through a source, `flip_flop`\nand `border_fill_source`; with `unknown-media-player`: a stinger whose\nplayer is not a configured media player; with `invalid-transition`:\nanything that does not parse or is out of range.\n\nParsed from raw JSON so a malformed descriptor is a typed 422; the\ndocumented shape is [`crate::openapi_schemas::TransitionDescriptorDoc`]."
               }
             ]
           }
@@ -25699,7 +25699,7 @@
           },
           {
             "type": "object",
-            "description": "Media transition (not rendered yet).",
+            "description": "Media transition: a media-player clip rolled over Program while the\ntake happens under it (ADR-0112 §5).",
             "required": [
               "player",
               "pre_roll",
@@ -25712,7 +25712,8 @@
               "clip_duration": {
                 "type": "integer",
                 "format": "int32",
-                "description": "Clip length in frames.",
+                "description": "Clip length in frames: how long it is drawn over Program.",
+                "maximum": 1000,
                 "minimum": 1
               },
               "kind": {
@@ -25724,29 +25725,32 @@
               "mix_rate": {
                 "type": "integer",
                 "format": "int32",
-                "description": "Mix window in frames.",
+                "description": "Mix window in frames (`1` is a cut); `trigger_point + mix_rate <=\nclip_duration`.",
+                "maximum": 1000,
                 "minimum": 1
               },
               "player": {
                 "type": "string",
-                "description": "The bound media player's id."
+                "description": "A configured media player's id (`GET /api/v1/media/players`)."
               },
               "pre_roll": {
                 "type": "integer",
                 "format": "int32",
-                "description": "Pre-roll frames.",
+                "description": "Frames from the AUTO to the clip's first frame (the player is cued\nand played on the AUTO's tick).",
+                "maximum": 1000,
                 "minimum": 1
               },
               "trigger_point": {
                 "type": "integer",
                 "format": "int32",
-                "description": "Frame the underlying mix starts on.",
+                "description": "Clip frame the underlying mix starts on.",
+                "maximum": 1000,
                 "minimum": 1
               }
             }
           }
         ],
-        "description": "`OpenAPI` mirror of [`multiview_core::switcher::TransitionDescriptor`]\n(ADR-0055 §3, ADR-0112 §4).\n\nSerde-equivalent: internally tagged on `kind`, `snake_case`, unknown\nfields (and fields of another kind) refused. Durations (`rate`, …) are\nwhole output frames, at least 1; colours are `\"#rgb\"`/`\"#rrggbb\"`.\nThe control API selects only what the Program drive renders (`cut`,\n`mix`, `dip` to a colour, `wipe` without `flip_flop`/`border_fill_source`)\nwith a rate of at most 1000 frames; the other kinds are documented\nbecause the engine's descriptor carries them."
+        "description": "`OpenAPI` mirror of [`multiview_core::switcher::TransitionDescriptor`]\n(ADR-0055 §3, ADR-0112 §4).\n\nSerde-equivalent: internally tagged on `kind`, `snake_case`, unknown\nfields (and fields of another kind) refused. Durations (`rate`, …) are\nwhole output frames, at least 1; colours are `\"#rgb\"`/`\"#rrggbb\"`.\nThe control API selects only what the Program drive renders (`cut`,\n`mix`, `dip` to a colour, `wipe` without `flip_flop`/`border_fill_source`,\n`stinger` through a configured media player) with a rate and stinger\nframe counts of at most 1000 frames; the DVE kinds are documented because\nthe engine's descriptor carries them."
       },
       "TransitionDoc": {
         "type": "object",

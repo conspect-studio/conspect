@@ -2603,9 +2603,10 @@ fn default_position_xy_doc() -> [f32; 2] {
 /// fields (and fields of another kind) refused. Durations (`rate`, …) are
 /// whole output frames, at least 1; colours are `"#rgb"`/`"#rrggbb"`.
 /// The control API selects only what the Program drive renders (`cut`,
-/// `mix`, `dip` to a colour, `wipe` without `flip_flop`/`border_fill_source`)
-/// with a rate of at most 1000 frames; the other kinds are documented
-/// because the engine's descriptor carries them.
+/// `mix`, `dip` to a colour, `wipe` without `flip_flop`/`border_fill_source`,
+/// `stinger` through a configured media player) with a rate and stinger
+/// frame counts of at most 1000 frames; the DVE kinds are documented because
+/// the engine's descriptor carries them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
@@ -2680,21 +2681,24 @@ pub enum TransitionDescriptorDoc {
         #[schema(minimum = 1)]
         rate: u32,
     },
-    /// Media transition (not rendered yet).
+    /// Media transition: a media-player clip rolled over Program while the
+    /// take happens under it (ADR-0112 §5).
     Stinger {
-        /// The bound media player's id.
+        /// A configured media player's id (`GET /api/v1/media/players`).
         player: String,
-        /// Pre-roll frames.
-        #[schema(minimum = 1)]
+        /// Frames from the AUTO to the clip's first frame (the player is cued
+        /// and played on the AUTO's tick).
+        #[schema(minimum = 1, maximum = 1000)]
         pre_roll: u32,
-        /// Clip length in frames.
-        #[schema(minimum = 1)]
+        /// Clip length in frames: how long it is drawn over Program.
+        #[schema(minimum = 1, maximum = 1000)]
         clip_duration: u32,
-        /// Frame the underlying mix starts on.
-        #[schema(minimum = 1)]
+        /// Clip frame the underlying mix starts on.
+        #[schema(minimum = 1, maximum = 1000)]
         trigger_point: u32,
-        /// Mix window in frames.
-        #[schema(minimum = 1)]
+        /// Mix window in frames (`1` is a cut); `trigger_point + mix_rate <=
+        /// clip_duration`.
+        #[schema(minimum = 1, maximum = 1000)]
         mix_rate: u32,
     },
 }
