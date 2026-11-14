@@ -2722,7 +2722,7 @@ msgstr ""
 msgid "Concepts"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:346
+#: src/components/routing/SubtitlePatchPanel.tsx:270
 msgid "config"
 msgstr ""
 
@@ -6305,7 +6305,7 @@ msgstr ""
 msgid "Listening, no caller attached"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:346
+#: src/components/routing/SubtitlePatchPanel.tsx:270
 msgid "live"
 msgstr ""
 
@@ -7639,7 +7639,7 @@ msgstr ""
 msgid "No pending actions."
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:411
+#: src/components/routing/SubtitlePatchPanel.tsx:333
 msgid "No pending change"
 msgstr ""
 
@@ -7715,7 +7715,7 @@ msgstr ""
 msgid "No source catalog available"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:309
+#: src/components/routing/SubtitlePatchPanel.tsx:233
 msgid "No source declares captions."
 msgstr ""
 
@@ -7800,7 +7800,7 @@ msgstr ""
 msgid "Nodes enrol with a keypair identity: the node proves itself with its key, not with a network address, so a node keeps its identity across DHCP changes and re-images. That is why the management address is optional for the <0>displaynode</0> driver — an enrolled node finds the controller and authenticates itself. After a network loss the node reconnects with its enrolled identity, re-pulls its stream, and re-converges its sync offset before un-muting its output."
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:380
+#: src/components/routing/SubtitlePatchPanel.tsx:304
 msgid "none"
 msgstr ""
 
@@ -7821,7 +7821,7 @@ msgstr ""
 msgid "None (no captions decoded)"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:357
+#: src/components/routing/SubtitlePatchPanel.tsx:281
 msgid "None (unpatch)"
 msgstr ""
 
@@ -8480,7 +8480,7 @@ msgstr ""
 msgid "Paste this command into a terminal to open the stream in VLC."
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:342
+#: src/components/routing/SubtitlePatchPanel.tsx:266
 msgid "patch"
 msgstr ""
 
@@ -8491,7 +8491,7 @@ msgstr ""
 #. placeholder {0}: source.name
 #. placeholder {1}: column.name
 #. placeholder {2}: slot.slot
-#: src/components/routing/SubtitlePatchPanel.tsx:337
+#: src/components/routing/SubtitlePatchPanel.tsx:261
 msgid "Patch {0} to {1} slot {2}"
 msgstr ""
 
@@ -8504,7 +8504,7 @@ msgstr ""
 msgid "Patch source for input {0}"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:342
+#: src/components/routing/SubtitlePatchPanel.tsx:266
 msgid "patched"
 msgstr ""
 
@@ -8538,8 +8538,7 @@ msgstr ""
 msgid "Peers discovered"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:256
-#: src/components/routing/SubtitlePatchPanel.tsx:274
+#: src/components/routing/SubtitlePatchPanel.tsx:198
 msgid "pending"
 msgstr ""
 
@@ -9293,7 +9292,7 @@ msgstr ""
 msgid "Red"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:328
+#: src/components/routing/SubtitlePatchPanel.tsx:252
 msgid "redacted"
 msgstr ""
 
@@ -9323,10 +9322,6 @@ msgstr ""
 
 #: src/pages/RelayManagementPage.tsx:73
 msgid "Refresh relay status"
-msgstr ""
-
-#: src/components/routing/SubtitlePatchPanel.tsx:207
-msgid "Refused"
 msgstr ""
 
 #: src/iptv/Controls.tsx:55
@@ -9787,7 +9782,7 @@ msgstr ""
 msgid "Rows"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:288
+#: src/components/routing/SubtitlePatchPanel.tsx:212
 msgid "Rows are sources that declare captions; columns are output subtitle slots."
 msgstr ""
 
@@ -10390,7 +10385,7 @@ msgstr ""
 msgid "Skip to content"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:298
+#: src/components/routing/SubtitlePatchPanel.tsx:222
 msgid "slot"
 msgstr ""
 
@@ -10423,7 +10418,7 @@ msgstr ""
 msgid "Sort order"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:293
+#: src/components/routing/SubtitlePatchPanel.tsx:217
 #: src/layout/components/CellsForm.tsx:398
 #: src/layout/components/GridLayoutEditor.tsx:667
 #: src/pages/approved/ShowPage.tsx:90
@@ -10501,7 +10496,7 @@ msgstr ""
 msgid "Source URL"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:267
+#: src/components/routing/SubtitlePatchPanel.tsx:191
 msgid "source-has-no-captions"
 msgstr ""
 
@@ -10680,7 +10675,7 @@ msgstr ""
 msgid "Station WMO id (optional)"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:400
+#: src/components/routing/SubtitlePatchPanel.tsx:324
 #: src/pages/DataPage.tsx:88
 #: src/pages/graphics/DataView.tsx:356
 #: src/pages/MeshPage.tsx:62
@@ -10876,8 +10871,8 @@ msgstr ""
 msgid "Subtitle layers"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:282
-#: src/components/routing/SubtitlePatchPanel.tsx:284
+#: src/components/routing/SubtitlePatchPanel.tsx:206
+#: src/components/routing/SubtitlePatchPanel.tsx:208
 msgid "Subtitle patch"
 msgstr ""
 
@@ -11039,7 +11034,7 @@ msgstr ""
 msgid "Take exit"
 msgstr ""
 
-#: src/components/routing/SubtitlePatchPanel.tsx:238
+#: src/components/routing/SubtitlePatchPanel.tsx:168
 #: src/pages/OutputAudioRow.tsx:279
 #: src/pages/OutputFeedRow.tsx:239
 msgid "Take failed"
@@ -12445,7 +12440,7 @@ msgstr ""
 
 #. placeholder {0}: column.name
 #. placeholder {1}: slot.slot
-#: src/components/routing/SubtitlePatchPanel.tsx:375
+#: src/components/routing/SubtitlePatchPanel.tsx:299
 msgid "Unpatch {0} slot {1}"
 msgstr ""
 

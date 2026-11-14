@@ -9,7 +9,7 @@
 // RoutingPage's own structure — lane patch-e is building a full patch-matrix
 // page in parallel on other branches, so this stays a drop-in component a
 // later merge can relocate trivially.
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useReducer, useRef } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { useQuery } from '@tanstack/react-query';
@@ -35,6 +35,8 @@ import {
   TableRow,
 } from '../ui/table';
 import { Badge } from '../ui/badge';
+import { EMPTY_SUBTITLE_ATTEMPTS, subtitleAttemptsReducer } from './subtitlePatchAttempts';
+import type { SubtitleAttemptState } from './subtitlePatchAttempts';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -51,20 +53,6 @@ function columnsOf(outputs: readonly PatchOutputView[], names: ReadonlyMap<strin
   return outputs
     .filter((o) => o.subtitle.length > 0)
     .map((o) => ({ output: o.output, name: names.get(o.output) ?? o.output, slots: o.subtitle }));
-}
-
-/**
- * Per-destination (output + slot) pending/outcome state, keyed by
- * `${output}:${slot}`. One state per destination, not per source row: the
- * destination is what a take applies to, so its status is shown once per
- * column (review UI-5), covering both the captioned-source rows and the
- * None (unpatch) row.
- */
-interface CellState {
-  readonly operationId: string;
-  readonly outcome?: string;
-  readonly note?: string;
-  readonly error?: string;
 }
 
 function cellKey(output: string, slot: number): string {
@@ -84,36 +72,14 @@ export function SubtitlePatchPanel(): JSX.Element | null {
     queryFn: () => getPatch(),
     refetchInterval: 4000,
   });
-  const [cells, setCells] = useState<Readonly<Record<string, CellState>>>({});
-  // One destination (output+slot) accepts only its LATEST attempt's result:
-  // review UI2-1 found that two attempts on the same destination (e.g. a
-  // second click while the first is still awaiting its take response) each
-  // wrote `cells[key]` unconditionally, so an older attempt's late-arriving
-  // 202/outcome could overwrite a newer attempt's already-displayed
-  // refusal. `attemptSeq` is the latest dispatched attempt number per
-  // destination key; every continuation (plan result, take acceptance, the
-  // catch block, and settlement from the buffered/live outcome) re-checks
-  // it against the attempt's own captured number before writing anything,
-  // and ignores itself — never overwrites, never "wins" late — when it is
-  // not the latest.
+  const [attempts, dispatch] = useReducer(subtitleAttemptsReducer, EMPTY_SUBTITLE_ATTEMPTS);
+  // Per-destination monotonic attempt counter (review UI2-1): a plain ref
+  // is enough here — it is read and incremented synchronously inside the
+  // click handler, before any `await`, so there is no race in generating
+  // the next attempt number itself; attempt OWNERSHIP (which attempt's
+  // continuations are allowed to still write) lives entirely in the
+  // reducer state above, compared via `isCurrentAttempt`.
   const attemptSeq = useRef(new Map<string, number>());
-  const isLatestAttempt = (key: string, attempt: number): boolean => attemptSeq.current.get(key) === attempt;
-  // Destinations with at least one attempt still in flight (dispatched but
-  // not yet settled by the LATEST attempt): their buttons are disabled
-  // (aria-disabled + a reason in the status region) so a second click
-  // cannot start a second concurrent attempt on the same destination while
-  // one is outstanding.
-  const [pendingKeys, setPendingKeys] = useState<ReadonlySet<string>>(new Set());
-  const setPending = (key: string, pending: boolean): void => {
-    setPendingKeys((current) => {
-      const has = current.has(key);
-      if (has === pending) return current;
-      const next = new Set(current);
-      if (pending) next.add(key);
-      else next.delete(key);
-      return next;
-    });
-  };
 
   // Outcomes are buffered by operation id from mount (not from the 202 on):
   // the realtime `route.output` event can arrive before `takePatch`'s HTTP
@@ -159,28 +125,7 @@ export function SubtitlePatchPanel(): JSX.Element | null {
           if (oldest === undefined) break;
           recentOutcomes.current.delete(oldest);
         }
-        // A cell's `operationId` is only ever written by the destination's
-        // latest attempt (every writer below is gated by
-        // `isLatestAttempt`), so matching on it here already excludes a
-        // superseded attempt's operation id without any extra bookkeeping.
-        // The settled keys are collected here and applied to `pendingKeys`
-        // in a separate call, outside the `cells` updater (an updater may
-        // run more than once, e.g. under StrictMode, and must stay a pure
-        // function of its previous state).
-        const settledKeys: string[] = [];
-        setCells((current) => {
-          let changed: Record<string, CellState> | undefined;
-          for (const [key, state] of Object.entries(current)) {
-            if (state.operationId === operationId && state.outcome === undefined) {
-              changed = { ...(changed ?? current), [key]: { ...state, outcome } };
-              settledKeys.push(key);
-            }
-          }
-          return changed ?? current;
-        });
-        for (const key of settledKeys) {
-          setPending(key, false);
-        }
+        dispatch({ type: 'outcome', operationId, outcome });
       }),
     [],
   );
@@ -193,52 +138,35 @@ export function SubtitlePatchPanel(): JSX.Element | null {
     const key = cellKey(output, slot);
     const attempt = (attemptSeq.current.get(key) ?? 0) + 1;
     attemptSeq.current.set(key, attempt);
-    const isLatest = (): boolean => isLatestAttempt(key, attempt);
-    setPending(key, true);
-    setCells((current) => ({ ...current, [key]: { operationId: '' } }));
+    dispatch({ type: 'start', key, attempt });
     try {
       const crosspoint = subtitleCrosspoint(output, slot, source);
       const plan = await planPatch({ crosspoints: [crosspoint] });
-      if (!isLatest()) return; // a newer attempt on this destination has started; ignore.
       const planned = plan.crosspoints[0];
       if (planned?.refusal) {
-        setCells((current) => ({
-          ...current,
-          [key]: { operationId: '', error: planned.refusal?.detail ?? t`Refused` },
-        }));
-        setPending(key, false);
+        dispatch({ type: 'planRefused', key, attempt, message: planned.refusal.detail });
         return;
       }
       const accepted = await takePatch({ crosspoints: [crosspoint] });
-      if (!isLatest()) return; // superseded while the take was in flight.
       const note = planned?.note;
       // The outcome may already have arrived (buffered above) while this
       // take's own HTTP response was still in flight.
       const already = recentOutcomes.current.get(accepted.operation_id);
-      setCells((current) => ({
-        ...current,
-        [key]:
-          note !== undefined && note !== null
-            ? { operationId: accepted.operation_id, note, ...(already !== undefined ? { outcome: already } : {}) }
-            : { operationId: accepted.operation_id, ...(already !== undefined ? { outcome: already } : {}) },
-      }));
-      // Settled already (the outcome had already been buffered) ⇒ no
-      // longer pending; otherwise stay pending until the realtime listener
-      // above settles it (or a newer attempt supersedes it, in which case
-      // that newer attempt owns the pending flag from here on).
-      if (already !== undefined) {
-        setPending(key, false);
-      }
+      dispatch({
+        type: 'accepted',
+        key,
+        attempt,
+        operationId: accepted.operation_id,
+        ...(note !== undefined && note !== null ? { note } : {}),
+        ...(already !== undefined ? { outcome: already } : {}),
+      });
     } catch (error) {
-      if (!isLatest()) return; // a newer attempt owns this destination now.
-      setCells((current) => ({
-        ...current,
-        [key]: {
-          operationId: '',
-          error: error instanceof OperationApiError ? (error.detail ?? error.message) : t`Take failed`,
-        },
-      }));
-      setPending(key, false);
+      dispatch({
+        type: 'takeFailed',
+        key,
+        attempt,
+        message: error instanceof OperationApiError ? (error.detail ?? error.message) : t`Take failed`,
+      });
     }
   };
 
@@ -246,29 +174,25 @@ export function SubtitlePatchPanel(): JSX.Element | null {
    * Destination-level status/error text for one column slot, if any:
    * an error (plan refusal or a thrown take) wins over everything else;
    * then a settled outcome; then the `source-has-no-captions` plan note;
-   * then "pending" while a take is accepted but not yet settled (a
-   * non-empty operation id with no outcome), or while any attempt on this
-   * destination is still in flight. `undefined` ⇒ no status to show
-   * (never attempted).
+   * then "pending" while busy (dispatched but not yet settled).
+   * `undefined` ⇒ no status to show (never attempted).
    */
-  function statusOf(cellState: CellState | undefined, pending: boolean): JSX.Element | undefined {
-    if (cellState === undefined) {
-      return pending ? <span>{t`pending`}</span> : undefined;
+  function statusOf(dest: SubtitleAttemptState | undefined): JSX.Element | undefined {
+    if (dest === undefined) return undefined;
+    if (dest.error !== undefined) {
+      return <span className="text-destructive">{dest.error}</span>;
     }
-    if (cellState.error !== undefined) {
-      return <span className="text-destructive">{cellState.error}</span>;
+    if (dest.outcome !== undefined) {
+      return <span>{dest.outcome}</span>;
     }
-    if (cellState.outcome !== undefined) {
-      return <span>{cellState.outcome}</span>;
-    }
-    if (cellState.note === 'source-has-no-captions') {
+    if (dest.note === 'source-has-no-captions') {
       return (
         <span>
           <Trans>source-has-no-captions</Trans>
         </span>
       );
     }
-    if (pending || cellState.operationId !== '') {
+    if (dest.busy) {
       return (
         <span>
           <Trans>pending</Trans>
@@ -320,7 +244,7 @@ export function SubtitlePatchPanel(): JSX.Element | null {
                     const redacted = subtitleSlotRedacted(slot);
                     const cellId = `subtitle-cell-${source.id}-${key}`;
                     const patched = current === source.id;
-                    const busy = pendingKeys.has(key);
+                    const busy = attempts[key]?.busy ?? false;
                     return (
                       <TableCell key={key} data-testid={cellId}>
                         {redacted ? (
@@ -362,7 +286,7 @@ export function SubtitlePatchPanel(): JSX.Element | null {
                 const current = subtitleSlotSource(slot);
                 const redacted = subtitleSlotRedacted(slot);
                 const cellId = `subtitle-cell-none-${key}`;
-                const busy = pendingKeys.has(key);
+                const busy = attempts[key]?.busy ?? false;
                 return (
                   <TableCell key={key} data-testid={cellId}>
                     {redacted ? null : (
@@ -402,9 +326,7 @@ export function SubtitlePatchPanel(): JSX.Element | null {
             {columns.flatMap((column) =>
               column.slots.map((slot) => {
                 const key = cellKey(column.output, slot.slot);
-                const cellState = cells[key];
-                const busy = pendingKeys.has(key);
-                const content = statusOf(cellState, busy);
+                const content = statusOf(attempts[key]);
                 return (
                   <TableCell key={key} data-testid={`subtitle-status-${key}`}>
                     <span role="status" aria-live="polite" className="text-xs">

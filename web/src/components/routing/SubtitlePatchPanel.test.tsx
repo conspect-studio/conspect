@@ -24,11 +24,29 @@ vi.mock('../../realtime/shared', () => ({
 
 import { renderWithProviders } from '../../test/render';
 import { SubtitlePatchPanel } from './SubtitlePatchPanel';
+import { EMPTY_SUBTITLE_ATTEMPTS, subtitleAttemptsReducer } from './subtitlePatchAttempts';
 
 function emit(data: Record<string, unknown>): void {
   act(() => {
     for (const listener of listeners) {
       listener({ v: 1, t: 'route.output', topic: 'outputs', seq: 1, ts: 1, data });
+    }
+  });
+}
+
+/**
+ * Deliver several `route.output` envelopes inside ONE `act()` (review
+ * UI3-1): a naive side-channel implementation settled the first
+ * destination correctly but could strand a second destination settling
+ * in the same batch; the reducer (one state transition per dispatched
+ * action, no data carried outside it) must not.
+ */
+function emitAll(events: readonly Record<string, unknown>[]): void {
+  act(() => {
+    for (const data of events) {
+      for (const listener of listeners) {
+        listener({ v: 1, t: 'route.output', topic: 'outputs', seq: 1, ts: 1, data });
+      }
     }
   });
 }
@@ -371,6 +389,177 @@ describe('SubtitlePatchPanel', () => {
     });
     expect(patchButton).not.toBeDisabled();
     expect(noneButton).not.toBeDisabled();
+  });
+
+  // UI3-1 (review round 3): outcome settlement used to go through a side
+  // channel (an array populated inside a `setCells` updater and consumed
+  // right after the `setCells` call) that could desynchronize from a
+  // SECOND state (`pendingKeys`) when two destinations settle in the same
+  // batch — the first destination's updater ran and its side-channel array
+  // was drained, but the second updater (React may run an updater more
+  // than once, or defer it) produced its own result after the drain had
+  // already happened, stranding that destination "busy" forever despite a
+  // successful outcome. The reducer fixes this by making `busy` part of
+  // the SAME state transition as the outcome, for every destination the
+  // one `outcome` action settles, in one `act()`.
+  it('settles two different pending destinations whose outcomes are delivered in ONE act(), re-enabling both (UI3-1 fix)', async () => {
+    holdTake = true;
+    renderWithProviders(<SubtitlePatchPanel />);
+    const cellA = await screen.findByTestId('subtitle-cell-cam-1-out-1:0');
+    const cellB = screen.getByTestId('subtitle-cell-none-out-1:1');
+    const buttonA = within(cellA).getByRole('button');
+    const buttonB = within(cellB).getByRole('button');
+
+    // Start attempt A on destination out-1:0 (accepted as op-X), holding
+    // its take.
+    takeOperationId = 'op-X';
+    const clickA = userEvent.click(buttonA);
+    await waitFor(() => {
+      expect(takeBody).not.toBeNull();
+    });
+    releaseTake?.();
+    await clickA;
+    await waitFor(() => {
+      expect(screen.getByTestId('subtitle-status-out-1:0').textContent).toBe('pending');
+    });
+    expect(buttonA).toBeDisabled();
+
+    // Start attempt B on a DIFFERENT destination, out-1:1 (accepted as
+    // op-Y), holding its take too.
+    holdTake = true;
+    takeOperationId = 'op-Y';
+    const clickB = userEvent.click(buttonB);
+    await waitFor(() => {
+      expect(takeBody).toEqual({
+        crosspoints: [{ plane: 'subtitle', destination: { output: 'out-1', slot: 1 }, source: 'none' }],
+      });
+    });
+    releaseTake?.();
+    await clickB;
+    await waitFor(() => {
+      expect(screen.getByTestId('subtitle-status-out-1:1').textContent).toBe('pending');
+    });
+    expect(buttonB).toBeDisabled();
+
+    // Both destinations are now accepted and pending (busy), each with its
+    // own operation id. Deliver BOTH outcomes inside ONE act().
+    emitAll([
+      { operation_id: 'op-X', outcome: 'subtitle:applied', output: 'out-1', tick: 1 },
+      { operation_id: 'op-Y', outcome: 'subtitle:applied', output: 'out-1', tick: 2 },
+    ]);
+
+    expect(screen.getByTestId('subtitle-status-out-1:0').textContent).toBe('subtitle:applied');
+    expect(screen.getByTestId('subtitle-status-out-1:1').textContent).toBe('subtitle:applied');
+    expect(buttonA).not.toBeDisabled();
+    expect(buttonB).not.toBeDisabled();
+  });
+
+  describe('subtitleAttemptsReducer (pure): the attempt-token guard directly', () => {
+    // UI3-1 (review round 3) + UI2-1: "a direct attempt-token test where
+    // A's take is still held when B starts on the same destination via
+    // the guard". The UI disables a destination's buttons while an
+    // attempt is pending (tested above through the real component), so
+    // reproducing "B starts while A's take is still held" at the DOM
+    // level would require bypassing that disabling; the reducer's own
+    // actions are "the component's API" the attempt-token guard is built
+    // on (`runTake` dispatches exactly these actions), so driving them
+    // directly exercises the guard itself, independent of the button.
+    it('A\'s late "accepted" is ignored once B has started on the same destination (A\'s take still conceptually held)', () => {
+      const started = subtitleAttemptsReducer(EMPTY_SUBTITLE_ATTEMPTS, {
+        type: 'start',
+        key: 'out-1:1',
+        attempt: 1, // attempt A dispatched; its take is now in flight ("held").
+      });
+      expect(started['out-1:1']).toEqual({ attempt: 1, busy: true, operationId: '' });
+
+      // B starts on the SAME destination while A's take has not resolved
+      // (no `accepted`/`takeFailed`/`planRefused` action for A has been
+      // dispatched yet) — exactly "A's take is still held when B starts".
+      const bStarted = subtitleAttemptsReducer(started, {
+        type: 'start',
+        key: 'out-1:1',
+        attempt: 2,
+      });
+      expect(bStarted['out-1:1']).toEqual({ attempt: 2, busy: true, operationId: '' });
+
+      // A's take now (late) resolves with a 202: its `accepted` action
+      // carries attempt 1, no longer current (current is 2) — ignored.
+      const aAccepted = subtitleAttemptsReducer(bStarted, {
+        type: 'accepted',
+        key: 'out-1:1',
+        attempt: 1,
+        operationId: 'op-A',
+      });
+      expect(aAccepted).toBe(bStarted); // same reference: a true no-op.
+
+      // B is refused in planning: its action carries the current attempt
+      // (2) and is applied.
+      const bRefused = subtitleAttemptsReducer(aAccepted, {
+        type: 'planRefused',
+        key: 'out-1:1',
+        attempt: 2,
+        message: 'B refused',
+      });
+      expect(bRefused['out-1:1']).toEqual({ attempt: 2, busy: false, operationId: '', error: 'B refused' });
+
+      // A's operation id (op-A) now delivers its realtime outcome, after
+      // B's start: ignored, because no destination's CURRENT `operationId`
+      // is `op-A` (A's `accepted` never wrote it — the no-op above).
+      const afterLateOutcome = subtitleAttemptsReducer(bRefused, {
+        type: 'outcome',
+        operationId: 'op-A',
+        outcome: 'subtitle:applied',
+      });
+      expect(afterLateOutcome).toBe(bRefused); // unchanged: B's refusal stands.
+    });
+  });
+
+  describe('subtitleAttemptsReducer (pure)', () => {
+    it('accepted with no attempt match (a newer attempt already started) leaves state unchanged', () => {
+      const state = { 'out-1:0': { attempt: 2, busy: true, operationId: '' } };
+      const next = subtitleAttemptsReducer(state, {
+        type: 'accepted',
+        key: 'out-1:0',
+        attempt: 1, // stale: the current attempt is 2
+        operationId: 'op-stale',
+      });
+      expect(next).toBe(state); // same reference: no-op.
+    });
+
+    it('outcome settles every destination whose current operationId matches, in one transition', () => {
+      const state = {
+        'out-1:0': { attempt: 1, busy: true, operationId: 'op-X' },
+        'out-1:1': { attempt: 1, busy: true, operationId: 'op-Y' },
+      };
+      const afterX = subtitleAttemptsReducer(state, {
+        type: 'outcome',
+        operationId: 'op-X',
+        outcome: 'subtitle:applied',
+      });
+      const afterY = subtitleAttemptsReducer(afterX, {
+        type: 'outcome',
+        operationId: 'op-Y',
+        outcome: 'subtitle:applied',
+      });
+      expect(afterY['out-1:0']).toEqual({ attempt: 1, busy: false, operationId: 'op-X', outcome: 'subtitle:applied' });
+      expect(afterY['out-1:1']).toEqual({ attempt: 1, busy: false, operationId: 'op-Y', outcome: 'subtitle:applied' });
+    });
+
+    it('an outcome for a stale operationId (superseded by a newer attempt) touches nothing', () => {
+      const state = {
+        'out-1:0': { attempt: 2, busy: false, operationId: 'op-B', error: 'B refused' },
+      };
+      const next = subtitleAttemptsReducer(state, {
+        type: 'outcome',
+        operationId: 'op-A', // belongs to attempt 1, no longer current
+        outcome: 'subtitle:applied',
+      });
+      expect(next).toBe(state);
+    });
+
+    it('EMPTY_SUBTITLE_ATTEMPTS is the initial reducer state', () => {
+      expect(EMPTY_SUBTITLE_ATTEMPTS).toEqual({});
+    });
   });
 
   it('every cell button and table header is keyboard-operable and labelled', async () => {
