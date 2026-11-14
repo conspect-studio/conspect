@@ -504,6 +504,8 @@ pub struct OutputRoutingHandle {
     pub(crate) audio_tap: crate::routing_audio::AudioTapCell,
     /// The active aux feeds (tests read their slots' counters).
     #[cfg(test)]
+    // reason: only the overlay-gated layout-bake pipeline tests read it.
+    #[cfg_attr(not(feature = "overlay"), allow(dead_code))]
     pub(crate) aux_feeds: AuxFeeds,
     takes: SyncSender<RouterMsg>,
     reformats: SyncSender<Reformat>,

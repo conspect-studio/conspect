@@ -109,8 +109,12 @@ fn recorder_with_video(seen: Seen, audio: SeenAudio, video: Option<SeenVideo>) -
 struct Run {
     frames: u64,
     /// Ticks the output clock emitted (counted on the hot loop itself).
+    // reason: only the overlay-gated layout-bake protection tests read it.
+    #[cfg_attr(not(feature = "overlay"), allow(dead_code))]
     hot_ticks: u64,
     /// Frames the live policy shed before the consumer (0 offline).
+    // reason: only the overlay-gated layout-bake protection tests read it.
+    #[cfg_attr(not(feature = "overlay"), allow(dead_code))]
     dropped: u64,
     outputs: Vec<Vec<(i64, bool, bool)>>,
     audio: Vec<Vec<multiview_ffmpeg::EncodedPacket>>,
