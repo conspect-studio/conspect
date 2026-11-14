@@ -30,6 +30,9 @@ pub struct ProgramCounters {
     pub lateness: LatenessSnapshot,
     /// Last-good repeats emitted (ticks behind).
     pub frames_repeated: u64,
+    /// Fresh ticks whose GPU readback missed its deadline and were repeated
+    /// as last-good (#395); each is also in `frames_repeated`.
+    pub compose_deadline_misses: u64,
     /// Wake latency and compose-phase histograms (#311).
     pub phases: PhasesSnapshot,
     /// The run's per-output clocks (#343; empty without a rate output).
@@ -117,6 +120,10 @@ impl ProgramMetrics {
             ticks_total: now.lateness.count,
             frames_repeated_total: now.frames_repeated,
             frames_repeated_window: now.frames_repeated.saturating_sub(oldest.frames_repeated),
+            compose_deadline_misses_total: now.compose_deadline_misses,
+            compose_deadline_misses_window: now
+                .compose_deadline_misses
+                .saturating_sub(oldest.compose_deadline_misses),
             bucket_edges_ms: LATENESS_EDGES_NS.iter().map(|ns| ns_to_ms(*ns)).collect(),
             buckets_total: now.lateness.buckets.to_vec(),
             lateness_mean_ms: window.mean_ns().map(ns_to_ms),
@@ -257,6 +264,11 @@ pub struct ProgramMetricsReport {
     pub frames_repeated_total: u64,
     /// Last-good repeats in the window.
     pub frames_repeated_window: u64,
+    /// Ticks whose GPU readback missed its deadline since the run started,
+    /// re-emitted as last-good (also counted in `frames_repeated_total`).
+    pub compose_deadline_misses_total: u64,
+    /// GPU readback deadline misses in the window.
+    pub compose_deadline_misses_window: u64,
     /// The bucket upper edges, ms (a final overflow bucket follows).
     pub bucket_edges_ms: Vec<f64>,
     /// Cumulative per-bucket counts (edges, then overflow).
@@ -401,6 +413,7 @@ mod tests {
             Some(ProgramCounters {
                 lateness: self.0.snapshot(),
                 frames_repeated: self.1.load(std::sync::atomic::Ordering::Relaxed),
+                compose_deadline_misses: 0,
                 phases: PhasesSnapshot::default(),
                 output_clocks: Vec::new(),
             })

@@ -329,7 +329,13 @@ where
             return Ok(ReresolveOutcome::Stopped);
         }
 
-        match resolver.resolve(watch_url).await {
+        // A stop abandons an in-flight resolve: dropping its future kills the
+        // `yt-dlp` child (`kill_on_drop`), so teardown never waits on it.
+        let outcome = tokio::select! {
+            result = resolver.resolve(watch_url) => result,
+            () = wait_for_stop(stop) => return Ok(ReresolveOutcome::Stopped),
+        };
+        match outcome {
             Ok(fresh) => {
                 backoff.reset();
                 // Make-before-break: the new URL is in hand and validated — hand it
@@ -361,7 +367,9 @@ where
                 let nap = backoff.next_delay(jitter);
                 tracing::warn!(
                     %watch_url,
-                    error = %err,
+                    // The redacted operator text: raw yt-dlp stderr may carry
+                    // signed URLs.
+                    error = %err.operator_message(),
                     attempt = backoff.attempts(),
                     ?nap,
                     "youtube re-resolution failed; backing off (tile degrades)"
@@ -383,6 +391,13 @@ fn backoff_jitter() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::from(d.subsec_nanos()));
     nanos % (JITTER_SCALE + 1)
+}
+
+/// Resolve once `stop` is raised, polling every 100 ms.
+async fn wait_for_stop(stop: &AtomicBool) {
+    while !stop.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Sleep for `wait`, re-checking `stop` every [`STOP_POLL`] so teardown is prompt.
