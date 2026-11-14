@@ -4879,8 +4879,9 @@ impl Pipeline {
 
     /// Test seam: the next run's shared bake consumer sleeps ONCE for `stall`
     /// at the first hot item at or after tick `at` (a stall in the path every
-    /// output shares, unlike a stall inside one sink).
-    #[cfg(test)]
+    /// output shares, unlike a stall inside one sink). Used only by the cast
+    /// pipeline tests, which need a real encoder (`gpl-codecs`).
+    #[cfg(all(test, feature = "gpl-codecs"))]
     pub(crate) fn stall_consumer_once_for_test(&mut self, at: u64, stall: Duration) {
         self.consumer_stall_for_test = Some((at, stall));
     }
