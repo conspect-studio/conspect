@@ -354,28 +354,48 @@ const PLANE_SPARES: usize = 3;
 /// growing memory without bound. Each lock guards only a `Vec` push or pop of
 /// the spare list (never a copy, an allocation of plane size, or a wait on a
 /// consumer).
+///
+/// Neither side ever waits on these locks (invariants #1/#10, data-plane
+/// safety §4). The return runs from [`Nv12Image`]'s `Drop`, on whichever
+/// thread lets go of the last reference (the output clock, an encoder, a
+/// preview); the lease runs on the clock. Both only `try_lock`: a contended
+/// return frees the plane instead of caching it, a contended lease allocates
+/// a fresh plane instead of reusing one. Each is counted; neither grows the
+/// cache past [`PLANE_SPARES`], so a descheduled holder of one of these locks
+/// costs at most an allocation, never a stalled tick.
 #[derive(Debug, Default)]
 struct PlaneReturn {
     y: std::sync::Mutex<Vec<Vec<u8>>>,
     uv: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Returned planes freed instead of cached because the lock was busy.
+    contended_returns: AtomicU64,
+    /// Leases served by a fresh allocation because the lock was busy.
+    contended_leases: AtomicU64,
 }
 
 impl PlaneReturn {
-    /// Return a completed frame's planes into the bounded caches. Poison is
+    /// Return a completed frame's planes into the bounded caches. Never
+    /// waits: a busy cache frees the plane (see the type docs). Poison is
     /// recovered (hot-path safety).
     fn give_back(&self, y: Vec<u8>, uv: Vec<u8>) {
-        Self::keep(&self.y, y);
-        Self::keep(&self.uv, uv);
+        self.keep(&self.y, y);
+        self.keep(&self.uv, uv);
     }
 
-    fn keep(slot: &std::sync::Mutex<Vec<Vec<u8>>>, plane: Vec<u8>) {
-        let mut spares = match slot.lock() {
+    fn keep(&self, slot: &std::sync::Mutex<Vec<Vec<u8>>>, plane: Vec<u8>) {
+        let mut spares = match slot.try_lock() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.contended_returns.fetch_add(1, Ordering::Relaxed);
+                drop(plane);
+                return;
+            }
         };
         if spares.len() < PLANE_SPARES {
             // Capacity is reserved once (`take_plane`), so this push
-            // never reallocates the list.
+            // normally never reallocates the list (at most once, if every
+            // lease so far found the lock busy).
             spares.push(plane);
         } else {
             // Drop the surplus plane outside the lock.
@@ -964,21 +984,31 @@ impl ScratchPool {
     /// is allocated and counted. The image's `Drop` returns the vectors through
     /// the shared bounded spare cache ([`PLANE_SPARES`] per plane kind).
     fn lease_planes(&self, y_len: usize, uv_len: usize) -> (Vec<u8>, Vec<u8>, Arc<PlaneReturn>) {
-        let y = Self::take_plane(&self.planes.y, y_len, &self.alloc_count);
-        let uv = Self::take_plane(&self.planes.uv, uv_len, &self.alloc_count);
+        let y = Self::take_plane(&self.planes, &self.planes.y, y_len, &self.alloc_count);
+        let uv = Self::take_plane(&self.planes, &self.planes.uv, uv_len, &self.alloc_count);
         (y, uv, Arc::clone(&self.planes))
     }
 
     /// Take one cached plane, growing/allocating only if its capacity cannot
-    /// serve `len`. Poison is recovered to protect the output clock.
+    /// serve `len`. Runs on the output clock, so it never waits on the cache
+    /// lock (a frame holder returning a plane may hold it): when the lock is
+    /// busy a fresh plane is allocated (counted in `alloc_count` and
+    /// `contended_leases`) and the cache is left as is. Poison is recovered to
+    /// protect the output clock.
     fn take_plane(
+        planes: &PlaneReturn,
         slot: &std::sync::Mutex<Vec<Vec<u8>>>,
         len: usize,
         counter: &AtomicU64,
     ) -> Vec<u8> {
-        let mut guard = match slot.lock() {
+        let mut guard = match slot.try_lock() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                planes.contended_leases.fetch_add(1, Ordering::Relaxed);
+                counter.fetch_add(1, Ordering::Relaxed);
+                return vec![0; len];
+            }
         };
         // Keep the spare list's own capacity for PLANE_SPARES entries so a
         // later return never grows it (one small allocation at warmup).
@@ -2010,5 +2040,104 @@ mod alpha_pool_tests {
         assert_eq!(pool.contended_drops(), 0, "fill ran under the pool lock");
         assert_eq!(pool.retained(), 1);
         assert_eq!(second.alpha_plane(), Some(&[9; 8][..]));
+    }
+}
+
+#[cfg(test)]
+mod plane_return_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Generous bound: a blocking path never finishes while the lock is held
+    /// (the guard outlives the wait), a non-blocking one in microseconds.
+    const BOUND: Duration = Duration::from_secs(10);
+
+    fn leased(pool: &ScratchPool) -> Nv12Image {
+        let (y, uv, back) = pool.lease_planes(8, 4);
+        Nv12Image::new_pooled(4, 2, y, uv, ColorInfo::default(), back).unwrap()
+    }
+
+    fn spares(slot: &std::sync::Mutex<Vec<Vec<u8>>>) -> usize {
+        slot.lock().unwrap().len()
+    }
+
+    /// R3 round 2 #3: the clock (or any last holder) drops a pooled canvas
+    /// while another thread holds the Y, then the UV, cache lock. The drop
+    /// completes without waiting and the contended plane is freed, not
+    /// cached; the other plane still returns to its cache.
+    #[test]
+    fn dropping_a_pooled_canvas_never_waits_on_a_held_cache_lock() {
+        let pool = ScratchPool::default();
+        // Both canvases are leased before either drop, so neither lease
+        // reuses a plane the other's drop returned.
+        let images = [leased(&pool), leased(&pool)];
+        let cases = [(&pool.planes.y, "y"), (&pool.planes.uv, "uv")];
+        for (image, (held, name)) in images.into_iter().zip(cases) {
+            let before = pool.planes.contended_returns.load(Ordering::Relaxed);
+            let guard = held.lock().unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let clock = std::thread::spawn(move || {
+                drop(image);
+                done_tx.send(()).unwrap();
+            });
+            let finished = done_rx.recv_timeout(BOUND).is_ok();
+            drop(guard);
+            clock.join().unwrap();
+            assert!(finished, "Nv12Image::drop blocked on the held {name} lock");
+            assert_eq!(
+                pool.planes.contended_returns.load(Ordering::Relaxed),
+                before + 1,
+                "{name}: the contended plane is freed and counted"
+            );
+        }
+        // Each plane kind was contended once and returned once: one spare
+        // each, the cache never exceeds its cap.
+        assert_eq!(spares(&pool.planes.y), 1);
+        assert_eq!(spares(&pool.planes.uv), 1);
+    }
+
+    /// R3 round 2 #3: the clock leases output planes while a frame holder
+    /// holds a cache lock. The lease completes without waiting by allocating
+    /// a fresh plane (counted), and leaves the cache untouched.
+    #[test]
+    fn leasing_planes_never_waits_on_a_held_cache_lock() {
+        let pool = ScratchPool::default();
+        drop(leased(&pool)); // one spare of each kind cached
+        let warm = pool.alloc_count();
+        for (held, name) in [(&pool.planes.y, "y"), (&pool.planes.uv, "uv")] {
+            let guard = held.lock().unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let finished = std::thread::scope(|s| {
+                let clock = s.spawn(|| {
+                    let (y, uv, back) = pool.lease_planes(8, 4);
+                    done_tx.send(()).unwrap();
+                    (y, uv, back)
+                });
+                let finished = done_rx.recv_timeout(BOUND).is_ok();
+                drop(guard);
+                let (y, uv, back) = clock.join().unwrap();
+                assert_eq!((y.len(), uv.len()), (8, 4), "{name}: full-size planes");
+                assert!(y.iter().chain(&uv).all(|&b| b == 0), "{name}: zeroed");
+                drop(Nv12Image::new_pooled(4, 2, y, uv, ColorInfo::default(), back).unwrap());
+                finished
+            });
+            assert!(finished, "lease_planes blocked on the held {name} lock");
+        }
+        assert_eq!(pool.planes.contended_leases.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            pool.alloc_count(),
+            warm + 2,
+            "each contended lease is one allocation"
+        );
+        // Bounded: the extra planes came back into a capped cache.
+        assert!(spares(&pool.planes.y) <= PLANE_SPARES);
+        assert!(spares(&pool.planes.uv) <= PLANE_SPARES);
+        // Uncontended, the cache serves the next lease with no allocation.
+        drop(leased(&pool));
+        assert_eq!(pool.alloc_count(), warm + 2);
     }
 }

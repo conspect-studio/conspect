@@ -119,10 +119,21 @@ tile. No switcher or drive code changes.
   a plane never waits: the frame's `Drop` (possibly on the output clock
   thread) only `try_lock`s the pool and frees the plane on contention, and
   `attach_with` holds the lock only to take the spare, never across the
-  copy/scale/extract (invariants #1/#10).
-- **FFI safety.** Scratch frames come from the checked
-  `multiview_ffmpeg::frame::alloc_video` (dimension cap, CPU format,
-  `av_frame_get_buffer` result), never the unchecked `Video::new`. Decoded
+  copy/scale/extract (invariants #1/#10). The same rule now covers the CPU
+  compositor's output-plane scratch pool (`PlaneReturn`/`ScratchPool`, a
+  pre-existing blocking path fixed in this PR): a canvas's `Drop` only
+  `try_lock`s the Y/UV spare caches and frees a plane on contention, and the
+  clock's lease only `try_lock`s and allocates a fresh plane on contention
+  (both counted; the caches never grow past their cap), so no frame holder
+  can stall the output clock.
+- **FFI safety.** Scratch frames are `multiview_ffmpeg::frame::ScratchFrame`s,
+  which only the checked `alloc_video` (null `AVFrame`, dimension cap, CPU
+  format, `av_frame_get_buffer` result) creates — never the unchecked
+  `Video::new`/`Video::empty`. `Scaler::run_into` reuses only a
+  `ScratchFrame` (its frame is never exposed mutably, so its geometry cannot
+  be raised over a small allocation) and re-validates every destination
+  plane against the frame's own buffers, and that the buffers are writable,
+  before libswscale or the identity copy writes. Decoded
   alpha is read through `frame::plane_rows`, which validates the plane,
   its signed linesize, its subsampled height and that every row lies in
   one of the frame's own buffers before yielding single-row slices, so a
@@ -132,9 +143,13 @@ tile. No switcher or drive code changes.
   strides, 10/16-bit rescale, packed channels, bad input as errors).
   Compositor: `tests/nv12_alpha.rs` pool reuse with no growth, and
   `pipeline::alpha_pool_tests` (dropping an alpha frame while another thread
-  holds the pool lock completes and frees the plane). FFI:
+  holds the pool lock completes and frees the plane), and
+  `pipeline::plane_return_tests` (a canvas drop and a plane lease each
+  complete while another thread holds the Y or UV cache lock). FFI:
   `multiview-ffmpeg` `frame::tests`, `alpha::tests` (negative linesize,
-  mismatched layout) and `tests/scale_resample.rs` (bottom-up identity
+  mismatched layout), `scale::run_into_tests` (an undersized or shared
+  destination is an error, a null frame allocation never becomes a
+  `ScratchFrame`) and `tests/scale_resample.rs` (bottom-up identity
   `run_into`). Player path
   (ffmpeg): `pipeline::media_alpha::tests` (yuva → NV12+A, rgba/argb/bgra
   → NV12+A, odd-size scaling, steady-state reuse, an unallocatable scratch
