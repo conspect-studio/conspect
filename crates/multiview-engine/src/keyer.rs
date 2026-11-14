@@ -64,6 +64,16 @@ pub const REFUSE_KEYER_SOURCE_LOST: &str =
     "source-lost: a keyer source reached its loss trigger; the keyer was taken off air";
 /// Typed refusal: a keyer AUTO rate override above [`MAX_KEYER_RATE`].
 pub const REFUSE_KEYER_RATE: &str = "keyer-rate: the AUTO rate is outside 1..=300 frames";
+/// Typed refusal: a `keyer_set` whose summed cost exceeds the keyer budget
+/// (ADR-0113 §9, rechecked at the tick; the control plane admits first).
+pub const REFUSE_KEYER_CAPACITY: &str = "capacity: the keyer budget cannot admit this definition";
+/// Typed refusal: a `keyer_set` that changes the fill or key of a keyer on
+/// air (or in a transition) without `on_air = "allow"`.
+pub const REFUSE_KEYER_ON_AIR_PROTECTED: &str =
+    "on-air-protected: the keyer is on air; changing its fill or key needs on_air = \"allow\"";
+/// Typed refusal: a `keyer_set` that would duplicate another keyer's id or z.
+pub const REFUSE_KEYER_DEFINITION: &str =
+    "keyer-definition: another keyer already has this id or z";
 /// Typed refusal: a held keyer command expired while Program repeated.
 pub const REFUSE_KEYER_REPEAT_DEADLINE: &str =
     "keyer take deadline expired while program repeated last-good";
@@ -144,6 +154,9 @@ fn rank(state: SourceState) -> u8 {
 /// a tick never looks a source up by id.
 #[derive(Debug, Clone)]
 pub struct KeyerDef {
+    /// The accepted definition this keyer was resolved from (the readback
+    /// the control plane serves and persists after `applied`, K4).
+    pub config: Arc<DownstreamKeyerConfig>,
     /// Authorizable object id, `<program>/<id>` (e.g. `main/dsk1`).
     pub object_id: Arc<str>,
     /// Fill source id (for the control plane's tally resolution and demand).
@@ -223,6 +236,7 @@ impl KeyerDef {
             .map_err(|_| format!("downstream keyer {name}: rate must be at least one frame"))?;
         let source = cfg.max_source_or_canvas(canvas_w, canvas_h);
         Ok(Self {
+            config: Arc::new(cfg.clone()),
             object_id: Arc::from(name.as_str()),
             fill_id: Arc::from(cfg.fill.as_str()),
             key_id: cfg.key.as_deref().map(Arc::from),
@@ -306,7 +320,7 @@ pub fn admit(
         };
         if let Some(slot) = runtime.slots.get_mut(index) {
             *slot = Some(KeyerSlot {
-                def,
+                def: Arc::new(def),
                 flags,
                 last_good: None,
                 pending_op: None,
@@ -314,17 +328,60 @@ pub fn admit(
             });
         }
     }
-    // Draw order: ascending z (validation made z unique per program).
-    let mut order = [0_usize, 1];
-    order.sort_by_key(|&i| {
-        runtime
-            .slots
-            .get(i)
-            .and_then(Option::as_ref)
-            .map_or(i32::MAX, |s| s.def.z)
-    });
-    runtime.draw_order = order;
+    runtime.draw_order = draw_order_of(&runtime.slots);
     Ok(runtime)
+}
+
+/// A definition for [`SwitcherVerb::KeyerSet`], resolved off the clock (the
+/// control plane builds it with
+/// [`SwitcherControl::resolve_keyer`](crate::switcher_control::SwitcherControl::resolve_keyer)),
+/// so the tick only moves an `Arc` in. Compared by identity.
+#[derive(Debug, Clone)]
+pub struct KeyerDefinition(pub Arc<KeyerDef>);
+
+impl PartialEq for KeyerDefinition {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The committed keyer definitions (published by the driver only when they
+/// change, K4): what `GET /api/v1/switcher/{me}` lists and what the control
+/// plane persists after `applied`.
+#[derive(Debug, Clone)]
+pub struct KeyerDefinitions {
+    /// Bumped once per applied `keyer_set`; 0 at attach.
+    pub version: u64,
+    /// The definitions by keyer index (config order at boot).
+    pub defs: [Option<Arc<KeyerDef>>; MAX_DSK],
+    /// Canvas the costs are computed on.
+    pub canvas: (u32, u32),
+    /// The keyer budget in canvas folds.
+    pub budget: f32,
+}
+
+impl KeyerDefinitions {
+    /// The index and definition of the keyer whose config id is `id`.
+    #[must_use]
+    pub fn find(&self, id: &str) -> Option<(u8, &Arc<KeyerDef>)> {
+        self.defs.iter().enumerate().find_map(|(index, def)| {
+            def.as_ref()
+                .filter(|d| d.config.id == id)
+                .map(|d| (index_u8(index), d))
+        })
+    }
+
+    /// The first free keyer index, if any.
+    #[must_use]
+    pub fn free_index(&self) -> Option<u8> {
+        self.defs.iter().position(Option::is_none).map(index_u8)
+    }
+
+    /// Whether any keyer is defined.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.defs.iter().any(Option::is_some)
+    }
 }
 
 /// An in-flight keyer AUTO: weight `f(tick − start)` in integer frames.
@@ -384,7 +441,7 @@ type Pair = (Arc<Nv12Image>, Option<Arc<Nv12Image>>);
 
 #[derive(Debug)]
 struct KeyerSlot {
-    def: KeyerDef,
+    def: Arc<KeyerDef>,
     flags: KeyerFlags,
     /// `(fill, key)` replaced only on a tick where both reads are live.
     last_good: Option<Pair>,
@@ -463,6 +520,9 @@ pub enum KeyerReason {
     SourceLost,
     /// A stale keyer's sources are live again.
     SourceRecovered,
+    /// The definition changed (`keyer_set`, K4); clients re-read the keyer
+    /// row. A newly defined keyer is announced with this reason too.
+    Definition,
 }
 
 /// A keyer state change, published only on a committed frame.
@@ -550,6 +610,17 @@ impl TallySet {
                 *last = None;
             }
         }
+    }
+
+    /// A set of `roles` (deduplicated; at most [`TALLY_SLOTS`]). Off the
+    /// clock: for consumers and tests building an expected set.
+    #[must_use]
+    pub fn from_roles(roles: impl IntoIterator<Item = TallyRole>) -> Self {
+        let mut set = Self::default();
+        for role in roles {
+            set.insert(role);
+        }
+        set
     }
 
     /// Whether `role` is in the set.
@@ -772,6 +843,32 @@ pub struct KeyerRuntime {
     counters: Arc<KeyerCounters>,
     reserved_cost: f64,
     budget: f32,
+    /// Bumped once per applied `keyer_set` (K4); restored by a reject.
+    def_version: u64,
+    /// The definitions before this tick's first `keyer_set`, restored by a
+    /// rejected frame (`None` on a tick without one).
+    undo: Option<DefUndo>,
+}
+
+/// What a rejected frame restores after a `keyer_set` (Arc refcounts only).
+#[derive(Debug)]
+struct DefUndo {
+    defs: [Option<Arc<KeyerDef>>; MAX_DSK],
+    reserved_cost: f64,
+    draw_order: [usize; MAX_DSK],
+    def_version: u64,
+}
+
+/// Slot indices in ascending z (validation made z unique per program).
+fn draw_order_of(slots: &[Option<KeyerSlot>; MAX_DSK]) -> [usize; MAX_DSK] {
+    let mut order = [0_usize, 1];
+    order.sort_by_key(|&i| {
+        slots
+            .get(i)
+            .and_then(Option::as_ref)
+            .map_or(i32::MAX, |s| s.def.z)
+    });
+    order
 }
 
 impl Default for KeyerRuntime {
@@ -789,6 +886,8 @@ impl Default for KeyerRuntime {
             counters: Arc::new(KeyerCounters::default()),
             reserved_cost: 0.0,
             budget: 0.0,
+            def_version: 0,
+            undo: None,
         }
     }
 }
@@ -816,7 +915,7 @@ impl KeyerRuntime {
     /// The definition of keyer `index`, if any.
     #[must_use]
     pub fn def(&self, index: usize) -> Option<&KeyerDef> {
-        self.slots.get(index)?.as_ref().map(|s| &s.def)
+        self.slots.get(index)?.as_ref().map(|s| &*s.def)
     }
 
     /// The current flags of keyer `index`, if any.
@@ -838,6 +937,8 @@ impl KeyerRuntime {
     /// Stage the `Copy` flags, the last-good pairs (refcount increments, no
     /// allocation) and the tally a rejected frame restores. Once per tick.
     pub(crate) fn begin_tick(&mut self) {
+        // The previous tick committed (or was rejected and restored).
+        self.undo = None;
         for ((staged, pair), slot) in self
             .staged
             .iter_mut()
@@ -1344,8 +1445,150 @@ impl KeyerRuntime {
                 slot.release();
             }
         }
+        if let Some(undo) = self.undo.take() {
+            for (slot, before) in self.slots.iter_mut().zip(undo.defs) {
+                match (before, slot.as_mut()) {
+                    (None, _) => *slot = None,
+                    (Some(def), Some(current)) => current.def = def,
+                    (Some(_), None) => {}
+                }
+            }
+            self.reserved_cost = undo.reserved_cost;
+            self.draw_order = undo.draw_order;
+            self.def_version = undo.def_version;
+        }
         self.tally = self.staged_tally;
         self.events.fill(None);
+    }
+
+    /// The version of the definitions (bumped per applied `keyer_set`).
+    #[must_use]
+    pub fn def_version(&self) -> u64 {
+        self.def_version
+    }
+
+    /// The committed definitions (Arc clones; built only when the driver
+    /// publishes a changed version, never per tick).
+    #[must_use]
+    pub fn definitions(&self) -> KeyerDefinitions {
+        let mut defs: [Option<Arc<KeyerDef>>; MAX_DSK] = [const { None }; MAX_DSK];
+        for (def, slot) in defs.iter_mut().zip(self.slots.iter()) {
+            *def = slot.as_ref().map(|s| Arc::clone(&s.def));
+        }
+        KeyerDefinitions {
+            version: self.def_version,
+            defs,
+            canvas: self.canvas,
+            budget: self.budget,
+        }
+    }
+
+    /// Apply a `keyer_set` at this tick (ADR-0113 §10, K4): a class-1
+    /// definition change of keyer `keyer` (a new keyer when the slot is
+    /// free). Rechecks what the control plane admitted: unique id and z, the
+    /// summed cost within the budget, and the on-air guard for a fill or key
+    /// change. A fill or key change of an engaged keyer (`allow`) needs the
+    /// new sources fresh now, else it is refused (never held). The tick only
+    /// moves `Arc`s; a rejected frame restores the previous definitions.
+    pub(crate) fn define(
+        &mut self,
+        keyer: u8,
+        def: Arc<KeyerDef>,
+        allow_on_air: bool,
+        operation_id: String,
+        tick: Tick,
+        sink: &mut OpSink<'_>,
+    ) {
+        let index = usize::from(keyer);
+        if index >= MAX_DSK {
+            sink.refused(operation_id, REFUSE_KEYER_UNKNOWN);
+            return;
+        }
+        let clash = self.slots.iter().enumerate().any(|(i, s)| {
+            i != index
+                && s.as_ref()
+                    .is_some_and(|s| s.def.config.id == def.config.id || s.def.z == def.z)
+        });
+        let current = self.slots.get(index).and_then(Option::as_ref);
+        // A slot keeps its id for life: a define racing another define for
+        // the same free slot never silently replaces a different keyer.
+        if clash || current.is_some_and(|s| s.def.config.id != def.config.id) {
+            sink.refused(operation_id, REFUSE_KEYER_DEFINITION);
+            return;
+        }
+        let old_cost = current.map_or(0.0, |s| s.def.cost);
+        let total = self.reserved_cost - old_cost + def.cost;
+        if !def.cost.is_finite() || total > f64::from(self.budget) + BUDGET_EPSILON {
+            sink.refused(operation_id, REFUSE_KEYER_CAPACITY);
+            return;
+        }
+        let sources_change =
+            current.is_some_and(|s| s.def.fill_id != def.fill_id || s.def.key_id != def.key_id);
+        if let Some(slot) = current {
+            let flags = slot.flags;
+            let engaged = flags.on_air
+                || flags.ramp.is_some()
+                || flags.flight.is_some()
+                || flags.pending.is_some();
+            if engaged && sources_change {
+                if !allow_on_air {
+                    sink.refused(operation_id, REFUSE_KEYER_ON_AIR_PROTECTED);
+                    return;
+                }
+                if (flags.on_air || flags.ramp.is_some()) && !live_now(&def, tick) {
+                    sink.refused(operation_id, REFUSE_KEYER_NO_FRESH_FRAME);
+                    return;
+                }
+            }
+        }
+        if self.undo.is_none() {
+            let mut defs: [Option<Arc<KeyerDef>>; MAX_DSK] = [const { None }; MAX_DSK];
+            for (d, slot) in defs.iter_mut().zip(self.slots.iter()) {
+                *d = slot.as_ref().map(|s| Arc::clone(&s.def));
+            }
+            self.undo = Some(DefUndo {
+                defs,
+                reserved_cost: self.reserved_cost,
+                draw_order: self.draw_order,
+                def_version: self.def_version,
+            });
+        }
+        let Some(entry) = self.slots.get_mut(index) else {
+            return;
+        };
+        match entry.as_mut() {
+            Some(slot) => {
+                slot.def = def;
+                if sources_change {
+                    // The pair belongs to the old sources: the next live
+                    // read of the new ones replaces it.
+                    slot.release();
+                }
+            }
+            None => {
+                *entry = Some(KeyerSlot {
+                    flags: KeyerFlags {
+                        tie: def.tie,
+                        ..KeyerFlags::default()
+                    },
+                    def,
+                    last_good: None,
+                    pending_op: None,
+                    ramp_op: None,
+                });
+            }
+        }
+        self.reserved_cost = total;
+        self.draw_order = draw_order_of(&self.slots);
+        self.def_version = self.def_version.saturating_add(1);
+        if let Some(slot) = self.slots.get(index).and_then(Option::as_ref) {
+            queue_event(
+                &mut self.events,
+                &self.counters,
+                event_of(tick.index, keyer, slot.flags, KeyerReason::Definition),
+            );
+        }
+        sink.applied(operation_id);
     }
 
     /// The snapshot rows (change-only publication by the driver).

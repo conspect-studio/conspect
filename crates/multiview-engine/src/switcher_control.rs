@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::keyer::{
-    KeyerAction, KeyerCounters, KeyerDraw, KeyerEvent, KeyerRuntime, KeyerSnapshot, KeyerTally,
-    OpSink, TieEnvelope, MAX_DSK,
+    KeyerAction, KeyerCounters, KeyerDef, KeyerDefinition, KeyerDefinitions, KeyerDraw, KeyerEvent,
+    KeyerRuntime, KeyerSnapshot, KeyerTally, OpSink, TieEnvelope, MAX_DSK,
 };
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
 use crate::switcher::{SwitcherProjection, SwitcherState};
@@ -159,6 +159,17 @@ pub enum SwitcherVerb {
         /// Tied.
         tie: bool,
     },
+    /// Define or change downstream keyer `keyer` at one tick (ADR-0113 §10,
+    /// K4): a class-1 change whose definition and stores the control plane
+    /// resolved and admitted off the clock. A free index defines a new keyer.
+    KeyerSet {
+        /// Keyer index (a free slot defines a new keyer).
+        keyer: u8,
+        /// The resolved definition (moved in; never cloned per tick).
+        def: KeyerDefinition,
+        /// `on_air = "allow"`: the fill or key of a keyer on air may change.
+        allow_on_air: bool,
+    },
     /// The mixer half of an atomic multi-crosspoint set (ADR-0110 §12.8,
     /// #308): validated and primed here, then applied only at the adoption
     /// tick the router proposes through `arm`, never on its own. Held in its
@@ -260,6 +271,17 @@ pub struct SwitcherControl {
     inputs: LatestState<InputsReadback>,
     keyer_events: EventStream<KeyerEvent>,
     keyer_counters: Arc<KeyerCounters>,
+    keyer_defs: LatestState<KeyerDefinitions>,
+    /// The run's frame stores, published once at attach so `keyer_set` can
+    /// resolve a definition off the clock (K4).
+    stores: LatestState<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    /// Whether a downstream keyer is defined (or a `keyer_set` defining the
+    /// first one is in flight): the output router refuses Clean while set
+    /// (K2a deviation until K2b). Shared with the routing handle.
+    dsk_defined: Arc<std::sync::atomic::AtomicBool>,
+    /// The `keyer` demand consumer set (ADR-0113 §4), installed at attach so
+    /// a committed `keyer_set` republishes the fill/key leases off the clock.
+    keyer_demand: Arc<std::sync::OnceLock<crate::ConsumerSet<Nv12Image>>>,
 }
 
 /// Actual paired-bus frame capability, published after the rendering provider
@@ -313,6 +335,10 @@ impl SwitcherControl {
             inputs: LatestState::new(),
             keyer_events,
             keyer_counters: Arc::new(KeyerCounters::default()),
+            keyer_defs: LatestState::new(),
+            stores: LatestState::new(),
+            dsk_defined: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            keyer_demand: Arc::new(std::sync::OnceLock::new()),
         };
         let driver = SwitcherTickDriver {
             rx,
@@ -340,6 +366,10 @@ impl SwitcherControl {
             keyers: Box::default(),
             keyer_events: handle.keyer_events.clone(),
             keyer_counters: Arc::clone(&handle.keyer_counters),
+            keyer_defs: handle.keyer_defs.clone(),
+            published_def_version: 0,
+            stores: handle.stores.clone(),
+            dsk_defined: Arc::clone(&handle.dsk_defined),
         };
         (handle, driver)
     }
@@ -464,6 +494,56 @@ impl SwitcherControl {
     pub fn keyer_counters(&self) -> Arc<KeyerCounters> {
         Arc::clone(&self.keyer_counters)
     }
+
+    /// The committed downstream keyer definitions (K4): published at attach
+    /// and then only on a committed `keyer_set` tick. `None` when no keyer
+    /// runtime was installed (no M/E keyers on this run).
+    #[must_use]
+    pub fn keyer_definitions(&self) -> Option<Arc<KeyerDefinitions>> {
+        self.keyer_defs.latest()
+    }
+
+    /// Resolve an accepted keyer definition against this run's frame stores
+    /// and canvas, off the clock (K4 `keyer_set`). The result is moved into
+    /// [`SwitcherVerb::KeyerSet`].
+    ///
+    /// # Errors
+    /// No keyer runtime on this run, or a fill or key without a frame store.
+    pub fn resolve_keyer(
+        &self,
+        config: &multiview_config::DownstreamKeyerConfig,
+    ) -> Result<KeyerDefinition, String> {
+        let defs = self
+            .keyer_defs
+            .latest()
+            .ok_or_else(|| "this run has no downstream keyer runtime".to_owned())?;
+        let stores = self
+            .stores
+            .latest()
+            .ok_or_else(|| "this run has no frame stores attached".to_owned())?;
+        let (w, h) = defs.canvas;
+        KeyerDef::from_config(config, &stores, w, h).map(|def| KeyerDefinition(Arc::new(def)))
+    }
+
+    /// The shared "a downstream keyer is defined" cell (the output router
+    /// refuses Clean while it is set). Set at attach; the control plane sets
+    /// it before enqueueing a `keyer_set` that defines the first DSK and
+    /// recomputes it from [`Self::keyer_definitions`] after the outcome.
+    #[must_use]
+    pub fn dsk_defined_cell(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.dsk_defined)
+    }
+
+    /// Install the run's `keyer` demand set (once, at attach).
+    pub fn set_keyer_demand(&self, set: crate::ConsumerSet<Nv12Image>) {
+        let _ = self.keyer_demand.set(set);
+    }
+
+    /// The run's `keyer` demand set, if installed.
+    #[must_use]
+    pub fn keyer_demand(&self) -> Option<&crate::ConsumerSet<Nv12Image>> {
+        self.keyer_demand.get()
+    }
 }
 
 /// Sole output-clock owner of the M/E state; do not share with REST handlers.
@@ -499,6 +579,10 @@ pub struct SwitcherTickDriver {
     keyers: Box<KeyerRuntime>,
     keyer_events: EventStream<KeyerEvent>,
     keyer_counters: Arc<KeyerCounters>,
+    keyer_defs: LatestState<KeyerDefinitions>,
+    published_def_version: u64,
+    stores: LatestState<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    dsk_defined: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Everything a rejected tick must restore (review SW2-03): the machine and
@@ -519,6 +603,14 @@ impl SwitcherTickDriver {
     pub fn set_keyers(&mut self, mut keyers: KeyerRuntime) {
         keyers.set_counters(Arc::clone(&self.keyer_counters));
         *self.keyers = keyers;
+        // The attach-time definitions (K4 readback); later only on a
+        // committed `keyer_set` tick.
+        self.keyer_defs.publish(self.keyers.definitions());
+        self.published_def_version = self.keyers.def_version();
+        self.dsk_defined.store(
+            !self.keyers.is_empty(),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// The keyer runtime (read-only: flags, last-good pair, tally).
@@ -716,6 +808,8 @@ impl SwitcherTickDriver {
     /// Install the shared, already allocated source stores before the clock
     /// starts. Only `is_primed` is sampled on a tick; ingest remains off-clock.
     pub fn set_prime_stores(&mut self, stores: HashMap<String, Arc<TileStore<Nv12Image>>>) {
+        // Shared with the control plane once, at attach (K4 `keyer_set`).
+        self.stores.publish(stores.clone());
         self.primed_stores = Some(stores);
     }
 
@@ -814,7 +908,8 @@ impl SwitcherTickDriver {
             | SwitcherVerb::SetTransition(_)
             | SwitcherVerb::KeyerCut { .. }
             | SwitcherVerb::KeyerAuto { .. }
-            | SwitcherVerb::KeyerTie { .. } => Err("not a take".into()),
+            | SwitcherVerb::KeyerTie { .. }
+            | SwitcherVerb::KeyerSet { .. } => Err("not a take".into()),
         }
     }
 
@@ -1063,6 +1158,26 @@ impl SwitcherTickDriver {
             };
             // Keyer verbs first: they reference no scene geometry, and a held
             // background take never blocks a DSK (ADR-0113 §6).
+            if let SwitcherVerb::KeyerSet {
+                keyer,
+                def,
+                allow_on_air,
+            } = command.verb
+            {
+                self.keyers.define(
+                    keyer,
+                    def.0,
+                    allow_on_air,
+                    command.operation_id,
+                    tick,
+                    &mut OpSink {
+                        success: &mut self.staged_success,
+                        outcomes: &self.outcomes,
+                        tick: tick.index,
+                    },
+                );
+                continue;
+            }
             if let Some((keyer, action)) = KeyerAction::of(&command.verb) {
                 self.keyers.command(
                     keyer,
@@ -1468,6 +1583,13 @@ impl SwitcherTickDriver {
                 keyers,
                 tally,
             });
+        }
+        // Definitions only on a committed `keyer_set` tick (allocates one
+        // Arc; never in steady state), before the tick's keyer events, so an
+        // event relay always resolves a keyer index against its definition.
+        if self.keyers.def_version() != self.published_def_version {
+            self.keyer_defs.publish(self.keyers.definitions());
+            self.published_def_version = self.keyers.def_version();
         }
         self.keyers.commit(&self.keyer_events);
         // Readback only on a committed patch tick (allocates; never steady state).

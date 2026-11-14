@@ -322,6 +322,23 @@ impl DownstreamKeyerConfig {
         )
     }
 
+    /// Validate one definition on its own (the K4 `keyer_set` admission):
+    /// every field check of [`SwitcherConfig::validate_keyers`] except the
+    /// cross-keyer ones (unique id and z, the budget), which the caller
+    /// checks against the live set.
+    ///
+    /// # Errors
+    /// A bad reference (`in:<n>` included), a refused-by-name feature or a
+    /// geometry out of bounds.
+    pub fn validate_definition(
+        &self,
+        sources: &[&str],
+        canvas_w: u32,
+        canvas_h: u32,
+    ) -> Result<(), ConfigError> {
+        self.validate(sources, &[self.program.as_str()], canvas_w, canvas_h)
+    }
+
     #[allow(clippy::too_many_lines)]
     // reason: one flat list of independent field checks, in document order.
     fn validate(
