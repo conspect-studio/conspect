@@ -26,7 +26,7 @@ mod runner;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use runner::{run_cast_sink, CastSetup};
+pub(crate) use runner::{run_cast_sink, CastAudioRoutes, CastSetup};
 
 /// Segments listed per playlist of a cast stream.
 pub const CAST_WINDOW: usize = 10;

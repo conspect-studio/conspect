@@ -13,8 +13,9 @@ use multiview_ffmpeg::{EncodedPacket, StreamKind};
 
 use multiview_core::time::Rational;
 use multiview_output::hls::cast::{
-    AudioUnit, CastAudioConfig, CastPackager, CastPackagerConfig, CastVideoConfig, VideoUnit,
+    AudioUnit, CastAudioRendition, CastPackager, CastPackagerConfig, CastVideoConfig, VideoUnit,
 };
+use multiview_output::hls::{SubtitleFeedReceiver, SubtitleRendition};
 use multiview_output::SharedEpoch;
 
 use super::ring::{Preroll, PrerollRing, RingKind, RingPacket};
@@ -32,8 +33,8 @@ const RESTART_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) enum CastInputKind {
     /// An H.264 access unit of the output's video rendition.
     Video,
-    /// An AAC frame of the output's program-audio slot.
-    Audio,
+    /// An AAC frame of the audio rendition with this index (#418).
+    Audio(usize),
 }
 
 /// One packet for the cast sink (borrowed from the delivery lease).
@@ -63,8 +64,40 @@ pub(crate) struct CastSetup {
     pub(crate) epoch: SharedEpoch,
     /// The video rendition, from the opened encoder.
     pub(crate) video: CastVideoConfig,
-    /// The audio rendition, when the run carries program audio.
-    pub(crate) audio: Option<CastAudioConfig>,
+    /// The audio renditions, in order (empty = video only). Rendition 0 is
+    /// the `DEFAULT=YES` one.
+    pub(crate) audio: Vec<CastAudioRendition>,
+    /// Which audio packets feed which rendition (#418).
+    pub(crate) audio_routes: CastAudioRoutes,
+    /// The `WebVTT` subtitle renditions, one per subtitle slot (#418).
+    pub(crate) subtitles: Vec<SubtitleRendition>,
+    /// The subtitle cue feed (the bake consumer's sampler is the sender).
+    /// The same receiver goes to every packager generation; while none runs
+    /// the runner drains and discards it (bounded per call).
+    pub(crate) subtitle_feed: Option<Arc<SubtitleFeedReceiver>>,
+}
+
+/// Which delivered audio stream feeds which audio rendition of a cast
+/// stream: built once per run from the output's audio selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CastAudioRoutes {
+    /// The rendition of the program audio ([`StreamKind::Audio`]), when it
+    /// is selected.
+    pub(crate) program: Option<usize>,
+    /// `tracks[i]` = the rendition of discrete track `i`
+    /// ([`StreamKind::AudioTrack`]`(i)`), when it is selected.
+    pub(crate) tracks: Vec<Option<usize>>,
+}
+
+impl CastAudioRoutes {
+    /// The rendition a packet of stream `kind` feeds; `None` = not carried.
+    pub(crate) fn rendition(&self, kind: StreamKind) -> Option<usize> {
+        match kind {
+            StreamKind::Audio => self.program,
+            StreamKind::AudioTrack(index) => self.tracks.get(usize::from(index)).copied().flatten(),
+            _ => None,
+        }
+    }
 }
 
 /// See the module docs.
@@ -85,13 +118,14 @@ pub(crate) struct CastRunner {
 
 impl CastRunner {
     pub(crate) fn new(setup: CastSetup) -> Self {
-        let audio_tb = setup
+        let audio_tbs: Vec<Rational> = setup
             .audio
-            .as_ref()
-            .map_or(Rational::new(1, 48_000), |audio| audio.time_base);
+            .iter()
+            .map(|rendition| rendition.config.time_base)
+            .collect();
         let ring = PrerollRing::new(
             setup.video.time_base,
-            audio_tb,
+            audio_tbs,
             PREROLL_NANOS,
             PREROLL_BYTES,
         );
@@ -122,6 +156,8 @@ impl CastRunner {
     /// [`Self::handle`] with the wall clock of the packet's arrival given
     /// (`unix_ns`, Unix nanoseconds).
     pub(crate) fn handle_at(&mut self, input: CastInput<'_>, now: Instant, unix_ns: i64) {
+        // No stream: the cues offered meanwhile are dropped, never kept.
+        self.discard_cues();
         let gate = Arc::clone(&self.setup.gate);
         if gate.is_disabled() {
             return;
@@ -175,12 +211,25 @@ impl CastRunner {
         self.feed(input, now);
     }
 
+    /// While no packager runs, drain the subtitle feed and drop what it
+    /// held: cues offered with no stream are never kept (one bounded,
+    /// non-blocking batch per call, at most the feed's capacity).
+    fn discard_cues(&self) {
+        if self.packager.is_some() {
+            return;
+        }
+        if let Some(feed) = self.setup.subtitle_feed.as_ref() {
+            drop(feed.drain());
+        }
+    }
+
     /// No packet arrived for a while: honour a deactivation anyway, so a
     /// stopped cast leaves no files behind while the feed is quiet.
     pub(crate) fn poll(&mut self) {
         if self.serving != 0 && self.setup.gate.activation().is_none() {
             self.stop_stream();
         }
+        self.discard_cues();
     }
 
     /// End of run: close the stream and remove its files.
@@ -194,7 +243,7 @@ impl CastRunner {
         let packet = RingPacket {
             kind: match input.kind {
                 CastInputKind::Video => RingKind::Video,
-                CastInputKind::Audio => RingKind::Audio,
+                CastInputKind::Audio(rendition) => RingKind::Audio(rendition),
             },
             pts: input.pts,
             dts: input.dts,
@@ -204,7 +253,7 @@ impl CastRunner {
         };
         match input.kind {
             CastInputKind::Video => self.ring.push_video(packet, unix_ns),
-            CastInputKind::Audio => self.ring.push_audio(packet),
+            CastInputKind::Audio(_) => self.ring.push_audio(packet),
         }
     }
 
@@ -233,17 +282,9 @@ impl CastRunner {
             window: CAST_WINDOW,
             target_segment_ns: CAST_TARGET_SEGMENT_NANOS,
             video: self.setup.video.clone(),
-            // #418 stage A minimal compile fix: the single program audio as
-            // rendition 0; stage B wires every selected track and subtitles.
-            audio: self
-                .setup
-                .audio
-                .clone()
-                .map(multiview_output::hls::cast::CastAudioRendition::program)
-                .into_iter()
-                .collect(),
-            subtitles: Vec::new(),
-            subtitle_feed: None,
+            audio: self.setup.audio.clone(),
+            subtitles: self.setup.subtitles.clone(),
+            subtitle_feed: self.setup.subtitle_feed.clone(),
             epoch: Some(self.setup.epoch.clone()),
             wall_anchor,
         };
@@ -269,8 +310,8 @@ impl CastRunner {
                 config_changed: input.config_changed,
                 data: input.data,
             }),
-            CastInputKind::Audio => packager.push_audio(
-                0,
+            CastInputKind::Audio(rendition) => packager.push_audio(
+                rendition,
                 AudioUnit {
                     pts: input.pts,
                     data: input.data,
@@ -319,7 +360,7 @@ fn ring_input(packet: &RingPacket) -> CastInput<'_> {
     CastInput {
         kind: match packet.kind {
             RingKind::Video => CastInputKind::Video,
-            RingKind::Audio => CastInputKind::Audio,
+            RingKind::Audio(rendition) => CastInputKind::Audio(rendition),
         },
         pts: packet.pts,
         dts: packet.dts,
@@ -361,7 +402,7 @@ pub(crate) fn run_cast_sink(
     let gate = Arc::clone(&setup.gate);
     let id = setup.id.clone();
     let dir = setup.dir.clone();
-    let has_audio = setup.audio.is_some();
+    let routes = setup.audio_routes.clone();
     let mut runner = CastRunner::new(setup);
     let mut report = CastSinkReport {
         packets: 0,
@@ -395,10 +436,12 @@ pub(crate) fn run_cast_sink(
         let packet = &leased.packet;
         let kind = match packet.kind() {
             StreamKind::Video => CastInputKind::Video,
-            StreamKind::Audio if has_audio => CastInputKind::Audio,
-            // A cast stream carries the program audio only (no discrete
-            // track, no future stream kind).
-            _ => continue,
+            // An unselected audio stream (and any future stream kind) is
+            // not carried.
+            other => match routes.rendition(other) {
+                Some(rendition) => CastInputKind::Audio(rendition),
+                None => continue,
+            },
         };
         let (Some(data), Some(pts)) = (packet.payload(), packet.pts()) else {
             continue;

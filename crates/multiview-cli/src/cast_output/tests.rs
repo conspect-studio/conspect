@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 
 use multiview_core::time::Rational;
 use multiview_core::wallclock::WallClockRef;
-use multiview_output::hls::cast::{CastAudioConfig, CastVideoConfig};
+use multiview_output::hls::cast::{CastAudioConfig, CastAudioRendition, CastVideoConfig};
 use multiview_output::hls::cast_check::{check_cast_dir, CastCheckReport};
 use multiview_output::SharedEpoch;
 
-use super::runner::{CastInput, CastInputKind, CastRunner, CastSetup};
+use super::runner::{CastAudioRoutes, CastInput, CastInputKind, CastRunner, CastSetup};
 use super::{
     claim_cast_dir, inspect_cast_dir, prepare_cast_dir, unix_nanos, CastDirState, CastGate,
     CastGateError, CAST_DIR_MARKER,
@@ -84,13 +84,22 @@ fn setup(dir: &Path, gate: &Arc<CastGate>, epoch: SharedEpoch, audio: bool) -> C
             bit_rate: Some(4_000_000),
             extradata: None,
         },
-        audio: audio.then_some(CastAudioConfig {
-            time_base: AUDIO_TB,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_rate: Some(128_000),
-            audio_specific_config: None,
-        }),
+        audio: audio
+            .then_some(CastAudioRendition::program(CastAudioConfig {
+                time_base: AUDIO_TB,
+                sample_rate: 48_000,
+                channels: 2,
+                bit_rate: Some(128_000),
+                audio_specific_config: None,
+            }))
+            .into_iter()
+            .collect(),
+        audio_routes: CastAudioRoutes {
+            program: audio.then_some(0),
+            tracks: Vec::new(),
+        },
+        subtitles: Vec::new(),
+        subtitle_feed: None,
     }
 }
 
@@ -153,7 +162,7 @@ impl Stream {
             let data = aac_frame(self.next_audio);
             runner.handle_at(
                 CastInput {
-                    kind: CastInputKind::Audio,
+                    kind: CastInputKind::Audio(0),
                     pts: self.next_audio * 1024,
                     dts: self.next_audio * 1024,
                     keyframe: false,
