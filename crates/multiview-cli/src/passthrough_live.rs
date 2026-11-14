@@ -1705,4 +1705,23 @@ mod tests {
         }
         assert_eq!(status.verdict(), Some(Err(MatchMiss::NotEnoughHistory)));
     }
+
+    /// #344 D2b: the published delay is the emitted AU's exact source-time
+    /// age: frame k arrives on tick k and a run starts TARGET_DEPTH ticks
+    /// later, so a steady run publishes exactly TARGET_DEPTH.
+    #[test]
+    fn the_published_delay_is_the_emitted_aus_source_age() {
+        let (log, _, status) = run(
+            120,
+            Script {
+                stall: 0..0,
+                change: u64::MAX,
+            },
+        );
+        assert_eq!(log.last().unwrap().state, PassthroughState::Passthrough);
+        assert_eq!(
+            u64::from(status.delay_ticks()),
+            multiview_output::passthrough::clock::TARGET_DEPTH
+        );
+    }
 }

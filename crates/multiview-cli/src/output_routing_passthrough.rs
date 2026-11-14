@@ -46,6 +46,14 @@ use crate::rendition_workers::{BakedTick, OfferRejection, RenditionWorker};
 /// so they are not counted against `routing.max_encoders`.
 pub const MAX_PASSTHROUGH_KEYS: usize = 8;
 
+/// Passthrough candidates one principal's takes may hold at once (review
+/// R1-A-1): no principal can take every key.
+pub const MAX_PASSTHROUGH_KEYS_PER_PRINCIPAL: usize = 4;
+
+/// A candidate that has metered this long (ticks) without its source ever
+/// matching is reclaimed (review R1-A-1): 3 x the 10 s window at 30 fps.
+pub const PASS_METER_LIMIT_TICKS: u64 = 900;
+
 /// The readback / plan reason of an output whose medium has no P0 in this
 /// slice (anything but HLS with TS segments and an H.264/HEVC slot 0).
 pub const NOT_SUPPORTED_ON_MEDIUM: &str = "passthrough-not-supported-on-medium";
@@ -213,6 +221,11 @@ enum Bridge {
 struct Candidate {
     output: usize,
     source: String,
+    /// The principal whose take patched the output (its candidate budget).
+    principal: String,
+    /// The tick the candidate started metering (reclaimed past
+    /// [`PASS_METER_LIMIT_TICKS`] without a first match).
+    since: u64,
     phase: Phase,
     key: Option<PassKey>,
     bridge: Bridge,
@@ -657,6 +670,29 @@ impl OutputRouter {
         }
     }
 
+    /// A candidate that metered past [`PASS_METER_LIMIT_TICKS`] without a
+    /// match: its key closes (the tap is unsubscribed) and it reports
+    /// `unavailable` until the next take of the output.
+    fn reclaim_candidate(
+        &mut self,
+        pos: usize,
+        verdict: Option<Result<(), MatchMiss>>,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let Some(output) = self.pass.candidates.get(pos).map(|c| c.output) else {
+            return;
+        };
+        self.close_pass_key(output, dispatcher);
+        let miss = verdict
+            .and_then(Result::err)
+            .unwrap_or(MatchMiss::NotEnoughHistory);
+        if let Some(c) = self.pass.candidates.get_mut(pos) {
+            c.phase = Phase::Failed;
+            c.failure = Some(format!("no-match: {}", miss.as_str()));
+        }
+        self.dirty = true;
+    }
+
     fn pass_open_failed(&mut self, pos: usize, error: &str) {
         self.pass.counters.open_failures = self.pass.counters.open_failures.saturating_add(1);
         if let Some(c) = self.pass.candidates.get_mut(pos) {
@@ -834,12 +870,26 @@ impl OutputRouter {
             if evaluate_traits_ok(traits, &slot).is_err() {
                 continue;
             }
-            if self.pass.keys_live() >= MAX_PASSTHROUGH_KEYS {
+            let principal = out
+                .principal
+                .clone()
+                .unwrap_or_else(|| super::BOOT_PRINCIPAL.to_owned());
+            let mine = self
+                .pass
+                .candidates
+                .iter()
+                .filter(|c| c.phase != Phase::Failed && c.principal == principal)
+                .count();
+            if self.pass.keys_live() >= MAX_PASSTHROUGH_KEYS
+                || mine >= MAX_PASSTHROUGH_KEYS_PER_PRINCIPAL
+            {
                 continue;
             }
             self.pass.candidates.push(Candidate {
                 output: index,
                 source: source.clone(),
+                principal,
+                since: tick,
                 phase: Phase::Metering,
                 key: None,
                 bridge: Bridge::None,
@@ -925,6 +975,14 @@ impl OutputRouter {
                 }
             }
             (Phase::Metering, Some((key, status, seen))) => {
+                let since = self.pass.candidates.get(pos).map_or(tick, |c| c.since);
+                if status.verdict() != Some(Ok(()))
+                    && tick.saturating_sub(since) >= PASS_METER_LIMIT_TICKS
+                {
+                    // Never matched: give the key back (review R1-A-1).
+                    self.reclaim_candidate(pos, status.verdict(), dispatcher);
+                    return;
+                }
                 if tick < retry_at || !seen || status.verdict() != Some(Ok(())) {
                     return;
                 }
@@ -1096,6 +1154,24 @@ impl OutputRouter {
                     })
                     .map(|d| d.key);
                 if let Some(key) = existing {
+                    // Shared (+0) when another output reads it; a lingering
+                    // key of another principal is ADOPTED: within the
+                    // patching principal's cap, and re-attributed to it
+                    // (review R1-A-2, as a set member's adoption).
+                    let unheld = self.subscribers(key) == 0;
+                    let foreign = self
+                        .dynamic
+                        .iter()
+                        .any(|d| d.key == key && d.principal != principal && !d.reformat);
+                    if unheld && foreign {
+                        if !self.adoption_fits(&principal) {
+                            self.bridge_refused(pos, tick);
+                            return;
+                        }
+                        if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
+                            principal.clone_into(&mut d.principal);
+                        }
+                    }
                     if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
                         d.linger_deadline = None;
                     }
@@ -1112,23 +1188,8 @@ impl OutputRouter {
                         break;
                     }
                 }
-                let refused = |router: &mut Self| {
-                    if let Some(c) = router.pass.candidates.get_mut(pos) {
-                        if c.bridge != Bridge::Refused {
-                            router.pass.counters.bridges_refused =
-                                router.pass.counters.bridges_refused.saturating_add(1);
-                        }
-                        c.bridge = Bridge::Refused;
-                        c.retry_at = tick.saturating_add(PASS_RETRY_TICKS);
-                    }
-                    // The key returns by itself on the slate (D1): runs allowed.
-                    if let Some(k) = router.pass.candidates.get(pos).and_then(|c| c.key.as_ref()) {
-                        k.status.allow_runs_from(0);
-                    }
-                    router.dirty = true;
-                };
                 if !self.has_capacity(&principal) {
-                    refused(self);
+                    self.bridge_refused(pos, tick);
                     return;
                 }
                 let id = self.next_open;
@@ -1160,10 +1221,44 @@ impl OutputRouter {
                         }
                         self.dirty = true;
                     }
-                    Err(_) => refused(self),
+                    Err(_) => self.bridge_refused(pos, tick),
                 }
             }
         }
+    }
+
+    /// No session for the picture bridge: the output stays on the key's
+    /// slate (counted once per fault), and the key returns by itself.
+    fn bridge_refused(&mut self, pos: usize, tick: u64) {
+        if let Some(c) = self.pass.candidates.get_mut(pos) {
+            if c.bridge != Bridge::Refused {
+                self.pass.counters.bridges_refused =
+                    self.pass.counters.bridges_refused.saturating_add(1);
+            }
+            c.bridge = Bridge::Refused;
+            c.retry_at = tick.saturating_add(PASS_RETRY_TICKS);
+        }
+        // The key returns by itself on the slate (D1): runs allowed.
+        if let Some(k) = self.pass.candidates.get(pos).and_then(|c| c.key.as_ref()) {
+            k.status.allow_runs_from(0);
+        }
+        self.dirty = true;
+    }
+
+    /// Whether `principal` may take one more encoder session by adopting a
+    /// lingering key (it does not grow the global count).
+    fn adoption_fits(&self, principal: &str) -> bool {
+        let mine = self
+            .dynamic
+            .iter()
+            .filter(|d| d.principal == principal)
+            .count()
+            + self
+                .opens
+                .values()
+                .filter(|o| o.principal == principal)
+                .count();
+        mine < self.cfg.max_per_principal
     }
 
     /// A forced move onto the warm bridge `key` (an IDR within the floor).

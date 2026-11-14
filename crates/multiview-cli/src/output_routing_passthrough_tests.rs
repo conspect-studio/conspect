@@ -325,11 +325,12 @@ fn a_matching_source_moves_onto_p0_after_metering_and_the_encoder_lingers_out() 
     assert!(pts.windows(2).all(|w| w[1] > w[0]), "monotonic: {pts:?}");
     // Audio by source time: the key publishes the emitted AU's exact delay
     // (it arrived on its tick and waits the clock's target depth).
-    let d = p.x.r.passthrough_audio_delay(1);
-    assert_eq!(
-        d,
-        Some(u32::try_from(multiview_output::passthrough::clock::TARGET_DEPTH).unwrap())
-    );
+    // (The worker reads the shared clock while this thread advances it, so
+    // the published delay is the target depth within one tick; the exact
+    // value is pinned by passthrough_live's deterministic test.)
+    let d = p.x.r.passthrough_audio_delay(1).expect("a delay on P0");
+    let target = u32::try_from(multiview_output::passthrough::clock::TARGET_DEPTH).unwrap();
+    assert!(d.abs_diff(target) <= 1, "delay {d}");
     assert_eq!(p.x.r.passthrough_audio_delay(0), None, "not on a key");
     // The other output stayed on Program.
     assert_eq!(p.view(0).bus, "program");
@@ -568,7 +569,10 @@ fn passthrough_keys_are_capped_separately_from_encoders() {
     let mut p = P0::new(n, 6, Script::default(), true);
     p.step();
     for o in 0..n {
-        p.x.h.try_take(take(&format!("t{o}"), o, src())).unwrap();
+        // Distinct principals: the global cap, not the per-principal one.
+        p.x.h
+            .try_take(take_by(&format!("t{o}"), o, &format!("p{o}")))
+            .unwrap();
     }
     p.run_until(120, |_| false);
     // The tap holds at most 8 consumers too; the router never asks for more.
@@ -697,4 +701,102 @@ fn a_set_take_off_p0_retires_the_candidate() {
     });
     assert!(p.view(0).passthrough.is_none(), "candidate retired");
     assert_eq!(p.x.h.snapshot().passthrough.keys_live, 0);
+}
+
+fn take_by(op: &str, output: usize, principal: &str) -> OutputTake {
+    OutputTake {
+        principal: principal.to_owned(),
+        ..take(op, output, src())
+    }
+}
+
+/// Review R1-A-1: one principal cannot hold every passthrough key: its
+/// candidates are capped at [`MAX_PASSTHROUGH_KEYS_PER_PRINCIPAL`], and a
+/// candidate that meters without ever matching is reclaimed after
+/// [`PASS_METER_LIMIT_TICKS`] so another principal's output gets one.
+#[test]
+fn passthrough_candidates_are_budgeted_per_principal_and_reclaimed() {
+    let n = MAX_PASSTHROUGH_KEYS;
+    let mut p = P0::new(n + 1, 12, Script::default(), true);
+    p.src.script.lock().unwrap().silent = true;
+    p.step();
+    for o in 0..n {
+        p.x.h
+            .try_take(take_by(&format!("a{o}"), o, "alice"))
+            .unwrap();
+    }
+    p.x.h.try_take(take_by("b", n, "bob")).unwrap();
+    p.run_until(60, |_| false);
+    let held = |p: &P0, who: std::ops::Range<usize>| {
+        let snap = p.x.h.snapshot();
+        who.filter(|&o| snap.outputs[o].passthrough.is_some())
+            .count()
+    };
+    assert_eq!(
+        held(&p, 0..n),
+        crate::output_routing::MAX_PASSTHROUGH_KEYS_PER_PRINCIPAL,
+        "one principal's share"
+    );
+    assert_eq!(held(&p, n..n + 1), 1, "another principal gets a candidate");
+    // A never-matching candidate is reclaimed (the source is silent).
+    p.run_until(crate::output_routing::PASS_METER_LIMIT_TICKS + 60, |p| {
+        p.view(n)
+            .passthrough
+            .is_some_and(|v| v.state == "unavailable")
+    })
+    .expect("reclaimed after the metering limit");
+    assert!(p
+        .view(n)
+        .passthrough
+        .unwrap()
+        .reason
+        .is_some_and(|r| r.contains("no-match")));
+}
+
+/// Review R1-A-2: a picture bridge that reuses another principal's
+/// lingering encoded key adopts it only within the patching principal's
+/// cap (and is then charged to it); at the cap it stays on the slate.
+#[test]
+fn a_bridge_never_adopts_another_principals_key_past_the_cap() {
+    let mut p = P0::new(2, 6, Script::default(), true);
+    p.step();
+    // Output 0 on P0 patched by "p"; its own encoded key lingers out.
+    p.take_cam(0);
+    p.run_until(200, |p| p.on_p0(0)).expect("on P0");
+    p.run_until(LINGER_TICKS + 5, |_| false);
+    // "other" takes cam onto output 1 and leaves: its key lingers.
+    p.x.h.try_take(take_by("o1", 1, "other")).unwrap();
+    p.run_until(OPEN_DEADLINE_TICKS, |p| p.view(1).bus == "src:cam")
+        .expect("other's take lands");
+    p.x.h.try_take(take_by("o2", 1, "other")).unwrap();
+    p.x.h
+        .try_take(OutputTake {
+            principal: "other".to_owned(),
+            ..take("o3", 1, PictureBus::Program)
+        })
+        .unwrap();
+    p.run_until(60, |p| p.view(1).bus == "program")
+        .expect("other left");
+    let lingering =
+        p.x.r
+            .dynamic
+            .iter()
+            .find(|d| d.bus == src())
+            .map(|d| (d.key, d.principal.clone()));
+    assert_eq!(lingering.as_ref().map(|l| l.1.as_str()), Some("other"));
+    // "p" is at its cap (0 sessions allowed per principal).
+    p.x.r.cfg.max_per_principal = 0;
+    let at = p.t;
+    p.src.script.lock().unwrap().stall = Some(at..at + 10);
+    p.run_until(60, |p| {
+        p.view(0)
+            .passthrough
+            .is_some_and(|v| v.reason.as_deref() == Some(crate::output_routing::NO_BRIDGE_SESSION))
+    })
+    .expect("stays on the slate at the cap");
+    assert!(p.on_p0(0), "never moved onto the adopted key");
+    assert!(
+        p.x.r.dynamic.iter().all(|d| d.principal == "other"),
+        "never re-attributed"
+    );
 }

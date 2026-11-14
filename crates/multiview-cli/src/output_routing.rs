@@ -39,8 +39,9 @@ use crate::routing_audio::{AudioTakeProgress, AudioTakeStart};
 use crate::routing_aux::{AuxFeed, AuxFeeds, AuxFormat, LayoutRef, PictureBus, PictureBusSlot};
 pub use passthrough::{
     static_verdict, PassEligibility, PassHooks, PassOpenFn, PassRequest, PassthroughCounters,
-    PassthroughView, TraitsLookup, MAX_PASSTHROUGH_KEYS, NOT_SUPPORTED_ON_MEDIUM,
-    NO_BRIDGE_SESSION, PASS_OPEN_DEADLINE_TICKS, PASS_RETRY_TICKS,
+    PassthroughView, TraitsLookup, MAX_PASSTHROUGH_KEYS, MAX_PASSTHROUGH_KEYS_PER_PRINCIPAL,
+    NOT_SUPPORTED_ON_MEDIUM, NO_BRIDGE_SESSION, PASS_METER_LIMIT_TICKS, PASS_OPEN_DEADLINE_TICKS,
+    PASS_RETRY_TICKS,
 };
 pub use sets::{TakeSet, MAX_SET_MEMBERS};
 
