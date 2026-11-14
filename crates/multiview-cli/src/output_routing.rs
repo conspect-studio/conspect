@@ -502,11 +502,12 @@ pub struct OutputRoutingHandle {
     pictures: Option<PlanPictures>,
     max_aux_canvases: usize,
     /// The run's subtitle slots (slice F #345 part F2): per output config id,
-    /// its route table, which the patch API re-points live. Empty until
-    /// [`OutputRoutingHandle::with_subtitles`].
-    subtitles: Arc<[(String, crate::subtitle_slots::SubtitleRoutes)]>,
-    /// The last output tick the subtitle sampler ran (a re-point is used
-    /// from the next one at the latest).
+    /// its route table, which the patch API re-points live. `None` once the
+    /// run ended ([`OutputRoutingHandle::end_subtitles`], review INV-1): a
+    /// re-point and the run's end are linearized by this control-plane
+    /// mutex (the sampler never takes it; it holds its own tables).
+    subtitles: Arc<Mutex<Option<SubtitleTables>>>,
+    /// The last output tick the subtitle sampler finished sampling.
     subtitle_tick: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -655,25 +656,67 @@ impl OutputRoutingHandle {
         tables: Vec<(String, crate::subtitle_slots::SubtitleRoutes)>,
         tick: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
-        self.subtitles = tables.into();
+        self.subtitles = Arc::new(Mutex::new(Some(tables.into())));
         self.subtitle_tick = tick;
         self
     }
 
-    /// The subtitle route table of the output whose config id is `id`.
-    #[must_use]
-    pub fn subtitle_routes(&self, id: &str) -> Option<&crate::subtitle_slots::SubtitleRoutes> {
+    fn subtitle_gate(&self) -> std::sync::MutexGuard<'_, Option<SubtitleTables>> {
         self.subtitles
-            .iter()
-            .find(|(output, _)| output == id)
-            .map(|(_, routes)| routes)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The last output tick the subtitle sampler ran.
+    /// Re-point subtitle slots of the output whose config id is `output`
+    /// (part F2), under the run's subtitle gate: a run that ended refuses
+    /// with [`SubtitleRepoint::Ended`] and nothing is stored. `Ok(tick)` is
+    /// the last tick the sampler FINISHED sampling before the swap (read
+    /// before it): that tick used the old table, and the first sampled tick
+    /// after it, or a later one, uses the new table (the bake consumer may
+    /// shed ticks, so no particular tick is promised; review INV-2).
+    ///
+    /// # Errors
+    /// [`SubtitleRepoint`] when nothing was changed.
+    pub fn repoint_subtitles(
+        &self,
+        output: &str,
+        slots: &[(usize, Option<String>)],
+    ) -> Result<u64, SubtitleRepoint> {
+        let gate = self.subtitle_gate();
+        let tables = gate.as_ref().ok_or(SubtitleRepoint::Ended)?;
+        let routes = tables
+            .iter()
+            .find(|(id, _)| id == output)
+            .map(|(_, routes)| routes)
+            .ok_or(SubtitleRepoint::NotInRun)?;
+        let tick = self
+            .subtitle_tick
+            .load(std::sync::atomic::Ordering::Acquire);
+        crate::subtitle_slots::repoint(routes, slots).map_err(|_| SubtitleRepoint::NotInRun)?;
+        Ok(tick)
+    }
+
+    /// The live subtitle route table of `output`, `None` when the run does
+    /// not sample it or has ended.
     #[must_use]
-    pub fn subtitle_tick(&self) -> u64 {
-        self.subtitle_tick
-            .load(std::sync::atomic::Ordering::Acquire)
+    pub fn subtitle_table(&self, output: &str) -> Option<Vec<Option<String>>> {
+        let gate = self.subtitle_gate();
+        gate.as_ref()?
+            .iter()
+            .find(|(id, _)| id == output)
+            .map(|(_, routes)| routes.load().to_vec())
+    }
+
+    /// End the run's subtitle routing (its teardown): later re-points are
+    /// refused and the live readback is gone. Idempotent.
+    pub fn end_subtitles(&self) {
+        *self.subtitle_gate() = None;
+    }
+
+    /// Whether the run's subtitle routing is still live (not ended).
+    #[must_use]
+    pub fn subtitles_live(&self) -> bool {
+        self.subtitle_gate().is_some()
     }
 
     /// The run's store lookup and canvas, when attached.
@@ -706,6 +749,28 @@ impl OutputRoutingHandle {
         self.outputs
             .iter()
             .position(|o| o.id.as_deref() == Some(id))
+    }
+}
+
+/// A run's subtitle route tables, per output config id (part F2).
+pub type SubtitleTables = Arc<[(String, crate::subtitle_slots::SubtitleRoutes)]>;
+
+/// Why [`OutputRoutingHandle::repoint_subtitles`] changed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleRepoint {
+    /// The run ended (or was replaced).
+    Ended,
+    /// The run does not sample this output, or the slot is beyond its table.
+    NotInRun,
+}
+
+/// Ends a run's subtitle routing when dropped (the run's teardown, on every
+/// exit path; review INV-1).
+pub struct SubtitleRunEnd(pub Arc<OutputRoutingHandle>);
+
+impl Drop for SubtitleRunEnd {
+    fn drop(&mut self) {
+        self.0.end_subtitles();
     }
 }
 
@@ -1269,7 +1334,7 @@ impl OutputRouter {
             has_preview: cfg.has_preview,
             pictures: None,
             max_aux_canvases: cfg.max_aux_canvases,
-            subtitles: Arc::from(Vec::new()),
+            subtitles: Arc::new(Mutex::new(Some(Arc::from(Vec::new())))),
             subtitle_tick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let mut router = Self {

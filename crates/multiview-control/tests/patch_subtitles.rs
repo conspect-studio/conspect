@@ -94,6 +94,7 @@ source = "secret-cam"
 "##;
 
 const OUT_A: &str = "hls /tmp/patch-subs/a/index.m3u8";
+const OUT_C: &str = "hls /tmp/patch-subs/c/index.m3u8";
 
 /// output-0 on both axes; `cam_a`, `cam_b`, `bars`; not `secret-cam`.
 const SUBS: &str = "subs-k.subs-secret";
@@ -150,6 +151,9 @@ struct FakeState {
 
 struct Fake {
     state: Mutex<FakeState>,
+    /// When set, a take re-pointing any slot to `cam_b` waits (bounded) on
+    /// it AFTER its swap: a forced "paused after the swap" schedule.
+    hold_cam_b: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     rx: Mutex<Option<Receiver<OutputOutcome>>>,
     _tx: std::sync::mpsc::SyncSender<OutputOutcome>,
 }
@@ -180,7 +184,19 @@ impl OutputRouting for Fake {
         for (slot, source) in &take.slots {
             table[*slot].clone_from(source);
         }
+        let hold = take
+            .slots
+            .iter()
+            .any(|(_, source)| source.as_deref() == Some("cam_b"));
         state.subtitle_takes.push(take);
+        drop(state);
+        if hold {
+            if let Some(rx) = self.hold_cam_b.lock().unwrap().take() {
+                // Bounded: under a correct serialization the other take
+                // cannot finish while this one holds it.
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+            }
+        }
         Ok(42)
     }
     fn subtitle_routes(&self, output: &str) -> Option<Vec<Option<String>>> {
@@ -223,6 +239,7 @@ fn rig(path: &Path) -> Rig {
         }),
         rx: Mutex::new(Some(rx)),
         _tx: tx,
+        hold_cam_b: Mutex::new(None),
     });
     let seam: Arc<dyn OutputRouting> = fake.clone();
     let api_keys = Arc::new(keys());
@@ -692,4 +709,212 @@ async fn get_lists_subtitle_slots_live_or_from_config_with_redaction() {
         outputs[1]["subtitle"][0]["source"],
         json!({"redacted": true})
     );
+}
+
+/// Review COR-1 / AUZ-2 / INV-4: two concurrent takes on the same slot with a
+/// forced inversion — take A (`cam_b`) swaps first and is then descheduled;
+/// take B (`cam_a`) swaps last. Live state ends on B, so the accepted state
+/// (what a restart starts from) must end on B too, and the outcomes are
+/// published in swap order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_slot_takes_persist_the_last_swapped_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    let (release_a, hold) = std::sync::mpsc::channel();
+    *rig.fake.hold_cam_b.lock().unwrap() = Some(hold);
+    let mut events = rig.state.engine.subscribe();
+    let body = |source: &str| patch(vec![sub("output-0", 1, json!({ "source": source }))]);
+    let router = rig.router.clone();
+    let a = tokio::spawn(async move {
+        let resp = send(
+            &router,
+            post(
+                "/api/v1/patch/take",
+                OPERATOR_TOKEN,
+                Some("race-a"),
+                &body("cam_b"),
+            ),
+        )
+        .await;
+        (resp.status(), body_json(resp).await)
+    });
+    // A has swapped (the fake recorded it) and is held.
+    wait_for(|| rig.takes().len() == 1).await;
+    let router = rig.router.clone();
+    let b = tokio::spawn(async move {
+        let resp = send(
+            &router,
+            post(
+                "/api/v1/patch/take",
+                OPERATOR_TOKEN,
+                Some("race-b"),
+                &body("cam_a"),
+            ),
+        )
+        .await;
+        (resp.status(), body_json(resp).await)
+    });
+    // Let B run to completion (persistence included) if nothing orders it
+    // after A; then release A.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let _ = release_a.send(());
+    let (status_a, body_a) = a.await.unwrap();
+    let (status_b, body_b) = b.await.unwrap();
+    assert_eq!(status_a, StatusCode::ACCEPTED, "{body_a}");
+    assert_eq!(status_b, StatusCode::ACCEPTED, "{body_b}");
+    let takes = rig.takes();
+    assert_eq!(takes.len(), 2);
+    let last = takes[1].slots[0].1.clone();
+    assert_eq!(last.as_deref(), Some("cam_a"), "B swapped last");
+    let live = rig.fake.state.lock().unwrap().tables[OUT_A].clone();
+    assert_eq!(live[1], last);
+    // Both outcomes published, in swap order.
+    let mut ops = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while ops.len() < 2 {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("two route.output outcomes")
+            .unwrap();
+        if let Event::RouteOutput(outcome) = event.event.as_ref() {
+            ops.push(outcome.operation_id.clone());
+        }
+    }
+    assert_eq!(
+        ops,
+        vec![
+            body_a["operation_id"].as_str().unwrap().to_owned(),
+            body_b["operation_id"].as_str().unwrap().to_owned()
+        ]
+    );
+    // The accepted state (a restart's start) agrees with the live route.
+    assert_eq!(persisted_sources(&rig)[1], last);
+    let control = rig.state.output_routing.as_ref().unwrap();
+    wait_for(|| control.subtitle_persist_pending() == 0).await;
+    assert_eq!(persisted_sources(&rig)[1], last);
+}
+
+/// Review AUZ-1 / INV-3: persistence is bounded. With the store blocked
+/// (the config-mutation lock held), takes fill the bounded queue; the next
+/// take is refused 503 BEFORE the engine is asked (its route unchanged, its
+/// key free), and the pending work never exceeds the bound. Releasing the
+/// store drains it and persists the applied sources.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_persistence_refuses_overload_without_touching_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    rig.fake
+        .state
+        .lock()
+        .unwrap()
+        .tables
+        .insert(OUT_C.to_owned(), vec![Some("secret-cam".to_owned())]);
+    let control = Arc::clone(rig.state.output_routing.as_ref().unwrap());
+    control.set_subtitle_persist_capacity(2);
+    let blocked = rig.state.lock_config_mutation().await;
+    let (status, _) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "o-1",
+        patch(vec![sub("output-0", 0, json!({"source": "cam_b"}))]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "o-2",
+        patch(vec![sub("output-2", 0, json!({"source": "cam_a"}))]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(control.subtitle_persist_pending(), 2);
+    // Full: refused, the engine is not asked, the route is unchanged.
+    let (status, problem) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "o-3",
+        patch(vec![sub("output-0", 1, json!({"source": "cam_a"}))]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{problem}");
+    assert!(problem["type"].as_str().unwrap().ends_with("engine-busy"));
+    assert_eq!(
+        rig.takes().len(),
+        2,
+        "the refused take never reached the engine"
+    );
+    assert_eq!(rig.fake.state.lock().unwrap().tables[OUT_A][1], None);
+    assert_eq!(control.subtitle_persist_pending(), 2, "bounded");
+    // Unblock: the queue drains and persists.
+    drop(blocked);
+    wait_for(|| control.subtitle_persist_pending() == 0).await;
+    assert_eq!(persisted_sources(&rig)[0].as_deref(), Some("cam_b"));
+    // The refused key was freed and its limiter slot refunded: once the
+    // output's window allows, the same key is a fresh take.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, _) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "o-3",
+        patch(vec![sub("output-0", 1, json!({"source": "cam_a"}))]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(rig.takes().len(), 3);
+}
+
+/// Review COR-2: a configured slot beyond the run's (shorter) live route
+/// table is not live: it reports its configured source, `live: false`,
+/// redacted for a caller without Read on it.
+#[tokio::test]
+async fn get_reports_a_slot_beyond_the_live_table_from_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    // output-2 declares one slot (secret-cam); the run's table has none.
+    rig.fake
+        .state
+        .lock()
+        .unwrap()
+        .tables
+        .insert(OUT_C.to_owned(), Vec::new());
+    let all = body_json(send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await).await;
+    let slot = &all["outputs"][2]["subtitle"][0];
+    assert_eq!(slot["live"], false, "{all}");
+    assert_eq!(slot["source"], json!({"source": "secret-cam"}), "{all}");
+    // Output-0's live slots stay live.
+    assert_eq!(all["outputs"][0]["subtitle"][1]["live"], true);
+    let limited = body_json(send(&rig.router, get("/api/v1/patch", LIMITED)).await).await;
+    let slot = &limited["outputs"][1]["subtitle"][0];
+    assert_eq!(slot["live"], false, "{limited}");
+    assert_eq!(slot["source"], json!({"redacted": true}));
+}
+
+/// Review INV-1 (control side): once the run stopped (the engine has no
+/// live table and refuses `Busy`), `GET /patch` reports the configured
+/// sources `live: false` and a take is 503 `engine-busy` with no outcome.
+#[tokio::test]
+async fn after_the_run_stops_get_is_not_live_and_a_take_is_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    {
+        let mut state = rig.fake.state.lock().unwrap();
+        state.tables.clear();
+        state.busy = true;
+    }
+    let all = body_json(send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await).await;
+    let a = &all["outputs"][0]["subtitle"];
+    assert_eq!(a[0]["live"], false, "{all}");
+    assert_eq!(a[0]["source"], json!({"source": "cam_a"}));
+    let (status, problem) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "stopped",
+        patch(vec![sub("output-0", 0, json!({"source": "cam_b"}))]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{problem}");
+    assert_eq!(rig.takes(), Vec::new());
+    let control = rig.state.output_routing.as_ref().unwrap();
+    assert_eq!(control.subtitle_persist_pending(), 0);
 }

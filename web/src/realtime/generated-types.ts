@@ -461,10 +461,10 @@ export type ResyncReason = "seq_evicted" | "unknown_session" | "session_expired"
 export interface RouteOutputEvent {
   /** The take's operation id (empty for a fallback). */
   readonly operation_id: string;
-  readonly outcome: "applied" | "superseded" | "refused:feed-not-fresh" | "refused:capacity" | "refused:encoder-not-ready" | "refused:unroutable" | "refused:format-mismatch" | "fallback:aux-failed" | "fallback:encoder-failed";
+  readonly outcome: "applied" | "superseded" | "refused:feed-not-fresh" | "refused:capacity" | "refused:encoder-not-ready" | "refused:unroutable" | "refused:format-mismatch" | "fallback:aux-failed" | "fallback:encoder-failed" | "subtitle:applied" | "subtitle:refused:not-in-run";
   /** Output API id (matches the envelope `id`). */
   readonly output: string;
-  /** Program tick at which the outcome was decided. */
+  /** Program tick at which the outcome was decided. For subtitle:* the last tick the subtitle sampler finished before the re-patch; it lands on the first tick sampled after it (no particular tick is promised: shed ticks are not sampled); 0 when refused. */
   readonly tick: number;
 }
 

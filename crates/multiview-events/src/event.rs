@@ -963,7 +963,10 @@ pub struct RouteOutputEvent {
     pub output: String,
     /// Opaque operation id from the take's 202 (empty for a fallback).
     pub operation_id: String,
-    /// The Program tick at which the outcome was decided.
+    /// The Program tick at which the outcome was decided. For `subtitle:*`
+    /// (#345 F2): the last tick the subtitle sampler finished BEFORE the
+    /// re-patch; it lands on the first tick sampled after it (no particular
+    /// tick is promised: the sampler may skip shed ticks). `0` when refused.
     pub tick: u64,
     /// `applied` | `superseded` | `refused:feed-not-fresh` | `refused:capacity` |
     /// `refused:encoder-not-ready` | `refused:unroutable` | `refused:format-mismatch` |

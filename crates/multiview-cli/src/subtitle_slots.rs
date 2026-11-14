@@ -14,8 +14,10 @@
 //! bounded [`SubtitleFeed`] (`try_send`, drop-and-count: invariant #10).
 //!
 //! A re-point ([`repoint`], part F2) replaces the whole table (RCU) and never
-//! waits on the sampler. It lands on one tick: the tick that first reads the new route
-//! closes the old source's cue at that tick and may open the new source's
+//! waits on the sampler. It lands on one tick, the first SAMPLED tick that
+//! reads the new route (the bake consumer may shed ticks, so not
+//! necessarily the next tick index): that tick
+//! closes the old source's cue and may open the new source's
 //! cue at the same tick.
 //!
 //! Pure Rust: the resolver (frame-store latch + caption cue store) is
@@ -180,8 +182,10 @@ pub struct SubtitleRun {
     outputs: Vec<SubtitleOutputSampler>,
     resolve: CueResolver,
     cadence: Rational,
-    /// The last sampled tick, published for the patch API (F2: a re-point
-    /// reports the tick it lands by). One relaxed-cost store per tick.
+    /// The last FINISHED sampled tick, published for the patch API (F2: a
+    /// re-point reports it; the re-point lands on a later sampled tick, not
+    /// necessarily the next index: the consumer may shed ticks). One store
+    /// per tick.
     last_tick: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
@@ -220,12 +224,15 @@ impl SubtitleRun {
         if self.outputs.is_empty() {
             return;
         }
-        if let Some(cell) = &self.last_tick {
-            cell.store(tick_index, std::sync::atomic::Ordering::Release);
-        }
         let now = MediaTime::from_tick(i64::try_from(tick_index).unwrap_or(i64::MAX), self.cadence);
         for output in &mut self.outputs {
             output.tick(now, &mut self.resolve);
+        }
+        // Published only once every table of this tick was read (review
+        // INV-2): a re-point that reads `T` here swapped after tick T used
+        // its tables, so it lands on a later sampled tick.
+        if let Some(cell) = &self.last_tick {
+            cell.store(tick_index, std::sync::atomic::Ordering::Release);
         }
     }
 }

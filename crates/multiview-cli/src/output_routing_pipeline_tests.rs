@@ -2193,3 +2193,48 @@ fn a_live_reformat_resets_one_output_and_leaves_the_other_untouched() {
     assert_eq!(decode_size(&run.video[1][at_index..]), Some((32, 64)));
     assert_eq!(decode_size(&run.video[0]), Some((64, 64)));
 }
+
+/// Review INV-1 through the real pipeline: while the run is live its
+/// subtitle routing is live; when the run returns, its published handle's
+/// subtitle routing is ended (a stale take is refused, no live readback),
+/// although the handle itself stays in the slot.
+#[test]
+fn a_run_ends_its_subtitle_routing_when_it_returns() {
+    use multiview_control::output_routing::{
+        OutputRouting, SubtitleTakeError, SubtitleTakeRequest,
+    };
+    let seen_live = Arc::new(AtomicBool::new(false));
+    let record = Arc::clone(&seen_live);
+    let kept: Arc<Mutex<Option<OutputRoutingSlot>>> = Arc::new(Mutex::new(None));
+    let keep = Arc::clone(&kept);
+    let run = drive("sub_run_end", 30, move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+            slot.load()
+        });
+        record.store(handle.subtitles_live(), Ordering::Release);
+        *keep.lock().unwrap() = Some(slot);
+    });
+    assert_eq!(run.frames, 30);
+    assert!(seen_live.load(Ordering::Acquire), "live during the run");
+    let slot = kept
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the controller kept the slot");
+    let handle = slot.load().expect("the handle stays published");
+    assert!(!handle.subtitles_live(), "ended with the run");
+    assert_eq!(
+        handle.repoint_subtitles("any", &[(0, None)]),
+        Err(super::SubtitleRepoint::Ended)
+    );
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(slot);
+    assert_eq!(
+        adapter.try_take_subtitles(SubtitleTakeRequest {
+            operation_id: "late".to_owned(),
+            output: "any".to_owned(),
+            slots: vec![(0, None)],
+            principal: "p".to_owned(),
+        }),
+        Err(SubtitleTakeError::Busy)
+    );
+}

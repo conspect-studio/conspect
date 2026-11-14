@@ -2513,24 +2513,38 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   per-output 2/s and per-principal 10/s limiter. `202 {operation_id, status: "accepted"}`.
 - **Engine.** `OutputRouting::try_take_subtitles` (wait-free, no channel). The run publishes
   its route tables, keyed by output config id, on the `OutputRoutingHandle`
-  (`with_subtitles`), so they are published and replaced with the handle between runs. The
-  adapter RCU-replaces the output's `SubtitleRoutes` table (`subtitle_slots::repoint`, writers
-  serialized by a control-plane mutex the sampler never takes; the sampler only loads the
-  table once per tick). `subtitle:applied` is reported at once, after the swap: the sampler
-  applies it at its next output tick (the answered `tick` is the last sampled tick + 1, at the
-  latest), so the old source's cue ends at T and the new one may start at T. No running engine
-  → 503 `engine-busy` (the key freed); an output the run does not sample (not in this run, or
-  slots declared after it started) → `subtitle:refused:not-in-run`, nothing changes. Without
-  an output-routing seam the routes answer 409 `routing-unavailable` as the video path does.
-  The outcome rides `route.output`.
-- **Persistence.** After `applied` (and only then), each named slot's
-  `slots.subtitle[i].source` is written into the accepted state under the config-mutation
-  lock, keeping the accepted output identities (`persist_subtitle_routes`), off the handler.
-  A run builds each slot's route from it, so a restart starts from the persisted source.
+  (`with_subtitles`), behind a per-run subtitle gate (a control-plane mutex the sampler never
+  takes; the sampler holds its own tables and only loads them once per tick). The adapter
+  RCU-replaces the output's `SubtitleRoutes` table under that gate
+  (`OutputRoutingHandle::repoint_subtitles` → `subtitle_slots::repoint`). The run's teardown
+  ends the gate (`SubtitleRunEnd`, dropped on every exit path of `drive_streaming`), so a take
+  that loaded the handle before the run ended or was replaced is refused and never mutates the
+  obsolete table, and the live readback of an ended run is gone. No running engine, or an
+  ended run → 503 `engine-busy` (key freed, rate slot refunded); an output the run does not
+  sample (not in this run, or slots declared after it started) → `subtitle:refused:not-in-run`,
+  nothing changes. Without an output-routing seam the routes answer 409 `routing-unavailable`
+  as the video path does.
+- **Landing tick (honest contract).** The outcome's `tick` is the last tick the sampler
+  FINISHED before the swap (it publishes a tick only after reading every table of that tick).
+  The re-patch lands on one tick: the first tick sampled after the reported one, where the old
+  source's cue ends and the new one may start. No particular index is promised: the bake
+  consumer may shed items, and shed ticks are not sampled.
+- **Ordering and bounded persistence.** One serialization (the control plane's subtitle queue
+  lock) covers admission, the engine swap, the take's settlement and the enqueue of its
+  outcome with a monotonic sequence, so the queue order is the swap order. The queue is
+  bounded (`MAX_PENDING_SUBTITLE_PERSISTS` = 16, queued plus in flight): a take that finds it
+  full is refused 503 `engine-busy` BEFORE the engine is asked (no route changes, key freed,
+  rate slot refunded). ONE serial worker task drains it: per batch it coalesces each
+  (output, slot) to the highest-sequence source, persists each output's
+  `slots.subtitle[i].source` under the config-mutation lock, keeping the accepted output
+  identities (`persist_subtitle_routes`), only for `applied` outcomes, then publishes the
+  outcomes on `route.output` in swap order. A run builds each slot's route from the accepted
+  state, so a restart starts from the last swapped source.
 - **`GET /patch`.** Each output gains `subtitle: [{slot, format, language, name, live,
-  source}]`: from the engine's live route table when the run samples the output (`live:
-  true`), else from the accepted config (`live: false`). A source the caller cannot Read is
-  `{redacted: true}`; an unpatched slot is `null`.
+  source}]`, decided per slot: from the engine's live route table when the running engine has
+  that slot (`live: true`), else from the accepted config (`live: false`: no run, an ended run,
+  an output not in this run, or a slot beyond the run's shorter table). A source the caller
+  cannot Read is `{redacted: true}`; an unpatched slot is `null`.
 
 ### 12.9 The Routing page (#308)
 

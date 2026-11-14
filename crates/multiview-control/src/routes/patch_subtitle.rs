@@ -15,10 +15,13 @@
 //! and the per-output 2/s and per-principal 10/s limiter (one request = one
 //! take). The engine re-points the output's route table wait-free (an RCU
 //! swap, no channel); the off-clock sampler reads it at its next tick, so
-//! the re-patch lands on one tick. The outcome is reported at once on
-//! `route.output` (`subtitle:applied`, or `subtitle:refused:not-in-run`), and
-//! an applied re-patch is persisted as the slots' `source` under the
-//! config-mutation lock.
+//! the re-patch lands on one tick (the first sampled tick after the
+//! reported one; the consumer may shed ticks, so no tick is promised). The
+//! swap and its queued outcome share one serialization with a bounded,
+//! single-consumer persistence queue: a full queue refuses the take before
+//! any route changes; the consumer persists the latest slot sources (in
+//! swap order) under the config-mutation lock, then publishes the outcomes
+//! on `route.output` (`subtitle:applied`, `subtitle:refused:not-in-run`).
 
 use std::time::Instant;
 
@@ -30,20 +33,12 @@ use super::patch::{problem, PatchPlan, PatchRefusal, PatchRequest, PlannedCrossp
 use crate::auth::Principal;
 use crate::concurrency::IdempotencyKey;
 use crate::error::{ControlError, ControlResult};
-use crate::output_routing::{
-    OutputOutcome, PendingTake, SubtitleTakeError, SubtitleTakeRequest, TakeReservation,
-};
+use crate::output_routing::{PendingTake, SubtitleAdmission, SubtitleTakeRequest, TakeReservation};
 use crate::state::AppState;
 
 /// The plan note of a source that declares no `captions`: not a refusal,
 /// the slot then carries an empty track.
 pub(crate) const NOTE_NO_CAPTIONS: &str = "source-has-no-captions";
-
-/// The outcome of an applied subtitle re-patch on `route.output`.
-pub(crate) const OUTCOME_APPLIED: &str = "subtitle:applied";
-/// The outcome of a re-patch the running engine does not sample (the output
-/// is not in this run, or the slot was declared after the run started).
-pub(crate) const OUTCOME_NOT_IN_RUN: &str = "subtitle:refused:not-in-run";
 
 const ONE_OUTPUT: &str = "a subtitle patch carries only the subtitle crosspoints of one output; \
      multi-destination patch sets arrive with patch salvos (#308)";
@@ -301,9 +296,10 @@ pub(crate) fn take(
         )));
     }
     // Limits key on existing outputs only (one request = one take).
+    let admitted_at = Instant::now();
     if let Err(retry) = control
         .limiter
-        .admit(&patch.output, &principal.key_id, Instant::now())
+        .admit(&patch.output, &principal.key_id, admitted_at)
     {
         return Ok(Err(super::output_routing::too_many_pub(retry)));
     }
@@ -319,23 +315,32 @@ pub(crate) fn take(
         slots: patch.slots.clone(),
         principal: principal.key_id.clone(),
     };
-    let (outcome, tick) = match control.routing.try_take_subtitles(request) {
-        Ok(tick) => (OUTCOME_APPLIED, tick),
-        Err(SubtitleTakeError::NotInRun) => (OUTCOME_NOT_IN_RUN, 0),
-        Err(SubtitleTakeError::Busy) => {
+    // Persistence capacity is reserved, the engine swapped and the outcome
+    // queued under ONE serialization, so the persisted order is the swap
+    // order and a full queue refuses before any route changes (review
+    // COR-1, AUZ-1/2, INV-3/4).
+    control.ensure_subtitle_worker(state);
+    let outcome = match control.take_subtitles(request, &patch.output) {
+        SubtitleAdmission::Queued(outcome) => outcome,
+        SubtitleAdmission::Busy => {
             control.release_take(&key, &op);
+            control
+                .limiter
+                .refund(&patch.output, &principal.key_id, admitted_at);
             return Ok(Err(ControlError::EngineBusy.into_response()));
         }
+        SubtitleAdmission::Full => {
+            control.release_take(&key, &op);
+            control
+                .limiter
+                .refund(&patch.output, &principal.key_id, admitted_at);
+            return Ok(Err(problem(
+                503,
+                "engine-busy",
+                "subtitle re-patches are waiting to be persisted; nothing was changed, retry",
+            )));
+        }
     };
-    let outcome = OutputOutcome {
-        operation_id: op.to_string(),
-        output: checked.config_id.clone(),
-        tick,
-        outcome: outcome.to_owned(),
-        feed: None,
-        audio: None,
-    };
-    control.settle(&outcome);
     state.audit(
         &principal.key_id,
         crate::audit::AuditAction::Command,
@@ -348,45 +353,7 @@ pub(crate) fn take(
             "outcome": outcome.outcome,
         })),
     );
-    report(state, &patch.output, &patch.slots, outcome);
     Ok(Ok(op.to_string()))
-}
-
-/// Persist an applied re-patch, then publish its outcome on `route.output`
-/// (off the handler, like the take relay: the 202 never waits on the store).
-fn report(
-    state: &AppState,
-    api_id: &str,
-    slots: &[(usize, Option<String>)],
-    outcome: OutputOutcome,
-) {
-    let event = |outcome: OutputOutcome| {
-        multiview_events::Event::RouteOutput(multiview_events::RouteOutputEvent {
-            output: api_id.to_owned(),
-            operation_id: outcome.operation_id,
-            tick: outcome.tick,
-            outcome: outcome.outcome,
-        })
-    };
-    if outcome.outcome != OUTCOME_APPLIED {
-        state.engine.publish_event(event(outcome));
-        return;
-    }
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        state.engine.publish_event(event(outcome));
-        return;
-    };
-    let state = state.clone();
-    let slots = slots.to_vec();
-    let event = event(outcome.clone());
-    runtime.spawn(async move {
-        if let Err(error) =
-            crate::output_routing::persist_subtitle_routes(&state, &outcome.output, &slots).await
-        {
-            tracing::warn!(%error, output = %outcome.output, "subtitle re-patch applied but not persisted");
-        }
-        state.engine.publish_event(event);
-    });
 }
 
 fn key_reused() -> ControlError {
@@ -396,7 +363,8 @@ fn key_reused() -> ControlError {
 /// The `subtitle` list of an output in `GET /patch`: from the engine's live
 /// route table when the run samples it (`live: true`), else from the
 /// accepted config (`live: false`). A source the caller cannot read is
-/// `{redacted: true}`.
+/// `{redacted: true}`. Decided per slot: a slot the run's table lacks is
+/// from config.
 pub(crate) fn output_view(
     state: &AppState,
     principal: &Principal,
@@ -416,8 +384,12 @@ pub(crate) fn output_view(
         .iter()
         .enumerate()
         .map(|(i, slot)| {
-            let source = match &live {
-                Some(table) => table.get(i).cloned().flatten(),
+            // A slot beyond the run's (shorter) table is not live: its
+            // configured source, `live: false` (review COR-2).
+            let entry = live.as_ref().and_then(|table| table.get(i));
+            let is_live = entry.is_some();
+            let source = match entry {
+                Some(live_source) => live_source.clone(),
                 None => slot.source.clone(),
             };
             let source = source.map_or(Value::Null, |id| {
@@ -432,7 +404,7 @@ pub(crate) fn output_view(
                 "format": slot.format.as_str(),
                 "language": slot.language,
                 "name": slot.name,
-                "live": live.is_some(),
+                "live": is_live,
                 "source": source,
             })
         })

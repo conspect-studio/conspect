@@ -20,7 +20,7 @@ use multiview_control::output_routing::{
 
 use crate::output_routing::{
     FallbackReason, OutputRoutingHandle, OutputRoutingSlot, OutputTake, ReformatRefusal,
-    RefuseReason, TakeOutcome, TakeResult, DEFAULT_MAX_ENCODERS,
+    RefuseReason, SubtitleRepoint, TakeOutcome, TakeResult, DEFAULT_MAX_ENCODERS,
 };
 use crate::routing_audio::AudioChoice;
 use crate::routing_aux::PictureBus;
@@ -222,9 +222,6 @@ pub struct OutputRoutingAdapter {
     outcome_rx: Mutex<Option<Receiver<OutputOutcome>>>,
     /// The handle whose outcome stream the pump already took.
     pumped: Mutex<Option<Arc<OutputRoutingHandle>>>,
-    /// Serializes subtitle re-points (read-modify-store of one route table)
-    /// on the control plane. The sampler never takes it: it only loads.
-    subtitle_writer: Mutex<()>,
 }
 
 impl std::fmt::Debug for OutputRoutingAdapter {
@@ -245,7 +242,6 @@ impl OutputRoutingAdapter {
             outcome_tx,
             outcome_rx: Mutex::new(Some(outcome_rx)),
             pumped: Mutex::new(None),
-            subtitle_writer: Mutex::new(()),
         }
     }
 
@@ -647,28 +643,24 @@ impl OutputRouting for OutputRoutingAdapter {
     }
 
     /// Slice F part F2: re-point the output's subtitle route table (RCU,
-    /// wait-free for the off-clock sampler, no channel). The sampler reads
-    /// it at its next output tick, so the answer is that tick: the last
-    /// sampled tick + 1 (at the latest; the re-patch lands on one tick).
+    /// wait-free for the off-clock sampler, no channel), under the run's
+    /// subtitle gate: a run that ended (or was replaced) refuses `Busy` and
+    /// is never mutated (review INV-1). The answer is the last tick the
+    /// sampler finished before the swap; the new table is used from the
+    /// first sampled tick after it (no particular tick is promised: the
+    /// consumer may shed ticks, review INV-2).
     fn try_take_subtitles(&self, take: SubtitleTakeRequest) -> Result<u64, SubtitleTakeError> {
         let handle = self.slot.load().ok_or(SubtitleTakeError::Busy)?;
-        let routes = handle
-            .subtitle_routes(&take.output)
-            .ok_or(SubtitleTakeError::NotInRun)?;
-        let _writer = self
-            .subtitle_writer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        crate::subtitle_slots::repoint(routes, &take.slots)
-            .map_err(|_| SubtitleTakeError::NotInRun)?;
-        Ok(handle.subtitle_tick().saturating_add(1))
+        handle
+            .repoint_subtitles(&take.output, &take.slots)
+            .map_err(|refusal| match refusal {
+                SubtitleRepoint::Ended => SubtitleTakeError::Busy,
+                SubtitleRepoint::NotInRun => SubtitleTakeError::NotInRun,
+            })
     }
 
     fn subtitle_routes(&self, output: &str) -> Option<Vec<Option<String>>> {
-        let handle = self.slot.load()?;
-        handle
-            .subtitle_routes(output)
-            .map(|routes| routes.load().to_vec())
+        self.slot.load()?.subtitle_table(output)
     }
 
     fn subscribe_outcomes(&self) -> Option<Receiver<OutputOutcome>> {

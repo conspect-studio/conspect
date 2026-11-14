@@ -1847,7 +1847,7 @@
             "type": "string"
           },
           "tick": {
-            "description": "Program tick at which the outcome was decided.",
+            "description": "Program tick at which the outcome was decided. For subtitle:* the last tick the subtitle sampler finished before the re-patch; it lands on the first tick sampled after it (no particular tick is promised: shed ticks are not sampled); 0 when refused.",
             "format": "uint64",
             "type": "integer"
           }

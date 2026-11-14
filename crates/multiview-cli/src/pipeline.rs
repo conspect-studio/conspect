@@ -4056,8 +4056,13 @@ impl Pipeline {
                 .with_subtitles(subtitle_tables, Arc::clone(&subtitle_tick)),
         );
         enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
+        // Review INV-1: the run's subtitle routing ends with the run (every
+        // exit path drops this guard), so a take can no longer re-point an
+        // ended or replaced run, and its live readback is gone.
+        let subtitle_end = crate::output_routing::SubtitleRunEnd(Arc::clone(&handle));
         self.output_routing.store(Some(handle));
         Ok(RunRouting {
+            subtitle_end,
             consumer: ConsumerRouting {
                 router: Box::new(router),
                 base_force,
@@ -5521,6 +5526,7 @@ impl Pipeline {
         let routing = self.build_output_routing(&binding_ids, &enforced_audio_tracks)?;
         self.issue_boot_audio_takes();
         let RunRouting {
+            subtitle_end: _subtitle_end,
             consumer: consumer_routing,
             aux_tx,
             preview_selection,
@@ -7754,6 +7760,8 @@ fn drive_audio_for_item(
 
 /// One run's output routing, split between the clock and the consumer.
 struct RunRouting {
+    /// Ends the run's subtitle routing when the run returns (review INV-1).
+    subtitle_end: crate::output_routing::SubtitleRunEnd,
     consumer: ConsumerRouting,
     /// The clock's non-blocking aux tick sender.
     aux_tx: multiview_engine::AuxTickSender,
