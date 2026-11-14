@@ -253,6 +253,16 @@ impl SubtitleOutputSampler {
             }
             pending.flush(&self.feed);
         }
+        // MED3-1: every change observed through `now` is in the feed only
+        // when no slot still holds an unsent one; while any does, the
+        // watermark stays put (the sink then holds back open-cue pieces).
+        if self
+            .slots
+            .iter()
+            .all(|(_, pending)| pending.cues.is_empty())
+        {
+            self.feed.mark_accepted_through(now);
+        }
     }
 }
 
@@ -664,6 +674,112 @@ mod tests {
                 .filter(|c| c.is_open())
                 .count();
             assert_eq!(open, 0, "slot {slot} keeps no OPEN_END cue");
+        }
+    }
+
+    /// The client-equivalent union of everything the sink publishes for slot
+    /// 0 while the sampler runs `text_at(ms)` on a 25 fps clock with a
+    /// one-cue feed, 1 s segments closed after the boundary tick is sampled,
+    /// and the feed jammed by a filler cue (slot 1) right after the 1 s close.
+    /// Returns the de-duplicated cues (as hls.js merges loaded segments).
+    fn published_union(
+        text_at: fn(i64) -> Option<&'static str>,
+        seconds: i64,
+    ) -> Vec<(MediaTime, MediaTime, Vec<String>)> {
+        use multiview_output::hls::subtitle::SlotCues;
+        use multiview_output::hls::SubtitleStats;
+        let (feed, rx) = subtitle_feed_with_capacity(1);
+        let routes = subtitle_routes(vec![Some("cam".to_owned()), None]);
+        let mut output = SubtitleOutputSampler::new(routes, feed, 2);
+        let mut resolve: CueResolver = Box::new(move |_, now: MediaTime| {
+            text_at(now.as_nanos() / 1_000_000).map(|t| bound_cue_lines(&[t]))
+        });
+        let stats = SubtitleStats::default();
+        let mut held = SlotCues::default();
+        let mut union: Vec<(MediaTime, MediaTime, Vec<String>)> = Vec::new();
+        for tick in 0..=seconds * 25 {
+            let now = at(tick);
+            output.tick(now, &mut resolve);
+            if tick > 0 && tick % 25 == 0 {
+                let batch = rx.drain_confirmed();
+                for cue in batch.cues {
+                    if cue.slot == 0 {
+                        held.push(cue, &stats);
+                    }
+                }
+                let start = at(tick - 25);
+                for piece in held.publish(start, now, batch.confirmed_through, &stats) {
+                    let key = (piece.start, piece.end, piece.lines);
+                    if !union.contains(&key) {
+                        union.push(key);
+                    }
+                }
+                held.retire_before(now);
+                if tick == 25 {
+                    // The sink stalls: a filler jams the one-cue feed until
+                    // the next segment close drains it.
+                    assert!(output.feed.offer(SubtitleCue {
+                        slot: 1,
+                        start: now,
+                        end: at(tick + 1),
+                        lines: vec!["filler".to_owned()],
+                    }));
+                }
+            }
+        }
+        union
+    }
+
+    /// How many published copies are active at each 10 ms instant.
+    fn copies(union: &[(MediaTime, MediaTime, Vec<String>)], at_ms: i64, text: &str) -> usize {
+        let t = MediaTime::from_nanos(at_ms * 1_000_000);
+        union
+            .iter()
+            .filter(|(a, b, l)| *a <= t && t < *b && l.first().is_some_and(|x| x == text))
+            .count()
+    }
+
+    #[test]
+    fn a_delayed_close_and_successor_never_overlap_published_pieces() {
+        // MED3-1 counterexample: A opens at 0.48 s; at 1.2 s A becomes B; B
+        // ends at 2.4 s. A's close and B sit refused in the sampler while
+        // segments [1, 2) and [2, 3) are published, then retry delivers them.
+        fn text_at(ms: i64) -> Option<&'static str> {
+            match ms {
+                480..1_200 => Some("A"),
+                1_200..2_400 => Some("B"),
+                _ => None,
+            }
+        }
+        let union = published_union(text_at, 6);
+        for t in (0..6_000).step_by(10) {
+            let (a, b) = (copies(&union, t, "A"), copies(&union, t, "B"));
+            assert_eq!(
+                a,
+                usize::from((480..1_200).contains(&t)),
+                "A at {t} ms: {union:?}"
+            );
+            assert_eq!(
+                b,
+                usize::from((1_200..2_400).contains(&t)),
+                "B at {t} ms: {union:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_delayed_close_followed_by_silence_never_overruns() {
+        fn text_at(ms: i64) -> Option<&'static str> {
+            (480..1_200).contains(&ms).then_some("A")
+        }
+        let union = published_union(text_at, 6);
+        for t in (0..6_000).step_by(10) {
+            let a = copies(&union, t, "A");
+            assert_eq!(
+                a,
+                usize::from((480..1_200).contains(&t)),
+                "A at {t} ms: {union:?}"
+            );
         }
     }
 }

@@ -38,6 +38,11 @@ pub const SUBTITLE_FEED_CAPACITY: usize = 256;
 /// Most cues a slot holds between segment closes; the oldest-ended is dropped
 /// (and counted) beyond it.
 pub const MAX_HELD_CUES_PER_SLOT: usize = 64;
+/// Most consecutive segment closes the sampler's accepted-through watermark
+/// may stay behind the segment start (or absent) before the sink publishes
+/// open cues through the segment end anyway (counted as `watermark_stale`),
+/// so a dead sampler cannot freeze subtitles (MED3-1).
+pub const MAX_WATERMARK_LAG_SEGMENTS: u32 = 2;
 /// Longest cue text kept, in bytes (all lines with their separators).
 pub const MAX_CUE_TEXT_BYTES: usize = 512;
 /// Most lines a cue keeps.
@@ -251,6 +256,7 @@ pub struct SubtitleStats {
     held_dropped: AtomicU64,
     truncated: AtomicU64,
     written: AtomicU64,
+    watermark_stale: AtomicU64,
 }
 
 impl SubtitleStats {
@@ -278,9 +284,58 @@ impl SubtitleStats {
         self.written.load(Ordering::Relaxed)
     }
 
+    /// Segment closes that published an open cue through the segment end
+    /// although the sampler's accepted-through watermark had stayed behind
+    /// the segment start for more than [`MAX_WATERMARK_LAG_SEGMENTS`]
+    /// consecutive closes.
+    #[must_use]
+    pub fn watermark_stale(&self) -> u64 {
+        self.watermark_stale.load(Ordering::Relaxed)
+    }
+
     #[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
     pub(crate) fn note_segment_written(&self) {
         self.written.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The sampler's **accepted-through watermark** for one output, shared by the
+/// feed's two ends (lock-free atomics only): the latest output instant `T`
+/// such that every cue change the sampler observed at ticks `<= T` has been
+/// accepted into the feed, plus how many cues the feed had accepted by then.
+/// The sink confirms `T` once it has received that many cues (MED3-1).
+#[derive(Debug, Default)]
+struct Watermark {
+    /// `T` as `ns + 1` (`0` = nothing confirmed yet); only advances.
+    through: AtomicU64,
+    /// Cues the feed accepted when `through` was last stored.
+    sent_at_mark: AtomicU64,
+    /// Cues the feed has accepted (engine side).
+    sent: AtomicU64,
+    /// Cues the sink has drained (sink side).
+    received: AtomicU64,
+}
+
+impl Watermark {
+    /// Store `through` with the current accepted count. The count is stored
+    /// before the instant (release), so a reader that sees an instant also
+    /// sees a count at least as large as the one paired with it: its check is
+    /// conservative, never optimistic.
+    fn advance(&self, through: MediaTime) {
+        let sent = self.sent.load(Ordering::Relaxed);
+        self.sent_at_mark.store(sent, Ordering::Release);
+        let encoded = u64::try_from(through.as_nanos()).map_or(0, |ns| ns.saturating_add(1));
+        self.through.fetch_max(encoded, Ordering::Release);
+    }
+
+    /// The instant confirmed by everything received so far, if any.
+    fn confirmed(&self) -> Option<MediaTime> {
+        let through = self.through.load(Ordering::Acquire);
+        let needed = self.sent_at_mark.load(Ordering::Acquire);
+        if through == 0 || self.received.load(Ordering::Relaxed) < needed {
+            return None;
+        }
+        i64::try_from(through - 1).ok().map(MediaTime::from_nanos)
     }
 }
 
@@ -289,9 +344,18 @@ impl SubtitleStats {
 pub struct SubtitleFeed {
     tx: SyncSender<SubtitleCue>,
     stats: Arc<SubtitleStats>,
+    accepted: Arc<Watermark>,
 }
 
 impl SubtitleFeed {
+    /// Publish that every cue change observed at instants `<= through` has
+    /// been accepted into the feed (the sampler calls it only when its
+    /// pending retries are empty after a tick's offers). Lock-free; it never
+    /// moves backwards.
+    pub fn mark_accepted_through(&self, through: MediaTime) {
+        self.accepted.advance(through);
+    }
+
     /// Offer one cue. Returns whether it was queued; a full feed (or a sink
     /// that already stopped) drops it and counts the drop. The text is
     /// bounded first (see [`SubtitleFeed::try_offer`]).
@@ -324,7 +388,10 @@ impl SubtitleFeed {
             cue.lines = bounded.lines;
         }
         match self.tx.try_send(cue) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.accepted.sent.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
             Err(TrySendError::Full(cue) | TrySendError::Disconnected(cue)) => Err(cue),
         }
     }
@@ -354,14 +421,48 @@ pub struct SubtitleFeedReceiver {
     // the sink thread, so it is never contended.
     rx: Mutex<Receiver<SubtitleCue>>,
     stats: Arc<SubtitleStats>,
+    accepted: Arc<Watermark>,
+    capacity: usize,
+}
+
+/// One bounded batch from the feed plus what it confirms.
+#[derive(Debug, Default)]
+pub struct DrainedCues {
+    /// At most the feed's capacity of cues, in send order.
+    pub cues: Vec<SubtitleCue>,
+    /// The instant through which the sampler's cue state is confirmed after
+    /// this batch: every change it observed at or before it is in `cues` or
+    /// an earlier batch. `None` when nothing is confirmed (no watermark yet,
+    /// or cues accepted before the watermark still wait in the feed).
+    pub confirmed_through: Option<MediaTime>,
 }
 
 impl SubtitleFeedReceiver {
-    /// Every cue queued so far (non-blocking).
+    /// The cues queued so far, non-blocking and **capped** at the feed's
+    /// capacity per call (INV3-2): concurrent offers refill the channel while
+    /// it drains, so an uncapped drain could collect without bound. Anything
+    /// beyond the cap stays in the bounded channel for the next call.
     #[must_use]
     pub fn drain(&self) -> Vec<SubtitleCue> {
         let rx = self.rx.lock().unwrap_or_else(PoisonError::into_inner);
-        rx.try_iter().collect()
+        let cues: Vec<SubtitleCue> = rx.try_iter().take(self.capacity).collect();
+        self.accepted.received.fetch_add(
+            u64::try_from(cues.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        cues
+    }
+
+    /// Like [`drain`](Self::drain), plus the sampler watermark confirmed
+    /// once this batch is received (MED3-1): the watermark counts only when
+    /// every cue the feed had accepted when it was stored has been drained.
+    #[must_use]
+    pub fn drain_confirmed(&self) -> DrainedCues {
+        let cues = self.drain();
+        DrainedCues {
+            cues,
+            confirmed_through: self.accepted.confirmed(),
+        }
     }
 
     /// The shared drop counters.
@@ -380,49 +481,68 @@ pub fn subtitle_feed() -> (SubtitleFeed, SubtitleFeedReceiver) {
 /// A bounded cue feed of `capacity` (tests use a small one).
 #[must_use]
 pub fn subtitle_feed_with_capacity(capacity: usize) -> (SubtitleFeed, SubtitleFeedReceiver) {
+    let capacity = capacity.max(1);
     let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
     let stats = Arc::new(SubtitleStats::default());
+    let accepted = Arc::new(Watermark::default());
     (
         SubtitleFeed {
             tx,
             stats: Arc::clone(&stats),
+            accepted: Arc::clone(&accepted),
         },
         SubtitleFeedReceiver {
             rx: Mutex::new(rx),
             stats,
+            accepted,
+            capacity,
         },
     )
 }
 
-/// One held cue plus whether a piece of it was already published while it
-/// was still open (its end unknown).
+/// One held cue plus how much of it was already published.
 #[derive(Debug)]
 struct Held {
     cue: SubtitleCue,
     /// A segment carried a piece of this cue while it was open: from then on
-    /// it is published as contiguous, non-overlapping per-segment pieces,
-    /// never as one total interval (MED2-1).
+    /// it is published as contiguous, non-overlapping pieces, never as one
+    /// total interval (MED2-1).
     rolling: bool,
+    /// For a rolling cue: the end of its last published piece (the next
+    /// piece starts here, MED3-1). For a known cue: `Some` once published.
+    published_through: Option<MediaTime>,
+}
+
+impl Held {
+    /// Whether a rolling cue still owes a piece (its published pieces do not
+    /// reach its end yet).
+    fn owes(&self) -> bool {
+        self.rolling && self.published_through.is_none_or(|p| p < self.cue.end)
+    }
 }
 
 /// The cues one slot holds between segment closes, bounded.
 #[derive(Debug, Default)]
 pub struct SlotCues {
     cues: VecDeque<Held>,
+    /// Consecutive segment closes whose sampler watermark did not confirm
+    /// through the segment end.
+    lagged: u32,
 }
 
 impl SlotCues {
     /// Hold `cue` (its text bounded); beyond [`MAX_HELD_CUES_PER_SLOT`] the
     /// cue that ends first is dropped and counted. A cue with the start of a
-    /// held open cue replaces it (its close; it inherits whether pieces of it
-    /// were already published); any other held open cue is closed at this
-    /// cue's start (a lost close never shows a cue forever past its
-    /// successor).
+    /// held open cue replaces it (its close; it inherits what of it was
+    /// already published); any other held open cue is closed at this cue's
+    /// start (a lost close never shows a cue forever past its successor).
     pub fn push(&mut self, mut cue: SubtitleCue, stats: &SubtitleStats) {
-        let mut rolling = false;
+        let mut inherited: Option<(bool, Option<MediaTime>)> = None;
         self.cues.retain(|h| {
             let replaced = h.cue.is_open() && h.cue.start == cue.start;
-            rolling |= replaced && h.rolling;
+            if replaced {
+                inherited = Some((h.rolling, h.published_through));
+            }
             !replaced
         });
         if cue.end <= cue.start {
@@ -444,7 +564,12 @@ impl SlotCues {
         if cue.lines.is_empty() {
             return;
         }
-        self.cues.push_back(Held { cue, rolling });
+        let (rolling, published_through) = inherited.unwrap_or((false, None));
+        self.cues.push_back(Held {
+            cue,
+            rolling,
+            published_through,
+        });
         while self.cues.len() > MAX_HELD_CUES_PER_SLOT {
             let oldest = self
                 .cues
@@ -480,41 +605,90 @@ impl SlotCues {
     ///
     /// - a cue whose end is known and that was never published open carries
     ///   its **total** interval in every segment it overlaps (RFC 8216 §3.5;
-    ///   identical copies, de-duplicated by the client);
-    /// - a cue still open (end unknown) carries the piece
-    ///   `[max(cue start, start), end)` and is marked rolling; from then on
-    ///   every segment carries its piece `[max(cue start, start),
-    ///   min(cue end, end))` — contiguous, non-overlapping pieces whose union
-    ///   is the cue's display time, through its close.
-    pub fn publish(&mut self, start: MediaTime, end: MediaTime) -> Vec<SubtitleCue> {
+    ///   identical copies, de-duplicated by the client); one that arrives
+    ///   late (it ended before this segment, never published) is carried once
+    ///   by this segment rather than lost;
+    /// - a cue still open (end unknown) is published as rolling pieces, each
+    ///   starting where the previous one ended, and asserting display only
+    ///   up to `confirmed` — the sampler's accepted-through watermark for the
+    ///   cue state this sink holds (MED3-1): the piece is `[from, min(end,
+    ///   confirmed))`. When the watermark lags, the remainder is carried to
+    ///   the next segment (subtitle publication lags; video never waits).
+    ///   After [`MAX_WATERMARK_LAG_SEGMENTS`] consecutive closes with the
+    ///   watermark behind the segment start (or absent) the piece runs to the
+    ///   segment end anyway (`watermark_stale` counted), so a dead sampler
+    ///   cannot freeze subtitles;
+    /// - once a rolling cue's close is held, its remaining piece runs to
+    ///   `min(cue end, end)`.
+    pub fn publish(
+        &mut self,
+        start: MediaTime,
+        end: MediaTime,
+        confirmed: Option<MediaTime>,
+        stats: &SubtitleStats,
+    ) -> Vec<SubtitleCue> {
+        // A watermark behind the whole segment is a lag; a partial one (inside
+        // the segment) just clips the piece and carries the rest forward.
+        let behind = confirmed.is_none_or(|c| c < start);
+        self.lagged = if behind {
+            self.lagged.saturating_add(1)
+        } else {
+            0
+        };
+        // Past the lag bound an open cue is published through the segment end
+        // regardless (counted); otherwise only through the confirmed instant.
+        let forced = behind && self.lagged > MAX_WATERMARK_LAG_SEGMENTS;
+        let open_limit = if forced {
+            end
+        } else {
+            confirmed.map_or(MediaTime::from_nanos(i64::MIN), |c| c.min(end))
+        };
+        let mut forced_used = false;
         let mut out = Vec::new();
         for held in &mut self.cues {
             let cue = &held.cue;
-            if !(cue.start < end && cue.end > start) {
-                continue;
-            }
-            if cue.is_open() {
-                held.rolling = true;
-            }
-            let piece = if held.rolling {
-                SubtitleCue {
-                    slot: cue.slot,
-                    start: cue.start.max(start),
-                    end: cue.end.min(end),
-                    lines: cue.lines.clone(),
+            if cue.is_open() || held.rolling {
+                if cue.start >= end {
+                    continue;
                 }
+                let from = held.published_through.unwrap_or(cue.start);
+                let to = if cue.is_open() {
+                    open_limit
+                } else {
+                    cue.end.min(end)
+                };
+                if to <= from {
+                    continue;
+                }
+                forced_used |= forced && cue.is_open();
+                held.rolling = true;
+                held.published_through = Some(to);
+                out.push(SubtitleCue {
+                    slot: cue.slot,
+                    start: from,
+                    end: to,
+                    lines: cue.lines.clone(),
+                });
             } else {
-                cue.clone()
-            };
-            out.push(piece);
+                let overlaps = cue.start < end && cue.end > start;
+                let late = held.published_through.is_none() && cue.end <= start;
+                if overlaps || late {
+                    held.published_through = Some(cue.end);
+                    out.push(cue.clone());
+                }
+            }
+        }
+        if forced_used {
+            stats.watermark_stale.fetch_add(1, Ordering::Relaxed);
         }
         out.sort_by_key(|c| (c.start, c.end));
         out
     }
 
-    /// Forget every cue that ended at or before `edge` (already written).
+    /// Forget every cue that ended at or before `edge` and owes nothing more
+    /// (already written).
     pub fn retire_before(&mut self, edge: MediaTime) {
-        self.cues.retain(|h| h.cue.end > edge);
+        self.cues.retain(|h| h.cue.end > edge || h.owes());
     }
 
     /// Number of cues held.
@@ -764,7 +938,7 @@ mod tests {
         held.push(open.clone(), &stats);
         // Segment [0, 1000) is published with the cue still open (end
         // unknown): it carries the piece [500, 1000) ...
-        let pieces = held.publish(ms(0), ms(1_000));
+        let pieces = held.publish(ms(0), ms(1_000), Some(ms(1_000)), &stats);
         let text = render_vtt(
             &pieces.iter().collect::<Vec<_>>(),
             ms(0),
@@ -779,7 +953,7 @@ mod tests {
         held.retire_before(ms(1_000));
         assert_eq!(held.len(), 1, "an open cue is kept");
         // ... the next segment, still open, the non-overlapping [1000, 2000).
-        let pieces = held.publish(ms(1_000), ms(2_000));
+        let pieces = held.publish(ms(1_000), ms(2_000), Some(ms(2_000)), &stats);
         let text = render_vtt(
             &pieces.iter().collect::<Vec<_>>(),
             ms(1_000),
@@ -797,7 +971,7 @@ mod tests {
         // overlaps an already-published piece.
         held.push(cue(0, 500, 2_400, &["long"]), &stats);
         assert_eq!(held.len(), 1);
-        let pieces = held.publish(ms(2_000), ms(3_000));
+        let pieces = held.publish(ms(2_000), ms(3_000), Some(ms(3_000)), &stats);
         let text = render_vtt(
             &pieces.iter().collect::<Vec<_>>(),
             ms(2_000),
@@ -1082,7 +1256,7 @@ mod tests {
                 ms(i64::try_from(seg).unwrap() * 1_000),
                 ms(i64::try_from(seg + 1).unwrap() * 1_000),
             );
-            let pieces = held.publish(start, end);
+            let pieces = held.publish(start, end, Some(end), &stats);
             let text = render_vtt(&pieces.iter().collect::<Vec<_>>(), start, end, ms(0), 0);
             for c in client_cues(&text) {
                 if !loaded.contains(&c) {
@@ -1132,7 +1306,7 @@ mod tests {
         let mut held = SlotCues::default();
         held.push(cue(0, 500, 2_400, &["known"]), &stats);
         assert_eq!(
-            held.publish(ms(1_000), ms(2_000))[0].start,
+            held.publish(ms(1_000), ms(2_000), Some(ms(2_000)), &stats)[0].start,
             ms(500),
             "total"
         );
@@ -1185,5 +1359,149 @@ mod tests {
         assert_eq!(b.lines(), ["  Hello ", "world"]);
         assert!(!b.truncated());
         assert_eq!(b.inspected_lines(), 3);
+    }
+
+    #[test]
+    fn drain_is_capped_per_batch_under_concurrent_refill() {
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+        // Four producers spin on a two-cue feed while the sink drains, so
+        // freed slots refill during a drain; every batch stays capped and
+        // every drain returns.
+        let (feed, rx) = subtitle_feed_with_capacity(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicI64::new(0));
+        let producers: Vec<_> = (0..4)
+            .map(|_| {
+                let (feed, stop, sent) = (feed.clone(), Arc::clone(&stop), Arc::clone(&sent));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if feed.try_offer(cue(0, 0, 1, &["x"])).is_ok() {
+                            sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(feed);
+        let mut drained = 0usize;
+        let mut largest = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            let batch = rx.drain();
+            largest = largest.max(batch.len());
+            drained += batch.len();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for p in producers {
+            p.join().unwrap();
+        }
+        assert!(largest <= 2, "a batch held {largest} > capacity 2");
+        loop {
+            let batch = rx.drain();
+            if batch.is_empty() {
+                break;
+            }
+            drained += batch.len();
+        }
+        assert_eq!(
+            i64::try_from(drained).unwrap(),
+            sent.load(Ordering::Relaxed),
+            "nothing lost, nothing invented"
+        );
+    }
+
+    #[test]
+    fn the_watermark_confirms_only_once_every_accepted_cue_is_drained() {
+        let (feed, rx) = subtitle_feed_with_capacity(1);
+        assert_eq!(rx.drain_confirmed().confirmed_through, None, "nothing yet");
+        // One cue accepted, then the mark: confirmed only after it is drained.
+        assert!(feed.try_offer(cue(0, 0, 10, &["a"])).is_ok());
+        feed.mark_accepted_through(ms(30));
+        let batch = rx.drain_confirmed();
+        assert_eq!(batch.cues.len(), 1);
+        assert_eq!(batch.confirmed_through, Some(ms(30)));
+        // A newer mark after another accepted cue: not confirmed until that
+        // cue is received (a capped batch leaves it in the channel).
+        assert!(feed.try_offer(cue(0, 40, 50, &["b"])).is_ok());
+        feed.mark_accepted_through(ms(60));
+        assert_eq!(
+            rx.accepted.confirmed(),
+            None,
+            "the cue paired with the mark is still in the feed"
+        );
+        let batch = rx.drain_confirmed();
+        assert_eq!(batch.cues.len(), 1);
+        assert_eq!(batch.confirmed_through, Some(ms(60)));
+        // The mark never moves back.
+        feed.mark_accepted_through(ms(20));
+        assert_eq!(rx.drain_confirmed().confirmed_through, Some(ms(60)));
+    }
+
+    #[test]
+    fn an_open_cue_is_published_only_through_the_confirmed_watermark() {
+        let stats = SubtitleStats::default();
+        let mut held = SlotCues::default();
+        let mut open = cue(0, 500, 0, &["A"]);
+        open.end = SubtitleCue::OPEN_END;
+        held.push(open, &stats);
+        // Confirmed through 0.96 s: the piece stops there, not at 1.0 s.
+        let p = held.publish(ms(0), ms(1_000), Some(ms(960)), &stats);
+        assert_eq!((p[0].start, p[0].end), (ms(500), ms(960)));
+        held.retire_before(ms(1_000));
+        // Confirmed through 1.16 s inside [1, 2): the next piece continues.
+        let p = held.publish(ms(1_000), ms(2_000), Some(ms(1_160)), &stats);
+        assert_eq!((p[0].start, p[0].end), (ms(960), ms(1_160)));
+        held.retire_before(ms(2_000));
+        // The close arrives late: the remainder [1.16, 1.2), never past it.
+        held.push(cue(0, 500, 1_200, &["A"]), &stats);
+        let p = held.publish(ms(2_000), ms(3_000), Some(ms(1_160)), &stats);
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].start, p[0].end), (ms(1_160), ms(1_200)));
+        held.retire_before(ms(3_000));
+        assert!(held.is_empty());
+        assert_eq!(stats.watermark_stale(), 0);
+    }
+
+    #[test]
+    fn a_dead_sampler_cannot_freeze_subtitles_for_long() {
+        let stats = SubtitleStats::default();
+        let mut held = SlotCues::default();
+        let mut open = cue(0, 500, 0, &["A"]);
+        open.end = SubtitleCue::OPEN_END;
+        held.push(open, &stats);
+        let confirmed = Some(ms(960));
+        let mut pieces = Vec::new();
+        for seg in 0..6 {
+            let (start, end) = (ms(seg * 1_000), ms((seg + 1) * 1_000));
+            pieces.extend(held.publish(start, end, confirmed, &stats));
+            held.retire_before(end);
+        }
+        // [0.5, 0.96), nothing for MAX_WATERMARK_LAG_SEGMENTS segments, then
+        // forced pieces from the uncovered point, contiguous.
+        let spans: Vec<_> = pieces.iter().map(|c| (c.start, c.end)).collect();
+        assert_eq!(
+            spans,
+            [
+                (ms(500), ms(960)),
+                (ms(960), ms(4_000)),
+                (ms(4_000), ms(5_000)),
+                (ms(5_000), ms(6_000)),
+            ]
+        );
+        assert_eq!(stats.watermark_stale(), 3);
+        // An absent watermark is lag too.
+        let stats = SubtitleStats::default();
+        let mut held = SlotCues::default();
+        let mut open = cue(0, 0, 0, &["B"]);
+        open.end = SubtitleCue::OPEN_END;
+        held.push(open, &stats);
+        let mut n = 0;
+        for seg in 0..3 {
+            n += held
+                .publish(ms(seg * 1_000), ms((seg + 1) * 1_000), None, &stats)
+                .len();
+        }
+        assert_eq!(n, 1, "only the forced segment publishes");
+        assert_eq!(stats.watermark_stale(), 1);
     }
 }

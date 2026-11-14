@@ -2127,7 +2127,19 @@ restart".
   each later segment the next contiguous piece, and the segment containing the close
   `[segment start, end)`. The pieces never overlap and their union is the display time, so a
   client sees exactly one copy at every instant (a test loads every segment together and counts
-  copies). An empty segment gets a header-only file. Old `.vtt` files retire with the TS grace
+  copies). A piece never asserts display beyond **confirmed** cue state: the sampler publishes a
+  lock-free per-output *accepted-through watermark* (`SubtitleFeed::mark_accepted_through`: the
+  latest tick T such that every slot change observed at ticks ≤ T was accepted into the feed; it
+  does not advance while any slot still holds a refused change), paired with the feed's accepted
+  count. The sink's `drain_confirmed` confirms T only once it has received that many cues, and an
+  open cue's piece then runs to `min(segment end, T)`; the rest is carried forward and the next
+  piece starts at the uncovered point (subtitle publication may lag; video never waits). So a
+  close or successor delayed by a full feed can never contradict an already-published piece. If
+  the watermark stays behind the segment start (or absent) for more than
+  `MAX_WATERMARK_LAG_SEGMENTS` (2) consecutive closes, the sink publishes through the segment end
+  anyway and counts `SubtitleStats::watermark_stale`, so a dead sampler cannot freeze subtitles.
+  A known cue whose close arrives after its time was already published is carried once by the
+  next segment rather than lost. An empty segment gets a header-only file. Old `.vtt` files retire with the TS grace
   (`prune_prior_*`) only when named exactly `subs<slot>-<index>.vtt` (all-digit fields); rendition
   cleanup removes only manifests matching the exact generated grammar
   `subs<slot>-g<generation>.m3u8` (all-digit fields), so e.g. `subtitles.m3u8`,
@@ -2143,7 +2155,10 @@ restart".
   `subtitle_slots::text_cue_lines`), so a bitmap cue is skipped without copying its pixels and
   a 256 KiB text cue costs a 512-byte copy. `SubtitleFeed::try_offer`/`offer` re-project any
   payload that is not already compact (defence at the public boundary), and `SlotCues::push`
-  does too. The engine-to-sink `SubtitleFeed` is a 256-cue channel the sampler only `try_send`s
+  does too. The sink drains at most the feed's capacity per segment close (`drain` is capped:
+  concurrent offers refill the channel while it drains, so an uncapped drain could collect without
+  bound); the rest waits in the channel. The engine-to-sink `SubtitleFeed` is a 256-cue channel
+  the sampler only `try_send`s
   into (never blocks). A change the full feed refuses is kept in a per-slot pending queue (at
   most 4) and retried non-blockingly on every later tick until accepted, so a close is never
   lost to a transient sink stall, even when silence follows; on overflow an unsent open cue

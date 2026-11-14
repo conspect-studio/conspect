@@ -3431,8 +3431,13 @@ impl<'a> SegmentState<'a> {
         if renditions.subtitles.is_empty() {
             return Ok(());
         }
+        // One bounded batch (INV3-2) plus the sampler watermark it confirms
+        // (MED3-1): an open cue is published only through confirmed state.
+        let mut confirmed = None;
         if let Some(feed) = self.subtitle_feed {
-            for cue in feed.drain() {
+            let batch = feed.drain_confirmed();
+            confirmed = batch.confirmed_through;
+            for cue in batch.cues {
                 if let Some(sub) = renditions.subtitles.get_mut(usize::from(cue.slot)) {
                     sub.held.push(cue, &renditions.subtitle_stats);
                 }
@@ -3448,7 +3453,9 @@ impl<'a> SegmentState<'a> {
             .unwrap_or_else(|| crate::hls::subtitle::pts_90k_of(start));
         for sub in &mut renditions.subtitles {
             let base = *sub.base.get_or_insert(start);
-            let pieces = sub.held.publish(start, end);
+            let pieces = sub
+                .held
+                .publish(start, end, confirmed, &renditions.subtitle_stats);
             let text = crate::hls::subtitle::render_vtt(
                 &pieces.iter().collect::<Vec<_>>(),
                 start,
