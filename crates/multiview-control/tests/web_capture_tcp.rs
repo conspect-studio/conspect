@@ -60,7 +60,7 @@ async fn capture_flow(real_browser: bool) {
     let producer = root.path().join("node");
     // This test exercises HTTP/service/artifact integration, not the Chrome codec.
     // Real Chrome/FFmpeg capture is proved by the runtime's required browser tests.
-    std::fs::write(&producer,"#!/bin/sh\ncat >/dev/null\nprintf 'actual-producer-bytes'\nprintf '%s\\n' '{\"event\":\"capture_complete\",\"frames\":2}' >&2\n").unwrap();
+    std::fs::write(&producer,"#!/bin/sh\ncat >/dev/null\nprintf 'actual-producer-bytes'\nprintf '%s\\n' '{\"event\":\"capture_complete\",\"frames\":2,\"steps_kept\":2}' >&2\n").unwrap();
     std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
     let find_tool = |name: &str| {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -131,6 +131,7 @@ sys.exit(subprocess.run([{}]+sys.argv[1:],input=json.dumps(request).encode()).re
                 } else {
                     "/bin/sh".into()
                 },
+                gl: multiview_webengine::capture::BrowserGl::Default,
             },
             store,
             Config {
@@ -161,7 +162,9 @@ sys.exit(subprocess.run([{}]+sys.argv[1:],input=json.dumps(request).encode()).re
     let server = tokio::spawn(multiview_control::serve(listener, state, async move {
         let _ = done.await;
     }));
-    let body=serde_json::json!({"fill_id":"radar","view":{"lat":-33.946,"lon":150.37,"zoom":10,"overlay":"radar","width":1280,"height":720,"fps":2,"frames":2,"public":true},"terms":{"accepted":true,"version":"windy-2023-09-01"}}).to_string();
+    // The producer wrapper swaps the source to an HTML page, which has no radar
+    // timeline: pin the wall-clock mode (step capture is proved in capture_runtime).
+    let body=serde_json::json!({"fill_id":"radar","view":{"lat":-33.946,"lon":150.37,"zoom":10,"overlay":"radar","width":1280,"height":720,"fps":2,"frames":2,"public":true,"capture":"realtime"},"terms":{"accepted":true,"version":"windy-2023-09-01"}}).to_string();
     let response = request(
         address,
         "POST",

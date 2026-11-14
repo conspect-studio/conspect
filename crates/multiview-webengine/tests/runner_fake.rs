@@ -86,6 +86,7 @@ fn env(script: &str) -> Env {
             node,
             browser: stub.clone(),
             ffmpeg: stub,
+            gl: multiview_webengine::capture::BrowserGl::Default,
         },
     }
 }
@@ -98,6 +99,7 @@ fn capture(document: usize) -> Capture {
         windy: None,
         background: Background::Opaque,
         document: "x".repeat(document),
+        capture: multiview_webengine::capture::CaptureOptions::default(),
     }
 }
 fn prov() -> Provenance {
