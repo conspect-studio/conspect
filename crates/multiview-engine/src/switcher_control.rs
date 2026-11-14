@@ -78,6 +78,20 @@ pub const REFUSE_PATCH_DURING_AUTO: &str =
 /// Typed refusal: a select names a raw source on an M/E with numbered inputs.
 pub const REFUSE_NOT_AN_INPUT: &str =
     "not-on-an-input: this M/E selects numbered inputs; select an input, not a source";
+/// Typed refusal: the transition kind or one of its options is not rendered.
+pub const REFUSE_UNSUPPORTED_TRANSITION: &str =
+    "unsupported-transition: this engine renders cut, mix and dip to a colour";
+
+/// Is `descriptor` a transition the Program drive renders (ADR-0112)?
+#[must_use]
+pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
+    match descriptor {
+        TransitionDescriptor::Cut | TransitionDescriptor::Mix { .. } => true,
+        TransitionDescriptor::Dip { dip_source, .. } => dip_source.is_none(),
+        _ => false,
+    }
+}
+
 /// Typed refusal: a select names an undeclared or unpatched input.
 pub const REFUSE_UNKNOWN_INPUT: &str = "unknown-slot: the input is not declared or not patched";
 
@@ -92,7 +106,7 @@ pub struct PatchSet {
 }
 
 /// An operator verb, already authorized and reference-validated on admission.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SwitcherVerb {
     /// Arm a new preview source, without changing on-air output. With numbered
     /// inputs installed this must be an input reference (`in:<n>`).
@@ -102,8 +116,12 @@ pub enum SwitcherVerb {
     SelectProgram(SourceRef),
     /// Atomically take PVW to PGM at the next frame boundary.
     Cut,
-    /// Begin an exact-duration automatic take on the next frame boundary.
+    /// Begin an exact-duration automatic take on the next frame boundary,
+    /// in the selected transition kind (ADR-0112 §3).
     Auto(FrameCount),
+    /// Select the transition the next AUTO uses (ADR-0112 §3). Refused
+    /// during a take and for a kind this engine does not render.
+    SetTransition(TransitionDescriptor),
     /// Re-patch numbered mixer inputs at one tick (all members or none).
     Patch(PatchSet),
     /// The mixer half of an atomic multi-crosspoint set (ADR-0110 §12.8,
@@ -668,18 +686,23 @@ impl SwitcherTickDriver {
                 let Some(pair) = scenes else {
                     return Err("no active PGM/PVW scene provider".into());
                 };
+                let descriptor = self.machine.transition_with_rate(*rate);
+                if !is_rendered_transition(&descriptor) {
+                    return Err(REFUSE_UNSUPPORTED_TRANSITION.into());
+                }
                 validate_mix(&pair.program, &pair.preview)
                     .map_err(|e| e.to_string())
                     .and_then(|()| {
                         self.machine
-                            .set_transition(TransitionDescriptor::Mix { rate: *rate })
+                            .set_transition(descriptor)
                             .map_err(|e| e.to_string())
                     })
                     .and_then(|()| self.machine.auto(tick).map_err(|e| e.to_string()))
             }
             SwitcherVerb::SelectPreview(_)
             | SwitcherVerb::Patch(_)
-            | SwitcherVerb::PatchArmed { .. } => Err("not a take".into()),
+            | SwitcherVerb::PatchArmed { .. }
+            | SwitcherVerb::SetTransition(_) => Err("not a take".into()),
         }
     }
 
@@ -774,6 +797,12 @@ impl SwitcherTickDriver {
     #[must_use]
     pub fn auto_window(&self) -> Option<(i128, FrameCount)> {
         self.machine.auto_window()
+    }
+
+    /// The selected (or, during a flight, the frozen in-flight) transition.
+    #[must_use]
+    pub fn transition(&self) -> &TransitionDescriptor {
+        self.machine.transition()
     }
 
     /// Authoritative post-command machine selections for the same output
@@ -907,6 +936,17 @@ impl SwitcherTickDriver {
                     Ok(true) => Ok(Some(projection)),
                     Ok(false) => Ok(None),
                     Err(err) => Err(err),
+                }
+            } else if let SwitcherVerb::SetTransition(descriptor) = &command.verb {
+                if is_rendered_transition(descriptor) {
+                    // Cloning the descriptor allocates only for a dip/wipe
+                    // carrying a source id, and only on this command's tick.
+                    self.machine
+                        .set_transition(descriptor.clone())
+                        .map(|()| Some(projection))
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err(REFUSE_UNSUPPORTED_TRANSITION.into())
                 }
             } else if let Some(error) = self.select_error(&command.verb) {
                 Err(error.into())

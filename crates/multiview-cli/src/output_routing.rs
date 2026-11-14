@@ -74,6 +74,11 @@ pub const REAPER_QUEUE: usize = 8;
 /// = 8 in the pipeline) on top of a full worker queue (`WORKER_QUEUE_TICKS` = 4)
 /// and the offers dropped meanwhile, so a transient stall never fails a key.
 pub const MAX_GAP_FILL_TICKS: u64 = 24;
+/// A live format reset (#342 B3) that has not landed within this many ticks
+/// is refused; the output keeps its format.
+pub const REFORMAT_DEADLINE_TICKS: u64 = 150;
+/// The reformat mailbox (control plane → router); full = `engine-busy`.
+pub const REFORMAT_MAILBOX: usize = 8;
 /// Operation-id prefixes of a start-up (boot) take — `boot:<output index>`
 /// and the audio-only `boot:audio:<output index>` — defined once in the
 /// control plane, whose outcome relay never persists a boot outcome
@@ -115,6 +120,71 @@ pub struct OutputTake {
     pub audio: Option<AudioChoice>,
     /// The principal the encoder is attributed to.
     pub principal: String,
+}
+
+/// A live format reset of one output (#342 B3, Class-2 for that output
+/// only): a new encoder at `settings` (the SAME codec, a new size / fit /
+/// bit rate) is opened off the clock, warmed, and the output is force-moved
+/// onto it at an IDR (make-before-break, flagged a decoder-config change);
+/// it then becomes the output's base key. Program and every other output
+/// are untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reformat {
+    /// Caller's id, echoed in the outcome.
+    pub operation_id: String,
+    /// Output index in the run's output list.
+    pub output_index: usize,
+    /// The new encoder settings (opened by the router's opener).
+    pub settings: ReformatSettings,
+    /// The new format a routed source/PVW is composed at for this output
+    /// (`None` = the canvas with the default fit).
+    pub feed_format: Option<AuxFormat>,
+    /// The principal the encoder is attributed to.
+    pub principal: String,
+}
+
+/// The encoder settings of a [`Reformat`]: what the opener needs to open an
+/// encoder that is not one of the run's rendition settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReformatSettings {
+    /// The concrete encoder name (must equal the output's current one).
+    pub codec_name: String,
+    /// Encoded width.
+    pub width: u32,
+    /// Encoded height.
+    pub height: u32,
+    /// Bit rate in bit/s.
+    pub bit_rate: usize,
+    /// The format Program/Clean are converted to (`None` = canvas-sized).
+    pub base_format: Option<AuxFormat>,
+}
+
+/// Why a [`Reformat`] was refused before or while it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReformatRefusal {
+    /// The output cannot reset live (out-of-band parameter sets, a codec
+    /// change, an unroutable kind): the change applies on the next restart.
+    RestartRequired,
+    /// No encoder capacity, or the open queue is full.
+    Capacity,
+    /// The encoder did not open, warm or move within
+    /// [`REFORMAT_DEADLINE_TICKS`].
+    EncoderNotReady,
+    /// A newer reformat of the same output replaced it.
+    Superseded,
+}
+
+impl ReformatRefusal {
+    /// The wire suffix (`reset:refused:<this>`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RestartRequired => "restart-required",
+            Self::Capacity => "capacity",
+            Self::EncoderNotReady => "encoder-not-ready",
+            Self::Superseded => "superseded",
+        }
+    }
 }
 
 /// A stored layout changed in the accepted library (ADR-0108 §10.1, PR 2):
@@ -300,6 +370,11 @@ pub enum TakeResult {
     Refused(RefuseReason),
     /// Moved back to Program without a take.
     Fallback(FallbackReason),
+    /// A live format reset landed: the output carries its new format from
+    /// `tick` (#342 B3).
+    ResetApplied,
+    /// A live format reset was refused; the output kept its format.
+    ResetRefused(ReformatRefusal),
 }
 
 /// One outcome on the outcome stream.
@@ -428,6 +503,7 @@ pub struct OutputRoutingHandle {
     #[cfg(test)]
     pub(crate) audio_tap: crate::routing_audio::AudioTapCell,
     takes: SyncSender<RouterMsg>,
+    reformats: SyncSender<Reformat>,
     layout_changes: LayoutInbox,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
@@ -474,6 +550,9 @@ pub struct RunOutput {
     /// Whether the output's binding has a program-audio slot, the slot a
     /// routed audio feed rides (§5.5). `false`: audio takes are refused.
     pub program_audio: bool,
+    /// The concrete video encoder name of the output's base key (#342 B3: a
+    /// live format reset keeps it; a codec change is restart-required).
+    pub codec_name: String,
 }
 
 impl std::fmt::Debug for OutputRoutingHandle {
@@ -516,6 +595,20 @@ impl OutputRoutingHandle {
         self.takes
             .try_send(RouterMsg::Set(set))
             .map_err(|_| TakeBusy)
+    }
+
+    /// Enqueue a live format reset without waiting (#342 B3).
+    ///
+    /// # Errors
+    /// [`TakeBusy`] when the mailbox is full or the run ended, or an id is
+    /// longer than [`MAX_TAKE_ID_BYTES`].
+    pub fn try_reformat(&self, reformat: Reformat) -> Result<(), TakeBusy> {
+        if reformat.principal.len() > MAX_TAKE_ID_BYTES
+            || reformat.operation_id.len() > MAX_TAKE_ID_BYTES
+        {
+            return Err(TakeBusy);
+        }
+        self.reformats.try_send(reformat).map_err(|_| TakeBusy)
     }
 
     /// Tell the router a stored layout changed. Coalesced per id (the
@@ -637,6 +730,11 @@ pub trait LiveEncoder: VideoEncodeWorker {
     fn parameter_sets(&self) -> Option<ParameterSets> {
         None
     }
+    /// The opened encoder's video stream parameters (#342 B3 review V2): a
+    /// live format reset hands them to the reset output's muxer.
+    fn stream_params(&self) -> Option<multiview_ffmpeg::StreamCodecParameters> {
+        None
+    }
 }
 
 /// Opens one encoder for a rendition settings index, on the opener thread.
@@ -646,6 +744,12 @@ pub type OpenFn = Box<dyn FnMut(usize) -> Result<Box<dyn LiveEncoder>, String> +
 /// non-canvas format converts on its own worker.
 pub type BusOpenFn =
     Box<dyn FnMut(usize, &PictureBus) -> Result<Box<dyn LiveEncoder>, String> + Send>;
+
+/// An opener for a live format reset's ad-hoc settings (#342 B3), run on
+/// the same `routing-open` thread. Absent: every reformat is refused
+/// `restart-required`.
+pub type ReformatOpenFn =
+    Box<dyn FnMut(&ReformatSettings, &PictureBus) -> Result<Box<dyn LiveEncoder>, String> + Send>;
 
 /// Resolve a source id to its store (wait-free, sees runtime-added sources).
 pub type StoreLookup = crate::routing_aux::StoreLookup;
@@ -782,6 +886,12 @@ pub struct RouterConfig {
     pub formats: Vec<Option<AuxFormat>>,
     /// The start-up take retry policy (#329).
     pub boot_retry: BootRetryPolicy,
+    /// Per output: whether a live format reset may reach it (#342 B3, review
+    /// M-1): HLS with TS segments only — its segment muxer is rebuilt with
+    /// the new parameters and a bumped TS `tables_version` at the
+    /// discontinuity. SRT/RIST (one session muxer) and every other kind are
+    /// restart-pending (follow-up #380). Missing = `false`.
+    pub live_reset: Vec<bool>,
 }
 
 /// How a refused start-up (boot) take is retried: re-issued at most once per
@@ -838,6 +948,9 @@ pub struct OpenRequest {
     pub settings: usize,
     /// The bus the encoder is fed.
     pub bus: PictureBus,
+    /// Ad-hoc settings of a live format reset (#342 B3): opened instead of
+    /// the rendition at `settings`.
+    pub reformat: Option<ReformatSettings>,
 }
 
 struct OpenResult {
@@ -851,10 +964,23 @@ enum Reap {
     Encoder(Box<dyn LiveEncoder>),
 }
 
+#[allow(clippy::struct_excessive_bools)]
+// reason: each flag is an independent per-key health/ownership fact read on
+// the consumer tick (seen, refused, degraded, reformat); a state enum would
+// conflate orthogonal facts.
 struct DynamicKey {
     bus: PictureBus,
     format: Option<AuxFormat>,
     settings: usize,
+    /// The ad-hoc settings this key was opened at (an output's landed
+    /// reset, review M-2); `None` = the rendition at `settings`.
+    reset: Option<ReformatSettings>,
+    /// A live format reset's key (#342 B3): never shared with another
+    /// output's take (its settings are the reset output's own); while
+    /// pinned (that output's base key) it never lingers.
+    reformat: bool,
+    /// The output whose base key this is, once a reformat landed.
+    pinned_for: Option<usize>,
     key: usize,
     worker: Option<RenditionWorker>,
     force_at: Arc<AtomicU64>,
@@ -893,6 +1019,10 @@ struct PendingOpen {
     bus: PictureBus,
     format: Option<AuxFormat>,
     settings: usize,
+    /// The ad-hoc settings opened (review M-2); `None` = the rendition.
+    reset: Option<ReformatSettings>,
+    /// Set for a live format reset's open (its key is that output's own).
+    reformat: bool,
     principal: String,
     deadline: u64,
     waiter: Option<usize>,
@@ -935,8 +1065,35 @@ struct Pending {
 struct OutputState {
     bus: PictureBus,
     key: usize,
+    /// The output's rendition settings index (review M-2): fixed for the
+    /// run, never the base video key (a live reset moves the base key to a
+    /// dynamic key while the settings index stays).
+    settings: usize,
+    /// The ad-hoc encoder settings of this output's landed live reset
+    /// (#342 B3, review M-2): a later take opens (or reuses) a key at THESE
+    /// settings, not the rendition's.
+    reset: Option<ReformatSettings>,
     since: u64,
     pending: Option<Pending>,
+    /// A live format reset in flight (at most one per output, #342 B3).
+    reformat: Option<ReformatState>,
+}
+
+/// One live format reset's progress.
+struct ReformatState {
+    req: Reformat,
+    started: u64,
+    phase: ReformatPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReformatPhase {
+    /// Waiting for the open `id`.
+    Opening(u64),
+    /// The new key runs; waiting for its first window.
+    Warming(usize),
+    /// A forced dispatcher move to the new key was requested.
+    Moving(usize),
 }
 
 /// A boot take being carried through its retry window (#329): one per output
@@ -955,10 +1112,16 @@ struct BusHealth {
 }
 
 /// The per-run router (lives on the bake consumer).
+#[allow(clippy::struct_excessive_bools)]
+// reason: independent cached gates (dirty, clean/program feeds active,
+// reformat opener present), each checked on its own hot path.
 pub struct OutputRouter {
     cfg: RouterConfig,
     aux: AuxWiring,
     takes: Receiver<RouterMsg>,
+    reformats: Receiver<Reformat>,
+    /// Whether this run has a reformat opener (else `restart-required`).
+    can_reformat: bool,
     layout_changes: LayoutInbox,
     /// The latest known state of each layout seen (bounded): a take carrying
     /// an older body than a later edit or removal is refused.
@@ -984,6 +1147,9 @@ pub struct OutputRouter {
     /// Whether a Clean feed is active (cached so `publish_clean` costs one
     /// bool load when nothing selects Clean).
     clean_active: bool,
+    /// Whether a Program picture feed is active (a dynamic key on Program:
+    /// a reformatted output, #342 B3).
+    program_active: bool,
     /// The last published `live_keys` (recomputed only while keys exist).
     live_keys: Vec<(String, usize)>,
     health: HashMap<FeedKey, BusHealth>,
@@ -1051,11 +1217,27 @@ impl OutputRouter {
         aux: AuxWiring,
         open: BusOpenFn,
     ) -> std::io::Result<(Self, OutputRoutingHandle)> {
+        Self::new_with_openers(cfg, aux, open, None)
+    }
+
+    /// [`Self::new_with_bus`] plus the opener of live format resets' ad-hoc
+    /// settings (#342 B3; `None`: every reformat is `restart-required`).
+    ///
+    /// # Errors
+    /// The OS error if a helper thread cannot be spawned.
+    pub fn new_with_openers(
+        cfg: RouterConfig,
+        aux: AuxWiring,
+        open: BusOpenFn,
+        reformat_open: Option<ReformatOpenFn>,
+    ) -> std::io::Result<(Self, OutputRoutingHandle)> {
         let (take_tx, takes) = mpsc::sync_channel(TAKE_MAILBOX);
+        let (reformat_tx, reformats) = mpsc::sync_channel(REFORMAT_MAILBOX);
         let layout_changes: LayoutInbox = Arc::new(Mutex::new(InboxState::default()));
         let layout_tx = Arc::clone(&layout_changes);
         let (outcomes, outcome_rx) = mpsc::sync_channel(OUTCOME_CAPACITY);
-        let (open_tx, open_rx) = spawn_opener(open)?;
+        let can_reformat = reformat_open.is_some();
+        let (open_tx, open_rx) = spawn_opener(open, reformat_open)?;
         let (reap_tx, reap_rx) = mpsc::sync_channel::<Reap>(REAPER_QUEUE);
         let reaper = std::thread::Builder::new()
             .name("routing-reaper".to_owned())
@@ -1078,8 +1260,11 @@ impl OutputRouter {
             .map(|&key| OutputState {
                 bus: PictureBus::Program,
                 key,
+                settings: key,
+                reset: None,
                 since: 0,
                 pending: None,
+                reformat: None,
             })
             .collect();
         let snapshot = Arc::new(SwapCell::from_pointee(RoutingSnapshot::default()));
@@ -1089,6 +1274,7 @@ impl OutputRouter {
             #[cfg(test)]
             audio_tap: Arc::clone(&audio_tap),
             takes: take_tx,
+            reformats: reformat_tx,
             layout_changes: layout_tx,
             snapshot: Arc::clone(&snapshot),
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
@@ -1101,6 +1287,8 @@ impl OutputRouter {
             cfg,
             aux,
             takes,
+            reformats,
+            can_reformat,
             layout_changes,
             layout_states: HashMap::new(),
             layout_states_forgotten: 0,
@@ -1119,6 +1307,7 @@ impl OutputRouter {
             next_generation: 0,
             feeds: HashMap::new(),
             clean_active: false,
+            program_active: false,
             live_keys: Vec::new(),
             health: HashMap::new(),
             last_forced: HashMap::new(),
@@ -1235,6 +1424,26 @@ impl OutputRouter {
         }
     }
 
+    /// Publish this tick's BAKED Program canvas to the Program picture feed
+    /// (#342 B3): read only by a dynamic key on Program — a reformatted
+    /// output's base key. Does nothing (one bool load) unless such a key
+    /// exists; never copies the picture.
+    pub(crate) fn publish_program(&mut self, tick: u64, canvas: &Arc<Nv12Image>) {
+        if !self.program_active {
+            return;
+        }
+        if let Some(feed) = self.feeds.get(&(PictureBus::Program, None)) {
+            feed.slot
+                .latest
+                .store(Some(Arc::new(crate::routing_aux::AuxFrame {
+                    tick,
+                    generation: 0,
+                    frame: Arc::clone(canvas),
+                })));
+            feed.slot.composed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// The output's picture format (`None` = the canvas).
     fn format_of(&self, index: usize) -> Option<AuxFormat> {
         self.cfg.formats.get(index).copied().flatten()
@@ -1329,6 +1538,7 @@ impl OutputRouter {
         self.first_tick.get_or_insert(tick);
         self.drain_layout_changes(tick, dispatcher);
         self.drain_takes(tick, dispatcher);
+        self.drain_reformats(tick, dispatcher);
         self.retry_boot_takes(tick);
         self.issue_boot_audio_after(tick, dispatcher);
         self.drain_opens(tick, dispatcher);
@@ -1336,6 +1546,7 @@ impl OutputRouter {
         self.drain_moves(tick, dispatcher);
         self.advance_takes(tick, pts, dispatcher);
         self.advance_sets(tick, dispatcher);
+        self.advance_reformats(tick, dispatcher);
         self.feed(tick, dispatcher);
         self.check_aux(tick, dispatcher);
         self.linger(tick, dispatcher);
@@ -1343,7 +1554,13 @@ impl OutputRouter {
         self.sync_live_keys(dispatcher);
         let halved_changed =
             self.aux.halved.load(Ordering::Relaxed) != self.snapshot.load().aux_halved;
-        if self.dirty || halved_changed || self.outputs.iter().any(|o| o.pending.is_some()) {
+        if self.dirty
+            || halved_changed
+            || self
+                .outputs
+                .iter()
+                .any(|o| o.pending.is_some() || o.reformat.is_some())
+        {
             self.publish_snapshot_at(tick);
         }
         Ok(())
@@ -1489,7 +1706,11 @@ impl OutputRouter {
                     );
                 }
             }
-            TakeResult::Applied | TakeResult::Superseded | TakeResult::Fallback(_) => {
+            TakeResult::Applied
+            | TakeResult::Superseded
+            | TakeResult::Fallback(_)
+            | TakeResult::ResetApplied
+            | TakeResult::ResetRefused(_) => {
                 *slot = None;
             }
         }
@@ -1958,14 +2179,18 @@ impl OutputRouter {
     }
 
     /// The picture bus a video key carries (`None`: unknown, e.g. closed).
+    /// A live key's own bus wins (review M-3): a
+    /// reformat key becomes an output's base key while rendering a source,
+    /// PVW or Clean, so membership in `base_keys` alone must not report it
+    /// as Program.
     fn bus_of_key(&self, key: usize) -> Option<PictureBus> {
-        if self.cfg.base_keys.contains(&key) {
-            return Some(PictureBus::Program);
+        if let Some(d) = self.dynamic.iter().find(|d| d.key == key) {
+            return Some(d.bus.clone());
         }
-        self.dynamic
-            .iter()
-            .find(|d| d.key == key)
-            .map(|d| d.bus.clone())
+        self.cfg
+            .base_keys
+            .contains(&key)
+            .then_some(PictureBus::Program)
     }
 
     /// A pending take whose dispatcher move vanished without an Applied or
@@ -2004,6 +2229,10 @@ impl OutputRouter {
                 continue;
             };
             self.dirty = true;
+            if open.reformat {
+                self.reformat_opened(result.id, &open, result.encoder, tick, dispatcher);
+                continue;
+            }
             let waiter = open.waiter;
             let refuse = |router: &mut Self, dispatcher: &mut RenditionDispatcher| {
                 if let Some(index) = waiter {
@@ -2069,6 +2298,9 @@ impl OutputRouter {
                 bus: open.bus,
                 format: open.format,
                 settings: open.settings,
+                reset: open.reset,
+                reformat: false,
+                pinned_for: None,
                 key,
                 worker: Some(worker),
                 force_at,
@@ -2198,6 +2430,32 @@ impl OutputRouter {
         }
     }
 
+    /// A dispatcher move was refused: a reformat's forced move refuses the
+    /// reformat; a take's move refuses the take.
+    fn move_refused(
+        &mut self,
+        output_index: usize,
+        reason: MoveRefusal,
+        tick: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        if self.reformat_move_refused(output_index, tick, dispatcher) {
+            return;
+        }
+        let moving = self
+            .outputs
+            .get(output_index)
+            .and_then(|o| o.pending.as_ref())
+            .is_some_and(|p| matches!(p.phase, Phase::Moving(_)));
+        if moving {
+            let reason = match reason {
+                MoveRefusal::FormatMismatch => RefuseReason::FormatMismatch,
+                MoveRefusal::EncoderNotReady | MoveRefusal::NoGate => RefuseReason::EncoderNotReady,
+            };
+            self.refuse_pending(output_index, tick, reason, dispatcher);
+        }
+    }
+
     fn drain_moves(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let mut superseded: Vec<usize> = Vec::new();
         for outcome in dispatcher.take_move_outcomes() {
@@ -2211,6 +2469,9 @@ impl OutputRouter {
                     if parameter_sets_changed {
                         self.parameter_set_changes = self.parameter_set_changes.saturating_add(1);
                         self.dirty = true;
+                    }
+                    if self.reformat_applied(output_index, key, at, dispatcher) {
+                        continue;
                     }
                     let Some(out) = self.outputs.get_mut(output_index) else {
                         continue;
@@ -2253,22 +2514,7 @@ impl OutputRouter {
                 MoveOutcome::Refused {
                     output_index,
                     reason,
-                } => {
-                    let moving = self
-                        .outputs
-                        .get(output_index)
-                        .and_then(|o| o.pending.as_ref())
-                        .is_some_and(|p| matches!(p.phase, Phase::Moving(_)));
-                    if moving {
-                        let reason = match reason {
-                            MoveRefusal::FormatMismatch => RefuseReason::FormatMismatch,
-                            MoveRefusal::EncoderNotReady | MoveRefusal::NoGate => {
-                                RefuseReason::EncoderNotReady
-                            }
-                        };
-                        self.refuse_pending(output_index, tick, reason, dispatcher);
-                    }
-                }
+                } => self.move_refused(output_index, reason, tick, dispatcher),
                 MoveOutcome::Superseded { output_index } => superseded.push(output_index),
                 MoveOutcome::AudioFallback { .. } => {}
                 MoveOutcome::AudioApplied { .. } | MoveOutcome::AudioRefused { .. } => {
@@ -2346,6 +2592,24 @@ impl OutputRouter {
             let Some(&base) = self.cfg.base_keys.get(index) else {
                 continue;
             };
+            // #342 B3 x #383: the output's base key can be its own reformat
+            // key, opened ON this very feed (a reset while on a layout or
+            // source). Falling back onto it would keep the fallen feed on air
+            // (a deleted layout composed by a pinned key). It is re-keyed to
+            // Program instead: the same canvas-sized picture its worker
+            // already converts to the output's format (sources/PVW, keyed at
+            // a feed format, never reach here: their reset key is not a
+            // canvas reader), fed by the bake consumer from the next tick.
+            if let Some(d) = self
+                .dynamic
+                .iter_mut()
+                .find(|d| d.key == base && d.bus == *bus && d.pinned_for == Some(index))
+            {
+                d.bus = PictureBus::Program;
+                d.format = None;
+                d.last_aux_tick = None;
+                self.dirty = true;
+            }
             // A take whose dispatcher move is in flight is settled first
             // (Superseded, audio restored): the forced rebind replaces
             // that move, which would otherwise strand it forever (#330
@@ -2576,11 +2840,12 @@ impl OutputRouter {
         tick: u64,
         dispatcher: &mut RenditionDispatcher,
     ) -> bool {
-        let settings = self.cfg.base_keys.get(index).copied();
-        let in_flight = self
-            .opens
-            .values()
-            .any(|o| o.bus == *bus && Some(o.settings) == settings);
+        let Some(out) = self.outputs.get(index) else {
+            return false;
+        };
+        let in_flight = self.opens.values().any(|o| {
+            o.bus == *bus && o.settings == out.settings && o.reset == out.reset && !o.reformat
+        });
         if in_flight && tick.saturating_sub(started) >= OPEN_DEADLINE_TICKS {
             self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
         }
@@ -2634,12 +2899,16 @@ impl OutputRouter {
         tick: u64,
         dispatcher: &mut RenditionDispatcher,
     ) {
-        let Some(&settings) = self.cfg.base_keys.get(index) else {
+        let (Some(&base), Some(out)) = (self.cfg.base_keys.get(index), self.outputs.get(index))
+        else {
             return;
         };
-        // The settings index already names (format, codec settings): the
-        // base key of the output. Its feed is (bus, format) for a routed
-        // source/PVW, the canvas picture for Clean.
+        // The output's encoder settings (review M-2): its rendition settings
+        // index plus, after a live reset, that reset's ad-hoc settings. The
+        // base key is only Program's encoder. Its feed is (bus, format) for
+        // a routed source/PVW, the canvas picture for Clean.
+        let settings = out.settings;
+        let reset = out.reset.clone();
         let (_, format) = self.feed_key(index, bus);
         // Take admission: open the output's private audio bus before the
         // video move (§5.2), so it is warm at the grid boundary G.
@@ -2647,7 +2916,7 @@ impl OutputRouter {
             audio.admit(index, bus, choice, tick, dispatcher);
         }
         let existing = if *bus == PictureBus::Program {
-            Some(settings)
+            Some(base)
         } else {
             self.dynamic
                 .iter()
@@ -2655,6 +2924,8 @@ impl OutputRouter {
                     d.bus == *bus
                         && d.format == format
                         && d.settings == settings
+                        && d.reset == reset
+                        && !d.reformat
                         && !dispatcher.is_key_failed(d.key)
                 })
                 .map(|d| d.key)
@@ -2689,7 +2960,8 @@ impl OutputRouter {
                 // stays with its holder: the newcomer rides it at +0 and is
                 // never able to move the holder's attribution or cap.
                 if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
-                    if !held_by_other {
+                    // A reformat key stays charged to its principal (X1).
+                    if !held_by_other && !d.reformat {
                         principal.clone_into(&mut d.principal);
                     }
                     d.linger_deadline = None;
@@ -2715,6 +2987,7 @@ impl OutputRouter {
             id,
             settings,
             bus: bus.clone(),
+            reformat: reset.clone(),
         }) {
             Ok(()) => {
                 self.opens.insert(
@@ -2723,6 +2996,8 @@ impl OutputRouter {
                         bus: bus.clone(),
                         format,
                         settings,
+                        reset,
+                        reformat: false,
                         principal: principal.to_owned(),
                         deadline: tick.saturating_add(OPEN_DEADLINE_TICKS),
                         waiter: Some(index),
@@ -2861,7 +3136,12 @@ impl OutputRouter {
         let counts: Vec<usize> = self
             .dynamic
             .iter()
-            .map(|d| self.subscribers(d.key))
+            .map(|d| {
+                // A reformat key held for its output (warming, moving or its
+                // base) counts as subscribed: it never lingers out from under
+                // the output (#342 B3).
+                self.subscribers(d.key) + usize::from(self.reformat_holds(d.key))
+            })
             .collect();
         let mut newly: Vec<(usize, String)> = Vec::new();
         for (d, &subs) in self.dynamic.iter_mut().zip(&counts) {
@@ -2966,7 +3246,14 @@ impl OutputRouter {
             })
             .collect();
         wanted.extend(pending);
+        // Program is a picture feed only for a dynamic key ON Program (a
+        // reformatted output's base key, #342 B3); a take to Program uses
+        // the output's base key and needs none.
+        let program_key = self.dynamic.iter().any(|d| d.bus == PictureBus::Program);
         wanted.retain(|(b, _)| *b != PictureBus::Program);
+        if program_key {
+            wanted.push((PictureBus::Program, None));
+        }
         wanted.sort_unstable_by_key(feed_order);
         wanted.dedup();
         let unchanged = wanted.iter().all(|b| self.feeds.contains_key(b))
@@ -2983,6 +3270,7 @@ impl OutputRouter {
                 .or_insert_with(|| AuxFeed::with_format(bus, format));
         }
         self.clean_active = self.feeds.keys().any(|(b, _)| *b == PictureBus::Clean);
+        self.program_active = self.feeds.keys().any(|(b, _)| *b == PictureBus::Program);
         let list: Vec<AuxFeed> = self
             .feeds
             .values()
@@ -3024,7 +3312,9 @@ impl OutputRouter {
         let mut keys: Vec<(String, usize)> = self
             .dynamic
             .iter()
-            .filter(|d| !dispatcher.is_key_failed(d.key))
+            // A key at a reset's ad-hoc settings is not the rendition's
+            // (review M-2): never reported as carrying `settings`.
+            .filter(|d| !dispatcher.is_key_failed(d.key) && d.reset.is_none() && !d.reformat)
             .map(|d| (crate::routing_aux::feed_name(&d.bus, d.format), d.settings))
             .collect();
         keys.sort_unstable();
@@ -3330,6 +3620,7 @@ fn feed_order(key: &FeedKey) -> (String, Option<(u32, u32, String)>) {
 /// (a panicking open is an error result, never a dead thread).
 fn spawn_opener(
     mut open: BusOpenFn,
+    mut reformat_open: Option<ReformatOpenFn>,
 ) -> std::io::Result<(SyncSender<OpenRequest>, Receiver<OpenResult>)> {
     let (open_tx, open_req_rx) = mpsc::sync_channel::<OpenRequest>(OPEN_QUEUE);
     let (open_res_tx, open_rx) = mpsc::sync_channel::<OpenResult>(OPEN_QUEUE);
@@ -3338,7 +3629,11 @@ fn spawn_opener(
         .spawn(move || {
             while let Ok(req) = open_req_rx.recv() {
                 let encoder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    open(req.settings, &req.bus)
+                    match (&req.reformat, reformat_open.as_mut()) {
+                        (Some(settings), Some(reformat_open)) => reformat_open(settings, &req.bus),
+                        (Some(_), None) => Err("no reformat opener".to_owned()),
+                        (None, _) => open(req.settings, &req.bus),
+                    }
                 }))
                 .unwrap_or_else(|_| Err("encoder open panicked".to_owned()));
                 if open_res_tx
@@ -3366,6 +3661,9 @@ fn aux_composed(bus: &PictureBus) -> bool {
 
 #[path = "output_routing_sets.rs"]
 mod sets;
+
+#[path = "output_routing_reformat.rs"]
+mod reformat;
 
 #[cfg(test)]
 #[path = "output_routing_tests.rs"]

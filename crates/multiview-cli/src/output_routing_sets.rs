@@ -113,7 +113,9 @@ const fn arm_reason(result: TakeResult) -> SetRefusal {
         TakeResult::Superseded => SetRefusal::Superseded,
         TakeResult::Refused(RefuseReason::EncoderNotReady | RefuseReason::FormatMismatch)
         | TakeResult::Applied
-        | TakeResult::Fallback(_) => SetRefusal::EncoderNotReady,
+        | TakeResult::Fallback(_)
+        | TakeResult::ResetApplied
+        | TakeResult::ResetRefused(_) => SetRefusal::EncoderNotReady,
     }
 }
 
@@ -215,28 +217,38 @@ impl OutputRouter {
         }
         // The resource delta: members whose (bus, format, settings) has no
         // live key, no open in flight and no earlier member sharing it.
-        let mut opens: Vec<(PictureBus, Option<super::AuxFormat>, usize)> = Vec::new();
+        let mut opens: Vec<(
+            PictureBus,
+            Option<super::AuxFormat>,
+            usize,
+            Option<super::ReformatSettings>,
+        )> = Vec::new();
         for m in &set.members {
             let index = m.output_index;
             let Some(bus) = m.bus.clone() else { continue };
-            let Some(&settings) = self.cfg.base_keys.get(index) else {
+            // The output's encoder settings (review M-2): its rendition
+            // settings plus any live reset's ad-hoc settings.
+            let Some(out) = self.outputs.get(index) else {
                 continue;
             };
-            if bus == PictureBus::Program || self.outputs.get(index).is_some_and(|o| o.bus == bus) {
+            if bus == PictureBus::Program || out.bus == bus {
                 continue;
             }
+            let (settings, reset) = (out.settings, out.reset.clone());
             let format = self.feed_key(index, &bus).1;
             let live = self.dynamic.iter().any(|d| {
                 d.bus == bus
                     && d.format == format
                     && d.settings == settings
+                    && d.reset == reset
+                    && !d.reformat
                     && !dispatcher.is_key_failed(d.key)
             });
             let in_flight = self
                 .opens
                 .values()
-                .any(|o| o.bus == bus && o.settings == settings);
-            let entry = (bus, format, settings);
+                .any(|o| o.bus == bus && o.settings == settings && o.reset == reset && !o.reformat);
+            let entry = (bus, format, settings, reset);
             if !live && !in_flight && !opens.contains(&entry) {
                 opens.push(entry);
             }
@@ -318,9 +330,12 @@ impl OutputRouter {
         tick: u64,
         dispatcher: &mut RenditionDispatcher,
     ) {
-        let Some(&settings) = self.cfg.base_keys.get(index) else {
+        let (Some(&base), Some(out)) = (self.cfg.base_keys.get(index), self.outputs.get(index))
+        else {
             return;
         };
+        // The output's encoder settings (review M-2), as `start_move`.
+        let (settings, reset) = (out.settings, out.reset.clone());
         let Some(group) = self.group_of(index) else {
             return;
         };
@@ -329,7 +344,7 @@ impl OutputRouter {
             audio.admit(index, bus, choice, tick, dispatcher);
         }
         let existing = if *bus == PictureBus::Program {
-            Some(settings)
+            Some(base)
         } else {
             self.dynamic
                 .iter()
@@ -337,6 +352,8 @@ impl OutputRouter {
                     d.bus == *bus
                         && d.format == format
                         && d.settings == settings
+                        && d.reset == reset
+                        && !d.reformat
                         && !dispatcher.is_key_failed(d.key)
                 })
                 .map(|d| d.key)
@@ -373,6 +390,7 @@ impl OutputRouter {
             id,
             settings,
             bus: bus.clone(),
+            reformat: reset.clone(),
         }) {
             Ok(()) => {
                 if let Some(s) = self.sets.active.iter_mut().find(|s| s.id == group) {
@@ -384,6 +402,8 @@ impl OutputRouter {
                         bus: bus.clone(),
                         format,
                         settings,
+                        reset,
+                        reformat: false,
                         principal: principal.to_owned(),
                         deadline: tick.saturating_add(OPEN_DEADLINE_TICKS),
                         waiter: Some(index),
