@@ -526,7 +526,18 @@ pub(crate) fn take_set(
         }
     }
     // One take for the principal, one per destination (§12.8 rule 3).
-    let mut destinations: Vec<String> = mixer
+    //
+    // B3: a set's output members are charged against the SAME limiter a
+    // single-output take uses (`control.limiter`, `take_output_slot0`'s
+    // `output_routing.rs`), not the mixer's `patch_limiter`: alternating
+    // single-output takes with two-output sets on one output must not
+    // double that output's or the principal's per-second budget. Mixer
+    // members keep `patch_limiter`, exactly as a plain mixer patch
+    // (`take_patch`). The two limiters are checked together before either
+    // records (`check_set` on both, then `record_set` on both): a refusal
+    // on either consumes nothing on the other (docs/architecture/
+    // output-routing.md §12.8).
+    let mixer_destinations: Vec<String> = mixer
         .as_ref()
         .map(|m| {
             m.members
@@ -535,13 +546,51 @@ pub(crate) fn take_set(
                 .collect()
         })
         .unwrap_or_default();
-    destinations.extend(outputs.iter().map(|o| o.api_id.clone()));
-    if let Err(retry) =
-        state
-            .patch_limiter
-            .admit_set(&destinations, &principal.key_id, Instant::now())
-    {
+    let output_destinations: Vec<String> = outputs.iter().map(|o| o.api_id.clone()).collect();
+    // The principal is charged once per set, but on every limiter whose
+    // destinations it touches: a mixed set must not escape either the
+    // mixer-patch principal budget or the output-take principal budget by
+    // routing only part of its destinations through each limiter.
+    let charge_mixer_principal = mixer.is_some();
+    let charge_output_principal = !outputs.is_empty();
+    let now = Instant::now();
+    let control_limiter = state.output_routing.as_ref().map(|c| &c.limiter);
+    if let Err(retry) = state.patch_limiter.check_set(
+        &mixer_destinations,
+        charge_mixer_principal.then_some(principal.key_id.as_str()),
+        now,
+    ) {
         return Ok(Err(too_many(retry)));
+    }
+    if !output_destinations.is_empty() {
+        let Some(limiter) = control_limiter else {
+            return Ok(Err(routing_unavailable()));
+        };
+        if let Err(retry) = limiter.check_set(
+            &output_destinations,
+            charge_output_principal.then_some(principal.key_id.as_str()),
+            now,
+        ) {
+            return Ok(Err(too_many(retry)));
+        }
+    }
+    // Both limiters passed their check; record on both now (never partially:
+    // a check failure above returned before either limiter recorded).
+    state.patch_limiter.record_set(
+        &mixer_destinations,
+        charge_mixer_principal.then_some(principal.key_id.as_str()),
+        now,
+    );
+    if !output_destinations.is_empty() {
+        // Existence of `control_limiter` was already proven above when
+        // `output_destinations` is non-empty.
+        if let Some(limiter) = control_limiter {
+            limiter.record_set(
+                &output_destinations,
+                charge_output_principal.then_some(principal.key_id.as_str()),
+                now,
+            );
+        }
     }
     // The set's NEW encoder delta (members with one encoder identity share
     // one) against the principal's cap and the global sessions (rule 1).

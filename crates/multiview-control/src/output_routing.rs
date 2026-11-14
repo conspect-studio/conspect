@@ -971,6 +971,59 @@ impl TakeLimiter {
         Ok(())
     }
 
+    /// Check (never record) the per-destination window for every entry in
+    /// `destinations`, and the per-principal window for `charge_principal`
+    /// when given. The counterpart to [`Self::record_set`]: a multi-member
+    /// take that spans two [`TakeLimiter`] instances (the mixer's
+    /// `patch_limiter` and an output's `control.limiter`, review B3) must
+    /// check both before recording into either, so a refusal on the second
+    /// limiter never leaves the first charged.
+    ///
+    /// # Errors
+    /// The longest delay until every needed slot frees.
+    pub fn check_set(
+        &self,
+        destinations: &[String],
+        charge_principal: Option<&str>,
+        now: Instant,
+    ) -> Result<(), Duration> {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (outputs, principals) = &mut *guard;
+        let mut wait: Option<Duration> = None;
+        for destination in destinations {
+            if let Err(delay) = outputs.check(destination, now) {
+                wait = Some(wait.map_or(delay, |w| w.max(delay)));
+            }
+        }
+        if let Some(principal) = charge_principal {
+            if let Err(delay) = principals.check(principal, now) {
+                wait = Some(wait.map_or(delay, |w| w.max(delay)));
+            }
+        }
+        wait.map_or(Ok(()), Err)
+    }
+
+    /// Record one take per entry in `destinations`, and one take for
+    /// `charge_principal` when given. Call only after every limiter this
+    /// multi-member take spans has passed [`Self::check_set`] (review B3):
+    /// this method itself never checks, so a caller that records on a
+    /// limiter it has not just checked can over-admit.
+    pub fn record_set(
+        &self,
+        destinations: &[String],
+        charge_principal: Option<&str>,
+        now: Instant,
+    ) {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (outputs, principals) = &mut *guard;
+        for destination in destinations {
+            outputs.record(destination, now);
+        }
+        if let Some(principal) = charge_principal {
+            principals.record(principal, now);
+        }
+    }
+
     /// Tracked (outputs, principals) — the bound is the cap.
     #[must_use]
     pub fn tracked(&self) -> (usize, usize) {

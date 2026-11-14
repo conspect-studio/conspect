@@ -2604,9 +2604,22 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   6. limits, then the encoder delta, then reserve, then enqueue.
 
   Any 403 or 422 changes nothing and burns no key.
-- **Limits and capacity.** `patch_limiter.admit_set` counts one take for the principal and one per
-  destination (`me1.in<N>`, output API ids), so 64 crosspoints never multiply either budget. The
-  set's NEW encoder delta counts members whose plan needs an encoder, deduplicated per identical
+- **Limits and capacity.** A set's destinations are checked and recorded against the SAME two
+  limiters a plain mixer patch and a single-output take already use, never a third independent
+  budget (#308 review B3, fixed in slice E2): mixer destinations (`me1.in<N>`) against
+  `state.patch_limiter` (as `take_patch`'s own admission), and output destinations (output API
+  ids) against `state.output_routing`'s `control.limiter` (the one `take_output_slot0` uses for
+  `/routing/output/take` and the slot-0 alias of `/patch/take`). Each distinct destination counts
+  one take regardless of how many crosspoints of that destination the set carries, so 64
+  crosspoints never multiply either budget — and alternating single-output takes with
+  multi-destination sets on the SAME output cannot double that output's 2/s budget by routing one
+  path through `patch_limiter` and the other through `control.limiter`. The principal is charged
+  once per limiter the set's destinations touch (`TakeLimiter::check_set`/`record_set`): a
+  mixer-only set charges only `patch_limiter`'s principal window, an output-only set charges only
+  `control.limiter`'s, and a mixed set charges both, so it cannot escape either principal budget by
+  hiding part of its destinations behind the other limiter. Both limiters are checked (never
+  recorded) before either records, so a refusal on either consumes nothing on the other. The set's
+  NEW encoder delta counts members whose plan needs an encoder, deduplicated per identical
   engine encoder identity: the router's sharing key (feed at the output's format, the output's
   encoder settings and its landed live reset's settings), read through the defaulted seam
   `OutputRouting::encoder_identity`. Same feed and format with different encoder settings is two
@@ -2664,9 +2677,12 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
     only legacy fields keeps its path byte-for-byte.
 - **Plan.** A set's plan lists every member in request order. It adds `set: {new_encoders, fits}`,
   and `can_take` requires every member and the delta to fit. OpenAPI declares the `200` of
-  `POST /patch/plan` and `POST /salvos/{id}/plan` as `oneOf` `PatchPlan` | `SetPlan`, and the
-  `202` of `POST /salvos/{id}/take` as `oneOf` `AcceptedBody` | `PatchAccepted` (document-only
-  schemas; the Rust types stay distinct).
+  `POST /patch/plan` and `POST /salvos/{id}/plan` as `anyOf` `PatchPlan` | `SetPlan` (`SetPlan`
+  flattens `PatchPlan`'s fields and adds `set`, and `PatchPlan` has no `additionalProperties:
+  false`, so a genuine `SetPlan` body also matches the `PatchPlan` arm; `oneOf`, which requires
+  exactly one match, would reject every real set-plan response — #308 review A5), and the `202` of
+  `POST /salvos/{id}/take` as `oneOf` `AcceptedBody` | `PatchAccepted` (document-only schemas; the
+  Rust types stay distinct).
 - **Deviations from the E2 design note.**
   - The set key's replay/conflict is checked right after shape, before existence and plan gates,
     not after them. This follows the slot-0 alias: a replay never re-plans, which matters because

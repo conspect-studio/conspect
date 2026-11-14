@@ -681,6 +681,134 @@ async fn the_limiter_counts_a_set_once_per_principal_and_per_destination() {
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 }
 
+/// #308 review B3: a single-output take (`POST /patch/take` with one
+/// output, which runs the slot-0 alias machinery) and a two-output set both
+/// charge output-0 against the SAME per-output limiter
+/// (`control.limiter`, `TAKES_PER_OUTPUT_PER_SEC = 2`): alternating the two
+/// paths on the same output and principal within one second cannot exceed
+/// that single per-output limit, nor the per-principal limit — the set path
+/// no longer has its own independent budget for output members. The
+/// over-limit request is 429 with nothing enqueued on either engine seam.
+#[tokio::test]
+async fn alternating_single_takes_and_sets_share_the_per_output_and_per_principal_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+
+    // 1st charge on output-0: a single-output take (the slot-0 alias path,
+    // `control.limiter` directly).
+    let (status, body) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "single-1",
+        &set(vec![video(0, bars())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(rig.fake.state.lock().unwrap().takes.len(), 1);
+
+    // 2nd charge on output-0: a two-output SET including output-0 (the set
+    // path, now also `control.limiter` for its output members). Before the
+    // B3 fix this used an independent `patch_limiter` budget and would have
+    // been wrongly admitted on its own separate counter even after output-0
+    // already held 2 single-output charges.
+    let (status, body) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "set-1",
+        &set(vec![video(0, bars()), video(5, bars())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(rig.fake.sets().len(), 1, "{body}");
+
+    // output-0 is now at TAKES_PER_OUTPUT_PER_SEC (2) in the ONE shared
+    // limiter: a 3rd touch of output-0, in either shape, is 429 and enqueues
+    // nothing on either engine seam.
+    let (status, body) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "single-2",
+        &set(vec![video(0, bars())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(body["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("too many"));
+    assert_eq!(
+        rig.fake.state.lock().unwrap().takes.len(),
+        1,
+        "the 429 enqueued no single take"
+    );
+    let (status, body) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "set-2",
+        &set(vec![video(0, bars()), video(6, bars())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(
+        rig.fake.sets().len(),
+        1,
+        "the 429 enqueued no set: output-0's shared budget, not an independent one"
+    );
+
+    // A fresh output (output-7) still has room: the per-output limit is
+    // per-destination, not global.
+    let (status, body) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "single-3",
+        &set(vec![video(7, bars())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // The per-principal limit (10/s) is ALSO one shared counter across both
+    // paths: it already holds 3 charges from above (single take on
+    // output-0, the set, single take on output-7). 7 more single takes on
+    // distinct, never-before-touched outputs reach the 10/s cap; the 11th
+    // touch (any shape) is 429 with nothing enqueued, even though every
+    // individual output involved is still under its own 2/s limit.
+    for i in 8..15 {
+        let (status, body) = take(
+            &rig,
+            OPERATOR_TOKEN,
+            &format!("single-fill-{i}"),
+            &set(vec![video(i, bars())]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "output-{i}: {body}");
+    }
+    let takes_before = rig.fake.state.lock().unwrap().takes.len();
+    let sets_before = rig.fake.sets().len();
+    let (status, body) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "eleventh-touch",
+        &set(vec![video(20, bars()), video(21, bars())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(
+        rig.fake.state.lock().unwrap().takes.len(),
+        takes_before,
+        "nothing enqueued on the over-limit request"
+    );
+    assert_eq!(
+        rig.fake.sets().len(),
+        sets_before,
+        "nothing enqueued on the over-limit request"
+    );
+
+    // Existing flood/limiter tests (`the_limiter_counts_a_set_once_per_...`,
+    // `takes_are_rate_limited_per_output_and_per_principal`,
+    // `a_set_flood_is_429_and_never_starves_another_principal`) keep passing
+    // unmodified: this test only adds the cross-path regression.
+}
+
 /// A principal holding its cap is refused `capacity` for a set that opens
 /// new encoders, before anything is enqueued; another principal's set is
 /// admitted (the fake records the principal each set is charged to).
