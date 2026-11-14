@@ -124,7 +124,7 @@ impl YoutubeError {
     }
 }
 
-/// Replace every `http://` / `https://` URL in `text` with `<url>`.
+/// Replace every `http://` / `https://` URL token in `text` with `<url>`.
 fn redact_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -140,8 +140,10 @@ fn redact_urls(text: &str) -> String {
         out.push_str(rest.get(..start).unwrap_or_default());
         out.push_str("<url>");
         let tail = rest.get(start..).unwrap_or_default();
+        // Conservative: only characters a URL cannot carry unescaped end it,
+        // so a `,`, `(` or `'` inside a path/query never leaves a tail behind.
         let end = tail
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | ','))
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '<' | '>' | '`'))
             .unwrap_or(tail.len());
         rest = tail.get(end..).unwrap_or_default();
     }

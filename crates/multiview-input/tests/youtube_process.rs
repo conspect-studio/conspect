@@ -268,3 +268,19 @@ async fn an_over_limit_output_is_refused_while_the_child_runs() {
         started.elapsed()
     );
 }
+
+/// Review ABUSE-04: a URL carrying legal sub-delimiters (`,` `(` `'`) is
+/// redacted whole in the operator message, never leaving its tail behind.
+#[test]
+fn operator_message_redacts_whole_urls_with_sub_delimiters() {
+    for raw in [
+        "ERROR: see https://h.test/a,b?sig=SECRET now",
+        "ERROR: see https://h.test/a(b)/signature/SECRET now",
+        "ERROR: 'https://u:pa(ss@h.test/x?sig=SECRET'",
+    ] {
+        let message = YoutubeError::Resolve(raw.to_owned()).operator_message();
+        assert!(!message.contains("SECRET"), "{message}");
+        assert!(!message.contains("pa(ss"), "{message}");
+        assert!(message.contains("<url>"), "{message}");
+    }
+}

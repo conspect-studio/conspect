@@ -397,13 +397,31 @@ fn sanitize_line_reduces_urls_to_scheme_and_host() {
         sanitize_line("x https://u:PW@[2001:db8::1]:8443/s/SIG/a.ts y"),
         "x https://[2001:db8::1]:8443/… y"
     );
-    // An unterminated bracket never panics and leaks nothing past the scheme.
-    let odd = sanitize_line("x https://[2001:db8::1/SIG?sig=Q");
-    assert!(!odd.contains("SIG"), "{odd}");
+    // Legal URI sub-delimiters never end the scan early (review ABUSE-04).
+    for (line, secret) in [
+        (
+            "Opening 'https://user:pa(ss@cdn.test/path?sig=SECRET'",
+            "SECRET",
+        ),
+        (
+            "Opening 'https://user:pa(ss@cdn.test/path?sig=SECRET'",
+            "pa(ss",
+        ),
+        ("x https://cdn.test/a(b)/signature/SECRET y", "SECRET"),
+        ("x https://cdn.test/a,b?sig=SECRET y", "SECRET"),
+        ("x https://cdn.test/it's/SECRET y", "SECRET"),
+        ("x https://[2001:db8::1/SECRET?sig=Q", "SECRET"),
+        ("x https://h.test/a]SECRET", "SECRET"),
+        ("two https://a.test/S1 and https://b.test/S2", "S1"),
+        ("two https://a.test/S1 and https://b.test/S2", "S2"),
+        ("x ://user:pw@h.test/SECRET", "SECRET"),
+    ] {
+        let clean = sanitize_line(line);
+        assert!(!clean.contains(secret), "{secret} leaked: {clean}");
+    }
     assert_eq!(
-        sanitize_line("[hls] see https://h.test/a]x"),
-        "[hls] see https://h.test/…]x"
+        sanitize_line("x https://cdn.test/a(b)/s y"),
+        "x https://cdn.test/… y"
     );
-    assert_eq!(sanitize_line("a :// b"), "a :// b");
     assert_eq!(sanitize_line("x rtsp://cam/main y"), "x rtsp://cam/… y");
 }

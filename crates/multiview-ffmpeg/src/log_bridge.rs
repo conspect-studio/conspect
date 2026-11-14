@@ -162,58 +162,48 @@ pub fn sanitize_line(raw: &str) -> String {
     out
 }
 
-/// The byte length of the URL that starts `text` (just past `://`). A URL ends
-/// at whitespace, a quote, `<`, `>`, `(`, `)` or a backtick; a `[` opens a
-/// bracketed IPv6 host whose `]` belongs to the URL, while an unmatched `]`
-/// ends it. An unclosed `[` runs to the next terminator, so nothing after it
-/// escapes redaction.
+/// The byte length of the URL token that starts `text` (just past `://`).
+/// Conservative on purpose: a token ends only at whitespace, `"`, `<`, `>` or a
+/// backtick — characters a URL cannot contain unescaped. Sub-delimiters that a
+/// URL may legally carry (`'`, `(`, `)`, `,`, `[`, `]`, …) stay inside, so no
+/// userinfo, path or query after one of them escapes redaction.
 fn url_end(text: &str) -> usize {
-    let mut depth = 0_u32;
-    for (i, c) in text.char_indices() {
-        match c {
-            '[' => depth = depth.saturating_add(1),
-            ']' if depth > 0 => depth -= 1,
-            ']' => return i,
-            c if c.is_whitespace() || matches!(c, '\'' | '"' | '<' | '>' | '(' | ')' | '`') => {
-                return i
-            }
-            _ => {}
-        }
-    }
-    text.len()
+    text.find(|c: char| c.is_whitespace() || matches!(c, '"' | '<' | '>' | '`'))
+        .unwrap_or(text.len())
 }
 
-/// `line` with every `scheme://…` URL reduced to `scheme://host/…` (see
-/// [`sanitize_line`]). A URL ends at whitespace or a quote/bracket character.
+/// `line` with every `scheme://…` URL token reduced to `scheme://host/…`
+/// (see [`sanitize_line`] and [`url_end`]). A token that libav wrapped in
+/// single quotes keeps its closing quote outside the redaction.
 fn redact_line_urls(line: &str) -> String {
     let mut out = String::with_capacity(line.len().min(MAX_LINE_LEN));
     let mut rest = line;
     while let Some(at) = rest.find("://") {
         let (before, after) = rest.split_at(at);
-        // The scheme is the run of URL-scheme characters right before `://`.
-        let scheme_len = before
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-            .map(char::len_utf8)
-            .sum::<usize>();
         let after = after.get(3..).unwrap_or_default();
-        let url_len = url_end(after);
-        let (url, tail) = after.split_at(url_len);
+        let (mut url, mut tail) = after.split_at(url_end(after));
+        // `'https://h/p'` — libav's quoting, not part of the URL.
+        let quoted = before.rfind('\'').is_some_and(|q| {
+            before.get(q + 1..).is_some_and(|scheme| {
+                scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            })
+        });
+        if quoted && url.ends_with('\'') {
+            let cut = url.len() - 1;
+            tail = after.get(cut..).unwrap_or_default();
+            url = url.get(..cut).unwrap_or_default();
+        }
         out.push_str(before);
-        if scheme_len == 0 {
-            out.push_str("://");
-            out.push_str(url);
-        } else {
-            let authority = url.split(['/', '?', '#']).next().unwrap_or_default();
-            let host = authority
-                .rsplit_once('@')
-                .map_or(authority, |(_, host)| host);
-            out.push_str("://");
-            out.push_str(host);
-            if url.len() > authority.len() || authority.len() != host.len() {
-                out.push_str("/…");
-            }
+        out.push_str("://");
+        let authority = url.split(['/', '?', '#']).next().unwrap_or_default();
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        out.push_str(host);
+        if url.len() > host.len() {
+            out.push_str("/…");
         }
         rest = tail;
     }

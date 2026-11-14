@@ -367,7 +367,9 @@ where
                 let nap = backoff.next_delay(jitter);
                 tracing::warn!(
                     %watch_url,
-                    error = %err,
+                    // The redacted operator text: raw yt-dlp stderr may carry
+                    // signed URLs.
+                    error = %err.operator_message(),
                     attempt = backoff.attempts(),
                     ?nap,
                     "youtube re-resolution failed; backing off (tile degrades)"

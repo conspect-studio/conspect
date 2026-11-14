@@ -15643,7 +15643,7 @@ fn resolve_hls_audio_url_with(
     let playlist = match fetcher.fetch(master_url) {
         Ok(playlist) => playlist,
         Err(reason) => {
-            tracing::warn!(master_url = %media_url_for_log(master_url), %reason, "could not fetch HLS master for audio pin; opening URL as-is");
+            tracing::warn!(master_url = %media_url_for_log(master_url), reason = %multiview_ffmpeg::sanitize_line(&reason), "could not fetch HLS master for audio pin; opening URL as-is");
             return None;
         }
     };
@@ -15665,7 +15665,7 @@ fn resolve_hls_variant_url_with(
     let playlist = match fetcher.fetch(master_url) {
         Ok(playlist) => playlist,
         Err(reason) => {
-            tracing::warn!(master_url = %media_url_for_log(master_url), %reason, "could not fetch HLS master for variant pin; opening URL as-is");
+            tracing::warn!(master_url = %media_url_for_log(master_url), reason = %multiview_ffmpeg::sanitize_line(&reason), "could not fetch HLS master for variant pin; opening URL as-is");
             return None;
         }
     };
@@ -15862,7 +15862,7 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
         match open_and_stream(plan, tag, stop) {
             Ok(()) => {}
             Err(reason) => {
-                tracing::warn!(source = %plan.id, %reason, "ingest stream ended/errored");
+                tracing::warn!(source = %plan.id, reason = %multiview_ffmpeg::sanitize_line(&reason), "ingest stream ended/errored");
             }
         }
         // How long THIS connection streamed (before any backoff) — feeds the
@@ -16905,7 +16905,7 @@ fn youtube_reresolve_thread(
         // The loop never returns `Err` for an extraction failure (those degrade the
         // tile + back off inside it); a returned error is a fatal-config fault.
         // Log it — the tile rides the decode thread's inline resolve fallback.
-        tracing::warn!(%watch_url, error = %e, "youtube re-resolution loop ended with error");
+        tracing::warn!(%watch_url, error = %e.operator_message(), "youtube re-resolution loop ended with error");
     }
 }
 
