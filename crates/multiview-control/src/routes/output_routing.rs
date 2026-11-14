@@ -686,6 +686,7 @@ pub(crate) fn notify_layout_change(state: &AppState, id: &str, body: Option<&ser
             Some(body) => crate::cast_streams::reauth::before_change(
                 state,
                 &output,
+                None,
                 Some(&RoutedFeed::Layout(id.to_owned())),
                 Some(body.0.as_ref()),
                 None,
@@ -694,6 +695,7 @@ pub(crate) fn notify_layout_change(state: &AppState, id: &str, body: Option<&ser
             None => crate::cast_streams::reauth::before_change(
                 state,
                 &output,
+                None,
                 Some(&RoutedFeed::Program),
                 None,
                 None,
@@ -1372,6 +1374,7 @@ fn enqueue_slot0(
     crate::cast_streams::reauth::before_change(
         state,
         &take.output,
+        Some(&take.operation_id),
         take.video.as_ref(),
         take.layout.as_ref().map(|body| body.0.as_ref()),
         take.audio.as_ref(),

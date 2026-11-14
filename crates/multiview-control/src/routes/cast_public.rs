@@ -11,6 +11,9 @@
 //!   custom Web Receiver, embedded, under a strict CSP. These static routes
 //!   win over the token route.
 //!
+//! Media is served only for a token armed at its output's CURRENT
+//! authorization generation (ABUSE-1, `cast_streams::reauth`).
+//!
 //! The token is a path segment: it is never logged by this crate (no layer
 //! here records request paths), never audited and never published.
 
@@ -160,7 +163,15 @@ async fn serve_media(
     // Token first (constant-time over every digest), then the file name, so
     // the work done does not depend on which one is wrong.
     let stream = state.cast_streams.lookup(&token);
-    let (Some((stream_id, config_id)), true) = (stream, file_allowed(&file)) else {
+    let (Some((_, config_id)), true) = (stream, file_allowed(&file)) else {
+        return not_found();
+    };
+    // ABUSE-1: the fail-closed barrier. A feed the engine moved the output
+    // to that its tokens were not authorized for (a fallback whose outcome
+    // is not relayed yet) re-authorizes them NOW; then only a token armed at
+    // the output's CURRENT generation is served.
+    crate::cast_streams::reauth::on_media(state, &config_id);
+    let Some((stream_id, config_id)) = state.cast_streams.serve(&token) else {
         return not_found();
     };
     let Some(dir) = output_dir(state, &config_id) else {
@@ -202,7 +213,11 @@ async fn take_report(
     let Ok(Path((token, file))) = path else {
         return not_found();
     };
-    if file != "report" || state.cast_streams.lookup(&token).is_none() {
+    let Some((_, config_id)) = state.cast_streams.lookup(&token) else {
+        return not_found();
+    };
+    crate::cast_streams::reauth::on_media(state, &config_id);
+    if file != "report" || state.cast_streams.serve(&token).is_none() {
         return not_found();
     }
     let limit = crate::cast_streams::MAX_REPORT_BYTES;

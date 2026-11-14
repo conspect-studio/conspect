@@ -295,6 +295,11 @@ fn write_stream(dir: &Path, tag: &str) {
 }
 
 fn rig() -> Rig {
+    rig_with(|state| state)
+}
+
+/// [`rig`] with the `AppState` adjusted by `adjust` (e.g. JWT enabled).
+fn rig_with(adjust: impl FnOnce(AppState) -> AppState) -> Rig {
     let tmp = tempfile::tempdir().unwrap();
     let mut dirs = HashMap::new();
     for id in ["cast-1", "cast-2"] {
@@ -344,6 +349,7 @@ fn rig() -> Rig {
     .with_cast_engine(cast.clone())
     .with_cast_streams(streams)
     .with_cast_app_id(Some("1A2B3C4D".to_owned()));
+    let state = adjust(state);
     Rig {
         router: multiview_control::router(state.clone()),
         cast,
@@ -1488,4 +1494,305 @@ async fn the_cast_api_take_seam_rechecks_live_tokens() {
         fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
         StatusCode::NOT_FOUND
     );
+}
+
+/// Every response a token gets for the playlist, a segment and the init.
+async fn statuses(rig: &Rig, token: &str) -> Vec<StatusCode> {
+    let mut out = Vec::new();
+    for file in ["master.m3u8", "seg-v-1-0.m4s", "init-v-1-0.mp4"] {
+        out.push(fetch(rig, &format!("/cast/{token}/{file}")).await.0);
+    }
+    out
+}
+
+/// ABUSE-1 round 2, create racing a take: the creation authorized its owner
+/// for what output-0 carried and claimed its token; a take to a feed the
+/// owner may not read lands AFTER that snapshot and BEFORE the token is
+/// armed. The token is never servable (not during the take, not after) and
+/// the creation is refused: no token is ever minted against a stale feed.
+#[tokio::test]
+async fn a_create_racing_a_take_never_serves_the_new_feed() {
+    let rig = rig();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (state, observed) = (rig.state.clone(), Arc::clone(&seen));
+    rig.state
+        .cast_streams
+        .set_before_arm(Some(Arc::new(move || {
+            let streams = &state.cast_streams;
+            observed.lock().unwrap().push(streams.servable_on("cast-1"));
+            multiview_control::cast_streams::lifecycle::submit_take(
+                &state,
+                &multiview_control::cast_streams::lifecycle::cast_operation_id(),
+                "cast-1",
+                &RoutedFeed::Source("secret-cam".to_owned()),
+                None,
+                "cs-op2",
+            )
+            .unwrap();
+            observed.lock().unwrap().push(streams.servable_on("cast-1"));
+        })));
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(rig.routing.bus("cast-1"), "src:secret-cam");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![0, 0],
+        "servable during the take"
+    );
+    assert_eq!(status, StatusCode::FORBIDDEN, "{doc}");
+    assert!(doc.get("path").is_none(), "{doc}");
+    assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+    // Nothing of this owner is left to serve after the take either.
+    let list =
+        body_json(send(&rig.router, support::get("/api/v1/cast/streams", SCOPED)).await).await;
+    assert_eq!(list, serde_json::json!([]), "{list}");
+}
+
+/// ABUSE-1 round 2, the benign race: a take to a feed the owner MAY read
+/// lands between snapshot and arming; the creation re-checks at the new
+/// generation and succeeds, and its token plays.
+#[tokio::test]
+async fn a_create_racing_a_readable_take_rechecks_and_plays() {
+    let rig = rig();
+    let state = rig.state.clone();
+    rig.state
+        .cast_streams
+        .set_before_arm(Some(Arc::new(move || {
+            multiview_control::cast_streams::lifecycle::submit_take(
+                &state,
+                &multiview_control::cast_streams::lifecycle::cast_operation_id(),
+                "cast-1",
+                &RoutedFeed::Program,
+                None,
+                "cs-op2",
+            )
+            .unwrap();
+        })));
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    assert_eq!(statuses(&rig, &token).await, vec![StatusCode::OK; 3]);
+}
+
+/// ABUSE-1 round 2, fallback before relay: the engine moves output-1 to
+/// Program (a fallback) and its outcome has NOT reached the control plane.
+/// The first media request already sees the new generation: the owner who
+/// may not read Program gets the generic 404 on every file, from the first
+/// request on, while a co-viewer who may read it keeps playing (its token
+/// was re-authorized synchronously on the media path). The late outcome
+/// changes neither.
+#[tokio::test]
+async fn a_fallback_before_its_relay_is_never_served_to_an_unauthorized_owner() {
+    let rig = rig();
+    let (status, lost) = create(
+        &rig,
+        SCOPED_B,
+        serde_json::json!({"output": "output-1", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{lost}");
+    let (status, kept) = create(&rig, OPERATOR_2, serde_json::json!({"output": "output-1"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{kept}");
+    let (lost, kept) = (token_of(&lost), token_of(&kept));
+    assert_eq!(statuses(&rig, &lost).await, vec![StatusCode::OK; 3]);
+    let before = rig.state.cast_streams.generation("cast-2").unwrap();
+    // The engine falls back; only its readback says so.
+    rig.routing
+        .live
+        .lock()
+        .unwrap()
+        .outputs
+        .get_mut("cast-2")
+        .unwrap()
+        .bus = "program".to_owned();
+    assert_eq!(statuses(&rig, &lost).await, vec![StatusCode::NOT_FOUND; 3]);
+    assert!(rig.state.cast_streams.generation("cast-2").unwrap() > before);
+    assert_eq!(statuses(&rig, &kept).await, vec![StatusCode::OK; 3]);
+    // The outcome arrives late: nothing changes.
+    rig.routing
+        .tx
+        .send(OutputOutcome {
+            operation_id: String::new(),
+            output: "cast-2".to_owned(),
+            tick: 9,
+            outcome: "fallback:aux-failed".to_owned(),
+            feed: Some(RoutedFeed::Program),
+            audio: None,
+        })
+        .unwrap();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        assert_eq!(statuses(&rig, &lost).await, vec![StatusCode::NOT_FOUND; 3]);
+        assert_eq!(statuses(&rig, &kept).await, vec![StatusCode::OK; 3]);
+    }
+}
+
+/// ABUSE-1 round 2, the positive case: an owner authorized for every feed
+/// keeps playing across takes (each moves the generation; the re-check moves
+/// its token forward in the same critical section), every response 200,
+/// with the outcomes relayed or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authorized_owner_keeps_playing_across_takes() {
+    let rig = rig();
+    let (status, doc) = create(
+        &rig,
+        OPERATOR_2,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    let mut last = rig.state.cast_streams.generation("cast-1").unwrap();
+    // One routing take (the per-output take limiter admits one), then the
+    // cast API's own take seam: both commit through the same gate.
+    let r = send(
+        &rig.router,
+        route_take(
+            OPERATOR_TOKEN,
+            "keep-0",
+            "output-0",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    for feed in [
+        None,
+        Some(RoutedFeed::Program),
+        Some(RoutedFeed::Source("a".to_owned())),
+    ] {
+        if let Some(feed) = feed {
+            multiview_control::cast_streams::lifecycle::submit_take(
+                &rig.state,
+                &multiview_control::cast_streams::lifecycle::cast_operation_id(),
+                "cast-1",
+                &feed,
+                None,
+                "cs-op2",
+            )
+            .unwrap();
+        }
+        let now = rig.state.cast_streams.generation("cast-1").unwrap();
+        assert!(now > last, "the take moved the generation");
+        last = now;
+        for _ in 0..5 {
+            assert_eq!(statuses(&rig, &token).await, vec![StatusCode::OK; 3]);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+const JWT_SECRET: &[u8] = b"cast-jwt-secret-shared-with-as";
+const JWT_ISS: &str = "https://auth.cast.example";
+const JWT_AUD: &str = "multiview";
+
+fn jwt_rig() -> Rig {
+    rig_with(|state| {
+        state
+            .with_jwt(
+                Arc::new(multiview_control::JwtValidator::new_hs256(
+                    JWT_SECRET.to_vec(),
+                    JWT_ISS,
+                    JWT_AUD,
+                )),
+                JWT_AUD,
+            )
+            .with_ack_clock(Arc::new(|| {
+                multiview_core::time::MediaTime::from_nanos(1_800_000_000_000_000_000)
+            }))
+    })
+}
+
+fn jwt_for(sub: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use hmac::{KeyInit, Mac};
+    let b64 = |v: &serde_json::Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+    let input = format!(
+        "{}.{}",
+        b64(&serde_json::json!({"alg": "HS256", "typ": "JWT"})),
+        b64(&serde_json::json!({
+            "iss": JWT_ISS, "sub": sub, "aud": [JWT_AUD],
+            "exp": 1_900_000_000i64, "iat": 1_700_000_000i64,
+            "x-nmos-api": {"version": "1.0", "access": {"multiview": "write"}}
+        })),
+    );
+    let mut mac = <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(JWT_SECRET).unwrap();
+    mac.update(input.as_bytes());
+    format!(
+        "{input}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
+
+/// ABUSE-3: with JWT validation configured, an unscoped NATIVE API key that
+/// created a stream and is then revoked does not come back as a "JWT
+/// owner": its token dies on the next take and on the periodic re-check.
+#[tokio::test]
+async fn a_revoked_native_key_never_resolves_as_a_jwt_owner() {
+    let rig = jwt_rig();
+    let (status, doc) = create(&rig, FRESH, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let (status, other) = create(&rig, OPERATOR_2, serde_json::json!({"output": "output-1"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{other}");
+    assert_eq!(
+        statuses(&rig, &token_of(&other)).await,
+        vec![StatusCode::OK; 3]
+    );
+    assert!(rig.state.api_keys.revoke("cs-fresh"));
+    assert!(rig.state.api_keys.revoke("cs-op2"));
+    // A take on output-0 revokes the first …
+    let r = send(
+        &rig.router,
+        route_take(
+            OPERATOR_TOKEN,
+            "abuse-3-take",
+            "output-0",
+            serde_json::json!({"bus": "program"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        statuses(&rig, &token_of(&doc)).await,
+        vec![StatusCode::NOT_FOUND; 3]
+    );
+    // … and the periodic re-check (no take) the second.
+    let other = token_of(&other);
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    assert_eq!(statuses(&rig, &other).await, vec![StatusCode::NOT_FOUND; 3]);
+}
+
+/// ABUSE-3, the positive case: a genuine JWT-authenticated owner (not in the
+/// key store) keeps its token across a take and the periodic re-check.
+#[tokio::test]
+async fn a_genuine_jwt_owner_keeps_its_token() {
+    let rig = jwt_rig();
+    let jwt = jwt_for("jwt-caster");
+    let (status, doc) = create(&rig, &jwt, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    let r = send(
+        &rig.router,
+        route_take(
+            OPERATOR_TOKEN,
+            "abuse-3-jwt",
+            "output-0",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert_eq!(statuses(&rig, &token).await, vec![StatusCode::OK; 3]);
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    assert_eq!(statuses(&rig, &token).await, vec![StatusCode::OK; 3]);
 }

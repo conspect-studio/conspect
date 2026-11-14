@@ -10600,7 +10600,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The role cannot write, or the caller may not read the output (object AND output axis) or the feed (a layout: its whole source closure). */
+            /** @description The role cannot write, or the caller may not read the output (object AND output axis) or the feed (a layout: its whole source closure), or a feed the output was taken to while the stream was being created. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -10618,7 +10618,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `cast-unavailable` (no usable cast output, the engine is not running, or the output's own error), `cast-capacity` (every cast output in use, or 32 streams / 8 for this caller), `cast-no-encoder` (no free encoder session for the take), or a routing refusal of the take passed through (`switcher-required`, `aux-capacity`, `output-kind-unroutable`, `routing-unavailable`, `refused:*`). */
+            /** @description `cast-unavailable` (no usable cast output, the engine is not running, or the output's own error), `cast-capacity` (every cast output in use, or 32 streams / 8 for this caller), `cast-no-encoder` (no free encoder session for the take), `cast-feed-changed` (the output's feed kept changing while the stream was being created: retry), or a routing refusal of the take passed through (`switcher-required`, `aux-capacity`, `output-kind-unroutable`, `routing-unavailable`, `refused:*`). */
             409: {
                 headers: {
                     [name: string]: unknown;

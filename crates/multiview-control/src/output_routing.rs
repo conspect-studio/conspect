@@ -1115,18 +1115,11 @@ async fn relay_one(
     let Some(api_id) = api_id else {
         return;
     };
-    // ABUSE-1 backstop: whatever moved the output (a take, an engine
-    // fallback), its cast tokens must still be readable by their owners.
-    if let Some(feed) = &outcome.feed {
-        crate::cast_streams::reauth::before_change(
-            state,
-            &outcome.output,
-            Some(feed),
-            None,
-            outcome.audio.as_ref(),
-            "engine",
-        );
-    }
+    // ABUSE-1: whatever moved the output (a take, an engine fallback), its
+    // cast tokens must still be readable by their owners.
+    // Relayed at once (not on the 5 s sweep): a feed the gate did not clear
+    // moves the output's generation and re-authorizes its tokens first.
+    crate::cast_streams::reauth::on_outcome(state, &outcome);
     // The feed to persist rides the outcome itself, so an `applied` persists
     // whether or not this process still holds the take's record. An
     // audio-only take (its record says so) keeps the persisted video.

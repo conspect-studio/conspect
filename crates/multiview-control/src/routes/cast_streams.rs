@@ -485,9 +485,9 @@ async fn authorized_feed(
         responses(
             (status = 201, description = "Created; `path` carries the token (shown only here and in the owner's GET).", body = CastStreamDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 403, description = "The role cannot write, or the caller may not read the output (object AND output axis) or the feed (a layout: its whole source closure).", body = crate::problem::Problem),
+            (status = 403, description = "The role cannot write, or the caller may not read the output (object AND output axis) or the feed (a layout: its whole source closure), or a feed the output was taken to while the stream was being created.", body = crate::problem::Problem),
             (status = 404, description = "Unknown output.", body = crate::problem::Problem),
-            (status = 409, description = "`cast-unavailable` (no usable cast output, the engine is not running, or the output's own error), `cast-capacity` (every cast output in use, or 32 streams / 8 for this caller), `cast-no-encoder` (no free encoder session for the take), or a routing refusal of the take passed through (`switcher-required`, `aux-capacity`, `output-kind-unroutable`, `routing-unavailable`, `refused:*`).", body = crate::problem::Problem),
+            (status = 409, description = "`cast-unavailable` (no usable cast output, the engine is not running, or the output's own error), `cast-capacity` (every cast output in use, or 32 streams / 8 for this caller), `cast-no-encoder` (no free encoder session for the take), `cast-feed-changed` (the output's feed kept changing while the stream was being created: retry), or a routing refusal of the take passed through (`switcher-required`, `aux-capacity`, `output-kind-unroutable`, `routing-unavailable`, `refused:*`).", body = crate::problem::Problem),
             (status = 422, description = "`unknown-feed` / `layout-not-admissible`, or a malformed body.", body = crate::problem::Problem),
             (status = 429, description = "Over 4 creations in a burst, then 1/s, per principal; see Retry-After.", body = crate::problem::Problem),
             (status = 503, description = "`engine-busy`: the take could not be enqueued or did not settle within 3 s.", body = crate::problem::Problem),
@@ -497,11 +497,13 @@ async fn authorized_feed(
 pub(crate) async fn create_cast_stream(
     State(state): State<AppState>,
     principal: Principal,
+    headers: axum::http::HeaderMap,
     body: Option<Json<CreateCastStream>>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    Ok(match mint_stream(&state, &principal, &req).await? {
+    let origin = crate::routes::auth_origin(&headers, &state);
+    Ok(match mint_stream(&state, &principal, origin, &req).await? {
         Ok(minted) => {
             let doc = stream_doc(&state, minted.view, Some(&minted.token));
             (StatusCode::CREATED, Json(doc)).into_response()
@@ -521,10 +523,11 @@ pub(crate) struct Minted {
 /// Create a cast stream for `principal` exactly as `POST /cast/streams`
 /// does (authorization of both ends, limiter, feed choice, take, activate,
 /// audit). `Ok(Err(response))` is a refusal to answer as it is; the owner of
-/// the stream is `principal`.
+/// the stream is `principal`, authenticated by `origin` (ABUSE-3).
 pub(crate) async fn mint_stream(
     state: &AppState,
     principal: &Principal,
+    origin: crate::cast_streams::AuthOrigin,
     req: &CreateCastStream,
 ) -> ControlResult<Result<Minted, Response>> {
     let state = state.clone();
@@ -580,7 +583,7 @@ pub(crate) async fn mint_stream(
             }
         }
     };
-    open_stream(&state, &principal, choice, feed, layout_body).await
+    open_stream(&state, &principal, origin, choice, feed, layout_body).await
 }
 
 type Opened = (
@@ -660,10 +663,43 @@ fn engine_refused(error: &crate::cast_engine::CastEngineError) -> Response {
     unavailable(error.to_string())
 }
 
+/// ABUSE-1: arm the token at the output's authorization generation, for
+/// everything the output may carry now; a feed change that raced this
+/// creation re-checks, and an owner who may not read it gets no token
+/// (`403`; `409 cast-feed-changed` when the output kept changing). On a
+/// refusal the claim is undone.
+fn arm_or_release(
+    state: &AppState,
+    claim: &crate::cast_streams::Claim,
+    config_id: &str,
+    take: bool,
+) -> Option<Response> {
+    let forbidden = crate::cast_streams::reauth::arm_stream(state, &claim.id, config_id).err()?;
+    if take {
+        state.cast_streams.remove(&claim.id);
+    } else {
+        state.cast_streams.release_claim(&claim.id, claim.first);
+    }
+    crate::cast_streams::lifecycle::sweep_now(state);
+    Some(if forbidden {
+        ControlError::Forbidden(
+            "The cast output was taken to a feed this caller may not read".to_owned(),
+        )
+        .into_response()
+    } else {
+        cast_problem(
+            409,
+            "cast-feed-changed",
+            "The cast output's feed changed while the stream was being created; try again",
+        )
+    })
+}
+
 /// Claim, prepare the output (take + activate) and answer `201`.
 async fn open_stream(
     state: &AppState,
     principal: &Principal,
+    origin: crate::cast_streams::AuthOrigin,
     choice: Choice,
     feed: RoutedFeed,
     layout: Option<crate::output_routing::LayoutBody>,
@@ -694,7 +730,7 @@ async fn open_stream(
     };
     state
         .cast_streams
-        .bind_principal(&claim.id, principal.clone());
+        .bind_principal(&claim.id, principal.clone(), origin);
     let engine = state.cast_engine.clone();
     let Some(engine) = engine else {
         state.cast_streams.release_claim(&claim.id, claim.first);
@@ -744,6 +780,9 @@ async fn open_stream(
         }
         crate::cast_streams::lifecycle::sweep_now(state);
         return Ok(Err(engine_refused(&error)));
+    }
+    if let Some(refused) = arm_or_release(state, &claim, &status.id, take) {
+        return Ok(Err(refused));
     }
     state.audit(
         &principal.key_id,

@@ -295,6 +295,7 @@ async fn screen_cast_dial_target(address: &str, policy: &DialPolicy) -> ControlR
 pub(crate) async fn start_cast_session(
     State(state): State<AppState>,
     principal: Principal,
+    headers: axum::http::HeaderMap,
     Json(request): Json<StartCastSessionRequest>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
@@ -310,7 +311,8 @@ pub(crate) async fn start_cast_session(
         .as_ref()
         .is_some_and(|engine| !engine.outputs().is_empty());
     if cast_outputs {
-        return start_stream_session(&state, &principal, &request).await;
+        let origin = crate::routes::auth_origin(&headers, &state);
+        return start_stream_session(&state, &principal, origin, &request).await;
     }
     if request.feed.is_some() {
         return Ok(crate::routes::cast_streams::cast_problem(
@@ -448,6 +450,7 @@ fn public_base(state: &AppState) -> Result<String, Box<Response>> {
 async fn start_stream_session(
     state: &AppState,
     principal: &Principal,
+    origin: crate::cast_streams::AuthOrigin,
     request: &StartCastSessionRequest,
 ) -> ControlResult<Response> {
     use crate::devices::cast::media::{CastMediaTarget, HlsSegmentFormat};
@@ -461,10 +464,11 @@ async fn start_stream_session(
         feed: request.feed.clone(),
         output: request.output.clone(),
     };
-    let minted = match crate::routes::cast_streams::mint_stream(state, principal, &create).await? {
-        Ok(minted) => minted,
-        Err(refused) => return Ok(refused),
-    };
+    let minted =
+        match crate::routes::cast_streams::mint_stream(state, principal, origin, &create).await? {
+            Ok(minted) => minted,
+            Err(refused) => return Ok(refused),
+        };
     let stream_id = minted.view.id.clone();
     let url = format!("{base}/cast/{}/master.m3u8", minted.token);
     let media_url = redact_cast_url(&url);

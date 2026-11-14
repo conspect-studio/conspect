@@ -18,17 +18,34 @@
 //! the reason stays readable by its owner (`GET /cast/streams/{id}`), the
 //! revocation is audited and logged (never the token).
 //!
-//! Engine-originated changes (a fallback) and anything that slipped between
-//! the check and the publication are re-checked when the outcome arrives.
-//! Control plane only: short locks, no `.await`, nothing touches the engine.
+//! Fail-closed authorization generation (ABUSE-1, round 2). Each cast
+//! output has a generation in the registry; every token records the one it
+//! is armed at and `/cast/<token>/…` serves only at the CURRENT one:
+//!
+//! * a committed feed change ([`before_change`], before the engine hears)
+//!   bumps it, records what the output may now carry, and re-authorizes
+//!   every armed token for it — moved forward or revoked — in ONE critical
+//!   section of the registry lock, so no request can see a half-done step;
+//! * a creation arms its token only at the generation whose cleared feeds
+//!   it authorized the owner for ([`arm_stream`]); a generation that moved
+//!   meanwhile re-checks, then refuses (`409 cast-feed-changed`);
+//! * a feed the engine reports on its outcome ([`on_outcome`], relayed at
+//!   once) or shows on its readback before that outcome arrived (an engine
+//!   fallback; [`on_media`], run synchronously on every media request
+//!   before the token is looked up) that the gate does not clear is
+//!   re-authorized the same way first.
+//!
+//! The re-checks run under the registry lock (key-store read + pure scope
+//! checks; the grants were resolved before the lock). Control plane only:
+//! no `.await` under a lock, nothing touches the engine.
 
 use multiview_config::AudioFeed;
 
 use crate::auth::Principal;
-use crate::output_routing::{RoutedAudio, RoutedFeed, RoutedLayout};
+use crate::output_routing::{OutputOutcome, RoutedAudio, RoutedFeed, RoutedLayout};
 use crate::state::AppState;
 
-use super::OwnedStream;
+use super::{AuthOrigin, Change, ChangeMode, OwnedStream};
 
 /// The reason recorded when the owner may not read the new feed.
 pub(crate) const REASON_FEED: &str =
@@ -39,91 +56,241 @@ pub(crate) const REASON_OWNER: &str = "revoked: this stream's owner can no longe
 pub(crate) const REASON_UNKNOWN: &str =
     "revoked: what the cast output now carries could not be determined";
 
-/// One grant the new feed requires.
+/// One grant a feed requires.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Need {
+pub(crate) enum Need {
     /// Read on this object id.
     Object(String),
     /// The switcher-bus rule (Program scope + the M/E grant).
     Bus,
 }
 
-/// Re-check every live token on cast output `config_id` for the feed it is
-/// about to carry: `video` (`None`: unchanged, read back from the engine),
-/// `layout` (the resolved body of a layout `video`, when the caller has
-/// it), `audio` (`None`: the output's configured audio choice). `actor` is
-/// the key id the revocations are audited to. Returns the revoked ids.
+/// The owner check every gate operation runs on each armed token.
+fn check(
+    state: &AppState,
+) -> impl Fn(&OwnedStream, Option<&[Need]>) -> Result<(), &'static str> + '_ {
+    move |stream, needs| match (resolve_owner(state, stream), needs) {
+        (None, _) => Err(REASON_OWNER),
+        (Some(_), None) => Err(REASON_UNKNOWN),
+        (Some(owner), Some(needs)) if !permits(&owner, &stream.output, needs) => Err(REASON_FEED),
+        (Some(_), Some(_)) => Ok(()),
+    }
+}
+
+/// Audit and log what a gate operation revoked; end the cast sessions that
+/// played it. Returns the revoked ids.
+fn report(state: &AppState, revoked: Vec<(OwnedStream, &'static str)>, actor: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for (stream, reason) in revoked {
+        tracing::info!(stream = %stream.id, output = %stream.output, reason, "cast: stream token revoked");
+        state.audit(
+            actor,
+            crate::audit::AuditAction::Delete,
+            "cast_stream",
+            &stream.id,
+            Some(serde_json::json!({ "output": stream.output, "reason": reason })),
+        );
+        ids.push(stream.id);
+    }
+    if !ids.is_empty() {
+        // A server-side cast session that played a revoked stream ends too.
+        crate::routes::cast_sessions::reap_streamless_sessions(state);
+    }
+    ids
+}
+
+/// Commit the feed change cast output `config_id` is about to carry, BEFORE
+/// the engine hears of it: `op` the take's operation id (`None`: a change
+/// without an outcome), `video` (`None`: unchanged), `layout` (the resolved
+/// body of a layout `video`, when the caller has it), `audio` (`None`: the
+/// output's configured audio choice). Bumps the output's generation and
+/// re-authorizes every armed token for it in one critical section. `actor`
+/// is the key id the revocations are audited to. Returns the revoked ids.
 pub(crate) fn before_change(
     state: &AppState,
     config_id: &str,
+    op: Option<&str>,
     video: Option<&RoutedFeed>,
     layout: Option<&RoutedLayout>,
     audio: Option<&RoutedAudio>,
     actor: &str,
 ) -> Vec<String> {
-    let streams = state.cast_streams.live_on(config_id);
-    if streams.is_empty() {
+    if state
+        .cast_streams
+        .slots()
+        .iter()
+        .all(|s| s.config_id != config_id)
+    {
         return Vec::new();
     }
-    let needs = closure(state, config_id, video, layout, audio);
-    let mut revoked = Vec::new();
-    for stream in &streams {
-        let reason = match (resolve_owner(state, stream), &needs) {
-            (None, _) => REASON_OWNER,
-            (Some(_), None) => REASON_UNKNOWN,
-            (Some(owner), Some(needs)) if !permits(&owner, &stream.output, needs) => REASON_FEED,
-            (Some(_), Some(_)) => continue,
-        };
-        if state.cast_streams.revoke(&stream.id, reason).is_some() {
-            tracing::info!(stream = %stream.id, output = %stream.output, reason, "cast: stream token revoked");
-            state.audit(
-                actor,
-                crate::audit::AuditAction::Delete,
-                "cast_stream",
-                &stream.id,
-                Some(serde_json::json!({ "output": stream.output, "reason": reason })),
-            );
-            revoked.push(stream.id.clone());
-        }
-    }
-    if !revoked.is_empty() {
-        // A server-side cast session that played a revoked stream ends too.
-        crate::routes::cast_sessions::reap_streamless_sessions(state);
-    }
-    revoked
+    let change = Change {
+        op: op.map(str::to_owned),
+        bus: video.map(RoutedFeed::bus_name),
+        needs: closure(state, config_id, video, layout, audio),
+    };
+    let revoked = state.cast_streams.commit(config_id, change, &check(state));
+    report(state, revoked, actor)
 }
 
-/// [`before_change`] for every output with live tokens, on what each
-/// carries now (after a change of what a feed resolves to, e.g. an audio
-/// track re-pointed to another input).
+/// An engine outcome (relayed at once): the feed it reports. When the armed
+/// tokens were not authorized for it (an engine fallback, a take decided
+/// otherwise) they are re-authorized at a new generation first.
+pub(crate) fn on_outcome(state: &AppState, outcome: &OutputOutcome) -> Vec<String> {
+    let Some(feed) = &outcome.feed else {
+        return Vec::new();
+    };
+    if state
+        .cast_streams
+        .slots()
+        .iter()
+        .all(|s| s.config_id != outcome.output)
+    {
+        return Vec::new();
+    }
+    let needs = closure(
+        state,
+        &outcome.output,
+        Some(feed),
+        None,
+        outcome.audio.as_ref(),
+    );
+    let op = (!outcome.operation_id.is_empty()).then_some(outcome.operation_id.as_str());
+    let revoked = state.cast_streams.observe(
+        &outcome.output,
+        op,
+        &feed.bus_name(),
+        needs,
+        ChangeMode::Outcome,
+        &check(state),
+    );
+    report(state, revoked, "engine")
+}
+
+/// The media path's barrier, run before each `/cast/<token>/…` lookup: when
+/// the engine readback shows output `config_id` on a picture bus the gate
+/// does not clear (a fallback whose outcome is not relayed yet), its tokens
+/// are re-authorized for it NOW, at a new generation, before anything is
+/// served. Cheap when nothing changed (one readback load, one short lock).
+pub(crate) fn on_media(state: &AppState, config_id: &str) {
+    let Some(bus) = live_bus(state, config_id) else {
+        return;
+    };
+    if state.cast_streams.clears(config_id, &bus) {
+        return;
+    }
+    let (_, needs) = live_needs(state, config_id);
+    let revoked = state.cast_streams.observe(
+        config_id,
+        None,
+        &bus,
+        needs,
+        ChangeMode::Readback,
+        &check(state),
+    );
+    report(state, revoked, "engine");
+}
+
+/// Arm stream `id` on `config_id` for `principal` (a creation): the owner
+/// must be authorized for every feed the gate clears and for what the
+/// output carries now, at the generation it read. A generation that moves
+/// meanwhile is re-checked (bounded), then refused.
+///
+/// # Errors
+/// `Err(true)`: the owner may not read what the output may now carry;
+/// `Err(false)`: the output kept changing (or the stream is gone).
+pub(crate) fn arm_stream(state: &AppState, id: &str, config_id: &str) -> Result<(), bool> {
+    const ATTEMPTS: usize = 3;
+    let Some(stream) = state.cast_streams.owned(id) else {
+        return Err(false);
+    };
+    let check = check(state);
+    for _ in 0..ATTEMPTS {
+        let snapshot = state.cast_streams.arm_snapshot(config_id);
+        state.cast_streams.run_before_arm();
+        let (bus, current) = live_needs(state, config_id);
+        let mut needs = snapshot.needs.clone();
+        if let (Some(all), Some(current)) = (needs.as_mut(), current.as_ref()) {
+            all.extend(current.iter().cloned());
+        } else {
+            needs = None;
+        }
+        if check(&stream, needs.as_deref()).is_err() {
+            return Err(true);
+        }
+        match state
+            .cast_streams
+            .arm(id, snapshot.generation, bus.map(|bus| (bus, current)))
+        {
+            Ok(()) => return Ok(()),
+            Err(super::api::ArmError::Gone) => return Err(false),
+            Err(super::api::ArmError::Stale) => {}
+        }
+    }
+    Err(false)
+}
+
+/// [`before_change`]'s re-check for every output with live tokens, on what
+/// each carries now and under each owner's CURRENT grants (a re-scoped or
+/// revoked key, an audio track re-pointed to another input); a feed the
+/// gate did not clear moves the generation.
 pub(crate) fn recheck_all(state: &AppState, actor: &str) -> Vec<String> {
-    state
+    let mut ids = Vec::new();
+    for slot in state
         .cast_streams
         .slots()
         .into_iter()
-        .filter(|slot| slot.streams > 0)
-        .flat_map(|slot| before_change(state, &slot.config_id, None, None, None, actor))
-        .collect()
+        .filter(|s| s.streams > 0)
+    {
+        let (bus, needs) = live_needs(state, &slot.config_id);
+        let bus = bus.unwrap_or_else(|| slot.feed.bus_name());
+        let revoked = state.cast_streams.observe(
+            &slot.config_id,
+            None,
+            &bus,
+            needs,
+            ChangeMode::Recheck,
+            &check(state),
+        );
+        ids.extend(report(state, revoked, actor));
+    }
+    ids
 }
 
-/// The owner's CURRENT principal: the API-key store's entry for its key id
-/// (re-scoped / revoked keys take effect), else — only for an owner the
-/// store never holds — the principal it authenticated with at creation: the
-/// local admin while auth is disabled, or a JWT subject (unscoped by
-/// construction) while JWT validation is configured. Anything else does not
-/// resolve.
+/// The picture bus the readback shows the output on now and its grants
+/// (with the output's configured audio choice; `None` grants: unknown).
+fn live_needs(state: &AppState, config_id: &str) -> (Option<String>, Option<Vec<Need>>) {
+    let Some(bus) = live_bus(state, config_id) else {
+        return (None, closure(state, config_id, None, None, None));
+    };
+    let needs = RoutedFeed::from_bus_name(&bus)
+        .and_then(|feed| closure(state, config_id, Some(&feed), None, None));
+    (Some(bus), needs)
+}
+
+/// The picture bus the engine readback shows the output on now.
+fn live_bus(state: &AppState, config_id: &str) -> Option<String> {
+    let snapshot = state.output_routing.as_ref()?.routing.snapshot()?;
+    Some(snapshot.outputs.get(config_id)?.bus.clone())
+}
+
+/// The owner's CURRENT principal, by how it authenticated at creation
+/// (ABUSE-3): a native API key is always the key store's entry for its key
+/// id (re-scoped keys take effect; a key the store no longer holds fails
+/// closed, whatever else is configured); a JWT subject is the principal it
+/// authenticated with, while JWT validation stays configured; the local
+/// admin, while auth stays disabled. An unbound stream does not resolve.
 fn resolve_owner(state: &AppState, stream: &OwnedStream) -> Option<Principal> {
-    if let Some(principal) = state.api_keys.principal_for_key(&stream.owner) {
-        return Some(principal);
+    match stream.origin? {
+        AuthOrigin::ApiKey => state.api_keys.principal_for_key(&stream.owner),
+        AuthOrigin::Jwt => {
+            let recorded = stream.principal.clone()?;
+            (state.jwt.is_some() && recorded.key_id == stream.owner).then_some(recorded)
+        }
+        AuthOrigin::LocalAdmin => {
+            let recorded = stream.principal.clone()?;
+            (state.auth_disabled && recorded == Principal::local_admin()).then_some(recorded)
+        }
     }
-    let recorded = stream.principal.clone()?;
-    if recorded.key_id != stream.owner {
-        return None;
-    }
-    if state.auth_disabled && recorded == Principal::local_admin() {
-        return Some(recorded);
-    }
-    (state.jwt.is_some() && recorded.is_global()).then_some(recorded)
 }
 
 fn permits(owner: &Principal, output: &str, needs: &[Need]) -> bool {

@@ -63,6 +63,11 @@ pub const MAX_LIMITED_PRINCIPALS: usize = 1024;
 /// Server-side revocations remembered for their owner's `GET` (oldest
 /// forgotten first; each also ages out after [`MAX_LIFETIME`]).
 pub const MAX_REVOKED: usize = 2 * MAX_STREAMS;
+/// Committed, unsettled feed changes remembered per output (oldest
+/// forgotten first, which only narrows what its tokens are served).
+pub const MAX_CARRY: usize = 8;
+/// Output authorization gates kept (one per cast output in practice).
+pub const MAX_GATES: usize = 64;
 /// The background sweep period (a lazy sweep also runs on every API call).
 pub const SWEEP_PERIOD: Duration = Duration::from_secs(5);
 
@@ -76,6 +81,25 @@ fn system_clock() -> Clock {
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
     })
 }
+
+/// How a stream's owner authenticated when it created the stream
+/// (ABUSE-3): the re-authorization resolves the owner by this, never by
+/// the shape of its recorded principal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthOrigin {
+    /// A native API key: always re-resolved from the key store; a key the
+    /// store no longer holds fails closed.
+    ApiKey,
+    /// A validated JWT (its subject is not in the key store): the recorded
+    /// principal, while JWT validation stays configured.
+    Jwt,
+    /// The local admin of an auth-disabled run, while auth stays disabled.
+    LocalAdmin,
+}
+
+/// A test-only interposition hook (see [`CastStreams::set_before_arm`]).
+#[cfg(any(test, feature = "_test-seams"))]
+pub type ArmHook = Arc<dyn Fn() + Send + Sync>;
 
 /// What fetched the media of a stream (no token, no IP).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -129,6 +153,8 @@ pub struct CastStreams {
     sweeper: std::sync::atomic::AtomicBool,
     /// The registered custom receiver app id (8 upper-case hex characters).
     app_id: Mutex<Option<String>>,
+    #[cfg(any(test, feature = "_test-seams"))]
+    before_arm: Mutex<Option<ArmHook>>,
 }
 
 impl std::fmt::Debug for CastStreams {
@@ -161,6 +187,8 @@ impl CastStreams {
             clock,
             sweeper: std::sync::atomic::AtomicBool::new(false),
             app_id: Mutex::new(None),
+            #[cfg(any(test, feature = "_test-seams"))]
+            before_arm: Mutex::new(None),
         }
     }
 
@@ -182,6 +210,31 @@ impl CastStreams {
             .clone()
     }
 
+    /// TEST SEAM: run `hook` once, inside a stream creation, after its
+    /// authorization snapshot of the output and before it arms the token
+    /// (deterministic interleaving tests of ABUSE-1).
+    #[cfg(any(test, feature = "_test-seams"))]
+    pub fn set_before_arm(&self, hook: Option<ArmHook>) {
+        *self
+            .before_arm
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    pub(crate) fn run_before_arm(&self) {
+        #[cfg(any(test, feature = "_test-seams"))]
+        {
+            let hook = self
+                .before_arm
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
     /// `true` exactly once: the caller starts the sweep task.
     pub(crate) fn claim_sweeper(&self) -> bool {
         !self.sweeper.swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -195,6 +248,7 @@ impl CastStreams {
 }
 
 mod api;
+pub(crate) use api::{Change, ChangeMode};
 pub use api::{OwnedStream, SlotView};
 
 #[cfg(test)]

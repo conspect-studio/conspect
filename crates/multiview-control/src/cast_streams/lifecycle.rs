@@ -68,6 +68,7 @@ pub fn submit_take(
     super::reauth::before_change(
         state,
         config_id,
+        Some(operation_id),
         Some(feed),
         layout.as_ref().map(|body| body.0.as_ref()),
         None,
@@ -154,6 +155,13 @@ pub fn sweep_now(state: &AppState) {
     finish(state, &ended);
 }
 
+/// The periodic re-check of every live token under its owner's CURRENT
+/// grants (the sweep's backstop: a re-scoped or revoked key, a feed change
+/// no take path saw), audited to `cast`.
+pub fn recheck_now(state: &AppState) {
+    super::reauth::recheck_all(state, "cast");
+}
+
 /// Start the one 5 s sweep task (idempotent per registry).
 pub(crate) fn spawn_sweeper(state: &AppState) {
     if !state.cast_streams.claim_sweeper() {
@@ -177,7 +185,7 @@ pub(crate) fn spawn_sweeper(state: &AppState) {
             // Backstop (ABUSE-1): what an output carries now, under each
             // owner's current grants (a re-scoped or revoked key, a feed
             // change no take path saw).
-            super::reauth::recheck_all(&state, "cast");
+            recheck_now(&state);
             crate::routes::cast_sessions::reap_streamless_sessions(&state);
         }
     });

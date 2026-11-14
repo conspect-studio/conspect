@@ -1099,6 +1099,31 @@ pub(crate) fn authenticate_principal(
     }
 }
 
+/// How the request authenticated (ABUSE-3), by the same order
+/// [`authenticate_principal`] uses: the local admin of an auth-disabled run,
+/// a native API key that verifies, else a JWT. Only meaningful for a request
+/// whose [`Principal`] was extracted.
+pub(crate) fn auth_origin(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> crate::cast_streams::AuthOrigin {
+    use crate::cast_streams::AuthOrigin;
+    if state.auth_disabled {
+        return AuthOrigin::LocalAdmin;
+    }
+    let header = header_value(headers, header::AUTHORIZATION);
+    if state
+        .api_keys
+        .verify_authorization(header.as_deref())
+        .is_ok()
+        || state.jwt.is_none()
+    {
+        AuthOrigin::ApiKey
+    } else {
+        AuthOrigin::Jwt
+    }
+}
+
 /// Extract a header value as an owned string, if present and valid UTF-8.
 fn header_value(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
     headers

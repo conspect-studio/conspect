@@ -1,12 +1,11 @@
 //! [`CastStreams`] operations. Every method takes the one lock briefly and
 //! never across an `.await`.
 
-use super::registry::{
-    Claim, ClaimError, Ended, Entry, Registry, ReportError, Revoked, Slot, StreamView,
-};
+use super::reauth::Need;
+use super::registry::{Claim, ClaimError, Ended, Entry, Registry, ReportError, Slot, StreamView};
 use super::{
     bounded_user_agent, token, CastFetches, CastStreams, ReceiverFetch, ReceiverReport,
-    CREATE_BURST, CREATE_REFILL, MAX_LIFETIME, MAX_LIMITED_PRINCIPALS, MAX_REVOKED, MAX_STREAMS,
+    CREATE_BURST, CREATE_REFILL, MAX_LIFETIME, MAX_LIMITED_PRINCIPALS, MAX_STREAMS,
     MAX_STREAMS_PER_PRINCIPAL, REPORT_INTERVAL,
 };
 use crate::output_routing::RoutedFeed;
@@ -26,6 +25,70 @@ pub struct OwnedStream {
     pub output: String,
     /// The owner as authenticated at creation, when recorded.
     pub principal: Option<crate::auth::Principal>,
+    /// How the owner authenticated at creation (ABUSE-3; `None`: never
+    /// bound, fails closed).
+    pub origin: Option<super::AuthOrigin>,
+}
+
+impl OwnedStream {
+    fn of(e: &Entry) -> Self {
+        Self {
+            id: e.id.clone(),
+            owner: e.owner.clone(),
+            output: e.output.clone(),
+            principal: e.principal.clone(),
+            origin: e.origin,
+        }
+    }
+}
+
+/// The owner check a gate operation runs on every armed token, under the
+/// registry lock (no `.await`, no engine): `Err(reason)` revokes it. The
+/// grants are those of the output's feed (`None`: undeterminable).
+pub(crate) type Check<'a> = &'a dyn Fn(&OwnedStream, Option<&[Need]>) -> Result<(), &'static str>;
+
+/// A feed change the control plane commits on an output (ABUSE-1).
+#[derive(Debug, Clone)]
+pub(crate) struct Change {
+    /// The take that commits it (`None`: a move without an outcome).
+    pub op: Option<String>,
+    /// Its picture bus (`None`: unchanged).
+    pub bus: Option<String>,
+    /// What it requires (`None`: undeterminable).
+    pub needs: Option<Vec<Need>>,
+}
+
+/// What the output was seen to carry: by an outcome (`op` set when it
+/// settles a take), the media path's readback, or a periodic re-check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangeMode {
+    /// An engine outcome: settles its take (and older ones).
+    Outcome,
+    /// The readback shows a bus the gate does not clear (a fallback the
+    /// relay has not delivered yet): re-authorize when not covered.
+    Readback,
+    /// Re-check every token against the current grants (a re-scoped key, a
+    /// re-pointed track): no generation move unless the needs grew.
+    Recheck,
+}
+
+/// A gate snapshot for arming a new token: its generation and what a new
+/// token must be authorized for besides the output's current feed.
+#[derive(Debug, Clone)]
+pub(crate) struct Arm {
+    /// The generation read.
+    pub generation: u64,
+    /// The cleared grants (`None`: undeterminable: refuse).
+    pub needs: Option<Vec<Need>>,
+}
+
+/// Why a token could not be armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArmError {
+    /// The output's generation moved since the snapshot: re-check.
+    Stale,
+    /// The stream is gone (revoked or expired).
+    Gone,
 }
 
 /// A cast output the registry holds: what it shows and how many streams.
@@ -161,6 +224,8 @@ impl CastStreams {
             fetches: CastFetches::default(),
             last_report: None,
             principal: None,
+            origin: None,
+            generation: None,
         });
         Ok(Claim { id, token, first })
     }
@@ -182,12 +247,236 @@ impl CastStreams {
         Some(Registry::view(&entry))
     }
 
-    /// Record the owner's principal as authenticated at creation (the
-    /// fallback when the API-key store does not hold the owner).
-    pub fn bind_principal(&self, id: &str, principal: crate::auth::Principal) {
+    /// Record the owner's principal and how it authenticated at creation
+    /// (ABUSE-3: the re-authorization resolves it by that provenance).
+    pub fn bind_principal(
+        &self,
+        id: &str,
+        principal: crate::auth::Principal,
+        origin: super::AuthOrigin,
+    ) {
         if let Some(entry) = self.lock().entries.iter_mut().find(|e| e.id == id) {
             entry.principal = Some(principal);
+            entry.origin = Some(origin);
         }
+    }
+
+    /// The gate of output `config_id` for arming a token (created at a
+    /// fresh generation on first use).
+    pub(crate) fn arm_snapshot(&self, config_id: &str) -> Arm {
+        let mut inner = self.lock();
+        let gate = inner.gate_mut(config_id);
+        Arm {
+            generation: gate.generation,
+            needs: gate.cleared_needs(),
+        }
+    }
+
+    /// Arm stream `id` at `generation` (its owner was checked against that
+    /// snapshot and against `current`, the output's feed it read: `(bus,
+    /// grants)`). A generation that moved meanwhile is [`ArmError::Stale`]:
+    /// no token is ever served against a stale feed.
+    ///
+    /// # Errors
+    /// [`ArmError`].
+    pub(crate) fn arm(
+        &self,
+        id: &str,
+        generation: u64,
+        current: Option<(String, Option<Vec<Need>>)>,
+    ) -> Result<(), ArmError> {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let at = inner
+            .entries
+            .iter()
+            .position(|e| e.id == id && !e.expired(now))
+            .ok_or(ArmError::Gone)?;
+        let config_id = inner
+            .entries
+            .get(at)
+            .map(|e| e.config_id.clone())
+            .ok_or(ArmError::Gone)?;
+        let gate = inner.gates.get_mut(&config_id).ok_or(ArmError::Stale)?;
+        if gate.generation != generation {
+            return Err(ArmError::Stale);
+        }
+        if gate.settled.is_none() {
+            gate.settled = current;
+        }
+        if let Some(entry) = inner.entries.get_mut(at) {
+            entry.generation = Some(generation);
+        }
+        Ok(())
+    }
+
+    /// Re-check every armed token on `config_id` against `needs`, at a new
+    /// generation (`bump`) or the current one; revoke the failing ones
+    /// (under the lock the caller holds).
+    fn recheck(
+        inner: &mut Registry,
+        config_id: &str,
+        needs: Option<&[Need]>,
+        bump: bool,
+        check: Check<'_>,
+        reasons: &mut Vec<(OwnedStream, &'static str)>,
+        now: u64,
+    ) {
+        let generation = if bump {
+            inner.bump(config_id)
+        } else {
+            inner.gate_mut(config_id).generation
+        };
+        let mut at = 0;
+        while let Some(entry) = inner.entries.get(at) {
+            if entry.config_id != config_id || entry.generation.is_none() || entry.expired(now) {
+                at += 1;
+                continue;
+            }
+            let stream = OwnedStream::of(entry);
+            match check(&stream, needs) {
+                Ok(()) => {
+                    if let Some(entry) = inner.entries.get_mut(at) {
+                        entry.generation = Some(generation);
+                    }
+                    at += 1;
+                }
+                Err(reason) => {
+                    let _ = inner.revoke_at(at, reason, now);
+                    reasons.push((stream, reason));
+                }
+            }
+        }
+    }
+
+    /// Commit `change` on output `config_id` (ABUSE-1), in ONE critical
+    /// section: a new generation, the change carried (what the output may
+    /// now carry, until an outcome settles it), every armed token
+    /// re-authorized for it and moved to the new generation or revoked.
+    /// Nothing to do on an output without streams. Returns the revoked.
+    pub(crate) fn commit(
+        &self,
+        config_id: &str,
+        change: Change,
+        check: Check<'_>,
+    ) -> Vec<(OwnedStream, &'static str)> {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let mut revoked = Vec::new();
+        if !inner.slots.contains_key(config_id)
+            && !inner.entries.iter().any(|e| e.config_id == config_id)
+        {
+            return revoked;
+        }
+        let gate = inner.gate_mut(config_id);
+        while gate.carry.len() >= super::MAX_CARRY {
+            gate.carry.pop_front();
+        }
+        gate.carry.push_back(super::registry::Carry {
+            op: change.op,
+            bus: change.bus,
+            needs: change.needs,
+        });
+        // Every token at the new generation is authorized for EVERYTHING
+        // the output may carry now (the invariant of [`super::registry::Gate`]).
+        let needs = gate.cleared_needs();
+        Self::recheck(
+            &mut inner,
+            config_id,
+            needs.as_deref(),
+            true,
+            check,
+            &mut revoked,
+            now,
+        );
+        revoked
+    }
+
+    /// The output `config_id` was seen on `bus` requiring `needs` (see
+    /// [`ChangeMode`]). When the armed tokens were not already authorized
+    /// for all of it (or on [`ChangeMode::Recheck`]), every one is
+    /// re-authorized in the same critical section — at a new generation
+    /// when the needs are new. Returns the revoked.
+    pub(crate) fn observe(
+        &self,
+        config_id: &str,
+        op: Option<&str>,
+        bus: &str,
+        needs: Option<Vec<Need>>,
+        mode: ChangeMode,
+        check: Check<'_>,
+    ) -> Vec<(OwnedStream, &'static str)> {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let mut revoked = Vec::new();
+        if !inner.slots.contains_key(config_id)
+            && !inner.entries.iter().any(|e| e.config_id == config_id)
+        {
+            return revoked;
+        }
+        let gate = inner.gate_mut(config_id);
+        let covered = match (&needs, gate.cleared_needs()) {
+            (Some(needs), Some(cleared)) => needs.iter().all(|n| cleared.contains(n)),
+            _ => false,
+        };
+        if mode == ChangeMode::Outcome {
+            gate.settle(op);
+        }
+        gate.settled = Some((bus.to_owned(), needs));
+        if !covered || mode == ChangeMode::Recheck {
+            // What the output may carry now, under the current grants.
+            let all = gate.cleared_needs();
+            Self::recheck(
+                &mut inner,
+                config_id,
+                all.as_deref(),
+                !covered,
+                check,
+                &mut revoked,
+                now,
+            );
+        }
+        revoked
+    }
+
+    /// Whether every armed token on `config_id` is authorized for the
+    /// picture bus `bus` (the media path's check of the readback).
+    #[must_use]
+    pub(crate) fn clears(&self, config_id: &str, bus: &str) -> bool {
+        self.lock()
+            .gates
+            .get(config_id)
+            .is_some_and(|g| g.clears(bus))
+    }
+
+    /// Stream `id` as the re-authorization reads it (armed or not).
+    #[must_use]
+    pub(crate) fn owned(&self, id: &str) -> Option<OwnedStream> {
+        self.lock()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(OwnedStream::of)
+    }
+
+    /// TEST SEAM: the tokens on `config_id` a public request would be
+    /// served for now.
+    #[cfg(any(test, feature = "_test-seams"))]
+    #[must_use]
+    pub fn servable_on(&self, config_id: &str) -> usize {
+        let now = self.now_ms();
+        let inner = self.lock();
+        inner
+            .entries
+            .iter()
+            .filter(|e| e.config_id == config_id && !e.expired(now) && inner.servable(e))
+            .count()
+    }
+
+    /// The generation of output `config_id` (`None`: no gate; tests).
+    #[must_use]
+    pub fn generation(&self, config_id: &str) -> Option<u64> {
+        self.lock().gates.get(config_id).map(|g| g.generation)
     }
 
     /// The live streams on the output `config_id`.
@@ -198,12 +487,7 @@ impl CastStreams {
             .entries
             .iter()
             .filter(|e| e.config_id == config_id && !e.expired(now))
-            .map(|e| OwnedStream {
-                id: e.id.clone(),
-                owner: e.owner.clone(),
-                output: e.output.clone(),
-                principal: e.principal.clone(),
-            })
+            .map(OwnedStream::of)
             .collect()
     }
 
@@ -214,19 +498,7 @@ impl CastStreams {
         let now = self.now_ms();
         let mut inner = self.lock();
         let at = inner.entries.iter().position(|e| e.id == id)?;
-        let entry = inner.entries.remove(at);
-        inner.last_report_ms.remove(id);
-        let horizon = now.saturating_sub(ms(MAX_LIFETIME));
-        inner.revoked.retain(|r| r.at_ms >= horizon);
-        while inner.revoked.len() >= MAX_REVOKED {
-            inner.revoked.pop_front();
-        }
-        inner.revoked.push_back(Revoked {
-            id: entry.id.clone(),
-            owner: entry.owner.clone(),
-            reason: reason.to_owned(),
-            at_ms: now,
-        });
+        let entry = inner.revoke_at(at, reason, now);
         Some(Registry::view(&entry))
     }
 
@@ -293,6 +565,23 @@ impl CastStreams {
         let at = inner.find(token, now)?;
         let entry = inner.entries.get(at)?;
         Some((entry.id.clone(), entry.config_id.clone()))
+    }
+
+    /// What a public request with `token` may be served (ABUSE-1): the
+    /// stream id and output config id of a live token armed at its output's
+    /// CURRENT generation, else `None` (the same 404 as an unknown token).
+    #[must_use]
+    pub fn serve(&self, token: &str) -> Option<(String, String)> {
+        if !token::well_formed(token) {
+            return None;
+        }
+        let now = self.now_ms();
+        let inner = self.lock();
+        let at = inner.find(token, now)?;
+        let entry = inner.entries.get(at)?;
+        inner
+            .servable(entry)
+            .then(|| (entry.id.clone(), entry.config_id.clone()))
     }
 
     /// Count a successful fetch on stream `id`; a playlist moves it to
