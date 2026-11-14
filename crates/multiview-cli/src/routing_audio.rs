@@ -1838,6 +1838,7 @@ mod tests {
                     },
                     slates: Vec::new(),
                     audio,
+                    overlays: multiview_config::LayoutOverlays::none(),
                     revision: 0,
                 },
             )))

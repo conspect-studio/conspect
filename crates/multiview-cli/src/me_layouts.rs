@@ -339,6 +339,7 @@ mod tests {
             },
             slates: vec![],
             audio: multiview_config::LayoutAudio::default(),
+            overlays: multiview_config::LayoutOverlays::none(),
             revision,
         }))
     }

@@ -4485,6 +4485,11 @@ export interface components {
             view: components["schemas"]["View"];
         };
         /**
+         * @description How the page animation becomes frames.
+         * @enum {string}
+         */
+        CaptureMode: "steps" | "realtime";
+        /**
          * @description One ephemeral cast session as the API serves it: the descriptive record
          *     plus the live lifecycle state.
          */
@@ -8515,6 +8520,11 @@ export interface components {
             output?: string | null;
         };
         /**
+         * @description Steps-mode duration rule.
+         * @enum {string}
+         */
+        StepTiming: "equal" | "proportional";
+        /**
          * @description `OpenAPI` mirror of [`multiview_core::stream::StreamDescriptor`].
          *
          *     Serde-equivalent: the [`StreamKindDoc`] is **flattened** (so a descriptor
@@ -9246,11 +9256,22 @@ export interface components {
         };
         /** @description Site-specific bounded view. */
         View: {
+            capture?: null | components["schemas"]["CaptureMode"];
+            /**
+             * Format: int32
+             * @description Steps-mode hold of the newest step in ms, 0 through 10000 (default 1000).
+             */
+            end_hold_ms?: number;
             /**
              * Format: int32
              * @description Capture cadence.
              */
             fps: number;
+            /**
+             * Format: int32
+             * @description Steps-mode per-step duration in ms, 100 through 5000 (default 600).
+             */
+            frame_ms?: number;
             /**
              * Format: int32
              * @description Capture frame count.
@@ -9271,10 +9292,17 @@ export interface components {
              * @description Longitude.
              */
             lon: number;
+            /**
+             * Format: int32
+             * @description Steps-mode count of most recent radar steps, 2 through 48 (default 12).
+             */
+            max_steps?: number;
             /** @description Radar or wind. */
             overlay: string;
             /** @description Explicitly use the public unauthenticated page. Default requests Premium. */
             public?: boolean;
+            /** @description Steps-mode per-step duration rule (default `equal`). */
+            timing?: components["schemas"]["StepTiming"];
             /**
              * Format: int32
              * @description Pixel width.
@@ -18268,7 +18296,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file) on a full-engine run — `restart` otherwise (ndi/youtube/aes67, or a run without the decoder; ADR-W018). */
+            /** @description The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file, and youtube on a build with the `youtube` feature) on a full-engine run — `restart` otherwise (ndi/aes67, or a run without the decoder; ADR-W018). */
             201: {
                 headers: {
                     [name: string]: unknown;
@@ -18479,7 +18507,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description This run cannot start sources. */
+            /** @description This run cannot start sources, or the source is saved but applies on restart (the detail says which). */
             409: {
                 headers: {
                     [name: string]: unknown;

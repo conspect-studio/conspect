@@ -409,6 +409,12 @@ pub mod webrtc_unified;
 
 /// A routed stored layout's integer aux canvas (ADR-0108 slice 3).
 pub mod aux_layout;
+/// The multiview overlay layers on a routed layout's aux canvas.
+#[cfg(feature = "overlay")]
+pub mod aux_overlays;
+/// Content-fault probe construction shared by Program and routed layouts.
+#[cfg(feature = "overlay")]
+pub mod fault_probes;
 /// Per-output format convert with a shared per-tick cache (#342).
 pub mod format_convert;
 /// Stored layouts as M/E sources (#307): the engine side of the registry.

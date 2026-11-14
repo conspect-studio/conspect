@@ -69,6 +69,7 @@ fn env(script: &str, config: Config) -> Env {
         node,
         browser: stub.clone(),
         ffmpeg: stub,
+        gl: multiview_webengine::capture::BrowserGl::Default,
     };
     let service = Service::start(tools, store_at(dir.path()), config).unwrap();
     Env { dir, work, service }
@@ -92,6 +93,7 @@ fn request(fill: &str) -> Request {
             windy: None,
             background: Background::Opaque,
             document: SECRET.into(),
+            capture: multiview_webengine::capture::CaptureOptions::default(),
         },
         maximum_bytes: 1000,
         timeout: Duration::from_secs(60),
@@ -486,6 +488,7 @@ fn checkpoint_restart_continues_ids_and_generations() {
         node: node.clone(),
         browser: stub.clone(),
         ffmpeg: stub.clone(),
+        gl: multiview_webengine::capture::BrowserGl::Default,
     };
     let store = store_at(dir.path());
     let service = Service::start(tools(), store, config(2, 8)).unwrap();
@@ -570,6 +573,7 @@ fn actual_browser_capture_through_service_is_pinnable() {
             node: var("CONSPECT_WEB_NODE").or_else(|| which("node"))?,
             browser: var("CONSPECT_WEB_BROWSER").or_else(browser)?,
             ffmpeg: var("CONSPECT_WEB_FFMPEG").or_else(|| which("ffmpeg"))?,
+            gl: multiview_webengine::capture::BrowserGl::Default,
         })
     })();
     let Some(tools) = tools else {
@@ -633,6 +637,7 @@ impl Durable {
             node: self.node.clone(),
             browser: self.stub.clone(),
             ffmpeg: self.stub.clone(),
+            gl: multiview_webengine::capture::BrowserGl::Default,
         }
     }
     fn store(&self) -> ArtifactStore {

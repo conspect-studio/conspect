@@ -737,6 +737,7 @@ fn routed(id: &str) -> LayoutBody {
         layout: (*scene("a")).clone(),
         slates: vec![multiview_config::FailoverSlate::Black],
         audio: multiview_config::LayoutAudio::default(),
+        overlays: multiview_config::LayoutOverlays::none(),
         revision: 1,
     }))
 }
