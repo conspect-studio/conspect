@@ -70,10 +70,7 @@ impl<C: CastConnector + 'static> DevicePollerFactory for CastSessionFactory<C> {
             config.app_id = launch.app_id;
             (launch.media, config, Some(launch.title))
         } else {
-            match self.resolve_rendition(device) {
-                Some(target) => (target, self.config, None),
-                None => return None,
-            }
+            (self.resolve_rendition(device)?, self.config, None)
         };
         let state_store = Arc::clone(&wiring.cast_sessions);
         let state_id = device.id.clone();

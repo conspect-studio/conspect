@@ -1,5 +1,5 @@
 //! ADR-0111 C2: a server-side Cast session (ADR-M011) plays a cast stream
-//! when the engine runs a cast output: it LAUNCHes the configured receiver
+//! when the engine runs a cast output: it launches the configured receiver
 //! app, LOADs the absolute `https` token URL (fMP4, LIVE), owns its stream
 //! (stop revokes it, a revoked stream ends the session), publishes the
 //! player state, and never exposes the token (answer, list, audit, events,

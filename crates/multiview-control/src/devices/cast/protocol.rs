@@ -202,7 +202,9 @@ pub fn load_frame_titled(
         "customData": { "title": title },
     });
     if media.format == HlsSegmentFormat::Fmp4 {
-        body["hlsSegmentFormat"] = serde_json::Value::from("fmp4");
+        if let Some(fields) = body.as_object_mut() {
+            fields.insert("hlsSegmentFormat".to_owned(), "fmp4".into());
+        }
     }
     frame(
         NS_MEDIA,

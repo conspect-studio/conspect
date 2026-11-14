@@ -178,7 +178,7 @@ pub struct CastSessionConfig {
     /// How long the establishment waits for the LAUNCH (and a reconnect for
     /// its `GET_STATUS` answer) before the attempt is declared unreachable.
     pub launch_timeout: Duration,
-    /// The receiver app the session LAUNCHes and recognises in
+    /// The receiver app the session launches and recognises in
     /// `RECEIVER_STATUS` (Google's Default Media Receiver `CC1AD845` unless
     /// a registered custom receiver is configured).
     pub app_id: CastAppId,

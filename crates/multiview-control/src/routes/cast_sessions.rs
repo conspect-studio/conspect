@@ -261,7 +261,7 @@ async fn screen_cast_dial_target(address: &str, policy: &DialPolicy) -> ControlR
 ///
 /// When the engine runs a cast output (ADR-0111) the session creates its own
 /// cast stream (`feed` / `output` as `POST /cast/streams` takes them, same
-/// authorization, owner = the caller), LAUNCHes the configured receiver app
+/// authorization, owner = the caller), launches the configured receiver app
 /// (the registered custom receiver, else the Default Media Receiver
 /// `CC1AD845`) and LOADs `{control.cast_media_base}/cast/<token>/master.m3u8`
 /// (fMP4, LIVE). The session owns the stream: stopping the session revokes
@@ -421,7 +421,7 @@ pub(crate) async fn start_cast_session(
 /// `409 cast-no-public-base` refusal: a TV resolves names through public DNS
 /// and the receiver page refuses mixed content, so a relative path or an
 /// `http://` base would LOAD a URL the TV cannot play.
-fn public_base(state: &AppState) -> Result<String, Response> {
+fn public_base(state: &AppState) -> Result<String, Box<Response>> {
     state
         .cast_delivery
         .as_ref()
@@ -429,19 +429,19 @@ fn public_base(state: &AppState) -> Result<String, Response> {
         .filter(|base| base.is_https())
         .map(|base| base.as_str().to_owned())
         .ok_or_else(|| {
-            crate::routes::cast_streams::cast_problem(
+            Box::new(crate::routes::cast_streams::cast_problem(
                 409,
                 "cast-no-public-base",
                 "A TV needs an absolute https:// address for the stream: set \
                  control.cast_media_base to this engine's public https origin (for example \
                  https://engine.example.org) and restart",
-            )
+            ))
         })
 }
 
 /// Start a session that plays its own cast stream: the stream is created
 /// exactly as `POST /cast/streams` creates it (same authorization, owner =
-/// the caller), the session LAUNCHes the configured receiver app and LOADs
+/// the caller), the session launches the configured receiver app and loads
 /// the absolute token URL. The token never leaves this function except in
 /// the actor's LOAD: the record, the answer, the audit entry and the events
 /// carry the redacted URL.
@@ -455,7 +455,7 @@ async fn start_stream_session(
     use crate::devices::cast::store::{redact_cast_url, SessionLaunch};
     let base = match public_base(state) {
         Ok(base) => base,
-        Err(refused) => return Ok(refused),
+        Err(refused) => return Ok(*refused),
     };
     let create = crate::routes::cast_streams::CreateCastStream {
         feed: request.feed.clone(),
