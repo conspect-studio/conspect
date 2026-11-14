@@ -657,11 +657,19 @@ impl AuxState {
             return;
         }
         if let Some(overlays) = inputs.overlays.as_ref() {
+            // Bounded by construction: at most MAX_PARALLEL_BAKES baking
+            // layouts (config caps routed layouts at the same bound) of at
+            // most MAX_BAKED_CELLS cells each (larger layouts get no bake).
             let sources: std::collections::HashSet<String> = self
                 .per_feed
                 .values()
                 .filter_map(|f| f.bake.as_ref())
-                .flat_map(crate::aux_overlays::LayoutOverlayBake::bound_sources)
+                .take(MAX_PARALLEL_BAKES)
+                .flat_map(|bake| {
+                    bake.bound_sources()
+                        .take(crate::aux_overlays::MAX_BAKED_CELLS)
+                })
+                .take(crate::aux_overlays::MAX_WANTED_SOURCES)
                 .map(str::to_owned)
                 .collect();
             let wanted = self.per_feed.values().any(|f| f.bake.is_some());
@@ -1467,6 +1475,7 @@ codec = "h264"
                 watermark: None,
                 wall_clock: crate::wallclock::WallClockSource::system(),
                 canvas_color: color,
+                source_probes: Arc::default(),
             }),
         })
         .unwrap();
@@ -1555,6 +1564,7 @@ codec = "h264"
                 watermark: None,
                 wall_clock,
                 canvas_color: CanvasColor::default(),
+                source_probes: Arc::default(),
             }),
         })
         .unwrap();

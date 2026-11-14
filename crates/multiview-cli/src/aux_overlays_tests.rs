@@ -84,6 +84,7 @@ fn inputs() -> AuxOverlayInputs {
         watermark: None,
         wall_clock: WallClockSource::system(),
         canvas_color: CanvasColor::default(),
+        source_probes: Arc::default(),
     }
 }
 
@@ -577,4 +578,193 @@ fn an_aux_only_black_source_shows_black_after_the_dwell() {
         None,
     );
     assert_eq!(bake.last_dynamics()["s1"].fault, TileFault::None);
+}
+
+/// Drive `ticks` ticks of `body` with every store publishing a solid `luma`
+/// frame (s0 uses `s0_luma`), baking with `signals`; return the bake.
+fn drive_solid(
+    body: &Arc<RoutedLayout>,
+    inputs: &AuxOverlayInputs,
+    s0_luma: u8,
+    signals: &AuxOverlaySignals,
+    ticks: i64,
+) -> LayoutOverlayBake {
+    let cells = body.layout.cells.len();
+    let all: Vec<Arc<TileStore<Nv12Image>>> = (0..cells)
+        .map(|i| Arc::new(TileStore::<Nv12Image>::with_defaults(format!("s{i}"))))
+        .collect();
+    let lookup_stores = all.clone();
+    let lookup: StoreLookup =
+        Arc::new(move |id: &str| lookup_stores.iter().find(|s| s.id() == id).cloned());
+    let mut canvas = LayoutCanvas::new(Arc::clone(body), spec(W, H)).unwrap();
+    canvas.keep_frames(true);
+    let mut bake = LayoutOverlayBake::new(body, inputs).expect("a bake");
+    for i in 0..ticks {
+        let pts = MediaTime::from_nanos(i * 40_000_000);
+        for (n, store) in all.iter().enumerate() {
+            let luma = if n == 0 {
+                s0_luma
+            } else {
+                u8::try_from(100 + (i % 2) * 40).unwrap()
+            };
+            store.publish(tile(W / 4, H / 4, luma), pts);
+        }
+        let picture = canvas.compose(&lookup, pts).unwrap();
+        let _ = bake.bake(
+            &picture,
+            pts,
+            canvas.cell_states(),
+            canvas.cell_frames(),
+            signals,
+            None,
+        );
+    }
+    bake
+}
+
+/// MR2-1 (a): a source on Program shows exactly the consumer's verdict
+/// (Program's own detector, with its declared probes and latches),
+/// regardless of what the layout's frames say — a configured or latched
+/// Program fault is never hidden by a local "clear", and a local fault never
+/// contradicts Program's verdict.
+#[test]
+fn a_program_source_keeps_the_consumers_fault_regardless_of_local_frames() {
+    let body = newsone(LayoutOverlays::default(), W, H);
+    // s1's picture moves (locally clear); Program says FROZEN (e.g. latched).
+    let mut on_program = AuxOverlaySignals::default();
+    on_program.program.insert("s1".to_owned());
+    on_program.faults.insert("s1".to_owned(), TileFault::Frozen);
+    // s0 is black locally, but on Program with no fault: Program's verdict.
+    on_program.program.insert("s0".to_owned());
+    let bake = drive_solid(&body, &inputs(), 16, &on_program, 60);
+    let d = bake.last_dynamics();
+    assert_eq!(
+        d["s1"].fault,
+        TileFault::Frozen,
+        "Program's latched fault stands"
+    );
+    assert_eq!(
+        d["s0"].fault,
+        TileFault::None,
+        "a local BLACK never overrides Program's verdict for a Program source"
+    );
+    assert_eq!(
+        bake.faults.fault("s0"),
+        Some(TileFault::Black),
+        "the local detector did see black (it is just not authoritative here)"
+    );
+}
+
+/// MR2-1 (b): an aux-only source honours its operator-declared black probe
+/// (threshold and dwell) exactly as Program would, not the defaults: a Y=80
+/// picture is black under a declared threshold of 100 (never under the
+/// default 16) and raises after the declared 80 ms dwell (~2 ticks), far
+/// sooner than the default 0.5 s.
+#[test]
+fn an_aux_only_source_follows_its_declared_black_probe() {
+    use multiview_config::probe::{DetectionZone, Dwell, Probe, ProbeKind};
+    use multiview_core::alarm::PerceivedSeverity;
+    let body = newsone(LayoutOverlays::default(), W, H);
+    let probe = Probe::new(
+        "s0-black",
+        "s0",
+        ProbeKind::black(100, DetectionZone::default()),
+        Dwell::new(80, 80),
+        PerceivedSeverity::Critical,
+        false,
+    );
+    let mut declared = inputs();
+    declared.source_probes = Arc::new(crate::fault_probes::resolve_source_probes(
+        &body.layout,
+        &[probe],
+    ));
+    let none = AuxOverlaySignals::default();
+    // Declared: black within ~2-3 ticks.
+    let bake = drive_solid(&body, &declared, 80, &none, 4);
+    assert_eq!(
+        bake.last_dynamics()["s0"].fault,
+        TileFault::Black,
+        "Y=80 is black under the declared threshold 100, raised after the 80 ms dwell"
+    );
+    // Default: Y=80 is never black (threshold 16), even after a long run.
+    let bake = drive_solid(&body, &inputs(), 80, &none, 30);
+    assert_eq!(bake.last_dynamics()["s0"].fault, TileFault::None);
+    // Default dwell: a real black (Y=16) is NOT yet raised after 4 ticks.
+    let bake = drive_solid(&body, &inputs(), 16, &none, 4);
+    assert_eq!(bake.last_dynamics()["s0"].fault, TileFault::None);
+}
+
+/// A layout of `n` full-canvas cells, each bound to its own source `s<i>`.
+fn many_cells(n: usize) -> Arc<RoutedLayout> {
+    let mut body = Arc::unwrap_or_clone(newsone(LayoutOverlays::default(), W, H));
+    body.layout.cells = (0..n)
+        .map(|i| Cell {
+            x: 0.0,
+            y: 0.0,
+            w: 0.1,
+            h: 0.1,
+            z: i32::try_from(i).unwrap(),
+            source: Some(format!("s{i}")),
+            ..Cell::default()
+        })
+        .collect();
+    body.slates = vec![multiview_config::FailoverSlate::Black; n];
+    Arc::new(body)
+}
+
+/// AR2-1: the overlay bake has a cell budget. A 65-cell layout still
+/// composes (one frame per tick) but gets no overlay bake (counted); a
+/// 64-cell layout bakes.
+#[test]
+fn a_layout_over_the_cell_budget_composes_but_does_not_bake() {
+    assert_eq!(MAX_BAKED_CELLS, 64);
+    let over = many_cells(MAX_BAKED_CELLS + 1);
+    let before = skipped_bakes().too_many_cells.load(Ordering::Relaxed);
+    assert!(
+        LayoutOverlayBake::new(&over, &inputs()).is_none(),
+        "65 cells: no bake"
+    );
+    assert!(
+        skipped_bakes().too_many_cells.load(Ordering::Relaxed) > before,
+        "counted"
+    );
+    let (lookup, _keep) = stores(&[], W, H);
+    let mut canvas = LayoutCanvas::new(Arc::clone(&over), spec(W, H)).unwrap();
+    assert!(
+        canvas.compose(&lookup, MediaTime::ZERO).is_some(),
+        "65 cells still compose"
+    );
+
+    let at = many_cells(MAX_BAKED_CELLS);
+    let mut bake = LayoutOverlayBake::new(&at, &inputs()).expect("64 cells: a bake");
+    // An edit growing it past the budget drops the bake.
+    assert!(!bake.rebuild(&over, &labels()));
+    const { assert!(MAX_WANTED_SOURCES == 8 * 64) };
+}
+
+/// AR2-1: a source bound by two cells is observed once per tick (the
+/// per-body first-index dedupe, no per-tick scan) and both cells show the
+/// same verdict.
+#[test]
+fn a_source_bound_twice_is_observed_once() {
+    let mut body = Arc::unwrap_or_clone(newsone(LayoutOverlays::default(), W, H));
+    // Cell 8 rebinds s0 (cells 0 and 8 both show s0).
+    body.layout.cells[8].source = Some("s0".to_owned());
+    let body = Arc::new(body);
+    let index = BodyIndex::of(&body);
+    assert_eq!(index.first.len(), 8, "9 cells, 8 distinct sources");
+    assert_eq!(index.state_of.len(), 8);
+    // Black for 15 ticks (560 ms, past the 0.5 s dwell): the verdict is
+    // right; the freeze window proves one observation per tick (observing it
+    // twice per tick would fill the window twice as fast).
+    let bake = drive_solid(&body, &inputs(), 16, &AuxOverlaySignals::default(), 15);
+    assert_eq!(bake.last_dynamics()["s0"].fault, TileFault::Black);
+    let window = bake.faults.per_source["s0"].window.len();
+    assert_eq!(window, 12, "one observation per tick (window capped at 12)");
+    let bake = drive_solid(&body, &inputs(), 16, &AuxOverlaySignals::default(), 6);
+    assert_eq!(
+        bake.faults.per_source["s0"].window.len(),
+        6,
+        "6 ticks: 6 observations, not 12"
+    );
 }

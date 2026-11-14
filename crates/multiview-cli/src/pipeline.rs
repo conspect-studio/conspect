@@ -4045,6 +4045,10 @@ impl Pipeline {
             watermark: self.watermark_signal.clone(),
             wall_clock: crate::wallclock::WallClockSource::system(),
             canvas_color: self.canvas_color,
+            // The same per-source probe overrides Program's fault detector
+            // resolves, once, shared read-only: an aux-only source honours
+            // its declared black/freeze probe.
+            source_probes: Arc::new(resolve_source_probes(&self.layout, &self.declared_probes)),
         };
         (
             inputs,
@@ -9681,75 +9685,10 @@ fn sample_caption_bitmaps(
     out
 }
 
-/// An operator-declared probe override for one source, resolved from
-/// `config.probes` (M10): the config [`Probe`](multiview_config::probe::Probe) the
-/// engine builds a config-derived analyser + X.733 lifecycle from, per fault
-/// class. A `None` entry means "no declared probe for this class — use the
-/// hardcoded default".
-///
-/// The first declared probe of each kind for a source wins (duplicate probe ids
-/// are already rejected by config validation; two probes of the same kind on one
-/// source is an unusual config and deterministically resolves to the first).
+/// Per-source declared probe overrides (shared with routed layouts' fault
+/// detection; see [`crate::fault_probes`]).
 #[cfg(feature = "overlay")]
-#[derive(Default, Clone)]
-struct SourceProbeOverride {
-    /// The declared black probe (its `luma_threshold` + `zone` + dwell + severity).
-    black: Option<multiview_config::probe::Probe>,
-    /// The declared freeze probe (its `difference_threshold` + `zone` + dwell + …).
-    freeze: Option<multiview_config::probe::Probe>,
-    /// The declared silence probe (its dwell + severity, and its `level_dbfs`,
-    /// which becomes this source's silence detection floor in place of the shared
-    /// [`SILENCE_FLOOR_DB`]).
-    silence: Option<multiview_config::probe::Probe>,
-}
-
-/// Resolve `config.probes` into per-**source** overrides by mapping each probe's
-/// watched **cell** to its bound source via the solved `layout` (M10).
-///
-/// A probe whose cell is unbound (no `source`) or absent from the layout is
-/// skipped — there is no picture/audio to analyse. Runs once at run start, off the
-/// hot loop.
-#[cfg(feature = "overlay")]
-fn resolve_source_probes(
-    layout: &Layout,
-    probes: &[multiview_config::probe::Probe],
-) -> std::collections::HashMap<String, SourceProbeOverride> {
-    use multiview_config::probe::ProbeKind;
-    let mut out: std::collections::HashMap<String, SourceProbeOverride> =
-        std::collections::HashMap::new();
-    for probe in probes {
-        // The config carries cell ids only on the raw cells, not the solved
-        // `Layout`; the layout cell binds a `source`, and a probe's `cell` field
-        // names a config cell id. The desugared run binds cell id == source id for
-        // the common single-source-per-cell case, so resolve by matching the
-        // probe's cell against a layout cell whose bound source equals it, falling
-        // back to treating the probe's `cell` as the source id directly when no
-        // distinct cell id is carried. Either way an unbound name is skipped.
-        let source = layout
-            .cells
-            .iter()
-            .filter_map(|c| c.source.clone())
-            .find(|s| s == &probe.cell)
-            .unwrap_or_else(|| probe.cell.clone());
-        let entry = out.entry(source).or_default();
-        match probe.kind {
-            ProbeKind::Black { .. } if entry.black.is_none() => {
-                entry.black = Some(probe.clone());
-            }
-            ProbeKind::Freeze { .. } if entry.freeze.is_none() => {
-                entry.freeze = Some(probe.clone());
-            }
-            ProbeKind::Silence { .. } if entry.silence.is_none() => {
-                entry.silence = Some(probe.clone());
-            }
-            // A loudness probe (or a duplicate of an already-captured kind, or a
-            // future kind) does not override one of the three content-fault badge
-            // classes; the loudness alarm rides the meter path elsewhere.
-            _ => {}
-        }
-    }
-    out
-}
+use crate::fault_probes::{resolve_source_probes, SourceProbeOverride};
 
 /// The dBFS floor at/below which the per-input meter is treated as **silent**
 /// for the audio-loss fault. Just above the meter's true floor so a genuinely
@@ -9949,67 +9888,43 @@ impl FaultDetector {
         audio_free_sources: AudioFreeSources,
         source_probes: std::collections::HashMap<String, SourceProbeOverride>,
     ) -> Self {
-        use multiview_engine::{
-            black_config_from_kind, freeze_config_from_kind, AlarmHysteresis, BlackConfig,
-            BlackProbe, FreezeConfig, FreezeProbe,
-        };
-        // Dwell windows on the media timeline. Black/silence raise after ~0.5 s of
-        // the condition and clear after ~0.3 s of its absence; freeze needs a
-        // longer ~2 s of identical frames so a brief genuine still does not trip
-        // it. These give the anti-flap hysteresis without coupling to wall-clock.
-        let dwell = |secs_num: i64, secs_den: i64| -> MediaTime {
-            MediaTime::from_nanos(secs_num.saturating_mul(1_000_000_000) / secs_den.max(1))
-        };
-        let down = dwell(3, 10); // 0.3 s
-                                 // The CLI freeze probe widens only the PER-SAMPLE tolerance vs the engine
-                                 // default — the root cause of the missed badge was tolerance, not the
-                                 // change threshold. Instrumented across the three real demo sources scaled
-                                 // to a 636x356 tile, the changed-fraction with diff_tolerance=6 was:
-                                 //   frozen:  median 0.000%, max 1.27%, 148/150 frames <= 0.1%
-                                 //   silent:  median 0.229%, max 1.91%,   4/150 frames <= 0.1%  (moving)
-                                 //   healthy: median 3.13%,  max 71%,      5/150 frames <= 0.1%
-                                 // diff_tolerance=6 collapses GOP re-quantization noise (the frozen source's
-                                 // per-GOP spike drops from 1.2-4.6% at the default tolerance 2 to <= 1.27%,
-                                 // its steady frames to 0.000%); the engine-default change_threshold (0.1%)
-                                 // is KEPT because at tolerance 6 it already separates a frozen feed (148/150
-                                 // below) from a moving-but-silent feed (only 4/150 below). An earlier 0.5%
-                                 // threshold over-loosened this and wrongly flagged the moving silent tile.
-                                 // The two residual per-GOP spikes the frozen source still shows are absorbed
-                                 // by the debounce window below, not by a looser threshold.
-        let freeze_cfg = FreezeConfig::default().with_tolerance(6);
+        // The default analysers + dwell windows (black/silence raise after
+        // ~0.5 s, freeze after ~2 s, all clear after ~0.3 s — media timeline,
+        // never wall-clock) and the CLI freeze tolerance, shared with routed
+        // layouts' fault detection.
+        //
+        // The CLI freeze probe widens only the PER-SAMPLE tolerance vs the
+        // engine default — the root cause of the missed badge was tolerance,
+        // not the change threshold. Instrumented across the three real demo
+        // sources scaled to a 636x356 tile, the changed-fraction with
+        // diff_tolerance=6 was:
+        //   frozen:  median 0.000%, max 1.27%, 148/150 frames <= 0.1%
+        //   silent:  median 0.229%, max 1.91%,   4/150 frames <= 0.1%  (moving)
+        //   healthy: median 3.13%,  max 71%,      5/150 frames <= 0.1%
+        // diff_tolerance=6 collapses GOP re-quantization noise; the
+        // engine-default change_threshold (0.1%) is KEPT because at tolerance 6
+        // it already separates a frozen feed from a moving-but-silent feed. The
+        // two residual per-GOP spikes the frozen source still shows are absorbed
+        // by the debounce window, not by a looser threshold.
+        let defaults = crate::fault_probes::DefaultProbes::default();
         // Build the per-source config-derived analysers ONCE from any declared
-        // black/freeze probe (its operator-authored threshold + zone). A declared
-        // freeze probe is honoured verbatim — the CLI's codec-noise tolerance/
-        // debounce defaults still apply to it via the shared sample path, but its
-        // change threshold + zone are the operator's. Sources without a declared
-        // probe never appear here and fall back to the shared defaults.
+        // black/freeze probe (its operator-authored threshold + zone). A
+        // declared freeze probe keeps the CLI's codec-noise tolerance; its
+        // change threshold + zone are the operator's. Sources without a
+        // declared probe fall back to the shared defaults.
         let mut declared_black = std::collections::HashMap::new();
         let mut declared_freeze = std::collections::HashMap::new();
         let mut declared_silence_floor = std::collections::HashMap::new();
         for (source, ov) in &source_probes {
-            if let Some(cfg) = ov
-                .black
-                .as_ref()
-                .and_then(|p| black_config_from_kind(&p.kind))
-            {
-                declared_black.insert(source.clone(), BlackProbe::new(cfg));
+            if let Some(probe) = crate::fault_probes::declared_black(ov) {
+                declared_black.insert(source.clone(), probe);
             }
-            if let Some(cfg) = ov
-                .freeze
-                .as_ref()
-                .and_then(|p| freeze_config_from_kind(&p.kind))
-            {
-                // Preserve the CLI's wider per-sample tolerance for real encoded
-                // sources; only the operator-authored change threshold + zone come
-                // from config (the engine `from_kind` keeps the default tolerance,
-                // which we override to the CLI's 6 to match the default path).
-                declared_freeze.insert(source.clone(), FreezeProbe::new(cfg.with_tolerance(6)));
+            if let Some(probe) = crate::fault_probes::declared_freeze(ov) {
+                declared_freeze.insert(source.clone(), probe);
             }
             // A declared silence probe carries the operator-authored level ceiling
-            // (`level_dbfs`); thread it into this source's detection floor so the
-            // instantaneous silence condition uses the operator's threshold rather
-            // than the shared default. Widen `f32 -> f64` exactly (`f64::from`, no
-            // `as` cast) to match the meter timeline scale.
+            // (`level_dbfs`); thread it into this source's detection floor. Widen
+            // `f32 -> f64` exactly (`f64::from`, no `as` cast).
             if let Some(multiview_config::probe::ProbeKind::Silence { level_dbfs }) =
                 ov.silence.as_ref().map(|p| p.kind)
             {
@@ -10023,13 +9938,13 @@ impl FaultDetector {
             cadence,
             audio_free_sources,
             machines: std::collections::HashMap::new(),
-            black: BlackProbe::new(BlackConfig::default()),
-            freeze: FreezeProbe::new(freeze_cfg),
+            black: defaults.black,
+            freeze: defaults.freeze,
             previous: std::collections::HashMap::new(),
             freeze_window: std::collections::HashMap::new(),
-            hysteresis_black: AlarmHysteresis::new(dwell(1, 2), down), // 0.5 s up
-            hysteresis_freeze: AlarmHysteresis::new(dwell(2, 1), down), // 2 s up
-            hysteresis_silence: AlarmHysteresis::new(dwell(1, 2), down), // 0.5 s up
+            hysteresis_black: defaults.black_dwell,
+            hysteresis_freeze: defaults.freeze_dwell,
+            hysteresis_silence: defaults.silence_dwell,
             source_probes,
             declared_black,
             declared_freeze,
@@ -10046,43 +9961,33 @@ impl FaultDetector {
     /// declared probe use the hardcoded default machine, so an undeclared source is
     /// byte-for-byte the prior behaviour.
     fn machines_for(&mut self, id: &str) -> &mut SourceFaultMachines {
-        use multiview_core::alarm::{AlarmId, AlarmKind, AlarmScope, PerceivedSeverity};
-        use multiview_engine::{AlarmHysteresis, AlarmStateMachine};
+        use crate::fault_probes::fault_machine;
+        use multiview_core::alarm::{AlarmKind, PerceivedSeverity};
         let hb = self.hysteresis_black;
         let hf = self.hysteresis_freeze;
         let hs = self.hysteresis_silence;
         let ov = self.source_probes.get(id).cloned().unwrap_or_default();
         self.machines.entry(id.to_owned()).or_insert_with(|| {
-            let mk = |kind: AlarmKind, sev: PerceivedSeverity, hyst: AlarmHysteresis| {
-                AlarmStateMachine::new(
-                    AlarmId::new(format!("{id}:{kind:?}")),
-                    kind,
-                    AlarmScope::Probe { id: id.to_owned() },
-                    sev,
-                    hyst,
-                )
-            };
             // A declared probe's full X.733 lifecycle (id/scope/severity/dwell/
             // latch) via `from_probe`; otherwise the hardcoded default machine.
-            let from_or_default = |probe: &Option<multiview_config::probe::Probe>,
-                                   kind: AlarmKind,
-                                   sev: PerceivedSeverity,
-                                   hyst: AlarmHysteresis| {
-                match probe {
-                    Some(p) => AlarmStateMachine::from_probe(p),
-                    None => mk(kind, sev, hyst),
-                }
-            };
             SourceFaultMachines {
-                black: from_or_default(&ov.black, AlarmKind::Black, PerceivedSeverity::Major, hb),
-                freeze: from_or_default(
-                    &ov.freeze,
+                black: fault_machine(
+                    id,
+                    ov.black.as_ref(),
+                    AlarmKind::Black,
+                    PerceivedSeverity::Major,
+                    hb,
+                ),
+                freeze: fault_machine(
+                    id,
+                    ov.freeze.as_ref(),
                     AlarmKind::Freeze,
                     PerceivedSeverity::Major,
                     hf,
                 ),
-                silence: from_or_default(
-                    &ov.silence,
+                silence: fault_machine(
+                    id,
+                    ov.silence.as_ref(),
                     AlarmKind::Silence,
                     PerceivedSeverity::Minor,
                     hs,
