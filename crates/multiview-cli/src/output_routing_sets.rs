@@ -155,6 +155,13 @@ impl OutputRouter {
         self.sets.clock = Some(applied_tick);
     }
 
+    /// Share the switcher's "DSK defined" cell (K4): a Clean take is refused
+    /// at the drain while it is set, closing the race with a `keyer_set`
+    /// that defines the first DSK after the take's plan passed.
+    pub(crate) fn set_dsk_cell(&mut self, cell: Arc<std::sync::atomic::AtomicBool>) {
+        self.dsk_defined = cell;
+    }
+
     /// The set output `index`'s pending take belongs to.
     pub(super) fn group_of(&self, index: usize) -> Option<u64> {
         self.outputs

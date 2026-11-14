@@ -4015,6 +4015,9 @@ impl Pipeline {
         // composed tick: a wait-free atomic load, never a lock on the clock.
         if let Some(control) = self.switcher_control.as_ref() {
             router.set_switcher_clock(control.applied_tick_cell());
+            // K4: one "DSK defined" cell shared by the switcher, the routing
+            // handle (plan) and the router (drain).
+            router.set_dsk_cell(control.dsk_defined_cell());
         }
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
         let handle = Arc::new(
@@ -4028,6 +4031,12 @@ impl Pipeline {
                 // ADR-0113 / K2a: Clean is refused while a DSK is defined.
                 .with_dsk_defined(!self.switcher_keyers.is_empty()),
         );
+        // K4: the switcher's cell, so a run-time `keyer_set` defining the
+        // first DSK refuses Clean from the same instant.
+        let handle = match self.switcher_control.as_ref() {
+            Some(control) => Arc::new((*handle).clone().with_dsk_cell(control.dsk_defined_cell())),
+            None => handle,
+        };
         enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
         self.output_routing.store(Some(handle));
         Ok(RunRouting {
@@ -4239,6 +4248,15 @@ impl Pipeline {
                 &self.switcher_keyers,
             ));
             self.keyer_demand = Some(keyers);
+        }
+        // K4: a run with an M/E can define its first DSK at run time
+        // (`keyer_set`), so the switcher always gets a `keyer` demand set.
+        if self.keyer_demand.is_none() && self.switcher_me.is_some() {
+            self.keyer_demand =
+                Some(manager.consumer_set(multiview_engine::ConsumerClass::Keyer, Rails::VIDEO));
+        }
+        if let (Some(control), Some(set)) = (&self.switcher_control, &self.keyer_demand) {
+            control.set_keyer_demand(set.clone());
         }
         self.demand_sets = Some((layout, audio));
         self.demand = Some(manager.clone());

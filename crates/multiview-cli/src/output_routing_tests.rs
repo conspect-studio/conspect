@@ -1968,6 +1968,28 @@ fn an_aux_failure_never_moves_an_output_off_clean() {
     assert_eq!(x.h.snapshot().outputs[1].bus, "clean");
 }
 
+/// ADR-0113 K4: the router shares the switcher's "DSK defined" cell. A
+/// Clean take already queued when a run-time `keyer_set` defines the first
+/// DSK is refused at the drain, and the handle's plan sees the same cell.
+#[test]
+fn a_clean_take_is_refused_at_the_drain_once_the_shared_dsk_cell_is_set() {
+    let (mut x, _seen) = ptr_harness(2);
+    x.tick(0);
+    let cell = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    x.r.set_dsk_cell(Arc::clone(&cell));
+    let h = x.h.clone().with_dsk_cell(Arc::clone(&cell));
+    assert!(!h.dsk_defined());
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    cell.store(true, Ordering::Release);
+    assert!(h.dsk_defined(), "the handle reads the shared cell");
+    x.tick(1);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Unroutable)]
+    );
+    assert_ne!(x.h.snapshot().outputs[1].bus, "clean");
+}
+
 /// Clean without an M/E is unroutable (like Preview).
 #[test]
 fn clean_without_a_switcher_is_refused() {

@@ -515,8 +515,9 @@ pub struct OutputRoutingHandle {
     outputs: Arc<[RunOutput]>,
     has_preview: bool,
     /// A downstream keyer is defined (ADR-0113, K2a): Program carries DSK
-    /// pixels, so Clean is refused until pre-DSK Clean lands (K2b).
-    dsk_defined: bool,
+    /// pixels, so Clean is refused until pre-DSK Clean lands (K2b). Shared
+    /// with the switcher (K4 `keyer_set` defines the first DSK at run time).
+    dsk_defined: Arc<std::sync::atomic::AtomicBool>,
     /// What the plan needs to tell an identity picture (P2) from a convert
     /// (P3), #342 B2: the run's store lookup and its canvas. `None` until
     /// [`OutputRoutingHandle::with_pictures`].
@@ -693,15 +694,28 @@ impl OutputRoutingHandle {
     /// Mark the run as defining a downstream keyer (ADR-0113, K2a): a take
     /// to Clean is then refused (`clean-unavailable-with-dsk`).
     #[must_use]
-    pub fn with_dsk_defined(mut self, defined: bool) -> Self {
-        self.dsk_defined = defined;
+    pub fn with_dsk_defined(self, defined: bool) -> Self {
+        self.dsk_defined
+            .store(defined, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    /// Share the switcher's "DSK defined" cell (K4: a `keyer_set` that
+    /// defines the first DSK sets it before its enqueue), keeping the
+    /// current value when the cell is already set.
+    #[must_use]
+    pub fn with_dsk_cell(mut self, cell: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        if self.dsk_defined() {
+            cell.store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.dsk_defined = cell;
         self
     }
 
     /// Whether the run defines a downstream keyer (Clean is unavailable).
     #[must_use]
-    pub const fn dsk_defined(&self) -> bool {
-        self.dsk_defined
+    pub fn dsk_defined(&self) -> bool {
+        self.dsk_defined.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The run's store lookup and canvas, when attached.
@@ -1176,6 +1190,10 @@ pub struct OutputRouter {
     /// Whether a Clean feed is active (cached so `publish_clean` costs one
     /// bool load when nothing selects Clean).
     clean_active: bool,
+    /// The shared "DSK defined" cell (the handle's; K4): a Clean take is
+    /// refused here too, so a take that passed the control-plane check just
+    /// before a `keyer_set` defined the first DSK never lands.
+    dsk_defined: Arc<std::sync::atomic::AtomicBool>,
     /// Whether a Program picture feed is active (a dynamic key on Program:
     /// a reformatted output, #342 B3).
     program_active: bool,
@@ -1320,7 +1338,7 @@ impl OutputRouter {
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
             outputs: Arc::from(Vec::new()),
             has_preview: cfg.has_preview,
-            dsk_defined: false,
+            dsk_defined: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pictures: None,
             max_aux_canvases: cfg.max_aux_canvases,
         };
@@ -1348,6 +1366,7 @@ impl OutputRouter {
             next_generation: 0,
             feeds: HashMap::new(),
             clean_active: false,
+            dsk_defined: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             program_active: false,
             live_keys: Vec::new(),
             health: HashMap::new(),
@@ -2099,7 +2118,10 @@ impl OutputRouter {
         // AES67, display), cannot take an audio choice.
         let audio_ok =
             take.audio.is_none() || (self.audio.is_some() && dispatcher.has_program_audio(index));
+        let clean_refused = take.bus == Some(PictureBus::Clean)
+            && self.dsk_defined.load(std::sync::atomic::Ordering::Acquire);
         let routable = index < self.outputs.len()
+            && !clean_refused
             && (!needs_switcher || self.cfg.has_preview)
             && (take.bus.is_some() || take.audio.is_some())
             && audio_ok;
