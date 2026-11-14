@@ -8190,7 +8190,10 @@ fn a_dsk_reserved_inside_the_drain_loses_to_the_admitted_clean_take() {
     x.r.drain_hook = None;
     let (stale, dsk) = won.lock().unwrap().take().unwrap();
     assert!(stale, "the handler ran before the snapshot showed the take");
-    assert!(dsk.is_none(), "the first DSK reserved under an admitted Clean take");
+    assert!(
+        dsk.is_none(),
+        "the first DSK reserved under an admitted Clean take"
+    );
     assert!(x.r.outputs[1].pending.is_some(), "the Clean take proceeds");
     assert!(!h.dsk_defined());
 }
@@ -8217,7 +8220,11 @@ fn a_reserved_dsk_refuses_clean_at_the_drain_and_releases_cleanly() {
     drop(dsk);
     x.h.try_take(take("c2", 1, PictureBus::Clean)).unwrap();
     x.tick(2);
-    assert_eq!(gate.clean_reservations(), 1, "the pending Clean take holds one");
+    assert_eq!(
+        gate.clean_reservations(),
+        1,
+        "the pending Clean take holds one"
+    );
     assert!(gate.try_reserve_dsk().is_none());
     // Superseded by a Program take: the reservation goes at the reconcile.
     x.h.try_take(take("p", 1, PictureBus::Program)).unwrap();

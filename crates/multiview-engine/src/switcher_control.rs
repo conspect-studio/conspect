@@ -14,13 +14,13 @@ use multiview_framestore::TileStore;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-use crate::clock::Tick;
 use crate::clean_gate::{CleanDskGate, DskReservation};
+use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::keyer::{
     KeyerAction, KeyerCounters, KeyerDef, KeyerDefinition, KeyerDefinitions, KeyerDraw, KeyerEvent,
-    KeyerReadback, REFUSE_KEYER_CLEAN, REFUSE_KEYER_SET_DEADLINE,
-    KeyerRuntime, KeyerSnapshot, KeyerTally, OpSink, TieEnvelope, MAX_DSK,
+    KeyerReadback, KeyerRuntime, KeyerSnapshot, KeyerTally, OpSink, TieEnvelope, MAX_DSK,
+    REFUSE_KEYER_CLEAN, REFUSE_KEYER_SET_DEADLINE,
 };
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
 use crate::switcher::{SwitcherProjection, SwitcherState};
@@ -571,9 +571,7 @@ impl SwitcherControl {
             def,
             readback,
             allow_on_air,
-            deadline: self
-                .applied_tick()
-                .saturating_add(KEYER_SET_DEADLINE_TICKS),
+            deadline: self.applied_tick().saturating_add(KEYER_SET_DEADLINE_TICKS),
         }
     }
 
@@ -1254,18 +1252,16 @@ impl SwitcherTickDriver {
                 // whatever the caller did. One CAS; no allocation.
                 let new_keyer = self.keyers.def(usize::from(keyer)).is_none();
                 let reservation = if new_keyer {
-                    match self.clean_gate.try_reserve_dsk() {
-                        Some(reservation) => Some(reservation),
-                        None => {
-                            self.publish_outcome(
-                                command.operation_id,
-                                tick.index,
-                                false,
-                                Some(REFUSE_KEYER_CLEAN.into()),
-                            );
-                            continue;
-                        }
-                    }
+                    let Some(reservation) = self.clean_gate.try_reserve_dsk() else {
+                        self.publish_outcome(
+                            command.operation_id,
+                            tick.index,
+                            false,
+                            Some(REFUSE_KEYER_CLEAN.into()),
+                        );
+                        continue;
+                    };
+                    Some(reservation)
                 } else {
                     None
                 };
@@ -1707,16 +1703,13 @@ impl SwitcherTickDriver {
         // index against its definition. The readback was built off the clock
         // with the request (review H6): publishing it moves an `Arc`.
         if self.keyers.def_version() != self.published_def_version {
-            match self.staged_readback.take() {
-                Some(readback) => {
-                    self.keyer_defs.publish_arc(readback);
-                }
-                None => {
-                    // Unreachable (every applied set carries its readback);
-                    // fail-safe: build it here and count the build.
-                    self.keyer_defs.publish(self.keyers.definitions());
-                    self.definition_builds += 1;
-                }
+            if let Some(readback) = self.staged_readback.take() {
+                self.keyer_defs.publish_arc(readback);
+            } else {
+                // Unreachable (every applied set carries its readback);
+                // fail-safe: build it here and count the build.
+                self.keyer_defs.publish(self.keyers.definitions());
+                self.definition_builds += 1;
             }
             self.published_def_version = self.keyers.def_version();
             // Before this tick's outcomes: once a caller sees `applied`, the

@@ -1651,8 +1651,13 @@ impl KeyerRuntime {
 
     /// Whether `readback` is exactly the definitions after `def` lands at
     /// `index`: version + 1, the same canvas, and every slot the same `Arc`
-    /// (O(MAX_DSK) pointer compares; no allocation).
-    fn readback_matches(&self, index: usize, def: &Arc<KeyerDef>, readback: &KeyerDefinitions) -> bool {
+    /// (`O(MAX_DSK)` pointer compares; no allocation).
+    fn readback_matches(
+        &self,
+        index: usize,
+        def: &Arc<KeyerDef>,
+        readback: &KeyerDefinitions,
+    ) -> bool {
         readback.version == self.def_version.saturating_add(1)
             && readback.canvas == self.canvas
             && self

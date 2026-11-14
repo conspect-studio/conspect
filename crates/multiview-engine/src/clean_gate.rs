@@ -91,12 +91,10 @@ impl CleanDskGate {
     /// is held (an output carries Clean or has a take to it pending).
     #[must_use]
     pub fn try_reserve_dsk(self: &Arc<Self>) -> Option<DskReservation> {
-        self.update(|w| {
-            (w & CLEAN_MASK == 0 && w & DSK_MASK != DSK_MASK).then_some(w + 1)
-        })
-        .then(|| DskReservation {
-            gate: Arc::clone(self),
-        })
+        self.update(|w| (w & CLEAN_MASK == 0 && w & DSK_MASK != DSK_MASK).then_some(w + 1))
+            .then(|| DskReservation {
+                gate: Arc::clone(self),
+            })
     }
 
     /// Reserve "Clean is routed or a take to it is pending": refused while a
@@ -155,9 +153,7 @@ impl CleanDskGate {
 impl Drop for DskReservation {
     fn drop(&mut self) {
         // Exactly this reservation's count; the CAS never underflows.
-        let _ = self
-            .gate
-            .update(|w| (w & DSK_MASK != 0).then_some(w - 1));
+        let _ = self.gate.update(|w| (w & DSK_MASK != 0).then_some(w - 1));
     }
 }
 

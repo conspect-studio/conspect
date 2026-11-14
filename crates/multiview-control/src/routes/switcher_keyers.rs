@@ -1130,9 +1130,8 @@ async fn settle_set(
     // Terminal without an outcome: the clock composed the deadline tick (a
     // drain at or after it refuses the verb; every earlier drain has
     // committed or been rejected by then), or the run is gone.
-    let settled = |handle: &SwitcherControl| {
-        handle.applied_tick() >= pending.deadline || handle.is_closed()
-    };
+    let settled =
+        |handle: &SwitcherControl| handle.applied_tick() >= pending.deadline || handle.is_closed();
     loop {
         match tokio::time::timeout(KEYER_SET_RECHECK, outcomes.recv()).await {
             Ok(Ok(item)) if item.event.operation_id == pending.op => break,

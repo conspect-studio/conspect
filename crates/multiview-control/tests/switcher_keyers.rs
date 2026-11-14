@@ -120,7 +120,7 @@ const ADMIN: &str = support::OPERATOR_TOKEN;
 const VIEWER: &str = support::VIEWER_TOKEN;
 /// A Viewer holding every object and Program grant FULL holds.
 const SCOPED_VIEWER: &str = "k-viewer.k-viewer-secret";
-/// A ReadOnly principal holding every object and Program grant FULL holds.
+/// A `ReadOnly` principal holding every object and Program grant FULL holds.
 const SCOPED_READ_ONLY: &str = "k-read-only.k-read-only-secret";
 
 fn keys() -> ApiKeyStore {
@@ -529,7 +529,7 @@ async fn every_keyer_verb_is_authorized_per_object_on_plan_and_command() {
 }
 
 /// Review H1: a keyer plan is a control-plane rehearsal of a command, so it
-/// needs the command's role (`Write`), not `Read`: a Viewer or ReadOnly
+/// needs the command's role (`Write`), not `Read`: a Viewer or `ReadOnly`
 /// principal holding every object grant is refused 403 on `/plan` for all
 /// four verbs, before any existence or admission answer.
 #[tokio::test]
@@ -901,9 +901,7 @@ async fn defining_the_first_dsk_while_clean_is_routed_is_refused() {
     );
     assert!(rig.leases.acquired.lock().unwrap().is_empty());
     assert!(
-        !rig.handle
-            .clean_gate()
-            .clean_refused(),
+        !rig.handle.clean_gate().clean_refused(),
         "the refusal holds no Clean reservation"
     );
     // Without a Clean subscriber the first DSK is defined, and the shared
@@ -915,10 +913,7 @@ async fn defining_the_first_dsk_while_clean_is_routed_is_refused() {
         command(&rig, FULL, "first", &verb).await.status(),
         StatusCode::ACCEPTED
     );
-    assert!(rig
-        .handle
-        .clean_gate()
-            .clean_refused());
+    assert!(rig.handle.clean_gate().clean_refused());
     tick(&mut rig.driver, 1);
     assert!(outcomes.try_recv().unwrap().event.completed);
     assert!(rig.handle.keyer_definitions().unwrap().any());
@@ -954,9 +949,7 @@ async fn a_keyer_set_held_past_its_deadline_never_applies_and_leaves_nothing() {
         "the command can still apply: its leases are held"
     );
     assert!(
-        rig.handle
-            .clean_gate()
-            .clean_refused(),
+        rig.handle.clean_gate().clean_refused(),
         "the command can still apply: Clean stays excluded"
     );
     // The clock drains it only after its deadline tick: refused, never applied.
@@ -971,17 +964,12 @@ async fn a_keyer_set_held_past_its_deadline_never_applies_and_leaves_nothing() {
     );
     assert!(!rig.handle.keyer_definitions().unwrap().any());
     wait_for(|| rig.leases.live.lock().unwrap().is_empty()).await;
-    wait_for(|| {
-        !rig.handle
-            .clean_gate()
-            .clean_refused()
-    })
-    .await;
-    assert!(persisted(&rig.state)
-        .switcher
-        .unwrap()
-        .downstream_keyers
-        .is_empty());
+    wait_for(|| !rig.handle.clean_gate().clean_refused()).await;
+    assert_eq!(
+        persisted(&rig.state).switcher.unwrap().downstream_keyers,
+        Vec::new(),
+        "nothing persisted"
+    );
 }
 
 /// Fill the engine mailbox so the next enqueue fails (503).
@@ -991,7 +979,10 @@ fn fill_mailbox(handle: &SwitcherControl) {
         .try_send(SwitcherCommand {
             operation_id: "fill".into(),
             scene_version: 1,
-            verb: SwitcherVerb::KeyerTie { keyer: 0, tie: true },
+            verb: SwitcherVerb::KeyerTie {
+                keyer: 0,
+                tie: true,
+            },
         })
         .is_ok()
     {}
@@ -1076,7 +1067,10 @@ async fn clean_and_the_first_dsk_never_both_win_in_either_order() {
         command(&rig, FULL, "dsk", &verb).await.status(),
         StatusCode::ACCEPTED
     );
-    assert!(gate.try_reserve_clean().is_none(), "Clean while a DSK is queued");
+    assert!(
+        gate.try_reserve_clean().is_none(),
+        "Clean while a DSK is queued"
+    );
     tick(&mut rig.driver, 1);
     assert!(gate.try_reserve_clean().is_none(), "Clean after it applied");
 }
