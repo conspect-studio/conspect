@@ -675,4 +675,62 @@ mod tests {
         rig.step(false);
         assert!(!rig.present());
     }
+
+    /// #307 review r2 (one store per body revision): a body edit publishes a
+    /// NEW, already primed store with the new revision for the same key. On
+    /// the adoption tick the Program cell samples the new store (its
+    /// pixels, never a NoSignal tick), and the driver holds the new
+    /// revision with it: store and revision swap together.
+    #[test]
+    fn a_store_swap_with_a_new_revision_rebinds_program_on_the_adoption_tick() {
+        let mut rig = rig(false);
+        rig.register();
+        rig.step(true);
+        rig.send(SwitcherVerb::SelectProgram(SourceRef::new(KEY)));
+        rig.step(true);
+        let luma = |frame: &CompositedFrame| frame.canvas.sample(8, 8).unwrap().0;
+        // The old body's pixels (luma 90) on Program.
+        let t = tick(rig.next);
+        rig.next += 1;
+        for store in &rig.stores {
+            store.publish(solid(200), t.pts);
+        }
+        rig.store.publish(solid(90), t.pts);
+        rig.hook.before_compose(&mut rig.drive, t);
+        let frame = rig.drive.compose(t).unwrap();
+        rig.hook.after_compose(&frame);
+        assert!(luma(&frame).abs_diff(90) < 8, "old body: {}", luma(&frame));
+        // The edit: a new store, primed before the engine set (luma 40).
+        let edited = Arc::new(TileStore::<Nv12Image>::with_defaults(KEY));
+        let t = tick(rig.next);
+        rig.next += 1;
+        edited.publish(solid(40), t.pts);
+        rig.store.publish(solid(90), t.pts);
+        for store in &rig.stores {
+            store.publish(solid(200), t.pts);
+        }
+        rig.sources.publish(LayoutSourceSet {
+            entries: vec![(Arc::from(KEY), Arc::clone(&edited), 2)],
+        });
+        rig.hook.before_compose(&mut rig.drive, t);
+        let frame = rig.drive.compose(t).unwrap();
+        rig.hook.after_compose(&frame);
+        assert!(Arc::ptr_eq(rig.drive.store(KEY).unwrap(), &edited));
+        assert_eq!(rig.hook.driver.source_revision(KEY), Some(2));
+        assert_eq!(
+            rig.handle.snapshot().unwrap().program.as_str(),
+            KEY,
+            "Program still selects the layout"
+        );
+        assert!(
+            luma(&frame).abs_diff(40) < 8,
+            "the new body's pixels from the adoption tick: {}",
+            luma(&frame)
+        );
+        assert_ne!(
+            frame.source_states.get(KEY),
+            Some(&multiview_core::traits::SourceState::NoSignal),
+            "no NoSignal tick on the swap"
+        );
+    }
 }
