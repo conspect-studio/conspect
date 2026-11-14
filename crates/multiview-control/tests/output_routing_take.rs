@@ -187,6 +187,9 @@ struct FakeState {
     routed: Vec<String>,
     /// The layout `audio` attribute the last layout audio plan saw.
     planned_layout_audio: Option<multiview_config::LayoutAudio>,
+    /// How the engine refuses Clean, e.g. while a downstream keyer is
+    /// defined (ADR-0113, K2a). `None`: Clean is planned normally.
+    clean_refusal: Option<PlanRefusal>,
 }
 
 struct Fake {
@@ -240,6 +243,11 @@ impl OutputRouting for Fake {
             return Err(PlanRefusal::SwitcherRequired);
         }
         let s = self.state.lock().unwrap();
+        if *feed == RoutedFeed::Clean {
+            if let Some(refusal) = s.clean_refusal {
+                return Err(refusal);
+            }
+        }
         let layout = matches!(feed, RoutedFeed::Layout(_));
         if layout && s.aux_full {
             return Err(PlanRefusal::AuxCapacity { active: 2, max: 2 });
@@ -797,6 +805,47 @@ async fn plan_reports_cost_and_redacts_sessions_for_scoped_principals() {
         body_json(resp).await["refusals"][0]["type"],
         "switcher-required"
     );
+}
+
+/// ADR-0113 K2a: while a downstream keyer is defined, Clean is refused as
+/// `clean-unavailable-with-dsk`, in the plan and as a 409 on take, and nothing
+/// reaches the engine.
+#[tokio::test]
+async fn clean_is_refused_while_a_downstream_keyer_is_defined() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    rig.fake.state.lock().unwrap().clean_refusal = Some(PlanRefusal::CleanUnavailableWithDsk);
+    let resp = send(
+        &rig.router,
+        post(
+            "/api/v1/routing/plan",
+            OPERATOR_TOKEN,
+            None,
+            &body("output-1", serde_json::json!({"bus": "clean"})),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body_json(resp).await["refusals"][0]["type"],
+        "clean-unavailable-with-dsk"
+    );
+    let resp = send(
+        &rig.router,
+        take(
+            &rig,
+            OPERATOR_TOKEN,
+            "clean-dsk",
+            "output-1",
+            serde_json::json!({"bus": "clean"}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(resp).await["type"],
+        "/problems/clean-unavailable-with-dsk"
+    );
+    assert!(rig.fake.takes().is_empty(), "nothing reaches the engine");
 }
 
 #[tokio::test]

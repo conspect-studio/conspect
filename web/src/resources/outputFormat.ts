@@ -100,6 +100,213 @@ export function bitrateOf(form: OutputFormState): string {
   return typeof kbps === 'number' || typeof kbps === 'string' ? String(kbps) : '';
 }
 
+/**
+ * Subtitle slot formats (`[[outputs.slots.subtitle]]`, slice F #345), mirrors
+ * `multiview_config::output_format::SubtitleFormat`
+ * (`crates/multiview-config/src/output_format.rs`).
+ */
+export const SUBTITLE_FORMATS = ['webvtt', 'cea608', 'dvb'] as const;
+/** A subtitle slot format. */
+export type SubtitleFormat = (typeof SUBTITLE_FORMATS)[number];
+
+/** Most subtitle slots an output may declare (`MAX_SUBTITLE_SLOTS`). */
+export const MAX_SUBTITLE_SLOTS = 8;
+/** Longest accepted subtitle slot language tag, in characters. */
+export const MAX_SUBTITLE_LANGUAGE_LEN = 35;
+/** Longest accepted subtitle slot menu name, in characters. */
+export const MAX_SUBTITLE_NAME_LEN = 64;
+
+/**
+ * One editable subtitle slot row (`[[outputs.slots.subtitle]]`): `source`
+ * `undefined` means unpatched.
+ */
+export interface SubtitleSlotRow {
+  readonly format: SubtitleFormat;
+  readonly language: string;
+  readonly name: string;
+  readonly source: string | undefined;
+}
+
+/**
+ * Whether an output kind's medium carries subtitles at all, and which
+ * formats it builds vs. only carries (mirrors `Output::slot_capability` /
+ * `SlotCapability.subtitle_medium_formats` / `subtitle_formats`,
+ * `crates/multiview-config/src/output_format.rs`). `ll_hls`, `srt`, `rist`
+ * and `rtmp` carry a non-empty `mediumFormats` with an EMPTY `builtFormats`
+ * (the medium supports it; the engine does not build it yet) — the editor
+ * renders those as "not supported yet" with a follow-up issue, distinct from
+ * a medium that carries no subtitles at all (`slot-medium-mismatch`).
+ */
+export interface SubtitleCapability {
+  readonly max: number;
+  readonly mediumFormats: readonly SubtitleFormat[];
+  readonly builtFormats: readonly SubtitleFormat[];
+}
+
+const NO_SUBTITLES: readonly SubtitleFormat[] = [];
+const WEBVTT_ONLY: readonly SubtitleFormat[] = ['webvtt'];
+const TS_SUBTITLES: readonly SubtitleFormat[] = ['cea608', 'dvb'];
+
+/**
+ * The subtitle capability of an output kind. Follow-up issues tracking the
+ * "not supported yet" gaps: LL-HLS WebVTT (fMP4 parts) #398, CEA-608 in A53
+ * SEI for TS/RTMP #399, DVB subtitles #400 (ADR-0110 §12.3, as built in
+ * slice F #345).
+ */
+export function subtitleCapabilityOf(kind: OutputKind): SubtitleCapability {
+  switch (kind) {
+    case 'hls':
+      return { max: MAX_SUBTITLE_SLOTS, mediumFormats: WEBVTT_ONLY, builtFormats: WEBVTT_ONLY };
+    case 'll-hls':
+      return { max: MAX_SUBTITLE_SLOTS, mediumFormats: WEBVTT_ONLY, builtFormats: NO_SUBTITLES };
+    case 'srt':
+    case 'rist':
+    case 'rtmp':
+      return { max: MAX_SUBTITLE_SLOTS, mediumFormats: TS_SUBTITLES, builtFormats: NO_SUBTITLES };
+    default:
+      // rtsp, ndi, display, webrtc, whip-push: any subtitle slot is
+      // slot-medium-mismatch.
+      return { max: 0, mediumFormats: NO_SUBTITLES, builtFormats: NO_SUBTITLES };
+  }
+}
+
+/**
+ * The follow-up issue number for a format the medium carries but the engine
+ * does not build yet, if any (shown next to the "not supported yet" text).
+ */
+export function subtitleFollowUpIssue(kind: OutputKind, format: SubtitleFormat): number | undefined {
+  if (kind === 'll-hls' && format === 'webvtt') return 398;
+  if ((kind === 'srt' || kind === 'rist' || kind === 'rtmp') && format === 'cea608') return 399;
+  if ((kind === 'srt' || kind === 'rist' || kind === 'rtmp') && format === 'dvb') return 400;
+  return undefined;
+}
+
+function asSubtitleFormat(value: unknown): SubtitleFormat {
+  return SUBTITLE_FORMATS.find((f) => f === value) ?? 'webvtt';
+}
+
+/** The authored subtitle slots (`extra.slots.subtitle`). */
+export function subtitleSlotsOf(form: OutputFormState): readonly SubtitleSlotRow[] {
+  const slots = form.extra.slots;
+  if (!isRecord(slots) || !Array.isArray(slots.subtitle)) return [];
+  return slots.subtitle.filter(isRecord).map((slot) => ({
+    format: asSubtitleFormat(slot.format),
+    language: typeof slot.language === 'string' ? slot.language : '',
+    name: typeof slot.name === 'string' ? slot.name : '',
+    source: typeof slot.source === 'string' ? slot.source : undefined,
+  }));
+}
+
+/** The form with `extra.slots.subtitle` replaced by `rows` (empty removes it). */
+export function withSubtitleSlots(
+  form: OutputFormState,
+  rows: readonly SubtitleSlotRow[],
+): OutputFormState {
+  const slots = isRecord(form.extra.slots) ? { ...form.extra.slots } : {};
+  if (rows.length === 0) {
+    delete slots.subtitle;
+  } else {
+    // Keep the raw authored value: trimming here on every keystroke (via
+    // updateRow → withSubtitleSlots → this) would eat a space the instant
+    // it was typed (review UI-2) and would silently strip a server-valid
+    // name/language that legitimately carries leading/trailing or interior
+    // whitespace. Submission-time normalization, if ever wanted, belongs at
+    // the save boundary (`outputFormToBody`), not in every edit.
+    slots.subtitle = rows.map((row) => {
+      const slot: Record<string, unknown> = { format: row.format };
+      if (row.language !== '') slot.language = row.language;
+      if (row.name !== '') slot.name = row.name;
+      if (row.source !== undefined) slot.source = row.source;
+      return slot;
+    });
+  }
+  const { slots: _dropped, ...rest } = form.extra;
+  void _dropped;
+  return Object.keys(slots).length === 0
+    ? { ...form, extra: rest }
+    : { ...form, extra: { ...rest, slots } };
+}
+
+/**
+ * A subtitle slot row's effective menu label (name, else language, else the
+ * default). Mirrors the server's `SubtitleSlot::effective_name`
+ * byte-for-byte: it never trims (`crates/multiview-config/src/
+ * output_format.rs`), so this does not either — a stored name/language
+ * that legitimately carries leading/trailing whitespace must compare equal
+ * to what the server computes.
+ */
+export function subtitleEffectiveName(row: SubtitleSlotRow, index: number): string {
+  if (row.name !== '') return row.name;
+  if (row.language !== '') return row.language;
+  return `Subtitles ${String(index + 1)}`;
+}
+
+/**
+ * Whether a Unicode scalar value is a Rust `char::is_control()` control
+ * character: C0 (U+0000–U+001F), DEL (U+007F) and C1 (U+0080–U+009F).
+ * `crates/multiview-config/src/output_format.rs:833–834` rejects a name
+ * containing one of these (plus `"`), so the editor must refuse the exact
+ * same set — not just C0 as a naive `\u0000-\u001f` regex would.
+ */
+function isControlScalar(codePoint: number): boolean {
+  return (codePoint >= 0x00 && codePoint <= 0x1f) || codePoint === 0x7f || (codePoint >= 0x80 && codePoint <= 0x9f);
+}
+
+/**
+ * One row's validation code, mirroring the server's checks
+ * (`validate_output_format` / `MAX_SUBTITLE_LANGUAGE_LEN` /
+ * `MAX_SUBTITLE_NAME_LEN`): `'language'`, `'name'`, `'format'` (the medium
+ * cannot carry it at all, or carries but does not build it yet) or
+ * `'duplicate-name'` (another slot's effective name repeats). `undefined` ⇒
+ * valid. Never trims: the server validates (and stores) the raw authored
+ * value.
+ */
+export function subtitleSlotError(
+  kind: OutputKind,
+  rows: readonly SubtitleSlotRow[],
+  index: number,
+): 'language' | 'name' | 'format' | 'duplicate-name' | undefined {
+  const row = rows[index];
+  if (row === undefined) return undefined;
+  const cap = subtitleCapabilityOf(kind);
+  if (!cap.mediumFormats.includes(row.format) || !cap.builtFormats.includes(row.format)) {
+    return 'format';
+  }
+  if (row.language !== '') {
+    const language = row.language;
+    const ok =
+      language.length >= 1 &&
+      language.length <= MAX_SUBTITLE_LANGUAGE_LEN &&
+      /^[A-Za-z0-9-]+$/.test(language);
+    if (!ok) return 'language';
+  }
+  if (row.name !== '') {
+    const name = row.name;
+    // Count Unicode scalar values (code points), not UTF-16 units: a
+    // spread/Array.from over a string iterates by code point, so a
+    // supplementary-plane character (e.g. an emoji outside the BMP) counts
+    // as 1, matching Rust's `chars().count()`.
+    const scalars = Array.from(name);
+    const hasControlOrQuote = scalars.some((c) => {
+      const codePoint = c.codePointAt(0);
+      return c === '"' || codePoint === undefined || isControlScalar(codePoint);
+    });
+    const ok = scalars.length <= MAX_SUBTITLE_NAME_LEN && !hasControlOrQuote;
+    if (!ok) return 'name';
+  }
+  const effective = subtitleEffectiveName(row, index);
+  const duplicate = rows.some(
+    (other, j) => j !== index && subtitleEffectiveName(other, j) === effective,
+  );
+  if (duplicate) return 'duplicate-name';
+  return undefined;
+}
+
+/** Whether the output kind's medium carries no subtitles at all (`max === 0`). */
+export function subtitleUnsupportedMedium(kind: OutputKind): boolean {
+  return subtitleCapabilityOf(kind).max === 0;
+}
+
 /** The read-only audio slots (`extra.slots.audio`). */
 export function audioSlotsOf(
   form: OutputFormState,

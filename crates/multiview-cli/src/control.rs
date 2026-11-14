@@ -426,6 +426,10 @@ where
     if let Some(demand) = crate::source_demand::installed_control_demand() {
         state = state.with_source_demand(demand);
     }
+    #[cfg(feature = "ffmpeg")]
+    {
+        state.player_load = crate::player::runtime_provider();
+    }
     if let Some(reader) = source_events {
         let reader = Arc::new(reader);
         let provider: Arc<dyn multiview_control::source_events::SourceEventProvider> =
@@ -4501,6 +4505,8 @@ input_id = "in_b"
                 program_input: None,
                 preview_input: None,
             }],
+            downstream_keyers: vec![],
+            keyer_budget: None,
             extra: serde_json::Map::new(),
         });
         let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
@@ -4557,6 +4563,8 @@ input_id = "in_b"
                 program_input: None,
                 preview_input: None,
             }],
+            downstream_keyers: vec![],
+            keyer_budget: None,
             extra: serde_json::Map::new(),
         });
         config

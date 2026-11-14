@@ -18,13 +18,14 @@
 
 use std::sync::Arc;
 
-use multiview_config::MixEffectsConfig;
+use multiview_config::{DownstreamKeyerConfig, MixEffectsConfig};
 use multiview_control::source_demand::{SwitcherPreviewLease, SwitcherPreviewLeases};
 use multiview_control::SharedSourceDemand;
 use multiview_core::switcher::SourceRef;
 use multiview_engine::switcher::SwitcherState;
 use multiview_engine::switcher_control::{ScenePair, SwitcherControl};
 use multiview_engine::switcher_inputs::MixerInputs;
+use multiview_engine::{keyer, SetItem};
 
 use crate::pipeline::{Pipeline, PipelineError};
 use crate::preview::ProgramSlot;
@@ -72,6 +73,48 @@ pub fn mixer_inputs(me: &MixEffectsConfig) -> Result<Option<MixerInputs>, String
     .map(Some)
 }
 
+/// The `keyer` demand items (ADR-0113 §4): one lease per fill and key,
+/// labelled with the keyer object id (`<program>/<id>`).
+#[must_use]
+pub fn keyer_demand_items(keyers: &[DownstreamKeyerConfig]) -> Vec<SetItem> {
+    let mut items = Vec::with_capacity(keyers.len().saturating_mul(2));
+    for dsk in keyers {
+        let label: Arc<str> = Arc::from(format!("{}/{}", dsk.program, dsk.id).as_str());
+        for source in std::iter::once(&dsk.fill).chain(dsk.key.as_ref()) {
+            items.push(SetItem {
+                id: Arc::from(source.as_str()),
+                label: Arc::clone(&label),
+                size: None,
+            });
+        }
+    }
+    items
+}
+
+/// Resolve the declared downstream keyers against the run's stores and
+/// admit them against the budget (ADR-0113 §9, reserved at definition).
+///
+/// # Errors
+/// A fill or key without a frame store in this run, or a document over the
+/// budget (validation refuses that first). Both are boot errors: a DSK is
+/// never silently dropped.
+pub fn admit_keyers<S: std::hash::BuildHasher>(
+    keyers: &[DownstreamKeyerConfig],
+    stores: &std::collections::HashMap<
+        String,
+        Arc<multiview_framestore::TileStore<multiview_compositor::pipeline::Nv12Image>>,
+        S,
+    >,
+    canvas: (u32, u32),
+    budget: f32,
+) -> Result<keyer::KeyerRuntime, String> {
+    let defs = keyers
+        .iter()
+        .map(|dsk| keyer::KeyerDef::from_config(dsk, stores, canvas.0, canvas.1))
+        .collect::<Result<Vec<_>, _>>()?;
+    keyer::admit(defs, canvas.0, canvas.1, budget)
+}
+
 /// Attach the declared first-slice M/E, if this document declares one.
 ///
 /// `demand` is this run's control-plane demand provider (the same one the
@@ -113,6 +156,18 @@ pub fn attach_first_slice(
         // starting inputs are patched to program_source/preview_source, so the
         // boot lease and the scene pair below name the resolved sources.
         driver.set_inputs(inputs);
+    }
+    if !pipeline.switcher_keyers().is_empty() {
+        // ADR-0113 / K2a: keyers are admitted before the clock starts; a
+        // missing store or an over-budget document fails the boot.
+        let runtime = admit_keyers(
+            pipeline.switcher_keyers(),
+            &pipeline.preview_stores(),
+            pipeline.canvas_size(),
+            pipeline.keyer_budget(),
+        )
+        .map_err(PipelineError::Engine)?;
+        driver.set_keyers(runtime);
     }
     control
         .set_scenes(ScenePair {

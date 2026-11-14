@@ -507,12 +507,18 @@ async fn run_pipeline(
     // desired.json itself is never changed). No socket binds during the build:
     // the control-plane/MoQ listeners bind later, so EADDRINUSE there fails
     // start-up and never reaches this decision.
+    // The durable player journal lives in the state dir, which depends only on
+    // the (canonicalized, as in `to_boot_model`) boot path, never on which
+    // state the fallback picks.
+    let player_state = multiview_control::boot_model::state_dir_for(
+        &std::fs::canonicalize(&args.config).unwrap_or_else(|_| args.config.clone()),
+    );
     let (start, built) = multiview_cli::boot::build_with_fallback(
         start.clone(),
         &args.config,
         &multiview_cli::boot::RetryPolicy::startup(),
         |config| {
-            Pipeline::build(config).map_err(|e| {
+            Pipeline::build_with_player_state(config, Some(&player_state)).map_err(|e| {
                 multiview_cli::boot::BuildFailure::new(
                     e.failure_class(),
                     format!("building the pipeline: {e}"),

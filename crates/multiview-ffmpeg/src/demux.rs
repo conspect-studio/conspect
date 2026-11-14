@@ -14,7 +14,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ffmpeg::codec::Parameters;
@@ -125,14 +126,62 @@ impl ReadPacket {
 /// Sentinel meaning "no deadline is armed" in [`ReadDeadline`].
 const DEADLINE_DISARMED: u64 = 0;
 
-/// Shared, lock-free read-deadline state read by the `AVIOInterruptCB` callback.
+/// A cancellation input for the libav interrupt callback (design C1, media
+/// player runtime load): the open serves generation `mine`; a newer request
+/// stores a different value in `current`, which aborts the open at the next
+/// callback poll while the demuxer's cancel is armed. `stop` aborts
+/// unconditionally.
 ///
-/// The callback runs on a **foreign / libav I/O thread** while a read is blocked
+/// The two `Arc`s keep the shared atomics alive for as long as the
+/// `AVFormatContext` that polls them exists, whichever owner drops first.
+#[derive(Debug, Clone)]
+pub struct CancelToken {
+    current: Arc<AtomicU64>,
+    mine: u64,
+    stop: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    /// A token for an open serving generation `mine`, cancelled when
+    /// `current != mine` (while armed) or when `stop` is set.
+    #[must_use]
+    pub fn new(current: Arc<AtomicU64>, mine: u64, stop: Arc<AtomicBool>) -> Self {
+        Self {
+            current,
+            mine,
+            stop,
+        }
+    }
+
+    /// The generation this open serves.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.mine
+    }
+
+    /// Whether the token asks for an abort right now, given `armed`.
+    #[must_use]
+    pub fn is_cancelled(&self, armed: bool) -> bool {
+        should_interrupt_cancellable(
+            0,
+            DEADLINE_DISARMED,
+            self.current.load(Ordering::Acquire),
+            self.mine,
+            armed,
+            self.stop.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// Shared, lock-free interrupt state read by the `AVIOInterruptCB` callback.
+///
+/// The callback runs on a **foreign / libav I/O thread** while a call is blocked
 /// (GP-0, ADR-0030). It must be allocation-light and must never let a Rust panic
-/// unwind across the FFI boundary, so it does nothing but compare two integers:
-/// an `AtomicU64` deadline (nanoseconds since `base`, or [`DEADLINE_DISARMED`])
-/// against the elapsed time. The owning [`Demuxer`] keeps this `Box` alive for
-/// the whole life of the context and frees it in `Drop` (no leak, unlike
+/// unwind across the FFI boundary, so it does nothing but compare integers: an
+/// `AtomicU64` deadline (nanoseconds since `base`, or [`DEADLINE_DISARMED`])
+/// against the elapsed time and, for a cancellable open, the generation and stop
+/// atomics of its [`CancelToken`]. The owning [`Demuxer`] keeps this `Box` alive
+/// for the whole life of the context and frees it in `Drop` (no leak, unlike
 /// `ffmpeg_next::format::input_with_interrupt`, which leaks the closure).
 struct ReadDeadline {
     /// Monotonic base captured at construction; the deadline is relative to it.
@@ -140,14 +189,32 @@ struct ReadDeadline {
     /// Nanoseconds-since-`base` past which a blocked read must abort, or
     /// [`DEADLINE_DISARMED`] when no deadline is armed.
     deadline_ns: AtomicU64,
+    /// Absolute multi-call phase deadline; reads may only shorten it, never
+    /// re-arm it farther out. Zero is disarmed.
+    phase_deadline_ns: AtomicU64,
+    /// The cancellation input, `None` for a deadline-only open.
+    cancel: Option<CancelToken>,
+    /// Whether a generation change cancels: set while opening, probing and
+    /// priming, cleared before the clip is staged so a later generation can never
+    /// abort reads of a committed clip.
+    armed: AtomicBool,
 }
 
 impl ReadDeadline {
     /// A fresh, disarmed deadline anchored at `now`.
     fn new() -> Self {
+        Self::with_cancel(None)
+    }
+
+    /// A fresh, disarmed deadline with an optional (armed) cancellation token.
+    fn with_cancel(cancel: Option<CancelToken>) -> Self {
+        let armed = cancel.is_some();
         Self {
             base: Instant::now(),
             deadline_ns: AtomicU64::new(DEADLINE_DISARMED),
+            phase_deadline_ns: AtomicU64::new(DEADLINE_DISARMED),
+            cancel,
+            armed: AtomicBool::new(armed),
         }
     }
 
@@ -162,16 +229,52 @@ impl ReadDeadline {
             .store(ns.max(DEADLINE_DISARMED + 1), Ordering::Release);
     }
 
+    /// Arm a cumulative phase budget; individual reads preserve this absolute
+    /// endpoint rather than extending it each time they start.
+    fn arm_phase(&self, timeout: Duration) {
+        let elapsed = self.base.elapsed();
+        let at = elapsed.saturating_add(timeout);
+        let ns = u64::try_from(at.as_nanos()).unwrap_or(u64::MAX);
+        self.phase_deadline_ns
+            .store(ns.max(DEADLINE_DISARMED + 1), Ordering::Release);
+    }
+
+    fn disarm_phase(&self) {
+        self.phase_deadline_ns
+            .store(DEADLINE_DISARMED, Ordering::Release);
+    }
+
+    fn phase_deadline(&self) -> u64 {
+        self.phase_deadline_ns.load(Ordering::Acquire)
+    }
+
+    fn restore_phase(&self, prior: u64) {
+        self.phase_deadline_ns.store(prior, Ordering::Release);
+    }
+
     /// Disarm the deadline (no read in progress).
     fn disarm(&self) {
         self.deadline_ns.store(DEADLINE_DISARMED, Ordering::Release);
     }
 
-    /// Whether a blocked read should abort *now*.
+    /// Whether a blocked read should abort *now* because its deadline expired.
     fn expired(&self) -> bool {
         let deadline = self.deadline_ns.load(Ordering::Acquire);
         let now_ns = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
         should_interrupt(now_ns, deadline)
+            || should_interrupt(now_ns, self.phase_deadline_ns.load(Ordering::Acquire))
+    }
+
+    /// Whether the cancellation input alone asks for an abort.
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.is_cancelled(self.armed.load(Ordering::Acquire)))
+    }
+
+    /// The full callback decision: deadline, generation or stop.
+    fn should_abort(&self) -> bool {
+        self.expired() || self.cancelled()
     }
 }
 
@@ -220,6 +323,21 @@ pub fn open_device_input(
     )
 }
 
+/// Pure decision of the cancellable callback (design 3.2): abort if the
+/// deadline is armed and expired, or if `armed` and `current != mine`, or if
+/// `stop` is set.
+#[must_use]
+fn should_interrupt_cancellable(
+    now_ns: u64,
+    deadline_ns: u64,
+    current: u64,
+    mine: u64,
+    armed: bool,
+    stop: bool,
+) -> bool {
+    should_interrupt(now_ns, deadline_ns) || (armed && current != mine) || stop
+}
+
 /// Options for [`Demuxer::open_with_interrupt`] (GP-0, ADR-0030).
 ///
 /// A live passthrough opens its demuxer with a read/write timeout so a stalled
@@ -237,6 +355,8 @@ pub struct DemuxOptions {
     extra: &'static [(&'static str, &'static str)],
     /// Operator HTTP request headers (`user_agent` / `referer` open options).
     headers: HttpHeaders,
+    /// Deadline for the open and probe only (falls back to `rw_timeout`).
+    open_timeout: Option<Duration>,
 }
 
 /// Operator-set HTTP request headers for an HLS input (libav `user_agent` /
@@ -332,6 +452,20 @@ impl DemuxOptions {
         &self.headers
     }
 
+    /// Set a separate deadline for the open and stream probe; reads keep using
+    /// the `rw_timeout`. Without it the open uses `rw_timeout`.
+    #[must_use]
+    pub fn with_open_timeout(mut self, timeout: Duration) -> Self {
+        self.open_timeout = Some(timeout);
+        self
+    }
+
+    /// The deadline the open and probe run under, if any.
+    #[must_use]
+    pub fn open_timeout(&self) -> Option<Duration> {
+        self.open_timeout.or(self.rw_timeout)
+    }
+
     /// The configured read/write timeout, if any.
     #[must_use]
     pub fn rw_timeout(&self) -> Option<Duration> {
@@ -342,6 +476,21 @@ impl DemuxOptions {
     #[must_use]
     pub const fn extra(&self) -> &'static [(&'static str, &'static str)] {
         self.extra
+    }
+}
+
+/// A cumulative, panic-safe phase deadline. The earliest nested deadline
+/// stays in force; dropping restores the exact earlier phase boundary.
+pub struct PhaseDeadlineGuard {
+    state: Option<Arc<ReadDeadline>>,
+    previous: u64,
+}
+
+impl Drop for PhaseDeadlineGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.as_ref() {
+            state.restore_phase(self.previous);
+        }
     }
 }
 
@@ -363,12 +512,11 @@ pub struct Demuxer {
     #[allow(dead_code)]
     registration: Option<crate::log_bridge::AvContextRegistration>,
     input: ffmpeg::format::context::Input,
-    /// The read-deadline state the injected `AVIOInterruptCB` reads. Boxed so its
-    /// address is stable for the raw pointer libav holds; `None` for a bare
-    /// [`Demuxer::open`] (no interrupt callback installed). The box outlives the
-    /// `AVFormatContext`: `input` (and so the callback) is dropped before this
-    /// field in declaration order.
-    deadline: Option<Box<ReadDeadline>>,
+    /// The read-deadline state the injected `AVIOInterruptCB` reads. Arc-backed
+    /// for stable callback pointer and an owned RAII phase guard; `None` for a
+    /// bare [`Demuxer::open`]. The Arc outlives `AVFormatContext`: `input` (and
+    /// the callback) is dropped before this field in declaration order.
+    deadline: Option<Arc<ReadDeadline>>,
     /// The configured read timeout, replayed to arm the deadline per read.
     rw_timeout: Option<Duration>,
     /// The opened path/URL, for timeout error reporting.
@@ -425,7 +573,7 @@ impl Demuxer {
         // The deadline box must outlive the AVFormatContext: libav stores a raw
         // pointer to it in `interrupt_callback`. We keep ownership here and arm
         // it for the duration of the (potentially blocking) open.
-        let deadline = Box::new(ReadDeadline::new());
+        let deadline = Arc::new(ReadDeadline::new());
         if let Some(timeout) = rw_timeout {
             deadline.arm(timeout);
         }
@@ -474,7 +622,7 @@ impl Demuxer {
         let path = Path::new(device);
         let source = device.to_owned();
         let rw_timeout = options.rw_timeout();
-        let deadline = Box::new(ReadDeadline::new());
+        let deadline = Arc::new(ReadDeadline::new());
         if let Some(timeout) = rw_timeout {
             deadline.arm(timeout);
         }
@@ -496,6 +644,135 @@ impl Demuxer {
             source,
             device: true,
         })
+    }
+
+    /// Open `path` with an interrupt callback that also honours a
+    /// [`CancelToken`] (design C1, media-player runtime load).
+    ///
+    /// The callback aborts the open, the stream probe and any later read when
+    /// the deadline expires, when the token's `current` generation moves away
+    /// from the one this open serves (while armed), or when its `stop` flag is
+    /// set. The token starts armed; call [`Demuxer::disarm_cancel`] once the
+    /// clip is staged so a later generation cannot abort reads of a committed
+    /// clip. `options.open_timeout()` bounds the open and probe; each read arms
+    /// `options.rw_timeout()`.
+    ///
+    /// A libav call that never polls the callback (a kernel `open(2)` on a FIFO
+    /// with no writer) cannot be cancelled; no exit time is promised.
+    ///
+    /// # Errors
+    /// * [`FfmpegError::Cancelled`] — the token cancelled the open.
+    /// * [`FfmpegError::ReadTimeout`] — the open exceeded its deadline.
+    /// * [`FfmpegError::OpenInput`] — the container could not be opened/probed.
+    pub fn open_cancellable(
+        path: &Path,
+        options: &DemuxOptions,
+        token: CancelToken,
+    ) -> Result<Self> {
+        ensure_initialized()?;
+        let source = path.display().to_string();
+        // Checked before any libav call: an already-cancelled request never
+        // touches the file.
+        if token.is_cancelled(true) {
+            return Err(FfmpegError::Cancelled { path: source });
+        }
+        let state = Arc::new(ReadDeadline::with_cancel(Some(token)));
+        if let Some(timeout) = options.open_timeout() {
+            state.arm(timeout);
+        }
+        let opened = open_input_with_interrupt(
+            path,
+            state.as_ref(),
+            options.rw_timeout(),
+            options.extra(),
+            &options.http_headers().open_options(),
+        );
+        let expired = state.expired();
+        let cancelled = state.cancelled();
+        state.disarm();
+        let input = match opened {
+            Ok(input) => input,
+            Err(_) if cancelled => return Err(FfmpegError::Cancelled { path: source }),
+            Err(_) if expired => {
+                return Err(FfmpegError::ReadTimeout {
+                    path: source,
+                    timeout_ms: options
+                        .open_timeout()
+                        .map_or(0, |t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX)),
+                })
+            }
+            Err(other) => return Err(other),
+        };
+        let registration = register_format_context(&input);
+        Ok(Self {
+            registration,
+            input,
+            deadline: Some(state),
+            rw_timeout: options.rw_timeout(),
+            source,
+            device: false,
+        })
+    }
+
+    /// Stop a generation change from cancelling this demuxer's calls (the
+    /// opener calls this just before staging). The deadline and `stop` still
+    /// apply. A no-op for a demuxer opened without a token.
+    pub fn disarm_cancel(&self) {
+        if let Some(state) = self.deadline.as_ref() {
+            state.armed.store(false, Ordering::Release);
+        }
+    }
+
+    /// Whether this demuxer's [`CancelToken`] currently asks for an abort.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.deadline.as_ref().is_some_and(|d| d.cancelled())
+    }
+
+    /// Enter a cumulative phase deadline that automatically restores the
+    /// previous deadline on normal return or Rust panic. Nested scopes take
+    /// the EARLIEST boundary; per-read deadlines cannot erase it.
+    #[must_use]
+    pub fn phase_deadline(&self, timeout: Duration) -> PhaseDeadlineGuard {
+        let Some(state) = self.deadline.as_ref() else {
+            return PhaseDeadlineGuard {
+                state: None,
+                previous: DEADLINE_DISARMED,
+            };
+        };
+        let previous = state.phase_deadline();
+        state.arm_phase(timeout);
+        if previous != DEADLINE_DISARMED {
+            let current = state.phase_deadline();
+            state.restore_phase(previous.min(current));
+        }
+        PhaseDeadlineGuard {
+            state: Some(Arc::clone(state)),
+            previous,
+        }
+    }
+
+    /// Arm the cumulative deadline for a multi-call phase (seek/prime) of
+    /// `timeout` from now. Per-read deadlines can be shorter, but each read
+    /// preserves this absolute endpoint; an N-packet pump cannot extend it.
+    pub fn arm_deadline(&self, timeout: Duration) {
+        if let Some(state) = self.deadline.as_ref() {
+            state.arm_phase(timeout);
+        }
+    }
+
+    /// Disarm a deadline armed with [`Demuxer::arm_deadline`].
+    pub fn disarm_deadline(&self) {
+        if let Some(state) = self.deadline.as_ref() {
+            state.disarm_phase();
+        }
+    }
+
+    /// The opened libav input, for read-only stream inspection (frame rates,
+    /// frame counts, codec parameters) that [`StreamParams`] does not carry.
+    #[must_use]
+    pub fn input(&self) -> &ffmpeg::format::context::Input {
+        &self.input
     }
 
     /// The address of this demuxer's `AVFormatContext`, as a `usize`.
@@ -721,6 +998,7 @@ impl Demuxer {
             }
         };
         let expired = self.deadline.as_ref().is_some_and(|d| d.expired());
+        let cancelled = self.deadline.as_ref().is_some_and(|d| d.cancelled());
         if let Some(deadline) = self.deadline.as_ref() {
             deadline.disarm();
         }
@@ -737,7 +1015,11 @@ impl Demuxer {
             // A read aborted by the interrupt callback surfaces as a libav error;
             // disambiguate it from a real decode error by the armed deadline.
             Err(other) => {
-                if expired {
+                if cancelled {
+                    Err(FfmpegError::Cancelled {
+                        path: self.source.clone(),
+                    })
+                } else if expired {
                     Err(FfmpegError::ReadTimeout {
                         path: self.source.clone(),
                         timeout_ms: self
@@ -983,23 +1265,33 @@ mod ffi_open {
     use super::ReadDeadline;
     use crate::error::{FfmpegError, Result};
 
-    /// `extern "C"` interrupt callback libav polls while a read is blocked.
+    /// `extern "C"` interrupt callback libav polls while a call is blocked.
     ///
-    /// `opaque` is the `*const ReadDeadline` we installed. The body only reads two
-    /// atomics + a monotonic clock and returns `1` to abort or `0` to continue —
-    /// no allocation, no `panic!`, no unwinding across FFI (every operation here
-    /// is panic-free, so no `catch_unwind` is needed).
+    /// `opaque` is the `*const ReadDeadline` we installed. The body only reads a
+    /// few atomics + a monotonic clock and returns `1` to abort or `0` to
+    /// continue — no allocation. It is panic-free and is also wrapped in
+    /// [`guarded`], so a Rust panic can never unwind into libav.
     extern "C" fn interrupt_cb(opaque: *mut c_void) -> c_int {
         if opaque.is_null() {
             return 0;
         }
-        // SAFETY: `opaque` is the `&ReadDeadline` pointer installed in
-        // `open_with_interrupt`; the owning `Box<ReadDeadline>` lives in the
-        // `Demuxer` for at least as long as the `AVFormatContext` that holds this
-        // callback (the context is closed in `Demuxer::drop` before the box is
-        // freed, by field declaration order), so the reference is valid here.
-        let deadline: &ReadDeadline = unsafe { &*opaque.cast::<ReadDeadline>() };
-        c_int::from(deadline.expired())
+        guarded(|| {
+            // SAFETY: `opaque` is the `&ReadDeadline` pointer installed in
+            // `open_input_with_interrupt`; the owning `Box<ReadDeadline>` lives in
+            // the `Demuxer` for at least as long as the `AVFormatContext` that
+            // holds this callback (the context is closed in `Demuxer::drop`
+            // before the box is freed, by field declaration order; on a failed
+            // open the box outlives the call that freed the context), so the
+            // reference is valid here.
+            let deadline: &ReadDeadline = unsafe { &*opaque.cast::<ReadDeadline>() };
+            deadline.should_abort()
+        })
+    }
+
+    /// Run the callback decision `decide`, mapping `true` to `1` (abort) and a
+    /// caught panic to `1` as well: a panic must never cross the FFI boundary.
+    pub(super) fn guarded(decide: impl FnOnce() -> bool + std::panic::UnwindSafe) -> c_int {
+        std::panic::catch_unwind(decide).map_or(1, c_int::from)
     }
 
     /// Open `path` with the interrupt callback wired to `deadline` and, if set,
@@ -1333,7 +1625,198 @@ mod interrupt_logic_tests {
 
     use std::time::Duration;
 
-    use super::{should_interrupt, DemuxOptions, ReadDeadline, DEADLINE_DISARMED};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use super::{
+        ffi_open::guarded, should_interrupt, should_interrupt_cancellable, CancelToken,
+        DemuxOptions, Demuxer, ReadDeadline, DEADLINE_DISARMED,
+    };
+    use crate::error::FfmpegError;
+
+    #[test]
+    fn owned_phase_guard_keeps_callback_state_alive_after_demux_owner_drops() {
+        let state = Arc::new(ReadDeadline::new());
+        let owner = Arc::clone(&state);
+        let guard = super::PhaseDeadlineGuard {
+            state: Some(Arc::clone(&state)),
+            previous: DEADLINE_DISARMED,
+        };
+        let weak = Arc::downgrade(&state);
+        drop(owner);
+        drop(state);
+        assert!(
+            weak.upgrade().is_some(),
+            "guard owns callback state independently"
+        );
+        drop(guard);
+        assert!(
+            weak.upgrade().is_none(),
+            "state released after last callback/guard owner"
+        );
+    }
+
+    #[test]
+    fn nested_owned_phase_guard_restores_deadline_on_unwind() {
+        let state = Arc::new(ReadDeadline::new());
+        let previous = state.phase_deadline();
+        state.arm_phase(std::time::Duration::from_secs(5));
+        let outer = state.phase_deadline();
+        assert_ne!(outer, previous);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _nested = super::PhaseDeadlineGuard {
+                state: Some(Arc::clone(&state)),
+                previous: outer,
+            };
+            state.arm_phase(std::time::Duration::ZERO);
+            assert!(state.expired());
+            panic!("inject panic inside phase");
+        }));
+        assert!(caught.is_err());
+        assert_eq!(state.phase_deadline(), outer);
+        state.disarm_phase();
+        assert_eq!(state.phase_deadline(), previous);
+    }
+
+    #[test]
+    fn cumulative_phase_deadline_survives_each_per_read_arm_and_disarm() {
+        let state = ReadDeadline::new();
+        state.arm_phase(std::time::Duration::ZERO);
+        state.arm(std::time::Duration::from_secs(300));
+        state.disarm();
+        assert!(
+            state.expired(),
+            "per-read disarm cannot erase the expired phase"
+        );
+        state.disarm_phase();
+        assert!(!state.expired(), "phase disarm clears only the phase");
+    }
+
+    /// Every combination of (deadline expired, `current != mine`, armed, stop):
+    /// abort iff expired, or (armed and superseded), or stop.
+    #[test]
+    fn should_interrupt_cancellable_truth_table() {
+        for expired in [false, true] {
+            for superseded in [false, true] {
+                for armed in [false, true] {
+                    for stop in [false, true] {
+                        let (now, deadline) = if expired { (10, 5) } else { (1, 5) };
+                        let current = if superseded { 8 } else { 7 };
+                        let want = expired || (armed && superseded) || stop;
+                        assert_eq!(
+                            should_interrupt_cancellable(now, deadline, current, 7, armed, stop),
+                            want,
+                            "expired={expired} superseded={superseded} armed={armed} stop={stop}"
+                        );
+                    }
+                }
+            }
+        }
+        // A disarmed deadline never fires on its own.
+        assert!(!should_interrupt_cancellable(
+            u64::MAX,
+            DEADLINE_DISARMED,
+            7,
+            7,
+            true,
+            false
+        ));
+    }
+
+    fn token(current: &Arc<AtomicU64>, mine: u64, stop: &Arc<AtomicBool>) -> CancelToken {
+        CancelToken::new(Arc::clone(current), mine, Arc::clone(stop))
+    }
+
+    #[test]
+    fn callback_cancels_on_a_newer_generation_while_armed() {
+        let current = Arc::new(AtomicU64::new(3));
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = ReadDeadline::with_cancel(Some(token(&current, 3, &stop)));
+        assert!(!state.should_abort(), "own generation: keep going");
+        current.store(4, Ordering::Release);
+        assert!(state.should_abort(), "a newer generation cancels");
+    }
+
+    #[test]
+    fn callback_does_not_cancel_after_disarm() {
+        let current = Arc::new(AtomicU64::new(3));
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = ReadDeadline::with_cancel(Some(token(&current, 3, &stop)));
+        state.armed.store(false, Ordering::Release);
+        current.store(9, Ordering::Release);
+        assert!(
+            !state.should_abort(),
+            "a staged clip's reads are never aborted by a later generation"
+        );
+        stop.store(true, Ordering::Release);
+        assert!(state.should_abort(), "stop still aborts after disarm");
+    }
+
+    #[test]
+    fn deadline_only_state_ignores_cancellation() {
+        let state = ReadDeadline::new();
+        assert!(!state.cancelled());
+        assert!(!state.should_abort());
+    }
+
+    #[test]
+    fn catch_unwind_maps_a_panic_to_abort() {
+        // Test-only injection: the guarded decision panics. The callback must
+        // return 1 (abort) and the panic must not escape.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let code = guarded(|| panic!("injected callback panic"));
+        std::panic::set_hook(prev);
+        assert_eq!(code, 1, "a caught panic aborts");
+        assert_eq!(guarded(|| false), 0);
+        assert_eq!(guarded(|| true), 1);
+    }
+
+    #[test]
+    fn open_cancellable_refuses_an_already_superseded_request() {
+        let current = Arc::new(AtomicU64::new(5));
+        let stop = Arc::new(AtomicBool::new(false));
+        let err = Demuxer::open_cancellable(
+            Path::new("/nonexistent/never-opened.mov"),
+            &DemuxOptions::new(),
+            token(&current, 4, &stop),
+        )
+        .err()
+        .expect("superseded open must fail");
+        assert!(
+            matches!(err, FfmpegError::Cancelled { .. }),
+            "named cancellation, got {err}"
+        );
+    }
+
+    #[test]
+    fn open_cancellable_reports_a_missing_file_as_open_input() {
+        let current = Arc::new(AtomicU64::new(1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let err = Demuxer::open_cancellable(
+            Path::new("/nonexistent/missing.mov"),
+            &DemuxOptions::new(),
+            token(&current, 1, &stop),
+        )
+        .err()
+        .expect("a missing file fails");
+        assert!(matches!(err, FfmpegError::OpenInput { .. }), "got {err}");
+    }
+
+    #[test]
+    fn open_cancellable_with_stop_set_is_cancelled() {
+        let current = Arc::new(AtomicU64::new(1));
+        let stop = Arc::new(AtomicBool::new(true));
+        let err = Demuxer::open_cancellable(
+            Path::new("/nonexistent/x.mov"),
+            &DemuxOptions::new(),
+            token(&current, 1, &stop),
+        )
+        .err()
+        .expect("stopped open fails");
+        assert!(matches!(err, FfmpegError::Cancelled { .. }), "got {err}");
+    }
 
     #[test]
     fn disarmed_deadline_never_interrupts() {
