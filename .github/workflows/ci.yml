@@ -293,6 +293,7 @@ jobs:
   #                      ntp     (adjtimex read via multiview-ntpsys FFI leaf)
   #   multiview-control: is07-mqtt (MQTT transport for IS-07 tally, rumqttc)
   #                      nmos    (NMOS IS-04/05/08 discovery + receiver bind)
+  #                      devices-net (live Cast driver + mDNS discovery)
   #   multiview-hal:     i915-pmu (Intel perf_event_open PMU, multiview-i915pmu)
   #
   # NDI (IN-3) is NOT a Cargo feature yet: the grafton-ndi link requires the
@@ -334,6 +335,13 @@ jobs:
             feature: is07-mqtt
           - crate: multiview-control
             feature: nmos
+          # The live Cast driver + mDNS discovery (ADR-M011, ADR-0111):
+          # `devices-net` = zowietek + cast (CASTV2 TLS + protobuf framing) +
+          # discovery (mdns-sd). Pure Rust, no device needed: the cast tests
+          # (`cast_net`, `cast_session_streams`, …) run over loopback [::1] and
+          # a scripted channel. The default jobs build none of `cast::net`.
+          - crate: multiview-control
+            feature: devices-net
           # multiview-control + multiview-cli off-by-default `tls` feature (TLS-0,
           # ADR-W029): static-certificate rustls termination on the control
           # listener. The default `lint`/`test` jobs build NEITHER the
