@@ -559,4 +559,111 @@ mod tests {
         assert_eq!(text_cue_lines(&store, at(1), store.generation() + 1), None);
         assert_eq!(text_cue_lines(&store, at(200), store.generation()), None);
     }
+
+    /// Chaos (invariant #10: the engine never waits on a client; bounded
+    /// queues drop, never grow): a wedged sink that NEVER drains the feed,
+    /// 3 slots and a hostile resolver (256 KiB whitespace-padded text that
+    /// changes every tick, alternating with nothing) for 10 000 ticks. Every
+    /// tick completes, the feed never holds more than its capacity, pending
+    /// stays bounded per slot, drops are counted, and the per-tick projection
+    /// work stays within its budget. Once the sink recovers, silence still
+    /// delivers the held cue's close (no open cue is left behind).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    // reason: one chaos scenario (wedge, recovery) checked end to end.
+    fn a_wedged_sink_never_blocks_or_grows_the_sampler() {
+        use multiview_output::hls::subtitle::{SlotCues, MAX_INSPECTED_BYTES};
+        use multiview_output::hls::SubtitleStats;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const CAPACITY: usize = 8;
+        const TICKS: u64 = 10_000;
+        let (feed, rx) = subtitle_feed_with_capacity(CAPACITY);
+        let stats = feed.stats();
+        let routes = subtitle_routes(vec![
+            Some("a".to_owned()),
+            Some("b".to_owned()),
+            Some("c".to_owned()),
+        ]);
+        let show = Arc::new(AtomicBool::new(false));
+        let max_inspected = Arc::new(AtomicUsize::new(0));
+        let pad = " ".repeat(256 * 1024);
+        let resolve: CueResolver = {
+            let (show, max_inspected) = (Arc::clone(&show), Arc::clone(&max_inspected));
+            Box::new(move |id, now| {
+                if !show.load(Ordering::Relaxed) {
+                    return None;
+                }
+                // Changing text, then two 256 KiB whitespace-only lines and
+                // more text: ~512 KiB of hostile source per sample.
+                let head = format!("{id} {}", now.as_nanos());
+                let source = [head.as_str(), pad.as_str(), pad.as_str(), "tail"];
+                let bounded = bound_cue_lines(&source);
+                max_inspected.fetch_max(bounded.inspected_bytes(), Ordering::Relaxed);
+                Some(bounded)
+            })
+        };
+        let run = SubtitleRun::new(
+            vec![SubtitleOutputSampler::new(routes, feed, 3)],
+            resolve,
+            Rational::new(25, 1),
+        );
+        // Drive the wedged run on its own thread: a blocked tick would never
+        // report back, so a bounded wait proves no tick blocks.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_show = Arc::clone(&show);
+        std::thread::spawn(move || {
+            let mut run = run;
+            for tick in 0..TICKS {
+                // Text on odd ticks (the last tick shows text), none on even.
+                worker_show.store(tick % 2 == 1, Ordering::Relaxed);
+                run.tick(tick);
+                let pending_ok = run.outputs[0]
+                    .slots
+                    .iter()
+                    .all(|(_, p)| p.cues.len() <= MAX_PENDING_PER_SLOT);
+                if !pending_ok {
+                    let _ = done_tx.send(Err(format!("pending grew at tick {tick}")));
+                    return;
+                }
+            }
+            let _ = done_tx.send(Ok(run));
+        });
+        let mut run = done_rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("every tick completes: the sampler never blocks on a wedged sink")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            max_inspected.load(Ordering::Relaxed) <= MAX_INSPECTED_BYTES,
+            "per-tick projection work within budget"
+        );
+        assert!(stats.feed_dropped() > 0, "the wedge drops and counts");
+        // The sink recovers: the feed never held more than its capacity.
+        let sink_stats = SubtitleStats::default();
+        let mut held: Vec<SlotCues> = (0..3).map(|_| SlotCues::default()).collect();
+        let mut deliver = |cues: Vec<SubtitleCue>| {
+            for cue in cues {
+                held[usize::from(cue.slot)].push(cue, &sink_stats);
+            }
+        };
+        let wedged = rx.drain();
+        assert!(wedged.len() <= CAPACITY, "{}", wedged.len());
+        assert!(wedged.iter().all(|c| c.lines.len() <= 4));
+        deliver(wedged);
+        // Silence follows: the pending changes and the held cues' closes
+        // arrive within a few ticks.
+        show.store(false, Ordering::Relaxed);
+        for tick in TICKS..TICKS + 8 {
+            run.tick(tick);
+            deliver(rx.drain());
+        }
+        assert!(run.outputs[0].slots.iter().all(|(_, p)| p.cues.is_empty()));
+        for (slot, cues) in held.iter().enumerate() {
+            let open = cues
+                .overlapping(MediaTime::ZERO, SubtitleCue::OPEN_END)
+                .into_iter()
+                .filter(|c| c.is_open())
+                .count();
+            assert_eq!(open, 0, "slot {slot} keeps no OPEN_END cue");
+        }
+    }
 }
