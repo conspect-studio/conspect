@@ -116,8 +116,8 @@ pub enum ControlError {
     #[error("the switcher M/E owns the Program canvas; {0} was not applied")]
     SwitcherOwnsCells(&'static str),
 
-    /// A stored layout the M/E has on Program, Preview or a mixer input
-    /// cannot be deleted (#307): 409 `layout-on-air`.
+    /// A stored layout registered as an M/E source cannot be deleted
+    /// (#307): 409 `layout-on-air`.
     #[error("layout {0:?} is on the M/E")]
     LayoutOnAir(String),
 
@@ -230,8 +230,8 @@ impl ControlError {
             )),
             Self::LayoutOnAir(layout) => {
                 Problem::new(409, "layout-on-air", "Layout is on the M/E").with_detail(format!(
-                    "layout {layout:?} is on the switcher M/E (Program, Preview or a mixer \
-                     input); take it off the M/E before deleting it"
+                    "layout {layout:?}: {}",
+                    crate::me_layouts::ME_LAYOUT_ON_AIR_DETAIL
                 ))
             }
             Self::LayoutNotAdmissible(detail) => Problem::new(

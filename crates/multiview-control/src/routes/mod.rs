@@ -353,19 +353,17 @@ async fn create_layout(
     Ok(layout_response(StatusCode::CREATED, &versioned))
 }
 
-/// The #307 guard of [`update_layout`]: `Ok(true)` when `id` is a
-/// registered M/E layout source and the edit is allowed, `Ok(false)` when it
-/// is not registered.
+/// The #307 guard of [`update_layout`] for a layout `registered` as an M/E
+/// source (from its [`crate::me_layouts::LayoutFence`]): `Ok(true)` when the
+/// edit is allowed, `Ok(false)` when it is not registered.
 fn authorize_me_layout_edit(
     state: &AppState,
     principal: &Principal,
     id: &str,
     body: &serde_json::Value,
+    registered: bool,
 ) -> ControlResult<bool> {
-    let Some(registry) = state.me_layouts.as_ref() else {
-        return Ok(false);
-    };
-    if !registry.contains(id) {
+    if !registered {
         return Ok(false);
     }
     let forbidden = || {
@@ -435,11 +433,25 @@ async fn update_layout(
     // §6.3: an edit of a layout on air on an output needs Write on those
     // outputs and Read on every source the new body shows.
     output_routing::authorize_routed_layout_edit(&state, &principal, &id, Some(&input.body))?;
+    // #307 review A3/M3: fence the layout BEFORE the registration check and
+    // the commit. Until the guard drops (after the commit, or on any early
+    // return) no body of it is registered; afterwards only a body read after
+    // the commit (an in-flight older read is refused `layout-changed`).
+    let fence = state
+        .me_layouts
+        .as_ref()
+        .map(|registry| registry.begin_edit(&id));
     // #307: an edit of a layout registered as an M/E source changes what the
     // M/E can put on air: Program scope + the M/E object + Read on every
     // source the NEW body binds (one generic 403), and the new body must
     // stay admissible (422, checked before the commit).
-    let me_registered = authorize_me_layout_edit(&state, &principal, &id, &input.body)?;
+    let me_registered = authorize_me_layout_edit(
+        &state,
+        &principal,
+        &id,
+        &input.body,
+        fence.as_ref().is_some_and(crate::me_layouts::LayoutFence::registered),
+    )?;
     let versioned = if state.boot_model.is_some() {
         let mut layouts = crate::boot_model::layout_library(&state)?;
         let layout = layouts
@@ -472,6 +484,8 @@ async fn update_layout(
             registry.update_body(body, state.source_demand.as_ref());
         }
     }
+    // The fence completes now: its revision is taken after the commit.
+    drop(fence);
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -491,11 +505,11 @@ async fn update_layout(
         tag = "layouts",
         params(("id" = String, Path, description = "Layout id.")),
         responses(
-            (status = 204, description = "The layout was deleted (and, if it was registered as an M/E source but off the M/E, unregistered first)."),
+            (status = 204, description = "The layout was deleted."),
             (status = 401, description = "Missing or invalid credentials.", body = Problem),
             (status = 403, description = "Not authorized to administer.", body = Problem),
             (status = 404, description = "No layout with that id.", body = Problem),
-            (status = 409, description = "`layout-on-air`: the switcher M/E has this layout on Program, Preview or a mixer input (#307).", body = Problem),
+            (status = 409, description = "`layout-on-air`: this layout is registered as an M/E source (#307): it is on Program, Preview or a mixer input, or was within the last 10 s; nothing changed.", body = Problem),
             (status = 412, description = "If-Match precondition failed.", body = Problem),
         ),
     )
@@ -519,15 +533,16 @@ async fn delete_layout(
     // §6.3: deleting a layout on air moves its outputs to Program, so it
     // needs Write on every output it feeds (403 `routed-layout`).
     output_routing::authorize_routed_layout_edit(&state, &principal, &id, None)?;
-    // #307: a layout the M/E has on Program, Preview or a patched input
-    // cannot be deleted (409 `layout-on-air`); a merely registered one is
-    // unregistered first.
-    if let Some(registry) = state.me_layouts.as_ref() {
-        if output_routing::me_layout_on_air(&state, &id) {
-            return Err(ControlError::LayoutOnAir(id));
-        }
-        registry.remove(&id);
-    }
+    // #307 (review A3): a layout registered as an M/E source at all
+    // (referenced or still lingering) cannot be deleted: 409
+    // `layout-on-air`, nothing changes. Otherwise the layout is fenced
+    // before the commit, so an in-flight read of it can never register the
+    // deleted body afterwards.
+    let fence = match state.me_layouts.as_ref().map(|r| r.begin_delete(&id)) {
+        Some(Err(_)) => return Err(ControlError::LayoutOnAir(id)),
+        Some(Ok(fence)) => Some(fence),
+        None => None,
+    };
     if state.boot_model.is_some() {
         let mut layouts = crate::boot_model::layout_library(&state)?;
         let config: multiview_config::MultiviewConfig =
@@ -555,6 +570,7 @@ async fn delete_layout(
     }
     // Outputs routed to the deleted layout fall back to Program.
     output_routing::notify_layout_change(&state, &id, None);
+    drop(fence);
     state.audit(
         &principal.key_id,
         AuditAction::Delete,

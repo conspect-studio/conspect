@@ -674,15 +674,6 @@ pub(crate) fn resolve_me_layout_body(
     Ok(LayoutBody(std::sync::Arc::new(routed)))
 }
 
-/// Whether the M/E references stored layout `id` (its Program/Preview or a
-/// patched input), from the engine's snapshot and readback.
-pub(crate) fn me_layout_on_air(state: &AppState, id: &str) -> bool {
-    state
-        .switcher
-        .as_ref()
-        .is_some_and(|control| crate::me_layouts::me_references(control, id))
-}
-
 /// The outputs (config ids) whose live feed or pending take is layout `id`.
 fn outputs_on_layout(state: &AppState, id: &str) -> Vec<String> {
     let bus = RoutedFeed::Layout(id.to_owned()).bus_name();

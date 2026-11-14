@@ -742,3 +742,294 @@ fn the_sweep_drops_an_unreferenced_entry_after_the_linger() {
     assert_eq!(registry.sweep(|_| false, released + ME_LAYOUT_LINGER), 1);
     assert_eq!(registry.ids(), Vec::<String>::new());
 }
+
+fn routed_rev(id: &str, revision: u64) -> LayoutBody {
+    LayoutBody(Arc::new(multiview_control::output_routing::RoutedLayout {
+        revision,
+        ..(*routed(id).0).clone()
+    }))
+}
+
+/// Live demand leases (acquired minus released), for lease ownership.
+#[derive(Default)]
+struct CountingDemand {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct CountedLease(Arc<std::sync::atomic::AtomicUsize>);
+
+impl multiview_control::SourceDemandLease for CountedLease {}
+
+impl Drop for CountedLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl multiview_control::SourceDemandProvider for CountingDemand {
+    fn status(&self, id: &str) -> multiview_control::SourceDemandView {
+        multiview_control::SourceDemandView::idle(id)
+    }
+    fn active(&self) -> Vec<multiview_control::SourceDemandView> {
+        Vec::new()
+    }
+    fn preview_lease(
+        &self,
+        _id: &str,
+        _label: &str,
+    ) -> Option<Box<dyn multiview_control::SourceDemandLease>> {
+        self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(Box::new(CountedLease(Arc::clone(&self.live))))
+    }
+    fn touch_preview(&self, _id: &str) -> Option<multiview_control::SourceDemandPhase> {
+        None
+    }
+}
+
+/// An engine side whose `unregister` parks on a barrier pair once armed:
+/// `entered` (the removal is inside the adapter) then `release`.
+struct BlockingSources {
+    inner: FakeSources,
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+impl BlockingSources {
+    fn new() -> Self {
+        Self {
+            inner: FakeSources::default(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+}
+
+impl MeLayoutSources for BlockingSources {
+    fn register(&self, body: LayoutBody) -> Result<(), MeLayoutRefusal> {
+        self.inner.register(body)
+    }
+    fn unregister(&self, id: &str) -> bool {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.wait();
+            self.release.wait();
+        }
+        self.inner.unregister(id)
+    }
+    fn registered(&self) -> Vec<String> {
+        self.inner.registered()
+    }
+}
+
+/// #307 review A2/M1/I3: a removal (sweep or remove) blocked inside the
+/// engine unregister cannot interleave with an `ensure` of the same id; the
+/// fresh registration lands after it, stays registered on both sides and
+/// owns exactly its own leases.
+fn removal_cannot_unregister_a_fresh_registration(sweep: bool) {
+    let sources = Arc::new(BlockingSources::new());
+    let engine: Arc<dyn MeLayoutSources> = sources.clone();
+    let registry = Arc::new(MeLayoutRegistry::new(engine));
+    let counting = CountingDemand::default();
+    let live = Arc::clone(&counting.live);
+    let demand: multiview_control::SharedSourceDemand = Arc::new(counting);
+    let t0 = Instant::now();
+    registry
+        .ensure(routed_rev("x", 10), Some(&demand), t0)
+        .unwrap();
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    sources
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let remover = {
+        let registry = Arc::clone(&registry);
+        std::thread::spawn(move || {
+            if sweep {
+                assert_eq!(registry.sweep(|_| false, t0 + ME_LAYOUT_LINGER), 1);
+            } else {
+                assert!(registry.remove("x"));
+            }
+        })
+    };
+    // The removal is now parked inside the adapter's unregister.
+    sources.entered.wait();
+    let ensured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ensurer = {
+        let registry = Arc::clone(&registry);
+        let demand = Arc::clone(&demand);
+        let ensured = Arc::clone(&ensured);
+        std::thread::spawn(move || {
+            registry
+                .ensure(routed_rev("x", 20), Some(&demand), Instant::now())
+                .unwrap();
+            ensured.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !ensured.load(std::sync::atomic::Ordering::SeqCst),
+        "ensure interleaved with a removal in progress"
+    );
+    sources.release.wait();
+    remover.join().unwrap();
+    ensurer.join().unwrap();
+    assert_eq!(registry.ids(), vec!["x".to_owned()]);
+    assert_eq!(sources.registered(), vec!["x".to_owned()]);
+    assert_eq!(sources.inner.bodies.lock().unwrap()["x"].0.revision, 20);
+    // The old entry's lease was released; the fresh one holds exactly its own.
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(registry.remove("x"));
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(sources.registered().is_empty());
+}
+
+#[test]
+fn a_sweep_cannot_unregister_a_concurrent_fresh_registration() {
+    removal_cannot_unregister_a_fresh_registration(true);
+}
+
+#[test]
+fn a_remove_cannot_unregister_a_concurrent_fresh_registration() {
+    removal_cannot_unregister_a_fresh_registration(false);
+}
+
+/// #307 review A3/M3: a body read before a committed edit is refused even
+/// when the layout was not registered (first registration), and a body read
+/// after the commit registers.
+#[tokio::test]
+async fn an_old_read_is_refused_after_an_edit_commits() {
+    let rig = Rig::new(false);
+    let registry = Arc::clone(rig.state.me_layouts.as_ref().unwrap());
+    let old = routed_rev(
+        "wall",
+        multiview_control::output_routing::next_layout_revision(),
+    );
+    let response = send(
+        &rig.router,
+        put_json(
+            "/api/v1/layouts/wall",
+            OPERATOR_TOKEN,
+            Some("W/\"1\""),
+            &json!({ "name": "wall", "body": layout_body(&[("b", 1.0)], 64) }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(registry.fence("wall") > old.0.revision);
+    assert_eq!(
+        registry.ensure(old, None, Instant::now()),
+        Err(multiview_control::me_layouts::MeLayoutError::Changed)
+    );
+    assert!(rig.sources.registered().is_empty(), "the old body never registers");
+    let fresh = routed_rev(
+        "wall",
+        multiview_control::output_routing::next_layout_revision(),
+    );
+    registry.ensure(fresh, None, Instant::now()).unwrap();
+    assert_eq!(rig.sources.registered(), vec!["wall".to_owned()]);
+}
+
+/// While an edit is committing (its fence guard alive), even a newer read
+/// is refused; once it completes only a read after it registers.
+#[test]
+fn a_committing_edit_refuses_every_registration() {
+    let sources = Arc::new(FakeSources::default());
+    let registry = MeLayoutRegistry::new(shared(&sources));
+    let fence = registry.begin_edit("x");
+    assert!(!fence.registered());
+    let during = routed_rev("x", multiview_control::output_routing::next_layout_revision());
+    assert_eq!(
+        registry.ensure(during.clone(), None, Instant::now()),
+        Err(multiview_control::me_layouts::MeLayoutError::Changed)
+    );
+    drop(fence);
+    assert_eq!(
+        registry.ensure(during, None, Instant::now()),
+        Err(multiview_control::me_layouts::MeLayoutError::Changed),
+        "read during the commit stays refused"
+    );
+    let after = routed_rev("x", multiview_control::output_routing::next_layout_revision());
+    registry.ensure(after, None, Instant::now()).unwrap();
+    assert_eq!(registry.ids(), vec!["x".to_owned()]);
+}
+
+/// #307 review A3: a body read before a delete never registers afterwards.
+#[tokio::test]
+async fn an_old_read_is_refused_after_a_delete() {
+    let rig = Rig::new(false);
+    let registry = Arc::clone(rig.state.me_layouts.as_ref().unwrap());
+    let old = routed_rev(
+        "w1",
+        multiview_control::output_routing::next_layout_revision(),
+    );
+    let response = send(
+        &rig.router,
+        delete_if_match("/api/v1/layouts/w1", ADMIN_TOKEN, Some("W/\"1\"")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        registry.ensure(old, None, Instant::now()),
+        Err(multiview_control::me_layouts::MeLayoutError::Changed)
+    );
+    assert!(rig.sources.registered().is_empty());
+    // Through HTTP the layout is simply gone now.
+    let response = submit(&rig, OPERATOR_TOKEN, "gone", select("select_preview", "w1")).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// #307 review A3: a registered layout cannot be deleted even when nothing
+/// references it any more (it lingers): 409 `layout-on-air`, nothing changes.
+#[tokio::test]
+async fn deleting_a_registered_but_unreferenced_layout_is_refused() {
+    let mut rig = Rig::new(false);
+    let response = submit(&rig, OPERATOR_TOKEN, "r0", select("select_preview", "wall")).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    rig.tick();
+    let response = submit(
+        &rig,
+        OPERATOR_TOKEN,
+        "r1",
+        json!({"me": "me1", "program": "main", "action": "select_preview", "source": "b"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    rig.tick();
+    assert_ne!(
+        rig.handle.snapshot().unwrap().preview.as_str(),
+        "layout:wall",
+        "off the M/E"
+    );
+    let response = send(
+        &rig.router,
+        delete_if_match("/api/v1/layouts/wall", ADMIN_TOKEN, Some("W/\"1\"")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let problem = body_json(response).await;
+    assert!(problem["type"].as_str().unwrap().ends_with("layout-on-air"));
+    assert!(problem["detail"]
+        .as_str()
+        .unwrap()
+        .contains("retry after 10 s"));
+    assert_eq!(rig.registered(), vec!["wall".to_owned()]);
+    // Still in the library.
+    let response = send(
+        &rig.router,
+        support::get("/api/v1/layouts/wall", OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // After the linger sweep it deletes.
+    let registry = rig.state.me_layouts.as_ref().unwrap();
+    assert_eq!(
+        registry.sweep(|_| false, Instant::now() + ME_LAYOUT_LINGER),
+        1
+    );
+    let response = send(
+        &rig.router,
+        delete_if_match("/api/v1/layouts/wall", ADMIN_TOKEN, Some("W/\"1\"")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}

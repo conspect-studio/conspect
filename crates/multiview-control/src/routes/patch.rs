@@ -625,7 +625,7 @@ pub(crate) async fn plan_patch(
         (status = 202, body = PatchAccepted),
         (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source; a replayed key is re-authorized.", body = crate::problem::Problem),
         (status = 404, description = "Unknown output.", body = crate::problem::Problem),
-        (status = 409, description = "`conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `aux-capacity` (no free layout canvas), or no source lease.", body = crate::problem::Problem),
+        (status = 409, description = "`conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `layout-changed` (a mixer input's `{layout}` was edited or deleted while this request was in flight; the key is released, retry), `aux-capacity` (no free layout canvas), or no source lease.", body = crate::problem::Problem),
         (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` / `layout-not-admissible` (an output slot's or a mixer input's layout), missing Idempotency-Key, or not 1..=64 crosspoints.", body = crate::problem::Problem),
         (status = 429, description = "Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After.", body = crate::problem::Problem),
         (status = 503, description = "`engine-busy` (the key and leases are released; or a `{layout}` could not be read now: every layout-read slot is in use; or the output clock did not adopt a newly registered mixer-input layout within 1 s) or `idempotency-capacity`.", body = crate::problem::Problem),
@@ -720,7 +720,7 @@ pub(crate) async fn take_patch(
             if let Err(error) = registry.ensure(body, state.source_demand.as_ref(), Instant::now())
             {
                 state.idempotency.release(Some(key), &op);
-                return Ok(problem(409, "capacity", error.detail()));
+                return Ok(problem(409, error.kind(), error.detail()));
             }
         }
         if !registry.adopted_within(ME_LAYOUT_ADOPT_WAIT).await {

@@ -466,7 +466,7 @@ pub(crate) async fn plan_switcher(
 }
 
 /// Enqueue a checked verb; a 202 never asserts frame application.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path)), request_body = SwitcherRequest, responses((status = 202, body = SwitcherAccepted), (status = 403, description = "Not authorized for the M/E, Program scope, a referenced object, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal.", body = crate::problem::Problem), (status = 409, description = "Switcher unavailable; `capacity` (a fifth stored layout as an M/E source, or a source it shows cannot be leased; key released); no source lease.", body = crate::problem::Problem), (status = 422, description = "Invalid verb or references (exactly one of `source`/`input`/`layout` on a select; none on cut/auto), `not-on-an-input`, `unknown-slot`, `unknown-source` (no such stored layout), `layout-not-admissible` (another canvas, a translucent cell, or a nested layout/bus cell).", body = crate::problem::Problem), (status = 503, description = "`engine-busy`: the mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key released).", body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path)), request_body = SwitcherRequest, responses((status = 202, body = SwitcherAccepted), (status = 403, description = "Not authorized for the M/E, Program scope, a referenced object, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal.", body = crate::problem::Problem), (status = 409, description = "Switcher unavailable; `capacity` (a fifth stored layout as an M/E source, or a source it shows cannot be leased; key released); `layout-changed` (the stored layout was edited or deleted while this request was in flight; key released, retry); no source lease.", body = crate::problem::Problem), (status = 422, description = "Invalid verb or references (exactly one of `source`/`input`/`layout` on a select; none on cut/auto), `not-on-an-input`, `unknown-slot`, `unknown-source` (no such stored layout), `layout-not-admissible` (another canvas, a translucent cell, or a nested layout/bus cell).", body = crate::problem::Problem), (status = 503, description = "`engine-busy`: the mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key released).", body = crate::problem::Problem))))]
 #[allow(clippy::too_many_lines)]
 // reason: one linear admission sequence (authz → resolve input → buses → key →
 // lease → enqueue); the input resolution added the lines, not new branches.
@@ -539,7 +539,7 @@ pub(crate) async fn submit_switcher(
                 {
                     state.idempotency.release(Some(key), &op);
                     return Ok(
-                        crate::problem::Problem::new(409, "capacity", "Selection refused")
+                        crate::problem::Problem::new(409, error.kind(), "Selection refused")
                             .with_detail(error.detail())
                             .into_response(),
                     );
