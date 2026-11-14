@@ -55,15 +55,16 @@ function outcome(id: string, completed: boolean, error?: string) {
 // Tracker events are supplied as the shell-owned socket supplies them; no second socket.
 // Confirmation needs two polls with an advancing tick (2 s refetch), hence the longer waits.
 describe('ProductionDesk single-authority completion', { timeout: 15000 }, () => {
-  it('keeps unsupported transitions disabled before the dominant CUT in DOM order; AUTO works', async () => {
+  it('enables MIX/WIPE/DIP before the dominant CUT in DOM order; AUTO works', async () => {
     const { container } = page();
     await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
     const keys = [...container.querySelectorAll('.bd-takes button')];
     expect(keys.map((key) => key.textContent)).toEqual(['MIX', 'WIPE', 'DIP', 'AUTO', 'CUT · cam-2']);
-    for (const key of keys.slice(0, 3)) expect(key).toBeDisabled();
+    // ADR-0112 §4: the transition keys are a supported control contract now.
+    for (const key of keys.slice(0, 3)) expect(key).not.toBeDisabled();
     expect(screen.getByRole('button', { name: 'MIX' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: 'AUTO' })).not.toBeDisabled();
-    expect(screen.getByRole('button', { name: 'AUTO' }).title).toContain('30 frames');
+    expect(screen.getByRole('button', { name: 'AUTO' }).title).toContain('AUTO MIX over 30 frames');
     expect(screen.getByRole('spinbutton', { name: 'Auto frames' })).not.toBeDisabled();
     expect(commandCount).toBe(0);
   });
