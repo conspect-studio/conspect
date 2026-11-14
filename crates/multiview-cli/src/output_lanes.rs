@@ -185,10 +185,9 @@ pub(super) fn rate_output_specs(
         let concrete = super::resolve_encoder(requested)?;
         let format = AuxFormat::base_of_output(declared, canvas);
         let (width, height) = format.map_or((base.width, base.height), |f| (f.width, f.height));
-        let bit_rate = declared
-            .video_slot0()
-            .and_then(|v| v.bitrate_kbps)
-            .map_or(Ok(base.bit_rate), |kbps| {
+        let bit_rate = declared.video_slot0().and_then(|v| v.bitrate_kbps).map_or(
+            Ok(base.bit_rate),
+            |kbps| {
                 usize::try_from(kbps)
                     .ok()
                     .and_then(|kbps| kbps.checked_mul(1000))
@@ -197,7 +196,8 @@ pub(super) fn rate_output_specs(
                         codec: requested.to_owned(),
                         reason: format!("video bit rate {kbps} kbit/s is out of range"),
                     })
-            })?;
+            },
+        )?;
         let mut encode = base.clone();
         encode.codec_name = concrete.name;
         encode.format = concrete.format;
@@ -475,8 +475,10 @@ impl PreparedLanes {
         for (rate, ids, targets) in groups {
             let dropped_offers = Arc::new(AtomicU64::new(0));
             let late_latches = Arc::new(AtomicU64::new(0));
-            let dropped_audio: Vec<Arc<AtomicU64>> =
-                targets.iter().map(|t| Arc::clone(&t.dropped_audio)).collect();
+            let dropped_audio: Vec<Arc<AtomicU64>> = targets
+                .iter()
+                .map(|t| Arc::clone(&t.dropped_audio))
+                .collect();
             let passed_end = Arc::new(AtomicBool::new(false));
             let body = LaneTick {
                 latch: Arc::clone(&latch),
@@ -853,7 +855,9 @@ impl AudioGate {
     /// (all of it once `video_done`); the terminal event only last.
     fn release(&mut self, video_tick: Option<u64>, video_done: bool) -> Vec<DispatchEvent> {
         let horizon = video_tick.map(|tick| {
-            let next = i64::try_from(tick).unwrap_or(i64::MAX).saturating_add(1 + AUDIO_LEAD_TICKS);
+            let next = i64::try_from(tick)
+                .unwrap_or(i64::MAX)
+                .saturating_add(1 + AUDIO_LEAD_TICKS);
             MediaTime::from_tick(next, self.rate).as_nanos()
         });
         let mut out = Vec::new();

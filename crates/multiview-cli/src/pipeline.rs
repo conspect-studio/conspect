@@ -119,7 +119,6 @@ use multiview_output::{display_matrix, DisplayMatrix};
 #[path = "output_lanes.rs"]
 mod output_lanes;
 
-
 /// The per-subscriber drop-oldest depth of the engine's outbound event stream.
 /// The pipeline has no realtime consumers wired here, but the publisher still
 /// needs a positive ring (invariant #10).
