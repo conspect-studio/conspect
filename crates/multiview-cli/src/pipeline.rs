@@ -4026,6 +4026,7 @@ impl Pipeline {
     ) {
         let signals = crate::aux_overlays::signals_slot();
         let wanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wanted_sources = crate::aux_overlays::wanted_sources();
         let config_labels = self.tile_labels.clone();
         let catalogue = Arc::clone(&self.catalogue);
         let labels: crate::aux_overlays::LabelLookup = Arc::new(move |id: &str| {
@@ -4039,6 +4040,7 @@ impl Pipeline {
         let inputs = crate::aux_overlays::AuxOverlayInputs {
             signals: Arc::clone(&signals),
             wanted: Arc::clone(&wanted),
+            wanted_sources: Arc::clone(&wanted_sources),
             labels,
             watermark: self.watermark_signal.clone(),
             wall_clock: crate::wallclock::WallClockSource::system(),
@@ -4046,7 +4048,7 @@ impl Pipeline {
         };
         (
             inputs,
-            crate::aux_overlays::AuxSignalsPublisher::new(signals, wanted, active),
+            crate::aux_overlays::AuxSignalsPublisher::new(signals, wanted, wanted_sources, active),
         )
     }
 
@@ -6321,12 +6323,22 @@ struct StreamBaker {
     tile_snapshot: Arc<Vec<crate::overlays::TileSpec>>,
     /// Last per-input audio peak observed by the consumer's live bus meter.
     live_meter_db: std::collections::HashMap<String, crate::overlays::MeterChannels>,
+    /// When each `live_meter_db` entry was last sampled (elapsed ns), so a
+    /// source that left the bus is forgotten (bounded map, A2).
+    live_meter_seen: std::collections::HashMap<String, i64>,
+    /// Elapsed ns of the last prune pass.
+    live_meter_pruned_ns: i64,
     /// Bounded per-input peak/RMS sampler shared with audio telemetry.
     input_meters: crate::meter_telemetry::InputMeters,
 }
 
 #[cfg(not(feature = "overlay"))]
 struct StreamBaker;
+
+/// A live meter not sampled for this long (its source left the program bus)
+/// is forgotten (~5 s).
+#[cfg(feature = "overlay")]
+const LIVE_METER_FORGET_NS: i64 = 5_000_000_000;
 
 #[cfg(feature = "overlay")]
 impl StreamBaker {
@@ -6357,6 +6369,8 @@ impl StreamBaker {
             baker,
             tile_snapshot,
             live_meter_db: std::collections::HashMap::new(),
+            live_meter_seen: std::collections::HashMap::new(),
+            live_meter_pruned_ns: 0,
             input_meters: crate::meter_telemetry::InputMeters::new(),
             canvas_color: ctx.canvas_color,
             cadence: ctx.cadence,
@@ -6404,9 +6418,24 @@ impl StreamBaker {
                     id.clone(),
                     crate::overlays::MeterChannels::from_db(&sample.peak_db),
                 );
+                self.live_meter_seen.insert(id.clone(), now_ns);
             }
         }
+        self.prune_live_meters(now_ns);
         samples
+    }
+
+    /// Forget the live meter of a source not sampled for
+    /// [`LIVE_METER_FORGET_NS`] (it left the program bus), so source churn
+    /// cannot grow the map without bound. At most once per second.
+    fn prune_live_meters(&mut self, now_ns: i64) {
+        if now_ns.saturating_sub(self.live_meter_pruned_ns) < 1_000_000_000 {
+            return;
+        }
+        self.live_meter_pruned_ns = now_ns;
+        let seen = &mut self.live_meter_seen;
+        seen.retain(|_, last| now_ns.saturating_sub(*last) <= LIVE_METER_FORGET_NS);
+        self.live_meter_db.retain(|id, _| seen.contains_key(id));
     }
 
     /// Bake one streamed tick's overlays into its canvas, returning the overlaid
@@ -6515,11 +6544,9 @@ impl StreamBaker {
         if !publisher.wanted() {
             return;
         }
-        publisher.publish(crate::aux_overlays::AuxOverlaySignals {
-            meters: self.live_meter_db.clone(),
-            faults: item.faults.clone(),
-            program: item.source_states.keys().cloned().collect(),
-        });
+        // Only the sources the baking layouts bind (bounded by layouts ×
+        // cells), never the whole tracked map.
+        publisher.publish_for(&self.live_meter_db, &item.faults, item.source_states.keys());
     }
 }
 
@@ -22479,6 +22506,47 @@ mod live_overlay_bake_tests {
         assert!(frame.events.is_empty());
         let cleared = baker.bake(&frame).expect("cleared");
         assert_eq!(region_diff(&plain, &cleared, (0, 30, 320, 120)), 0);
+    }
+
+    /// A2: source churn (1000 distinct sources joining and leaving the
+    /// program bus) never grows the live meter map past the sources sampled
+    /// within the forget window.
+    #[test]
+    fn live_meters_of_sources_that_left_the_bus_are_forgotten() {
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+        let mut max_len = 0;
+        // 1000 sources, one live at a time, each for one 40 ms tick.
+        for i in 0..1000u64 {
+            let mut bus = multiview_audio::ProgramBus::new(
+                crate::audio::canonical_format(),
+                Rational::new(25, 1),
+            );
+            let store = crate::audio::new_store();
+            store
+                .publish_samples(&vec![0.25; 1_920 * 2])
+                .expect("samples");
+            bus.add_source(format!("churn-{i}"), store, 0.0);
+            let _ = super::drive_audio_for_item(&mut bus, 0);
+            let elapsed = std::time::Duration::from_millis(40 * i);
+            let _ = baker.sample_input_meters(&bus, elapsed);
+            max_len = max_len.max(baker.live_meter_db.len());
+        }
+        // Bounded: never more than the sources sampled within the forget
+        // window (5 s + the 1 s prune period at 25 ticks/s = 150 ids), and
+        // never more than the sampler tracks.
+        assert!(max_len <= 150, "live meter map bounded: {max_len}");
+        assert!(
+            max_len <= crate::meter_telemetry::MAX_INPUT_TRACKS,
+            "live meter map within the sampler's bound: {max_len}"
+        );
+        assert_eq!(baker.live_meter_db.len(), baker.live_meter_seen.len());
+        // 40 s on, every churned source has been gone > 5 s: forgotten.
+        assert!(
+            baker.live_meter_db.is_empty(),
+            "departed sources are forgotten: {:?}",
+            baker.live_meter_db.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

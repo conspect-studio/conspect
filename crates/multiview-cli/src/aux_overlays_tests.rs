@@ -79,6 +79,7 @@ fn inputs() -> AuxOverlayInputs {
     AuxOverlayInputs {
         signals: signals_slot(),
         wanted: Arc::new(AtomicBool::new(false)),
+        wanted_sources: wanted_sources(),
         labels: labels(),
         watermark: None,
         wall_clock: WallClockSource::system(),
@@ -166,10 +167,18 @@ fn bake_once(
     let body = newsone(layers, W, H);
     let (lookup, _stores) = stores(missing, W, H);
     let mut canvas = LayoutCanvas::new(Arc::clone(&body), spec(W, H)).unwrap();
+    canvas.keep_frames(true);
     let pts = MediaTime::from_nanos(40_000_000);
     let picture = canvas.compose(&lookup, pts).unwrap();
     let mut bake = LayoutOverlayBake::new(&body, &inputs()).expect("layers on: a bake");
-    let baked = bake.bake(&picture, pts, canvas.cell_states(), &signals(), preview);
+    let baked = bake.bake(
+        &picture,
+        pts,
+        canvas.cell_states(),
+        canvas.cell_frames(),
+        &signals(),
+        preview,
+    );
     let dynamics = bake.last_dynamics().clone();
     let list = bake
         .baker
@@ -317,6 +326,7 @@ fn a_bake_error_publishes_the_un_overlaid_picture() {
         &bad,
         MediaTime::from_nanos(0),
         &[],
+        &[],
         &AuxOverlaySignals::default(),
         None,
     );
@@ -337,8 +347,12 @@ fn the_publisher_is_inert_until_a_layout_wants_signals_and_aux_is_active() {
     let slot = signals_slot();
     let wanted = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicBool::new(true));
-    let publisher =
-        AuxSignalsPublisher::new(Arc::clone(&slot), Arc::clone(&wanted), Arc::clone(&active));
+    let publisher = AuxSignalsPublisher::new(
+        Arc::clone(&slot),
+        Arc::clone(&wanted),
+        wanted_sources(),
+        Arc::clone(&active),
+    );
     assert!(!publisher.wanted());
     wanted.store(true, Ordering::Relaxed);
     assert!(publisher.wanted());
@@ -355,6 +369,7 @@ fn measure_one_1080p_newsone_aux_bake() {
     let body = newsone(LayoutOverlays::default(), W, H);
     let (lookup, _stores) = stores(&[], W, H);
     let mut canvas = LayoutCanvas::new(Arc::clone(&body), spec(W, H)).unwrap();
+    canvas.keep_frames(true);
     let started = std::time::Instant::now();
     let mut bake = LayoutOverlayBake::new(&body, &inputs()).unwrap();
     println!(
@@ -371,7 +386,14 @@ fn measure_one_1080p_newsone_aux_bake() {
         let picture = canvas.compose(&lookup, pts).unwrap();
         let composed = started.elapsed();
         let started = std::time::Instant::now();
-        let out = bake.bake(&picture, pts, canvas.cell_states(), &signals, None);
+        let out = bake.bake(
+            &picture,
+            pts,
+            canvas.cell_states(),
+            canvas.cell_frames(),
+            &signals,
+            None,
+        );
         let elapsed = started.elapsed();
         drop(out);
         if i > 0 {
@@ -397,6 +419,7 @@ fn a_dying_source_reads_no_signal_in_its_chip_while_the_bake_continues() {
     let body = newsone(LayoutOverlays::default(), W, H);
     let (lookup, all) = stores(&[], W, H);
     let mut canvas = LayoutCanvas::new(Arc::clone(&body), spec(W, H)).unwrap();
+    canvas.keep_frames(true);
     let mut bake = LayoutOverlayBake::new(&body, &inputs()).unwrap();
     let signals = signals();
     let mut seen = Vec::new();
@@ -407,7 +430,14 @@ fn a_dying_source_reads_no_signal_in_its_chip_while_the_bake_continues() {
             store.publish(tile(W / 4, H / 4, 120), pts);
         }
         let picture = canvas.compose(&lookup, pts).expect("one frame per tick");
-        let out = bake.bake(&picture, pts, canvas.cell_states(), &signals, None);
+        let out = bake.bake(
+            &picture,
+            pts,
+            canvas.cell_states(),
+            canvas.cell_frames(),
+            &signals,
+            None,
+        );
         assert!(!Arc::ptr_eq(&out, &picture));
         let state = bake.last_dynamics()["s0"].state;
         if seen.last() != Some(&state) {
@@ -428,4 +458,123 @@ fn a_dying_source_reads_no_signal_in_its_chip_while_the_bake_continues() {
         canvas.counters().slate_cells > 0,
         "the dead cell shows its slate"
     );
+}
+
+/// A2: whatever the consumer tracks, the published snapshot holds only the
+/// sources the baking layouts bind (bounded by layouts × cells).
+#[test]
+fn the_signals_snapshot_is_bounded_by_the_wanted_sources() {
+    let slot = signals_slot();
+    let sources = wanted_sources();
+    sources.store(Arc::new(
+        ["s0", "s1", "s2"].iter().map(|s| (*s).to_owned()).collect(),
+    ));
+    let publisher = AuxSignalsPublisher::new(
+        Arc::clone(&slot),
+        Arc::new(AtomicBool::new(true)),
+        Arc::clone(&sources),
+        Arc::new(AtomicBool::new(true)),
+    );
+    // Source churn: 1000 distinct ids tracked by the consumer.
+    let mut meters = HashMap::new();
+    let mut faults = HashMap::new();
+    let mut program = Vec::new();
+    for i in 0..1000 {
+        let id = format!("churn-{i}");
+        meters.insert(id.clone(), MeterChannels::from_db(&[-10.0]));
+        faults.insert(id.clone(), TileFault::Black);
+        program.push(id);
+    }
+    meters.insert("s0".to_owned(), MeterChannels::from_db(&[-3.0]));
+    faults.insert("s2".to_owned(), TileFault::Frozen);
+    program.push("s1".to_owned());
+    publisher.publish_for(&meters, &faults, program.iter());
+    let snapshot = slot.load();
+    let wanted = sources.load();
+    assert!(snapshot.meters.keys().all(|id| wanted.contains(id)));
+    assert!(snapshot.faults.keys().all(|id| wanted.contains(id)));
+    assert!(snapshot.program.iter().all(|id| wanted.contains(id)));
+    assert!(
+        snapshot.meters.len() + snapshot.faults.len() + snapshot.program.len() <= 3 * wanted.len()
+    );
+    assert_eq!(snapshot.meters.len(), 1);
+    assert_eq!(snapshot.faults["s2"], TileFault::Frozen);
+    assert!(snapshot.program.contains("s1"));
+}
+
+/// M1: a black source that is NOT on Program (the consumer's snapshot has no
+/// fault for it) reads BLACK on the routed layout after the 0.5 s dwell —
+/// from the layout's own detection over the frames compose read. A source
+/// with a healthy picture stays clear; the snapshot still supplies silence.
+#[test]
+fn an_aux_only_black_source_shows_black_after_the_dwell() {
+    let body = newsone(LayoutOverlays::default(), W, H);
+    let all: Vec<Arc<TileStore<Nv12Image>>> = (0..9)
+        .map(|i| Arc::new(TileStore::<Nv12Image>::with_defaults(format!("s{i}"))))
+        .collect();
+    let lookup_stores = all.clone();
+    let lookup: StoreLookup =
+        Arc::new(move |id: &str| lookup_stores.iter().find(|s| s.id() == id).cloned());
+    let mut canvas = LayoutCanvas::new(Arc::clone(&body), spec(W, H)).unwrap();
+    canvas.keep_frames(true);
+    let mut bake = LayoutOverlayBake::new(&body, &inputs()).unwrap();
+    // Nothing on Program; s5 is silent per the consumer (it reads PCM).
+    let mut remote = AuxOverlaySignals::default();
+    remote.faults.insert("s5".to_owned(), TileFault::Silent);
+    let mut black_at = None;
+    // 60 ticks = 2.4 s: past the 2 s after which the layout's own "clear"
+    // verdict is trusted over the consumer's.
+    for i in 0..60i64 {
+        let pts = MediaTime::from_nanos(i * 40_000_000);
+        for (n, store) in all.iter().enumerate() {
+            // s0 is black; the rest move (a changing mid-grey picture).
+            let luma = if n == 0 {
+                16
+            } else {
+                u8::try_from(100 + (i % 2) * 40).unwrap()
+            };
+            store.publish(tile(W / 4, H / 4, luma), pts);
+        }
+        let picture = canvas.compose(&lookup, pts).unwrap();
+        let _ = bake.bake(
+            &picture,
+            pts,
+            canvas.cell_states(),
+            canvas.cell_frames(),
+            &remote,
+            None,
+        );
+        if black_at.is_none() && bake.last_dynamics()["s0"].fault == TileFault::Black {
+            black_at = Some(i);
+        }
+    }
+    let at = black_at.expect("s0 reads BLACK on the layout");
+    assert!(at >= 12, "not before the 0.5 s dwell (tick {at})");
+    assert!(at <= 16, "soon after the dwell (tick {at})");
+    let d = bake.last_dynamics();
+    assert_eq!(d["s1"].fault, TileFault::None, "a moving picture is clear");
+    assert_eq!(
+        d["s5"].fault,
+        TileFault::Silent,
+        "silence from the snapshot"
+    );
+
+    // Once warm, the layout's own picture verdict wins over the snapshot for
+    // a source that is also on Program.
+    let mut stale = AuxOverlaySignals::default();
+    stale.faults.insert("s1".to_owned(), TileFault::Frozen);
+    let pts = MediaTime::from_nanos(61 * 40_000_000);
+    for store in &all {
+        store.publish(tile(W / 4, H / 4, 90), pts);
+    }
+    let picture = canvas.compose(&lookup, pts).unwrap();
+    let _ = bake.bake(
+        &picture,
+        pts,
+        canvas.cell_states(),
+        canvas.cell_frames(),
+        &stale,
+        None,
+    );
+    assert_eq!(bake.last_dynamics()["s1"].fault, TileFault::None);
 }

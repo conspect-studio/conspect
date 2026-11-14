@@ -109,6 +109,11 @@ pub struct LayoutCanvas {
     /// Per source-bound cell (draw order): the `TileRead` state compose saw
     /// this tick (`NoSignal` when the store is missing). Reused every tick.
     states: Vec<(Arc<str>, SourceState)>,
+    /// Per source-bound cell (same order as `states`): the frame compose read
+    /// this tick, when [`LayoutCanvas::keep_frames`] is on (the overlay
+    /// bake's fault detection reads it; no second store read). Reused.
+    frames: Vec<Option<Arc<Nv12Image>>>,
+    keep_frames: bool,
     counters: LayoutCounters,
     warned: bool,
 }
@@ -206,6 +211,8 @@ impl LayoutCanvas {
             columns: Vec::new(),
             pictures: Vec::new(),
             states: Vec::new(),
+            frames: Vec::new(),
+            keep_frames: false,
             counters: LayoutCounters::default(),
             warned: false,
         })
@@ -229,6 +236,24 @@ impl LayoutCanvas {
     #[must_use]
     pub fn cell_states(&self) -> &[(Arc<str>, SourceState)] {
         &self.states
+    }
+
+    /// Keep each source-bound cell's read frame for the tick (one `Arc`
+    /// clone per cell) so the overlay bake can probe content faults without
+    /// reading the stores again. Off by default (a clean layout pays nothing).
+    pub fn keep_frames(&mut self, on: bool) {
+        self.keep_frames = on;
+        if !on {
+            self.frames.clear();
+        }
+    }
+
+    /// Per source-bound cell (parallel to [`LayoutCanvas::cell_states`]): the
+    /// frame the last compose read (`None`: no picture), when
+    /// [`LayoutCanvas::keep_frames`] is on; empty otherwise.
+    #[must_use]
+    pub fn cell_frames(&self) -> &[Option<Arc<Nv12Image>>] {
+        &self.frames
     }
 
     fn slate(&mut self, policy: FailoverSlate) -> Option<Arc<Nv12Image>> {
@@ -277,6 +302,7 @@ impl LayoutCanvas {
         let mut pictures = std::mem::take(&mut self.pictures);
         pictures.clear();
         self.states.clear();
+        self.frames.clear();
         for i in 0..self.cells.len() {
             let Some(cell) = self.cells.get(i) else {
                 break;
@@ -294,6 +320,9 @@ impl LayoutCanvas {
                 self.states.push((Arc::clone(source), state));
             }
             let tile = read.and_then(|read| read.frame().cloned());
+            if self.keep_frames && cell.source.is_some() {
+                self.frames.push(tile.clone());
+            }
             let picture = match tile {
                 Some(tile) if tile.alpha_plane().is_none() && tile.color() == tag => Some(tile),
                 Some(_) => {

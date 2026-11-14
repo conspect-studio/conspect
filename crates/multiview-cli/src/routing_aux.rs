@@ -154,6 +154,9 @@ pub struct PictureBusSlot {
     pub latest: SwapCell<Option<Arc<AuxFrame>>>,
     /// Frames published into this slot.
     pub composed: AtomicU64,
+    /// Of those, frames that carry a successful overlay bake (a routed
+    /// layout with overlays; diagnostics and tests).
+    pub baked: AtomicU64,
 }
 
 /// An output picture format a routed feed is composed at (#342): size and fit.
@@ -604,6 +607,7 @@ impl AuxState {
                 &item.picture,
                 tick.pts,
                 item.canvas.cell_states(),
+                item.canvas.cell_frames(),
                 signals,
                 preview,
             ));
@@ -628,6 +632,9 @@ impl AuxState {
                 run(&mut item);
             }
             let frame = item.out.take().unwrap_or_else(|| Arc::clone(&item.picture));
+            if !Arc::ptr_eq(&frame, &item.picture) {
+                item.slot.baked.fetch_add(1, Ordering::Relaxed);
+            }
             item.slot.latest.store(Some(Arc::new(AuxFrame {
                 tick: tick.index,
                 generation: item.generation,
@@ -650,7 +657,15 @@ impl AuxState {
             return;
         }
         if let Some(overlays) = inputs.overlays.as_ref() {
+            let sources: std::collections::HashSet<String> = self
+                .per_feed
+                .values()
+                .filter_map(|f| f.bake.as_ref())
+                .flat_map(crate::aux_overlays::LayoutOverlayBake::bound_sources)
+                .map(str::to_owned)
+                .collect();
             let wanted = self.per_feed.values().any(|f| f.bake.is_some());
+            overlays.wanted_sources.store(Arc::new(sources));
             overlays.wanted.store(wanted, Ordering::Relaxed);
         }
     }
@@ -690,6 +705,14 @@ impl AuxState {
                         crate::aux_overlays::LayoutOverlayBake::new(&layout.body, overlays)
                     }
                 };
+                if let Some(canvas) = entry.layout.as_mut() {
+                    canvas.keep_frames(
+                        entry
+                            .bake
+                            .as_ref()
+                            .is_some_and(crate::aux_overlays::LayoutOverlayBake::wants_frames),
+                    );
+                }
                 self.bakes_changed = true;
             }
         }
@@ -1439,6 +1462,7 @@ codec = "h264"
             overlays: Some(crate::aux_overlays::AuxOverlayInputs {
                 signals,
                 wanted: Arc::clone(&wanted),
+                wanted_sources: crate::aux_overlays::wanted_sources(),
                 labels: Arc::new(|id: &str| Some(id.to_uppercase())),
                 watermark: None,
                 wall_clock: crate::wallclock::WallClockSource::system(),
@@ -1526,6 +1550,7 @@ codec = "h264"
             overlays: Some(crate::aux_overlays::AuxOverlayInputs {
                 signals,
                 wanted: Arc::new(AtomicBool::new(false)),
+                wanted_sources: crate::aux_overlays::wanted_sources(),
                 labels: fx::labels(),
                 watermark: None,
                 wall_clock,
@@ -1658,17 +1683,33 @@ codec = "h264"
         let (stores, _keep) = crate::aux_overlays::tests::stores(&[], 1920, 1080);
         let feeds = two_layout_feeds();
         let slots: Vec<_> = feeds.iter().map(|f| Arc::clone(&f.slot)).collect();
-        let (tx, _handle) =
-            spawn_baking(feeds, stores, crate::wallclock::WallClockSource::system());
+        let (tx, handle) = spawn_baking(feeds, stores, crate::wallclock::WallClockSource::system());
         let mut total = Duration::ZERO;
         let mut worst = Duration::ZERO;
         for i in 0..TICKS {
             let started = Instant::now();
             tx.offer(tick(i));
+            // Bounded, yielding wait: a wedged or failed aux thread ends the
+            // measurement with its counters instead of hanging the suite.
+            let deadline = started + Duration::from_secs(30);
             while !slots
                 .iter()
                 .all(|s| s.composed.load(Ordering::Relaxed) == i + 1)
             {
+                let counts: Vec<u64> = slots
+                    .iter()
+                    .map(|s| s.composed.load(Ordering::Relaxed))
+                    .collect();
+                assert!(
+                    !handle.failed.load(Ordering::Acquire),
+                    "tick {i}: the aux thread failed (composed {counts:?})"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "tick {i}: timed out waiting for both layouts (composed {counts:?}, \
+                     failed {})",
+                    handle.failed.load(Ordering::Acquire)
+                );
                 std::thread::yield_now();
             }
             let elapsed = started.elapsed();
