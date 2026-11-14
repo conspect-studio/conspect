@@ -6555,7 +6555,7 @@ impl StreamBaker {
         }
         // Only the sources the baking layouts bind (bounded by layouts ×
         // cells), never the whole tracked map.
-        publisher.publish_for(&self.live_meter_db, &item.faults, item.source_states.keys());
+        publisher.publish_for(&self.live_meter_db, &item.faults, &item.source_states);
     }
 }
 

@@ -327,16 +327,17 @@ impl AuxSignalsPublisher {
     /// for ids the baking layouts bind, and which of those are on Program.
     /// The snapshot is bounded by the wanted set, however many sources the
     /// consumer tracks.
-    pub fn publish_for<'a>(
+    pub fn publish_for<V>(
         &self,
         meters: &HashMap<String, MeterChannels>,
         faults: &HashMap<String, TileFault>,
-        program: impl Iterator<Item = &'a String>,
+        program: &HashMap<String, V>,
     ) {
         let wanted = self.sources.load();
         let mut signals = AuxOverlaySignals::default();
-        // The wanted set is bounded by construction (MAX_WANTED_SOURCES);
-        // the take is a second, local guarantee.
+        // Every lookup is driven by the wanted set (bounded by construction,
+        // MAX_WANTED_SOURCES; the take is a second, local guarantee), so the
+        // work per frame never grows with Program's layout or the tracked maps.
         for id in wanted.iter().take(MAX_WANTED_SOURCES) {
             if let Some(m) = meters.get(id) {
                 signals.meters.insert(id.clone(), *m);
@@ -344,9 +345,7 @@ impl AuxSignalsPublisher {
             if let Some(f) = faults.get(id) {
                 signals.faults.insert(id.clone(), *f);
             }
-        }
-        for id in program {
-            if wanted.contains(id) {
+            if program.contains_key(id) {
                 signals.program.insert(id.clone());
             }
         }

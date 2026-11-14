@@ -484,17 +484,19 @@ fn the_signals_snapshot_is_bounded_by_the_wanted_sources() {
     // Source churn: 1000 distinct ids tracked by the consumer.
     let mut meters = HashMap::new();
     let mut faults = HashMap::new();
-    let mut program = Vec::new();
+    let mut program = HashMap::new();
     for i in 0..1000 {
         let id = format!("churn-{i}");
         meters.insert(id.clone(), MeterChannels::from_db(&[-10.0]));
         faults.insert(id.clone(), TileFault::Black);
-        program.push(id);
+        program.insert(id, multiview_core::traits::SourceState::Live);
     }
     meters.insert("s0".to_owned(), MeterChannels::from_db(&[-3.0]));
     faults.insert("s2".to_owned(), TileFault::Frozen);
-    program.push("s1".to_owned());
-    publisher.publish_for(&meters, &faults, program.iter());
+    program.insert("s1".to_owned(), multiview_core::traits::SourceState::Live);
+    // The Program map is only probed by the wanted ids (never iterated), so
+    // 1000 unrelated Program sources add no work and no entries.
+    publisher.publish_for(&meters, &faults, &program);
     let snapshot = slot.load();
     let wanted = sources.load();
     assert!(snapshot.meters.keys().all(|id| wanted.contains(id)));
