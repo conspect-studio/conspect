@@ -7516,7 +7516,11 @@ fn principal_holdings_are_rebuilt_only_when_they_change() {
         x.r.publish_snapshot_at(t);
         t += 1;
     }
-    assert_eq!(rebuilds(&x), before, "unchanged publications rebuild nothing");
+    assert_eq!(
+        rebuilds(&x),
+        before,
+        "unchanged publications rebuild nothing"
+    );
     assert!(Arc::ptr_eq(&published, &x.h.snapshot().principals_held));
     // `q` moves away: cam lingers, still charged to `q`.
     let mut back = take("q-back", 3, PictureBus::Program);

@@ -535,7 +535,13 @@ mod tests {
     }
 
     fn reserve(sets: &PatchSets, key: &str, digest: &str, principal: &str) -> SetReservation {
-        sets.reserve(key, digest, principal, &members(&["o"], false), Instant::now())
+        sets.reserve(
+            key,
+            digest,
+            principal,
+            &members(&["o"], false),
+            Instant::now(),
+        )
     }
 
     fn admitted(sets: &PatchSets, key: &str, outputs: &[&str], with_mixer: bool) -> String {
@@ -676,9 +682,8 @@ mod tests {
         );
         // Settled (here by the deadline): the pending slots free and the
         // settled records are evicted for new ones.
-        assert!(!sets
-            .expire(Instant::now() + SET_OUTCOME_DEADLINE)
-            .is_empty());
+        let settled = sets.expire(Instant::now() + SET_OUTCOME_DEADLINE);
+        assert_eq!(take(&settled).len(), MAX_SET_RECORDS_PER_PRINCIPAL);
         assert_eq!(sets.pending_len(), 0);
         assert!(matches!(
             reserve(&sets, "more", "d", "p"),
@@ -723,12 +728,14 @@ mod tests {
                 .collect();
             assert_eq!(fresh.len(), 1, "exactly one admission wins: {results:?}");
             assert!(
-                results
-                    .iter()
-                    .any(|(_, r)| *r == SetReservation::Capacity),
+                results.iter().any(|(_, r)| *r == SetReservation::Capacity),
                 "the other fails closed"
             );
-            assert_eq!(sets.pending_len(), MAX_PENDING_SETS, "never beyond the bound");
+            assert_eq!(
+                sets.pending_len(),
+                MAX_PENDING_SETS,
+                "never beyond the bound"
+            );
             // The rollback of the winner frees its slot (and its key).
             let (key, op) = fresh[0];
             sets.release(key, op);

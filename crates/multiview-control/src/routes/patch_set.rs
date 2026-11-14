@@ -222,7 +222,10 @@ fn encoder_key(state: &AppState, config_id: &str, feed: &RoutedFeed) -> String {
         .output_routing
         .as_ref()
         .and_then(|c| c.routing.encoder_identity(config_id, feed))
-        .map_or_else(|| format!("member:{config_id}"), |id| format!("encoder:{id}"))
+        .map_or_else(
+            || format!("member:{config_id}"),
+            |id| format!("encoder:{id}"),
+        )
 }
 
 /// Whether a set's `delta` new encoders fit `principal`'s cap (when the

@@ -461,8 +461,8 @@ fn response_one_of(path: &str, status: &str) -> Vec<String> {
     use utoipa::OpenApi;
 
     let json = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
-    let schema = &json["paths"][path]["post"]["responses"][status]["content"]["application/json"]
-        ["schema"];
+    let schema =
+        &json["paths"][path]["post"]["responses"][status]["content"]["application/json"]["schema"];
     let name = schema["$ref"]
         .as_str()
         .and_then(|r| r.strip_prefix("#/components/schemas/"))
@@ -492,6 +492,9 @@ fn salvo_take_202_is_accepted_body_or_patch_accepted() {
 /// `set: {new_encoders, fits}`) beside the single-destination `PatchPlan`.
 #[test]
 fn patch_plans_200_declare_the_set_cost() {
+    use multiview_control::openapi::ApiDoc;
+    use utoipa::OpenApi;
+
     for path in ["/api/v1/patch/plan", "/api/v1/salvos/{id}/plan"] {
         assert_eq!(
             response_one_of(path, "200"),
@@ -502,9 +505,10 @@ fn patch_plans_200_declare_the_set_cost() {
             "{path}"
         );
     }
-    use multiview_control::openapi::ApiDoc;
-    use utoipa::OpenApi;
     let json = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
     let set = &json["components"]["schemas"]["SetCost"]["properties"];
-    assert!(set["new_encoders"].is_object() && set["fits"].is_object(), "{set}");
+    assert!(
+        set["new_encoders"].is_object() && set["fits"].is_object(),
+        "{set}"
+    );
 }

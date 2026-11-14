@@ -604,13 +604,10 @@ impl OutputRouter {
                 self.refuse_pending(index, tick, RefuseReason::Capacity, dispatcher);
                 return;
             }
-            if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
-                if unheld && principal != BOOT_PRINCIPAL && !d.reformat {
-                    principal.clone_into(&mut d.principal);
-                    self.holdings_dirty = true;
-                }
-                d.linger_deadline = None;
-            }
+            self.adopt_key(
+                key,
+                (unheld && principal != BOOT_PRINCIPAL).then_some(principal),
+            );
             self.member_ready(index, key);
             return;
         }
@@ -639,8 +636,7 @@ impl OutputRouter {
                 if let Some(s) = self.sets.active.iter_mut().find(|s| s.id == group) {
                     s.reserved = s.reserved.saturating_sub(1);
                 }
-                self.holdings_dirty = true;
-                self.opens.insert(
+                self.insert_open(
                     id,
                     PendingOpen {
                         bus: bus.clone(),

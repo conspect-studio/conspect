@@ -2312,9 +2312,7 @@ impl OutputRouter {
 
     fn drain_opens(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         while let Ok(result) = self.open_rx.try_recv() {
-            let removed = self.opens.remove(&result.id);
-            self.holdings_dirty |= removed.is_some();
-            let Some(open) = removed else {
+            let Some(open) = self.remove_open(result.id) else {
                 // Late (deadline passed): never used.
                 if let Ok(encoder) = result.encoder {
                     self.reap(Reap::Encoder(encoder));
@@ -2387,8 +2385,7 @@ impl OutputRouter {
                 continue;
             };
             self.last_forced.insert(key, tick);
-            self.holdings_dirty = true;
-            self.dynamic.push(DynamicKey {
+            self.push_key(DynamicKey {
                 bus: open.bus,
                 format: open.format,
                 settings: open.settings,
@@ -2867,8 +2864,7 @@ impl OutputRouter {
                     let late = self.opens.get(&id).is_none_or(|o| tick >= o.deadline);
                     if late {
                         // The result, if it ever comes, goes to the reaper.
-                        self.opens.remove(&id);
-                        self.holdings_dirty = true;
+                        self.remove_open(id);
                         self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                     }
                 }
@@ -3063,14 +3059,8 @@ impl OutputRouter {
                 // linger cleared). A key another output still subscribes
                 // stays with its holder: the newcomer rides it at +0 and is
                 // never able to move the holder's attribution or cap.
-                if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
-                    // A reformat key stays charged to its principal (X1).
-                    if !held_by_other && !d.reformat {
-                        principal.clone_into(&mut d.principal);
-                        self.holdings_dirty = true;
-                    }
-                    d.linger_deadline = None;
-                }
+                // A reformat key stays charged to its principal (X1).
+                self.adopt_key(key, (!held_by_other).then_some(principal));
             } else {
                 self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
             }
@@ -3095,8 +3085,7 @@ impl OutputRouter {
             reformat: reset.clone(),
         }) {
             Ok(()) => {
-                self.holdings_dirty = true;
-                self.opens.insert(
+                self.insert_open(
                     id,
                     PendingOpen {
                         bus: bus.clone(),
@@ -3118,6 +3107,39 @@ impl OutputRouter {
                 self.refuse_pending(index, tick, RefuseReason::Capacity, dispatcher);
             }
         }
+    }
+
+    /// Insert an open in flight (a holding: marks holdings changed).
+    fn insert_open(&mut self, id: u64, open: PendingOpen) {
+        self.holdings_dirty = true;
+        self.opens.insert(id, open);
+    }
+
+    /// Remove an open in flight (a holding: marks holdings changed when
+    /// there was one).
+    fn remove_open(&mut self, id: u64) -> Option<PendingOpen> {
+        let open = self.opens.remove(&id);
+        self.holdings_dirty |= open.is_some();
+        open
+    }
+
+    /// Clear live key `key`'s linger and, with `principal`, re-attribute it
+    /// to that principal unless it is a reformat key (an adoption: marks
+    /// holdings changed).
+    pub(super) fn adopt_key(&mut self, key: usize, principal: Option<&str>) {
+        if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
+            if let Some(principal) = principal.filter(|_| !d.reformat) {
+                principal.clone_into(&mut d.principal);
+                self.holdings_dirty = true;
+            }
+            d.linger_deadline = None;
+        }
+    }
+
+    /// Add a live key (a holding: marks holdings changed).
+    fn push_key(&mut self, key: DynamicKey) {
+        self.holdings_dirty = true;
+        self.dynamic.push(key);
     }
 
     fn has_capacity(&self, principal: &str) -> bool {
