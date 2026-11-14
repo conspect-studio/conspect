@@ -593,6 +593,8 @@ pub enum WarningCodeDoc {
     AcceptedStateRejected,
     /// The front-door TLS certificate is failing to renew or has expired.
     TlsCertificate,
+    /// A boot-file edit removed items the accepted state had (#367).
+    ConfigFileRemovedAccepted,
 }
 
 /// `OpenAPI` mirror of [`multiview_events::HealthWarning`] (SA-0).
