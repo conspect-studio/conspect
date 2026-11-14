@@ -103,8 +103,12 @@ current generation (otherwise a plain 404), and a create arms its token only at 
 against (it re-checks up to 3 times, then answers 403, or 409 `cast-feed-changed`). Engine outcomes are relayed
 at once; every `/cast` request first compares the engine's routing readback with the authorized feeds and
 re-authorizes synchronously on a difference, so an engine fallback is never served to an owner who may not read
-it after the readback (published every tick) shows it. The owner's authentication provenance (native API key,
-JWT, local admin with auth off) is recorded at issuance: a native key always re-resolves from the key store and a
+it after the readback (published every tick) shows it. A media request is authorized twice: before the file is
+resolved, and after it is open and before any byte is sent (a cast file is renamed into place whole, so its bytes
+are fixed at open); a token revoked or moved off the current generation in between gets the generic 404. At most
+64 cast outputs hold authorization gates; past that, creation is refused and nothing is served. The owner's
+authentication provenance (native API key, JWT, local admin with auth off) comes from the authentication that
+succeeded and is recorded at issuance: a native key always re-resolves from the key store and a
 revoked key fails closed. A 5 s sweep catches re-scoped or revoked keys and re-pointed audio tracks.
 
 **Diagnosis without a device log.** The engine records, per stream and for the receiver page, the last fetch
