@@ -388,6 +388,22 @@ fn sanitize_line_reduces_urls_to_scheme_and_host() {
         sanitize_line("Opening 'http://[::1]:8080' for reading"),
         "Opening 'http://[::1]:8080' for reading"
     );
+    // IPv6 authorities: path, query and userinfo are still dropped.
+    assert_eq!(
+        sanitize_line("Opening 'https://[2001:db8::1]/segment?sig=SECRET' for reading"),
+        "Opening 'https://[2001:db8::1]/…' for reading"
+    );
+    assert_eq!(
+        sanitize_line("x https://u:PW@[2001:db8::1]:8443/s/SIG/a.ts y"),
+        "x https://[2001:db8::1]:8443/… y"
+    );
+    // An unterminated bracket never panics and leaks nothing past the scheme.
+    let odd = sanitize_line("x https://[2001:db8::1/SIG?sig=Q");
+    assert!(!odd.contains("SIG"), "{odd}");
+    assert_eq!(
+        sanitize_line("[hls] see https://h.test/a]x"),
+        "[hls] see https://h.test/…]x"
+    );
     assert_eq!(sanitize_line("a :// b"), "a :// b");
     assert_eq!(sanitize_line("x rtsp://cam/main y"), "x rtsp://cam/… y");
 }

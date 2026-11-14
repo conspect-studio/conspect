@@ -162,10 +162,30 @@ pub fn sanitize_line(raw: &str) -> String {
     out
 }
 
+/// The byte length of the URL that starts `text` (just past `://`). A URL ends
+/// at whitespace, a quote, `<`, `>`, `(`, `)` or a backtick; a `[` opens a
+/// bracketed IPv6 host whose `]` belongs to the URL, while an unmatched `]`
+/// ends it. An unclosed `[` runs to the next terminator, so nothing after it
+/// escapes redaction.
+fn url_end(text: &str) -> usize {
+    let mut depth = 0_u32;
+    for (i, c) in text.char_indices() {
+        match c {
+            '[' => depth = depth.saturating_add(1),
+            ']' if depth > 0 => depth -= 1,
+            ']' => return i,
+            c if c.is_whitespace() || matches!(c, '\'' | '"' | '<' | '>' | '(' | ')' | '`') => {
+                return i
+            }
+            _ => {}
+        }
+    }
+    text.len()
+}
+
 /// `line` with every `scheme://…` URL reduced to `scheme://host/…` (see
 /// [`sanitize_line`]). A URL ends at whitespace or a quote/bracket character.
 fn redact_line_urls(line: &str) -> String {
-    const END: &[char] = &['\'', '"', '<', '>', '(', ')', '[', ']', '`'];
     let mut out = String::with_capacity(line.len().min(MAX_LINE_LEN));
     let mut rest = line;
     while let Some(at) = rest.find("://") {
@@ -178,9 +198,7 @@ fn redact_line_urls(line: &str) -> String {
             .map(char::len_utf8)
             .sum::<usize>();
         let after = after.get(3..).unwrap_or_default();
-        let url_len = after
-            .find(|c: char| c.is_whitespace() || END.contains(&c))
-            .unwrap_or(after.len());
+        let url_len = url_end(after);
         let (url, tail) = after.split_at(url_len);
         out.push_str(before);
         if scheme_len == 0 {
