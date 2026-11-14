@@ -461,10 +461,10 @@ export type ResyncReason = "seq_evicted" | "unknown_session" | "session_expired"
 export interface RouteOutputEvent {
   /** The take's operation id (empty for a fallback). */
   readonly operation_id: string;
-  readonly outcome: "applied" | "superseded" | "refused:feed-not-fresh" | "refused:capacity" | "refused:encoder-not-ready" | "refused:unroutable" | "refused:format-mismatch" | "fallback:aux-failed" | "fallback:encoder-failed";
+  readonly outcome: "applied" | "superseded" | "refused:feed-not-fresh" | "refused:capacity" | "refused:encoder-not-ready" | "refused:unroutable" | "refused:format-mismatch" | "fallback:aux-failed" | "fallback:encoder-failed" | "subtitle:applied" | "subtitle:refused:not-in-run";
   /** Output API id (matches the envelope `id`). */
   readonly output: string;
-  /** Program tick at which the outcome was decided. */
+  /** Program tick at which the outcome was decided. For subtitle:applied (the route table was swapped): a completed-tick lower bound observed before the swap (0: possibly no tick completed yet), not a landing tick; a sample in flight finishes on the old table, and the first table read starting after the swap sees the new route unless a later take supersedes it first (then it is never sampled) or the run ends. 0 when refused. */
   readonly tick: number;
 }
 

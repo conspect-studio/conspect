@@ -2442,6 +2442,10 @@ pub struct Pipeline {
     /// thread before each convert (a chaos test wedges it). Always `None`
     /// outside tests.
     convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// Test seam (review INV2-1): run in teardown after the egress join
+    /// (the bake consumer has exited) and before ingest teardown.
+    #[cfg(test)]
+    teardown_hook: Option<Box<dyn Fn() + Send + Sync>>,
     /// Per runnable output (same order as `output_video_keys`): the format a
     /// routed source/PVW is composed at for it (#342 review M3).
     output_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
@@ -3668,6 +3672,8 @@ impl Pipeline {
             rendition_configs,
             rendition_formats,
             convert_hook: None,
+            #[cfg(test)]
+            teardown_hook: None,
             output_formats,
             output_video_keys,
             output_inband_sets,
@@ -4030,6 +4036,8 @@ impl Pipeline {
         let aux_canvas = self.aux_canvas();
         let plan_stores = Arc::clone(&stores);
         let subtitle_stores = Arc::clone(&stores);
+        // Slice F part F2: the sampler publishes its tick for the patch API.
+        let subtitle_tick = Arc::new(AtomicU64::new(0));
         // Filled once this run's Program exists (§7 back-off input).
         let program_lateness: crate::routing_aux::ProgramLateness =
             Arc::new(multiview_framestore::SwapCell::empty());
@@ -4096,23 +4104,46 @@ impl Pipeline {
             router.set_switcher_clock(control.applied_tick_cell());
         }
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
-        let handle = Arc::new(handle.with_outputs(run_outputs).with_pictures(
-            crate::output_routing::PlanPictures {
-                stores: plan_stores,
-                canvas: aux_canvas,
-                preview_selection: preview_selection.clone(),
-            },
-        ));
+        // Slice F part F2: the run's subtitle route tables, keyed by output
+        // config id, ride the handle the adapter reads (published and
+        // replaced with it between runs), so `/patch/take` re-points them.
+        let subtitle_tables = self
+            .subtitle_outputs
+            .iter()
+            .map(|plan| (plan.output_id.clone(), Arc::clone(&plan.routes)))
+            .collect();
+        let handle = Arc::new(
+            handle
+                .with_outputs(run_outputs)
+                .with_pictures(crate::output_routing::PlanPictures {
+                    stores: plan_stores,
+                    canvas: aux_canvas,
+                    preview_selection: preview_selection.clone(),
+                })
+                .with_subtitles(subtitle_tables, Arc::clone(&subtitle_tick)),
+        );
         enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
+        // Review INV-1: the run's subtitle routing ends with the run (every
+        // exit path drops this guard), so a take can no longer re-point an
+        // ended or replaced run, and its live readback is gone.
+        let subtitle_end = crate::output_routing::SubtitleRunEnd(Arc::clone(&handle));
+        // Review INV2-1: the bake consumer holds this; its exit, for any
+        // reason, ends subtitle admission wait-free.
+        let subtitle_exit = handle.subtitle_consumer_exit();
         self.output_routing.store(Some(handle));
         Ok(RunRouting {
+            subtitle_end,
             consumer: ConsumerRouting {
                 router: Box::new(router),
                 base_force,
                 inband_sets: self.output_inband_sets.clone(),
                 base_formats: self.rendition_formats.clone(),
                 convert_hook: self.convert_hook.clone(),
-                subtitles: Box::new(self.subtitle_run(subtitle_stores)),
+                subtitles: Box::new(
+                    self.subtitle_run(subtitle_stores)
+                        .with_tick_cell(subtitle_tick),
+                ),
+                subtitle_exit,
             },
             aux_tx,
             preview_selection,
@@ -4548,6 +4579,13 @@ impl Pipeline {
     #[must_use]
     pub fn window_subscriptions(&self) -> crate::output_window_registry::WindowSubscriptionSlot {
         Arc::clone(&self.window_subscriptions)
+    }
+
+    /// Test seam (review INV2-1): run `hook` in teardown once the bake
+    /// consumer has exited, before ingest teardown and the run's return.
+    #[cfg(test)]
+    pub(crate) fn set_teardown_hook(&mut self, hook: Box<dyn Fn() + Send + Sync>) {
+        self.teardown_hook = Some(hook);
     }
 
     /// Test seam (#342 review I3): run `hook` on every `format-convert`
@@ -5788,6 +5826,7 @@ impl Pipeline {
         let routing = self.build_output_routing(&binding_ids, &enforced_audio_tracks)?;
         self.issue_boot_audio_takes();
         let RunRouting {
+            subtitle_end,
             consumer: consumer_routing,
             aux_tx,
             preview_selection,
@@ -6290,6 +6329,10 @@ impl Pipeline {
             crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
         }
         stage("clock-returned");
+        // Review INV2-1: no subtitle re-point is admitted once teardown
+        // starts (before the egress join and the ingest teardown); the
+        // guard still ends it on every other exit path.
+        subtitle_end.0.end_subtitles();
         if let Some(cause) = crate::exit_watchdog::armed() {
             tracing::info!(?cause, "exit deadline armed; finalising outputs first");
         }
@@ -6317,6 +6360,10 @@ impl Pipeline {
             crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
         }
         stage("egress-joined");
+        #[cfg(test)]
+        if let Some(hook) = self.teardown_hook.as_ref() {
+            hook();
+        }
         // Then tear ingest down (signal + bounded join per producer). Producers
         // blocked in libav network reads use their full grace here; the exit
         // watchdog bounds the total.
@@ -8093,6 +8140,8 @@ fn drive_audio_for_item(
 
 /// One run's output routing, split between the clock and the consumer.
 struct RunRouting {
+    /// Ends the run's subtitle routing when the run returns (review INV-1).
+    subtitle_end: crate::output_routing::SubtitleRunEnd,
     consumer: ConsumerRouting,
     /// The clock's non-blocking aux tick sender.
     aux_tx: multiview_engine::AuxTickSender,
@@ -8127,6 +8176,8 @@ struct ConsumerRouting {
     /// The subtitle-slot cue sampler (slice F #345), ticked once per item.
     /// Boxed for `clippy::large_futures`, like the router.
     subtitles: Box<crate::subtitle_slots::SubtitleRun>,
+    /// Ends subtitle admission when the consumer exits (review INV2-1).
+    subtitle_exit: crate::output_routing::SubtitleConsumerExit,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
@@ -8676,7 +8727,11 @@ fn consumer_main<D: WindowDelivery>(
         base_formats,
         convert_hook,
         mut subtitles,
+        subtitle_exit,
     } = routing;
+    // Dropped when this function returns (any path, a panic included):
+    // the consumer samples no subtitle table after that (review INV2-1).
+    let _subtitle_exit = subtitle_exit;
     // #342 review I1/I2: one `format-convert` thread per distinct non-canvas
     // base format, fed non-blocking right after the bake. Empty (no thread,
     // no work) for a run whose base keys are all at the canvas format.
@@ -13620,6 +13675,75 @@ pub(crate) struct SubtitleOutputPlan {
     routes: crate::subtitle_slots::SubtitleRoutes,
     feed: multiview_output::hls::SubtitleFeed,
     slots: usize,
+}
+
+#[cfg(test)]
+mod subtitle_route_boot_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+
+    /// Slice F #345 part F2: a re-patch is persisted as the slots' `source`
+    /// in the accepted state, and a run builds each HLS output's route table
+    /// from it, so a restart starts every subtitle slot on its persisted
+    /// source (an absent source = unpatched).
+    #[test]
+    fn a_restart_starts_each_subtitle_slot_from_its_persisted_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.m3u8");
+        let toml = format!(
+            r##"
+schema_version = 1
+[canvas]
+width = 640
+height = 360
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "cam_a"
+kind = "bars"
+[[sources]]
+id = "cam_b"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "cam_a"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs.slots.subtitle]]
+language = "en"
+source = "cam_b"
+[[outputs.slots.subtitle]]
+language = "es"
+"##,
+            path.display()
+        );
+        let config = MultiviewConfig::load_from_toml(&toml).expect("parse");
+        config.validate().expect("validates");
+        let epoch = multiview_output::SharedEpoch::default();
+        let output = &config.outputs[0];
+        let (_built, plan) =
+            build_hls_output(output, &path.display().to_string(), &epoch).expect("builds");
+        let plan = plan.expect("an HLS output with subtitle slots has a plan");
+        assert_eq!(plan.output_id, output.id());
+        assert_eq!(plan.slots, 2);
+        assert_eq!(
+            plan.routes.load().to_vec(),
+            vec![Some("cam_b".to_owned()), None]
+        );
+    }
 }
 
 /// A fresh link-status record for a push sink: listener mode is read from the

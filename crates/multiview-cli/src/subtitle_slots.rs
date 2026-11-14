@@ -29,8 +29,11 @@
 //! reached the sink (counted as a feed drop); the close of a cue the sink
 //! holds open is never dropped.
 //!
-//! A re-point lands on one tick: the tick that first reads the new route
-//! closes the old source's cue at that tick and may open the new source's
+//! A re-point ([`repoint`], part F2) replaces the whole table (RCU) and never
+//! waits on the sampler. It lands on one tick, the first SAMPLED tick that
+//! reads the new route (the bake consumer may shed ticks, so not
+//! necessarily the next tick index): that tick
+//! closes the old source's cue and may open the new source's
 //! cue at the same tick.
 //!
 //! Pure Rust: the resolver (frame-store latch + caption cue store) is
@@ -56,6 +59,25 @@ pub type SubtitleRoutes = Arc<SwapCell<Arc<[Option<String>]>>>;
 #[must_use]
 pub fn subtitle_routes(sources: Vec<Option<String>>) -> SubtitleRoutes {
     Arc::new(SwapCell::new(Arc::from(sources)))
+}
+
+/// Re-point slots of `routes` (part F2): a copy of the current table with
+/// each `(slot, source)` applied, stored whole (wait-free for the sampler,
+/// which reads either the old or the new table, never a mix). `Err(slot)`
+/// for a slot the table does not have; nothing is stored then. Concurrent
+/// re-points of ONE table must be serialized by the caller (the adapter
+/// holds a control-plane mutex; the sampler never takes it).
+///
+/// # Errors
+/// The first slot beyond the table.
+pub fn repoint(routes: &SubtitleRoutes, slots: &[(usize, Option<String>)]) -> Result<(), usize> {
+    let mut next: Vec<Option<String>> = routes.load().to_vec();
+    for (slot, source) in slots {
+        let entry = next.get_mut(*slot).ok_or(*slot)?;
+        entry.clone_from(source);
+    }
+    routes.store(Arc::from(next));
+    Ok(())
 }
 
 /// The resolver the pipeline supplies: the active caption lines of source
@@ -272,6 +294,11 @@ pub struct SubtitleRun {
     outputs: Vec<SubtitleOutputSampler>,
     resolve: CueResolver,
     cadence: Rational,
+    /// The last FINISHED sampled tick, published for the patch API (F2: a
+    /// re-point reports it; the re-point lands on a later sampled tick, not
+    /// necessarily the next index: the consumer may shed ticks). One store
+    /// per tick.
+    last_tick: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl SubtitleRun {
@@ -286,7 +313,15 @@ impl SubtitleRun {
             outputs,
             resolve,
             cadence,
+            last_tick: None,
         }
+    }
+
+    /// Publish every sampled tick into `cell` (part F2).
+    #[must_use]
+    pub fn with_tick_cell(mut self, cell: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.last_tick = Some(cell);
+        self
     }
 
     /// A run with no subtitle slot (one `is_empty` check per tick).
@@ -304,6 +339,12 @@ impl SubtitleRun {
         let now = MediaTime::from_tick(i64::try_from(tick_index).unwrap_or(i64::MAX), self.cadence);
         for output in &mut self.outputs {
             output.tick(now, &mut self.resolve);
+        }
+        // Published only once every table of this tick was read (review
+        // INV-2): a re-point that reads `T` here swapped after tick T used
+        // its tables, so it lands on a later sampled tick.
+        if let Some(cell) = &self.last_tick {
+            cell.store(tick_index, std::sync::atomic::Ordering::Release);
         }
     }
 }

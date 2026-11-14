@@ -6232,6 +6232,596 @@ fn a_reformatted_layout_output_follows_edits_back_off_and_a_delete() {
     assert!(o0.windows(2).all(|w| w[1] == w[0] + 1), "no gap: {o0:?}");
 }
 
+/// Slice F #345 part F2: a subtitle take through the control adapter
+/// re-points the run's route table (published on the handle, keyed by
+/// output config id) and the off-clock sampler uses the new source on the
+/// very next tick: the old source's cue closes at T and the new one opens at
+/// T. Between runs the adapter answers `Busy`; an output the run does not
+/// sample (or a slot beyond its table) is `NotInRun` and changes nothing.
+#[test]
+fn a_subtitle_take_repoints_the_route_table_for_the_next_sampler_tick() {
+    use crate::subtitle_slots::{subtitle_routes, CueResolver, SubtitleOutputSampler, SubtitleRun};
+    use multiview_control::output_routing::{
+        OutputRouting, SubtitleTakeError, SubtitleTakeRequest,
+    };
+    use multiview_output::hls::subtitle::subtitle_feed_with_capacity;
+    let (_r, h, _aux) = router(1, 6, Box::new(|_| Err("never".to_owned())));
+    let routes = subtitle_routes(vec![Some("cam_a".to_owned()), None]);
+    let tick = Arc::new(AtomicU64::new(0));
+    let h = h
+        .with_outputs(vec![RunOutput {
+            id: Some("hls-1".into()),
+            settings: 0,
+            feed_format: None,
+            base_format: None,
+            routable: true,
+            program_audio: true,
+            codec_name: String::new(),
+        }])
+        .with_subtitles(
+            vec![("hls-1".to_owned(), Arc::clone(&routes))],
+            Arc::clone(&tick),
+        );
+    let slot = output_routing_slot();
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let request = |output: &str, slots: Vec<(usize, Option<String>)>| SubtitleTakeRequest {
+        operation_id: "op".to_owned(),
+        output: output.to_owned(),
+        slots,
+        principal: "p".to_owned(),
+    };
+    // No run: Busy, and no live table.
+    assert_eq!(
+        adapter.try_take_subtitles(request("hls-1", vec![(0, None)])),
+        Err(SubtitleTakeError::Busy)
+    );
+    assert_eq!(adapter.subtitle_routes("hls-1"), None);
+    slot.store(Some(Arc::new(h)));
+    let (feed, rx) = subtitle_feed_with_capacity(16);
+    let resolve: CueResolver = Box::new(|id, _| match id {
+        "cam_a" => Some(multiview_output::hls::bound_cue_lines(&["from a"])),
+        "cam_b" => Some(multiview_output::hls::bound_cue_lines(&["from b"])),
+        _ => None,
+    });
+    let mut run = SubtitleRun::new(
+        vec![SubtitleOutputSampler::new(Arc::clone(&routes), feed, 2)],
+        resolve,
+        CADENCE,
+    )
+    .with_tick_cell(Arc::clone(&tick));
+    run.tick(10);
+    run.tick(11);
+    assert_eq!(tick.load(Ordering::Acquire), 11);
+    // The take: slot 0 → cam_b; the answer is the last finished tick (11),
+    // and the next sampled tick (12 here) uses the new table.
+    assert_eq!(
+        adapter.try_take_subtitles(request("hls-1", vec![(0, Some("cam_b".to_owned()))])),
+        Ok(11)
+    );
+    assert_eq!(
+        adapter.subtitle_routes("hls-1"),
+        Some(vec![Some("cam_b".to_owned()), None])
+    );
+    run.tick(12);
+    let at = |t: i64| MediaTime::from_tick(t, CADENCE);
+    let cues = rx.drain();
+    assert_eq!(cues.len(), 3, "{cues:?}");
+    assert_eq!((cues[1].start, cues[1].end), (at(10), at(12)));
+    assert_eq!(cues[1].lines[0], "from a");
+    assert_eq!(
+        (cues[2].start, cues[2].lines[0].as_str()),
+        (at(12), "from b")
+    );
+    // Not in this run / a slot beyond the table: refused, table unchanged.
+    assert_eq!(
+        adapter.try_take_subtitles(request("other", vec![(0, None)])),
+        Err(SubtitleTakeError::NotInRun)
+    );
+    assert_eq!(
+        adapter.try_take_subtitles(request("hls-1", vec![(0, None), (5, None)])),
+        Err(SubtitleTakeError::NotInRun)
+    );
+    assert_eq!(
+        adapter.subtitle_routes("hls-1"),
+        Some(vec![Some("cam_b".to_owned()), None])
+    );
+}
+
+/// A run handle for subtitle tests: one HLS output `hls-1` with a 2-slot
+/// route table (`cam_a`, unpatched) and its tick cell.
+fn subtitle_run_handle() -> (
+    OutputRoutingHandle,
+    crate::subtitle_slots::SubtitleRoutes,
+    Arc<AtomicU64>,
+) {
+    let (_r, h, _aux) = router(1, 6, Box::new(|_| Err("never".to_owned())));
+    let routes = crate::subtitle_slots::subtitle_routes(vec![Some("cam_a".to_owned()), None]);
+    let tick = Arc::new(AtomicU64::new(0));
+    let h = h.with_subtitles(
+        vec![("hls-1".to_owned(), Arc::clone(&routes))],
+        Arc::clone(&tick),
+    );
+    (h, routes, tick)
+}
+
+fn subtitle_request(
+    output: &str,
+    slots: Vec<(usize, Option<String>)>,
+) -> multiview_control::output_routing::SubtitleTakeRequest {
+    multiview_control::output_routing::SubtitleTakeRequest {
+        operation_id: "op".to_owned(),
+        output: output.to_owned(),
+        slots,
+        principal: "p".to_owned(),
+    }
+}
+
+/// Review INV-1: a take that loaded the run's handle and was paused across
+/// the run's END must not mutate the ended run's table nor report applied;
+/// after the stop the adapter answers `Busy` and has no live readback.
+#[test]
+fn a_subtitle_take_paused_across_the_run_end_never_mutates_the_ended_run() {
+    use multiview_control::output_routing::{OutputRouting, SubtitleTakeError};
+    let (h, routes, _tick) = subtitle_run_handle();
+    let h = Arc::new(h);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::clone(&h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    // The take "loaded" the handle (it holds `paused`) and is descheduled.
+    let paused = slot.load().unwrap();
+    // The run ends (its teardown drops the guard).
+    drop(SubtitleRunEnd(Arc::clone(&h)));
+    // The take resumes on the handle it loaded: refused, nothing stored.
+    assert_eq!(
+        paused.repoint_subtitles("hls-1", &[(0, Some("cam_b".to_owned()))]),
+        Err(SubtitleRepoint::Ended)
+    );
+    assert_eq!(routes.load().to_vec(), vec![Some("cam_a".to_owned()), None]);
+    // Through the adapter: Busy, and the live readback is gone.
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request("hls-1", vec![(0, None)])),
+        Err(SubtitleTakeError::Busy)
+    );
+    assert_eq!(adapter.subtitle_routes("hls-1"), None);
+    assert!(!h.subtitles_live());
+}
+
+/// Review INV-1: a take paused across a run REPLACEMENT (run 1 ends, run 2
+/// publishes its handle) never touches either table through the obsolete
+/// handle; a new take re-points run 2 only.
+#[test]
+fn a_subtitle_take_paused_across_a_run_replacement_never_mutates_either_run() {
+    use multiview_control::output_routing::OutputRouting;
+    let (h1, routes1, _t1) = subtitle_run_handle();
+    let (h2, routes2, _t2) = subtitle_run_handle();
+    let (h1, h2) = (Arc::new(h1), Arc::new(h2));
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::clone(&h1)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let paused = slot.load().unwrap();
+    // Replacement: run 1 ends, run 2 publishes.
+    drop(SubtitleRunEnd(Arc::clone(&h1)));
+    slot.store(Some(Arc::clone(&h2)));
+    assert_eq!(
+        paused.repoint_subtitles("hls-1", &[(0, Some("cam_b".to_owned()))]),
+        Err(SubtitleRepoint::Ended)
+    );
+    assert_eq!(routes1.load()[0].as_deref(), Some("cam_a"));
+    assert_eq!(routes2.load()[0].as_deref(), Some("cam_a"));
+    // A fresh take reaches run 2.
+    assert!(adapter
+        .try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))]
+        ))
+        .is_ok());
+    assert_eq!(routes2.load()[0].as_deref(), Some("cam_b"));
+    assert_eq!(routes1.load()[0].as_deref(), Some("cam_a"));
+}
+
+/// Review INV-2: the bake consumer can shed ticks, so the answered tick is
+/// the last tick the sampler FINISHED before the swap (never a promised
+/// landing tick), and the re-patch lands on the first sampled tick after it,
+/// whatever its index.
+#[test]
+fn a_subtitle_take_reports_the_last_finished_tick_and_lands_on_the_next_sampled_one() {
+    use crate::subtitle_slots::{CueResolver, SubtitleOutputSampler, SubtitleRun};
+    use multiview_control::output_routing::OutputRouting;
+    use multiview_output::hls::subtitle::subtitle_feed_with_capacity;
+    let (h, routes, tick) = subtitle_run_handle();
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let (feed, rx) = subtitle_feed_with_capacity(64);
+    let resolve: CueResolver = Box::new(|id, _| match id {
+        "cam_a" => Some(multiview_output::hls::bound_cue_lines(&["from a"])),
+        "cam_b" => Some(multiview_output::hls::bound_cue_lines(&["from b"])),
+        _ => None,
+    });
+    let mut run = SubtitleRun::new(
+        vec![SubtitleOutputSampler::new(Arc::clone(&routes), feed, 2)],
+        resolve,
+        CADENCE,
+    )
+    .with_tick_cell(Arc::clone(&tick));
+    run.tick(10);
+    // The take: tick 10 used the old table; nothing promises 11.
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))]
+        )),
+        Ok(10)
+    );
+    // Ticks 11..19 are shed; the next sampled tick (20) applies it.
+    run.tick(20);
+    let at = |t: i64| MediaTime::from_tick(t, CADENCE);
+    let cues = rx.drain();
+    assert_eq!(cues.len(), 3, "{cues:?}");
+    assert_eq!((cues[1].start, cues[1].end), (at(10), at(20)));
+    assert_eq!(
+        (cues[2].start, cues[2].lines[0].as_str()),
+        (at(20), "from b")
+    );
+}
+
+/// Review INV-2, concurrent: the sampler runs on its own thread sampling
+/// every 7th tick while a re-point lands; the answered tick is one the old
+/// route was sampled on, the new source first appears on a sampled tick
+/// strictly after it, and no old-source cue opens after that.
+#[test]
+fn a_concurrent_subtitle_repoint_lands_after_the_answered_tick() {
+    use crate::subtitle_slots::{CueResolver, SubtitleOutputSampler, SubtitleRun};
+    use multiview_control::output_routing::OutputRouting;
+    use multiview_output::hls::subtitle::subtitle_feed_with_capacity;
+    use std::sync::atomic::AtomicBool;
+    let (h, routes, tick) = subtitle_run_handle();
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let (feed, rx) = subtitle_feed_with_capacity(4096);
+    let resolve: CueResolver = Box::new(|id, _| match id {
+        "cam_a" => Some(multiview_output::hls::bound_cue_lines(&["from a"])),
+        "cam_b" => Some(multiview_output::hls::bound_cue_lines(&["from b"])),
+        _ => None,
+    });
+    let mut run = SubtitleRun::new(
+        vec![SubtitleOutputSampler::new(Arc::clone(&routes), feed, 2)],
+        resolve,
+        CADENCE,
+    )
+    .with_tick_cell(Arc::clone(&tick));
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::clone(&done);
+    let sampler = std::thread::spawn(move || {
+        let mut t = 7_u64;
+        let mut after = 0;
+        while after < 20 {
+            run.tick(t);
+            t += 7;
+            if stop.load(Ordering::Acquire) {
+                after += 1;
+            }
+        }
+    });
+    while tick.load(Ordering::Acquire) < 700 {
+        std::thread::yield_now();
+    }
+    let answered = adapter
+        .try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))],
+        ))
+        .unwrap();
+    done.store(true, Ordering::Release);
+    sampler.join().unwrap();
+    let cues = rx.drain();
+    let landed = cues
+        .iter()
+        .find(|cue| cue.lines[0] == "from b")
+        .expect("the new source was sampled")
+        .start;
+    let answered_at = MediaTime::from_tick(i64::try_from(answered).unwrap(), CADENCE);
+    assert!(
+        answered >= 700 && answered % 7 == 0,
+        "a sampled tick: {answered}"
+    );
+    assert!(landed > answered_at, "{landed:?} after {answered_at:?}");
+    // The old cue closes exactly where the new one opens (one tick).
+    let closed = cues
+        .iter()
+        .find(|cue| cue.lines[0] == "from a" && !cue.is_open())
+        .expect("the old cue closed");
+    assert_eq!(closed.end, landed);
+}
+
+/// Review INV2-1: the bake consumer's exit (its guard dropped, for any
+/// reason) ends subtitle admission wait-free: a later take is `Busy`, the
+/// table is unchanged and there is no live readback.
+#[test]
+fn the_consumer_exit_ends_subtitle_admission() {
+    use multiview_control::output_routing::{OutputRouting, SubtitleTakeError};
+    let (h, routes, _tick) = subtitle_run_handle();
+    let h = Arc::new(h);
+    let exit = h.subtitle_consumer_exit();
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::clone(&h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    assert!(adapter.subtitle_routes("hls-1").is_some());
+    drop(exit);
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))]
+        )),
+        Err(SubtitleTakeError::Busy)
+    );
+    assert_eq!(routes.load().to_vec(), vec![Some("cam_a".to_owned()), None]);
+    assert_eq!(adapter.subtitle_routes("hls-1"), None);
+    assert!(!h.subtitles_live());
+}
+
+/// Review COR2-1 / INV2-2, deterministic: a sample of tick 11 loads the OLD
+/// table and is paused in its resolver; a take swaps (answering the
+/// completed lower bound 10); tick 11 completes with the old source; the
+/// first table read that starts after the swap (tick 12) uses the new one.
+/// Before any sample the answered bound is 0.
+#[test]
+fn an_in_flight_sample_finishes_on_the_old_table_and_the_next_read_sees_the_take() {
+    use crate::subtitle_slots::{CueResolver, SubtitleOutputSampler, SubtitleRun};
+    use multiview_control::output_routing::OutputRouting;
+    use multiview_output::hls::subtitle::subtitle_feed_with_capacity;
+    use std::sync::Barrier;
+    let (h, routes, tick) = subtitle_run_handle();
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = Arc::new(crate::output_routing_control::OutputRoutingAdapter::new(
+        Arc::clone(&slot),
+    ));
+    let (feed, rx) = subtitle_feed_with_capacity(64);
+    // The resolver parks tick 11 (after its table load) on two barriers.
+    let paused = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let (p, r) = (Arc::clone(&paused), Arc::clone(&resume));
+    let at = |t: i64| MediaTime::from_tick(t, CADENCE);
+    let tick11 = at(11);
+    let resolve: CueResolver = Box::new(move |id, now| {
+        if now == tick11 && id == "cam_a" {
+            p.wait();
+            r.wait();
+        }
+        match id {
+            "cam_a" => Some(multiview_output::hls::bound_cue_lines(&["from a"])),
+            "cam_b" => Some(multiview_output::hls::bound_cue_lines(&["from b"])),
+            _ => None,
+        }
+    });
+    let mut run = SubtitleRun::new(
+        vec![SubtitleOutputSampler::new(Arc::clone(&routes), feed, 2)],
+        resolve,
+        CADENCE,
+    )
+    .with_tick_cell(Arc::clone(&tick));
+    run.tick(10);
+    let sampler = std::thread::spawn(move || {
+        run.tick(11);
+        run
+    });
+    paused.wait();
+    // Tick 11 is in flight on the old table: the take swaps now.
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))]
+        )),
+        Ok(10),
+        "a completed-tick lower bound observed before the swap"
+    );
+    resume.wait();
+    let mut run = sampler.join().unwrap();
+    assert_eq!(tick.load(Ordering::Acquire), 11);
+    // Tick 11 finished on the old source: no change, no cue.
+    let cues = rx.drain();
+    assert_eq!(cues.len(), 1, "only tick 10's open cue: {cues:?}");
+    assert_eq!(cues[0].lines[0], "from a");
+    run.tick(12);
+    let cues = rx.drain();
+    assert_eq!(cues.len(), 2, "{cues:?}");
+    assert_eq!((cues[0].start, cues[0].end), (at(10), at(12)));
+    assert_eq!(
+        (cues[1].start, cues[1].lines[0].as_str()),
+        (at(12), "from b")
+    );
+
+    // Pre-first-sample: the bound is 0 (no tick need have completed).
+    let (h2, _routes2, _tick2) = subtitle_run_handle();
+    assert_eq!(
+        h2.repoint_subtitles("hls-1", &[(0, None)]),
+        Ok(0),
+        "0 before any completed sample"
+    );
+}
+
+/// Review COR2-1 / INV2-2: two takes before the next table read — both
+/// answer `applied` (each swapped the table), but the superseded one is
+/// never sampled: the next read sees only the last.
+#[test]
+fn a_take_superseded_before_the_next_read_is_never_sampled() {
+    use crate::subtitle_slots::{CueResolver, SubtitleOutputSampler, SubtitleRun};
+    use multiview_control::output_routing::OutputRouting;
+    use multiview_output::hls::subtitle::subtitle_feed_with_capacity;
+    let (h, routes, tick) = subtitle_run_handle();
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let (feed, rx) = subtitle_feed_with_capacity(64);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let resolve: CueResolver = Box::new(move |id, _| {
+        log.lock().unwrap().push(id.to_owned());
+        Some(multiview_output::hls::bound_cue_lines(&[format!(
+            "from {id}"
+        )
+        .as_str()]))
+    });
+    let mut run = SubtitleRun::new(
+        vec![SubtitleOutputSampler::new(Arc::clone(&routes), feed, 2)],
+        resolve,
+        CADENCE,
+    )
+    .with_tick_cell(Arc::clone(&tick));
+    run.tick(10);
+    for source in ["cam_b", "cam_c"] {
+        assert_eq!(
+            adapter.try_take_subtitles(subtitle_request(
+                "hls-1",
+                vec![(0, Some(source.to_owned()))]
+            )),
+            Ok(10)
+        );
+    }
+    run.tick(11);
+    assert_eq!(
+        *asked.lock().unwrap(),
+        vec!["cam_a", "cam_c"],
+        "cam_b never read"
+    );
+    let cues = rx.drain();
+    assert!(
+        cues.iter().all(|cue| cue.lines[0] != "from cam_b"),
+        "{cues:?}"
+    );
+    assert_eq!(cues.last().unwrap().lines[0], "from cam_c");
+}
+
+/// Review COR3-1: after the consumer exited (the tables are still held
+/// until teardown clears them), a take for an output absent from the run is
+/// `Busy`, not `NotInRun`: the ended check precedes the output lookup. In a
+/// live run the same take is `NotInRun`, and the state is not left stuck.
+#[test]
+fn after_consumer_exit_an_absent_output_is_busy_not_not_in_run() {
+    use multiview_control::output_routing::{OutputRouting, SubtitleTakeError};
+    let (h, _routes, _tick) = subtitle_run_handle();
+    let h = Arc::new(h);
+    let exit = h.subtitle_consumer_exit();
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::clone(&h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    // Live: absent output is NotInRun, twice (the lookup failure does not
+    // leave admission stuck), and a present one still applies.
+    for _ in 0..2 {
+        assert_eq!(
+            adapter.try_take_subtitles(subtitle_request("absent", vec![(0, None)])),
+            Err(SubtitleTakeError::NotInRun)
+        );
+    }
+    assert!(adapter
+        .try_take_subtitles(subtitle_request("hls-1", vec![(1, None)]))
+        .is_ok());
+    drop(exit);
+    assert!(
+        h.subtitle_routes_for_test("hls-1").is_some(),
+        "tables still held"
+    );
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request("absent", vec![(0, None)])),
+        Err(SubtitleTakeError::Busy)
+    );
+}
+
+/// Review INV3-1, exit BEFORE publication: the consumer exits while a take
+/// is about to be admitted; the take finds the run ended at its one
+/// admission point, publishes nothing, and is `Busy`.
+#[test]
+fn a_consumer_exit_before_admission_publishes_nothing() {
+    use multiview_control::output_routing::{OutputRouting, SubtitleTakeError};
+    let (h, routes, _tick) = subtitle_run_handle();
+    let h = Arc::new(h);
+    let exit = Mutex::new(Some(h.subtitle_consumer_exit()));
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::clone(&h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let stages = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&stages);
+    h.set_repoint_hook(Box::new(move |stage| log.lock().unwrap().push(stage)));
+    // The exit lands first (the take has loaded the handle, not admitted).
+    drop(exit.lock().unwrap().take());
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))]
+        )),
+        Err(SubtitleTakeError::Busy)
+    );
+    assert!(stages.lock().unwrap().is_empty(), "never admitted");
+    assert_eq!(routes.load().to_vec(), vec![Some("cam_a".to_owned()), None]);
+}
+
+/// Review INV3-1, exit AFTER publication: a take is admitted and publishes;
+/// the consumer samples the new route and exits (its guard ends admission)
+/// while the take is still between publication and return. The take stays
+/// applied: the table is NOT rolled back (what the consumer sampled is what
+/// is applied and then persisted), and later takes are `Busy`.
+#[test]
+fn a_consumer_exit_after_publication_keeps_the_take_applied() {
+    use crate::subtitle_slots::{CueResolver, SubtitleOutputSampler, SubtitleRun};
+    use multiview_control::output_routing::{OutputRouting, SubtitleTakeError};
+    use multiview_output::hls::subtitle::subtitle_feed_with_capacity;
+    let (h, routes, tick) = subtitle_run_handle();
+    let h = Arc::new(h);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::clone(&h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let (feed, rx) = subtitle_feed_with_capacity(64);
+    let resolve: CueResolver = Box::new(|id, _| {
+        Some(multiview_output::hls::bound_cue_lines(&[format!(
+            "from {id}"
+        )
+        .as_str()]))
+    });
+    let run = SubtitleRun::new(
+        vec![SubtitleOutputSampler::new(Arc::clone(&routes), feed, 2)],
+        resolve,
+        CADENCE,
+    )
+    .with_tick_cell(Arc::clone(&tick));
+    // The consumer: its run and its exit guard.
+    let consumer = Mutex::new(Some((run, h.subtitle_consumer_exit())));
+    consumer.lock().unwrap().as_mut().unwrap().0.tick(10);
+    let consumer = Arc::new(consumer);
+    let on_publish = Arc::clone(&consumer);
+    h.set_repoint_hook(Box::new(move |stage| {
+        if stage == RepointStage::Published {
+            // Paused after publication: the consumer samples the new route,
+            // then exits (dropping its guard).
+            let (mut run, exit) = on_publish.lock().unwrap().take().unwrap();
+            run.tick(11);
+            drop(exit);
+            drop(run);
+        }
+    }));
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))]
+        )),
+        Ok(10),
+        "applied: it was published (and sampled)"
+    );
+    let cues = rx.drain();
+    assert_eq!(cues.last().unwrap().lines[0], "from cam_b", "{cues:?}");
+    assert_eq!(
+        routes.load().to_vec(),
+        vec![Some("cam_b".to_owned()), None],
+        "never rolled back"
+    );
+    assert!(!h.subtitles_live());
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request("hls-1", vec![(0, None)])),
+        Err(SubtitleTakeError::Busy)
+    );
+}
+
 // ---- Atomic multi-crosspoint sets (ADR-0110 §12.8, #308) ----
 
 use multiview_engine::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};

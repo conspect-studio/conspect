@@ -15,13 +15,14 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use multiview_control::output_routing::{
     AudioPlanCost, LayoutBody, OutputLive, OutputOutcome, OutputReformatRequest, OutputRouting,
     OutputTakeRequest, OutputTakeSet, PlanCost, PlanPath, PlanRefusal, ReformatSubmitError,
-    RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
+    RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, SubtitleTakeError, SubtitleTakeRequest,
+    TakeSubmitError,
 };
 
 use crate::output_routing::{
     FallbackReason, OutputRoutingHandle, OutputRoutingSlot, OutputTake, ReformatRefusal,
-    RefuseReason, TakeOutcome, TakeResult, TakeSet, DEFAULT_MAX_ENCODERS, MAX_SET_MEMBERS,
-    MAX_TAKE_ID_BYTES,
+    RefuseReason, SubtitleRepoint, TakeOutcome, TakeResult, TakeSet, DEFAULT_MAX_ENCODERS,
+    MAX_SET_MEMBERS, MAX_TAKE_ID_BYTES,
 };
 use crate::routing_audio::AudioChoice;
 use crate::routing_aux::PictureBus;
@@ -679,6 +680,27 @@ impl OutputRouting for OutputRoutingAdapter {
             sessions_max: self.max_encoders,
             dropped_ticks: snapshot.dropped_aux_ticks,
         })
+    }
+
+    /// Slice F part F2: re-point the output's subtitle route table (RCU,
+    /// wait-free for the off-clock sampler, no channel), under the run's
+    /// subtitle gate: a run that ended, is tearing down, whose consumer
+    /// exited, or was replaced refuses `Busy` and is never mutated (review
+    /// INV-1, INV2-1). The answer is a completed-tick lower bound observed
+    /// before the swap (`0`: possibly none), not a landing tick; see
+    /// [`OutputRoutingHandle::repoint_subtitles`] (review COR2-1/INV2-2).
+    fn try_take_subtitles(&self, take: SubtitleTakeRequest) -> Result<u64, SubtitleTakeError> {
+        let handle = self.slot.load().ok_or(SubtitleTakeError::Busy)?;
+        handle
+            .repoint_subtitles(&take.output, &take.slots)
+            .map_err(|refusal| match refusal {
+                SubtitleRepoint::Ended => SubtitleTakeError::Busy,
+                SubtitleRepoint::NotInRun => SubtitleTakeError::NotInRun,
+            })
+    }
+
+    fn subtitle_routes(&self, output: &str) -> Option<Vec<Option<String>>> {
+        self.slot.load()?.subtitle_table(output)
     }
 
     fn subscribe_outcomes(&self) -> Option<Receiver<OutputOutcome>> {

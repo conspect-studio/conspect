@@ -1307,6 +1307,7 @@ pub(crate) fn take_output_slot0(
         api_id: output_id.to_owned(),
         feed: feed.clone(),
         audio: audio.clone(),
+        subtitles: None,
     };
     let pending_check = pending.clone();
     let op = match control.reserve_take(&key, &principal.key_id, pending) {
@@ -1464,7 +1465,7 @@ fn same_take(
 ///
 /// # Errors
 /// A missing `Idempotency-Key` (422).
-fn slot0_key_of(idem: &IdempotencyKey) -> ControlResult<String> {
+pub(crate) fn slot0_key_of(idem: &IdempotencyKey) -> ControlResult<String> {
     idem.0
         .as_deref()
         .map(slot0_take_key)
