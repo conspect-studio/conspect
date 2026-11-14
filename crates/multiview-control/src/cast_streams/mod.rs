@@ -101,6 +101,14 @@ pub enum AuthOrigin {
 #[cfg(any(test, feature = "_test-seams"))]
 pub type ArmHook = Arc<dyn Fn() + Send + Sync>;
 
+/// A test-only pause of one media request (see
+/// [`CastStreams::set_before_open`]): signal `.0` when paused, resume on `.1`.
+#[cfg(any(test, feature = "_test-seams"))]
+pub type OpenPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 /// What fetched the media of a stream (no token, no IP).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -155,6 +163,8 @@ pub struct CastStreams {
     app_id: Mutex<Option<String>>,
     #[cfg(any(test, feature = "_test-seams"))]
     before_arm: Mutex<Option<ArmHook>>,
+    #[cfg(any(test, feature = "_test-seams"))]
+    before_open: Mutex<Option<OpenPause>>,
 }
 
 impl std::fmt::Debug for CastStreams {
@@ -189,6 +199,8 @@ impl CastStreams {
             app_id: Mutex::new(None),
             #[cfg(any(test, feature = "_test-seams"))]
             before_arm: Mutex::new(None),
+            #[cfg(any(test, feature = "_test-seams"))]
+            before_open: Mutex::new(None),
         }
     }
 
@@ -237,6 +249,35 @@ impl CastStreams {
     #[cfg(not(any(test, feature = "_test-seams")))]
     #[allow(clippy::unused_self)] // Same signature as the test-seam build.
     pub(crate) const fn run_before_arm(&self) {}
+
+    /// TEST SEAM: pause the next `/cast/<token>/…` media request after its
+    /// authorization and before it opens the file (deterministic
+    /// request-in-flight tests of ABUSE-1).
+    #[cfg(any(test, feature = "_test-seams"))]
+    pub fn set_before_open(&self, pause: Option<OpenPause>) {
+        *self
+            .before_open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = pause;
+    }
+
+    #[cfg(any(test, feature = "_test-seams"))]
+    pub(crate) async fn run_before_open(&self) {
+        let pause = self
+            .before_open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((paused, resume)) = pause {
+            let _ = paused.send(());
+            let _ = resume.await;
+        }
+    }
+
+    /// The test seam is compiled out of production builds.
+    #[cfg(not(any(test, feature = "_test-seams")))]
+    #[allow(clippy::unused_self, clippy::unused_async)] // Same signature as the test-seam build.
+    pub(crate) async fn run_before_open(&self) {}
 
     /// `true` exactly once: the caller starts the sweep task.
     pub(crate) fn claim_sweeper(&self) -> bool {

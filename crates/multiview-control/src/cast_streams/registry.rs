@@ -276,9 +276,15 @@ impl Registry {
 
     /// The gate of `config_id`, created (at a fresh generation) on first
     /// use. Gates exist only for outputs with streams (the sweep drops the
-    /// others), so they are bounded by [`super::MAX_STREAMS`].
-    pub(super) fn gate_mut(&mut self, config_id: &str) -> &mut Gate {
+    /// others), so they are bounded by [`super::MAX_STREAMS`]; creation is
+    /// additionally refused beyond [`super::MAX_GATES`] (`None`), which
+    /// fails closed: an output without a gate never serves a token
+    /// ([`Self::servable`]) and no token can be armed on it.
+    pub(super) fn gate_mut(&mut self, config_id: &str) -> Option<&mut Gate> {
         if !self.gates.contains_key(config_id) {
+            if self.gates.len() >= super::MAX_GATES {
+                return None;
+            }
             self.last_generation = self.last_generation.saturating_add(1);
             let generation = self.last_generation;
             self.gates.insert(
@@ -289,15 +295,17 @@ impl Registry {
                 },
             );
         }
-        self.gates.entry(config_id.to_owned()).or_default()
+        self.gates.get_mut(config_id)
     }
 
-    /// Move `config_id` to a fresh generation and return it.
-    pub(super) fn bump(&mut self, config_id: &str) -> u64 {
+    /// Move `config_id` to a fresh generation and return it (`None`: no
+    /// gate could be created; see [`Self::gate_mut`]).
+    pub(super) fn bump(&mut self, config_id: &str) -> Option<u64> {
+        self.gate_mut(config_id)?;
         self.last_generation = self.last_generation.saturating_add(1);
         let generation = self.last_generation;
-        self.gate_mut(config_id).generation = generation;
-        generation
+        self.gates.get_mut(config_id)?.generation = generation;
+        Some(generation)
     }
 
     /// Revoke entry `at` on the server's behalf (see

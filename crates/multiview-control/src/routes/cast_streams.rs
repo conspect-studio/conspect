@@ -496,13 +496,11 @@ async fn authorized_feed(
 )]
 pub(crate) async fn create_cast_stream(
     State(state): State<AppState>,
-    principal: Principal,
-    headers: axum::http::HeaderMap,
+    crate::routes::Authenticated(principal, origin): crate::routes::Authenticated,
     body: Option<Json<CreateCastStream>>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    let origin = crate::routes::auth_origin(&headers, &state);
     Ok(match mint_stream(&state, &principal, origin, &req).await? {
         Ok(minted) => {
             let doc = stream_doc(&state, minted.view, Some(&minted.token));

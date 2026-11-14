@@ -12,7 +12,9 @@
 //!   win over the token route.
 //!
 //! Media is served only for a token armed at its output's CURRENT
-//! authorization generation (ABUSE-1, `cast_streams::reauth`).
+//! authorization generation (ABUSE-1, `cast_streams::reauth`), checked
+//! before the file is resolved AND again after it is open, before any byte
+//! of the response is released.
 //!
 //! The token is a path segment: it is never logged by this crate (no layer
 //! here records request paths), never audited and never published.
@@ -177,10 +179,27 @@ async fn serve_media(
     let Some(dir) = output_dir(state, &config_id) else {
         return not_found();
     };
+    state.cast_streams.run_before_open().await;
+    // `serve_file` returns once the file is OPEN (canonicalize + confine +
+    // open + fstat awaited on the blocking pool); its body streams from that
+    // open handle only. Every cast file is renamed into place whole
+    // (`write_renamed` / `atomic_write`), so the bytes are fixed at open: a
+    // later rename cannot change what this response sends.
     let response =
         multiview_output::hls::http::serve_file(dir, &file, method, headers.clone()).await;
     let status = response.status();
     if status == StatusCode::NOT_FOUND {
+        return not_found();
+    }
+    // ABUSE-1, the request in flight: the authorization above was taken
+    // BEFORE the awaits. A take or fallback may have revoked this owner and
+    // published a feed it may not read meanwhile, so re-run the barrier and
+    // re-check the token (live, armed at the output's CURRENT generation,
+    // same stream on the same output) AFTER the file is open and BEFORE any
+    // byte is released. On failure the open handle is dropped unread and
+    // the answer is the generic 404.
+    crate::cast_streams::reauth::on_media(state, &config_id);
+    if state.cast_streams.serve(&token).as_ref() != Some(&(stream_id.clone(), config_id.clone())) {
         return not_found();
     }
     if status.is_success() || status == StatusCode::NOT_MODIFIED {

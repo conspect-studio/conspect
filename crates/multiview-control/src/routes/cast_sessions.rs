@@ -294,8 +294,7 @@ async fn screen_cast_dial_target(address: &str, policy: &DialPolicy) -> ControlR
 )]
 pub(crate) async fn start_cast_session(
     State(state): State<AppState>,
-    principal: Principal,
-    headers: axum::http::HeaderMap,
+    crate::routes::Authenticated(principal, origin): crate::routes::Authenticated,
     Json(request): Json<StartCastSessionRequest>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
@@ -311,7 +310,6 @@ pub(crate) async fn start_cast_session(
         .as_ref()
         .is_some_and(|engine| !engine.outputs().is_empty());
     if cast_outputs {
-        let origin = crate::routes::auth_origin(&headers, &state);
         return start_stream_session(&state, &principal, origin, &request).await;
     }
     if request.feed.is_some() {

@@ -198,3 +198,28 @@ fn memory_stays_bounded_under_a_create_expire_storm() {
         assert!(limited <= MAX_LIMITED_PRINCIPALS && rates <= MAX_STREAMS);
     }
 }
+
+/// INV (round 3): gate creation is bounded by [`MAX_GATES`] and fails
+/// closed: past it no gate is created, nothing is cleared and nothing can
+/// be armed or served on that output.
+#[test]
+fn gates_are_bounded_and_fail_closed_past_the_cap() {
+    let (_, streams) = clocked();
+    let claim = streams
+        .claim("op", "output-x", "over", &RoutedFeed::Program, false)
+        .unwrap();
+    for i in 0..MAX_GATES {
+        let arm = streams.arm_snapshot(&format!("c{i}"));
+        assert!(arm.generation > 0);
+    }
+    let arm = streams.arm_snapshot("over");
+    assert_eq!(arm.generation, 0);
+    assert!(arm.needs.is_none());
+    assert_eq!(streams.lock().gates.len(), MAX_GATES);
+    assert_eq!(
+        streams.arm(&claim.id, arm.generation, None),
+        Err(api::ArmError::Stale)
+    );
+    assert!(streams.serve(&claim.token).is_none());
+    assert_eq!(streams.generation("over"), None);
+}

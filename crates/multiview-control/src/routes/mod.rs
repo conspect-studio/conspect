@@ -1083,44 +1083,52 @@ pub(crate) fn authenticate_principal(
     parts: &axum::http::request::Parts,
     state: &AppState,
 ) -> Result<Principal, ControlError> {
+    authenticate(parts, state).map(|(principal, _)| principal)
+}
+
+/// Authenticate the request once and return the [`Principal`] together with
+/// HOW it authenticated (ABUSE-3): the provenance is the branch that
+/// actually succeeded, in the same step, never inferred later by verifying
+/// the credential again (a key revoked in between would otherwise read as
+/// "not a native key, so a JWT").
+pub(crate) fn authenticate(
+    parts: &axum::http::request::Parts,
+    state: &AppState,
+) -> Result<(Principal, crate::cast_streams::AuthOrigin), ControlError> {
+    use crate::cast_streams::AuthOrigin;
     // Auth disabled (explicit trusted-network mode): every request is a local
     // admin, no credential required.
     if state.auth_disabled {
-        return Ok(Principal::local_admin());
+        return Ok((Principal::local_admin(), AuthOrigin::LocalAdmin));
     }
     let header = header_value(&parts.headers, header::AUTHORIZATION);
     // Primary: native API key. If that fails and a JWT validator is
     // configured, fall back to OAuth2/JWT (the alternative authn path).
     match state.api_keys.verify_authorization(header.as_deref()) {
-        Ok(principal) => Ok(principal),
+        Ok(principal) => Ok((principal, AuthOrigin::ApiKey)),
         Err(api_key_err) => state
             .authenticate_jwt(header.as_deref())
-            .ok_or(api_key_err)?,
+            .ok_or(api_key_err)?
+            .map(|principal| (principal, AuthOrigin::Jwt)),
     }
 }
 
-/// How the request authenticated (ABUSE-3), by the same order
-/// [`authenticate_principal`] uses: the local admin of an auth-disabled run,
-/// a native API key that verifies, else a JWT. Only meaningful for a request
-/// whose [`Principal`] was extracted.
-pub(crate) fn auth_origin(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> crate::cast_streams::AuthOrigin {
-    use crate::cast_streams::AuthOrigin;
-    if state.auth_disabled {
-        return AuthOrigin::LocalAdmin;
-    }
-    let header = header_value(headers, header::AUTHORIZATION);
-    if state
-        .api_keys
-        .verify_authorization(header.as_deref())
-        .is_ok()
-        || state.jwt.is_none()
-    {
-        AuthOrigin::ApiKey
-    } else {
-        AuthOrigin::Jwt
+/// An authenticated request: its [`Principal`] and the provenance of that
+/// very authentication ([`authenticate`]; ABUSE-3). For handlers that record
+/// how their caller authenticated (cast stream creation).
+#[derive(Debug, Clone)]
+pub(crate) struct Authenticated(pub Principal, pub crate::cast_streams::AuthOrigin);
+
+impl axum::extract::FromRequestParts<AppState> for Authenticated {
+    type Rejection = ControlError;
+
+    fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(
+            authenticate(parts, state).map(|(principal, origin)| Self(principal, origin)),
+        )
     }
 }
 

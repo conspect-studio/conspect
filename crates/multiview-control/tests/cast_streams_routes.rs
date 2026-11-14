@@ -1796,3 +1796,185 @@ async fn a_genuine_jwt_owner_keeps_its_token() {
     multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
     assert_eq!(statuses(&rig, &token).await, vec![StatusCode::OK; 3]);
 }
+
+/// A `POST /api/v1/cast/streams` whose JSON body is held back until
+/// `release` fires; `polled` fires when axum first reads it (every header
+/// extractor, the `Principal` included, has run by then).
+fn held_create(
+    token: &str,
+    body: serde_json::Value,
+    polled: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> Request<Body> {
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let stream = async_stream::stream! {
+        let _ = polled.send(());
+        let _ = release.await;
+        yield Ok::<_, std::io::Error>(bytes);
+    };
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/cast/streams")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// ABUSE-3 round 3: provenance comes from the authentication that
+/// succeeded, never from a later re-verification. A native key passes
+/// `Principal` extraction, is revoked while its request body is still in
+/// flight, and the handler then runs with JWT configured: the stream is
+/// never recorded as a JWT owner, so it fails closed (refused, or revoked
+/// on the next re-check) instead of living on with the revoked key's grants.
+#[tokio::test]
+async fn a_key_revoked_mid_request_is_never_recorded_as_a_jwt_owner() {
+    let rig = jwt_rig();
+    let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let request = held_create(
+        FRESH,
+        serde_json::json!({"output": "output-0"}),
+        polled_tx,
+        release_rx,
+    );
+    let router = rig.router.clone();
+    let call = tokio::spawn(async move { send(&router, request).await });
+    polled_rx.await.unwrap();
+    assert!(rig.state.api_keys.revoke("cs-fresh"));
+    release_tx.send(()).unwrap();
+    let response = call.await.unwrap();
+    let status = response.status();
+    let doc: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).unwrap_or_default();
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    if status == StatusCode::CREATED {
+        assert_eq!(
+            statuses(&rig, &token_of(&doc)).await,
+            vec![StatusCode::NOT_FOUND; 3],
+            "a revoked native key resurrected as a JWT owner"
+        );
+    }
+    assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0, "{doc}");
+}
+
+/// The request seam of ABUSE-1 round 3: pause the next `/cast/<token>/…`
+/// media request after its authorization and before the file is opened.
+/// Returns (paused, resume).
+fn pause_media(
+    rig: &Rig,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    rig.state
+        .cast_streams
+        .set_before_open(Some((paused_tx, resume_rx)));
+    (paused_rx, resume_tx)
+}
+
+/// Overwrite output `id`'s files the way the packager does (a new file
+/// renamed over the name) with bytes tagged `tag`.
+fn republish(rig: &Rig, id: &str, tag: &str) {
+    let dir = rig.dir.path().join(id);
+    for (name, bytes) in [
+        ("master.m3u8", format!("#EXTM3U\n#{tag}\n").into_bytes()),
+        ("seg-v-1-0.m4s", tag.as_bytes().repeat(100)),
+        ("init-v-1-0.mp4", tag.as_bytes().to_vec()),
+    ] {
+        let tmp = dir.join(format!("{name}.tmp"));
+        std::fs::write(&tmp, bytes).unwrap();
+        std::fs::rename(&tmp, dir.join(name)).unwrap();
+    }
+}
+
+/// ABUSE-1 round 3, request in flight: a media request passed its
+/// authorization and is paused before it opens the file; a take to a feed
+/// its owner may not read revokes the owner and the output publishes the
+/// restricted media. Resumed, the request answers the generic 404 and never
+/// a byte of the restricted feed, for playlists, segments and init.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_in_flight_across_a_revoking_take_never_serves_its_bytes() {
+    for file in ["master.m3u8", "seg-v-1-0.m4s", "init-v-1-0.mp4"] {
+        let rig = rig();
+        let (status, doc) = create(
+            &rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{doc}");
+        let token = token_of(&doc);
+        let (paused, resume) = pause_media(&rig);
+        let router = rig.router.clone();
+        let path = format!("/cast/{token}/{file}");
+        let call = tokio::spawn(async move {
+            let response = send(&router, public("GET", &path).body(Body::empty()).unwrap()).await;
+            (response.status(), body_bytes(response).await)
+        });
+        paused.await.unwrap();
+        let r = send(
+            &rig.router,
+            route_take(
+                OPERATOR_TOKEN,
+                "abuse-1-in-flight",
+                "output-0",
+                serde_json::json!({"source": "secret-cam"}),
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        republish(&rig, "cast-1", "RESTRICTED");
+        resume.send(()).unwrap();
+        let (status, body) = call.await.unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND, "{file}");
+        assert_eq!(body, b"not found\n", "{file}");
+    }
+}
+
+/// ABUSE-1 round 3, the positive case: an owner authorized for the new
+/// feed, paused the same way across the same take, is served (the new
+/// media, which it may read).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authorized_request_in_flight_across_a_take_is_served() {
+    for file in ["master.m3u8", "seg-v-1-0.m4s", "init-v-1-0.mp4"] {
+        let rig = rig();
+        let (status, doc) = create(
+            &rig,
+            OPERATOR_2,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{doc}");
+        let token = token_of(&doc);
+        let (paused, resume) = pause_media(&rig);
+        let router = rig.router.clone();
+        let path = format!("/cast/{token}/{file}");
+        let call = tokio::spawn(async move {
+            let response = send(&router, public("GET", &path).body(Body::empty()).unwrap()).await;
+            (response.status(), body_bytes(response).await)
+        });
+        paused.await.unwrap();
+        let r = send(
+            &rig.router,
+            route_take(
+                OPERATOR_TOKEN,
+                "abuse-1-in-flight-ok",
+                "output-0",
+                serde_json::json!({"source": "secret-cam"}),
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        republish(&rig, "cast-1", "NEWFEED");
+        resume.send(()).unwrap();
+        let (status, body) = call.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{file}");
+        assert!(
+            String::from_utf8_lossy(&body).contains("NEWFEED"),
+            "{file}: {body:?}"
+        );
+    }
+}

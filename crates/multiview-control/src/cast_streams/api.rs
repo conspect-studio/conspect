@@ -265,11 +265,18 @@ impl CastStreams {
     /// fresh generation on first use).
     pub(crate) fn arm_snapshot(&self, config_id: &str) -> Arm {
         let mut inner = self.lock();
-        let gate = inner.gate_mut(config_id);
-        Arm {
-            generation: gate.generation,
-            needs: gate.cleared_needs(),
-        }
+        // No gate (over [`super::MAX_GATES`]): nothing is cleared and
+        // arming finds no gate either, so the creation is refused.
+        inner.gate_mut(config_id).map_or(
+            Arm {
+                generation: 0,
+                needs: None,
+            },
+            |gate| Arm {
+                generation: gate.generation,
+                needs: gate.cleared_needs(),
+            },
+        )
     }
 
     /// Arm stream `id` at `generation` (its owner was checked against that
@@ -325,8 +332,11 @@ impl CastStreams {
         let generation = if bump {
             inner.bump(config_id)
         } else {
-            inner.gate_mut(config_id).generation
+            inner.gate_mut(config_id).map(|g| g.generation)
         };
+        // No gate: no token on this output is servable; revoke every armed
+        // one (fail closed) rather than leave it waiting for a gate.
+        let generation = generation.unwrap_or(0);
         let mut at = 0;
         while let Some(entry) = inner.entries.get(at) {
             if entry.config_id != config_id || entry.generation.is_none() || entry.expired(now) {
@@ -334,7 +344,12 @@ impl CastStreams {
                 continue;
             }
             let stream = OwnedStream::of(entry);
-            match check(&stream, needs) {
+            let verdict = if generation == 0 {
+                Err(super::reauth::REASON_UNKNOWN)
+            } else {
+                check(&stream, needs)
+            };
+            match verdict {
                 Ok(()) => {
                     if let Some(entry) = inner.entries.get_mut(at) {
                         entry.generation = Some(generation);
@@ -368,7 +383,11 @@ impl CastStreams {
         {
             return revoked;
         }
-        let gate = inner.gate_mut(config_id);
+        let Some(gate) = inner.gate_mut(config_id) else {
+            // Over [`super::MAX_GATES`]: fail closed on this output.
+            Self::recheck(&mut inner, config_id, None, false, check, &mut revoked, now);
+            return revoked;
+        };
         while gate.carry.len() >= super::MAX_CARRY {
             gate.carry.pop_front();
         }
@@ -414,7 +433,11 @@ impl CastStreams {
         {
             return revoked;
         }
-        let gate = inner.gate_mut(config_id);
+        let Some(gate) = inner.gate_mut(config_id) else {
+            // Over [`super::MAX_GATES`]: fail closed on this output.
+            Self::recheck(&mut inner, config_id, None, false, check, &mut revoked, now);
+            return revoked;
+        };
         let covered = match (&needs, gate.cleared_needs()) {
             (Some(needs), Some(cleared)) => needs.iter().all(|n| cleared.contains(n)),
             _ => false,
