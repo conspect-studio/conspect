@@ -957,18 +957,22 @@ impl ComposeScratch {
         // One bounded reservation per new high-water cell count. `capacity()` only
         // grows, so once it covers the layout this is a no-op for every later tick
         // — the steady-state per-tick allocation is zero.
+        // The vectors were just cleared (`len() == 0`), and `reserve(n)`
+        // guarantees `capacity() >= len() + n`, so `reserve(cell_count)` is
+        // the exact request. (Reserving `cell_count - capacity()` is a no-op
+        // on a cleared non-empty-capacity vector and re-counted a growth on
+        // every tick above the high-water mark.)
         let mut grew = false;
         if self.held.capacity() < cell_count {
-            self.held.reserve(cell_count - self.held.capacity());
+            self.held.reserve(cell_count);
             grew = true;
         }
         if self.placements.capacity() < cell_count {
-            self.placements
-                .reserve(cell_count - self.placements.capacity());
+            self.placements.reserve(cell_count);
             grew = true;
         }
         if self.order.capacity() < cell_count {
-            self.order.reserve(cell_count - self.order.capacity());
+            self.order.reserve(cell_count);
             grew = true;
         }
         if grew {
