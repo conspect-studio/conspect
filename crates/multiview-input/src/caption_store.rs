@@ -147,6 +147,21 @@ impl<C: Clone> CaptionCueStore<C> {
     /// Sample a cue only when its lifecycle matches the selected video frame.
     #[must_use]
     pub fn active_at_generation(&self, now: MediaTime, generation: u64) -> Option<C> {
+        self.with_active_at_generation(now, generation, C::clone)
+    }
+
+    /// Project the cue [`active_at_generation`](Self::active_at_generation)
+    /// would return through `project`, **borrowing** it from the snapshot:
+    /// nothing is cloned, so a reader that needs only part of a cue (e.g.
+    /// bounded text, skipping bitmap pixels) never copies the whole payload.
+    /// `None` when no cue of `generation` covers `now`. Lock-free like every
+    /// read here; `project` runs on the caller's thread.
+    pub fn with_active_at_generation<R>(
+        &self,
+        now: MediaTime,
+        generation: u64,
+        project: impl FnOnce(&C) -> R,
+    ) -> Option<R> {
         let window = self.window.load();
         if window.generation != generation {
             return None;
@@ -156,7 +171,7 @@ impl<C: Clone> CaptionCueStore<C> {
             .iter()
             .rev()
             .find(|e| e.start <= now && now < e.end)
-            .map(|e| e.cue.clone())
+            .map(|e| project(&e.cue))
     }
 }
 
@@ -267,6 +282,61 @@ mod tests {
             r.join().expect("reader panicked");
         }
         assert_eq!(check_cue_a(a.active_at(mt(0)), 0), Ok(XS_PUBLISHES));
+    }
+
+    /// A payload that counts its clones: the projecting read must not clone.
+    #[derive(Debug)]
+    struct Counted {
+        clones: Arc<std::sync::atomic::AtomicUsize>,
+        bytes: Vec<u8>,
+    }
+
+    impl Clone for Counted {
+        fn clone(&self) -> Self {
+            self.clones
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self {
+                clones: Arc::clone(&self.clones),
+                bytes: self.bytes.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn projecting_read_borrows_without_cloning_the_cue() {
+        let clones = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = CaptionCueStore::new();
+        store.publish(
+            mt(0),
+            mt(10),
+            Counted {
+                clones: Arc::clone(&clones),
+                bytes: vec![7; 1 << 20],
+            },
+        );
+        let before = clones.load(std::sync::atomic::Ordering::Relaxed);
+        let len = store.with_active_at_generation(mt(5), store.generation(), |c| c.bytes.len());
+        assert_eq!(len, Some(1 << 20));
+        assert_eq!(
+            clones.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "no clone"
+        );
+        assert_eq!(
+            store.with_active_at_generation(mt(5), store.generation() + 1, |c| c.bytes.len()),
+            None,
+            "another generation sees nothing"
+        );
+        assert_eq!(
+            store.with_active_at_generation(mt(10), store.generation(), |_| ()),
+            None
+        );
+        // The cloning read still clones (once).
+        assert!(store.active_at(mt(5)).is_some());
+        assert_eq!(
+            clones.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
     }
 
     #[test]

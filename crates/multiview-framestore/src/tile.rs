@@ -636,6 +636,31 @@ impl<T> TileStore<T> {
         (read, source_time)
     }
 
+    /// The source timestamp of the frame [`read_at_with_source_time`] would
+    /// latch at `now`, **without** advancing the prune watermark (slice F
+    /// #345: an off-clock subtitle sampler must observe the selection the
+    /// compositor makes, never change what the producer may prune). `None`
+    /// when no frame would be drawn (empty ring, slate) or the frame carries
+    /// no source time.
+    ///
+    /// [`read_at_with_source_time`]: TileStore::read_at_with_source_time
+    #[must_use]
+    pub fn peek_at_with_source_time(&self, now: MediaTime) -> Option<SourceFrameTime> {
+        let ring = self.ring.load();
+        let (selected, state) = latch_and_classify(&ring, now, self.thresholds)?;
+        // Mirror `read_at_with_source_time`: a frame is drawn when the tile is
+        // live/held, or under hold-forever whatever its state.
+        let drawn = matches!(
+            state,
+            SourceState::Live | SourceState::Stale | SourceState::Reconnecting
+        ) || matches!(self.policy, NoSignalPolicy::HoldForever);
+        if drawn {
+            selected.source_time
+        } else {
+            None
+        }
+    }
+
     /// The most recent slot sequence number (`0` if nothing published).
     #[must_use]
     pub fn sequence(&self) -> u64 {
@@ -719,6 +744,41 @@ mod event_clock_tests {
             Some(old),
             "an already latched frame stays immutable"
         );
+    }
+
+    #[test]
+    fn peek_selects_like_read_at_without_advancing_the_watermark() {
+        let store = TileStore::with_defaults("camera");
+        let at = |ns: i64| SourceFrameTime {
+            pts: MediaTime::from_nanos(ns),
+            generation: 3,
+            event_clock: None,
+        };
+        store.publish_arc_with_source_time(Arc::new(1), MediaTime::ZERO, Some(at(10)));
+        store.publish_arc_with_source_time(Arc::new(2), MediaTime::from_nanos(100), Some(at(20)));
+        let watermark = || store.latch_watermark_seq.load(Ordering::Relaxed);
+        let before = watermark();
+        assert_eq!(
+            store.peek_at_with_source_time(MediaTime::from_nanos(50)),
+            Some(at(10))
+        );
+        assert_eq!(
+            store.peek_at_with_source_time(MediaTime::from_nanos(150)),
+            Some(at(20))
+        );
+        assert_eq!(
+            watermark(),
+            before,
+            "a peek never moves the prune watermark"
+        );
+        // The same selection the latching read makes.
+        assert_eq!(
+            store.read_at_with_source_time(MediaTime::from_nanos(50)).1,
+            Some(at(10))
+        );
+        assert_ne!(watermark(), before, "the latching read does");
+        let empty: TileStore<u32> = TileStore::with_defaults("idle");
+        assert_eq!(empty.peek_at_with_source_time(MediaTime::ZERO), None);
     }
 
     #[test]

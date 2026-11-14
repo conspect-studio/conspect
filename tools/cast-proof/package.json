@@ -1,0 +1,15 @@
+{
+  "name": "conspect-cast-receiver-harness",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Automated playback proof for the Conspect Google Cast receiver (real CAF SDK + Shaka in headless Chrome, fake platform IPC).",
+  "scripts": {
+    "all": "./run-all.sh"
+  },
+  "dependencies": {
+    "puppeteer-core": "24.43.1",
+    "shaka-player": "4.15.56",
+    "ws": "8.23.0"
+  }
+}
