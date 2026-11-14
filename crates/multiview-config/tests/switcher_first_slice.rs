@@ -139,3 +139,30 @@ fn switcher_and_program_edits_are_restart_class_not_silently_lost() {
         .changed_sections
         .contains("programs"));
 }
+
+/// ADR-0112 §5: a persisted stinger selection loads only when its player is
+/// one of the document's `[[media_players]]`.
+#[test]
+fn a_persisted_stinger_names_a_configured_media_player() {
+    let stinger = |player: &str| {
+        serde_json::from_value(serde_json::json!({
+            "kind": "stinger", "player": player, "pre_roll": 2,
+            "clip_duration": 30, "trigger_point": 8, "mix_rate": 6
+        }))
+        .unwrap()
+    };
+    let with_player = format!("{BASE}\n[[media_players]]\nid = \"vt1\"\n");
+    let mut cfg = MultiviewConfig::load_from_toml(&with_player).unwrap();
+    me(&mut cfg);
+    cfg.switcher.as_mut().unwrap().mix_effects[0].transition = Some(stinger("vt1"));
+    cfg.validate().unwrap();
+    // A source id is not a media player.
+    cfg.switcher.as_mut().unwrap().mix_effects[0].transition = Some(stinger("a"));
+    let error = cfg.validate().unwrap_err().to_string();
+    assert!(error.contains("not a configured media player"), "{error}");
+    // Without any media player the stinger has nothing to roll.
+    let mut bare = config();
+    me(&mut bare);
+    bare.switcher.as_mut().unwrap().mix_effects[0].transition = Some(stinger("vt1"));
+    assert!(bare.validate().is_err());
+}
