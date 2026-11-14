@@ -2941,28 +2941,33 @@ impl Pipeline {
         // must not depend on tile-sizing at all). Fail-closed.
         #[cfg(feature = "aes67")]
         ensure_no_cell_binds_an_aes67_source(config)?;
-        let layout = Arc::new(config.solve_layout()?);
         let switcher_me = config
             .switcher
             .as_ref()
             .and_then(|s| s.mix_effects.first())
             .cloned();
-        // This slice admits a single real full-canvas source cell. A running
-        // legacy multiview with multiple cells remains untouched when the M/E
-        // block is absent; an opted-in unsupported layout fails loudly instead
-        // of replacing the operator's canvas with a guessed source.
-        // The SAME admission rules the control plane applies before it persists an
-        // accepted state (#317): `multiview_config::switcher_canvas_admission`,
-        // and (ADR-0108 slice 1, step 1) `outputs_carry_program`: an output fed
-        // directly by a source is validated and read back, but this engine does
-        // not carry it yet — fail loudly rather than put Program on it.
-        config
-            .switcher_canvas_admission(&layout)
+        // The Program canvas (#307, `docs/architecture/output-routing.md` §3):
+        // with an M/E declared it IS the M/E bus, one full-canvas cell bound to
+        // `program_source`. A document already of that shape is used unchanged
+        // (same cell id); any other document (a multi-cell wall) keeps its
+        // layout as a stored layout, routable to outputs, and Program is the
+        // synthesized one-cell bus. Without an M/E the legacy multiview is
+        // untouched. The SAME function the control plane applies before it
+        // persists an accepted state (#317); it still refuses overlays with an
+        // M/E. And (ADR-0108 slice 1, step 1) `outputs_carry_program`.
+        let program = config
+            .program_canvas(config.solve_layout()?)
             .map_err(|refusal| PipelineError::Engine(refusal.to_string()))?;
         ensure_outputs_carry_program(config)?;
-        let switcher_cell_id = switcher_me
-            .as_ref()
-            .and_then(|_| config.cells.first().map(|cell| cell.id.clone()));
+        if program.synthesized {
+            tracing::info!(
+                cells = config.cells.len(),
+                "switcher declared: Program is the one-cell M/E bus; the configured \
+                 layout stays a stored layout, routable to outputs"
+            );
+        }
+        let switcher_cell_id = switcher_me.as_ref().and(program.cell_id);
+        let layout = Arc::new(program.layout);
         let cadence = config.canvas.fps.rational();
         let canvas_color = CanvasColor::default();
         let tag = canvas_color.output_tag();
@@ -3901,8 +3906,8 @@ impl Pipeline {
     /// slot source and tick, the source's caption store at the picture the
     /// compositor latches for that tick (`peek_at_with_source_time`: the
     /// same selection, without moving the store's prune watermark) and the
-    /// cue store's text cue for that picture's generation. Lock-free reads
-    /// only; it runs on the bake consumer, never the output clock. A source
+    /// cue store's text cue for that picture's generation, projected to
+    /// bounded text without cloning the cue. Lock-free reads only; it runs on the bake consumer, never the output clock. A source
     /// with no caption store (or a build without captions) yields no cues.
     fn subtitle_run(
         &self,
@@ -3933,19 +3938,14 @@ impl Pipeline {
             Box::new(move |id: &str, now: MediaTime| {
                 let store = captions.load().get(id).cloned()?;
                 let picture = stores(id)?.peek_at_with_source_time(now)?;
-                match store.active_at_generation(picture.pts, picture.generation)? {
-                    multiview_ffmpeg::caption::CaptionCue::Text { text, .. }
-                        if !text.lines.is_empty() =>
-                    {
-                        Some(text.lines)
-                    }
-                    _ => None,
-                }
+                // Borrow-and-project (ABU-1/INV-1): bounded text only, a
+                // bitmap cue is skipped without copying its pixels.
+                crate::subtitle_slots::text_cue_lines(&store, picture.pts, picture.generation)
             })
         };
         #[cfg(not(feature = "overlay"))]
         let resolve: crate::subtitle_slots::CueResolver = {
-            let _ = stores;
+            drop(stores);
             Box::new(|_: &str, _: MediaTime| None)
         };
         crate::subtitle_slots::SubtitleRun::new(outputs, resolve, self.cadence)
@@ -4013,7 +4013,7 @@ impl Pipeline {
         );
         let reformat_open =
             reformat_opener(self.encode_cfg.clone(), self.rendition_configs.clone());
-        let (router, handle) = crate::output_routing::OutputRouter::new_with_openers(
+        let (mut router, handle) = crate::output_routing::OutputRouter::new_with_openers(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -4042,6 +4042,11 @@ impl Pipeline {
             Some(reformat_open),
         )
         .map_err(spawn_err)?;
+        // Atomic sets (#308) pick their adoption tick after the clock's last
+        // composed tick: a wait-free atomic load, never a lock on the clock.
+        if let Some(control) = self.switcher_control.as_ref() {
+            router.set_switcher_clock(control.applied_tick_cell());
+        }
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
         // Slice F part F2: the run's subtitle route tables, keyed by output
         // config id, ride the handle the adapter reads (published and
@@ -13265,11 +13270,7 @@ fn build_hls_output(
                 .iter()
                 .enumerate()
                 .map(|(i, slot)| multiview_output::hls::SubtitleRendition {
-                    name: slot
-                        .name
-                        .clone()
-                        .or_else(|| slot.language.clone())
-                        .unwrap_or_else(|| format!("Subtitles {}", i + 1)),
+                    name: slot.effective_name(i),
                     language: slot.language.clone(),
                 })
                 .collect();
@@ -26874,6 +26875,208 @@ mod chaos {
                     std::thread::sleep(d);
                 }
             }
+        }
+    }
+}
+
+/// INV3-1 (#345): the wedged-subtitle-sink chaos run at the integrated level.
+/// The REAL pipeline (output clock, bake consumer, encoder, HLS sink) runs live
+/// with three subtitle slots whose cue feed is never drained (a wedged
+/// subtitle consumer) while the patched source's caption store carries
+/// hostile, changing cues (text padded with 256 KiB of whitespace). Invariants
+/// #1/#10: the clock keeps its cadence, the bake consumer keeps up (sampling
+/// stays bounded and never waits on the feed), video segments keep their
+/// tick-derived stamps, and the feed never holds more than its capacity.
+///
+/// The slots carry a source (`cc`) that is ingested but not shown in a cell,
+/// so the run measures the subtitle-slot path alone: burning such a cue into
+/// a displayed tile is the separate overlay path, which this does not cover.
+#[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
+mod subtitle_wedge_chaos {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    const FPS: u64 = 25;
+    /// Hostile caption cues published before the run.
+    const CUES: i64 = 80;
+    const RUN_SECS: u64 = 4;
+    const WEDGE_CAPACITY: usize = 8;
+
+    fn config(playlist: &std::path::Path) -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[sources]]
+id = "cc"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs.slots.subtitle]]
+name = "one"
+source = "cc"
+[[outputs.slots.subtitle]]
+name = "two"
+source = "cc"
+[[outputs.slots.subtitle]]
+name = "three"
+source = "cc"
+"##,
+            playlist.display()
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    }
+
+    /// `(pts, duration)` of every video packet of an MPEG-TS file.
+    fn video_packets(ts: &std::path::Path) -> Vec<(i64, i64)> {
+        let out = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts,duration",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(ts)
+            .output()
+            .expect("ffprobe runs");
+        assert!(out.status.success(), "ffprobe: {out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split(',');
+                Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)]
+    // reason: one end-to-end chaos run checked across clock, sink and files.
+    async fn a_wedged_subtitle_sink_with_hostile_captions_never_stalls_video() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let playlist = dir.path().join("index.m3u8");
+        let mut pipeline = Pipeline::build(&config(&playlist)).expect("pipeline builds");
+        assert_eq!(pipeline.subtitle_outputs.len(), 1);
+        assert_eq!(pipeline.subtitle_outputs[0].slots, 3);
+        // Wedge: the sampler feeds a small channel nobody ever drains.
+        let (wedged, wedged_rx) =
+            multiview_output::hls::subtitle::subtitle_feed_with_capacity(WEDGE_CAPACITY);
+        let wedge_stats = wedged.stats();
+        pipeline.subtitle_outputs[0].feed = wedged;
+        // Hostile, changing captions: a new 100 ms cue every 100 ms over the
+        // run's source timeline, each a short text padded with 256 KiB of
+        // whitespace plus a blank line. (The store deep-clones its window on
+        // every publish, so the count stays modest.)
+        let store = pipeline.attach_caption_store(
+            "cc",
+            Arc::new(crate::captions::CueStore::with_capacity(128)),
+        );
+        let pad = " ".repeat(256 * 1024);
+        for i in 0..CUES {
+            let (start, end) = (
+                MediaTime::from_nanos(i * 100_000_000),
+                MediaTime::from_nanos((i + 1) * 100_000_000),
+            );
+            let lines = vec![format!("cue {i}{pad}"), String::new(), format!("tail {i}")];
+            let cue = multiview_ffmpeg::caption::CaptionCue::try_text(start, end, lines, None)
+                .expect("text cue");
+            store.publish(start, end, cue);
+        }
+        let stop = StopSignal::new();
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(RUN_SECS));
+                stop.stop();
+            })
+        };
+        let started = std::time::Instant::now();
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(RUN_SECS + 60),
+            pipeline.run_until(&stop),
+        )
+        .await
+        .expect("the run ends: nothing blocks on the wedged subtitle feed")
+        .expect("the run succeeds");
+        stopper.join().expect("stopper");
+        let elapsed = started.elapsed().as_secs_f64();
+
+        // The clock kept its cadence (CI-load tolerant: >= 90 %).
+        let expected = elapsed * f64::from(u32::try_from(FPS).unwrap());
+        let frames = f64::from(u32::try_from(report.frames).expect("small"));
+        assert!(
+            frames >= 0.9 * expected.min(f64::from(u32::try_from(RUN_SECS * FPS).unwrap())),
+            "clock ticks {frames} over {elapsed:.2} s (expected ~{expected:.0})"
+        );
+        // The bake consumer kept up: at most 10 % of ticks shed.
+        assert!(
+            report.dropped * 10 <= report.frames,
+            "consumer shed {} of {} ticks",
+            report.dropped,
+            report.frames
+        );
+        // The hostile cues were sampled (truncated) and the wedge dropped
+        // (counted) instead of growing: the feed holds at most its capacity.
+        assert!(
+            wedge_stats.truncated() > 0,
+            "hostile cues reached the sampler"
+        );
+        assert!(wedge_stats.feed_dropped() > 0, "the wedge drops and counts");
+        let queued = wedged_rx.drain();
+        assert!(queued.len() <= WEDGE_CAPACITY, "{}", queued.len());
+        assert!(queued
+            .iter()
+            .all(|c| c.lines.len() <= 4 && c.lines.iter().map(String::len).sum::<usize>() <= 512));
+        // Video kept flowing with tick-derived stamps: consecutive packets of
+        // each written segment are exactly one tick apart (90 kHz / 25).
+        let segments: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("output dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "ts")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("video-"))
+            })
+            .collect();
+        assert!(segments.len() >= 2, "video segments written: {segments:?}");
+        let tick_90k = i64::try_from(90_000 / FPS).unwrap();
+        for seg in &segments {
+            let mut pts: Vec<i64> = video_packets(seg).into_iter().map(|(p, _)| p).collect();
+            pts.sort_unstable();
+            assert!(!pts.is_empty(), "{seg:?} carries video");
+            assert!(
+                pts.windows(2).all(|w| w[1] - w[0] == tick_90k),
+                "{seg:?}: {pts:?}"
+            );
         }
     }
 }

@@ -2385,6 +2385,9 @@ struct SubtitleSlotState {
     live: LivePlaylist,
     prefix: String,
     held: crate::hls::subtitle::SlotCues,
+    /// The rendition's shared `WebVTT` timeline origin (LOCAL zero): its
+    /// first segment's start, set at the first segment close (MED-2).
+    base: Option<MediaTime>,
 }
 
 /// One audio-only MPEG-TS muxer, opened ONCE at the run's first video keyframe
@@ -2589,7 +2592,10 @@ impl<'a> SegmentState<'a> {
         // aligned with the video playlist (same sequence, same segments).
         let mut subtitle_entries = Vec::with_capacity(subtitles.len());
         let mut sub_slots = Vec::with_capacity(subtitles.len());
-        for (i, rendition) in subtitles.iter().enumerate() {
+        // RFC 8216 §4.3.4.1.1: distinct NAMEs in the group (config validates
+        // this; the sink disambiguates anything unvalidated).
+        let names = crate::hls::subtitle::unique_rendition_names(subtitles);
+        for ((i, rendition), name) in subtitles.iter().enumerate().zip(names) {
             let uri = format!("subs{i}-g{generation}.m3u8");
             let mut subs_live = LivePlaylist::new(parent.join(&uri), window);
             subs_live.set_epoch_source(epoch.clone());
@@ -2599,7 +2605,7 @@ impl<'a> SegmentState<'a> {
                 subs_live.set_initial_discontinuity();
             }
             subtitle_entries.push(SubtitleMedia {
-                name: rendition.name.clone(),
+                name,
                 uri,
                 language: rendition.language.clone(),
             });
@@ -2607,6 +2613,7 @@ impl<'a> SegmentState<'a> {
                 live: subs_live,
                 prefix: format!("subs{i}-"),
                 held: crate::hls::subtitle::SlotCues::default(),
+                base: None,
             });
         }
         let sub_counters = self
@@ -3424,8 +3431,13 @@ impl<'a> SegmentState<'a> {
         if renditions.subtitles.is_empty() {
             return Ok(());
         }
+        // One bounded batch (INV3-2) plus the sampler watermark it confirms
+        // (MED3-1): an open cue is published only through confirmed state.
+        let mut confirmed = None;
         if let Some(feed) = self.subtitle_feed {
-            for cue in feed.drain() {
+            let batch = feed.drain_confirmed();
+            confirmed = batch.confirmed_through;
+            for cue in batch.cues {
                 if let Some(sub) = renditions.subtitles.get_mut(usize::from(cue.slot)) {
                     sub.held.push(cue, &renditions.subtitle_stats);
                 }
@@ -3440,10 +3452,15 @@ impl<'a> SegmentState<'a> {
             .or_else(|| read_first_video_pts(main_ts))
             .unwrap_or_else(|| crate::hls::subtitle::pts_90k_of(start));
         for sub in &mut renditions.subtitles {
+            let base = *sub.base.get_or_insert(start);
+            let pieces = sub
+                .held
+                .publish(start, end, confirmed, &renditions.subtitle_stats);
             let text = crate::hls::subtitle::render_vtt(
-                &sub.held.overlapping(start, end),
+                &pieces.iter().collect::<Vec<_>>(),
                 start,
                 end,
+                base,
                 mpegts,
             );
             let path = self.dir.join(format!("{}{index}.vtt", sub.prefix));
@@ -3835,7 +3852,7 @@ fn prune_prior_rendition_manifests_inactive(dir: &Path, active: &[&Path], oldest
             || !(name.starts_with("video-")
                 || name.starts_with("audio-program-")
                 || name.starts_with("audio-track")
-                || name.starts_with("subs")
+                || is_generated_subtitle_manifest(name)
                 || matches!(name, "video.m3u8" | "audio-program.m3u8"))
             || active.contains(&entry.path().as_path())
         {
@@ -3859,6 +3876,39 @@ fn prune_prior_rendition_manifests_inactive(dir: &Path, active: &[&Path], oldest
             }
         }
     }
+}
+
+/// Whether `name` is exactly a subtitle media playlist this sink generates:
+/// `subs<slot>-g<generation>.m3u8` with decimal slot and generation (ABU-2).
+/// Anything else (`subtitles.m3u8`, `subscriptions.m3u8`, …) is not ours and
+/// is never removed by rendition cleanup.
+fn is_generated_subtitle_manifest(name: &str) -> bool {
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix("subs")
+        .and_then(|rest| rest.strip_suffix(".m3u8"))
+        .and_then(|rest| rest.split_once("-g"))
+        .is_some_and(|(slot, generation)| {
+            decimal(slot)
+                && decimal(generation)
+                && slot.parse::<u8>().is_ok()
+                && generation.parse::<u64>().is_ok()
+        })
+}
+
+/// The segment index of a subtitle segment this sink generates:
+/// `subs<slot>-<index>.vtt` with all-ASCII-digit slot and index (ABU2-2).
+/// Anything else (`subs+1-1.vtt`, `subs1-+1.vtt`, …) is not ours: `None`.
+fn generated_subtitle_segment_index(name: &str) -> Option<u64> {
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (slot, index) = name
+        .strip_prefix("subs")?
+        .strip_suffix(".vtt")?
+        .split_once('-')?;
+    if !decimal(slot) || !decimal(index) {
+        return None;
+    }
+    slot.parse::<u8>().ok()?;
+    index.parse().ok()
 }
 
 /// Reap prior-run TS files after the new manifests have advanced beyond them.
@@ -3903,15 +3953,9 @@ fn prune_prior_live_segments(dir: &Path, prefix: &str, next: u64, window: usize)
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         // Slice F (#345): a prior run's subtitle `.vtt` ages out with its TS.
-        if let Some(stem) = name.strip_suffix(".vtt") {
-            let number = stem.strip_prefix("subs").and_then(|s| {
-                s.split_once('-')
-                    .and_then(|(slot, index)| slot.parse::<u8>().ok().map(|_| index))
-            });
+        if name.strip_suffix(".vtt").is_some() {
             if !references.contains(std::ffi::OsStr::new(name))
-                && number
-                    .and_then(|index| index.parse::<u64>().ok())
-                    .is_some_and(|index| index < oldest)
+                && generated_subtitle_segment_index(name).is_some_and(|index| index < oldest)
             {
                 match std::fs::remove_file(entry.path()) {
                     Ok(()) | Err(_) => {}
@@ -5728,9 +5772,12 @@ mod tests {
             let carried = first_video_pts_90k(&ts).expect("a video PES PTS");
             let vtt =
                 std::fs::read_to_string(dir.path().join(format!("subs0-{index}.vtt"))).unwrap();
+            // One shared WebVTT timeline per rendition (LOCAL zero = its first
+            // segment start), so each map names the segment's own LOCAL.
+            let local = format!("00:00:00.{:03}", 100 * i);
             assert!(
                 vtt.starts_with(&format!(
-                    "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{carried},LOCAL:00:00:00.000\n"
+                    "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{carried},LOCAL:{local}\n"
                 )),
                 "the map names the PTS the TS carries: {vtt}"
             );
@@ -5740,7 +5787,7 @@ mod tests {
                 std::fs::read_to_string(dir.path().join(format!("subs1-{index}.vtt"))).unwrap();
             assert_eq!(
                 empty,
-                format!("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{carried},LOCAL:00:00:00.000\n"),
+                format!("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{carried},LOCAL:{local}\n"),
                 "an empty slot still gets a valid header-only segment"
             );
         }
@@ -5758,18 +5805,17 @@ mod tests {
                 .to_owned();
             std::fs::read_to_string(dir.path().join(format!("subs0-{index}.vtt"))).unwrap()
         };
+        // RFC 8216 §3.5: the spanning cue carries its total interval, with
+        // the same timestamps in both segments.
+        for i in [0, 1] {
+            assert!(
+                vtt(i).contains("00:00:00.050 --> 00:00:00.150\nFish &amp; &lt;chips&gt;\n"),
+                "{}",
+                vtt(i)
+            );
+        }
         assert!(
-            vtt(0).contains("00:00:00.050 --> 00:00:00.100\nFish &amp; &lt;chips&gt;\n"),
-            "{}",
-            vtt(0)
-        );
-        assert!(
-            vtt(1).contains("00:00:00.000 --> 00:00:00.050\nFish &amp; &lt;chips&gt;\n"),
-            "{}",
-            vtt(1)
-        );
-        assert!(
-            vtt(2).contains("00:00:00.050 --> 00:00:00.080\nthird\n"),
+            vtt(2).contains("00:00:00.250 --> 00:00:00.280\nthird\n"),
             "{}",
             vtt(2)
         );
@@ -5814,5 +5860,98 @@ mod tests {
         .unwrap();
         prune_prior_live_segments(dir.path(), "seg", 60, 3);
         assert!(dir.path().join("subs0-3.vtt").exists());
+    }
+
+    #[test]
+    fn only_generated_subtitle_segments_are_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = [
+            "subs+1-1.vtt",
+            "subs1-+1.vtt",
+            "subs-1-1.vtt",
+            "subs1--1.vtt",
+            "subs1-1-1.vtt",
+            "subs1-.vtt",
+            "subs-1.vtt",
+            "subs999-1.vtt",
+            "subs 1-1.vtt",
+            "subs1-1 .vtt",
+            "subtitles-1.vtt",
+        ];
+        for name in foreign.iter().chain(&["subs1-1.vtt", "subs12-0.vtt"]) {
+            std::fs::write(dir.path().join(name), "WEBVTT\n").unwrap();
+        }
+        // next 60, window 3: grace 12, so index < 48 retires.
+        prune_prior_live_segments(dir.path(), "seg", 60, 3);
+        for name in foreign {
+            assert!(dir.path().join(name).exists(), "{name} is not ours");
+        }
+        assert!(!dir.path().join("subs1-1.vtt").exists());
+        assert!(!dir.path().join("subs12-0.vtt").exists());
+        assert_eq!(
+            super::generated_subtitle_segment_index("subs3-47.vtt"),
+            Some(47)
+        );
+        assert_eq!(
+            super::generated_subtitle_segment_index("subs+3-47.vtt"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_generated_subtitle_manifests_are_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every manifest lists a segment that does not exist, which would
+        // retire a manifest this sink owns.
+        let listing = "#EXTM3U\n#EXTINF:1,\nother-1.ts\n";
+        let foreign = [
+            "subtitles.m3u8",
+            "subscriptions.m3u8",
+            "subs.m3u8",
+            "subs0.m3u8",
+            "subs-g1.m3u8",
+            "subs0-g.m3u8",
+            "subs0-gx.m3u8",
+            "subs0-g1-x.m3u8",
+            "subs999-g1.m3u8",
+            "subs+1-g1.m3u8",
+        ];
+        for name in foreign.iter().chain(&["subs0-g1.m3u8", "subs7-g12.m3u8"]) {
+            std::fs::write(dir.path().join(name), listing).unwrap();
+        }
+        prune_prior_rendition_manifests_inactive(dir.path(), &[], 48);
+        for name in foreign {
+            assert!(dir.path().join(name).exists(), "{name} is not ours");
+        }
+        assert!(!dir.path().join("subs0-g1.m3u8").exists());
+        assert!(!dir.path().join("subs7-g12.m3u8").exists());
+        assert!(super::is_generated_subtitle_manifest("subs3-g0.m3u8"));
+        assert!(!super::is_generated_subtitle_manifest("subtitles.m3u8"));
+    }
+
+    #[test]
+    fn duplicate_subtitle_names_reach_the_master_distinct() {
+        use crate::hls::{subtitle_feed, SubtitleRendition};
+        let _counter_guard = counter_guard();
+        let (packets, params) = sized_packets(160, 120, 0, 6);
+        let dir = tempfile::tempdir().unwrap();
+        let (_feed, rx) = subtitle_feed();
+        let en = || SubtitleRendition {
+            name: "en".to_owned(),
+            language: Some("en".to_owned()),
+        };
+        let mut state = subtitle_state(dir.path(), &params, &rx, &[en(), en()]);
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: -1,
+            params: None,
+            last_pts: None,
+        };
+        state.drive_from_packets(&mut source).unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+        assert!(master.contains("NAME=\"en\",LANGUAGE"), "{master}");
+        assert!(master.contains("NAME=\"en (2)\",LANGUAGE"), "{master}");
     }
 }

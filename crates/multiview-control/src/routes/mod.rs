@@ -128,6 +128,52 @@ pub struct SwapRequest {
 pub struct ApplyLayoutRequest {
     /// The layout id to make active on the running multiview.
     pub layout: String,
+    /// Optional: take the layout to this output instead of the Program canvas
+    /// (#307). A thin alias for `POST /api/v1/routing/output/take` with
+    /// `{"layout": <layout>}` as the video feed: the same authorization (Write
+    /// on the output and its output scope, Read on the layout and every source
+    /// it shows), Idempotency-Key contract, limits and response. Allowed with
+    /// or without a switcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ApplyLayoutTarget>,
+}
+
+/// Where `apply-layout` sends the layout when `target` is present (#307).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ApplyLayoutTarget {
+    /// The output API id (the id `/api/v1/outputs/{id}` addresses).
+    pub output: String,
+}
+
+/// Whether the accepted configuration declares a switcher M/E: then the
+/// Program canvas is the M/E bus, `apply-layout` cannot replace it, and cell
+/// edits are refused (#307). Reads the accepted envelope (else the adopted
+/// config) under a boot model, else the loaded base document — the section
+/// the composed document carries verbatim — without composing or validating
+/// the whole document, so a store-only run with no working layout still
+/// answers.
+pub(crate) fn switcher_declared(state: &AppState) -> ControlResult<bool> {
+    if let Some(model) = &state.boot_model {
+        let declared = |config: &multiview_config::MultiviewConfig| {
+            config
+                .switcher
+                .as_ref()
+                .is_some_and(|switcher| !switcher.mix_effects.is_empty())
+        };
+        return Ok(match model.accepted().map_err(ControlError::Repository)? {
+            Some(desired) => declared(&desired.config),
+            None => declared(&model.adopted_config()),
+        });
+    }
+    Ok(state
+        .base_document
+        .as_deref()
+        .and_then(|document| document.get("switcher"))
+        .and_then(|switcher| switcher.get("mix_effects"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|mix_effects| !mix_effects.is_empty()))
 }
 
 /// Attach the resource's `ETag` to a successful response carrying a layout.
@@ -723,6 +769,13 @@ async fn cmd_swap(
     // input onto the tile, so a scoped operator may swap in only sources within
     // its object allowlist (a missing/out-of-scope id fails closed).
     crate::auth::authorize_object(&principal, &req.source)?;
+    // #307 review M1: with a switcher M/E the document's cells are neither
+    // Program (the M/E bus) nor the stored layout outputs show, so a swap
+    // would be a silent no-op. Refused after authorization (no existence
+    // leak) and before the idempotency reservation (the key stays usable).
+    if switcher_declared(&state)? {
+        return Err(ControlError::SwitcherOwnsCells("a tile swap"));
+    }
     let tile = req.tile.clone();
     let source = req.source.clone();
     let response = submit_accepted(&state, &idem, |op| Command::SwapSource {
@@ -808,6 +861,12 @@ fn merge_selected_layout_key(
 /// releases the key. The submit mirrors [`cmd_swap`] (shed-on-full) and never
 /// blocks the engine (invariant #10); the outcome rides the realtime stream
 /// as a `job.progress` event (ADR-W008).
+///
+/// #307: with a switcher M/E declared the Program canvas is the M/E bus, so a
+/// request without `target` answers `422 switcher-owns-program` BEFORE any
+/// idempotency reservation (the key stays free). With `target: {output}` the
+/// request is an output take of the layout (`take_output_as`, the same code
+/// path as `POST /routing/output/take`).
 #[cfg_attr(
     feature = "openapi",
     utoipa::path(
@@ -819,7 +878,10 @@ fn merge_selected_layout_key(
             (status = 202, description = "Apply-layout accepted: the stored layout was resolved + solved and will swap in at the next frame boundary; `applied_live`/`carried_only` state the property classes. Outcome on the realtime stream (`job.progress`).", body = AcceptedBody),
             (status = 401, description = "Missing or invalid credentials.", body = Problem),
             (status = 403, description = "Not authorized to apply a layout.", body = Problem),
-            (status = 422, description = "The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), the running canvas is unknown (no seeded snapshot — the gate fails closed), or a switcher M/E is declared and the layout is not one full-canvas cell bound to its program source (type `/problems/layout-not-admissible-with-switcher`; nothing is applied or persisted).", body = Problem),
+            (status = 404, description = "With `target`: unknown output (as `POST /routing/output/take`).", body = Problem),
+            (status = 409, description = "With `target`: the output take's 409s (`routing-unavailable`, `output-kind-unroutable`, `capacity`, `aux-capacity`, …).", body = Problem),
+            (status = 422, description = "The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and a layout as a switcher source). With `target`: the output take's 422s.", body = Problem),
+            (status = 429, description = "With `target`: over the output take rate limits; see Retry-After.", body = Problem),
             (status = 503, description = "Engine command bus at capacity; shed.", body = Problem),
         ),
     )
@@ -834,6 +896,18 @@ pub(crate) async fn cmd_apply_layout(
     idem: IdempotencyKey,
     Json(req): Json<ApplyLayoutRequest>,
 ) -> ControlResult<Response> {
+    if let Some(target) = &req.target {
+        // The alias runs the output take's whole path, authorization first.
+        let take = output_routing::OutputRouteRequest {
+            target: output_routing::OutputTargetKind::Output(output_routing::OutputTarget {
+                output: target.output.clone(),
+                stream: output_routing::OutputStream::Video,
+            }),
+            feed: Some(multiview_config::VideoFeed::Layout(req.layout.clone())),
+            audio: None,
+        };
+        return output_routing::take_output_as(&state, &principal, &idem, &take).await;
+    }
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &req.layout)?;
 
@@ -846,6 +920,12 @@ pub(crate) async fn cmd_apply_layout(
     // `ApplyLayout` lands (a shed leaves the snapshot at the prior adopted
     // layout, so a shed apply-layout never leaks into `active.toml`).
     let _mutation = state.lock_config_mutation().await;
+    // #307: with a switcher M/E the Program canvas is the M/E bus. Refused
+    // BEFORE the idempotency reservation: nothing reserved, persisted or sent,
+    // so the same key stays usable for the operation the operator meant.
+    if switcher_declared(&state)? {
+        return Err(ControlError::SwitcherOwnsProgram(req.layout));
+    }
     // Reserve the idempotency key and a bounded engine slot before the disk
     // commit. A full bus cannot create an unacknowledged accepted selection.
     let op = match state.idempotency.reserve(idem.0.as_deref()) {
@@ -889,21 +969,11 @@ pub(crate) async fn cmd_apply_layout(
             &versioned.layout.body,
             state.running_canvas.as_ref(),
         )?;
-        // #317: validate the RESULTING state with the start-up admission rule
-        // (the same function `Pipeline::build` calls) BEFORE anything is applied
-        // or persisted. A refusal is a typed 422, the idempotency key and the bus
-        // slot are released below, and the accepted state stays last-good.
-        let prospective = prospective_layout_config(&state, &versioned.layout.body);
-        // A base that does not compose fails closed below when there is a boot
-        // model to persist into; without one nothing is persisted and the engine
-        // drain's own admission backstop (`apply_stored_layout`) still holds it.
-        if let Ok(config) = &prospective {
-            config
-                .switcher_canvas_admission(&resolved.solved)
-                .map_err(ControlError::NotAdmissibleWithSwitcher)?;
-        }
+        // No switcher is declared here (refused above, #307), so the resulting
+        // state's Program canvas is the layout itself; the commit below still
+        // runs the full start-up admission (`admit_for_boot`) before persisting.
         if state.boot_model.is_some() {
-            let config = prospective?;
+            let config = prospective_layout_config(&state, &versioned.layout.body)?;
             crate::boot_model::commit_desired_with_selection(
                 &state,
                 config,

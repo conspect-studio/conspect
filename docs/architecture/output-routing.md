@@ -396,6 +396,35 @@ working. The configs that fail today (switcher plus multi-cell) start, with Prog
 default their outputs carry Program, and the operator routes `layout:config` to the outputs that
 should keep the wall.
 
+*As built (#307 PR 1).* One pure function, `MultiviewConfig::program_canvas`
+(`crates/multiview-config/src/admission.rs`), derives the Program canvas for `Pipeline::build`, the
+control plane's start-up admission (`boot_model::admit_for_boot`, every `desired.json` commit, the
+config watcher) and the engine command drain. A document that already is one unstyled, full-canvas,
+opaque cell bound to `program_source` is used unchanged (same cell id, byte-identical first-slice
+behaviour). Any other document gets a synthesized cell: x = y = 0, w = h = 1, z 0, `fill`, opacity 1,
+bound to `program_source`, on the same canvas, with the reserved id `me1.program` (lengthened with
+`~` if an authored cell already carries it). Overlays with a switcher are still refused. Deviations:
+the configured layout's library id is its seeded working-layout id (`schema_v1`, from
+`state.rs` `seed_working_layout`), not literally `config`; it is routed with
+`POST /routing/output/take` `{"layout":"schema_v1"}`. With a switcher, the drain keys the Program
+drive by the M/E's cell alone; a stored layout from the config watcher (an accepted edit) updates
+only the document mirror, never the Program drive, and never resets the M/E's Program binding.
+
+**Cell edits are refused under a switcher (#307 review M1).** `POST /commands/swap`, a video→cell
+`POST /routing/video/take`, and a salvo take/fire (`POST /salvos/{id}/take`, `/fire`) whose salvo
+recalls a layout or cell sources would change neither Program (the M/E bus) nor the stored layout
+outputs consume, so they would be silent no-ops. With a switcher M/E declared in the accepted
+config they answer 422 `switcher-owns-program`, after the route's role and per-object
+authorization (no existence leak) and before the idempotency reservation (no key burned, nothing
+sent). The detail says Program is the M/E bus and names what to use instead: edit the stored layout
+with `PUT /api/v1/layouts/{id}` (routed outputs showing it update live) or a switcher select
+(`POST /switcher/commands/select_preview` / `select_program`). Audio/subtitle takes, salvo arm and
+cancel, and a salvo of only tally/UMD recalls are unaffected. The drain keeps a backstop: such a
+command that still reaches it (for example from event automation) is dropped with one warning per
+drain (debug afterwards) and does **not** touch the working-config mirror, so the mirror never
+diverges from the accepted state. Without a switcher every route behaves as before. Tally and audio-follow-video read the one bound Program
+source as before; removing the source on Program still slates the Program cell (fail-closed).
+
 **`apply-layout` in the new model.** It means "route layout X to the feed `program`'s canvas".
 
 - **No switcher declared.** It keeps today's meaning exactly: the Program canvas swaps to X at the
@@ -404,9 +433,16 @@ should keep the wall.
   (`crates/multiview-engine/src/switcher_hook.rs:66` rebinds a named cell that a foreign layout does not have). The call answers
   422 `switcher-owns-program`. The detail names the two operations that do what the operator means:
   `POST /routing/output/take` (layout to an output) and `POST /switcher/commands/select_preview`
-  with `layout:<id>`. It never silently changes something else.
+  with `layout:<id>`. It never silently changes something else. *As built (#307 PR 1):* the check
+  runs before the idempotency reservation (nothing reserved, persisted or sent); the detail
+  describes the second operation as "a layout as a switcher source" until it lands in PR 2. The
+  old `layout-not-admissible-with-switcher` problem is no longer returned by apply-layout; its
+  slug remains only for the overlays refusal on persisting commands.
 - An optional body field `target: {output: id}` makes `apply-layout` a thin alias for an output
-  take, so the Layouts page "Apply" can offer "Apply to output …".
+  take, so the Layouts page "Apply" can offer "Apply to output …". *As built:* it calls the take's
+  own handler body (`take_output_as`), so authorization (Write and output scope on the output,
+  Read on the layout and its whole source closure), the Idempotency-Key contract, limits and the
+  response are the output take's. It works with or without a switcher.
 
 ---
 
@@ -2061,31 +2097,88 @@ restart".
   - every other kind: any subtitle slot is `slot-medium-mismatch`.
   - An unknown `source` is refused at document validation (`subtitle slot i names unknown
     source`). An output without subtitle slots serializes exactly as before.
+  - The effective menu labels (`SubtitleSlot::effective_name`: the name, else the language, else
+    "Subtitles i+1") must be distinct within an output (RFC 8216 §4.3.4.1.1: every member of a
+    group has a different `NAME`): two slots with `language = "en"` and no name, two equal names,
+    or a name equal to another slot's fallback are `slot-format-unsupported` (`subtitle slot i
+    name "…" repeats slot j's`).
 - **Sink** (`multiview-output::hls::subtitle`, `PacketMuxSink::with_subtitles`). A subtitle slot
   forces the master/rendition layout like an audio rendition does. Slot `i` is a media playlist
   `subs<i>-g<gen>.m3u8` in the master's `GROUP-ID="subs"` (`DEFAULT=NO,AUTOSELECT=YES`,
-  `NAME` = the slot name, else its language, else "Subtitles i+1"); every `EXT-X-STREAM-INF`
+  `NAME` = the slot's effective name; the sink also disambiguates any duplicate that reaches it
+  unvalidated, deterministically, with a ` (i+1)` suffix); every `EXT-X-STREAM-INF`
   names `SUBTITLES="subs"`, and the master is published only once every subtitle playlist exists.
   At every video segment close each slot writes `subs<i>-<index>.vtt` (tmp + rename; the TS
   segment's index) and pushes it with the video segment's duration and start PTS, so the media
-  sequence, discontinuities and PDT match the video playlist. Each file starts
-  `WEBVTT` / `X-TIMESTAMP-MAP=MPEGTS:<n>,LOCAL:00:00:00.000`, where `n` is the 90 kHz PTS the
-  segment's first video PES carries **as written** (read back from the video rendition's `.ts`,
-  so the muxer's own offset is included; a test checks it against the real TS) and LOCAL zero is
-  the segment start. Then the cues overlapping the segment, clipped to it, relative to its start,
-  with `&`, `<`, `>` escaped. An empty segment gets a header-only file. Old `.vtt` files and
-  `subs*` playlists retire with the TS grace (`prune_prior_*`).
-- **Bounds.** The engine-to-sink `SubtitleFeed` is a 256-cue channel: the sampler only
-  `try_send`s (drop and count, never blocks). The sink holds at most 64 cues per slot (drops the
-  first-ending one), a cue keeps at most 4 lines and 512 bytes. `SubtitleStats` counts feed
-  drops, held drops, truncations and written segments (`PacketMuxSink::subtitle_stats`).
+  sequence, discontinuities and PDT match the video playlist. Each rendition has one shared,
+  non-negative `WebVTT` timeline: LOCAL zero is its first segment's start. Each file starts
+  `WEBVTT` / `X-TIMESTAMP-MAP=MPEGTS:<n>,LOCAL:<l>`, where `l` is the segment start on that
+  timeline (to the millisecond) and `n` is the 90 kHz PTS the segment's first video PES carries
+  **as written** (read back from the video rendition's `.ts`, so the muxer's own offset is
+  included; a test checks it against the real TS), moved back by the sub-millisecond remainder
+  modulo 2^33 so the pair is exact and a 33-bit PTS wrap between segments stays on one timeline.
+  Then the cues overlapping the segment (`SlotCues::publish`), with `&`, `<`, `>` escaped.
+  Published segments are immutable and clients merge the cues of every loaded segment (hls.js
+  de-duplicates only identical start/end/text), so no published interval may later turn false
+  or overlap another copy. A cue whose end is known before its first publication carries its
+  **total** display interval in every segment it overlaps (RFC 8216 §3.5; identical copies), so it
+  has identical timestamps in each. A cue still open (end unknown) when a segment is published
+  becomes *rolling*: that segment carries the piece `[max(start, segment start), segment end)`,
+  each later segment the next contiguous piece, and the segment containing the close
+  `[segment start, end)`. The pieces never overlap and their union is the display time, so a
+  client sees exactly one copy at every instant (a test loads every segment together and counts
+  copies). A piece never asserts display beyond **confirmed** cue state: the sampler publishes a
+  lock-free per-output *accepted-through watermark* (`SubtitleFeed::mark_accepted_through`: the
+  latest tick T such that every slot change observed at ticks ≤ T was accepted into the feed; it
+  does not advance while any slot still holds a refused change), paired with the feed's accepted
+  count. The sink's `drain_confirmed` confirms T only once it has received that many cues, and an
+  open cue's piece then runs to `min(segment end, T)`; the rest is carried forward and the next
+  piece starts at the uncovered point (subtitle publication may lag; video never waits). So a
+  close or successor delayed by a full feed can never contradict an already-published piece.
+  Staleness **fails closed**: display is never inferred from a timeout. If the watermark stays
+  behind the segment start (or absent) for more than `MAX_WATERMARK_LAG_SEGMENTS` (2) consecutive
+  closes, every close that withholds an open cue counts `SubtitleStats::watermark_stale`, but
+  nothing of the cue is published past the confirmed point. A permanently dead sampler therefore
+  shows the cue only up to its last confirmed instant: subtitles stop, video is unaffected. The
+  only reconciliation state is each held cue's last published end, bounded by the 64 held cues
+  per slot. When the watermark advances again, or the real close or successor arrives, the cue
+  resumes with a piece starting at that end. The client's union therefore stays one copy,
+  contiguous or gapped, never overlapping and never past the true close.
+  A known cue whose close arrives after its time was already published is carried once by the
+  next segment rather than lost. An empty segment gets a header-only file. Old `.vtt` files retire with the TS grace
+  (`prune_prior_*`) only when named exactly `subs<slot>-<index>.vtt` (all-digit fields); rendition
+  cleanup removes only manifests matching the exact generated grammar
+  `subs<slot>-g<generation>.m3u8` (all-digit fields), so e.g. `subtitles.m3u8`,
+  `subscriptions.m3u8` or `subs+1-1.vtt` are never touched.
+- **Bounds.** Cue text is bounded to 4 lines and 512 bytes (`bound_cue_lines`: UTF-8 boundary
+  safe, blank lines dropped, a fresh exact-size allocation, never the source's capacity). Its
+  work is bounded too: it examines at most 16 source lines (blank ones included) and 4 KiB of
+  source bytes (whitespace included), checking that budget before each next line and classifying
+  whitespace only within the inspected prefix, so a hostile cue (256 KiB of padding, 100k blank
+  lines) costs a fixed amount of work per tick (`BoundedLines::inspected_*`). The bound applies
+  **before** the engine retains, compares or enqueues it: the resolver projects the active cue
+  while borrowing it from the cue-store snapshot (`CaptionCueStore::with_active_at_generation`,
+  `subtitle_slots::text_cue_lines`), so a bitmap cue is skipped without copying its pixels and
+  a 256 KiB text cue costs a 512-byte copy. `SubtitleFeed::try_offer`/`offer` re-project any
+  payload that is not already compact (defence at the public boundary), and `SlotCues::push`
+  does too. The sink drains at most the feed's capacity per segment close (`drain` is capped:
+  concurrent offers refill the channel while it drains, so an uncapped drain could collect without
+  bound); the rest waits in the channel. The engine-to-sink `SubtitleFeed` is a 256-cue channel
+  the sampler only `try_send`s
+  into (never blocks). A change the full feed refuses is kept in a per-slot pending queue (at
+  most 4) and retried non-blockingly on every later tick until accepted, so a close is never
+  lost to a transient sink stall, even when silence follows; on overflow an unsent open cue
+  superseded by its close goes first, then the oldest unsent closed cue (counted as a feed
+  drop), never the close of a cue the sink holds open. The sink holds at most 64 cues per slot
+  (drops the first-ending one). `SubtitleStats` counts feed drops, held drops, truncations and
+  written segments (`PacketMuxSink::subtitle_stats`).
 - **Engine** (`multiview-cli::subtitle_slots`). Each HLS output with subtitle slots gets a route
   table `Arc<SwapCell<Arc<[Option<String>]>>>` (slot → source, from config `source`; F2
   re-points it live, see §12.8 "As built in slice F (#345, part F2)"). Once per item the **bake consumer** (never the output clock; the hot-loop
   projection gains no work) reads the table, asks the source's caption store for the text cue at
   the picture the compositor latches for that tick (`TileStore::peek_at_with_source_time`: the same
-  selection as `read_at`, without moving the prune watermark) and
-  `CueStore::active_at_generation(pts, generation)`. `SubtitleSlotSampler` turns the samples
+  selection as `read_at`, without moving the prune watermark) and the bounded text projection of
+  `CueStore::with_active_at_generation(pts, generation, ..)`. `SubtitleSlotSampler` turns the samples
   into cue changes on the output timeline (`MediaTime::from_tick`): an open cue when text
   appears, the closed cue when it changes. A cue spanning segment boundaries is written into each
   segment it covers. A re-point lands on one tick: the old source's cue ends at tick T and the new
@@ -2172,7 +2265,9 @@ A formatted output falls back to its own base key (Program at its format).
 ### 12.5 Passthrough and invariant #1
 
 **Match rules** (all required; any miss means P1-P3): a constant frame rate (every source DTS
-delta exactly one frame period over the last 10 s); codec equal; profile and level within the
+delta exactly one frame period over the last 10 s); codec equal; profile on the codec's explicit
+decoder-compatibility ladder at or below the slot's (Extended, scalable, multiview and other
+profiles off the ladder never match; plain Baseline only into a Baseline slot) and level within the
 slot's settings; coded size equal to the slot's; frame rate exactly equal (as a rational) to the
 output's; scan equal; all four colour tags equal (primaries, transfer, matrix, range; untagged is
 not equal); bit depth and chroma equal; the source's measured GOP not longer than the medium allows
@@ -2295,6 +2390,48 @@ continuous PCR from those timestamps. The rule then depends only on the paramete
 (ADR-0108's slice-1 behaviour of refusing parameter-set changes on non-TS outputs ends, per medium,
 once that muxer writes its rule.)
 
+**As built in slice D, part D1 (#344).** The core is pure Rust and always compiled:
+`crates/multiview-output/src/passthrough/` (`tap.rs`, `match_rules.rs`, `clock.rs`) and
+`crates/multiview-ffmpeg/src/h264_repeat.rs`. Differences from the text above:
+- *The tap.* `CompressedTap` gives each consumer (8 at most) its own bounded
+  `sync_channel` of 64 AUs. The writer only `try_send`s and the clock only `try_recv`s. A full
+  channel drops the **newest** AU for that consumer only, and the drop is counted. That happens
+  when the consumer's clock is dead or wedged, and also for a live clock when a demux burst puts
+  more than 64 unread AUs in its channel between two of its ticks (a clock takes at most 16 per
+  tick). The drop-oldest bound is the clock's jitter buffer (8 AUs), where ordinary jitter is
+  absorbed. Any AU loss is a DTS gap for that clock: a stall at the missing AU's tick, so the slot
+  bridges and returns after 30 on-time ticks; it never emits a picture that references a lost one.
+  The writer never blocks: it `try_lock`s its sender list (held only by `subscribe`, which builds
+  its channel first) and drops the AU, counted as `contended`, when it is held; a reader's `Drop`
+  never locks (the writer prunes disconnected senders). An AU over `MAX_AU_BYTES` (8 MiB) is
+  dropped and counted, at the tap and in the clock.
+- *Timestamps.* Conversion to ticks is relative to a per-stream epoch (the first AU's DTS,
+  re-anchored after a malformed AU, a time-base change or a DTS off the epoch's grid), so an
+  absolute source DTS need not be a whole number of frame periods. All offset arithmetic is
+  checked; an overflow, or a converted magnitude above 2^62 ticks, is `malformed`.
+- *Presentation delay.* After a run with B-frames the bridge carries one constant presentation
+  delay (`pts = tick + d`, `d = max(0, max emitted PTS + 1 - t)`), so a bridge picture never
+  presents at or before a picture already emitted; a new run adds the smallest constant delay that
+  puts its IDR after everything emitted (at most 8 ticks, else the slot stays bridged with
+  `presentation-delay` until the output signals a discontinuity and the timeline is reset).
+- *Start of a run.* The first IDR of a run gets `dts' = max(tick, arrival tick + 3)`, so it waits
+  `TARGET_DEPTH` ticks in the buffer (the bridge fills those ticks) and the run starts with
+  3 ticks of depth.
+- *Too deep with B-frames.* The drop set is the decode-order suffix before the IDR. It starts at
+  the queued AU with the highest PTS among the AUs after the previous IDR. For IBBP that is the
+  last P and the B after it. For a P-only source it is the AU before the IDR. The IDR and
+  everything after it shift back by the size of the drop set. This is applied only if every AU
+  kept before the IDR presents before the IDR's new PTS; otherwise it waits for the next IDR.
+- *Repeat AU.* H.264 only. HEVC has no repeat AU yet, so an HEVC underrun stalls and bridges.
+  The H.264 repeat sets `num_ref_idx_l0_active` to 1, so it copies `RefPicList0[0]`. That is the
+  previous picture only when the previous picture is a short-term reference marked by the sliding
+  window, so it returns `None` (and the clock does not correct) after a non-reference picture,
+  adaptive reference marking (any MMCO), or a long-term IDR, and also for POC type 1, MBAFF, FMO,
+  separate colour planes and intra-only profiles. Its parsing is bounded (parameter sets up to
+  4 KiB, a 4 KiB slice-header prefix, at most 1024 NALs).
+- *Return after a stall that hid a parameter change.* An IDR whose parameter generation differs
+  from the previous run's always needs the 300-tick parameter-change wait.
+
 **Audio with passthrough video.** Audio is always decoded and re-encoded on the global AAC grid
 (ADR-0108 §5.2). For lip sync, the audio of a passthrough slot is read at the source time of the
 video AU emitted on the tick (the tap carries each AU's source PTS on the ingest timeline,
@@ -2374,6 +2511,18 @@ slots at the grid boundary G(T).
   carries its previous source.
 - If any member fails, nothing changes and every member gets the same refusal. A single take for a
   member that lands first supersedes the set as a whole (ADR-0108 §6.2).
+- **Audio of a member that keeps its video** (#308 reviews A-3, A-4). Its audio change is part of
+  the shared decision: the slot move is gated on that member's grouped (no-cut) move, and the set
+  is proposed only once that audio is ready (bus warm for 2 AAC frames, `AudioSpecificConfig`
+  identical to the program's), else the set waits or is refused whole. An output that reads the
+  shared program stage gets a new private bus. An output that already reads a private bus gets a
+  **staged** second bus. It is opened at preparation carrying the same audio as the bus on air,
+  and it is the only bus that fades to the new audio at G(T). The bus on air is never touched
+  before the decision. When the group applies, the slot moves onto the staged bus at G(T) and the
+  old bus closes. When the group is refused, superseded or failed, the staged bus closes, the
+  output keeps its old audio, nothing fades and the choice is restored. There is at most one staged
+  bus per output (a newer change replaces it), and it counts as a live private bus against the
+  dynamic audio-stage cap.
 
 **Admission of a multi-crosspoint take (per principal; §4.3 and §6.4 carried forward).**
 
@@ -2556,6 +2705,57 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   that slot (`live: true`), else from the accepted config (`live: false`: no run, an ended run,
   an output not in this run, or a slot beyond the run's shorter table). A source the caller
   cannot Read is `{redacted: true}`; an unpatched slot is `null`.
+
+**As built in slice E1 (#308, engine half; the HTTP/salvo/UI PRs follow).**
+- **Handshake.** A set's two halves meet in one `SetArm` (`multiview-engine/src/patch_set.rs`), a
+  cell of atomics written only by `compare_exchange`, so the clock never locks, allocates or awaits
+  to take part. States: `Pending → SwitcherReady → Proposed(T) → Applying(T) → Committed`, with
+  `Refused(reason)` reachable from `Pending`, `SwitcherReady` and `Proposed`; the reason rides in the
+  same byte, so refusal and reason are one CAS and the first terminal write wins. `Applying` is the
+  switcher's claim on `T` before it touches the input table, so a refusal racing in from the router
+  either wins (nothing applied) or loses (the patch commits at `T`); a mixer patch composed at `T` is
+  never contradicted. A missed or repeated `T` (`Proposed` → `SwitcherReady`) and a rejected frame at
+  `T` (`Applying` → `SwitcherReady`, the table restored) hand the set back to the router.
+- **Switcher.** `SwitcherVerb::PatchArmed { set, arm }` lives in its own one-set slot beside the held
+  take, so an armed salvo never blocks a Cut or AUTO; a second armed set while one is held is refused
+  `engine-busy`. It is validated at drain, marked `SwitcherReady` once its new Program source (if
+  any) is fresh, and applied only on the drain of `T`, after the tick's commands, re-validated there
+  (a Cut that moved PGM onto a member's input refuses the set `on-air-protected`). Work per tick is
+  O(1) except one O(members) validation on `T`. Its outcome is published on `T`'s commit.
+- **Router.** `OutputRoutingHandle::try_take_set(TakeSet)` uses the existing bounded mailbox (one
+  slot per set; ≤ 64 members, distinct outputs). Admission at drain refuses the set whole when a
+  member is unroutable or when its new encoder opens exceed the principal's or the global cap
+  (0-subscriber lingers are closed first). The opens are reserved at admission; single takes
+  (`has_capacity`) count the reservations, and every reservation is released on refusal, supersede
+  or deadline. Members prime/open/warm through the take machinery and park in `Phase::Ready`; a
+  no-op member (already on its bus) parks at once. When every member is ready and the arm is
+  `SwitcherReady`, `T = max(router tick + 2, clock's last composed tick + 3)`, delayed to the 60-tick
+  force floor of any member key other outputs watch, never past the deadline. The router forces an
+  IDR at `T` on every member key, registers one grouped dispatcher move and proposes `T`. A single
+  take or set on any member output supersedes the whole set. Freshness keeps its 50-tick and opens
+  their 90-tick member bounds; a set not adopted within `SET_ADOPT_DEADLINE_TICKS = 150` ticks of
+  admission is refused with its first cause.
+- **Dispatcher group commit.** `rebind_group` registers every member move at window `T` exactly, and
+  the group is decided once for every member. It applies iff the arm committed at `T` (or the set has
+  no mixer half) and every member key is usable, its window `T` complete, opening on a gated RAP and
+  within the output's parameter-set rule. A member window that is not complete yet holds the
+  decision. That member's binding and every other member binding wait at window `T`, at most
+  `MAX_PENDING_WINDOWS`; then the group is refused. Window `T` is never delivered before the
+  decision. Bindings with no grouped move are never held; at most 64 groups.
+- **Residual fault.** If a member's encoder dies after the mixer half committed at `T`, the outputs
+  cannot follow: each output member reports `refused:encoder-not-ready`. The router counts it in
+  `set_partial` (snapshot) and logs `set-partial`. This is an encoder fault after commit, not an
+  admission refusal; Program and every other output are unaffected.
+- **Seam.** `OutputRouting::try_take_set(OutputTakeSet)` is defaulted to refuse (`Unroutable`); the
+  run's adapter implements it, mapping each member like a single take. One `OutputOutcome` per member
+  carries the set's `operation_id`. The pipeline hands the router the switcher's applied-tick cell
+  (`SwitcherControl::applied_tick_cell`).
+- **Deviations from the E1 design note.** These are recorded here and in the note:
+  - the extra `Applying` state, which closes the commit-vs-refusal race;
+  - the switcher's own deadline backstop for a ready-but-never-proposed set: 150 + 16 ticks
+    (`SET_SWITCHER_GRACE_TICKS`; the router normally refuses first);
+  - `refused:on-air-protected` added to the router's refusal kinds;
+  - per-member freshness and open bounds reuse the single-take constants.
 
 ### 12.9 The Routing page (#308)
 

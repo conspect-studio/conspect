@@ -104,6 +104,12 @@ pub mod log_bridge;
 /// `demux::ReadPacket::is_idr` wires it to a demuxed packet.
 pub mod idr;
 
+/// H.264 repeat access unit (output-routing §12.5 cadence drift): a
+/// non-reference, all-`P_Skip` P picture built from the active SPS/PPS and the
+/// previous slice header (CAVLC and a minimal §9.3.4 CABAC encoder). Pure,
+/// always compiled; `None` on anything unsupported.
+pub mod h264_repeat;
+
 /// Actual-byte AVC decoder descriptions and RFC 6381 codec identifiers.
 pub mod codec_metadata;
 
