@@ -136,11 +136,10 @@ pub fn alloc_video(format: Pixel, width: u32, height: u32) -> Result<Video> {
             return Err(FfmpegError::FrameAlloc("allocated plane is unusable"));
         }
     }
-    // `av_frame_get_buffer` storage comes from `av_buffer_alloc` (not
-    // zeroed). Initialise every owned byte once, row padding and tail
-    // included, before any Rust `u8` slice can expose it (review PB-12).
-    // One-time per allocation; steady-state reuse never re-zeroes.
-    fill_owned_buffers(&mut frame, 0);
+    // Not zeroed here (review PB-16): a plain `Video` (e.g. `Scaler::run`'s
+    // per-frame output) is never turned into a Rust slice by this crate, so
+    // the opaque conversion path pays no extra pass. `ScratchFrame::alloc`,
+    // whose bytes Rust does read, initialises every owned byte (PB-12).
     Ok(frame)
 }
 
@@ -176,10 +175,18 @@ fn for_each_owned_buffer(frame: &Video, mut f: impl FnMut(*mut u8, usize)) {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Test probe: how many whole-frame fills ran on this thread (PB-16).
+    static FILLS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
 /// Set every byte of every buffer `frame` owns to `value`, padding included
 /// (review PB-12: `av_frame_get_buffer` storage is not initialised). Called
 /// once per allocation, before any Rust slice can expose the bytes.
 fn fill_owned_buffers(frame: &mut Video, value: u8) {
+    #[cfg(test)]
+    FILLS.with(|n| n.set(n.get() + 1));
     for_each_owned_buffer(frame, |data, size| {
         #[allow(unsafe_code)]
         // SAFETY: `data`/`size` are a buffer ref's own allocation, borrowed
@@ -273,7 +280,16 @@ impl ScratchFrame {
     /// As [`alloc_video`].
     pub fn alloc(format: Pixel, width: u32, height: u32) -> Result<Self> {
         Ok(Self {
-            frame: alloc_video(format, width, height)?,
+            frame: {
+                // `av_frame_get_buffer` storage comes from `av_buffer_alloc`
+                // (not zeroed). A ScratchFrame's bytes are read in Rust, so
+                // every owned byte (row padding and tail included) is
+                // initialised once here, before any slice exists (review
+                // PB-12). Steady-state reuse never re-zeroes.
+                let mut frame = alloc_video(format, width, height)?;
+                fill_owned_buffers(&mut frame, 0);
+                frame
+            },
         })
     }
 
@@ -885,8 +901,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
 
-    /// Review PB-12: every byte a fresh frame owns (active rows, row padding
-    /// and the tail) is initialised before any Rust slice can see it. Many
+    /// Review PB-12: every byte a fresh `ScratchFrame` owns (active rows, row
+    /// padding and the tail) is initialised before any Rust slice can see it. Many
     /// rounds of dirty-then-free of the same size make it overwhelmingly
     /// likely that a recycled heap block is handed back without zeroing.
     #[test]
@@ -896,9 +912,10 @@ mod tests {
                 let mut dirty = alloc_video(Pixel::GRAY8, 13, 7).unwrap();
                 fill_owned_buffers(&mut dirty, 0xA5 ^ round);
             }
-            let frame = alloc_video(Pixel::GRAY8, 13, 7).unwrap();
+            let scratch = ScratchFrame::alloc(Pixel::GRAY8, 13, 7).unwrap();
+            let frame = scratch.frame();
             let mut total = 0_usize;
-            for_each_owned_buffer(&frame, |data, size| {
+            for_each_owned_buffer(frame, |data, size| {
                 #[allow(unsafe_code)]
                 // SAFETY: reading `size` bytes of a buffer `frame` owns and
                 // keeps alive for this borrow.
@@ -911,6 +928,28 @@ mod tests {
             });
             assert!(total >= 13 * 7, "the whole allocation was inspected");
         }
+    }
+
+    /// Review PB-16: the plain checked allocator (behind `Scaler::run`'s
+    /// per-frame output on the opaque conversion path) does not pay a
+    /// whole-buffer fill; only `ScratchFrame::alloc` does, once.
+    #[test]
+    fn only_a_scratch_frame_pays_the_initialising_fill() {
+        let before = FILLS.with(core::cell::Cell::get);
+        for _ in 0..10 {
+            drop(alloc_video(Pixel::NV12, 64, 36).unwrap());
+        }
+        assert_eq!(
+            FILLS.with(core::cell::Cell::get),
+            before,
+            "plain frames are not filled"
+        );
+        let _scratch = ScratchFrame::alloc(Pixel::NV12, 64, 36).unwrap();
+        assert_eq!(
+            FILLS.with(core::cell::Cell::get),
+            before + 1,
+            "a scratch frame is filled once"
+        );
     }
 
     #[test]

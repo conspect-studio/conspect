@@ -126,9 +126,11 @@ tile. No switcher or drive code changes.
   clock's lease only `try_lock`s and allocates a fresh plane on contention
   (both counted; the caches never grow past their cap), so no frame holder
   can stall the output clock.
-- **FFI safety.** Every frame `alloc_video` returns has all its owned buffer
-  bytes (rows, row padding, tail) initialised once at allocation, since
-  `av_frame_get_buffer` storage is not zeroed (review PB-12). `plane_rows` never yields
+- **FFI safety.** Every `ScratchFrame` has all its owned buffer bytes (rows,
+  row padding, tail) initialised once at allocation, since
+  `av_frame_get_buffer` storage is not zeroed (review PB-12); plain
+  `alloc_video` frames (e.g. `Scaler::run`'s per-frame output) are not
+  filled, because this crate never reads them in Rust (review PB-16). `plane_rows` never yields
   more than a row's active bytes (`av_image_get_linesize`), so a decoder
   frame's unwritten stride padding is never a Rust slice (review PB-13). Scratch frames are `multiview_ffmpeg::frame::ScratchFrame`s,
   which only the checked `alloc_video` (null `AVFrame`, dimension cap, CPU
