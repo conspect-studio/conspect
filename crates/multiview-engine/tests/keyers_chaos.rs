@@ -341,7 +341,10 @@ async fn stalled_consumers_never_stall_the_clock_while_sources_die() {
         u64::try_from(events.len()).unwrap() + events_lag,
         events_pending
     );
-    assert!(!events.is_empty());
+    assert!(
+        !events.is_empty(),
+        "the stalled keyer-event reader still has the newest events"
+    );
     assert!(
         handle.keyer_counters().source_lost() > 0,
         "keyers dropped at the trigger during the run"

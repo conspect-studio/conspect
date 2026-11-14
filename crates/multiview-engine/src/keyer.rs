@@ -122,7 +122,7 @@ impl LossTrigger {
 }
 
 /// A local order on source states (`SourceState` is `non_exhaustive` and has
-/// no `Ord`): Live < Stale < Reconnecting < NoSignal; anything unknown ranks
+/// no `Ord`): `Live` < `Stale` < `Reconnecting` < `NoSignal`; anything unknown ranks
 /// as no signal.
 fn rank(state: SourceState) -> u8 {
     if state == SourceState::Live {
@@ -500,7 +500,6 @@ impl TallySet {
     }
 
     /// The roles, in insertion order.
-    #[must_use]
     pub fn roles(&self) -> impl Iterator<Item = TallyRole> + '_ {
         self.roles.iter().flatten().copied()
     }
@@ -1161,9 +1160,7 @@ impl KeyerRuntime {
                 slot.release();
             }
         }
-        for entry in &mut self.events {
-            *entry = None;
-        }
+        self.events.fill(None);
     }
 
     /// The snapshot rows (change-only publication by the driver).

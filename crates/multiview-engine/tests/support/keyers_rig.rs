@@ -114,7 +114,7 @@ impl Rig {
         &self.stores[id]
     }
 
-    pub(crate) fn solid(&self, luma: u8, w: u32, h: u32) -> Nv12Image {
+    pub(crate) fn solid(luma: u8, w: u32, h: u32) -> Nv12Image {
         let color = ColorInfo::default().resolve_defaults(w, h);
         Nv12Image::solid(w, h, luma, 128, 128, color).unwrap()
     }
@@ -132,7 +132,7 @@ impl Rig {
         w: u32,
         h: u32,
     ) -> Arc<Nv12Image> {
-        let frame = Arc::new(self.solid(luma, w, h));
+        let frame = Arc::new(Self::solid(luma, w, h));
         self.stores[id].publish_arc(Arc::clone(&frame), pts(index));
         frame
     }
@@ -166,7 +166,7 @@ impl Rig {
         let drive = CompositorDrive::new(
             layout(program),
             self.stores.clone(),
-            self.solid(LUMA_BG, SIDE, SIDE),
+            Self::solid(LUMA_BG, SIDE, SIDE),
             CanvasColor::default(),
             LinearRgba::TRANSPARENT,
         )
