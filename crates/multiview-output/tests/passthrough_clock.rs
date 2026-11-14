@@ -776,3 +776,26 @@ fn repeat_source_refusal_does_not_correct_and_underrun_bridges() {
     assert!(stalled);
     assert_eq!(c.counters().repeats, 0);
 }
+
+#[test]
+fn parameter_change_hidden_in_a_stall_still_waits_300_ticks() {
+    let mut c = steady_clock();
+    let mut cfg = SourceCfg::steady(Pattern::POnly);
+    // The source stops at 20 s and resumes at 22 s with new parameters from
+    // its first IDR after the gap (AU 660 at 30000/1001 is ~22.02 s).
+    cfg.stall = Some((20_000_000_000, 22_000_000_000));
+    cfg.param_change_at = Some(660);
+    let mut src = Source::new(cfg);
+    let mut gate = Gate::open();
+    let log = run(&mut c, &mut src, &mut gate, 2 * TICKS_PER_MIN, |_, _, _| {});
+    let first = log.first_au.unwrap();
+    let (stall_tick, reason) = log.first_bridge_at_or_after(first).unwrap();
+    assert_eq!(reason, BridgeReason::Stall);
+    let back = log.first_run_start_after(stall_tick).unwrap();
+    let resume_tick = 22_000_000_000_u64 * 30_000 / (1001 * 1_000_000_000);
+    assert!(
+        back >= resume_tick + 300,
+        "new parameters wait 300 ticks ({back})"
+    );
+    assert_eq!(log.bridges_after(back), 0);
+}

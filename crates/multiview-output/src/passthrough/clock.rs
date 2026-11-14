@@ -42,7 +42,9 @@
 //! **on-time** ticks (30 after a stall-class fault, 300 after a parameter
 //! change, none for the first run after [`PassthroughClock::arm`]); the slot
 //! gate's `matches(gen)` and `matched_slate_ready(gen)`; and a strict IDR at the
-//! head of the queue.
+//! head of the queue. An IDR whose `params_gen` differs from the previous
+//! run's always needs the 300-tick wait, even when the change happened inside
+//! a stall.
 //!
 //! **On-time tick** (precise): the clock keeps a *probe* over arriving AUs.
 //! The first AU after a re-anchor fixes a virtual offset that would put it
@@ -67,7 +69,10 @@
 //! * Too shallow: when the AU due now is a strict IDR (not a run start) and it
 //!   is the only queued AU (depth <= 1), emit a [`Emission::Repeat`] on this
 //!   tick and the IDR on the next (offset + 1). Never for a run with reordering
-//!   (any `pts' != dts'`): its underrun stalls and bridges.
+//!   (any `pts' != dts'`): its underrun stalls and bridges. When the
+//!   [`RepeatSource`] returns `None` the IDR is emitted on time and no
+//!   correction happens; an actual underrun then stalls and bridges on its
+//!   own tick (bridging pre-emptively would only cost the 30-tick return).
 //! * One correction per IDR at most.
 
 use std::collections::VecDeque;
@@ -191,6 +196,11 @@ impl Emission {
 
 /// Synthesises the repeat AU after `prev` (the last emitted AU). `None` when
 /// unsupported (the clock then does not correct; see the module docs).
+///
+/// The implementation must build from the parameter sets of `prev.params_gen`
+/// (for H.264: `multiview_ffmpeg::h264_repeat::RepeatAuBuilder`, built once per
+/// generation); an HEVC source returns `None` in slice D (its underrun stalls
+/// and bridges).
 pub trait RepeatSource {
     /// The repeat AU's bytes, valid after `prev`.
     fn repeat_after(&mut self, prev: &TapAu) -> Option<Arc<[u8]>>;
@@ -305,6 +315,8 @@ pub struct PassthroughClock {
     last_emitted: Option<TapAu>,
     /// Depth used by the last run decision (0 when bridged).
     last_depth: usize,
+    /// Parameter generation of the most recent run (reset by `arm`).
+    last_run_gen: Option<u64>,
     counters: ClockCounters,
 }
 
@@ -328,6 +340,7 @@ impl PassthroughClock {
             pending_fault: None,
             last_emitted: None,
             last_depth: 0,
+            last_run_gen: None,
             counters: ClockCounters::default(),
         }
     }
@@ -339,6 +352,7 @@ impl PassthroughClock {
             return;
         }
         self.armed = true;
+        self.last_run_gen = None;
         self.state = State::Bridge {
             reason: BridgeReason::AwaitingIdr,
             required: 0,
@@ -627,6 +641,15 @@ impl PassthroughClock {
                 continue;
             }
             let gen = head.au.params_gen;
+            // New parameters since the last run (a change hidden inside a
+            // stall included) need the parameter-change wait and re-check.
+            let gen_changed = self.last_run_gen.is_some_and(|g| g != gen);
+            let required = if gen_changed {
+                required.max(PARAM_RETURN_TICKS)
+            } else {
+                required
+            };
+            let param_fault = param_fault || gen_changed;
             if self.stable < required {
                 self.queue.pop_front();
                 continue;
@@ -660,6 +683,7 @@ impl PassthroughClock {
                 first_pending: true,
             };
             self.counters.runs = self.counters.runs.saturating_add(1);
+            self.last_run_gen = Some(gen);
             return self.decide_run(t, repeat);
         }
         if let State::Bridge { reason: r, .. } = &mut self.state {

@@ -2248,6 +2248,30 @@ continuous PCR from those timestamps. The rule then depends only on the paramete
 (ADR-0108's slice-1 behaviour of refusing parameter-set changes on non-TS outputs ends, per medium,
 once that muxer writes its rule.)
 
+**As built in slice D, part D1 (#344).** The core is pure Rust and always compiled:
+`crates/multiview-output/src/passthrough/` (`tap.rs`, `match_rules.rs`, `clock.rs`) and
+`crates/multiview-ffmpeg/src/h264_repeat.rs`. Differences from the text above:
+- *The tap.* `CompressedTap` gives each consumer (8 at most) its own bounded
+  `sync_channel` of 64 AUs. The writer only `try_send`s and the clock only `try_recv`s. A full
+  channel drops the **newest** AU for that consumer only, and the drop is counted. That happens
+  only when the consumer's clock is dead or wedged, because a live clock drains every tick. The
+  drop-oldest bound is the clock's jitter buffer (8 AUs), and that is where jitter is absorbed.
+- *Start of a run.* The first IDR of a run gets `dts' = max(tick, arrival tick + 3)`, so it waits
+  `TARGET_DEPTH` ticks in the buffer (the bridge fills those ticks) and the run starts with
+  3 ticks of depth.
+- *Too deep with B-frames.* The drop set is the decode-order suffix before the IDR. It starts at
+  the queued AU with the highest PTS among the AUs after the previous IDR. For IBBP that is the
+  last P and the B after it. For a P-only source it is the AU before the IDR. The IDR and
+  everything after it shift back by the size of the drop set. This is applied only if every AU
+  kept before the IDR presents before the IDR's new PTS; otherwise it waits for the next IDR.
+- *Repeat AU.* H.264 only. HEVC has no repeat AU yet, so an HEVC underrun stalls and bridges.
+  The H.264 repeat sets `num_ref_idx_l0_active` to 1, so it copies the most recent reference
+  picture whatever the PPS default. It returns `None` (and the clock does not correct) for POC
+  type 1, MBAFF, FMO, separate colour planes, a previous MMCO 5, intra-only profiles, and a
+  repeat after a non-reference picture under POC type 2.
+- *Return after a stall that hid a parameter change.* An IDR whose parameter generation differs
+  from the previous run's always needs the 300-tick parameter-change wait.
+
 **Audio with passthrough video.** Audio is always decoded and re-encoded on the global AAC grid
 (ADR-0108 §5.2). For lip sync, the audio of a passthrough slot is read at the source time of the
 video AU emitted on the tick (the tap carries each AU's source PTS on the ingest timeline,
