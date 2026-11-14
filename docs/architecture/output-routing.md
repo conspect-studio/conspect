@@ -425,6 +425,118 @@ drain (debug afterwards) and does **not** touch the working-config mirror, so th
 diverges from the accepted state. Without a switcher every route behaves as before. Tally and audio-follow-video read the one bound Program
 source as before; removing the source on Program still slates the Program cell (fail-closed).
 
+*As built (#307 PR 2): a stored layout as an M/E source.* Scope: `layout:<id>` on PVW/PGM and on
+numbered mixer inputs, taken with CUT/AUTO/DIP through the unchanged engine path. Not in this PR:
+`bus:program`/`bus:preview` cells and the feed-cycle check (PR 3), audio-follow-video for a layout
+source (PR 4), the UI (PR 5), and the overlay bake on layout sources (lane layout-overlays).
+
+- **API.** `select_preview`/`select_program` take exactly one of `source`/`input`/`layout`
+  (`source: "layout:<id>"` is the same request); `layout` on `cut`/`auto` and `output` stay 422.
+  `POST /patch/take` takes a mixer crosspoint `{"layout": id}` (engine source `layout:<id>`); one
+  request names at most one stored layout; `{"bus": …}` on a mixer input stays 422
+  `unknown-source`. With numbered inputs a layout select must name a layout already patched to an
+  input (`not-on-an-input`), exactly like a source. A layout patched to an input is not written
+  to `desired.json` (it is a runtime registration; the input keeps its configured source there).
+- **Admission.** The routing rule of `resolve_layout` (exists, parses, solves, running-canvas gate,
+  every cell opaque) plus: no cell binds `layout:*` or `bus:*` (422 `layout-not-admissible`,
+  "nested layouts and buses are not M/E sources"). An unknown layout is 422 `unknown-source`.
+- **Authorization (§6.3).** A layout select or patch needs Read on the layout AND on every source
+  its stored body binds (one generic 403, before any 422 detail, before the Idempotency-Key). A
+  CUT/AUTO (plan and submit) whose current Preview is `layout:X` needs the closure of X's
+  REGISTERED body (what the engine composes; not registered = 409 `layout-changed`). A select of
+  an input patched to `layout:X` needs it too. A plan registers nothing.
+- **Execution-bound authorization (review A1).** Authorization is checked against a snapshot, but
+  commands queue: a select or re-patch queued before a CUT, or a body edit, could otherwise put an
+  unauthorized source on air. Every CUT/AUTO and select carries a `SelectionGuard`
+  (`switcher_control.rs`): the resolved Preview a CUT/AUTO authorized, the resolved source a select
+  authorized (`in:N` through the table), and — when that source is `layout:*` — the authorized
+  body revision. At the tick (and again when a held take is replayed) the driver refuses a command
+  whose guard no longer holds with `selection-changed: the Preview or input changed after this
+  operation was authorized; re-plan`; nothing changes. The driver learns body revisions at adoption
+  (`LayoutSourceSet` entries carry them; ≤ 4, no per-tick allocation). An unguarded command
+  (`expect: None`) behaves as before.
+- **Patch execution guard (review A4).** A patch names a layout id, not immutable content, so a
+  body edit after `ensure` could otherwise put an unauthorized body on an input (and on Program
+  with `on_air: allow`). `take_patch` keeps the revision `ensure` returns for each layout member and
+  sends `SelectionGuard.member_revisions` (`[(layout:<id>, revision)]`). The driver refuses the
+  whole patch `selection-changed` (no member applied) when the revision it holds for any listed key
+  differs — at the first drain and again when a held patch is replayed after prime. An armed salvo
+  half (`PatchArmed`, #308) carries no guard (the control never sends one; salvo members are not
+  layout sources) and is exempt.
+- **Registry.** `MeLayoutRegistry` (control, one std mutex, never touched by the clock) holds at
+  most **4** layouts (409 `capacity` for a fifth; the key is released), one demand lease per
+  bound source (label `switcher:me1:layout:<id>`; a select of a layout takes no per-select
+  source lease), and the instant the M/E last referenced each. A sweep every second drops an
+  entry not referenced by the M/E (Program, Preview or a patched input, from the engine snapshot
+  and readback) for **10 s** (`ME_LAYOUT_LINGER`). Every mutation that touches the engine
+  adapter (`ensure`, `update_body`, `remove`, `sweep`) calls it while still holding the registry
+  mutex (lock order registry → adapter writer; the adapter never calls back), so a removal can
+  never unregister a concurrent fresh registration of the same id (review A2); a removed entry's
+  leases are released after its unregister.
+- **Lifecycle fence (review A3).** The registry keeps a per-layout fence (bounded at 1024; the
+  smallest is evicted and raises a floor every unfenced id uses). An edit or delete holds the fence
+  at "committing" (every registration refused) across its repository commit and completes it with
+  `next_layout_revision()` taken after the commit. `ensure` (first registration, re-registration
+  and re-select refresh) refuses a body whose revision is at or below the fence with 409
+  `layout-changed` ("the layout changed while this request was in flight; retry"); the
+  Idempotency-Key is released. So a request that read the body before an edit or delete can never
+  register the old or deleted body.
+- **One store per body revision (review r2).** The binary's adapter (`multiview-cli`
+  `me_layouts.rs`) creates a NEW `layout:<id>` `TileStore` for every registration AND every body
+  change, so every frame a store holds was composed from exactly one body. Order: (1) publish the
+  compose set with the new body and new store (the aux starts filling it; the old store is no
+  longer fed and holds last-good of the old, already-authorized body); (2) off the clock, wait up
+  to 1 s (`PRIME_WAIT`) for the new store to be `is_primed()`; (3) publish the engine set with the
+  new store AND the new revision as one entry — the hook swaps both in one adoption and rebinds
+  the Program cell to the new store on that tick (no NoSignal tick when it primed). Until (3) the
+  clock holds the old store with the old revision; from (3) the new pair. So the engine never
+  holds a revision for a store that holds another body's frames, and a revision guard binds the
+  pixels too. The wait (2) runs on a short-lived promoter thread (`me-layout-prime`, one at a
+  time, 2 ms poll, exits when nothing is pending): the caller is the registry, holding its std
+  mutex inside an async handler on a tokio worker, so it must not sleep. While a body is pending
+  the adapter reports not-adopted, so the control's existing ≤ 1 s acknowledgement wait covers
+  prime and adoption (a slower prime answers 503 `engine-busy`, key released; a retry succeeds
+  once promoted). **Never primes:** if the store has no frame after 1 s (aux wedged or failed) the
+  engine set is published anyway; that store ages to slate exactly like an aux failure. A CUT or
+  select guarded by a just-edited revision before its promotion is refused `selection-changed`
+  (fail closed, re-plan). A routed Preview monitor (below) reads the compose set's store, so it
+  can show the committed new body up to one prime earlier than Program; it has no execution
+  authority.
+- **Engine adoption.** The adapter publishes the compose set to the routing-aux thread first,
+  then a `LayoutSourceSet` (`LayoutSources`: `SwapCell` + generation `AtomicU64`). The frame
+  hook does one Acquire load per fresh tick, after the legacy control and before `drain_at_tick`;
+  only on a generation change does it insert/replace the `layout:*` stores in the drive, the
+  driver's primed stores and the preview stores (allocation only then) and acknowledge the
+  generation. Acquisition is **bounded** (review I1): one `SwapCell::try_load` attempt; if a
+  publish raced it the hook keeps its previous set, neither records nor acknowledges the
+  generation, and retries next tick. The deferred-removal path reads the hook's cached copy of the
+  last adopted set, never reloading on the clock. A removal of a key the M/E still references (PGM, PVW, a patched input, or the held
+  take) is deferred and re-checked every tick (O(≤4), no allocation) until released. Repeat ticks
+  do not adopt. A select/patch naming a newly registered layout waits (≤ 1 s, off the clock) for
+  that acknowledgement before it is enqueued, so the drain that sees the command has the store;
+  otherwise 503 `engine-busy`, key released.
+- **Compose.** The routing-aux thread composes each registered layout after the routed feeds with
+  its own `LayoutCanvas` (rebuilt when the body `Arc` changes; each body has its own store) and `publish_arc(frame, T.pts)`
+  into the `layout:<id>` store. The clock offers ticks while a routed feed **or** an M/E layout is
+  active (second gate flag, `AuxTickSender::me_layout_flag`, owned by the registry). The halved-
+  cadence back-off applies unchanged. Latency is one tick, as above.
+- **Routed Preview of a layout (review M2).** The routing-aux store lookup falls back to the M/E
+  layout compose set (`routing_aux::with_me_layouts`: one `SwapCell` load, linear find over ≤ 4,
+  only for an unknown `layout:*` id), so a routed Preview feed — and any routed `src:` lookup —
+  publishes the composed layout while Preview is `layout:<id>`.
+- **Failure.** If the aux thread panics or wedges, the layout stores are simply no longer fed and
+  age LIVE → STALE → NO_SIGNAL (slate) on Program; the clock never waits
+  (`crates/multiview-engine/tests/switcher_layout_source_chaos.rs`).
+- **Edit/delete.** Editing a registered layout needs `program:main` scope, the `me1` object and
+  Read on every source of the NEW body (403 `routed-layout`); the new body must stay admissible
+  (422 `layout-not-admissible`, checked before the commit). After the commit the body swaps at the
+  next tick (revision taken after the commit, like `notify_layout_change`). Deleting a layout that
+  is registered as an M/E source **at all** — on Program, Preview or an input, or merely lingering
+  — is 409 `layout-on-air` ("take it off Program, Preview and every mixer input, then retry after
+  10 s") and nothing changes; an unregistered one is fenced, then deleted.
+- **Audio.** A layout on the M/E's Program is **silent** on the Program audio bus until PR 4:
+  `audio.rs` `select_program_source` finds no channel named `layout:<id>`.
+
 **`apply-layout` in the new model.** It means "route layout X to the feed `program`'s canvas".
 
 - **No switcher declared.** It keeps today's meaning exactly: the Program canvas swaps to X at the
@@ -434,8 +546,9 @@ source as before; removing the source on Program still slates the Program cell (
   422 `switcher-owns-program`. The detail names the two operations that do what the operator means:
   `POST /routing/output/take` (layout to an output) and `POST /switcher/commands/select_preview`
   with `layout:<id>`. It never silently changes something else. *As built (#307 PR 1):* the check
-  runs before the idempotency reservation (nothing reserved, persisted or sent); the detail
-  describes the second operation as "a layout as a switcher source" until it lands in PR 2. The
+  runs before the idempotency reservation (nothing reserved, persisted or sent). Since #307 PR 2
+  the detail names the real M/E-source operation: `select_preview` with `{"layout": id}` (or a
+  mixer patch `{"layout": id}`), then CUT or AUTO. The
   old `layout-not-admissible-with-switcher` problem is no longer returned by apply-layout; its
   slug remains only for the overlays refusal on persisting commands.
 - An optional body field `target: {output: id}` makes `apply-layout` a thin alias for an output

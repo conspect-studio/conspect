@@ -774,6 +774,7 @@ fn reversed_success_receipts_preserve_the_latest_preview_demand() {
                             operation_id: id.into(),
                             scene_version: 1,
                             verb: SwitcherVerb::SelectPreview(SourceRef::new(source)),
+                            expect: None,
                         })
                         .map_err(|_| ())?;
                     Ok(handle.composed_count())

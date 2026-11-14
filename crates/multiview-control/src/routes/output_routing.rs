@@ -570,6 +570,92 @@ fn resolve_layout(
     Ok(Ok(routed))
 }
 
+/// The 422 kind and detail of a layout that is not admissible as an M/E
+/// source because a cell binds another layout or a bus (#307).
+pub(crate) const ME_NESTED_DETAIL: &str =
+    "a stored layout whose cells bind another layout (`layout:*`) or a bus (`bus:*`) cannot be an \
+     M/E source: nested layouts and buses are not M/E sources";
+
+/// Whether a solved layout binds a nested layout or a bus in any cell.
+fn binds_layout_or_bus(layout: &multiview_core::layout::Layout) -> bool {
+    layout.cells.iter().any(|cell| {
+        cell.source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("layout:") || s.starts_with("bus:"))
+    })
+}
+
+/// Resolve stored layout `id` as an M/E source (#307 PR 2): exactly the
+/// routing rule of [`resolve_layout`] (exists, parses, solves, the running
+/// canvas, every cell opaque; Read on every bound source first), plus no
+/// cell binds `layout:*` or `bus:*`. A missing layout is 422
+/// `unknown-source`; anything else not admissible is 422
+/// `layout-not-admissible`.
+///
+/// # Errors
+/// 403 for an unreadable bound source (generic); repository errors.
+pub(crate) fn resolve_me_layout(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+    read: Option<&LayoutRead>,
+) -> ControlResult<Result<LayoutBody, FeedRefusal>> {
+    Ok(match resolve_layout(state, principal, id, read)? {
+        Err((_, "unknown-feed", _)) => Err((
+            422,
+            "unknown-source",
+            "the layout does not exist".to_owned(),
+        )),
+        Err(refusal) => Err(refusal),
+        Ok(routed) if binds_layout_or_bus(&routed.layout) => {
+            Err((422, "layout-not-admissible", ME_NESTED_DETAIL.to_owned()))
+        }
+        Ok(routed) => Ok(LayoutBody(std::sync::Arc::new(routed))),
+    })
+}
+
+/// A typed M/E-source refusal as an RFC 9457 response.
+pub(crate) fn me_refusal(refusal: FeedRefusal) -> Response {
+    let (status, kind, detail) = refusal;
+    crate::problem::Problem::new(status, kind, "Selection refused")
+        .with_detail(detail)
+        .into_response()
+}
+
+/// Resolve a stored layout body for an M/E source edit (#307): the edit's
+/// NEW body must stay admissible. No authorization here (the edit route
+/// authorizes). `Err` is the 422 detail.
+pub(crate) fn resolve_me_layout_body(
+    state: &AppState,
+    id: &str,
+    body: &serde_json::Value,
+) -> Result<LayoutBody, String> {
+    let resolved = crate::command::resolve_layout_document(id, body, state.running_canvas.as_ref())
+        .map_err(|e| match e {
+            ControlError::Validation(detail) => detail,
+            other => other.to_string(),
+        })?;
+    let routed = RoutedLayout {
+        id: id.to_owned(),
+        slates: resolved.document.cell_slates(),
+        audio: resolved.document.audio.clone(),
+        overlays: resolved.document.overlays,
+        layout: resolved.solved,
+        revision: crate::output_routing::next_layout_revision(),
+    };
+    if !routed.integer_drawable() {
+        return Err(
+            "this layout has a translucent cell; an M/E layout source draws opaque cells \
+                    only (set every cell's opacity to 1)"
+                .to_owned(),
+        );
+    }
+    if binds_layout_or_bus(&routed.layout) {
+        return Err(ME_NESTED_DETAIL.to_owned());
+    }
+    Ok(LayoutBody(std::sync::Arc::new(routed)))
+}
+
 /// The outputs (config ids) whose live feed or pending take is layout `id`.
 fn outputs_on_layout(state: &AppState, id: &str) -> Vec<String> {
     let bus = RoutedFeed::Layout(id.to_owned()).bus_name();

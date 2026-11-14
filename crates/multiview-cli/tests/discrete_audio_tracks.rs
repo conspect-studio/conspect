@@ -335,7 +335,7 @@ async fn run(output_audio: &str) -> (tempfile::TempDir, PathBuf) {
 /// with audio start PTS within one AAC frame, and the track carrying the discrete
 /// input (440 Hz) rather than the program (1 kHz).
 async fn assert_two_audio_streams(output_audio: &str) {
-    let (_guard, out_dir) = run(output_audio).await;
+    let (_guard, out_dir) = Box::pin(run(output_audio)).await;
     let segs = segments(&out_dir);
     assert!(!segs.is_empty(), "no segments written");
     let mut joined = Vec::new();
@@ -419,7 +419,7 @@ async fn assert_two_audio_streams(output_audio: &str) {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // Full manifest traversal and real decode belong in one end-to-end assertion.
 async fn master_resolves_playable_distinct_audio_only_renditions() {
-    let (_guard, dir) = run("[outputs.audio]\nmode = \"auto\"").await;
+    let (_guard, dir) = Box::pin(run("[outputs.audio]\nmode = \"auto\"")).await;
     let master = std::fs::read_to_string(dir.join("master.m3u8")).expect("master");
     assert!(master.contains("NAME=\"Program\",DEFAULT=YES"), "{master}");
     assert!(master.contains("NAME=\"AU ABC\",DEFAULT=NO"), "{master}");
@@ -527,18 +527,20 @@ async fn master_resolves_playable_distinct_audio_only_renditions() {
 
 #[tokio::test]
 async fn tracks_mode_muxes_a_discrete_track_into_every_segment() {
-    assert_two_audio_streams("[outputs.audio]\nmode = \"tracks\"\ntracks = [\"prog\", \"au-abc\"]")
-        .await;
+    Box::pin(assert_two_audio_streams(
+        "[outputs.audio]\nmode = \"tracks\"\ntracks = [\"prog\", \"au-abc\"]",
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn auto_mode_carries_program_plus_every_declared_track() {
-    assert_two_audio_streams("[outputs.audio]\nmode = \"auto\"").await;
+    Box::pin(assert_two_audio_streams("[outputs.audio]\nmode = \"auto\"")).await;
 }
 
 #[tokio::test]
 async fn program_mode_stays_single_audio_with_tracks_declared() {
-    let (_guard, out_dir) = run("[outputs.audio]\nmode = \"program\"").await;
+    let (_guard, out_dir) = Box::pin(run("[outputs.audio]\nmode = \"program\"")).await;
     for seg in segments(&out_dir) {
         let streams = probe_streams(&seg);
         let kinds: Vec<&str> = streams.iter().map(|s| s.0.as_str()).collect();
@@ -548,7 +550,10 @@ async fn program_mode_stays_single_audio_with_tracks_declared() {
 
 #[tokio::test]
 async fn tracks_mode_without_prog_carries_only_the_listed_track() {
-    let (_guard, out_dir) = run("[outputs.audio]\nmode = \"tracks\"\ntracks = [\"au-abc\"]").await;
+    let (_guard, out_dir) = Box::pin(run(
+        "[outputs.audio]\nmode = \"tracks\"\ntracks = [\"au-abc\"]",
+    ))
+    .await;
     for seg in segments(&out_dir) {
         let streams = probe_streams(&seg);
         let kinds: Vec<&str> = streams.iter().map(|s| s.0.as_str()).collect();

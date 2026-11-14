@@ -115,6 +115,21 @@ pub enum ControlError {
     /// reserved or sent.
     #[error("the switcher M/E owns the Program canvas; {0} was not applied")]
     SwitcherOwnsCells(&'static str),
+
+    /// A stored layout registered as an M/E source cannot be deleted
+    /// (#307): 409 `layout-on-air`.
+    #[error("layout {0:?} is on the M/E")]
+    LayoutOnAir(String),
+
+    /// A stored layout an operation names changed (or was released) while
+    /// the request was in flight (#307 review A1/A3): 409 `layout-changed`.
+    #[error("layout {0:?} changed while the request was in flight")]
+    LayoutChanged(String),
+
+    /// A stored layout (an M/E source, #307) is not admissible: 422
+    /// `layout-not-admissible`.
+    #[error("layout not admissible: {0}")]
+    LayoutNotAdmissible(String),
 }
 
 /// The stable problem `type` slug for [`ControlError::NotAdmissibleWithSwitcher`].
@@ -200,7 +215,10 @@ impl ControlError {
                 "The switcher is on: the Program canvas is the M/E bus, so layout {layout:?} \
                  cannot replace it. To show the layout on an output, take it there with \
                  POST /api/v1/routing/output/take (feed {{\"layout\":\"{layout}\"}}) or send \
-                 apply-layout with target {{\"output\":\"<id>\"}}. Nothing was changed."
+                 apply-layout with target {{\"output\":\"<id>\"}}. To put the layout on the M/E \
+                 as a source, select it with POST /api/v1/switcher/commands/select_preview \
+                 {{\"layout\":\"{layout}\"}} (or patch it to a mixer input), then CUT or AUTO. \
+                 Nothing was changed."
             )),
             Self::SwitcherOwnsCells(operation) => Problem::new(
                 422,
@@ -215,9 +233,29 @@ impl ControlError {
                  (POST /api/v1/switcher/commands/select_preview or select_program). \
                  Nothing was changed."
             )),
+            Self::LayoutOnAir(layout) => me_layout_conflict(&layout, MeLayoutError::OnAir),
+            Self::LayoutChanged(layout) => me_layout_conflict(&layout, MeLayoutError::Changed),
+            Self::LayoutNotAdmissible(detail) => Problem::new(
+                422,
+                "layout-not-admissible",
+                "Layout not admissible as an M/E source",
+            )
+            .with_detail(detail),
         }
     }
 }
+
+/// A 409 M/E layout-source refusal of stored layout `layout` (#307).
+fn me_layout_conflict(layout: &str, error: crate::me_layouts::MeLayoutError) -> Problem {
+    let title = match error {
+        MeLayoutError::OnAir => "Layout is on the M/E",
+        _ => "Layout changed",
+    };
+    Problem::new(409, error.kind(), title)
+        .with_detail(format!("layout {layout:?}: {}", error.detail()))
+}
+
+use crate::me_layouts::MeLayoutError;
 
 impl axum::response::IntoResponse for ControlError {
     fn into_response(self) -> axum::response::Response {

@@ -100,6 +100,34 @@ pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
 /// Typed refusal: a select names an undeclared or unpatched input.
 pub const REFUSE_UNKNOWN_INPUT: &str = "unknown-slot: the input is not declared or not patched";
 
+/// Typed refusal (#307 review A1): what the command would put on a bus is not
+/// what the control plane authorized (a queued select or re-patch, or a
+/// stored-layout body edit, landed in between).
+pub const REFUSE_SELECTION_CHANGED: &str =
+    "selection-changed: the Preview or input changed after this operation was authorized; re-plan";
+
+/// What a command was authorized against (#307 review A1), checked at the
+/// tick it is applied (and again when a held take is replayed). `None`
+/// fields are not checked; a command with no guard behaves as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectionGuard {
+    /// CUT/AUTO: the resolved Preview source the take was authorized for.
+    pub preview: Option<SourceRef>,
+    /// A select: the resolved source of its target (`in:N` through the
+    /// input table, or the raw ref) it was authorized for.
+    pub target: Option<SourceRef>,
+    /// When the source the command puts on a bus is a `layout:*` source: the
+    /// stored-layout body revision whose closure was authorized. Refused when
+    /// the driver holds another revision for that key (or none).
+    pub layout_revision: Option<u64>,
+    /// A patch (#307 review A4): for each `layout:*` member source, the
+    /// stored-layout body revision the control plane authorized. The patch is
+    /// refused (no member applied) when the driver holds another revision for
+    /// any listed key (or none). Bounded by the patch's ≤ 64 members; empty =
+    /// unchecked.
+    pub member_revisions: Vec<(SourceRef, u64)>,
+}
+
 /// A set of mixer-input crosspoints applied at one tick, all or none
 /// (ADR-0110 §12.8). Bounded by the control plane to 64 members.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +136,13 @@ pub struct PatchSet {
     pub members: Vec<(u16, Option<SourceRef>)>,
     /// `on_air = "allow"`: a member may re-patch the input on PGM (a cut).
     pub allow_on_air: bool,
+}
+
+/// Whether a patch set names `id` as a member source. Allocation-free.
+fn patch_names(set: &PatchSet, id: &str) -> bool {
+    set.members
+        .iter()
+        .any(|(_, source)| source.as_ref().is_some_and(|s| s.as_str() == id))
 }
 
 /// An operator verb, already authorized and reference-validated on admission.
@@ -174,6 +209,21 @@ pub struct SwitcherCommand {
     pub scene_version: u64,
     /// The operator action.
     pub verb: SwitcherVerb,
+    /// What the control plane authorized (#307 review A1); `None` = unchecked.
+    pub expect: Option<SelectionGuard>,
+}
+
+impl SwitcherCommand {
+    /// An unguarded command (`expect: None`).
+    #[must_use]
+    pub fn new(operation_id: impl Into<String>, scene_version: u64, verb: SwitcherVerb) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            scene_version,
+            verb,
+            expect: None,
+        }
+    }
 }
 
 /// Engine-owned bus selection projected at a real output frame boundary.
@@ -286,6 +336,7 @@ impl SwitcherControl {
             active_auto: None,
             active_auto_scenes: None,
             primed_stores: None,
+            source_revisions: Vec::with_capacity(crate::switcher_layouts::MAX_ME_LAYOUT_SOURCES),
             pending_take: None,
             armed: None,
             last_tick: 0,
@@ -305,6 +356,10 @@ impl SwitcherControl {
     ///
     /// # Errors
     /// Returns the command unchanged if the bounded mailbox is full or closed.
+    #[allow(clippy::result_large_err)]
+    // reason: the refusal hands the caller its unsent command back (the
+    // mpsc `TrySendError` contract); boxing it would allocate per command
+    // and change every construction site for a cold error path.
     pub fn try_send(&self, command: SwitcherCommand) -> Result<(), SwitcherCommand> {
         self.tx
             .try_send(command)
@@ -423,6 +478,9 @@ pub struct SwitcherTickDriver {
     composed_count: Arc<std::sync::atomic::AtomicU64>,
     auto_capable: Arc<std::sync::atomic::AtomicBool>,
     primed_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    /// Body revisions of the adopted `layout:*` stores (≤ 4; allocates only
+    /// when a key is first adopted).
+    source_revisions: Vec<(String, u64)>,
     pending_take: Option<(SwitcherCommand, u64)>,
     /// The armed mixer half of an atomic set (#308), if any.
     armed: Option<ArmedSet>,
@@ -613,6 +671,124 @@ impl SwitcherTickDriver {
     /// starts. Only `is_primed` is sampled on a tick; ingest remains off-clock.
     pub fn set_prime_stores(&mut self, stores: HashMap<String, Arc<TileStore<Nv12Image>>>) {
         self.primed_stores = Some(stores);
+    }
+
+    /// Register (or replace) one primed store at a frame boundary: a stored
+    /// layout adopted as an M/E source (#307), with the body `revision` it
+    /// composes (what a [`SelectionGuard::layout_revision`] is checked
+    /// against). Without an installed store map (no prime provider) the store
+    /// is not inserted, so it never fabricates one. Allocates only for a new
+    /// key (on a registry change, never in the steady state).
+    pub fn insert_prime_store(
+        &mut self,
+        id: &str,
+        store: Arc<TileStore<Nv12Image>>,
+        revision: u64,
+    ) {
+        if let Some(stores) = self.primed_stores.as_mut() {
+            if let Some(existing) = stores.get_mut(id) {
+                *existing = store;
+            } else {
+                stores.insert(id.to_owned(), store);
+            }
+        }
+        if let Some(entry) = self.source_revisions.iter_mut().find(|(k, _)| k == id) {
+            entry.1 = revision;
+        } else {
+            self.source_revisions.push((id.to_owned(), revision));
+        }
+    }
+
+    /// The body revision held for adopted layout source `id`, if any.
+    #[must_use]
+    pub fn source_revision(&self, id: &str) -> Option<u64> {
+        self.source_revisions
+            .iter()
+            .find(|(k, _)| k == id)
+            .map(|(_, revision)| *revision)
+    }
+
+    /// Unregister one primed store; `true` if it was registered. The caller
+    /// checks [`Self::references_source`] first.
+    pub fn remove_prime_store(&mut self, id: &str) -> bool {
+        if let Some(index) = self.source_revisions.iter().position(|(k, _)| k == id) {
+            self.source_revisions.swap_remove(index);
+        }
+        self.primed_stores
+            .as_mut()
+            .is_some_and(|stores| stores.remove(id).is_some())
+    }
+
+    /// Whether `command`'s [`SelectionGuard`] no longer holds at this tick
+    /// (#307 review A1). Allocation-free: compares against the machine's
+    /// resolved selections and the ≤ 4 held layout revisions.
+    fn guard_violated(&self, command: &SwitcherCommand) -> bool {
+        let Some(guard) = command.expect.as_ref() else {
+            return false;
+        };
+        let incoming = match &command.verb {
+            SwitcherVerb::Cut | SwitcherVerb::Auto(_) => {
+                let preview = self.resolve(self.machine.preview());
+                if guard.preview.as_ref().is_some_and(|want| want != preview) {
+                    return true;
+                }
+                preview
+            }
+            SwitcherVerb::SelectPreview(target) | SwitcherVerb::SelectProgram(target) => {
+                let resolved = self.resolve(target);
+                if guard.target.as_ref().is_some_and(|want| want != resolved) {
+                    return true;
+                }
+                resolved
+            }
+            SwitcherVerb::Patch(_) => {
+                // #307 review A4: a patch names a layout id, not immutable
+                // content; refuse when any authorized member body changed.
+                return guard
+                    .member_revisions
+                    .iter()
+                    .any(|(key, want)| self.source_revision(key.as_str()) != Some(*want));
+            }
+            // `PatchArmed` (an armed salvo, #308) is exempt: the control plane
+            // never sends a guard with it today (salvo members are not layout
+            // sources), so there is nothing authorized to re-check.
+            SwitcherVerb::SetTransition(_) | SwitcherVerb::PatchArmed { .. } => return false,
+        };
+        guard
+            .layout_revision
+            .is_some_and(|want| self.source_revision(incoming.as_str()) != Some(want))
+    }
+
+    /// Whether the M/E references `id` now: the resolved PGM or PVW source,
+    /// any numbered input patched to it, or the held take naming it (a
+    /// select target or a patch member). Allocation-free.
+    #[must_use]
+    pub fn references_source(&self, id: &str) -> bool {
+        let (program, preview) = self.resolved_selections();
+        if program.as_str() == id || preview.as_str() == id {
+            return true;
+        }
+        if self
+            .inputs
+            .as_ref()
+            .is_some_and(|table| table.input_for_source(id).is_some())
+        {
+            return true;
+        }
+        match self.pending_take.as_ref().map(|(command, _)| &command.verb) {
+            Some(SwitcherVerb::SelectProgram(target) | SwitcherVerb::SelectPreview(target))
+                if self.resolve(target).as_str() == id =>
+            {
+                return true;
+            }
+            Some(SwitcherVerb::Patch(set)) if patch_names(set, id) => return true,
+            _ => {}
+        }
+        // An armed salvo set (#308) holds its own slot; its members are
+        // references until it settles.
+        self.armed
+            .as_ref()
+            .is_some_and(|armed| patch_names(&armed.set, id))
     }
 
     /// Advertise AUTO. Called only by the frame hook that renders the
@@ -872,20 +1048,44 @@ impl SwitcherTickDriver {
         if let Some((command, deadline)) = self.pending_take.take() {
             if let SwitcherVerb::Patch(set) = &command.verb {
                 // A held patch re-validates against the live table: nothing
-                // else could change it while it held the only slot.
-                match self.gate_patch(&command, set, tick, true) {
-                    Ok(true) => self.staged_success.push(command.operation_id),
-                    Ok(false) if tick.index >= deadline => self.publish_outcome(
+                // else could change it while it held the only slot. A layout
+                // body adopted while it held (#307 review A4) is a refusal.
+                if self.guard_violated(&command) {
+                    self.publish_outcome(
                         command.operation_id,
                         tick.index,
                         false,
-                        Some(REFUSE_NO_FRESH_FRAME.into()),
-                    ),
-                    Ok(false) => self.pending_take = Some((command, deadline)),
-                    Err(err) => {
-                        self.publish_outcome(command.operation_id, tick.index, false, Some(err));
+                        Some(REFUSE_SELECTION_CHANGED.into()),
+                    );
+                } else {
+                    match self.gate_patch(&command, set, tick, true) {
+                        Ok(true) => self.staged_success.push(command.operation_id),
+                        Ok(false) if tick.index >= deadline => self.publish_outcome(
+                            command.operation_id,
+                            tick.index,
+                            false,
+                            Some(REFUSE_NO_FRESH_FRAME.into()),
+                        ),
+                        Ok(false) => self.pending_take = Some((command, deadline)),
+                        Err(err) => {
+                            self.publish_outcome(
+                                command.operation_id,
+                                tick.index,
+                                false,
+                                Some(err),
+                            );
+                        }
                     }
                 }
+            } else if self.guard_violated(&command) {
+                // A held take re-checks what it was authorized for: a body
+                // edit adopted while it held is a refusal, never a take.
+                self.publish_outcome(
+                    command.operation_id,
+                    tick.index,
+                    false,
+                    Some(REFUSE_SELECTION_CHANGED.into()),
+                );
             } else if self.fresh_at(self.incoming(&command.verb), tick) == Some(true) {
                 self.stage();
                 let scenes = self.scenes.latest();
@@ -939,6 +1139,8 @@ impl SwitcherTickDriver {
             } else if self.pending_take.is_some() {
                 // One held take at a time; a PVW change would retarget it.
                 Err("a take is already held waiting for source prime".into())
+            } else if self.guard_violated(&command) {
+                Err(REFUSE_SELECTION_CHANGED.into())
             } else if let SwitcherVerb::Patch(set) = &command.verb {
                 match self.gate_patch(&command, set, tick, false) {
                     // Applied: the projection is unchanged by a patch.
@@ -1362,5 +1564,464 @@ impl SwitcherTickDriver {
             completed,
             error,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! #307 review A1: execution-bound authorization ([`SelectionGuard`]).
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use crate::switcher_inputs::MixerInputs;
+    use multiview_core::color::ColorInfo;
+    use multiview_core::layout::{Canvas, Cell};
+    use multiview_core::time::MediaTime;
+    use multiview_framestore::{NoSignalPolicy, TileThresholds};
+
+    fn store(id: &str) -> Arc<TileStore<Nv12Image>> {
+        let thresholds = TileThresholds::from_millis(500, 2_000, 10_000).unwrap();
+        let store = Arc::new(TileStore::new(id, thresholds, NoSignalPolicy::Slate));
+        store.publish(
+            Nv12Image::solid(
+                64,
+                64,
+                128,
+                128,
+                128,
+                ColorInfo::default().resolve_defaults(64, 64),
+            )
+            .unwrap(),
+            MediaTime::ZERO,
+        );
+        store
+    }
+
+    fn scene() -> Arc<Layout> {
+        Arc::new(Layout {
+            name: "bus".into(),
+            canvas: Canvas {
+                width: 64,
+                height: 64,
+                fps_num: 25,
+                fps_den: 1,
+            },
+            cells: vec![Cell {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+                source: Some("a".into()),
+                ..Cell::default()
+            }],
+        })
+    }
+
+    struct Rig {
+        handle: SwitcherControl,
+        driver: SwitcherTickDriver,
+        outcomes: EventSubscription<SwitcherOutcome>,
+        seen: Vec<SwitcherOutcome>,
+        next: u64,
+    }
+
+    impl Rig {
+        fn new(inputs: bool) -> Self {
+            let (program, preview) = if inputs {
+                (SourceRef::input(1), SourceRef::input(2))
+            } else {
+                (SourceRef::new("a"), SourceRef::new("b"))
+            };
+            let (handle, mut driver) =
+                SwitcherControl::new(SwitcherState::new(program, preview, vec![]));
+            driver.set_prime_stores(
+                ["a", "b", "secret"]
+                    .into_iter()
+                    .map(|id| (id.to_owned(), store(id)))
+                    .collect(),
+            );
+            driver.insert_prime_store("layout:wall", store("layout:wall"), 7);
+            if inputs {
+                driver.set_inputs(
+                    MixerInputs::new([
+                        (1, None, Some(SourceRef::new("a"))),
+                        (2, None, Some(SourceRef::new("b"))),
+                        (3, None, Some(SourceRef::new("layout:wall"))),
+                    ])
+                    .unwrap(),
+                );
+            }
+            handle
+                .set_scenes(ScenePair {
+                    version: 1,
+                    program: scene(),
+                    preview: scene(),
+                })
+                .unwrap();
+            let outcomes = handle.outcomes();
+            let mut rig = Self {
+                handle,
+                driver,
+                outcomes,
+                seen: Vec::new(),
+                next: 0,
+            };
+            rig.tick();
+            rig
+        }
+
+        fn send(&self, op: &str, verb: SwitcherVerb, expect: Option<SelectionGuard>) {
+            self.handle
+                .try_send(SwitcherCommand {
+                    operation_id: op.to_owned(),
+                    scene_version: 1,
+                    verb,
+                    expect,
+                })
+                .unwrap();
+        }
+
+        fn tick(&mut self) {
+            let tick = Tick {
+                index: self.next,
+                pts: MediaTime::ZERO,
+            };
+            self.next += 1;
+            self.driver.drain_at_tick(tick);
+            self.driver.commit_composed_tick(tick);
+        }
+
+        fn outcome(&mut self, op: &str) -> SwitcherOutcome {
+            while let Ok(event) = self.outcomes.try_recv() {
+                self.seen.push((*event.event).clone());
+            }
+            let index = self
+                .seen
+                .iter()
+                .position(|o| o.operation_id == op)
+                .unwrap_or_else(|| panic!("no outcome for {op}"));
+            self.seen.remove(index)
+        }
+
+        fn program(&self) -> String {
+            self.handle.snapshot().unwrap().program.as_str().to_owned()
+        }
+    }
+
+    fn preview_guard(source: &str, layout_revision: Option<u64>) -> SelectionGuard {
+        SelectionGuard {
+            preview: Some(SourceRef::new(source)),
+            target: None,
+            layout_revision,
+            member_revisions: Vec::new(),
+        }
+    }
+
+    fn target_guard(source: &str, layout_revision: Option<u64>) -> SelectionGuard {
+        SelectionGuard {
+            preview: None,
+            target: Some(SourceRef::new(source)),
+            layout_revision,
+            member_revisions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_guarded_cut_after_a_queued_preview_change_is_refused() {
+        let mut rig = Rig::new(false);
+        // Queued before the CUT: an unrestricted select of `secret`; the CUT
+        // was authorized against the old Preview `b`.
+        rig.send(
+            "pv",
+            SwitcherVerb::SelectPreview(SourceRef::new("secret")),
+            None,
+        );
+        rig.send("cut", SwitcherVerb::Cut, Some(preview_guard("b", None)));
+        rig.tick();
+        assert_eq!(rig.outcome("pv").error, None);
+        assert_eq!(
+            rig.outcome("cut").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+        assert_eq!(rig.program(), "a", "Program unchanged");
+        // A CUT authorized for the current Preview takes it.
+        rig.send(
+            "cut2",
+            SwitcherVerb::Cut,
+            Some(preview_guard("secret", None)),
+        );
+        rig.tick();
+        assert_eq!(rig.outcome("cut2").error, None);
+        assert_eq!(rig.program(), "secret");
+    }
+
+    #[test]
+    fn a_guarded_auto_after_a_queued_preview_change_is_refused() {
+        let mut rig = Rig::new(false);
+        rig.driver.advertise_auto();
+        rig.send(
+            "pv",
+            SwitcherVerb::SelectPreview(SourceRef::new("secret")),
+            None,
+        );
+        rig.send(
+            "auto",
+            SwitcherVerb::Auto(FrameCount::try_from(3).unwrap()),
+            Some(preview_guard("b", None)),
+        );
+        rig.tick();
+        assert_eq!(
+            rig.outcome("auto").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+        assert!(!rig.handle.snapshot().unwrap().in_flight);
+    }
+
+    #[test]
+    fn an_input_select_after_a_queued_repatch_of_that_input_is_refused() {
+        let mut rig = Rig::new(true);
+        // Input 2 is re-patched to `secret` before the select authorized for
+        // its old patch `b` lands.
+        rig.send(
+            "patch",
+            SwitcherVerb::Patch(PatchSet {
+                members: vec![(2, Some(SourceRef::new("secret")))],
+                allow_on_air: false,
+            }),
+            None,
+        );
+        rig.send(
+            "pgm",
+            SwitcherVerb::SelectProgram(SourceRef::input(2)),
+            Some(target_guard("b", None)),
+        );
+        rig.tick();
+        assert_eq!(rig.outcome("patch").error, None);
+        assert_eq!(
+            rig.outcome("pgm").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+        assert_eq!(rig.program(), "a");
+        // Preview select by input: same rule.
+        rig.send(
+            "pv",
+            SwitcherVerb::SelectPreview(SourceRef::input(3)),
+            Some(target_guard("b", None)),
+        );
+        rig.tick();
+        assert_eq!(
+            rig.outcome("pv").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+    }
+
+    #[test]
+    fn a_body_edit_between_authorization_and_execution_is_refused() {
+        let mut rig = Rig::new(false);
+        // Authorized against revision 7; the hook adopted revision 8 since.
+        rig.driver
+            .insert_prime_store("layout:wall", store("layout:wall"), 8);
+        rig.send(
+            "pv",
+            SwitcherVerb::SelectPreview(SourceRef::new("layout:wall")),
+            Some(target_guard("layout:wall", Some(7))),
+        );
+        rig.tick();
+        assert_eq!(
+            rig.outcome("pv").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+        rig.send(
+            "pv2",
+            SwitcherVerb::SelectPreview(SourceRef::new("layout:wall")),
+            Some(target_guard("layout:wall", Some(8))),
+        );
+        rig.tick();
+        assert_eq!(rig.outcome("pv2").error, None);
+        // A CUT authorized for revision 8 is refused after another edit.
+        rig.driver
+            .insert_prime_store("layout:wall", store("layout:wall"), 9);
+        rig.send(
+            "cut",
+            SwitcherVerb::Cut,
+            Some(preview_guard("layout:wall", Some(8))),
+        );
+        rig.tick();
+        assert_eq!(
+            rig.outcome("cut").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+        assert_eq!(rig.program(), "a");
+        rig.send(
+            "cut2",
+            SwitcherVerb::Cut,
+            Some(preview_guard("layout:wall", Some(9))),
+        );
+        rig.tick();
+        assert_eq!(rig.outcome("cut2").error, None);
+        assert_eq!(rig.program(), "layout:wall");
+    }
+
+    #[test]
+    fn a_held_take_rechecks_its_guard_when_replayed() {
+        let mut rig = Rig::new(false);
+        // A layout store with no frame yet: the select is held for prime.
+        let unprimed = Arc::new(TileStore::<Nv12Image>::with_defaults("layout:wall"));
+        rig.driver
+            .insert_prime_store("layout:wall", Arc::clone(&unprimed), 7);
+        rig.send(
+            "pgm",
+            SwitcherVerb::SelectProgram(SourceRef::new("layout:wall")),
+            Some(target_guard("layout:wall", Some(7))),
+        );
+        rig.tick();
+        assert!(rig.outcomes.try_recv().is_err(), "held, no outcome yet");
+        // The body is edited (revision 8) while it holds; then it primes.
+        let primed = store("layout:wall");
+        rig.driver
+            .insert_prime_store("layout:wall", Arc::clone(&primed), 8);
+        rig.tick();
+        assert_eq!(
+            rig.outcome("pgm").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+        assert_eq!(rig.program(), "a");
+    }
+
+    fn patch_guard(key: &str, revision: u64) -> SelectionGuard {
+        SelectionGuard {
+            member_revisions: vec![(SourceRef::new(key), revision)],
+            ..SelectionGuard::default()
+        }
+    }
+
+    fn patch_wall_to(input: u16) -> SwitcherVerb {
+        SwitcherVerb::Patch(PatchSet {
+            members: vec![(input, Some(SourceRef::new("layout:wall")))],
+            allow_on_air: true,
+        })
+    }
+
+    fn input_source(rig: &SwitcherTickDriver, input: u16) -> Option<String> {
+        rig.inputs
+            .as_ref()
+            .and_then(|table| table.source(input))
+            .map(|s| s.as_str().to_owned())
+    }
+
+    #[test]
+    fn a_patch_whose_layout_body_changed_is_refused_at_first_drain() {
+        let mut rig = Rig::new(true);
+        // Authorized against revision 7; revision 8 adopted since.
+        rig.driver
+            .insert_prime_store("layout:wall", store("layout:wall"), 8);
+        rig.send(
+            "patch",
+            patch_wall_to(1),
+            Some(patch_guard("layout:wall", 7)),
+        );
+        rig.tick();
+        assert_eq!(
+            rig.outcome("patch").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+        assert_eq!(input_source(&rig.driver, 1).as_deref(), Some("a"));
+        rig.send(
+            "patch2",
+            patch_wall_to(1),
+            Some(patch_guard("layout:wall", 8)),
+        );
+        rig.tick();
+        assert_eq!(rig.outcome("patch2").error, None);
+        assert_eq!(input_source(&rig.driver, 1).as_deref(), Some("layout:wall"));
+    }
+
+    #[test]
+    fn a_held_patch_whose_layout_body_changed_is_refused_at_replay() {
+        let mut rig = Rig::new(true);
+        let unprimed = Arc::new(TileStore::<Nv12Image>::with_defaults("layout:wall"));
+        rig.driver
+            .insert_prime_store("layout:wall", Arc::clone(&unprimed), 7);
+        rig.send(
+            "patch",
+            patch_wall_to(1),
+            Some(patch_guard("layout:wall", 7)),
+        );
+        rig.tick();
+        assert!(rig.outcomes.try_recv().is_err(), "held, no outcome yet");
+        // Edited (revision 8, new primed store) while held.
+        rig.driver
+            .insert_prime_store("layout:wall", store("layout:wall"), 8);
+        rig.tick();
+        assert_eq!(
+            rig.outcome("patch").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+        assert_eq!(input_source(&rig.driver, 1).as_deref(), Some("a"));
+        assert_eq!(rig.program(), "a");
+    }
+
+    #[test]
+    fn a_held_patch_with_an_unchanged_revision_applies_at_replay() {
+        let mut rig = Rig::new(true);
+        let unprimed = Arc::new(TileStore::<Nv12Image>::with_defaults("layout:wall"));
+        rig.driver
+            .insert_prime_store("layout:wall", Arc::clone(&unprimed), 7);
+        rig.send(
+            "patch",
+            patch_wall_to(1),
+            Some(patch_guard("layout:wall", 7)),
+        );
+        rig.tick();
+        assert!(rig.outcomes.try_recv().is_err(), "held, no outcome yet");
+        // The same body primes (same store, same revision).
+        unprimed.publish(
+            Nv12Image::solid(
+                64,
+                64,
+                128,
+                128,
+                128,
+                ColorInfo::default().resolve_defaults(64, 64),
+            )
+            .unwrap(),
+            MediaTime::ZERO,
+        );
+        rig.tick();
+        assert_eq!(rig.outcome("patch").error, None);
+        assert_eq!(input_source(&rig.driver, 1).as_deref(), Some("layout:wall"));
+    }
+
+    #[test]
+    fn unguarded_commands_are_unchecked() {
+        let mut rig = Rig::new(false);
+        rig.send(
+            "pv",
+            SwitcherVerb::SelectPreview(SourceRef::new("secret")),
+            None,
+        );
+        rig.send("cut", SwitcherVerb::Cut, None);
+        rig.tick();
+        assert_eq!(rig.outcome("cut").error, None);
+        assert_eq!(rig.program(), "secret");
+        // The default guard checks nothing either.
+        rig.send(
+            "pv2",
+            SwitcherVerb::SelectPreview(SourceRef::new("b")),
+            Some(SelectionGuard::default()),
+        );
+        rig.tick();
+        assert_eq!(rig.outcome("pv2").error, None);
+    }
+
+    #[test]
+    fn source_revisions_follow_insert_and_remove() {
+        let mut rig = Rig::new(false);
+        assert_eq!(rig.driver.source_revision("layout:wall"), Some(7));
+        rig.driver
+            .insert_prime_store("layout:wall", store("layout:wall"), 9);
+        assert_eq!(rig.driver.source_revision("layout:wall"), Some(9));
+        assert!(rig.driver.remove_prime_store("layout:wall"));
+        assert_eq!(rig.driver.source_revision("layout:wall"), None);
+        rig.tick();
     }
 }

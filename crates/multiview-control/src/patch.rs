@@ -88,7 +88,16 @@ pub async fn persist_inputs(
         return Ok(());
     }
     for input in &mut me.inputs {
-        if let Some(live) = table.inputs.iter().find(|live| live.number == input.number) {
+        // A stored layout patched to an input (#307, `layout:<id>`) is a
+        // runtime registration, not a configured source: the accepted
+        // document keeps that input's previous patch.
+        if let Some(live) = table.inputs.iter().find(|live| {
+            live.number == input.number
+                && !live
+                    .source
+                    .as_ref()
+                    .is_some_and(|s| s.as_str().starts_with("layout:"))
+        }) {
             input.video = live
                 .source
                 .as_ref()

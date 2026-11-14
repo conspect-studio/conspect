@@ -144,6 +144,7 @@ async fn attached_control_cut_changes_received_program_and_separate_pvw_monitor(
                 operation_id: "cut-cli".into(),
                 scene_version: 1,
                 verb: SwitcherVerb::Cut,
+                expect: None,
             })
             .unwrap();
         let done = tokio::time::timeout(Duration::from_secs(4), outcomes.recv())
@@ -313,6 +314,7 @@ async fn multi_cell_document_switcher_binds_the_synthesized_program_cell() {
             operation_id: "cut-wall".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         });
         let completed = tokio::time::timeout(Duration::from_secs(4), outcomes.recv())
             .await

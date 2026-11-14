@@ -2,7 +2,8 @@
 //!
 //! The clock hands each FRESH composed tick to the off-clock `routing-aux`
 //! thread through one non-blocking `try_send` into a capacity-4 channel, and
-//! only while some routed feed is active ([`AuxTickSender::active_flag`]).
+//! only while some routed feed is active ([`AuxTickSender::active_flag`]) or a
+//! stored layout is registered as an M/E source ([`AuxTickSender::me_layout_flag`]).
 //! A full or disconnected channel drops the tick and counts it: the clock never
 //! waits on the aux thread (invariants #1 and #10). See
 //! `docs/architecture/output-routing.md` §2.2 and §4.4.
@@ -35,6 +36,9 @@ pub struct AuxTick {
 pub struct AuxTickSender {
     tx: SyncSender<AuxTick>,
     active: Arc<AtomicBool>,
+    /// Raised while a stored layout is registered as an M/E source (#307):
+    /// the aux thread composes it even with no routed feed.
+    me_active: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
     sent: Arc<AtomicU64>,
 }
@@ -48,6 +52,7 @@ pub fn aux_tick_channel() -> (AuxTickSender, Receiver<AuxTick>) {
         AuxTickSender {
             tx,
             active: Arc::new(AtomicBool::new(false)),
+            me_active: Arc::new(AtomicBool::new(false)),
             dropped: Arc::new(AtomicU64::new(0)),
             sent: Arc::new(AtomicU64::new(0)),
         },
@@ -56,10 +61,10 @@ pub fn aux_tick_channel() -> (AuxTickSender, Receiver<AuxTick>) {
 }
 
 impl AuxTickSender {
-    /// Offer one tick: a relaxed flag check, then at most one `try_send`.
+    /// Offer one tick: two flag loads, then at most one `try_send`.
     /// Full or disconnected → the tick is dropped and counted.
     pub fn offer(&self, tick: AuxTick) {
-        if !self.active.load(Ordering::Acquire) {
+        if !self.active.load(Ordering::Acquire) && !self.me_active.load(Ordering::Acquire) {
             return;
         }
         match self.tx.try_send(tick) {
@@ -76,6 +81,21 @@ impl AuxTickSender {
     #[must_use]
     pub fn active_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.active)
+    }
+
+    /// The flag the M/E layout-source registry raises while any stored
+    /// layout is registered as an M/E source (#307).
+    #[must_use]
+    pub fn me_layout_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.me_active)
+    }
+
+    /// Replace the M/E layout flag with a shared one (the registry owns it
+    /// across runs). Call before the sender is cloned into the clock.
+    #[must_use]
+    pub fn with_me_layout_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.me_active = flag;
+        self
     }
 
     /// Ticks handed to the aux thread (zero while no routed feed is active).
@@ -180,5 +200,21 @@ mod tests {
         drop(rx);
         tx.offer(tick(11));
         assert_eq!(tx.dropped_counter().load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn the_me_layout_flag_alone_gates_sends() {
+        let (tx, rx) = aux_tick_channel();
+        tx.me_layout_flag().store(true, Ordering::Release);
+        tx.offer(tick(1));
+        assert_eq!(rx.try_recv().unwrap().index, 1);
+        tx.me_layout_flag().store(false, Ordering::Release);
+        tx.offer(tick(2));
+        assert!(rx.try_recv().is_err());
+        let shared = Arc::new(AtomicBool::new(true));
+        let tx = tx.with_me_layout_flag(Arc::clone(&shared));
+        tx.offer(tick(3));
+        assert_eq!(rx.try_recv().unwrap().index, 3);
+        assert_eq!(tx.sent_counter().load(Ordering::Relaxed), 2);
     }
 }

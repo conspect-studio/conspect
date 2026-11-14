@@ -112,6 +112,7 @@ fn real_paired_frames_gate_202_and_cut_waits_for_prime_then_persists() {
             operation_id: "cut1".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     for n in 1..6 {

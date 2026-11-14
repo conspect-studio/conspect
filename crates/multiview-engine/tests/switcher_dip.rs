@@ -134,6 +134,7 @@ impl Rig {
                 operation_id: op.into(),
                 scene_version: 1,
                 verb,
+                expect: None,
             })
             .unwrap();
     }
@@ -424,6 +425,7 @@ fn seed_bordered_wipe(handle: &SwitcherControl, rate: u32) {
                 operation_id: op.into(),
                 scene_version: 1,
                 verb,
+                expect: None,
             })
             .unwrap();
     }
@@ -498,6 +500,7 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
                     operation_id: op.clone(),
                     scene_version: 1,
                     verb,
+                    expect: None,
                 };
                 if handle.try_send(command).is_ok() {
                     accepted.lock().unwrap().push(op);
@@ -769,6 +772,7 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
                     operation_id: format!("rt-{n}"),
                     scene_version: 1,
                     verb,
+                    expect: None,
                 };
                 if handle.try_send(command).is_err() {
                     full.fetch_add(1, Ordering::Relaxed);

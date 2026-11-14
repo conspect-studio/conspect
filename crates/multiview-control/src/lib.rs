@@ -73,6 +73,7 @@ pub mod layout_projection;
 /// request-concurrency + rate middleware backing the control-plane `DoS` floor.
 pub(crate) mod limits;
 pub mod live_apply;
+pub mod me_layouts;
 pub mod moq;
 #[cfg(feature = "moq-transport")]
 pub mod moq_provider;
@@ -302,6 +303,17 @@ pub fn router_with(state: AppState, surface: Surface) -> Router {
             output_routing::spawn_outcome_relay(&state, control);
         }
         patch::spawn_persist_relay(&state);
+        if let (Some(registry), Some(control), Ok(runtime)) = (
+            state.me_layouts.as_ref(),
+            state.switcher.as_ref(),
+            tokio::runtime::Handle::try_current(),
+        ) {
+            runtime.spawn(switcher_events::sweep_me_layouts(
+                control.clone(),
+                std::sync::Arc::downgrade(registry),
+                switcher_events::ME_LAYOUT_SWEEP_INTERVAL,
+            ));
+        }
         if let Some(metrics) = state.program_metrics.as_ref() {
             program_metrics::spawn_sampler(metrics);
         }

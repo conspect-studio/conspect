@@ -98,6 +98,7 @@ async fn terminal_only_corr_and_dual_scope_survive_bounded_relay() {
             operation_id: "op1".into(),
             scene_version: 1,
             verb: SwitcherVerb::Auto(FrameCount::try_from(3).unwrap()),
+            expect: None,
         })
         .unwrap();
     for index in 0..3 {
