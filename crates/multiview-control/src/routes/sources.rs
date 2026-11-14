@@ -384,7 +384,11 @@ fn refuse_on_bus_media_edit(
 /// fill and key. Empty on a run with no switcher.
 pub(crate) fn switcher_bus_consumers(state: &AppState, id: &str) -> Vec<String> {
     let mut consumers = Vec::new();
-    if let Some(snapshot) = state.switcher.as_ref().and_then(|s| s.snapshot()) {
+    if let Some(snapshot) = state
+        .switcher
+        .as_ref()
+        .and_then(multiview_engine::switcher_control::SwitcherControl::snapshot)
+    {
         if snapshot.program.as_str() == id {
             consumers.push("program bus".to_owned());
         }
@@ -718,6 +722,7 @@ pub(crate) fn validate_source_body(
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to write.", body = crate::problem::Problem),
             (status = 404, description = "No source with that id.", body = crate::problem::Problem),
+            (status = 409, description = "On a switcher run: a media edit of a source on a bus (Program, Preview, or a downstream keyer's fill/key) is refused before it is stored; the detail names every such consumer. Take it off the bus first; policy-only edits apply live (issue #464).", body = crate::problem::Problem),
             (status = 412, description = "If-Match precondition failed.", body = crate::problem::Problem),
             (status = 422, description = "The body is not a valid source document (detail names the field path).", body = crate::problem::Problem),
         ),

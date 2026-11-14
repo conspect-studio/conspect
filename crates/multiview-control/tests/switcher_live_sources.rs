@@ -24,10 +24,10 @@ use multiview_control::{
     StopRefusal,
 };
 use multiview_core::switcher::SourceRef;
+use multiview_core::time::MediaTime;
 use multiview_engine::clock::Tick;
 use multiview_engine::switcher::SwitcherState;
 use multiview_engine::switcher_control::SwitcherControl;
-use multiview_core::time::MediaTime;
 use serde_json::json;
 use support::{body_json, etag, get, harness_with, post_json, put_json, send, OPERATOR_TOKEN};
 
@@ -208,10 +208,7 @@ async fn live_source_switcher_media_edit_on_a_bus_is_refused_naming_the_bus() {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT, "{id}");
-        let detail = body_json(resp).await["detail"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let detail = body_json(resp).await["detail"].as_str().unwrap().to_owned();
         assert!(detail.contains(consumer), "{id}: {detail}");
         assert_eq!(upserts(&mut rig, id), 0, "{id}: nothing enqueued");
         // Nothing was stored: the old URL is still the accepted document.

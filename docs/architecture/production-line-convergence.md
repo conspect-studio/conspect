@@ -53,6 +53,9 @@ switcher audio selection in the bake consumer.
   through the `DemandManager` (catalogue upsert + `restart`), which already
   prevents a stale rail. The removal-time pixel retirement it introduced is kept
   (`clear_on_remove`, switcher runs only). See PR Concerns.
+  (Later: 3dcc363d restored the fence for every live upsert on a switcher
+  run, which also refused NEW sources; issue #464 replaced it — see
+  [switcher-live-sources.md](switcher-live-sources.md).)
 - 654648c9: `drive_selected_audio_for_item` catches up shed ticks under the
   prior selection before applying the survivor's selection; stale items never
   change gains.

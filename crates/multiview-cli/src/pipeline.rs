@@ -11574,7 +11574,9 @@ impl LiveIngestSpawner {
         let unchanged = {
             let current = self.live_bus_stores.load();
             match store {
-                Some(store) => current.get(id).is_some_and(|known| Arc::ptr_eq(known, store)),
+                Some(store) => current
+                    .get(id)
+                    .is_some_and(|known| Arc::ptr_eq(known, store)),
                 None => !current.contains_key(id),
             }
         };
@@ -26667,8 +26669,15 @@ segment_ms = 1000
         );
         let retained = rails.store("cam1").expect("boot store exists");
         retained.publish(
-            Nv12Image::solid(16, 16, 200, 128, 128, multiview_core::color::ColorInfo::default().resolve_defaults(16, 16))
-                .expect("frame"),
+            Nv12Image::solid(
+                16,
+                16,
+                200,
+                128,
+                128,
+                multiview_core::color::ColorInfo::default().resolve_defaults(16, 16),
+            )
+            .expect("frame"),
             MediaTime::from_nanos(0),
         );
         assert!(retained.read_at(MediaTime::from_nanos(0)).frame().is_some());
@@ -26679,7 +26688,11 @@ segment_ms = 1000
             retained.read_at(MediaTime::from_nanos(0)).frame().is_none(),
             "the old media is retired before the new definition is catalogued"
         );
-        assert_ne!(live_lifecycle("cam1"), before, "a detached old writer is fenced");
+        assert_ne!(
+            live_lifecycle("cam1"),
+            before,
+            "a detached old writer is fenced"
+        );
         // The catalogue keeps the entry; the hub's upsert replaces it.
         assert!(rails.store("cam1").is_some());
         guarded.source_removed("cam1");
@@ -26699,7 +26712,10 @@ segment_ms = 1000
         let _manager = pipeline.demand();
         let mut guarded = pipeline.live_spawner();
         guarded.clear_on_remove = true;
-        assert!(!guarded.invalidate_live_edit("fresh"), "a new id is never refused");
+        assert!(
+            !guarded.invalidate_live_edit("fresh"),
+            "a new id is never refused"
+        );
         let source: Source = serde_json::from_value(
             serde_json::json!({"id": "fresh", "kind": "hls", "url": "http://[::1]:9/f.m3u8"}),
         )

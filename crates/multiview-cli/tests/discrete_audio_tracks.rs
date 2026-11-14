@@ -527,13 +527,15 @@ async fn master_resolves_playable_distinct_audio_only_renditions() {
 
 #[tokio::test]
 async fn tracks_mode_muxes_a_discrete_track_into_every_segment() {
-    assert_two_audio_streams("[outputs.audio]\nmode = \"tracks\"\ntracks = [\"prog\", \"au-abc\"]")
-        .await;
+    Box::pin(assert_two_audio_streams(
+        "[outputs.audio]\nmode = \"tracks\"\ntracks = [\"prog\", \"au-abc\"]",
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn auto_mode_carries_program_plus_every_declared_track() {
-    assert_two_audio_streams("[outputs.audio]\nmode = \"auto\"").await;
+    Box::pin(assert_two_audio_streams("[outputs.audio]\nmode = \"auto\"")).await;
 }
 
 #[tokio::test]
