@@ -265,8 +265,12 @@ clock"). The cost came from two places. The output clock thread cloned the whole
 - **Counters.** `overlays::caption_burn_stats()` counts `text_truncated` (exactly once per cut cue),
   `bitmap_refused` and `text_rasters` (cache misses). A cue's identity is the cue store's per-cue
   publish sequence, which is new for every published cue, including a same-window replacement or a cue
-  after a generation change. For the sidecar, the identity is the track index. A held cue is never
-  re-counted.
+  after a generation change. For the sidecar, the identity is the track index. The tally remembers the
+  last 64 distinct cut-cue identities, not only the last one. A held cue, or an overlapping cue that
+  resurfaces (A, a newer B, then A again), is therefore never re-counted. A cue is recounted only if more
+  than 64 other cut cues were counted between two of its appearances. For a native store that needs more
+  than 64 retained overlapping cues; the default store retains 16. Per sample, the tally scans at most 64
+  `u64`s.
 - **Chaos test.** `pipeline::caption_burnin_chaos` runs a displayed captioned source with 8 KiB and
   64 KiB cues changing every 100 ms. It asserts that the run succeeds (never behind the clock), that at
   most 1 % of ticks are shed, that video PTS steps are tick-exact, and that the truncation counter is

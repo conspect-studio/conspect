@@ -22674,6 +22674,52 @@ mod live_overlay_bake_tests {
         assert!(ctx.sidecar_caption_lines("other", at(1_500)).is_none());
     }
 
+    /// Issue #430 (MED2-1): overlapping cut sidecar cues count once each,
+    /// however the newest-active selection alternates between them.
+    #[test]
+    fn sidecar_overlapping_cut_cues_count_once_each() {
+        let pad = "z".repeat(8 * 1024);
+        let probe = |srt: String, samples: &[i64]| {
+            let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+            let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+            let mut ctx = bake_context(&slot);
+            ctx.subtitles = Some(multiview_overlay::subtitle::CueTrack::parse_srt(&srt).unwrap());
+            ctx.sidecar_target = Some("in_a".to_owned());
+            ctx.sidecar_truncated = crate::overlays::TruncationTally::with_stats(stats);
+            let seen: Vec<String> = samples
+                .iter()
+                .map(|s| {
+                    let at = multiview_core::time::MediaTime::from_nanos(s * 1_000_000_000);
+                    let lines = ctx.sidecar_caption_lines("in_a", at).unwrap();
+                    lines.first().unwrap().get(..1).unwrap().to_owned()
+                })
+                .collect();
+            (seen, stats.text_truncated())
+        };
+        // A = [0, 10) s, B = [2, 3) s: samples 1, 2, 4 select A, B, A.
+        let (seen, count) = probe(
+            format!(
+                "1\n00:00:00,000 --> 00:00:10,000\nA {pad}\n\n\
+                 2\n00:00:02,000 --> 00:00:03,000\nB {pad}\n"
+            ),
+            &[1, 2, 4],
+        );
+        assert_eq!(seen, ["A", "B", "A"]);
+        assert_eq!(count, 2, "A, B, A is two cut cues");
+        // An older overlapping cue first surfaces after the newer one ends:
+        // A = [0, 10) and B = [0, 5) (equal starts: the later one in the
+        // document wins until it ends).
+        let (seen, count) = probe(
+            format!(
+                "1\n00:00:00,000 --> 00:00:10,000\nA {pad}\n\n\
+                 2\n00:00:00,000 --> 00:00:05,000\nB {pad}\n"
+            ),
+            &[1, 2, 6, 7, 3, 8],
+        );
+        assert_eq!(seen, ["B", "B", "A", "A", "B", "A"]);
+        assert_eq!(count, 2, "B then the exposed A, each once");
+    }
+
     /// One streamed tick over a uniform dark canvas.
     fn item(tick_index: u64) -> StreamItem {
         let tag = CanvasColor::default().output_tag();

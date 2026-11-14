@@ -1892,6 +1892,55 @@ input_id = "cam_b"
         .unwrap()
     }
 
+    /// Issue #430 (MED2-1): overlapping cut cues count once each, however
+    /// the newest-active selection alternates between them.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn cue_store_source_counts_overlapping_cut_cues_once_each() {
+        use multiview_overlay::CueSource as _;
+        let window = |tag: &str, start: i64, end: i64| {
+            let CaptionCue::Text { text, .. } = hostile_cue(tag, start) else {
+                panic!("text cue");
+            };
+            CaptionCue::try_text(
+                MediaTime::from_nanos(start),
+                MediaTime::from_nanos(end),
+                text.lines,
+                None,
+            )
+            .unwrap()
+        };
+        let probe = |cues: Vec<CaptionCue>, samples: &[i64]| {
+            let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+            let store = Arc::new(CueStore::new());
+            for cue in cues {
+                store.publish(cue.start(), cue.end(), cue);
+            }
+            let source = CueStoreSource::with_tally(
+                store,
+                crate::overlays::TruncationTally::with_stats(stats),
+            );
+            let mut seen = Vec::new();
+            for &t in samples {
+                let cue = source.active_at(MediaTime::from_nanos(t)).unwrap();
+                seen.push(cue.lines.first().unwrap().get(..2).unwrap().to_owned());
+            }
+            (seen, stats.text_truncated())
+        };
+        // A = [0, 10), B = [2, 3): samples 1, 2, 4 select A, B, A.
+        let (seen, count) = probe(vec![window("A", 0, 10), window("B", 2, 3)], &[1, 2, 4]);
+        assert_eq!(seen, ["cA", "cB", "cA"]);
+        assert_eq!(count, 2, "A, B, A is two cut cues");
+        // An older overlapping cue first surfaces after the newer one ends:
+        // A = [0, 10) published, then B = [0, 5) (newest wins until 5).
+        let (seen, count) = probe(
+            vec![window("A", 0, 10), window("B", 0, 5)],
+            &[1, 2, 6, 7, 3, 8],
+        );
+        assert_eq!(seen, ["cB", "cB", "cA", "cA", "cB", "cA"]);
+        assert_eq!(count, 2, "B then the exposed A, each once");
+    }
+
     /// Issue #430: the clock-thread text projection the burn-in path samples
     /// is bounded (inspection + output).
     #[cfg(feature = "overlay")]
