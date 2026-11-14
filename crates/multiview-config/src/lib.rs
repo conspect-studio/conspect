@@ -158,8 +158,10 @@ pub use schema::{
     SrtOptions,
 };
 pub use switcher::{
-    MixEffectsConfig, MixerInput, MixerInputVideo, SwitcherConfig, INPUT_REF_PREFIX,
-    MAX_MIXER_INPUTS,
+    keyer_cost, DownstreamKeyerConfig, KeyerLossPolicy, KeyerLossTrigger, KeyerRect, KeyerSize,
+    KeyerType, MixEffectsConfig, MixerInput, MixerInputVideo, SwitcherConfig, DEFAULT_KEYER_BUDGET,
+    DEFAULT_KEYER_RATE, DSK_FOLD, INPUT_REF_PREFIX, KEYER_UPLOAD_WEIGHT, MAX_DOWNSTREAM_KEYERS,
+    MAX_KEYER_RATE, MAX_MIXER_INPUTS, MIN_KEYER_FLY,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
@@ -1481,6 +1483,13 @@ impl MultiviewConfig {
                 .first()
                 .map_or(ProgramId::MAIN, |p| p.id.as_str());
             switcher.validate(&sources, &[program_id])?;
+            // ADR-0113 §9: keyers are admitted at definition, on this canvas.
+            switcher.validate_keyers(
+                &sources,
+                &[program_id],
+                self.canvas.width,
+                self.canvas.height,
+            )?;
         }
         Ok(())
     }
@@ -1764,8 +1773,23 @@ impl MultiviewConfig {
             .switcher
             .as_ref()
             .is_some_and(|s| !s.mix_effects.is_empty());
+        let defines_dsk = self
+            .switcher
+            .as_ref()
+            .is_some_and(SwitcherConfig::defines_dsk);
         match &video {
             VideoFeed::Bus(OutputBus::Program) => {}
+            // ADR-0113 / slice K2a: with a downstream keyer defined, Program
+            // carries DSK pixels, so Clean can no longer alias it, and the
+            // pre-DSK Clean compositor is slice K2b. Refuse at boot rather
+            // than route DSK pixels as "clean".
+            VideoFeed::Bus(OutputBus::Clean) if defines_dsk => {
+                return Err(ConfigError::Validation(format!(
+                    "output {:?} selects Clean, which is unavailable while a downstream keyer \
+                     is defined (clean-unavailable-with-dsk; pre-DSK Clean is not built yet)",
+                    xp.output
+                )));
+            }
             VideoFeed::Bus(_) => {
                 if !has_me {
                     return Err(ConfigError::Validation(format!(

@@ -4362,6 +4362,8 @@ input_id = "in_b"
                 program_input: None,
                 preview_input: None,
             }],
+            downstream_keyers: vec![],
+            keyer_budget: None,
             extra: serde_json::Map::new(),
         });
         let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
