@@ -15,7 +15,6 @@
 )] // Test fixtures: scene layers are named A, B, K, U, D as in ADR-0113 §2.
 
 use multiview_compositor::blend::{over, LinearRgba, PremulRgba};
-use multiview_compositor::key::luma_matte;
 use multiview_compositor::pipeline::{
     canvas_linear_to_output_yuv, composite_reference, composite_with, composite_with_threads,
     tile_yuv_to_canvas_linear, AlphaPlanePool, CanvasColor, Nv12Image, Tile,
@@ -101,6 +100,50 @@ fn yuv(img: &Nv12Image, x: u32, y: u32) -> [u8; 3] {
     [a, b, c]
 }
 
+// --- test-local scalar oracles (never the production helpers) ----------------
+
+/// `clamp((y − clip) × gain, 0, 1)` written out here, independent of
+/// `key::luma_matte`.
+fn matte(y: f32, clip: f32, gain: f32) -> f32 {
+    ((y - clip) * gain).clamp(0.0, 1.0)
+}
+
+/// Component-wise `out × (1 − t) + inc × t` on premultiplied values.
+fn lerp_px(out: PremulRgba, inc: PremulRgba, t: f32) -> PremulRgba {
+    PremulRgba {
+        r: out.r * (1.0 - t) + inc.r * t,
+        g: out.g * (1.0 - t) + inc.g * t,
+        b: out.b * (1.0 - t) + inc.b * t,
+        a: out.a * (1.0 - t) + inc.a * t,
+    }
+}
+
+/// The ADR-0113 §2 merge written out per pixel: MIX `lerp(out, in, p)`, DIP
+/// `lerp(lerp(out, colour, d), in, i)` with an opaque colour.
+fn merge_px(m: SceneMerge, out: PremulRgba, inc: PremulRgba) -> PremulRgba {
+    match m {
+        SceneMerge::Mix { p } => lerp_px(out, inc, p),
+        SceneMerge::Dip { colour, d, i } => {
+            let c = PremulRgba {
+                r: colour.r,
+                g: colour.g,
+                b: colour.b,
+                a: 1.0,
+            };
+            lerp_px(lerp_px(out, c, d), inc, i)
+        }
+        _ => panic!("K1 builds MIX and DIP"),
+    }
+}
+
+/// Encode within one code value (the merge is f32 arithmetic in another
+/// association order than the kernel's fused multiply-adds).
+fn assert_close(got: [u8; 3], want: [u8; 3], what: &str) {
+    for (g, w) in got.iter().zip(want) {
+        assert!(g.abs_diff(w) <= 1, "{what}: {got:?} vs {want:?}");
+    }
+}
+
 #[test]
 fn a_linear_self_key_uses_the_fill_alpha_once() {
     // A 0.5 alpha fill keyed linearly composes as 0.5 coverage, never 0.25.
@@ -178,7 +221,7 @@ fn a_luma_self_key_applies_clip_gain_and_invert() {
     ] {
         let fill = solid(4, 4, y8, 128, 128, c);
         let ynorm = (f32::from(y8) - 16.0) / 219.0;
-        let m = luma_matte(ynorm, clip, gain);
+        let m = matte(ynorm, clip, gain);
         let m = if invert { 1.0 - m } else { m };
         let keyed = comp(
             4,
@@ -320,7 +363,10 @@ proptest! {
         a in -0.2_f32..1.2, b in -0.2_f32..1.2, clip in -0.5_f32..1.5, gain in -2.0_f32..50.0,
     ) {
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let (mlo, mhi) = (luma_matte(lo, clip, gain), luma_matte(hi, clip, gain));
+        let (mlo, mhi) = (
+            multiview_compositor::key::luma_matte(lo, clip, gain),
+            multiview_compositor::key::luma_matte(hi, clip, gain),
+        );
         prop_assert!(mlo <= mhi);
         prop_assert!((0.0..=1.0).contains(&mlo) && (0.0..=1.0).contains(&mhi));
     }
@@ -357,12 +403,15 @@ fn an_opaque_key_going_on_mixes_exactly() {
     );
     let pa = premul(lin(&a, 0, 0), 1.0);
     let pk = premul(lin(&k, 0, 0), 1.0);
-    assert_eq!(yuv(&out, 1, 1), encode(m.apply(pa, over(pk, pa))));
-    assert_eq!(
-        yuv(&out, 5, 1),
-        encode(m.apply(pa, pa)),
-        "outside the key: A"
+    assert_close(
+        yuv(&out, 1, 1),
+        encode(merge_px(m, pa, over(pk, pa))),
+        "under the key",
     );
+    // Independent of the merge: 0.5·K + 0.5·A under an opaque key.
+    let half = lerp_px(pa, pk, 0.5);
+    assert_close(yuv(&out, 1, 1), encode(half), "0.5·K + 0.5·A");
+    assert_close(yuv(&out, 5, 1), encode(pa), "outside the key: A");
 }
 
 #[test]
@@ -385,16 +434,16 @@ fn a_background_and_key_transition_merges_both_scenes() {
                     .in_group(scene(SceneMember::In, m)),
             ],
         );
-        let km = luma_matte((30.0 - 16.0) / 219.0, 0.0, 1.0);
+        let km = matte((30.0 - 16.0) / 219.0, 0.0, 1.0);
         let (pa, pb, pk) = (
             premul(lin(&a, 0, 0), 1.0),
             premul(lin(&b, 0, 0), 1.0),
             premul(lin(&k, 0, 0), km),
         );
-        assert_eq!(
+        assert_close(
             yuv(&on, 0, 0),
-            encode(m.apply(pa, over(pk, pb))),
-            "on p={p}"
+            encode(merge_px(m, pa, over(pk, pb))),
+            &format!("on p={p}"),
         );
         let off = comp(
             4,
@@ -407,10 +456,10 @@ fn a_background_and_key_transition_merges_both_scenes() {
                 Tile::placed(&a, 0, 0, 1.0).in_group(scene(SceneMember::In, m)),
             ],
         );
-        assert_eq!(
+        assert_close(
             yuv(&off, 0, 0),
-            encode(m.apply(over(pk, pb), pa)),
-            "off p={p}"
+            encode(merge_px(m, over(pk, pb), pa)),
+            &format!("off p={p}"),
         );
     }
 }
@@ -442,12 +491,12 @@ fn unarmed_keys_below_and_above_and_a_dsk_fold_in_the_right_place() {
         ],
     );
     let base = over(premul(lin(&u1, 0, 0), 0.5), premul(lin(&a, 0, 0), 1.0));
-    let merged = m.apply(base, over(premul(lin(&k, 0, 0), 0.8), base));
+    let merged = merge_px(m, base, over(premul(lin(&k, 0, 0), 0.8), base));
     let top = over(
         premul(lin(&d, 0, 0), 0.6),
         over(premul(lin(&u2, 0, 0), 0.4), merged),
     );
-    assert_eq!(yuv(&out, 2, 2), encode(top));
+    assert_close(yuv(&out, 2, 2), encode(top), "U1, K merged, U2, D");
 }
 
 #[test]
@@ -472,15 +521,85 @@ fn a_dip_merge_colours_every_pixel_even_where_no_tile_lies() {
                 .in_group(scene(SceneMember::In, m)),
         ],
     );
+    // With d = 1 the outgoing scene is fully replaced by the colour, so an
+    // uncovered pixel is exactly 0.5·colour + 0.5·background (both scenes
+    // there are the black background).
+    let c = PremulRgba {
+        r: 0.2,
+        g: 0.05,
+        b: 0.6,
+        a: 1.0,
+    };
     let bg = BLACK.premultiplied();
-    assert_eq!(
+    assert_close(
         yuv(&out, 6, 2),
-        encode(m.apply(bg, bg)),
-        "uncovered pixel dips too"
+        encode(lerp_px(c, bg, 0.5)),
+        "uncovered pixel dips too",
     );
     let pa = premul(lin(&a, 0, 0), 1.0);
     let pk = premul(lin(&k, 0, 0), 1.0);
-    assert_eq!(yuv(&out, 1, 1), encode(m.apply(pa, over(pk, pa))));
+    assert_close(
+        yuv(&out, 1, 1),
+        encode(lerp_px(c, pk, 0.5)),
+        "K over A at i",
+    );
+    assert_close(
+        yuv(&out, 1, 1),
+        encode(merge_px(m, pa, over(pk, pa))),
+        "merge formula",
+    );
+}
+
+#[test]
+fn a_dip_merge_before_the_switch_point_runs_the_outgoing_leg() {
+    // First leg: d = 0.25, i = 0 — out towards the colour, incoming unseen.
+    let c = bt709(ColorRange::Limited);
+    let a = solid(4, 4, 150, 110, 140, c);
+    let k = solid(4, 4, 40, 180, 90, c);
+    let m = SceneMerge::Dip {
+        colour: LinearRgba::opaque(0.7, 0.1, 0.1),
+        d: 0.25,
+        i: 0.0,
+    };
+    let out = comp(
+        4,
+        4,
+        &[
+            Tile::placed(&a, 0, 0, 1.0).in_group(scene(SceneMember::Out, m)),
+            Tile::placed(&k, 0, 0, 1.0).in_group(scene(SceneMember::In, m)),
+        ],
+    );
+    let pa = premul(lin(&a, 0, 0), 1.0);
+    let col = PremulRgba {
+        r: 0.7,
+        g: 0.1,
+        b: 0.1,
+        a: 1.0,
+    };
+    assert_close(
+        yuv(&out, 1, 1),
+        encode(lerp_px(pa, col, 0.25)),
+        "0.75·A + 0.25·colour",
+    );
+}
+
+#[test]
+fn a_nan_weight_reads_as_zero_and_never_poisons_the_layers_beneath() {
+    let c = bt709(ColorRange::Limited);
+    let bg = solid(4, 4, 140, 100, 160, c);
+    let k = solid(4, 4, 220, 128, 128, c);
+    let base = comp(4, 4, &[Tile::placed(&bg, 0, 0, 1.0)]);
+    for key in [TileKey::linear(), TileKey::luma(0.1, 2.0)] {
+        let out = comp(
+            4,
+            4,
+            &[
+                Tile::placed(&bg, 0, 0, 1.0),
+                Tile::placed(&k, 0, 0, f32::NAN).with_key(key),
+            ],
+        );
+        assert_eq!(out, base, "NaN-weight keyer contributes nothing");
+    }
 }
 
 #[test]
@@ -585,4 +704,63 @@ fn grouped_composites_reuse_the_pooled_scene_accumulators() {
         warm,
         "no growth after warmup"
     );
+}
+
+#[test]
+fn keys_and_groups_across_band_boundaries_match_the_oracle_on_every_thread_count() {
+    // 320x256 is above the parallel threshold, so 2-4 threads really split the
+    // canvas into bands; the keyed and grouped tiles straddle band edges.
+    let c = bt709(ColorRange::Limited);
+    let (w, h) = (320_u32, 256_u32);
+    let a = varied(w, h, 3, c);
+    let b = varied(w, h, 4, c);
+    let fill = varied(64, 48, 5, c);
+    let key = varied(80, 40, 6, bt709(ColorRange::Full));
+    for (merge, p) in [
+        (SceneMerge::Mix { p: 0.4 }, 0.4_f32),
+        (
+            SceneMerge::Dip {
+                colour: LinearRgba::opaque(0.1, 0.3, 0.2),
+                d: 1.0,
+                i: 0.3,
+            },
+            0.3,
+        ),
+    ] {
+        let tiles = [
+            Tile::placed(&a, 0, 0, 1.0).in_group(scene(SceneMember::Out, merge)),
+            Tile::placed(&b, 0, 0, 1.0).in_group(scene(SceneMember::In, merge)),
+            Tile::scaled(&fill, 40, 60, 200, 150, 0.9)
+                .with_key(TileKey::luma(0.1, 3.0).with_source(&key).masked(KeyMask {
+                    x: 4,
+                    y: 2,
+                    w: 50,
+                    h: 40,
+                }))
+                .in_group(scene(SceneMember::In, merge)),
+            Tile::scaled(&fill, 100, 20, 128, 220, p).with_key(TileKey::linear().with_source(&key)),
+        ];
+        let oracle = composite_reference(w, h, canvas(), BLACK, &tiles, true).unwrap();
+        let backend = RunBackend::cpu();
+        for threads in 1..=4 {
+            let fast = backend
+                .composite_with_thread_count(w, h, canvas(), BLACK, &tiles, threads)
+                .unwrap();
+            assert_eq!(fast, oracle, "threads={threads}");
+        }
+        assert!(backend.band_count() >= 2, "the parallel band path ran");
+        let warm = backend.scratch_alloc_count();
+        for _ in 0..5 {
+            drop(
+                backend
+                    .composite_with_thread_count(w, h, canvas(), BLACK, &tiles, 4)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            backend.scratch_alloc_count(),
+            warm,
+            "no growth after warmup"
+        );
+    }
 }

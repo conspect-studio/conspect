@@ -8,7 +8,10 @@
 
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::pipeline::{composite, CanvasColor, Nv12Image, Tile};
-use multiview_compositor::{Error, GpuCompositor, GpuTarget, RunBackend, RunBackendKind, TileKey};
+use multiview_compositor::{
+    Error, GpuCompositor, GpuTarget, RunBackend, RunBackendKind, SceneMember, SceneMerge,
+    TileGroup, TileKey,
+};
 use multiview_core::color::{
     ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
 };
@@ -53,4 +56,38 @@ fn a_keyed_frame_is_composed_on_the_cpu_until_the_gpu_key_path_lands() {
     let oracle = composite(16, 8, CanvasColor::default(), black, &tiles).unwrap();
     assert_eq!(out, oracle);
     assert_eq!(backend.gpu_cpu_fallback_frames(), 1);
+
+    // Repeated keyed and grouped frames reuse the persistent fallback's LUTs
+    // and band/scene scratch: no growth after warmup (review I1/A1).
+    let m = SceneMerge::Mix { p: 0.5 };
+    let grouped = [
+        Tile::placed(&bg, 0, 0, 1.0).in_group(TileGroup::Scene {
+            member: SceneMember::Both,
+            merge: m,
+        }),
+        Tile::placed(&fill, 4, 0, 1.0)
+            .with_key(TileKey::luma(0.1, 2.0))
+            .in_group(TileGroup::Scene {
+                member: SceneMember::In,
+                merge: m,
+            }),
+    ];
+    drop(
+        backend
+            .composite(16, 8, CanvasColor::default(), black, &grouped)
+            .unwrap(),
+    );
+    let (scratch, luts) = (backend.scratch_alloc_count(), backend.lut_build_count());
+    assert!(scratch > 0, "the fallback's pool is the counted one");
+    for i in 0..20 {
+        let frame = if i % 2 == 0 { &tiles[..] } else { &grouped[..] };
+        drop(
+            backend
+                .composite(16, 8, CanvasColor::default(), black, frame)
+                .unwrap(),
+        );
+    }
+    assert_eq!(backend.scratch_alloc_count(), scratch, "no scratch growth");
+    assert_eq!(backend.lut_build_count(), luts, "no LUT rebuilds");
+    assert_eq!(backend.gpu_cpu_fallback_frames(), 22);
 }

@@ -213,6 +213,17 @@ impl TileGroup {
     }
 }
 
+/// `true` when any tile is keyed or scene-grouped: such a frame is composed
+/// on the CPU reference until the GPU key path lands (after #395). A scan
+/// with no allocation, so the run backend can route the frame before it
+/// builds a GPU refusal.
+#[must_use]
+pub fn needs_cpu_keyer_path(tiles: &[crate::pipeline::Tile<'_>]) -> bool {
+    tiles
+        .iter()
+        .any(|t| t.key.is_some() || t.group != TileGroup::Top)
+}
+
 /// Clamp to `[0, 1]`, mapping NaN to 0 so a bad weight can never poison a
 /// pixel.
 #[must_use]

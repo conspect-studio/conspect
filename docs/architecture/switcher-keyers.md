@@ -484,15 +484,22 @@ keyers.
 - **Deviation: WIPE merge and the GPU key path are not in K1.** `SceneMerge::Wipe` lands with K3 on
   top of lane `transitions`' mask. The WGSL key path (`key_params`, binding 6) is not merged before
   #395. Until it is, `GpuCompositor` refuses a frame with a keyed or grouped tile with a typed
-  `GpuLimit`, and `RunBackend` composes that frame on the CPU reference (counted in
-  `gpu_cpu_fallback_frames`); it is never drawn without its key. ADR-0113 §9 already bounds this:
+  `GpuLimit`, and `RunBackend` routes a keyed or grouped frame (an allocation-free scan, before
+  any GPU work) to a **persistent** CPU reference owned by the GPU compositor, whose LUT cache and
+  band/scene scratch survive across ticks (counted in `gpu_cpu_fallback_frames`; its pool is what
+  `scratch_alloc_count` reports on a GPU backend). It is never drawn without its key. A genuine
+  GPU failure falls back through the same persistent backend. ADR-0113 §9 already bounds this:
   the default budget is 1 full-canvas DSK until the mda001 run passes.
-- Tests: `tests/keyers_cpu.rs` (17: goldens for linear self key with alpha used once, linear key
+- Tests: `tests/keyers_cpu.rs` (20: goldens for linear self key with alpha used once, linear key
   source, luma clip/gain/invert, luma on a key source, mask with a flying key, unequal fill/key
   sizes up and down, mixed ranges, premultiply-once after primaries, weight; a monotonic and
   bounded clip/gain property; exact MIX and DIP scene merges against an independent per-pixel
-  computation; the tile-driven kernel equal to the oracle with keys and groups at 1-4 threads; no
-  scratch growth over 50 grouped composites) and `tests/keyers_gpu_fallback.rs` (`wgpu`).
+  computation written out in the test (never the production helpers), both DIP legs; a NaN weight
+  reads as 0; the tile-driven kernel equal to the oracle with keys and groups at 1-4 threads, on a
+  small canvas (proptest) and on a 320x256 canvas above the parallel threshold with tiles across
+  band edges; no scratch growth over 50 grouped composites) and `tests/keyers_gpu_fallback.rs`
+  (`wgpu`: the refusal, the oracle-equal fallback, and no scratch growth or LUT rebuild over 20
+  repeated keyed and grouped fallback frames).
 - Bench: `examples/keyer_composite_bench.rs`. CPU figures from a shared 56-core devcontainer (not
   the target host; median ms at 1080p): 0 keyers 30.0, 1 full-canvas alpha DSK 41.1, 2 full-canvas
   keyers 54.5, 2 flying 576x324 31.2, 1080p source in a 128x72 fly 27.6, key-changing MIX + DSK

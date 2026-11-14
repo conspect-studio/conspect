@@ -1825,7 +1825,9 @@ fn tile_pixel(
         Some(lut) => lut.tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?,
         None => tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?,
     };
-    let mut a = tile.opacity.clamp(0.0, 1.0) * tile_alpha(tile.image, sx, sy);
+    // `unit` maps a NaN opacity (a keyer's weight rides it) to 0, so a bad
+    // weight never poisons the layers beneath; finite values clamp as before.
+    let mut a = crate::key::unit(tile.opacity) * tile_alpha(tile.image, sx, sy);
     if let Some(key) = &tile.key {
         // Post-range-expand fill Y (pipeline step 1) for a luma self key.
         let fill_y = range::expand_luma(y8, range::require_resolved(tile.image.color().range)?);

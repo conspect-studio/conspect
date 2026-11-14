@@ -86,6 +86,12 @@ pub struct GpuCompositor {
     /// Frames the run backend re-composited on the CPU after a genuine GPU
     /// failure (observability; see `RunBackend::gpu_cpu_fallback_frames`).
     cpu_fallback_frames: std::sync::atomic::AtomicU64,
+    /// The persistent CPU reference used for a per-frame fallback (a genuine
+    /// GPU failure, or a keyed frame until the GPU key path lands): its LUT
+    /// cache and band/scene scratch survive across ticks, so a repeated
+    /// fallback reuses them instead of allocating every frame (ADR-0113 K1
+    /// review I1/A1).
+    cpu_fallback: crate::backend::CpuBackend,
 }
 
 /// The overlay sub-pass, its content-keyed image-texture cache, and the
@@ -248,6 +254,7 @@ impl GpuCompositor {
             #[cfg(feature = "overlay")]
             overlay,
             cpu_fallback_frames: std::sync::atomic::AtomicU64::new(0),
+            cpu_fallback: crate::backend::CpuBackend::default(),
         })
     }
 
@@ -257,6 +264,12 @@ impl GpuCompositor {
         self.cpu_fallback_frames
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .saturating_add(1)
+    }
+
+    /// The persistent CPU reference this compositor's run backend falls back
+    /// to for one frame.
+    pub(crate) const fn cpu_fallback(&self) -> &crate::backend::CpuBackend {
+        &self.cpu_fallback
     }
 
     /// Frames re-composited on the CPU after a genuine GPU failure.
@@ -730,10 +743,7 @@ impl GpuCompositor {
         // GPU readback). Until then a keyed or grouped tile is a typed limit,
         // so `RunBackend` composes that frame on the CPU reference (counted)
         // instead of drawing it without its key.
-        if tiles
-            .iter()
-            .any(|t| t.key.is_some() || t.group != crate::key::TileGroup::Top)
-        {
+        if crate::key::needs_cpu_keyer_path(tiles) {
             return Err(Error::GpuLimit(
                 "keyer tiles are composed on the CPU until the GPU key path lands".to_owned(),
             ));
