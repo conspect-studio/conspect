@@ -15515,6 +15515,14 @@
         },
         "additionalProperties": false
       },
+      "CaptureMode": {
+        "type": "string",
+        "description": "How the page animation becomes frames.",
+        "enum": [
+          "steps",
+          "realtime"
+        ]
+      },
       "CastSessionDoc": {
         "type": "object",
         "description": "One ephemeral cast session as the API serves it: the descriptive record\nplus the live lifecycle state.",
@@ -24007,6 +24015,14 @@
           }
         }
       },
+      "StepTiming": {
+        "type": "string",
+        "description": "Steps-mode duration rule.",
+        "enum": [
+          "equal",
+          "proportional"
+        ]
+      },
       "StreamDescriptorDoc": {
         "allOf": [
           {
@@ -25596,10 +25612,33 @@
           "frames"
         ],
         "properties": {
+          "capture": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CaptureMode",
+                "description": "`steps` iterates the radar timeline (default for radar; radar only);\n`realtime` records `frames` wall-clock screenshots (default for wind)."
+              }
+            ]
+          },
+          "end_hold_ms": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Steps-mode hold of the newest step in ms, 0 through 10000 (default 1000).",
+            "minimum": 0
+          },
           "fps": {
             "type": "integer",
             "format": "int32",
             "description": "Capture cadence.",
+            "minimum": 0
+          },
+          "frame_ms": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Steps-mode per-step duration in ms, 100 through 5000 (default 600).",
             "minimum": 0
           },
           "frames": {
@@ -25624,6 +25663,12 @@
             "format": "double",
             "description": "Longitude."
           },
+          "max_steps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Steps-mode count of most recent radar steps, 2 through 48 (default 12).",
+            "minimum": 0
+          },
           "overlay": {
             "type": "string",
             "description": "Radar or wind."
@@ -25631,6 +25676,10 @@
           "public": {
             "type": "boolean",
             "description": "Explicitly use the public unauthenticated page. Default requests Premium."
+          },
+          "timing": {
+            "$ref": "#/components/schemas/StepTiming",
+            "description": "Steps-mode per-step duration rule (default `equal`)."
           },
           "width": {
             "type": "integer",

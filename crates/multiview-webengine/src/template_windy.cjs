@@ -23,13 +23,23 @@ function statusExpression(overlay) {
   return `JSON.stringify((()=>{
     const active=window.W?.store?.get?.('overlay');
     const text=document.body?.innerText||'';
-    return {overlay:active||null,noData:/No data!/i.test(text),
+    return {overlay:active||null,timestamp:window.W?.store?.get?.('timestamp')??null,noData:/No data!/i.test(text),
       loginVisible:!!document.querySelector('.rhpane__top-icons__login'),
-      subscription:localStorage.getItem('settings_subscription'),
+      subscription:(()=>{try{return localStorage.getItem('settings_subscription');}catch{return null;}})(),
       time:document.querySelector('.timecode .box,.main-timecode .box')?.textContent||null,
       canvases:document.querySelectorAll('canvas').length,
       tilesLoaded:document.querySelectorAll('.leaflet-tile-loaded').length,
       tilesPending:[...document.querySelectorAll('img.leaflet-tile')].filter(i=>!i.complete||i.naturalWidth===0).length};
   })())`;
 }
-module.exports = {TERMS_VERSION, CLEAN, validate, url, statusExpression};
+// Radar step timeline (spike-proven): the store's radarCalendar lists step timestamps.
+const CALENDAR_EXPRESSION = `JSON.stringify((()=>{const c=window.W?.store?.get?.('radarCalendar');
+  return Array.isArray(c?.timestamps)?c.timestamps.slice(-200):null;})())`;
+// One-shot probe (never per poll: extra contexts can evict the map's own context).
+const WEBGL_EXPRESSION = `(()=>{try{const c=document.createElement('canvas');const g=c.getContext('webgl2')||c.getContext('webgl');
+  if(!g)return false;g.getExtension('WEBGL_lose_context')?.loseContext();return true;}catch{return false;}})()`;
+function setTimestampExpression(t) {
+  if (!Number.isSafeInteger(t) || t <= 0) throw new Error('invalid step');
+  return `window.W.store.set('timestamp',${t})`;
+}
+module.exports = {TERMS_VERSION, CLEAN, validate, url, statusExpression, CALENDAR_EXPRESSION, WEBGL_EXPRESSION, setTimestampExpression};

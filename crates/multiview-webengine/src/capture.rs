@@ -11,6 +11,86 @@ pub struct Tools {
     pub browser: std::path::PathBuf,
     /// LGPL-compatible `FFmpeg` executable.
     pub ffmpeg: std::path::PathBuf,
+    /// Browser GL backend chosen by the deployment (`CONSPECT_WEB_BROWSER_GL`),
+    /// never by an API request. Omitted means the browser default (no flags).
+    #[serde(default)]
+    pub gl: BrowserGl,
+}
+
+/// Deployment-only browser GL mode. No mode ever adds `--disable-gpu`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserGl {
+    /// No GL flags: the browser's own selection.
+    #[default]
+    Default,
+    /// Software WebGL for GPU-less hosts:
+    /// `--use-angle=swiftshader --enable-unsafe-swiftshader`.
+    Swiftshader,
+    /// Real GPU through EGL: `--use-gl=angle --use-angle=gl-egl`.
+    Egl,
+}
+
+impl std::str::FromStr for BrowserGl {
+    type Err = std::io::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "default" => Ok(Self::Default),
+            "swiftshader" => Ok(Self::Swiftshader),
+            "egl" => Ok(Self::Egl),
+            _ => Err(std::io::Error::other("invalid browser GL mode")),
+        }
+    }
+}
+
+/// How the page animation becomes frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    /// Drive the page's radar timeline (`W.store` `radarCalendar`): one
+    /// screenshot per step, identical consecutive steps dropped. Default for
+    /// Windy radar.
+    Steps,
+    /// Wall-clock screenshots `1000/fps` ms apart (`frames` of them). Default
+    /// for Windy wind (particles have no step timeline) and authored HTML.
+    Realtime,
+}
+
+/// Per-step duration rule for [`CaptureMode::Steps`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepTiming {
+    /// Every step lasts `frame_ms`.
+    #[default]
+    Equal,
+    /// Step duration follows the real gap to the next radar timestamp,
+    /// normalised to a mean of `frame_ms`, clamped to `[frame_ms/4, frame_ms*4]`.
+    Proportional,
+}
+
+/// Default per-step duration in milliseconds.
+pub const DEFAULT_FRAME_MS: u32 = 600;
+/// Default hold of the newest step before the loop wraps, in milliseconds.
+pub const DEFAULT_END_HOLD_MS: u32 = 1000;
+/// Default number of most recent radar steps captured.
+pub const DEFAULT_MAX_STEPS: u32 = 12;
+/// Hard cap on encoded output frames.
+pub const MAX_FRAMES: u32 = 600;
+
+const fn default_frame_ms() -> u32 {
+    DEFAULT_FRAME_MS
+}
+const fn default_end_hold_ms() -> u32 {
+    DEFAULT_END_HOLD_MS
+}
+const fn default_max_steps() -> u32 {
+    DEFAULT_MAX_STEPS
+}
+
+/// Frames for a duration at `fps`: `round(ms * fps / 1000)`, integer math only.
+#[must_use]
+pub fn frames_for_ms(ms: u32, fps: u32) -> u64 {
+    (u64::from(ms) * u64::from(fps) + 500) / 1000
 }
 
 impl Tools {
@@ -55,7 +135,8 @@ pub struct Capture {
     pub height: u32,
     /// Output frames per second, 1 through 30.
     pub fps: u32,
-    /// Output frame count, 2 through 600.
+    /// Output frame count, 2 through 600, for [`CaptureMode::Realtime`]. In
+    /// steps mode the producer derives the actual count from the kept steps.
     pub frames: u32,
     /// Authored document. External network requests are blocked by the host.
     pub document: String,
@@ -65,9 +146,54 @@ pub struct Capture {
     /// Background mode; omitted means opaque (no alpha). Windy requires opaque.
     #[serde(default)]
     pub background: Background,
+    /// Capture mode and step-loop options; omitted means defaults.
+    #[serde(default)]
+    pub capture: CaptureOptions,
+}
+
+/// Capture mode plus the step-loop knobs (ignored in realtime mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureOptions {
+    /// Capture mode; omitted means steps for Windy radar, realtime otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<CaptureMode>,
+    /// Steps-mode duration rule (default equal).
+    #[serde(default)]
+    pub timing: StepTiming,
+    /// Steps-mode per-step duration, 100 through 5000 ms (default 600).
+    #[serde(default = "default_frame_ms")]
+    pub frame_ms: u32,
+    /// Steps-mode hold on the newest step, 0 through 10000 ms (default 1000).
+    #[serde(default = "default_end_hold_ms")]
+    pub end_hold_ms: u32,
+    /// Steps-mode count of most recent radar steps, 2 through 48 (default 12).
+    #[serde(default = "default_max_steps")]
+    pub max_steps: u32,
+}
+
+impl Default for CaptureOptions {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            timing: StepTiming::Equal,
+            frame_ms: DEFAULT_FRAME_MS,
+            end_hold_ms: DEFAULT_END_HOLD_MS,
+            max_steps: DEFAULT_MAX_STEPS,
+        }
+    }
 }
 
 impl Capture {
+    /// The mode actually used: explicit, else steps for Windy radar, else realtime.
+    #[must_use]
+    pub fn effective_capture(&self) -> CaptureMode {
+        self.capture.mode.unwrap_or_else(|| match &self.windy {
+            Some(view) if view.overlay == "radar" => CaptureMode::Steps,
+            _ => CaptureMode::Realtime,
+        })
+    }
+
     /// Validate allocation and runtime bounds before starting processes.
     /// # Errors
     /// Rejects unsupported geometry, count, cadence or document size.
@@ -92,6 +218,22 @@ impl Capture {
                 ));
             }
             view.validate()?;
+        }
+        if self.effective_capture() == CaptureMode::Steps {
+            // Steps drive a radar timeline: Windy radar, or an authored page
+            // exposing the same `W.store` contract. Wind has no step timeline.
+            let o = &self.capture;
+            let nominal = u64::from(o.max_steps) * frames_for_ms(o.frame_ms, self.fps).max(1)
+                + frames_for_ms(o.end_hold_ms, self.fps);
+            if self.windy.as_ref().is_some_and(|v| v.overlay != "radar")
+                || self.background != Background::Opaque
+                || !(100..=5000).contains(&o.frame_ms)
+                || o.end_hold_ms > 10_000
+                || !(2..=48).contains(&o.max_steps)
+                || nominal > u64::from(MAX_FRAMES)
+            {
+                return Err(std::io::Error::other("invalid step capture limits"));
+            }
         }
         Ok(())
     }
