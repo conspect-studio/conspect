@@ -18271,6 +18271,7 @@ fn tap_writer_for(
         field_order: facts.field_order,
         bits_per_raw_sample: facts.bits_per_raw_sample,
         extradata: facts.extradata,
+        extradata_oversize: facts.extradata_oversize,
     };
     let origin = Arc::clone(&plan.output_origin);
     let now_ns = Box::new(move || {
@@ -18278,11 +18279,7 @@ fn tap_writer_for(
             .load()
             .and_then(|run| u64::try_from(run.time().now_nanos()).ok())
     });
-    Some(crate::passthrough_tap::TapWriter::connect(
-        Arc::clone(tap),
-        open,
-        now_ns,
-    ))
+    crate::passthrough_tap::TapWriter::try_connect(Arc::clone(tap), open, now_ns)
 }
 
 /// Resolve the best video stream's `(index, codec parameters, time-base,

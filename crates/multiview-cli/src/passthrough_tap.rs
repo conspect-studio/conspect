@@ -57,6 +57,8 @@ pub struct SourceTap {
     params_gen: AtomicU64,
     /// Packets skipped before the copy because they exceed `MAX_AU_BYTES`.
     oversize: AtomicU64,
+    /// Connections refused because their extradata exceeded the bound.
+    refused_extradata: AtomicU64,
     /// Packets skipped because they carried no DTS/PTS, no run clock existed,
     /// or a length-prefixed packet was malformed.
     unstamped: AtomicU64,
@@ -87,6 +89,7 @@ impl SourceTap {
             connections: AtomicU64::new(0),
             params_gen: AtomicU64::new(0),
             oversize: AtomicU64::new(0),
+            refused_extradata: AtomicU64::new(0),
             unstamped: AtomicU64::new(0),
         }
     }
@@ -113,6 +116,14 @@ impl SourceTap {
     #[must_use]
     pub fn oversize(&self) -> u64 {
         self.oversize.load(Ordering::Relaxed)
+    }
+
+    /// Connections refused for an extradata over
+    /// `multiview_ffmpeg::MAX_FACTS_EXTRADATA` (passthrough disabled for
+    /// that connection).
+    #[must_use]
+    pub fn refused_extradata(&self) -> u64 {
+        self.refused_extradata.load(Ordering::Relaxed)
     }
 
     /// Packets the writer skipped for a missing timestamp or run clock.
@@ -205,9 +216,17 @@ pub struct OpenFacts {
     pub field_order: i32,
     /// `bits_per_raw_sample` (0 unknown).
     pub bits_per_raw_sample: i32,
-    /// Codec extradata (avcC or Annex-B sets; may be empty).
+    /// Codec extradata (avcC or Annex-B sets; may be empty). Bounded by
+    /// `multiview_ffmpeg::MAX_FACTS_EXTRADATA` at the copy.
     pub extradata: Vec<u8>,
+    /// The stream's extradata was over the bound and not copied: the
+    /// connection gets no writer ([`TapWriter::try_connect`]).
+    pub extradata_oversize: bool,
 }
+
+/// Largest SPS NAL the tap extracts and keeps (4 KiB, as D1's
+/// `h264_repeat` parameter-set bound).
+pub const MAX_SPS_BYTES: usize = 4096;
 
 /// The first SPS NAL of H.264 extradata: an avcC record (first byte 1) or
 /// Annex-B parameter sets.
@@ -219,9 +238,12 @@ fn extradata_sps(extradata: &[u8]) -> Option<&[u8]> {
             return None;
         }
         let len = usize::from(u16::from_be_bytes([*extradata.get(6)?, *extradata.get(7)?]));
+        if len > MAX_SPS_BYTES {
+            return None;
+        }
         return extradata.get(8..8_usize.checked_add(len)?);
     }
-    idr::h264_nal_of_type(extradata, NalFraming::AnnexB, 7)
+    idr::h264_nal_of_type(extradata, NalFraming::AnnexB, 7).filter(|s| s.len() <= MAX_SPS_BYTES)
 }
 
 fn code_point(v: i32) -> Option<u8> {
@@ -337,6 +359,24 @@ impl std::fmt::Debug for TapWriter {
 }
 
 impl TapWriter {
+    /// [`Self::connect`], unless the connection's extradata was over the
+    /// bound (`facts.extradata_oversize`): then no writer exists for the
+    /// connection, the previous stream description is withdrawn and the
+    /// refusal is counted ([`SourceTap::refused_extradata`]).
+    #[must_use]
+    pub fn try_connect(
+        tap: Arc<SourceTap>,
+        facts: OpenFacts,
+        now_ns: Box<dyn Fn() -> Option<u64> + Send>,
+    ) -> Option<Self> {
+        if facts.extradata_oversize {
+            tap.refused_extradata.fetch_add(1, Ordering::Relaxed);
+            tap.stream.store(None);
+            return None;
+        }
+        Some(Self::connect(tap, facts, now_ns))
+    }
+
     /// Start a connection on `tap`: bump the connection generation and the
     /// parameter generation (a reconnect is a parameter change) and publish
     /// the stream's traits.
@@ -430,6 +470,7 @@ impl TapWriter {
                     }
                     if codec == CodecKind::H264 {
                         let sps = idr::h264_nal_of_type(data, framing, 7);
+                        let sps = sps.filter(|s| s.len() <= MAX_SPS_BYTES);
                         if sps.is_some() && sps != self.traits_sps.as_deref() {
                             self.publish(sps.map(<[u8]>::to_vec));
                         }
@@ -504,6 +545,7 @@ mod tests {
             field_order: 0,
             bits_per_raw_sample: 8,
             extradata: Vec::new(),
+            extradata_oversize: false,
         }
     }
     fn clock() -> Box<dyn Fn() -> Option<u64> + Send> {
@@ -668,5 +710,32 @@ mod tests {
         let au = reader.try_recv().unwrap();
         assert_eq!(&au.data[..], &idr_au(SPS)[..]);
         assert!(au.strict_idr);
+    }
+
+    /// #344 D2a review R1-A-1: a connection whose extradata was over the
+    /// bound gets no writer (passthrough disabled for it, never a truncated
+    /// configuration), counted under its own reason; the tap stays usable.
+    #[test]
+    fn an_oversize_extradata_connection_gets_no_writer_and_is_counted() {
+        let tap = Arc::new(SourceTap::new());
+        let mut f = facts();
+        f.extradata_oversize = true;
+        assert!(TapWriter::try_connect(Arc::clone(&tap), f, clock()).is_none());
+        assert_eq!(tap.refused_extradata(), 1);
+        assert!(tap.stream().is_none(), "no traits published");
+        assert!(TapWriter::try_connect(Arc::clone(&tap), facts(), clock()).is_some());
+        assert_eq!(tap.refused_extradata(), 1);
+    }
+
+    /// SPS extraction is bounded: an avcC SPS length past the record (or
+    /// over the SPS bound) yields no SPS, never a read past the record.
+    #[test]
+    fn avcc_sps_extraction_is_bounded() {
+        let mut rec = vec![1, 0x64, 0, 0x1F, 0xFF, 0xE1, 0xFF, 0xFF];
+        rec.extend_from_slice(&[0x67; 16]);
+        assert_eq!(extradata_sps(&rec), None);
+        let mut huge = vec![1, 0x64, 0, 0x1F, 0xFF, 0xE1, 0x20, 0x00];
+        huge.extend(std::iter::repeat_n(0x67, 0x2000));
+        assert_eq!(extradata_sps(&huge), None, "over MAX_SPS_BYTES");
     }
 }

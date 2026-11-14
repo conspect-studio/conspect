@@ -1242,7 +1242,25 @@ pub struct VideoStreamFacts {
     /// `bits_per_raw_sample` (`0` unknown).
     pub bits_per_raw_sample: i32,
     /// The codec extradata (avcC/hvcC or Annex-B sets; empty when none).
+    /// Empty when [`Self::extradata_oversize`] is set: never truncated.
     pub extradata: Vec<u8>,
+    /// The stream's extradata exceeded [`MAX_FACTS_EXTRADATA`] and was not
+    /// copied. A caller that needs the decoder configuration (passthrough)
+    /// must refuse the connection rather than use a partial one.
+    pub extradata_oversize: bool,
+}
+
+/// Largest codec extradata [`video_stream_facts`] copies (64 KiB). A real
+/// avcC/hvcC record is a few hundred bytes (H.264 SPS/PPS, HEVC VPS/SPS/PPS
+/// with SEI): 64 KiB leaves two orders of magnitude of headroom while a
+/// hostile container (libav accepts ~2 GiB) costs nothing per connection.
+pub const MAX_FACTS_EXTRADATA: usize = 64 * 1024;
+
+/// A copy of `extradata` when it is within [`MAX_FACTS_EXTRADATA`]; `None`
+/// (nothing copied) when over. The length is checked before the copy.
+#[must_use]
+pub fn bounded_extradata(extradata: &[u8]) -> Option<Vec<u8>> {
+    (extradata.len() <= MAX_FACTS_EXTRADATA).then(|| extradata.to_vec())
 }
 
 /// Read [`VideoStreamFacts`] from `params`.
@@ -1259,10 +1277,14 @@ pub fn video_stream_facts(params: &Parameters) -> VideoStreamFacts {
     unsafe {
         let raw = params.as_ptr();
         let len = usize::try_from((*raw).extradata_size).unwrap_or(0);
-        let extradata = if (*raw).extradata.is_null() || len == 0 {
-            Vec::new()
+        let (extradata, extradata_oversize) = if (*raw).extradata.is_null() || len == 0 {
+            (Vec::new(), false)
+        } else if len > MAX_FACTS_EXTRADATA {
+            // Checked on the length: an oversize record is never copied.
+            (Vec::new(), true)
         } else {
-            std::slice::from_raw_parts((*raw).extradata, len).to_vec()
+            let bytes = std::slice::from_raw_parts((*raw).extradata, len);
+            (bounded_extradata(bytes).unwrap_or_default(), false)
         };
         VideoStreamFacts {
             profile: (*raw).profile,
@@ -1276,6 +1298,7 @@ pub fn video_stream_facts(params: &Parameters) -> VideoStreamFacts {
             field_order: i32::try_from((*raw).field_order as u32).unwrap_or(0),
             bits_per_raw_sample: (*raw).bits_per_raw_sample,
             extradata,
+            extradata_oversize,
         }
     }
 }
@@ -1362,5 +1385,23 @@ mod interrupt_logic_tests {
         assert_eq!(DemuxOptions::new().rw_timeout(), None);
         let opts = DemuxOptions::new().with_rw_timeout(Duration::from_millis(250));
         assert_eq!(opts.rw_timeout(), Some(Duration::from_millis(250)));
+    }
+}
+
+#[cfg(test)]
+mod stream_facts_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::{bounded_extradata, MAX_FACTS_EXTRADATA};
+
+    /// #344 D2a review R1-A-1: an attacker-sized extradata is never copied;
+    /// the bound is checked on the length before the copy.
+    #[test]
+    fn extradata_over_the_bound_is_refused_before_any_copy() {
+        let ok = vec![7_u8; MAX_FACTS_EXTRADATA];
+        assert_eq!(bounded_extradata(&ok).unwrap().len(), MAX_FACTS_EXTRADATA);
+        let big = vec![7_u8; MAX_FACTS_EXTRADATA + 1];
+        assert!(bounded_extradata(&big).is_none());
+        assert_eq!(bounded_extradata(&[]).unwrap(), Vec::<u8>::new());
     }
 }
