@@ -492,6 +492,9 @@ impl LiveEncoder for ConvertLive {
     fn parameter_sets(&self) -> Option<ParameterSets> {
         self.inner.parameter_sets()
     }
+    fn stream_params(&self) -> Option<multiview_ffmpeg::StreamCodecParameters> {
+        self.inner.stream_params()
+    }
 }
 
 #[cfg(test)]
