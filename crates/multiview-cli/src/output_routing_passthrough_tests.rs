@@ -667,3 +667,34 @@ fn a_multibyte_bake_error_is_truncated_at_a_char_boundary() {
     assert!(reason.len() <= 160, "{}", reason.len());
     assert!(reason.starts_with("slate-bake-failed: é"));
 }
+
+/// Review R1-I-1/A-3: an atomic set that takes a P0 output to another feed
+/// ends the candidate exactly like a single take: the old key is retired,
+/// its tap unsubscribed, and a later fault/recovery of the old source never
+/// moves the output back to it.
+#[test]
+fn a_set_take_off_p0_retires_the_candidate() {
+    let mut p = P0::new(1, 6, Script::default(), true);
+    p.step();
+    p.take_cam(0);
+    p.run_until(200, |p| p.on_p0(0)).expect("on P0");
+    p.x.h
+        .try_take_set(TakeSet {
+            operation_id: "set".to_owned(),
+            principal: "q".to_owned(),
+            members: vec![take("m", 0, PictureBus::Program)],
+            arm: None,
+        })
+        .unwrap();
+    p.run_until(60, |p| p.view(0).bus == "program")
+        .expect("the set lands");
+    // The old source stalls and recovers: the output must stay on Program.
+    let at = p.t;
+    p.src.script.lock().unwrap().stall = Some(at..at + 10);
+    p.run_until(200, |p| {
+        assert_eq!(p.view(0).bus, "program", "never back to the old source");
+        false
+    });
+    assert!(p.view(0).passthrough.is_none(), "candidate retired");
+    assert_eq!(p.x.h.snapshot().passthrough.keys_live, 0);
+}

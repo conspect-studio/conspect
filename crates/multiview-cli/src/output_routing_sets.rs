@@ -472,6 +472,12 @@ impl OutputRouter {
             }
             set.operation_id.clone_into(&mut m.operation_id);
             set.principal.clone_into(&mut m.principal);
+            // A set member is a video take like any other: it ends the
+            // output's passthrough candidate for another feed (#344 D2b
+            // review R1-I-1/A-3).
+            if let Some(bus) = m.bus.as_ref() {
+                self.pass_take_started(index, bus);
+            }
             if let Some(out) = self.outputs.get_mut(index) {
                 out.pending = Some(Pending {
                     take: m,
