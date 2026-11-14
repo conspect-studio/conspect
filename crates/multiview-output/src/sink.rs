@@ -146,6 +146,14 @@ pub trait PacketSource {
     fn take_decoder_config_change(&mut self) -> bool {
         false
     }
+
+    /// The new decoder configuration's video stream parameters, when the
+    /// change [`Self::take_decoder_config_change`] just reported came with
+    /// them (#342 B3, a live format reset): a segment muxer rebuilt at the
+    /// change is seeded from them instead of the run's original seed.
+    fn take_decoder_config_params(&mut self) -> Option<StreamCodecParameters> {
+        None
+    }
 }
 
 /// One muxer stream's registration: the `Send` codec-params snapshot it is
@@ -2208,6 +2216,7 @@ impl PacketMuxSink {
 /// the encoder-fed [`SegmentSink`] borrows its run's seed [`VideoEncoder`]; the
 /// packet-fed [`PacketMuxSink`] borrows the [`StreamCodecParameters`] snapshot
 /// the cli's single encoder produced (no encoder instance on this thread).
+#[derive(Clone, Copy)]
 enum StreamSeed<'a> {
     /// Seed a stream from a live encoder's codec context.
     Encoder(&'a VideoEncoder),
@@ -2242,6 +2251,10 @@ impl StreamSeed<'_> {
 /// [`Muxer::redirect_output`] doc for the libav-source cross-reference). The
 /// discrete per-rendition audio muxers ([`AudioRenditionState::current`])
 /// carry the identical one-muxer-per-rendition-for-the-run fix.
+#[allow(clippy::struct_excessive_bools)]
+// reason: each flag is an independent segmentation fact (recovering, a
+// pending decoder-config change, a pending rebuild, a failed publication,
+// two test-only fault injections); a state enum would conflate them.
 struct SegmentState<'a> {
     dir: &'a Path,
     prefix: &'a str,
@@ -2268,6 +2281,13 @@ struct SegmentState<'a> {
     /// Inject one packet-write failure in the real segment driver (unit test only).
     #[cfg(test)]
     fail_packet_write_once: bool,
+    /// Test seam: fail the next segment-muxer rebuild once (review V2).
+    #[cfg(test)]
+    fail_rebuild_once: bool,
+    /// Test seam: the next rebuild of the master's video rendition muxer
+    /// fails once (review R2-V1).
+    #[cfg(test)]
+    fail_rendition_rebuild_once: bool,
     /// Consecutive failed reopen attempts; terminal errors reach the supervisor.
     recovery_failures: u8,
     /// A close/playlist publication failure must reach the caller, not hide.
@@ -2287,6 +2307,22 @@ struct SegmentState<'a> {
     /// segment. Unused (and stays `0`) for the batch flavour, which keeps its
     /// historical `done.len()`-derived names.
     seg_index: u64,
+    /// The MPEG-TS PAT/PMT `version_number` (5 bits) the segment muxer
+    /// writes. Bumped (mod 32) when a decoder-configuration change starts a
+    /// segment: that output's muxer is rebuilt with `tables_version`+1 so a
+    /// receiver re-reads its tables (#342 B3). 0 = libav's default.
+    tables_version: u8,
+    /// The video stream parameters a rebuilt segment muxer is seeded from
+    /// after a live format reset (#342 B3 review V2); `None` = the run's
+    /// original [`Self::seed`].
+    reseed: Option<StreamCodecParameters>,
+    /// A flagged change whose segment has not started yet (a failed rebuild
+    /// is retried at the next RAP by the recovery path, review V2): the
+    /// next keyframe rebuilds the muxer and marks the discontinuity.
+    change_pending: bool,
+    /// The muxer was released for a rebuild that has not opened yet: the
+    /// next build bumps `tables_version` exactly once.
+    rebuild_pending: bool,
     /// OUTMETA (ADR-0088/0089): the per-output metadata + tag-path display
     /// matrix applied to the long-lived video muxer ONCE, before its first
     /// `write_header` (the codec/stream layout is fixed for the run, invariant
@@ -2330,6 +2366,14 @@ struct AudioRenditions<'a> {
     video: AudioRenditionState<'a>,
     master: PathBuf,
     master_text: Option<String>,
+    /// The audio entries the master lists (unchanged for the run).
+    audio_entries: Vec<AudioRendition>,
+    /// The video variant's media playlist URI.
+    video_uri: String,
+    /// After a live reset (#342 B3, review R3-1): the master re-rendered from
+    /// the NEW encoder's parameters, waiting for the reset segment to be
+    /// published in the media playlists before it replaces the master.
+    pending_master: Option<String>,
     /// The master is static for a run: queued once (#220) to an off-packet-path
     /// publisher, never written + fsynced inline on a segment close.
     master_published: bool,
@@ -2386,6 +2430,10 @@ impl<'a> SegmentState<'a> {
             recovering: false,
             #[cfg(test)]
             fail_packet_write_once: false,
+            #[cfg(test)]
+            fail_rebuild_once: false,
+            #[cfg(test)]
+            fail_rendition_rebuild_once: false,
             recovery_failures: 0,
             publication_failed: false,
             #[cfg(test)]
@@ -2393,6 +2441,10 @@ impl<'a> SegmentState<'a> {
             stats: EncodeStats::default(),
             live: None,
             seg_index: 0,
+            tables_version: 0,
+            reseed: None,
+            change_pending: false,
+            rebuild_pending: false,
             meta: None,
             tracks: None,
             renditions: None,
@@ -2418,7 +2470,7 @@ impl<'a> SegmentState<'a> {
             .tracks
             .map_or(&default_selection, |(selection, _)| selection);
         let mut master = MasterPlaylist::new();
-        let mut states = Vec::new();
+        let mut states: Vec<AudioRenditionState<'a>> = Vec::new();
         let parent = playlist_path.parent().unwrap_or_else(|| Path::new("."));
         let generation = self.seg_index;
         if selection.program {
@@ -2484,48 +2536,14 @@ impl<'a> SegmentState<'a> {
         if self.seg_index != 0 {
             video_live.set_initial_discontinuity();
         }
-        let max_audio_rate = states
-            .iter()
-            .filter_map(|state| state.stream.params.bit_rate())
-            .max()
-            .unwrap_or(0);
-        // BANDWIDTH is mandatory for a listed variant. With no configured
-        // video rate, keep the master absent rather than advertise a lie.
-        let bandwidth = video
-            .params
-            .bit_rate()
-            .filter(|rate| *rate > 0)
-            .map(|rate| rate.saturating_add(max_audio_rate));
-        let mut variant = VariantStream::new(video_uri, bandwidth.unwrap_or(0));
-        if let Some((width, height)) = video.params.video_dimensions() {
-            variant = variant.with_resolution(width, height);
-        }
-        if let Some(video_codec) = video.params.hls_codec() {
-            if states.is_empty() {
-                variant = variant.with_codecs(video_codec);
-            } else if let Some(audio_codec) = states
-                .first()
-                .and_then(|state| state.stream.params.hls_codec())
-            {
-                if states
-                    .iter()
-                    .all(|state| state.stream.params.hls_codec() == Some(audio_codec))
-                {
-                    variant = variant.with_codecs(format!("{video_codec},{audio_codec}"));
-                }
-            }
-        }
-        if video.time_base.num > 0 && video.time_base.den > 0 {
-            let numerator = u32::try_from(video.time_base.den).ok();
-            let denominator = u32::try_from(video.time_base.num).ok();
-            if let (Some(numerator), Some(denominator)) = (numerator, denominator) {
-                let fps = f64::from(numerator) / f64::from(denominator);
-                if (0.0..=120.0).contains(&fps) && fps > 0.0 {
-                    variant = variant.with_frame_rate(fps);
-                }
-            }
-        }
-        master.push_variant(variant);
+        let audio_entries = master.audio_renditions().to_vec();
+        let master_text = render_master(
+            &audio_entries,
+            &video_uri,
+            video.params,
+            video.time_base,
+            &states,
+        );
         // Publish only after the first complete media segment exists.
         self.renditions = Some(AudioRenditions {
             states,
@@ -2537,8 +2555,11 @@ impl<'a> SegmentState<'a> {
                 current: None,
             },
             master: parent.join("master.m3u8"),
-            master_text: bandwidth.map(|_| master.render()),
+            master_text,
             master_published: false,
+            audio_entries,
+            video_uri,
+            pending_master: None,
             master_writer: None,
             retention_window: window,
         });
@@ -2556,6 +2577,11 @@ impl<'a> SegmentState<'a> {
         let Some(renditions) = self.renditions.as_mut() else {
             return Ok(());
         };
+        let tables_version = self.tables_version;
+        let reseed = self.reseed.as_ref();
+        let mut rebuilt_video = false;
+        #[cfg(test)]
+        let fail_video_rebuild = &mut self.fail_rendition_rebuild_once;
         for state in renditions
             .states
             .iter_mut()
@@ -2569,11 +2595,41 @@ impl<'a> SegmentState<'a> {
                 segment.write_path = write_path;
                 segment.packets = 0;
             } else {
-                let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
+                // The master's video-only rendition carries the video stream:
+                // after a live reset it is (re)built like the main muxer, from
+                // the NEW encoder's parameters at the run's current
+                // `tables_version` (review R2-V1). Audio renditions keep their
+                // own (unchanged) stream at version 0.
+                let video = state.kind == StreamKind::Video;
+                let version = if video { tables_version } else { 0 };
+                #[cfg(test)]
+                if video && version > 0 && std::mem::take(fail_video_rebuild) {
+                    return Err(Error::Output(
+                        "injected video rendition rebuild failure".to_owned(),
+                    ));
+                }
+                let mut muxer = if version == 0 {
+                    Muxer::create_as(&write_path, "mpegts").map_err(ff)?
+                } else {
+                    let version = version.to_string();
+                    Muxer::create_with_options(
+                        &write_path,
+                        "mpegts",
+                        &[("tables_version", version.as_str())],
+                    )
+                    .map_err(ff)?
+                };
+                let params = match reseed {
+                    Some(params) if video => params,
+                    _ => state.stream.params,
+                };
                 let stream_index = muxer
-                    .add_stream_from_parameters(state.stream.params, state.stream.time_base)
+                    .add_stream_from_parameters(params, state.stream.time_base)
                     .map_err(ff)?;
                 muxer.write_header().map_err(ff)?;
+                if video && version > 0 {
+                    rebuilt_video = true;
+                }
                 state.current = Some(AudioSegment {
                     muxer,
                     stream_index,
@@ -2581,6 +2637,20 @@ impl<'a> SegmentState<'a> {
                     write_path,
                     packets: 0,
                 });
+            }
+        }
+        // A live reset's rendition is rebuilt (review R3-1): the master is
+        // re-rendered from the NEW encoder's parameters and replaces the
+        // advertised one once this segment is in the media playlists.
+        if rebuilt_video {
+            if let Some(params) = reseed {
+                renditions.pending_master = render_master(
+                    &renditions.audio_entries,
+                    &renditions.video_uri,
+                    params,
+                    renditions.video.stream.time_base,
+                    &renditions.states,
+                );
             }
         }
         Ok(())
@@ -2804,9 +2874,11 @@ impl<'a> SegmentState<'a> {
             if self.recovering
                 && !(packet.kind() == StreamKind::Video
                     && packet.is_keyframe()
-                    && match self.seed {
-                        StreamSeed::Params(params) => params.is_decoder_ready_rap(&packet),
-                        StreamSeed::Encoder(_) => false,
+                    && match (self.reseed.as_ref(), self.seed) {
+                        (Some(params), _) | (None, StreamSeed::Params(params)) => {
+                            params.is_decoder_ready_rap(&packet)
+                        }
+                        (None, StreamSeed::Encoder(_)) => false,
                     })
             {
                 continue;
@@ -2814,6 +2886,11 @@ impl<'a> SegmentState<'a> {
             let pts = pts_from_packet(packet.pts(), self.stats.packets, self.time_base);
             let boundary = packet.kind() == StreamKind::Video && packet.is_keyframe();
             let config_changed = boundary && source.take_decoder_config_change();
+            if config_changed {
+                if let Some(params) = source.take_decoder_config_params() {
+                    self.reseed = Some(params);
+                }
+            }
             if let Err(error) = self.write_packet_marking(packet, pts, config_changed) {
                 // A segment-boundary failure can be a playlist publication or
                 // file-system fault, not a damaged muxer. Let the supervisor
@@ -2826,9 +2903,11 @@ impl<'a> SegmentState<'a> {
                 // Unsupported codecs and encoder-seeded live sinks have no
                 // decoder-ready RAP classifier. Fail now rather than silently
                 // draining an unbounded live packet source forever.
-                let supported = match self.seed {
-                    StreamSeed::Params(params) => params.supports_decoder_ready_rap(),
-                    StreamSeed::Encoder(_) => false,
+                let supported = match (self.reseed.as_ref(), self.seed) {
+                    (Some(params), _) | (None, StreamSeed::Params(params)) => {
+                        params.supports_decoder_ready_rap()
+                    }
+                    (None, StreamSeed::Encoder(_)) => false,
                 };
                 if !supported {
                     return Err(Error::Output(format!(
@@ -2876,8 +2955,11 @@ impl<'a> SegmentState<'a> {
                 // invariant #7); the first packet is always a keyframe.
                 let is_key = packet.is_keyframe();
                 if is_key {
-                    self.start_segment(pts)?;
-                    if config_changed {
+                    // Survives a failed start: the recovery path's next RAP
+                    // retries the rebuild and the mark (review V2).
+                    self.change_pending |= config_changed;
+                    self.start_segment_with(pts, self.change_pending)?;
+                    if std::mem::take(&mut self.change_pending) {
                         self.mark_started_segment_discontinuous();
                     }
                 }
@@ -2961,6 +3043,9 @@ impl<'a> SegmentState<'a> {
             }
         }
         if let Some(renditions) = self.renditions.as_mut() {
+            // A failed reset keeps the advertised master until the recovery
+            // rebuild succeeds (review R3-1): it re-renders it then.
+            renditions.pending_master = None;
             for state in renditions
                 .states
                 .iter_mut()
@@ -3038,6 +3123,16 @@ impl<'a> SegmentState<'a> {
     /// later call redirects it in place — see [`SegmentState`]'s doc for why
     /// this is the continuity-counter fix, not an optimization.
     fn start_segment(&mut self, start_pts: MediaTime) -> Result<()> {
+        self.start_segment_with(start_pts, false)
+    }
+
+    /// [`Self::start_segment`]; `config_changed` (a keyframe opening a new
+    /// decoder configuration, #342 B3) rebuilds the segment muxer with the
+    /// next TS `tables_version` instead of redirecting the long-lived one,
+    /// so the PAT/PMT `version_number` changes at the segment that starts
+    /// here. Legal: that segment is `EXT-X-DISCONTINUITY` anyway, so its
+    /// continuity counters may restart.
+    fn start_segment_with(&mut self, start_pts: MediaTime, config_changed: bool) -> Result<()> {
         if let Err(error) = self.close_current(start_pts) {
             self.publication_failed = true;
             return Err(error);
@@ -3067,6 +3162,29 @@ impl<'a> SegmentState<'a> {
         } else {
             path.clone()
         };
+        // The config change is handled BEFORE any redirect (review R2-V1):
+        // the main muxer and the master's video-only rendition muxer are
+        // both released here and rebuilt below from the NEW encoder's
+        // parameters at the next `tables_version`.
+        if config_changed {
+            // Bumped once per change: a retry of this change at the next
+            // RAP (after a failed build, `change_pending`) reuses the bumped
+            // version; it is cleared once both muxers are built below.
+            if !self.rebuild_pending {
+                self.rebuild_pending = true;
+                self.tables_version = (self.tables_version + 1) % 32;
+            }
+            if let Some(mut old) = self.current.take() {
+                // Flush and close the finished segment's file (already
+                // published by `close_current`); the muxer is then rebuilt.
+                old.muxer.release_output().map_err(ff)?;
+            }
+            if let Some(renditions) = self.renditions.as_mut() {
+                if let Some(mut old) = renditions.video.current.take() {
+                    old.muxer.release_output().map_err(ff)?;
+                }
+            }
+        }
         self.open_audio_segments(index)?;
         if let Some(segment) = self.current.as_mut() {
             // Redirect the SAME long-lived muxer to the new file. Every
@@ -3081,12 +3199,35 @@ impl<'a> SegmentState<'a> {
             segment.start_pts = start_pts;
         } else {
             // First segment of the run: build the ONE long-lived muxer +
-            // register its streams. Never rebuilt for a later segment.
-            let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
+            // register its streams. Rebuilt for a later segment only at a
+            // decoder-configuration change (with the next tables_version,
+            // bumped above).
+            #[cfg(test)]
+            if self.tables_version > 0 && std::mem::take(&mut self.fail_rebuild_once) {
+                return Err(Error::Output(
+                    "injected segment muxer rebuild failure".to_owned(),
+                ));
+            }
+            let mut muxer = if self.tables_version == 0 {
+                Muxer::create_as(&write_path, "mpegts").map_err(ff)?
+            } else {
+                let version = self.tables_version.to_string();
+                Muxer::create_with_options(
+                    &write_path,
+                    "mpegts",
+                    &[("tables_version", version.as_str())],
+                )
+                .map_err(ff)?
+            };
             // Register video then audio BEFORE the header — every segment
             // carries the same pinned two-stream layout (ADR-R005 §3.3,
             // AUD-4).
-            let stream_index = self.seed.add_stream(&mut muxer, self.time_base)?;
+            let stream_index = match self.reseed.as_ref() {
+                Some(params) => muxer
+                    .add_stream_from_parameters(params, self.time_base)
+                    .map_err(ff)?,
+                None => self.seed.add_stream(&mut muxer, self.time_base)?,
+            };
             let audio_index = match self.audio {
                 Some(a) => Some(
                     muxer
@@ -3115,6 +3256,8 @@ impl<'a> SegmentState<'a> {
                 start_pts,
             });
         }
+        // Both muxers are built: the change (if any) is complete.
+        self.rebuild_pending = false;
         Ok(())
     }
 
@@ -3159,6 +3302,64 @@ impl<'a> SegmentState<'a> {
     /// `.ts`). The batch flavour leaves the muxed-in-place file untouched and
     /// only records it for the finalize-time playlist render — byte-identical
     /// to before.
+    /// Publish (or, after a live reset, republish) the rendition master,
+    /// LAST: after video and every audio media playlist exist (review R3-1).
+    ///
+    /// # Errors
+    /// The master publisher could not be spawned.
+    fn publish_master(&mut self) -> Result<()> {
+        let Some(renditions) = self.renditions.as_mut() else {
+            return Ok(());
+        };
+        // Publish master last, after video and every audio playlist exist.
+        // A run without valid video bitrate metadata still serves the legacy
+        // index and media playlists, but never publishes a false BANDWIDTH.
+        // A live reset's master (review R3-1): this close has just pushed
+        // the reset segment (with its discontinuity) into every media
+        // playlist's publisher, so the master advertising the new
+        // parameters is queued now — after them, atomically, through the
+        // same writer (latest wins).
+        if let Some(text) = renditions.pending_master.take() {
+            match renditions.master_writer.as_ref() {
+                Some(writer) if renditions.master_published => {
+                    writer.publish(text.clone());
+                    renditions.master_text = Some(text);
+                }
+                // Not advertised yet: the first publication below carries
+                // the new parameters.
+                _ => renditions.master_text = Some(text),
+            }
+        }
+        if let Some(master_text) = renditions.master_text.as_ref() {
+            if !renditions.master_published
+                && renditions
+                    .states
+                    .iter()
+                    .all(|state| state.live.playlist_path().exists())
+                && renditions.video.live.playlist_path().exists()
+            {
+                // Ordering is preserved: every media playlist exists before
+                // the master is queued. Pruning of the previous run's files
+                // still waits until the on-disk master equals this text
+                // (`current_renditions_ready`).
+                let writer = BackgroundFile::spawn_with(
+                    renditions.master.clone(),
+                    self.master_writer.clone(),
+                )?;
+                writer.publish(master_text.clone());
+                renditions.master_writer = Some(writer);
+                renditions.master_published = true;
+            }
+        } else if renditions.video.live.playlist_path().exists() {
+            // No trustworthy BANDWIDTH: retire the previous master only once
+            // this run has playable media. Never advertise obsolete tracks.
+            match std::fs::remove_file(&renditions.master) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     fn close_current(&mut self, end_pts: MediaTime) -> Result<()> {
         let Some(segment) = self.current.as_mut() else {
             return Ok(());
@@ -3216,38 +3417,7 @@ impl<'a> SegmentState<'a> {
                 segment.start_pts.as_nanos(),
             )?;
         }
-        if let Some(renditions) = self.renditions.as_mut() {
-            // Publish master last, after video and every audio playlist exist.
-            // A run without valid video bitrate metadata still serves the legacy
-            // index and media playlists, but never publishes a false BANDWIDTH.
-            if let Some(master_text) = renditions.master_text.as_ref() {
-                if !renditions.master_published
-                    && renditions
-                        .states
-                        .iter()
-                        .all(|state| state.live.playlist_path().exists())
-                    && renditions.video.live.playlist_path().exists()
-                {
-                    // Ordering is preserved: every media playlist exists before
-                    // the master is queued. Pruning of the previous run's files
-                    // still waits until the on-disk master equals this text
-                    // (`current_renditions_ready`).
-                    let writer = BackgroundFile::spawn_with(
-                        renditions.master.clone(),
-                        self.master_writer.clone(),
-                    )?;
-                    writer.publish(master_text.clone());
-                    renditions.master_writer = Some(writer);
-                    renditions.master_published = true;
-                }
-            } else if renditions.video.live.playlist_path().exists() {
-                // No trustworthy BANDWIDTH: retire the previous master only once
-                // this run has playable media. Never advertise obsolete tracks.
-                match std::fs::remove_file(&renditions.master) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-        }
+        self.publish_master()?;
         if let Some(renditions) = self.renditions.as_ref() {
             // Never reap a file named by the still-advertised master when its
             // replacement could not be published (including unknown bitrate).
@@ -3382,6 +3552,65 @@ impl<'a> SegmentState<'a> {
 fn bound_live_report(done: &mut Vec<(PathBuf, f64)>, window: usize) {
     let excess = done.len().saturating_sub(window);
     done.drain(..excess);
+}
+
+/// The master playlist text for a video variant at `video` params plus the
+/// audio renditions `states` (`None`: no trustworthy BANDWIDTH — no video
+/// bit rate — so no master is advertised). One rendering for the run's start
+/// and for a live reset's new parameters (review R3-1).
+fn render_master(
+    audio_entries: &[AudioRendition],
+    video_uri: &str,
+    video: &StreamCodecParameters,
+    time_base: Rational,
+    states: &[AudioRenditionState<'_>],
+) -> Option<String> {
+    let max_audio_rate = states
+        .iter()
+        .filter_map(|state| state.stream.params.bit_rate())
+        .max()
+        .unwrap_or(0);
+    // BANDWIDTH is mandatory for a listed variant. With no configured
+    // video rate, keep the master absent rather than advertise a lie.
+    let bandwidth = video
+        .bit_rate()
+        .filter(|rate| *rate > 0)
+        .map(|rate| rate.saturating_add(max_audio_rate))?;
+    let mut variant = VariantStream::new(video_uri.to_owned(), bandwidth);
+    if let Some((width, height)) = video.video_dimensions() {
+        variant = variant.with_resolution(width, height);
+    }
+    if let Some(video_codec) = video.hls_codec() {
+        if states.is_empty() {
+            variant = variant.with_codecs(video_codec);
+        } else if let Some(audio_codec) = states
+            .first()
+            .and_then(|state| state.stream.params.hls_codec())
+        {
+            if states
+                .iter()
+                .all(|state| state.stream.params.hls_codec() == Some(audio_codec))
+            {
+                variant = variant.with_codecs(format!("{video_codec},{audio_codec}"));
+            }
+        }
+    }
+    if time_base.num > 0 && time_base.den > 0 {
+        let numerator = u32::try_from(time_base.den).ok();
+        let denominator = u32::try_from(time_base.num).ok();
+        if let (Some(numerator), Some(denominator)) = (numerator, denominator) {
+            let fps = f64::from(numerator) / f64::from(denominator);
+            if (0.0..=120.0).contains(&fps) && fps > 0.0 {
+                variant = variant.with_frame_rate(fps);
+            }
+        }
+    }
+    let mut master = MasterPlaylist::new();
+    for audio in audio_entries {
+        master.push_audio(audio.clone());
+    }
+    master.push_variant(variant);
+    Some(master.render())
 }
 
 fn current_renditions_ready(renditions: &AudioRenditions<'_>) -> bool {
@@ -3748,6 +3977,565 @@ mod tests {
             *next_uri, "seg2.ts",
             "the discontinuity precedes the segment starting at the flagged keyframe:\n{flagged}"
         );
+    }
+
+    /// Real MPEG-2 packets: `n` ticks from `start` encoded at `w`×`h`, every
+    /// third a keyframe, plus that encoder's stream parameters.
+    fn sized_packets(
+        w: u32,
+        h: u32,
+        start: u64,
+        n: u64,
+    ) -> (
+        Vec<multiview_ffmpeg::EncodedPacket>,
+        multiview_ffmpeg::StreamCodecParameters,
+    ) {
+        rated_packets(w, h, 2_000_000, start, n)
+    }
+
+    /// [`sized_packets`] at bit rate `bit_rate` (bit/s).
+    fn rated_packets(
+        w: u32,
+        h: u32,
+        bit_rate: usize,
+        start: u64,
+        n: u64,
+    ) -> (
+        Vec<multiview_ffmpeg::EncodedPacket>,
+        multiview_ffmpeg::StreamCodecParameters,
+    ) {
+        use multiview_core::frame::FrameMeta;
+        use multiview_core::pixel::PixelFormat;
+        use multiview_core::time::MediaTime;
+        let mut config = EncodeConfig::mpeg2(w, h);
+        config.bit_rate = bit_rate;
+        let mut enc = super::VideoRenditionEncoder::new(&config).unwrap();
+        enc.start_at(start);
+        let params = enc.codec_params().clone();
+        let mut out = Vec::new();
+        for tick in start..start + n {
+            if (tick - start) % 3 == 0 {
+                enc.force_next_keyframe();
+            }
+            let mut video = ffmpeg::util::frame::Video::new(ffmpeg::format::Pixel::YUV420P, w, h);
+            for plane in 0..3 {
+                video
+                    .data_mut(plane)
+                    .fill(if plane == 0 { 80 } else { 128 });
+            }
+            let frame = DecodedVideoFrame {
+                frame: video,
+                meta: FrameMeta {
+                    pts: MediaTime::ZERO,
+                    width: w,
+                    height: h,
+                    format: PixelFormat::Nv12,
+                    color: multiview_core::color::ColorInfo::default(),
+                },
+                raw_pts: None,
+                a53_cc: None,
+            };
+            out.extend(enc.encode_frame_at(frame, tick).unwrap());
+        }
+        out.extend(enc.finish().unwrap());
+        (out, params)
+    }
+
+    /// Width × height of the video stream a written `.ts` file declares: the
+    /// MPEG-2 sequence header (`00 00 01 B3`, 12-bit width, 12-bit height) of
+    /// its first video access unit, read from the TS payload bytes (segments
+    /// this short are below libavformat's probe threshold).
+    fn ts_video_size(path: &std::path::Path) -> (u32, u32) {
+        let bytes = std::fs::read(path).unwrap();
+        // Concatenate the payloads of the TS packets (skip header/adaptation).
+        let mut payload = Vec::new();
+        for p in bytes.chunks_exact(188) {
+            assert_eq!(p[0], 0x47, "TS sync");
+            let pid = (u16::from(p[1] & 0x1f) << 8) | u16::from(p[2]);
+            if pid == 0 || pid == 0x1fff || p[3] & 0x10 == 0 {
+                continue;
+            }
+            let mut at = 4;
+            if p[3] & 0x20 != 0 {
+                at += 1 + usize::from(p[4]);
+            }
+            payload.extend_from_slice(&p[at.min(188)..]);
+        }
+        let i = payload
+            .windows(4)
+            .position(|w| w == [0, 0, 1, 0xb3])
+            .unwrap_or_else(|| panic!("no MPEG-2 sequence header in {}", path.display()));
+        let h = &payload[i + 4..i + 7];
+        let width = (u32::from(h[0]) << 4) | (u32::from(h[1]) >> 4);
+        let height = (u32::from(h[1] & 0x0f) << 8) | u32::from(h[2]);
+        (width, height)
+    }
+
+    /// A source switching encoders at a flagged keyframe and handing the new
+    /// encoder's parameters with the change (as a live format reset does).
+    struct Switching {
+        packets: std::vec::IntoIter<multiview_ffmpeg::EncodedPacket>,
+        switch_pts: i64,
+        params: Option<multiview_ffmpeg::StreamCodecParameters>,
+        last_pts: Option<i64>,
+    }
+    impl super::PacketSource for Switching {
+        fn next_packet(&mut self) -> Result<Option<multiview_ffmpeg::EncodedPacket>> {
+            let next = self.packets.next();
+            self.last_pts = next.as_ref().and_then(multiview_ffmpeg::EncodedPacket::pts);
+            Ok(next)
+        }
+        fn take_decoder_config_change(&mut self) -> bool {
+            self.last_pts == Some(self.switch_pts)
+        }
+        fn take_decoder_config_params(
+            &mut self,
+        ) -> Option<multiview_ffmpeg::StreamCodecParameters> {
+            if self.last_pts == Some(self.switch_pts) {
+                self.params.take()
+            } else {
+                None
+            }
+        }
+    }
+
+    /// #342 B3 review V2: the segment muxer rebuilt at a live format reset is
+    /// seeded from the NEW encoder's parameters: segments before the switch
+    /// declare the old size, the switch segment and later the new one, with
+    /// one discontinuity and the bumped table version.
+    #[test]
+    fn a_rebuilt_segment_muxer_declares_the_new_encoders_size() {
+        use super::{SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        let _counter_guard = counter_guard();
+        let (mut packets, old_params) = sized_packets(160, 120, 0, 6);
+        let (new_packets, new_params) = sized_packets(80, 120, 6, 6);
+        packets.extend(new_packets);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&old_params),
+            Rational::new(1, 30),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 10));
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: 6,
+            params: Some(new_params),
+            last_pts: None,
+        };
+        state.drive_from_packets(&mut source).unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let sizes: Vec<(u32, u32)> = (0..4)
+            .map(|i| ts_video_size(&dir.path().join(format!("seg{i}.ts"))))
+            .collect();
+        assert_eq!(sizes, vec![(160, 120), (160, 120), (80, 120), (80, 120)]);
+        let playlist = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        assert_eq!(
+            playlist.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "{playlist}"
+        );
+        let (_, before) = ts_table_versions(&dir.path().join("seg1.ts"));
+        let (_, after) = ts_table_versions(&dir.path().join("seg2.ts"));
+        assert_eq!(after, (before + 1) % 32);
+    }
+
+    /// Review V2: a failed rebuild is not fatal: the segment is abandoned and
+    /// the sink recovers at the next RAP, where the rebuild and the
+    /// discontinuity happen (seeded from the new parameters).
+    #[test]
+    fn a_failed_rebuild_recovers_at_the_next_rap() {
+        use super::{SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        let _counter_guard = counter_guard();
+        let (mut packets, old_params) = sized_packets(160, 120, 0, 6);
+        let (new_packets, new_params) = sized_packets(80, 120, 6, 9);
+        packets.extend(new_packets);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&old_params),
+            Rational::new(1, 30),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 10));
+        state.fail_rebuild_once = true;
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: 6,
+            params: Some(new_params),
+            last_pts: None,
+        };
+        state
+            .drive_from_packets(&mut source)
+            .expect("recovered, not fatal");
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let playlist = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        // The segment at the switch was abandoned; the next RAP (pts 9)
+        // opened the rebuilt muxer at the new size.
+        let uris: Vec<&str> = playlist.lines().filter(|l| !l.starts_with('#')).collect();
+        let last = dir.path().join(uris.last().unwrap());
+        assert_eq!(ts_video_size(&last), (80, 120), "{playlist}");
+        let first = dir.path().join(uris[0]);
+        assert_eq!(ts_video_size(&first), (160, 120));
+        assert!(playlist.contains("#EXT-X-DISCONTINUITY\n"), "{playlist}");
+        // The retried rebuild uses the ONE bumped version (review R2-V1).
+        let (_, before) = ts_table_versions(&first);
+        let (_, rebuilt) = ts_table_versions(&last);
+        assert_eq!(rebuilt, (before + 1) % 32, "{playlist}");
+    }
+
+    /// A live `SegmentState` with the master/rendition layout (the master's
+    /// video-only rendition alongside the main muxer), over `dir`.
+    fn rendition_state<'a>(
+        dir: &'a std::path::Path,
+        params: &'a multiview_ffmpeg::StreamCodecParameters,
+    ) -> super::SegmentState<'a> {
+        use super::{MuxStream, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        let mut state = SegmentState::new(
+            StreamSeed::Params(params),
+            Rational::new(1, 30),
+            None,
+            dir,
+            "seg",
+        );
+        let playlist = dir.join("index.m3u8");
+        state.live = Some(LivePlaylist::new(playlist.clone(), 10));
+        state
+            .set_audio_renditions(
+                &playlist,
+                10,
+                crate::epoch::SharedEpoch::new(),
+                MuxStream::new(params, Rational::new(1, 30)),
+                None,
+                &[],
+            )
+            .unwrap();
+        state
+    }
+
+    /// The `.ts` URIs a media playlist lists, in order.
+    fn playlist_uris(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// #342 B3 review R2-V1: on a live reset of an HLS output with the
+    /// master/rendition layout, the master's video-only rendition is rebuilt
+    /// exactly like the main muxer: its segment at the flagged keyframe
+    /// declares the NEW encoder's size with the bumped PAT/PMT
+    /// `version_number`, and both the main and the rendition media playlists
+    /// carry one discontinuity there.
+    #[test]
+    fn a_reset_rebuilds_the_masters_video_rendition_from_the_new_encoder() {
+        let _counter_guard = counter_guard();
+        let (mut packets, old_params) = sized_packets(160, 120, 0, 6);
+        let (new_packets, new_params) = sized_packets(80, 120, 6, 6);
+        packets.extend(new_packets);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = rendition_state(dir.path(), &old_params);
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: 6,
+            params: Some(new_params),
+            last_pts: None,
+        };
+        state.drive_from_packets(&mut source).unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let video_playlist = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().is_some_and(|x| x == "m3u8")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("video-g"))
+            })
+            .expect("the video rendition playlist");
+        let uris = playlist_uris(&video_playlist);
+        assert_eq!(uris.len(), 4, "{uris:?}");
+        let sizes: Vec<(u32, u32)> = uris
+            .iter()
+            .map(|u| ts_video_size(&dir.path().join(u)))
+            .collect();
+        assert_eq!(sizes, vec![(160, 120), (160, 120), (80, 120), (80, 120)]);
+        let (_, before) = ts_table_versions(&dir.path().join(&uris[1]));
+        let (_, after) = ts_table_versions(&dir.path().join(&uris[2]));
+        assert_eq!(
+            after,
+            (before + 1) % 32,
+            "the rendition's PMT version bumps"
+        );
+        for playlist in [dir.path().join("index.m3u8"), video_playlist] {
+            let text = std::fs::read_to_string(&playlist).unwrap();
+            assert_eq!(
+                text.matches("#EXT-X-DISCONTINUITY\n").count(),
+                1,
+                "{}: {text}",
+                playlist.display()
+            );
+        }
+    }
+
+    /// The master's single variant line (`#EXT-X-STREAM-INF:...`).
+    fn master_variant(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("master.m3u8"))
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("#EXT-X-STREAM-INF:"))
+            .unwrap()
+            .to_owned()
+    }
+
+    /// #342 B3 review R3-1: after a live reset (160x120 at 2 Mbit/s →
+    /// 80x120 at 1 Mbit/s) the master advertises the NEW variant —
+    /// RESOLUTION and BANDWIDTH from the new encoder's parameters — and it
+    /// is published only once the reset segment is in the media playlists.
+    /// Before the reset it advertises the old variant.
+    #[test]
+    fn a_reset_republishes_the_master_with_the_new_variant() {
+        let _counter_guard = counter_guard();
+        let (mut packets, old_params) = rated_packets(160, 120, 2_000_000, 0, 6);
+        let (new_packets, new_params) = rated_packets(80, 120, 1_000_000, 6, 6);
+        packets.extend(new_packets);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = rendition_state(dir.path(), &old_params);
+        // Before the reset: the first segments only.
+        let before: Vec<_> = packets
+            .iter()
+            .take(6)
+            .map(|p| p.clone_shared_ref().unwrap())
+            .collect();
+        let mut first = Switching {
+            packets: before.into_iter(),
+            switch_pts: -1,
+            params: None,
+            last_pts: None,
+        };
+        state.drive_from_packets(&mut first).unwrap();
+        let mut source = Switching {
+            packets: packets.into_iter().skip(6).collect::<Vec<_>>().into_iter(),
+            switch_pts: 6,
+            params: Some(new_params),
+            last_pts: None,
+        };
+        // Before the reset the master advertises the old variant (whether or
+        // not its background write has landed yet).
+        let master_before = state
+            .renditions
+            .as_ref()
+            .and_then(|r| r.master_text.clone())
+            .expect("a master is rendered");
+        assert!(
+            master_before.contains("RESOLUTION=160x120"),
+            "{master_before}"
+        );
+        assert!(
+            master_before.contains("BANDWIDTH=2000000"),
+            "{master_before}"
+        );
+        state.drive_from_packets(&mut source).unwrap();
+        // Mid-run (before `finish`): the reset segment has closed, so the
+        // master advertising the new variant is republished on its own; the
+        // on-disk master reaches it (atomic: only ever old or new text).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap_or_default();
+            assert!(
+                text.is_empty() || text.contains("RESOLUTION=") && text.contains("#EXTM3U"),
+                "never a torn master: {text}"
+            );
+            if text.contains("RESOLUTION=80x120") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the new master is republished during the run: {text}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let variant = master_variant(dir.path());
+        assert!(variant.contains("RESOLUTION=80x120"), "{variant}");
+        assert!(variant.contains("BANDWIDTH=1000000"), "{variant}");
+        assert!(!variant.contains("160x120"), "{variant}");
+    }
+
+    /// Review R2-V1: a failed rebuild of the video rendition is contained
+    /// like the main muxer's: the segment is abandoned and both muxers
+    /// recover at the next RAP, rebuilt from the new parameters (never a
+    /// fatal error, never the old size after the switch).
+    #[test]
+    fn a_failed_video_rendition_rebuild_recovers_at_the_next_rap() {
+        let _counter_guard = counter_guard();
+        let (mut packets, old_params) = sized_packets(160, 120, 0, 6);
+        let (new_packets, new_params) = sized_packets(80, 120, 6, 9);
+        packets.extend(new_packets);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = rendition_state(dir.path(), &old_params);
+        state.fail_rendition_rebuild_once = true;
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: 6,
+            params: Some(new_params),
+            last_pts: None,
+        };
+        state
+            .drive_from_packets(&mut source)
+            .expect("recovered, not fatal");
+        assert!(
+            !state.fail_rendition_rebuild_once,
+            "the video rendition was rebuilt (and the injected failure hit)"
+        );
+        // Review R3-1: the master follows the reset once the recovery
+        // rebuild succeeded.
+        assert!(
+            state
+                .renditions
+                .as_ref()
+                .and_then(|r| r.master_text.as_deref())
+                .is_some_and(|t| t.contains("RESOLUTION=80x120")),
+            "the recovered rebuild re-renders the master"
+        );
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        for playlist in std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "m3u8"))
+            .filter(|p| p.file_name().is_some_and(|n| n != "master.m3u8"))
+        {
+            let uris = playlist_uris(&playlist);
+            let text = std::fs::read_to_string(&playlist).unwrap();
+            let last = dir.path().join(uris.last().unwrap());
+            assert_eq!(
+                ts_video_size(&last),
+                (80, 120),
+                "{}: {text}",
+                playlist.display()
+            );
+            assert_eq!(ts_video_size(&dir.path().join(&uris[0])), (160, 120));
+            assert!(text.contains("#EXT-X-DISCONTINUITY\n"), "{text}");
+            // The retried rebuild uses the ONE bumped version, not two.
+            let (_, first) = ts_table_versions(&dir.path().join(&uris[0]));
+            let (_, rebuilt) = ts_table_versions(&last);
+            assert_eq!(rebuilt, (first + 1) % 32, "{}", playlist.display());
+        }
+    }
+
+    /// The `version_number` of the PAT and of the PMT it points at, from the
+    /// first sections of each in a written `.ts` file.
+    fn ts_table_versions(path: &std::path::Path) -> (u8, u8) {
+        let bytes = std::fs::read(path).unwrap();
+        let section = |pid: u16| -> Option<Vec<u8>> {
+            bytes.chunks_exact(188).find_map(|p| {
+                let this = (u16::from(p[1] & 0x1f) << 8) | u16::from(p[2]);
+                let start = p[1] & 0x40 != 0;
+                if p[0] != 0x47 || this != pid || !start {
+                    return None;
+                }
+                let mut at = 4;
+                if p[3] & 0x20 != 0 {
+                    at += 1 + usize::from(p[4]);
+                }
+                let pointer = usize::from(p[at]);
+                Some(p[at + 1 + pointer..].to_vec())
+            })
+        };
+        let pat = section(0).unwrap();
+        assert_eq!(pat[0], 0x00, "PAT table id");
+        let pat_version = (pat[5] >> 1) & 0x1f;
+        // The first program entry after the 8-byte header.
+        let pmt_pid = (u16::from(pat[10] & 0x1f) << 8) | u16::from(pat[11]);
+        let pmt = section(pmt_pid).unwrap();
+        assert_eq!(pmt[0], 0x02, "PMT table id");
+        (pat_version, (pmt[5] >> 1) & 0x1f)
+    }
+
+    /// #342 B3: a decoder-configuration change also bumps the TS PAT/PMT
+    /// `version_number` of the segment it starts (the muxer is rebuilt with
+    /// `tables_version`+1), and only there: earlier segments keep the old
+    /// version, later ones keep the new one; one `EXT-X-DISCONTINUITY`.
+    #[test]
+    fn a_decoder_config_change_bumps_the_ts_table_version_at_its_segment() {
+        use super::{PacketSource, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+
+        struct Flagged {
+            packets: std::vec::IntoIter<EncodedPacket>,
+            last_pts: Option<i64>,
+        }
+        impl PacketSource for Flagged {
+            fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+                let next = self.packets.next();
+                self.last_pts = next.as_ref().and_then(EncodedPacket::pts);
+                Ok(next)
+            }
+            fn take_decoder_config_change(&mut self) -> bool {
+                self.last_pts == Some(6)
+            }
+        }
+        let _counter_guard = counter_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&params),
+            encoder.time_base(),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 10));
+        let packets: Vec<EncodedPacket> = (0..12)
+            .map(|index| {
+                let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+                packet.set_flags(if index % 3 == 0 {
+                    Flags::KEY
+                } else {
+                    Flags::empty()
+                });
+                packet.set_pts(Some(index));
+                packet.set_dts(Some(index));
+                EncodedPacket::from_packet(packet)
+            })
+            .collect();
+        let mut source = Flagged {
+            packets: packets.into_iter(),
+            last_pts: None,
+        };
+        state.drive_from_packets(&mut source).unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let playlist = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        assert_eq!(
+            playlist.matches("#EXT-X-DISCONTINUITY\n").count(),
+            1,
+            "{playlist}"
+        );
+        let versions: Vec<(u8, u8)> = (0..4)
+            .map(|i| ts_table_versions(&dir.path().join(format!("seg{i}.ts"))))
+            .collect();
+        assert_eq!(versions[0], versions[1], "unchanged before the flag");
+        assert_eq!(versions[2], versions[3], "stable after the flag");
+        assert_ne!(versions[1].1, versions[2].1, "PMT version_number changed");
+        assert_ne!(versions[1].0, versions[2].0, "PAT version_number changed");
+        assert_eq!(versions[2].1, (versions[1].1 + 1) % 32, "bumped by one");
     }
 
     #[test]

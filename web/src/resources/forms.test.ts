@@ -1102,6 +1102,8 @@ describe('outputFormToBody', () => {
 });
 
 describe('outputFormFromRecord', () => {
+  // #342 B3 review M-low: an AES67 (audio-only) output has no form, so the
+  // output format editor (encoded video only) can never be shown for it.
   it('refuses an unknown kind with the undefined sentinel (never folds)', () => {
     expect(
       outputFormFromRecord({
