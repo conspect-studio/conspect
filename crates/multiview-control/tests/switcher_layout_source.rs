@@ -1215,3 +1215,86 @@ async fn a_cut_of_a_layout_edited_after_authorization_is_refused() {
         "layout:wall"
     );
 }
+
+/// #307 review A4: a scoped patch of `layout:wall` is authorized for the
+/// body `ensure` registered; an edit committed after that (before the tick)
+/// to a body the scoped caller cannot read makes the engine refuse the patch
+/// `selection-changed`, the input unchanged.
+#[tokio::test]
+async fn a_patch_of_a_layout_edited_after_authorization_is_refused() {
+    let mut rig = Rig::new(true);
+    let mut outcomes = rig.handle.outcomes();
+    let op = accepted_op(
+        send(
+            &rig.router,
+            keyed(
+                post_json(
+                    "/api/v1/patch/take",
+                    LIMITED,
+                    &patch_xp(3, json!({"layout": "wall"})),
+                ),
+                "pe0",
+            ),
+        )
+        .await,
+    )
+    .await;
+    let response = send(
+        &rig.router,
+        put_json(
+            "/api/v1/layouts/wall",
+            OPERATOR_TOKEN,
+            Some("W/\"1\""),
+            &json!({ "name": "wall", "body": layout_body(&[("a", 1.0), ("secret", 1.0)], 64) }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    rig.tick();
+    let outcome = outcome_of(&mut outcomes, &op);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("selection-changed")),
+        "{outcome:?}"
+    );
+    let table = rig.handle.inputs().unwrap();
+    let input = table.inputs.iter().find(|i| i.number == 3).unwrap();
+    assert!(input.source.is_none(), "input 3 unchanged: {input:?}");
+    // Re-planned: the scoped caller may not read the new closure.
+    let response = send(
+        &rig.router,
+        keyed(
+            post_json(
+                "/api/v1/patch/take",
+                LIMITED,
+                &patch_xp(3, json!({"layout": "wall"})),
+            ),
+            "pe1",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // An unrestricted operator's patch of the current body applies.
+    let op = accepted_op(
+        send(
+            &rig.router,
+            keyed(
+                post_json(
+                    "/api/v1/patch/take",
+                    OPERATOR_TOKEN,
+                    &patch_xp(3, json!({"layout": "wall"})),
+                ),
+                "pe2",
+            ),
+        )
+        .await,
+    )
+    .await;
+    rig.tick();
+    assert_eq!(outcome_of(&mut outcomes, &op).error, None);
+    let table = rig.handle.inputs().unwrap();
+    let input = table.inputs.iter().find(|i| i.number == 3).unwrap();
+    assert_eq!(input.source.as_ref().unwrap().as_str(), "layout:wall");
+}

@@ -34,7 +34,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use multiview_core::switcher::SourceRef;
 use multiview_engine::switcher_control::{
-    PatchSet, SwitcherCommand, SwitcherControl, SwitcherSnapshot,
+    PatchSet, SelectionGuard, SwitcherCommand, SwitcherControl, SwitcherSnapshot,
 };
 use multiview_engine::switcher_inputs::{InputsReadback, MAX_PATCH_MEMBERS};
 use multiview_events::AuthzScope;
@@ -709,6 +709,7 @@ pub(crate) async fn take_patch(
     // (#307) before the enqueue; the engine refuses a patch to a store it
     // has not adopted, so the take waits (bounded, off the clock) for the
     // frame hook to adopt it.
+    let mut member_revisions = Vec::new();
     if !checked.bodies.is_empty() {
         let Some(registry) = state.me_layouts.as_ref() else {
             state.idempotency.release(Some(key), &op);
@@ -717,10 +718,16 @@ pub(crate) async fn take_patch(
             ));
         };
         for body in checked.bodies {
-            if let Err(error) = registry.ensure(body, state.source_demand.as_ref(), Instant::now())
-            {
-                state.idempotency.release(Some(key), &op);
-                return Ok(problem(409, error.kind(), error.detail()));
+            let key_ref = SourceRef::new(crate::me_layouts::source_key(&body.0.id));
+            match registry.ensure(body, state.source_demand.as_ref(), Instant::now()) {
+                // The authorized body's revision binds the execution (#307
+                // review A4): the engine refuses `selection-changed` when the
+                // hook holds another revision at the applying tick.
+                Ok(revision) => member_revisions.push((key_ref, revision)),
+                Err(error) => {
+                    state.idempotency.release(Some(key), &op);
+                    return Ok(problem(409, error.kind(), error.detail()));
+                }
             }
         }
         if !registry.adopted_within(ME_LAYOUT_ADOPT_WAIT).await {
@@ -776,7 +783,10 @@ pub(crate) async fn take_patch(
                 .collect(),
             allow_on_air: req.on_air == OnAir::Allow,
         }),
-        expect: None,
+        expect: (!member_revisions.is_empty()).then(|| SelectionGuard {
+            member_revisions,
+            ..SelectionGuard::default()
+        }),
     };
     let [program_lease, preview_lease] = leases;
     let owner = &state.switcher_preview_lease;

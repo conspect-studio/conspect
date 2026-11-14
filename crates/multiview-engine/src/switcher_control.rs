@@ -120,6 +120,12 @@ pub struct SelectionGuard {
     /// stored-layout body revision whose closure was authorized. Refused when
     /// the driver holds another revision for that key (or none).
     pub layout_revision: Option<u64>,
+    /// A patch (#307 review A4): for each `layout:*` member source, the
+    /// stored-layout body revision the control plane authorized. The patch is
+    /// refused (no member applied) when the driver holds another revision for
+    /// any listed key (or none). Bounded by the patch's ≤ 64 members; empty =
+    /// unchecked.
+    pub member_revisions: Vec<(SourceRef, u64)>,
 }
 
 /// A set of mixer-input crosspoints applied at one tick, all or none
@@ -735,9 +741,18 @@ impl SwitcherTickDriver {
                 }
                 resolved
             }
-            SwitcherVerb::SetTransition(_)
-            | SwitcherVerb::Patch(_)
-            | SwitcherVerb::PatchArmed { .. } => return false,
+            SwitcherVerb::Patch(_) => {
+                // #307 review A4: a patch names a layout id, not immutable
+                // content; refuse when any authorized member body changed.
+                return guard
+                    .member_revisions
+                    .iter()
+                    .any(|(key, want)| self.source_revision(key.as_str()) != Some(*want));
+            }
+            // `PatchArmed` (an armed salvo, #308) is exempt: the control plane
+            // never sends a guard with it today (salvo members are not layout
+            // sources), so there is nothing authorized to re-check.
+            SwitcherVerb::SetTransition(_) | SwitcherVerb::PatchArmed { .. } => return false,
         };
         guard
             .layout_revision
@@ -1033,18 +1048,33 @@ impl SwitcherTickDriver {
         if let Some((command, deadline)) = self.pending_take.take() {
             if let SwitcherVerb::Patch(set) = &command.verb {
                 // A held patch re-validates against the live table: nothing
-                // else could change it while it held the only slot.
-                match self.gate_patch(&command, set, tick, true) {
-                    Ok(true) => self.staged_success.push(command.operation_id),
-                    Ok(false) if tick.index >= deadline => self.publish_outcome(
+                // else could change it while it held the only slot. A layout
+                // body adopted while it held (#307 review A4) is a refusal.
+                if self.guard_violated(&command) {
+                    self.publish_outcome(
                         command.operation_id,
                         tick.index,
                         false,
-                        Some(REFUSE_NO_FRESH_FRAME.into()),
-                    ),
-                    Ok(false) => self.pending_take = Some((command, deadline)),
-                    Err(err) => {
-                        self.publish_outcome(command.operation_id, tick.index, false, Some(err));
+                        Some(REFUSE_SELECTION_CHANGED.into()),
+                    );
+                } else {
+                    match self.gate_patch(&command, set, tick, true) {
+                        Ok(true) => self.staged_success.push(command.operation_id),
+                        Ok(false) if tick.index >= deadline => self.publish_outcome(
+                            command.operation_id,
+                            tick.index,
+                            false,
+                            Some(REFUSE_NO_FRESH_FRAME.into()),
+                        ),
+                        Ok(false) => self.pending_take = Some((command, deadline)),
+                        Err(err) => {
+                            self.publish_outcome(
+                                command.operation_id,
+                                tick.index,
+                                false,
+                                Some(err),
+                            );
+                        }
                     }
                 }
             } else if self.guard_violated(&command) {
@@ -1682,6 +1712,7 @@ mod tests {
             preview: Some(SourceRef::new(source)),
             target: None,
             layout_revision,
+            member_revisions: Vec::new(),
         }
     }
 
@@ -1690,6 +1721,7 @@ mod tests {
             preview: None,
             target: Some(SourceRef::new(source)),
             layout_revision,
+            member_revisions: Vec::new(),
         }
     }
 
@@ -1853,6 +1885,110 @@ mod tests {
             Some(REFUSE_SELECTION_CHANGED)
         );
         assert_eq!(rig.program(), "a");
+    }
+
+    fn patch_guard(key: &str, revision: u64) -> SelectionGuard {
+        SelectionGuard {
+            member_revisions: vec![(SourceRef::new(key), revision)],
+            ..SelectionGuard::default()
+        }
+    }
+
+    fn patch_wall_to(input: u16) -> SwitcherVerb {
+        SwitcherVerb::Patch(PatchSet {
+            members: vec![(input, Some(SourceRef::new("layout:wall")))],
+            allow_on_air: true,
+        })
+    }
+
+    fn input_source(rig: &SwitcherTickDriver, input: u16) -> Option<String> {
+        rig.inputs
+            .as_ref()
+            .and_then(|table| table.source(input))
+            .map(|s| s.as_str().to_owned())
+    }
+
+    #[test]
+    fn a_patch_whose_layout_body_changed_is_refused_at_first_drain() {
+        let mut rig = Rig::new(true);
+        // Authorized against revision 7; revision 8 adopted since.
+        rig.driver
+            .insert_prime_store("layout:wall", store("layout:wall"), 8);
+        rig.send(
+            "patch",
+            patch_wall_to(1),
+            Some(patch_guard("layout:wall", 7)),
+        );
+        rig.tick();
+        assert_eq!(
+            rig.outcome("patch").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+        assert_eq!(input_source(&rig.driver, 1).as_deref(), Some("a"));
+        rig.send(
+            "patch2",
+            patch_wall_to(1),
+            Some(patch_guard("layout:wall", 8)),
+        );
+        rig.tick();
+        assert_eq!(rig.outcome("patch2").error, None);
+        assert_eq!(input_source(&rig.driver, 1).as_deref(), Some("layout:wall"));
+    }
+
+    #[test]
+    fn a_held_patch_whose_layout_body_changed_is_refused_at_replay() {
+        let mut rig = Rig::new(true);
+        let unprimed = Arc::new(TileStore::<Nv12Image>::with_defaults("layout:wall"));
+        rig.driver
+            .insert_prime_store("layout:wall", Arc::clone(&unprimed), 7);
+        rig.send(
+            "patch",
+            patch_wall_to(1),
+            Some(patch_guard("layout:wall", 7)),
+        );
+        rig.tick();
+        assert!(rig.outcomes.try_recv().is_err(), "held, no outcome yet");
+        // Edited (revision 8, new primed store) while held.
+        rig.driver
+            .insert_prime_store("layout:wall", store("layout:wall"), 8);
+        rig.tick();
+        assert_eq!(
+            rig.outcome("patch").error.as_deref(),
+            Some(REFUSE_SELECTION_CHANGED)
+        );
+        assert_eq!(input_source(&rig.driver, 1).as_deref(), Some("a"));
+        assert_eq!(rig.program(), "a");
+    }
+
+    #[test]
+    fn a_held_patch_with_an_unchanged_revision_applies_at_replay() {
+        let mut rig = Rig::new(true);
+        let unprimed = Arc::new(TileStore::<Nv12Image>::with_defaults("layout:wall"));
+        rig.driver
+            .insert_prime_store("layout:wall", Arc::clone(&unprimed), 7);
+        rig.send(
+            "patch",
+            patch_wall_to(1),
+            Some(patch_guard("layout:wall", 7)),
+        );
+        rig.tick();
+        assert!(rig.outcomes.try_recv().is_err(), "held, no outcome yet");
+        // The same body primes (same store, same revision).
+        unprimed.publish(
+            Nv12Image::solid(
+                64,
+                64,
+                128,
+                128,
+                128,
+                ColorInfo::default().resolve_defaults(64, 64),
+            )
+            .unwrap(),
+            MediaTime::ZERO,
+        );
+        rig.tick();
+        assert_eq!(rig.outcome("patch").error, None);
+        assert_eq!(input_source(&rig.driver, 1).as_deref(), Some("layout:wall"));
     }
 
     #[test]

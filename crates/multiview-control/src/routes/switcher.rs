@@ -329,6 +329,7 @@ fn authorize_target(
         preview: None,
         target: Some(SourceRef::new(&target.source)),
         layout_revision,
+        member_revisions: Vec::new(),
     }))
 }
 
@@ -358,6 +359,7 @@ fn authorize_take_of_layout(
         preview: Some(snapshot.preview.clone()),
         target: None,
         layout_revision,
+        member_revisions: Vec::new(),
     }))
 }
 
