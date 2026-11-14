@@ -334,7 +334,8 @@ pub struct AudioRoutingCounters {
     /// program stream (§5.2).
     pub returned: u64,
     /// Steps of a passthrough output's source-time audio delay (#344 D2b):
-    /// each repeated or skipped one tick of PCM at a tick boundary.
+    /// each repeated or skipped at most one AAC frame (1024 samples) of PCM
+    /// at an AAC grid boundary.
     pub source_delay_steps: u64,
 }
 
@@ -378,7 +379,7 @@ struct OutputAudio {
     watch: Option<Watch>,
     /// Audio by source time (#344 D2b): while the output is on a
     /// passthrough key, the key's published delay `d` (clamped to
-    /// [`MAX_SOURCE_DELAY_TICKS`]) and the source's last blocks.
+    /// [`MAX_SOURCE_DELAY_TICKS`]) and the source's recent PCM.
     delay: SourceDelay,
 }
 
@@ -386,47 +387,122 @@ struct OutputAudio {
 /// ticks (the passthrough clock's jitter bound).
 pub(crate) const MAX_SOURCE_DELAY_TICKS: u32 = 8;
 
-/// One passthrough output's source-time audio delay (#344 D2b): a bounded
-/// ring of the source's last `MAX_SOURCE_DELAY_TICKS + 1` blocks. The
-/// routed audio of tick `t` is the source's block of tick `t - d`. A step
-/// in `d` (a drift correction or a new run) repeats or skips exactly one
-/// tick of PCM at that tick boundary (counted).
+/// One passthrough output's source-time audio delay (#344 D2b, review
+/// R1-M-2/M-4): a bounded, sample-indexed FIFO of the source's interleaved
+/// PCM. Output frame `n` is source frame `n - lag`; `lag` follows the
+/// target `d` ticks in frames (rational: `d * rate / fps`, rounded), but
+/// only on the 1024-sample AAC grid and by at most one AAC frame (1024
+/// frames) per grid boundary, so a step repeats or skips at most one AAC
+/// frame of PCM there, and the PCM is contiguous everywhere else.
 #[derive(Default)]
 struct SourceDelay {
-    /// The delay to apply (`None`: not on a passthrough key).
-    target: Option<u32>,
-    /// The delay applied on the last fed tick.
-    applied: Option<u32>,
-    /// The source id the ring holds.
+    /// The delay to reach, in frames (`None`: not on a passthrough key).
+    target: Option<u64>,
+    /// The delay applied now, in frames.
+    lag: u64,
+    /// The source id the FIFO holds.
     source: Option<String>,
-    /// Newest last; at most `MAX_SOURCE_DELAY_TICKS + 1` blocks.
-    ring: std::collections::VecDeque<AudioBlock>,
+    /// Interleaved samples of source frames `end - len .. end`.
+    buf: std::collections::VecDeque<f32>,
+    /// The absolute frame index after the last pushed frame.
+    end: u64,
+    channels: usize,
+    /// Lag steps taken (each one AAC frame at most).
+    steps: u64,
 }
 
+/// Largest block (frames) a tick carries in practice (a shed catch-up
+/// block at 48 kHz below 12 fps is the only larger one; it is cut).
+const MAX_BLOCK_FRAMES: u64 = 4_096;
+
 impl SourceDelay {
-    /// Record `block` (the source's block of this tick) and return the
-    /// block of tick `t - d` (the oldest held when fewer are held), or
-    /// `None` when no delay applies.
-    fn delayed(&mut self, id: &str, block: Option<&AudioBlock>) -> Option<AudioBlock> {
-        let d = self.target?;
-        if self.source.as_deref() != Some(id) {
-            self.source = Some(id.to_owned());
-            self.ring.clear();
-        }
-        let Some(block) = block else {
-            // No strip this tick: silence enters the ring like a block.
-            self.ring.clear();
-            return None;
+    /// The target delay `d` ticks (clamped to [`MAX_SOURCE_DELAY_TICKS`]) in
+    /// frames at `rate` / `fps`; `None` clears the FIFO.
+    fn set_target(&mut self, ticks: Option<u32>, rate: u32, fps: Rational) {
+        let Some(d) = ticks else {
+            if self.target.is_some() {
+                *self = Self::default();
+            }
+            return;
         };
-        self.ring.push_back(block.clone());
-        let cap = usize::try_from(MAX_SOURCE_DELAY_TICKS).unwrap_or(8) + 1;
-        while self.ring.len() > cap {
-            self.ring.pop_front();
+        let d = u64::from(d.min(MAX_SOURCE_DELAY_TICKS));
+        let (num, den) = (
+            u64::try_from(fps.num).unwrap_or(0),
+            u64::try_from(fps.den).unwrap_or(0),
+        );
+        self.target = (num > 0).then(|| {
+            let x = d.saturating_mul(u64::from(rate)).saturating_mul(den);
+            (x.saturating_add(num / 2)) / num
+        });
+    }
+
+    /// The target in frames.
+    #[cfg(test)]
+    const fn target_frames(&self) -> Option<u64> {
+        self.target
+    }
+
+    /// Frames queued.
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.buf.len() / self.channels.max(1)
+    }
+
+    /// The FIFO bound in frames.
+    #[cfg(test)]
+    #[allow(clippy::unused_self)]
+    fn capacity(&self) -> usize {
+        usize::try_from(Self::cap_frames()).unwrap_or(usize::MAX)
+    }
+
+    fn cap_frames() -> u64 {
+        // 8 ticks at the slowest common cadence (23.976) plus one block.
+        (u64::from(MAX_SOURCE_DELAY_TICKS) * 48_000 * 1_001).div_ceil(24_000) + MAX_BLOCK_FRAMES
+    }
+
+    /// Push the source's `block` (first frame `start`) and return the
+    /// delayed block of the same length, or `None` when no delay applies.
+    fn delayed(&mut self, id: &str, block: Option<&AudioBlock>, start: u64) -> Option<AudioBlock> {
+        let target = self.target?;
+        let block = block?;
+        let channels = block.format().channel_count().max(1);
+        if self.source.as_deref() != Some(id) || self.channels != channels || start != self.end {
+            // Another source, a layout change or a hole: start over.
+            self.source = Some(id.to_owned());
+            self.channels = channels;
+            self.buf.clear();
+            self.lag = 0;
         }
-        let d = usize::try_from(d)
-            .unwrap_or(0)
-            .min(self.ring.len().saturating_sub(1));
-        self.ring.get(self.ring.len() - 1 - d).cloned()
+        let frames = u64::try_from(block.frame_count()).unwrap_or(0);
+        self.buf.extend(block.interleaved().iter().copied());
+        self.end = start.saturating_add(frames);
+        let cap = Self::cap_frames().saturating_mul(u64::try_from(channels).unwrap_or(1));
+        while u64::try_from(self.buf.len()).unwrap_or(u64::MAX) > cap {
+            self.buf.pop_front();
+        }
+        let held = u64::try_from(self.buf.len() / channels).unwrap_or(0);
+        let first = self.end.saturating_sub(held);
+        let mut out = Vec::with_capacity(block.interleaved().len());
+        for n in start..self.end {
+            if n % AAC_FRAME_SAMPLES == 0 && self.lag != target {
+                let step = self.lag.abs_diff(target).min(AAC_FRAME_SAMPLES);
+                self.lag = if target > self.lag {
+                    self.lag + step
+                } else {
+                    self.lag - step
+                };
+                self.steps = self.steps.saturating_add(1);
+            }
+            let src = n.checked_sub(self.lag).filter(|&s| s >= first);
+            match src.and_then(|s| usize::try_from(s - first).ok()) {
+                Some(k) => {
+                    let at = k * channels;
+                    out.extend((0..channels).map(|c| self.buf.get(at + c).copied().unwrap_or(0.0)));
+                }
+                None => out.extend(std::iter::repeat_n(0.0, channels)),
+            }
+        }
+        AudioBlock::from_interleaved(block.format(), out).ok()
     }
 }
 
@@ -528,12 +604,9 @@ impl RoutedAudio {
     /// D2b): `Some(d)` while it is on a passthrough key (clamped to
     /// [`MAX_SOURCE_DELAY_TICKS`]), `None` otherwise (the ring is dropped).
     pub(crate) fn set_source_delay(&mut self, output: usize, delay: Option<u32>) {
+        let (rate, fps) = (self.config.sample_rate, self.cadence);
         if let Some(o) = self.outputs.get_mut(output) {
-            let delay = delay.map(|d| d.min(MAX_SOURCE_DELAY_TICKS));
-            if delay.is_none() && o.delay.target.is_some() {
-                o.delay = SourceDelay::default();
-            }
-            o.delay.target = delay;
+            o.delay.set_target(delay, rate, fps);
         }
     }
 
@@ -1351,7 +1424,7 @@ impl RoutedAudio {
         for (output, o) in self.outputs.iter_mut().enumerate() {
             // Audio by source time (#344 D2b): a passthrough output's own
             // source is read `d` ticks back from its bounded ring.
-            let delayed = Self::delay_source(o, inputs, &mut self.counters);
+            let delayed = Self::delay_source(o, inputs, ctx.block_start, &mut self.counters);
             let swapped: Vec<(&str, &AudioBlock)>;
             let ctx_delayed;
             let ctx = if let Some((id, block)) = delayed.as_ref() {
@@ -1428,8 +1501,10 @@ impl RoutedAudio {
     fn delay_source(
         o: &mut OutputAudio,
         inputs: &[(&str, &AudioBlock)],
+        block_start: u64,
         counters: &mut AudioRoutingCounters,
     ) -> Option<(String, AudioBlock)> {
+        let before = o.delay.steps;
         let delayed = o
             .bus
             .as_ref()
@@ -1437,16 +1512,13 @@ impl RoutedAudio {
                 (AudioSource::Source(id), None) if o.delay.target.is_some() => {
                     let block = inputs.iter().find(|(i, _)| *i == id).map(|(_, b)| *b);
                     let id = id.clone();
-                    o.delay.delayed(&id, block).map(|b| (id, b))
+                    o.delay.delayed(&id, block, block_start).map(|b| (id, b))
                 }
                 _ => None,
             });
-        let held = u32::try_from(o.delay.ring.len().saturating_sub(1)).unwrap_or(0);
-        let applied = delayed.as_ref().and(o.delay.target).map(|d| d.min(held));
-        if applied.is_some() && o.delay.applied.is_some() && applied != o.delay.applied {
-            counters.source_delay_steps = counters.source_delay_steps.saturating_add(1);
-        }
-        o.delay.applied = applied;
+        counters.source_delay_steps = counters
+            .source_delay_steps
+            .saturating_add(o.delay.steps.saturating_sub(before));
         delayed
     }
 
@@ -1902,6 +1974,7 @@ fn bus_worker(w: &BusWorker, jobs: &Receiver<Vec<f32>>) -> bool {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+    use multiview_audio::cadence::SampleClock;
     use multiview_audio::format::AudioFormat;
     use multiview_audio::ChannelLayout;
 
@@ -1913,61 +1986,100 @@ mod tests {
         .unwrap()
     }
 
-    /// #344 D2b: the source-time delay ring is bounded (9 blocks), `d` is
-    /// clamped to 8, tick `t` reads the source block of tick `t - d` (the
-    /// oldest held while the ring fills), and a step in `d` repeats or
-    /// skips exactly one block.
+    /// `n` as an exact f32 (test ramps stay below 2^24).
+    fn exact(n: u64) -> f32 {
+        f32::from(u16::try_from(n % 65_536).unwrap())
+            + 65_536.0 * f32::from(u8::try_from(n / 65_536).unwrap())
+    }
+
+    /// A ramp: sample frame `n` (both channels) carries the value `n`.
+    fn ramp(start: u64, frames: usize) -> AudioBlock {
+        let v: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let x = exact(start + u64::try_from(i).unwrap());
+                [x, x]
+            })
+            .collect();
+        AudioBlock::from_interleaved(AudioFormat::new(48_000, ChannelLayout::Stereo), v).unwrap()
+    }
+
+    /// Drive `ticks` ticks of a ramp at 30000/1001 (1601/1602-frame
+    /// blocks) through `delay`, with the target `d(t)`; returns per output
+    /// frame (value, absolute frame index) for frames after `skip` ticks.
+    fn drive(
+        delay: &mut SourceDelay,
+        ticks: u64,
+        d: impl Fn(u64) -> Option<u32>,
+    ) -> Vec<(f32, u64)> {
+        let fps = Rational::new(30_000, 1_001);
+        let clock = SampleClock::new(48_000, fps);
+        let mut out = Vec::new();
+        for t in 0..ticks {
+            let start = clock.total_at(t);
+            let frames = usize::try_from(clock.total_at(t + 1) - start).unwrap();
+            delay.set_target(d(t), 48_000, fps);
+            let block = ramp(start, frames);
+            let got = delay.delayed("cam", Some(&block), start).unwrap();
+            assert_eq!(got.frame_count(), frames, "tick {t}: frames preserved");
+            for (i, f) in got.interleaved().chunks(2).enumerate() {
+                assert_eq!(f[0], f[1]);
+                out.push((f[0], start + u64::try_from(i).unwrap()));
+            }
+        }
+        out
+    }
+
+    /// Review R1-M-2: at a constant delay the output is the source's PCM,
+    /// contiguous, exactly `d` ticks of frames (rational: 1601/1602-frame
+    /// ticks at 30000/1001) behind, for thousands of ticks; the FIFO is
+    /// bounded.
     #[test]
-    fn passthrough_source_delay_ring_is_bounded_and_clamped() {
-        let mut r = SourceDelay {
-            target: Some(3),
-            ..SourceDelay::default()
-        };
-        let mut got = Vec::new();
-        for t in 0..20_u16 {
-            let b = block(f32::from(t), 4);
-            let out = r.delayed("cam", Some(&b)).unwrap();
-            got.push(out.interleaved()[0]);
-            assert!(r.ring.len() <= usize::try_from(MAX_SOURCE_DELAY_TICKS).unwrap() + 1);
+    fn passthrough_source_delay_is_a_contiguous_sample_fifo() {
+        let mut delay = SourceDelay::default();
+        let out = drive(&mut delay, 3_000, |_| Some(3));
+        // 3 ticks at 30000/1001 and 48 kHz: 4804.8 -> 4805 frames.
+        let lag = 4_805_u64;
+        // After the ramp-in steps, every frame is exactly `lag` behind.
+        let settled = out
+            .iter()
+            .position(|&(v, n)| n >= lag && (v - exact(n - lag)).abs() < 0.5)
+            .expect("settles");
+        assert!(settled < 48_000, "ramp-in within 1 s: {settled}");
+        for &(v, n) in &out[settled..] {
+            let want = exact(n - lag);
+            assert_eq!(v, want, "frame {n}: contiguous, {lag} behind");
         }
-        assert_eq!(&got[..4], &[0.0, 0.0, 0.0, 0.0], "fills from the oldest");
-        assert_eq!(got[10], 7.0, "tick 10 reads tick 7");
-        // Step 3 -> 2 at tick 20: the block of tick 17 is skipped.
-        r.target = Some(2);
-        let next = r.delayed("cam", Some(&block(20.0, 4))).unwrap();
-        assert_eq!(
-            next.interleaved()[0],
-            18.0,
-            "one tick skipped (17 -> 18 at once)"
-        );
-        // Step 2 -> 3: one tick repeated.
-        r.target = Some(3);
-        let again = r.delayed("cam", Some(&block(21.0, 4))).unwrap();
-        assert_eq!(again.interleaved()[0], 18.0, "one tick repeated");
-        // The router clamps d to the ring bound.
-        let mut audio = RoutedAudio::new(
-            1,
-            AudioEncodeConfig::aac(48_000, 2, 128_000),
-            Rational::new(25, 1),
-            None,
-            Arc::new(|_: &str| 1.0),
-            None,
-        );
-        audio.set_source_delay(0, Some(1000));
-        assert_eq!(audio.outputs[0].delay.target, Some(MAX_SOURCE_DELAY_TICKS));
-        audio.set_source_delay(0, None);
-        assert_eq!(audio.outputs[0].delay.target, None);
-        assert!(audio.outputs[0].delay.ring.is_empty(), "ring dropped");
-        // Another source resets the ring.
-        let mut r = SourceDelay {
-            target: Some(8),
-            ..SourceDelay::default()
-        };
-        for t in 0..5_u16 {
-            let _ = r.delayed("a", Some(&block(f32::from(t), 4)));
+        assert!(delay.queued() <= delay.capacity());
+        // The clamp: d is never above MAX_SOURCE_DELAY_TICKS.
+        let mut d8 = SourceDelay::default();
+        d8.set_target(Some(1000), 48_000, Rational::new(30_000, 1_001));
+        assert_eq!(d8.target_frames(), Some(12_813), "8 ticks of frames");
+    }
+
+    /// Review R1-M-4: a step in `d` lands only on the 1024-sample AAC grid,
+    /// at most one 1024-frame repeat or skip per grid boundary, and the PCM
+    /// is contiguous between steps.
+    #[test]
+    fn passthrough_source_delay_steps_on_the_aac_grid() {
+        let mut delay = SourceDelay::default();
+        let out = drive(&mut delay, 900, |t| Some(if t < 400 { 3 } else { 2 }));
+        // From one second in (the ramp-in from silence is done).
+        let mut steps = Vec::new();
+        for w in out[48_000..].windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if (b.0 - a.0 - 1.0).abs() > 0.5 {
+                steps.push((b.1, b.0 - a.0 - 1.0));
+            }
         }
-        let b = r.delayed("b", Some(&block(99.0, 4))).unwrap();
-        assert_eq!(b.interleaved()[0], 99.0);
+        assert_ne!(steps.len(), 0, "the step happened");
+        for &(n, jump) in &steps {
+            assert_eq!(n % AAC_FRAME_SAMPLES, 0, "step at frame {n} on the grid");
+            assert!(jump.abs() <= 1024.0, "one block at most: {jump}");
+        }
+        // 3 -> 2 ticks is 1601-1602 frames: two grid steps (skips).
+        let late: Vec<_> = steps.iter().filter(|s| s.0 > 400 * 1601).collect();
+        assert_eq!(late.len(), 2, "{late:?}");
+        assert!(late.iter().all(|s| s.1 > 0.0), "skips when d shrinks");
     }
 
     #[test]

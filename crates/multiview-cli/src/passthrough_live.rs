@@ -1707,8 +1707,8 @@ mod tests {
     }
 
     /// #344 D2b: the published delay is the emitted AU's exact source-time
-    /// age: frame k arrives on tick k and a run starts TARGET_DEPTH ticks
-    /// later, so a steady run publishes exactly TARGET_DEPTH.
+    /// age: frame k arrives on tick k and a run starts `TARGET_DEPTH` ticks
+    /// later, so a steady run publishes exactly `TARGET_DEPTH`.
     #[test]
     fn the_published_delay_is_the_emitted_aus_source_age() {
         let (log, _, status) = run(
