@@ -1880,44 +1880,91 @@ pub(crate) fn tile_specs_for_layout(
     tile_specs_with(layout, |id| labels.get(id).cloned())
 }
 
+/// The most characters a tile label carries into the baker. A display name
+/// is operator input of any length; shaping and rasterizing it runs on every
+/// baked frame, so it is capped here, before it reaches the baker.
+pub const MAX_LABEL_CHARS: usize = 64;
+
+/// `label` capped to [`MAX_LABEL_CHARS`] characters (on a `char` boundary, so
+/// never mid-UTF-8), with `…` appended when cut.
+#[must_use]
+pub fn cap_label(label: &str) -> String {
+    match label.char_indices().nth(MAX_LABEL_CHARS) {
+        None => label.to_owned(),
+        Some((cut, _)) => {
+            let mut capped = String::with_capacity(cut.saturating_add(3));
+            capped.push_str(label.get(..cut).unwrap_or_default());
+            capped.push('\u{2026}');
+            capped
+        }
+    }
+}
+
 /// [`tile_specs_for_layout`] with a label lookup closure (`None` = the id).
+///
+/// Specs come out in the compositor's draw order — ascending `z`, stable in
+/// cell order — so a higher cell's chrome paints over a lower cell's, never
+/// the reverse. A cell whose rect is wholly covered by one opaque higher-`z`
+/// cell draws no chrome at all (nothing of it is visible). A partially
+/// covered cell still draws its full chrome: its label/meter/flag may then
+/// sit under the covering cell's picture region but are painted after that
+/// picture (chrome is one pass over the composed canvas), so partial
+/// occlusion is a known approximation, not clipped per pixel.
 #[must_use]
 pub fn tile_specs_with(
     layout: &multiview_core::layout::Layout,
     label: impl Fn(&str) -> Option<String>,
 ) -> Vec<TileSpec> {
     let (cw, ch) = (layout.canvas.width, layout.canvas.height);
-    layout
-        .cells
+    let mut order: Vec<usize> = (0..layout.cells.len()).collect();
+    order.sort_by_key(|&i| layout.cells.get(i).map_or(i32::MIN, |c| c.z));
+    let edges = |cell: &multiview_core::layout::Cell| {
+        (
+            crate::display_size::frac_to_px(cell.x, cw),
+            crate::display_size::frac_to_px(cell.y, ch),
+            crate::display_size::frac_to_px(cell.x + cell.w, cw),
+            crate::display_size::frac_to_px(cell.y + cell.h, ch),
+        )
+    };
+    order
         .iter()
-        .filter_map(|cell| {
+        .enumerate()
+        .filter_map(|(rank, &i)| {
+            let cell = layout.cells.get(i)?;
             let id = cell.source.as_deref()?;
-            let text = label(id).unwrap_or_else(|| id.to_owned());
+            let (left, top, right, bottom) = edges(cell);
+            // Wholly hidden by one opaque cell drawn after it (higher z, or
+            // equal z later in cell order): no chrome.
+            let hidden = order.iter().skip(rank.saturating_add(1)).any(|&j| {
+                layout.cells.get(j).is_some_and(|above| {
+                    let (a_left, a_top, a_right, a_bottom) = edges(above);
+                    above.opacity >= 1.0
+                        && a_left <= left
+                        && a_top <= top
+                        && a_right >= right
+                        && a_bottom >= bottom
+                })
+            });
+            if hidden {
+                return None;
+            }
+            let text = cap_label(&label(id).unwrap_or_else(|| id.to_owned()));
             // Match the compositor's normalized endpoint quantization, not an
             // independent truncation of width/height that can spill a pixel.
-            let x = norm_to_px_f32(cell.x, cw);
-            let y = norm_to_px_f32(cell.y, ch);
-            let right = norm_to_px_f32(cell.x + cell.w, cw);
-            let bottom = norm_to_px_f32(cell.y + cell.h, ch);
+            let x = f32_dim(left);
+            let y = f32_dim(top);
             Some(TileSpec::new(
                 id,
                 text,
                 PixelRect {
                     x,
                     y,
-                    width: right - x,
-                    height: bottom - y,
+                    width: f32_dim(right) - x,
+                    height: f32_dim(bottom) - y,
                 },
             ))
         })
         .collect()
-}
-
-/// A normalized edge to canvas pixels as `f32`: the compositor's exact integer
-/// [`crate::display_size::frac_to_px`], widened losslessly (overlay sizes are
-/// well under 2^24).
-fn norm_to_px_f32(frac: f32, extent: u32) -> f32 {
-    f32_dim(crate::display_size::frac_to_px(frac, extent))
 }
 
 /// Round a non-negative `f32` pixel measure to `u32` (saturating), no `as`.
@@ -4168,5 +4215,148 @@ mod tests {
             glyphs_in(&pvw, band) > plain_glyphs,
             "chip reads LIVE · PVW"
         );
+    }
+
+    fn layout_of(cells: Vec<multiview_core::layout::Cell>) -> multiview_core::layout::Layout {
+        multiview_core::layout::Layout {
+            name: "l".to_owned(),
+            canvas: multiview_core::layout::Canvas {
+                width: 1280,
+                height: 720,
+                fps_num: 25,
+                fps_den: 1,
+            },
+            cells,
+        }
+    }
+
+    fn cell_at(
+        source: &str,
+        rect: (f32, f32, f32, f32),
+        depth: i32,
+    ) -> multiview_core::layout::Cell {
+        multiview_core::layout::Cell {
+            x: rect.0,
+            y: rect.1,
+            w: rect.2,
+            h: rect.3,
+            z: depth,
+            source: Some(source.to_owned()),
+            ..multiview_core::layout::Cell::default()
+        }
+    }
+
+    /// M2: tile specs follow the compositor's draw order (ascending z, stable
+    /// in cell order) whatever the document order; a cell wholly covered by
+    /// an opaque higher-z cell draws no chrome; a partially covered one does.
+    #[test]
+    fn tile_specs_follow_z_order_and_skip_fully_covered_cells() {
+        let layout = layout_of(vec![
+            // Document order: top (z 5) first, then the full-frame base (z 0).
+            cell_at("top", (0.5, 0.5, 0.25, 0.25), 5),
+            cell_at("base", (0.0, 0.0, 1.0, 1.0), 0),
+            // Wholly under `cover` (z 3): no chrome.
+            cell_at("hidden", (0.1, 0.1, 0.2, 0.2), 1),
+            cell_at("cover", (0.0, 0.0, 0.4, 0.4), 3),
+            // Partly under `top`: keeps its chrome.
+            cell_at("partial", (0.6, 0.6, 0.3, 0.3), 2),
+        ]);
+        let specs = tile_specs_for_layout(&layout, &HashMap::new());
+        let ids: Vec<&str> = specs.iter().map(|t| t.source_id.as_str()).collect();
+        assert_eq!(ids, ["base", "partial", "cover", "top"]);
+
+        // Higher-z chrome paints last: `top`'s label chip is drawn after
+        // `base`'s chrome in the list.
+        let mut baker = OverlayBaker::new(specs, epoch_clock())
+            .unwrap()
+            .with_clock(None);
+        let list = baker
+            .draw_list(
+                MediaTime::ZERO,
+                &HashMap::new(),
+                &no_captions(),
+                &no_bitmaps(),
+            )
+            .unwrap();
+        let first_in = |x0: i32, y0: i32| {
+            list.primitives.iter().position(|p| {
+                matches!(p, OverlayPrimitive::Glyph { dest_x, dest_y, .. }
+                    if *dest_x >= x0 && *dest_y >= y0)
+            })
+        };
+        let base_first = first_in(0, 0).unwrap();
+        let top_first = first_in(640, 360).unwrap();
+        assert!(base_first < top_first, "base chrome before top chrome");
+
+        // A translucent cover hides nothing.
+        let mut translucent = layout.clone();
+        translucent.cells[3].opacity = 0.5;
+        let ids: Vec<String> = tile_specs_for_layout(&translucent, &HashMap::new())
+            .into_iter()
+            .map(|t| t.source_id)
+            .collect();
+        assert!(ids.iter().any(|id| id == "hidden"));
+    }
+
+    /// A1: a label is capped before the baker shapes it — on a char
+    /// boundary, with an ellipsis — so a 100 KB display name yields a bounded
+    /// draw list and the bake completes.
+    #[test]
+    fn a_huge_label_is_capped_and_bakes_a_bounded_draw_list() {
+        assert_eq!(cap_label("short"), "short");
+        let exact: String = "é".repeat(MAX_LABEL_CHARS);
+        assert_eq!(cap_label(&exact), exact, "exactly at the cap: unchanged");
+        let multi = "é".repeat(MAX_LABEL_CHARS + 1);
+        let capped = cap_label(&multi);
+        assert_eq!(capped.chars().count(), MAX_LABEL_CHARS + 1);
+        assert!(capped.ends_with('\u{2026}'));
+
+        let huge = "W".repeat(100 * 1024);
+        let layout = layout_of(vec![cell_at("cam", (0.0, 0.0, 1.0, 1.0), 0)]);
+        let specs = tile_specs_with(&layout, |_| Some(huge.clone()));
+        assert_eq!(specs[0].label.chars().count(), MAX_LABEL_CHARS + 1);
+        // The id fallback is capped too.
+        let long_id = "x".repeat(10_000);
+        let layout = layout_of(vec![cell_at(&long_id, (0.0, 0.0, 1.0, 1.0), 0)]);
+        let fallback = tile_specs_for_layout(&layout, &HashMap::new());
+        assert_eq!(fallback[0].label.chars().count(), MAX_LABEL_CHARS + 1);
+
+        let mut baker = OverlayBaker::new(specs, epoch_clock())
+            .unwrap()
+            .with_layers(LayoutOverlays {
+                meters: false,
+                flags: false,
+                clock: false,
+                ..LayoutOverlays::default()
+            });
+        let list = baker
+            .draw_list(
+                MediaTime::ZERO,
+                &HashMap::new(),
+                &no_captions(),
+                &no_bitmaps(),
+            )
+            .unwrap();
+        let glyphs = list
+            .primitives
+            .iter()
+            .filter(|p| matches!(p, OverlayPrimitive::Glyph { .. }))
+            .count();
+        assert!(glyphs <= MAX_LABEL_CHARS + 1, "glyphs {glyphs}");
+        let canvas = multiview_compositor::pipeline::Nv12Image::solid(
+            1280,
+            720,
+            16,
+            128,
+            128,
+            multiview_compositor::pipeline::CanvasColor::default().output_tag(),
+        )
+        .unwrap();
+        multiview_compositor::overlay::apply_overlays_to_nv12(
+            &canvas,
+            &list,
+            multiview_compositor::pipeline::CanvasColor::default(),
+        )
+        .unwrap();
     }
 }
