@@ -8,8 +8,8 @@
 )]
 
 use multiview_config::{
-    Anchor, ConfigError, MultiviewConfig, OutputAudioMode, OutputFitMode, Scan,
-    SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
+    Anchor, ConfigError, MultiviewConfig, OutputAudioMode, OutputFitMode, Scan, SubtitleFormat,
+    MAX_SUBTITLE_SLOTS, SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
 };
 
 const HEAD: &str = r##"
@@ -661,4 +661,207 @@ fn more_than_eight_distinct_base_formats_are_refused() {
         SLOT_FORMAT_UNSUPPORTED,
         "9 distinct video encoders",
     );
+}
+
+// ---- Slice F (#345): subtitle slots -------------------------------------
+
+fn hls_subs(slots: &str) -> String {
+    format!(
+        r#"
+[[outputs]]
+kind = "hls"
+id = "subs"
+path = "/srv/hls/s"
+codec = "h264"
+{slots}
+"#
+    )
+}
+
+const TWO_SUBS: &str = r#"
+[[outputs.slots.subtitle]]
+language = "en"
+name = "English (CC)"
+source = "cam_a"
+[[outputs.slots.subtitle]]
+format = "webvtt"
+language = "es-419"
+"#;
+
+#[test]
+fn hls_webvtt_subtitle_slots_parse_validate_and_round_trip() {
+    let cfg = parse(&hls_subs(TWO_SUBS));
+    cfg.validate().expect("HLS carries WebVTT subtitle slots");
+    let slots = cfg.outputs[0].slots().expect("slots");
+    assert_eq!(slots.subtitle.len(), 2);
+    assert_eq!(slots.subtitle[0].format, SubtitleFormat::Webvtt);
+    assert_eq!(slots.subtitle[0].language.as_deref(), Some("en"));
+    assert_eq!(slots.subtitle[0].name.as_deref(), Some("English (CC)"));
+    assert_eq!(slots.subtitle[0].source.as_deref(), Some("cam_a"));
+    assert_eq!(slots.subtitle[1].source, None);
+    assert!(slots.video.is_empty() && slots.audio.is_empty());
+    // Subtitle slots do not imply an audio selection.
+    assert!(cfg.outputs[0].effective_audio().is_none());
+    let toml = cfg.to_toml().expect("to toml");
+    assert_eq!(
+        MultiviewConfig::load_from_toml(&toml).expect("reparse"),
+        cfg
+    );
+    let json = cfg.to_json().expect("to json");
+    assert!(json.contains("\"subtitle\""));
+    assert_eq!(
+        MultiviewConfig::load_from_json(&json).expect("reparse"),
+        cfg
+    );
+}
+
+#[test]
+fn absent_subtitle_slots_serialize_byte_identically() {
+    // A slots table with only audio: no `subtitle` key appears.
+    let cfg = parse(VERTICAL);
+    let toml = cfg.to_toml().expect("to toml");
+    let json = cfg.to_json().expect("to json");
+    assert!(!toml.contains("subtitle"), "{toml}");
+    assert!(!json.contains("subtitle"), "{json}");
+    // Re-serialising the reparsed document yields the same bytes.
+    let again = MultiviewConfig::load_from_toml(&toml).expect("reparse");
+    assert_eq!(again.to_toml().expect("to toml"), toml);
+}
+
+#[test]
+fn unknown_subtitle_field_and_format_are_rejected_at_parse() {
+    let bad_field = doc(&hls_subs("[[outputs.slots.subtitle]]\nlang = \"en\"\n"));
+    assert!(MultiviewConfig::load_from_toml(&bad_field).is_err());
+    let bad_format = doc(&hls_subs("[[outputs.slots.subtitle]]\nformat = \"srt\"\n"));
+    assert!(MultiviewConfig::load_from_toml(&bad_format).is_err());
+}
+
+#[test]
+fn eight_subtitle_slots_accepted_nine_refused() {
+    let eight = "[[outputs.slots.subtitle]]\n".repeat(MAX_SUBTITLE_SLOTS);
+    parse(&hls_subs(&eight)).validate().expect("8 slots");
+    let nine = "[[outputs.slots.subtitle]]\n".repeat(MAX_SUBTITLE_SLOTS + 1);
+    assert_code(&hls_subs(&nine), SLOT_MEDIUM_MISMATCH, "9 subtitle slot(s)");
+}
+
+#[test]
+fn ll_hls_webvtt_is_slot_format_unsupported() {
+    assert_code(
+        r#"
+[[outputs]]
+kind = "ll_hls"
+path = "/srv/hls/ll"
+codec = "h264"
+[[outputs.slots.subtitle]]
+"#,
+        SLOT_FORMAT_UNSUPPORTED,
+        "not built yet",
+    );
+}
+
+fn ts_output(kind_lines: &str, format: &str) -> String {
+    format!("[[outputs]]\n{kind_lines}\ncodec = \"h264\"\n[[outputs.slots.subtitle]]\nformat = \"{format}\"\n")
+}
+
+#[test]
+fn ts_and_rtmp_subtitles_are_refused_with_the_right_code() {
+    let kinds = [
+        "kind = \"srt\"\nurl = \"srt://[::1]:9000\"",
+        "kind = \"rist\"\nurl = \"rist://[::1]:9000\"",
+        "kind = \"rtmp\"\nurl = \"rtmp://[::1]/live/k\"",
+    ];
+    for kind in kinds {
+        for format in ["cea608", "dvb"] {
+            assert_code(
+                &ts_output(kind, format),
+                SLOT_FORMAT_UNSUPPORTED,
+                "not built yet",
+            );
+        }
+        assert_code(
+            &ts_output(kind, "webvtt"),
+            SLOT_MEDIUM_MISMATCH,
+            "\"webvtt\" is not carried",
+        );
+    }
+}
+
+#[test]
+fn subtitles_on_other_kinds_are_slot_medium_mismatch() {
+    let kinds = [
+        "kind = \"rtsp_server\"\nmount = \"/m\"\ncodec = \"h264\"",
+        "kind = \"webrtc\"\nlabel = \"web\"",
+        "kind = \"ndi\"\nname = \"pgm\"",
+        "kind = \"display\"",
+        "kind = \"aes67\"\nlabel = \"pcm\"\nmulticast = \"[ff3e::1]:5004\"",
+    ];
+    for kind in kinds {
+        for format in ["webvtt", "cea608", "dvb"] {
+            assert_code(
+                &format!(
+                    "[[outputs]]\n{kind}\n[[outputs.slots.subtitle]]\nformat = \"{format}\"\n"
+                ),
+                SLOT_MEDIUM_MISMATCH,
+                "is not carried by this medium",
+            );
+        }
+    }
+}
+
+#[test]
+fn subtitle_language_is_validated() {
+    for ok in ["en", "es-419", "zh-Hant-TW", &"a".repeat(35)] {
+        parse(&hls_subs(&format!(
+            "[[outputs.slots.subtitle]]\nlanguage = \"{ok}\"\n"
+        )))
+        .validate()
+        .unwrap_or_else(|e| panic!("{ok:?} accepted: {e}"));
+    }
+    for bad in ["", "en_US", "en US", "é", &"a".repeat(36)] {
+        assert_code(
+            &hls_subs(&format!(
+                "[[outputs.slots.subtitle]]\nlanguage = \"{bad}\"\n"
+            )),
+            SLOT_FORMAT_UNSUPPORTED,
+            "language",
+        );
+    }
+}
+
+#[test]
+fn subtitle_name_is_validated() {
+    parse(&hls_subs(&format!(
+        "[[outputs.slots.subtitle]]\nname = \"{}\"\n",
+        "é".repeat(64)
+    )))
+    .validate()
+    .expect("64 characters accepted");
+    for bad in [
+        "é".repeat(65),
+        "quote \\\"here\\\"".to_owned(),
+        "tab\\there".to_owned(),
+        "nl\\nhere".to_owned(),
+    ] {
+        assert_code(
+            &hls_subs(&format!("[[outputs.slots.subtitle]]\nname = \"{bad}\"\n")),
+            SLOT_FORMAT_UNSUPPORTED,
+            "name must be",
+        );
+    }
+}
+
+#[test]
+fn subtitle_source_must_be_declared() {
+    let msg = refusal(&hls_subs(
+        "[[outputs.slots.subtitle]]\nsource = \"ghost\"\n",
+    ));
+    assert!(
+        msg.contains("subtitle slot 0 names unknown source \"ghost\""),
+        "{msg}"
+    );
+    parse(&hls_subs(
+        "[[outputs.slots.subtitle]]\nsource = \"cam_b\"\n",
+    ))
+    .validate()
+    .expect("declared source");
 }

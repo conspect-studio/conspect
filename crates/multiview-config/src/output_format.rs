@@ -19,8 +19,14 @@
 //! scan, colour, pixel format or aspect the engine cannot produce yet, an
 //! invalid size, or a format on a kind slice B does not convert for).
 //!
+//! Slice F (#345) adds subtitle slots (`[[outputs.slots.subtitle]]`): a
+//! format (`webvtt` | `cea608` | `dvb`), a language, a menu name and the
+//! source whose captions the slot carries (its patch). HLS carries up to
+//! [`MAX_SUBTITLE_SLOTS`] `WebVTT` renditions; every other format/medium pair is
+//! refused with the same two prefixes.
+//!
 //! Every type is `#[non_exhaustive]`: slice C adds per-output rates, slice D
-//! passthrough and slice F subtitle slots.
+//! passthrough.
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +48,13 @@ pub const MAX_FORMAT_AREA: u64 = 3840 * 2160;
 
 /// Largest accepted video slot bit rate, in kbit/s (1 Gbit/s).
 pub const MAX_SLOT_BITRATE_KBPS: u32 = 1_000_000;
+
+/// Most subtitle slots an output may declare (slice F, #345).
+pub const MAX_SUBTITLE_SLOTS: usize = 8;
+/// Longest accepted subtitle slot language tag, in characters.
+pub const MAX_SUBTITLE_LANGUAGE_LEN: usize = 35;
+/// Longest accepted subtitle slot menu name, in characters.
+pub const MAX_SUBTITLE_NAME_LEN: usize = 64;
 
 /// The audio grid every audio slot is encoded on (ADR-0108 §5.2): stereo.
 pub const SLOT_AUDIO_CHANNELS: u16 = 2;
@@ -256,6 +269,65 @@ pub struct AudioSlot {
     pub codec: Option<String>,
 }
 
+/// The format a subtitle slot is carried as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SubtitleFormat {
+    /// `WebVTT` renditions (HLS `TYPE=SUBTITLES`). The only format built in F1.
+    #[default]
+    Webvtt,
+    /// CEA-608 in A/53 SEI (TS/RTMP); not built yet (follow-up).
+    Cea608,
+    /// DVB subtitles (TS); not built yet (follow-up).
+    Dvb,
+}
+
+impl SubtitleFormat {
+    /// The config token of this format.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Webvtt => "webvtt",
+            Self::Cea608 => "cea608",
+            Self::Dvb => "dvb",
+        }
+    }
+}
+
+/// One subtitle slot (`[[outputs.slots.subtitle]]`, slice F #345).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct SubtitleSlot {
+    /// Carried format (default `webvtt`).
+    #[serde(default)]
+    pub format: SubtitleFormat,
+    /// Language tag (BCP-47-ish: 1..=35 of `[A-Za-z0-9-]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Menu label (≤ 64 printable characters, no `"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The source whose captions this slot carries (its patch); absent ⇒
+    /// unpatched (the rendition stays empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl SubtitleSlot {
+    /// A slot of `format` with no language, name or source.
+    #[must_use]
+    pub const fn new(format: SubtitleFormat) -> Self {
+        Self {
+            format,
+            language: None,
+            name: None,
+            source: None,
+        }
+    }
+}
+
 /// An output's media slots. An empty list means "absent" (today's single slot).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -267,6 +339,9 @@ pub struct OutputSlots {
     /// Audio slots: slot 0 the program, slot `i > 0` a discrete track.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio: Vec<AudioSlot>,
+    /// Subtitle slots (slice F); empty ⇒ none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtitle: Vec<SubtitleSlot>,
 }
 
 /// A video codec family a medium carries. [`CodecFamily::of`] is THE codec
@@ -318,11 +393,21 @@ pub struct SlotCapability {
     pub raw_video: bool,
     /// Whether slice B converts the Program to a non-canvas format for it.
     pub format_convertible: bool,
+    /// Most subtitle slots (0 ⇒ the medium carries no subtitles).
+    pub subtitle_max: usize,
+    /// The subtitle formats this medium carries (built or not).
+    pub subtitle_medium_formats: &'static [SubtitleFormat],
+    /// The subtitle formats the engine builds for this medium (a subset of
+    /// `subtitle_medium_formats`).
+    pub subtitle_formats: &'static [SubtitleFormat],
 }
 
 const H264_HEVC: &[CodecFamily] = &[CodecFamily::H264, CodecFamily::Hevc];
 const H264_HEVC_MPEG2: &[CodecFamily] = &[CodecFamily::H264, CodecFamily::Hevc, CodecFamily::Mpeg2];
 const H264_ONLY: &[CodecFamily] = &[CodecFamily::H264];
+const WEBVTT: &[SubtitleFormat] = &[SubtitleFormat::Webvtt];
+const TS_SUBTITLES: &[SubtitleFormat] = &[SubtitleFormat::Cea608, SubtitleFormat::Dvb];
+const NO_SUBTITLES: &[SubtitleFormat] = &[];
 
 impl Output {
     /// The output's declared picture format, if any (absent ⇒ the canvas).
@@ -405,19 +490,37 @@ impl Output {
     #[must_use]
     pub const fn slot_capability(&self) -> SlotCapability {
         match self {
-            Output::Hls { .. } | Output::LlHls { .. } => SlotCapability {
+            Output::Hls { .. } => SlotCapability {
                 video_max: 1,
                 audio_max: None,
                 video_codecs: H264_HEVC,
                 raw_video: false,
                 format_convertible: true,
+                subtitle_max: MAX_SUBTITLE_SLOTS,
+                subtitle_medium_formats: WEBVTT,
+                subtitle_formats: WEBVTT,
             },
+            // LL-HLS carries WebVTT in fMP4/CMAF parts: not built yet.
+            Output::LlHls { .. } => SlotCapability {
+                video_max: 1,
+                audio_max: None,
+                video_codecs: H264_HEVC,
+                raw_video: false,
+                format_convertible: true,
+                subtitle_max: MAX_SUBTITLE_SLOTS,
+                subtitle_medium_formats: WEBVTT,
+                subtitle_formats: NO_SUBTITLES,
+            },
+            // MPEG-TS (and RTMP) carry CEA-608 (A/53 SEI) / DVB subtitles: not built yet.
             Output::Srt { .. } | Output::Rist { .. } => SlotCapability {
                 video_max: 1,
                 audio_max: None,
                 video_codecs: H264_HEVC_MPEG2,
                 raw_video: false,
                 format_convertible: true,
+                subtitle_max: MAX_SUBTITLE_SLOTS,
+                subtitle_medium_formats: TS_SUBTITLES,
+                subtitle_formats: NO_SUBTITLES,
             },
             Output::Rtmp { multitrack, .. } => SlotCapability {
                 video_max: 1,
@@ -425,6 +528,9 @@ impl Output {
                 video_codecs: if *multitrack { H264_HEVC } else { H264_ONLY },
                 raw_video: false,
                 format_convertible: true,
+                subtitle_max: MAX_SUBTITLE_SLOTS,
+                subtitle_medium_formats: TS_SUBTITLES,
+                subtitle_formats: NO_SUBTITLES,
             },
             // The RTSP server is not a packet sink yet (the engine skips it), so
             // there is nothing to convert for.
@@ -434,6 +540,9 @@ impl Output {
                 video_codecs: H264_HEVC,
                 raw_video: false,
                 format_convertible: false,
+                subtitle_max: 0,
+                subtitle_medium_formats: NO_SUBTITLES,
+                subtitle_formats: NO_SUBTITLES,
             },
             Output::Webrtc { .. } | Output::WhipPush { .. } => SlotCapability {
                 video_max: 1,
@@ -441,6 +550,9 @@ impl Output {
                 video_codecs: H264_ONLY,
                 raw_video: false,
                 format_convertible: false,
+                subtitle_max: 0,
+                subtitle_medium_formats: NO_SUBTITLES,
+                subtitle_formats: NO_SUBTITLES,
             },
             Output::Ndi { .. } | Output::Display { .. } => SlotCapability {
                 video_max: 1,
@@ -448,6 +560,9 @@ impl Output {
                 video_codecs: &[],
                 raw_video: true,
                 format_convertible: false,
+                subtitle_max: 0,
+                subtitle_medium_formats: NO_SUBTITLES,
+                subtitle_formats: NO_SUBTITLES,
             },
             Output::Aes67 { .. } => SlotCapability {
                 video_max: 0,
@@ -455,6 +570,9 @@ impl Output {
                 video_codecs: &[],
                 raw_video: false,
                 format_convertible: false,
+                subtitle_max: 0,
+                subtitle_medium_formats: NO_SUBTITLES,
+                subtitle_formats: NO_SUBTITLES,
             },
         }
     }
@@ -524,6 +642,7 @@ pub fn validate_output_format(
     if let Some(slots) = output.slots() {
         validate_video_slots(output, cap, &slots.video)?;
         validate_audio_slots(output, cap, &slots.audio, discrete_tracks)?;
+        validate_subtitle_slots(output, cap, &slots.subtitle)?;
     }
     if let Some(format) = output.format() {
         validate_format(output, cap, format, canvas)?;
@@ -657,6 +776,94 @@ fn validate_audio_slots(
                 output,
                 &format!("audio slot {i} codec must be {SLOT_AUDIO_CODEC:?}"),
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_subtitle_slots(
+    output: &Output,
+    cap: SlotCapability,
+    subtitle: &[SubtitleSlot],
+) -> Result<(), ConfigError> {
+    for (i, slot) in subtitle.iter().enumerate() {
+        let format = slot.format.as_str();
+        if !cap.subtitle_medium_formats.contains(&slot.format) {
+            return Err(mismatch(
+                output,
+                &format!("subtitle slot {i} format {format:?} is not carried by this medium"),
+            ));
+        }
+        if !cap.subtitle_formats.contains(&slot.format) {
+            return Err(unsupported(
+                output,
+                &format!(
+                    "subtitle slot {i} format {format:?} is not built yet for this medium \
+                     (follow-up)"
+                ),
+            ));
+        }
+        if let Some(language) = &slot.language {
+            let ok = (1..=MAX_SUBTITLE_LANGUAGE_LEN).contains(&language.len())
+                && language
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+            if !ok {
+                return Err(unsupported(
+                    output,
+                    &format!(
+                        "subtitle slot {i} language {language:?} must be \
+                         1..={MAX_SUBTITLE_LANGUAGE_LEN} of [A-Za-z0-9-]"
+                    ),
+                ));
+            }
+        }
+        if let Some(name) = &slot.name {
+            let ok = name.chars().count() <= MAX_SUBTITLE_NAME_LEN
+                && !name.chars().any(|c| c.is_control() || c == '"');
+            if !ok {
+                return Err(unsupported(
+                    output,
+                    &format!(
+                        "subtitle slot {i} name must be at most {MAX_SUBTITLE_NAME_LEN} \
+                         characters, no control characters and no '\"'"
+                    ),
+                ));
+            }
+        }
+    }
+    if subtitle.len() > cap.subtitle_max {
+        return Err(mismatch(
+            output,
+            &format!(
+                "declares {} subtitle slot(s); this medium carries {}",
+                subtitle.len(),
+                cap.subtitle_max
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Every subtitle slot `source` of `output` must name a declared source
+/// (`source_ids`). Called from document validation, where the sources are
+/// known.
+///
+/// # Errors
+///
+/// [`ConfigError::Validation`] naming the slot and the unknown source.
+pub fn validate_subtitle_sources(output: &Output, source_ids: &[&str]) -> Result<(), ConfigError> {
+    let Some(slots) = output.slots() else {
+        return Ok(());
+    };
+    for (i, slot) in slots.subtitle.iter().enumerate() {
+        if let Some(source) = &slot.source {
+            if !source_ids.contains(&source.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "output {:?}: subtitle slot {i} names unknown source {source:?}",
+                    output.id()
+                )));
+            }
         }
     }
     Ok(())
