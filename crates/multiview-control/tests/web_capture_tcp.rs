@@ -162,7 +162,9 @@ sys.exit(subprocess.run([{}]+sys.argv[1:],input=json.dumps(request).encode()).re
     let server = tokio::spawn(multiview_control::serve(listener, state, async move {
         let _ = done.await;
     }));
-    let body=serde_json::json!({"fill_id":"radar","view":{"lat":-33.946,"lon":150.37,"zoom":10,"overlay":"radar","width":1280,"height":720,"fps":2,"frames":2,"public":true},"terms":{"accepted":true,"version":"windy-2023-09-01"}}).to_string();
+    // The producer wrapper swaps the source to an HTML page, which has no radar
+    // timeline: pin the wall-clock mode (step capture is proved in capture_runtime).
+    let body=serde_json::json!({"fill_id":"radar","view":{"lat":-33.946,"lon":150.37,"zoom":10,"overlay":"radar","width":1280,"height":720,"fps":2,"frames":2,"public":true,"capture":"realtime"},"terms":{"accepted":true,"version":"windy-2023-09-01"}}).to_string();
     let response = request(
         address,
         "POST",
