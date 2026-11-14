@@ -221,14 +221,19 @@ impl WipeMask {
 /// Coverage of a signed distance `d` (positive inside) through an edge of
 /// width `softness` (`0` is hard). Mirrors `wipe_edge` in `composite.wgsl`.
 fn edge(d: f32, softness: f32) -> f32 {
-    if softness > 0.0 {
-        // Saturate outside the band before dividing (merge review R-7): a tiny
-        // softness would overflow `d / softness`. Inside it `|d| <= softness/2`,
-        // so the ratio is bounded by 0.5 and the value is the same as before.
-        let half = softness * 0.5;
-        if d >= half {
+    // A subnormal softness is a hard edge (merge review R-8): a GPU may flush
+    // it to zero, so both paths treat it so and never disagree.
+    if softness >= f32::MIN_POSITIVE {
+        // Saturate outside the band before dividing (merge reviews R-7, R-8):
+        // a tiny softness would overflow `d / softness`. `2·d` is exact (the
+        // geometry is bounded far below overflow) where `softness / 2` can
+        // round for a subnormal softness, so the band test is exactly the old
+        // clamp boundary; inside it the ratio is bounded by 0.5 and `d = 0`
+        // still reads 0.5.
+        let d2 = d * 2.0;
+        if d2 >= softness {
             1.0
-        } else if d <= -half {
+        } else if d2 <= -softness {
             0.0
         } else {
             (d / softness + 0.5).clamp(0.0, 1.0)

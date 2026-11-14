@@ -981,3 +981,50 @@ fn a_tiny_softness_wipe_draws_as_a_hard_edge() {
     };
     assert_eq!(draw(tiny), draw(hard));
 }
+
+/// Merge review R-8: a subnormal softness is a hard edge on both paths (a GPU
+/// may flush it to zero): a pixel exactly on the edge reads 1, as with
+/// softness 0, never an overflow or a 0.5 the GPU could not reproduce.
+#[test]
+fn a_subnormal_softness_is_a_hard_edge() {
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    let sub = WipeMask::new(
+        MaskShape::Horizontal,
+        0.25,
+        2,
+        2,
+        [0.0, 0.0],
+        false,
+        f32::from_bits(1),
+        0.0,
+    );
+    let hard = WipeMask::new(
+        MaskShape::Horizontal,
+        0.25,
+        2,
+        2,
+        [0.0, 0.0],
+        false,
+        0.0,
+        0.0,
+    );
+    assert!(sub.is_valid_for(2, 2));
+    // Pixel (0, 0) has u = 0.25 = radius: exactly on the edge (d = 0).
+    assert_eq!(sub.radius, 0.25);
+    for x in 0..2 {
+        assert_eq!(sub.coverage(x, 0), hard.coverage(x, 0), "x={x}");
+    }
+    assert_eq!(sub.coverage(0, 0), 1.0);
+    // The smallest normal softness is soft: the on-edge pixel reads 0.5.
+    let normal = WipeMask::new(
+        MaskShape::Horizontal,
+        0.25,
+        2,
+        2,
+        [0.0, 0.0],
+        false,
+        f32::MIN_POSITIVE,
+        0.0,
+    );
+    assert_eq!(normal.coverage(0, 0), 0.5);
+}
