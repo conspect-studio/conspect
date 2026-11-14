@@ -146,7 +146,8 @@ tile. No switcher or drive code changes.
   byte (the last row, or row 0 of a bottom-up plane) in the same owning
   buffer (`frame::check_swscale_source`/`check_swscale_destination`;
   checked even for `alloc_video` outputs, not assumed), so an exact-size
-  allocation whose padding became active rows is an error.
+  allocation whose padding became active rows is an error. The buffer scan
+  walks `buf[]`/`extended_buf` in place, allocation-free.
   Decoded alpha is read through `frame::plane_rows`, which validates the plane,
   its signed linesize, its subsampled height and that every row lies in
   one of the frame's own buffers before yielding single-row slices, so a

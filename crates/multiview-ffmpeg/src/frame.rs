@@ -556,32 +556,78 @@ fn plane_height(format: ffi::AVPixelFormat, plane: usize, height: usize) -> Opti
     Some(height.checked_add(round)? >> shift)
 }
 
-/// The buffers a frame owns: `buf[0..8]` plus `extended_buf`.
-fn owned_buffers(raw: *const ffi::AVFrame) -> impl Iterator<Item = (usize, usize)> {
-    #[allow(unsafe_code)]
-    // SAFETY: `raw` is a live frame borrowed by the caller; `buf` entries are
-    // null or valid `AVBufferRef`s, `extended_buf` holds `nb_extended_buf`
-    // valid entries when non-null. Only addresses and sizes are copied out.
-    let spans: Vec<(usize, usize)> = unsafe {
-        let mut spans = Vec::new();
-        let mut push = |b: *mut ffi::AVBufferRef| {
-            if !b.is_null() && !(*b).data.is_null() {
-                spans.push(((*b).data.expose_provenance(), (*b).size));
+/// The buffers a frame owns, `(data address, size)`: `buf[0..8]` then
+/// `extended_buf[0..nb_extended_buf]`, read lazily one ref per step — no
+/// heap allocation, so plane validation stays allocation-free on the
+/// steady-state `run_into` path.
+struct OwnedBuffers<'a> {
+    raw: *const ffi::AVFrame,
+    next: usize,
+    _frame: PhantomData<&'a ffi::AVFrame>,
+}
+
+/// Number of `AVFrame::buf` slots (`AV_NUM_DATA_POINTERS`).
+const BUF_SLOTS: usize = 8;
+
+impl Iterator for OwnedBuffers<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<(usize, usize)> {
+        loop {
+            let index = self.next;
+            #[allow(unsafe_code)]
+            // SAFETY: `raw` is a live, non-null frame borrowed by the caller
+            // for the iterator's lifetime; `buf` has `BUF_SLOTS` entries,
+            // each null or a valid `AVBufferRef`; `extended_buf`, when
+            // non-null, holds `nb_extended_buf` valid entries and `index` is
+            // bounded by that count before the `add`. Only the address and
+            // size are copied out.
+            let slot = unsafe {
+                if index < BUF_SLOTS {
+                    Some(
+                        (*self.raw)
+                            .buf
+                            .get(index)
+                            .copied()
+                            .unwrap_or(core::ptr::null_mut()),
+                    )
+                } else {
+                    let extended = (*self.raw).extended_buf;
+                    let n = usize::try_from((*self.raw).nb_extended_buf).unwrap_or(0);
+                    let i = index - BUF_SLOTS;
+                    if extended.is_null() || i >= n {
+                        None
+                    } else {
+                        Some(*extended.add(i))
+                    }
+                }
+            };
+            self.next = index.checked_add(1)?;
+            let b = slot?;
+            #[allow(unsafe_code)]
+            // SAFETY: `b` is null or a valid `AVBufferRef` (see above).
+            let span = unsafe {
+                if b.is_null() || (*b).data.is_null() {
+                    None
+                } else {
+                    Some(((*b).data.expose_provenance(), (*b).size))
+                }
+            };
+            if span.is_some() {
+                return span;
             }
-        };
-        for &b in &(*raw).buf {
-            push(b);
         }
-        let extended = (*raw).extended_buf;
-        if !extended.is_null() {
-            let n = usize::try_from((*raw).nb_extended_buf).unwrap_or(0);
-            for i in 0..n {
-                push(*extended.add(i));
-            }
-        }
-        spans
-    };
-    spans.into_iter()
+    }
+}
+
+/// The buffers a frame owns (see [`OwnedBuffers`]); `raw` must be a live,
+/// non-null frame that outlives the iterator.
+fn owned_buffers<'a>(raw: *const ffi::AVFrame) -> OwnedBuffers<'a> {
+    OwnedBuffers {
+        raw,
+        next: 0,
+        _frame: PhantomData,
+    }
 }
 
 /// Validate `plane` of `frame` and iterate its rows, `row_bytes` bytes each.
