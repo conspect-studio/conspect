@@ -398,6 +398,18 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
 }
 
 fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: bool) -> Harness {
+    harness_full(outputs, max, open, has_preview, None, Vec::new())
+}
+
+/// [`harness_with`] plus the passthrough wiring (#344 D2b).
+fn harness_full(
+    outputs: usize,
+    max: usize,
+    open: Option<OpenFn>,
+    has_preview: bool,
+    pass: Option<PassHooks>,
+    eligibility: Vec<PassEligibility>,
+) -> Harness {
     let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
     let store2 = Arc::new(TileStore::<Nv12Image>::with_defaults("cam2"));
     let lookup = Arc::clone(&store);
@@ -417,7 +429,8 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             Ok(enc)
         })
     });
-    let (r, h) = OutputRouter::new(
+    let mut open = open;
+    let (r, h) = OutputRouter::new_with_passthrough(
         RouterConfig {
             cadence: CADENCE,
             gop: 5,
@@ -430,7 +443,7 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
             live_reset: Vec::new(),
-            passthrough: Vec::new(),
+            passthrough: eligibility,
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -447,7 +460,9 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             halved: Arc::new(AtomicBool::new(false)),
             sizing: None,
         },
-        open,
+        Box::new(move |settings, _bus| open(settings)),
+        None,
+        pass,
     )
     .unwrap();
     let outcomes = h.outcomes().unwrap();
@@ -7482,3 +7497,6 @@ fn a_rejected_set_never_switches_a_staying_members_private_bus_audio() {
         );
     }
 }
+
+#[path = "output_routing_passthrough_tests.rs"]
+mod passthrough;

@@ -100,7 +100,7 @@ impl PassthroughState {
 }
 
 /// The bridge reason codes on [`PassthroughStatus::reason`] (0 = none).
-fn reason_code(reason: BridgeReason) -> u8 {
+pub(crate) fn reason_code(reason: BridgeReason) -> u8 {
     match reason {
         BridgeReason::NotArmed => 1,
         BridgeReason::AwaitingIdr => 2,
@@ -555,6 +555,11 @@ struct Matcher {
     traits: TraitsFn,
     meter: StreamMeter,
     last_eval: Option<u64>,
+    /// The measured rules passed once (the key earned P0): from then on only
+    /// the static traits are re-checked. A stall or a reconnect leaves a DTS
+    /// gap in the 10 s window (`not-cfr` for 10 s); the clock's own 30 / 300
+    /// on-time ticks decide the return instead (§12.5).
+    latched: bool,
 }
 
 /// Ticks between two verdict evaluations.
@@ -660,6 +665,7 @@ impl PassthroughLive {
             traits,
             meter: StreamMeter::new(),
             last_eval: None,
+            latched: false,
         });
         self
     }
@@ -700,6 +706,9 @@ impl PassthroughLive {
     }
 
     /// One tick: exactly one packet stamped `dts == tick`.
+    #[allow(clippy::too_many_lines)]
+    // reason: the one per-tick sequence (re-arm, drain, meter, gate, clock,
+    // status, emission); each step is a few lines and order-dependent.
     fn tick(&mut self, tick: u64) -> Result<EncodedPacket, PipelineError> {
         let now = (self.now_ns)();
         let rearm = self.status.rearm.load(Ordering::Acquire);
@@ -721,7 +730,7 @@ impl PassthroughLive {
             *slot = Some(au);
             n += 1;
         }
-        if let Some(last) = drained.iter().take(n).filter_map(Option::as_ref).last() {
+        if let Some(last) = drained.get(n.wrapping_sub(1)).and_then(Option::as_ref) {
             self.status
                 .latest_gen
                 .store(last.params_gen, Ordering::Release);
@@ -736,8 +745,13 @@ impl PassthroughLive {
             {
                 m.last_eval = Some(tick);
                 let verdict = (m.traits)().map_or(Err(MatchMiss::NotEnoughHistory), |traits| {
-                    evaluate(&traits, &m.meter, &m.slot)
+                    if m.latched {
+                        multiview_output::passthrough::evaluate_traits(&traits, &m.slot)
+                    } else {
+                        evaluate(&traits, &m.meter, &m.slot)
+                    }
                 });
+                m.latched |= verdict.is_ok();
                 self.gate.verdict_ok = verdict.is_ok();
                 let code = verdict.map_or_else(miss_code, |()| 1);
                 self.status.verdict.store(code, Ordering::Release);

@@ -225,6 +225,46 @@ struct Candidate {
     /// The take that patched the output superseded the candidate: it closes
     /// as soon as no output reads its key.
     ending: bool,
+    /// The readback signature last published ([`Candidate::signature`]).
+    shown: u64,
+}
+
+impl Candidate {
+    /// A cheap signature of what [`PassState::view`] shows (phase, bridge,
+    /// the key's emitted state, reason and verdict): the snapshot is
+    /// republished when it changes, never per tick otherwise.
+    fn signature(&self) -> u64 {
+        let phase: u64 = match self.phase {
+            Phase::Opening { .. } => 1,
+            Phase::Metering => 2,
+            Phase::Moving => 3,
+            Phase::On => 4,
+            Phase::Away => 5,
+            Phase::Returning => 6,
+            Phase::Failed => 7,
+        };
+        let bridge: u64 = match self.bridge {
+            Bridge::Refused => 1,
+            _ => 0,
+        };
+        let (state, reason, verdict) = self.key.as_ref().map_or((0, 0, 0), |k| {
+            (
+                match k.status.state() {
+                    PassthroughState::Slate => 1_u64,
+                    _ => 0,
+                },
+                k.status.reason().map_or(0_u64, |r| {
+                    u64::from(crate::passthrough_live::reason_code(r))
+                }),
+                match k.status.verdict() {
+                    None => 0_u64,
+                    Some(Ok(())) => 1,
+                    Some(Err(m)) => u64::from(crate::passthrough_live::miss_code(m)),
+                },
+            )
+        });
+        phase | bridge << 4 | state << 5 | reason << 8 | verdict << 16
+    }
 }
 
 /// The router's passthrough state.
@@ -309,6 +349,7 @@ impl PassState {
 
     /// The passthrough key status of output `output` (the audio rail and
     /// tests read it).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn status_of(&self, output: usize) -> Option<Arc<PassthroughStatus>> {
         self.get(output)
             .and_then(|c| c.key.as_ref())
@@ -372,10 +413,12 @@ impl PassState {
         self.counters = c;
     }
 
+    /// Candidates holding (or about to hold) a key: every candidate but a
+    /// failed one, so the cap bounds keys, opens and retries alike.
     fn keys_live(&self) -> usize {
         self.candidates
             .iter()
-            .filter(|c| c.key.is_some() || matches!(c.phase, Phase::Opening { .. }))
+            .filter(|c| c.phase != Phase::Failed)
             .count()
     }
 }
@@ -400,15 +443,9 @@ const fn return_ticks(param_fault: bool) -> u32 {
 
 impl OutputRouter {
     /// The passthrough status of output `index`'s key (tests, audio).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn passthrough_status(&self, index: usize) -> Option<Arc<PassthroughStatus>> {
         self.pass.status_of(index)
-    }
-
-    /// Whether output `index` reads its passthrough key now.
-    pub(crate) fn on_passthrough(&self, index: usize) -> bool {
-        self.outputs
-            .get(index)
-            .is_some_and(|o| self.pass.on_key(index, o.key))
     }
 
     /// A new video take on output `index` towards `bus`: an existing
@@ -418,6 +455,9 @@ impl OutputRouter {
         let Some(c) = self.pass.get_mut(index) else {
             return;
         };
+        // A re-take of the same source keeps the candidate (on P0 the take
+        // applies at once: the output already carries that source); a
+        // failed one is retried by the next take.
         if *bus == PictureBus::Source(c.source.clone()) && c.phase != Phase::Failed {
             return;
         }
@@ -534,11 +574,11 @@ impl OutputRouter {
             (Ok(encoder), Some(status)) => (encoder, status),
             (Ok(encoder), None) => {
                 self.reap(Reap::Encoder(encoder));
-                self.pass_open_failed(pos, "passthrough key without status".to_owned());
+                self.pass_open_failed(pos, "passthrough key without status");
                 return;
             }
             (Err(e), _) => {
-                self.pass_open_failed(pos, e);
+                self.pass_open_failed(pos, &e);
                 return;
             }
         };
@@ -602,7 +642,7 @@ impl OutputRouter {
         }
     }
 
-    fn pass_open_failed(&mut self, pos: usize, error: String) {
+    fn pass_open_failed(&mut self, pos: usize, error: &str) {
         self.pass.counters.open_failures = self.pass.counters.open_failures.saturating_add(1);
         if let Some(c) = self.pass.candidates.get_mut(pos) {
             tracing::warn!(output = c.output, %error, "routing: passthrough candidate not opened");
@@ -618,12 +658,11 @@ impl OutputRouter {
     /// or `None`).
     pub(super) fn bridge_opened(&mut self, index: usize, key: Option<usize>, tick: u64) {
         if let Some(c) = self.pass.get_mut(index) {
-            c.bridge = match key {
-                Some(key) => Bridge::Warming(key),
-                None => {
-                    c.retry_at = tick.saturating_add(PASS_RETRY_TICKS);
-                    Bridge::None
-                }
+            c.bridge = if let Some(key) = key {
+                Bridge::Warming(key)
+            } else {
+                c.retry_at = tick.saturating_add(PASS_RETRY_TICKS);
+                Bridge::None
             };
             self.dirty = true;
         }
@@ -704,6 +743,13 @@ impl OutputRouter {
             self.close_pass_key(output, dispatcher);
             if let Some(c) = self.pass.get_mut(output) {
                 c.ending = true;
+            }
+        }
+        for c in &mut self.pass.candidates {
+            let sig = c.signature();
+            if sig != c.shown {
+                c.shown = sig;
+                self.dirty = true;
             }
         }
         let live = self.pass.candidates.iter().any(|c| c.key.is_some());
@@ -788,6 +834,7 @@ impl OutputRouter {
                 retry_at: tick,
                 failure: None,
                 ending: false,
+                shown: 0,
             });
             self.dirty = true;
         }
@@ -966,6 +1013,8 @@ impl OutputRouter {
     /// The output reads its key and the key bridges on its slate: bring in
     /// the on-demand picture bridge (the encoded source key), charged to
     /// the principal that patched the output.
+    #[allow(clippy::too_many_lines)]
+    // reason: one bridge state machine (open, warm, move, reuse, admission).
     fn advance_bridge(&mut self, pos: usize, tick: u64, dispatcher: &mut RenditionDispatcher) {
         let Some(c) = self.pass.candidates.get(pos) else {
             return;
@@ -1113,9 +1162,21 @@ impl OutputRouter {
         tick: u64,
         dispatcher: &mut RenditionDispatcher,
     ) {
-        let windows = self.request_idr(key, tick);
+        // A bridge key nobody reads yet (just opened, or lingering): an IDR
+        // on it costs no viewer anything, so it skips the force floor like
+        // a take's warm-up; a shared key keeps the floor.
+        let (at, windows) = if self.subscribers(key) == 0 {
+            let at = tick.saturating_add(1);
+            if let Some(d) = self.dynamic.iter().find(|d| d.key == key) {
+                d.force_at.store(at, Ordering::Release);
+            }
+            self.last_forced.insert(key, at);
+            (at, self.cfg.gop.saturating_add(3))
+        } else {
+            (tick, self.request_idr(key, tick))
+        };
         let ok = dispatcher
-            .rebind_video_forced(index, key, tick, windows)
+            .rebind_video_forced(index, key, at, windows)
             .is_ok();
         if let Some(c) = self.pass.candidates.get_mut(pos) {
             if ok {

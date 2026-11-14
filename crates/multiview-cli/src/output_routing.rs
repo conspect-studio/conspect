@@ -3106,6 +3106,9 @@ impl OutputRouter {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
+    // reason: the single take admission (reuse, admission, open); D2b added
+    // only the open request's passthrough field.
     fn start_move(
         &mut self,
         index: usize,
@@ -3923,7 +3926,3 @@ mod tests;
 #[cfg(test)]
 #[path = "output_routing_pipeline_tests.rs"]
 mod pipeline_tests;
-
-#[cfg(test)]
-#[path = "output_routing_passthrough_tests.rs"]
-mod passthrough_tests;

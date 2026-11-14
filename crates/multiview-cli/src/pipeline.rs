@@ -8151,10 +8151,8 @@ fn passthrough_opener(
         )
         .with_slate_move_points(false);
         let status = live.status();
-        Ok((
-            Box::new(live) as Box<dyn crate::output_routing::LiveEncoder>,
-            status,
-        ))
+        let live: Box<dyn crate::output_routing::LiveEncoder> = Box::new(live);
+        Ok((live, status))
     })
 }
 
