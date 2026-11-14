@@ -23,6 +23,7 @@ use std::sync::Arc;
 use multiview_core::time::Rational;
 use multiview_output::passthrough::{
     BridgeReason, ClockState, Emission, PassthroughClock, RepeatSource, SlotGate, TapAu,
+    MAX_PRESENTATION_DELAY,
 };
 
 const FPS: Rational = Rational::FPS_29_97;
@@ -268,6 +269,7 @@ fn run(
     let mut repeats = Repeats;
     let mut max_pts: Option<i64> = None;
     let mut prev_was_repeat = false;
+    let mut run_extra = 0_i64;
     for tick in 0..ticks {
         hook(tick, clock, gate);
         gate.now_tick = tick;
@@ -299,15 +301,25 @@ fn run(
             } => {
                 let i = index_of(data);
                 let (sd, _) = src.display(i);
-                assert_eq!(
-                    pts - dts,
-                    src.reorder(i),
-                    "tick {tick}: source reorder kept (AU {i})"
-                );
+                // R1-M2: a run may carry a constant extra presentation delay
+                // (fixed at its IDR, at most MAX_PRESENTATION_DELAY) so it
+                // presents after a preceding B-frame bridge; the source
+                // reorder is kept on top of it.
                 if *run_start {
                     assert!(*keyframe, "tick {tick}: a run starts at a strict IDR");
                     log.run_starts.push(tick);
+                    let extra = pts - dts - src.reorder(i);
+                    assert!(
+                        (0..=i64::try_from(MAX_PRESENTATION_DELAY).unwrap()).contains(&extra),
+                        "tick {tick}: run extra delay {extra} out of bounds"
+                    );
+                    run_extra = extra;
                 }
+                assert_eq!(
+                    pts - dts,
+                    src.reorder(i) + run_extra,
+                    "tick {tick}: source reorder kept (AU {i})"
+                );
                 if *keyframe {
                     assert!(
                         max_pts.is_none_or(|m| *pts > m),
@@ -334,7 +346,14 @@ fn run(
                 prev_was_repeat = true;
             }
             Emission::Bridge { dts, pts, reason } => {
-                assert_eq!((*dts, *pts), (t, t), "bridge: pts == dts == tick");
+                // R1-M2: dts == tick; a bridge after a B-frame run presents
+                // with a constant delay, after everything already emitted.
+                assert_eq!(*dts, t, "bridge: dts == tick");
+                assert!(*pts >= *dts, "tick {tick}: bridge pts before dts");
+                assert!(
+                    max_pts.is_none_or(|m| *pts > m),
+                    "tick {tick}: a bridge presents after everything emitted"
+                );
                 assert!(
                     !prev_was_repeat,
                     "tick {tick}: a repeat must be followed by its IDR"
