@@ -135,7 +135,11 @@ pub fn extract_alpha(
     dst: &mut [u8],
     dst_stride: usize,
 ) -> Result<(), AlphaError> {
-    if layout.step == 0 || layout.step < layout.offset + layout.depth.sample_bytes() {
+    let sample_end = layout
+        .offset
+        .checked_add(layout.depth.sample_bytes())
+        .ok_or(AlphaError::Layout("step must cover the alpha sample"))?;
+    if layout.step == 0 || layout.step < sample_end {
         return Err(AlphaError::Layout("step must cover the alpha sample"));
     }
     let max = match layout.depth {
@@ -160,11 +164,17 @@ pub fn extract_alpha(
         let d_start = row
             .checked_mul(dst_stride)
             .ok_or(AlphaError::Geometry("destination offset overflows"))?;
+        let s_end = s_start
+            .checked_add(src_row)
+            .ok_or(AlphaError::Geometry("source offset overflows"))?;
+        let d_end = d_start
+            .checked_add(width)
+            .ok_or(AlphaError::Geometry("destination offset overflows"))?;
         let s = src
-            .get(s_start..s_start + src_row)
+            .get(s_start..s_end)
             .ok_or(AlphaError::Geometry("source plane too short"))?;
         let d = dst
-            .get_mut(d_start..d_start + width)
+            .get_mut(d_start..d_end)
             .ok_or(AlphaError::Geometry("destination plane too short"))?;
         let samples = s.get(layout.offset..).unwrap_or_default();
         match layout.depth {
@@ -325,5 +335,42 @@ mod tests {
         assert!(extract_alpha(bad_bits, &[0; 16], 8, 2, 2, &mut dst, 2).is_err());
         // Zero-sized regions are a no-op.
         assert!(extract_alpha(layout, &[], 0, 0, 0, &mut [], 0).is_ok());
+    }
+
+    /// PB-3: overflowing layout and row-range arithmetic is an error, never a
+    /// panic ("never panics" contract), at every boundary.
+    #[test]
+    fn overflowing_offsets_strides_and_dimensions_are_errors_not_panics() {
+        let mut dst = [0_u8; 8];
+        // offset + sample_bytes overflows.
+        let huge_offset = AlphaLayout::packed(4, usize::MAX, AlphaDepth::U8);
+        assert_eq!(
+            extract_alpha(huge_offset, &[0; 8], 4, 2, 1, &mut dst, 2),
+            Err(AlphaError::Layout("step must cover the alpha sample"))
+        );
+        let huge_offset_16 = AlphaLayout::packed(8, usize::MAX - 1, AlphaDepth::U16Le { bits: 10 });
+        assert!(matches!(
+            extract_alpha(huge_offset_16, &[0; 16], 8, 2, 1, &mut dst, 2),
+            Err(AlphaError::Layout(_))
+        ));
+        let planar = AlphaLayout::planar(0, AlphaDepth::U8);
+        // Row 1's source range end (`row * stride + row_bytes`) overflows.
+        let src = [0_u8; 8];
+        assert!(matches!(
+            extract_alpha(planar, &src, usize::MAX - 1, 2, 2, &mut dst, 2),
+            Err(AlphaError::Geometry(_))
+        ));
+        // Row 1's destination range end overflows.
+        assert!(matches!(
+            extract_alpha(planar, &src, 2, 2, 2, &mut dst, usize::MAX - 1),
+            Err(AlphaError::Geometry(_))
+        ));
+        // Huge strides that do not overflow simply run off the buffers.
+        assert!(extract_alpha(planar, &src, usize::MAX / 2, 2, 3, &mut dst, 2).is_err());
+        // Huge dimensions.
+        assert!(extract_alpha(planar, &src, 2, usize::MAX, 1, &mut dst, usize::MAX).is_err());
+        assert!(extract_alpha(planar, &src, 2, 2, usize::MAX, &mut dst, 2).is_err());
+        let packed = AlphaLayout::packed(usize::MAX, 0, AlphaDepth::U8);
+        assert!(extract_alpha(packed, &src, usize::MAX, 3, 1, &mut dst, 3).is_err());
     }
 }
