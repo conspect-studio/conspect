@@ -1840,6 +1840,19 @@ border, the clock, and optional safe-area markers.
   thread reads the newest snapshot; it never waits for the consumer. Meters and tally are
   normally one tick behind Program's; while the consumer falls behind, the snapshot ages with it
   (no bound is claimed — the picture never waits for it).
+- **Content faults** (BLACK / FROZEN) are detected per layout on the aux thread, from the frames the
+  compose already read, with Program's probes and dwells, so a source shown only on a routed layout
+  gets its badge too. A source on both: a local fault always shows; after 2 s of observation the
+  layout's own clear verdict also wins over the consumer's; before that the consumer's fills in.
+  NO AUDIO and the meters come from the program bus's per-input taps only: a source that is on no
+  audio route shows an empty meter and no silence badge (unchanged from Program).
+- **Draw order and occlusion.** Cell chrome is emitted in the compositor's draw order (ascending
+  `z`), so higher cells' chrome paints last; a cell wholly covered by one opaque higher cell draws
+  no chrome. A partly covered cell keeps its full chrome, drawn over the covering picture. Labels
+  are capped at 64 characters (Program too).
+- **Bounded signals.** The aux thread publishes the set of sources its baking layouts bind
+  (only when that set changes); the consumer's snapshot holds only those sources, and its live
+  meter map forgets a source 5 s after it leaves the bus.
 - **Tally.** Red border for a source on Program, green for a source on Preview; with flags on,
   the state chip also reads `PGM` / `PVW` (meaning is never colour alone).
 - **Failure.** A bake error publishes the un-overlaid picture (counted, warned once); it never
