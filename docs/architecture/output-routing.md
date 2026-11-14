@@ -453,8 +453,16 @@ source (PR 4), the UI (PR 5), and the overlay bake on layout sources (lane layou
   body revision. At the tick (and again when a held take is replayed) the driver refuses a command
   whose guard no longer holds with `selection-changed: the Preview or input changed after this
   operation was authorized; re-plan`; nothing changes. The driver learns body revisions at adoption
-  (`LayoutSourceSet` entries carry them; ≤ 4, no per-tick allocation). A patch names its members
-  explicitly and carries no guard. An unguarded command (`expect: None`) behaves as before.
+  (`LayoutSourceSet` entries carry them; ≤ 4, no per-tick allocation). An unguarded command
+  (`expect: None`) behaves as before.
+- **Patch execution guard (review A4).** A patch names a layout id, not immutable content, so a
+  body edit after `ensure` could otherwise put an unauthorized body on an input (and on Program
+  with `on_air: allow`). `take_patch` keeps the revision `ensure` returns for each layout member and
+  sends `SelectionGuard.member_revisions` (`[(layout:<id>, revision)]`). The driver refuses the
+  whole patch `selection-changed` (no member applied) when the revision it holds for any listed key
+  differs — at the first drain and again when a held patch is replayed after prime. An armed salvo
+  half (`PatchArmed`, #308) carries no guard (the control never sends one; salvo members are not
+  layout sources) and is exempt.
 - **Registry.** `MeLayoutRegistry` (control, one std mutex, never touched by the clock) holds at
   most **4** layouts (409 `capacity` for a fifth; the key is released), one demand lease per
   bound source (label `switcher:me1:layout:<id>`; a select of a layout takes no per-select
@@ -473,8 +481,29 @@ source (PR 4), the UI (PR 5), and the overlay bake on layout sources (lane layou
   `layout-changed` ("the layout changed while this request was in flight; retry"); the
   Idempotency-Key is released. So a request that read the body before an edit or delete can never
   register the old or deleted body.
-- **Engine adoption.** The binary's adapter publishes the compose set to the routing-aux thread
-  first, then a `LayoutSourceSet` (`LayoutSources`: `SwapCell` + generation `AtomicU64`). The frame
+- **One store per body revision (review r2).** The binary's adapter (`multiview-cli`
+  `me_layouts.rs`) creates a NEW `layout:<id>` `TileStore` for every registration AND every body
+  change, so every frame a store holds was composed from exactly one body. Order: (1) publish the
+  compose set with the new body and new store (the aux starts filling it; the old store is no
+  longer fed and holds last-good of the old, already-authorized body); (2) off the clock, wait up
+  to 1 s (`PRIME_WAIT`) for the new store to be `is_primed()`; (3) publish the engine set with the
+  new store AND the new revision as one entry — the hook swaps both in one adoption and rebinds
+  the Program cell to the new store on that tick (no NoSignal tick when it primed). Until (3) the
+  clock holds the old store with the old revision; from (3) the new pair. So the engine never
+  holds a revision for a store that holds another body's frames, and a revision guard binds the
+  pixels too. The wait (2) runs on a short-lived promoter thread (`me-layout-prime`, one at a
+  time, 2 ms poll, exits when nothing is pending): the caller is the registry, holding its std
+  mutex inside an async handler on a tokio worker, so it must not sleep. While a body is pending
+  the adapter reports not-adopted, so the control's existing ≤ 1 s acknowledgement wait covers
+  prime and adoption (a slower prime answers 503 `engine-busy`, key released; a retry succeeds
+  once promoted). **Never primes:** if the store has no frame after 1 s (aux wedged or failed) the
+  engine set is published anyway; that store ages to slate exactly like an aux failure. A CUT or
+  select guarded by a just-edited revision before its promotion is refused `selection-changed`
+  (fail closed, re-plan). A routed Preview monitor (below) reads the compose set's store, so it
+  can show the committed new body up to one prime earlier than Program; it has no execution
+  authority.
+- **Engine adoption.** The adapter publishes the compose set to the routing-aux thread first,
+  then a `LayoutSourceSet` (`LayoutSources`: `SwapCell` + generation `AtomicU64`). The frame
   hook does one Acquire load per fresh tick, after the legacy control and before `drain_at_tick`;
   only on a generation change does it insert/replace the `layout:*` stores in the drive, the
   driver's primed stores and the preview stores (allocation only then) and acknowledge the
@@ -487,7 +516,7 @@ source (PR 4), the UI (PR 5), and the overlay bake on layout sources (lane layou
   that acknowledgement before it is enqueued, so the drain that sees the command has the store;
   otherwise 503 `engine-busy`, key released.
 - **Compose.** The routing-aux thread composes each registered layout after the routed feeds with
-  its own `LayoutCanvas` (rebuilt when the body `Arc` changes) and `publish_arc(frame, T.pts)`
+  its own `LayoutCanvas` (rebuilt when the body `Arc` changes; each body has its own store) and `publish_arc(frame, T.pts)`
   into the `layout:<id>` store. The clock offers ticks while a routed feed **or** an M/E layout is
   active (second gate flag, `AuxTickSender::me_layout_flag`, owned by the registry). The halved-
   cadence back-off applies unchanged. Latency is one tick, as above.
