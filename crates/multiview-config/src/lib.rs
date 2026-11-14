@@ -45,6 +45,7 @@ pub mod layout_doc;
 pub mod limits;
 pub mod media;
 pub mod media_fill;
+pub mod merge;
 pub mod multicast;
 pub mod network_diagnostics;
 pub mod network_tls;
@@ -110,6 +111,7 @@ pub use media_fill::{
     CaptureMode, DuringRefresh, FillRefresh, FrameTiming, MediaFill, MediaFillKind, ParamValue,
     SlotStorage, TemplateConstraints, TermsAcceptance, ViewBackground, WebCaptureView,
 };
+pub use merge::{merge_file_edit, removed_accepted_items};
 pub use multicast::{
     classify, MulticastClass, MulticastGroup, MulticastIface, PacketCount, RejectReason,
     RejectedGroup,
