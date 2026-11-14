@@ -135,6 +135,8 @@ struct FakeSource {
     script: Arc<Mutex<Script>>,
     /// Passthrough opens performed (the slate "bake" count).
     opens: Arc<AtomicUsize>,
+    /// The error a failing bake returns.
+    bake_error: Arc<Mutex<String>>,
 }
 
 impl FakeSource {
@@ -144,6 +146,7 @@ impl FakeSource {
             now: Arc::new(AtomicU64::new(0)),
             script: Arc::new(Mutex::new(script)),
             opens: Arc::new(AtomicUsize::new(0)),
+            bake_error: Arc::new(Mutex::new("encoder not found: libx264".to_owned())),
         }
     }
 
@@ -153,12 +156,13 @@ impl FakeSource {
         let tap = Arc::clone(&self.tap);
         let now = Arc::clone(&self.now);
         let opens = Arc::clone(&self.opens);
+        let bake_error = Arc::clone(&self.bake_error);
         PassHooks {
             open: Box::new(move |req: &PassRequest| {
                 assert_eq!(req.source, "cam");
                 opens.fetch_add(1, Ordering::Relaxed);
                 if !bake {
-                    return Err("encoder not found: libx264".to_owned());
+                    return Err(bake_error.lock().unwrap().clone());
                 }
                 let reader = tap.subscribe().ok_or_else(|| "tap full".to_owned())?;
                 let clock = Arc::clone(&now);
@@ -641,4 +645,25 @@ fn the_plan_reports_p0_from_the_engines_own_predicate() {
     let live = adapter.current_passthrough("hls").unwrap();
     assert_eq!(live.state, "passthrough");
     assert_eq!(adapter.current_passthrough("file"), None);
+}
+
+/// Review R1-I-3: a bake error whose 160th byte falls inside a multi-byte
+/// character never panics the router tick; the reason is cut at a char
+/// boundary and stays bounded.
+#[test]
+fn a_multibyte_bake_error_is_truncated_at_a_char_boundary() {
+    let mut p = P0::new(1, 6, Script::default(), false);
+    // "slate-bake-failed: " is 19 bytes; 'é' is 2: byte 160 splits one.
+    *p.src.bake_error.lock().unwrap() = "é".repeat(200);
+    p.step();
+    p.take_cam(0);
+    p.run_until(60, |p| {
+        p.view(0)
+            .passthrough
+            .is_some_and(|v| v.state == "unavailable")
+    })
+    .expect("the failure is reported, the tick did not panic");
+    let reason = p.view(0).passthrough.unwrap().reason.unwrap();
+    assert!(reason.len() <= 160, "{}", reason.len());
+    assert!(reason.starts_with("slate-bake-failed: é"));
 }

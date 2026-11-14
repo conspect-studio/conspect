@@ -663,9 +663,7 @@ impl OutputRouter {
             tracing::warn!(output = c.output, %error, "routing: passthrough candidate not opened");
             c.phase = Phase::Failed;
             // The bake / open error, bounded; it names no source.
-            let mut text = format!("slate-bake-failed: {error}");
-            text.truncate(160);
-            c.failure = Some(text);
+            c.failure = Some(bounded_reason(&format!("slate-bake-failed: {error}")));
         }
     }
 
@@ -1203,6 +1201,19 @@ impl OutputRouter {
         }
         self.dirty = true;
     }
+}
+
+/// Longest failure reason kept, in bytes.
+const MAX_REASON_BYTES: usize = 160;
+
+/// `text` cut to at most [`MAX_REASON_BYTES`] at a char boundary (an open
+/// error is arbitrary text; `String::truncate` inside a character panics).
+fn bounded_reason(text: &str) -> String {
+    let mut end = text.len().min(MAX_REASON_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or_default().to_owned()
 }
 
 fn evaluate_traits_ok(traits: Option<SourceTraits>, slot: &SlotSpec) -> Result<(), MatchMiss> {
