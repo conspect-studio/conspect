@@ -89,6 +89,73 @@ pub struct LayoutDocument {
     /// follows the video (ADR-0108 §5.1). Absent = the program mix.
     #[serde(default, skip_serializing_if = "LayoutAudio::is_program")]
     pub audio: LayoutAudio,
+    /// Which multiview overlay layers the layout's aux canvas bakes when an
+    /// output routes it. Absent = [`LayoutOverlays::default`] (Program's set).
+    #[serde(default, skip_serializing_if = "LayoutOverlays::is_default")]
+    pub overlays: LayoutOverlays,
+}
+
+/// Which multiview overlay layers a layout's aux canvas bakes (stored in the
+/// layout body as `overlays`). A partial object fills the omitted layers from
+/// the default; an unknown key is rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // independent on/off layer switches
+pub struct LayoutOverlays {
+    /// Per-cell source-name label chip.
+    pub labels: bool,
+    /// Per-cell audio meter bars (+ scale).
+    pub meters: bool,
+    /// Per-cell state chip (LIVE/STALE/NO SIGNAL/IDLE…) and content-fault
+    /// badge (BLACK/FROZEN/NO AUDIO).
+    pub flags: bool,
+    /// Per-cell tally border (red = on Program, green = Preview).
+    pub tally: bool,
+    /// Clock layers (digital clock, reference badge, analog faces).
+    pub clock: bool,
+    /// Per-tile safe-area guides.
+    pub safe_area: bool,
+}
+
+impl LayoutOverlays {
+    /// Every layer off: a clean layout (no bake at all).
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            labels: false,
+            meters: false,
+            flags: false,
+            tally: false,
+            clock: false,
+            safe_area: false,
+        }
+    }
+
+    /// Whether this is the default layer set (serde skip predicate).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether at least one layer is on.
+    #[must_use]
+    pub const fn any(&self) -> bool {
+        self.labels || self.meters || self.flags || self.tally || self.clock || self.safe_area
+    }
+}
+
+impl Default for LayoutOverlays {
+    /// All layers on except `safe_area` (matches Program's defaults).
+    fn default() -> Self {
+        Self {
+            labels: true,
+            meters: true,
+            flags: true,
+            tally: true,
+            clock: true,
+            safe_area: false,
+        }
+    }
 }
 
 /// A stored layout's `audio` attribute (ADR-0108 §5.1): what `follow`
@@ -357,5 +424,48 @@ mod tests {
 
         body["audio"] = serde_json::json!("follow");
         assert!(LayoutDocument::from_body(&body).is_err());
+    }
+
+    #[test]
+    fn absent_overlays_default_to_programs_layer_set_and_never_serialize() {
+        let doc = LayoutDocument::from_body(&editor_body()).unwrap();
+        assert_eq!(doc.overlays, LayoutOverlays::default());
+        assert!(doc.overlays.labels && doc.overlays.meters && doc.overlays.flags);
+        assert!(doc.overlays.tally && doc.overlays.clock && !doc.overlays.safe_area);
+        assert!(serde_json::to_value(&doc).unwrap().get("overlays").is_none());
+    }
+
+    #[test]
+    fn partial_overlays_object_fills_defaults() {
+        let mut body = editor_body();
+        body["overlays"] = serde_json::json!({ "meters": false, "safe_area": true });
+        let doc = LayoutDocument::from_body(&body).unwrap();
+        let want = LayoutOverlays {
+            meters: false,
+            safe_area: true,
+            ..LayoutOverlays::default()
+        };
+        assert_eq!(doc.overlays, want);
+    }
+
+    #[test]
+    fn unknown_overlay_key_is_rejected() {
+        let mut body = editor_body();
+        body["overlays"] = serde_json::json!({ "lables": false });
+        assert!(LayoutDocument::from_body(&body).is_err());
+    }
+
+    #[test]
+    fn non_default_overlays_round_trip_and_none_disables_every_layer() {
+        let mut body = editor_body();
+        body["overlays"] = serde_json::json!({ "clock": false });
+        let doc = LayoutDocument::from_body(&body).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        assert_eq!(json["overlays"]["clock"], serde_json::json!(false));
+        let back = LayoutDocument::from_body(&json).unwrap();
+        assert_eq!(back.overlays, doc.overlays);
+
+        assert!(!LayoutOverlays::none().any());
+        assert!(LayoutOverlays::default().any());
     }
 }
