@@ -817,14 +817,7 @@ impl CommandReceiver {
     #[must_use]
     pub fn try_drain(&mut self) -> Vec<Command> {
         let bound = self.rx.max_capacity();
-        let mut drained = Vec::new();
-        while drained.len() < bound {
-            let Ok(command) = self.rx.try_recv() else {
-                break;
-            };
-            drained.push(command);
-        }
-        drained
+        drain_bounded(bound, || self.rx.try_recv().ok())
     }
 
     /// Await the next command (for an engine that drains on a dedicated task).
@@ -835,18 +828,52 @@ impl CommandReceiver {
     }
 }
 
+/// Take items from `next` until it returns `None` or `bound` items are taken.
+///
+/// The bound holds no matter how fast the source refills while we take from
+/// it (a producer that refills the bus during the drain is such a source).
+fn drain_bounded<T>(bound: usize, mut next: impl FnMut() -> Option<T>) -> Vec<T> {
+    let mut drained = Vec::new();
+    while drained.len() < bound {
+        let Some(item) = next() else {
+            break;
+        };
+        drained.push(item);
+    }
+    drained
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::float_cmp)]
+
+    /// #307 review I2, deterministic: a source that refills on every take
+    /// (never empty) still yields exactly `bound` items per call, and the
+    /// rest stays in the source.
+    #[test]
+    fn drain_bounded_stops_at_the_bound_against_a_source_that_always_refills() {
+        let mut produced = 0_u64;
+        let mut source = || {
+            produced += 1;
+            Some(produced)
+        };
+        let first = super::drain_bounded(8, &mut source);
+        assert_eq!(first, (1..=8).collect::<Vec<_>>());
+        let second = super::drain_bounded(8, &mut source);
+        assert_eq!(second, (9..=16).collect::<Vec<_>>(), "FIFO, nothing lost");
+        let mut finite = vec![3, 2, 1];
+        assert_eq!(super::drain_bounded(8, || finite.pop()), vec![1, 2, 3]);
+    }
 
     use super::*;
     use multiview_config::routing::{StreamRef, StreamSelector};
     use multiview_core::stream::StreamKind;
     use multiview_engine::RouteIntent;
 
-    /// #307 review I2: one `try_drain` takes at most the bus capacity even
-    /// while a producer refills the queue during the drain, so one tick's
-    /// command work is bounded; the rest waits for the next call.
+    /// #307 review I2, on the real bus: `try_drain` wires the bus capacity
+    /// as its bound and loses nothing while a producer thread keeps the bus
+    /// busy. The bound itself is proven deterministically by
+    /// `drain_bounded_stops_at_the_bound_against_a_source_that_always_refills`.
     #[test]
     fn try_drain_is_bounded_by_the_capacity_while_producers_refill() {
         const CAP: usize = 8;
@@ -855,8 +882,13 @@ mod tests {
         let producer = {
             let done = std::sync::Arc::clone(&done);
             std::thread::spawn(move || {
+                // Own stop deadline: the producer ends even if the consumer
+                // loop never reaches `done.store` (no hang on a regression).
+                let stop = std::time::Instant::now() + std::time::Duration::from_secs(60);
                 let mut sent = 0_u64;
-                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                while !done.load(std::sync::atomic::Ordering::Acquire)
+                    && std::time::Instant::now() < stop
+                {
                     if tx
                         .try_submit(Command::Start {
                             op: OperationId::new(),
@@ -871,14 +903,14 @@ mod tests {
                 sent
             })
         };
-        // Drain until the producer has really refilled the queue several times
-        // over. A fixed iteration count raced on a loaded CI runner: all drains
-        // could finish before the producer thread was ever scheduled (total 0).
-        // The deadline only bounds a broken producer; it is not a timing claim.
+        // Drain until the producer has refilled the bus many times over. A
+        // fixed iteration count raced on a loaded CI runner: all drains could
+        // finish before the producer thread was ever scheduled (total 0). The
+        // deadline only bounds a broken producer; it is not a timing claim.
         let mut total = 0_usize;
         let mut max = 0_usize;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while total <= 4 * CAP && std::time::Instant::now() < deadline {
+        while total <= 256 * CAP && std::time::Instant::now() < deadline {
             let n = rx.try_drain().len();
             max = max.max(n);
             total += n;
