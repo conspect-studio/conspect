@@ -39,9 +39,9 @@ pub const SUBTITLE_FEED_CAPACITY: usize = 256;
 /// (and counted) beyond it.
 pub const MAX_HELD_CUES_PER_SLOT: usize = 64;
 /// Most consecutive segment closes the sampler's accepted-through watermark
-/// may stay behind the segment start (or absent) before the sink publishes
-/// open cues through the segment end anyway (counted as `watermark_stale`),
-/// so a dead sampler cannot freeze subtitles (MED3-1).
+/// may stay behind the segment start (or absent) before a withheld open cue
+/// is counted as `watermark_stale`. Publication still fails closed: an open
+/// cue is never published past the confirmed instant (MED4-1).
 pub const MAX_WATERMARK_LAG_SEGMENTS: u32 = 2;
 /// Longest cue text kept, in bytes (all lines with their separators).
 pub const MAX_CUE_TEXT_BYTES: usize = 512;
@@ -284,10 +284,10 @@ impl SubtitleStats {
         self.written.load(Ordering::Relaxed)
     }
 
-    /// Segment closes that published an open cue through the segment end
-    /// although the sampler's accepted-through watermark had stayed behind
-    /// the segment start for more than [`MAX_WATERMARK_LAG_SEGMENTS`]
-    /// consecutive closes.
+    /// Segment closes that withheld an open cue because the sampler's
+    /// accepted-through watermark had stayed behind the segment start (or
+    /// absent) for more than [`MAX_WATERMARK_LAG_SEGMENTS`] consecutive
+    /// closes (publication fails closed; this counts it).
     #[must_use]
     pub fn watermark_stale(&self) -> u64 {
         self.watermark_stale.load(Ordering::Relaxed)
@@ -614,12 +614,20 @@ impl SlotCues {
     ///   cue state this sink holds (MED3-1): the piece is `[from, min(end,
     ///   confirmed))`. When the watermark lags, the remainder is carried to
     ///   the next segment (subtitle publication lags; video never waits).
-    ///   After [`MAX_WATERMARK_LAG_SEGMENTS`] consecutive closes with the
-    ///   watermark behind the segment start (or absent) the piece runs to the
-    ///   segment end anyway (`watermark_stale` counted), so a dead sampler
-    ///   cannot freeze subtitles;
-    /// - once a rolling cue's close is held, its remaining piece runs to
-    ///   `min(cue end, end)`.
+    ///   Staleness **fails closed** (MED4-1): display is never inferred from
+    ///   a timeout. While the watermark stays behind the segment start (or
+    ///   absent) for more than [`MAX_WATERMARK_LAG_SEGMENTS`] consecutive
+    ///   closes, each close that withholds an open cue counts
+    ///   `watermark_stale`, and nothing of the cue is published past the
+    ///   confirmed point. A permanently dead sampler therefore shows the cue
+    ///   only up to its last confirmed instant (subtitles stop; video is
+    ///   unaffected). The only state kept is the held cue's last published
+    ///   end (bounded by [`MAX_HELD_CUES_PER_SLOT`]);
+    /// - when the watermark advances again, or the real close arrives, the
+    ///   cue resumes with a piece starting at its last published end, up to
+    ///   `min(confirmed, end)` while open or `min(cue end, end)` once closed:
+    ///   the client's union stays one copy, contiguous or gapped, never
+    ///   overlapping and never past the true close.
     pub fn publish(
         &mut self,
         start: MediaTime,
@@ -635,15 +643,11 @@ impl SlotCues {
         } else {
             0
         };
-        // Past the lag bound an open cue is published through the segment end
-        // regardless (counted); otherwise only through the confirmed instant.
-        let forced = behind && self.lagged > MAX_WATERMARK_LAG_SEGMENTS;
-        let open_limit = if forced {
-            end
-        } else {
-            confirmed.map_or(MediaTime::from_nanos(i64::MIN), |c| c.min(end))
-        };
-        let mut forced_used = false;
+        let stale = behind && self.lagged > MAX_WATERMARK_LAG_SEGMENTS;
+        // An open cue is only ever published through the confirmed instant
+        // (fail closed: never through a timeout).
+        let open_limit = confirmed.map_or(MediaTime::from_nanos(i64::MIN), |c| c.min(end));
+        let mut withheld = false;
         let mut out = Vec::new();
         for held in &mut self.cues {
             let cue = &held.cue;
@@ -653,6 +657,7 @@ impl SlotCues {
                 }
                 let from = held.published_through.unwrap_or(cue.start);
                 let to = if cue.is_open() {
+                    withheld |= open_limit < end;
                     open_limit
                 } else {
                     cue.end.min(end)
@@ -660,7 +665,6 @@ impl SlotCues {
                 if to <= from {
                     continue;
                 }
-                forced_used |= forced && cue.is_open();
                 held.rolling = true;
                 held.published_through = Some(to);
                 out.push(SubtitleCue {
@@ -678,7 +682,7 @@ impl SlotCues {
                 }
             }
         }
-        if forced_used {
+        if stale && withheld {
             stats.watermark_stale.fetch_add(1, Ordering::Relaxed);
         }
         out.sort_by_key(|c| (c.start, c.end));
@@ -1503,5 +1507,41 @@ mod tests {
         }
         assert_eq!(n, 1, "only the forced segment publishes");
         assert_eq!(stats.watermark_stale(), 1);
+    }
+
+    #[test]
+    fn a_late_close_after_staleness_resumes_from_the_last_published_end() {
+        let stats = SubtitleStats::default();
+        let mut held = SlotCues::default();
+        let mut open = cue(0, 500, 0, &["A"]);
+        open.end = SubtitleCue::OPEN_END;
+        held.push(open, &stats);
+        let mut pieces = Vec::new();
+        // The watermark freezes at 0.96 s for five segments (stale), then A's
+        // true close (1.2 s) and a known successor B [1.2, 2.4) arrive.
+        for seg in 0..5 {
+            let (start, end) = (ms(seg * 1_000), ms((seg + 1) * 1_000));
+            pieces.extend(held.publish(start, end, Some(ms(960)), &stats));
+            held.retire_before(end);
+        }
+        assert_eq!(stats.watermark_stale(), 2, "segments 3 and 4 withheld A");
+        held.push(cue(0, 500, 1_200, &["A"]), &stats);
+        held.push(cue(0, 1_200, 2_400, &["B"]), &stats);
+        pieces.extend(held.publish(ms(5_000), ms(6_000), Some(ms(6_000)), &stats));
+        let spans: Vec<_> = pieces
+            .iter()
+            .map(|c| (c.start, c.end, c.lines[0].as_str()))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                (ms(500), ms(960), "A"),
+                (ms(960), ms(1_200), "A"),
+                (ms(1_200), ms(2_400), "B"),
+            ],
+            "contiguous, never overlapping, nothing of A after its true close"
+        );
+        held.retire_before(ms(6_000));
+        assert!(held.is_empty());
     }
 }

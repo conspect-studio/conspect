@@ -686,6 +686,19 @@ mod tests {
         text_at: fn(i64) -> Option<&'static str>,
         seconds: i64,
     ) -> Vec<(MediaTime, MediaTime, Vec<String>)> {
+        published_union_with(text_at, seconds, 2, None).0
+    }
+
+    /// [`published_union`] with the jam re-applied after every segment close
+    /// before second `jam_until` (so the sampler's retries keep failing and
+    /// its watermark stays frozen), and the sampler dead (no more ticks) from
+    /// second `dead_from` on. Also returns the sink's `watermark_stale`.
+    fn published_union_with(
+        text_at: fn(i64) -> Option<&'static str>,
+        seconds: i64,
+        jam_until: i64,
+        dead_from: Option<i64>,
+    ) -> (Vec<(MediaTime, MediaTime, Vec<String>)>, u64) {
         use multiview_output::hls::subtitle::SlotCues;
         use multiview_output::hls::SubtitleStats;
         let (feed, rx) = subtitle_feed_with_capacity(1);
@@ -699,7 +712,9 @@ mod tests {
         let mut union: Vec<(MediaTime, MediaTime, Vec<String>)> = Vec::new();
         for tick in 0..=seconds * 25 {
             let now = at(tick);
-            output.tick(now, &mut resolve);
+            if dead_from.is_none_or(|d| tick < d * 25) {
+                output.tick(now, &mut resolve);
+            }
             if tick > 0 && tick % 25 == 0 {
                 let batch = rx.drain_confirmed();
                 for cue in batch.cues {
@@ -715,7 +730,7 @@ mod tests {
                     }
                 }
                 held.retire_before(now);
-                if tick == 25 {
+                if tick >= 25 && tick < jam_until * 25 {
                     // The sink stalls: a filler jams the one-cue feed until
                     // the next segment close drains it.
                     assert!(output.feed.offer(SubtitleCue {
@@ -727,7 +742,7 @@ mod tests {
                 }
             }
         }
-        union
+        (union, stats.watermark_stale())
     }
 
     /// How many published copies are active at each 10 ms instant.
@@ -780,6 +795,78 @@ mod tests {
                 usize::from((480..1_200).contains(&t)),
                 "A at {t} ms: {union:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_close_delayed_past_the_stale_bound_never_overlaps_its_successor() {
+        // MED4-1: the feed stays jammed for four segment closes (beyond the
+        // two-segment stale bound) while A's close at 1.2 s and B [1.2, 2.4)
+        // wait in the sampler; then retry delivers them.
+        fn text_at(ms: i64) -> Option<&'static str> {
+            match ms {
+                480..1_200 => Some("A"),
+                1_200..2_400 => Some("B"),
+                _ => None,
+            }
+        }
+        let (union, stale) = published_union_with(text_at, 9, 5, None);
+        assert!(stale > 0, "the jam outlasted the stale bound: {union:?}");
+        for t in (0..9_000).step_by(10) {
+            let (a, b) = (copies(&union, t, "A"), copies(&union, t, "B"));
+            assert!(
+                a <= 1 && b <= 1 && a + b <= 1,
+                "overlap at {t} ms: {union:?}"
+            );
+            assert_eq!(
+                a,
+                usize::from((480..1_200).contains(&t)),
+                "A at {t} ms: {union:?}"
+            );
+            assert_eq!(
+                b,
+                usize::from((1_200..2_400).contains(&t)),
+                "B at {t} ms: {union:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_close_delayed_past_the_stale_bound_then_silence_never_overruns() {
+        fn text_at(ms: i64) -> Option<&'static str> {
+            (480..1_200).contains(&ms).then_some("A")
+        }
+        let (union, stale) = published_union_with(text_at, 9, 5, None);
+        assert!(stale > 0);
+        for t in (0..9_000).step_by(10) {
+            let a = copies(&union, t, "A");
+            assert_eq!(
+                a,
+                usize::from((480..1_200).contains(&t)),
+                "A at {t} ms: {union:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_permanently_dead_sampler_never_extends_stale_text() {
+        // The sampler dies at 2 s with A still showing (its close never
+        // comes); segments keep closing for 8 s. A is published only through
+        // the last confirmed instant (< 2 s), never beyond.
+        fn text_at(ms: i64) -> Option<&'static str> {
+            (480..5_000).contains(&ms).then_some("A")
+        }
+        let (union, stale) = published_union_with(text_at, 8, 0, Some(2));
+        assert!(stale > 0, "withheld closes are counted");
+        let last = union
+            .iter()
+            .filter(|(_, _, l)| l[0] == "A")
+            .map(|(_, e, _)| *e)
+            .max()
+            .expect("A was shown");
+        assert!(last <= at(50), "A published through {last:?}: {union:?}");
+        for t in (0..8_000).step_by(10) {
+            assert!(copies(&union, t, "A") <= 1, "at {t} ms: {union:?}");
         }
     }
 }

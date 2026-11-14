@@ -2134,10 +2134,16 @@ restart".
   count. The sink's `drain_confirmed` confirms T only once it has received that many cues, and an
   open cue's piece then runs to `min(segment end, T)`; the rest is carried forward and the next
   piece starts at the uncovered point (subtitle publication may lag; video never waits). So a
-  close or successor delayed by a full feed can never contradict an already-published piece. If
-  the watermark stays behind the segment start (or absent) for more than
-  `MAX_WATERMARK_LAG_SEGMENTS` (2) consecutive closes, the sink publishes through the segment end
-  anyway and counts `SubtitleStats::watermark_stale`, so a dead sampler cannot freeze subtitles.
+  close or successor delayed by a full feed can never contradict an already-published piece.
+  Staleness **fails closed**: display is never inferred from a timeout. If the watermark stays
+  behind the segment start (or absent) for more than `MAX_WATERMARK_LAG_SEGMENTS` (2) consecutive
+  closes, every close that withholds an open cue counts `SubtitleStats::watermark_stale`, but
+  nothing of the cue is published past the confirmed point. A permanently dead sampler therefore
+  shows the cue only up to its last confirmed instant: subtitles stop, video is unaffected. The
+  only reconciliation state is each held cue's last published end, bounded by the 64 held cues
+  per slot. When the watermark advances again, or the real close or successor arrives, the cue
+  resumes with a piece starting at that end. The client's union therefore stays one copy,
+  contiguous or gapped, never overlapping and never past the true close.
   A known cue whose close arrives after its time was already published is carried once by the
   next segment rather than lost. An empty segment gets a header-only file. Old `.vtt` files retire with the TS grace
   (`prune_prior_*`) only when named exactly `subs<slot>-<index>.vtt` (all-digit fields); rendition
