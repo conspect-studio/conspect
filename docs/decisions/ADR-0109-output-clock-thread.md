@@ -524,7 +524,13 @@ waited 5.0 s on the clock thread.
   Teardown with the GPU hung: the drop on the clock thread takes < 500 ms and
   the GPU is dropped on `gpu-compose`. All three fail on the pre-#415 path.
   A fourth case has the GPU stuck from tick 0 with a 50 ms CPU fallback: the
-  stand-in goes out on time and every tick follows. Unit tests also cover
+  stand-in goes out on time and every tick follows. The chaos assertions
+  are host-speed independent (issue #447): each emitted frame records the
+  backend's CPU-fallback count, so every fresh frame is exactly a GPU or a
+  CPU composite (a repeat never counts one), and liveness is a goal in
+  ticks (≥ 20 fresh CPU frames after the loss, ≥ 20 fresh GPU frames after
+  a stall) that the run keeps ticking for, up to 1800 ticks, instead of a
+  share of a fixed 150-tick window. Unit tests also cover
   same-scene adoption between frames, refusal of other-scene results, never
   adopting a CPU result older than a delivered GPU frame, an adopted frame
   carrying its own job's metadata, a late panic marking the device lost,
