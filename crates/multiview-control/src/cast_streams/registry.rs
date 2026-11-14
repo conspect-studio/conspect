@@ -81,10 +81,94 @@ pub(super) struct Carry {
     pub needs: Option<Vec<super::reauth::Need>>,
 }
 
+/// What the cast engine reported about one output's sink when a grant set
+/// was superseded (#418 review ABUSE-HISTORY-R4): the baseline its
+/// retirement is proven against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SinkMark {
+    /// A cast stream is active (an inactive output serves no media).
+    pub active: bool,
+    /// The generation in the names of the files being served.
+    pub generation: u64,
+    /// Video segments published for that generation.
+    pub video_segments: u64,
+}
+
+impl SinkMark {
+    /// The mark of an engine status.
+    pub(crate) fn of(status: &crate::cast_engine::CastOutputStatus) -> Self {
+        Self {
+            active: status.active,
+            generation: status.generation,
+            video_segments: status.video_segments,
+        }
+    }
+
+    /// Whether `now` (the output's current status) proves that nothing
+    /// servable at this mark is servable any more: the output is inactive,
+    /// or serves another generation (new file names; the old ones are
+    /// purged and never served: `routes::cast_public`), or published
+    /// [`super::RETIRE_SEGMENTS`] more video segments of this generation
+    /// (every file of the marked era left the packager's retention).
+    fn replaced_by(&self, now: &Self) -> bool {
+        !now.active
+            || now.generation != self.generation
+            || now.video_segments >= self.video_segments.saturating_add(super::RETIRE_SEGMENTS)
+    }
+
+    /// One mark at least as late as both (an overflow merge): replaced only
+    /// when both are. Generations only ever increase, so the later
+    /// generation's mark implies the earlier one's.
+    fn later(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        let (a, b) = (a?, b?);
+        Some(match a.generation.cmp(&b.generation) {
+            std::cmp::Ordering::Less => b,
+            std::cmp::Ordering::Greater => a,
+            std::cmp::Ordering::Equal => Self {
+                active: a.active || b.active,
+                generation: a.generation,
+                video_segments: a.video_segments.max(b.video_segments),
+            },
+        })
+    }
+}
+
+/// The grants of a superseded feed whose media may still be servable
+/// (#418 review ABUSE-HISTORY-R4).
+#[derive(Debug, Clone)]
+pub(super) struct Superseded {
+    /// Unix ms before which it never expires (superseded +
+    /// [`super::MEDIA_RETENTION_MS`]).
+    pub not_before: u64,
+    /// The output's sink when it was superseded (`None`: the engine status
+    /// was unavailable; it then expires only on an inactive output).
+    pub mark: Option<SinkMark>,
+    /// The grants (`None`: undeterminable, fails closed).
+    pub needs: Option<Vec<super::reauth::Need>>,
+}
+
+impl Superseded {
+    /// Whether it may be forgotten at `now` with the output's sink at
+    /// `sink` (`None`: the engine status is unavailable — fail closed:
+    /// never). BOTH the retention must have elapsed AND the sink must have
+    /// provably replaced everything servable from the time it was
+    /// superseded: a stalled sink keeps it forever.
+    fn expired(&self, now: u64, sink: Option<&SinkMark>) -> bool {
+        let Some(sink) = sink else {
+            return false;
+        };
+        let replaced = match &self.mark {
+            Some(mark) => mark.replaced_by(sink),
+            None => !sink.active,
+        };
+        now >= self.not_before && replaced
+    }
+}
+
 /// The authorization gate of one output (ABUSE-1). Invariant: every token
 /// armed at `generation` passed the grants of the `settled` feed, of every
-/// carried take and of every unexpired `history` entry, so the media of any
-/// bus [`Gate::clears`] (and any retained byte of a superseded feed) may be
+/// carried take and of every `history` entry, so the media of any bus
+/// [`Gate::clears`] (and any retained byte of a superseded feed) may be
 /// served to it; anything else bumps the generation and re-authorizes every
 /// token first, in the same critical section.
 #[derive(Debug, Clone, Default)]
@@ -97,11 +181,11 @@ pub(super) struct Gate {
     pub settled: Option<(String, Option<Vec<super::reauth::Need>>)>,
     /// #418 review ABUSE-HISTORY-R4: the grants of superseded feeds (a
     /// replaced `settled`, a settled or forgotten carry) whose media may
-    /// still be servable, each with the Unix ms it stops counting at
-    /// (replacement + [`super::MEDIA_RETENTION_MS`]); oldest first, at most
-    /// [`super::MAX_HISTORY`] (an overflow merges into the oldest entry,
-    /// keeping the later expiry: a need is never dropped early).
-    pub history: std::collections::VecDeque<(u64, Option<Vec<super::reauth::Need>>)>,
+    /// still be servable; oldest first, at most [`super::MAX_HISTORY`] (an
+    /// overflow merges into the oldest entry, keeping the later retention
+    /// and sink mark: a need is never dropped early). Forgotten only by
+    /// [`Gate::prune`], once [`Superseded::expired`].
+    pub history: std::collections::VecDeque<Superseded>,
 }
 
 /// The union of two grant sets (`None` anywhere: undeterminable).
@@ -125,23 +209,18 @@ impl Gate {
             || self.carry.iter().any(|c| c.bus.as_deref() == Some(bus))
     }
 
-    /// Every grant a new token must hold at `now`: the settled feed's, every
-    /// carried take's and every superseded feed's whose media may still be
-    /// served (unexpired history; `None` anywhere: undeterminable).
+    /// Every grant a new token must hold: the settled feed's, every
+    /// carried take's and every superseded feed's still in the history
+    /// (`None` anywhere: undeterminable). Call [`Gate::prune`] first.
     /// Forgetting a carried take (over [`super::MAX_CARRY`]) moves it to
     /// the history, so nothing is narrowed while its bytes stay servable.
-    pub(super) fn cleared_needs(&self, now: u64) -> Option<Vec<super::reauth::Need>> {
+    pub(super) fn cleared_needs(&self) -> Option<Vec<super::reauth::Need>> {
         let mut all = Vec::new();
         let settled = self.settled.as_ref().map(|(_, needs)| needs);
-        let history = self
-            .history
-            .iter()
-            .filter(|(expires, _)| *expires > now)
-            .map(|(_, needs)| needs);
         for needs in settled
             .into_iter()
             .chain(self.carry.iter().map(|c| &c.needs))
-            .chain(history)
+            .chain(self.history.iter().map(|h| &h.needs))
         {
             for need in needs.as_ref()? {
                 if !all.contains(need) {
@@ -152,32 +231,46 @@ impl Gate {
         Some(all)
     }
 
-    /// Forget the history entries expired at `now` (lazy: wherever `now`
-    /// is at hand). Only narrows what a new token must hold.
-    pub(super) fn prune(&mut self, now: u64) {
-        self.history.retain(|(expires, _)| *expires > now);
+    /// Forget the history entries expired at `now` with the output's sink
+    /// at `sink` (see [`Superseded::expired`]; lazy: wherever both are at
+    /// hand). Only narrows what a new token must hold.
+    pub(super) fn prune(&mut self, now: u64, sink: Option<&SinkMark>) {
+        self.history.retain(|h| !h.expired(now, sink));
     }
 
-    /// Whether any history entry still counts at `now`.
-    pub(super) fn remembers(&self, now: u64) -> bool {
-        self.history.iter().any(|(expires, _)| *expires > now)
+    /// Whether any history entry is left.
+    pub(super) fn remembers(&self) -> bool {
+        !self.history.is_empty()
     }
 
-    /// Record superseded `needs` whose media stays servable for
-    /// [`super::MEDIA_RETENTION_MS`] from `now`. Bounded: past
-    /// [`super::MAX_HISTORY`] they merge into the oldest entry, which keeps
-    /// the later expiry, so no need ever expires early.
-    pub(super) fn retire(&mut self, needs: Option<Vec<super::reauth::Need>>, now: u64) {
-        self.prune(now);
-        let expires = now.saturating_add(super::MEDIA_RETENTION_MS);
+    /// Record superseded `needs` whose media may stay servable, with the
+    /// sink's current status `sink` as the baseline of their retirement.
+    /// Bounded: past [`super::MAX_HISTORY`] they merge into the oldest
+    /// entry, which keeps the later retention and mark, so no need ever
+    /// expires early.
+    pub(super) fn retire(
+        &mut self,
+        needs: Option<Vec<super::reauth::Need>>,
+        now: u64,
+        sink: Option<&SinkMark>,
+    ) {
+        self.prune(now, sink);
+        let entry = Superseded {
+            not_before: now.saturating_add(super::MEDIA_RETENTION_MS),
+            mark: sink.copied(),
+            needs,
+        };
         if self.history.len() >= super::MAX_HISTORY {
-            if let Some((at, merged)) = self.history.pop_front() {
-                self.history
-                    .push_front((at.max(expires), union(merged, needs)));
+            if let Some(old) = self.history.pop_front() {
+                self.history.push_front(Superseded {
+                    not_before: old.not_before.max(entry.not_before),
+                    mark: SinkMark::later(old.mark, entry.mark),
+                    needs: union(old.needs, entry.needs),
+                });
             }
             return;
         }
-        self.history.push_back((expires, needs));
+        self.history.push_back(entry);
     }
 
     /// Replace the settled feed with `next`; the grants it replaced move to
@@ -186,11 +279,12 @@ impl Gate {
         &mut self,
         next: (String, Option<Vec<super::reauth::Need>>),
         now: u64,
+        sink: Option<&SinkMark>,
     ) {
         if let Some((_, old)) = self.settled.replace(next) {
             let unchanged = self.settled.as_ref().is_some_and(|(_, new)| *new == old);
             if !unchanged {
-                self.retire(old, now);
+                self.retire(old, now, sink);
             }
         }
     }
@@ -199,7 +293,7 @@ impl Gate {
     /// control-plane move without an operation id (its bus is the one the
     /// outcome reports, or it no longer is on air). The settled carries
     /// move to the history: their media may still be servable.
-    pub(super) fn settle(&mut self, op: Option<&str>, now: u64) {
+    pub(super) fn settle(&mut self, op: Option<&str>, now: u64, sink: Option<&SinkMark>) {
         let mut gone = Vec::new();
         if let Some(at) =
             op.and_then(|op| self.carry.iter().position(|c| c.op.as_deref() == Some(op)))
@@ -211,7 +305,7 @@ impl Gate {
         self.carry = keep.into();
         gone.extend(unrequested);
         for carry in gone {
-            self.retire(carry.needs, now);
+            self.retire(carry.needs, now, sink);
         }
     }
 }
@@ -355,7 +449,7 @@ impl Registry {
     }
 
     /// The gate of `config_id`, created (at a fresh generation) on first
-    /// use. Gates exist only for outputs with streams or unexpired history
+    /// use. Gates exist only for outputs with streams or a history
     /// (the sweep drops the others); creation is
     /// additionally refused beyond [`super::MAX_GATES`] (`None`), which
     /// fails closed: an output without a gate never serves a token
@@ -435,7 +529,13 @@ impl Registry {
 
     /// Remove expired entries, start lingers and end the lingers that are
     /// over. O(streams + slots).
-    pub(super) fn sweep(&mut self, now: u64) -> Vec<Ended> {
+    /// `sinks`: the engine status of every cast output by config id
+    /// (`None`: unavailable; an output missing from it is unavailable too).
+    pub(super) fn sweep(
+        &mut self,
+        now: u64,
+        sinks: Option<&HashMap<String, SinkMark>>,
+    ) -> Vec<Ended> {
         let before = self.entries.len();
         self.entries.retain(|e| !e.expired(now));
         if self.entries.len() != before {
@@ -473,17 +573,18 @@ impl Registry {
         // A gate that lost its last stream retires its feeds to the history
         // first: the output lingers and its files stay servable.
         self.gates.retain(|config_id, gate| {
-            gate.prune(now);
+            let sink = sinks.and_then(|s| s.get(config_id));
+            gate.prune(now, sink);
             if counts.contains_key(config_id.as_str()) {
                 return true;
             }
             if let Some((_, needs)) = gate.settled.take() {
-                gate.retire(needs, now);
+                gate.retire(needs, now, sink);
             }
             for carry in std::mem::take(&mut gate.carry) {
-                gate.retire(carry.needs, now);
+                gate.retire(carry.needs, now, sink);
             }
-            gate.remembers(now)
+            gate.remembers()
         });
         ended
     }

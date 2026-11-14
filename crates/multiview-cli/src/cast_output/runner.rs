@@ -267,7 +267,7 @@ impl CastRunner {
 
     fn start_packager(&mut self, generation: u64, wall_anchor: Option<(i64, i64)>, now: Instant) {
         let gate = Arc::clone(&self.setup.gate);
-        gate.begin_generation(self.serving);
+        gate.begin_generation(self.serving, generation);
         // The directory may have changed since the run was built: nothing is
         // written into a directory that is not (or no longer) this output's.
         if let Err(reason) = claim_cast_dir(&self.setup.dir, &self.setup.id) {
@@ -351,7 +351,12 @@ impl CastRunner {
         self.restarts = self.restarts.saturating_add(1);
         self.setup.gate.set_error(Some(reason.to_owned()));
         self.setup.gate.note_restart();
-        self.setup.gate.begin_generation(self.serving);
+        // The failed packager's files are purged (best effort): report a
+        // fresh generation no file carries, so none of them is served and
+        // the control plane sees them retired (#418 ABUSE-HISTORY-R4).
+        self.setup
+            .gate
+            .begin_generation(self.serving, next_generation());
         self.retry_at = Some(now + RESTART_INTERVAL);
     }
 }

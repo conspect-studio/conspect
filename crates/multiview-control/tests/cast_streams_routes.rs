@@ -128,10 +128,32 @@ struct FakeCast {
     activations: Mutex<Vec<(String, bool)>>,
     deactivations: Mutex<Vec<String>>,
     error: Mutex<Option<String>>,
+    /// Video segments an active output reports (default 9).
+    segments: Mutex<HashMap<String, u64>>,
+    /// The engine status is unavailable (no outputs reported).
+    hidden: std::sync::atomic::AtomicBool,
+}
+
+impl FakeCast {
+    /// Set the video segments an active `id` reports.
+    fn set_segments(&self, id: &str, n: u64) {
+        self.segments.lock().unwrap().insert(id.to_owned(), n);
+    }
+    /// Move active `id` to file generation `generation` (a new packager).
+    fn set_generation(&self, id: &str, generation: u64) {
+        self.state
+            .lock()
+            .unwrap()
+            .insert(id.to_owned(), (true, generation));
+    }
 }
 
 impl CastEngine for FakeCast {
     fn outputs(&self) -> Vec<CastOutputStatus> {
+        if self.hidden.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        let segments = self.segments.lock().unwrap().clone();
         let state = self.state.lock().unwrap();
         let error = self.error.lock().unwrap().clone();
         ["cast-1", "cast-2"]
@@ -144,7 +166,11 @@ impl CastEngine for FakeCast {
                     active,
                     ready: active,
                     generation,
-                    video_segments: if active { 9 } else { 0 },
+                    video_segments: if active {
+                        segments.get(*id).copied().unwrap_or(9)
+                    } else {
+                        0
+                    },
                     dropped_packets: 0,
                     last_error: error.clone(),
                     width: 640,
@@ -163,8 +189,13 @@ impl CastEngine for FakeCast {
             .lock()
             .unwrap()
             .push((id.to_owned(), preroll));
-        self.state.lock().unwrap().insert(id.to_owned(), (true, 1));
-        Ok(1)
+        // Idempotent while active: the running generation.
+        let mut state = self.state.lock().unwrap();
+        let entry = state.entry(id.to_owned()).or_insert((false, 0));
+        if !entry.0 {
+            *entry = (true, 1);
+        }
+        Ok(entry.1)
     }
     fn deactivate(&self, id: &str) -> Result<(), CastEngineError> {
         self.deactivations.lock().unwrap().push(id.to_owned());
@@ -371,6 +402,8 @@ fn rig_mode(doc: &str, mode: Mode, adjust: impl FnOnce(AppState) -> AppState) ->
         activations: Mutex::new(Vec::new()),
         deactivations: Mutex::new(Vec::new()),
         error: Mutex::new(None),
+        segments: Mutex::new(HashMap::new()),
+        hidden: std::sync::atomic::AtomicBool::new(false),
     });
     let routing = FakeRouting::new();
     let now = Arc::new(AtomicU64::new(1_000_000));
@@ -2928,8 +2961,21 @@ async fn a_new_token_is_refused_while_a_superseded_private_subtitle_source_stays
         "just before the retention: {doc}"
     );
     advance_keeping(&rig, &admin, Duration::from_secs(1)).await;
+    // The sink is stalled (9 segments, as when superseded): the retention
+    // alone never expires the history (ABUSE-HISTORY-R4, round 5).
     let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
-    assert_eq!(status, StatusCode::CREATED, "retention over: {doc}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "stalled sink: {doc}");
+    advance_keeping(&rig, &admin, Duration::from_secs(600)).await;
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "still stalled: {doc}");
+    // 20 more segments: the oldest retained file may still be of that era.
+    rig.cast.set_segments("cast-1", 9 + 20);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "one file left: {doc}");
+    // 21: every file of the superseded era is retired.
+    rig.cast.set_segments("cast-1", 9 + 21);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "sink replaced it: {doc}");
     let scoped = token_of(&doc);
     assert_eq!(
         fetch(&rig, &format!("/cast/{scoped}/master.m3u8")).await.0,
@@ -2967,7 +3013,14 @@ async fn a_new_token_is_refused_while_a_superseded_private_video_feed_stays_serv
     );
     advance_keeping(&rig, &admin, retention()).await;
     let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
-    assert_eq!(status, StatusCode::CREATED, "retention over: {doc}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "stalled sink: {doc}");
+    rig.cast.set_segments("cast-1", 9 + 21);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "retention over, sink replaced: {doc}"
+    );
 }
 
 /// ABUSE-HISTORY-R4: an existing token whose owner is re-scoped off the
@@ -3004,4 +3057,109 @@ async fn a_recheck_within_the_retention_revokes_an_owner_who_lost_the_superseded
     let (status, body) = fetch(&rig, &format!("/cast/{token}/master.m3u8")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body, b"not found\n");
+}
+
+/// ABUSE-HISTORY-R4 (round 5): a new file generation (a new activation or
+/// packager: new names, the old ones purged and never served) retires the
+/// superseded media once the retention elapsed, however few segments.
+#[tokio::test]
+async fn a_new_sink_generation_expires_the_history_after_the_retention() {
+    let rig = subtitle_history_rig();
+    let (status, admin) =
+        create(&rig, ADMIN_TOKEN, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{admin}");
+    let admin = token_of(&admin);
+    repatched_then_settled(&rig).await;
+    write_generation(&rig, "cast-1", 2);
+    rig.cast.set_generation("cast-1", 2);
+    rig.cast.set_segments("cast-1", 1);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "within the retention: {doc}");
+    advance_keeping(&rig, &admin, retention()).await;
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "new generation: {doc}");
+    assert_eq!(rig.state.cast_streams.history_len("cast-1"), 0);
+}
+
+/// ABUSE-HISTORY-R4 (round 5): with the engine status unavailable nothing
+/// superseded is forgotten (fail closed), even when the sink did replace
+/// it; once the status is back and proves it, the history goes.
+#[tokio::test]
+async fn an_unavailable_sink_status_keeps_the_history() {
+    let rig = subtitle_history_rig();
+    let (status, admin) =
+        create(&rig, ADMIN_TOKEN, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{admin}");
+    let admin = token_of(&admin);
+    repatched_then_settled(&rig).await;
+    let kept = rig.state.cast_streams.history_len("cast-1");
+    assert!(kept > 0);
+    advance_keeping(&rig, &admin, retention()).await;
+    rig.cast.set_segments("cast-1", 9 + 21);
+    rig.cast.hidden.store(true, Ordering::SeqCst);
+    multiview_control::cast_streams::lifecycle::sweep_now(&rig.state);
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    assert_eq!(
+        rig.state.cast_streams.history_len("cast-1"),
+        kept,
+        "status unavailable: kept"
+    );
+    rig.cast.hidden.store(false, Ordering::SeqCst);
+    multiview_control::cast_streams::lifecycle::sweep_now(&rig.state);
+    assert_eq!(rig.state.cast_streams.history_len("cast-1"), 0);
+}
+
+/// Write a minimal stream of file generation `generation` into `id`'s dir.
+fn write_generation(rig: &Rig, id: &str, generation: u64) {
+    let dir = rig.dir.path().join(id);
+    std::fs::write(dir.join(format!("seg-v-{generation}-0.m4s")), b"new-seg").unwrap();
+    std::fs::write(dir.join(format!("init-v-{generation}-0.mp4")), b"new-init").unwrap();
+    std::fs::write(
+        dir.join(format!("sub0-{generation}-0.vtt")),
+        "WEBVTT\n\nnew\n",
+    )
+    .unwrap();
+}
+
+/// ABUSE-HISTORY-R4 (round 5), defence in depth: a file of another
+/// generation than the output's current one (left by a best-effort purge)
+/// is the generic 404 even for a valid token; the current one is served,
+/// playlists always.
+#[tokio::test]
+async fn a_stale_generation_file_is_never_served() {
+    let rig = rig();
+    let (status, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    std::fs::write(
+        rig.dir.path().join("cast-1").join("sub0-1-0.vtt"),
+        "WEBVTT\n\nold\n",
+    )
+    .unwrap();
+    for file in ["seg-v-1-0.m4s", "init-v-1-0.mp4", "sub0-1-0.vtt"] {
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{token}/{file}")).await.0,
+            StatusCode::OK,
+            "{file}"
+        );
+    }
+    write_generation(&rig, "cast-1", 2);
+    rig.cast.set_generation("cast-1", 2);
+    for file in ["seg-v-1-0.m4s", "init-v-1-0.mp4", "sub0-1-0.vtt"] {
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/{file}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "stale {file}");
+        assert_eq!(body, b"not found\n");
+    }
+    for file in [
+        "seg-v-2-0.m4s",
+        "init-v-2-0.mp4",
+        "sub0-2-0.vtt",
+        "master.m3u8",
+    ] {
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{token}/{file}")).await.0,
+            StatusCode::OK,
+            "{file}"
+        );
+    }
 }

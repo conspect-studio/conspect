@@ -209,10 +209,10 @@ fn gates_are_bounded_and_fail_closed_past_the_cap() {
         .claim("op", "output-x", "over", &RoutedFeed::Program, false)
         .unwrap();
     for i in 0..MAX_GATES {
-        let arm = streams.arm_snapshot(&format!("c{i}"));
+        let arm = streams.arm_snapshot(&format!("c{i}"), None);
         assert!(arm.generation > 0);
     }
-    let arm = streams.arm_snapshot("over");
+    let arm = streams.arm_snapshot("over", None);
     assert_eq!(arm.generation, 0);
     assert!(arm.needs.is_none());
     assert_eq!(streams.lock().gates.len(), MAX_GATES);
@@ -224,55 +224,114 @@ fn gates_are_bounded_and_fail_closed_past_the_cap() {
     assert_eq!(streams.generation("over"), None);
 }
 
-/// #418 review ABUSE-HISTORY-R4: the retention covers everything the
-/// packager can still serve after a feed is replaced: `2 * CAST_WINDOW`
-/// (10) retained segments of at most the fixed `EXT-X-TARGETDURATION`
-/// (2 x 2 s nominal = 4 s), pinned by value (those constants live in
-/// crates this one cannot name).
+/// #418 review ABUSE-HISTORY-R4: [`RETIRE_SEGMENTS`] is the packager's
+/// retention plus the segment in progress: `multiview_output::hls::cast`
+/// keeps the files of `2 * window` published segments (`retire_old_files`)
+/// and the run's window is `multiview-cli` `CAST_WINDOW` = 10, pinned by
+/// value (those live in crates this one cannot name).
 #[test]
-fn media_retention_covers_every_servable_segment() {
-    const CAST_WINDOW: u64 = 10;
-    const TARGET_DURATION_MS: u64 = 2 * 2_000;
-    let servable = 2 * CAST_WINDOW * TARGET_DURATION_MS;
-    assert_eq!(servable, 80_000);
-    assert!(
-        MEDIA_RETENTION_MS >= servable + 20_000,
-        "slack for held cues"
-    );
+fn retire_segments_match_the_packager_retention() {
+    assert_eq!(CAST_WINDOW, 10);
+    assert_eq!(RETIRE_SEGMENTS, 21);
+    assert_eq!(RETIRE_SEGMENTS, 2 * CAST_WINDOW + 1);
+    // The time floor still covers 2 x window segments of the 4 s
+    // EXT-X-TARGETDURATION at the nominal cadence.
+    const { assert!(MEDIA_RETENTION_MS >= 2 * CAST_WINDOW * 4_000) };
 }
 
-/// ABUSE-HISTORY-R4: superseded grants stay cleared until their retention
-/// ends; an overflow merges into the oldest entry with the LATER expiry, so
-/// no need is dropped early.
+fn mark(active: bool, generation: u64, video_segments: u64) -> SinkMark {
+    SinkMark {
+        active,
+        generation,
+        video_segments,
+    }
+}
+
+/// ABUSE-HISTORY-R4: a superseded grant set expires only when its retention
+/// elapsed AND the sink replaced its media (new generation, inactive, or
+/// [`RETIRE_SEGMENTS`] more segments); without a sink status, never.
 #[test]
-fn gate_history_keeps_superseded_needs_until_retention_and_merges_bounded() {
+fn gate_history_expires_only_after_retention_and_sink_replacement() {
+    use super::reauth::Need;
+    let need = |s: &str| Need::Object(s.to_owned());
+    let at = mark(true, 7, 100);
+    let mut gate = registry::Gate::default();
+    gate.replace_settled(("src:s2".to_owned(), Some(vec![need("s2")])), 0, Some(&at));
+    gate.replace_settled(
+        ("src:s1".to_owned(), Some(vec![need("s1")])),
+        1_000,
+        Some(&at),
+    );
+    let after = 1_000 + MEDIA_RETENTION_MS;
+    let holds = |gate: &mut registry::Gate, now: u64, sink: Option<&SinkMark>| {
+        gate.prune(now, sink);
+        gate.cleared_needs().unwrap().contains(&need("s2"))
+    };
+    // A stalled sink keeps it, however long.
+    assert!(holds(&mut gate, after * 1_000, Some(&at)));
+    assert!(holds(&mut gate, after, Some(&mark(true, 7, 120))));
+    // Status unavailable: kept.
+    assert!(holds(&mut gate, after, None));
+    // Replaced, but the retention not yet elapsed: kept.
+    assert!(holds(
+        &mut gate,
+        MEDIA_RETENTION_MS - 1,
+        Some(&mark(true, 8, 0))
+    ));
+    // Every file retired (100 + 21 segments): gone.
+    let mut g = gate.clone();
+    assert!(!holds(&mut g, after, Some(&mark(true, 7, 121))));
+    assert_eq!(g.cleared_needs().unwrap(), vec![need("s1")]);
+    // A new generation: gone. Inactive: gone.
+    let mut g = gate.clone();
+    assert!(!holds(&mut g, after, Some(&mark(true, 8, 0))));
+    let mut g = gate.clone();
+    assert!(!holds(&mut g, after, Some(&mark(false, 0, 0))));
+    // Superseded while the status was unavailable: only an inactive output
+    // proves it replaced.
+    let mut gate = registry::Gate::default();
+    gate.retire(Some(vec![need("s2")]), 0, None);
+    assert!(holds(&mut gate, after, Some(&mark(true, 9, 1_000))));
+    assert!(!holds(&mut gate, after, Some(&mark(false, 0, 0))));
+}
+
+/// ABUSE-HISTORY-R4: the history is bounded; an overflow merges into the
+/// oldest entry with the LATER retention and sink mark, so no need is
+/// dropped early. Undeterminable history fails closed.
+#[test]
+fn gate_history_merges_bounded_and_never_drops_a_need_early() {
     use super::reauth::Need;
     let need = |s: &str| Need::Object(s.to_owned());
     let mut gate = registry::Gate::default();
-    gate.replace_settled(("src:s2".to_owned(), Some(vec![need("s2")])), 0);
-    gate.replace_settled(("src:s1".to_owned(), Some(vec![need("s1")])), 1_000);
-    let cleared = gate.cleared_needs(1_000).unwrap();
-    assert!(cleared.contains(&need("s2")) && cleared.contains(&need("s1")));
-    assert!(gate
-        .cleared_needs(1_000 + MEDIA_RETENTION_MS - 1)
-        .unwrap()
-        .contains(&need("s2")));
-    assert_eq!(
-        gate.cleared_needs(1_000 + MEDIA_RETENTION_MS).unwrap(),
-        vec![need("s1")]
-    );
-    // Overflow: no need expires before its own retention ends.
-    let mut gate = registry::Gate::default();
     let max = u64::try_from(MAX_HISTORY).unwrap();
     for i in 0..max + 3 {
-        gate.retire(Some(vec![need(&format!("n{i}"))]), i);
+        gate.retire(
+            Some(vec![need(&format!("n{i}"))]),
+            i,
+            Some(&mark(true, 7, i * 10)),
+        );
     }
     assert_eq!(gate.history.len(), MAX_HISTORY);
     for i in 0..max + 3 {
-        let cleared = gate.cleared_needs(i + MEDIA_RETENTION_MS - 1).unwrap();
-        assert!(cleared.contains(&need(&format!("n{i}"))), "n{i}");
+        let mut g = gate.clone();
+        g.prune(
+            i + MEDIA_RETENTION_MS - 1,
+            Some(&mark(true, 7, i * 10 + RETIRE_SEGMENTS)),
+        );
+        assert!(
+            g.cleared_needs().unwrap().contains(&need(&format!("n{i}"))),
+            "n{i}"
+        );
+        let mut g = gate.clone();
+        g.prune(
+            i + MEDIA_RETENTION_MS,
+            Some(&mark(true, 7, i * 10 + RETIRE_SEGMENTS - 1)),
+        );
+        assert!(
+            g.cleared_needs().unwrap().contains(&need(&format!("n{i}"))),
+            "n{i}"
+        );
     }
-    // Undeterminable history fails closed while it counts.
-    gate.retire(None, 0);
-    assert!(gate.cleared_needs(1).is_none());
+    gate.retire(None, 0, None);
+    assert!(gate.cleared_needs().is_none());
 }

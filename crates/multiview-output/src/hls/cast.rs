@@ -424,6 +424,29 @@ pub fn is_packager_file_name(name: &str) -> bool {
     false
 }
 
+/// The generation a [`CastPackager`] media file name carries: `<gen>` of
+/// `seg-v-<gen>-<n>.m4s`, `seg-a[<i>]-<gen>-<n>.m4s`,
+/// `sub<i>-<gen>-<n>.vtt`, `init-v-<gen>-<k>.mp4`,
+/// `init-a[<i>]-<gen>-<k>.mp4` (also with `.tmp`). `None` for a playlist
+/// (they carry no generation) and for any name [`is_packager_file_name`]
+/// refuses.
+#[must_use]
+pub fn packager_file_generation(name: &str) -> Option<u64> {
+    if !is_packager_file_name(name) {
+        return None;
+    }
+    let name = name.strip_suffix(".tmp").unwrap_or(name);
+    // Every generation-carrying name ends in `-<gen>-<n>.<ext>` (the
+    // packager writes lower-case names only; a playlist carries none).
+    let (stem, ext) = name.rsplit_once('.')?;
+    if ext == "m3u8" {
+        return None;
+    }
+    let (head, _) = stem.rsplit_once('-')?;
+    let (_, generation) = head.rsplit_once('-')?;
+    generation.parse().ok()
+}
+
 /// Delete the files a [`CastPackager`] wrote directly in `dir` (best effort):
 /// only names [`is_packager_file_name`] accepts, only regular files (never a
 /// symlink, never a sub-directory). Every other file is left alone, so a
@@ -1853,6 +1876,38 @@ impl CastPackager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #418 review ABUSE-HISTORY-R4: the control plane serves a media file
+    /// only when this generation is the output's current one.
+    #[test]
+    fn cast_packager_file_generation_is_parsed_from_every_media_name() {
+        for (name, generation) in [
+            ("seg-v-17-0.m4s", 17),
+            ("seg-a-17-3.m4s", 17),
+            ("seg-a2-1700000000001-12.m4s", 1_700_000_000_001),
+            ("sub0-5-9.vtt", 5),
+            ("sub7-5-9.vtt", 5),
+            ("init-v-42-1.mp4", 42),
+            ("init-a-42-0.mp4", 42),
+            ("init-a15-42-0.mp4", 42),
+            ("seg-v-17-0.m4s.tmp", 17),
+        ] {
+            assert_eq!(packager_file_generation(name), Some(generation), "{name}");
+        }
+        for name in [
+            "master.m3u8",
+            "video.m3u8",
+            "audio3.m3u8",
+            "subs0.m3u8",
+            "seg-v-x-0.m4s",
+            "sub8-5-9.vtt",
+            "seg-v-17.m4s",
+            "other-1-2.m4s",
+            "seg-v-99999999999999999999999-0.m4s",
+        ] {
+            assert_eq!(packager_file_generation(name), None, "{name}");
+        }
+    }
 
     #[test]
     fn times_in_different_time_bases_compare_exactly() {

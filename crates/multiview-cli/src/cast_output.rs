@@ -84,7 +84,11 @@ pub enum CastGateError {
 pub struct CastGateStatus {
     /// A cast stream is active.
     pub active: bool,
-    /// The activation's generation (0 when inactive).
+    /// The generation in the names of the files served now (0 when
+    /// inactive): the activation's, or after a packager restart the
+    /// restarted packager's (#418 review ABUSE-HISTORY-R4: the control plane
+    /// serves only files of this generation and treats a change as the old
+    /// files' retirement).
     pub generation: u64,
     /// The master playlist and at least [`CAST_READY_SEGMENTS`] segments are
     /// published for this generation.
@@ -117,8 +121,10 @@ pub(crate) type CastTestHook = Arc<dyn Fn() + Send + Sync>;
 pub struct CastGate {
     /// `generation << 1 | preroll`; 0 = inactive.
     state: AtomicU64,
-    /// The generation the progress fields below describe.
+    /// The activation the progress fields below describe.
     progress_generation: AtomicU64,
+    /// The file-name generation of that activation's current packager.
+    file_generation: AtomicU64,
     ready: AtomicBool,
     video_segments: AtomicU64,
     audio_segments: AtomicU64,
@@ -155,6 +161,7 @@ impl CastGate {
         Self {
             state: AtomicU64::new(0),
             progress_generation: AtomicU64::new(0),
+            file_generation: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             video_segments: AtomicU64::new(0),
             audio_segments: AtomicU64::new(0),
@@ -247,13 +254,19 @@ impl CastGate {
     }
 
     /// A point-in-time status for the control plane. Progress is reported
-    /// only for the generation that is active now.
+    /// only for the activation that is active now; its generation is the
+    /// one in the names of the files its current packager writes.
     #[must_use]
     pub fn status(&self) -> CastGateStatus {
         let activation = self.activation();
-        let generation = activation.map_or(0, |(generation, _)| generation);
+        let activated = activation.map_or(0, |(generation, _)| generation);
         let current =
-            generation != 0 && self.progress_generation.load(Ordering::Acquire) == generation;
+            activated != 0 && self.progress_generation.load(Ordering::Acquire) == activated;
+        let generation = if current {
+            self.file_generation.load(Ordering::Acquire)
+        } else {
+            activated
+        };
         let count = |cell: &AtomicU64| {
             if current {
                 cell.load(Ordering::Acquire)
@@ -297,13 +310,19 @@ impl CastGate {
             .unwrap_or_else(PoisonError::into_inner) = error;
     }
 
-    /// A packager for `generation` starts: its progress is zero.
-    pub(crate) fn begin_generation(&self, generation: u64) {
+    /// A packager of the activation `activation` writing files of
+    /// generation `files` starts (or, with no packager, none runs): its
+    /// progress is zero.
+    pub(crate) fn begin_generation(&self, activation: u64, files: u64) {
         self.ready.store(false, Ordering::Release);
         self.video_segments.store(0, Ordering::Release);
         self.audio_segments.store(0, Ordering::Release);
+        // The progress activation last, so a reader that sees it also sees
+        // the file generation that goes with it.
+        self.progress_generation.store(0, Ordering::Release);
+        self.file_generation.store(files, Ordering::Release);
         self.progress_generation
-            .store(generation, Ordering::Release);
+            .store(activation, Ordering::Release);
     }
 
     /// Publish the packager's progress (sink thread, atomics only).

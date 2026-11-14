@@ -58,7 +58,7 @@ use crate::auth::Principal;
 use crate::output_routing::{OutputOutcome, RoutedAudio, RoutedFeed, RoutedLayout};
 use crate::state::AppState;
 
-use super::{AuthOrigin, Change, ChangeMode, OwnedStream};
+use super::{AuthOrigin, Change, ChangeMode, OwnedStream, SinkMark};
 
 /// The reason recorded when the owner may not read the new feed.
 pub(crate) const REASON_FEED: &str =
@@ -141,7 +141,10 @@ pub(crate) fn before_change(
         bus: video.map(RoutedFeed::bus_name),
         needs: closure(state, config_id, video, layout, audio, None),
     };
-    let revoked = state.cast_streams.commit(config_id, change, &check(state));
+    let revoked =
+        state
+            .cast_streams
+            .commit(config_id, change, sink(state, config_id), &check(state));
     report(state, revoked, actor)
 }
 
@@ -171,7 +174,10 @@ pub(crate) fn before_subtitle_change(
         bus: None,
         needs: closure(state, config_id, None, None, None, Some(slots)),
     };
-    let revoked = state.cast_streams.commit(config_id, change, &check(state));
+    let revoked =
+        state
+            .cast_streams
+            .commit(config_id, change, sink(state, config_id), &check(state));
     report(state, revoked, actor)
 }
 
@@ -205,9 +211,37 @@ pub(crate) fn on_outcome(state: &AppState, outcome: &OutputOutcome) -> Vec<Strin
         &feed.bus_name(),
         needs,
         ChangeMode::Outcome,
+        sink(state, &outcome.output),
         &check(state),
     );
     report(state, revoked, "engine")
+}
+
+/// The engine status of cast output `config_id`'s sink (#418 review
+/// ABUSE-HISTORY-R4): what a superseded grant set's retirement is proven
+/// against. `None` (no engine, no such output): unavailable, so nothing
+/// superseded is forgotten.
+pub(crate) fn sink(state: &AppState, config_id: &str) -> Option<SinkMark> {
+    state
+        .cast_engine
+        .as_ref()?
+        .outputs()
+        .iter()
+        .find(|o| o.id == config_id)
+        .map(SinkMark::of)
+}
+
+/// Every cast output's sink status (see [`sink`]; `None`: no engine).
+pub(crate) fn sinks(state: &AppState) -> Option<std::collections::HashMap<String, SinkMark>> {
+    Some(
+        state
+            .cast_engine
+            .as_ref()?
+            .outputs()
+            .iter()
+            .map(|o| (o.id.clone(), SinkMark::of(o)))
+            .collect(),
+    )
 }
 
 /// The media path's barrier, run before each `/cast/<token>/…` lookup: when
@@ -239,6 +273,7 @@ pub(crate) fn on_media(state: &AppState, config_id: &str) {
         &bus,
         needs,
         ChangeMode::Readback,
+        sink(state, config_id),
         &check(state),
     );
     report(state, revoked, "engine");
@@ -259,7 +294,9 @@ pub(crate) fn arm_stream(state: &AppState, id: &str, config_id: &str) -> Result<
     };
     let check = check(state);
     for _ in 0..ATTEMPTS {
-        let snapshot = state.cast_streams.arm_snapshot(config_id);
+        let snapshot = state
+            .cast_streams
+            .arm_snapshot(config_id, sink(state, config_id));
         state.cast_streams.run_before_arm();
         let (bus, current) = live_needs(state, config_id);
         let mut needs = snapshot.needs.clone();
@@ -303,6 +340,7 @@ pub(crate) fn recheck_all(state: &AppState, actor: &str) -> Vec<String> {
             &bus,
             needs,
             ChangeMode::Recheck,
+            sink(state, &slot.config_id),
             &check(state),
         );
         ids.extend(report(state, revoked, actor));

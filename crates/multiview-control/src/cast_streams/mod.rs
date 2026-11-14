@@ -34,6 +34,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use registry::Registry;
+pub(crate) use registry::SinkMark;
 pub use registry::{Claim, ClaimError, Ended, ReportError, StreamView};
 
 /// A never-fetched token expires this long after creation.
@@ -66,18 +67,28 @@ pub const MAX_REVOKED: usize = 2 * MAX_STREAMS;
 /// Committed, unsettled feed changes remembered per output (oldest
 /// forgotten first, which only narrows what its tokens are served).
 pub const MAX_CARRY: usize = 8;
-/// How long the media of a superseded feed stays servable, in ms (#418
-/// review ABUSE-HISTORY-R4): a cast token must keep holding that feed's
-/// grants this long after it was replaced. The packager lists the last
-/// `CAST_WINDOW` (10) segments and keeps their files for twice that
-/// (`multiview_output::hls::cast` `retire_old_files`: `window * 2`), every
-/// segment at most the fixed `EXT-X-TARGETDURATION` (4 s:
-/// `TARGET_DURATION_MULTIPLIER` 2 x `CAST_TARGET_SEGMENT_NANOS` 2 s, both
-/// in `multiview-cli` / `multiview-output`, which this crate cannot name):
-/// 2 x 10 x 4 s = 80 s, the subtitle `.vtt` files likewise; plus slack for
-/// held cue pieces and a segment still being written: 120 s. Pinned by
-/// value in `media_retention_covers_every_servable_segment`.
+/// The least time a superseded feed's grants stay required, in ms (#418
+/// review ABUSE-HISTORY-R4). A floor, never the expiry on its own: a
+/// superseded grant set is forgotten only once this has elapsed AND its
+/// output's sink provably replaced everything servable from that time
+/// (`registry::SinkMark`: a new generation, an inactive output, or
+/// [`RETIRE_SEGMENTS`] more video segments). A stalled sink therefore keeps
+/// it, however long. 2 x 10 x 4 s = 80 s of retained media at the nominal
+/// cadence, plus slack: 120 s.
 pub const MEDIA_RETENTION_MS: u64 = 120_000;
+/// The packager's playlist window (`multiview-cli` `cast_output::CAST_WINDOW`,
+/// which this crate cannot name; pinned by value in
+/// `retire_segments_match_the_packager_retention`).
+pub const CAST_WINDOW: u64 = 10;
+/// Video segments the packager publishes, after a mark, before every file
+/// servable at that mark is gone: it lists `CAST_WINDOW` segments and keeps
+/// the files of `2 * CAST_WINDOW` (`multiview_output::hls::cast`
+/// `retire_old_files`: `on_disk.len() > window * 2` unlinks the oldest
+/// segment with its audio and `.vtt` files, after each published video
+/// segment), and one more covers the segment being written at the mark.
+/// After that many, no `seg-*`/`sub*` file of the marked era is on disk and
+/// no playlist lists one.
+pub const RETIRE_SEGMENTS: u64 = 2 * CAST_WINDOW + 1;
 /// Superseded-feed grant sets remembered per output (an overflow merges
 /// into the oldest entry, never dropping a need early).
 pub const MAX_HISTORY: usize = MAX_CARRY;

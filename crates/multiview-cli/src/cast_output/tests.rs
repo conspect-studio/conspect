@@ -232,7 +232,7 @@ fn the_gate_activates_once_per_stream_with_a_new_generation_each_time() {
     assert!(second > first, "{second} > {first}");
     assert_eq!(gate.activation(), Some((second, false)));
     // Progress belongs to one generation only.
-    gate.begin_generation(second);
+    gate.begin_generation(second, second);
     gate.publish_progress(5, 5, true);
     let status = gate.status();
     assert!(status.ready && status.video_segments == 5 && status.generation == second);
@@ -716,6 +716,10 @@ fn a_packager_error_restarts_a_new_generation_at_most_once_per_second() {
         Vec::<String>::new(),
         "a failed stream leaves no files"
     );
+    // While failed, the status names a generation no file carries: the
+    // purged files of the failed packager are never served (#418 review
+    // ABUSE-HISTORY-R4).
+    assert!(status.generation > generation, "{status:?}");
 
     // With the clock standing still nothing restarts at all.
     let frozen = start + Duration::from_secs(61);
@@ -733,8 +737,11 @@ fn a_packager_error_restarts_a_new_generation_at_most_once_per_second() {
     let report = validated(&dir);
     let status = gate.status();
     assert!(status.ready && report.video_segments >= 5, "{status:?}");
-    assert_eq!(status.generation, generation, "the activation is the same");
+    assert_eq!(gate.activation().map(|(g, _)| g), Some(generation));
+    // #418 review ABUSE-HISTORY-R4: the status reports the generation of
+    // the files served now (the restarted packager's), not the activation's.
     assert!(listed_generation(&dir) > generation, "new file names");
+    assert_eq!(status.generation, listed_generation(&dir));
     assert_eq!(report.discontinuities, 0);
 }
 
