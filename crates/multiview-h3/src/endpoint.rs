@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures_util::FutureExt as _;
 use tokio::task::JoinHandle;
 
 use crate::config::H3Limits;
@@ -443,7 +445,8 @@ async fn accept_loop(
         let limits = limits.clone();
         let peers = peers.clone();
         let counters = Arc::clone(&counters);
-        runtime.spawn(async move {
+        let panics = Arc::clone(&counters);
+        let connection = async move {
             let connecting = match incoming.accept() {
                 Ok(connecting) => connecting,
                 Err(err) => {
@@ -480,6 +483,17 @@ async fn accept_loop(
             });
             if let Err(err) = serve_connection(conn, remote, site, wt, &limits, counters).await {
                 tracing::debug!(%remote, %err, "h3 connection ended");
+            }
+        };
+        // A panic anywhere in this connection's task (handshake, the h3
+        // driver, the peers hook) unwinds this task only: the handshake slot,
+        // the connection cap and the peer guard are RAII and released by the
+        // unwind, the QUIC connection closes on drop, and the accept loop
+        // never sees it. Caught here so it is counted (issue #403).
+        runtime.spawn(async move {
+            if AssertUnwindSafe(connection).catch_unwind().await.is_err() {
+                Counters::inc(&panics.connection_panics);
+                tracing::error!(%remote, "h3 connection task panicked; only that connection was ended");
             }
         });
     }
