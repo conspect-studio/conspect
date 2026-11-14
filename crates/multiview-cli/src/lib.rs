@@ -295,6 +295,12 @@ pub mod output_routing;
 pub mod output_routing_control;
 #[cfg(feature = "ffmpeg")]
 pub mod output_window_registry;
+/// The passthrough routing key (`PassthroughLive`, output-routing §12.5, #344).
+#[cfg(feature = "ffmpeg")]
+pub mod passthrough_live;
+/// Passthrough ingest tap registry and writer (output-routing §12.5, #344).
+#[cfg(feature = "ffmpeg")]
+pub mod passthrough_tap;
 /// The full libav\* end-to-end `multiview run` pipeline (ingest → composite →
 /// encode-once → fan out to file/HLS sinks). Behind the off-by-default `ffmpeg`
 /// feature so the baseline build stays pure-Rust; software H.264/H.265 needs
@@ -423,6 +429,9 @@ pub mod nv12_blit;
 pub mod output_fit;
 /// The `routing-aux` thread: routed feeds (ADR-0108 slices 1 and 3).
 pub mod routing_aux;
+/// Subtitle slots on outputs (slice F #345): the off-clock cue sampler that
+/// fills HLS WebVTT renditions from each slot's patched source.
+pub mod subtitle_slots;
 
 /// The shared monitor wall (ADR-0103): one composed, once-encoded MoQ stream.
 #[cfg(feature = "moq-output")]

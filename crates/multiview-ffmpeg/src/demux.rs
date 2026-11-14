@@ -956,21 +956,7 @@ impl Demuxer {
     /// random-access structure this classifier does not model.
     #[must_use]
     pub fn stream_idr_framing(&self, index: usize) -> Option<(CodecKind, NalFraming)> {
-        let params = self.input.stream(index)?.parameters();
-        let codec = match params.id() {
-            ffmpeg::codec::Id::H264 => CodecKind::H264,
-            ffmpeg::codec::Id::HEVC => CodecKind::Hevc,
-            ffmpeg::codec::Id::AV1 => CodecKind::Av1,
-            _ => return None,
-        };
-        let framing = match codec {
-            // AV1 is carried as the low-overhead OBU stream.
-            CodecKind::Av1 => NalFraming::Obu,
-            // H.264 / HEVC: avcC/hvcC extradata ⇒ length-prefixed; else Annex-B.
-            CodecKind::H264 | CodecKind::Hevc => nal_framing_from_extradata(&params)?,
-            CodecKind::Other => return None,
-        };
-        Some((codec, framing))
+        stream_framing(&self.input.stream(index)?.parameters())
     }
 
     /// Read the next coded packet from any stream, or [`None`] at end-of-stream.
@@ -1498,6 +1484,117 @@ mod ffi_open {
 
 use ffi_open::{ensure_devices_registered, open_input_with_format, open_input_with_interrupt};
 
+/// The `(codec, framing)` pair of a demuxed stream's codec parameters (see
+/// [`Demuxer::stream_idr_framing`]), for callers that hold the parameters of
+/// an `Input` they opened themselves. `None` for a codec the IDR classifier
+/// does not model or a malformed avcC/hvcC record.
+#[must_use]
+pub fn stream_framing(params: &Parameters) -> Option<(CodecKind, NalFraming)> {
+    let codec = match params.id() {
+        ffmpeg::codec::Id::H264 => CodecKind::H264,
+        ffmpeg::codec::Id::HEVC => CodecKind::Hevc,
+        ffmpeg::codec::Id::AV1 => CodecKind::Av1,
+        _ => return None,
+    };
+    let framing = match codec {
+        // AV1 is carried as the low-overhead OBU stream.
+        CodecKind::Av1 => NalFraming::Obu,
+        // H.264 / HEVC: avcC/hvcC extradata ⇒ length-prefixed; else Annex-B.
+        CodecKind::H264 | CodecKind::Hevc => nal_framing_from_extradata(params)?,
+        CodecKind::Other => return None,
+    };
+    Some((codec, framing))
+}
+
+/// The raw video facts of a demuxed stream's codec parameters that the
+/// passthrough match rules need (output-routing §12.5): plain libav scalars
+/// (ISO/IEC 23091-2 code points for the colour fields, which libav's enums
+/// equal) plus a copy of the extradata. Read once per (re)connect, never per
+/// packet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VideoStreamFacts {
+    /// `profile` (libav; `-99` unknown).
+    pub profile: i32,
+    /// `level` (libav; `-99` unknown).
+    pub level: i32,
+    /// Width in pixels (`0` unknown).
+    pub width: u32,
+    /// Height in pixels (`0` unknown).
+    pub height: u32,
+    /// `color_primaries` code point (2 = unspecified).
+    pub color_primaries: i32,
+    /// `color_trc` code point (2 = unspecified).
+    pub color_trc: i32,
+    /// `color_space` (matrix coefficients) code point (2 = unspecified).
+    pub color_space: i32,
+    /// `color_range` (libav: 0 unspecified, 1 MPEG/limited, 2 JPEG/full).
+    pub color_range: i32,
+    /// `field_order` (libav: 0 unknown, 1 progressive, 2..=5 interlaced).
+    pub field_order: i32,
+    /// `bits_per_raw_sample` (`0` unknown).
+    pub bits_per_raw_sample: i32,
+    /// The codec extradata (avcC/hvcC or Annex-B sets; empty when none).
+    /// Empty when [`Self::extradata_oversize`] is set: never truncated.
+    pub extradata: Vec<u8>,
+    /// The stream's extradata exceeded [`MAX_FACTS_EXTRADATA`] and was not
+    /// copied. A caller that needs the decoder configuration (passthrough)
+    /// must refuse the connection rather than use a partial one.
+    pub extradata_oversize: bool,
+}
+
+/// Largest codec extradata [`video_stream_facts`] copies (64 KiB). A real
+/// avcC/hvcC record is a few hundred bytes (H.264 SPS/PPS, HEVC VPS/SPS/PPS
+/// with SEI): 64 KiB leaves two orders of magnitude of headroom while a
+/// hostile container (libav accepts ~2 GiB) costs nothing per connection.
+pub const MAX_FACTS_EXTRADATA: usize = 64 * 1024;
+
+/// A copy of `extradata` when it is within [`MAX_FACTS_EXTRADATA`]; `None`
+/// (nothing copied) when over. The length is checked before the copy.
+#[must_use]
+pub fn bounded_extradata(extradata: &[u8]) -> Option<Vec<u8>> {
+    (extradata.len() <= MAX_FACTS_EXTRADATA).then(|| extradata.to_vec())
+}
+
+/// Read [`VideoStreamFacts`] from `params`.
+#[must_use]
+#[allow(unsafe_code)]
+// reason(allow as_conversions): the colour / field-order fields are bindgen
+// `#[repr(u32)]` C enums; `as u32` is the only discriminant read (no From).
+#[allow(clippy::as_conversions)]
+pub fn video_stream_facts(params: &Parameters) -> VideoStreamFacts {
+    // SAFETY: `params.as_ptr()` is a valid `AVCodecParameters` for the borrow
+    // of `params`. Every field read here is a plain scalar (or the extradata
+    // pointer + size, copied into an owned Vec within the borrow). Nothing is
+    // written and no pointer escapes.
+    unsafe {
+        let raw = params.as_ptr();
+        let len = usize::try_from((*raw).extradata_size).unwrap_or(0);
+        let (extradata, extradata_oversize) = if (*raw).extradata.is_null() || len == 0 {
+            (Vec::new(), false)
+        } else if len > MAX_FACTS_EXTRADATA {
+            // Checked on the length: an oversize record is never copied.
+            (Vec::new(), true)
+        } else {
+            let bytes = std::slice::from_raw_parts((*raw).extradata, len);
+            (bounded_extradata(bytes).unwrap_or_default(), false)
+        };
+        VideoStreamFacts {
+            profile: (*raw).profile,
+            level: (*raw).level,
+            width: u32::try_from((*raw).width).unwrap_or(0),
+            height: u32::try_from((*raw).height).unwrap_or(0),
+            color_primaries: i32::try_from((*raw).color_primaries as u32).unwrap_or(2),
+            color_trc: i32::try_from((*raw).color_trc as u32).unwrap_or(2),
+            color_space: i32::try_from((*raw).color_space as u32).unwrap_or(2),
+            color_range: i32::try_from((*raw).color_range as u32).unwrap_or(0),
+            field_order: i32::try_from((*raw).field_order as u32).unwrap_or(0),
+            bits_per_raw_sample: (*raw).bits_per_raw_sample,
+            extradata,
+            extradata_oversize,
+        }
+    }
+}
+
 /// Read the NAL framing of an H.264 / HEVC stream from its codec extradata.
 ///
 /// avcC and hvcC config records use different length-size offsets. Delegate
@@ -1771,5 +1868,23 @@ mod interrupt_logic_tests {
         assert_eq!(DemuxOptions::new().rw_timeout(), None);
         let opts = DemuxOptions::new().with_rw_timeout(Duration::from_millis(250));
         assert_eq!(opts.rw_timeout(), Some(Duration::from_millis(250)));
+    }
+}
+
+#[cfg(test)]
+mod stream_facts_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::{bounded_extradata, MAX_FACTS_EXTRADATA};
+
+    /// #344 D2a review R1-A-1: an attacker-sized extradata is never copied;
+    /// the bound is checked on the length before the copy.
+    #[test]
+    fn extradata_over_the_bound_is_refused_before_any_copy() {
+        let ok = vec![7_u8; MAX_FACTS_EXTRADATA];
+        assert_eq!(bounded_extradata(&ok).unwrap().len(), MAX_FACTS_EXTRADATA);
+        let big = vec![7_u8; MAX_FACTS_EXTRADATA + 1];
+        assert!(bounded_extradata(&big).is_none());
+        assert_eq!(bounded_extradata(&[]).unwrap(), Vec::<u8>::new());
     }
 }

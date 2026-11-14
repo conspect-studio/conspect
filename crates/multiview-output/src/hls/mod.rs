@@ -31,10 +31,15 @@ mod live;
 mod master;
 mod media;
 mod pdt;
+pub mod subtitle;
 
 pub use live::{default_writer, BackgroundFile, LivePlaylist, ManifestWriter, PublishFence};
 #[cfg(feature = "ffmpeg")]
 pub(crate) use live::{media_segment_references, media_segment_uris};
-pub use master::{AudioRendition, MasterPlaylist, VariantStream};
+pub use master::{AudioRendition, MasterPlaylist, SubtitleMedia, VariantStream};
 pub use media::{MediaPlaylist, Part, Segment, SegmentType, ServerControl};
 pub use pdt::format_program_date_time;
+pub use subtitle::{
+    bound_cue_lines, subtitle_feed, BoundedLines, SubtitleCue, SubtitleFeed, SubtitleFeedReceiver,
+    SubtitleRendition, SubtitleStats,
+};

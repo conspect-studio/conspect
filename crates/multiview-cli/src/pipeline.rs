@@ -2435,6 +2435,9 @@ pub struct Pipeline {
     declared_audio_outputs: Vec<(String, Vec<usize>)>,
     /// The runnable outputs declared in the config.
     outputs: Vec<RunnableOutput>,
+    /// The HLS outputs' subtitle slots (slice F #345): route tables + cue
+    /// feeds, sampled by the bake consumer.
+    subtitle_outputs: Vec<SubtitleOutputPlan>,
     /// The bake-consumer push handles for the configured AES67 outputs (#103),
     /// paired with the serve-side `Aes67Sender` inside each `RunnableOutput::Aes67`.
     /// `drive_streaming` hands these to the bake consumer, which pushes every
@@ -2632,6 +2635,12 @@ struct IngestPlan {
     live_anchor: LiveAnchorSlot,
     /// Authoritative source lifecycle shared by video, audio and captions.
     lifecycle: u64,
+    /// The source's compressed passthrough tap (output-routing §12.5, #344
+    /// D2a), registered in [`crate::passthrough_tap`]'s wait-free lookup. The
+    /// demux reader offers each video packet to it only while a passthrough
+    /// consumer exists (one atomic load otherwise). `None` for producers with
+    /// no compressed stream (players, synthetic, tests).
+    tap: Option<Arc<crate::passthrough_tap::SourceTap>>,
     /// Whether this is a live (continuous, never-EOF) source. Live sources are
     /// reopened on EOF/error (a transient HLS/RTSP drop reconnects); a finite
     /// file/VOD source plays once and then holds its last frame.
@@ -3357,6 +3366,7 @@ impl Pipeline {
         #[cfg(not(feature = "display-kms"))]
         let has_display = false;
         let mut outputs = built.packet;
+        let subtitle_outputs = built.subtitles;
         if outputs.is_empty() && !has_display {
             return Err(PipelineError::NoOutput("file/HLS"));
         }
@@ -3652,6 +3662,7 @@ impl Pipeline {
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
+            subtitle_outputs,
             #[cfg(feature = "display-kms")]
             display_plans: built.display,
             #[cfg(feature = "ndi-bindings")]
@@ -3919,6 +3930,55 @@ impl Pipeline {
             .collect()
     }
 
+    /// The run's subtitle-slot sampler (slice F #345). The resolver reads, per
+    /// slot source and tick, the source's caption store at the picture the
+    /// compositor latches for that tick (`peek_at_with_source_time`: the
+    /// same selection, without moving the store's prune watermark) and the
+    /// cue store's text cue for that picture's generation, projected to
+    /// bounded text without cloning the cue. Lock-free reads only; it runs on the bake consumer, never the output clock. A source
+    /// with no caption store (or a build without captions) yields no cues.
+    fn subtitle_run(
+        &self,
+        stores: crate::routing_aux::StoreLookup,
+    ) -> crate::subtitle_slots::SubtitleRun {
+        if self.subtitle_outputs.is_empty() {
+            return crate::subtitle_slots::SubtitleRun::none(self.cadence);
+        }
+        let outputs = self
+            .subtitle_outputs
+            .iter()
+            .map(|plan| {
+                tracing::info!(
+                    output = %plan.output_id,
+                    slots = plan.slots,
+                    "subtitle slots: WebVTT renditions sampled off the output clock"
+                );
+                crate::subtitle_slots::SubtitleOutputSampler::new(
+                    Arc::clone(&plan.routes),
+                    plan.feed.clone(),
+                    plan.slots,
+                )
+            })
+            .collect();
+        #[cfg(feature = "overlay")]
+        let resolve: crate::subtitle_slots::CueResolver = {
+            let captions = Arc::clone(&self.live_caption_stores);
+            Box::new(move |id: &str, now: MediaTime| {
+                let store = captions.load().get(id).cloned()?;
+                let picture = stores(id)?.peek_at_with_source_time(now)?;
+                // Borrow-and-project (ABU-1/INV-1): bounded text only, a
+                // bitmap cue is skipped without copying its pixels.
+                crate::subtitle_slots::text_cue_lines(&store, picture.pts, picture.generation)
+            })
+        };
+        #[cfg(not(feature = "overlay"))]
+        let resolve: crate::subtitle_slots::CueResolver = {
+            drop(stores);
+            Box::new(|_: &str, _: MediaTime| None)
+        };
+        crate::subtitle_slots::SubtitleRun::new(outputs, resolve, self.cadence)
+    }
+
     /// Build one run's output routing (ADR-0108 slice 1): the clock's aux tick
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
@@ -3953,6 +4013,7 @@ impl Pipeline {
             Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new()));
         let aux_canvas = self.aux_canvas();
         let plan_stores = Arc::clone(&stores);
+        let subtitle_stores = Arc::clone(&stores);
         // Filled once this run's Program exists (§7 back-off input).
         let program_lateness: crate::routing_aux::ProgramLateness =
             Arc::new(multiview_framestore::SwapCell::empty());
@@ -4035,6 +4096,7 @@ impl Pipeline {
                 inband_sets: self.output_inband_sets.clone(),
                 base_formats: self.rendition_formats.clone(),
                 convert_hook: self.convert_hook.clone(),
+                subtitles: Box::new(self.subtitle_run(subtitle_stores)),
             },
             aux_tx,
             preview_selection,
@@ -7858,6 +7920,9 @@ struct ConsumerRouting {
     /// Chaos/test hook run on every convert thread before each convert
     /// (#342 review I3); `None` in production.
     convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// The subtitle-slot cue sampler (slice F #345), ticked once per item.
+    /// Boxed for `clippy::large_futures`, like the router.
+    subtitles: Box<crate::subtitle_slots::SubtitleRun>,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
@@ -8406,6 +8471,7 @@ fn consumer_main<D: WindowDelivery>(
         inband_sets,
         base_formats,
         convert_hook,
+        mut subtitles,
     } = routing;
     // #342 review I1/I2: one `format-convert` thread per distinct non-canvas
     // base format, fed non-blocking right after the bake. Empty (no thread,
@@ -8754,6 +8820,9 @@ fn consumer_main<D: WindowDelivery>(
         };
         let overlaid = baker.bake(&item)?;
         router.publish_program(item.tick_index, &overlaid);
+        // Slice F (#345): sample every HLS subtitle slot at this tick, off the
+        // clock (one empty check when no output declares a subtitle slot).
+        subtitles.tick(item.tick_index);
         // NO-FALTER: fill any ticks this consumer missed (a transient stall
         // shed them from the hot queue) with frame substitution — the last
         // good baked canvas restamped at each missing tick's index. The
@@ -10954,6 +11023,7 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
             store.filter(|_| self.clear_on_remove)
         });
         let lifecycle = remove_live_lifecycle(id);
+        crate::passthrough_tap::forget(id);
         if let Some(store) = retired_store {
             store.clear();
         }
@@ -12713,6 +12783,8 @@ struct BuiltOutputs {
     /// shares the existing per-sink thread + end-of-program lifecycle — but it
     /// consumes the canvas tap below, never the packets.
     packet: Vec<RunnableOutput>,
+    /// The HLS outputs' subtitle slots (slice F #345).
+    subtitles: Vec<SubtitleOutputPlan>,
     /// DRM/KMS display heads, started as raw-frame sinks at stream start.
     #[cfg(feature = "display-kms")]
     display: Vec<DisplayOutputPlan>,
@@ -13324,7 +13396,7 @@ fn build_hls_output(
     output: &Output,
     path: &str,
     epoch: &multiview_output::SharedEpoch,
-) -> Result<RunnableOutput, PipelineError> {
+) -> Result<(RunnableOutput, Option<SubtitleOutputPlan>), PipelineError> {
     let (dir, prefix, playlist_path) = hls_paths(Path::new(path));
     // #324: classified by kind — permissions, a read-only or full volume is a
     // host fault (retried, never a reason to fall back from the operator's
@@ -13334,18 +13406,63 @@ fn build_hls_output(
         PipelineError::io(format!("output hls: creating {}", dir.display()), source)
     })?;
     let (meta, matrix) = output_mux_meta(output);
-    Ok(RunnableOutput::Hls {
-        id: output.id(),
-        sink: PacketMuxSink::segment_live(
-            dir,
-            prefix,
-            playlist_path.clone(),
-            HLS_LIVE_WINDOW,
-            epoch.clone(),
-        )
-        .with_output_metadata(meta, matrix),
-        playlist_path,
-    })
+    let mut sink = PacketMuxSink::segment_live(
+        dir,
+        prefix,
+        playlist_path.clone(),
+        HLS_LIVE_WINDOW,
+        epoch.clone(),
+    )
+    .with_output_metadata(meta, matrix);
+    // Slice F (#345): WebVTT subtitle renditions for a TS-segment HLS output
+    // (config refuses them on LL-HLS), fed by the bake consumer's sampler.
+    let mut plan = None;
+    if let (Output::Hls { .. }, Some(slots)) = (output, output.slots()) {
+        if !slots.subtitle.is_empty() {
+            let renditions = slots
+                .subtitle
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| multiview_output::hls::SubtitleRendition {
+                    name: slot.effective_name(i),
+                    language: slot.language.clone(),
+                })
+                .collect();
+            let (feed, rx) = multiview_output::hls::subtitle_feed();
+            sink = sink.with_subtitles(renditions, rx);
+            plan = Some(SubtitleOutputPlan {
+                output_id: output.id(),
+                routes: crate::subtitle_slots::subtitle_routes(
+                    slots
+                        .subtitle
+                        .iter()
+                        .map(|slot| slot.source.clone())
+                        .collect(),
+                ),
+                feed,
+                slots: slots.subtitle.len(),
+            });
+        }
+    }
+    Ok((
+        RunnableOutput::Hls {
+            id: output.id(),
+            sink,
+            playlist_path,
+        },
+        plan,
+    ))
+}
+
+/// One HLS output's subtitle slots for the run (slice F #345): its route
+/// table (slot → source, re-pointed live by the patch API), the engine side
+/// of its sink's cue feed and its slot count.
+#[derive(Clone)]
+pub(crate) struct SubtitleOutputPlan {
+    output_id: String,
+    routes: crate::subtitle_slots::SubtitleRoutes,
+    feed: multiview_output::hls::SubtitleFeed,
+    slots: usize,
 }
 
 /// A fresh link-status record for a push sink: listener mode is read from the
@@ -13448,6 +13565,7 @@ fn build_outputs(
     #[cfg(feature = "aes67")]
     ensure_no_aes67_ssrc_collision(outputs)?;
     let mut runnable = Vec::new();
+    let mut subtitles = Vec::new();
     #[cfg(feature = "display-kms")]
     let mut display_plans = Vec::new();
     #[cfg(feature = "ndi-bindings")]
@@ -13466,7 +13584,9 @@ fn build_outputs(
                 }
             }
             Output::Hls { path, .. } | Output::LlHls { path, .. } => {
-                runnable.push(build_hls_output(output, path, epoch)?);
+                let (built, plan) = build_hls_output(output, path, epoch)?;
+                runnable.push(built);
+                subtitles.extend(plan);
             }
             Output::Rtmp { url, .. } => {
                 runnable.push(build_push_output(output, PushProtocol::Rtmp, url, "rtmp"));
@@ -13592,6 +13712,7 @@ fn build_outputs(
     // the anchor is prepended at run time by `maybe_prepend_program_ts`, not here.
     Ok(BuiltOutputs {
         packet: runnable,
+        subtitles,
         #[cfg(feature = "display-kms")]
         display: display_plans,
         #[cfg(feature = "ndi-bindings")]
@@ -14718,6 +14839,7 @@ fn ingest_plan_for(
         output_origin: crate::timing_status::anchor_slot(),
         live_anchor: live_anchor_slot(&source.id),
         lifecycle: 0,
+        tap: Some(crate::passthrough_tap::source_tap(&source.id)),
         live,
         #[cfg(feature = "overlay")]
         incontainer_sub: None,
@@ -15076,6 +15198,7 @@ fn build_media_player_boot_with_state(
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             // A media player is a finite asset played under transport control;
             // it is not a live (reconnect-forever) source — the player loop owns
             // its own loop/hold lifecycle.
@@ -18905,6 +19028,10 @@ fn open_and_stream(
     // error (docs/architecture/local-capture-devices.md).
     let is_device = matches!(plan.location, SourceLocation::Device { .. });
     let mut last_device_frame = Instant::now();
+    // The compressed passthrough tap (output-routing §12.5, #344 D2a): one
+    // writer per connection, fed on the demux thread. Without a consumer it
+    // costs one atomic load per video packet; it never blocks this thread.
+    let mut tap_writer = tap_writer_for(plan, &input, stream_index, declared_fps);
     let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
         let mut packet = ffmpeg::codec::packet::Packet::empty();
         match packet.read(&mut input) {
@@ -18926,6 +19053,9 @@ fn open_and_stream(
                 last_device_frame = Instant::now();
                 if packet.stream() == stream_index {
                     video_fence = video_fence.saturating_add(1);
+                    if let (Some(writer), Some(bytes)) = (tap_writer.as_mut(), packet.data()) {
+                        writer.on_packet(bytes, packet.dts(), packet.pts(), packet.is_key());
+                    }
                 }
                 Some(ReadItem::Packet((video_fence, packet)))
             }
@@ -19913,6 +20043,50 @@ fn heartbeat_player_hold(
             }),
         );
     }
+}
+
+/// The passthrough tap writer for this connection of `plan` (#344 D2a), or
+/// `None` when the plan has no tap or the stream's codec/framing is not one
+/// the strict-IDR classifier models. Bumps the tap's connection generation
+/// and publishes the stream's match-rule traits. Arrival times are read from
+/// the run's monotonic time source (wait-free); before a run seeds the writer
+/// skips packets (counted), so a passthrough clock never sees a mixed base.
+fn tap_writer_for(
+    plan: &IngestPlan,
+    input: &ffmpeg::format::context::Input,
+    stream_index: usize,
+    declared_fps: Rational,
+) -> Option<crate::passthrough_tap::TapWriter> {
+    let tap = plan.tap.as_ref()?;
+    let stream = input.stream(stream_index)?;
+    let params = stream.parameters();
+    let (codec, framing) = multiview_ffmpeg::stream_framing(&params)?;
+    let facts = multiview_ffmpeg::video_stream_facts(&params);
+    let open = crate::passthrough_tap::OpenFacts {
+        codec,
+        framing,
+        time_base: multiview_ffmpeg::from_ff_rational(stream.time_base()),
+        frame_rate: declared_fps,
+        profile: facts.profile,
+        level: facts.level,
+        width: facts.width,
+        height: facts.height,
+        color_primaries: facts.color_primaries,
+        color_trc: facts.color_trc,
+        color_space: facts.color_space,
+        color_range: facts.color_range,
+        field_order: facts.field_order,
+        bits_per_raw_sample: facts.bits_per_raw_sample,
+        extradata: facts.extradata,
+        extradata_oversize: facts.extradata_oversize,
+    };
+    let origin = Arc::clone(&plan.output_origin);
+    let now_ns = Box::new(move || {
+        origin
+            .load()
+            .and_then(|run| u64::try_from(run.time().now_nanos()).ok())
+    });
+    crate::passthrough_tap::TapWriter::try_connect(Arc::clone(tap), open, now_ns)
 }
 
 /// Resolve the best video stream's `(index, codec parameters, time-base,
@@ -24769,6 +24943,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -24941,6 +25116,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -25057,6 +25233,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -28844,7 +29021,7 @@ loop_default = true
                 std::fs::create_dir(&path).unwrap();
                 let st = ArtifactStore::open(&path, Limits { bytes: 128 << 20, count: 20 }).unwrap();
                 Arc::new(Service::start_durable(
-                    Tools { node: tool, browser: "/bin/sh".into(), ffmpeg: "/bin/sh".into() },
+                    Tools { node: tool, browser: "/bin/sh".into(), ffmpeg: "/bin/sh".into(), gl: multiview_webengine::capture::BrowserGl::Default },
                     st,
                     Config { queue_capacity: 4, history: 16, max_fills: 8 },
                     &dir.path().join(format!("{name}.journal")),
@@ -28886,7 +29063,7 @@ loop_default = true
             let mut n = 0u32;
             let mut capture = |fill: &'static str| {
                 n += 1;
-                let body = serde_json::json!({"fill_id": fill, "view": {"lat": -33.9, "lon": 150.3, "zoom": 10, "overlay": "radar", "width": 1280, "height": 720, "fps": 25, "frames": 25, "public": true}, "terms": {"accepted": true, "version": "windy-2023-09-01"}}).to_string();
+                let body = serde_json::json!({"fill_id": fill, "view": {"lat": -33.9, "lon": 150.3, "zoom": 10, "overlay": "radar", "width": 1280, "height": 720, "fps": 25, "frames": 25, "public": true, "capture": "realtime"}, "terms": {"accepted": true, "version": "windy-2023-09-01"}}).to_string();
                 (body, format!("cap-{n}"))
             };
             let mut produce = |fill: &'static str| {
@@ -30340,6 +30517,208 @@ loop_default = true
         assert!(rig.runtime.coordinator.is_quiescent(retired));
         assert!(rig.runtime.audio_commit.retirement_complete(retired));
         drop(rig.shutdown());
+    }
+}
+
+/// INV3-1 (#345): the wedged-subtitle-sink chaos run at the integrated level.
+/// The REAL pipeline (output clock, bake consumer, encoder, HLS sink) runs live
+/// with three subtitle slots whose cue feed is never drained (a wedged
+/// subtitle consumer) while the patched source's caption store carries
+/// hostile, changing cues (text padded with 256 KiB of whitespace). Invariants
+/// #1/#10: the clock keeps its cadence, the bake consumer keeps up (sampling
+/// stays bounded and never waits on the feed), video segments keep their
+/// tick-derived stamps, and the feed never holds more than its capacity.
+///
+/// The slots carry a source (`cc`) that is ingested but not shown in a cell,
+/// so the run measures the subtitle-slot path alone: burning such a cue into
+/// a displayed tile is the separate overlay path, which this does not cover.
+#[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
+mod subtitle_wedge_chaos {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    const FPS: u64 = 25;
+    /// Hostile caption cues published before the run.
+    const CUES: i64 = 80;
+    const RUN_SECS: u64 = 4;
+    const WEDGE_CAPACITY: usize = 8;
+
+    fn config(playlist: &std::path::Path) -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[sources]]
+id = "cc"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs.slots.subtitle]]
+name = "one"
+source = "cc"
+[[outputs.slots.subtitle]]
+name = "two"
+source = "cc"
+[[outputs.slots.subtitle]]
+name = "three"
+source = "cc"
+"##,
+            playlist.display()
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    }
+
+    /// `(pts, duration)` of every video packet of an MPEG-TS file.
+    fn video_packets(ts: &std::path::Path) -> Vec<(i64, i64)> {
+        let out = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts,duration",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(ts)
+            .output()
+            .expect("ffprobe runs");
+        assert!(out.status.success(), "ffprobe: {out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split(',');
+                Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)]
+    // reason: one end-to-end chaos run checked across clock, sink and files.
+    async fn a_wedged_subtitle_sink_with_hostile_captions_never_stalls_video() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let playlist = dir.path().join("index.m3u8");
+        let mut pipeline = Pipeline::build(&config(&playlist)).expect("pipeline builds");
+        assert_eq!(pipeline.subtitle_outputs.len(), 1);
+        assert_eq!(pipeline.subtitle_outputs[0].slots, 3);
+        // Wedge: the sampler feeds a small channel nobody ever drains.
+        let (wedged, wedged_rx) =
+            multiview_output::hls::subtitle::subtitle_feed_with_capacity(WEDGE_CAPACITY);
+        let wedge_stats = wedged.stats();
+        pipeline.subtitle_outputs[0].feed = wedged;
+        // Hostile, changing captions: a new 100 ms cue every 100 ms over the
+        // run's source timeline, each a short text padded with 256 KiB of
+        // whitespace plus a blank line. (The store deep-clones its window on
+        // every publish, so the count stays modest.)
+        let store = pipeline.attach_caption_store(
+            "cc",
+            Arc::new(crate::captions::CueStore::with_capacity(128)),
+        );
+        let pad = " ".repeat(256 * 1024);
+        for i in 0..CUES {
+            let (start, end) = (
+                MediaTime::from_nanos(i * 100_000_000),
+                MediaTime::from_nanos((i + 1) * 100_000_000),
+            );
+            let lines = vec![format!("cue {i}{pad}"), String::new(), format!("tail {i}")];
+            let cue = multiview_ffmpeg::caption::CaptionCue::try_text(start, end, lines, None)
+                .expect("text cue");
+            store.publish(start, end, cue);
+        }
+        let stop = StopSignal::new();
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(RUN_SECS));
+                stop.stop();
+            })
+        };
+        let started = std::time::Instant::now();
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(RUN_SECS + 60),
+            pipeline.run_until(&stop),
+        )
+        .await
+        .expect("the run ends: nothing blocks on the wedged subtitle feed")
+        .expect("the run succeeds");
+        stopper.join().expect("stopper");
+        let elapsed = started.elapsed().as_secs_f64();
+
+        // The clock kept its cadence (CI-load tolerant: >= 90 %).
+        let expected = elapsed * f64::from(u32::try_from(FPS).unwrap());
+        let frames = f64::from(u32::try_from(report.frames).expect("small"));
+        assert!(
+            frames >= 0.9 * expected.min(f64::from(u32::try_from(RUN_SECS * FPS).unwrap())),
+            "clock ticks {frames} over {elapsed:.2} s (expected ~{expected:.0})"
+        );
+        // The bake consumer kept up: at most 10 % of ticks shed.
+        assert!(
+            report.dropped * 10 <= report.frames,
+            "consumer shed {} of {} ticks",
+            report.dropped,
+            report.frames
+        );
+        // The hostile cues were sampled (truncated) and the wedge dropped
+        // (counted) instead of growing: the feed holds at most its capacity.
+        assert!(
+            wedge_stats.truncated() > 0,
+            "hostile cues reached the sampler"
+        );
+        assert!(wedge_stats.feed_dropped() > 0, "the wedge drops and counts");
+        let queued = wedged_rx.drain();
+        assert!(queued.len() <= WEDGE_CAPACITY, "{}", queued.len());
+        assert!(queued
+            .iter()
+            .all(|c| c.lines.len() <= 4 && c.lines.iter().map(String::len).sum::<usize>() <= 512));
+        // Video kept flowing with tick-derived stamps: consecutive packets of
+        // each written segment are exactly one tick apart (90 kHz / 25).
+        let segments: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("output dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "ts")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("video-"))
+            })
+            .collect();
+        assert!(segments.len() >= 2, "video segments written: {segments:?}");
+        let tick_90k = i64::try_from(90_000 / FPS).unwrap();
+        for seg in &segments {
+            let mut pts: Vec<i64> = video_packets(seg).into_iter().map(|(p, _)| p).collect();
+            pts.sort_unstable();
+            assert!(!pts.is_empty(), "{seg:?} carries video");
+            assert!(
+                pts.windows(2).all(|w| w[1] - w[0] == tick_90k),
+                "{seg:?}: {pts:?}"
+            );
+        }
     }
 }
 
