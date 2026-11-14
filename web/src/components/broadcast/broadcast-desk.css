@@ -178,6 +178,14 @@
 .bd-transitions button{min-width:48px;min-height:48px;padding:4px 6px;border:1px solid var(--bd-line2);border-radius:4px;background:var(--bd-bg3);color:var(--bd-text);font-size:12px;font-weight:700}
 
 .bd-transitions button[aria-pressed=true]{border-color:#6aa6ff;color:#6aa6ff}
+.bd-transition-params{display:flex;flex-wrap:wrap;gap:8px;align-items:center;border:0;margin:0 0 8px;padding:0}
+.bd-transition-params legend{width:100%;padding:8px 0 4px;font-weight:700}
+.bd-patterns{display:flex;gap:4px}
+.bd-patterns button{display:inline-flex;align-items:center;justify-content:center;min-width:48px;min-height:48px;border:1px solid var(--bd-line2);border-radius:4px;background:var(--bd-bg3)}
+.bd-patterns button[aria-pressed=true]{border-color:#6aa6ff}
+.bd-wipe-preview .bd-wipe-thumb{width:64px;height:36px;border:1px solid var(--bd-line2);border-radius:2px}
+.bd-transition-params input[type=color]{width:48px;min-height:48px;padding:2px}
+.bd-apply-transition{min-height:48px;padding:4px 10px;border:1px solid var(--bd-line2);border-radius:4px;background:var(--bd-bg3);color:var(--bd-text);font-weight:700}
 
 .bd-alarm-summary{min-height:72px;font-size:12px;color:var(--bd-muted)}
 
