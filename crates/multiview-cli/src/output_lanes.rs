@@ -87,6 +87,9 @@ pub(super) struct LaneOutputSpec {
     pub(super) inband: bool,
 }
 
+/// A lane tick's latch observer: (output tick, latched Program tick).
+pub(crate) type LatchObserver = Arc<dyn Fn(u64, Option<u64>) + Send + Sync>;
+
 /// Test seams (all `None`/empty in production).
 #[derive(Default)]
 pub(crate) struct LaneHooks {
@@ -97,7 +100,7 @@ pub(crate) struct LaneHooks {
     /// Run first in every lane encode (a chaos test panics in it).
     pub(crate) on_encode: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     /// Observes each lane tick's latch: (output tick, latched Program tick).
-    pub(crate) on_latch: Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync>>,
+    pub(crate) on_latch: Option<LatchObserver>,
     /// Latch delay override (tests on a loaded runner widen the margin).
     pub(crate) latch_delay: Option<Duration>,
     /// Replacement sink runners, one per rate output in config order.
@@ -344,9 +347,13 @@ pub(super) fn prepare(
                 continue;
             }
         };
-        let picture = spec
-            .format
-            .unwrap_or_else(|| AuxFormat::new(canvas.width, canvas.height, Default::default()));
+        let picture = spec.format.unwrap_or_else(|| {
+            AuxFormat::new(
+                canvas.width,
+                canvas.height,
+                multiview_config::OutputFit::default(),
+            )
+        });
         let Some(black) = black_at(picture, canvas.color) else {
             lines.push(format!(
                 "{}: rate output FAILED (cannot allocate a {}x{} picture)",
@@ -361,14 +368,13 @@ pub(super) fn prepare(
             }
             _ => BindingPolicy::Bounded,
         };
-        let runner: SinkRunner = match test_runner {
-            Some(runner) => runner,
-            None => {
-                let output = spec.output;
-                Box::new(move |rx, params, time_base, audio, tracks| {
-                    run_one_output(output, rx, &params, time_base, audio.as_ref(), &tracks)
-                })
-            }
+        let runner: SinkRunner = if let Some(runner) = test_runner {
+            runner
+        } else {
+            let output = spec.output;
+            Box::new(move |rx, params, time_base, audio, tracks| {
+                run_one_output(output, rx, &params, time_base, audio.as_ref(), &tracks)
+            })
         };
         let dropped_audio = Arc::new(AtomicU64::new(0));
         let audio_rx = audio.program.is_some().then(|| {
@@ -429,6 +435,7 @@ impl PreparedLanes {
     /// distinct rate one output clock seeded with Program's `seed_nanos` on
     /// `time`. Called once Program's seed is known, before its first tick
     /// completes. A lane that cannot start is reported, never fatal.
+    #[allow(clippy::too_many_lines)] // One linear start-up: outputs, then one clock per rate.
     pub(super) fn start(self, time: &Arc<dyn TimeSource>, seed_nanos: i64) -> RunningLanes {
         let PreparedLanes {
             outputs,
@@ -593,7 +600,7 @@ struct LaneTick {
     end: Arc<RunEnd>,
     passed_end: Arc<AtomicBool>,
     on_tick: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-    on_latch: Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync>>,
+    on_latch: Option<LatchObserver>,
 }
 
 impl LaneTick {
@@ -799,7 +806,7 @@ fn start_output(
     };
     let consumer = std::thread::Builder::new()
         .name("multiview-rate-consumer".to_owned())
-        .spawn(move || lane_consumer(dispatcher, delivery, &video_rx, audio_rx, gate))
+        .spawn(move || lane_consumer(dispatcher, delivery, &video_rx, audio_rx.as_ref(), gate))
         .map_err(|e| PipelineError::thread_spawn("rate output consumer", e))?;
     let mut video = LaneVideo::new(
         Box::new(PipelineVideoWorker(encoder)),
@@ -894,7 +901,7 @@ fn lane_consumer(
     mut dispatcher: RenditionDispatcher,
     mut delivery: BindingDelivery,
     video_rx: &Receiver<DispatchEvent>,
-    audio_rx: Option<Receiver<DispatchEvent>>,
+    audio_rx: Option<&Receiver<DispatchEvent>>,
     mut gate: AudioGate,
 ) -> Result<Vec<BindingStatus>, PipelineError> {
     let mut video_done = false;
@@ -908,7 +915,7 @@ fn lane_consumer(
         if video_done {
             if audio_done {
                 // Only held audio remains: released below.
-            } else if let Some(rx) = audio_rx.as_ref() {
+            } else if let Some(rx) = audio_rx {
                 match rx.recv_timeout(CONSUMER_STEP) {
                     Ok(event) => gate.hold(event),
                     Err(RecvTimeoutError::Timeout) => {}
@@ -925,7 +932,7 @@ fn lane_consumer(
                 events.push(event);
             }
         }
-        if let Some(rx) = audio_rx.as_ref().filter(|_| !audio_done) {
+        if let Some(rx) = audio_rx.filter(|_| !audio_done) {
             loop {
                 match rx.try_recv() {
                     Ok(event) => gate.hold(event),
@@ -938,23 +945,31 @@ fn lane_consumer(
             }
         }
         let mut failed = None;
-        for event in events {
-            if let DispatchEvent::Video { tick, .. } = &event {
-                video_tick = Some(video_tick.map_or(*tick, |t| t.max(*tick)));
-            }
-            if let Err(e) = dispatcher.dispatch(event, Instant::now(), &mut delivery) {
-                if !matches!(e, DispatchError::Admission { .. }) {
-                    failed = Some(e);
-                    break;
+        // Audio is released after each video piece: a video window commits
+        // only with its audio, so a gap fill's windows drain one by one.
+        let mut pieces: Vec<Option<DispatchEvent>> = events
+            .into_iter()
+            .flat_map(split_video_event)
+            .map(Some)
+            .collect();
+        pieces.push(None);
+        'events: for piece in pieces {
+            if let Some(event) = piece {
+                if let DispatchEvent::Video { tick, .. } = &event {
+                    video_tick = Some(video_tick.map_or(*tick, |t| t.max(*tick)));
                 }
-            }
-        }
-        if failed.is_none() {
-            for event in gate.release(video_tick, video_done) {
                 if let Err(e) = dispatcher.dispatch(event, Instant::now(), &mut delivery) {
                     if !matches!(e, DispatchError::Admission { .. }) {
                         failed = Some(e);
                         break;
+                    }
+                }
+            }
+            for event in gate.release(video_tick, video_done) {
+                if let Err(e) = dispatcher.dispatch(event, Instant::now(), &mut delivery) {
+                    if !matches!(e, DispatchError::Admission { .. }) {
+                        failed = Some(e);
+                        break 'events;
                     }
                 }
             }
@@ -979,6 +994,66 @@ fn lane_consumer(
             reason: "incomplete final window (an encoder or audio tail did not arrive)".to_owned(),
         }),
         Ok(()) => Ok(delivery.statuses()),
+    }
+}
+
+/// Split one lane video event into one event per packet. A gap fill
+/// ([`LaneVideo`]) emits up to [`LANE_GAP_SECONDS`] of ticks in ONE event, but
+/// the dispatcher stages a whole event before it drains, and one stage holds
+/// at most 16 windows: unsplit, any gap over 16 ticks would fail the output
+/// (`StagingOverflow`) although the gap is within what the lane fills.
+///
+/// Watermarks: when the event carries a proof (the encoder proved no reorder,
+/// so its packets are in frame order and no later packet is earlier), each
+/// piece but the last proves the bound after its own packet; the last piece
+/// keeps the event's watermark. An unproven event's pieces stay unproven.
+fn split_video_event(event: DispatchEvent) -> Vec<DispatchEvent> {
+    match event {
+        DispatchEvent::Video {
+            key_index,
+            tick,
+            timebase,
+            packets,
+            watermark,
+        } if packets.len() > 1 => {
+            let last = packets.len() - 1;
+            packets
+                .into_iter()
+                .enumerate()
+                .map(|(i, packet)| {
+                    let piece_watermark = if i == last {
+                        watermark
+                    } else {
+                        watermark.and_then(|_| {
+                            let pts = u64::try_from(packet.pts()?).ok()?;
+                            crate::rendition_workers::next_tick_lower_bound_ns(
+                                pts,
+                                Rational::new(timebase.den, timebase.num),
+                            )
+                        })
+                    };
+                    // A piece's own tick (the dispatcher keys windows by
+                    // DTS; the consumer's audio horizon by this tick); the
+                    // last piece keeps the event's tick.
+                    let piece_tick = if i == last {
+                        tick
+                    } else {
+                        packet
+                            .pts()
+                            .and_then(|pts| u64::try_from(pts).ok())
+                            .map_or(tick, |pts| pts.min(tick))
+                    };
+                    DispatchEvent::Video {
+                        key_index,
+                        tick: piece_tick,
+                        timebase,
+                        packets: vec![packet],
+                        watermark: piece_watermark,
+                    }
+                })
+                .collect()
+        }
+        other => vec![other],
     }
 }
 
