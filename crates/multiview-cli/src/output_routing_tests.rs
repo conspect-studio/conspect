@@ -5115,6 +5115,7 @@ fn layout_bus(id: &str) -> PictureBus {
             },
             slates: vec![multiview_config::FailoverSlate::Black],
             audio: multiview_config::LayoutAudio::default(),
+            overlays: multiview_config::LayoutOverlays::none(),
             revision: crate::output_routing::next_layout_revision(),
         },
     )))

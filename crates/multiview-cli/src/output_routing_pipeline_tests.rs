@@ -1691,6 +1691,7 @@ fn two_cell_layout(prefix: &str, order: [&str; 2]) -> PictureBus {
             id: "swapped".to_owned(),
             slates: vec![multiview_config::FailoverSlate::Black; 2],
             audio: multiview_config::LayoutAudio::default(),
+            overlays: multiview_config::LayoutOverlays::none(),
             revision: crate::output_routing::next_layout_revision(),
             layout,
         },
