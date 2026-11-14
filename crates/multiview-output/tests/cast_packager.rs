@@ -13,8 +13,8 @@ use std::path::Path;
 use multiview_core::time::Rational;
 use multiview_core::wallclock::WallClockRef;
 use multiview_output::hls::cast::{
-    is_packager_file_name, purge_dir, AudioUnit, CastAudioConfig, CastPackager, CastPackagerConfig,
-    CastVideoConfig, VideoUnit,
+    is_packager_file_name, purge_dir, AudioUnit, CastAudioConfig, CastAudioRendition, CastPackager,
+    CastPackagerConfig, CastVideoConfig, VideoUnit,
 };
 use multiview_output::hls::cast_check::{check_cast_dir, CastCheckReport};
 use multiview_output::hls::cmaf;
@@ -100,6 +100,16 @@ fn aac_frame(index: i64, adts: bool) -> Vec<u8> {
 const VIDEO_TB: Rational = Rational::new(1001, 30_000);
 const AUDIO_TB: Rational = Rational::new(1, 48_000);
 
+fn audio_config() -> CastAudioConfig {
+    CastAudioConfig {
+        time_base: AUDIO_TB,
+        sample_rate: 48_000,
+        channels: 2,
+        bit_rate: Some(192_000),
+        audio_specific_config: None,
+    }
+}
+
 fn config(dir: &Path, audio: bool) -> CastPackagerConfig {
     CastPackagerConfig {
         dir: dir.to_path_buf(),
@@ -113,13 +123,12 @@ fn config(dir: &Path, audio: bool) -> CastPackagerConfig {
             bit_rate: Some(6_000_000),
             extradata: None,
         },
-        audio: audio.then_some(CastAudioConfig {
-            time_base: AUDIO_TB,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_rate: Some(192_000),
-            audio_specific_config: None,
-        }),
+        audio: audio
+            .then(|| CastAudioRendition::program(audio_config()))
+            .into_iter()
+            .collect(),
+        subtitles: Vec::new(),
+        subtitle_feed: None,
         epoch: None,
         wall_anchor: None,
     }
@@ -141,7 +150,7 @@ struct Feeder {
 
 impl Feeder {
     fn new(config: CastPackagerConfig) -> Self {
-        let audio = config.audio.is_some();
+        let audio = !config.audio.is_empty();
         Self {
             packager: CastPackager::new(config).unwrap(),
             framing: Framing::AnnexB,
@@ -168,10 +177,13 @@ impl Feeder {
 
     fn audio_frame(&mut self, index: i64) -> multiview_output::Result<()> {
         let data = aac_frame(index, self.adts);
-        self.packager.push_audio(AudioUnit {
-            pts: index * 1024,
-            data: &data,
-        })
+        self.packager.push_audio(
+            0,
+            AudioUnit {
+                pts: index * 1024,
+                data: &data,
+            },
+        )
     }
 
     /// Push the audio frames that start before `video_index` plus a skew
@@ -1016,7 +1028,7 @@ fn the_audio_config_comes_from_the_configuration_then_adts_then_rate_and_channel
     // configuration claims 6 channels; the header says AAC-LC 48 kHz stereo).
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path(), true);
-    cfg.audio.as_mut().unwrap().channels = 6;
+    cfg.audio[0].config.channels = 6;
     let mut feeder = Feeder::new(cfg);
     feeder.adts = true;
     feeder.run(0..200).unwrap();
@@ -1026,7 +1038,7 @@ fn the_audio_config_comes_from_the_configuration_then_adts_then_rate_and_channel
     // A supplied config wins over the ADTS header (HE-AAC v1 signalling).
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path(), true);
-    cfg.audio.as_mut().unwrap().audio_specific_config = Some(vec![0x2B, 0x11, 0x88, 0x00]);
+    cfg.audio[0].config.audio_specific_config = Some(vec![0x2B, 0x11, 0x88, 0x00]);
     let mut feeder = Feeder::new(cfg);
     feeder.adts = true;
     feeder.run(0..200).unwrap();
@@ -1371,10 +1383,13 @@ fn an_adts_stream_at_another_rate_than_configured_is_refused() {
     // AAC-LC 44.1 kHz stereo header on a rendition configured for 48 kHz.
     let frame = [0xFF, 0xF1, 0x50, 0x80, 0x01, 0x7F, 0xFC, 9, 8, 7, 6];
     let error = packager
-        .push_audio(AudioUnit {
-            pts: 0,
-            data: &frame,
-        })
+        .push_audio(
+            0,
+            AudioUnit {
+                pts: 0,
+                data: &frame,
+            },
+        )
         .unwrap_err();
     assert!(error.to_string().contains("44100"), "{error}");
 }
