@@ -279,4 +279,55 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     await waitFor(() => { expect(screen.getByText(/Switcher applied/i)).toBeTruthy(); });
     expect(screen.getByRole('button', { name: 'CUT' })).toHaveProperty('disabled', false);
   });
+
+  it('WIPE sends set_transition with the picked pattern and parameters, after a passing plan, without a take confirmation', async () => {
+    const bodies: unknown[] = [];
+    let planned: unknown;
+    server.use(
+      http.post('*/api/v1/switcher/plan', async ({ request }) => { planned = await request.json(); return HttpResponse.json({ can_take: true, class: 'class1', scene_version: 1 }); }),
+      http.post('*/api/v1/switcher/commands/set_transition', async ({ request }) => { bodies.push(await request.json()); commandCount += 1; return HttpResponse.json({ operation_id: `op-t${String(commandCount)}`, kind: 'set_transition' }, { status: 202 }); }),
+    );
+    const { client } = page();
+    const circle = await screen.findByRole('button', { name: 'Circle wipe' });
+    await waitFor(() => { expect(circle).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Reverse' }));
+    expect(screen.getByRole('img', { name: 'Preview of Horizontal wipe at 50%' })).toHaveAttribute('data-reverse', 'true');
+    await userEvent.click(circle);
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(screen.queryByRole('button', { name: 'Confirm take' })).not.toBeInTheDocument();
+    expect(planned).toMatchObject({ action: 'set_transition' });
+    expect(bodies[0]).toMatchObject({ me: 'me1', program: 'main', action: 'set_transition', transition: { kind: 'wipe', pattern: 'circle', rate: 30, reverse: true, softness: 0, border_width: 0 } });
+    expect(bodies[0]).not.toHaveProperty('duration_frames');
+    expect(screen.getByRole('img', { name: 'Preview of Circle wipe at 50%' })).toHaveAttribute('data-pattern', 'circle');
+    // The applied event releases the guard; DIP then sends its colour.
+    await screen.findByText(/waiting for the applied event/i);
+    act(() => { getOperationTracker(client).onEnvelope(frame('op-t1', outcome('op-t1', true))); });
+    await waitFor(() => { expect(screen.getByText(/Switcher applied/i)).toBeTruthy(); });
+    const dip = screen.getByRole('button', { name: 'DIP' });
+    await waitFor(() => { expect(dip).not.toBeDisabled(); });
+    await userEvent.click(dip);
+    await waitFor(() => { expect(commandCount).toBe(2); });
+    expect(bodies[1]).toMatchObject({ action: 'set_transition', transition: { kind: 'dip', rate: 30, color: '#000000' } });
+  });
+
+  it('reflects the engine-selected transition and AUTO uses it', async () => {
+    let body: unknown;
+    server.use(
+      http.get('*/api/v1/switcher/me1', () => { polls += 1; return HttpResponse.json({ ...state, tick: state.tick + polls, transition: { kind: 'wipe', pattern: 'box', rate: 30, reverse: false, softness: 0, border_width: 0 } }); }),
+      http.post('*/api/v1/switcher/commands/auto', async ({ request }) => { body = await request.json(); commandCount += 1; return HttpResponse.json({ operation_id: 'op-auto', kind: 'auto' }, { status: 202 }); }),
+    );
+    page();
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'WIPE' })).toHaveAttribute('aria-pressed', 'true'); }, { timeout: 6000 });
+    expect(screen.getByRole('button', { name: 'MIX' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: 'Box wipe' })).toHaveAttribute('aria-pressed', 'true');
+    const auto = screen.getByRole('button', { name: 'AUTO' });
+    await waitFor(() => { expect(auto).not.toBeDisabled(); }, { timeout: 6000 });
+    expect(auto.title).toContain('AUTO WIPE over 30 frames');
+    await userEvent.click(auto);
+    await userEvent.click(await screen.findByRole('button', { name: 'Confirm take' }));
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    // AUTO carries only its rate; the engine uses the selected WIPE.
+    expect(body).toMatchObject({ action: 'auto', duration_frames: 30 });
+    expect(body).not.toHaveProperty('transition');
+  });
 });
