@@ -146,6 +146,17 @@ M/E are still refused (`SwitcherCanvasRefusal::Overlays`). `boot_admission` adds
   the stored layout outputs show; the detail names `PUT /api/v1/layouts/{id}`
   (routed outputs update live) and a switcher select. One that still reaches the
   drain is dropped (warned once) without mutating the working-config mirror;
+- chaos (#307 review I2): `crates/multiview-cli/tests/switcher_layout_chaos.rs`
+  drives a two-cell wall's synthesized Program canvas through the real
+  `command_drain` inside the real `SwitcherFrameHook` for 600 manual-clock
+  ticks while stored/no-document `ApplyLayout`, `SwapSource`, `RouteVideo`
+  (wall cell and the Program cell id) and salvo arm/take flood the bounded
+  command bus, Cut/SelectPreview flood the M/E mailbox, a stalled subscriber
+  never reads either publisher, and the Preview source is lost for 100 ticks.
+  It asserts one frame per tick, contiguous ticks, PTS = tick x 40 ms, no
+  repeat, one full-canvas bound source on Program (never the wall), both
+  queues filled and never blocked, at most `MAX_COMMANDS_PER_TICK`+1 M/E
+  outcomes per tick, and a final Cut that completes after the flood;
 - `multiview validate <config>`, which now also checks what `multiview run` will
   start from (`.multiview/desired.json` when it exists) and exits non-zero with
   start-up's reason. Run it as the deploy preflight. It also warns while an
