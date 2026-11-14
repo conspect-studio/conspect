@@ -230,6 +230,14 @@ impl<P: Pacer> MultiviewProgram<P> {
         self.runtime.frames_repeated_counter()
     }
 
+    /// The program's wait-free cumulative compose-deadline-miss counter: fresh
+    /// ticks whose GPU readback missed its deadline and were re-emitted as
+    /// last-good (issue #395).
+    #[must_use]
+    pub fn compose_deadline_misses_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.runtime.compose_deadline_misses_counter()
+    }
+
     /// Drive the protected per-tick loop **forever**, until this program's
     /// [`StopSignal`] is raised, applying the per-tick `control` reconfiguration
     /// hook at each frame boundary.

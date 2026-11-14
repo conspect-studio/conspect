@@ -2130,6 +2130,8 @@ pub struct ProgramMetricsHandles {
     pub phases: Arc<multiview_engine::lateness::TickPhases>,
     /// Cumulative last-good repeats.
     pub frames_repeated: Arc<std::sync::atomic::AtomicU64>,
+    /// Cumulative GPU readback deadline misses repeated as last-good (#395).
+    pub compose_deadline_misses: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Where a run publishes its [`ProgramMetricsHandles`].
@@ -5523,6 +5525,7 @@ impl Pipeline {
                 lateness: program.lateness(),
                 phases: program.phases(),
                 frames_repeated: program.frames_repeated_counter(),
+                compose_deadline_misses: program.compose_deadline_misses_counter(),
             })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
         // the shared slot — a single lock-free store the off-hot-path
