@@ -66,6 +66,21 @@ pub const MAX_REVOKED: usize = 2 * MAX_STREAMS;
 /// Committed, unsettled feed changes remembered per output (oldest
 /// forgotten first, which only narrows what its tokens are served).
 pub const MAX_CARRY: usize = 8;
+/// How long the media of a superseded feed stays servable, in ms (#418
+/// review ABUSE-HISTORY-R4): a cast token must keep holding that feed's
+/// grants this long after it was replaced. The packager lists the last
+/// `CAST_WINDOW` (10) segments and keeps their files for twice that
+/// (`multiview_output::hls::cast` `retire_old_files`: `window * 2`), every
+/// segment at most the fixed `EXT-X-TARGETDURATION` (4 s:
+/// `TARGET_DURATION_MULTIPLIER` 2 x `CAST_TARGET_SEGMENT_NANOS` 2 s, both
+/// in `multiview-cli` / `multiview-output`, which this crate cannot name):
+/// 2 x 10 x 4 s = 80 s, the subtitle `.vtt` files likewise; plus slack for
+/// held cue pieces and a segment still being written: 120 s. Pinned by
+/// value in `media_retention_covers_every_servable_segment`.
+pub const MEDIA_RETENTION_MS: u64 = 120_000;
+/// Superseded-feed grant sets remembered per output (an overflow merges
+/// into the oldest entry, never dropping a need early).
+pub const MAX_HISTORY: usize = MAX_CARRY;
 /// Output authorization gates kept (one per cast output in practice).
 pub const MAX_GATES: usize = 64;
 /// The background sweep period (a lazy sweep also runs on every API call).

@@ -121,6 +121,10 @@ are fixed at open); a token revoked or moved off the current generation in betwe
 authentication provenance (native API key, JWT, local admin with auth off) comes from the authentication that
 succeeded and is recorded at issuance: a native key always re-resolves from the key store and a
 revoked key fails closed. A 5 s sweep catches re-scoped or revoked keys and re-pointed audio tracks.
+Superseded feeds keep counting while their media stays servable: when a take, audio change or subtitle re-patch
+is settled, the grants of what it replaced stay required for 120 s (the packager keeps 2 x 10 segments of at
+most the fixed 4 s `EXT-X-TARGETDURATION` = 80 s on disk, plus slack), so a new token, and every re-check under
+current grants, must still cover them.
 
 **Diagnosis without a device log.** The engine records, per stream and for the receiver page, the last fetch
 time and User-Agent (a Cast device contains `CrKey`). No fetch from a Cast device after a cast starts means the

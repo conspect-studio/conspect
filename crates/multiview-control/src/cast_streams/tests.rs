@@ -223,3 +223,56 @@ fn gates_are_bounded_and_fail_closed_past_the_cap() {
     assert!(streams.serve(&claim.token).is_none());
     assert_eq!(streams.generation("over"), None);
 }
+
+/// #418 review ABUSE-HISTORY-R4: the retention covers everything the
+/// packager can still serve after a feed is replaced: `2 * CAST_WINDOW`
+/// (10) retained segments of at most the fixed `EXT-X-TARGETDURATION`
+/// (2 x 2 s nominal = 4 s), pinned by value (those constants live in
+/// crates this one cannot name).
+#[test]
+fn media_retention_covers_every_servable_segment() {
+    const CAST_WINDOW: u64 = 10;
+    const TARGET_DURATION_MS: u64 = 2 * 2_000;
+    let servable = 2 * CAST_WINDOW * TARGET_DURATION_MS;
+    assert_eq!(servable, 80_000);
+    assert!(
+        MEDIA_RETENTION_MS >= servable + 20_000,
+        "slack for held cues"
+    );
+}
+
+/// ABUSE-HISTORY-R4: superseded grants stay cleared until their retention
+/// ends; an overflow merges into the oldest entry with the LATER expiry, so
+/// no need is dropped early.
+#[test]
+fn gate_history_keeps_superseded_needs_until_retention_and_merges_bounded() {
+    use super::reauth::Need;
+    let need = |s: &str| Need::Object(s.to_owned());
+    let mut gate = registry::Gate::default();
+    gate.replace_settled(("src:s2".to_owned(), Some(vec![need("s2")])), 0);
+    gate.replace_settled(("src:s1".to_owned(), Some(vec![need("s1")])), 1_000);
+    let cleared = gate.cleared_needs(1_000).unwrap();
+    assert!(cleared.contains(&need("s2")) && cleared.contains(&need("s1")));
+    assert!(gate
+        .cleared_needs(1_000 + MEDIA_RETENTION_MS - 1)
+        .unwrap()
+        .contains(&need("s2")));
+    assert_eq!(
+        gate.cleared_needs(1_000 + MEDIA_RETENTION_MS).unwrap(),
+        vec![need("s1")]
+    );
+    // Overflow: no need expires before its own retention ends.
+    let mut gate = registry::Gate::default();
+    let max = u64::try_from(MAX_HISTORY).unwrap();
+    for i in 0..max + 3 {
+        gate.retire(Some(vec![need(&format!("n{i}"))]), i);
+    }
+    assert_eq!(gate.history.len(), MAX_HISTORY);
+    for i in 0..max + 3 {
+        let cleared = gate.cleared_needs(i + MEDIA_RETENTION_MS - 1).unwrap();
+        assert!(cleared.contains(&need(&format!("n{i}"))), "n{i}");
+    }
+    // Undeterminable history fails closed while it counts.
+    gate.retire(None, 0);
+    assert!(gate.cleared_needs(1).is_none());
+}

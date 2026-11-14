@@ -2773,3 +2773,235 @@ async fn without_a_run_view_cast_creation_fails_closed() {
         assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// #418 review ABUSE-HISTORY-R4: the media of a superseded feed (retained
+// segments and `.vtt` files, listed or not) stays servable for a while after
+// a take or a subtitle re-patch, so the gate keeps that feed's grants for
+// `MEDIA_RETENTION_MS` after an outcome settles a newer one.
+// ---------------------------------------------------------------------------
+
+/// The accepted subtitle slot sources of cast-1.
+fn accepted_subtitles(rig: &Rig) -> Vec<Option<String>> {
+    let config: MultiviewConfig = serde_json::from_value(
+        multiview_control::boot_model::current_desired_config(&rig.state).unwrap(),
+    )
+    .unwrap();
+    config
+        .outputs
+        .iter()
+        .find(|o| o.id() == "cast-1")
+        .and_then(|o| o.slots())
+        .map(|s| s.subtitle.iter().map(|s| s.source.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Wait until the relay has handled the outcome of operation `op`.
+async fn settled(events: &mut multiview_engine::EventSubscription<Event>, op: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("the take's outcome is relayed")
+            .unwrap();
+        if let Event::RouteOutput(outcome) = event.event.as_ref() {
+            if outcome.operation_id == op {
+                return;
+            }
+        }
+    }
+}
+
+/// A take of output-0 to `feed` by an operator, waited until settled.
+async fn take_settled(rig: &Rig, key: &str, feed: serde_json::Value) {
+    let mut events = rig.state.engine.subscribe();
+    let r = send(
+        &rig.router,
+        route_take(OPERATOR_TOKEN, key, "output-0", feed),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let op = body_json(r).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    settled(&mut events, &op).await;
+}
+
+/// A private-to-public subtitle re-patch (secret-cam → a) of output-0 on
+/// a rig whose run samples secret-cam, persisted, then an ordinary take of
+/// output-0 to source `a` whose outcome settles: the subtitle commit is gone
+/// from the gate, but secret-cam's cues stay servable.
+async fn repatched_then_settled(rig: &Rig) {
+    let r = send(
+        &rig.router,
+        subtitle_take(
+            OPERATOR_TOKEN,
+            "history-subs",
+            serde_json::json!({"source": "a"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    for _ in 0..500 {
+        if accepted_subtitles(rig) == vec![Some("a".to_owned())] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(accepted_subtitles(rig), vec![Some("a".to_owned())]);
+    assert_eq!(
+        rig.routing.subtitles.lock().unwrap()["cast-1"],
+        vec![Some("a".to_owned())]
+    );
+    take_settled(rig, "history-take", serde_json::json!({"source": "a"})).await;
+    assert_eq!(rig.routing.bus("cast-1"), "src:a");
+}
+
+fn subtitle_history_rig() -> Rig {
+    let rig = rig_doc(&subtitle_doc("secret-cam"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+    rig
+}
+
+/// Keep `token` live across `total` of clock time (playlist fetches every
+/// 30 s refresh its idle expiry).
+async fn advance_keeping(rig: &Rig, token: &str, total: Duration) {
+    let step = Duration::from_secs(30);
+    let mut left = total;
+    while !left.is_zero() {
+        let d = left.min(step);
+        rig.advance(d);
+        left -= d;
+        assert_eq!(
+            fetch(rig, &format!("/cast/{token}/master.m3u8")).await.0,
+            StatusCode::OK
+        );
+    }
+}
+
+fn retention() -> Duration {
+    Duration::from_millis(multiview_control::cast_streams::MEDIA_RETENTION_MS)
+}
+
+/// ABUSE-HISTORY-R4 (the reviewer's scenario): an administrator's stream
+/// plays output-0 with private subtitle source secret-cam; an operator
+/// re-patches the subtitles to public `a` and takes the output to source
+/// `a`, and that outcome settles. A new principal allowed the output, Program
+/// and `a` but not secret-cam is refused while secret-cam's `.vtt` files
+/// may still be served, then admitted once the retention passed. The
+/// administrator's own token is never revoked by the history.
+#[tokio::test]
+async fn a_new_token_is_refused_while_a_superseded_private_subtitle_source_stays_servable() {
+    let rig = subtitle_history_rig();
+    let (status, admin) =
+        create(&rig, ADMIN_TOKEN, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{admin}");
+    let admin = token_of(&admin);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "secret-cam on air: {doc}");
+    repatched_then_settled(&rig).await;
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{admin}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "retained secret-cam cues: {doc}"
+    );
+    advance_keeping(
+        &rig,
+        &admin,
+        retention().checked_sub(Duration::from_secs(1)).unwrap(),
+    )
+    .await;
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "just before the retention: {doc}"
+    );
+    advance_keeping(&rig, &admin, Duration::from_secs(1)).await;
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "retention over: {doc}");
+    let scoped = token_of(&doc);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{scoped}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+}
+
+/// ABUSE-HISTORY-R4, the video case: after a take from private
+/// `secret-cam` to public `a` settles, its retained segments may still be
+/// served: a principal without secret-cam gets no token until the retention
+/// passed.
+#[tokio::test]
+async fn a_new_token_is_refused_while_a_superseded_private_video_feed_stays_servable() {
+    let rig = rig();
+    let (status, admin) = create(
+        &rig,
+        ADMIN_TOKEN,
+        serde_json::json!({"output": "output-0", "feed": {"source": "secret-cam"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{admin}");
+    let admin = token_of(&admin);
+    assert_eq!(rig.routing.bus("cast-1"), "src:secret-cam");
+    take_settled(&rig, "history-video", serde_json::json!({"source": "a"})).await;
+    assert_eq!(rig.routing.bus("cast-1"), "src:a");
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{admin}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "retained secret-cam segments: {doc}"
+    );
+    advance_keeping(&rig, &admin, retention()).await;
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "retention over: {doc}");
+}
+
+/// ABUSE-HISTORY-R4: an existing token whose owner is re-scoped off the
+/// superseded private source while its media is still servable is revoked
+/// by the re-check (under the CURRENT grants, history included).
+#[tokio::test]
+async fn a_recheck_within_the_retention_revokes_an_owner_who_lost_the_superseded_source() {
+    let rig = subtitle_history_rig();
+    let (status, created) = create(&rig, FRESH, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let token = token_of(&created);
+    repatched_then_settled(&rig).await;
+    // The take and the re-check under unchanged grants keep it.
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    assert!(rig.state.api_keys.set_principal(
+        "cs-fresh",
+        Principal {
+            key_id: "cs-fresh".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: Some(vec![
+                "output-0".to_owned(),
+                "a".to_owned(),
+                "me1".to_owned(),
+            ]),
+            scoped_output_ids: Some(vec!["output-0".to_owned(), "program:main".to_owned()]),
+            scoped_discovery_domains: None,
+        },
+    ));
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    let (status, body) = fetch(&rig, &format!("/cast/{token}/master.m3u8")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found\n");
+}

@@ -264,6 +264,7 @@ impl CastStreams {
     /// The gate of output `config_id` for arming a token (created at a
     /// fresh generation on first use).
     pub(crate) fn arm_snapshot(&self, config_id: &str) -> Arm {
+        let now = self.now_ms();
         let mut inner = self.lock();
         // No gate (over [`super::MAX_GATES`]): nothing is cleared and
         // arming finds no gate either, so the creation is refused.
@@ -272,9 +273,12 @@ impl CastStreams {
                 generation: 0,
                 needs: None,
             },
-            |gate| Arm {
-                generation: gate.generation,
-                needs: gate.cleared_needs(),
+            |gate| {
+                gate.prune(now);
+                Arm {
+                    generation: gate.generation,
+                    needs: gate.cleared_needs(now),
+                }
             },
         )
     }
@@ -388,8 +392,13 @@ impl CastStreams {
             Self::recheck(&mut inner, config_id, None, false, check, &mut revoked, now);
             return revoked;
         };
+        gate.prune(now);
         while gate.carry.len() >= super::MAX_CARRY {
-            gate.carry.pop_front();
+            // Forgotten, not settled: its media may still be on air or
+            // retained, so its grants stay required (ABUSE-HISTORY-R4).
+            if let Some(old) = gate.carry.pop_front() {
+                gate.retire(old.needs, now);
+            }
         }
         gate.carry.push_back(super::registry::Carry {
             op: change.op,
@@ -397,8 +406,9 @@ impl CastStreams {
             needs: change.needs,
         });
         // Every token at the new generation is authorized for EVERYTHING
-        // the output may carry now (the invariant of [`super::registry::Gate`]).
-        let needs = gate.cleared_needs();
+        // the output may carry now or still serves (the invariant of
+        // [`super::registry::Gate`]).
+        let needs = gate.cleared_needs(now);
         Self::recheck(
             &mut inner,
             config_id,
@@ -438,17 +448,22 @@ impl CastStreams {
             Self::recheck(&mut inner, config_id, None, false, check, &mut revoked, now);
             return revoked;
         };
-        let covered = match (&needs, gate.cleared_needs()) {
+        gate.prune(now);
+        let covered = match (&needs, gate.cleared_needs(now)) {
             (Some(needs), Some(cleared)) => needs.iter().all(|n| cleared.contains(n)),
             _ => false,
         };
+        // What is settled or carried here moves to the history, not away:
+        // its media stays servable for [`super::MEDIA_RETENTION_MS`]
+        // (ABUSE-HISTORY-R4). Only narrowing on the gate's own expiry.
         if mode == ChangeMode::Outcome {
-            gate.settle(op);
+            gate.settle(op, now);
         }
-        gate.settled = Some((bus.to_owned(), needs));
+        gate.replace_settled((bus.to_owned(), needs), now);
         if !covered || mode == ChangeMode::Recheck {
-            // What the output may carry now, under the current grants.
-            let all = gate.cleared_needs();
+            // What the output may carry now or still serves, under the
+            // current grants.
+            let all = gate.cleared_needs(now);
             Self::recheck(
                 &mut inner,
                 config_id,
@@ -466,10 +481,11 @@ impl CastStreams {
     /// `needs` (the media path's check of the subtitle readback, #418).
     #[must_use]
     pub(crate) fn covers(&self, config_id: &str, needs: &[Need]) -> bool {
+        let now = self.now_ms();
         self.lock()
             .gates
             .get(config_id)
-            .and_then(super::registry::Gate::cleared_needs)
+            .and_then(|g| g.cleared_needs(now))
             .is_some_and(|cleared| needs.iter().all(|n| cleared.contains(n)))
     }
 
