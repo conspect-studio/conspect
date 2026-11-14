@@ -74,6 +74,11 @@ describe('LayoutsPage Apply with the switcher on (#307)', () => {
     const reasons = screen.getAllByTestId('layout-apply-blocked-reason');
     const reason = reasons.find((r) => r.id === applyButton('NewsOne').getAttribute('aria-describedby'));
     expect(reason?.textContent).toContain('The switcher is on: Program is the M/E bus.');
+    // Layout-to-output takes live on the Outputs page (#307 review M2).
+    expect(reason?.textContent).toContain('Take this layout to an output from Outputs.');
+    expect(reason?.textContent).not.toContain('Routing');
+    const link = reason?.querySelector('a');
+    expect(link?.getAttribute('href')).toBe('/outputs');
     expect(applyButton('Single').disabled).toBe(true);
   });
 

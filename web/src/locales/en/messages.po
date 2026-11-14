@@ -756,7 +756,7 @@ msgid "About display nodes"
 msgstr "About display nodes"
 
 #: src/layout/components/GridLayoutEditor.tsx:300
-#: src/pages/LayoutsPage.tsx:243
+#: src/pages/LayoutsPage.tsx:247
 msgid "About layouts"
 msgstr "About layouts"
 
@@ -829,7 +829,7 @@ msgstr "Accent colour (#RRGGBB, optional)"
 msgid "Accept the publisher's audio (Opus)"
 msgstr "Accept the publisher's audio (Opus)"
 
-#: src/pages/LayoutsPage.tsx:319
+#: src/pages/LayoutsPage.tsx:323
 msgid "Accessible editing path: Cells form + Inspector in the editor"
 msgstr "Accessible editing path: Cells form + Inspector in the editor"
 
@@ -1184,7 +1184,7 @@ msgstr "All"
 msgid "All cells showing this source"
 msgstr "All cells showing this source"
 
-#: src/pages/LayoutsPage.tsx:286
+#: src/pages/LayoutsPage.tsx:290
 msgid "All configured layouts."
 msgstr "All configured layouts."
 
@@ -2005,7 +2005,7 @@ msgstr "Camera 1"
 #: src/pages/DeviceDetailPage.tsx:1211
 #: src/pages/graphics/DataView.tsx:320
 #: src/pages/graphics/LibraryView.tsx:155
-#: src/pages/LayoutsPage.tsx:357
+#: src/pages/LayoutsPage.tsx:361
 #: src/pages/MediaPlayersPage.tsx:894
 #: src/pages/OutputFeedRow.tsx:458
 #: src/pages/OutputsPage.tsx:1598
@@ -2988,7 +2988,7 @@ msgstr "costs you nothing functional — every feature works the same. We simply
 msgid "Could not acknowledge alarm"
 msgstr "Could not acknowledge alarm"
 
-#: src/pages/LayoutsPage.tsx:189
+#: src/pages/LayoutsPage.tsx:193
 msgid "Could not apply layout"
 msgstr "Could not apply layout"
 
@@ -3044,7 +3044,7 @@ msgstr "Could not create sources"
 msgid "Could not delete"
 msgstr "Could not delete"
 
-#: src/pages/LayoutsPage.tsx:222
+#: src/pages/LayoutsPage.tsx:226
 msgid "Could not delete layout"
 msgstr "Could not delete layout"
 
@@ -3114,7 +3114,7 @@ msgstr "Could not load for editing"
 msgid "Could not load graphics channels."
 msgstr "Could not load graphics channels."
 
-#: src/pages/LayoutsPage.tsx:270
+#: src/pages/LayoutsPage.tsx:274
 msgid "Could not load layouts:"
 msgstr "Could not load layouts:"
 
@@ -3391,7 +3391,7 @@ msgstr "Create sources with a transparent background (for layering over video)"
 msgid "Create today source"
 msgstr "Create today source"
 
-#: src/pages/LayoutsPage.tsx:280
+#: src/pages/LayoutsPage.tsx:284
 msgid "Create your first layout"
 msgstr "Create your first layout"
 
@@ -3726,8 +3726,8 @@ msgid "Degraded event evidence: information may be incomplete."
 msgstr "Degraded event evidence: information may be incomplete."
 
 #: src/pages/approved/SourcesSurface.tsx:249
-#: src/pages/LayoutsPage.tsx:143
-#: src/pages/LayoutsPage.tsx:360
+#: src/pages/LayoutsPage.tsx:147
+#: src/pages/LayoutsPage.tsx:364
 #: src/pages/OutputsPage.tsx:1101
 #: src/pages/OutputsPage.tsx:1219
 #: src/pages/OutputsPage.tsx:1655
@@ -3752,11 +3752,11 @@ msgstr "Delete {0}"
 msgid "Delete {0}? If it is on air it is cut off air."
 msgstr "Delete {0}? If it is on air it is cut off air."
 
-#: src/pages/LayoutsPage.tsx:137
+#: src/pages/LayoutsPage.tsx:141
 msgid "Delete layout"
 msgstr "Delete layout"
 
-#: src/pages/LayoutsPage.tsx:334
+#: src/pages/LayoutsPage.tsx:338
 msgid "Delete layout?"
 msgstr "Delete layout?"
 
@@ -4366,7 +4366,7 @@ msgid "EBU R128 (−23 LUFS)"
 msgstr "EBU R128 (−23 LUFS)"
 
 #: src/pages/approved/SourcesSurface.tsx:246
-#: src/pages/LayoutsPage.tsx:131
+#: src/pages/LayoutsPage.tsx:135
 #: src/pages/OutputsPage.tsx:1091
 #: src/pages/OutputsPage.tsx:1209
 #: src/pages/SalvosPage.tsx:296
@@ -6007,7 +6007,7 @@ msgstr "Layering over a looped video background"
 msgid "Layout"
 msgstr "Layout"
 
-#: src/pages/LayoutsPage.tsx:181
+#: src/pages/LayoutsPage.tsx:185
 msgid "Layout applied live"
 msgstr "Layout applied live"
 
@@ -6015,7 +6015,7 @@ msgstr "Layout applied live"
 msgid "layout cell"
 msgstr "layout cell"
 
-#: src/pages/LayoutsPage.tsx:218
+#: src/pages/LayoutsPage.tsx:222
 msgid "Layout deleted"
 msgstr "Layout deleted"
 
@@ -6024,7 +6024,7 @@ msgstr "Layout deleted"
 msgid "Layout name"
 msgstr "Layout name"
 
-#: src/pages/LayoutsPage.tsx:188
+#: src/pages/LayoutsPage.tsx:192
 msgid "Layout not applied: the switcher is on"
 msgstr "Layout not applied: the switcher is on"
 
@@ -6057,7 +6057,7 @@ msgstr "layout: {id}"
 #: src/docs/registry.ts:227
 #: src/pages/DashboardPage.tsx:58
 #: src/pages/docs/FeaturesPage.tsx:25
-#: src/pages/LayoutsPage.tsx:234
+#: src/pages/LayoutsPage.tsx:238
 #: src/pages/OutputFeedRow.tsx:323
 msgid "Layouts"
 msgstr "Layouts"
@@ -6385,7 +6385,7 @@ msgstr "Loading IPTV publication…"
 msgid "Loading layout…"
 msgstr "Loading layout…"
 
-#: src/pages/LayoutsPage.tsx:266
+#: src/pages/LayoutsPage.tsx:270
 msgid "Loading layouts…"
 msgstr "Loading layouts…"
 
@@ -7196,7 +7196,7 @@ msgid "New instances blocked"
 msgstr "New instances blocked"
 
 #: src/pages/LayoutEditorPage.tsx:338
-#: src/pages/LayoutsPage.tsx:257
+#: src/pages/LayoutsPage.tsx:261
 msgid "New layout"
 msgstr "New layout"
 
@@ -7424,7 +7424,7 @@ msgstr "No journal records match these filters."
 msgid "No layout cells found — enter the cell id to watch."
 msgstr "No layout cells found — enter the cell id to watch."
 
-#: src/pages/LayoutsPage.tsx:275
+#: src/pages/LayoutsPage.tsx:279
 msgid "No layouts are defined yet."
 msgstr "No layouts are defined yet."
 
@@ -7803,7 +7803,7 @@ msgid "Nothing loaded — no bytes at risk"
 msgstr "Nothing loaded — no bytes at risk"
 
 #: src/pages/LayoutEditorPage.tsx:128
-#: src/pages/LayoutsPage.tsx:191
+#: src/pages/LayoutsPage.tsx:195
 msgid "Nothing was changed; the current layout keeps running."
 msgstr "Nothing was changed; the current layout keeps running."
 
@@ -8106,7 +8106,7 @@ msgstr "Operation {0}; the result arrives on the realtime stream."
 
 #: src/api/operationStatus.ts:24
 #: src/pages/LayoutEditorPage.tsx:118
-#: src/pages/LayoutsPage.tsx:182
+#: src/pages/LayoutsPage.tsx:186
 #: src/pages/SalvosPage.tsx:154
 #: src/pages/TallyPage.tsx:142
 msgid "Operation id"
@@ -10294,7 +10294,7 @@ msgstr "Sources"
 msgid "Sources & library"
 msgstr "Sources & library"
 
-#: src/pages/LayoutsPage.tsx:237
+#: src/pages/LayoutsPage.tsx:241
 msgid "Sources → Layouts → Outputs. The accessible editor offers a form-based path equivalent to the drag-and-drop canvas. Save keeps a layout; apply asks the running engine to use it now. Saved layouts are not separate live renderers."
 msgstr "Sources → Layouts → Outputs. The accessible editor offers a form-based path equivalent to the drag-and-drop canvas. Save keeps a layout; apply asks the running engine to use it now. Saved layouts are not separate live renderers."
 
@@ -10834,7 +10834,7 @@ msgid "Takes are locked and this one changes what is on program (the current PGM
 msgstr "Takes are locked and this one changes what is on program (the current PGM source or the audio program bus). Confirm to apply it."
 
 #: src/pages/LayoutEditorPage.tsx:118
-#: src/pages/LayoutsPage.tsx:182
+#: src/pages/LayoutsPage.tsx:186
 msgid "Takes effect at the next frame boundary."
 msgstr "Takes effect at the next frame boundary."
 
@@ -11470,13 +11470,9 @@ msgstr "The stored preset body could not be expanded."
 msgid "The stream becomes an ordinary source linked to its IPTV-ORG entry. The Sources page opens the create dialog next with this choice already set; nothing is saved until you confirm there."
 msgstr "The stream becomes an ordinary source linked to its IPTV-ORG entry. The Sources page opens the create dialog next with this choice already set; nothing is saved until you confirm there."
 
-#: src/pages/LayoutsPage.tsx:131
-#~ msgid "The switcher is on: a multi-cell layout cannot be the Program canvas."
-#~ msgstr "The switcher is on: a multi-cell layout cannot be the Program canvas."
-
 #: src/pages/LayoutsPage.tsx:123
-msgid "The switcher is on: Program is the M/E bus. Take this layout to an output from Routing."
-msgstr "The switcher is on: Program is the M/E bus. Take this layout to an output from Routing."
+msgid "The switcher is on: Program is the M/E bus. Take this layout to an output from <0>Outputs</0>."
+msgstr "The switcher is on: Program is the M/E bus. Take this layout to an output from <0>Outputs</0>."
 
 #: src/pages/docs/concepts/GlossaryPage.tsx:350
 msgid "The text label strip under (or on) each tile showing the source name — named for the physical display modules mounted under monitors in traditional galleries. UMD text can be static or driven dynamically by a router or automation system."
@@ -11683,7 +11679,7 @@ msgstr "This output already carries this feed"
 msgid "This overlay kind has no configurable parameters in this build. Parameters authored in a config file are preserved unchanged."
 msgstr "This overlay kind has no configurable parameters in this build. Parameters authored in a config file are preserved unchanged."
 
-#: src/pages/LayoutsPage.tsx:337
+#: src/pages/LayoutsPage.tsx:341
 msgid "This permanently removes the layout. Running outputs are not affected until a new layout is applied."
 msgstr "This permanently removes the layout. Running outputs are not affected until a new layout is applied."
 
@@ -12363,7 +12359,7 @@ msgstr "Video RTP arrived, but no decoded frames were reported."
 msgid "Video using a brightness curve (PQ or HLG) and usually the BT.2020 gamut that represents far brighter highlights and deeper shadows than standard dynamic range (SDR). HDR tiles must be tone-mapped onto an SDR canvas or they look dim and grey."
 msgstr "Video using a brightness curve (PQ or HLG) and usually the BT.2020 gamut that represents far brighter highlights and deeper shadows than standard dynamic range (SDR). HDR tiles must be tone-mapped onto an SDR canvas or they look dim and grey."
 
-#: src/pages/LayoutsPage.tsx:251
+#: src/pages/LayoutsPage.tsx:255
 msgid "View current engine program"
 msgstr "View current engine program"
 

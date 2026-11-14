@@ -121,7 +121,11 @@ function useColumns(
                   data-testid="layout-apply-blocked-reason"
                 >
                   <Trans>
-                    The switcher is on: Program is the M/E bus. Take this layout to an output from Routing.
+                    The switcher is on: Program is the M/E bus. Take this layout to an output from{' '}
+                    <Link to="/outputs" className="underline underline-offset-2">
+                      Outputs
+                    </Link>
+                    .
                   </Trans>
                 </span>
               ) : null}
