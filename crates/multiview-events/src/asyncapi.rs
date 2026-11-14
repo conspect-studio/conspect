@@ -480,6 +480,17 @@ fn build_messages_switcher_events() -> serde_json::Map<String, Value> {
             "payload": { "$ref": "#/components/schemas/SwitcherOperation" }
         }),
     );
+    map.insert(
+        "SwitcherKeyer".to_owned(),
+        json!({
+            "name": "SwitcherKeyer",
+            "title": "Downstream keyer state change",
+            "summary": "A downstream keyer went on or off air, turned stale, or was redefined (switcher.keyer on topic `switcher`).",
+            "description": "Emitted on topic `switcher` with envelope `id` = keyer object id (`<program>/<keyer>`), only on committed state changes, never per ramp tick (ADR-0113 §8). Lossless. Delivered only to principals with the M/E object, the `program:<id>` grant and the keyer object; a fill or key source the principal cannot read is `\"redacted\"`, exactly as `GET /api/v1/switcher/{me}`.",
+            "contentType": "application/json",
+            "payload": { "$ref": "#/components/schemas/SwitcherKeyer" }
+        }),
+    );
     map.insert("MediaPlayerEvent".to_owned(), json!({
         "name": "MediaPlayerEvent",
         "title": "Media-player transport-state lifecycle",
@@ -738,6 +749,7 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/TallyEvent" },
         { "$ref": "#/components/schemas/SalvoEvent" },
         { "$ref": "#/components/schemas/SwitcherOperation" },
+        { "$ref": "#/components/schemas/SwitcherKeyer" },
         { "$ref": "#/components/schemas/MediaPlayerEvent" },
         { "$ref": "#/components/schemas/GraphicsChannelEvent" },
         { "$ref": "#/components/schemas/CatalogueLinkStatus" },
@@ -1563,6 +1575,7 @@ fn salvo_event_schema() -> Value {
 fn switcher_event_schemas() -> Value {
     json!({
         "SwitcherOperation": switcher_operation_schema(),
+        "SwitcherKeyer": switcher_keyer_schema(),
         "MediaPlayerState": media_player_state_schema(),
         "MediaPlayerEvent": media_player_event_schema(),
         "GraphicsChannelEvent": graphics_channel_event_schema(),
@@ -1582,6 +1595,28 @@ fn switcher_operation_schema() -> Value {
             "operation_id": { "type": "string" },
             "completed": { "type": "boolean" },
             "error": { "type": "string" }
+        }
+    })
+}
+
+fn switcher_keyer_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "A committed downstream keyer change; envelope id equals the keyer object id.",
+        "required": ["me", "program", "keyer", "tick", "on_air", "stale", "reason", "fill"],
+        "properties": {
+            "me": { "type": "string" },
+            "program": { "type": "string" },
+            "keyer": { "type": "string", "description": "Keyer object id, `<program>/<keyer>`." },
+            "tick": { "type": "integer", "format": "uint64" },
+            "on_air": { "type": "boolean" },
+            "stale": { "type": "boolean" },
+            "reason": {
+                "type": "string",
+                "enum": ["operator", "tie", "on-at-start", "source-lost", "source-recovered", "definition"]
+            },
+            "fill": { "type": "string", "description": "Fill source id, or `redacted`." },
+            "key": { "type": "string", "description": "Key source id, or `redacted`; absent for a self key." }
         }
     })
 }

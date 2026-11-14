@@ -55,6 +55,7 @@ pub mod source_events;
 pub mod sources;
 pub mod support;
 pub mod switcher;
+pub mod switcher_keyers;
 pub mod sync_groups;
 pub mod system;
 pub mod tally;

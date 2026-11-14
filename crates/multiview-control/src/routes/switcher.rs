@@ -38,11 +38,18 @@ pub struct SwitcherRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     /// Action to classify on `/plan`, one of `select_program`, `select_preview`,
-    /// `cut`, `auto`; the action is part of the same validated request.
+    /// `cut`, `auto`, `keyer_cut`, `keyer_auto`, `keyer_tie`, `keyer_set`;
+    /// the action is part of the same validated request.
     pub action: String,
     /// AUTO duration at the output's exact cadence; no floating milliseconds.
+    /// For `keyer_auto`, an optional rate override in 1..=300 frames.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_frames: Option<u32>,
+    /// Downstream keyer fields (ADR-0113 §8, K4): `keyer` names the keyer
+    /// (object id `<program>/<keyer>`); `on`, `tie` and the `keyer_set`
+    /// definition fields. Fill and key name sources only (`in:<n>` is 422).
+    #[serde(flatten)]
+    pub keyer: super::switcher_keyers::KeyerFields,
 }
 
 /// A dry-run result, including the scene generation the take must recheck.
@@ -80,6 +87,11 @@ pub struct SwitcherStateResponse {
     pub preview_source: String,
     /// Active AUTO status.
     pub in_flight: bool,
+    /// Downstream keyer rows the caller may read (keyer object id), with
+    /// unreadable source ids `"redacted"`; changes only on state changes.
+    pub keyers: Vec<super::switcher_keyers::KeyerRow>,
+    /// Engine tally resolved to source ids; unreadable ids are dropped.
+    pub tally: super::switcher_keyers::TallyView,
 }
 
 fn engine(state: &AppState) -> ControlResult<&SwitcherControl> {
@@ -112,13 +124,26 @@ pub fn authorize_refs(principal: &Principal, req: &SwitcherRequest) -> ControlRe
     if let Some(output) = &req.output {
         authorize_output(principal, output)?;
     }
+    // ADR-0113 §10: the keyer object id and every named fill/key source,
+    // before any existence answer.
+    super::switcher_keyers::authorize(principal, &req.me, &req.program, &req.keyer)?;
+    Ok(())
+}
+
+fn validate_me(req: &SwitcherRequest) -> ControlResult<()> {
+    if req.me != "me1" || req.program != "main" {
+        return Err(ControlError::Validation(
+            "first-slice runtime admits only me1 in main".into(),
+        ));
+    }
     Ok(())
 }
 
 fn validate_first_slice(req: &SwitcherRequest, kind: &str) -> ControlResult<()> {
-    if req.me != "me1" || req.program != "main" {
+    validate_me(req)?;
+    if !req.keyer.is_empty() {
         return Err(ControlError::Validation(
-            "first-slice runtime admits only me1 in main".into(),
+            "keyer fields belong to the keyer verbs".into(),
         ));
     }
     if req.layout.is_some() || req.output.is_some() {
@@ -304,7 +329,7 @@ fn validate_buses(
 }
 
 /// Read authoritative state; no runtime means an explicit 409, never fake PGM.
-#[cfg_attr(feature = "openapi", utoipa::path(get, path = "/api/v1/switcher/{me}", tag = "switcher", params(("me" = String, Path)), responses((status = 200, body = SwitcherStateResponse), (status = 403, body = crate::problem::Problem), (status = 409, body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(get, path = "/api/v1/switcher/{me}", tag = "switcher", params(("me" = String, Path)), responses((status = 200, description = "Engine-owned state. `keyers[]` lists only the downstream keyer rows whose object id (`<program>/<keyer>`) the caller may read, with unreadable fill/key source ids replaced by `\"redacted\"`; `tally` drops unreadable ids (ADR-0113 §8).", body = SwitcherStateResponse), (status = 403, body = crate::problem::Problem), (status = 409, body = crate::problem::Problem))))]
 pub(crate) async fn get_switcher(
     State(state): State<AppState>,
     principal: Principal,
@@ -323,6 +348,7 @@ pub(crate) async fn get_switcher(
     let snapshot = handle.snapshot().ok_or_else(|| {
         ControlError::Conflict("switcher has not emitted a real output tick".into())
     })?;
+    let defs = handle.keyer_definitions();
     Ok((
         StatusCode::OK,
         Json(SwitcherStateResponse {
@@ -330,13 +356,15 @@ pub(crate) async fn get_switcher(
             program_source: snapshot.program.as_str().to_owned(),
             preview_source: snapshot.preview.as_str().to_owned(),
             in_flight: snapshot.in_flight,
+            keyers: super::switcher_keyers::rows(&principal, defs.as_deref(), &snapshot),
+            tally: super::switcher_keyers::tally(&principal, defs.as_deref(), &snapshot),
         }),
     )
         .into_response())
 }
 
 /// Dry-run command admission, including BOLA on every referenced object.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, body = SwitcherPlan), (status = 403, body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, description = "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).", body = SwitcherPlan), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer).", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer` (a keyer the caller may read is not defined).", body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, description = "Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`.", body = crate::problem::Problem))))]
 pub(crate) async fn plan_switcher(
     State(state): State<AppState>,
     principal: Principal,
@@ -344,6 +372,11 @@ pub(crate) async fn plan_switcher(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     authorize_refs(&principal, &req)?;
+    if super::switcher_keyers::is_keyer_verb(&req.action) {
+        validate_me(&req)?;
+        let handle = engine(&state)?;
+        return super::switcher_keyers::plan(&state, &principal, handle, &req);
+    }
     validate_source_configured(&state, &req)?;
     validate_first_slice(&req, &req.action)?;
     let handle = engine(&state)?;
@@ -373,7 +406,7 @@ pub(crate) async fn plan_switcher(
 }
 
 /// Enqueue a checked verb; a 202 never asserts frame application.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path)), request_body = SwitcherRequest, responses((status = 202, body = SwitcherAccepted), (status = 403, body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, body = crate::problem::Problem), (status = 503, body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path, description = "The verb; must equal `action`."), ("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")), request_body = SwitcherRequest, responses((status = 202, description = "Queued; the outcome arrives as `switcher.operation` at the engine tick. Keyer verbs also emit `switcher.keyer` on a committed state change.", body = SwitcherAccepted), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source; the key is not burned.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer`.", body = crate::problem::Problem), (status = 409, description = "`capacity` (keyer budget; generic for scoped callers), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyers-unavailable`; nothing is enqueued and every lease taken is released.", body = crate::problem::Problem), (status = 422, body = crate::problem::Problem), (status = 503, description = "`engine-busy` (the 64-slot mailbox is full; key and leases released) or `idempotency-capacity`.", body = crate::problem::Problem))))]
 #[allow(clippy::too_many_lines)]
 // reason: one linear admission sequence (authz → resolve input → buses → key →
 // lease → enqueue); the input resolution added the lines, not new branches.
@@ -391,6 +424,21 @@ pub(crate) async fn submit_switcher(
         return Err(ControlError::Validation(
             "switcher action disagrees with command path".into(),
         ));
+    }
+    if super::switcher_keyers::is_keyer_verb(&kind) {
+        validate_me(&req)?;
+        let handle = engine(&state)?;
+        let scene_version = handle
+            .scene_version()
+            .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;
+        return super::switcher_keyers::submit(
+            &state,
+            &principal,
+            handle,
+            &idem,
+            &req,
+            scene_version,
+        );
     }
     validate_first_slice(&req, &kind)?;
     let handle = engine(&state)?;

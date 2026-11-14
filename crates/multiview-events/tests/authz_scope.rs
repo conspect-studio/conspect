@@ -339,3 +339,26 @@ fn route_output_is_object_and_output_of_the_output() {
         }
     );
 }
+
+#[test]
+fn switcher_keyer_is_scoped_by_me_program_and_keyer_object() {
+    // ADR-0113 §8 (K4): the GET twin filters `keyers[]` by the keyer object
+    // after the M/E object and the program grant; the event needs all three.
+    let e = event_from(
+        "switcher.keyer",
+        json!({
+            "me": "me1", "program": "main", "keyer": "main/dsk1", "tick": 7,
+            "on_air": true, "stale": false, "reason": "operator", "fill": "gfx"
+        }),
+    );
+    assert_eq!(
+        e.authz_scope(),
+        AuthzScope::Keyer {
+            me: "me1",
+            program: "main",
+            keyer: "main/dsk1"
+        }
+    );
+    let wire = serde_json::to_value(&e).unwrap();
+    assert!(wire["data"].get("key").is_none(), "a self key omits `key`");
+}

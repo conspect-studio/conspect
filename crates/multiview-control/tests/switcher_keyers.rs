@@ -1,0 +1,1020 @@
+//! Downstream keyer control API (ADR-0113 §10, design note §8 and §11.7,
+//! slice K4): `keyer_cut`, `keyer_auto`, `keyer_tie` and `keyer_set` on the
+//! existing switcher plan/command routes; BOLA on the M/E, the program, the
+//! keyer object and every source, on plan and command; `GET` row filtering
+//! and redaction with a GET/events parity test for a scoped principal;
+//! idempotent replay; 503 on a full mailbox; `capacity`, `on-air-protected`
+//! and the Clean rule, each releasing what it took; `in:<n>` refused;
+//! persistence after `applied` and a restart with keyers off.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    // `body` takes the `json!` value by value for call-site ergonomics.
+    clippy::needless_pass_by_value
+)]
+mod support;
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use multiview_compositor::pipeline::Nv12Image;
+use multiview_config::{MultiviewConfig, StartMode};
+use multiview_control::auth::{ApiKeyStore, Principal, Role};
+use multiview_control::output_routing::{
+    OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost, PlanRefusal, RoutedFeed,
+    RoutingLive, TakeSubmitError,
+};
+use multiview_control::realtime::SessionStream;
+use multiview_control::state::EngineStateSnapshot;
+use multiview_control::{
+    boot_model::BootModel, command_bus, AppState, InMemoryRepository, SourceDemandLease,
+    SourceDemandPhase, SourceDemandProvider, SourceDemandView,
+};
+use multiview_core::color::ColorInfo;
+use multiview_core::layout::{Canvas, Cell, Layout};
+use multiview_core::switcher::SourceRef;
+use multiview_core::time::MediaTime;
+use multiview_engine::clock::Tick;
+use multiview_engine::keyer;
+use multiview_engine::switcher::SwitcherState;
+use multiview_engine::switcher_control::{
+    ProviderStatus, ScenePair, SwitcherControl, SwitcherTickDriver,
+};
+use multiview_engine::EnginePublisher;
+use multiview_events::Event;
+use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
+use serde_json::{json, Value};
+use support::{body_json, get, post_json, send};
+
+const DOC: &str = r##"
+schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "absolute"
+[[sources]]
+id = "a"
+kind = "bars"
+[[sources]]
+id = "b"
+kind = "bars"
+[[sources]]
+id = "gfx"
+kind = "bars"
+[[sources]]
+id = "gfx2"
+kind = "bars"
+[[sources]]
+id = "secret"
+kind = "bars"
+[[cells]]
+id = "pgm"
+rect = { x = 0.0, y = 0.0, w = 1.0, h = 1.0 }
+[cells.source]
+input_id = "a"
+[[outputs]]
+kind = "hls"
+path = "/tmp/switcher-keyers/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[switcher]
+[[switcher.mix_effects]]
+id = "me1"
+program = "main"
+program_source = "a"
+preview_source = "b"
+[[switcher.downstream_keyers]]
+id = "dsk1"
+program = "main"
+fill = "gfx"
+z = 1
+max_source = { w = 64, h = 64 }
+"##;
+
+/// Full rights on me1, main, the keyer and every source but `secret`.
+const FULL: &str = "k-full.k-full-secret";
+/// Like FULL but without the keyer object `main/dsk1`.
+const NO_KEYER: &str = "k-no-keyer.k-no-keyer-secret";
+/// Like FULL but without the `gfx` source (dsk1's fill).
+const NO_FILL: &str = "k-no-fill.k-no-fill-secret";
+/// Like FULL but without the `me1` object.
+const NO_ME: &str = "k-no-me.k-no-me-secret";
+/// Like FULL but without `program:main`.
+const NO_PROGRAM: &str = "k-no-program.k-no-program-secret";
+/// An unscoped operator.
+const ADMIN: &str = support::OPERATOR_TOKEN;
+/// A viewer (Read only).
+const VIEWER: &str = support::VIEWER_TOKEN;
+
+fn keys() -> ApiKeyStore {
+    let mut keys = support::seeded_keys();
+    let all = ["me1", "main/dsk1", "main/dsk2", "a", "b", "gfx", "gfx2"];
+    let mut add = |id: &str, without: Option<&str>, program: bool| {
+        let objects: Vec<String> = all
+            .iter()
+            .filter(|o| Some(**o) != without)
+            .map(|o| (*o).to_owned())
+            .collect();
+        keys.register(
+            id,
+            &format!("{id}-secret"),
+            Principal {
+                key_id: id.to_owned(),
+                role: Role::Operator,
+                scoped_object_ids: Some(objects),
+                scoped_output_ids: Some(if program {
+                    vec!["program:main".to_owned()]
+                } else {
+                    vec![]
+                }),
+                scoped_discovery_domains: None,
+            },
+        );
+    };
+    add("k-full", None, true);
+    add("k-no-keyer", Some("main/dsk1"), true);
+    add("k-no-fill", Some("gfx"), true);
+    add("k-no-me", Some("me1"), true);
+    add("k-no-program", None, false);
+    keys
+}
+
+fn stores() -> HashMap<String, Arc<TileStore<Nv12Image>>> {
+    let thresholds = TileThresholds::from_millis(500, 2_000, 10_000).unwrap();
+    ["a", "b", "gfx", "gfx2", "secret"]
+        .into_iter()
+        .map(|id| {
+            let store = Arc::new(TileStore::new(id, thresholds, NoSignalPolicy::Slate));
+            store.publish(
+                Nv12Image::solid(
+                    64,
+                    64,
+                    200,
+                    128,
+                    128,
+                    ColorInfo::default().resolve_defaults(64, 64),
+                )
+                .unwrap(),
+                MediaTime::ZERO,
+            );
+            (id.to_owned(), store)
+        })
+        .collect()
+}
+
+fn scene(id: &str) -> Arc<Layout> {
+    Arc::new(Layout {
+        name: id.into(),
+        canvas: Canvas {
+            width: 64,
+            height: 64,
+            fps_num: 25,
+            fps_den: 1,
+        },
+        cells: vec![Cell {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+            source: Some(id.into()),
+            ..Cell::default()
+        }],
+    })
+}
+
+/// A routing seam whose live snapshot says whether an output carries Clean.
+struct Routing {
+    live: Mutex<Option<RoutingLive>>,
+}
+
+impl Routing {
+    fn with_clean(clean: bool) -> Arc<Self> {
+        let live = clean.then(|| {
+            let mut outputs = HashMap::new();
+            outputs.insert(
+                "out-a".to_owned(),
+                multiview_control::output_routing::OutputLive {
+                    bus: "clean".to_owned(),
+                    since_tick: 0,
+                    pending: None,
+                    degraded: false,
+                    audio: None,
+                    pending_audio: None,
+                    private_audio: false,
+                },
+            );
+            RoutingLive {
+                outputs,
+                ..RoutingLive::default()
+            }
+        });
+        Arc::new(Self {
+            live: Mutex::new(live),
+        })
+    }
+}
+
+impl OutputRouting for Routing {
+    fn plan(&self, _output: &str, _feed: &RoutedFeed) -> Result<PlanCost, PlanRefusal> {
+        Err(PlanRefusal::OutputKindUnroutable)
+    }
+    fn plan_audio(
+        &self,
+        _output: &str,
+        _video: Option<&RoutedFeed>,
+        _audio: Option<&multiview_control::output_routing::RoutedAudio>,
+    ) -> Result<multiview_control::output_routing::AudioPlanCost, PlanRefusal> {
+        Ok(multiview_control::output_routing::AudioPlanCost::default())
+    }
+    fn try_take(&self, _take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
+        Err(TakeSubmitError::Unroutable)
+    }
+    fn snapshot(&self) -> Option<RoutingLive> {
+        self.live.lock().unwrap().clone()
+    }
+    fn subscribe_outcomes(&self) -> Option<std::sync::mpsc::Receiver<OutputOutcome>> {
+        None
+    }
+}
+
+/// Records lease acquisitions and drops.
+#[derive(Default)]
+struct LeaseLog {
+    live: Mutex<Vec<String>>,
+    acquired: Mutex<Vec<String>>,
+}
+
+struct Lease {
+    tag: String,
+    log: Arc<LeaseLog>,
+}
+impl SourceDemandLease for Lease {}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut live = self.log.live.lock().unwrap();
+        if let Some(at) = live.iter().position(|t| *t == self.tag) {
+            live.remove(at);
+        }
+    }
+}
+
+struct Demand {
+    log: Arc<LeaseLog>,
+}
+impl SourceDemandProvider for Demand {
+    fn status(&self, id: &str) -> SourceDemandView {
+        SourceDemandView::idle(id)
+    }
+    fn active(&self) -> Vec<SourceDemandView> {
+        Vec::new()
+    }
+    fn preview_lease(&self, id: &str, label: &str) -> Option<Box<dyn SourceDemandLease>> {
+        let tag = format!("{label}:{id}");
+        self.log.live.lock().unwrap().push(tag.clone());
+        self.log.acquired.lock().unwrap().push(tag.clone());
+        Some(Box::new(Lease {
+            tag,
+            log: Arc::clone(&self.log),
+        }))
+    }
+    fn touch_preview(&self, _id: &str) -> Option<SourceDemandPhase> {
+        None
+    }
+}
+
+struct Rig {
+    router: axum::Router,
+    state: AppState,
+    handle: SwitcherControl,
+    driver: SwitcherTickDriver,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    leases: Arc<LeaseLog>,
+}
+
+fn tick(driver: &mut SwitcherTickDriver, index: u64) {
+    let tick = Tick {
+        index,
+        pts: MediaTime::ZERO,
+    };
+    driver.drain_at_tick(tick);
+    driver.commit_composed_tick(tick);
+}
+
+fn build(path: &Path, doc: &str, clean_routed: bool) -> Rig {
+    let config = MultiviewConfig::load_from_toml(doc).unwrap();
+    config.validate().unwrap();
+    let seeded = multiview_control::seed_resources(&config).unwrap();
+    let publisher = Arc::new(EnginePublisher::new(256));
+    let (sender, _receiver) = command_bus(64);
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("a"),
+        SourceRef::new("b"),
+        vec![],
+    ));
+    let stores = stores();
+    driver.set_prime_stores(stores.clone());
+    let switcher = config.switcher.as_ref().unwrap();
+    let defs = switcher
+        .downstream_keyers
+        .iter()
+        .map(|cfg| keyer::KeyerDef::from_config(cfg, &stores, 64, 64).unwrap())
+        .collect();
+    driver.set_keyers(keyer::admit(defs, 64, 64, switcher.keyer_budget.unwrap_or(3.0)).unwrap());
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: scene("a"),
+            preview: scene("b"),
+        })
+        .unwrap();
+    driver.publish_provider_status(ProviderStatus {
+        scene_version: 1,
+        last_tick: 0,
+        width: 64,
+        height: 64,
+        fps_num: 25,
+        fps_den: 1,
+    });
+    tick(&mut driver, 0);
+    let leases = Arc::new(LeaseLog::default());
+    let state = AppState::new(
+        Arc::clone(&publisher),
+        sender,
+        Arc::new(InMemoryRepository::new()),
+        Arc::new(keys()),
+    )
+    .with_seeded_resources(seeded)
+    .with_base_document(serde_json::to_value(&config).unwrap())
+    .with_boot_model(Arc::new(BootModel::new(
+        path.to_path_buf(),
+        config.clone(),
+        config,
+        StartMode::Boot,
+        false,
+        None,
+    )))
+    .with_switcher(handle.clone())
+    .with_output_routing(Routing::with_clean(clean_routed))
+    .with_source_demand(Arc::new(Demand {
+        log: Arc::clone(&leases),
+    }));
+    tokio::spawn(
+        multiview_control::routes::switcher_keyers::forward_keyer_events(
+            handle.clone(),
+            Arc::clone(&publisher),
+            "me1".into(),
+            "main".into(),
+        ),
+    );
+    Rig {
+        router: multiview_control::router(state.clone()),
+        state,
+        handle,
+        driver,
+        publisher,
+        leases,
+    }
+}
+
+fn rig(path: &Path) -> Rig {
+    build(path, DOC, false)
+}
+
+fn temp_boot(doc: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multiview.toml");
+    std::fs::write(&path, doc).unwrap();
+    (dir, path)
+}
+
+fn body(action: &str, extra: Value) -> Value {
+    let mut base = json!({ "me": "me1", "program": "main", "action": action });
+    for (k, v) in extra.as_object().unwrap() {
+        base[k] = v.clone();
+    }
+    base
+}
+
+async fn plan(rig: &Rig, token: &str, body: &Value) -> axum::response::Response {
+    send(&rig.router, post_json("/api/v1/switcher/plan", token, body)).await
+}
+
+async fn command(rig: &Rig, token: &str, key: &str, body: &Value) -> axum::response::Response {
+    let kind = body["action"].as_str().unwrap();
+    let mut request: Request<Body> =
+        post_json(&format!("/api/v1/switcher/commands/{kind}"), token, body);
+    request
+        .headers_mut()
+        .insert("Idempotency-Key", key.parse().unwrap());
+    send(&rig.router, request).await
+}
+
+async fn kind_of(response: axum::response::Response) -> (StatusCode, String) {
+    let status = response.status();
+    let body = body_json(response).await;
+    (
+        status,
+        body["type"]
+            .as_str()
+            .unwrap_or_default()
+            .trim_start_matches("/problems/")
+            .to_owned(),
+    )
+}
+
+async fn wait_for<F: Fn() -> bool>(f: F) {
+    for _ in 0..400 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition not reached");
+}
+
+fn persisted(state: &AppState) -> MultiviewConfig {
+    serde_json::from_value(multiview_control::boot_model::current_desired_config(state).unwrap())
+        .unwrap()
+}
+
+/// The BOLA matrix: each verb, on plan and on command, refuses every
+/// principal missing one grant (M/E, program, keyer object, a named source),
+/// with 403 before any existence answer, and never enqueues.
+#[tokio::test]
+async fn every_keyer_verb_is_authorized_per_object_on_plan_and_command() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = rig(&path);
+    let mut outcomes = rig.handle.outcomes();
+    let verbs = [
+        body("keyer_cut", json!({ "keyer": "dsk1", "on": true })),
+        body("keyer_auto", json!({ "keyer": "dsk1", "on": true })),
+        body("keyer_tie", json!({ "keyer": "dsk1", "tie": true })),
+        body("keyer_set", json!({ "keyer": "dsk1", "rate": 20 })),
+    ];
+    for verb in &verbs {
+        for token in [NO_ME, NO_PROGRAM, NO_KEYER] {
+            assert_eq!(
+                plan(&rig, token, verb).await.status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                command(&rig, token, "bola", verb).await.status(),
+                StatusCode::FORBIDDEN,
+                "{token} {verb}"
+            );
+        }
+        assert_eq!(
+            command(&rig, VIEWER, "bola-viewer", verb).await.status(),
+            StatusCode::FORBIDDEN,
+            "a viewer cannot command"
+        );
+    }
+    // Read on every named source: a keyer_set naming an unreadable fill or
+    // key, and an unknown keyer that the principal may not see, are 403, not
+    // 404 or 422 (nothing about existence leaks).
+    for (token, extra) in [
+        (FULL, json!({ "keyer": "dsk1", "fill": "secret" })),
+        (FULL, json!({ "keyer": "dsk1", "key": "secret" })),
+        (NO_FILL, json!({ "keyer": "dsk1", "fill": "gfx" })),
+        (FULL, json!({ "keyer": "dsk9", "fill": "gfx2" })),
+    ] {
+        let verb = body("keyer_set", extra);
+        assert_eq!(
+            plan(&rig, token, &verb).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            command(&rig, token, "bola-src", &verb).await.status(),
+            StatusCode::FORBIDDEN,
+            "{verb}"
+        );
+    }
+    // A principal that may not read the current fill can still drive the
+    // keyer it controls (the fill is not named by the request).
+    let cut = body("keyer_cut", json!({ "keyer": "dsk1", "on": true }));
+    assert_eq!(plan(&rig, NO_FILL, &cut).await.status(), StatusCode::OK);
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().is_err(), "nothing was enqueued");
+    // The denied keys were never burned: the same key now succeeds.
+    let response = command(&rig, FULL, "bola", &cut).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn cut_auto_and_tie_are_202_with_an_outcome_on_the_engine_tick() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = rig(&path);
+    let mut outcomes = rig.handle.outcomes();
+    let response = plan(
+        &rig,
+        FULL,
+        &body("keyer_cut", json!({"keyer":"dsk1","on":true})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let planned = body_json(response).await;
+    assert_eq!(planned["class"], "class1");
+    assert_eq!(planned["keyer"], "main/dsk1");
+    assert_eq!(planned["can_take"], true);
+    assert_eq!(planned["on_air"], false);
+
+    let cut = body("keyer_cut", json!({"keyer":"dsk1","on":true}));
+    let accepted = body_json(command(&rig, FULL, "cut-1", &cut).await).await;
+    assert_eq!(accepted["kind"], "keyer_cut");
+    let op = accepted["operation_id"].as_str().unwrap().to_owned();
+    // Replay: the first 202, nothing enqueued twice.
+    let again = body_json(command(&rig, FULL, "cut-1", &cut).await).await;
+    assert_eq!(again["operation_id"], op.as_str());
+    tick(&mut rig.driver, 1);
+    let outcome = outcomes.try_recv().unwrap().event;
+    assert_eq!(
+        (outcome.operation_id.as_str(), outcome.tick),
+        (op.as_str(), 1)
+    );
+    assert!(outcome.completed);
+    assert!(outcomes.try_recv().is_err(), "the replay enqueued nothing");
+    assert!(rig.handle.snapshot().unwrap().keyers[0].unwrap().on_air);
+
+    let auto = body(
+        "keyer_auto",
+        json!({"keyer":"dsk1","on":false,"duration_frames":4}),
+    );
+    assert_eq!(
+        command(&rig, FULL, "auto-1", &auto).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 2);
+    let ramp = rig.handle.snapshot().unwrap().keyers[0]
+        .unwrap()
+        .ramp
+        .unwrap();
+    assert_eq!((ramp.start_tick, ramp.rate, ramp.to_on), (2, 4, false));
+    // A second AUTO while ramping is refused by the plan and as a 409.
+    let response = plan(&rig, FULL, &auto).await;
+    assert_eq!(
+        body_json(response).await["refusal"]["type"],
+        "keyer-ramping"
+    );
+    let (status, kind) = kind_of(command(&rig, FULL, "auto-2", &auto).await).await;
+    assert_eq!(
+        (status, kind.as_str()),
+        (StatusCode::CONFLICT, "keyer-ramping")
+    );
+    for index in 3..=6 {
+        tick(&mut rig.driver, index);
+    }
+    assert!(!rig.handle.snapshot().unwrap().keyers[0].unwrap().on_air);
+
+    let tie = body("keyer_tie", json!({"keyer":"dsk1","tie":true}));
+    assert_eq!(
+        command(&rig, FULL, "tie-1", &tie).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 7);
+    assert!(rig.handle.snapshot().unwrap().keyers[0].unwrap().tie);
+
+    // Shape: bounds and the verb's own fields only.
+    for (bad, kind) in [
+        (
+            body(
+                "keyer_auto",
+                json!({"keyer":"dsk1","on":true,"duration_frames":301}),
+            ),
+            "keyer-rate",
+        ),
+        (body("keyer_cut", json!({"keyer":"dsk1"})), "validation"),
+        (
+            body("keyer_cut", json!({"keyer":"dsk1","on":true,"fill":"gfx"})),
+            "validation",
+        ),
+        (body("keyer_cut", json!({"on":true})), "validation"),
+        (
+            body("keyer_cut", json!({"keyer":"dsk1","on":true,"source":"a"})),
+            "validation",
+        ),
+    ] {
+        let (status, got) = kind_of(command(&rig, FULL, "bad", &bad).await).await;
+        assert_eq!(
+            (status, got.as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, kind),
+            "{bad}"
+        );
+    }
+    // An unknown keyer the principal may read: 404, nothing burned.
+    let unknown = body("keyer_cut", json!({"keyer":"dsk2","on":true}));
+    assert_eq!(
+        command(&rig, FULL, "u", &unknown).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    // Keyer fields on a background verb are refused.
+    let cut_bg = body("cut", json!({"keyer":"dsk1"}));
+    assert_eq!(
+        command(&rig, FULL, "bg", &cut_bg).await.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[tokio::test]
+async fn a_full_mailbox_is_503_and_releases_the_key_and_the_leases() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = rig(&path);
+    let mut sent = 0;
+    loop {
+        let verb = body("keyer_tie", json!({"keyer":"dsk1","tie": sent % 2 == 0}));
+        let response = command(&rig, FULL, &format!("flood-{sent}"), &verb).await;
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            break;
+        }
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        sent += 1;
+        assert!(sent <= 64, "the mailbox is bounded");
+    }
+    assert_eq!(sent, 64);
+    let define = body("keyer_set", json!({"keyer":"dsk1","fill":"gfx2"}));
+    let (status, kind) = kind_of(command(&rig, FULL, "set-busy", &define).await).await;
+    assert_eq!(
+        (status, kind.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "engine-busy")
+    );
+    assert!(
+        rig.leases.live.lock().unwrap().is_empty(),
+        "a refused enqueue holds no lease"
+    );
+    tick(&mut rig.driver, 1);
+    tick(&mut rig.driver, 2);
+    tick(&mut rig.driver, 3);
+    tick(&mut rig.driver, 4);
+    // The key was released: the same key is admitted now.
+    assert_eq!(
+        command(&rig, FULL, "set-busy", &define).await.status(),
+        StatusCode::ACCEPTED
+    );
+}
+
+#[tokio::test]
+async fn in_n_is_refused_with_422_for_fill_and_key() {
+    let (_dir, path) = temp_boot(DOC);
+    let rig = rig(&path);
+    let keys = support::seeded_keys();
+    drop(keys);
+    for extra in [
+        json!({"keyer":"dsk1","fill":"in:1"}),
+        json!({"keyer":"dsk1","key":"in:2"}),
+    ] {
+        let verb = body("keyer_set", extra);
+        let (status, kind) = kind_of(command(&rig, ADMIN, "in", &verb).await).await;
+        assert_eq!(
+            (status, kind.as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "keyer-source-not-a-source"
+            )
+        );
+        let (status, _) = kind_of(plan(&rig, ADMIN, &verb).await).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[tokio::test]
+async fn capacity_refusal_is_generic_for_scoped_callers_and_releases_everything() {
+    let (_dir, path) = temp_boot(DOC);
+    let rig = rig(&path);
+    // dsk1 (full canvas, fill only) costs 2.0 of the 3.0 default budget; a
+    // full-canvas dsk2 would cost 2.0 more.
+    let verb = body("keyer_set", json!({"keyer":"dsk2","fill":"gfx2"}));
+    let scoped = body_json(plan(&rig, FULL, &verb).await).await;
+    assert_eq!(scoped["can_take"], false);
+    assert_eq!(scoped["refusal"]["type"], "capacity");
+    assert_eq!(scoped["cost"]["delta"], 2.0);
+    assert!(scoped["cost"].get("reserved").is_none(), "{scoped}");
+    assert!(scoped["cost"].get("budget").is_none());
+    assert!(scoped["cost"].get("holders").is_none());
+    assert!(!scoped["refusal"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("main/dsk1"));
+    let unscoped = body_json(plan(&rig, ADMIN, &verb).await).await;
+    assert_eq!(unscoped["cost"]["reserved"], 4.0);
+    assert_eq!(unscoped["cost"]["budget"], 3.0);
+    assert_eq!(unscoped["cost"]["holders"], json!(["main/dsk1"]));
+    // A repeated refused command leaves no lease, no reservation, no key.
+    for _ in 0..3 {
+        let (status, kind) = kind_of(command(&rig, FULL, "cap", &verb).await).await;
+        assert_eq!((status, kind.as_str()), (StatusCode::CONFLICT, "capacity"));
+    }
+    assert!(rig.leases.acquired.lock().unwrap().is_empty());
+    assert!(rig.state.idempotency.peek("cap").is_none());
+    assert_eq!(rig.handle.keyer_definitions().unwrap().version, 0);
+    // A fly small enough fits: 1×(16·16)/4096 + 1×(16·16)/4096.
+    let small = body(
+        "keyer_set",
+        json!({"keyer":"dsk2","fill":"gfx2","fly":{"x":0,"y":0,"w":16,"h":16},"max_source":{"w":16,"h":16}}),
+    );
+    assert_eq!(
+        body_json(plan(&rig, FULL, &small).await).await["can_take"],
+        true
+    );
+    // Raising max_source is an admitted cost increase like any other.
+    let raise = body(
+        "keyer_set",
+        json!({"keyer":"dsk1","max_source":{"w":128,"h":128}}),
+    );
+    let raised = body_json(plan(&rig, FULL, &raise).await).await;
+    assert_eq!(raised["refusal"]["type"], "capacity", "{raised}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_air_protected_and_a_make_before_break_fill_change() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = rig(&path);
+    let mut outcomes = rig.handle.outcomes();
+    command(
+        &rig,
+        FULL,
+        "on",
+        &body("keyer_cut", json!({"keyer":"dsk1","on":true})),
+    )
+    .await;
+    tick(&mut rig.driver, 1);
+    outcomes.try_recv().unwrap();
+    let change = body("keyer_set", json!({"keyer":"dsk1","fill":"gfx2"}));
+    let planned = body_json(plan(&rig, FULL, &change).await).await;
+    assert_eq!(planned["on_air"], true);
+    assert_eq!(planned["refusal"]["type"], "on-air-protected");
+    let (status, kind) = kind_of(command(&rig, FULL, "protect", &change).await).await;
+    assert_eq!(
+        (status, kind.as_str()),
+        (StatusCode::CONFLICT, "on-air-protected")
+    );
+    assert!(
+        rig.leases.acquired.lock().unwrap().is_empty(),
+        "no lease taken"
+    );
+    // A parameter change that keeps the sources is not protected.
+    let rate = body("keyer_set", json!({"keyer":"dsk1","rate":30}));
+    assert_eq!(
+        body_json(plan(&rig, FULL, &rate).await).await["can_take"],
+        true
+    );
+    let allow = body(
+        "keyer_set",
+        json!({"keyer":"dsk1","fill":"gfx2","on_air":"allow"}),
+    );
+    let op = body_json(command(&rig, FULL, "allow", &allow).await).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Make-before-break: the new fill is leased before the tick applies it.
+    assert_eq!(
+        *rig.leases.live.lock().unwrap(),
+        vec!["keyer:main/dsk1:gfx2".to_owned()]
+    );
+    tick(&mut rig.driver, 2);
+    let outcome = outcomes.try_recv().unwrap().event;
+    assert_eq!(outcome.operation_id, op);
+    assert!(outcome.completed, "{outcome:?}");
+    let defs = rig.handle.keyer_definitions().unwrap();
+    assert_eq!(&*defs.defs[0].as_ref().unwrap().fill_id, "gfx2");
+    assert!(rig.handle.snapshot().unwrap().keyers[0].unwrap().on_air);
+    // After the outcome the request's lease is released (the demand set
+    // holds the new sources) and the definition is persisted.
+    wait_for(|| rig.leases.live.lock().unwrap().is_empty()).await;
+    wait_for(|| persisted(&rig.state).switcher.unwrap().downstream_keyers[0].fill == "gfx2").await;
+}
+
+#[tokio::test]
+async fn defining_the_first_dsk_while_clean_is_routed_is_refused() {
+    let doc = DOC.split("[[switcher.downstream_keyers]]").next().unwrap();
+    let (_dir, path) = temp_boot(doc);
+    let rig = build(&path, doc, true);
+    assert!(!rig.handle.keyer_definitions().unwrap().any());
+    let verb = body("keyer_set", json!({"keyer":"dsk1","fill":"gfx"}));
+    let planned = body_json(plan(&rig, FULL, &verb).await).await;
+    assert_eq!(planned["refusal"]["type"], "clean-unavailable-with-dsk");
+    let (status, kind) = kind_of(command(&rig, FULL, "clean", &verb).await).await;
+    assert_eq!(
+        (status, kind.as_str()),
+        (StatusCode::CONFLICT, "clean-unavailable-with-dsk")
+    );
+    assert!(rig.leases.acquired.lock().unwrap().is_empty());
+    assert!(
+        !rig.handle
+            .dsk_defined_cell()
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the refusal holds no Clean reservation"
+    );
+    // Without a Clean subscriber the first DSK is defined, and the shared
+    // cell refuses Clean from the enqueue on.
+    let (_dir2, path2) = temp_boot(doc);
+    let mut rig = build(&path2, doc, false);
+    let mut outcomes = rig.handle.outcomes();
+    assert_eq!(
+        command(&rig, FULL, "first", &verb).await.status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(rig
+        .handle
+        .dsk_defined_cell()
+        .load(std::sync::atomic::Ordering::Acquire));
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    assert!(rig.handle.keyer_definitions().unwrap().any());
+}
+
+async fn next_keyer(
+    s: &mut SessionStream,
+) -> Option<(Option<String>, multiview_events::SwitcherKeyer)> {
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), s.next_delta()).await {
+            Ok(Ok(Some(frame))) => {
+                if let Event::SwitcherKeyer(e) = frame.envelope.payload {
+                    return Some((frame.envelope.id, e));
+                }
+            }
+            Ok(Ok(None)) => {}
+            _ => return None,
+        }
+    }
+}
+
+/// GET lists only the keyer rows the caller may read, redacts unreadable
+/// sources, drops them from tally; `switcher.keyer` events are scoped and
+/// redacted the same way (parity for a scoped principal).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_and_events_filter_and_redact_alike_for_a_scoped_principal() {
+    let doc = DOC.replace("fill = \"gfx\"", "fill = \"gfx\"\nkey = \"secret\"");
+    let (_dir, path) = temp_boot(&doc);
+    let mut rig = build(&path, &doc, false);
+    let session = |objects: &[&str], program: bool| {
+        SessionStream::new(rig.publisher.subscribe(), "s", None).with_scopes(
+            Some(objects.iter().map(|o| (*o).to_owned()).collect()),
+            Some(if program {
+                vec!["program:main".into()]
+            } else {
+                vec![]
+            }),
+            None,
+        )
+    };
+    let mut full = session(&["me1", "main/dsk1", "a", "b", "gfx", "gfx2"], true);
+    let mut no_keyer = session(&["me1", "a", "b", "gfx", "gfx2"], true);
+    let mut no_program = session(&["me1", "main/dsk1", "a", "b", "gfx"], false);
+    let mut no_fill = session(&["me1", "main/dsk1", "a", "b", "gfx2"], true);
+    let response = command(
+        &rig,
+        ADMIN,
+        "on",
+        &body("keyer_cut", json!({"keyer":"dsk1","on":true})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    // The hook resolves keyers (and so the tally) on a composed frame only;
+    // this rig drains without the hook, so tally is the background roles.
+    tick(&mut rig.driver, 1);
+    let (id, event) = next_keyer(&mut full).await.expect("a readable keyer event");
+    assert_eq!(id.as_deref(), Some("main/dsk1"));
+    assert_eq!(
+        (event.fill.as_str(), event.key.as_deref()),
+        ("gfx", Some("redacted"))
+    );
+    assert!(event.on_air);
+    assert!(
+        next_keyer(&mut no_keyer).await.is_none(),
+        "keyer object scope filters"
+    );
+    assert!(
+        next_keyer(&mut no_program).await.is_none(),
+        "program scope filters"
+    );
+    let (_, redacted) = next_keyer(&mut no_fill).await.unwrap();
+    assert_eq!(redacted.fill, "redacted");
+
+    // GET parity for the same principals (FULL lacks `secret`).
+    let get_for = |token: &'static str| {
+        let router = rig.router.clone();
+        async move { body_json(send(&router, get("/api/v1/switcher/me1", token)).await).await }
+    };
+    let full_get = get_for(FULL).await;
+    let row = &full_get["keyers"][0];
+    assert_eq!(row["id"], "dsk1");
+    assert_eq!(row["family"], "dsk");
+    assert_eq!(
+        (row["fill"].as_str(), row["key"].as_str()),
+        (Some(event.fill.as_str()), event.key.as_deref())
+    );
+    assert_eq!(row["on_air"], event.on_air);
+    assert_eq!(row["type"], "linear");
+    assert!(row["ramp"].is_null());
+    assert_eq!(row["rate"], 15);
+    assert_eq!(row["loss"], "drop_to_off_air");
+    assert_eq!(full_get["keyers"].as_array().unwrap().len(), 1);
+    let no_keyer_get = get_for(NO_KEYER).await;
+    assert_eq!(no_keyer_get["keyers"], json!([]));
+    let no_fill_get = get_for(NO_FILL).await;
+    assert_eq!(no_fill_get["keyers"][0]["fill"], redacted.fill.as_str());
+    // Tally carries only readable ids.
+    let admin = get_for(ADMIN).await;
+    for list in ["program", "preview"] {
+        for id in admin["tally"][list].as_array().unwrap() {
+            assert!(id.is_string());
+        }
+        for id in full_get["tally"][list].as_array().unwrap() {
+            assert_ne!(id, "secret");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn applied_definitions_persist_and_a_restart_comes_up_with_keyers_off() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = rig(&path);
+    let mut outcomes = rig.handle.outcomes();
+    command(
+        &rig,
+        FULL,
+        "on",
+        &body("keyer_cut", json!({"keyer":"dsk1","on":true})),
+    )
+    .await;
+    tick(&mut rig.driver, 1);
+    outcomes.try_recv().unwrap();
+    let set = body(
+        "keyer_set",
+        json!({"keyer":"dsk2","fill":"gfx2","fly":{"x":0,"y":0,"w":16,"h":16},
+               "max_source":{"w":16,"h":16},"type":"luma","clip":0.25,"gain":2.0,
+               "on_at_start":true}),
+    );
+    assert_eq!(
+        command(&rig, FULL, "def2", &set).await.status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(
+        persisted(&rig.state)
+            .switcher
+            .unwrap()
+            .downstream_keyers
+            .len()
+            == 1,
+        "nothing is persisted before the engine applied it"
+    );
+    tick(&mut rig.driver, 2);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    wait_for(|| {
+        persisted(&rig.state)
+            .switcher
+            .unwrap()
+            .downstream_keyers
+            .len()
+            == 2
+    })
+    .await;
+    let config = persisted(&rig.state);
+    config.validate().unwrap();
+    let dsks = &config.switcher.as_ref().unwrap().downstream_keyers;
+    assert_eq!(dsks[1].id, "dsk2");
+    assert_eq!(dsks[1].z, 2);
+    assert!((dsks[1].clip - 0.25).abs() < 1e-6);
+    let text = toml::to_string(&config).unwrap();
+    assert!(!text.contains("on_air"), "on-air state is never persisted");
+    // Restart: the persisted document boots (the preflight accepts it) with
+    // every keyer off except the on_at_start intent.
+    let reloaded = MultiviewConfig::load_from_toml(&text).unwrap();
+    reloaded.validate().unwrap();
+    let (_dir2, path2) = temp_boot(&text);
+    let restarted = build(&path2, &text, false);
+    let snapshot = restarted.handle.snapshot().unwrap();
+    assert!(snapshot.keyers.iter().flatten().all(|k| !k.on_air));
+    let defs = restarted.handle.keyer_definitions().unwrap();
+    assert!(!defs.defs[0].as_ref().unwrap().on_at_start);
+    assert!(defs.defs[1].as_ref().unwrap().on_at_start);
+    assert!(
+        restarted
+            .driver
+            .keyers()
+            .flags(1)
+            .unwrap()
+            .pending
+            .is_some(),
+        "on_at_start comes up as the boot intent"
+    );
+    assert!(restarted
+        .driver
+        .keyers()
+        .flags(0)
+        .unwrap()
+        .pending
+        .is_none());
+}

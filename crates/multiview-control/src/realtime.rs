@@ -1253,6 +1253,19 @@ impl SessionStream {
     /// source (an automation pin's owner), redacted unless that source is in
     /// scope. Live and replayed deltas both pass through here.
     fn redact_embedded_objects(&self, event: &mut Event) {
+        // ADR-0113 §8 (K4): a keyer row the principal may read still names
+        // its fill and key sources; an unreadable one is `"redacted"`, the
+        // same rule `GET /api/v1/switcher/{me}` applies to `keyers[]`.
+        if let Event::SwitcherKeyer(keyer) = event {
+            if !self.id_in_object_scope(&keyer.fill) {
+                crate::routes::switcher_keyers::REDACTED.clone_into(&mut keyer.fill);
+            }
+            if let Some(key) = keyer.key.as_mut() {
+                if !self.id_in_object_scope(key) {
+                    crate::routes::switcher_keyers::REDACTED.clone_into(key);
+                }
+            }
+        }
         if let Event::InputLifecycle(lifecycle) = event {
             for holder in &mut lifecycle.lease_holders {
                 if holder
@@ -1318,6 +1331,7 @@ pub fn event_scope_id(event: &Event) -> Option<String> {
         // A media-player lifecycle event scopes by the player id (ADR-RT008), so
         // the `ids` filter narrows the coarse `switcher` topic to one player.
         Event::SwitcherOperation(e) => Some(e.me.clone()),
+        Event::SwitcherKeyer(e) => Some(e.keyer.clone()),
         Event::RouteOutput(e) => Some(e.output.clone()),
         Event::MediaPlayerState(e) => Some(e.player.clone()),
         Event::GraphicsChannelState(e) => Some(e.channel.clone()),
@@ -1434,6 +1448,7 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // discrete transport-state transition rides the lossless `switcher`
         // topic (scoped finer by the player `id`), NOT the `$control` catch-all.
         Event::SwitcherOperation(_)
+        | Event::SwitcherKeyer(_)
         | Event::MediaPlayerState(_)
         | Event::GraphicsChannelState(_) => Topic::Switcher,
         _ => Topic::Control,
