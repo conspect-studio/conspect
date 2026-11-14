@@ -173,6 +173,7 @@ describe('useSources', () => {
       locator: 'rtsp://h/s',
       // rtsp carries no source-event cue surface (ADR-0183): never observed.
       eventObservation: 'not_supported',
+      hasCaptions: false,
     });
     // NDI binds by source name; file by path — both projected onto `locator`.
     expect(result.current.data?.[1]?.locator).toBe('STUDIO (CAM 1)');
