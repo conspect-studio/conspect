@@ -2130,6 +2130,8 @@ pub struct ProgramMetricsHandles {
     pub phases: Arc<multiview_engine::lateness::TickPhases>,
     /// Cumulative last-good repeats.
     pub frames_repeated: Arc<std::sync::atomic::AtomicU64>,
+    /// Cumulative GPU readback deadline misses repeated as last-good (#395).
+    pub compose_deadline_misses: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Where a run publishes its [`ProgramMetricsHandles`].
@@ -2919,6 +2921,10 @@ impl Pipeline {
     #[allow(clippy::too_many_lines)]
     // reason: see `build`.
     fn build_inner(config: &MultiviewConfig) -> Result<Self, PipelineError> {
+        // The run's explicit `yt-dlp` path, for live-added `YouTube` sources and
+        // their audio rails (issue #420).
+        #[cfg(feature = "youtube")]
+        crate::youtube_status::set_resolver_path(crate::youtube_resolver_path(config));
         // Fail-closed (#103): an AES67 PCM-audio source in a non-`aes67` build is a
         // config this binary cannot honour — reject it clearly up front, never wire
         // it dark (the same contract as a `display` source/output in a non-
@@ -3928,6 +3934,10 @@ impl Pipeline {
         // Filled once this run's Program exists (§7 back-off input).
         let program_lateness: crate::routing_aux::ProgramLateness =
             Arc::new(multiview_framestore::SwapCell::empty());
+        // Routed layouts' overlay layers: the consumer publishes its signals
+        // into this wait-free slot only while the aux thread wants them.
+        #[cfg(feature = "overlay")]
+        let (aux_overlays, aux_signals) = self.aux_overlay_inputs(aux_tx.active_flag());
         let aux = crate::routing_aux::spawn_routing_aux(crate::routing_aux::AuxInputs {
             rx: aux_rx,
             feeds: Arc::clone(&feeds),
@@ -3937,6 +3947,8 @@ impl Pipeline {
             layout_canvas: self.layout_canvas_spec(),
             program_lateness: Some(Arc::clone(&program_lateness)),
             tick_ns: u64::try_from(self.encode_cfg.cadence.period_nanos()).unwrap_or(0),
+            #[cfg(feature = "overlay")]
+            overlays: Some(aux_overlays),
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
@@ -3950,7 +3962,7 @@ impl Pipeline {
         );
         let reformat_open =
             reformat_opener(self.encode_cfg.clone(), self.rendition_configs.clone());
-        let (router, handle) = crate::output_routing::OutputRouter::new_with_openers(
+        let (mut router, handle) = crate::output_routing::OutputRouter::new_with_openers(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -3979,6 +3991,11 @@ impl Pipeline {
             Some(reformat_open),
         )
         .map_err(spawn_err)?;
+        // Atomic sets (#308) pick their adoption tick after the clock's last
+        // composed tick: a wait-free atomic load, never a lock on the clock.
+        if let Some(control) = self.switcher_control.as_ref() {
+            router.set_switcher_clock(control.applied_tick_cell());
+        }
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
         let handle = Arc::new(handle.with_outputs(run_outputs).with_pictures(
             crate::output_routing::PlanPictures {
@@ -4001,7 +4018,53 @@ impl Pipeline {
             preview_selection,
             aux,
             program_lateness,
+            #[cfg(feature = "overlay")]
+            aux_signals,
         })
+    }
+
+    /// The routed-layout overlay inputs for the aux thread and the matching
+    /// consumer-side publisher (cfg `overlay`). Labels: the config display
+    /// names first, then the live catalogue's `display_name` (wait-free
+    /// `SwapCell` load), else `None` (the bake falls back to the id).
+    #[cfg(feature = "overlay")]
+    fn aux_overlay_inputs(
+        &self,
+        active: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        crate::aux_overlays::AuxOverlayInputs,
+        crate::aux_overlays::AuxSignalsPublisher,
+    ) {
+        let signals = crate::aux_overlays::signals_slot();
+        let wanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wanted_sources = crate::aux_overlays::wanted_sources();
+        let config_labels = self.tile_labels.clone();
+        let catalogue = Arc::clone(&self.catalogue);
+        let labels: crate::aux_overlays::LabelLookup = Arc::new(move |id: &str| {
+            config_labels.get(id).cloned().or_else(|| {
+                catalogue
+                    .load()
+                    .get(id)
+                    .and_then(|entry| entry.source().display_name.clone())
+            })
+        });
+        let inputs = crate::aux_overlays::AuxOverlayInputs {
+            signals: Arc::clone(&signals),
+            wanted: Arc::clone(&wanted),
+            wanted_sources: Arc::clone(&wanted_sources),
+            labels,
+            watermark: self.watermark_signal.clone(),
+            wall_clock: crate::wallclock::WallClockSource::system(),
+            canvas_color: self.canvas_color,
+            // The same per-source probe overrides Program's fault detector
+            // resolves, once, shared read-only: an aux-only source honours
+            // its declared black/freeze probe.
+            source_probes: Arc::new(resolve_source_probes(&self.layout, &self.declared_probes)),
+        };
+        (
+            inputs,
+            crate::aux_overlays::AuxSignalsPublisher::new(signals, wanted, wanted_sources, active),
+        )
     }
 
     /// Issue one audio-only take per output whose persisted audio feed is not
@@ -5440,7 +5503,8 @@ impl Pipeline {
         // The consumer owns a Send `BakeContext` and builds its own (non-Send)
         // overlay baker from it, plus the single `ProgramEncoder`; the bake +
         // encode math moved off the hot loop, never onto it.
-        let bake_ctx = self.bake_context();
+        #[cfg_attr(not(feature = "overlay"), allow(unused_mut))]
+        let mut bake_ctx = self.bake_context();
         #[cfg(feature = "overlay")]
         let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
         // Output routing (ADR-0108 slice 1): the clock's aux tick sender (inert
@@ -5454,7 +5518,13 @@ impl Pipeline {
             preview_selection,
             aux: _routing_aux,
             program_lateness,
+            #[cfg(feature = "overlay")]
+            aux_signals,
         } = routing;
+        #[cfg(feature = "overlay")]
+        {
+            bake_ctx.aux_signals = Some(aux_signals);
+        }
         demand.start();
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
@@ -5518,6 +5588,7 @@ impl Pipeline {
                 lateness: program.lateness(),
                 phases: program.phases(),
                 frames_repeated: program.frames_repeated_counter(),
+                compose_deadline_misses: program.compose_deadline_misses_counter(),
             })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
         // the shared slot — a single lock-free store the off-hot-path
@@ -6113,6 +6184,7 @@ impl Pipeline {
                 .demand
                 .as_ref()
                 .map(|manager| (manager.activity_reader(), Arc::clone(&self.catalogue))),
+            aux_signals: None,
         }
     }
 
@@ -6180,6 +6252,11 @@ struct BakeContext {
         multiview_engine::ActivityReader,
         crate::source_rails::Catalogue,
     )>,
+    /// Routed layouts' overlay signals: published at most once per baked
+    /// frame, only while a routed layout wants them (one relaxed load
+    /// otherwise). `None` before routing is wired and in tests.
+    #[cfg(feature = "overlay")]
+    aux_signals: Option<crate::aux_overlays::AuxSignalsPublisher>,
 }
 
 impl BakeContext {
@@ -6262,12 +6339,22 @@ struct StreamBaker {
     tile_snapshot: Arc<Vec<crate::overlays::TileSpec>>,
     /// Last per-input audio peak observed by the consumer's live bus meter.
     live_meter_db: std::collections::HashMap<String, crate::overlays::MeterChannels>,
+    /// When each `live_meter_db` entry was last sampled (elapsed ns), so a
+    /// source that left the bus is forgotten (bounded map, A2).
+    live_meter_seen: std::collections::HashMap<String, i64>,
+    /// Elapsed ns of the last prune pass.
+    live_meter_pruned_ns: i64,
     /// Bounded per-input peak/RMS sampler shared with audio telemetry.
     input_meters: crate::meter_telemetry::InputMeters,
 }
 
 #[cfg(not(feature = "overlay"))]
 struct StreamBaker;
+
+/// A live meter not sampled for this long (its source left the program bus)
+/// is forgotten (~5 s).
+#[cfg(feature = "overlay")]
+const LIVE_METER_FORGET_NS: i64 = 5_000_000_000;
 
 #[cfg(feature = "overlay")]
 impl StreamBaker {
@@ -6298,6 +6385,8 @@ impl StreamBaker {
             baker,
             tile_snapshot,
             live_meter_db: std::collections::HashMap::new(),
+            live_meter_seen: std::collections::HashMap::new(),
+            live_meter_pruned_ns: 0,
             input_meters: crate::meter_telemetry::InputMeters::new(),
             canvas_color: ctx.canvas_color,
             cadence: ctx.cadence,
@@ -6345,9 +6434,24 @@ impl StreamBaker {
                     id.clone(),
                     crate::overlays::MeterChannels::from_db(&sample.peak_db),
                 );
+                self.live_meter_seen.insert(id.clone(), now_ns);
             }
         }
+        self.prune_live_meters(now_ns);
         samples
+    }
+
+    /// Forget the live meter of a source not sampled for
+    /// [`LIVE_METER_FORGET_NS`] (it left the program bus), so source churn
+    /// cannot grow the map without bound. At most once per second.
+    fn prune_live_meters(&mut self, now_ns: i64) {
+        if now_ns.saturating_sub(self.live_meter_pruned_ns) < 1_000_000_000 {
+            return;
+        }
+        self.live_meter_pruned_ns = now_ns;
+        let seen = &mut self.live_meter_seen;
+        seen.retain(|_, last| now_ns.saturating_sub(*last) <= LIVE_METER_FORGET_NS);
+        self.live_meter_db.retain(|id, _| seen.contains_key(id));
     }
 
     /// Bake one streamed tick's overlays into its canvas, returning the overlaid
@@ -6419,6 +6523,7 @@ impl StreamBaker {
                     state,
                     fault,
                     activity,
+                    tally: crate::overlays::TileTally::Off,
                 },
             );
             if !captions.contains_key(&spec.source_id) {
@@ -6439,7 +6544,25 @@ impl StreamBaker {
             .map_err(|e| PipelineError::Engine(format!("overlay draw: {e}")))?;
         let overlaid = apply_overlays_to_nv12(&item.canvas, &list, self.canvas_color)
             .map_err(|e| PipelineError::Engine(format!("overlay blend: {e}")))?;
+        self.publish_aux_signals(item);
         Ok(Arc::new(overlaid))
+    }
+
+    /// Hand routed layouts the per-source signals this frame carries (live
+    /// meters, content faults, the sources on Program) — at most once per
+    /// baked frame, and only while some routed layout bakes overlays: one
+    /// relaxed load otherwise. A wait-free store; the aux thread never waits
+    /// on it and this never waits on the aux thread.
+    fn publish_aux_signals(&self, item: &StreamItem) {
+        let Some(publisher) = self.meter.aux_signals.as_ref() else {
+            return;
+        };
+        if !publisher.wanted() {
+            return;
+        }
+        // Only the sources the baking layouts bind (bounded by layouts ×
+        // cells), never the whole tracked map.
+        publisher.publish_for(&self.live_meter_db, &item.faults, &item.source_states);
     }
 }
 
@@ -7692,6 +7815,9 @@ struct RunRouting {
     aux: crate::routing_aux::RoutingAuxHandle,
     /// Where the run publishes Program's lateness for the aux back-off.
     program_lateness: crate::routing_aux::ProgramLateness,
+    /// The consumer's side of the routed-layout overlay signals.
+    #[cfg(feature = "overlay")]
+    aux_signals: crate::aux_overlays::AuxSignalsPublisher,
 }
 
 /// Output-routing state the bake consumer owns for one run (ADR-0108).
@@ -9571,75 +9697,10 @@ fn sample_caption_bitmaps(
     out
 }
 
-/// An operator-declared probe override for one source, resolved from
-/// `config.probes` (M10): the config [`Probe`](multiview_config::probe::Probe) the
-/// engine builds a config-derived analyser + X.733 lifecycle from, per fault
-/// class. A `None` entry means "no declared probe for this class — use the
-/// hardcoded default".
-///
-/// The first declared probe of each kind for a source wins (duplicate probe ids
-/// are already rejected by config validation; two probes of the same kind on one
-/// source is an unusual config and deterministically resolves to the first).
+/// Per-source declared probe overrides (shared with routed layouts' fault
+/// detection; see [`crate::fault_probes`]).
 #[cfg(feature = "overlay")]
-#[derive(Default, Clone)]
-struct SourceProbeOverride {
-    /// The declared black probe (its `luma_threshold` + `zone` + dwell + severity).
-    black: Option<multiview_config::probe::Probe>,
-    /// The declared freeze probe (its `difference_threshold` + `zone` + dwell + …).
-    freeze: Option<multiview_config::probe::Probe>,
-    /// The declared silence probe (its dwell + severity, and its `level_dbfs`,
-    /// which becomes this source's silence detection floor in place of the shared
-    /// [`SILENCE_FLOOR_DB`]).
-    silence: Option<multiview_config::probe::Probe>,
-}
-
-/// Resolve `config.probes` into per-**source** overrides by mapping each probe's
-/// watched **cell** to its bound source via the solved `layout` (M10).
-///
-/// A probe whose cell is unbound (no `source`) or absent from the layout is
-/// skipped — there is no picture/audio to analyse. Runs once at run start, off the
-/// hot loop.
-#[cfg(feature = "overlay")]
-fn resolve_source_probes(
-    layout: &Layout,
-    probes: &[multiview_config::probe::Probe],
-) -> std::collections::HashMap<String, SourceProbeOverride> {
-    use multiview_config::probe::ProbeKind;
-    let mut out: std::collections::HashMap<String, SourceProbeOverride> =
-        std::collections::HashMap::new();
-    for probe in probes {
-        // The config carries cell ids only on the raw cells, not the solved
-        // `Layout`; the layout cell binds a `source`, and a probe's `cell` field
-        // names a config cell id. The desugared run binds cell id == source id for
-        // the common single-source-per-cell case, so resolve by matching the
-        // probe's cell against a layout cell whose bound source equals it, falling
-        // back to treating the probe's `cell` as the source id directly when no
-        // distinct cell id is carried. Either way an unbound name is skipped.
-        let source = layout
-            .cells
-            .iter()
-            .filter_map(|c| c.source.clone())
-            .find(|s| s == &probe.cell)
-            .unwrap_or_else(|| probe.cell.clone());
-        let entry = out.entry(source).or_default();
-        match probe.kind {
-            ProbeKind::Black { .. } if entry.black.is_none() => {
-                entry.black = Some(probe.clone());
-            }
-            ProbeKind::Freeze { .. } if entry.freeze.is_none() => {
-                entry.freeze = Some(probe.clone());
-            }
-            ProbeKind::Silence { .. } if entry.silence.is_none() => {
-                entry.silence = Some(probe.clone());
-            }
-            // A loudness probe (or a duplicate of an already-captured kind, or a
-            // future kind) does not override one of the three content-fault badge
-            // classes; the loudness alarm rides the meter path elsewhere.
-            _ => {}
-        }
-    }
-    out
-}
+use crate::fault_probes::{resolve_source_probes, SourceProbeOverride};
 
 /// The dBFS floor at/below which the per-input meter is treated as **silent**
 /// for the audio-loss fault. Just above the meter's true floor so a genuinely
@@ -9839,67 +9900,43 @@ impl FaultDetector {
         audio_free_sources: AudioFreeSources,
         source_probes: std::collections::HashMap<String, SourceProbeOverride>,
     ) -> Self {
-        use multiview_engine::{
-            black_config_from_kind, freeze_config_from_kind, AlarmHysteresis, BlackConfig,
-            BlackProbe, FreezeConfig, FreezeProbe,
-        };
-        // Dwell windows on the media timeline. Black/silence raise after ~0.5 s of
-        // the condition and clear after ~0.3 s of its absence; freeze needs a
-        // longer ~2 s of identical frames so a brief genuine still does not trip
-        // it. These give the anti-flap hysteresis without coupling to wall-clock.
-        let dwell = |secs_num: i64, secs_den: i64| -> MediaTime {
-            MediaTime::from_nanos(secs_num.saturating_mul(1_000_000_000) / secs_den.max(1))
-        };
-        let down = dwell(3, 10); // 0.3 s
-                                 // The CLI freeze probe widens only the PER-SAMPLE tolerance vs the engine
-                                 // default — the root cause of the missed badge was tolerance, not the
-                                 // change threshold. Instrumented across the three real demo sources scaled
-                                 // to a 636x356 tile, the changed-fraction with diff_tolerance=6 was:
-                                 //   frozen:  median 0.000%, max 1.27%, 148/150 frames <= 0.1%
-                                 //   silent:  median 0.229%, max 1.91%,   4/150 frames <= 0.1%  (moving)
-                                 //   healthy: median 3.13%,  max 71%,      5/150 frames <= 0.1%
-                                 // diff_tolerance=6 collapses GOP re-quantization noise (the frozen source's
-                                 // per-GOP spike drops from 1.2-4.6% at the default tolerance 2 to <= 1.27%,
-                                 // its steady frames to 0.000%); the engine-default change_threshold (0.1%)
-                                 // is KEPT because at tolerance 6 it already separates a frozen feed (148/150
-                                 // below) from a moving-but-silent feed (only 4/150 below). An earlier 0.5%
-                                 // threshold over-loosened this and wrongly flagged the moving silent tile.
-                                 // The two residual per-GOP spikes the frozen source still shows are absorbed
-                                 // by the debounce window below, not by a looser threshold.
-        let freeze_cfg = FreezeConfig::default().with_tolerance(6);
+        // The default analysers + dwell windows (black/silence raise after
+        // ~0.5 s, freeze after ~2 s, all clear after ~0.3 s — media timeline,
+        // never wall-clock) and the CLI freeze tolerance, shared with routed
+        // layouts' fault detection.
+        //
+        // The CLI freeze probe widens only the PER-SAMPLE tolerance vs the
+        // engine default — the root cause of the missed badge was tolerance,
+        // not the change threshold. Instrumented across the three real demo
+        // sources scaled to a 636x356 tile, the changed-fraction with
+        // diff_tolerance=6 was:
+        //   frozen:  median 0.000%, max 1.27%, 148/150 frames <= 0.1%
+        //   silent:  median 0.229%, max 1.91%,   4/150 frames <= 0.1%  (moving)
+        //   healthy: median 3.13%,  max 71%,      5/150 frames <= 0.1%
+        // diff_tolerance=6 collapses GOP re-quantization noise; the
+        // engine-default change_threshold (0.1%) is KEPT because at tolerance 6
+        // it already separates a frozen feed from a moving-but-silent feed. The
+        // two residual per-GOP spikes the frozen source still shows are absorbed
+        // by the debounce window, not by a looser threshold.
+        let defaults = crate::fault_probes::DefaultProbes::default();
         // Build the per-source config-derived analysers ONCE from any declared
-        // black/freeze probe (its operator-authored threshold + zone). A declared
-        // freeze probe is honoured verbatim — the CLI's codec-noise tolerance/
-        // debounce defaults still apply to it via the shared sample path, but its
-        // change threshold + zone are the operator's. Sources without a declared
-        // probe never appear here and fall back to the shared defaults.
+        // black/freeze probe (its operator-authored threshold + zone). A
+        // declared freeze probe keeps the CLI's codec-noise tolerance; its
+        // change threshold + zone are the operator's. Sources without a
+        // declared probe fall back to the shared defaults.
         let mut declared_black = std::collections::HashMap::new();
         let mut declared_freeze = std::collections::HashMap::new();
         let mut declared_silence_floor = std::collections::HashMap::new();
         for (source, ov) in &source_probes {
-            if let Some(cfg) = ov
-                .black
-                .as_ref()
-                .and_then(|p| black_config_from_kind(&p.kind))
-            {
-                declared_black.insert(source.clone(), BlackProbe::new(cfg));
+            if let Some(probe) = crate::fault_probes::declared_black(ov) {
+                declared_black.insert(source.clone(), probe);
             }
-            if let Some(cfg) = ov
-                .freeze
-                .as_ref()
-                .and_then(|p| freeze_config_from_kind(&p.kind))
-            {
-                // Preserve the CLI's wider per-sample tolerance for real encoded
-                // sources; only the operator-authored change threshold + zone come
-                // from config (the engine `from_kind` keeps the default tolerance,
-                // which we override to the CLI's 6 to match the default path).
-                declared_freeze.insert(source.clone(), FreezeProbe::new(cfg.with_tolerance(6)));
+            if let Some(probe) = crate::fault_probes::declared_freeze(ov) {
+                declared_freeze.insert(source.clone(), probe);
             }
             // A declared silence probe carries the operator-authored level ceiling
-            // (`level_dbfs`); thread it into this source's detection floor so the
-            // instantaneous silence condition uses the operator's threshold rather
-            // than the shared default. Widen `f32 -> f64` exactly (`f64::from`, no
-            // `as` cast) to match the meter timeline scale.
+            // (`level_dbfs`); thread it into this source's detection floor. Widen
+            // `f32 -> f64` exactly (`f64::from`, no `as` cast).
             if let Some(multiview_config::probe::ProbeKind::Silence { level_dbfs }) =
                 ov.silence.as_ref().map(|p| p.kind)
             {
@@ -9913,13 +9950,13 @@ impl FaultDetector {
             cadence,
             audio_free_sources,
             machines: std::collections::HashMap::new(),
-            black: BlackProbe::new(BlackConfig::default()),
-            freeze: FreezeProbe::new(freeze_cfg),
+            black: defaults.black,
+            freeze: defaults.freeze,
             previous: std::collections::HashMap::new(),
             freeze_window: std::collections::HashMap::new(),
-            hysteresis_black: AlarmHysteresis::new(dwell(1, 2), down), // 0.5 s up
-            hysteresis_freeze: AlarmHysteresis::new(dwell(2, 1), down), // 2 s up
-            hysteresis_silence: AlarmHysteresis::new(dwell(1, 2), down), // 0.5 s up
+            hysteresis_black: defaults.black_dwell,
+            hysteresis_freeze: defaults.freeze_dwell,
+            hysteresis_silence: defaults.silence_dwell,
             source_probes,
             declared_black,
             declared_freeze,
@@ -9936,43 +9973,33 @@ impl FaultDetector {
     /// declared probe use the hardcoded default machine, so an undeclared source is
     /// byte-for-byte the prior behaviour.
     fn machines_for(&mut self, id: &str) -> &mut SourceFaultMachines {
-        use multiview_core::alarm::{AlarmId, AlarmKind, AlarmScope, PerceivedSeverity};
-        use multiview_engine::{AlarmHysteresis, AlarmStateMachine};
+        use crate::fault_probes::fault_machine;
+        use multiview_core::alarm::{AlarmKind, PerceivedSeverity};
         let hb = self.hysteresis_black;
         let hf = self.hysteresis_freeze;
         let hs = self.hysteresis_silence;
         let ov = self.source_probes.get(id).cloned().unwrap_or_default();
         self.machines.entry(id.to_owned()).or_insert_with(|| {
-            let mk = |kind: AlarmKind, sev: PerceivedSeverity, hyst: AlarmHysteresis| {
-                AlarmStateMachine::new(
-                    AlarmId::new(format!("{id}:{kind:?}")),
-                    kind,
-                    AlarmScope::Probe { id: id.to_owned() },
-                    sev,
-                    hyst,
-                )
-            };
             // A declared probe's full X.733 lifecycle (id/scope/severity/dwell/
             // latch) via `from_probe`; otherwise the hardcoded default machine.
-            let from_or_default = |probe: &Option<multiview_config::probe::Probe>,
-                                   kind: AlarmKind,
-                                   sev: PerceivedSeverity,
-                                   hyst: AlarmHysteresis| {
-                match probe {
-                    Some(p) => AlarmStateMachine::from_probe(p),
-                    None => mk(kind, sev, hyst),
-                }
-            };
             SourceFaultMachines {
-                black: from_or_default(&ov.black, AlarmKind::Black, PerceivedSeverity::Major, hb),
-                freeze: from_or_default(
-                    &ov.freeze,
+                black: fault_machine(
+                    id,
+                    ov.black.as_ref(),
+                    AlarmKind::Black,
+                    PerceivedSeverity::Major,
+                    hb,
+                ),
+                freeze: fault_machine(
+                    id,
+                    ov.freeze.as_ref(),
                     AlarmKind::Freeze,
                     PerceivedSeverity::Major,
                     hf,
                 ),
-                silence: from_or_default(
-                    &ov.silence,
+                silence: fault_machine(
+                    id,
+                    ov.silence.as_ref(),
                     AlarmKind::Silence,
                     PerceivedSeverity::Minor,
                     hs,
@@ -10744,6 +10771,8 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn source_removed(&self, id: &str) {
+        #[cfg(feature = "youtube")]
+        crate::youtube_status::forget(id);
         let retired_store = self.demand.as_ref().and_then(|(catalogue, manager)| {
             let store = catalogue
                 .load()
@@ -10963,8 +10992,58 @@ impl LiveIngestSpawner {
         {
             plan.decode_placement = self.decode_placement_for(&plan.id);
         }
-        spawn_ingest_producer(plan, registry)
-            .map(|(stop, handle)| crate::live_sources::SpawnedProducer { stop, handle })
+        // A live-added `YouTube` source resolves with the run's `yt-dlp` and
+        // keeps its master fresh exactly like a startup one (issue #420).
+        #[cfg(feature = "youtube")]
+        let youtube = match &plan.location {
+            SourceLocation::Youtube { watch_url } => {
+                plan.youtube_yt_dlp_path = crate::youtube_status::resolver_path();
+                plan.youtube_url_slot
+                    .clone()
+                    .map(|slot| (watch_url.clone(), slot, plan.youtube_yt_dlp_path.clone()))
+            }
+            _ => None,
+        };
+        let id = plan.id.clone();
+        let produced = spawn_ingest_producer(plan, registry)
+            .map(|(stop, handle)| crate::live_sources::SpawnedProducer { stop, handle });
+        #[cfg(feature = "youtube")]
+        if let (Some((watch_url, slot, path)), Some(producer)) = (youtube, produced.as_ref()) {
+            spawn_live_youtube_reresolve(&id, watch_url, slot, path, &producer.stop, registry);
+        }
+        #[cfg(not(feature = "youtube"))]
+        let _ = id;
+        produced
+    }
+}
+
+/// Spawn the proactive re-resolution loop of a live-added `YouTube` source
+/// (issue #420). It SHARES the video producer's stop flag and registers it
+/// under `{id}/youtube-reresolve`, so the hub's teardown of the source (which
+/// raises `{id}` and every `{id}/` companion, then waits for their exit) stops
+/// it with the producer. A failed spawn only loses the proactive refresh: the
+/// decode thread still resolves on every reconnect.
+#[cfg(feature = "youtube")]
+fn spawn_live_youtube_reresolve(
+    id: &str,
+    watch_url: String,
+    slot: Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>,
+    yt_dlp_path: Option<String>,
+    stop: &Arc<AtomicBool>,
+    registry: &crate::live_sources::StopRegistry,
+) {
+    let exited =
+        crate::live_sources::register_stop(registry, &format!("{id}/youtube-reresolve"), stop);
+    let exit_guard = crate::live_sources::ExitGuard::new(&exited);
+    let thread_stop = Arc::clone(stop);
+    if let Err(e) = std::thread::Builder::new()
+        .name(format!("multiview-yt-reresolve-{id}"))
+        .spawn(move || {
+            let _exit = exit_guard;
+            youtube_reresolve_thread(&watch_url, yt_dlp_path.as_deref(), &slot, &thread_stop);
+        })
+    {
+        tracing::error!(error = %e, source = %id, "could not spawn youtube re-resolution thread; falling back to resolve-on-reconnect");
     }
 }
 
@@ -12169,51 +12248,10 @@ fn duration_from_nanos(nanos: i64) -> Duration {
     Duration::from_nanos(u64::try_from(nanos.max(0)).unwrap_or(u64::MAX))
 }
 
-/// Resolve source-bound cells into canvas-space tile chrome, in cell order.
+/// Resolve source-bound cells into canvas-space tile chrome, in cell order
+/// (moved to [`crate::overlays`] so a routed layout's aux bake shares it).
 #[cfg(feature = "overlay")]
-pub(crate) fn tile_specs_for_layout(
-    layout: &Layout,
-    labels: &std::collections::HashMap<String, String>,
-) -> Vec<crate::overlays::TileSpec> {
-    use multiview_overlay::geometry::PixelRect;
-    let (cw, ch) = (layout.canvas.width, layout.canvas.height);
-    layout
-        .cells
-        .iter()
-        .filter_map(|cell| {
-            let id = cell.source.as_deref()?;
-            let label = labels.get(id).cloned().unwrap_or_else(|| id.to_owned());
-            // Match the compositor's normalized endpoint quantization, not an
-            // independent truncation of width/height that can spill a pixel.
-            let x = norm_to_px_f32(cell.x, cw);
-            let y = norm_to_px_f32(cell.y, ch);
-            let right = norm_to_px_f32(cell.x + cell.w, cw);
-            let bottom = norm_to_px_f32(cell.y + cell.h, ch);
-            Some(crate::overlays::TileSpec::new(
-                id,
-                label,
-                PixelRect {
-                    x,
-                    y,
-                    width: right - x,
-                    height: bottom - y,
-                },
-            ))
-        })
-        .collect()
-}
-
-/// Convert a normalized fraction in `[0,1]` to a pixel coordinate `f32` against
-/// `extent`, `as`-cast-free, for placing the per-tile overlay surface. Reuses the
-/// exact integer [`crate::display_size::frac_to_px`] then widens losslessly (overlay sizes are well
-/// under 2^24).
-#[cfg(feature = "overlay")]
-fn norm_to_px_f32(frac: f32, extent: u32) -> f32 {
-    let px = crate::display_size::frac_to_px(frac, extent);
-    let high = u16::try_from(px >> 16).unwrap_or(u16::MAX);
-    let low = u16::try_from(px & 0xFFFF).unwrap_or(u16::MAX);
-    f32::from(high) * 65_536.0 + f32::from(low)
-}
+pub(crate) use crate::overlays::tile_specs_for_layout;
 
 /// Whole ticks in one second at `cadence` (`num/den`), rounded to nearest, used
 /// as the GOP / segment length. Exact integer arithmetic (never float fps).
@@ -12419,7 +12457,7 @@ pub fn analog_clocks_from_config(
 }
 
 /// Exact small-`u32` → `f32` widening (canvas sizes are well under `2^24`), no
-/// `as` cast — mirrors [`norm_to_px_f32`]'s widener.
+/// `as` cast — mirrors the overlay tile resolver's widener.
 #[cfg(feature = "overlay")]
 fn u32_to_f32(value: u32) -> f32 {
     let high = u16::try_from(value >> 16).unwrap_or(u16::MAX);
@@ -14771,6 +14809,19 @@ fn build_media_player_boot(
 /// The location mirrors the video [`ingest_plan_for`] mapping so a source's audio
 /// is decoded from the SAME media as its video (the audio peer opens its own
 /// libav context — the contexts are `!Send` and must not be shared).
+/// Whether `kind` is a `YouTube` source (always `false` without the feature).
+const fn is_youtube_kind(kind: &SourceKind) -> bool {
+    #[cfg(feature = "youtube")]
+    {
+        matches!(kind, SourceKind::Youtube { .. })
+    }
+    #[cfg(not(feature = "youtube"))]
+    {
+        let _ = kind;
+        false
+    }
+}
+
 fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPlan> {
     let (location, live) = match &source.kind {
         // Synthetic sources render video in-process and carry no audio.
@@ -14799,11 +14850,13 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
             Ok(lowered) => (lowered, true),
             Err(_) => return None,
         },
-        // YouTube/NDI audio is not wired through the libav file decoder here:
-        // YouTube needs the watch-URL resolve step (deferred to its own slice) and
-        // NDI audio is a host-memory receive. Both ride silence on the bus for now.
+        // `YouTube` (issue #420): the location is the WATCH url; the audio rail
+        // never opens it. It reads the video rail's fetched copy of the
+        // resolved master, else the master the video rail resolved, else
+        // resolves once itself (see `audio_ingest_loop`). NDI audio is a
+        // host-memory receive and rides silence on the bus for now.
         #[cfg(feature = "youtube")]
-        SourceKind::Youtube { .. } => return None,
+        SourceKind::Youtube { url } => (url.clone(), true),
         #[cfg(feature = "ndi")]
         SourceKind::Ndi { .. } => return None,
         // Any other (incl. NDI without the feature, future kinds): no audio path.
@@ -14817,6 +14870,7 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         anchor_floor: 0,
         audio_only: false,
         http_headers: http_headers_for(&source.kind).to_ffmpeg(),
+        youtube: is_youtube_kind(&source.kind),
     })
 }
 
@@ -15571,14 +15625,14 @@ fn resolve_hls_audio_url_with(
     let playlist = match fetcher.fetch(master_url) {
         Ok(playlist) => playlist,
         Err(reason) => {
-            tracing::warn!(%master_url, %reason, "could not fetch HLS master for audio pin; opening URL as-is");
+            tracing::warn!(master_url = %media_url_for_log(master_url), reason = %multiview_ffmpeg::sanitize_line(&reason), "could not fetch HLS master for audio pin; opening URL as-is");
             return None;
         }
     };
     let master = multiview_input::hls::MasterPlaylist::parse(&playlist.body).ok()?;
     let uri = master.pick_audio_uri()?;
     let audio_url = crate::captions::resolve_rendition_uri(&playlist.url, uri);
-    tracing::info!(%master_url, %audio_url, "pinned HLS audio decode to one media playlist");
+    tracing::info!(master_url = %media_url_for_log(master_url), audio_url = %media_url_for_log(&audio_url), "pinned HLS audio decode to one media playlist");
     Some(audio_url)
 }
 
@@ -15593,14 +15647,14 @@ fn resolve_hls_variant_url_with(
     let playlist = match fetcher.fetch(master_url) {
         Ok(playlist) => playlist,
         Err(reason) => {
-            tracing::warn!(%master_url, %reason, "could not fetch HLS master for variant pin; opening URL as-is");
+            tracing::warn!(master_url = %media_url_for_log(master_url), reason = %multiview_ffmpeg::sanitize_line(&reason), "could not fetch HLS master for variant pin; opening URL as-is");
             return None;
         }
     };
     let master = match multiview_input::hls::MasterPlaylist::parse(&playlist.body) {
         Ok(master) => master,
         Err(err) => {
-            tracing::warn!(%master_url, error = %err, "HLS master parse failed for variant pin; opening URL as-is");
+            tracing::warn!(master_url = %media_url_for_log(master_url), error = %err, "HLS master parse failed for variant pin; opening URL as-is");
             return None;
         }
     };
@@ -15613,10 +15667,12 @@ fn resolve_hls_variant_url_with(
     // Resolving against the requested origin yields a 404 that aborts the ingest.
     // For a non-redirecting fetch the effective URL equals the requested URL.
     let variant_url = crate::captions::resolve_rendition_uri(&playlist.url, &variant.uri);
+    // Only scheme and host are logged: a signed CDN master (a `YouTube`
+    // googlevideo URL) carries its signature in the path AND the query.
     tracing::info!(
-        %master_url,
-        effective_url = %playlist.url,
-        %variant_url,
+        master_url = %media_url_for_log(master_url),
+        effective_url = %media_url_for_log(&playlist.url),
+        variant_url = %media_url_for_log(&variant_url),
         target_height = ?target_height,
         variant_height = ?variant.resolution_height,
         "pinned HLS main demuxer to a video variant (WebVTT rendition isolation)"
@@ -15654,6 +15710,22 @@ fn main_demuxer_open_url(
         )
     };
     resolved.unwrap_or_else(|| url.to_owned())
+}
+
+/// A media URL as it may be logged: `scheme://host/…` only. A resolved
+/// `YouTube` googlevideo master carries its signature both in path segments
+/// (`/signature/<sig>/`) and in the query, and tokenised HLS CDNs do the same,
+/// so neither the path nor the query is logged. Userinfo is dropped. A string
+/// that is not a URL (a file path) is returned unchanged.
+pub(crate) fn media_url_for_log(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}/…")
 }
 
 /// Master-playlist fetcher for the variant pin that carries the source's
@@ -15772,7 +15844,7 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
         match open_and_stream(plan, tag, stop) {
             Ok(()) => {}
             Err(reason) => {
-                tracing::warn!(source = %plan.id, %reason, "ingest stream ended/errored");
+                tracing::warn!(source = %plan.id, reason = %multiview_ffmpeg::sanitize_line(&reason), "ingest stream ended/errored");
             }
         }
         // How long THIS connection streamed (before any backoff) — feeds the
@@ -16671,7 +16743,11 @@ fn youtube_resolver_config(yt_dlp_path: Option<&str>) -> multiview_input::youtub
 /// live) is returned as a `String` error — the caller's reconnect bracket backs
 /// off and retries while the tile degrades; it is never a panic.
 #[cfg(feature = "youtube")]
-fn resolve_youtube_master(watch_url: &str, yt_dlp_path: Option<&str>) -> Result<String, String> {
+pub(crate) fn resolve_youtube_master(
+    watch_url: &str,
+    yt_dlp_path: Option<&str>,
+    stop: Option<&AtomicBool>,
+) -> Result<String, String> {
     use multiview_input::youtube::reresolve::{ingest_url, ProcessResolver, Resolver};
 
     // A dedicated current-thread runtime for this one resolve. `yt-dlp`'s own hard
@@ -16684,9 +16760,29 @@ fn resolve_youtube_master(watch_url: &str, yt_dlp_path: Option<&str>) -> Result<
         .map_err(|e| format!("youtube resolver runtime: {e}"))?;
     let process = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
     let master = runtime
-        .block_on(process.resolve(watch_url))
+        .block_on(async {
+            // A stop abandons the resolve: dropping its future kills the
+            // `yt-dlp` child (`kill_on_drop`), so a removed source's thread
+            // leaves promptly instead of finishing up to three bounded runs.
+            tokio::select! {
+                resolved = process.resolve(watch_url) => Some(resolved),
+                () = wait_for_stop(stop) => None,
+            }
+        })
+        .ok_or_else(|| "stopped".to_owned())?
         .map_err(|e| e.operator_message())?;
     Ok(ingest_url(&master).to_owned())
+}
+
+/// Resolves once `stop` is raised (polled every 100 ms); never when `None`.
+#[cfg(feature = "youtube")]
+async fn wait_for_stop(stop: Option<&AtomicBool>) {
+    let Some(stop) = stop else {
+        return std::future::pending().await;
+    };
+    while !stop.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Pick the `*.googlevideo.com` HLS master URL to open for a `YouTube` source on a
@@ -16791,7 +16887,7 @@ fn youtube_reresolve_thread(
         // The loop never returns `Err` for an extraction failure (those degrade the
         // tile + back off inside it); a returned error is a fatal-config fault.
         // Log it — the tile rides the decode thread's inline resolve fallback.
-        tracing::warn!(%watch_url, error = %e, "youtube re-resolution loop ended with error");
+        tracing::warn!(%watch_url, error = %e.operator_message(), "youtube re-resolution loop ended with error");
     }
 }
 
@@ -16833,13 +16929,27 @@ fn open_and_stream(
     let resolved_youtube_url = match &plan.location {
         SourceLocation::Youtube { watch_url } => {
             let resolved = youtube_open_url(plan.youtube_url_slot.as_deref(), || {
-                resolve_youtube_master(watch_url, plan.youtube_yt_dlp_path.as_deref())
+                resolve_youtube_master(watch_url, plan.youtube_yt_dlp_path.as_deref(), Some(stop))
             });
             crate::youtube_status::record(&plan.id, resolved.as_ref().err().map(String::as_str));
-            Some(resolved?)
+            let resolved = resolved?;
+            // Publish the master this connection opens so the audio rail opens
+            // the SAME stream (issue #420), never a second `yt-dlp` run.
+            crate::youtube_status::record_master(&plan.id, watch_url, &resolved);
+            Some(resolved)
         }
         _ => None,
     };
+    // A resolved `YouTube` master opens through the SAME network-URL path as an
+    // `hls` source (variant pin, loopback segment fetcher shared with the audio
+    // rail, source-event bridge); `plan.location` stays the `YouTube` location so
+    // the HLS checks below treat it as HLS.
+    #[cfg(feature = "youtube")]
+    let youtube_open = resolved_youtube_url.map(SourceLocation::Url);
+    #[cfg(feature = "youtube")]
+    let open_location = youtube_open.as_ref().unwrap_or(&plan.location);
+    #[cfg(not(feature = "youtube"))]
+    let open_location = &plan.location;
 
     // Network sources open with an `rw_timeout` so a dead live source fails fast
     // instead of hanging this decode thread on open or a blocking read (#45).
@@ -16852,7 +16962,7 @@ fn open_and_stream(
     // before `input` so libav closes its duplicate first.
     #[cfg(feature = "srt-libsrt")]
     let mut _srt_reader: Option<crate::srt_ingest::SrtReader> = None;
-    let mut input = match &plan.location {
+    let mut input = match open_location {
         SourceLocation::Path(p) => {
             ffmpeg::format::input_with_dictionary(p, opts).map_err(|e| e.to_string())?
         }
@@ -16952,24 +17062,12 @@ fn open_and_stream(
             ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
                 .map_err(|e| e.to_string())?
         }
-        // A YouTube source opens the manifest URL resolved above (a network HLS
-        // master) exactly like any other URL — variant-pinned the same way so its
-        // master's WebVTT rendition (if any) is never folded into the main context.
+        // Unreachable: a `YouTube` source opens through the `Url` arm above with
+        // the master resolved before this match. Guarded so the match stays
+        // exhaustive.
         #[cfg(feature = "youtube")]
         SourceLocation::Youtube { .. } => {
-            // `resolved_youtube_url` is `Some` for this arm (set just above for the
-            // same `Youtube` location); a `let-else` keeps it panic-free.
-            let Some(url) = resolved_youtube_url.as_deref() else {
-                return Err("youtube source did not resolve a manifest url".to_owned());
-            };
-            let open_url = main_demuxer_open_url(
-                url,
-                &plan.location,
-                variant_height(plan),
-                &plan.http_headers,
-            );
-            ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
-                .map_err(|e| e.to_string())?
+            return Err("youtube source did not resolve a manifest url".to_owned());
         }
         // Unreachable: `ingest_loop` routes synthetic sources to the generator
         // before opening any media. Guarded so the match stays exhaustive.
@@ -22334,6 +22432,7 @@ mod live_overlay_bake_tests {
             canvas_height: 180,
             overlay_apply: Some(Arc::clone(slot)),
             activity: None,
+            aux_signals: None,
         }
     }
 
@@ -22436,6 +22535,47 @@ mod live_overlay_bake_tests {
         assert!(frame.events.is_empty());
         let cleared = baker.bake(&frame).expect("cleared");
         assert_eq!(region_diff(&plain, &cleared, (0, 30, 320, 120)), 0);
+    }
+
+    /// A2: source churn (1000 distinct sources joining and leaving the
+    /// program bus) never grows the live meter map past the sources sampled
+    /// within the forget window.
+    #[test]
+    fn live_meters_of_sources_that_left_the_bus_are_forgotten() {
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+        let mut max_len = 0;
+        // 1000 sources, one live at a time, each for one 40 ms tick.
+        for i in 0..1000u64 {
+            let mut bus = multiview_audio::ProgramBus::new(
+                crate::audio::canonical_format(),
+                Rational::new(25, 1),
+            );
+            let store = crate::audio::new_store();
+            store
+                .publish_samples(&vec![0.25; 1_920 * 2])
+                .expect("samples");
+            bus.add_source(format!("churn-{i}"), store, 0.0);
+            let _ = super::drive_audio_for_item(&mut bus, 0);
+            let elapsed = std::time::Duration::from_millis(40 * i);
+            let _ = baker.sample_input_meters(&bus, elapsed);
+            max_len = max_len.max(baker.live_meter_db.len());
+        }
+        // Bounded: never more than the sources sampled within the forget
+        // window (5 s + the 1 s prune period at 25 ticks/s = 150 ids), and
+        // never more than the sampler tracks.
+        assert!(max_len <= 150, "live meter map bounded: {max_len}");
+        assert!(
+            max_len <= crate::meter_telemetry::MAX_INPUT_TRACKS,
+            "live meter map within the sampler's bound: {max_len}"
+        );
+        assert_eq!(baker.live_meter_db.len(), baker.live_meter_seen.len());
+        // 40 s on, every churned source has been gone > 5 s: forgotten.
+        assert!(
+            baker.live_meter_db.is_empty(),
+            "departed sources are forgotten: {:?}",
+            baker.live_meter_db.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -26633,5 +26773,89 @@ mod chaos {
                 }
             }
         }
+    }
+}
+
+/// Issue #420: a `YouTube` source carries an audio plan bound to its WATCH url,
+/// flagged so the audio rail never hands that url to libav.
+#[cfg(all(test, feature = "youtube"))]
+mod youtube_audio_plan_tests {
+    use super::audio_ingest_plan_for;
+    use multiview_config::Source;
+
+    #[test]
+    fn youtube_sources_get_a_live_audio_plan_on_the_watch_url() {
+        let yt: Source = serde_json::from_value(serde_json::json!({
+            "id": "yt", "kind": "youtube", "url": "https://www.youtube.com/watch?v=KHy_n-EMWY8",
+        }))
+        .expect("youtube");
+        let plan = audio_ingest_plan_for(&yt).expect("youtube audio plan");
+        assert!(plan.youtube);
+        assert!(plan.live);
+        assert_eq!(plan.location, "https://www.youtube.com/watch?v=KHy_n-EMWY8");
+        let hls: Source = serde_json::from_value(serde_json::json!({
+            "id": "h", "kind": "hls", "url": "https://o.test/m.m3u8",
+        }))
+        .expect("hls");
+        assert!(!audio_ingest_plan_for(&hls).expect("hls plan").youtube);
+    }
+}
+
+/// Issue #420: a live-added `YouTube` source's re-resolution loop shares the
+/// video producer's stop flag and is registered as an `{id}/` companion, so
+/// the hub's stop of the source ends it within the teardown grace.
+#[cfg(all(test, feature = "youtube"))]
+mod youtube_live_reresolve_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_live_reresolve_loop_is_an_id_companion_and_stops_with_the_producer() {
+        let registry = crate::live_sources::stop_registry();
+        let stop = Arc::new(AtomicBool::new(false));
+        let slot = Arc::new(multiview_framestore::SwapCell::empty());
+        super::spawn_live_youtube_reresolve(
+            "ytlive",
+            "https://youtu.be/x".to_owned(),
+            slot,
+            // A missing binary: every resolve fails fast and the loop backs off.
+            Some("/nonexistent/multiview-test-yt-dlp".to_owned()),
+            &stop,
+            &registry,
+        );
+        assert!(registry
+            .lock()
+            .expect("registry")
+            .contains_key("ytlive/youtube-reresolve"));
+        let started = Instant::now();
+        crate::live_sources::stop_rail(&registry, "ytlive", true, false, Vec::new());
+        assert!(
+            stop.load(Ordering::Acquire),
+            "the shared producer flag is raised"
+        );
+        assert!(registry.lock().expect("registry").is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the loop left within the teardown grace: {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod media_url_for_log_tests {
+    use super::media_url_for_log;
+
+    #[test]
+    fn path_query_fragment_and_userinfo_never_reach_the_log() {
+        let logged = media_url_for_log(
+            "https://user:pw@manifest.googlevideo.com/api/manifest/hls_variant/expire/1893456000/signature/PATHSIG/lsig/LSIG/index.m3u8?sig=QSIG#FRAG",
+        );
+        assert_eq!(logged, "https://manifest.googlevideo.com/…");
+        for secret in ["PATHSIG", "LSIG", "QSIG", "FRAG", "pw"] {
+            assert!(!logged.contains(secret), "{secret} leaked: {logged}");
+        }
+        assert_eq!(media_url_for_log("/media/clip.mp4"), "/media/clip.mp4");
     }
 }

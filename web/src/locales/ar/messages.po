@@ -13,7 +13,7 @@ msgstr ""
 "Language-Team: \n"
 "Plural-Forms: \n"
 
-#: src/pages/approved/SourcesSurface.tsx:219
+#: src/pages/approved/SourcesSurface.tsx:247
 msgid "— dark"
 msgstr ""
 
@@ -151,6 +151,12 @@ msgstr ""
 #. placeholder {0}: stats.dropped
 #: src/events/JournalPanel.tsx:111
 msgid "{0} observations were dropped since this server started, so this history has gaps."
+msgstr ""
+
+#. placeholder {0}: summary.on
+#. placeholder {1}: summary.total
+#: src/pages/LayoutsPage.tsx:122
+msgid "{0} of {1}"
 msgstr ""
 
 #. placeholder {0}: link.dropped
@@ -407,7 +413,7 @@ msgstr ""
 msgid "<0>Output clock</0> — decides <1>when</1> each frame is emitted (monotonic, fixed cadence)."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1120
+#: src/pages/SourcesPage.tsx:1253
 msgid "<0>Read the row:</0> Signal (frames arriving), Lifecycle (idle → starting → ready → failed), Activation (always-on / on-demand) and Tally (red = on programme) are separate facts. Anything this page cannot confirm reads Unknown."
 msgstr ""
 
@@ -451,7 +457,7 @@ msgstr ""
 msgid "<0>Wikidata</0> city coordinates — CC0."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1127
+#: src/pages/SourcesPage.tsx:1260
 msgid "<0>YouTube restream:</0> the inbound ingest and the outbound destination publishing (Routing) are separate paths — one failing never means the other is broken."
 msgstr ""
 
@@ -479,7 +485,7 @@ msgstr ""
 msgid "● Amber — PREVIEW"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:217
+#: src/pages/approved/SourcesSurface.tsx:245
 msgid "● AMBER — preview"
 msgstr ""
 
@@ -491,7 +497,7 @@ msgstr ""
 msgid "● on PGM"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:214
+#: src/pages/approved/SourcesSurface.tsx:242
 msgid "● RED — on air"
 msgstr ""
 
@@ -515,7 +521,7 @@ msgstr ""
 msgid "1+5"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:380
+#: src/pages/SourcesPage.tsx:428
 msgid "12-hour clock"
 msgstr ""
 
@@ -531,7 +537,7 @@ msgstr ""
 msgid "2×2"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:540
+#: src/pages/SourcesPage.tsx:588
 msgid "24-hour HH:MM:SS in the timezone below."
 msgstr ""
 
@@ -555,7 +561,7 @@ msgstr ""
 msgid "A bearer token sent on the WHIP POST to the remote origin."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:321
+#: src/pages/SourcesPage.tsx:369
 msgid "A bearer token the publisher presents on the WHIP POST. Leave blank to require a control-plane API key with Write scope instead — publishing is never anonymous."
 msgstr ""
 
@@ -611,7 +617,7 @@ msgstr ""
 msgid "A layout name is required."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:422
+#: src/pages/SourcesPage.tsx:470
 msgid "A location/title drawn on the face. Leave blank for none."
 msgstr ""
 
@@ -668,7 +674,7 @@ msgid "A receiver address is required"
 msgstr ""
 
 #: src/pages/DevicesPage.tsx:194
-#: src/pages/SourcesPage.tsx:899
+#: src/pages/SourcesPage.tsx:947
 msgid "A reference only — never a plaintext secret. Leave blank for none."
 msgstr ""
 
@@ -708,7 +714,7 @@ msgstr ""
 msgid "A source is a managed input. Each one owns its ingest, decode, color handling, and reconnect behaviour, and is referenced by tiles via a stable id. Supported kinds include RTSP, HLS, MPEG-TS, SRT, RTMP, NDI, file, and a built-in synthetic test pattern. When a source stops delivering frames, its tile holds the last good frame and moves through a clear state machine — live, stale, reconnecting, no-signal — while the engine reconnects without disturbing the rest of the wall."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1094
+#: src/pages/SourcesPage.tsx:1227
 msgid "A source is an ingest input referenced by id for production, routing, and monitoring."
 msgstr ""
 
@@ -762,7 +768,7 @@ msgid "About display nodes"
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:300
-#: src/pages/LayoutsPage.tsx:247
+#: src/pages/LayoutsPage.tsx:657
 msgid "About layouts"
 msgstr ""
 
@@ -793,8 +799,8 @@ msgid "About probes and alarms"
 msgstr ""
 
 #: src/pages/docs/FeaturesPage.tsx:53
-#: src/pages/SourcesPage.tsx:1133
-#: src/pages/SourcesPage.tsx:1208
+#: src/pages/SourcesPage.tsx:1266
+#: src/pages/SourcesPage.tsx:1349
 msgid "About source transports"
 msgstr ""
 
@@ -831,11 +837,11 @@ msgstr ""
 msgid "Accent colour (#RRGGBB, optional)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:333
+#: src/pages/SourcesPage.tsx:381
 msgid "Accept the publisher's audio (Opus)"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:323
+#: src/pages/LayoutsPage.tsx:733
 msgid "Accessible editing path: Cells form + Inspector in the editor"
 msgstr ""
 
@@ -885,12 +891,16 @@ msgstr ""
 msgid "Action log"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:461
+msgid "Action/graphics safe-area guide lines."
+msgstr ""
+
 #: src/pages/AlarmsPage.tsx:221
-#: src/pages/approved/SourcesSurface.tsx:342
+#: src/pages/approved/SourcesSurface.tsx:370
 #: src/pages/CastPage.tsx:320
 #: src/pages/DevicesPage.tsx:634
 #: src/pages/graphics/DataView.tsx:365
-#: src/pages/LayoutsPage.tsx:94
+#: src/pages/LayoutsPage.tsx:132
 #: src/pages/OverlaysPage.tsx:194
 #: src/pages/ProbesPage.tsx:452
 #: src/pages/SyncGroupsPage.tsx:295
@@ -902,12 +912,12 @@ msgstr ""
 msgid "Actions that take time return <0>202 Accepted</0> with an operation id; the final result arrives on the realtime stream, not in the HTTP response body."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:340
-#: src/pages/approved/SourcesSurface.tsx:393
+#: src/pages/approved/SourcesSurface.tsx:368
+#: src/pages/approved/SourcesSurface.tsx:421
 msgid "Activation"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:200
+#: src/pages/approved/SourcesSurface.tsx:228
 msgid "Activation unknown"
 msgstr ""
 
@@ -963,6 +973,10 @@ msgstr ""
 msgid "Add {title} as source"
 msgstr ""
 
+#: src/components/broadcast/ProductionDesk.tsx:322
+msgid "Add a source — opens the New source dialog"
+msgstr ""
+
 #: src/pages/IptvPage.tsx:206
 msgid "Add an output or source"
 msgstr ""
@@ -1014,6 +1028,10 @@ msgstr ""
 
 #: src/iptv/BulkAddDialog.tsx:140
 msgid "Add selected streams as sources"
+msgstr ""
+
+#: src/components/broadcast/ProductionDesk.tsx:322
+msgid "Add source"
 msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:1046
@@ -1102,7 +1120,7 @@ msgid "Adopting step by step"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:895
-#: src/pages/SourcesPage.tsx:707
+#: src/pages/SourcesPage.tsx:755
 msgid "Advanced"
 msgstr ""
 
@@ -1182,7 +1200,8 @@ msgid "Align"
 msgstr ""
 
 #: src/events/JournalPanel.tsx:85
-#: src/pages/approved/SourcesSurface.tsx:291
+#: src/pages/approved/SourcesSurface.tsx:319
+#: src/pages/LayoutsPage.tsx:118
 msgid "All"
 msgstr ""
 
@@ -1190,7 +1209,7 @@ msgstr ""
 msgid "All cells showing this source"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:290
+#: src/pages/LayoutsPage.tsx:700
 msgid "All configured layouts."
 msgstr ""
 
@@ -1234,14 +1253,14 @@ msgstr ""
 msgid "Also known as"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:200
-#: src/pages/approved/SourcesSurface.tsx:325
+#: src/pages/approved/SourcesSurface.tsx:228
+#: src/pages/approved/SourcesSurface.tsx:353
 #: src/pages/DataPage.tsx:91
 #: src/pages/MeshPage.tsx:65
 msgid "Always on"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:691
+#: src/pages/SourcesPage.tsx:739
 msgid "Always on (started at boot)"
 msgstr ""
 
@@ -1310,7 +1329,7 @@ msgstr ""
 msgid "An SRT URL must start with srt://."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:347
+#: src/pages/SourcesPage.tsx:395
 msgid "Analog (hands on a dial)"
 msgstr ""
 
@@ -1417,7 +1436,7 @@ msgid "Applies on the next restart."
 msgstr ""
 
 #: src/iptv/SourceLinks.tsx:359
-#: src/pages/LayoutsPage.tsx:115
+#: src/pages/LayoutsPage.tsx:153
 msgid "Apply"
 msgstr ""
 
@@ -1425,7 +1444,7 @@ msgstr ""
 msgid "Apply filter"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:107
+#: src/pages/LayoutsPage.tsx:145
 msgid "Apply layout to engine"
 msgstr ""
 
@@ -1541,7 +1560,7 @@ msgstr ""
 msgid "Assigned the selection to area \"{0}\"."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:610
+#: src/pages/SourcesPage.tsx:658
 msgid "At the target"
 msgstr ""
 
@@ -1596,6 +1615,10 @@ msgstr ""
 
 #: src/iptv/ProbeSummary.tsx:60
 msgid "Audio languages"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:414
+msgid "Audio meters"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:60
@@ -1681,11 +1704,11 @@ msgstr ""
 msgid "Auto — apply URL/header changes"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:499
+#: src/pages/SourcesPage.tsx:547
 msgid "Auto (drop leading zero units)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:675
+#: src/pages/SourcesPage.tsx:723
 msgid "Auto (first usable track)"
 msgstr ""
 
@@ -1707,7 +1730,7 @@ msgstr ""
 msgid "Automatic"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:205
+#: src/pages/SourcesPage.tsx:253
 msgid "Automatic (default)"
 msgstr ""
 
@@ -1715,7 +1738,7 @@ msgstr ""
 msgid "Automatic (EDID preferred mode)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1004
+#: src/pages/SourcesPage.tsx:1052
 msgid "Automatic (resolve the guide automatically)"
 msgstr ""
 
@@ -1749,7 +1772,7 @@ msgstr ""
 msgid "Available"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:748
+#: src/pages/SourcesPage.tsx:796
 msgid "Available for local TS/file sources with a teletext stream; page 100–899."
 msgstr ""
 
@@ -1966,7 +1989,7 @@ msgid "Broadcast area"
 msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:363
-#: src/pages/SourcesPage.tsx:1109
+#: src/pages/SourcesPage.tsx:1242
 msgid "Browse IPTV-ORG"
 msgstr ""
 
@@ -2050,7 +2073,8 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1211
 #: src/pages/graphics/DataView.tsx:320
 #: src/pages/graphics/LibraryView.tsx:155
-#: src/pages/LayoutsPage.tsx:361
+#: src/pages/LayoutsPage.tsx:499
+#: src/pages/LayoutsPage.tsx:771
 #: src/pages/MediaPlayersPage.tsx:894
 #: src/pages/OutputFeedRow.tsx:458
 #: src/pages/OutputsPage.tsx:1604
@@ -2151,12 +2175,16 @@ msgstr ""
 msgid "Capabilities"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:769
+#: src/pages/LayoutsPage.tsx:405
+msgid "Caption each cell with its bound source's name."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:817
 msgid "Caption field / service"
 msgstr ""
 
 #: src/iptv/ProbeSummary.tsx:66
-#: src/pages/SourcesPage.tsx:732
+#: src/pages/SourcesPage.tsx:780
 msgid "Captions"
 msgstr ""
 
@@ -2270,7 +2298,7 @@ msgstr ""
 #: src/docs/registry.ts:143
 #: src/layout/components/LayoutEditor.tsx:360
 #: src/pages/docs/ConfigPage.tsx:185
-#: src/pages/LayoutsPage.tsx:87
+#: src/pages/LayoutsPage.tsx:105
 msgid "Cells"
 msgstr ""
 
@@ -2479,8 +2507,16 @@ msgstr ""
 msgid "Clauses"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:120
+msgid "Clean"
+msgstr ""
+
 #: src/pages/OutputFeedRow.tsx:310
 msgid "CLEAN"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:480
+msgid "Clean (no overlays)"
 msgstr ""
 
 #: src/pages/OutputFeedRow.tsx:179
@@ -2544,6 +2580,8 @@ msgid "Clip-ready selection"
 msgstr ""
 
 #: src/events/JournalPanel.tsx:31
+#: src/pages/LayoutsPage.tsx:450
+#: src/pages/SourcesPage.tsx:102
 msgid "Clock"
 msgstr ""
 
@@ -2633,6 +2671,10 @@ msgstr ""
 
 #: src/layout/components/CellPropertiesPanel.tsx:275
 msgid "Colour (hex)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:98
+msgid "Colour bars"
 msgstr ""
 
 #: src/layout/components/CellPropertiesPanel.tsx:118
@@ -2751,9 +2793,9 @@ msgstr ""
 msgid "Configured fail-state probes."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:334
-#: src/pages/approved/SourcesSurface.tsx:380
-#: src/pages/SourcesPage.tsx:1095
+#: src/pages/approved/SourcesSurface.tsx:362
+#: src/pages/approved/SourcesSurface.tsx:408
+#: src/pages/SourcesPage.tsx:1228
 msgid "Configured ingest sources."
 msgstr ""
 
@@ -2921,7 +2963,7 @@ msgstr ""
 msgid "Continue"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:479
+#: src/pages/SourcesPage.tsx:527
 msgid "Continue past the target"
 msgstr ""
 
@@ -3041,7 +3083,7 @@ msgstr ""
 msgid "Could not acknowledge alarm"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:193
+#: src/pages/LayoutsPage.tsx:603
 msgid "Could not apply layout"
 msgstr ""
 
@@ -3097,7 +3139,7 @@ msgstr ""
 msgid "Could not delete"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:226
+#: src/pages/LayoutsPage.tsx:636
 msgid "Could not delete layout"
 msgstr ""
 
@@ -3167,7 +3209,7 @@ msgstr ""
 msgid "Could not load graphics channels."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:274
+#: src/pages/LayoutsPage.tsx:684
 msgid "Could not load layouts:"
 msgstr ""
 
@@ -3203,7 +3245,7 @@ msgstr ""
 msgid "Could not load salvos:"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1098
+#: src/pages/SourcesPage.tsx:1231
 msgid "Could not load sources:"
 msgstr ""
 
@@ -3269,6 +3311,10 @@ msgstr ""
 msgid "Could not load the ticket:"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:388
+msgid "Could not load this layout's current layers. Close and try again."
+msgstr ""
+
 #: src/pages/SupportPage.tsx:303
 msgid "Could not load tickets:"
 msgstr ""
@@ -3310,6 +3356,14 @@ msgstr ""
 
 #: src/pages/CastPage.tsx:153
 msgid "Could not save as a device"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:359
+msgid "Could not save layers"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:358
+msgid "Could not save layers: this layout is routed"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:94
@@ -3377,11 +3431,11 @@ msgstr ""
 msgid "Could not update the source"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:467
+#: src/pages/SourcesPage.tsx:515
 msgid "Count down to the target"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:469
+#: src/pages/SourcesPage.tsx:517
 msgid "Count up from the target"
 msgstr ""
 
@@ -3448,7 +3502,7 @@ msgstr ""
 msgid "Create today source"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:284
+#: src/pages/LayoutsPage.tsx:694
 msgid "Create your first layout"
 msgstr ""
 
@@ -3497,7 +3551,7 @@ msgid "Credentials are referenced, never inlined: <0>auth</0> holds a <1>secret_
 msgstr ""
 
 #: src/pages/DevicesPage.tsx:191
-#: src/pages/SourcesPage.tsx:896
+#: src/pages/SourcesPage.tsx:944
 msgid "Credentials secret reference"
 msgstr ""
 
@@ -3606,7 +3660,7 @@ msgstr ""
 msgid "Cuts to"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:491
+#: src/pages/SourcesPage.tsx:539
 msgid "D:HH:MM:SS (drop day when zero)"
 msgstr ""
 
@@ -3782,9 +3836,9 @@ msgstr ""
 msgid "Degraded event evidence: information may be incomplete."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:249
-#: src/pages/LayoutsPage.tsx:147
-#: src/pages/LayoutsPage.tsx:364
+#: src/pages/approved/SourcesSurface.tsx:277
+#: src/pages/LayoutsPage.tsx:196
+#: src/pages/LayoutsPage.tsx:774
 #: src/pages/OutputsPage.tsx:1103
 #: src/pages/OutputsPage.tsx:1221
 #: src/pages/OutputsPage.tsx:1661
@@ -3809,11 +3863,11 @@ msgstr ""
 msgid "Delete {0}? If it is on air it is cut off air."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:141
+#: src/pages/LayoutsPage.tsx:190
 msgid "Delete layout"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:338
+#: src/pages/LayoutsPage.tsx:748
 msgid "Delete layout?"
 msgstr ""
 
@@ -3842,7 +3896,7 @@ msgstr ""
 msgid "Delete salvo?"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:248
+#: src/pages/approved/SourcesSurface.tsx:276
 msgid "Delete source"
 msgstr ""
 
@@ -3925,8 +3979,8 @@ msgstr ""
 #: src/components/broadcast/TaskWorkspace.tsx:82
 #: src/events/JournalPanel.tsx:127
 #: src/iptv/IptvOrgPage.tsx:841
-#: src/pages/approved/SourcesSurface.tsx:269
-#: src/pages/approved/SourcesSurface.tsx:272
+#: src/pages/approved/SourcesSurface.tsx:297
+#: src/pages/approved/SourcesSurface.tsx:300
 #: src/pages/MediaPlayersPage.tsx:548
 msgid "Details"
 msgstr ""
@@ -3943,6 +3997,11 @@ msgstr ""
 
 #: src/pages/ProbesPage.tsx:477
 msgid "Detect per-cell fail states — black, freeze, silence, and loudness violations — and raise X.733 alarms."
+msgstr ""
+
+#. placeholder {0}: detectedKindText(detected.kind)
+#: src/pages/SourcesPage.tsx:1146
+msgid "Detected: {0}"
 msgstr ""
 
 #: src/devices/FromDevice.tsx:85
@@ -3994,7 +4053,7 @@ msgstr ""
 msgid "Different hardware can only achieve different sync quality, and Conspect reports the tier it MEASURES rather than the one a datasheet promises:"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:349
+#: src/pages/SourcesPage.tsx:397
 msgid "Digital (HH:MM:SS readout)"
 msgstr ""
 
@@ -4007,15 +4066,15 @@ msgstr ""
 msgid "direct: {id}"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:601
+#: src/pages/SourcesPage.tsx:649
 msgid "Direction"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:947
+#: src/pages/SourcesPage.tsx:995
 msgid "Disabled — any previously configured URL/channel id is retained for later re-enable."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1008
+#: src/pages/SourcesPage.tsx:1056
 msgid "Disabled (no guide fetched for this source)"
 msgstr ""
 
@@ -4035,7 +4094,7 @@ msgstr ""
 msgid "Disarmed — no automatic action will be taken."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:703
+#: src/pages/SourcesPage.tsx:751
 msgid "Discard the source wall-clock"
 msgstr ""
 
@@ -4090,13 +4149,13 @@ msgstr ""
 msgid "Dismiss"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:619
+#: src/pages/SourcesPage.tsx:667
 msgid "Display format"
 msgstr ""
 
 #: src/pages/graphics/DataView.tsx:277
 #: src/pages/SalvosPage.tsx:357
-#: src/pages/SourcesPage.tsx:968
+#: src/pages/SourcesPage.tsx:1016
 msgid "Display name"
 msgstr ""
 
@@ -4196,11 +4255,11 @@ msgstr ""
 msgid "Drag, resize and rotate cells on the canvas, or drop a source from the palette. The same cells are fully editable on the Cells tab without a pointer."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:445
+#: src/pages/SourcesPage.tsx:493
 msgid "Draw hour numerals (analogue / dual face)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:632
+#: src/pages/SourcesPage.tsx:680
 msgid "Drawn with the count. Leave blank for none."
 msgstr ""
 
@@ -4245,11 +4304,11 @@ msgstr ""
 msgid "Dropped outside any target; nothing changed."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:394
+#: src/pages/SourcesPage.tsx:442
 msgid "DST-correct, preferred over a fixed offset (e.g. Australia/Sydney, UTC). Leave blank to use a fixed offset instead."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:567
+#: src/pages/SourcesPage.tsx:615
 msgid "DST-correct, preferred over a fixed offset. Leave blank to use a fixed offset instead."
 msgstr ""
 
@@ -4257,7 +4316,7 @@ msgstr ""
 msgid "DTLS transport failed."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:351
+#: src/pages/SourcesPage.tsx:399
 msgid "Dual (analogue face + digital readout)"
 msgstr ""
 
@@ -4280,7 +4339,7 @@ msgstr ""
 msgid "Duration unknown"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:679
+#: src/pages/SourcesPage.tsx:727
 msgid "DVB teletext page"
 msgstr ""
 
@@ -4294,7 +4353,7 @@ msgstr ""
 
 #: src/devices/InputStreamsInspector.tsx:62
 #: src/pages/RoutingPage.tsx:468
-#: src/pages/SourcesPage.tsx:1185
+#: src/pages/SourcesPage.tsx:1325
 msgid "e.g. cam-north"
 msgstr ""
 
@@ -4339,7 +4398,7 @@ msgstr ""
 msgid "e.g. Main wall"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:631
+#: src/pages/SourcesPage.tsx:679
 msgid "e.g. ON AIR IN"
 msgstr ""
 
@@ -4359,7 +4418,7 @@ msgstr ""
 msgid "e.g. src-foyer-main"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:421
+#: src/pages/SourcesPage.tsx:469
 msgid "e.g. Sydney"
 msgstr ""
 
@@ -4431,8 +4490,8 @@ msgstr ""
 msgid "EBU R128 (−23 LUFS)"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:246
-#: src/pages/LayoutsPage.tsx:135
+#: src/pages/approved/SourcesSurface.tsx:274
+#: src/pages/LayoutsPage.tsx:173
 #: src/pages/OutputsPage.tsx:1093
 #: src/pages/OutputsPage.tsx:1211
 #: src/pages/SalvosPage.tsx:296
@@ -4495,9 +4554,9 @@ msgstr ""
 msgid "Edit salvo"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:239
-#: src/pages/approved/SourcesSurface.tsx:239
-#: src/pages/SourcesPage.tsx:1093
+#: src/pages/approved/SourcesSurface.tsx:267
+#: src/pages/approved/SourcesSurface.tsx:267
+#: src/pages/SourcesPage.tsx:1226
 msgid "Edit source"
 msgstr ""
 
@@ -4538,7 +4597,7 @@ msgstr ""
 msgid "Element name"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:683
+#: src/pages/SourcesPage.tsx:731
 msgid "Embedded CEA-608 (CC1–CC4 only)"
 msgstr ""
 
@@ -4583,7 +4642,7 @@ msgstr ""
 msgid "Engine default (mixed program bus)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:699
+#: src/pages/SourcesPage.tsx:747
 msgid "Engine default (reclock to house)"
 msgstr ""
 
@@ -4674,7 +4733,7 @@ msgstr ""
 msgid "Entries"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:910
+#: src/pages/SourcesPage.tsx:958
 msgid "EPG mode"
 msgstr ""
 
@@ -4757,7 +4816,7 @@ msgstr ""
 msgid "Example sync group"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:327
+#: src/pages/approved/SourcesSurface.tsx:355
 msgid "Exceptions (failed / starting) sort first"
 msgstr ""
 
@@ -4833,16 +4892,16 @@ msgid "External evidence (test injection or authenticated hook)"
 msgstr ""
 
 #: src/pages/OverlaysPage.tsx:52
-#: src/pages/SourcesPage.tsx:370
+#: src/pages/SourcesPage.tsx:418
 msgid "Face"
 msgstr ""
 
 #: src/components/broadcast/ProducerStatus.tsx:60
-#: src/pages/approved/SourcesSurface.tsx:324
+#: src/pages/approved/SourcesSurface.tsx:352
 msgid "Failed"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:154
+#: src/pages/approved/SourcesSurface.tsx:181
 msgid "Failed — no reason reported."
 msgstr ""
 
@@ -4903,11 +4962,15 @@ msgstr ""
 msgid "Fields:"
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:122
+msgid "File"
+msgstr ""
+
 #: src/pages/docs/concepts/TransportsPage.tsx:324
 msgid "File / synthetic"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:234
+#: src/pages/SourcesPage.tsx:282
 msgid "File path"
 msgstr ""
 
@@ -4920,7 +4983,7 @@ msgstr ""
 msgid "Fill (stretch)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:248
+#: src/pages/SourcesPage.tsx:296
 msgid "Fill colour"
 msgstr ""
 
@@ -4932,7 +4995,7 @@ msgstr ""
 msgid "Filter by object id"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:289
+#: src/pages/approved/SourcesSurface.tsx:317
 msgid "Filter sources"
 msgstr ""
 
@@ -5146,7 +5209,7 @@ msgstr ""
 msgid "Getting started"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:300
+#: src/pages/SourcesPage.tsx:348
 msgid "Give this to a publisher (OBS ≥ 30, GStreamer whipclientsink, or a browser) to push media into this source. Relative to the control plane origin."
 msgstr ""
 
@@ -5228,7 +5291,7 @@ msgid "GPU overlays"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:924
-#: src/pages/SourcesPage.tsx:853
+#: src/pages/SourcesPage.tsx:901
 msgid "GPU vendor"
 msgstr ""
 
@@ -5288,7 +5351,7 @@ msgstr ""
 msgid "Group"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:988
+#: src/pages/SourcesPage.tsx:1036
 msgid "Group / category"
 msgstr ""
 
@@ -5411,7 +5474,7 @@ msgstr ""
 #: src/pages/approved/MediaSurface.tsx:135
 #: src/pages/approved/RoutingSurface.tsx:94
 #: src/pages/approved/ShowPage.tsx:41
-#: src/pages/SourcesPage.tsx:1087
+#: src/pages/SourcesPage.tsx:1220
 msgid "Help"
 msgstr ""
 
@@ -5419,11 +5482,11 @@ msgstr ""
 msgid "Help from the community and the documentation. The in-app docs cover most setup and troubleshooting."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:493
+#: src/pages/SourcesPage.tsx:541
 msgid "HH:MM:SS"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:497
+#: src/pages/SourcesPage.tsx:545
 msgid "HH:MM:SS:FF (with frames)"
 msgstr ""
 
@@ -5478,11 +5541,15 @@ msgstr ""
 msgid "HLS session"
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:108
+msgid "HLS stream"
+msgstr ""
+
 #: src/pages/MonitoringPage.tsx:232
 msgid "HLS video (buffered)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:477
+#: src/pages/SourcesPage.tsx:525
 msgid "Hold at 00:00:00"
 msgstr ""
 
@@ -5514,7 +5581,7 @@ msgstr ""
 #: src/pages/OutputsPage.tsx:1464
 #: src/pages/OverlaysPage.tsx:234
 #: src/pages/ProbesPage.tsx:496
-#: src/pages/SourcesPage.tsx:1137
+#: src/pages/SourcesPage.tsx:1270
 msgid "How configuration applies"
 msgstr ""
 
@@ -5591,13 +5658,13 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1032
 #: src/pages/DeviceDetailPage.tsx:1135
 #: src/pages/DevicesPage.tsx:113
-#: src/pages/LayoutsPage.tsx:78
+#: src/pages/LayoutsPage.tsx:96
 #: src/pages/OutputsPage.tsx:1557
 #: src/pages/OverlaysPage.tsx:268
 #: src/pages/ProbesPage.tsx:520
 #: src/pages/SalvosPage.tsx:211
 #: src/pages/SalvosPage.tsx:341
-#: src/pages/SourcesPage.tsx:1181
+#: src/pages/SourcesPage.tsx:1321
 #: src/pages/SyncGroupsPage.tsx:379
 #: src/pages/TallyPage.tsx:364
 msgid "Identifier"
@@ -5612,7 +5679,7 @@ msgid "Identify requested"
 msgstr ""
 
 #: src/components/SourceDemandBadge.tsx:106
-#: src/pages/approved/SourcesSurface.tsx:323
+#: src/pages/approved/SourcesSurface.tsx:351
 #: src/pages/OutputsPage.tsx:210
 msgid "Idle"
 msgstr ""
@@ -5644,6 +5711,10 @@ msgstr ""
 #: src/docs/registry.ts:55
 #: src/pages/docs/ContainerPage.tsx:33
 msgid "Images"
+msgstr ""
+
+#: src/components/YoutubeVtClipHint.tsx:42
+msgid "Import as VT clip"
 msgstr ""
 
 #: src/pages/M3uImportDialog.tsx:128
@@ -5874,7 +5945,7 @@ msgstr ""
 msgid "IPTV playlist"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:954
+#: src/pages/SourcesPage.tsx:1002
 msgid "IPTV playlist presentation"
 msgstr ""
 
@@ -5940,7 +6011,7 @@ msgstr ""
 #: src/pages/OverlaysPage.tsx:289
 #: src/pages/ProbesPage.tsx:419
 #: src/pages/ProbesPage.tsx:542
-#: src/pages/SourcesPage.tsx:1202
+#: src/pages/SourcesPage.tsx:1342
 #: src/pages/SystemActionsPage.tsx:234
 msgid "Kind"
 msgstr ""
@@ -5948,7 +6019,7 @@ msgstr ""
 #. placeholder {0}: ctx.row.original.rawKind
 #. placeholder {0}: output.rawKind
 #. placeholder {0}: source.rawKind
-#: src/pages/approved/SourcesSurface.tsx:230
+#: src/pages/approved/SourcesSurface.tsx:258
 #: src/pages/OutputsPage.tsx:986
 #: src/pages/OverlaysPage.tsx:204
 #: src/pages/ProbesPage.tsx:462
@@ -5959,8 +6030,8 @@ msgstr ""
 msgid "Kinds: <0>test</0>, <1>rtsp</1>, <2>hls</2>, <3>ts</3>, <4>srt</4>, <5>rtmp</5>, <6>ndi</6>, <7>file</7>."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:419
-#: src/pages/SourcesPage.tsx:629
+#: src/pages/SourcesPage.tsx:467
+#: src/pages/SourcesPage.tsx:677
 msgid "Label (optional)"
 msgstr ""
 
@@ -6083,12 +6154,23 @@ msgstr ""
 msgid "Layering over a looped video background"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:112
+#: src/pages/LayoutsPage.tsx:179
+#: src/pages/LayoutsPage.tsx:185
+#: src/pages/LayoutsPage.tsx:372
+msgid "Layers"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:348
+msgid "Layers saved"
+msgstr ""
+
 #: src/docs/registry.ts:133
 #: src/pages/docs/ConfigPage.tsx:110
 msgid "Layout"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:185
+#: src/pages/LayoutsPage.tsx:595
 msgid "Layout applied live"
 msgstr ""
 
@@ -6096,7 +6178,7 @@ msgstr ""
 msgid "layout cell"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:222
+#: src/pages/LayoutsPage.tsx:632
 msgid "Layout deleted"
 msgstr ""
 
@@ -6105,7 +6187,7 @@ msgstr ""
 msgid "Layout name"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:192
+#: src/pages/LayoutsPage.tsx:602
 msgid "Layout not applied: the switcher is on"
 msgstr ""
 
@@ -6138,7 +6220,7 @@ msgstr ""
 #: src/docs/registry.ts:227
 #: src/pages/DashboardPage.tsx:58
 #: src/pages/docs/FeaturesPage.tsx:25
-#: src/pages/LayoutsPage.tsx:238
+#: src/pages/LayoutsPage.tsx:648
 #: src/pages/OutputFeedRow.tsx:323
 msgid "Layouts"
 msgstr "التخطيطات"
@@ -6171,7 +6253,7 @@ msgstr ""
 msgid "leave blank to require a View API key"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:319
+#: src/pages/SourcesPage.tsx:367
 msgid "leave blank to require a Write API key"
 msgstr ""
 
@@ -6226,8 +6308,8 @@ msgstr ""
 msgid "Licensing heartbeat"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:339
-#: src/pages/approved/SourcesSurface.tsx:392
+#: src/pages/approved/SourcesSurface.tsx:367
+#: src/pages/approved/SourcesSurface.tsx:420
 msgid "Lifecycle"
 msgstr ""
 
@@ -6296,6 +6378,10 @@ msgstr ""
 msgid "LIVE"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:426
+msgid "LIVE / STALE / NO SIGNAL and BLACK / FROZEN / NO AUDIO badges."
+msgstr ""
+
 #: src/docs/registry.ts:198
 #: src/pages/docs/ApiPage.tsx:34
 msgid "Live API playground"
@@ -6346,11 +6432,11 @@ msgstr ""
 msgid "Live sessions"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1079
+#: src/pages/SourcesPage.tsx:1212
 msgid "Live source lifecycle — exceptions sort first."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:116
+#: src/pages/SourcesPage.tsx:163
 msgid "Live streams only: this resolves a currently-broadcasting YouTube URL, never a pre-recorded/past video. To play a pre-recorded video, use a VT clip instead (not built yet)."
 msgstr ""
 
@@ -6466,7 +6552,7 @@ msgstr ""
 msgid "Loading layout…"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:270
+#: src/pages/LayoutsPage.tsx:680
 msgid "Loading layouts…"
 msgstr ""
 
@@ -6527,7 +6613,7 @@ msgid "Loading source events…"
 msgstr ""
 
 #: src/pages/approved/RoutingSurface.tsx:410
-#: src/pages/SourcesPage.tsx:1097
+#: src/pages/SourcesPage.tsx:1230
 msgid "Loading sources…"
 msgstr ""
 
@@ -6545,6 +6631,10 @@ msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:392
 msgid "Loading the catalogue…"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:384
+msgid "Loading the current layers…"
 msgstr ""
 
 #: src/events/JournalPanel.tsx:118
@@ -6586,7 +6676,7 @@ msgstr ""
 msgid "Local clock"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:553
+#: src/pages/SourcesPage.tsx:601
 msgid "Local YYYY-MM-DDTHH:MM:SS, resolved in the timezone below."
 msgstr ""
 
@@ -6612,7 +6702,7 @@ msgid "Locking every device's frame timing to one shared reference signal so all
 msgstr ""
 
 #: src/pages/IptvPage.tsx:253
-#: src/pages/SourcesPage.tsx:978
+#: src/pages/SourcesPage.tsx:1026
 msgid "Logo URL"
 msgstr ""
 
@@ -6749,7 +6839,7 @@ msgstr ""
 msgid "Manual — never change automatically"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1006
+#: src/pages/SourcesPage.tsx:1054
 msgid "Manual (explicit XMLTV URL + channel id)"
 msgstr ""
 
@@ -6785,7 +6875,7 @@ msgstr ""
 msgid "Matching places"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:823
+#: src/pages/SourcesPage.tsx:871
 msgid "Matrix"
 msgstr ""
 
@@ -6968,7 +7058,7 @@ msgstr ""
 msgid "MLDv2"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:495
+#: src/pages/SourcesPage.tsx:543
 msgid "MM:SS"
 msgstr ""
 
@@ -7025,7 +7115,7 @@ msgstr ""
 msgid "MoQ video was refused: this account has no access to it. Showing the next available preview."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1103
+#: src/pages/SourcesPage.tsx:1236
 msgid "More"
 msgstr ""
 
@@ -7075,6 +7165,10 @@ msgstr ""
 #: src/docs/registry.ts:693
 #: src/pages/docs/concepts/GlossaryPage.tsx:183
 msgid "MPEG-TS (Transport Stream)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:112
+msgid "MPEG-TS (UDP/HTTP)"
 msgstr ""
 
 #: src/pages/docs/concepts/TransportsPage.tsx:310
@@ -7133,14 +7227,14 @@ msgstr ""
 #: src/pages/graphics/LibraryView.tsx:117
 #: src/pages/graphics/PlayoutView.tsx:467
 #: src/pages/IptvPage.tsx:253
-#: src/pages/LayoutsPage.tsx:69
+#: src/pages/LayoutsPage.tsx:87
 #: src/pages/OutputsPage.tsx:1569
 #: src/pages/OverlaysPage.tsx:168
 #: src/pages/OverlaysPage.tsx:280
 #: src/pages/ProbesPage.tsx:414
 #: src/pages/ProbesPage.tsx:532
 #: src/pages/SalvosPage.tsx:210
-#: src/pages/SourcesPage.tsx:1193
+#: src/pages/SourcesPage.tsx:1333
 #: src/pages/SyncGroupsPage.tsx:234
 #: src/pages/SyncGroupsPage.tsx:391
 #: src/pages/TallyPage.tsx:241
@@ -7173,6 +7267,7 @@ msgstr ""
 #: src/pages/docs/concepts/GlossaryPage.tsx:208
 #: src/pages/docs/concepts/TransportsPage.tsx:78
 #: src/pages/docs/concepts/TransportsPage.tsx:282
+#: src/pages/SourcesPage.tsx:120
 msgid "NDI"
 msgstr ""
 
@@ -7181,7 +7276,7 @@ msgid "NDI (Network Device Interface) is a production-LAN video transport: sende
 msgstr ""
 
 #: src/pages/DeviceDetailPage.tsx:1057
-#: src/pages/SourcesPage.tsx:220
+#: src/pages/SourcesPage.tsx:268
 msgid "NDI source name"
 msgstr ""
 
@@ -7214,7 +7309,7 @@ msgstr ""
 msgid "Needs headers"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:294
+#: src/pages/approved/SourcesSurface.tsx:322
 msgid "Needs me"
 msgstr ""
 
@@ -7273,7 +7368,7 @@ msgid "New instances blocked"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:338
-#: src/pages/LayoutsPage.tsx:261
+#: src/pages/LayoutsPage.tsx:671
 msgid "New layout"
 msgstr ""
 
@@ -7298,8 +7393,8 @@ msgstr ""
 msgid "New salvo"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1091
-#: src/pages/SourcesPage.tsx:1092
+#: src/pages/SourcesPage.tsx:1224
+#: src/pages/SourcesPage.tsx:1225
 msgid "New source"
 msgstr ""
 
@@ -7501,7 +7596,7 @@ msgstr ""
 msgid "No layout cells found — enter the cell id to watch."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:279
+#: src/pages/LayoutsPage.tsx:689
 msgid "No layouts are defined yet."
 msgstr ""
 
@@ -7521,7 +7616,7 @@ msgstr ""
 msgid "No live item: timing and overrun are unknown."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:179
+#: src/pages/approved/SourcesSurface.tsx:207
 msgid "No live signal data"
 msgstr ""
 
@@ -7541,7 +7636,7 @@ msgstr ""
 msgid "No locations yet. Nothing is fetched until one is added."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:139
+#: src/pages/approved/SourcesSurface.tsx:159
 msgid "No locator configured"
 msgstr ""
 
@@ -7682,11 +7777,11 @@ msgid "No sources available"
 msgstr ""
 
 #: src/pages/approved/RoutingSurface.tsx:420
-#: src/pages/SourcesPage.tsx:1096
+#: src/pages/SourcesPage.tsx:1229
 msgid "No sources configured."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:331
+#: src/pages/approved/SourcesSurface.tsx:359
 msgid "No sources match this filter."
 msgstr ""
 
@@ -7738,6 +7833,10 @@ msgstr ""
 msgid "No transcript available for this asset."
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:1148
+msgid "No transport detected — pick the Kind manually below."
+msgstr ""
+
 #: src/pages/LicencePage.tsx:183
 msgid "No watermark"
 msgstr ""
@@ -7759,7 +7858,7 @@ msgstr ""
 msgid "none (located by enrolled identity)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:673
+#: src/pages/SourcesPage.tsx:721
 msgid "None (no captions decoded)"
 msgstr ""
 
@@ -7788,6 +7887,10 @@ msgstr ""
 msgid "Not available"
 msgstr ""
 
+#: src/components/YoutubeVtClipHint.tsx:45
+msgid "Not available on this server yet — tracked as issue #423. There is no server endpoint to import a URL into the media library."
+msgstr ""
+
 #: src/iptv/BulkAddDialog.tsx:105
 msgid "Not created"
 msgstr ""
@@ -7810,7 +7913,7 @@ msgid "Not in use: this source is not running and costs nothing."
 msgstr ""
 
 #: src/iptv/SourceLinks.tsx:93
-#: src/pages/approved/SourcesSurface.tsx:253
+#: src/pages/approved/SourcesSurface.tsx:281
 msgid "Not linked to IPTV-ORG"
 msgstr ""
 
@@ -7880,7 +7983,7 @@ msgid "Nothing loaded — no bytes at risk"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:128
-#: src/pages/LayoutsPage.tsx:195
+#: src/pages/LayoutsPage.tsx:605
 msgid "Nothing was changed; the current layout keeps running."
 msgstr ""
 
@@ -7972,7 +8075,7 @@ msgstr ""
 msgid "Off"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:677
+#: src/pages/SourcesPage.tsx:725
 msgid "Off (pinned off)"
 msgstr ""
 
@@ -8011,8 +8114,8 @@ msgstr ""
 msgid "on air"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:298
-#: src/pages/approved/SourcesSurface.tsx:309
+#: src/pages/approved/SourcesSurface.tsx:326
+#: src/pages/approved/SourcesSurface.tsx:337
 msgid "On air"
 msgstr ""
 
@@ -8020,7 +8123,7 @@ msgstr ""
 msgid "ON AIR"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:316
+#: src/pages/approved/SourcesSurface.tsx:344
 msgid "On air filter unavailable: the program bus is not confirmed right now (switcher state missing or stale), so no source can be confirmed on air."
 msgstr ""
 
@@ -8032,11 +8135,11 @@ msgstr ""
 msgid "On break start"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:200
+#: src/pages/approved/SourcesSurface.tsx:228
 msgid "On demand"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:693
+#: src/pages/SourcesPage.tsx:741
 msgid "On demand (idle until something uses it)"
 msgstr ""
 
@@ -8077,7 +8180,7 @@ msgstr ""
 msgid "ONLINE / DEGRADED"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:773
+#: src/pages/SourcesPage.tsx:821
 msgid "Only CEA-608 fields cc1, cc2, cc3 and cc4 decode. CEA-708 services are not supported."
 msgstr ""
 
@@ -8183,7 +8286,7 @@ msgstr ""
 
 #: src/api/operationStatus.ts:24
 #: src/pages/LayoutEditorPage.tsx:118
-#: src/pages/LayoutsPage.tsx:186
+#: src/pages/LayoutsPage.tsx:596
 #: src/pages/SalvosPage.tsx:154
 #: src/pages/TallyPage.tsx:142
 msgid "Operation id"
@@ -8244,7 +8347,7 @@ msgstr ""
 msgid "Out of spec"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:164
+#: src/pages/approved/SourcesSurface.tsx:192
 msgid "Outbound publishing is a separate path (Routing)"
 msgstr ""
 
@@ -8361,11 +8464,11 @@ msgstr ""
 msgid "Override failed"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:795
+#: src/pages/SourcesPage.tsx:843
 msgid "Override the detected colour metadata"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:639
+#: src/pages/SourcesPage.tsx:687
 msgid "Overrun prefix (optional)"
 msgstr ""
 
@@ -8392,6 +8495,14 @@ msgstr ""
 
 #: src/events/SourceEventsButton.tsx:27
 msgid "Past expected return (end unconfirmed)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:1126
+msgid "Paste a link or address"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:1130
+msgid "Paste a YouTube link, an HLS/.m3u8 URL, an rtsp(s)/srt/rist/rtmp(s) URL, a udp/rtp address, or a file path — the kind, id and name below fill in automatically."
 msgstr ""
 
 #: src/pages/SettingsPage.tsx:192
@@ -8447,6 +8558,10 @@ msgstr ""
 
 #: src/pages/SystemActionsPage.tsx:103
 msgid "Pending actions"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:415
+msgid "Per-cell audio level meters."
 msgstr ""
 
 #. placeholder {0}: h.host
@@ -8515,7 +8630,7 @@ msgstr ""
 msgid "Picture format and slots"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:844
+#: src/pages/SourcesPage.tsx:892
 msgid "Pin decode to a specific GPU"
 msgstr ""
 
@@ -8734,7 +8849,7 @@ msgstr ""
 msgid "Preview: {name}"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:805
+#: src/pages/SourcesPage.tsx:853
 msgid "Primaries"
 msgstr ""
 
@@ -8933,7 +9048,7 @@ msgstr ""
 msgid "Program still image for output {0}"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:208
+#: src/pages/approved/SourcesSurface.tsx:236
 msgid "Program tally is not confirmed right now (switcher state missing or stale), so it is not guessed."
 msgstr ""
 
@@ -8962,7 +9077,7 @@ msgstr ""
 msgid "Provenance — recorded history, read-only."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:934
+#: src/pages/SourcesPage.tsx:982
 msgid "Provider channel id"
 msgstr ""
 
@@ -8998,7 +9113,7 @@ msgstr ""
 msgid "Publish this source's upstream URL directly (credentials are always removed)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:317
+#: src/pages/SourcesPage.tsx:365
 msgid "Publisher token (optional)"
 msgstr ""
 
@@ -9073,7 +9188,7 @@ msgstr ""
 msgid "Raise ticket"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:832
+#: src/pages/SourcesPage.tsx:880
 msgid "Range"
 msgstr ""
 
@@ -9085,7 +9200,7 @@ msgstr ""
 msgid "Raw"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:483
+#: src/pages/SourcesPage.tsx:531
 msgid "Re-arm to the next occurrence (recurring daily)"
 msgstr ""
 
@@ -9093,7 +9208,7 @@ msgstr ""
 msgid "Re-patch…"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:481
+#: src/pages/SourcesPage.tsx:529
 msgid "Reach zero, then count the overrun up"
 msgstr ""
 
@@ -9114,7 +9229,7 @@ msgid "Reading…"
 msgstr ""
 
 #: src/components/SourceDemandBadge.tsx:80
-#: src/pages/approved/SourcesSurface.tsx:321
+#: src/pages/approved/SourcesSurface.tsx:349
 msgid "Ready"
 msgstr ""
 
@@ -9192,12 +9307,16 @@ msgstr ""
 msgid "Recovery has not succeeded within the no-signal timeout. The tile switches to a clear \"signal lost\" slate — an honest statement that what is on screen is no longer recent video."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:593
+#: src/pages/SourcesPage.tsx:641
 msgid "Recur daily (re-arm each day)"
 msgstr ""
 
 #: src/components/TallyLampBadge.tsx:30
 msgid "Red"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:440
+msgid "Red = on Program, green = on Preview."
 msgstr ""
 
 #: src/pages/SupportPage.tsx:494
@@ -9212,7 +9331,7 @@ msgstr ""
 msgid "Referer"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:722
+#: src/pages/SourcesPage.tsx:770
 msgid "Referer header (optional)"
 msgstr ""
 
@@ -9368,7 +9487,7 @@ msgstr ""
 msgid "Removed. Member devices keep running; only the alignment grouping is gone."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1155
+#: src/pages/SourcesPage.tsx:1288
 msgid "Removed. The running engine drops the source immediately (the response header confirms) — tiles bound to it show the no-signal slate until re-routed."
 msgstr ""
 
@@ -9440,7 +9559,7 @@ msgstr ""
 msgid "Requests will be unauthenticated."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:927
+#: src/pages/SourcesPage.tsx:975
 msgid "Required in manual mode; credential-free http(s) only."
 msgstr ""
 
@@ -9455,6 +9574,10 @@ msgstr ""
 
 #: src/pages/docs/ContainerPage.tsx:98
 msgid "Requires the NVIDIA driver and the NVIDIA Container Toolkit on the host. The modern path requests devices through CDI; NVENC and NVDEC also need the <0>video</0> driver capability."
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:491
+msgid "Reset to defaults"
 msgstr ""
 
 #: src/pages/RoutingPage.tsx:191
@@ -9543,11 +9666,11 @@ msgstr ""
 msgid "Results stream in below as they are found. {0}"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:81
+#: src/pages/approved/SourcesSurface.tsx:95
 msgid "Retry"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:78
+#: src/pages/approved/SourcesSurface.tsx:81
 msgid "Retry {name}"
 msgstr ""
 
@@ -9614,6 +9737,10 @@ msgstr ""
 
 #: src/components/broadcast/library/Chips.tsx:69
 msgid "Rights unknown"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:116
+msgid "RIST"
 msgstr ""
 
 #: src/pages/docs/components.tsx:147
@@ -9692,6 +9819,10 @@ msgstr ""
 msgid "RTMP is a TCP push protocol that remains the lingua franca for sending a stream <0>to</0> a service — most streaming platforms still ingest it. Classic RTMP carries H.264 video and AAC audio only; newer \"enhanced\" endpoints negotiate H.265 and AV1. As an input it appears when an encoder or app pushes to Conspect; as an output it is how Conspect pushes the composed canvas to a platform."
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:118
+msgid "RTMP push"
+msgstr ""
+
 #: src/docs/registry.ts:393
 #: src/docs/registry.ts:728
 #: src/pages/docs/concepts/GlossaryPage.tsx:267
@@ -9704,11 +9835,15 @@ msgstr ""
 msgid "RTSP (Real Time Streaming Protocol) is the standard way IP cameras and encoders publish a live stream on a local network. The client asks the device to describe and play its stream; the media itself then flows as RTP packets, either over UDP or interleaved in the same TCP connection. Latency is low (commonly a few hundred milliseconds) and the URL form is simple: <0>rtsp://camera.local:8554/main</0>."
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:106
+msgid "RTSP camera / encoder"
+msgstr ""
+
 #: src/pages/docs/concepts/TransportsPage.tsx:67
 msgid "RTSP carries whatever the camera encodes — usually H.264 or H.265 — so the picture quality and bitrate are set at the camera. It has no built-in recovery beyond TCP retransmission; on flaky links a stream simply stalls and must reconnect, which Conspect handles per tile without disturbing the rest of the wall."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:201
+#: src/pages/SourcesPage.tsx:249
 msgid "RTSP transport"
 msgstr ""
 
@@ -9749,6 +9884,10 @@ msgstr ""
 #: src/preview/PreviewDiagnostics.tsx:28
 #: src/preview/PreviewDiagnostics.tsx:28
 msgid "Safe technical details"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:460
+msgid "Safe-area markers"
 msgstr ""
 
 #: src/pages/DataPage.tsx:132
@@ -9795,6 +9934,7 @@ msgstr ""
 #: src/components/broadcast/library/VTReferenceSummary.tsx:246
 #: src/pages/CastPage.tsx:523
 #: src/pages/IptvPage.tsx:125
+#: src/pages/LayoutsPage.tsx:502
 #: src/pages/OutputsPage.tsx:1611
 #: src/pages/SalvosPage.tsx:398
 #: src/pages/SettingsPage.tsx:218
@@ -9965,11 +10105,11 @@ msgstr ""
 msgid "Search results"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:286
+#: src/pages/approved/SourcesSurface.tsx:314
 msgid "Search sources by name"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:285
+#: src/pages/approved/SourcesSurface.tsx:313
 msgid "Search sources…"
 msgstr ""
 
@@ -10112,7 +10252,7 @@ msgstr ""
 msgid "Sending {0}…"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:715
+#: src/pages/SourcesPage.tsx:763
 msgid "Sent on every HLS request. Not a secret; exported with the config."
 msgstr ""
 
@@ -10138,7 +10278,7 @@ msgstr ""
 msgid "Set an identifier above; the WHEP play endpoint is derived from it and shown here once it is filled in."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:289
+#: src/pages/SourcesPage.tsx:337
 msgid "Set an identifier above; the WHIP publish endpoint is derived from it and shown here once it is filled in."
 msgstr ""
 
@@ -10220,23 +10360,23 @@ msgstr ""
 msgid "Show streams of {name}"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:649
+#: src/pages/SourcesPage.tsx:697
 msgid "Show the overrun badge (OVER / ELAPSED)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:437
+#: src/pages/SourcesPage.tsx:485
 msgid "Show the reference-lock badge (PTP/NTP/SYS)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:429
+#: src/pages/SourcesPage.tsx:477
 msgid "Show the UTC offset badge"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:642
+#: src/pages/SourcesPage.tsx:690
 msgid "Shown past the target. Blank uses the default “+”."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:782
+#: src/pages/SourcesPage.tsx:830
 msgid "Sidecar file path"
 msgstr ""
 
@@ -10245,8 +10385,8 @@ msgstr ""
 msgid "Sign in"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:338
-#: src/pages/approved/SourcesSurface.tsx:391
+#: src/pages/approved/SourcesSurface.tsx:366
+#: src/pages/approved/SourcesSurface.tsx:419
 msgid "Signal"
 msgstr ""
 
@@ -10254,7 +10394,7 @@ msgstr ""
 msgid "Signal unconfirmed"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:179
+#: src/pages/approved/SourcesSurface.tsx:207
 msgid "Signal unknown"
 msgstr ""
 
@@ -10304,6 +10444,10 @@ msgstr ""
 msgid "Software paths depend on the build and selected codecs; check capabilities before relying on a deployment without a GPU."
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:100
+msgid "Solid colour"
+msgstr ""
+
 #: src/pages/M3uImportDialog.tsx:105
 msgid "Some sources could not be created"
 msgstr ""
@@ -10315,7 +10459,7 @@ msgstr ""
 #: src/layout/components/CellsForm.tsx:398
 #: src/layout/components/GridLayoutEditor.tsx:667
 #: src/pages/approved/ShowPage.tsx:90
-#: src/pages/approved/SourcesSurface.tsx:337
+#: src/pages/approved/SourcesSurface.tsx:365
 #: src/pages/IptvPage.tsx:232
 #: src/pages/SwitcherPage.tsx:137
 msgid "Source"
@@ -10369,6 +10513,10 @@ msgstr ""
 msgid "Source live preview"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:404
+msgid "Source names"
+msgstr ""
+
 #: src/preview/SourcePreviewButton.tsx:20
 msgid "Source preview"
 msgstr ""
@@ -10384,7 +10532,7 @@ msgstr ""
 
 #: src/components/broadcast/library/MetadataInspector.tsx:406
 #: src/pages/DeviceDetailPage.tsx:1071
-#: src/pages/SourcesPage.tsx:184
+#: src/pages/SourcesPage.tsx:232
 msgid "Source URL"
 msgstr ""
 
@@ -10406,19 +10554,19 @@ msgstr ""
 msgid "Sources"
 msgstr "المصادر"
 
-#: src/pages/SourcesPage.tsx:1076
+#: src/pages/SourcesPage.tsx:1209
 msgid "Sources & library"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:241
+#: src/pages/LayoutsPage.tsx:651
 msgid "Sources → Layouts → Outputs. The accessible editor offers a form-based path equivalent to the drag-and-drop canvas. Save keeps a layout; apply asks the running engine to use it now. Saved layouts are not separate live renderers."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1118
+#: src/pages/SourcesPage.tsx:1251
 msgid "Sources help"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:460
+#: src/pages/SourcesPage.tsx:508
 msgid "Specific date & time"
 msgstr ""
 
@@ -10444,6 +10592,7 @@ msgstr ""
 #: src/pages/docs/concepts/GlossaryPage.tsx:302
 #: src/pages/docs/concepts/TransportsPage.tsx:106
 #: src/pages/docs/concepts/TransportsPage.tsx:289
+#: src/pages/SourcesPage.tsx:114
 msgid "SRT"
 msgstr ""
 
@@ -10452,7 +10601,7 @@ msgid "SRT (Secure Reliable Transport) is an open-source UDP transport built for
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:933
-#: src/pages/SourcesPage.tsx:862
+#: src/pages/SourcesPage.tsx:910
 msgid "Stable device id"
 msgstr ""
 
@@ -10488,7 +10637,7 @@ msgstr ""
 
 #: src/components/SourceLifecycleActions.tsx:53
 #: src/pages/CastPage.tsx:462
-#: src/pages/SourcesPage.tsx:875
+#: src/pages/SourcesPage.tsx:923
 msgid "Start"
 msgstr ""
 
@@ -10531,7 +10680,7 @@ msgstr ""
 #: src/components/broadcast/ProductionDesk.tsx:113
 #: src/components/broadcast/ProductionDesk.tsx:114
 #: src/components/SourceDemandBadge.tsx:89
-#: src/pages/approved/SourcesSurface.tsx:322
+#: src/pages/approved/SourcesSurface.tsx:350
 msgid "Starting"
 msgstr ""
 
@@ -10554,6 +10703,10 @@ msgstr ""
 msgid "State / province"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:424
+msgid "State & fault flags"
+msgstr ""
+
 #: src/layout/components/CellPropertiesPanel.tsx:245
 msgid "Static source hint"
 msgstr ""
@@ -10569,7 +10722,7 @@ msgstr ""
 msgid "Status"
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:189
+#: src/pages/approved/SourcesSurface.tsx:217
 msgid "Status unknown"
 msgstr ""
 
@@ -10659,7 +10812,7 @@ msgstr ""
 msgid "Stored credential reference:"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:685
+#: src/pages/SourcesPage.tsx:733
 msgid "Stored sidecar (not decoded per source)"
 msgstr ""
 
@@ -10684,7 +10837,7 @@ msgstr ""
 msgid "Stored. It goes live via config export + restart; the running engine is unchanged until then."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1154
+#: src/pages/SourcesPage.tsx:1287
 msgid "Stored. Synthetic sources (bars, solid colour, clock, timer) and — on a full-engine run — network/file sources apply to the running engine immediately; NDI / YouTube / AES67 (and any kind on the software engine) go live via config export + restart. The response header declares which applied."
 msgstr ""
 
@@ -10725,7 +10878,7 @@ msgstr ""
 msgid "Streams the device serves. Binding one creates an ordinary managed Source carrying device_ref — the engine ingest path is untouched."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:223
+#: src/pages/SourcesPage.tsx:271
 msgid "STUDIO (CAM 1)"
 msgstr ""
 
@@ -10761,7 +10914,7 @@ msgstr ""
 msgid "subtitle route"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:681
+#: src/pages/SourcesPage.tsx:729
 msgid "Subtitle track (id / language)"
 msgstr ""
 
@@ -10870,7 +11023,7 @@ msgstr ""
 msgid "Synchronized output"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1139
+#: src/pages/SourcesPage.tsx:1272
 msgid "Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately when saved, and deleting any source removes it from the running engine immediately. Network and file sources (RTSP, HLS, MPEG-TS, SRT, RTMP, RIST, file) also apply live on a full-engine run; on the software engine, and for NDI / YouTube / AES67, they are stored and go live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
 msgstr ""
 
@@ -10954,7 +11107,7 @@ msgid "Takes are locked and this one changes what is on program (the current PGM
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:118
-#: src/pages/LayoutsPage.tsx:186
+#: src/pages/LayoutsPage.tsx:596
 msgid "Takes effect at the next frame boundary."
 msgstr ""
 
@@ -10975,8 +11128,8 @@ msgstr ""
 #: src/app/navigation.tsx:65
 #: src/docs/registry.ts:247
 #: src/docs/registry.ts:753
-#: src/pages/approved/SourcesSurface.tsx:341
-#: src/pages/approved/SourcesSurface.tsx:394
+#: src/pages/approved/SourcesSurface.tsx:369
+#: src/pages/approved/SourcesSurface.tsx:422
 #: src/pages/docs/concepts/GlossaryPage.tsx:326
 #: src/pages/docs/FeaturesPage.tsx:124
 #: src/pages/TallyPage.tsx:178
@@ -10989,6 +11142,10 @@ msgstr ""
 
 #: src/pages/OverlaysPage.tsx:134
 msgid "Tally binding (optional)"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:438
+msgid "Tally borders"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:339
@@ -11011,7 +11168,7 @@ msgstr ""
 msgid "Tally shows which sources are on-air. A tally profile maps the bits of an external tally bus to colors (for example red for program, green for preview) and maps bus index positions to specific tiles. A <0>tally_border</0> overlay then lights the tile's edge to match. This lets an upstream router or mixer drive the borders on the wall."
 msgstr ""
 
-#: src/pages/approved/SourcesSurface.tsx:209
+#: src/pages/approved/SourcesSurface.tsx:237
 msgid "Tally unknown"
 msgstr ""
 
@@ -11026,7 +11183,7 @@ msgstr ""
 #: src/pages/LogsPage.tsx:173
 #: src/pages/OverlaysPage.tsx:178
 #: src/pages/OverlaysPage.tsx:298
-#: src/pages/SourcesPage.tsx:524
+#: src/pages/SourcesPage.tsx:572
 #: src/pages/TallyPage.tsx:205
 #: src/pages/TallyPage.tsx:318
 msgid "Target"
@@ -11039,7 +11196,7 @@ msgstr ""
 msgid "Target {0} LUFS · ceiling {1} dBTP · ±{2} LU"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:548
+#: src/pages/SourcesPage.tsx:596
 msgid "Target date &amp; time"
 msgstr ""
 
@@ -11063,7 +11220,7 @@ msgstr ""
 msgid "Target subtitle layer"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:535
+#: src/pages/SourcesPage.tsx:583
 msgid "Target time of day"
 msgstr ""
 
@@ -11079,7 +11236,7 @@ msgstr ""
 msgid "Teardown relay"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:743
+#: src/pages/SourcesPage.tsx:791
 msgid "Teletext page"
 msgstr ""
 
@@ -11328,7 +11485,7 @@ msgstr ""
 msgid "The event journal is unavailable: this server does not provide it yet (backend not deployed)."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:939
+#: src/pages/SourcesPage.tsx:987
 msgid "The exact channel id as it appears in the XMLTV feed."
 msgstr ""
 
@@ -11451,6 +11608,10 @@ msgstr ""
 
 #: src/pages/docs/concepts/TransportsPage.tsx:175
 msgid "The MPEG transport stream is the container broadcast infrastructure speaks: a self-synchronizing packet format that multiplexes video, audio, subtitles, and data on numbered PIDs. Sent over UDP — usually to a multicast group so one sender feeds any number of receivers on the network — it is the classic in-facility distribution method, with latency well under a second."
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:451
+msgid "The on-screen clock."
 msgstr ""
 
 #: src/pages/docs/concepts/GlossaryPage.tsx:361
@@ -11594,7 +11755,7 @@ msgstr ""
 msgid "The stream becomes an ordinary source linked to its IPTV-ORG entry. The Sources page opens the create dialog next with this choice already set; nothing is saved until you confirm there."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:123
+#: src/pages/LayoutsPage.tsx:161
 msgid "The switcher is on: Program is the M/E bus. Take this layout to an output from <0>Outputs</0>."
 msgstr ""
 
@@ -11650,7 +11811,7 @@ msgid "The vendor does not document this mount, so the URL is operator-supplied 
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:937
-#: src/pages/SourcesPage.tsx:866
+#: src/pages/SourcesPage.tsx:914
 msgid "The vendor's stable handle (UUID / PCI bus id), never the index."
 msgstr ""
 
@@ -11767,6 +11928,10 @@ msgstr ""
 msgid "This is the lowest-latency way to reach a web page (well under a second, glass to glass) and the transport the in-app live preview uses when the build supports it, falling back to a ~1 fps still image otherwise. Reaching viewers across restrictive networks can need a TURN relay; that is configured by the operator on the server, not in the browser. A <0>webrtc</0> output is published at a derived WHEP URL and a <1>webrtc</1> source is published to at a derived WHIP URL — the forms show both so a publisher or viewer can be configured without reading the protocol specs."
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:394
+msgid "This layout changed elsewhere since it was opened here. Reopen Layers to edit the current version — nothing was overwritten."
+msgstr ""
+
 #: src/pages/LayoutEditorPage.tsx:290
 msgid "This layout uses the factory preset \"{preset}\". To edit it, convert it to an editable form first — nothing changes until you save."
 msgstr ""
@@ -11803,7 +11968,7 @@ msgstr ""
 msgid "This overlay kind has no configurable parameters in this build. Parameters authored in a config file are preserved unchanged."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:341
+#: src/pages/LayoutsPage.tsx:751
 msgid "This permanently removes the layout. Running outputs are not affected until a new layout is applied."
 msgstr ""
 
@@ -11836,11 +12001,11 @@ msgstr ""
 msgid "This screen is part of an upcoming milestone."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:137
+#: src/pages/SourcesPage.tsx:184
 msgid "This server build does not include YouTube live ingest. A saved source will stay `NO_SIGNAL` until it is rebuilt with the `youtube` feature."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:131
+#: src/pages/SourcesPage.tsx:178
 msgid "This server cannot resolve YouTube sources right now: `yt-dlp` was not found. A saved source will stay `NO_SIGNAL` until the server operator installs it."
 msgstr ""
 
@@ -11868,7 +12033,7 @@ msgstr ""
 msgid "This source was not found."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:786
+#: src/pages/SourcesPage.tsx:834
 msgid "This stored sidecar is not decoded per source. Use the legacy command-line subtitle option instead."
 msgstr ""
 
@@ -11926,7 +12091,7 @@ msgstr ""
 msgid "Time not known."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:458
+#: src/pages/SourcesPage.tsx:506
 msgid "Time of day (recurring)"
 msgstr ""
 
@@ -11946,8 +12111,12 @@ msgstr ""
 msgid "Timed ID3"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:388
-#: src/pages/SourcesPage.tsx:561
+#: src/pages/SourcesPage.tsx:104
+msgid "Timer"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:436
+#: src/pages/SourcesPage.tsx:609
 msgid "Timezone (IANA id)"
 msgstr ""
 
@@ -11955,8 +12124,8 @@ msgstr ""
 msgid "Timezone offset (minutes from UTC, optional)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:406
-#: src/pages/SourcesPage.tsx:579
+#: src/pages/SourcesPage.tsx:454
+#: src/pages/SourcesPage.tsx:627
 msgid "Timezone offset (minutes from UTC)"
 msgstr ""
 
@@ -11973,7 +12142,7 @@ msgstr ""
 msgid "To let callers pull the program, use srt://[::]:7001?mode=listener: one socket serves up to 16 IPv6 and IPv4 callers. 0.0.0.0 is IPv4 only."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:190
+#: src/pages/SourcesPage.tsx:238
 msgid "To receive from a remote encoder, use srt://[::]:7001?mode=listener: one socket accepts an IPv6 or IPv4 caller, one at a time. 0.0.0.0 is IPv4 only."
 msgstr ""
 
@@ -11993,7 +12162,7 @@ msgstr ""
 msgid "Top (%)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:757
+#: src/pages/SourcesPage.tsx:805
 msgid "Track id or language tag"
 msgstr ""
 
@@ -12057,7 +12226,7 @@ msgstr ""
 msgid "Transcript words"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:814
+#: src/pages/SourcesPage.tsx:862
 msgid "Transfer"
 msgstr ""
 
@@ -12138,7 +12307,7 @@ msgid "Turning it on"
 msgstr ""
 
 #: src/pages/IptvPage.tsx:253
-#: src/pages/SourcesPage.tsx:959
+#: src/pages/SourcesPage.tsx:1007
 msgid "tvg-id"
 msgstr ""
 
@@ -12223,7 +12392,7 @@ msgstr ""
 #: src/components/broadcast/ProductionDesk.tsx:341
 #: src/components/broadcast/ProductionDesk.tsx:341
 #: src/pages/approved/RoutingSurface.tsx:44
-#: src/pages/approved/SourcesSurface.tsx:326
+#: src/pages/approved/SourcesSurface.tsx:354
 #: src/pages/MediaPlayersPage.tsx:355
 #: src/pages/OutputFeedRow.tsx:307
 msgid "Unknown"
@@ -12377,7 +12546,7 @@ msgstr ""
 msgid "Upstream changes applied"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:907
+#: src/pages/SourcesPage.tsx:955
 msgid "Upstream EPG (electronic programme guide)"
 msgstr ""
 
@@ -12407,7 +12576,7 @@ msgstr ""
 msgid "Use stream"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:701
+#: src/pages/SourcesPage.tsx:749
 msgid "Use the source wall-clock when trusted"
 msgstr ""
 
@@ -12419,7 +12588,7 @@ msgstr ""
 msgid "User-Agent"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:712
+#: src/pages/SourcesPage.tsx:760
 msgid "User-Agent header (optional)"
 msgstr ""
 
@@ -12507,7 +12676,7 @@ msgstr ""
 msgid "Video using a brightness curve (PQ or HLG) and usually the BT.2020 gamut that represents far brighter highlights and deeper shadows than standard dynamic range (SDR). HDR tiles must be tone-mapped onto an SDR canvas or they look dim and grey."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:255
+#: src/pages/LayoutsPage.tsx:665
 msgid "View current engine program"
 msgstr ""
 
@@ -12634,7 +12803,7 @@ msgstr ""
 msgid "Wall tiles are still previews refreshed every ~2 s — not live video."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:885
+#: src/pages/SourcesPage.tsx:933
 msgid "Wall-clock handling"
 msgstr ""
 
@@ -12653,7 +12822,7 @@ msgstr ""
 msgid "Warning"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:184
+#: src/pages/SourcesPage.tsx:232
 msgid "Watch / live / channel URL"
 msgstr ""
 
@@ -12685,6 +12854,10 @@ msgstr ""
 #: src/docs/registry.ts:431
 #: src/pages/docs/concepts/TransportsPage.tsx:197
 msgid "WebRTC (WHIP and WHEP)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:124
+msgid "WebRTC (WHIP)"
 msgstr ""
 
 #: src/docs/registry.ts:168
@@ -12757,7 +12930,7 @@ msgstr ""
 msgid "What is WHEP?"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:309
+#: src/pages/SourcesPage.tsx:357
 msgid "What is WHIP?"
 msgstr ""
 
@@ -12840,6 +13013,10 @@ msgstr ""
 msgid "Whether this server can resolve a live YouTube source (ADR-0015): the build feature plus the `yt-dlp` resolver found at startup."
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:375
+msgid "Which multiview layers {layoutName} bakes when a routed output shows it."
+msgstr ""
+
 #: src/pages/docs/concepts/CodecsPage.tsx:159
 msgid "Which transports carry which codecs"
 msgstr ""
@@ -12849,12 +13026,12 @@ msgstr ""
 msgid "WHIP (WebRTC-HTTP Ingestion Protocol)"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:297
+#: src/pages/SourcesPage.tsx:345
 msgid "WHIP publish endpoint"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:411
-#: src/pages/SourcesPage.tsx:584
+#: src/pages/SourcesPage.tsx:459
+#: src/pages/SourcesPage.tsx:632
 msgid "Whole minutes between −720 and 840 (e.g. 600 = UTC+10)."
 msgstr ""
 
@@ -12922,7 +13099,7 @@ msgstr ""
 msgid "Writes an HLS playlist and segments to <0>path</0> with a <1>codec</1> and a <2>segment_ms</2> duration."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:922
+#: src/pages/SourcesPage.tsx:970
 msgid "XMLTV guide URL"
 msgstr ""
 
@@ -12982,8 +13159,16 @@ msgstr ""
 msgid "Your tickets"
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:110
+msgid "YouTube live"
+msgstr ""
+
 #: src/pages/CapabilitiesPage.tsx:240
 msgid "YouTube live ingest"
+msgstr ""
+
+#: src/components/YoutubeVtClipHint.tsx:30
+msgid "YouTube sources must be live. For a recorded video, import it as a VT clip instead."
 msgstr ""
 
 #: src/pages/CapabilitiesPage.tsx:261

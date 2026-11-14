@@ -273,7 +273,7 @@ mod guide_change_tests {
 ///   live (e.g. `rtsp` → `ndi`) enqueues [`Command::RemoveSource`] — the
 ///   running producer stops (a stale picture pretending to be the new feed
 ///   would be dishonest) — but the new document itself applies on `restart`.
-/// * Non-live kinds (`ndi`/`youtube`/`aes67`, or network kinds on a run with
+/// * Non-live kinds (`ndi`/`aes67`, `youtube` without the feature, or network kinds on a run with
 ///   no decoder), a full/closed bus (no engine draining), or an unparseable
 ///   stored doc → `restart`, honestly.
 ///
@@ -520,7 +520,7 @@ pub(crate) async fn get_source(
         params(("id" = String, Path, description = "Source id.")),
         request_body = crate::openapi_schemas::SourceResourceInputDoc,
         responses(
-            (status = 201, description = "The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file) on a full-engine run — `restart` otherwise (ndi/youtube/aes67, or a run without the decoder; ADR-W018).", body = crate::resource_store::Resource),
+            (status = 201, description = "The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file, and youtube on a build with the `youtube` feature) on a full-engine run — `restart` otherwise (ndi/aes67, or a run without the decoder; ADR-W018).", body = crate::resource_store::Resource),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to write.", body = crate::problem::Problem),
             (status = 422, description = "The body is not a valid source document (detail names the field path).", body = crate::problem::Problem),
@@ -924,7 +924,7 @@ fn activation_of(
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to operate this source.", body = crate::problem::Problem),
             (status = 404, description = "No such source.", body = crate::problem::Problem),
-            (status = 409, description = "This run cannot start sources.", body = crate::problem::Problem),
+            (status = 409, description = "This run cannot start sources, or the source is saved but applies on restart (the detail says which).", body = crate::problem::Problem),
         ),
     )
 )]
@@ -936,14 +936,17 @@ pub(crate) async fn start_source(
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &id)?;
     let source = accepted_source(&state, &id)?;
-    let started = state
-        .source_demand
-        .as_ref()
-        .is_some_and(|demand| demand.start_source(&id));
-    if !started {
+    let Some(demand) = state.source_demand.as_ref() else {
         return Err(crate::error::ControlError::Conflict(
             "this run cannot start sources on request".to_owned(),
         ));
+    };
+    if !demand.start_source(&id) {
+        // The source is stored but the running engine does not know it: it
+        // was saved as a restart-only change (issue #420). Say so plainly.
+        return Err(crate::error::ControlError::Conflict(format!(
+            "source {id:?} is saved but not running in this engine; it applies on restart"
+        )));
     }
     state.audit(
         &principal.key_id,

@@ -331,7 +331,7 @@ where
             Err(e) => {
                 tracing::info!(
                     yt_dlp_path = %resolver_config.yt_dlp_path,
-                    error = %e,
+                    error = %multiview_ffmpeg::sanitize_line(&e.to_string()),
                     "yt-dlp not found/usable; youtube sources will report unavailable until it is installed"
                 );
                 None
@@ -3145,11 +3145,11 @@ impl CommandDrain {
             return;
         };
         let synthetic = crate::synth::SyntheticKind::from_source_kind(&source.kind);
-        if synthetic.is_none() && !source.kind.is_network_media() {
+        if synthetic.is_none() && !live_decoded_kind(&source.kind) {
             tracing::warn!(
                 source = %source.id,
                 "upsert_source held: this kind is not live-appliable \
-                 (ndi/youtube/aes67 apply on restart)"
+                 (ndi/aes67, or youtube without the feature, apply on restart)"
             );
             return;
         }
@@ -3741,6 +3741,15 @@ async fn persist_layouts(
         }
     }
     Arc::clone(seeded)
+}
+
+/// Whether a decoded (non-synthetic) source kind is live-appliable in this
+/// build: the network/file kinds, plus `youtube` (an HLS wrapper, issue #420)
+/// when the build carries the `youtube` feature.
+fn live_decoded_kind(kind: &multiview_config::SourceKind) -> bool {
+    kind.is_network_media()
+        || (cfg!(feature = "youtube")
+            && matches!(kind, multiview_config::SourceKind::Youtube { .. }))
 }
 
 #[cfg(test)]
@@ -5594,5 +5603,23 @@ mod push_links_tests {
     #[test]
     fn no_push_outputs_means_no_fragment() {
         assert!(push_links_fragment(&[]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod live_decoded_kind_tests {
+    use super::live_decoded_kind;
+
+    #[test]
+    fn youtube_is_live_exactly_when_the_build_resolves_it() {
+        let yt: multiview_config::SourceKind = serde_json::from_value(
+            serde_json::json!({"kind": "youtube", "url": "https://youtu.be/x"}),
+        )
+        .expect("youtube kind");
+        assert_eq!(live_decoded_kind(&yt), cfg!(feature = "youtube"));
+        let ndi: multiview_config::SourceKind =
+            serde_json::from_value(serde_json::json!({"kind": "ndi", "name": "CAM"}))
+                .expect("ndi kind");
+        assert!(!live_decoded_kind(&ndi));
     }
 }
