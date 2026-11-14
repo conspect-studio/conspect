@@ -92,7 +92,11 @@ const RUNDOWN: &str = "/api/v1/graphics/channels/gfx-channel-1/rundown";
 fn state_for(path: &Path, config: &MultiviewConfig) -> AppState {
     let seeded = multiview_control::seed_resources(config).unwrap();
     let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
-    let (sender, _receiver) = command_bus(64);
+    let (sender, receiver) = command_bus(64);
+    // A running engine holds the receiver for the life of the run; a closed bus
+    // means shutdown, and the config-file watcher commits nothing then (#367).
+    // Leaked on purpose (a test process ends anyway).
+    Box::leak(Box::new(receiver));
     AppState::new(
         publisher,
         sender,
@@ -502,9 +506,10 @@ async fn revert_to_start_removes_graphics_edits_for_good() {
     assert_eq!(read(&restarted, SOURCE).await.0, StatusCode::NOT_FOUND);
 }
 
-/// A file edit replaces the whole envelope. The hub is the base of the next
-/// graphics mutation, so it must follow, or that mutation writes back content
-/// the accepted file no longer holds.
+/// A file edit's graphics change must reach the hub: the hub is the base of
+/// the next graphics mutation, so a stale hub would undo the file edit on the
+/// next API commit. Content the file edit did not touch (the item the API
+/// created) stays (#367: a file edit applies only what the FILE changed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_edit_cannot_be_undone_by_the_next_graphics_commit() {
     let dir = tempfile::tempdir().unwrap();
@@ -520,8 +525,16 @@ async fn a_file_edit_cannot_be_undone_by_the_next_graphics_commit() {
     }
     seed_graphics(&router).await;
 
+    let file_source = r#"
+[[graphics.data_sources]]
+id = "from-file"
+name = "From the file"
+kind = "bom_weather"
+forecast_product = "IDV10753"
+aac = "VIC_PT042"
+"#;
     let edited = dir.path().join("edited.toml");
-    std::fs::write(&edited, BOOT.replace("#101014", "#202024")).unwrap();
+    std::fs::write(&edited, format!("{BOOT}{file_source}")).unwrap();
     std::fs::rename(&edited, &path).unwrap();
     for _ in 0..2 {
         assert!(poll.poll_once().await);
@@ -536,9 +549,17 @@ async fn a_file_edit_cannot_be_undone_by_the_next_graphics_commit() {
     )
     .await;
     let desired = load_desired(&path).unwrap().unwrap();
+    let ids: Vec<&str> = desired
+        .config
+        .graphics
+        .data_sources
+        .iter()
+        .map(|d| d.id.as_str())
+        .collect();
     assert!(
-        desired.config.graphics.item("syd7").is_none(),
-        "a graphics commit resurrected content the file edit replaced"
+        ids.contains(&"from-file"),
+        "a graphics commit undid the file edit (stale hub): {ids:?}"
     );
+    assert!(ids.contains(&"other"), "{ids:?}");
     watch.stop();
 }

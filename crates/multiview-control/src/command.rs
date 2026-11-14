@@ -787,6 +787,15 @@ impl CommandSender {
         }
     }
 
+    /// Whether the engine side (the receiver) has been dropped or closed, so
+    /// nothing submitted now can apply. This turns true only once the drain
+    /// is torn down, after the exit decision; it is a backstop, not the
+    /// shutdown signal (#367 uses the exit freeze for that).
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// The shared routing ledger (ADR-0183 automation compare-and-restore).
     #[must_use]
     pub fn ledger(&self) -> &std::sync::Arc<RoutingLedger> {
