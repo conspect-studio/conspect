@@ -170,8 +170,22 @@ impl PatchSets {
         })
     }
 
-    /// Reserve `key` for the body `digest`, charged to `principal`.
-    pub fn reserve(&self, key: &str, digest: &str, principal: &str) -> SetReservation {
+    /// Reserve `key` for the body `digest`, charged to `principal`, and
+    /// register the fresh set for its outcome (`members`, admitted `now`),
+    /// all under ONE lock acquisition: the pending bound
+    /// ([`MAX_PENDING_SETS`]) is checked and charged atomically with the key
+    /// record, so concurrent admissions never exceed it. Registered before
+    /// the enqueue, so an outcome never beats it. A failure after this point
+    /// must [`Self::release`] both; settlement and the deadline free the
+    /// pending slot.
+    pub fn reserve(
+        &self,
+        key: &str,
+        digest: &str,
+        principal: &str,
+        members: &SetMembers,
+        now: Instant,
+    ) -> SetReservation {
         let mut inner = self.lock();
         if let Some(record) = inner.records.get(key) {
             return if record.digest == digest {
@@ -208,13 +222,6 @@ impl PatchSets {
                 settled: false,
             },
         );
-        SetReservation::Fresh(op)
-    }
-
-    /// Register the set `op` (reserved under `key`) for its outcome, before
-    /// it is enqueued, so an outcome never beats it.
-    pub fn register(&self, key: &str, op: &OperationId, members: &SetMembers, now: Instant) {
-        let mut inner = self.lock();
         inner.pending.insert(
             op.as_str().to_owned(),
             Pending {
@@ -229,10 +236,11 @@ impl PatchSets {
                 admitted: now,
             },
         );
+        SetReservation::Fresh(op)
     }
 
-    /// Undo [`Self::reserve`] and [`Self::register`] for a set that never
-    /// reached the engine (only if `key` still names `op`).
+    /// Undo [`Self::reserve`] (the key record AND the pending slot) for a
+    /// set that never reached the engine (only if `key` still names `op`).
     pub fn release(&self, key: &str, op: &OperationId) {
         let mut inner = self.lock();
         inner.pending.remove(op.as_str());
@@ -406,25 +414,40 @@ fn settle(inner: &mut Inner, op: &str, forced: Option<&str>) -> Vec<Event> {
     out
 }
 
+/// The §12.8 typed kind of an engine refusal code (the part after
+/// `refused:`), shared by output members and the mixer half: the engine's
+/// `unroutable` is `slot-medium-mismatch`, its `format-mismatch`
+/// (`SetRefusal::FormatMismatch`) is `slot-format-unsupported`; every other
+/// code is already a §12.8 kind.
+#[must_use]
+fn typed_kind(code: &str) -> &str {
+    match code {
+        "unroutable" => "slot-medium-mismatch",
+        "format-mismatch" => "slot-format-unsupported",
+        other => other,
+    }
+}
+
 /// The §12.8 refusal kind of an output member's `route.output` outcome.
 #[must_use]
 pub fn output_refusal_kind(outcome: &str) -> &str {
     match outcome {
         "superseded" => "superseded",
-        "refused:unroutable" => "slot-medium-mismatch",
-        "refused:format-mismatch" => "slot-format-unsupported",
-        other => other
-            .strip_prefix("refused:")
-            .or_else(|| other.strip_prefix("fallback:"))
-            .unwrap_or(other),
+        other => typed_kind(
+            other
+                .strip_prefix("refused:")
+                .or_else(|| other.strip_prefix("fallback:"))
+                .unwrap_or(other),
+        ),
     }
 }
 
-/// The §12.8 refusal kind of the mixer half's `switcher.operation` error.
+/// The §12.8 refusal kind of the mixer half's `switcher.operation` error,
+/// normalized through the same typed mapping as an output member's.
 #[must_use]
 pub fn mixer_refusal_kind(error: &str) -> &str {
     if let Some(code) = error.strip_prefix("refused:") {
-        return code.split(':').next().unwrap_or(code);
+        return typed_kind(code.split(':').next().unwrap_or(code));
     }
     if error.starts_with("engine-busy") {
         return "engine-busy";
@@ -504,19 +527,23 @@ mod tests {
         })
     }
 
+    fn members(outputs: &[&str], with_mixer: bool) -> SetMembers {
+        SetMembers {
+            outputs: outputs.iter().map(|s| (*s).to_owned()).collect(),
+            mixer: with_mixer,
+        }
+    }
+
+    fn reserve(sets: &PatchSets, key: &str, digest: &str, principal: &str) -> SetReservation {
+        sets.reserve(key, digest, principal, &members(&["o"], false), Instant::now())
+    }
+
     fn admitted(sets: &PatchSets, key: &str, outputs: &[&str], with_mixer: bool) -> String {
-        let SetReservation::Fresh(op) = sets.reserve(key, "d", "p") else {
+        let SetReservation::Fresh(op) =
+            sets.reserve(key, "d", "p", &members(outputs, with_mixer), Instant::now())
+        else {
             panic!("fresh");
         };
-        sets.register(
-            key,
-            &op,
-            &SetMembers {
-                outputs: outputs.iter().map(|s| (*s).to_owned()).collect(),
-                mixer: with_mixer,
-            },
-            Instant::now(),
-        );
         op.as_str().to_owned()
     }
 
@@ -615,17 +642,17 @@ mod tests {
     #[test]
     fn keys_bind_the_body_and_the_store_is_bounded() {
         let sets = PatchSets::default();
-        let SetReservation::Fresh(op) = sets.reserve("k", "a", "p") else {
+        let SetReservation::Fresh(op) = reserve(&sets, "k", "a", "p") else {
             panic!()
         };
         assert_eq!(
-            sets.reserve("k", "a", "p"),
+            reserve(&sets, "k", "a", "p"),
             SetReservation::Replay(op.clone())
         );
-        assert_eq!(sets.reserve("k", "b", "p"), SetReservation::Conflict);
+        assert_eq!(reserve(&sets, "k", "b", "p"), SetReservation::Conflict);
         sets.release("k", &op);
         assert!(matches!(
-            sets.reserve("k", "b", "p"),
+            reserve(&sets, "k", "b", "p"),
             SetReservation::Fresh(_)
         ));
         // Pending sets are bounded; a full pending map fails closed.
@@ -633,28 +660,119 @@ mod tests {
         for i in 0..MAX_PENDING_SETS {
             let _ = admitted(&sets, &format!("k{i}"), &["o"], false);
         }
-        assert_eq!(sets.reserve("over", "d", "q"), SetReservation::Capacity);
+        assert_eq!(reserve(&sets, "over", "d", "q"), SetReservation::Capacity);
         assert_eq!(sets.pending_len(), MAX_PENDING_SETS);
         // A principal's records are capped; settled ones are evicted.
         let sets = PatchSets::default();
         for i in 0..MAX_SET_RECORDS_PER_PRINCIPAL {
-            let SetReservation::Fresh(_) = sets.reserve(&format!("k{i}"), "d", "p") else {
+            let SetReservation::Fresh(_) = reserve(&sets, &format!("k{i}"), "d", "p") else {
                 panic!()
             };
         }
         assert_eq!(
-            sets.reserve("more", "d", "p"),
+            reserve(&sets, "more", "d", "p"),
             SetReservation::Capacity,
             "all pending"
         );
-        sets.lock()
-            .records
-            .values_mut()
-            .for_each(|r| r.settled = true);
+        // Settled (here by the deadline): the pending slots free and the
+        // settled records are evicted for new ones.
+        assert!(!sets
+            .expire(Instant::now() + SET_OUTCOME_DEADLINE)
+            .is_empty());
+        assert_eq!(sets.pending_len(), 0);
         assert!(matches!(
-            sets.reserve("more", "d", "p"),
+            reserve(&sets, "more", "d", "p"),
             SetReservation::Fresh(_)
         ));
         assert_eq!(sets.records_len(), MAX_SET_RECORDS_PER_PRINCIPAL);
+    }
+
+    /// The pending bound is charged atomically with the key record: at 255
+    /// pending, two racing admissions get exactly one slot; a rollback
+    /// (`release`) and a settlement each free one again.
+    #[test]
+    fn the_pending_bound_holds_under_concurrent_admission() {
+        use std::sync::{Arc, Barrier};
+        let sets = Arc::new(PatchSets::default());
+        for i in 0..MAX_PENDING_SETS - 1 {
+            let _ = admitted(&sets, &format!("k{i}"), &["o"], false);
+        }
+        assert_eq!(sets.pending_len(), MAX_PENDING_SETS - 1);
+        for round in 0..64 {
+            let barrier = Arc::new(Barrier::new(2));
+            let racers: Vec<_> = (0..2)
+                .map(|n| {
+                    let (sets, barrier) = (Arc::clone(&sets), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        let key = format!("race{round}-{n}");
+                        barrier.wait();
+                        (key.clone(), reserve(&sets, &key, "d", &format!("q{n}")))
+                    })
+                })
+                .collect();
+            let results: Vec<(String, SetReservation)> = racers
+                .into_iter()
+                .map(|h| h.join().expect("racer"))
+                .collect();
+            let fresh: Vec<(&String, &OperationId)> = results
+                .iter()
+                .filter_map(|(k, r)| match r {
+                    SetReservation::Fresh(op) => Some((k, op)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(fresh.len(), 1, "exactly one admission wins: {results:?}");
+            assert!(
+                results
+                    .iter()
+                    .any(|(_, r)| *r == SetReservation::Capacity),
+                "the other fails closed"
+            );
+            assert_eq!(sets.pending_len(), MAX_PENDING_SETS, "never beyond the bound");
+            // The rollback of the winner frees its slot (and its key).
+            let (key, op) = fresh[0];
+            sets.release(key, op);
+            assert_eq!(sets.pending_len(), MAX_PENDING_SETS - 1);
+            assert_eq!(sets.peek(key, "d"), None, "key released");
+        }
+        // A settled set frees its slot too.
+        let SetReservation::Fresh(op) = reserve(&sets, "last", "d", "q") else {
+            panic!("the freed slot admits");
+        };
+        assert_eq!(reserve(&sets, "over", "d", "q"), SetReservation::Capacity);
+        let out = sets.observe(&route(op.as_str(), "o", 3, "applied"));
+        assert_eq!(take(&out).len(), 1);
+        assert_eq!(sets.pending_len(), MAX_PENDING_SETS - 1);
+        assert!(matches!(
+            reserve(&sets, "over", "d", "q"),
+            SetReservation::Fresh(_)
+        ));
+    }
+
+    /// The mixer half's refusal codes use the same typed kinds as an
+    /// output member's (§12.8): `format-mismatch` is never published raw.
+    #[test]
+    fn mixer_refusals_map_to_the_same_typed_kinds() {
+        assert_eq!(
+            mixer_refusal_kind("refused:format-mismatch"),
+            "slot-format-unsupported"
+        );
+        assert_eq!(
+            mixer_refusal_kind("refused:unroutable"),
+            "slot-medium-mismatch"
+        );
+        assert_eq!(
+            mixer_refusal_kind("refused:feed-not-fresh"),
+            "feed-not-fresh"
+        );
+        let sets = PatchSets::default();
+        let op = admitted(&sets, "k", &["output-0"], true);
+        let _ = sets.observe(&mixer(&op, 7, Some("refused:format-mismatch")));
+        let out = sets.observe(&route(&op, "output-0", 7, "refused:superseded"));
+        let out = take(&out);
+        assert_eq!(out.len(), 2);
+        assert!(out
+            .iter()
+            .all(|t| t.refusal.as_deref() == Some("slot-format-unsupported")));
     }
 }

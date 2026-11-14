@@ -562,22 +562,24 @@ pub(crate) fn take_set(
             },
         )));
     }
-    let op = match state.patch_sets.reserve(key, &digest, &principal.key_id) {
-        SetReservation::Capacity => return Err(ControlError::IdempotencyCapacity),
-        SetReservation::Conflict => return Err(super::output_routing::key_reused()),
-        SetReservation::Replay(op) => return Ok(Ok(op.to_string())),
-        SetReservation::Fresh(op) => op,
-    };
-    // Registered before the enqueue, so an outcome never beats it.
-    state.patch_sets.register(
+    // The key record and the pending slot in one atomic reservation,
+    // registered before the enqueue so an outcome never beats it; every
+    // failure below releases both.
+    let op = match state.patch_sets.reserve(
         key,
-        &op,
+        &digest,
+        &principal.key_id,
         &SetMembers {
             outputs: outputs.iter().map(|o| o.api_id.clone()).collect(),
             mixer: mixer.is_some(),
         },
         Instant::now(),
-    );
+    ) {
+        SetReservation::Capacity => return Err(ControlError::IdempotencyCapacity),
+        SetReservation::Conflict => return Err(super::output_routing::key_reused()),
+        SetReservation::Replay(op) => return Ok(Ok(op.to_string())),
+        SetReservation::Fresh(op) => op,
+    };
     let arm = (mixer.is_some() && !outputs.is_empty()).then(|| Arc::new(SetArm::new()));
     // The mixer half first: armed (with outputs) or a plain atomic patch.
     if let Some(mixer) = &mixer {
