@@ -853,12 +853,21 @@ mod tests {
     #[test]
     fn drain_bounded_stops_at_the_bound_against_a_source_that_always_refills() {
         let mut produced = 0_u64;
+        // A ninth take within one call panics at once, so an unbounded drain
+        // fails fast instead of hanging on the never-empty source.
+        let budget = std::cell::Cell::new(8_u32);
         let mut source = || {
+            assert!(
+                budget.get() > 0,
+                "drain took more than the bound in one call"
+            );
+            budget.set(budget.get() - 1);
             produced += 1;
             Some(produced)
         };
         let first = super::drain_bounded(8, &mut source);
         assert_eq!(first, (1..=8).collect::<Vec<_>>());
+        budget.set(8);
         let second = super::drain_bounded(8, &mut source);
         assert_eq!(second, (9..=16).collect::<Vec<_>>(), "FIFO, nothing lost");
         let mut finite = vec![3, 2, 1];
