@@ -1085,9 +1085,12 @@ mod tests {
     }
 
     /// The slate bake uses the slot's own encoder once and keeps one closed
-    /// GOP led by a self-contained IDR.
+    /// GOP led by a self-contained IDR. The default LGPL `FFmpeg` (CI's linked
+    /// image) has no libx264: there the bake must fail cleanly with an error
+    /// (no slate means no passthrough key opens), never panic.
     #[test]
     fn the_format_slate_bakes_one_closed_gop_with_the_slot_encoder() {
+        let encoder = ffmpeg_next::encoder::find_by_name("libx264").map(|_| "libx264");
         let cfg = multiview_output::sink::EncodeConfig {
             codec_name: "libx264".to_owned(),
             width: 64,
@@ -1108,7 +1111,15 @@ mod tests {
             multiview_core::color::ColorInfo::default(),
         )
         .unwrap();
-        let slate = bake_slate(&cfg, &black, CodecKind::H264).unwrap();
+        let baked = bake_slate(&cfg, &black, CodecKind::H264);
+        let Some(encoder) = encoder else {
+            let Err(err) = baked else {
+                panic!("no libx264 linked: the bake must fail");
+            };
+            assert!(err.contains("not found"), "{err}");
+            return;
+        };
+        let slate = baked.unwrap_or_else(|e| panic!("{encoder}: {e}"));
         assert_eq!(slate.packets().len(), 10);
         assert!(idr::is_self_contained_idr(
             &slate.packets()[0],
