@@ -848,7 +848,9 @@ impl CompositorDrive<Nv12Image> {
                     },
                 );
                 // The border band: the colour drawn through the same edge
-                // grown by the border width, under the incoming picture.
+                // grown by the border width, under the incoming picture. Its
+                // mask excludes the revealed interior, so a stale or missing
+                // incoming frame never turns the wipe into a colour fill.
                 if let (Some(color), true) = (border_color, border_width > 0.0) {
                     if let Some((_, fill)) =
                         self.transition_fill.as_ref().filter(|(c, _)| *c == color)

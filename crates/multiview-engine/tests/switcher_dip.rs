@@ -1076,3 +1076,66 @@ fn repeated_bordered_wipes_build_the_border_once_and_never_grow_the_scratch_pool
     assert_eq!(rig.drive.transition_fill_builds(), 1);
     assert_eq!(rig.handle.snapshot().unwrap().completion_count, 5);
 }
+
+/// Review MED-03: when the incoming source stops being fresh during a
+/// bordered wipe, Program shows the outgoing picture plus the border band
+/// only; the border colour never fills the revealed interior.
+#[test]
+fn a_bordered_wipe_with_a_stale_incoming_source_shows_only_the_band() {
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    let mut rig = rig();
+    let border = Rgb8::new(0, 255, 0);
+    rig.send(
+        "set",
+        SwitcherVerb::SetTransition(wipe(
+            40,
+            "box",
+            &serde_json::json!({"border_width": 0.1, "border_color": "#00ff00"}),
+        )),
+    );
+    rig.step(0);
+    rig.step(1);
+    rig.send(
+        "auto",
+        SwitcherVerb::Auto(FrameCount::try_from(40).unwrap()),
+    );
+    rig.step(2);
+    // From here only the outgoing source publishes; the incoming one's last
+    // fresh frame is tick 2 and it is past the 500 ms hold by tick 22.
+    let mut last = None;
+    for index in 3..=22 {
+        let t = tick(index);
+        rig.a.publish(solid(A_Y), t.pts);
+        rig.hook.before_compose(&mut rig.drive, t);
+        let frame = rig.drive.compose(t).unwrap();
+        rig.hook.after_compose(&frame);
+        last = Some(Arc::clone(&frame.canvas));
+    }
+    let got = last.unwrap();
+    assert!(
+        rig.handle.snapshot().unwrap().in_flight,
+        "the wipe is still running"
+    );
+    let mask = WipeMask::new(MaskShape::Box, 0.5, W, W, [0.5, 0.5], false, 0.0, 0.1);
+    let a = solid(A_Y);
+    let fill =
+        Nv12Image::solid_rgb(2, 2, border.r, border.g, border.b, CanvasColor::default()).unwrap();
+    let want = pipeline::composite(
+        W,
+        W,
+        CanvasColor::default(),
+        LinearRgba::TRANSPARENT,
+        &[
+            Tile::scaled(&a, 0, 0, W, W, 1.0),
+            Tile::scaled(&fill, 0, 0, W, W, 1.0).with_mask(mask.expanded(0.1)),
+        ],
+    )
+    .unwrap();
+    assert_frame(&got, &want, "stale incoming at elapsed 20");
+    // The centre (revealed interior) is the outgoing picture, not the border.
+    assert_eq!(
+        got.sample(W / 2, W / 2).unwrap().0,
+        A_Y,
+        "interior shows the outgoing picture"
+    );
+}

@@ -72,9 +72,10 @@ pub struct WipeMask {
     pub radius: f32,
     /// The soft-edge width in canvas-height units (`0` is a hard edge).
     pub softness: f32,
-    /// Grow the revealed region by this much, in canvas-height units (the
-    /// border band's draw uses the
-    /// border width; the incoming picture uses `0`).
+    /// The border band's width in canvas-height units: `> 0` makes this the
+    /// band's draw, covering the edge grown by this much except where the
+    /// edge itself fully covers: never the revealed interior (review MED-03); `0`
+    /// is the incoming picture's own mask.
     pub expand: f32,
     /// An exact coverage for the whole canvas at an endpoint: `Some(0.0)` at
     /// progress `<= 0`, `Some(1.0)` at progress `>= 1`, else `None`.
@@ -138,11 +139,18 @@ impl WipeMask {
         }
     }
 
-    /// The same edge grown by `expand` (canvas-height units): the border
-    /// band's draw.
+    /// The border band of this edge, `expand` wide (canvas-height units):
+    /// coverage of the edge grown by `expand`, cut to zero wherever the edge
+    /// itself fully covers. The band never covers the revealed interior, so a missing,
+    /// stale or transparent incoming picture shows the outgoing one there,
+    /// never the border colour (review MED-03). At either endpoint the band
+    /// covers nothing.
     #[must_use]
-    pub const fn expanded(mut self, expand: f32) -> Self {
-        self.expand = expand;
+    pub fn expanded(mut self, expand: f32) -> Self {
+        self.expand = clamp01(expand);
+        if self.expand > 0.0 && self.pinned.is_some() {
+            self.pinned = Some(0.0);
+        }
         self
     }
 
@@ -160,14 +168,31 @@ impl WipeMask {
         } else {
             (self.radius, 1.0)
         };
-        let d = sign * inside(self.shape, self.aspect, self.origin, radius, u, v) + self.expand;
-        if self.softness > 0.0 {
-            (d / self.softness + 0.5).clamp(0.0, 1.0)
-        } else if d >= 0.0 {
-            1.0
+        let d = sign * inside(self.shape, self.aspect, self.origin, radius, u, v);
+        if self.expand > 0.0 {
+            // Zero wherever the incoming picture is fully revealed; the grown
+            // edge's coverage elsewhere (so with an opaque incoming picture the
+            // frame is exactly the grown-edge band under it).
+            if edge(d, self.softness) >= 1.0 {
+                0.0
+            } else {
+                edge(d + self.expand, self.softness)
+            }
         } else {
-            0.0
+            edge(d, self.softness)
         }
+    }
+}
+
+/// Coverage of a signed distance `d` (positive inside) through an edge of
+/// width `softness` (`0` is hard). Mirrors `wipe_edge` in `composite.wgsl`.
+fn edge(d: f32, softness: f32) -> f32 {
+    if softness > 0.0 {
+        (d / softness + 0.5).clamp(0.0, 1.0)
+    } else if d >= 0.0 {
+        1.0
+    } else {
+        0.0
     }
 }
 

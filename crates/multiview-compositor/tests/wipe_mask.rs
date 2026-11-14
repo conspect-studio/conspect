@@ -291,3 +291,49 @@ fn box_border_and_soft_edge_have_the_same_pixel_width_on_every_side() {
     let start = WipeMask::new(MaskShape::Box, 0.0, w, h, [0.5, 0.5], false, 0.0, 0.125);
     assert!((0..h).all(|y| (0..w).all(|x| start.expanded(0.125).coverage(x, y) == 0.0)));
 }
+
+/// Review MED-03: the border band never covers the revealed interior, so a
+/// missing, stale or transparent incoming picture leaves the outgoing one
+/// visible there; with an opaque incoming picture on top the visible band is
+/// exactly the strip the grown edge adds.
+#[test]
+fn border_band_never_covers_the_revealed_interior() {
+    let (w, h) = (96_u32, 64_u32);
+    for shape in SHAPES {
+        for reverse in [false, true] {
+            for soft in [0.0, 0.1] {
+                for progress in [0.1_f32, 0.3, 0.5, 0.8, 0.95] {
+                    let mask = WipeMask::new(shape, progress, w, h, [0.4, 0.6], reverse, soft, 0.1);
+                    let band = mask.expanded(0.1);
+                    let mut interior = 0;
+                    let mut in_band = 0;
+                    for y in 0..h {
+                        for x in 0..w {
+                            let c = mask.coverage(x, y);
+                            let b = band.coverage(x, y);
+                            assert!((0.0..=1.0).contains(&b));
+                            if c >= 1.0 {
+                                interior += 1;
+                                assert_eq!(
+                                    b, 0.0,
+                                    "{shape:?} rev={reverse} soft={soft} p={progress} ({x},{y})"
+                                );
+                            } else if c <= 0.0 && b >= 0.5 {
+                                in_band += 1;
+                            }
+                        }
+                    }
+                    if (0.3..=0.8).contains(&progress) {
+                        // Non-vacuous mid-flight (the band leaves the canvas near the end): a revealed interior and a
+                        // band (at least half strength outside the edge) both exist.
+                        assert!(interior > 0, "{shape:?} p={progress}: nothing revealed");
+                        assert!(
+                            in_band > 0,
+                            "{shape:?} rev={reverse} soft={soft} p={progress}: no band"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
