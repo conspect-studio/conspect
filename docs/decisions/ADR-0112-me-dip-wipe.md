@@ -140,6 +140,13 @@ tile. No switcher or drive code changes.
   linesize, every row inside one of the frame's own refcounted buffers; a
   frame without such buffers is an error), so a source whose geometry was
   raised over a small allocation is an error, not an out-of-bounds read.
+  Before `sws_scale` (not the identity copies, which read only active
+  bytes) both sides must also have the 16 bytes `libavutil/frame.h` says
+  libswscale may read beyond a plane, after the plane's highest active
+  byte (the last row, or row 0 of a bottom-up plane) in the same owning
+  buffer (`frame::check_swscale_source`/`check_swscale_destination`;
+  checked even for `alloc_video` outputs, not assumed), so an exact-size
+  allocation whose padding became active rows is an error.
   Decoded alpha is read through `frame::plane_rows`, which validates the plane,
   its signed linesize, its subsampled height and that every row lies in
   one of the frame's own buffers before yielding single-row slices, so a
@@ -155,7 +162,10 @@ tile. No switcher or drive code changes.
   `multiview-ffmpeg` `frame::tests`, `alpha::tests` (negative linesize,
   mismatched layout), `scale::run_into_tests` (an undersized or shared
   destination is an error, an undersized or unbuffered source is an error
-  in the conversion and identity paths of `run` and `run_into`, a
+  in the conversion and identity paths of `run` and `run_into`, a source
+  or destination without the 16-byte swscale padding — exact-end or
+  15-byte tail, top-down or bottom-up — is refused before `sws_scale`
+  while a padded or normally allocated one converts, a
   bottom-up source still converts, a null frame allocation never becomes a
   `ScratchFrame`) and `tests/scale_resample.rs` (bottom-up identity
   `run_into`). Player path

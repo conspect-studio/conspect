@@ -16,6 +16,12 @@
 //!   span lies inside one of the frame's own reference-counted buffers — and
 //!   only then yields the rows one at a time, in display order, whatever the
 //!   stride's sign. No slice longer than one row is ever constructed.
+//! * [`check_swscale_source`] / [`check_swscale_destination`] add the
+//!   libswscale contract on top: `libavutil/frame.h` documents that
+//!   "swscale can read up to 16 bytes beyond the planes", so
+//!   [`SWSCALE_PADDING`] bytes past the plane's highest active byte must lie
+//!   in the same owning buffer. Rust row reads and `av_frame_copy` read only
+//!   active bytes and keep the active-only check.
 
 use core::marker::PhantomData;
 
@@ -219,7 +225,7 @@ impl ScratchFrame {
     /// # Errors
     /// [`FfmpegError::FrameLayout`] when the plane fails validation.
     pub fn plane(&self, plane: usize) -> Result<(&[u8], usize)> {
-        let (ptr, len, stride) = writable_span(&self.frame, plane)?;
+        let (ptr, len, stride) = writable_span(&self.frame, plane, 0)?;
         #[allow(unsafe_code)]
         // SAFETY: `writable_span` proved `[ptr, ptr + len)` lies inside one
         // `AVBufferRef` the frame holds (initialized libav memory); the
@@ -236,7 +242,7 @@ impl ScratchFrame {
     /// buffers are shared (not writable).
     pub fn plane_mut(&mut self, plane: usize) -> Result<(&mut [u8], usize)> {
         self.check_writable()?;
-        let (ptr, len, stride) = writable_span(&self.frame, plane)?;
+        let (ptr, len, stride) = writable_span(&self.frame, plane, 0)?;
         #[allow(unsafe_code)]
         // SAFETY: as `plane`, and the buffers are exclusively ours
         // (`av_frame_is_writable`, checked above); `&mut self` makes this
@@ -255,9 +261,20 @@ impl ScratchFrame {
         self.check_writable()?;
         let planes = format_planes(self.frame.format())?;
         for plane in 0..planes {
-            writable_span(&self.frame, plane)?;
+            writable_span(&self.frame, plane, 0)?;
         }
         Ok(())
+    }
+
+    /// [`Self::check_destination`] for a `sws_scale` write: additionally
+    /// [`SWSCALE_PADDING`] bytes past every plane's last active byte must
+    /// lie in the same owning buffer ([`check_swscale_destination`]).
+    ///
+    /// # Errors
+    /// [`FfmpegError::FrameLayout`] naming the first failure.
+    pub fn check_swscale_destination(&mut self) -> Result<()> {
+        self.check_writable()?;
+        check_swscale_destination(&self.frame)
     }
 
     /// The raw frame, for a libav call that writes the already-validated
@@ -335,6 +352,52 @@ const PALETTE_BYTES: usize = 256 * 4;
 /// # Errors
 /// [`FfmpegError::FrameLayout`] naming the first failure.
 pub fn check_source(frame: &Video) -> Result<()> {
+    source_planes(frame, 0)
+}
+
+/// Bytes libswscale may read (and write) past a plane: `libavutil/frame.h`
+/// on `AVFrame::data` — "Some filters and swscale can read up to 16 bytes
+/// beyond the planes, if these filters are to be used, then 16 extra bytes
+/// must be allocated." `av_frame_get_buffer` (hence [`alloc_video`]) adds
+/// at least this much after every plane.
+pub const SWSCALE_PADDING: usize = 16;
+
+/// [`check_source`] for a `sws_scale` read: additionally, for every plane,
+/// the [`SWSCALE_PADDING`] bytes after the plane's highest active byte must
+/// lie in the same owning buffer as its rows. "Beyond" is in address order
+/// (libswscale's SIMD row loads run past a row's end): for a forward plane
+/// that is after the last row, for a bottom-up (negative linesize) plane
+/// after row 0, whose end is the plane's highest address. Nothing is
+/// required before the lowest address: libswscale never reads before a
+/// row's first byte, and a flipped `av_frame_get_buffer` plane 0 starts at
+/// its buffer's first byte, so such a requirement would refuse every
+/// `vflip` frame.
+///
+/// # Errors
+/// [`FfmpegError::FrameLayout`] naming the first failure.
+pub fn check_swscale_source(frame: &Video) -> Result<()> {
+    source_planes(frame, SWSCALE_PADDING)
+}
+
+/// Validate every plane of `frame` as a `sws_scale` **destination**: every
+/// row's active bytes plus [`SWSCALE_PADDING`] bytes after the plane's
+/// highest active byte inside one owning buffer, and a forward (positive)
+/// linesize. Does not check writability (see
+/// [`ScratchFrame::check_swscale_destination`]).
+///
+/// # Errors
+/// [`FfmpegError::FrameLayout`] naming the first failure.
+pub fn check_swscale_destination(frame: &Video) -> Result<()> {
+    let planes = format_planes(frame.format())?;
+    for plane in 0..planes {
+        writable_span(frame, plane, SWSCALE_PADDING)?;
+    }
+    Ok(())
+}
+
+/// [`check_source`] with `pad` readable bytes required past every plane's
+/// highest active byte.
+fn source_planes(frame: &Video, pad: usize) -> Result<()> {
     let planes = format_planes(frame.format())?;
     if frame.width() == 0 || frame.height() == 0 {
         return Err(FfmpegError::FrameLayout(
@@ -343,7 +406,7 @@ pub fn check_source(frame: &Video) -> Result<()> {
     }
     for plane in 0..planes {
         let bytes = row_bytes(frame, plane)?;
-        let rows = plane_rows(frame, plane, bytes)?;
+        let rows = padded_plane_rows(frame, plane, bytes, pad)?;
         if rows.rows == 0 {
             return Err(FfmpegError::FrameLayout("plane is empty"));
         }
@@ -389,16 +452,17 @@ fn span_in_buffers(raw: *const ffi::AVFrame, low: usize, high: usize) -> bool {
 
 /// `(first byte, span length, stride)` of `plane` of `frame`, a forward
 /// (positive linesize) plane whose every row's active bytes
-/// (`av_image_get_linesize`) lie in one buffer the frame owns — checked by
-/// [`plane_rows`] — and whose span `stride * (rows - 1) + row_bytes`
-/// therefore lies in that same contiguous buffer.
-fn writable_span(frame: &Video, plane: usize) -> Result<(*mut u8, usize, usize)> {
+/// (`av_image_get_linesize`), plus `pad` bytes after the last one, lie in
+/// one buffer the frame owns — checked by [`padded_plane_rows`] — and whose
+/// span `stride * (rows - 1) + row_bytes` therefore lies in that same
+/// contiguous buffer. The returned span never includes the padding.
+fn writable_span(frame: &Video, plane: usize, pad: usize) -> Result<(*mut u8, usize, usize)> {
     let planes = format_planes(frame.format())?;
     if plane >= planes {
         return Err(FfmpegError::FrameLayout("plane is not part of the format"));
     }
     let row_bytes = row_bytes(frame, plane)?;
-    let rows = plane_rows(frame, plane, row_bytes)?;
+    let rows = padded_plane_rows(frame, plane, row_bytes, pad)?;
     if rows.rows == 0 || row_bytes == 0 {
         return Err(FfmpegError::FrameLayout("plane is empty"));
     }
@@ -532,6 +596,19 @@ fn owned_buffers(raw: *const ffi::AVFrame) -> impl Iterator<Item = (usize, usize
 /// # Errors
 /// [`FfmpegError::FrameLayout`] naming the first check that failed.
 pub fn plane_rows(frame: &Video, plane: usize, row_bytes: usize) -> Result<PlaneRows<'_>> {
+    padded_plane_rows(frame, plane, row_bytes, 0)
+}
+
+/// [`plane_rows`], additionally requiring `pad` bytes after the plane's
+/// highest active byte (the end of the last row for a forward plane, of
+/// row 0 for a bottom-up one) inside the same owning buffer as the rows.
+/// The rows yielded never include the padding.
+fn padded_plane_rows(
+    frame: &Video,
+    plane: usize,
+    row_bytes: usize,
+    pad: usize,
+) -> Result<PlaneRows<'_>> {
     let no_rows = || PlaneRows {
         first: core::ptr::null(),
         linesize: 0,
@@ -589,17 +666,25 @@ pub fn plane_rows(frame: &Video, plane: usize, row_bytes: usize) -> Result<Plane
     let last_row = i128::try_from(rows - 1).map_err(|_| FfmpegError::FrameLayout("rows"))?;
     let step = i128::try_from(stride).map_err(|_| FfmpegError::FrameLayout("linesize"))?;
     let width = i128::try_from(row_bytes).map_err(|_| FfmpegError::FrameLayout("row"))?;
+    let pad = i128::try_from(pad).map_err(|_| FfmpegError::FrameLayout("padding"))?;
     let last = base + last_row * step;
     let (low, high) = (base.min(last), base.max(last) + width);
-    let inside = owned_buffers(raw).any(|(start, size)| {
-        let (Ok(start), Ok(size)) = (i128::try_from(start), i128::try_from(size)) else {
-            return false;
-        };
-        low >= start && high <= start + size
-    });
-    if !inside {
+    let fits = |end: i128| {
+        owned_buffers(raw).any(|(start, size)| {
+            let (Ok(start), Ok(size)) = (i128::try_from(start), i128::try_from(size)) else {
+                return false;
+            };
+            low >= start && end <= start + size
+        })
+    };
+    if !fits(high) {
         return Err(FfmpegError::FrameLayout(
             "plane rows lie outside the frame's buffers",
+        ));
+    }
+    if pad > 0 && !fits(high + pad) {
+        return Err(FfmpegError::FrameLayout(
+            "plane lacks the 16 bytes of padding libswscale may access past it",
         ));
     }
     // `rows - 1` times `stride` is inside one allocation, so it fits isize.

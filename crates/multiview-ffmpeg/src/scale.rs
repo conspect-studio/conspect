@@ -17,7 +17,10 @@ use ffmpeg::util::frame::Video;
 use ffmpeg_next as ffmpeg;
 
 use crate::error::{FfmpegError, Result};
-use crate::frame::{alloc_video, check_source, plane_rows, ScratchFrame};
+use crate::frame::{
+    alloc_video, check_source, check_swscale_destination, check_swscale_source, plane_rows,
+    ScratchFrame,
+};
 
 /// A `(format, width, height)` description of a scaler endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,7 +127,9 @@ impl Scaler {
     /// * [`FfmpegError::FrameMismatch`] — `input` does not match the source spec.
     /// * [`FfmpegError::FrameLayout`] — an `input` plane is not inside the
     ///   frame's own buffers for its geometry, or the frame has no
-    ///   refcounted buffers ([`check_source`]).
+    ///   refcounted buffers ([`check_source`]); for a conversion also a
+    ///   source or destination plane without the 16 bytes libswscale may
+    ///   access past it in the same buffer ([`check_swscale_source`]).
     /// * [`FfmpegError::Convert`] — libswscale reported a conversion error.
     pub fn run(&mut self, input: &Video) -> Result<Video> {
         if input.format() != self.src.format
@@ -170,11 +175,18 @@ impl Scaler {
             }
             return Ok(output);
         }
-        // `check_source` proved every row libswscale reads (the spec's
-        // geometry) lies inside `input`'s buffers.
+        // libswscale may read up to 16 bytes past a plane (libavutil/frame.h):
+        // the active-byte check above is not enough for it.
+        check_swscale_source(input)?;
         // Checked allocation: `sws.run` would otherwise allocate an empty
-        // output with an unchecked `av_frame_get_buffer`.
+        // output with an unchecked `av_frame_get_buffer`. Its padding is
+        // verified, not assumed, before libswscale writes.
         let mut output = alloc_video(self.dst.format, self.dst.width, self.dst.height)?;
+        check_swscale_destination(&output)?;
+        // `check_swscale_source` proved every row libswscale reads (the
+        // spec's geometry) plus `SWSCALE_PADDING` bytes past each plane lie
+        // inside `input`'s buffers; `check_swscale_destination` the same for
+        // what it writes into `output`.
         self.sws
             .run(input, &mut output)
             .map_err(FfmpegError::Convert)?;
@@ -195,7 +207,10 @@ impl Scaler {
     /// re-validated against the frame's own buffers and the buffers must be
     /// writable (`av_frame_is_writable`); a failure is an error, never a
     /// write. Every source plane is validated the same way, read-only
-    /// ([`check_source`]), before either path reads it. An identity spec
+    /// ([`check_source`]), before either path reads it; the conversion path
+    /// also requires the 16 bytes libswscale may access past every source
+    /// and destination plane in the same buffer ([`check_swscale_source`],
+    /// [`ScratchFrame::check_swscale_destination`]). An identity spec
     /// copies the planes row by row through validated row views
     /// ([`plane_rows`]), so a bottom-up (negative linesize) input is fine.
     ///
@@ -251,10 +266,14 @@ impl Scaler {
             }
             return Ok(());
         }
-        // `check_destination` proved every plane of the (unchanged) frame
-        // is writable, forward and inside its own buffers for the spec's
-        // geometry, which is exactly what `sws_scale` writes; `check_source`
-        // proved the same, read-only, for every input plane it reads.
+        // libswscale may read and write up to 16 bytes past a plane
+        // (libavutil/frame.h), so require that padding in the same owning
+        // buffer on both sides. With these, every plane of the (unchanged)
+        // output is writable, forward and inside its own buffers for the
+        // spec's geometry plus `SWSCALE_PADDING`, and every input plane is
+        // readable to the same extent — what `sws_scale` touches.
+        check_swscale_source(input)?;
+        output.check_swscale_destination()?;
         self.sws
             .run(input, output.video_mut())
             .map_err(FfmpegError::Convert)
@@ -461,6 +480,134 @@ mod run_into_tests {
         )
         .unwrap();
         scale.run_into(&gray(4, 2), &mut out).unwrap();
+    }
+
+    /// A `GRAY8` `w x h` frame whose one plane lives in a hand-made
+    /// refcounted buffer of exactly `lead + w * h + tail` bytes, rows at
+    /// `lead` with stride `w` (bottom-up, negative stride, when `flip`):
+    /// `tail == 0` is an allocation whose last active byte is the buffer's
+    /// last byte, with none of the padding libswscale may read past it.
+    fn tight_gray(w: usize, h: usize, lead: usize, tail: usize, flip: bool) -> Video {
+        let size = lead + w * h + tail;
+        let mut frame = Video::empty();
+        frame.set_format(Pixel::GRAY8);
+        frame.set_width(u32::try_from(w).unwrap());
+        frame.set_height(u32::try_from(h).unwrap());
+        #[allow(unsafe_code)]
+        // SAFETY: `frame` is a live, empty frame owned here; `buf[0]` takes
+        // ownership of a fresh `size`-byte zeroed buffer (freed by the
+        // frame's Drop); `data[0]` points `lead` bytes into it (plus
+        // `(h - 1) * w` for the flipped first row), so every row lies in it.
+        unsafe {
+            let raw = frame.as_mut_ptr();
+            let buf = ffmpeg::ffi::av_buffer_allocz(size);
+            assert!(!buf.is_null());
+            let base = (*buf).data.add(lead);
+            let stride = libc::c_int::try_from(w).unwrap();
+            (*raw).buf[0] = buf;
+            if flip {
+                (*raw).data[0] = base.add((h - 1) * w);
+                (*raw).linesize[0] = -stride;
+            } else {
+                (*raw).data[0] = base;
+                (*raw).linesize[0] = stride;
+            }
+        }
+        frame
+    }
+
+    /// The `run`/`run_into` outcome of a `w x h` -> `32 x 16` conversion.
+    fn convert(src: &Video, w: u32, h: u32) -> (Result<()>, Result<()>) {
+        let mut scale = Scaler::new(
+            ScaleSpec::new(Pixel::GRAY8, w, h),
+            ScaleSpec::new(Pixel::GRAY8, 32, 16),
+        )
+        .unwrap();
+        let run = scale.run(src).map(drop);
+        let mut out = ScratchFrame::alloc(Pixel::GRAY8, 32, 16).unwrap();
+        (run, scale.run_into(src, &mut out))
+    }
+
+    fn refused(result: Result<()>, what: &str) {
+        match result {
+            Ok(()) => panic!("{what}: reached sws_scale without its padding"),
+            Err(e) => assert!(matches!(e, FfmpegError::FrameLayout(_)), "{what}: {e}"),
+        }
+    }
+
+    /// R3 round 4: libswscale may read up to 16 bytes beyond a plane
+    /// (libavutil/frame.h), so a source whose active rows end at (or fewer
+    /// than 16 bytes before) the end of its buffer is refused before
+    /// `sws_scale`, top-down or bottom-up.
+    #[test]
+    fn a_source_without_swscale_padding_is_refused() {
+        for (tail, flip, what) in [
+            (0, false, "exact-end source"),
+            (15, false, "15-byte tail source"),
+            (0, true, "exact-end bottom-up source"),
+            (15, true, "15-byte tail bottom-up source"),
+        ] {
+            let src = tight_gray(64, 4, 0, tail, flip);
+            let (run, run_into) = convert(&src, 64, 4);
+            refused(run, &format!("run: {what}"));
+            refused(run_into, &format!("run_into: {what}"));
+        }
+        // Padding in front of a bottom-up plane is not past its highest
+        // byte (row 0), which is where libswscale over-reads.
+        let src = tight_gray(64, 4, 16, 0, true);
+        let (run, run_into) = convert(&src, 64, 4);
+        refused(run, "run: bottom-up source padded only in front");
+        refused(run_into, "run_into: bottom-up source padded only in front");
+    }
+
+    /// The same frames with the documented 16 bytes after the last row
+    /// convert; so does a normally allocated frame. The identity paths read
+    /// only active bytes (`av_frame_copy`, row copy), so they need none.
+    #[test]
+    fn a_source_with_swscale_padding_converts() {
+        for flip in [false, true] {
+            let src = tight_gray(64, 4, 0, 16, flip);
+            let (run, run_into) = convert(&src, 64, 4);
+            run.unwrap();
+            run_into.unwrap();
+        }
+        let (run, run_into) = convert(&gray(64, 4), 64, 4);
+        run.unwrap();
+        run_into.unwrap();
+        let exact = tight_gray(64, 4, 0, 0, false);
+        let spec = ScaleSpec::new(Pixel::GRAY8, 64, 4);
+        let mut identity = Scaler::new(spec, spec).unwrap();
+        identity.run(&exact).unwrap();
+        let mut out = ScratchFrame::alloc(Pixel::GRAY8, 64, 4).unwrap();
+        identity.run_into(&exact, &mut out).unwrap();
+    }
+
+    /// R3 round 4: libswscale may write past the last destination row as
+    /// well, so a destination without 16 bytes after its last row is
+    /// refused before `sws_scale`; the identity row copy still uses it.
+    #[test]
+    fn a_destination_without_swscale_padding_is_refused() {
+        let src = gray(4, 2);
+        let mut scale = Scaler::new(
+            ScaleSpec::new(Pixel::GRAY8, 4, 2),
+            ScaleSpec::new(Pixel::GRAY8, 64, 4),
+        )
+        .unwrap();
+        for tail in [0, 15] {
+            let mut out = ScratchFrame::from_video_unchecked(tight_gray(64, 4, 0, tail, false));
+            refused(
+                scale.run_into(&src, &mut out),
+                &format!("{tail}-byte tail destination"),
+            );
+        }
+        let mut out = ScratchFrame::from_video_unchecked(tight_gray(64, 4, 0, 16, false));
+        scale.run_into(&src, &mut out).unwrap();
+        let mut checked = ScratchFrame::alloc(Pixel::GRAY8, 64, 4).unwrap();
+        scale.run_into(&src, &mut checked).unwrap();
+        let spec = ScaleSpec::new(Pixel::GRAY8, 64, 4);
+        let mut identity = Scaler::new(spec, spec).unwrap();
+        let mut out = ScratchFrame::from_video_unchecked(tight_gray(64, 4, 0, 0, false));
+        identity.run_into(&gray(64, 4), &mut out).unwrap();
     }
 
     /// A spec change reallocates through the checked path; a failure there
