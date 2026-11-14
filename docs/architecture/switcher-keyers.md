@@ -567,8 +567,14 @@ keyers.
   - **DIP (ADR-0112).** The same flip, with the DIP envelope: `i` going on (0 until the switch
     point) and `1 − d` going off, from the same `kernel::dip_weights` the transition tiles use.
     `MixOverlay::tie_envelope()` returns a `Copy` `TieEnvelope { going_on, going_off }` for the
-    overlay's `TransitionStyle`, so the hook passes one value whatever the transition is. WIPE is
-    not rendered on main yet (`unsupported-transition`); a tied keyer on a WIPE is K3.
+    overlay's `TransitionStyle`, so the hook passes one value whatever the transition is.
+  - **Deviation: WIPE (ADR-0112, rendered since the merge of main into K1).** §3.2 asks for the
+    per-pixel envelope `m(x, y)` going on and `1 − m(x, y)` going off. A keyer tile carries a
+    single `WipeMask` slot and the compositor has no complement mask, so in K2a a tied keyer on a
+    WIPE behaves like a CUT at the transition end: `tie_envelope()` returns `{going_on: 0,
+    going_off: 1}`, the keyer keeps its state through the flight and flips on the terminal tick
+    (`keyers_dsk::a_tied_dsk_on_a_wipe_cuts_at_the_terminal_tick`). The exact WIPE envelope is K3
+    (#388).
   - **Gate.** A CUT or AUTO is also gated on the fill and key of every tied keyer it would put on
     (`take_fresh`).
   - **Abort.** An AUTO aborted by SW2-02 never reaches the terminal tick, so tied keyers keep their
@@ -583,7 +589,7 @@ keyers.
   calls `driver.resolve_keyers(tick, envelope, &mut keyer_buf)` and then `drive.set_keyer_draws`, a
   `mem::swap` of a fixed `[Option<KeyerDraw>; 2]`. `KeyerDraw` is two `Arc`s plus `Copy` parameters.
   - `compose` reserves a constant `KEYER_TILES = 4` in `begin`, on top of the two transition tiles
-    (DIP colour and incoming), so `scratch_reservations` does not depend on keyer state.
+    (DIP colour and incoming, or WIPE incoming and border band), so `scratch_reservations` does not depend on keyer state.
   - **Fix: `ComposeScratch::begin`.** It reserved `cell_count - capacity()` on a cleared vector.
     `Vec::reserve` is relative to `len()` (0 after `clear`), so the request was too small whenever
     the target exceeded twice the old capacity, and the odometer then counted a growth on every
@@ -633,7 +639,7 @@ keyers.
   - `multiview-engine` `keyer` unit tests.
   - `multiview-control` `tests/output_routing_take.rs`: Clean is refused in the plan and as a 409
     `clean-unavailable-with-dsk` on take while a DSK is defined.
-  - `tests/keyers_dsk.rs`: CUT, AUTO k/N, tie on CUT, MIX and DIP, abort, reject, held background take,
+  - `tests/keyers_dsk.rs`: CUT, AUTO k/N, tie on CUT, MIX, DIP and WIPE (the CUT-at-end deviation), abort, reject, held background take,
     `on_at_start`, unknown index, z order and tally.
   - `tests/keyers_gate_loss.rs`: refusal at exactly +50 with 0 lost ticks, `keyer-pending`,
     fill-only and key-only death mid-ramp (`Arc::ptr_eq` frozen pair, drop at the trigger, stays

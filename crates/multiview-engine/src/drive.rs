@@ -722,7 +722,8 @@ impl CompositorDrive<Nv12Image> {
         let mut scratch = self.scratch.borrow_mut();
         let cell_count = self.layout.cells.len();
         // A transition adds at most two full-canvas tiles (the DIP colour and
-        // the incoming picture), so the pool is sized once for both. The
+        // the incoming picture, or the WIPE incoming picture and its border
+        // band), so the pool is sized once for both. The
         // keyer slots are always reserved (ADR-0113), so the pool never grows
         // when a keyer goes on air.
         scratch.begin(cell_count + 2 * usize::from(self.mix_overlay.is_some()) + KEYER_TILES);

@@ -1,5 +1,5 @@
 //! Downstream keyer frame coordination (ADR-0113 §5, design note §11.3, slice
-//! K2a): CUT, AUTO, TIE on CUT and MIX, abort and reject atomicity, a held
+//! K2a): CUT, AUTO, TIE on CUT, MIX, DIP and WIPE, abort and reject atomicity, a held
 //! background take, `on_at_start`, tally and the snapshot. Real hook, CPU
 //! drive, exact tick PTS.
 #![allow(
@@ -288,6 +288,68 @@ fn a_tied_dsk_follows_a_dip_and_flips_on_the_terminal_tick() {
             (weight - (1.0 - d)).abs() < 1e-6,
             "going off follows 1-d at {k}: {weight}"
         );
+    }
+    let end = 2 * u64::from(n) + 1;
+    keep_fresh(&rig, end);
+    step(&mut hook, &mut drive, end);
+    assert!(!handle.snapshot().unwrap().keyers[0].unwrap().on_air);
+    assert_eq!(weight_of(&drive, 0), None);
+}
+
+/// K2a deviation (design note §14, K3): a tied keyer on a WIPE keeps its
+/// state through the flight (weight 0 going on, 1 going off) and flips on
+/// the terminal tick, a CUT at the transition end. The per-pixel `m(x, y)`
+/// envelope lands with K3.
+#[test]
+fn a_tied_dsk_on_a_wipe_cuts_at_the_terminal_tick() {
+    let rig = rig();
+    let mut cfg = dsk("dsk1", "gfx", None, 1);
+    cfg.tie = true;
+    let (handle, mut hook, mut drive) = rig.build(&[cfg], 3.0, "a", "b");
+    let n = 4_u32;
+    let wipe: TransitionDescriptor = serde_json::from_value(serde_json::json!({
+        "kind": "wipe",
+        "pattern": "linear_edge",
+        "rate": n,
+    }))
+    .unwrap();
+    handle
+        .try_send(cmd("set", SwitcherVerb::SetTransition(wipe)))
+        .unwrap();
+    let rate = FrameCount::try_from(n).unwrap();
+    handle
+        .try_send(cmd("wipe", SwitcherVerb::Auto(rate)))
+        .unwrap();
+    for k in 0..u64::from(n) {
+        keep_fresh(&rig, k);
+        step(&mut hook, &mut drive, k);
+        assert_eq!(
+            weight_of(&drive, 0),
+            None,
+            "stays off during the wipe at {k}"
+        );
+        assert!(!handle.snapshot().unwrap().keyers[0].unwrap().on_air);
+    }
+    keep_fresh(&rig, u64::from(n));
+    step(&mut hook, &mut drive, u64::from(n));
+    assert!(
+        handle.snapshot().unwrap().keyers[0].unwrap().on_air,
+        "flips on the terminal tick"
+    );
+    assert_eq!(weight_of(&drive, 0), Some(1.0));
+    handle
+        .try_send(cmd("wipe2", SwitcherVerb::Auto(rate)))
+        .unwrap();
+    for k in 0..u64::from(n) {
+        let index = u64::from(n) + 1 + k;
+        keep_fresh(&rig, index);
+        step(&mut hook, &mut drive, index);
+        assert_eq!(
+            weight_of(&drive, 0),
+            Some(1.0),
+            "stays fully on during the wipe at {k}"
+        );
+        assert!(handle.snapshot().unwrap().keyers[0].unwrap().on_air);
     }
     let end = 2 * u64::from(n) + 1;
     keep_fresh(&rig, end);
