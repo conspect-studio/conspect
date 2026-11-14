@@ -1973,6 +1973,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/media/players/{id}/load-operations/{operation}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read one actor- and player-scoped native load operation. */
+        get: operations["get_player_load_operation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/media/players/{id}/pause": {
         parameters: {
             query?: never;
@@ -4092,6 +4109,16 @@ export interface components {
             /** @description The output API id (the id `/api/v1/outputs/{id}` addresses). */
             output: string;
         };
+        /** @description Exact immutable completed capture selector; no path or owner override. */
+        ArtifactRef: {
+            /** @description Exact artifact ID returned by that job. */
+            artifactId: string;
+            /**
+             * Format: int64
+             * @description Actor-owned completed capture job.
+             */
+            captureJobId: number;
+        };
         /**
          * @description `OpenAPI` mirror of `multiview_config::audio::AudioChannels` (tagged by
          *     `kind`, `snake_case`).
@@ -6205,6 +6232,24 @@ export interface components {
             /** @description Whether the engine should stamp a corner watermark (derived, S3). */
             watermark: boolean;
         };
+        /** @description Bounded operation view; completion needs native video and audio adoption. */
+        LoadOperation: {
+            native?: null | components["schemas"]["NativeLoadAck"];
+            /**
+             * Format: int64
+             * @description Operation id.
+             */
+            operation: number;
+            /** @description Lifecycle state name. */
+            state: string;
+        };
+        /** @description Wire responses of the legacy command and explicit native artifact load. */
+        LoadResponse: components["schemas"]["AcceptedBody"] | components["schemas"]["LoadOperation"];
+        /**
+         * @description Commit landing intent.
+         * @enum {string}
+         */
+        LoadThen: "cue" | "resume";
         /**
          * @description `OpenAPI` mirror of [`multiview_telemetry::LogLevel`] (ADR-0060): the five
          *     `tracing` severities. Serde-equivalent: a unit enum rendered lowercase.
@@ -6545,6 +6590,58 @@ export interface components {
             description?: string | null;
             /** @description Stable rendition identity inside the family (the published track name). */
             track: string;
+        };
+        /** @description Actual native facts, never acceptance-derived metadata. */
+        NativeLoadAck: {
+            /**
+             * Format: int64
+             * @description Cadence denominator.
+             */
+            cadence_den: number;
+            /**
+             * Format: int64
+             * @description Cadence numerator.
+             */
+            cadence_num: number;
+            /**
+             * Format: int64
+             * @description Probed duration in whole frames, if known.
+             */
+            duration_frames?: number | null;
+            /**
+             * Format: int64
+             * @description Actual probed duration converted with the exact rational cadence.
+             */
+            duration_ns?: number | null;
+            /**
+             * Format: int64
+             * @description Load generation the player committed.
+             */
+            generation: number;
+            /** @description Whether the clip carries adopted audio. */
+            has_audio: boolean;
+            /**
+             * Format: int32
+             * @description Frame height in pixels.
+             */
+            height: number;
+            /**
+             * Format: int64
+             * @description Operation id of the load.
+             */
+            operation: number;
+            /** @description Source id the player adopted. */
+            source_id: string;
+            /**
+             * Format: int64
+             * @description Timeline position in nanoseconds.
+             */
+            timeline_ns: number;
+            /**
+             * Format: int32
+             * @description Frame width in pixels.
+             */
+            width: number;
         };
         /**
          * @description The mandatory NDI attribution (AGENTS.md §G) — present iff the `ndi` feature
@@ -9452,6 +9549,7 @@ export interface components {
          *     carry an empty body.
          */
         TransportBody: {
+            artifactRef?: null | components["schemas"]["ArtifactRef"];
             /** @description The media-library asset id (required for `load`, ignored otherwise). */
             asset?: string | null;
             /**
@@ -9460,6 +9558,8 @@ export interface components {
              *     (ADR-T015); used by `cue`/`seek`. Absent cues/seeks to the in-point.
              */
             frame?: number | null;
+            /** @description Native commit landing intent; defaults to cue. */
+            then?: components["schemas"]["LoadThen"];
         };
         /**
          * @description One leg's RTP transport parameters (IS-05 supports up to two legs for
@@ -15254,7 +15354,10 @@ export interface operations {
     load_player: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required for artifactRef; stable actor-scoped retry key. */
+                "Idempotency-Key": string;
+            };
             path: {
                 /** @description Media-player id. */
                 id: string;
@@ -15267,13 +15370,13 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Load accepted; outcome on the realtime stream. */
+            /** @description Legacy load returns an accepted command; artifactRef load returns an operation whose completion requires native video and audio adoption. */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AcceptedBody"];
+                    "application/json": components["schemas"]["LoadResponse"];
                 };
             };
             /** @description Missing or invalid credentials. */
@@ -15313,6 +15416,67 @@ export interface operations {
                 };
             };
             /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_player_load_operation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Authorized player identity. */
+                id: string;
+                /** @description Native load generation. */
+                operation: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Actual native load outcome. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoadOperation"];
+                };
+            };
+            /** @description Authentication required. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Player access denied. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Operation is unknown or belongs to another actor. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Native player provider unavailable. */
             503: {
                 headers: {
                     [name: string]: unknown;

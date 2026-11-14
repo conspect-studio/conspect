@@ -165,6 +165,17 @@ impl LoopDeck {
         }
     }
 
+    /// Allocated PCM backing bytes retained by this deck (body and seam).
+    /// This excludes transient decode windows which callers separately charge.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> usize {
+        self.body
+            .capacity()
+            .checked_add(self.seam.capacity())
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+            .unwrap_or(usize::MAX)
+    }
+
     /// Build a deck over a contiguously-decoded buffer.
     ///
     /// `decoded` is `loop_frames` body frames (the `[vamp_in, vamp_out)` content)

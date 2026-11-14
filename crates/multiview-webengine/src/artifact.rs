@@ -501,6 +501,16 @@ pub struct Lease {
     pins: Arc<AtomicUsize>,
 }
 impl Lease {
+    /// Linux native decoder adapter for the already verified open descriptor.
+    /// The caller must retain this lease until every native reader retires.
+    /// This does not resolve an arbitrary path or open another store.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn local_read_path(&self) -> std::path::PathBuf {
+        use std::os::fd::AsRawFd;
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
     /// Completed identity and provenance, never a local path.
     #[must_use]
     pub fn artifact(&self) -> &Artifact {

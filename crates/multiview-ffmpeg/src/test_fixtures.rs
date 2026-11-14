@@ -1095,3 +1095,494 @@ unsafe fn encode_hls_video(
     }
     drain_video(oc, vst, vctx, ptr::null_mut())
 }
+
+// ---------------------------------------------------------------------------
+// Media-player clip fixtures (design 9, "Fixtures"): short constant-frame-rate
+// clips in a QuickTime container, built through the safe encoder + muxer
+// wrappers (no FFmpeg CLI, no raw FFI). Every frame carries a distinct luma
+// level so a test can tell frames and clips apart from the published tile.
+// ---------------------------------------------------------------------------
+
+/// The video codec of a generated player clip. Both are in-tree LGPL encoders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerClipCodec {
+    /// Lossless intra FFV1 (`yuv420p`): the step-2 decode path.
+    Ffv1,
+    /// Intra Motion-JPEG (`yuvj420p`): each frame is a self-contained JPEG,
+    /// so [`corrupt_player_clip_frame`] can break one frame's decode.
+    Mjpeg,
+}
+
+/// What [`generate_player_clip`] writes.
+#[derive(Debug, Clone, Copy)]
+pub struct PlayerClipSpec {
+    /// The video codec.
+    pub codec: PlayerClipCodec,
+    /// The exact constant frame rate (`num/den` fps), e.g. `30000/1001`.
+    pub cadence: multiview_core::time::Rational,
+    /// How many video frames to write.
+    pub frames: u32,
+    /// Frame width (even).
+    pub width: u32,
+    /// Frame height (even).
+    pub height: u32,
+    /// The luma of frame 0; frame `i` has luma `luma_base + i * LUMA_STEP`
+    /// (mod 220, kept in the video range), so clips with different bases
+    /// differ frame by frame.
+    pub luma_base: u8,
+    /// When `Some(amplitude)`, also write a stereo 48 kHz `pcm_f32le` track of
+    /// a constant DC level `amplitude` for the clip's duration (a constant is
+    /// easy to recognise in the audio store, unlike a tone's phase).
+    pub audio_level: Option<f32>,
+    /// Keyframe interval in frames. `1` (the default) makes every frame a
+    /// keyframe; a larger value (FFV1 only) writes real non-keyframe packets so
+    /// a container seek lands on a preceding keyframe.
+    pub gop: u32,
+    /// Presentation timestamp of frame 0, in frame periods (a nonzero source
+    /// PTS origin, as many containers have). Video-only clips.
+    pub pts_offset_frames: u32,
+}
+
+/// The luma increment between consecutive frames of a generated clip.
+pub const LUMA_STEP: u8 = 3;
+
+impl PlayerClipSpec {
+    /// A small FFV1 clip at `cadence` with `frames` frames, 64x48, no audio.
+    #[must_use]
+    pub const fn ffv1(cadence: multiview_core::time::Rational, frames: u32, luma_base: u8) -> Self {
+        Self {
+            codec: PlayerClipCodec::Ffv1,
+            cadence,
+            frames,
+            width: 64,
+            height: 48,
+            luma_base,
+            audio_level: None,
+            gop: 1,
+            pts_offset_frames: 0,
+        }
+    }
+
+    /// The luma of source frame `index`.
+    #[must_use]
+    pub fn luma_of(&self, index: u32) -> u8 {
+        let step = u32::from(LUMA_STEP).saturating_mul(index) % 200;
+        let base = u32::from(self.luma_base);
+        u8::try_from(16 + (base + step) % 220).unwrap_or(235)
+    }
+}
+
+/// Write a constant-frame-rate player clip at `path` (a `.mov`).
+///
+/// The stream time base is the exact frame period, every packet lasts one
+/// period, so the container's `avg_frame_rate` and `r_frame_rate` are both
+/// exactly `spec.cadence` after reduction.
+///
+/// # Errors
+/// Returns [`FfmpegError`] if any encoder/muxer step fails.
+pub fn generate_player_clip(path: &Path, spec: &PlayerClipSpec) -> Result<()> {
+    use crate::encode::{AudioEncodeTarget, AudioEncoder, VideoEncodeTarget, VideoEncoder};
+    use crate::mux::Muxer;
+    use ffmpeg::format::sample::Type as SampleType;
+    use ffmpeg::format::{Pixel, Sample};
+    use multiview_core::time::Rational;
+
+    const AUDIO_RATE: u32 = 48_000;
+    const BLOCK: u64 = 1024;
+
+    if spec.cadence.num <= 0 || spec.cadence.den <= 0 {
+        return Err(FfmpegError::FrameMismatch(
+            "player clip cadence must be positive",
+        ));
+    }
+    if spec.width == 0 || spec.height == 0 || spec.width % 2 != 0 || spec.height % 2 != 0 {
+        return Err(FfmpegError::FrameMismatch(
+            "player clip dimensions must be positive and even",
+        ));
+    }
+    let period = Rational::new(spec.cadence.den, spec.cadence.num);
+    let (codec_name, format) = match spec.codec {
+        PlayerClipCodec::Ffv1 => ("ffv1", Pixel::YUV420P),
+        PlayerClipCodec::Mjpeg => ("mjpeg", Pixel::YUVJ420P),
+    };
+    let mut venc = VideoEncoder::new(&VideoEncodeTarget {
+        codec_name: codec_name.to_owned(),
+        width: spec.width,
+        height: spec.height,
+        format,
+        time_base: period,
+        bit_rate: 0,
+        gop: spec.gop.max(1),
+        cuda_device: None,
+    })?;
+    let mut mux = Muxer::create_as(path, "mov")?;
+    let vindex = mux.add_stream(venc.as_codec_context(), period)?;
+
+    let mut audio = match spec.audio_level {
+        Some(level) => {
+            let enc = AudioEncoder::new(&AudioEncodeTarget {
+                codec_name: "pcm_f32le".to_owned(),
+                format: Sample::F32(SampleType::Packed),
+                channel_layout: ffmpeg::ChannelLayout::STEREO,
+                sample_rate: AUDIO_RATE,
+                bit_rate: 0,
+            })?;
+            let index = mux.add_stream(
+                enc.as_codec_context(),
+                Rational::new(1, i64::from(AUDIO_RATE)),
+            )?;
+            Some((enc, index, level))
+        }
+        None => None,
+    };
+    mux.write_header()?;
+
+    let mut frame = ffmpeg::util::frame::Video::new(format, spec.width, spec.height);
+    for i in 0..spec.frames {
+        let luma = spec.luma_of(i);
+        frame.data_mut(0).fill(luma);
+        // Chroma carries the clip's base so two clips differ in colour too.
+        frame.data_mut(1).fill(spec.luma_base);
+        frame.data_mut(2).fill(128);
+        frame.set_pts(Some(i64::from(i) + i64::from(spec.pts_offset_frames)));
+        venc.send_frame(&frame)?;
+        drain_player_video(&mut venc, &mut mux, vindex)?;
+    }
+    venc.send_eof()?;
+    drain_player_video(&mut venc, &mut mux, vindex)?;
+
+    if let Some((enc, index, level)) = audio.as_mut() {
+        // The audio covers exactly the video duration: frames × period seconds.
+        let total = u64::from(spec.frames)
+            .saturating_mul(u64::from(AUDIO_RATE))
+            .saturating_mul(u64::try_from(spec.cadence.den).unwrap_or(1))
+            / u64::try_from(spec.cadence.num).unwrap_or(1).max(1);
+        let block = vec![*level; usize::try_from(BLOCK * 2).unwrap_or(0)];
+        let mut written = 0u64;
+        while written < total {
+            let n = BLOCK.min(total - written);
+            let samples = usize::try_from(n).unwrap_or(0);
+            enc.send_interleaved_f32(&block, samples, i64::try_from(written).unwrap_or(0))?;
+            while let Some(pkt) = enc.receive_packet()? {
+                mux.write_packet(*index, pkt)?;
+            }
+            written += n;
+        }
+        enc.send_eof()?;
+        while let Some(pkt) = enc.receive_packet()? {
+            mux.write_packet(*index, pkt)?;
+        }
+    }
+    mux.finish()
+}
+
+fn drain_player_video(
+    venc: &mut crate::encode::VideoEncoder,
+    mux: &mut crate::mux::Muxer,
+    index: usize,
+) -> Result<()> {
+    while let Some(mut pkt) = venc.receive_packet()? {
+        // One frame period per packet in the encoder time base, so the
+        // container records a constant frame duration.
+        pkt.set_duration(1);
+        mux.write_packet(index, pkt)?;
+    }
+    Ok(())
+}
+
+/// Write a file that no demuxer accepts (header corruption): `bytes` of a
+/// repeating non-media pattern.
+///
+/// # Errors
+/// Returns [`FfmpegError::Mux`] on an IO error.
+pub fn write_corrupt_clip(path: &Path, bytes: usize) -> Result<()> {
+    let data: Vec<u8> = (0..bytes)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0) ^ 0x5a)
+        .collect();
+    std::fs::write(path, data).map_err(|_| FfmpegError::Mux(ffmpeg::Error::Bug))
+}
+
+/// Break the decode of video frame `index` of an MJPEG clip written by
+/// [`generate_player_clip`]. Locate the actual video packet using libav's MOV
+/// sample table and overwrite only that packet's JPEG payload, never container
+/// metadata or another stream's packets. Earlier frames remain decodable.
+///
+/// # Errors
+/// Returns [`FfmpegError::Mux`] on an IO error or when frame `index` is not
+/// found.
+pub fn corrupt_player_clip_frame(path: &Path, index: usize) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let io = |_| FfmpegError::Mux(ffmpeg::Error::Bug);
+    let data = std::fs::read(path).map_err(io)?;
+
+    let mut demux = crate::demux::Demuxer::open(path)?;
+    let video = demux
+        .best_stream(crate::convert::MediaKind::Video)
+        .ok_or_else(bug)?;
+    let mut frame = 0usize;
+    let (start, size) = loop {
+        let packet = demux.read_packet()?.ok_or_else(bug)?;
+        if packet.stream_index != video {
+            continue;
+        }
+        if frame == index {
+            let offset = usize::try_from(packet.packet.position()).map_err(|_| bug())?;
+            break (offset, packet.packet.size());
+        }
+        frame += 1;
+    };
+    // Reject a missing/invalid sample table entry before touching the file.
+    let span = data
+        .get(start..start.checked_add(size).ok_or_else(bug)?)
+        .ok_or_else(bug)?;
+    if size < 4 || !span.starts_with(&[0xff, 0xd8]) || !span.ends_with(&[0xff, 0xd9]) {
+        return Err(bug());
+    }
+    // Zero the entire JPEG sample, including SOI: libav cannot mistake it for
+    // a decodable image. The MOV metadata, trailer and other packets are intact.
+    let zeros = vec![0; size];
+    drop(demux);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(io)?;
+    file.seek(SeekFrom::Start(u64::try_from(start).map_err(|_| bug())?))
+        .map_err(io)?;
+    file.write_all(&zeros).map_err(io)
+}
+
+#[cfg(test)]
+mod player_clip_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use multiview_core::time::Rational;
+
+    use super::{corrupt_player_clip_frame, generate_player_clip, PlayerClipCodec, PlayerClipSpec};
+    use crate::convert::MediaKind;
+    use crate::demux::Demuxer;
+
+    fn probe(path: &std::path::Path) -> (Rational, Rational, i64) {
+        let d = Demuxer::open(path).unwrap();
+        let s = d
+            .input()
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .unwrap();
+        let avg = crate::convert::from_ff_rational(s.avg_frame_rate());
+        let r = crate::convert::from_ff_rational(s.rate());
+        (avg, r, s.frames())
+    }
+
+    fn reduced(r: Rational) -> (i64, i64) {
+        fn gcd(a: i64, b: i64) -> i64 {
+            if b == 0 {
+                a.abs()
+            } else {
+                gcd(b, a % b)
+            }
+        }
+        let g = gcd(r.num, r.den).max(1);
+        (r.num / g, r.den / g)
+    }
+
+    #[test]
+    fn generated_clips_declare_their_exact_cadence() {
+        let dir = tempfile::tempdir().unwrap();
+        for (codec, cadence) in [
+            (PlayerClipCodec::Ffv1, Rational::new(30000, 1001)),
+            (PlayerClipCodec::Ffv1, Rational::new(25, 1)),
+            (PlayerClipCodec::Mjpeg, Rational::new(30000, 1001)),
+        ] {
+            verify_generated_clip(dir.path(), codec, cadence);
+        }
+    }
+
+    fn verify_generated_clip(dir: &std::path::Path, codec: PlayerClipCodec, cadence: Rational) {
+        let path = dir.join(format!("{codec:?}-{}.mov", cadence.num));
+        let mut spec = PlayerClipSpec::ffv1(cadence, 6, 40);
+        spec.codec = codec;
+        spec.audio_level = Some(0.25);
+        generate_player_clip(&path, &spec).unwrap();
+        let (avg, r, frames) = probe(&path);
+        assert_eq!(reduced(avg), reduced(cadence), "{codec:?} avg_frame_rate");
+        assert_eq!(reduced(r), reduced(cadence), "{codec:?} r_frame_rate");
+        assert_eq!(frames, 6, "{codec:?} frame count");
+        let mut demux = Demuxer::open(&path).unwrap();
+        let video = demux.best_stream(MediaKind::Video).unwrap();
+        let audio = demux.best_stream(MediaKind::Audio).unwrap();
+        let mut audio_decoder = crate::decode_stream::StreamAudioDecoder::new(
+            demux.stream_parameters(audio).unwrap(),
+            demux
+                .streams()
+                .iter()
+                .find(|s| s.index == audio)
+                .unwrap()
+                .time_base,
+        )
+        .unwrap();
+        let mut decoder = crate::decode_stream::StreamVideoDecoder::new(
+            demux.stream_parameters(video).unwrap(),
+            demux
+                .streams()
+                .iter()
+                .find(|s| s.index == video)
+                .unwrap()
+                .time_base,
+        )
+        .unwrap();
+        let mut video_packets = 0;
+        let mut audio_packets = 0;
+        let mut decoded_audio_samples = 0usize;
+        let mut decoded_video_frames = 0;
+        let mut video_pts = Vec::new();
+        while let Some(packet) = demux.read_packet().unwrap() {
+            if packet.stream_index == video {
+                video_packets += 1;
+                video_pts.push(packet.pts().unwrap());
+                decoder.send_packet(&packet.packet).unwrap();
+                while decoder.receive_frame().unwrap().is_some() {
+                    decoded_video_frames += 1;
+                }
+            } else if packet.stream_index == audio {
+                audio_packets += 1;
+                audio_decoder.send_packet(&packet.packet).unwrap();
+                while let Some(samples) = audio_decoder.receive_frame().unwrap() {
+                    assert_eq!(samples.frame.channels(), 2);
+                    assert_eq!(samples.frame.rate(), 48_000);
+                    assert!(samples
+                        .frame
+                        .plane::<(f32, f32)>(0)
+                        .iter()
+                        .take(samples.frame.samples())
+                        .all(|&(left, right)| {
+                            left.to_bits() == 0.25_f32.to_bits()
+                                && right.to_bits() == 0.25_f32.to_bits()
+                        }));
+                    decoded_audio_samples += samples.frame.samples();
+                }
+            }
+        }
+        decoder.send_eof().unwrap();
+        while decoder.receive_frame().unwrap().is_some() {
+            decoded_video_frames += 1;
+        }
+        audio_decoder.send_eof().unwrap();
+        while let Some(samples) = audio_decoder.receive_frame().unwrap() {
+            decoded_audio_samples += samples.frame.samples();
+        }
+        let expected_samples = 6 * 48_000 * cadence.den / cadence.num;
+        assert_eq!(
+            i64::try_from(decoded_audio_samples).unwrap(),
+            expected_samples,
+            "{codec:?} audio duration"
+        );
+        let video_tb = demux
+            .streams()
+            .iter()
+            .find(|s| s.index == video)
+            .unwrap()
+            .time_base;
+        for (i, pts) in video_pts.iter().enumerate() {
+            assert_eq!(
+                *pts * video_tb.num * cadence.num,
+                i64::try_from(i).unwrap() * video_tb.den * cadence.den,
+                "{codec:?} packet {i} exact timestamp"
+            );
+        }
+        assert_eq!(video_packets, 6, "{codec:?} video packets");
+        assert_eq!(decoded_video_frames, 6, "{codec:?} decoded video frames");
+        assert!(audio_packets > 0, "{codec:?} audio packets");
+    }
+
+    #[test]
+    fn corruption_only_changes_the_target_video_packet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupted.mov");
+        let mut spec = PlayerClipSpec::ffv1(Rational::new(25, 1), 6, 40);
+        spec.codec = PlayerClipCodec::Mjpeg;
+        spec.audio_level = Some(0.25);
+        generate_player_clip(&path, &spec).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut demux = Demuxer::open(&path).unwrap();
+        let video = demux.best_stream(MediaKind::Video).unwrap();
+        let audio = demux.best_stream(MediaKind::Audio).unwrap();
+        let mut video_ranges = Vec::new();
+        let mut audio_ranges = Vec::new();
+        while let Some(packet) = demux.read_packet().unwrap() {
+            let start = usize::try_from(packet.packet.position()).unwrap();
+            let range = start..start + packet.packet.size();
+            if packet.stream_index == video {
+                video_ranges.push(range);
+            } else if packet.stream_index == audio {
+                audio_ranges.push(range);
+            }
+        }
+        drop(demux);
+        assert_eq!(video_ranges.len(), 6);
+        assert_ne!(audio_ranges.len(), 0);
+        corrupt_player_clip_frame(&path, 3).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        for (i, range) in video_ranges.iter().enumerate() {
+            if i == 3 {
+                assert_ne!(&before[range.clone()], &after[range.clone()]);
+            } else {
+                assert_eq!(&before[range.clone()], &after[range.clone()]);
+            }
+        }
+        for range in audio_ranges {
+            assert_eq!(&before[range.clone()], &after[range]);
+        }
+        // Every byte outside the target sample is unchanged, including the MOV
+        // sample table / trailer and interleaved audio.
+        let target = &video_ranges[3];
+        assert_eq!(&before[..target.start], &after[..target.start]);
+        assert_eq!(&before[target.end..], &after[target.end..]);
+        let mut demux = Demuxer::open(&path).unwrap();
+        let mut decoder = crate::decode_stream::StreamVideoDecoder::new(
+            demux.stream_parameters(video).unwrap(),
+            demux
+                .streams()
+                .iter()
+                .find(|s| s.index == video)
+                .unwrap()
+                .time_base,
+        )
+        .unwrap();
+        let mut decoded_before = 0;
+        let mut target_failed = false;
+        let mut decoded_target = 0;
+        let mut decoded_after = 0;
+        let mut frame = 0;
+        while let Some(packet) = demux.read_packet().unwrap() {
+            if packet.stream_index != video {
+                continue;
+            }
+            match decoder.send_packet(&packet.packet) {
+                Err(_) if frame == 3 => target_failed = true,
+                Err(error) => panic!("valid MJPEG packet {frame} rejected: {error}"),
+                Ok(()) => loop {
+                    match decoder.receive_frame() {
+                        Ok(Some(_)) if frame < 3 => decoded_before += 1,
+                        Ok(Some(_)) if frame == 3 => decoded_target += 1,
+                        Ok(Some(_)) => decoded_after += 1,
+                        Ok(None) => break,
+                        Err(_) if frame == 3 => {
+                            target_failed = true;
+                            break;
+                        }
+                        Err(error) => panic!("valid MJPEG packet {frame} failed: {error}"),
+                    }
+                },
+            }
+            frame += 1;
+        }
+        assert!(
+            target_failed || decoded_target == 0,
+            "corrupt MJPEG packet must fail or yield no frame"
+        );
+        assert_eq!(decoded_before, 3);
+        assert_eq!(decoded_after, 2);
+    }
+}
