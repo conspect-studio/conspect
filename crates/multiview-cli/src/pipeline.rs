@@ -6247,6 +6247,7 @@ impl Pipeline {
                 .as_ref()
                 .map(|manager| (manager.activity_reader(), Arc::clone(&self.catalogue))),
             aux_signals: None,
+            sidecar_truncated: crate::overlays::TruncationTally::new(),
         }
     }
 
@@ -6319,6 +6320,9 @@ struct BakeContext {
     /// otherwise). `None` before routing is wired and in tests.
     #[cfg(feature = "overlay")]
     aux_signals: Option<crate::aux_overlays::AuxSignalsPublisher>,
+    /// Issue #430: counts a cut sidecar cue once, keyed by its track index.
+    #[cfg(feature = "overlay")]
+    sidecar_truncated: crate::overlays::TruncationTally,
 }
 
 impl BakeContext {
@@ -6344,9 +6348,16 @@ impl BakeContext {
         if self.sidecar_target.as_deref() != Some(id) {
             return None;
         }
-        let cue = self.subtitles.as_ref().and_then(|t| t.active_cue(pts))?;
-        // Issue #430: copy only the bounded burn-in projection.
+        let track = self.subtitles.as_ref()?;
+        // Issue #430: an indexed (O(log n)) lookup, then only the bounded
+        // burn-in projection is copied; a cut cue is counted once.
+        let index = track.active_cue_index(pts)?;
+        let cue = track.cues().get(index)?;
         let bounded = multiview_output::hls::bound_cue_lines(&cue.lines);
+        self.sidecar_truncated.observe(
+            u64::try_from(index).unwrap_or(u64::MAX),
+            bounded.truncated(),
+        );
         (!bounded.is_empty()).then(|| bounded.into_lines())
     }
 }
@@ -22619,7 +22630,48 @@ mod live_overlay_bake_tests {
             overlay_apply: Some(Arc::clone(slot)),
             activity: None,
             aux_signals: None,
+            sidecar_truncated: crate::overlays::TruncationTally::new(),
         }
+    }
+
+    /// Issue #430 (MED-2): a truncated sidecar cue is counted exactly once
+    /// while held, its truncated successor once more, and a small cue never.
+    #[test]
+    fn sidecar_truncation_is_counted_once_per_cue() {
+        let pad = "y".repeat(8 * 1024);
+        let srt = format!(
+            "1\n00:00:01,000 --> 00:00:02,000\nfirst {pad}\n\n\
+             2\n00:00:02,000 --> 00:00:03,000\nsecond {pad}\n\n\
+             3\n00:00:03,000 --> 00:00:04,000\nsmall\n"
+        );
+        let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut ctx = bake_context(&slot);
+        ctx.subtitles = Some(multiview_overlay::subtitle::CueTrack::parse_srt(&srt).unwrap());
+        ctx.sidecar_target = Some("in_a".to_owned());
+        ctx.sidecar_truncated = crate::overlays::TruncationTally::with_stats(stats);
+        let at = |ms: i64| multiview_core::time::MediaTime::from_nanos(ms * 1_000_000);
+        for ms in (1_000..2_000).step_by(40) {
+            let lines = ctx.sidecar_caption_lines("in_a", at(ms)).unwrap();
+            assert!(lines.iter().map(String::len).sum::<usize>() <= 512);
+        }
+        assert_eq!(stats.text_truncated(), 1, "a held cut cue counts once");
+        for ms in (2_000..3_000).step_by(40) {
+            assert!(ctx.sidecar_caption_lines("in_a", at(ms)).is_some());
+        }
+        assert_eq!(
+            stats.text_truncated(),
+            2,
+            "its cut successor counts once more"
+        );
+        for ms in (3_000..4_000).step_by(40) {
+            assert_eq!(
+                ctx.sidecar_caption_lines("in_a", at(ms)),
+                Some(vec!["small".to_owned()])
+            );
+        }
+        assert_eq!(stats.text_truncated(), 2, "a small cue is not counted");
+        assert!(ctx.sidecar_caption_lines("other", at(1_500)).is_none());
     }
 
     /// One streamed tick over a uniform dark canvas.

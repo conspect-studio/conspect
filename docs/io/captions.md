@@ -252,8 +252,21 @@ clock"). The cost came from two places. The output clock thread cloned the whole
   (`sample_caption_bitmaps`). The copy now happens only for a cue within ≤ 4096 px per side and ≤ 256 KiB
   RGBA, which is the decoder's own payload cap. A larger cue is refused and counted, never copied. The
   baker checks the same bound before drawing.
-- **Counters.** `overlays::caption_burn_stats()` counts `text_truncated` (once per cut cue),
-  `bitmap_refused` and `text_rasters` (cache misses).
+- **Rasterization cache.** cosmic-text's `SwashCache` never evicts. A source that rotates through
+  distinct glyphs (Unicode ranges, sizes, missing glyphs) would grow it on every cue change. `TextEngine`
+  tracks the entries (missing-glyph entries included) and the coverage bytes it inserts. It clears the
+  whole cache before it exceeds 2048 entries or 8 MiB and counts each clear (`swash_cache_clears`). We
+  chose this as the simplest correct bound: a clear only costs re-rasterizing glyphs that are used again,
+  and the glyph atlas keeps its own, independently bounded slots.
+- **Sidecar (`--subtitles`) lookup.** `CueTrack` builds a step-function index of the active cue once, at
+  parse or deserialize time. Each tick's lookup is then a binary search: O(log n) with no per-tick scan,
+  even before the first cue or in a gap. Overlapping cues still resolve to the newest-starting one. A cut
+  sidecar cue is counted like a native one.
+- **Counters.** `overlays::caption_burn_stats()` counts `text_truncated` (exactly once per cut cue),
+  `bitmap_refused` and `text_rasters` (cache misses). A cue's identity is the cue store's per-cue
+  publish sequence, which is new for every published cue, including a same-window replacement or a cue
+  after a generation change. For the sidecar, the identity is the track index. A held cue is never
+  re-counted.
 - **Chaos test.** `pipeline::caption_burnin_chaos` runs a displayed captioned source with 8 KiB and
   64 KiB cues changing every 100 ms. It asserts that the run succeeds (never behind the clock), that at
   most 1 % of ticks are shed, that video PTS steps are tick-exact, and that the truncation counter is

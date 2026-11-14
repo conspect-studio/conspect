@@ -171,6 +171,53 @@ pub fn caption_burn_stats() -> &'static CaptionBurnStats {
     &STATS
 }
 
+/// Counts a truncated caption cue **once per cue identity** (issue #430):
+/// a reader samples the same cue on every tick, so it remembers the identity
+/// of the last cut cue it counted. The identity is supplied by the caller —
+/// the cue store's per-cue publish sequence, or a sidecar track index — and
+/// must change whenever the cue does (replacement, generation change).
+#[derive(Debug)]
+pub struct TruncationTally {
+    /// `1 +` the identity of the last counted cue (`0` = none yet).
+    last: std::sync::atomic::AtomicU64,
+    stats: &'static CaptionBurnStats,
+}
+
+impl TruncationTally {
+    /// A tally counting into the process-wide [`caption_burn_stats`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_stats(caption_burn_stats())
+    }
+
+    /// A tally counting into `stats` (tests use a private sink).
+    #[must_use]
+    pub const fn with_stats(stats: &'static CaptionBurnStats) -> Self {
+        Self {
+            last: std::sync::atomic::AtomicU64::new(0),
+            stats,
+        }
+    }
+
+    /// Record one sample of cue `identity`; counts it when it was `truncated`
+    /// and is not the cue counted last.
+    pub fn observe(&self, identity: u64, truncated: bool) {
+        if !truncated {
+            return;
+        }
+        let key = identity.wrapping_add(1).max(1);
+        if self.last.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+            self.stats.note_text_truncated();
+        }
+    }
+}
+
+impl Default for TruncationTally {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Widest / tallest bitmap caption cue burned in, in source pixels.
 pub const MAX_BURN_BITMAP_DIM: u32 = 4096;
 /// Largest bitmap caption cue burned in (premultiplied RGBA bytes): the
