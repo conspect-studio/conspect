@@ -50,9 +50,9 @@ const MAX_UNITS_WITHOUT_PARAMETER_SETS: u32 = 300;
 const MAX_AUDIO_AHEAD_SECONDS: i64 = 10;
 /// Closed video segments that may wait for their audio.
 const MAX_VIDEO_SEGMENTS_AWAITING_AUDIO: usize = 3;
-/// An open video segment longer than this many target durations (no IDR
-/// arrived) is an error.
-const MAX_OPEN_SEGMENT_TARGETS: i128 = 10;
+/// `EXT-X-TARGETDURATION` is fixed for the packager's lifetime at this many
+/// times the nominal segment duration, rounded (4 s for a 2 s nominal).
+const TARGET_DURATION_MULTIPLIER: u64 = 2;
 /// Samples an open video segment may hold.
 const MAX_OPEN_SEGMENT_SAMPLES: usize = 4096;
 /// Forward deviation (samples) of an audio frame's pts from the 1024-sample
@@ -496,8 +496,16 @@ impl CastPackager {
                 (Some(sps), Some(pps))
             }
         };
+        // Fixed for the packager's lifetime: `EXT-X-TARGETDURATION` must not
+        // change within a live playlist (RFC 8216 §4.4.3.1). Chosen up front
+        // as twice the nominal segment duration so a delayed-IDR segment (up
+        // to roughly double the nominal length) still fits without a
+        // mid-playlist change; segments that still exceed it are a packager
+        // error instead (the caller starts a new generation).
         let target_duration = rounded_seconds(
-            u64::try_from(config.target_segment_ns).unwrap_or(0),
+            u64::try_from(config.target_segment_ns)
+                .unwrap_or(0)
+                .saturating_mul(TARGET_DURATION_MULTIPLIER),
             1_000_000_000,
         );
         let audio = match config.audio {
@@ -825,12 +833,18 @@ impl CastPackager {
         let span = i128::from(last.dts.saturating_sub(first.dts))
             .saturating_mul(i128::from(tb.num))
             .saturating_mul(i128::from(NS_PER_SECOND));
-        let limit = (i128::from(self.target_segment_ns) * MAX_OPEN_SEGMENT_TARGETS)
-            .saturating_mul(i128::from(tb.den));
+        // `EXT-X-TARGETDURATION` is fixed (see `new`): once the open segment
+        // already spans it, no IDR can arrive that lets it close within the
+        // bound `publish_pair` enforces, so this fails now instead of
+        // growing for up to ten targets before an eventual publish error.
+        let limit = i128::from(self.target_duration)
+            .saturating_mul(i128::from(NS_PER_SECOND) * i128::from(tb.den));
         if open.samples.len() > MAX_OPEN_SEGMENT_SAMPLES || span > limit {
             return Err(Error::Output(format!(
-                "cast packager: no IDR for {} samples; the open video segment exceeds its bound",
-                open.samples.len()
+                "cast packager: no IDR for {} samples; the open video segment exceeds the \
+                 fixed EXT-X-TARGETDURATION {} s",
+                open.samples.len(),
+                self.target_duration
             )));
         }
         Ok(())
@@ -1080,10 +1094,18 @@ impl CastPackager {
             && (frames.is_none() || self.audio_end == audio_start);
         let discontinuity = self.progress.video_segments > 0
             && (closed.after_gap || init_replaced || self.dropped_pairs > 0 || !continuous);
-        self.target_duration = self.target_duration.max(rounded_seconds(
-            closed.duration_ticks,
-            self.video.clock.timescale,
-        ));
+        // `EXT-X-TARGETDURATION` is fixed for the packager's lifetime (see
+        // `new`): a closed segment that would not fit it cannot be
+        // published into a playlist that already advertises the smaller
+        // value. The caller starts a new generation instead.
+        let video_seconds = rounded_seconds(closed.duration_ticks, self.video.clock.timescale);
+        if video_seconds > self.target_duration {
+            return Err(Error::Output(format!(
+                "cast packager: video segment {video_seconds} s exceeds the fixed \
+                 EXT-X-TARGETDURATION {}",
+                self.target_duration
+            )));
+        }
 
         // Audio first: the video playlist never lists a sequence number the
         // audio playlist lacks.
@@ -1180,11 +1202,21 @@ impl CastPackager {
             return Ok(name);
         };
         let rate = audio.config.sample_rate;
+        // `EXT-X-TARGETDURATION` is fixed for the packager's lifetime (see
+        // `new`): an audio segment that would not fit it is a packager
+        // error, same as an over-long video segment in `publish_pair`.
+        let audio_seconds = rounded_seconds(ticks, rate);
+        if audio_seconds > self.target_duration {
+            return Err(Error::Output(format!(
+                "cast packager: audio segment {audio_seconds} s exceeds the fixed \
+                 EXT-X-TARGETDURATION {}",
+                self.target_duration
+            )));
+        }
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         audio.bytes = audio.bytes.saturating_add(size);
         audio.ticks = audio.ticks.saturating_add(ticks);
         audio.peak_bps = audio.peak_bps.max(bits_per_second(size, ticks, rate));
-        self.target_duration = self.target_duration.max(rounded_seconds(ticks, rate));
         let mut segment = Segment::new(name.clone(), seconds(ticks, rate)).with_map_uri(init_name);
         segment.discontinuity = discontinuity;
         segment.program_date_time_ns = pdt;

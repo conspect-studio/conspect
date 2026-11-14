@@ -445,7 +445,7 @@ fn thirty_seconds_of_2997_with_audio_is_a_valid_cast_stream() {
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     assert_eq!(report.video_segments, 10);
     assert_eq!(report.audio_segments, 10);
-    assert_eq!(report.target_duration, 2);
+    assert_eq!(report.target_duration, 4);
     assert_eq!(report.codecs, "avc1.640028,mp4a.40.2");
     assert_eq!(report.media_sequence, 5, "15 segments closed, 10 listed");
     assert_eq!(report.discontinuities, 0);
@@ -463,7 +463,7 @@ fn thirty_seconds_of_2997_with_audio_is_a_valid_cast_stream() {
     let video = read(dir.path(), "video.m3u8");
     assert!(
         video.starts_with(
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:5\n\
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:5\n\
          #EXT-X-MAP:URI=\"init-v-7-0.mp4\"\n#EXT-X-PROGRAM-DATE-TIME:"
         ),
         "{video}"
@@ -714,10 +714,10 @@ fn assert_reports(dir: &Path, needle: &str) {
 
 #[test]
 fn the_validator_reports_each_corruption() {
-    // EXTINF above the target duration.
+    // EXTINF above the target duration (fixed at 4 s: twice the 2 s nominal).
     let dir = good_dir();
     rewrite(dir.path(), "video.m3u8", |t| {
-        t.replacen("#EXTINF:2.002000,", "#EXTINF:2.502000,", 1)
+        t.replacen("#EXTINF:2.002000,", "#EXTINF:4.502000,", 1)
     });
     assert_reports(dir.path(), "exceeds EXT-X-TARGETDURATION");
     assert_reports(dir.path(), "but the samples last");
@@ -1139,7 +1139,57 @@ fn a_gap_right_after_the_start_keeps_the_stream_valid() {
     assert_eq!(extinfs(&video)[..2], ["0.100100", "2.002000"]);
     assert_eq!(discontinuities(&video)[0].0, "seg-v-7-1.m4s");
     assert_eq!(report.discontinuities, 1);
-    assert_eq!(report.target_duration, 2);
+    assert_eq!(report.target_duration, 4);
+}
+
+/// `EXT-X-TARGETDURATION` is fixed at twice the nominal segment duration
+/// (4 s for the 2 s nominal here) for the packager's lifetime (MEDIA-1): a
+/// delayed-IDR GOP longer than the nominal target must not raise it.
+#[test]
+fn a_delayed_idr_stream_keeps_the_same_target_duration_in_every_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut feeder = Feeder::new(config(dir.path(), true));
+    // Every GOP is 3.003 s (90 frames at 29.97 fps): longer than the 2 s
+    // nominal but still well inside the fixed 4 s target.
+    feeder.gop = 90;
+    for chunk in 0..6 {
+        feeder.run(chunk * 90..(chunk + 1) * 90).unwrap();
+        if feeder.packager.published().master {
+            let video = read(dir.path(), "video.m3u8");
+            let audio = read(dir.path(), "audio.m3u8");
+            assert!(
+                video.contains("#EXT-X-TARGETDURATION:4\n"),
+                "snapshot {chunk}: {video}"
+            );
+            assert!(
+                audio.contains("#EXT-X-TARGETDURATION:4\n"),
+                "snapshot {chunk}: {audio}"
+            );
+        }
+    }
+    let report = validate(dir.path());
+    assert_eq!(report.target_duration, 4);
+    assert!(report.video_segments >= 3, "{report:?}");
+}
+
+/// A GOP long enough that it can no longer close within the fixed 4 s
+/// target (MEDIA-1) is a packager error raised early by
+/// `check_open_bounds`, not after the old 10-target grace window.
+#[test]
+fn an_over_long_gop_without_an_idr_is_a_packager_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut feeder = Feeder::new(config(dir.path(), true));
+    // 150 frames at 29.97 fps is 5.005 s: no IDR arrives before the open
+    // segment's span exceeds the fixed 4 s target.
+    feeder.gop = 150;
+    let err = feeder
+        .run(0..150)
+        .expect_err("an over-long GOP must be a packager error");
+    let message = err.to_string();
+    assert!(
+        message.contains("EXT-X-TARGETDURATION") || message.contains("exceeds"),
+        "{message}"
+    );
 }
 
 #[test]

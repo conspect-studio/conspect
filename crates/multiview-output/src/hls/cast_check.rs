@@ -68,6 +68,32 @@ impl CastCheckReport {
     }
 }
 
+/// Compare two [`CastCheckReport`]s of the same directory taken at
+/// different times: reports what a live playlist must never change between
+/// snapshots (MEDIA-1's `EXT-X-TARGETDURATION`, and the codecs it
+/// advertises). Cheap: no filesystem access, just the two already-computed
+/// reports.
+#[must_use]
+pub fn check_stability(before: &CastCheckReport, after: &CastCheckReport) -> Vec<String> {
+    let mut findings = Vec::new();
+    if before.target_duration != 0
+        && after.target_duration != 0
+        && before.target_duration != after.target_duration
+    {
+        findings.push(format!(
+            "EXT-X-TARGETDURATION changed across snapshots: {} -> {}",
+            before.target_duration, after.target_duration
+        ));
+    }
+    if !before.codecs.is_empty() && !after.codecs.is_empty() && before.codecs != after.codecs {
+        findings.push(format!(
+            "master.m3u8 CODECS changed across snapshots: \"{}\" -> \"{}\"",
+            before.codecs, after.codecs
+        ));
+    }
+    findings
+}
+
 /// Split an attribute list (`A=1,B="x,y",C=z`) into its pairs; quotes are
 /// removed from quoted values.
 fn parse_attributes(list: &str) -> BTreeMap<String, String> {
@@ -1147,5 +1173,44 @@ mod tests {
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].starts_with("master.m3u8: cannot be read"));
         assert!(!report.is_ok());
+    }
+
+    #[test]
+    fn check_stability_flags_a_target_duration_or_codecs_change_but_not_zero_values() {
+        let mut before = CastCheckReport {
+            target_duration: 4,
+            codecs: "avc1.640028,mp4a.40.2".to_owned(),
+            ..CastCheckReport::default()
+        };
+        let same = before.clone();
+        assert_eq!(super::check_stability(&before, &same), Vec::<String>::new());
+
+        let mut after = before.clone();
+        after.target_duration = 6;
+        let findings = super::check_stability(&before, &after);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].contains("EXT-X-TARGETDURATION changed"),
+            "{findings:?}"
+        );
+
+        after = before.clone();
+        after.codecs = "avc1.4D401F,mp4a.40.2".to_owned();
+        let findings = super::check_stability(&before, &after);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].contains("CODECS changed"), "{findings:?}");
+
+        // A report with a zero (unread) field never triggers a finding.
+        before.target_duration = 0;
+        assert_eq!(super::check_stability(&before, &after), {
+            let mut only_codecs = Vec::new();
+            if before.codecs != after.codecs {
+                only_codecs.push(format!(
+                    "master.m3u8 CODECS changed across snapshots: \"{}\" -> \"{}\"",
+                    before.codecs, after.codecs
+                ));
+            }
+            only_codecs
+        });
     }
 }
