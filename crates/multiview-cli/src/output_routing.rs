@@ -519,7 +519,83 @@ pub struct OutputRoutingHandle {
     /// [`OutputRoutingHandle::with_pictures`].
     pictures: Option<PlanPictures>,
     max_aux_canvases: usize,
+    /// The run's subtitle slots and their admission (slice F #345 F2).
+    sub: HandleSubtitles,
 }
+
+/// A run handle's subtitle state (slice F #345 part F2).
+#[derive(Clone)]
+struct HandleSubtitles {
+    /// The run's subtitle slots (slice F #345 part F2): per output config id,
+    /// its route table, which the patch API re-points live. `None` once the
+    /// run ended ([`OutputRoutingHandle::end_subtitles`], review INV-1): a
+    /// re-point and the run's end are linearized by this control-plane
+    /// mutex (the sampler never takes it; it holds its own tables).
+    tables: Arc<Mutex<Option<SubtitleTables>>>,
+    /// The run's subtitle admission state ([`SUBTITLES_LIVE`],
+    /// [`SUBTITLES_WRITING`], [`SUBTITLES_ENDED`]): the bake consumer ends it
+    /// wait-free (one atomic swap, never the mutex) when it exits for any
+    /// reason (review INV2-1); a re-point is admitted by ONE compare-exchange
+    /// from live (review INV3-1), never rolled back.
+    state: Arc<std::sync::atomic::AtomicU8>,
+    /// The last output tick the subtitle sampler completed (0 before any).
+    tick: Arc<std::sync::atomic::AtomicU64>,
+    /// Every table the run had, kept for tests after the gate is cleared.
+    #[cfg(test)]
+    test_tables: Arc<Mutex<SubtitleTables>>,
+    /// Test seam: called at each [`RepointStage`] of a re-point.
+    #[cfg(test)]
+    hook: Arc<Mutex<Option<RepointHook>>>,
+}
+
+/// A test hook on a re-point's stages.
+#[cfg(test)]
+type RepointHook = Box<dyn Fn(RepointStage) + Send + Sync>;
+
+/// Where a re-point is (test seam, review INV3-1).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepointStage {
+    /// Past the admission point, nothing published yet.
+    Admitted,
+    /// The table is published (or the lookup refused it).
+    Published,
+}
+
+#[cfg(test)]
+impl HandleSubtitles {
+    fn hook(&self, stage: RepointStage) {
+        if let Some(hook) = self
+            .hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(stage);
+        }
+    }
+}
+
+impl Default for HandleSubtitles {
+    fn default() -> Self {
+        Self {
+            tables: Arc::new(Mutex::new(Some(Arc::from(Vec::new())))),
+            state: Arc::new(std::sync::atomic::AtomicU8::new(SUBTITLES_LIVE)),
+            #[cfg(test)]
+            test_tables: Arc::new(Mutex::new(Arc::from(Vec::new()))),
+            #[cfg(test)]
+            hook: Arc::default(),
+            tick: Arc::default(),
+        }
+    }
+}
+
+/// Subtitle admission open: no re-point in progress.
+const SUBTITLES_LIVE: u8 = 0;
+/// A control-plane re-point was admitted and is publishing.
+const SUBTITLES_WRITING: u8 = 1;
+/// The run's subtitle routing ended (consumer exit or teardown).
+const SUBTITLES_ENDED: u8 = 2;
 
 /// What the plan reads to tell an identity picture (P2) from a convert
 /// (P3), #342 B2: the run's store lookup, its canvas and the M/E's PVW
@@ -687,6 +763,154 @@ impl OutputRoutingHandle {
         self
     }
 
+    /// Attach the run's subtitle route tables (per output config id) and the
+    /// sampler's tick cell (slice F #345 part F2).
+    #[must_use]
+    pub fn with_subtitles(
+        mut self,
+        tables: Vec<(String, crate::subtitle_slots::SubtitleRoutes)>,
+        tick: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let tables: SubtitleTables = tables.into();
+        #[cfg(test)]
+        {
+            self.sub.test_tables = Arc::new(Mutex::new(Arc::clone(&tables)));
+        }
+        self.sub.tables = Arc::new(Mutex::new(Some(tables)));
+        self.sub.tick = tick;
+        self
+    }
+
+    fn subtitle_gate(&self) -> std::sync::MutexGuard<'_, Option<SubtitleTables>> {
+        self.sub
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Re-point subtitle slots of the output whose config id is `output`
+    /// (part F2), under the run's subtitle gate.
+    ///
+    /// ONE linearization point decides admission (review INV3-1): the
+    /// compare-exchange of the admission state from live to writing. A run
+    /// already ended (consumer exited, teardown started, or replaced) fails
+    /// it and is refused [`SubtitleRepoint::Ended`] BEFORE any output lookup
+    /// (review COR3-1), and nothing is published. Once it succeeds the take
+    /// is admitted and its table is published; there is no rollback. A
+    /// consumer that exits after the admission may or may not have sampled
+    /// it, which the contract allows (an applied take may never be sampled
+    /// when the run ends first); it is applied and persisted either way. The
+    /// consumer never waits: its exit is one atomic swap.
+    ///
+    /// `Ok(tick)` is a completed-tick LOWER BOUND observed before the swap:
+    /// the sampler had completed tick `tick` (or, when `0`, possibly no tick
+    /// yet) before the table was replaced. `Ok` means the table was swapped,
+    /// nothing more: a sample already in flight finishes on the old table,
+    /// and the first table read that STARTS after the swap sees the new
+    /// route unless a later re-point supersedes it first (then this one is
+    /// never sampled) or the run ends first (review COR2-1/INV2-2).
+    ///
+    /// # Errors
+    /// [`SubtitleRepoint`] when nothing was changed.
+    pub fn repoint_subtitles(
+        &self,
+        output: &str,
+        slots: &[(usize, Option<String>)],
+    ) -> Result<u64, SubtitleRepoint> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let gate = self.subtitle_gate();
+        let tables = gate.as_ref().ok_or(SubtitleRepoint::Ended)?;
+        // The linearization point: admitted, or ended (nothing published).
+        self.sub
+            .state
+            .compare_exchange(SUBTITLES_LIVE, SUBTITLES_WRITING, AcqRel, Acquire)
+            .map_err(|_| SubtitleRepoint::Ended)?;
+        #[cfg(test)]
+        self.sub.hook(RepointStage::Admitted);
+        let published = tables
+            .iter()
+            .find(|(id, _)| id == output)
+            .map(|(_, routes)| routes)
+            .ok_or(SubtitleRepoint::NotInRun)
+            .and_then(|routes| {
+                let tick = self.sub.tick.load(Acquire);
+                crate::subtitle_slots::repoint(routes, slots)
+                    .map(|()| tick)
+                    .map_err(|_| SubtitleRepoint::NotInRun)
+            });
+        #[cfg(test)]
+        self.sub.hook(RepointStage::Published);
+        // Back to live, unless the consumer ended the run meanwhile (then it
+        // stays ended; the admitted take keeps its answer).
+        let _ = self
+            .sub
+            .state
+            .compare_exchange(SUBTITLES_WRITING, SUBTITLES_LIVE, AcqRel, Acquire);
+        published
+    }
+
+    /// Test seam: run `hook` at each stage of a re-point (review INV3-1).
+    #[cfg(test)]
+    pub(crate) fn set_repoint_hook(&self, hook: Box<dyn Fn(RepointStage) + Send + Sync>) {
+        *self
+            .sub
+            .hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// The live subtitle route table of `output`, `None` when the run does
+    /// not sample it or has ended.
+    #[must_use]
+    pub fn subtitle_table(&self, output: &str) -> Option<Vec<Option<String>>> {
+        let gate = self.subtitle_gate();
+        if !self.subtitles_live() {
+            return None;
+        }
+        gate.as_ref()?
+            .iter()
+            .find(|(id, _)| id == output)
+            .map(|(_, routes)| routes.load().to_vec())
+    }
+
+    /// End the run's subtitle routing (its teardown): later re-points are
+    /// refused and the live readback is gone. Idempotent.
+    pub fn end_subtitles(&self) {
+        let mut gate = self.subtitle_gate();
+        self.sub
+            .state
+            .store(SUBTITLES_ENDED, std::sync::atomic::Ordering::Release);
+        *gate = None;
+    }
+
+    /// Whether the run's subtitle routing is still live (not ended).
+    #[must_use]
+    pub fn subtitles_live(&self) -> bool {
+        self.sub.state.load(std::sync::atomic::Ordering::Acquire) != SUBTITLES_ENDED
+    }
+
+    /// The route table of `output` itself, even after the run ended (tests
+    /// check an ended run's table is left unchanged).
+    #[cfg(test)]
+    pub(crate) fn subtitle_routes_for_test(
+        &self,
+        output: &str,
+    ) -> Option<crate::subtitle_slots::SubtitleRoutes> {
+        self.sub
+            .test_tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(id, _)| id == output)
+            .map(|(_, routes)| Arc::clone(routes))
+    }
+
+    /// The wait-free end the bake consumer holds (review INV2-1).
+    #[must_use]
+    pub fn subtitle_consumer_exit(&self) -> SubtitleConsumerExit {
+        SubtitleConsumerExit(Arc::clone(&self.sub.state))
+    }
+
     /// The run's store lookup and canvas, when attached.
     #[must_use]
     pub fn pictures(&self) -> Option<&PlanPictures> {
@@ -717,6 +941,41 @@ impl OutputRoutingHandle {
         self.outputs
             .iter()
             .position(|o| o.id.as_deref() == Some(id))
+    }
+}
+
+/// A run's subtitle route tables, per output config id (part F2).
+pub type SubtitleTables = Arc<[(String, crate::subtitle_slots::SubtitleRoutes)]>;
+
+/// Why [`OutputRoutingHandle::repoint_subtitles`] changed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleRepoint {
+    /// The run ended (or was replaced).
+    Ended,
+    /// The run does not sample this output, or the slot is beyond its table.
+    NotInRun,
+}
+
+/// Held by the bake consumer for its whole life: dropped when it exits, for
+/// any reason, it ends subtitle admission with one atomic swap (no lock, no
+/// wait: the consumer never blocks on the control plane; review INV2-1).
+pub struct SubtitleConsumerExit(Arc<std::sync::atomic::AtomicU8>);
+
+impl Drop for SubtitleConsumerExit {
+    fn drop(&mut self) {
+        self.0
+            .swap(SUBTITLES_ENDED, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Ends a run's subtitle routing when dropped (the run's teardown, on every
+/// exit path; review INV-1). Teardown also ends it explicitly as soon as
+/// the clock returns (review INV2-1).
+pub struct SubtitleRunEnd(pub Arc<OutputRoutingHandle>);
+
+impl Drop for SubtitleRunEnd {
+    fn drop(&mut self) {
+        self.0.end_subtitles();
     }
 }
 
@@ -1305,6 +1564,7 @@ impl OutputRouter {
             has_preview: cfg.has_preview,
             pictures: None,
             max_aux_canvases: cfg.max_aux_canvases,
+            sub: HandleSubtitles::default(),
         };
         let mut router = Self {
             cfg,

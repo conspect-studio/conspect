@@ -1108,6 +1108,21 @@ fn audio_gate(
     }
 }
 
+/// The slot-0 take's admission gates, video plan first then audio (`Some` =
+/// refused): the same order and answers as checking each in turn.
+fn take_gates(
+    control: &crate::output_routing::OutputRoutingControl,
+    principal: &Principal,
+    config_id: &str,
+    feed: Option<&RoutedFeed>,
+    audio: Option<&RoutedAudio>,
+) -> Option<Response> {
+    if let Some(refused) = feed.and_then(|feed| plan_gate(control, principal, config_id, feed)) {
+        return Some(refused);
+    }
+    audio.and_then(|audio| audio_gate(control, config_id, feed, audio))
+}
+
 /// The take-time admission gate from the engine's plan (`Some` = refused).
 fn plan_gate(
     control: &crate::output_routing::OutputRoutingControl,
@@ -1292,21 +1307,21 @@ pub(crate) fn take_output_slot0(
             Err((response, _)) => return Ok(SlotTake::Refused(response)),
         },
     };
-    if let Some(feed) = &feed {
-        if let Some(refused) = plan_gate(&control, principal, &config_id, feed) {
-            return Ok(SlotTake::Refused(refused));
-        }
-    }
-    if let Some(audio) = &audio {
-        if let Some(refused) = audio_gate(&control, &config_id, feed.as_ref(), audio) {
-            return Ok(SlotTake::Refused(refused));
-        }
+    if let Some(refused) = take_gates(
+        &control,
+        principal,
+        &config_id,
+        feed.as_ref(),
+        audio.as_ref(),
+    ) {
+        return Ok(SlotTake::Refused(refused));
     }
     // The record exists before the enqueue, so an outcome never beats it.
     let pending = PendingTake {
         api_id: output_id.to_owned(),
         feed: feed.clone(),
         audio: audio.clone(),
+        subtitles: None,
     };
     let pending_check = pending.clone();
     let op = match control.reserve_take(&key, &principal.key_id, pending) {
@@ -1464,7 +1479,7 @@ fn same_take(
 ///
 /// # Errors
 /// A missing `Idempotency-Key` (422).
-fn slot0_key_of(idem: &IdempotencyKey) -> ControlResult<String> {
+pub(crate) fn slot0_key_of(idem: &IdempotencyKey) -> ControlResult<String> {
     idem.0
         .as_deref()
         .map(slot0_take_key)
