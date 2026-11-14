@@ -849,10 +849,14 @@ jobs:
           cargo build --locked --release -p multiview-cli --features gpl-codecs,overlay
           cargo build --locked --release -p multiview-output --example cast_validate
           # The cast pipeline + chaos tests (real libx264, 160x90, real time).
-          # `overlay` wires caption sources, so the subtitle-slot cue checks run too (#418).
-          cargo test --locked -p multiview-cli --features gpl-codecs,overlay --lib -- cast_output binding_delivery \
+          cargo test --locked -p multiview-cli --features gpl-codecs --lib -- cast_output binding_delivery \
             2>&1 | tee cast-pipeline-tests.log
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed;' cast-pipeline-tests.log
+          # `overlay` wires caption sources: the subtitle-slot cue check of test g (#418) runs alone, because
+          # the debug overlay build cannot hold real-time cadence for 8 parallel engines on 4 vCPU.
+          cargo test --locked -p multiview-cli --features gpl-codecs,overlay --lib -- \
+            cast_output::pipeline_tests::g_ --test-threads=1 2>&1 | tee cast-subtitle-tests.log
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' cast-subtitle-tests.log
           npm ci --prefix tools/cast-proof --no-audit --no-fund
           export CHROME_PATH=/usr/bin/chromium
           status=0
@@ -882,6 +886,7 @@ jobs:
           path: |
             tools/cast-proof/out
             cast-pipeline-tests.log
+            cast-subtitle-tests.log
           if-no-files-found: ignore
           retention-days: 7
 
