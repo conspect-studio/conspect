@@ -167,33 +167,51 @@ pub fn scan_parameter_sets(
     if !matches!(codec, CodecKind::H264 | CodecKind::Hevc) {
         return ParameterSetScan::Absent;
     }
-    let mut nals: Vec<&[u8]> = Vec::new();
-    collect_nals(au, framing, &mut nals);
+    // Streaming, bounded by MAX_AU_NALS (fail closed past it): never an
+    // unbounded collection of NAL slices on the demux thread. A parameter
+    // set waits one NAL so its successor's forbidden bit can be checked.
     let mut out = Vec::new();
     let mut last_rank: Option<u8> = None;
     let mut seen_vcl = false;
-    for (n, nal) in nals.iter().enumerate() {
+    let mut count = 0_usize;
+    let mut pending: Option<&[u8]> = None;
+    let mut rejected = false;
+    for_each_nal(au, framing, |nal| {
+        count += 1;
+        if count > MAX_AU_NALS {
+            rejected = true;
+            return true;
+        }
+        if let Some(set) = pending.take() {
+            let forbidden_next = matches!(framing, NalFraming::AnnexB)
+                && nal.first().is_some_and(|&b| b & 0x80 != 0);
+            if forbidden_next {
+                rejected = true;
+                return true;
+            }
+            out.push(set);
+        }
         let r = match classify_nal(nal, codec) {
             NalClass::Vcl => {
                 seen_vcl = true;
-                continue;
+                return false;
             }
-            NalClass::Other => continue,
+            NalClass::Other => return false,
             NalClass::ParameterSet(r) => r,
         };
-        if seen_vcl || last_rank.is_some_and(|last| r <= last) {
-            return ParameterSetScan::Rejected;
+        if seen_vcl || last_rank.is_some_and(|last| r <= last) || nal.len() < 4 {
+            rejected = true;
+            return true;
         }
         last_rank = Some(r);
-        let forbidden_next = matches!(framing, NalFraming::AnnexB)
-            && nals
-                .get(n + 1)
-                .and_then(|next| next.first())
-                .is_some_and(|&b| b & 0x80 != 0);
-        if nal.len() < 4 || forbidden_next {
-            return ParameterSetScan::Rejected;
-        }
-        out.push(*nal);
+        pending = Some(nal);
+        false
+    });
+    if rejected {
+        return ParameterSetScan::Rejected;
+    }
+    if let Some(set) = pending {
+        out.push(set);
     }
     if out.is_empty() {
         ParameterSetScan::Absent
@@ -291,6 +309,138 @@ pub fn h264_nal_of_type(au: &[u8], framing: NalFraming, nal_type: u8) -> Option<
 /// slices); more is hostile.
 pub const MAX_AU_NALS: usize = 1024;
 
+/// The number of NAL units of an Annex-B `au`, or `None` as soon as it
+/// exceeds `max` (allocation-free, early exit).
+#[must_use]
+pub fn annex_b_nal_count(au: &[u8], max: usize) -> Option<usize> {
+    let mut count = 0_usize;
+    let over = annexb_any_nal(au, &mut |_| {
+        count += 1;
+        count > max
+    });
+    (!over).then_some(count)
+}
+
+/// A minimal Exp-Golomb reader over the first bytes of an H.264 NAL payload
+/// (emulation-prevention bytes skipped), for reading parameter-set and slice
+/// ids. Bounded: at most 32 payload bytes are ever looked at.
+struct IdReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    zeros: u8,
+    cur: u8,
+    bit: u8,
+}
+
+impl<'a> IdReader<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self {
+            bytes: payload.get(..payload.len().min(32)).unwrap_or(&[]),
+            pos: 0,
+            zeros: 0,
+            cur: 0,
+            bit: 0,
+        }
+    }
+    fn next_byte(&mut self) -> Option<u8> {
+        loop {
+            let b = *self.bytes.get(self.pos)?;
+            self.pos += 1;
+            if self.zeros >= 2 && b == 3 {
+                self.zeros = 0;
+                continue;
+            }
+            self.zeros = if b == 0 {
+                self.zeros.saturating_add(1)
+            } else {
+                0
+            };
+            return Some(b);
+        }
+    }
+    fn bit(&mut self) -> Option<u32> {
+        if self.bit == 0 {
+            self.cur = self.next_byte()?;
+            self.bit = 8;
+        }
+        self.bit -= 1;
+        Some(u32::from((self.cur >> self.bit) & 1))
+    }
+    fn skip(&mut self, n: u32) -> Option<()> {
+        for _ in 0..n {
+            self.bit()?;
+        }
+        Some(())
+    }
+    /// `ue(v)`, refusing anything above `max`.
+    fn ue(&mut self, max: u32) -> Option<u32> {
+        let mut zeros = 0_u32;
+        while self.bit()? == 0 {
+            zeros += 1;
+            if zeros > 16 {
+                return None;
+            }
+        }
+        let mut v = 1_u32;
+        for _ in 0..zeros {
+            v = (v << 1) | self.bit()?;
+        }
+        let v = v - 1;
+        (v <= max).then_some(v)
+    }
+}
+
+/// `(pic_parameter_set_id, seq_parameter_set_id)` of an H.264 PPS NAL
+/// (header byte included).
+#[must_use]
+pub fn h264_pps_ids(nal: &[u8]) -> Option<(u32, u32)> {
+    let (&h, payload) = nal.split_first()?;
+    if h & 0x1F != 8 {
+        return None;
+    }
+    let mut r = IdReader::new(payload);
+    Some((r.ue(255)?, r.ue(31)?))
+}
+
+/// `seq_parameter_set_id` of an H.264 SPS NAL (header byte included).
+#[must_use]
+pub fn h264_sps_id(nal: &[u8]) -> Option<u32> {
+    let (&h, payload) = nal.split_first()?;
+    if h & 0x1F != 7 {
+        return None;
+    }
+    let mut r = IdReader::new(payload);
+    r.skip(24)?; // profile_idc, constraint flags, level_idc
+    r.ue(31)
+}
+
+/// `pic_parameter_set_id` of an H.264 coded slice NAL (types 1..=5).
+#[must_use]
+pub fn h264_slice_pps_id(nal: &[u8]) -> Option<u32> {
+    let (&h, payload) = nal.split_first()?;
+    if !(1..=5).contains(&(h & 0x1F)) {
+        return None;
+    }
+    let mut r = IdReader::new(payload);
+    r.ue(u32::MAX)?; // first_mb_in_slice
+    r.ue(9)?; // slice_type
+    r.ue(255)
+}
+
+/// The `pic_parameter_set_id` of the first coded slice of an H.264 `au`.
+#[must_use]
+pub fn h264_au_pps_id(au: &[u8], framing: NalFraming) -> Option<u32> {
+    let mut found = None;
+    for_each_nal(au, framing, |nal| match nal.first() {
+        Some(&b) if (1..=5).contains(&(b & 0x1F)) => {
+            found = h264_slice_pps_id(nal);
+            true
+        }
+        _ => false,
+    });
+    found
+}
+
 /// Why an access unit cannot be re-framed ([`annex_b_size`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReframeError {
@@ -316,8 +466,10 @@ pub fn annex_b_size(
     max_bytes: usize,
 ) -> Result<usize, ReframeError> {
     match framing {
-        NalFraming::AnnexB if au.len() <= max_bytes => Ok(au.len()),
-        NalFraming::AnnexB => Err(ReframeError::TooLarge),
+        NalFraming::AnnexB if au.len() > max_bytes => Err(ReframeError::TooLarge),
+        NalFraming::AnnexB => annex_b_nal_count(au, MAX_AU_NALS)
+            .map(|_| au.len())
+            .ok_or(ReframeError::TooLarge),
         NalFraming::Obu => Err(ReframeError::Malformed),
         NalFraming::LengthPrefixed { nal_length_size } => {
             let size = usize::from(nal_length_size);
@@ -395,14 +547,6 @@ pub fn to_annex_b(
         offset = end;
     }
     (at == total).then_some(out)
-}
-
-/// Every NAL unit of `au` under `framing` (empty NALs skipped).
-fn collect_nals<'a>(au: &'a [u8], framing: NalFraming, out: &mut Vec<&'a [u8]>) {
-    for_each_nal(au, framing, |nal| {
-        out.push(nal);
-        false
-    });
 }
 
 /// H.264: at least one `nal_unit_type == 5` (IDR slice) NAL is present.
@@ -953,5 +1097,47 @@ mod tests {
         );
         // Annex B passes through, still bounded by the cap.
         assert!(to_annex_b(&[0, 0, 1, 0x65], NalFraming::AnnexB, 3).is_none());
+    }
+
+    /// #344 D2a review R2-A-3: an Annex-B AU is held to the NAL budget too,
+    /// and the parameter-set scan fails closed past it (no unbounded
+    /// collection on the demux thread).
+    #[test]
+    fn annex_b_nal_count_is_budgeted_and_the_set_scan_fails_closed() {
+        let many: Vec<u8> = (0..=MAX_AU_NALS).flat_map(|_| [0_u8, 0, 1, 0x41]).collect();
+        assert_eq!(
+            annex_b_size(&many, NalFraming::AnnexB, usize::MAX),
+            Err(super::ReframeError::TooLarge)
+        );
+        assert_eq!(super::annex_b_nal_count(&many, MAX_AU_NALS), None);
+        let ok: Vec<u8> = (0..MAX_AU_NALS).flat_map(|_| [0_u8, 0, 1, 0x41]).collect();
+        assert_eq!(
+            annex_b_size(&ok, NalFraming::AnnexB, usize::MAX),
+            Ok(ok.len())
+        );
+        assert_eq!(
+            super::annex_b_nal_count(&ok, MAX_AU_NALS),
+            Some(MAX_AU_NALS)
+        );
+        // A huge AU with a parameter set first: the scan is Rejected, not
+        // collected.
+        let mut big = vec![0_u8, 0, 1, 0x67, 0x64, 0, 0x1f, 0xac];
+        big.extend((0..200_000).flat_map(|_| [0_u8, 0, 1, 0x41]));
+        assert_eq!(
+            super::scan_parameter_sets(&big, CodecKind::H264, NalFraming::AnnexB),
+            super::ParameterSetScan::Rejected
+        );
+    }
+
+    #[test]
+    fn h264_ids_are_read_from_the_set_and_slice_headers() {
+        // pps_id 1 (ue "010"), sps_id 0 ("1"): 0b0101_1... = 0x58 + trailing.
+        assert_eq!(super::h264_pps_ids(&[0x68, 0x58, 0x80]), Some((1, 0)));
+        // SPS: profile, flags, level, then sps_id 0 ("1").
+        assert_eq!(super::h264_sps_id(&[0x67, 0x64, 0, 0x1f, 0x80]), Some(0));
+        // IDR slice: first_mb 0 ("1"), slice_type 7 ("0001000"), pps_id 1
+        // ("010"): 1 0001000 010... = 0x88 0x40.
+        assert_eq!(super::h264_slice_pps_id(&[0x65, 0x88, 0x40]), Some(1));
+        assert_eq!(super::h264_slice_pps_id(&[0x67, 0x88]), None, "not a slice");
     }
 }

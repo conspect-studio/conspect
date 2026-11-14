@@ -302,6 +302,8 @@ fn extradata_sets(extradata: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
 /// inserted after a leading access unit delimiter (or at the front), in one
 /// exact-size allocation. `None` when the result would exceed `max_bytes`.
 fn with_sets(au: &[u8], sps: &[u8], pps: &[u8], max_bytes: usize) -> Option<Arc<[u8]>> {
+    // The two inserted NALs count against the AU's NAL budget too.
+    idr::annex_b_nal_count(au, idr::MAX_AU_NALS.saturating_sub(2))?;
     // An AUD, when it is the first NAL, stays first (H.264 7.4.1.2.3):
     // insert after it, at the next start code.
     let first_nal_at = au.windows(3).position(|w| w == [0, 0, 1]).map(|p| p + 3)?;
@@ -1097,5 +1099,33 @@ mod tests {
             with_sets(&bare, SPS, PPS, bare.len() + 8).is_none(),
             "bounded"
         );
+    }
+
+    /// #344 D2a review R2-A-3: an Annex-B packet with more than `MAX_AU_NALS`
+    /// NALs is refused before any copy or classification, counted, and
+    /// never offered; an IDR at exactly the budget does not get sets
+    /// inserted past it.
+    #[test]
+    fn an_annex_b_packet_over_the_nal_budget_is_refused_and_counted() {
+        let tap = Arc::new(SourceTap::new());
+        let reader = tap.tap().subscribe().unwrap();
+        let mut w = TapWriter::connect(Arc::clone(&tap), facts(), clock());
+        let many: Vec<u8> = (0..=idr::MAX_AU_NALS)
+            .flat_map(|_| [0_u8, 0, 1, 0x41])
+            .collect();
+        w.on_packet(&many, Some(0), Some(0), false);
+        assert_eq!(tap.oversize(), 1);
+        assert!(reader.try_recv().is_none());
+        // A set-less IDR at exactly the budget: completing it would exceed it.
+        let mut w = TapWriter::connect(Arc::clone(&tap), facts(), clock());
+        w.on_packet(&idr_au(SPS), Some(0), Some(0), true);
+        assert!(reader.try_recv().is_some());
+        let full: Vec<u8> = (0..idr::MAX_AU_NALS - 1)
+            .flat_map(|_| [0_u8, 0, 1, 0x06, 0x05])
+            .chain([0, 0, 1, 0x65, 0x88, 0x80])
+            .collect();
+        w.on_packet(&full, Some(3600), Some(3600), true);
+        assert_eq!(tap.oversize(), 2);
+        assert!(reader.try_recv().is_none());
     }
 }
