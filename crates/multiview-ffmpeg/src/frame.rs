@@ -121,7 +121,59 @@ pub fn alloc_video(format: Pixel, width: u32, height: u32) -> Result<Video> {
             return Err(FfmpegError::FrameAlloc("allocated plane is unusable"));
         }
     }
+    // `av_frame_get_buffer` storage comes from `av_buffer_alloc` (not
+    // zeroed). Initialise every owned byte once, row padding and tail
+    // included, before any Rust `u8` slice can expose it (review PB-12).
+    // One-time per allocation; steady-state reuse never re-zeroes.
+    fill_owned_buffers(&mut frame, 0);
     Ok(frame)
+}
+
+/// Visit every `AVBufferRef` the frame owns (`buf[]` then `extended_buf`)
+/// as a raw `(data, size)` pair taken from the ref itself.
+fn for_each_owned_buffer(frame: &Video, mut f: impl FnMut(*mut u8, usize)) {
+    #[allow(unsafe_code)]
+    // SAFETY: `frame` is a live, borrowed frame: each `buf` slot is null or a
+    // valid `AVBufferRef`, and `extended_buf` (when non-null) holds
+    // `nb_extended_buf` valid refs. Only each ref's own `data`/`size` are
+    // copied out; the callback receives pointers into buffers `frame` keeps
+    // alive for the duration of the borrow.
+    unsafe {
+        let raw = frame.as_ptr();
+        if raw.is_null() {
+            return;
+        }
+        let mut visit = |b: *mut ffi::AVBufferRef| {
+            if !b.is_null() && !(*b).data.is_null() {
+                f((*b).data, (*b).size);
+            }
+        };
+        for b in (*raw).buf {
+            visit(b);
+        }
+        let extended = (*raw).extended_buf;
+        if !extended.is_null() {
+            let n = usize::try_from((*raw).nb_extended_buf).unwrap_or(0);
+            for i in 0..n {
+                visit(*extended.add(i));
+            }
+        }
+    }
+}
+
+/// Set every byte of every buffer `frame` owns to `value`, padding included
+/// (review PB-12: `av_frame_get_buffer` storage is not initialised). Called
+/// once per allocation, before any Rust slice can expose the bytes.
+fn fill_owned_buffers(frame: &mut Video, value: u8) {
+    for_each_owned_buffer(frame, |data, size| {
+        #[allow(unsafe_code)]
+        // SAFETY: `data`/`size` are a buffer ref's own allocation, borrowed
+        // mutably through `frame`, which holds the only reference (freshly
+        // allocated, refcount 1); `u8` has no alignment/validity requirement.
+        unsafe {
+            core::ptr::write_bytes(data, value, size);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -751,6 +803,34 @@ fn padded_plane_rows(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// Review PB-12: every byte a fresh frame owns (active rows, row padding
+    /// and the tail) is initialised before any Rust slice can see it. Many
+    /// rounds of dirty-then-free of the same size make it overwhelmingly
+    /// likely that a recycled heap block is handed back without zeroing.
+    #[test]
+    fn a_fresh_frame_owns_only_initialised_bytes() {
+        for round in 0..64_u8 {
+            {
+                let mut dirty = alloc_video(Pixel::GRAY8, 13, 7).unwrap();
+                fill_owned_buffers(&mut dirty, 0xA5 ^ round);
+            }
+            let frame = alloc_video(Pixel::GRAY8, 13, 7).unwrap();
+            let mut total = 0_usize;
+            for_each_owned_buffer(&frame, |data, size| {
+                #[allow(unsafe_code)]
+                // SAFETY: reading `size` bytes of a buffer `frame` owns and
+                // keeps alive for this borrow.
+                let bytes = unsafe { core::slice::from_raw_parts(data, size) };
+                total += size;
+                assert!(
+                    bytes.iter().all(|&b| b == 0),
+                    "round {round}: uninitialised bytes exposed"
+                );
+            });
+            assert!(total >= 13 * 7, "the whole allocation was inspected");
+        }
+    }
 
     #[test]
     fn alloc_video_checks_size_and_format_before_touching_planes() {
