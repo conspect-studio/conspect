@@ -182,7 +182,7 @@ pub use log_bridge::{
 #[cfg(feature = "ffmpeg")]
 pub use log_bridge::install as install_log_bridge;
 
-pub use idr::{is_idr, CodecKind, NalFraming};
+pub use idr::{is_idr, CodecKind, NalFraming, ReframeError};
 
 pub use hwdecode::{
     cuvid_decoder, cuvid_resize_option, decode_surface_pool, nvdec_disabled, nvdec_resize_target,
@@ -317,8 +317,9 @@ pub use decode_stream::{
 
 #[cfg(feature = "ffmpeg")]
 pub use demux::{
-    discard_unrouted_subtitles, open_device_input, DemuxOptions, Demuxer, HttpHeaders, ReadPacket,
-    StreamParams,
+    bounded_extradata, discard_unrouted_subtitles, open_device_input, stream_framing,
+    video_stream_facts, DemuxOptions, Demuxer, HttpHeaders, ReadPacket, StreamParams,
+    VideoStreamFacts, MAX_FACTS_EXTRADATA,
 };
 
 #[cfg(feature = "ffmpeg")]

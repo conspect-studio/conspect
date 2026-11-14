@@ -80,11 +80,22 @@ pub struct StartCastSessionRequest {
     /// program canvas).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// What to show, as `POST /cast/streams` takes it
+    /// (`{"bus":"program"|"preview"|"clean"}`, `{"source":"<id>"}`,
+    /// `{"layout":"<id>"}`). When the engine runs a cast output the session
+    /// creates its own cast stream (same authorization as `POST
+    /// /cast/streams`, owner = the caller) and LOADs
+    /// `{control.cast_media_base}/cast/<token>/master.m3u8`; `output` may
+    /// then name a cast output. Without a cast output a `feed` is refused
+    /// (`409 cast-unavailable`) and `output` names an HLS rendition as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+    pub feed: Option<multiview_config::VideoFeed>,
 }
 
 /// One ephemeral cast session as the API serves it: the descriptive record
 /// plus the live lifecycle state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CastSessionDoc {
     /// The runtime session id (`cast-session-…`, UUID-fresh per start).
@@ -96,8 +107,26 @@ pub struct CastSessionDoc {
     pub address: String,
     /// The output id whose rendition the session casts.
     pub output: String,
-    /// The resolved device-reachable media URL the session LOADs.
+    /// The device-reachable media URL the session LOADs. For a session
+    /// that plays a cast stream the token is redacted:
+    /// `https://…/cast/<redacted>/master.m3u8`.
     pub media_url: String,
+    /// The cast stream the session owns (stopping the session revokes it;
+    /// revoking or expiring it ends the session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    /// The receiver's player state as last reported: `connecting`,
+    /// `loading`, `playing`, `buffering`, `paused`, `idle`, `load-failed`,
+    /// `no-media`, `preempted`, `relaunching`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub player_state: Option<String>,
+    /// Why the receiver is idle or refused the LOAD (its `idleReason` /
+    /// error reason, e.g. `ERROR`, `FINISHED`), while not playing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_reason: Option<String>,
+    /// The cast stream's last receiver report (custom receiver only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_report: Option<crate::cast_streams::ReceiverReport>,
     /// The session's live lifecycle state (the DEV-A3 wire vocabulary, e.g.
     /// `ADOPTING`/`ONLINE`/`DEGRADED`), read from the latest-wins status
     /// registry.
@@ -151,12 +180,21 @@ fn live_state(state: &AppState, id: &str) -> String {
 /// Project a stored record + the live state into the served document.
 fn doc(state: &AppState, record: CastSessionRecord) -> CastSessionDoc {
     let session_state = live_state(state, &record.id);
+    let last_report = record
+        .stream_id
+        .as_deref()
+        .and_then(|id| state.cast_streams.get(id))
+        .and_then(|(view, _token)| view.last_report);
     CastSessionDoc {
         id: record.id,
         name: record.name,
         address: record.address,
         output: record.output,
         media_url: record.media_url,
+        stream_id: record.stream_id,
+        player_state: record.player_state,
+        idle_reason: record.idle_reason,
+        last_report,
         state: session_state,
         started_unix_ns: record.started_unix_ns,
     }
@@ -221,10 +259,21 @@ async fn screen_cast_dial_target(address: &str, policy: &DialPolicy) -> ControlR
 
 /// `POST /api/v1/cast/sessions` — start an ad-hoc cast session (role: write).
 ///
-/// Resolves the rendition, spawns the supervised session actor through the
-/// shared poller registry, and records the ephemeral session. The actor
-/// CONNECTs → `LAUNCH`es the Default Media Receiver (`CC1AD845`) → `LOAD`s the
-/// device-reachable HLS URL, then supervises the session (ADR-M011).
+/// When the engine runs a cast output (ADR-0111) the session creates its own
+/// cast stream (`feed` / `output` as `POST /cast/streams` takes them, same
+/// authorization, owner = the caller), launches the configured receiver app
+/// (the registered custom receiver, else the Default Media Receiver
+/// `CC1AD845`) and LOADs `{control.cast_media_base}/cast/<token>/master.m3u8`
+/// (fMP4, LIVE). The session owns the stream: stopping the session revokes
+/// it, and a revoked or expired stream ends the session. Only the receiver's
+/// playlist fetches keep the token alive. The token is never served,
+/// audited, published or logged (`media_url` is redacted).
+///
+/// Without a cast output: resolves the HLS rendition, spawns the supervised
+/// session actor through the shared poller registry, and records the
+/// ephemeral session. The actor CONNECTs → `LAUNCH`es the Default Media
+/// Receiver (`CC1AD845`) → `LOAD`s the device-reachable HLS URL, then
+/// supervises the session (ADR-M011).
 #[cfg_attr(
     feature = "openapi",
     utoipa::path(
@@ -235,15 +284,17 @@ async fn screen_cast_dial_target(address: &str, policy: &DialPolicy) -> ControlR
         responses(
             (status = 201, description = "The started ephemeral session (runtime-only; never exported).", body = CastSessionDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 403, description = "Not authorized to start a session.", body = crate::problem::Problem),
-            (status = 409, description = "No castable rendition (control.cast_media_base unset / no HLS output) or no live cast driver in this build.", body = crate::problem::Problem),
-            (status = 422, description = "The address is not a valid host[:port], or the named output is not a served HLS rendition.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to start a session; with a cast output: the caller may not read the output (object and output axis) or the feed, exactly as for `POST /cast/streams`.", body = crate::problem::Problem),
+            (status = 409, description = "No live cast driver in this build; with a cast output: `cast-no-public-base` (control.cast_media_base is not an absolute https:// origin) or any refusal of `POST /cast/streams` (`cast-unavailable`, `cast-capacity`, `cast-no-encoder`, routing refusals); without one: no castable rendition (control.cast_media_base unset / no HLS output) or `cast-unavailable` for a `feed`.", body = crate::problem::Problem),
+            (status = 422, description = "The address is not a valid host[:port], the named output is not a served HLS rendition, or `unknown-feed`.", body = crate::problem::Problem),
+            (status = 429, description = "The `POST /cast/streams` creation limit (burst 4, then 1/s per principal).", body = crate::problem::Problem),
+            (status = 503, description = "`engine-busy`: the take onto the cast output did not settle within 3 s.", body = crate::problem::Problem),
         ),
     )
 )]
 pub(crate) async fn start_cast_session(
     State(state): State<AppState>,
-    principal: Principal,
+    crate::routes::Authenticated(principal, origin): crate::routes::Authenticated,
     Json(request): Json<StartCastSessionRequest>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
@@ -253,6 +304,22 @@ pub(crate) async fn start_cast_session(
     // against the operator dial policy — all BEFORE any side effect, so a
     // rejected target casts nothing and records nothing.
     screen_cast_dial_target(&request.address, &state.dial_policy).await?;
+    // A running cast output: the session plays its own cast stream (ADR-0111).
+    let cast_outputs = state
+        .cast_engine
+        .as_ref()
+        .is_some_and(|engine| !engine.outputs().is_empty());
+    if cast_outputs {
+        return start_stream_session(&state, &principal, origin, &request).await;
+    }
+    if request.feed.is_some() {
+        return Ok(crate::routes::cast_streams::cast_problem(
+            409,
+            "cast-unavailable",
+            "No cast output can be used: add an output with kind = \"cast\" (or check that the \
+             engine is running)",
+        ));
+    }
     // A castable rendition requires the delivery map the binary builds from
     // `control.cast_media_base` × the served HLS mounts (ADR-M011: the media
     // URL must be device-reachable — Cast devices resolve via hardcoded
@@ -306,7 +373,7 @@ pub(crate) async fn start_cast_session(
         address: request.address.clone(),
         output,
         media_url: target.url.clone(),
-        started_unix_ns: None,
+        ..CastSessionRecord::default()
     };
     state.cast_sessions.insert(record.clone());
     let wiring = state.poller_wiring();
@@ -350,6 +417,184 @@ pub(crate) async fn start_cast_session(
     Ok((StatusCode::CREATED, Json(doc(&state, served))).into_response())
 }
 
+/// The absolute `https://` base a cast stream URL is joined onto, or the
+/// `409 cast-no-public-base` refusal: a TV resolves names through public DNS
+/// and the receiver page refuses mixed content, so a relative path or an
+/// `http://` base would LOAD a URL the TV cannot play.
+fn public_base(state: &AppState) -> Result<String, Box<Response>> {
+    state
+        .cast_delivery
+        .as_ref()
+        .and_then(|delivery| delivery.base())
+        .filter(|base| base.is_https())
+        .map(|base| base.as_str().to_owned())
+        .ok_or_else(|| {
+            Box::new(crate::routes::cast_streams::cast_problem(
+                409,
+                "cast-no-public-base",
+                "A TV needs an absolute https:// address for the stream: set \
+                 control.cast_media_base to this engine's public https origin (for example \
+                 https://engine.example.org) and restart",
+            ))
+        })
+}
+
+/// Start a session that plays its own cast stream: the stream is created
+/// exactly as `POST /cast/streams` creates it (same authorization, owner =
+/// the caller), the session launches the configured receiver app and loads
+/// the absolute token URL. The token never leaves this function except in
+/// the actor's LOAD: the record, the answer, the audit entry and the events
+/// carry the redacted URL.
+async fn start_stream_session(
+    state: &AppState,
+    principal: &Principal,
+    origin: crate::cast_streams::AuthOrigin,
+    request: &StartCastSessionRequest,
+) -> ControlResult<Response> {
+    use crate::devices::cast::media::{CastMediaTarget, HlsSegmentFormat};
+    use crate::devices::cast::protocol::{CastAppId, DEFAULT_LOAD_TITLE};
+    use crate::devices::cast::store::{redact_cast_url, SessionLaunch};
+    let base = match public_base(state) {
+        Ok(base) => base,
+        Err(refused) => return Ok(*refused),
+    };
+    let create = crate::routes::cast_streams::CreateCastStream {
+        feed: request.feed.clone(),
+        output: request.output.clone(),
+    };
+    let minted =
+        match crate::routes::cast_streams::mint_stream(state, principal, origin, &create).await? {
+            Ok(minted) => minted,
+            Err(refused) => return Ok(refused),
+        };
+    let stream_id = minted.view.id.clone();
+    let url = format!("{base}/cast/{}/master.m3u8", minted.token);
+    let media_url = redact_cast_url(&url);
+    let app_id = state
+        .cast_streams
+        .receiver_app_id()
+        .as_deref()
+        .and_then(CastAppId::parse)
+        .unwrap_or_default();
+    let id = format!("cast-session-{}", uuid::Uuid::new_v4());
+    let device: Result<multiview_config::Device, _> = serde_json::from_value(serde_json::json!({
+        "id": id,
+        "display_name": request.name,
+        "driver": "cast",
+        "address": request.address,
+        "display": { "assign": { "output": minted.view.output } },
+    }));
+    let Ok(device) = device else {
+        revoke_stream(state, &stream_id);
+        return Err(ControlError::Validation(
+            "cast session document did not build".to_owned(),
+        ));
+    };
+    state.device_pollers.clear_tombstone(&id);
+    state.device_status.ensure(&id);
+    let record = CastSessionRecord {
+        id: id.clone(),
+        name: request.name.clone(),
+        address: request.address.clone(),
+        output: minted.view.output.clone(),
+        media_url,
+        stream_id: Some(stream_id.clone()),
+        launch: Some(SessionLaunch {
+            media: CastMediaTarget {
+                url,
+                format: HlsSegmentFormat::Fmp4,
+            },
+            app_id,
+            title: request
+                .name
+                .clone()
+                .unwrap_or_else(|| DEFAULT_LOAD_TITLE.to_owned()),
+        }),
+        player_state: Some("connecting".to_owned()),
+        ..CastSessionRecord::default()
+    };
+    state.cast_sessions.insert(record.clone());
+    let wiring = state.poller_wiring();
+    if !state.device_pollers.start(&device, &wiring) {
+        state.cast_sessions.remove(&id);
+        state.device_status.forget(&id);
+        revoke_stream(state, &stream_id);
+        return Err(ControlError::Conflict(
+            "no live cast driver in this build (the `cast` feature is off) — cannot start a \
+             session"
+                .to_owned(),
+        ));
+    }
+    let _seq = wiring.broadcaster.cast_session_started(
+        &id,
+        record.name.clone(),
+        &record.address,
+        &record.output,
+    );
+    state.audit(
+        &principal.key_id,
+        AuditAction::Create,
+        CAST_SESSION_KIND,
+        &id,
+        Some(serde_json::json!({
+            "address": record.address,
+            "output": record.output,
+            "media_url": record.media_url,
+            "stream_id": stream_id,
+            "app_id": app_id.as_str(),
+        })),
+    );
+    let served = state.cast_sessions.get(&id).unwrap_or(record);
+    Ok((StatusCode::CREATED, Json(doc(state, served))).into_response())
+}
+
+/// End every session whose cast stream is gone (revoked through `DELETE
+/// /cast/streams/{id}`, or expired because the receiver stopped fetching):
+/// the receiver gets its `STOP`, the record and status go, the removal is
+/// announced. Runs on the lazy sweep of the session routes and on the 5 s
+/// cast sweep; never awaits a device on the caller's path (the graceful
+/// join runs in its own task).
+pub(crate) fn reap_streamless_sessions(state: &AppState) {
+    let orphans: Vec<String> = state
+        .cast_sessions
+        .list()
+        .into_iter()
+        .filter(|record| {
+            record
+                .stream_id
+                .as_deref()
+                .is_some_and(|stream| state.cast_streams.get(stream).is_none())
+        })
+        .map(|record| record.id)
+        .collect();
+    for id in orphans {
+        if state.cast_sessions.remove(&id).is_none() {
+            continue;
+        }
+        let _dispatched = state.device_pollers.dispatch(&id, PollerControl::StopCast);
+        let _seq = state.poller_wiring().broadcaster.cast_session_removed(&id);
+        let task_state = state.clone();
+        let finish = async move {
+            task_state
+                .device_pollers
+                .stop_graceful(&id, STOP_GRACE)
+                .await;
+            task_state.device_pollers.clear_tombstone(&id);
+            task_state.device_status.forget(&id);
+            task_state.device_drivers.forget(&id);
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(finish));
+        }
+    }
+}
+
+/// Revoke a session's cast stream at once (and finish its output).
+fn revoke_stream(state: &AppState, stream_id: &str) {
+    let _ = state.cast_streams.remove(stream_id);
+    crate::cast_streams::lifecycle::sweep_now(state);
+}
+
 /// `GET /api/v1/cast/sessions` — list the live ephemeral sessions (role: read).
 #[cfg_attr(
     feature = "openapi",
@@ -369,6 +614,8 @@ pub(crate) async fn list_cast_sessions(
     principal: Principal,
 ) -> ControlResult<Json<Vec<CastSessionDoc>>> {
     principal.role.require(Action::Read)?;
+    crate::cast_streams::lifecycle::sweep_now(&state);
+    reap_streamless_sessions(&state);
     // Per-object visibility (BOLA, ADR-W005/ADR-W025): a scoped principal sees
     // ONLY its allowlisted sessions — by parity with `GET /{id}` 403'ing an
     // out-of-scope id, an unfiltered collection would let it enumerate (and read
@@ -408,6 +655,8 @@ pub(crate) async fn get_cast_session(
 ) -> ControlResult<Json<CastSessionDoc>> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
+    crate::cast_streams::lifecycle::sweep_now(&state);
+    reap_streamless_sessions(&state);
     let record = state
         .cast_sessions
         .get(&id)
@@ -448,7 +697,7 @@ pub(crate) async fn stop_cast_session(
 ) -> ControlResult<StatusCode> {
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let _record = state
+    let record = state
         .cast_sessions
         .remove(&id)
         .ok_or_else(|| ControlError::NotFound {
@@ -460,6 +709,11 @@ pub(crate) async fn stop_cast_session(
     // the graceful stop joins the exit deterministically.
     let _dispatched = state.device_pollers.dispatch(&id, PollerControl::StopCast);
     state.device_pollers.stop_graceful(&id, STOP_GRACE).await;
+    // The session owns its cast stream: revoked once the receiver was told
+    // to STOP (so the TV ends on the STOP, not on a 404 first).
+    if let Some(stream_id) = record.stream_id.as_deref() {
+        revoke_stream(&state, stream_id);
+    }
     // The id is UUID-fresh and never reused: clear its tombstone so the set
     // stays bounded under churning ad-hoc sessions (the tombstone's job —
     // making a delete win over a racing adopt — is done once the stop above
@@ -527,6 +781,13 @@ pub(crate) async fn save_cast_session(
             kind: CAST_SESSION_KIND,
             id: id.clone(),
         })?;
+    if record.stream_id.is_some() {
+        return Err(ControlError::Conflict(
+            "a session that plays a cast stream cannot be saved as a device: its stream is \
+             temporary (stop it and cast again instead)"
+                .to_owned(),
+        ));
+    }
     let display_name = request.display_name.clone().or_else(|| record.name.clone());
     let body = serde_json::json!({
         "id": request.device_id,

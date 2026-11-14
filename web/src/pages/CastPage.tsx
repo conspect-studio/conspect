@@ -1,6 +1,11 @@
-// Cast — ad-hoc Cast (Chromecast / Google Cast) device sessions.
+// Cast — two ways to show the engine on a Google Cast / Chromecast receiver:
 //
-// An operator casts a running output's rendition to a Cast receiver on the
+//   * "Cast from this browser" (`../cast/BrowserCastSection`): this Chrome or
+//     Edge is the Cast sender; the TV fetches a token URL from a cast output.
+//   * "Cast from the engine (same network)", below: the engine dials the
+//     receiver itself (ADR-M011).
+//
+// Engine side: an operator casts a running output's rendition to a Cast receiver on the
 // network as an EPHEMERAL session, then optionally promotes it to a permanent
 // managed device. Discovered Cast receivers come from the shared discovery
 // inventory (driver_kind === 'cast'); the live ephemeral session list is POLLED
@@ -8,7 +13,7 @@
 // this surface refetches — a live-WS upgrade is a later drop-in). Volume is a
 // 202 command: the applied level lands on the realtime stream, surfaced here as
 // the accepted operation id.
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { Cast, Save, Trash2, Volume2 } from 'lucide-react';
@@ -21,7 +26,13 @@ import {
   useStopCastSession,
 } from '../api/cast-sessionsQueries';
 import type { CastSession } from '../api/cast-sessionsQueries';
-import { useDiscoveredInventory } from '../devices/queries';
+import { DISCOVERY_INVENTORY_QUERY_KEY, useDiscoveredInventory } from '../devices/queries';
+import { scanDevices } from '../devices/api';
+import { useQueryClient } from '@tanstack/react-query';
+import { feedFromKey } from '../api/outputRouting';
+import { BrowserCastSection } from '../cast/BrowserCastSection';
+import { CastFeedPicker, useFeedOptions } from '../cast/CastFeedPicker';
+import { parseReceiverReport, receiverErrorCodes } from '../cast/castReport';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
@@ -51,6 +62,24 @@ interface StartDraft {
   readonly address: string;
   readonly name: string;
   readonly output: string;
+  /** The feed select value (`bus:program`, `src:<id>`, `aux:<layout>`). */
+  readonly feed: string;
+}
+
+/** The engine-side session state line: player state, idle reason, receiver report. */
+function sessionStateLine(session: CastSession): string | null {
+  const parts: string[] = [];
+  if (typeof session.player_state === 'string' && session.player_state !== '') parts.push(session.player_state);
+  if (typeof session.idle_reason === 'string' && session.idle_reason !== '') parts.push(session.idle_reason);
+  const report = parseReceiverReport(session.last_report?.report);
+  if (report !== null) {
+    if (report.width !== null && report.height !== null) parts.push(`${String(report.width)}×${String(report.height)}`);
+    if (report.latencyS !== null) parts.push(`${report.latencyS.toFixed(1)} s`);
+    const codes = report.state === 'error' ? receiverErrorCodes(report.error) : null;
+    if (report.error?.message !== null && report.error?.message !== undefined) parts.push(report.error.message);
+    if (codes !== null) parts.push(codes);
+  }
+  return parts.length === 0 ? null : parts.join(' · ');
 }
 
 /** The save-as-device dialog draft (keyed to a session). */
@@ -75,6 +104,26 @@ export function CastPage(): JSX.Element {
   const stop = useStopCastSession();
   const save = useSaveCastSession();
   const volume = useSetCastVolume();
+  const feedOptions = useFeedOptions();
+  const queryClient = useQueryClient();
+  // Ask the engine for a fresh mDNS browse when the page opens; the rows land
+  // in the inventory once the scan's budget has passed.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let live = true;
+    scanDevices()
+      .then((accepted) => {
+        if (!live) return;
+        timer = setTimeout(() => {
+          void queryClient.invalidateQueries({ queryKey: DISCOVERY_INVENTORY_QUERY_KEY });
+        }, Math.min(Math.max(accepted.budget_ms, 500), 15_000) + 250);
+      })
+      .catch(() => undefined);
+    return (): void => {
+      live = false;
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [queryClient]);
 
   const [startDraft, setStartDraft] = useState<StartDraft | null>(null);
   const [saveDraft, setSaveDraft] = useState<SaveDraft | null>(null);
@@ -89,7 +138,7 @@ export function CastPage(): JSX.Element {
   );
 
   const openStart = (address = '', name = ''): void => {
-    setStartDraft({ address, name, output: '' });
+    setStartDraft({ address, name, output: '', feed: '' });
   };
 
   const submitStart = (): void => {
@@ -103,11 +152,13 @@ export function CastPage(): JSX.Element {
     }
     const name = startDraft.name.trim();
     const output = startDraft.output.trim();
+    const feed = startDraft.feed === '' ? undefined : feedFromKey(startDraft.feed);
     start.mutate(
       {
         address,
         ...(name !== '' ? { name } : {}),
         ...(output !== '' ? { output } : {}),
+        ...(feed !== undefined ? { feed } : {}),
       },
       {
         onSuccess: (session): void => {
@@ -215,23 +266,36 @@ export function CastPage(): JSX.Element {
         title={<Trans>Cast</Trans>}
         description={
           <Trans>
-            Cast a running output to a Chromecast / Google Cast receiver as an
-            ephemeral session, then optionally save it as a permanent device.
-            The session list refreshes on its own.
+            Show Program, Preview, a layout or a source on a Chromecast or Google Cast TV: from this browser,
+            or from the engine when it shares the TV&apos;s network.
           </Trans>
         }
-        actions={
+      />
+
+      <BrowserCastSection />
+
+      <section aria-labelledby="cast-engine" className="mb-4 grid gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 id="cast-engine" className="text-sm font-semibold">
+            <Trans>Cast from the engine (same network)</Trans>
+          </h2>
           <Button onClick={(): void => { openStart(); }}>
             <Cast aria-hidden="true" />
             <Trans>Start cast</Trans>
           </Button>
-        }
-      />
+        </div>
+        <p className="text-sm text-muted-foreground">
+          <Trans>
+            The engine dials the TV itself, so this only works when the engine and the TV share a network. A
+            session can be saved as a permanent device. The session list refreshes on its own.
+          </Trans>
+        </p>
+      </section>
 
       <section aria-labelledby="cast-discovered" className="mb-8">
-        <h2 id="cast-discovered" className="mb-2 text-sm font-semibold">
+        <h3 id="cast-discovered" className="mb-2 text-sm font-semibold">
           <Trans>Discovered receivers</Trans>
-        </h2>
+        </h3>
         {discovery.isPending ? (
           <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
             <Trans>Looking for Cast receivers…</Trans>
@@ -253,16 +317,24 @@ export function CastPage(): JSX.Element {
             <TableHeader>
               <TableRow>
                 <TableHead>{t`Name`}</TableHead>
+                <TableHead>{t`Model`}</TableHead>
                 <TableHead>{t`Address`}</TableHead>
                 <TableHead>{t`Cast`}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {castDevices.map((service) => (
+              {castDevices.map((service) => {
+                const friendly = service.txt.fn ?? service.name;
+                return (
                 <TableRow key={service.key}>
                   <TableCell>
                     <span lang="" dir="auto" className="font-medium">
-                      {service.name}
+                      {friendly}
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    <span lang="" dir="auto" className="text-sm text-muted-foreground">
+                      {service.txt.md ?? '—'}
                     </span>
                   </TableCell>
                   <TableCell>
@@ -274,9 +346,9 @@ export function CastPage(): JSX.Element {
                     <Button
                       variant="outline"
                       size="sm"
-                      aria-label={`${t`Cast to`}: ${service.name}`}
+                      aria-label={`${t`Cast to`}: ${friendly}`}
                       onClick={(): void => {
-                        openStart(service.primaryAddress, service.name);
+                        openStart(service.primaryAddress, friendly);
                       }}
                     >
                       <Cast aria-hidden="true" />
@@ -284,16 +356,17 @@ export function CastPage(): JSX.Element {
                     </Button>
                   </TableCell>
                 </TableRow>
-              ))}
+                );
+              })}
             </TableBody>
           </Table>
         )}
       </section>
 
       <section aria-labelledby="cast-sessions">
-        <h2 id="cast-sessions" className="mb-2 text-sm font-semibold">
+        <h3 id="cast-sessions" className="mb-2 text-sm font-semibold">
           <Trans>Live sessions</Trans>
-        </h2>
+        </h3>
         {sessions.isPending ? (
           <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
             <Trans>Loading cast sessions…</Trans>
@@ -340,6 +413,11 @@ export function CastPage(): JSX.Element {
                   </TableCell>
                   <TableCell>
                     <Badge variant="outline">{session.state}</Badge>
+                    {sessionStateLine(session) !== null ? (
+                      <p className="mt-1 text-xs text-muted-foreground" lang="" dir="auto">
+                        {sessionStateLine(session)}
+                      </p>
+                    ) : null}
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">
@@ -439,6 +517,14 @@ export function CastPage(): JSX.Element {
                   }}
                 />
               </div>
+              <CastFeedPicker
+                options={[{ key: '', label: t`The output's own rendition`, group: 'buses' }, ...feedOptions]}
+                value={startDraft.feed}
+                label={t`What to show`}
+                onChange={(key): void => {
+                  setStartDraft({ ...startDraft, feed: key });
+                }}
+              />
               <div className="grid gap-1.5">
                 <Label htmlFor="cast-output">
                   <Trans>Output id (optional)</Trans>

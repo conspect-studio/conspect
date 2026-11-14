@@ -40,6 +40,20 @@ fn supports_nv12_storage_writes(adapter: &wgpu::Adapter, features: wgpu::Feature
             })
 }
 
+/// The one process-wide wgpu instance every [`GpuContext`] is created from.
+///
+/// Issue #415: creating a fresh `wgpu::Instance` per compositor made the
+/// Vulkan loader re-enumerate (and `dlclose` unused ICDs) while another
+/// thread was recording on a device of a different instance; on lavapipe that
+/// raced into a SIGSEGV inside the loader. One shared instance is what wgpu
+/// recommends and enumerates the drivers once.
+fn shared_instance() -> wgpu::Instance {
+    static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+    INSTANCE
+        .get_or_init(|| wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle()))
+        .clone()
+}
+
 /// A headless wgpu device + queue (no surface — the compositor renders into
 /// textures and reads back to NV12).
 #[derive(Debug)]
@@ -48,6 +62,9 @@ pub struct GpuContext {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Device loss / uncaptured device errors, written by the callbacks
+    /// registered in [`GpuContext::new`] (issue #415).
+    health: std::sync::Arc<crate::readback::GpuHealth>,
 }
 
 impl GpuContext {
@@ -81,7 +98,7 @@ impl GpuContext {
                 "no wgpu backend compiled for this target".to_owned(),
             ));
         }
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance = shared_instance();
 
         let adapter = match target.filter(|t| t.is_some()) {
             // Pin to the chosen device: enumerate adapters and match by the pure
@@ -157,11 +174,28 @@ impl GpuContext {
         }))
         .map_err(|e| Error::DeviceRequest(e.to_string()))?;
 
+        // Issue #415: device loss and uncaptured device errors become typed
+        // state, never a panic. wgpu's default uncaptured-error handler
+        // panics on whatever thread recorded the call (the GPU worker); this
+        // one marks the device faulted instead (its output can no longer be
+        // trusted), so the run backend composites on the CPU from the next
+        // frame. Both callbacks only set flags: they never block.
+        let health = std::sync::Arc::new(crate::readback::GpuHealth::default());
+        let lost = std::sync::Arc::clone(&health);
+        device.set_device_lost_callback(move |reason, message| {
+            lost.mark_lost(&format!("device lost ({reason:?}): {message}"));
+        });
+        let faulted = std::sync::Arc::clone(&health);
+        device.on_uncaptured_error(std::sync::Arc::new(move |error: wgpu::Error| {
+            faulted.mark_lost(&format!("uncaptured GPU error: {error}"));
+        }));
+
         Ok(Self {
             instance,
             adapter,
             device,
             queue,
+            health,
         })
     }
 
@@ -181,6 +215,12 @@ impl GpuContext {
     #[must_use]
     pub fn adapter(&self) -> &wgpu::Adapter {
         &self.adapter
+    }
+
+    /// The device health the device-lost / uncaptured-error callbacks write.
+    #[must_use]
+    pub fn health(&self) -> &std::sync::Arc<crate::readback::GpuHealth> {
+        &self.health
     }
 
     /// The wgpu instance that owns this context.
