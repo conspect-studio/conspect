@@ -366,7 +366,7 @@ impl RunBackend {
             SIM_POOL.get_or_init(|| std::sync::Arc::new(crate::offclock::Admission::new(u64::MAX)));
         let sim = crate::readback::SimulatedGpu::new(latency);
         let control = crate::readback::SimulatedGpuControl::new(&sim);
-        let backend = crate::offclock::OffClockGpu::new_in(pool, sim)?;
+        let backend = crate::offclock::OffClockGpu::build(pool, move || Ok(sim))?;
         Ok((Self::SimulatedGpu(Box::new(backend)), control))
     }
 
@@ -414,7 +414,7 @@ impl RunBackend {
     pub fn destroy_gpu_device_for_test(&self) {
         #[cfg(feature = "wgpu")]
         if let Self::Gpu(gpu) = self {
-            gpu.gpu().destroy_device_for_test();
+            let _ = gpu.with_gpu(crate::gpu::GpuCompositor::destroy_device_for_test);
         }
     }
 
@@ -432,7 +432,7 @@ impl RunBackend {
     pub fn composite_job(
         &self,
         job: &std::sync::Arc<crate::offclock::FrameJob>,
-    ) -> Result<Nv12Image> {
+    ) -> Result<crate::offclock::JobOutput> {
         match self {
             Self::Cpu(cpu) => {
                 let tiles = job.borrowed_tiles();
@@ -443,6 +443,7 @@ impl RunBackend {
                     job.background,
                     &tiles,
                 )
+                .map(crate::offclock::JobOutput::fresh)
             }
             #[cfg(feature = "wgpu")]
             Self::Gpu(gpu) => gpu.composite_job(job),
@@ -476,25 +477,18 @@ impl RunBackend {
         if let Some(target) = target {
             #[cfg(feature = "wgpu")]
             {
-                // Admission before the device exists (issue #415): a process
-                // that already pins the cap of live GPU workers (some may be
-                // wedged in a hung driver) builds no further device.
-                let admission = crate::offclock::gpu_admission();
-                let gpu = match admission.try_acquire() {
-                    None => Err(crate::error::Error::GpuRuntime(format!(
-                        "GPU worker admission cap reached ({} live)",
-                        admission.live()
-                    ))),
-                    Some(permit) => {
+                // Admission before the device exists, and the device is built
+                // (and later dropped) on its own worker thread, never on the
+                // caller (issue #415). A process that already pins the cap of
+                // live GPU backends (some may be wedged in a hung driver)
+                // builds no further device.
+                let gpu = crate::offclock::OffClockGpu::build(
+                    &crate::offclock::gpu_admission(),
+                    move || {
                         crate::gpu::GpuCompositor::new(target.is_some().then_some(&target))
-                            .and_then(|gpu| {
-                                crate::offclock::OffClockGpu::with_permit(
-                                    permit,
-                                    std::sync::Arc::new(gpu),
-                                )
-                            })
-                    }
-                };
+                            .map(std::sync::Arc::new)
+                    },
+                );
                 match gpu {
                     Ok(gpu) => {
                         tracing::info!("compositor backend: GPU (wgpu) selected");
@@ -527,6 +521,19 @@ impl RunBackend {
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => RunBackendKind::Gpu,
             Self::SimulatedGpu(_) => RunBackendKind::SimulatedGpu,
+        }
+    }
+
+    /// `true` if this backend composites off the caller's thread (a GPU
+    /// backend, or the simulated one): its [`RunBackend::composite_job`] may
+    /// return an adopted earlier frame (issue #415).
+    #[must_use]
+    pub const fn is_offclock(&self) -> bool {
+        match self {
+            Self::Cpu(_) => false,
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(_) => true,
+            Self::SimulatedGpu(_) => true,
         }
     }
 

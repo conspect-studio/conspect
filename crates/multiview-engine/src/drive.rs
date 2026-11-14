@@ -43,7 +43,16 @@ use std::sync::Arc;
 use multiview_compositor::backend::{RunBackend, RunBackendKind};
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::mask::{MaskShape, WipeMask};
-use multiview_compositor::offclock::{FrameJob, SharedTile};
+use multiview_compositor::offclock::{FrameJob, JobMeta, SharedTile};
+
+/// The source metadata of one composite, carried with its job so an adopted
+/// late frame reports the sources it actually shows (issue #415).
+#[derive(Debug)]
+struct FrameMeta {
+    source_states: HashMap<String, SourceState>,
+    source_times: HashMap<String, multiview_framestore::tile::SourceFrameTime>,
+    mix: Option<MixOverlay>,
+}
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
 use multiview_core::layout::Layout;
 use multiview_core::switcher::Rgb8;
@@ -823,6 +832,16 @@ impl CompositorDrive<Nv12Image> {
                 })
                 .collect(),
             scene: self.scene_key(),
+            // Only a GPU backend can hand back an earlier job's pixels (its
+            // CPU fallback adopts a late result): it needs that job's source
+            // metadata. The CPU backend composites this job inline.
+            meta: self.backend.is_offclock().then(|| {
+                JobMeta(Arc::new(FrameMeta {
+                    source_states: source_states.clone(),
+                    source_times: source_times.clone(),
+                    mix: self.mix_overlay.clone(),
+                }))
+            }),
         });
 
         // Dispatch the composite through the selected backend (CPU reference by
@@ -831,10 +850,26 @@ impl CompositorDrive<Nv12Image> {
         // bounded: a frame not ready in time is `Error::ComposeDeadline`,
         // which the runtime turns into a counted last-good repeat of this
         // tick (issues #395, #415). Any other failure becomes `Error::Canvas`.
-        let canvas_image = backend.composite_job(&job).map_err(|e| match e {
+        let output = backend.composite_job(&job).map_err(|e| match e {
             multiview_compositor::Error::GpuDeadline(why) => Error::ComposeDeadline(why),
             other => Error::Canvas(other.to_string()),
         })?;
+        // An adopted late result is the picture of an EARLIER job of the same
+        // scene: report that job's source states, times and transition step
+        // with it (issue #415 review MC-R2-1), never this tick's.
+        let mut mix = self.mix_overlay.clone();
+        if let Some(adopted) = output.adopted {
+            let meta = adopted
+                .as_ref()
+                .and_then(|m| m.0.downcast_ref::<FrameMeta>())
+                .ok_or_else(|| {
+                    Error::ComposeDeadline("adopted frame has no source metadata".to_owned())
+                })?;
+            source_states.clone_from(&meta.source_states);
+            source_times.clone_from(&meta.source_times);
+            mix.clone_from(&meta.mix);
+        }
+        let canvas_image = output.image;
 
         // Drop the borrowing tiles, then release the held `Arc`s now (rather than
         // pinning them until the next tick's `begin`), keeping the pooled
@@ -852,7 +887,7 @@ impl CompositorDrive<Nv12Image> {
             source_states,
             source_times,
             repeat: false,
-            mix: self.mix_overlay.clone(),
+            mix,
         })
     }
 

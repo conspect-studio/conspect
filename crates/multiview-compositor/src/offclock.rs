@@ -95,9 +95,43 @@ pub struct FrameJob {
     /// frame's (it then differs only by the source frames sampled one tick
     /// earlier); a staged-then-rolled-back scene never reaches the output.
     pub scene: u64,
+    /// Caller metadata handed back with an adopted result.
+    pub meta: Option<JobMeta>,
 }
 
 impl FrameJob {
+    /// An owned job from borrowed tiles (copies the tile images: the
+    /// off-clock synchronous path only, never the clock).
+    #[must_use]
+    pub fn from_tiles(
+        canvas_w: u32,
+        canvas_h: u32,
+        canvas: CanvasColor,
+        background: LinearRgba,
+        tiles: &[Tile<'_>],
+    ) -> Self {
+        Self {
+            canvas_w,
+            canvas_h,
+            canvas,
+            background,
+            tiles: tiles
+                .iter()
+                .map(|t| SharedTile {
+                    image: Arc::new(t.image.clone()),
+                    dst_x: t.dst_x,
+                    dst_y: t.dst_y,
+                    dst_w: t.dst_w,
+                    dst_h: t.dst_h,
+                    opacity: t.opacity,
+                    mask: t.mask,
+                })
+                .collect(),
+            scene: 0,
+            meta: None,
+        }
+    }
+
     /// The job's tiles as borrowed [`Tile`]s.
     #[must_use]
     pub fn borrowed_tiles(&self) -> Vec<Tile<'_>> {
@@ -184,11 +218,48 @@ impl FrameComposer for CpuFallback {
     }
 }
 
+/// Opaque per-job data the caller attaches to a [`FrameJob`] (the drive's
+/// source states and times for that frame). An adopted late result hands
+/// back the metadata of the job that produced its pixels, never the current
+/// frame's (issue #415 review MC-R2-1).
+#[derive(Clone)]
+pub struct JobMeta(pub Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for JobMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JobMeta")
+    }
+}
+
+/// A composited frame and, when it is an adopted late result, the metadata
+/// of the job that produced it.
+#[derive(Debug)]
+pub struct JobOutput {
+    /// The pixels.
+    pub image: Nv12Image,
+    /// `Some` only for an adopted earlier job: its [`FrameJob::meta`].
+    pub adopted: Option<Option<JobMeta>>,
+}
+
+impl JobOutput {
+    /// A frame composed for the job it was returned for.
+    #[must_use]
+    pub fn fresh(image: Nv12Image) -> Self {
+        Self {
+            image,
+            adopted: None,
+        }
+    }
+}
+
 /// The outcome of one [`Worker::run`].
 #[derive(Debug)]
 pub enum Outcome {
     /// The job finished within the wait.
     Done(Result<Nv12Image>),
+    /// An adopting worker returned an EARLIER job's frame (same scene and
+    /// generation), with that job's metadata.
+    Adopted(Nv12Image, Option<JobMeta>),
     /// The job panicked (caught on the worker); the message.
     Panicked(String),
     /// The wait elapsed with the job still running (the worker is now busy).
@@ -198,17 +269,32 @@ pub enum Outcome {
     Busy(Duration),
 }
 
+/// The identity of a running / finished job for adoption.
+#[derive(Debug, Clone)]
+struct JobTag {
+    seq: u64,
+    scene: u64,
+    generation: u64,
+    meta: Option<JobMeta>,
+}
+
 #[derive(Debug, Default)]
 struct Slot {
     job: Option<(u64, Arc<FrameJob>)>,
-    /// `(seq, scene, outcome)` of the last finished job.
-    result: Option<(u64, u64, Outcome)>,
-    /// Scene key of the job now running.
-    running_scene: u64,
+    /// The last finished job and its outcome.
+    result: Option<(JobTag, Outcome)>,
+    /// The job now running.
+    running: Option<JobTag>,
     /// When the job now running (or queued) was handed over.
     busy_since: Option<Instant>,
     seq: u64,
+    /// Bumped by [`Worker::invalidate`]: results of older generations are
+    /// never adopted.
+    generation: u64,
     stop: bool,
+    /// The composer built on the worker thread (or why it failed), taken
+    /// once by the spawner.
+    init: Option<Result<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -224,19 +310,17 @@ impl Shared {
     }
 }
 
-/// A prewarmed worker thread owning one [`FrameComposer`] (see the module
-/// docs). The clock side keeps an `Arc` only to read the composer's counters;
-/// on drop it is handed back to the worker so the composer is dropped there.
+/// A prewarmed worker thread that BUILDS and owns one [`FrameComposer`]
+/// (see the module docs). The composer is constructed on the worker thread
+/// and dropped there; the handle keeps only a [`std::sync::Weak`] to read its
+/// counters, so no path ever destroys it on the caller's (clock) thread.
 pub struct Worker<C: FrameComposer> {
     shared: Arc<Shared>,
     /// Whether a frame finds the worker busy waits (within its own budget)
     /// for the running job and takes its result (the CPU fallback), instead
     /// of failing fast and discarding it (the GPU).
     adopt_late: bool,
-    /// `None` only during drop.
-    composer: Option<Arc<C>>,
-    /// The retire channel: the clock's `Arc` travels here on drop.
-    retire: Arc<Mutex<Option<Arc<C>>>>,
+    composer: std::sync::Weak<C>,
 }
 
 impl<C: FrameComposer> std::fmt::Debug for Worker<C> {
@@ -266,28 +350,34 @@ fn guarded(f: impl FnOnce() -> Result<Nv12Image>) -> Outcome {
     }
 }
 
-impl<C: FrameComposer> Worker<C> {
-    /// Spawn the worker thread `name` owning `composer`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::GpuRuntime`] when the thread cannot be spawned. There is no
-    /// inline fallback: GPU work never runs on the caller's (clock) thread.
-    pub fn spawn(name: &str, composer: Arc<C>) -> Result<Self> {
-        Self::spawn_with(name, composer, WorkerOptions::default())
-    }
+/// How long a spawner waits for a worker to BUILD its composer (10 s: a
+/// wgpu device request is a driver round trip, normally milliseconds). On
+/// timeout the spawn fails and the worker drops whatever it builds later on
+/// its own thread.
+pub const WORKER_INIT_WAIT: Duration = Duration::from_secs(10);
 
-    /// As [`Worker::spawn`] with explicit [`WorkerOptions`].
+impl<C: FrameComposer> Worker<C> {
+    /// Spawn the worker thread `name`, which builds its composer with `make`.
     ///
     /// # Errors
     ///
-    /// As [`Worker::spawn`]; `composer` is then dropped on the caller.
-    pub fn spawn_with(name: &str, composer: Arc<C>, options: WorkerOptions) -> Result<Self> {
+    /// [`Error::GpuRuntime`] when the thread cannot be spawned (then `make`
+    /// never runs: no device exists), when `make` fails or panics (anything it
+    /// built is dropped on the worker), or when it does not finish within
+    /// `init_wait`. There is no inline fallback: a composer never runs or
+    /// drops on the caller's thread.
+    pub fn spawn_with<F>(
+        name: &str,
+        make: F,
+        options: WorkerOptions,
+        init_wait: Duration,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<Arc<C>> + Send + 'static,
+    {
         let shared = Arc::new(Shared::default());
-        let retire: Arc<Mutex<Option<Arc<C>>>> = Arc::new(Mutex::new(None));
         let thread_shared = Arc::clone(&shared);
-        let thread_composer = Arc::clone(&composer);
-        let thread_retire = Arc::clone(&retire);
+        let (weak_tx, weak_rx) = std::sync::mpsc::channel::<std::sync::Weak<C>>();
         let WorkerOptions {
             adopt_late,
             panic_marks,
@@ -301,37 +391,87 @@ impl<C: FrameComposer> Worker<C> {
         std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
-                // The admission permit lives exactly as long as this thread.
+                // The admission lease lives exactly as long as this thread.
                 let _permit = permit;
-                worker_loop(
-                    &thread_shared,
-                    thread_composer,
-                    &thread_retire,
-                    panic_marks.as_deref(),
-                );
+                let built = match std::panic::catch_unwind(AssertUnwindSafe(make)) {
+                    Ok(result) => result,
+                    Err(payload) => Err(Error::GpuRuntime(format!(
+                        "compose worker init panicked: {}",
+                        panic_message(payload.as_ref())
+                    ))),
+                };
+                let mut slot = thread_shared.lock();
+                match built {
+                    Ok(composer) if !slot.stop => {
+                        let _ = weak_tx.send(Arc::downgrade(&composer));
+                        slot.init = Some(Ok(()));
+                        drop(slot);
+                        thread_shared.job_done.notify_all();
+                        let marks = panic_marks.as_deref().and_then(std::sync::OnceLock::get);
+                        worker_loop(&thread_shared, composer, marks.map(Arc::as_ref));
+                    }
+                    // The spawner gave up waiting: drop it here.
+                    Ok(composer) => {
+                        drop(slot);
+                        drop(composer);
+                    }
+                    Err(e) => {
+                        slot.init = Some(Err(e));
+                        drop(slot);
+                        thread_shared.job_done.notify_all();
+                    }
+                }
             })
             .map_err(|e| {
                 Error::GpuRuntime(format!("could not spawn compose worker {name}: {e}"))
             })?;
+        let due = Instant::now().checked_add(init_wait);
+        let mut slot = shared.lock();
+        loop {
+            if let Some(init) = slot.init.take() {
+                init?;
+                break;
+            }
+            let now = Instant::now();
+            let remaining = match due {
+                Some(due) if due > now => due - now,
+                _ => {
+                    slot.stop = true;
+                    return Err(Error::GpuRuntime(format!(
+                        "compose worker {name} did not build its composer within {} ms",
+                        init_wait.as_millis()
+                    )));
+                }
+            };
+            slot = match shared.job_done.wait_timeout(slot, remaining) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        drop(slot);
+        let composer = weak_rx
+            .try_recv()
+            .map_err(|_| Error::GpuRuntime(format!("compose worker {name} lost its composer")))?;
         Ok(Self {
             shared,
             adopt_late,
-            composer: Some(composer),
-            retire,
+            composer,
         })
     }
 
-    /// The composer (for reading its counters).
-    ///
-    /// # Panics
-    ///
-    /// Never: the composer is only taken during drop.
-    #[must_use]
-    pub fn composer(&self) -> &C {
-        match self.composer.as_deref() {
-            Some(c) => c,
-            None => unreachable_composer(),
-        }
+    /// Run `f` on the composer, if it is still alive (counters, settings).
+    /// The temporary strong reference is released before returning; the
+    /// composer is only ever dropped by the worker, which outlives every
+    /// handle method call (it exits only after the handle's drop).
+    pub fn with_composer<R>(&self, f: impl FnOnce(&C) -> R) -> Option<R> {
+        self.composer.upgrade().map(|c| f(&c))
+    }
+
+    /// Make every running or finished job's result non-adoptable (the GPU
+    /// delivered a newer frame, review MC-R2-2).
+    pub fn invalidate(&self) {
+        let mut slot = self.shared.lock();
+        slot.generation = slot.generation.wrapping_add(1);
     }
 
     /// Hand `job` to the worker and wait for it at most `wait`. Never blocks
@@ -341,43 +481,63 @@ impl<C: FrameComposer> Worker<C> {
     /// While an earlier job still runs, nothing is handed over. A worker
     /// without `adopt_late` returns [`Outcome::Busy`] at once and later
     /// discards that job's result. An adopting worker (the CPU fallback)
-    /// waits, still at most `wait`, for the running job and returns ITS
-    /// result when its [`FrameJob::scene`] equals `job`'s; a result that
-    /// finished between two calls is adopted under the same rule. A
-    /// fallback slower than the clock's wait therefore still delivers
-    /// frames, and a scene that was rolled back never reaches the output.
+    /// waits, still at most `wait`, for the running job and returns its
+    /// frame as [`Outcome::Adopted`] (with that job's metadata) when its
+    /// [`FrameJob::scene`] equals `job`'s and no [`Worker::invalidate`]
+    /// happened since it was handed over; a result that finished between
+    /// two calls is adopted under the same rule. A fallback slower than the
+    /// clock's wait therefore still delivers frames; a rolled-back scene, or
+    /// a frame older than one the GPU already delivered, never reaches the
+    /// output.
     #[must_use]
     pub fn run(&self, job: &Arc<FrameJob>, wait: Duration) -> Outcome {
         let due = Instant::now().checked_add(wait);
         let mut slot = self.shared.lock();
         if let Some(since) = slot.busy_since {
-            if !self.adopt_late || slot.running_scene != job.scene {
+            let adoptable = self.adopt_late
+                && slot
+                    .running
+                    .as_ref()
+                    .is_some_and(|t| t.scene == job.scene && t.generation == slot.generation);
+            if !adoptable {
                 return Outcome::Busy(since.elapsed());
             }
-            let running = slot.seq;
+            let running = slot.running.as_ref().map_or(0, |t| t.seq);
             let (outcome, guard) = self.wait_for(slot, running, due);
             slot = guard;
             match outcome {
-                Some(outcome) => return outcome,
-                None if slot.busy_since.is_some() => return Outcome::Busy(since.elapsed()),
-                // Finished but not adoptable: the worker is idle, submit.
-                None => {}
+                Some((tag, Outcome::Done(Ok(image)))) if tag.generation == slot.generation => {
+                    return Outcome::Adopted(image, tag.meta);
+                }
+                // Finished, but not a frame / invalidated meanwhile.
+                Some(_) => {}
+                None => return Outcome::Busy(since.elapsed()),
             }
         }
         // A finished result of an abandoned job: adopt it when allowed (same
-        // scene, a frame), else it is stale.
-        if let Some((_, scene, outcome)) = slot.result.take() {
-            if self.adopt_late && scene == job.scene && matches!(outcome, Outcome::Done(Ok(_))) {
-                return outcome;
+        // scene and generation, a frame), else it is stale.
+        if let Some((tag, outcome)) = slot.result.take() {
+            if self.adopt_late && tag.scene == job.scene && tag.generation == slot.generation {
+                if let Outcome::Done(Ok(image)) = outcome {
+                    return Outcome::Adopted(image, tag.meta);
+                }
             }
         }
         slot.seq = slot.seq.wrapping_add(1);
         let seq = slot.seq;
         slot.job = Some((seq, Arc::clone(job)));
-        slot.running_scene = job.scene;
+        slot.running = Some(JobTag {
+            seq,
+            scene: job.scene,
+            generation: slot.generation,
+            meta: job.meta.clone(),
+        });
         slot.busy_since = Some(Instant::now());
         self.shared.job_ready.notify_one();
-        self.wait_for(slot, seq, due).0.unwrap_or(Outcome::TimedOut)
+        match self.wait_for(slot, seq, due).0 {
+            Some((_, outcome)) => outcome,
+            None => Outcome::TimedOut,
+        }
     }
 
     /// Wait until `due` for the result of job `seq`; `None` on timeout.
@@ -386,11 +546,11 @@ impl<C: FrameComposer> Worker<C> {
         mut slot: MutexGuard<'a, Slot>,
         seq: u64,
         due: Option<Instant>,
-    ) -> (Option<Outcome>, MutexGuard<'a, Slot>) {
+    ) -> (Option<(JobTag, Outcome)>, MutexGuard<'a, Slot>) {
         loop {
-            if slot.result.as_ref().is_some_and(|(s, _, _)| *s == seq) {
-                if let Some((_, _, outcome)) = slot.result.take() {
-                    return (Some(outcome), slot);
+            if slot.result.as_ref().is_some_and(|(t, _)| t.seq == seq) {
+                if let Some(result) = slot.result.take() {
+                    return (Some(result), slot);
                 }
             }
             let now = Instant::now();
@@ -413,26 +573,11 @@ impl<C: FrameComposer> Worker<C> {
     }
 }
 
-#[cold]
-fn unreachable_composer() -> ! {
-    // The composer is only `None` inside `Drop::drop`, which never calls
-    // `composer()`. Kept as an abort-free typed path for the lint set.
-    #[allow(clippy::panic)] // reason: provably unreachable (see above)
-    {
-        panic!("compose worker used after drop")
-    }
-}
-
 impl<C: FrameComposer> Drop for Worker<C> {
     fn drop(&mut self) {
-        let Some(composer) = self.composer.take() else {
-            return;
-        };
-        // Hand our `Arc` to the worker, then stop it. The worker drops every
-        // `Arc` it holds on its own thread when it leaves its loop; it is never
-        // joined, so a composer stuck in a hung device call wedges only that
-        // detached thread (issue #415).
-        *self.retire.lock().unwrap_or_else(PoisonError::into_inner) = Some(composer);
+        // Stop the worker. It drops its composer on its own thread when it
+        // leaves its loop and is never joined, so a composer stuck in a hung
+        // device call wedges only that detached thread (issue #415).
         let mut slot = self.shared.lock();
         slot.stop = true;
         drop(slot);
@@ -446,21 +591,24 @@ pub struct WorkerOptions {
     /// Adopt a running / finished job's result for a later frame of the same
     /// scene (see [`Worker::run`]).
     pub adopt_late: bool,
-    /// Mark this health lost when a job panics (on the worker itself).
-    pub panic_marks: Option<Arc<GpuHealth>>,
-    /// An admission permit released when the worker THREAD exits (not when
-    /// the handle drops): a wedged worker keeps holding it.
-    pub permit: Option<AdmissionPermit>,
+    /// Mark this health lost when a job panics (on the worker itself); set
+    /// by the composer's builder once the device exists.
+    pub panic_marks: Option<Arc<std::sync::OnceLock<Arc<GpuHealth>>>>,
+    /// An admission lease released when the LAST worker thread holding it
+    /// exits (not when a handle drops): a wedged worker keeps holding it.
+    pub permit: Option<Arc<AdmissionPermit>>,
 }
 
-/// A process-wide cap on live GPU compose workers (issue #415 review BR-2).
+/// A process-wide cap on live GPU backends (issue #415 review BR-2).
 ///
 /// A GPU wedged in a driver call keeps its detached worker, the compositor and
-/// one [`FrameJob`] alive until the device returns. Every GPU backend takes a
-/// permit before its device is used and the permit lives in the worker
-/// thread, so repeated construct / wedge / tear-down cycles cannot accumulate
-/// threads and memory without bound: once the cap is reached, new GPU
-/// backends are refused (the selector uses the CPU reference). Never waits.
+/// one [`FrameJob`] alive until the device returns; a CPU fallback job keeps
+/// its worker busy until it finishes. Every GPU backend takes one permit
+/// before its device exists, shared by both of its worker threads and held
+/// until both exit, so repeated construct / wedge / tear-down cycles cannot
+/// accumulate threads, devices and memory without bound: once the cap is
+/// reached, new GPU backends are refused (the selector uses the CPU
+/// reference). Never waits.
 #[derive(Debug)]
 pub struct Admission {
     live: AtomicU64,
@@ -468,7 +616,7 @@ pub struct Admission {
 }
 
 impl Admission {
-    /// An admission pool of `cap` live GPU workers.
+    /// An admission pool of `cap` live GPU backends.
     #[must_use]
     pub const fn new(cap: u64) -> Self {
         Self {
@@ -514,13 +662,13 @@ impl Drop for AdmissionPermit {
     }
 }
 
-/// The most GPU backends (each one GPU worker) alive in one process,
-/// wedged ones included. A host runs a handful of programs; 8 leaves
-/// headroom for migrations while bounding what a repeatedly hanging device
-/// can pin.
+/// The most GPU backends alive in one process, wedged ones included (each is
+/// one GPU worker and one CPU-fallback worker). A host runs a handful of
+/// programs; 8 leaves headroom for migrations while bounding what a
+/// repeatedly hanging device can pin.
 pub const MAX_LIVE_GPU_WORKERS: u64 = 8;
 
-/// The process-wide GPU worker admission pool.
+/// The process-wide GPU backend admission pool.
 #[must_use]
 pub fn gpu_admission() -> Arc<Admission> {
     static POOL: std::sync::OnceLock<Arc<Admission>> = std::sync::OnceLock::new();
@@ -529,18 +677,47 @@ pub fn gpu_admission() -> Arc<Admission> {
 
 #[cfg(test)]
 thread_local! {
-    static FAIL_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_SPAWN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Test seam: make worker spawns on this thread fail.
+/// Test seam: make the next `n` worker spawns on this thread fail.
 #[cfg(test)]
-pub(crate) fn fail_spawns_on_this_thread(fail: bool) {
-    FAIL_SPAWN.with(|f| f.set(fail));
+pub(crate) fn fail_spawns_on_this_thread(n: u32) {
+    FAIL_SPAWN.with(|f| f.set(n));
+}
+
+/// Test seam: skip `skip` spawns on this thread, then fail the next one.
+#[cfg(test)]
+pub(crate) fn fail_spawn_after(skip: u32) {
+    FAIL_SPAWN.with(|f| f.set(skip.saturating_add(1) | (1 << 31)));
 }
 
 #[cfg(test)]
 fn spawn_should_fail() -> bool {
-    FAIL_SPAWN.with(std::cell::Cell::get)
+    FAIL_SPAWN.with(|f| {
+        let v = f.get();
+        if v & (1 << 31) != 0 {
+            let skip = (v & !(1 << 31)).saturating_sub(1);
+            if skip == 0 {
+                f.set(1);
+                return spawn_should_fail_plain(f);
+            }
+            f.set(skip | (1 << 31));
+            return false;
+        }
+        spawn_should_fail_plain(f)
+    })
+}
+
+#[cfg(test)]
+fn spawn_should_fail_plain(f: &std::cell::Cell<u32>) -> bool {
+    let v = f.get();
+    if v > 0 {
+        f.set(v - 1);
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(not(test))]
@@ -551,7 +728,6 @@ const fn spawn_should_fail() -> bool {
 fn worker_loop<C: FrameComposer>(
     shared: &Shared,
     composer: Arc<C>,
-    retire: &Mutex<Option<Arc<C>>>,
     panic_marks: Option<&GpuHealth>,
 ) {
     loop {
@@ -559,10 +735,7 @@ fn worker_loop<C: FrameComposer>(
         let (seq, job) = loop {
             if slot.stop {
                 drop(slot);
-                // Teardown happens here, on the worker thread: our `Arc`, and
-                // the clock side's (handed over on drop).
-                let retired = retire.lock().unwrap_or_else(PoisonError::into_inner).take();
-                drop(retired);
+                // Teardown happens here, on the worker thread.
                 drop(composer);
                 return;
             }
@@ -576,7 +749,6 @@ fn worker_loop<C: FrameComposer>(
         };
         drop(slot);
         let outcome = guarded(|| job.run(composer.as_ref()));
-        let scene = job.scene;
         drop(job);
         // A panic out of a GPU call loses the device for good, recorded here
         // on the worker: whether or not the clock still waits for this job.
@@ -584,7 +756,9 @@ fn worker_loop<C: FrameComposer>(
             health.mark_lost(&format!("GPU call panicked: {why}"));
         }
         let mut slot = shared.lock();
-        slot.result = Some((seq, scene, outcome));
+        if let Some(tag) = slot.running.take().filter(|t| t.seq == seq) {
+            slot.result = Some((tag, outcome));
+        }
         slot.busy_since = None;
         drop(slot);
         shared.job_done.notify_all();
@@ -614,63 +788,64 @@ const GPU_WORKER: &str = "gpu-compose";
 const CPU_WORKER: &str = "gpu-cpu-fallback";
 
 impl<G: GpuComposer> OffClockGpu<G> {
-    /// Drive `gpu` through a prewarmed GPU worker with a CPU fallback worker,
-    /// admitted against the process-wide [`gpu_admission`] pool. The worker
-    /// owns `gpu` from here on; a caller may keep only a `Weak`.
+    /// Build a GPU backend whose composer `make` constructs ON its worker
+    /// thread, admitted against `admission` before anything is built.
     ///
     /// # Errors
     ///
     /// [`Error::GpuRuntime`] when the admission cap is reached or a worker
-    /// thread cannot be spawned. The caller then uses the CPU reference;
-    /// GPU work never falls back to running on the caller's thread.
-    pub fn new(gpu: Arc<G>) -> Result<Self> {
-        Self::new_in(&gpu_admission(), gpu)
-    }
-
-    /// As [`OffClockGpu::new`] against an explicit admission pool.
-    ///
-    /// # Errors
-    ///
-    /// As [`OffClockGpu::new`].
-    pub fn new_in(admission: &Arc<Admission>, gpu: Arc<G>) -> Result<Self> {
+    /// thread cannot be spawned; `make`'s own error (e.g. no adapter). The
+    /// caller then uses the CPU reference. Whatever `make` built is dropped
+    /// on its worker thread, never on the caller's.
+    pub fn build<F>(admission: &Arc<Admission>, make: F) -> Result<Self>
+    where
+        F: FnOnce() -> Result<Arc<G>> + Send + 'static,
+    {
         let Some(permit) = admission.try_acquire() else {
             return Err(Error::GpuRuntime(format!(
                 "GPU worker admission cap reached ({} live)",
                 admission.live()
             )));
         };
-        Self::with_permit(permit, gpu)
-    }
-
-    /// As [`OffClockGpu::new`] with a permit taken BEFORE the device was
-    /// created (so a refused admission never builds a device).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::GpuRuntime`] when a worker thread cannot be spawned.
-    pub fn with_permit(permit: AdmissionPermit, gpu: Arc<G>) -> Result<Self> {
-        let health = gpu.health();
-        let cpu = CpuFallback {
-            cpu: crate::backend::CpuBackend::default(),
-            cost_nanos: gpu.cpu_fallback_cost(),
-        };
-        // The CPU worker first: if it fails, `gpu` was never handed over.
-        let cpu = Worker::spawn_with(
-            CPU_WORKER,
-            Arc::new(cpu),
-            WorkerOptions {
-                adopt_late: true,
-                ..WorkerOptions::default()
-            },
-        )?;
+        let permit = Arc::new(permit);
+        let marks: Arc<std::sync::OnceLock<Arc<GpuHealth>>> = Arc::default();
+        let marks_out = Arc::clone(&marks);
+        // The GPU worker builds the device on its own thread.
         let gpu = Worker::spawn_with(
             GPU_WORKER,
-            gpu,
+            move || {
+                let gpu = make()?;
+                let _ = marks_out.set(gpu.health());
+                Ok(gpu)
+            },
             WorkerOptions {
                 adopt_late: false,
-                panic_marks: Some(Arc::clone(&health)),
+                panic_marks: Some(Arc::clone(&marks)),
+                permit: Some(Arc::clone(&permit)),
+            },
+            WORKER_INIT_WAIT,
+        )?;
+        let health = marks
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| Error::GpuRuntime("GPU worker built no health".to_owned()))?;
+        let cost_nanos = gpu.with_composer(GpuComposer::cpu_fallback_cost).flatten();
+        // If this fails, `gpu` drops here: its worker stops and drops the
+        // device on its own thread.
+        let cpu = Worker::spawn_with(
+            CPU_WORKER,
+            move || {
+                Ok(Arc::new(CpuFallback {
+                    cpu: crate::backend::CpuBackend::default(),
+                    cost_nanos,
+                }))
+            },
+            WorkerOptions {
+                adopt_late: true,
+                panic_marks: None,
                 permit: Some(permit),
             },
+            WORKER_INIT_WAIT,
         )?;
         Ok(Self {
             gpu,
@@ -680,10 +855,9 @@ impl<G: GpuComposer> OffClockGpu<G> {
         })
     }
 
-    /// The GPU composer (counters, tests).
-    #[must_use]
-    pub fn gpu(&self) -> &G {
-        self.gpu.composer()
+    /// Run `f` on the GPU composer (counters, tests); `None` once dropped.
+    pub fn with_gpu<R>(&self, f: impl FnOnce(&G) -> R) -> Option<R> {
+        self.gpu.with_composer(f)
     }
 
     /// The device health.
@@ -699,7 +873,7 @@ impl<G: GpuComposer> OffClockGpu<G> {
             u64::try_from(period.as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        self.gpu().set_frame_period(period);
+        let _ = self.with_gpu(|g| g.set_frame_period(period));
     }
 
     fn period(&self) -> Duration {
@@ -718,7 +892,7 @@ impl<G: GpuComposer> OffClockGpu<G> {
     /// Readbacks the #395 gate reported as missed (diagnostic).
     #[must_use]
     pub fn readback_gate_misses(&self) -> u64 {
-        self.gpu().gate_misses()
+        self.with_gpu(GpuComposer::gate_misses).unwrap_or(0)
     }
 
     /// Frames dispatched to the CPU fallback.
@@ -732,7 +906,7 @@ impl<G: GpuComposer> OffClockGpu<G> {
     }
 
     /// Count every [`Error::GpuDeadline`] handed back to the caller.
-    fn counted(&self, result: Result<Nv12Image>) -> Result<Nv12Image> {
+    fn counted<T>(&self, result: Result<T>) -> Result<T> {
         if matches!(result, Err(Error::GpuDeadline(_))) {
             self.health.record_deadline_return();
         }
@@ -756,12 +930,12 @@ impl<G: GpuComposer> OffClockGpu<G> {
     /// [`Error::GpuDeadline`] when no frame is ready within the budget (the
     /// engine repeats last-good under the tick), or a request error the CPU
     /// reference would reject too.
-    pub fn composite_job(&self, job: &Arc<FrameJob>) -> Result<Nv12Image> {
+    pub fn composite_job(&self, job: &Arc<FrameJob>) -> Result<JobOutput> {
         let result = self.composite_job_uncounted(job);
         self.counted(result)
     }
 
-    fn composite_job_uncounted(&self, job: &Arc<FrameJob>) -> Result<Nv12Image> {
+    fn composite_job_uncounted(&self, job: &Arc<FrameJob>) -> Result<JobOutput> {
         let start = Instant::now();
         let period = self.period();
         let budget = frame_budget(period);
@@ -774,7 +948,12 @@ impl<G: GpuComposer> OffClockGpu<G> {
             MAX_GPU_JOB_WAIT.min(budget)
         };
         match self.gpu.run(job, wait) {
-            Outcome::Done(Ok(image)) => Ok(image),
+            Outcome::Done(Ok(image)) => {
+                // A newer frame than any CPU job still in flight.
+                self.cpu.invalidate();
+                Ok(JobOutput::fresh(image))
+            }
+            Outcome::Adopted(image, _) => Ok(JobOutput::fresh(image)),
             Outcome::Done(Err(err @ Error::GpuDeadline(_))) => Err(err),
             Outcome::Done(Err(Error::GpuLost(why))) => {
                 self.lost(&why);
@@ -787,7 +966,7 @@ impl<G: GpuComposer> OffClockGpu<G> {
             Outcome::Done(Err(err)) if is_gpu_failure(&err) => {
                 self.cpu_frame(job, start, budget, &err.to_string())
             }
-            Outcome::Done(other) => other,
+            Outcome::Done(Err(other)) => Err(other),
             Outcome::TimedOut => Err(Self::clock_miss(format!(
                 "GPU frame not ready within the clock's {} us wait",
                 wait.as_micros()
@@ -813,43 +992,51 @@ impl<G: GpuComposer> OffClockGpu<G> {
         start: Instant,
         budget: Duration,
         why: &str,
-    ) -> Result<Nv12Image> {
+    ) -> Result<JobOutput> {
         let remaining = budget.saturating_sub(start.elapsed());
-        match self.cpu.run(job, remaining) {
-            Outcome::Done(Ok(image)) => {
-                let frames = self.health.record_cpu_fallback();
-                if frames.is_power_of_two() {
-                    tracing::warn!(
-                        reason = why,
-                        fallback_frames = frames,
-                        "GPU composite unavailable; composited on the CPU reference (off the clock thread)"
-                    );
-                }
-                Ok(image)
-            }
-            Outcome::Done(Err(err)) => Err(err),
+        let output = match self.cpu.run(job, remaining) {
+            Outcome::Done(Ok(image)) => JobOutput::fresh(image),
+            Outcome::Adopted(image, meta) => JobOutput {
+                image,
+                adopted: Some(meta),
+            },
+            Outcome::Done(Err(err)) => return Err(err),
             Outcome::Panicked(why) => {
-                Err(Self::clock_miss(format!("CPU fallback panicked: {why}")))
+                return Err(Self::clock_miss(format!("CPU fallback panicked: {why}")));
             }
-            Outcome::TimedOut => Err(Self::clock_miss(format!(
-                "CPU fallback not ready within the clock's {} us wait",
-                remaining.as_micros()
-            ))),
-            Outcome::Busy(held) => Err(Self::clock_miss(format!(
-                "CPU fallback still busy with an earlier frame after {} ms",
-                held.as_millis()
-            ))),
+            Outcome::TimedOut => {
+                return Err(Self::clock_miss(format!(
+                    "CPU fallback not ready within the clock's {} us wait",
+                    remaining.as_micros()
+                )));
+            }
+            Outcome::Busy(held) => {
+                return Err(Self::clock_miss(format!(
+                    "CPU fallback still busy with an earlier frame after {} ms",
+                    held.as_millis()
+                )));
+            }
+        };
+        let frames = self.health.record_cpu_fallback();
+        if frames.is_power_of_two() {
+            tracing::warn!(
+                reason = why,
+                fallback_frames = frames,
+                "GPU composite unavailable; composited on the CPU reference (off the clock thread)"
+            );
         }
+        Ok(output)
     }
 
-    /// The synchronous off-clock path ([`crate::backend::RunBackend::composite`]):
-    /// composite on the caller's thread with the same lost-device handling,
-    /// panics caught. Used by tests, benches and one-shot renders; the engine's
-    /// output clock uses [`Self::composite_job`].
+    /// The synchronous off-clock path ([`crate::backend::RunBackend::composite`])
+    /// for tests, benches and one-shot renders: the same as
+    /// [`Self::composite_job`] but waiting without a clock budget (the
+    /// unclocked bounds still apply), and an adopted result is never
+    /// returned (a caller of this path asked for exactly these tiles).
     ///
     /// # Errors
     ///
-    /// As [`Self::composite_job`], without the clock-side waits.
+    /// As [`Self::composite_job`].
     pub fn composite_inline(
         &self,
         canvas_w: u32,
@@ -858,23 +1045,24 @@ impl<G: GpuComposer> OffClockGpu<G> {
         background: LinearRgba,
         tiles: &[Tile<'_>],
     ) -> Result<Nv12Image> {
-        let result = self.composite_inline_uncounted(canvas_w, canvas_h, canvas, background, tiles);
+        let job = Arc::new(FrameJob::from_tiles(
+            canvas_w, canvas_h, canvas, background, tiles,
+        ));
+        let result = self.composite_inline_uncounted(&job);
         self.counted(result)
     }
 
-    fn composite_inline_uncounted(
-        &self,
-        canvas_w: u32,
-        canvas_h: u32,
-        canvas: CanvasColor,
-        background: LinearRgba,
-        tiles: &[Tile<'_>],
-    ) -> Result<Nv12Image> {
-        let on_cpu = |why: &str| {
-            let image = self
-                .cpu
-                .composer()
-                .compose_tiles(canvas_w, canvas_h, canvas, background, tiles)?;
+    fn composite_inline_uncounted(&self, job: &Arc<FrameJob>) -> Result<Nv12Image> {
+        let on_cpu = |why: &str| -> Result<Nv12Image> {
+            let image = match self.cpu.run(job, UNCLOCKED_FRAME_BUDGET) {
+                Outcome::Done(result) => result?,
+                Outcome::Panicked(why) => {
+                    return Err(Error::GpuRuntime(format!("CPU fallback panicked: {why}")))
+                }
+                Outcome::Adopted(..) | Outcome::TimedOut | Outcome::Busy(_) => {
+                    return Err(Error::GpuDeadline("CPU fallback not ready".to_owned()))
+                }
+            };
             let frames = self.health.record_cpu_fallback();
             if frames.is_power_of_two() {
                 tracing::warn!(
@@ -888,8 +1076,11 @@ impl<G: GpuComposer> OffClockGpu<G> {
         if self.health.is_lost() {
             return on_cpu("GPU device lost");
         }
-        let gpu = self.gpu();
-        match guarded(|| gpu.compose_tiles(canvas_w, canvas_h, canvas, background, tiles)) {
+        match self.gpu.run(job, UNCLOCKED_FRAME_BUDGET) {
+            Outcome::Done(Ok(image)) => {
+                self.cpu.invalidate();
+                Ok(image)
+            }
             Outcome::Done(Err(Error::GpuLost(why))) => {
                 self.lost(&why);
                 on_cpu(&why)
@@ -899,10 +1090,17 @@ impl<G: GpuComposer> OffClockGpu<G> {
                 on_cpu(&why)
             }
             Outcome::Done(Err(err)) if is_gpu_failure(&err) => on_cpu(&err.to_string()),
-            Outcome::Done(other) => other,
-            Outcome::TimedOut | Outcome::Busy(_) => {
-                Err(Error::GpuDeadline("unreachable inline outcome".to_owned()))
+            Outcome::Done(Err(other)) => Err(other),
+            Outcome::Adopted(..) | Outcome::TimedOut => Err(Error::GpuDeadline(
+                "GPU frame not ready within the unclocked budget".to_owned(),
+            )),
+            Outcome::Busy(held) if held >= STALL_HOLD => {
+                on_cpu(&format!("GPU busy for {} ms", held.as_millis()))
             }
+            Outcome::Busy(held) => Err(Error::GpuDeadline(format!(
+                "GPU still busy with an earlier frame after {} ms",
+                held.as_millis()
+            ))),
         }
     }
 }
@@ -968,6 +1166,18 @@ mod tests {
         }
     }
 
+    fn spawn_probe(name: &str, probe: &Arc<Probe>, options: WorkerOptions) -> Worker<Probe> {
+        let probe = Arc::clone(probe);
+        Worker::spawn_with(name, move || Ok(probe), options, Duration::from_secs(10)).unwrap()
+    }
+
+    fn adopting() -> WorkerOptions {
+        WorkerOptions {
+            adopt_late: true,
+            ..WorkerOptions::default()
+        }
+    }
+
     fn job() -> Arc<FrameJob> {
         Arc::new(FrameJob {
             canvas_w: 16,
@@ -976,6 +1186,7 @@ mod tests {
             background: LinearRgba::TRANSPARENT,
             tiles: Vec::new(),
             scene: 0,
+            meta: None,
         })
     }
 
@@ -998,7 +1209,7 @@ mod tests {
     #[test]
     fn done_timed_out_busy_and_late_results_are_discarded() {
         let probe = Arc::new(Probe::default());
-        let worker = Worker::spawn("probe-a", Arc::clone(&probe)).unwrap();
+        let worker = spawn_probe("probe-a", &probe, WorkerOptions::default());
         assert!(matches!(
             worker.run(&job(), Duration::from_secs(5)),
             Outcome::Done(Ok(_))
@@ -1034,15 +1245,7 @@ mod tests {
     fn an_adopting_worker_hands_the_running_job_result_to_the_next_frame() {
         let probe = Arc::new(Probe::default());
         let block = Arc::clone(&probe.block);
-        let worker = Worker::spawn_with(
-            "probe-d",
-            Arc::clone(&probe),
-            WorkerOptions {
-                adopt_late: true,
-                ..WorkerOptions::default()
-            },
-        )
-        .unwrap();
+        let worker = spawn_probe("probe-d", &probe, adopting());
         block.store(true, Ordering::Release);
         assert!(matches!(
             worker.run(&job(), Duration::from_millis(5)),
@@ -1063,7 +1266,7 @@ mod tests {
         // second job was handed over.
         assert!(matches!(
             worker.run(&job(), Duration::from_secs(5)),
-            Outcome::Done(Ok(_))
+            Outcome::Adopted(..)
         ));
         assert_eq!(probe.runs.load(Ordering::Relaxed), runs);
         unblock.join().unwrap();
@@ -1072,7 +1275,7 @@ mod tests {
     #[test]
     fn a_panicking_job_is_reported_and_the_worker_survives() {
         let probe = Arc::new(Probe::default());
-        let worker = Worker::spawn("probe-b", Arc::clone(&probe)).unwrap();
+        let worker = spawn_probe("probe-b", &probe, WorkerOptions::default());
         probe.panic.store(true, Ordering::Release);
         let outcome = worker.run(&job(), Duration::from_secs(5));
         assert!(
@@ -1091,7 +1294,8 @@ mod tests {
         let probe = Arc::new(Probe::default());
         let dropped_on = Arc::clone(&probe.dropped_on);
         let block = Arc::clone(&probe.block);
-        let worker = Worker::spawn("probe-c", probe).unwrap();
+        let worker = spawn_probe("probe-c", &probe, WorkerOptions::default());
+        drop(probe);
         block.store(true, Ordering::Release);
         assert!(matches!(
             worker.run(&job(), Duration::from_millis(5)),
@@ -1117,15 +1321,7 @@ mod tests {
     fn a_result_finished_between_frames_is_adopted_in_the_same_scene() {
         let probe = Arc::new(Probe::default());
         let block = Arc::clone(&probe.block);
-        let worker = Worker::spawn_with(
-            "probe-e",
-            Arc::clone(&probe),
-            WorkerOptions {
-                adopt_late: true,
-                ..WorkerOptions::default()
-            },
-        )
-        .unwrap();
+        let worker = spawn_probe("probe-e", &probe, adopting());
         block.store(true, Ordering::Release);
         assert!(matches!(
             worker.run(&job_in(7), Duration::from_millis(5)),
@@ -1139,7 +1335,7 @@ mod tests {
         // Same scene: adopted at once, no new job.
         assert!(matches!(
             worker.run(&job_in(7), Duration::from_millis(0)),
-            Outcome::Done(Ok(_))
+            Outcome::Adopted(..)
         ));
         assert_eq!(probe.runs.load(Ordering::Relaxed), runs);
     }
@@ -1151,15 +1347,7 @@ mod tests {
     fn a_late_result_of_another_scene_is_never_adopted() {
         let probe = Arc::new(Probe::default());
         let block = Arc::clone(&probe.block);
-        let worker = Worker::spawn_with(
-            "probe-f",
-            Arc::clone(&probe),
-            WorkerOptions {
-                adopt_late: true,
-                ..WorkerOptions::default()
-            },
-        )
-        .unwrap();
+        let worker = spawn_probe("probe-f", &probe, adopting());
         block.store(true, Ordering::Release);
         assert!(matches!(
             worker.run(&job_in(1), Duration::from_millis(5)),
@@ -1190,15 +1378,16 @@ mod tests {
         let probe = Arc::new(Probe::default());
         let block = Arc::clone(&probe.block);
         let health = Arc::new(GpuHealth::default());
-        let worker = Worker::spawn_with(
+        let marks: Arc<std::sync::OnceLock<Arc<GpuHealth>>> = Arc::default();
+        marks.set(Arc::clone(&health)).unwrap();
+        let worker = spawn_probe(
             "probe-g",
-            Arc::clone(&probe),
+            &probe,
             WorkerOptions {
-                panic_marks: Some(Arc::clone(&health)),
+                panic_marks: Some(marks),
                 ..WorkerOptions::default()
             },
-        )
-        .unwrap();
+        );
         block.store(true, Ordering::Release);
         assert!(matches!(
             worker.run(&job(), Duration::from_millis(5)),
@@ -1218,14 +1407,111 @@ mod tests {
     /// error, never an inline fallback onto the caller's thread.
     #[test]
     fn spawn_failure_is_an_error_never_inline() {
-        fail_spawns_on_this_thread(true);
-        let probe = Arc::new(Probe::default());
-        let worker = Worker::spawn("probe-h", Arc::clone(&probe));
-        let backend = crate::backend::RunBackend::simulated_gpu(Duration::from_millis(1));
-        fail_spawns_on_this_thread(false);
-        assert!(matches!(worker, Err(Error::GpuRuntime(_))));
+        // The GPU worker cannot be spawned: the builder never runs, so no
+        // device ever exists on (or is dropped on) the caller.
+        fail_spawns_on_this_thread(1);
+        let built = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&built);
+        let pool = Arc::new(Admission::new(4));
+        let backend = OffClockGpu::<crate::readback::SimulatedGpu>::build(&pool, move || {
+            flag.store(true, Ordering::Release);
+            Ok(crate::readback::SimulatedGpu::new(Duration::from_millis(1)))
+        });
+        fail_spawns_on_this_thread(0);
         assert!(matches!(backend, Err(Error::GpuRuntime(_))));
-        assert_eq!(probe.runs.load(Ordering::Relaxed), 0);
+        assert!(!built.load(Ordering::Acquire), "no device was built");
+        assert_eq!(pool.live(), 0, "the refused backend holds no lease");
+    }
+
+    /// Review BR-1 / INV-1 round 2: the CPU worker cannot be spawned AFTER
+    /// the GPU device was built: the device is dropped on its own worker
+    /// thread, never on the caller.
+    #[test]
+    fn a_failed_second_spawn_drops_the_device_on_its_worker() {
+        fail_spawn_after(1);
+        let pool = Arc::new(Admission::new(4));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let backend = OffClockGpu::<crate::readback::SimulatedGpu>::build(&pool, move || {
+            let sim = crate::readback::SimulatedGpu::new(Duration::from_millis(1));
+            let _ = tx.send(crate::readback::SimulatedGpuControl::new(&sim));
+            Ok(sim)
+        });
+        fail_spawns_on_this_thread(0);
+        assert!(matches!(backend, Err(Error::GpuRuntime(_))));
+        let control = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let dropped_on = loop {
+            if let Some(name) = control.dropped_on() {
+                break name;
+            }
+            assert!(Instant::now() < deadline, "device never dropped");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(dropped_on, GPU_WORKER);
+        while pool.live() != 0 {
+            assert!(Instant::now() < deadline, "lease never released");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Review MC-R2-2: a CPU result that was still running when the GPU
+    /// delivered a newer frame is never adopted later.
+    #[test]
+    fn a_cpu_result_older_than_a_gpu_frame_is_never_adopted() {
+        let probe = Arc::new(Probe::default());
+        let block = Arc::clone(&probe.block);
+        let worker = spawn_probe("probe-j", &probe, adopting());
+        block.store(true, Ordering::Release);
+        assert!(matches!(
+            worker.run(&job_in(3), Duration::from_millis(5)),
+            Outcome::TimedOut
+        ));
+        // The GPU recovered and delivered: invalidate.
+        worker.invalidate();
+        // Still running: not adoptable, fail fast.
+        assert!(matches!(
+            worker.run(&job_in(3), Duration::from_secs(5)),
+            Outcome::Busy(_)
+        ));
+        block.store(false, Ordering::Release);
+        while worker.is_busy() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let runs = probe.runs.load(Ordering::Relaxed);
+        // Finished but stale: discarded, a fresh job runs.
+        assert!(matches!(
+            worker.run(&job_in(3), Duration::from_secs(5)),
+            Outcome::Done(Ok(_))
+        ));
+        assert_eq!(probe.runs.load(Ordering::Relaxed), runs + 1);
+    }
+
+    /// Review MC-R2-1: an adopted result carries the metadata of the job
+    /// that produced it, not of the frame that adopted it.
+    #[test]
+    fn an_adopted_result_carries_its_own_jobs_metadata() {
+        let probe = Arc::new(Probe::default());
+        let block = Arc::clone(&probe.block);
+        let worker = spawn_probe("probe-k", &probe, adopting());
+        let with_meta = |tag: u32| {
+            Arc::new(FrameJob {
+                scene: 9,
+                meta: Some(JobMeta(Arc::new(tag))),
+                ..(*job()).clone()
+            })
+        };
+        block.store(true, Ordering::Release);
+        assert!(matches!(
+            worker.run(&with_meta(1), Duration::from_millis(5)),
+            Outcome::TimedOut
+        ));
+        block.store(false, Ordering::Release);
+        match worker.run(&with_meta(2), Duration::from_secs(5)) {
+            Outcome::Adopted(_, Some(JobMeta(meta))) => {
+                assert_eq!(meta.downcast_ref::<u32>(), Some(&1));
+            }
+            other => panic!("expected an adopted frame, got {other:?}"),
+        }
     }
 
     /// Review BR-2: admission caps live GPU workers per process and a permit
@@ -1235,17 +1521,17 @@ mod tests {
         let pool = Arc::new(Admission::new(1));
         let probe = Arc::new(Probe::default());
         let block = Arc::clone(&probe.block);
-        let permit = pool.try_acquire().unwrap();
+        let permit = Arc::new(pool.try_acquire().unwrap());
         assert!(pool.try_acquire().is_none(), "cap of one");
-        let worker = Worker::spawn_with(
+        let worker = spawn_probe(
             "probe-i",
-            probe,
+            &probe,
             WorkerOptions {
                 permit: Some(permit),
                 ..WorkerOptions::default()
             },
-        )
-        .unwrap();
+        );
+        drop(probe);
         block.store(true, Ordering::Release);
         assert!(matches!(
             worker.run(&job(), Duration::from_millis(5)),

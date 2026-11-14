@@ -445,10 +445,13 @@ waited 5.0 s on the clock thread.
   frame (while still running, or after finishing between two frames) only
   when the later frame has the same **scene key**. That key covers the drive's
   scene epoch, bumped by every layout, binding, store, slate or style change,
-  plus the transition step. So a fallback slower than a tick still delivers
-  frames (the 50 ms chaos variant), and a staged-then-rolled-back scene never
-  reaches the output: the adopted frame differs only by source frames sampled
-  a tick earlier. A CPU frame not ready in time is a miss. Unclocked callers
+  plus the transition step. Adoption also requires that no GPU frame was
+  delivered since the CPU job was handed over (a generation the GPU success
+  path bumps), so an older picture never follows a newer one. An adopted
+  frame is reported with *its own* job's source states, source times and
+  transition step, which travel with the job, never the current tick's. So a
+  fallback slower than a tick still delivers frames (the 50 ms chaos
+  variant), and a staged-then-rolled-back scene never reaches the output. A CPU frame not ready in time is a miss. Unclocked callers
   (period never set) get a 4 s budget, which is twice the 2 s unclocked
   readback deadline.
 * **First tick.** With no last-good frame yet, a miss on tick 0 emits a black
@@ -456,15 +459,22 @@ waited 5.0 s on the clock thread.
   memset, never a composite). It is counted as a miss and a repeat, and the
   staged scene is rolled back. This replaces #395's inline CPU composite on
   the clock thread.
-* **No inline fallback, bounded worker count.** If a worker thread cannot be
-  spawned, backend construction fails and the selector uses the CPU
-  reference. GPU work never runs on the caller's thread. A process-wide
-  admission pool (`MAX_LIVE_GPU_WORKERS` = 8) is taken *before* the device is
-  created. Each permit lives in the GPU worker thread, not in its handle. A
-  worker wedged in a hung driver call therefore keeps counting, so repeated
+* **No inline fallback, bounded worker count.** The wgpu device is created
+  **on its GPU worker thread**, after the thread exists. The handle keeps only
+  a `Weak`, so the device is also only ever dropped there. If the GPU worker
+  cannot be spawned, no device is built. If the CPU worker then fails, the
+  GPU worker drops the device on its own thread. Either way the selector uses
+  the CPU reference, and GPU work never runs or tears down on the caller's
+  thread. Device creation that takes longer than `WORKER_INIT_WAIT` (10 s)
+  also fails the selection; the worker discards the late device itself.
+  A process-wide admission pool (`MAX_LIVE_GPU_WORKERS` = 8 backends) is
+  taken *before* anything is built. One lease is shared by both of a
+  backend's worker threads and released only when the last of them exits, not
+  when a handle drops. A worker wedged in a hung driver call, or a CPU worker
+  still finishing a costly job, therefore keeps counting, and repeated
   construct, wedge and tear-down cycles are refused at the cap instead of
-  piling up threads, devices and retained jobs. Each wedged worker pins at
-  most one `FrameJob`: the `Arc`s of one frame's source images.
+  piling up threads, devices and retained jobs. Each worker pins at most one
+  `FrameJob`: the `Arc`s of one frame's source images.
 * **Device loss is typed and permanent, never a panic.** `GpuContext::new`
   registers a device-lost callback and an uncaptured-error handler. The
   handler replaces wgpu's panicking default and marks the device faulted,
@@ -515,9 +525,12 @@ waited 5.0 s on the clock thread.
   the GPU is dropped on `gpu-compose`. All three fail on the pre-#415 path.
   A fourth case has the GPU stuck from tick 0 with a 50 ms CPU fallback: the
   stand-in goes out on time and every tick follows. Unit tests also cover
-  same-scene adoption between frames, refusal of other-scene results, a late
-  panic marking the device lost, spawn failure as an error (never inline),
-  and admission held until the worker thread exits.
+  same-scene adoption between frames, refusal of other-scene results, never
+  adopting a CPU result older than a delivered GPU frame, an adopted frame
+  carrying its own job's metadata, a late panic marking the device lost,
+  spawn failure building no device, a failed second spawn dropping the
+  device on its own worker, and admission held until the worker thread
+  exits.
   The wgpu tests (they skip without an adapter, as in CI) destroy a real
   device and check that it yields `GpuLost`, never a panic, and that the run
   backend then composites on the CPU for good.
