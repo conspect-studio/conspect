@@ -18,14 +18,16 @@
 // principal permits any id — a stable, player-derived id that an operator
 // could also explicitly allow-list per player, same as any other object id.
 //
-// LOOP TIMING (TODO WINDY_LOOP_TIMING_FIELDS): a parallel lane is adding
-// optional `View` fields (`capture: 'steps'|'realtime'`, `timing:
-// 'equal'|'proportional'`, `frame_ms`, `end_hold_ms`, `max_steps`). The
-// server's `CaptureBody`/`View` deny unknown fields, so until those land in
-// `../api/schema.ts` this section stays visibly present but disabled — never
-// silently sent — so wiring it up later is a one-line change (delete the
-// `disabled` + the TODO guard below once the generated `View` type carries
-// the fields).
+// LOOP (capture mode / timing): optional `View` fields (`capture:
+// 'steps'|'realtime'`, `timing: 'equal'|'proportional'`, `frame_ms`,
+// `end_hold_ms`, `max_steps`). Radar defaults to steps-mode (a short loop of
+// the most recent radar steps); Wind only supports realtime (the server
+// refuses `steps` capture combined with the wind overlay) so the UI hides
+// and forces realtime for Wind. In steps mode `frames` is ignored
+// server-side, so the frames field is hidden; the nominal total frame count
+// (`max_steps * round(frame_ms * fps / 1000) + round(end_hold_ms * fps /
+// 1000)`) must stay <= 600 (the server's hard cap), validated client-side
+// below.
 import { useEffect, useRef, useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
@@ -61,8 +63,35 @@ import {
   SelectValue,
 } from '../components/ui/select';
 
-/** Always false until the generated `View` type carries the loop-timing fields. */
-const WINDY_LOOP_TIMING_FIELDS_AVAILABLE = false as const;
+/** `View.capture` — steps-mode (radar) or realtime (wind, or operator choice). */
+type CaptureMode = NonNullable<CaptureView['capture']>;
+
+/** `View.timing` — steps-mode per-step duration rule. */
+type StepTiming = NonNullable<CaptureView['timing']>;
+
+/** The server's hard cap on nominal total frames for any one capture. */
+const MAX_NOMINAL_FRAMES = 600;
+
+/** Default steps-mode per-step duration, ms (`View.frame_ms`). */
+const DEFAULT_FRAME_MS = 600;
+
+/** Default steps-mode newest-step hold, ms (`View.end_hold_ms`). */
+const DEFAULT_END_HOLD_MS = 1000;
+
+/** Default steps-mode step count (`View.max_steps`). */
+const DEFAULT_MAX_STEPS = 12;
+
+/**
+ * The nominal total frame count the server computes for a steps-mode
+ * capture: `max_steps * round(frame_ms * fps / 1000) + round(end_hold_ms *
+ * fps / 1000)`. Mirrors the server-side cap check so the client can refuse
+ * a doomed submit before it round-trips.
+ */
+function nominalStepsFrames(fps: number, frameMs: number, endHoldMs: number, maxSteps: number): number {
+  const perStep = Math.round((frameMs * fps) / 1000);
+  const hold = Math.round((endHoldMs * fps) / 1000);
+  return maxSteps * perStep + hold;
+}
 
 /** A named preset location (lat/lon) offered as a shortcut. */
 interface LocationPreset {
@@ -102,6 +131,12 @@ interface FillDraft {
   readonly frames: number;
   readonly then: 'cue' | 'resume';
   readonly premium: boolean;
+  /** Steps (radar default) or realtime (forced for wind). */
+  readonly capture: CaptureMode;
+  readonly timing: StepTiming;
+  readonly frameMs: number;
+  readonly endHoldMs: number;
+  readonly maxSteps: number;
 }
 
 const DEFAULT_DRAFT: FillDraft = {
@@ -115,6 +150,11 @@ const DEFAULT_DRAFT: FillDraft = {
   frames: 60,
   then: 'resume',
   premium: false,
+  capture: 'steps',
+  timing: 'equal',
+  frameMs: DEFAULT_FRAME_MS,
+  endHoldMs: DEFAULT_END_HOLD_MS,
+  maxSteps: DEFAULT_MAX_STEPS,
 };
 
 function draftStorageKey(playerId: string): string {
@@ -125,7 +165,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
-function isFillDraft(value: unknown): value is FillDraft {
+/** The base (pre-loop) draft fields; a draft saved before the loop fields landed still matches this. */
+type BaseFillDraft = Pick<
+  FillDraft,
+  'overlay' | 'lat' | 'lon' | 'zoom' | 'width' | 'height' | 'fps' | 'frames' | 'then' | 'premium'
+>;
+
+function isBaseFillDraft(value: unknown): value is BaseFillDraft {
   if (!isRecord(value)) return false;
   const v = value;
   return (
@@ -142,13 +188,25 @@ function isFillDraft(value: unknown): value is FillDraft {
   );
 }
 
+/** Fills in the loop fields from `DEFAULT_DRAFT` when a stored draft predates them. */
+function withLoopDefaults(base: BaseFillDraft, loose: Record<string, unknown>): FillDraft {
+  const capture: CaptureMode =
+    loose.capture === 'steps' || loose.capture === 'realtime' ? loose.capture : DEFAULT_DRAFT.capture;
+  const timing: StepTiming =
+    loose.timing === 'equal' || loose.timing === 'proportional' ? loose.timing : DEFAULT_DRAFT.timing;
+  const frameMs = typeof loose.frameMs === 'number' ? loose.frameMs : DEFAULT_DRAFT.frameMs;
+  const endHoldMs = typeof loose.endHoldMs === 'number' ? loose.endHoldMs : DEFAULT_DRAFT.endHoldMs;
+  const maxSteps = typeof loose.maxSteps === 'number' ? loose.maxSteps : DEFAULT_DRAFT.maxSteps;
+  return { ...base, capture, timing, frameMs, endHoldMs, maxSteps };
+}
+
 /** Read a player's last fill draft from `localStorage`, or the default. */
 function loadDraft(playerId: string): FillDraft {
   try {
     const raw = window.localStorage.getItem(draftStorageKey(playerId));
     if (raw === null) return DEFAULT_DRAFT;
     const parsed: unknown = JSON.parse(raw);
-    return isFillDraft(parsed) ? parsed : DEFAULT_DRAFT;
+    return isBaseFillDraft(parsed) ? withLoopDefaults(parsed, parsed) : DEFAULT_DRAFT;
   } catch {
     // localStorage can throw (disabled / private mode); fall back silently.
     return DEFAULT_DRAFT;
@@ -281,8 +339,18 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
     setDraft((d) => ({ ...d, width: preset.width, height: preset.height }));
   };
 
+  // Wind only supports realtime capture (the server refuses `steps` +
+  // `wind`); radar defaults to — and may choose — steps.
+  const isWind = draft.overlay === 'wind';
+  const effectiveCapture: CaptureMode = isWind ? 'realtime' : draft.capture;
+  const isStepsMode = effectiveCapture === 'steps';
+  const nominalFrames = isStepsMode
+    ? nominalStepsFrames(draft.fps, draft.frameMs, draft.endHoldMs, draft.maxSteps)
+    : draft.frames;
+  const frameCapExceeded = isStepsMode && nominalFrames > MAX_NOMINAL_FRAMES;
+
   const submit = (): void => {
-    if (!termsAccepted || !capsAvailable) return;
+    if (!termsAccepted || !capsAvailable || frameCapExceeded) return;
     const view: CaptureView = {
       lat: draft.lat,
       lon: draft.lon,
@@ -293,6 +361,10 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
       fps: draft.fps,
       frames: draft.frames,
       public: !effectivePremium,
+      capture: effectiveCapture,
+      ...(isStepsMode
+        ? { timing: draft.timing, frame_ms: draft.frameMs, end_hold_ms: draft.endHoldMs, max_steps: draft.maxSteps }
+        : {}),
     };
     const body: CaptureBody = {
       fill_id: windyFillId(playerId),
@@ -548,22 +620,24 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                   }}
                 />
               </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="windy-frames">
-                  <Trans>Frames</Trans>
-                </Label>
-                <Input
-                  id="windy-frames"
-                  type="number"
-                  min={2}
-                  max={600}
-                  step={1}
-                  value={draft.frames}
-                  onChange={(e): void => {
-                    setDraft((d) => ({ ...d, frames: Number(e.target.value) }));
-                  }}
-                />
-              </div>
+              {isStepsMode ? null : (
+                <div className="grid gap-1.5">
+                  <Label htmlFor="windy-frames">
+                    <Trans>Frames</Trans>
+                  </Label>
+                  <Input
+                    id="windy-frames"
+                    type="number"
+                    min={2}
+                    max={600}
+                    step={1}
+                    value={draft.frames}
+                    onChange={(e): void => {
+                      setDraft((d) => ({ ...d, frames: Number(e.target.value) }));
+                    }}
+                  />
+                </div>
+              )}
             </div>
 
             {premiumAvailable ? (
@@ -614,22 +688,143 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
               </div>
             </div>
 
-            {/* TODO WINDY_LOOP_TIMING_FIELDS_AVAILABLE: flip to true once
-                ../api/schema.ts's `View` carries
-                capture/timing/frame_ms/end_hold_ms/max_steps — delete this
-                placeholder block and wire real controls instead. */}
-            <fieldset disabled={!WINDY_LOOP_TIMING_FIELDS_AVAILABLE} className="grid gap-1.5 opacity-60">
-              <Label className="text-muted-foreground">
-                <Trans>Loop timing (coming soon)</Trans>
+            <div className="grid gap-1.5 rounded-md border p-3">
+              <Label>
+                <Trans>Loop</Trans>
               </Label>
-              <p className="text-xs text-muted-foreground">
-                <Trans>
-                  Per-step capture/timing controls are not yet in the
-                  server's capture schema; this section is a placeholder and
-                  sends nothing.
-                </Trans>
-              </p>
-            </fieldset>
+
+              <div className="grid gap-1.5">
+                <Label>
+                  <Trans>Capture mode</Trans>
+                </Label>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="windy-capture-steps"
+                    type="radio"
+                    name="windy-capture"
+                    className="size-4"
+                    checked={effectiveCapture === 'steps'}
+                    disabled={isWind}
+                    onChange={(): void => {
+                      setDraft((d) => ({ ...d, capture: 'steps' }));
+                    }}
+                  />
+                  <Label htmlFor="windy-capture-steps" className={isWind ? 'text-muted-foreground' : undefined}>
+                    <Trans>Radar steps</Trans>
+                  </Label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="windy-capture-realtime"
+                    type="radio"
+                    name="windy-capture"
+                    className="size-4"
+                    checked={effectiveCapture === 'realtime'}
+                    disabled={isWind}
+                    onChange={(): void => {
+                      setDraft((d) => ({ ...d, capture: 'realtime' }));
+                    }}
+                  />
+                  <Label htmlFor="windy-capture-realtime">
+                    <Trans>Realtime</Trans>
+                  </Label>
+                </div>
+                {isWind ? (
+                  <p className="text-xs text-muted-foreground">
+                    <Trans>Wind only supports realtime capture.</Trans>
+                  </p>
+                ) : null}
+              </div>
+
+              {isStepsMode ? (
+                <>
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="windy-timing">
+                      <Trans>Timing</Trans>
+                    </Label>
+                    <Select
+                      value={draft.timing}
+                      onValueChange={(value): void => {
+                        setDraft((d) => ({ ...d, timing: value === 'proportional' ? 'proportional' : 'equal' }));
+                      }}
+                    >
+                      <SelectTrigger id="windy-timing" className="w-56">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="equal">{t`Equal`}</SelectItem>
+                        <SelectItem value="proportional">{t`Proportional to radar time`}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="flex gap-2">
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="windy-frame-ms">
+                        <Trans>Frame duration (ms)</Trans>
+                      </Label>
+                      <Input
+                        id="windy-frame-ms"
+                        type="number"
+                        min={100}
+                        max={5000}
+                        step={1}
+                        value={draft.frameMs}
+                        onChange={(e): void => {
+                          setDraft((d) => ({ ...d, frameMs: Number(e.target.value) }));
+                        }}
+                      />
+                    </div>
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="windy-end-hold-ms">
+                        <Trans>End hold (ms)</Trans>
+                      </Label>
+                      <Input
+                        id="windy-end-hold-ms"
+                        type="number"
+                        min={0}
+                        max={10000}
+                        step={1}
+                        value={draft.endHoldMs}
+                        onChange={(e): void => {
+                          setDraft((d) => ({ ...d, endHoldMs: Number(e.target.value) }));
+                        }}
+                      />
+                    </div>
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="windy-max-steps">
+                        <Trans>Max steps</Trans>
+                      </Label>
+                      <Input
+                        id="windy-max-steps"
+                        type="number"
+                        min={2}
+                        max={48}
+                        step={1}
+                        value={draft.maxSteps}
+                        onChange={(e): void => {
+                          setDraft((d) => ({ ...d, maxSteps: Number(e.target.value) }));
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  {frameCapExceeded ? (
+                    <p role="alert" className="text-xs text-destructive">
+                      <Trans>
+                        This would capture {nominalFrames} frames, above the
+                        server's cap of {MAX_NOMINAL_FRAMES}. Lower max
+                        steps, frame duration or end hold.
+                      </Trans>
+                    </p>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      <Trans>Nominal total frames: {nominalFrames} (cap {MAX_NOMINAL_FRAMES}).</Trans>
+                    </p>
+                  )}
+                </>
+              ) : null}
+            </div>
 
             <div className="grid gap-1.5">
               <Label htmlFor="windy-then">
@@ -776,7 +971,7 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
           {jobId === undefined || (terminalCaptureState && jobState !== 'succeeded') ? (
             <Button
               type="button"
-              disabled={!termsAccepted || !capsAvailable || submitting}
+              disabled={!termsAccepted || !capsAvailable || submitting || frameCapExceeded}
               onClick={jobId === undefined ? submit : recapture}
             >
               {submitting ? <Loader2 className="mr-2 size-4 animate-spin" aria-hidden="true" /> : null}

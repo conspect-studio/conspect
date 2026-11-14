@@ -111,6 +111,107 @@ describe('WindyFillDialog', () => {
     expect(captureButton).toBeEnabled();
   });
 
+  it('sends steps-mode defaults for the default radar overlay', async () => {
+    let capturedView: Record<string, unknown> | undefined;
+    server.use(
+      capabilitiesHandler(),
+      http.post('*/api/v1/media/captures', async ({ request }) => {
+        const body = (await request.json()) as { view?: Record<string, unknown> };
+        capturedView = body.view;
+        return HttpResponse.json({ job_id: 1, status_url: '/api/v1/media/captures/1' }, { status: 202 });
+      }),
+      http.get('*/api/v1/media/captures/1', () =>
+        HttpResponse.json({ job_id: 1, fill_id: 'vt-vt-1-windy', state: 'queued' })),
+    );
+
+    renderDialog();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+
+    await waitFor(() => {
+      expect(capturedView).toBeDefined();
+    });
+    expect(capturedView).toMatchObject({
+      overlay: 'radar',
+      capture: 'steps',
+      timing: 'equal',
+      frame_ms: 600,
+      end_hold_ms: 1000,
+      max_steps: 12,
+    });
+  });
+
+  it('sends realtime capture with no step fields for the wind overlay, and hides steps controls', async () => {
+    let capturedView: Record<string, unknown> | undefined;
+    server.use(
+      capabilitiesHandler(),
+      http.post('*/api/v1/media/captures', async ({ request }) => {
+        const body = (await request.json()) as { view?: Record<string, unknown> };
+        capturedView = body.view;
+        return HttpResponse.json({ job_id: 2, status_url: '/api/v1/media/captures/2' }, { status: 202 });
+      }),
+      http.get('*/api/v1/media/captures/2', () =>
+        HttpResponse.json({ job_id: 2, fill_id: 'vt-vt-1-windy', state: 'queued' })),
+    );
+
+    renderDialog();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+
+    // Switch overlay to Wind.
+    await userEvent.click(screen.getByRole('combobox', { name: /overlay/i }));
+    await userEvent.click(screen.getByRole('option', { name: 'Wind' }));
+
+    // Steps-only controls (timing/frame duration/etc.) are hidden for wind.
+    expect(screen.queryByLabelText(/timing/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/frame duration/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/Wind only supports realtime capture/i)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+
+    await waitFor(() => {
+      expect(capturedView).toBeDefined();
+    });
+    expect(capturedView).toMatchObject({ overlay: 'wind', capture: 'realtime' });
+    expect(capturedView).not.toHaveProperty('timing');
+    expect(capturedView).not.toHaveProperty('frame_ms');
+    expect(capturedView).not.toHaveProperty('end_hold_ms');
+    expect(capturedView).not.toHaveProperty('max_steps');
+  });
+
+  it('disables submit with an inline error when steps-mode exceeds the server frame cap', async () => {
+    server.use(capabilitiesHandler());
+    renderDialog();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+
+    const captureButton = screen.getByRole('button', { name: 'Capture' });
+    expect(captureButton).toBeEnabled();
+
+    const maxSteps = screen.getByLabelText(/max steps/i);
+    await userEvent.clear(maxSteps);
+    await userEvent.type(maxSteps, '48');
+
+    const frameMs = screen.getByLabelText(/frame duration/i);
+    await userEvent.clear(frameMs);
+    await userEvent.type(frameMs, '5000');
+
+    await waitFor(() => {
+      expect(screen.getByText(/above the server's cap of 600/i)).toBeInTheDocument();
+    });
+    expect(captureButton).toBeDisabled();
+  });
+
   it('runs the happy path: capture -> succeeded -> artifact load -> committed', async () => {
     let createCalls = 0;
     server.use(
