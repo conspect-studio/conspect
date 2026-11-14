@@ -641,7 +641,7 @@
           "cast"
         ],
         "summary": "`POST /api/v1/cast/sessions` — start an ad-hoc cast session (role: write).",
-        "description": "Resolves the rendition, spawns the supervised session actor through the\nshared poller registry, and records the ephemeral session. The actor\nCONNECTs → `LAUNCH`es the Default Media Receiver (`CC1AD845`) → `LOAD`s the\ndevice-reachable HLS URL, then supervises the session (ADR-M011).",
+        "description": "When the engine runs a cast output (ADR-0111) the session creates its own\ncast stream (`feed` / `output` as `POST /cast/streams` takes them, same\nauthorization, owner = the caller), LAUNCHes the configured receiver app\n(the registered custom receiver, else the Default Media Receiver\n`CC1AD845`) and LOADs `{control.cast_media_base}/cast/<token>/master.m3u8`\n(fMP4, LIVE). The session owns the stream: stopping the session revokes\nit, and a revoked or expired stream ends the session. Only the receiver's\nplaylist fetches keep the token alive. The token is never served,\naudited, published or logged (`media_url` is redacted).\n\nWithout a cast output: resolves the HLS rendition, spawns the supervised\nsession actor through the shared poller registry, and records the\nephemeral session. The actor CONNECTs → `LAUNCH`es the Default Media\nReceiver (`CC1AD845`) → `LOAD`s the device-reachable HLS URL, then\nsupervises the session (ADR-M011).",
         "operationId": "start_cast_session",
         "requestBody": {
           "content": {
@@ -675,7 +675,7 @@
             }
           },
           "403": {
-            "description": "Not authorized to start a session.",
+            "description": "Not authorized to start a session; with a cast output: the caller may not read the output (object and output axis) or the feed, exactly as for `POST /cast/streams`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -685,7 +685,7 @@
             }
           },
           "409": {
-            "description": "No castable rendition (control.cast_media_base unset / no HLS output) or no live cast driver in this build.",
+            "description": "No live cast driver in this build; with a cast output: `cast-no-public-base` (control.cast_media_base is not an absolute https:// origin) or any refusal of `POST /cast/streams` (`cast-unavailable`, `cast-capacity`, `cast-no-encoder`, routing refusals); without one: no castable rendition (control.cast_media_base unset / no HLS output) or `cast-unavailable` for a `feed`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -695,7 +695,27 @@
             }
           },
           "422": {
-            "description": "The address is not a valid host[:port], or the named output is not a served HLS rendition.",
+            "description": "The address is not a valid host[:port], the named output is not a served HLS rendition, or `unknown-feed`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The `POST /cast/streams` creation limit (burst 4, then 1/s per principal).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`engine-busy`: the take onto the cast output did not settle within 3 s.",
             "content": {
               "application/json": {
                 "schema": {
@@ -15828,9 +15848,27 @@
             "type": "string",
             "description": "The runtime session id (`cast-session-…`, UUID-fresh per start)."
           },
+          "idle_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the receiver is idle or refused the LOAD (its `idleReason` /\nerror reason, e.g. `ERROR`, `FINISHED`), while not playing."
+          },
+          "last_report": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReceiverReport",
+                "description": "The cast stream's last receiver report (custom receiver only)."
+              }
+            ]
+          },
           "media_url": {
             "type": "string",
-            "description": "The resolved device-reachable media URL the session LOADs."
+            "description": "The device-reachable media URL the session LOADs. For a session\nthat plays a cast stream the token is redacted:\n`https://…/cast/<redacted>/master.m3u8`."
           },
           "name": {
             "type": [
@@ -15843,6 +15881,13 @@
             "type": "string",
             "description": "The output id whose rendition the session casts."
           },
+          "player_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The receiver's player state as last reported: `connecting`,\n`loading`, `playing`, `buffering`, `paused`, `idle`, `load-failed`,\n`no-media`, `preempted`, `relaunching`."
+          },
           "started_unix_ns": {
             "type": [
               "integer",
@@ -15854,6 +15899,13 @@
           "state": {
             "type": "string",
             "description": "The session's live lifecycle state (the DEV-A3 wire vocabulary, e.g.\n`ADOPTING`/`ONLINE`/`DEGRADED`), read from the latest-wins status\nregistry."
+          },
+          "stream_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cast stream the session owns (stopping the session revokes it;\nrevoking or expiring it ends the session)."
           }
         }
       },
@@ -24485,6 +24537,13 @@
           "address": {
             "type": "string",
             "description": "The device authority to dial: `host[:port]`, IPv6 bracketed\n(`[2001:db8::20]:8009`); the CASTV2 port 8009 is the default when\nomitted (Cast **groups** advertise non-default ports — give the\nadvertised one)."
+          },
+          "feed": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "What to show, as `POST /cast/streams` takes it\n(`{\"bus\":\"program\"|\"preview\"|\"clean\"}`, `{\"source\":\"<id>\"}`,\n`{\"layout\":\"<id>\"}`). When the engine runs a cast output the session\ncreates its own cast stream (same authorization as `POST\n/cast/streams`, owner = the caller) and LOADs\n`{control.cast_media_base}/cast/<token>/master.m3u8`; `output` may\nthen name a cast output. Without a cast output a `feed` is refused\n(`409 cast-unavailable`) and `output` names an HLS rendition as before."
           },
           "name": {
             "type": [
