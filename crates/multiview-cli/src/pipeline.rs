@@ -14989,6 +14989,8 @@ fn build_media_player_boot_with_state(
                 #[cfg(test)]
                 panic_after_commit: Arc::new(AtomicBool::new(false)),
                 #[cfg(test)]
+                preroll_limits: None,
+                #[cfg(test)]
                 observer: None,
                 #[cfg(test)]
                 trace: None,
@@ -16175,24 +16177,60 @@ fn runtime_seek_micros(frame: u64, cadence: Rational, source_origin_ns: i64) -> 
 /// every seek the decoded pictures are offered here, labelled by their actual
 /// source index (`(pts - origin) / period`), and discarded until the target is
 /// reached. Runs only on the player's decode worker, never on the output clock.
-/// Bounded by a frame count and the shared read budget: once exceeded, the
-/// next decoded picture is adopted (best effort) and playback continues —
-/// preroll never blocks or spins forever.
+/// Bounded by a discarded-frame count and a wall-time budget. Exhausting either
+/// is a seek FAILURE ([`PrerollAdmit::Exhausted`]): the pre-target picture is
+/// never published; the caller holds last-good, pauses and reports the fault.
 #[cfg(feature = "ffmpeg")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SeekPreroll {
     target: Option<u64>,
-    bound: u64,
+    max_discard: u64,
+    time_budget: Duration,
     discarded: u64,
     started: Option<std::time::Instant>,
 }
 
 #[cfg(feature = "ffmpeg")]
+impl Default for SeekPreroll {
+    fn default() -> Self {
+        Self {
+            target: None,
+            max_discard: 0,
+            time_budget: crate::player::OpenerConfig::READ_TIMEOUT,
+            discarded: 0,
+            started: None,
+        }
+    }
+}
+
+/// What to do with one decoded picture while a seek target may be pending.
+#[cfg(feature = "ffmpeg")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrerollAdmit {
+    /// Pre-target keyframe preroll: drop it (no stamp advance, no publish).
+    Discard,
+    /// Publish this picture as source frame `index`.
+    Publish(u64),
+    /// The preroll budget ran out before the target was reached. The picture
+    /// (source frame `landed`, before `target`) must NOT be published.
+    Exhausted {
+        /// The requested source frame.
+        target: u64,
+        /// The pre-target source frame decoded when the budget ran out.
+        landed: u64,
+        /// Pictures discarded for this seek, including `landed`.
+        discarded: u64,
+    },
+}
+
+#[cfg(feature = "ffmpeg")]
 impl SeekPreroll {
-    /// Arm a pending source-frame target after a successful seek + flush.
-    fn arm(&mut self, target: u64, bound: u64) {
+    /// Arm a pending source-frame target after a successful seek + flush,
+    /// with its discard-count and wall-time budgets.
+    fn arm(&mut self, target: u64, (max_discard, time_budget): (u64, Duration)) {
         self.target = Some(target);
-        self.bound = bound;
+        self.max_discard = max_discard;
+        self.time_budget = time_budget;
         self.discarded = 0;
         self.started = None;
     }
@@ -16204,32 +16242,79 @@ impl SeekPreroll {
         self.started = None;
     }
 
-    /// Offer one decoded picture whose actual source index is `index`.
-    /// `None`: discard it (pre-target preroll, no stamp advance). `Some(i)`:
-    /// publish it labelled as source frame `i`; `next` is the sequential index
-    /// used when no seek is pending.
-    fn admit(&mut self, index: u64, next: u64) -> Option<u64> {
-        let Some(target) = self.target else {
-            return Some(next);
-        };
-        if index < target {
-            self.discarded = self.discarded.saturating_add(1);
-            let started = *self.started.get_or_insert_with(std::time::Instant::now);
-            if self.discarded <= self.bound
-                && started.elapsed() < crate::player::OpenerConfig::READ_TIMEOUT
-            {
-                return None;
-            }
-            tracing::warn!(
-                target,
-                landed = index,
-                discarded = self.discarded,
-                "player seek preroll budget exhausted; landing on best frame"
-            );
-        }
-        self.clear();
-        Some(index)
+    /// [`Self::admit_at`] at the current instant.
+    fn admit(&mut self, index: u64, next: u64) -> PrerollAdmit {
+        self.admit_at(index, next, std::time::Instant::now())
     }
+
+    /// Offer one decoded picture whose actual source index is `index`, at
+    /// `now` (injectable for deterministic budget tests). `next` is the
+    /// sequential index used when no seek is pending.
+    fn admit_at(&mut self, index: u64, next: u64, now: std::time::Instant) -> PrerollAdmit {
+        let Some(target) = self.target else {
+            return PrerollAdmit::Publish(next);
+        };
+        if index >= target {
+            self.clear();
+            return PrerollAdmit::Publish(index);
+        }
+        self.discarded = self.discarded.saturating_add(1);
+        let started = *self.started.get_or_insert(now);
+        if self.discarded <= self.max_discard
+            && now.saturating_duration_since(started) < self.time_budget
+        {
+            return PrerollAdmit::Discard;
+        }
+        let discarded = self.discarded;
+        self.clear();
+        PrerollAdmit::Exhausted {
+            target,
+            landed: index,
+            discarded,
+        }
+    }
+}
+
+/// Discard-count and wall-time budgets for one runtime seek preroll. Tests may
+/// inject tight limits per runtime; production uses clip length + 256 frames
+/// and the shared per-read budget.
+#[cfg(feature = "ffmpeg")]
+fn preroll_budget(runtime: &crate::player::PlayerRuntime, out_point: u64) -> (u64, Duration) {
+    #[cfg(test)]
+    if let Some(limits) = runtime.preroll_limits {
+        return limits;
+    }
+    let _ = runtime;
+    (
+        out_point.saturating_add(256),
+        crate::player::OpenerConfig::READ_TIMEOUT,
+    )
+}
+
+/// A seek preroll ran out of budget before its target: fail the seek exactly
+/// like a failed native seek. The pre-target picture is not published, the
+/// player pauses (the caller heartbeats last-good, never blocking the clock)
+/// and the redacted `SeekFailed` fault is published on the runtime status.
+#[cfg(feature = "ffmpeg")]
+fn fail_exhausted_preroll(
+    plan: &IngestPlan,
+    handle: &crate::player::PlayerHandle,
+    runtime: &crate::player::PlayerRuntime,
+    player: &mut crate::player::MediaPlayer,
+    (target, landed, discarded): (u64, u64, u64),
+) {
+    tracing::warn!(
+        player = %plan.id,
+        target,
+        landed,
+        discarded,
+        "player seek preroll budget exhausted before target; holding last-good"
+    );
+    player.pause();
+    let epoch = handle.control_bus.load().clip_epoch.0;
+    crate::player::publish_status(&runtime.status, |status| {
+        status.after_seek_failure(epoch, target)
+    });
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -16422,7 +16507,7 @@ fn player_runtime_body(
                             warmup_packets = 0;
                             warmup_started = None;
                             frame_index = target;
-                            preroll.arm(target, clip.geometry.out_point().saturating_add(256));
+                            preroll.arm(target, preroll_budget(runtime, clip.geometry.out_point()));
                         } else {
                             tracing::warn!(player = %plan.id, target, "player cue seek failed; held until next load");
                             player.pause();
@@ -16447,7 +16532,7 @@ fn player_runtime_body(
                             warmup_packets = 0;
                             warmup_started = None;
                             frame_index = frame;
-                            preroll.arm(frame, clip.geometry.out_point().saturating_add(256));
+                            preroll.arm(frame, preroll_budget(runtime, clip.geometry.out_point()));
                         } else {
                             tracing::warn!(player = %plan.id, frame, "player seek failed; held until next load");
                             player.pause();
@@ -16853,41 +16938,61 @@ fn player_runtime_body(
                                     );
                                     // Pre-target keyframe preroll: discard, no
                                     // stamp advance and no stale republish.
-                                    let Some(index) = preroll.admit(actual, frame_index) else {
-                                        continue;
-                                    };
-                                    frame_index = index.saturating_add(1);
-                                    match player.on_decoded(index) {
-                                        PlayerAction::Publish { at } => {
-                                            if let Ok(image) = clip.scaler.convert(
-                                                &decoded.frame,
-                                                plan.canvas_color.output_tag(),
-                                            ) {
-                                                last = Arc::new(image);
-                                            }
-                                            PlayerAction::Publish { at }
-                                        }
-                                        PlayerAction::SeekFlushTo { frame } => {
-                                            // libav seek and flush are on the ingest thread only for
-                                            // the already-open current clip; never on the output clock.
-                                            let micros = runtime_seek_micros(
-                                                frame,
-                                                cadence,
-                                                clip.source_origin_ns,
+                                    match preroll.admit(actual, frame_index) {
+                                        PrerollAdmit::Discard => continue,
+                                        PrerollAdmit::Exhausted {
+                                            target,
+                                            landed,
+                                            discarded,
+                                        } => {
+                                            frame_index = landed.saturating_add(1);
+                                            fail_exhausted_preroll(
+                                                plan,
+                                                handle,
+                                                runtime,
+                                                &mut player,
+                                                (target, landed, discarded),
                                             );
-                                            if clip.demuxer.seek(micros).is_ok() {
-                                                let _ = clip.decoder.flush();
-                                                frame_index = frame;
-                                                preroll.arm(
-                                                    frame,
-                                                    clip.geometry.out_point().saturating_add(256),
-                                                );
-                                            } else {
-                                                player.pause();
-                                            }
                                             player.on_heartbeat()
                                         }
-                                        _ => player.on_heartbeat(),
+                                        PrerollAdmit::Publish(index) => {
+                                            frame_index = index.saturating_add(1);
+                                            match player.on_decoded(index) {
+                                                PlayerAction::Publish { at } => {
+                                                    if let Ok(image) = clip.scaler.convert(
+                                                        &decoded.frame,
+                                                        plan.canvas_color.output_tag(),
+                                                    ) {
+                                                        last = Arc::new(image);
+                                                    }
+                                                    PlayerAction::Publish { at }
+                                                }
+                                                PlayerAction::SeekFlushTo { frame } => {
+                                                    // libav seek and flush are on the ingest thread only for
+                                                    // the already-open current clip; never on the output clock.
+                                                    let micros = runtime_seek_micros(
+                                                        frame,
+                                                        cadence,
+                                                        clip.source_origin_ns,
+                                                    );
+                                                    if clip.demuxer.seek(micros).is_ok() {
+                                                        let _ = clip.decoder.flush();
+                                                        frame_index = frame;
+                                                        preroll.arm(
+                                                            frame,
+                                                            preroll_budget(
+                                                                runtime,
+                                                                clip.geometry.out_point(),
+                                                            ),
+                                                        );
+                                                    } else {
+                                                        player.pause();
+                                                    }
+                                                    player.on_heartbeat()
+                                                }
+                                                _ => player.on_heartbeat(),
+                                            }
+                                        }
                                     }
                                 }
                                 // Decoder reorder warm-up is not a source frame.
@@ -16939,21 +17044,38 @@ fn player_runtime_body(
                                     clip.source_origin_ns,
                                     clip.geometry.frame_period_ns(),
                                 );
-                                let Some(index) = preroll.admit(actual, frame_index) else {
-                                    continue;
-                                };
-                                frame_index = index.saturating_add(1);
-                                match player.on_decoded(index) {
-                                    PlayerAction::Publish { at } => {
-                                        if let Ok(image) = clip
-                                            .scaler
-                                            .convert(&decoded.frame, plan.canvas_color.output_tag())
-                                        {
-                                            last = Arc::new(image);
-                                        }
-                                        PlayerAction::Publish { at }
+                                match preroll.admit(actual, frame_index) {
+                                    PrerollAdmit::Discard => continue,
+                                    PrerollAdmit::Exhausted {
+                                        target,
+                                        landed,
+                                        discarded,
+                                    } => {
+                                        frame_index = landed.saturating_add(1);
+                                        fail_exhausted_preroll(
+                                            plan,
+                                            handle,
+                                            runtime,
+                                            &mut player,
+                                            (target, landed, discarded),
+                                        );
+                                        player.on_heartbeat()
                                     }
-                                    _ => player.on_heartbeat(),
+                                    PrerollAdmit::Publish(index) => {
+                                        frame_index = index.saturating_add(1);
+                                        match player.on_decoded(index) {
+                                            PlayerAction::Publish { at } => {
+                                                if let Ok(image) = clip.scaler.convert(
+                                                    &decoded.frame,
+                                                    plan.canvas_color.output_tag(),
+                                                ) {
+                                                    last = Arc::new(image);
+                                                }
+                                                PlayerAction::Publish { at }
+                                            }
+                                            _ => player.on_heartbeat(),
+                                        }
+                                    }
                                 }
                             }
                             Ok(None) if player.is_playing_state() => {
@@ -16987,13 +17109,15 @@ fn player_runtime_body(
                                         && clip.decoder.flush().is_ok()
                                     {
                                         frame_index = target;
-                                        let bound = clip.geometry.out_point().saturating_add(256);
-                                        preroll.arm(target, bound);
+                                        let budget =
+                                            preroll_budget(runtime, clip.geometry.out_point());
+                                        preroll.arm(target, budget);
                                         // Re-prime one frame in this SAME output
                                         // tick. A seek-only heartbeat repeats the
                                         // last picture and loses a frame at every
                                         // lap seam. No open or teardown here.
                                         let mut primed = None;
+                                        let mut exhausted = None;
                                         // The aggregate phase deadline persists
                                         // through each per-read arm/disarm. A
                                         // malicious 64-packet stream cannot turn
@@ -17001,7 +17125,7 @@ fn player_runtime_body(
                                         // Pre-target keyframe preroll is decoded
                                         // and discarded here too (bounded by the
                                         // preroll budget and the same deadline).
-                                        for _ in 0..64_u64.saturating_add(bound) {
+                                        for _ in 0..64_u64.saturating_add(budget.0) {
                                             if stop.load(Ordering::Acquire) {
                                                 break;
                                             }
@@ -17012,14 +17136,23 @@ fn player_runtime_body(
                                                         clip.source_origin_ns,
                                                         clip.geometry.frame_period_ns(),
                                                     );
-                                                    if let Some(index) =
-                                                        preroll.admit(actual, frame_index)
-                                                    {
-                                                        frame_index = index;
-                                                        primed = Some(decoded);
-                                                        break;
+                                                    match preroll.admit(actual, frame_index) {
+                                                        PrerollAdmit::Discard => continue,
+                                                        PrerollAdmit::Publish(index) => {
+                                                            frame_index = index;
+                                                            primed = Some(decoded);
+                                                        }
+                                                        PrerollAdmit::Exhausted {
+                                                            target,
+                                                            landed,
+                                                            discarded,
+                                                        } => {
+                                                            frame_index = landed.saturating_add(1);
+                                                            exhausted =
+                                                                Some((target, landed, discarded));
+                                                        }
                                                     }
-                                                    continue;
+                                                    break;
                                                 }
                                                 Ok(None) => {}
                                                 Err(error) => {
@@ -17035,6 +17168,15 @@ fn player_runtime_body(
                                                         .is_ok() => {}
                                                 _ => break,
                                             }
+                                        }
+                                        if let Some(failure) = exhausted {
+                                            fail_exhausted_preroll(
+                                                plan,
+                                                handle,
+                                                runtime,
+                                                &mut player,
+                                                failure,
+                                            );
                                         }
                                         match primed {
                                             Some(decoded) => {
@@ -28832,7 +28974,7 @@ loop_default = true
 
     impl Rig {
         fn start(config: &MultiviewConfig, state: Option<&std::path::Path>) -> Option<Self> {
-            Self::start_observed(config, state, None)
+            Self::start_observed(config, state, None, None)
         }
 
         /// As [`Rig::start`], wiring the worker's test-only publication observer.
@@ -28840,6 +28982,7 @@ loop_default = true
             config: &MultiviewConfig,
             state: Option<&std::path::Path>,
             observer: Option<std::sync::mpsc::SyncSender<(MediaTime, MediaTime, Arc<Nv12Image>)>>,
+            preroll_limits: Option<(u64, Duration)>,
         ) -> Option<Self> {
             let layout = config.solve_layout().unwrap();
             let cadence = config.canvas.fps.rational();
@@ -28851,14 +28994,12 @@ loop_default = true
                 state,
             );
             let mut plan = boot.plans.into_iter().next()?;
-            if let Some(observer) = observer {
-                plan.player
-                    .as_mut()
-                    .unwrap()
-                    .runtime
-                    .as_mut()
-                    .unwrap()
-                    .observer = Some(observer);
+            {
+                let runtime = plan.player.as_mut().unwrap().runtime.as_mut().unwrap();
+                runtime.preroll_limits = preroll_limits;
+                if let Some(observer) = observer {
+                    runtime.observer = Some(observer);
+                }
             }
             let handle = plan.player.as_ref().unwrap().clone();
             let runtime = handle.runtime.as_ref().unwrap().clone();
@@ -29127,8 +29268,12 @@ loop_default = true
     }
 
     fn start_with_clip(spec: ClipSpec) -> (Rig, Observed) {
+        start_with_clip_limited(spec, None)
+    }
+
+    fn start_with_clip_limited(spec: ClipSpec, limits: Option<(u64, Duration)>) -> (Rig, Observed) {
         let (tx, rx) = std::sync::mpsc::sync_channel(16_384);
-        let rig = Rig::start_observed(&plain_config(), None, Some(tx)).unwrap();
+        let rig = Rig::start_observed(&plain_config(), None, Some(tx), limits).unwrap();
         rig.runtime.opener.request(spec).unwrap();
         wait("clip committed", &|| {
             rig.handle.control_bus.load().clip_epoch.0 >= 1 && rig.runtime.native.load().is_some()
@@ -29330,6 +29475,184 @@ loop_default = true
         wait("B retired too", &|| {
             coordinator.retirement_complete(coordinator.retirement_barrier())
         });
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Unit: count exhaustion is a distinct outcome, never a pre-target publish.
+    #[test]
+    fn seek_preroll_count_exhaustion_is_distinct_and_never_publishes_pre_target() {
+        let t0 = Instant::now();
+        let mut preroll = SeekPreroll::default();
+        assert_eq!(preroll.admit_at(5, 5, t0), PrerollAdmit::Publish(5), "idle");
+        preroll.arm(13, (2, Duration::from_secs(3600)));
+        assert_eq!(preroll.admit_at(10, 13, t0), PrerollAdmit::Discard);
+        assert_eq!(preroll.admit_at(11, 13, t0), PrerollAdmit::Discard);
+        assert_eq!(
+            preroll.admit_at(12, 13, t0),
+            PrerollAdmit::Exhausted {
+                target: 13,
+                landed: 12,
+                discarded: 3
+            }
+        );
+        // Disarmed after the failure; a fresh arm reaching the target publishes it.
+        preroll.arm(13, (2, Duration::from_secs(3600)));
+        assert_eq!(preroll.admit_at(12, 13, t0), PrerollAdmit::Discard);
+        assert_eq!(preroll.admit_at(13, 13, t0), PrerollAdmit::Publish(13));
+        assert_eq!(preroll.admit_at(14, 14, t0), PrerollAdmit::Publish(14));
+    }
+
+    /// Unit: wall-time exhaustion with an injected clock (no sleeping).
+    #[test]
+    fn seek_preroll_time_exhaustion_is_distinct_with_injected_clock() {
+        let t0 = Instant::now();
+        let budget = Duration::from_millis(100);
+        let mut preroll = SeekPreroll::default();
+        preroll.arm(30, (1_000, budget));
+        assert_eq!(preroll.admit_at(20, 30, t0), PrerollAdmit::Discard);
+        assert_eq!(
+            preroll.admit_at(21, 30, t0 + Duration::from_millis(99)),
+            PrerollAdmit::Discard
+        );
+        assert_eq!(
+            preroll.admit_at(22, 30, t0 + budget),
+            PrerollAdmit::Exhausted {
+                target: 30,
+                landed: 22,
+                discarded: 3
+            }
+        );
+        // The clock starts at the first discarded picture of each seek.
+        preroll.arm(30, (1_000, budget));
+        assert_eq!(
+            preroll.admit_at(20, 30, t0 + Duration::from_secs(10)),
+            PrerollAdmit::Discard
+        );
+        assert_eq!(
+            preroll.admit_at(30, 30, t0 + Duration::from_secs(10) + budget),
+            PrerollAdmit::Publish(30),
+            "reaching the target is never a failure"
+        );
+    }
+
+    /// Collect observed tile lumas for `ticks` output ticks after a fault.
+    fn lumas_for_ticks(rig: &Rig, rx: &Observed, ticks: u64) -> Vec<u8> {
+        let period = MediaTime::from_tick(1, rig.cadence).as_nanos();
+        let mut now = 1_000_000_000_i64 + 3_600 * 1_000_000_000;
+        let mut out = Vec::new();
+        for _ in 0..ticks {
+            now += period;
+            rig.clock.set(now);
+            while let Ok((_, _, image)) = rx.recv_timeout(Duration::from_millis(5)) {
+                out.push(centre_luma(&image));
+            }
+        }
+        out
+    }
+
+    fn assert_seek_failed(rig: &Rig, rx: &Observed, frame: u64) -> Vec<u8> {
+        // The worker only decodes when the run clock releases its next stamp:
+        // keep advancing it, one tick at a time, until the fault is published.
+        let period = MediaTime::from_tick(1, rig.cadence).as_nanos();
+        let mut now = 1_000_000_000_i64 + 1_800 * 1_000_000_000;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        while rig.runtime.status.load().fault.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "hang deadline: seek failure reported"
+            );
+            now += period;
+            rig.clock.set(now);
+            while let Ok((_, _, image)) = rx.recv_timeout(Duration::from_millis(5)) {
+                seen.push(centre_luma(&image));
+            }
+        }
+        assert_eq!(
+            rig.runtime.status.load().fault,
+            Some(crate::player::PlayerFault::SeekFailed {
+                generation: rig.handle.control_bus.load().clip_epoch.0,
+                frame,
+            })
+        );
+        wait("audio rail paused", &|| {
+            rig.handle.control_bus.load().state == crate::player::AudioTransport::Paused
+        });
+        seen
+    }
+
+    /// Runtime path, COUNT exhaustion on a user seek: seek 13 (keyframe 10)
+    /// with a 2-frame discard budget. Frames 10/11 are discarded, 12 exhausts:
+    /// it is never shown; last-good (primed frame 0) is held, the player
+    /// pauses and `SeekFailed{13}` is reported.
+    #[test]
+    fn runtime_seek_preroll_count_exhaustion_holds_last_good_and_reports() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "gop.mov", 10, 0);
+        let (rig, rx) = start_with_clip_limited(
+            ClipSpec::new(&path, LoadThen::Cue),
+            Some((2, Duration::from_secs(3600))),
+        );
+        rig.handle.mailbox.submit(TransportVerb::Seek { frame: 13 });
+        rig.handle.mailbox.submit(TransportVerb::Play);
+        let lumas = published_lumas(&rig, &rx, spec.luma_of(0), 1);
+        assert_eq!(lumas, vec![spec.luma_of(0)]);
+        let mut held = assert_seek_failed(&rig, &rx, 13);
+        held.extend(lumas_for_ticks(&rig, &rx, 40));
+        assert!(!held.is_empty(), "heartbeat keeps publishing");
+        assert!(
+            held.iter().all(|l| *l == spec.luma_of(0)),
+            "only last-good is shown, never a pre-target frame: {held:?}"
+        );
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Runtime path, TIME exhaustion (injected zero wall budget) on an in-band
+    /// vamp wrap to a non-keyframe `vamp_in`: material before `vamp_in` is
+    /// never played; the last lap picture is held and the failure reported.
+    #[test]
+    fn runtime_vamp_wrap_preroll_time_exhaustion_never_plays_before_vamp_in() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "gop.mov", 10, 0);
+        let mut clip = ClipSpec::new(&path, LoadThen::Cue);
+        clip.vamp_in = Some(13);
+        clip.vamp_out = Some(17);
+        let (rig, rx) = start_with_clip_limited(clip, Some((1_000, Duration::ZERO)));
+        rig.handle.mailbox.submit(TransportVerb::Vamp);
+        let got = published_lumas(&rig, &rx, spec.luma_of(0), 17);
+        let want: Vec<u8> = (0_u32..=16).map(|i| spec.luma_of(i)).collect();
+        assert_eq!(got, want, "first pass up to vamp_out");
+        let mut held = assert_seek_failed(&rig, &rx, 13);
+        held.extend(lumas_for_ticks(&rig, &rx, 40));
+        assert!(
+            held.iter().all(|l| *l == spec.luma_of(16)),
+            "last lap picture held; no pre-vamp_in frame: {held:?}"
+        );
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Runtime path, COUNT exhaustion in the EOF-lap re-prime (`vamp_in` 23,
+    /// keyframe 20, budget 1): 20 discarded, 21 exhausts and is never shown.
+    #[test]
+    fn runtime_eof_lap_preroll_count_exhaustion_holds_and_reports() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "gop.mov", 10, 0);
+        let mut clip = ClipSpec::new(&path, LoadThen::Cue);
+        clip.vamp_in = Some(23);
+        let (rig, rx) = start_with_clip_limited(clip, Some((1, Duration::from_secs(3600))));
+        rig.handle.mailbox.submit(TransportVerb::Vamp);
+        let got = published_lumas(&rig, &rx, spec.luma_of(0), 40);
+        let want: Vec<u8> = (0_u32..40).map(|i| spec.luma_of(i)).collect();
+        assert_eq!(got, want, "first pass to clip end");
+        let mut held = assert_seek_failed(&rig, &rx, 23);
+        held.extend(lumas_for_ticks(&rig, &rx, 40));
+        assert!(
+            held.iter().all(|l| *l == spec.luma_of(39)),
+            "terminal picture held; no pre-vamp_in frame: {held:?}"
+        );
         assert!(rig.shutdown().is_none());
     }
 

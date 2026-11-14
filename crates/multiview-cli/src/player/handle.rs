@@ -218,6 +218,10 @@ pub struct PlayerRuntime {
     /// One-shot panic injection after all native owners enter fixed slots.
     #[cfg(test)]
     pub panic_after_commit: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only seek preroll limits `(max discarded frames, wall budget)`;
+    /// `None` uses the production budget.
+    #[cfg(test)]
+    pub preroll_limits: Option<(u64, std::time::Duration)>,
     /// Bounded test-only loop trace, inspected only after a failing condition.
     #[cfg(test)]
     pub trace:
