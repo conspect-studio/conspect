@@ -454,3 +454,193 @@ fn routing_plan_200_is_route_plan_or_output_plan() {
         ]
     );
 }
+
+/// The `oneOf` component refs a path's response references.
+fn response_one_of(path: &str, status: &str) -> Vec<String> {
+    use multiview_control::openapi::ApiDoc;
+    use utoipa::OpenApi;
+
+    let json = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+    let schema =
+        &json["paths"][path]["post"]["responses"][status]["content"]["application/json"]["schema"];
+    let name = schema["$ref"]
+        .as_str()
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .unwrap_or_else(|| panic!("{path} {status} references a component schema"));
+    json["components"]["schemas"][name]["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{path} {status} is a oneOf"))
+        .iter()
+        .filter_map(|arm| arm["$ref"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// #308 review A3: a patch salvo's take answers `PatchAccepted` (no
+/// `kind`), a legacy salvo's `AcceptedBody`; the `202` declares both.
+#[test]
+fn salvo_take_202_is_accepted_body_or_patch_accepted() {
+    assert_eq!(
+        response_one_of("/api/v1/salvos/{id}/take", "202"),
+        [
+            "#/components/schemas/AcceptedBody",
+            "#/components/schemas/PatchAccepted"
+        ]
+    );
+}
+
+/// #308 review A4: both plan endpoints declare a set's `SetPlan` (with
+/// `set: {new_encoders, fits}`) beside the single-destination `PatchPlan`.
+///
+/// #308 review A5: the combinator is `anyOf`, not `oneOf`. `SetPlan`
+/// `#[serde(flatten)]`s `PatchPlan` and adds `set`, and `PatchPlan` has no
+/// `additionalProperties: false`, so every genuine `SetPlan` response body
+/// also validates against the `PatchPlan` arm. A `oneOf` (exactly one match)
+/// would reject every real set-plan response; `anyOf` (at least one match)
+/// accepts it while still documenting the two shapes.
+#[test]
+fn patch_plans_200_declare_the_set_cost() {
+    use multiview_control::openapi::ApiDoc;
+    use utoipa::OpenApi;
+
+    for path in ["/api/v1/patch/plan", "/api/v1/salvos/{id}/plan"] {
+        assert_eq!(
+            response_any_of(path, "200"),
+            [
+                "#/components/schemas/PatchPlan",
+                "#/components/schemas/SetPlan"
+            ],
+            "{path}"
+        );
+    }
+    let json = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+    let set = &json["components"]["schemas"]["SetCost"]["properties"];
+    assert!(
+        set["new_encoders"].is_object() && set["fits"].is_object(),
+        "{set}"
+    );
+}
+
+/// The `anyOf` component refs a path's response references (counterpart to
+/// `response_one_of`, used where the branches genuinely overlap: see A5).
+fn response_any_of(path: &str, status: &str) -> Vec<String> {
+    use multiview_control::openapi::ApiDoc;
+    use utoipa::OpenApi;
+
+    let json = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+    let schema =
+        &json["paths"][path]["post"]["responses"][status]["content"]["application/json"]["schema"];
+    let name = schema["$ref"]
+        .as_str()
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .unwrap_or_else(|| panic!("{path} {status} references a component schema"));
+    json["components"]["schemas"][name]["anyOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{path} {status} is an anyOf"))
+        .iter()
+        .filter_map(|arm| arm["$ref"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// #308 review A5: a sample `SetPlan` response body (a real set-of-two
+/// destinations shape) validates against the declared `200` schema for both
+/// plan endpoints — i.e. the schema is permissive enough to accept it. A
+/// `oneOf` of `PatchPlan`/`SetPlan` would reject it, because every `SetPlan`
+/// also matches the `PatchPlan` arm (flatten + no `additionalProperties:
+/// false`); `anyOf` must accept it. A single-destination `PatchPlan` body
+/// must also validate (it matches the `PatchPlan` arm and is not required to
+/// avoid the `SetPlan` arm, since `anyOf` only requires at least one match).
+#[test]
+fn set_plan_and_single_plan_bodies_validate_against_the_200_schema() {
+    use multiview_control::openapi::ApiDoc;
+    use utoipa::OpenApi;
+
+    let json = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+    let schema = &json["paths"]["/api/v1/patch/plan"]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    let name = schema["$ref"]
+        .as_str()
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .expect("the 200 references a component schema");
+    let combinator = &json["components"]["schemas"][name];
+    assert!(
+        combinator.get("anyOf").is_some(),
+        "{name} must be an anyOf (A5): {combinator}"
+    );
+
+    // A single-destination plan: matches `PatchPlan` directly.
+    let single_plan = serde_json::json!({
+        "class": "class1",
+        "crosspoints": [
+            {
+                "destination": {"output": "out-1"},
+                "path": "P1",
+                "on_air": false,
+                "refusal": null,
+            }
+        ],
+        "can_take": true,
+    });
+    // A set-of-two-destinations plan: `PatchPlan`'s fields plus `set`.
+    let set_plan = serde_json::json!({
+        "class": "class1",
+        "crosspoints": [
+            {
+                "destination": {"output": "out-1"},
+                "path": "P1",
+                "on_air": false,
+                "refusal": null,
+            },
+            {
+                "destination": {"output": "out-2"},
+                "path": "P2",
+                "on_air": false,
+                "refusal": null,
+            }
+        ],
+        "can_take": true,
+        "set": {"new_encoders": 1, "fits": true},
+    });
+
+    for (label, body) in [("single plan", &single_plan), ("set plan", &set_plan)] {
+        assert!(
+            validates_any_of(&json, combinator, body),
+            "{label} body {body} must validate against {name}'s anyOf arms"
+        );
+    }
+}
+
+/// Whether `body` satisfies at least one `anyOf` arm of `combinator`, judged
+/// against each arm's own `required`/`properties` (a minimal structural
+/// check, not a full JSON-Schema validator: this repo has no `jsonschema`
+/// dependency, so the check inlines the two properties `anyOf` promises —
+/// every `required` key present, and no property outside the arm's declared
+/// set when the arm forbids additional ones).
+fn validates_any_of(
+    doc: &serde_json::Value,
+    combinator: &serde_json::Value,
+    body: &serde_json::Value,
+) -> bool {
+    let arms = combinator["anyOf"].as_array().expect("anyOf arms");
+    arms.iter().any(|arm| {
+        let Some(name) = arm["$ref"]
+            .as_str()
+            .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        else {
+            return false;
+        };
+        let schema = &doc["components"]["schemas"][name];
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        let required_ok = required
+            .iter()
+            .all(|key| key.as_str().is_some_and(|k| body.get(k).is_some()));
+        let additional_ok = schema["additionalProperties"] != serde_json::json!(false) || {
+            let props = schema["properties"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            body.as_object()
+                .is_some_and(|obj| obj.keys().all(|k| props.contains_key(k)))
+        };
+        required_ok && additional_ok
+    })
+}
