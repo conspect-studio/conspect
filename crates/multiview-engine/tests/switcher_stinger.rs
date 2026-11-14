@@ -952,3 +952,35 @@ fn a_stinger_mix_carries_its_exact_audio_window() {
         ]
     );
 }
+
+/// Review SA-5: a clip start on the tick clones the registered store's `Arc`
+/// and never copies the player id. The engine is `forbid(unsafe_code)`, so a
+/// counting `#[global_allocator]` is not available; as in the audio store
+/// tests, the stable-pointer assertion is the proof: across many stingers the
+/// drive's clip id is the store's own id storage (one address, never a fresh
+/// `String`), and an unregistered player is no clip at all.
+#[test]
+fn a_clip_start_reuses_the_registered_store_and_copies_nothing() {
+    let mut rig = rig(None);
+    let mut addresses = HashSet::new();
+    for _ in 0..50 {
+        rig.drive.set_stinger_clip(Some("p"));
+        let id = rig.drive.stinger_clip().unwrap();
+        assert_eq!(id, "p");
+        addresses.insert(id.as_ptr() as usize);
+        rig.drive.set_stinger_clip(None);
+        assert_eq!(rig.drive.stinger_clip(), None);
+    }
+    assert_eq!(addresses.len(), 1, "a clip start copied the player id");
+    assert_eq!(
+        addresses.into_iter().next(),
+        Some(rig.p.id().as_ptr() as usize),
+        "the clip id is the registered store's own id"
+    );
+    rig.drive.set_stinger_clip(Some("missing"));
+    assert_eq!(
+        rig.drive.stinger_clip(),
+        None,
+        "an unregistered player is no clip"
+    );
+}

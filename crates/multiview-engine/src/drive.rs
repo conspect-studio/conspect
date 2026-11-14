@@ -263,7 +263,10 @@ pub struct CompositorDrive<T> {
     /// ADR-0112 §5: the stinger clip's media player, drawn as one more
     /// full-canvas tile above every other tile (its own alpha, else opaque)
     /// while its clip window is open. `None` outside a stinger clip.
-    stinger_clip: Option<String>,
+    /// The stinger clip's player store (ADR-0112 §5): an `Arc` of the
+    /// registered store, so starting a clip clones a pointer and never
+    /// allocates on the tick (review SA-5).
+    stinger_clip: Option<Arc<TileStore<T>>>,
 }
 
 impl<T> CompositorDrive<T> {
@@ -307,22 +310,22 @@ impl<T> CompositorDrive<T> {
     }
 
     /// Draw the stinger clip from `player`'s store on top of the next
-    /// composites (ADR-0112 §5), or stop with `None`. Pure state: the id is
-    /// allocated once per clip, never per tick. Only a fresh frame is drawn;
-    /// a stale, missing or unregistered player store draws nothing (never a
-    /// slate on Program), so this never fails.
+    /// composites (ADR-0112 §5), or stop with `None`. Pure state with no
+    /// allocation (review SA-5): the registered store's `Arc` is cloned.
+    /// Only a fresh frame is drawn; a stale or missing frame, or an
+    /// unregistered player (no store), draws nothing (never a slate on
+    /// Program), so this never fails.
     pub fn set_stinger_clip(&mut self, player: Option<&str>) {
-        match (player, &mut self.stinger_clip) {
-            (None, slot) => *slot = None,
-            (Some(player), Some(current)) if current == player => {}
-            (Some(player), slot) => *slot = Some(player.to_owned()),
-        }
+        self.stinger_clip = player
+            .and_then(|player| self.stores.get(player))
+            .map(Arc::clone);
     }
 
-    /// The stinger clip's player, while a clip is drawn.
+    /// The stinger clip's player id, while a clip with a registered store is
+    /// drawn.
     #[must_use]
     pub fn stinger_clip(&self) -> Option<&str> {
-        self.stinger_clip.as_deref()
+        self.stinger_clip.as_deref().map(TileStore::id)
     }
 
     /// Draw `source` as one full-canvas tile at `elapsed / duration` above
@@ -771,7 +774,7 @@ impl CompositorDrive<Nv12Image> {
         if let Some(frame) = self
             .stinger_clip
             .as_deref()
-            .and_then(|player| self.fresh_frame(player, now))
+            .and_then(|store| Self::fresh_store_frame(store, now))
         {
             held.push(frame);
             placements.push(Placement {
@@ -957,13 +960,18 @@ impl CompositorDrive<Nv12Image> {
     /// `source`'s frame at `now` if it is fresh (live), else `None`: never a
     /// held stale frame or a slate. Wait-free store read.
     fn fresh_frame(&self, source: &str, now: MediaTime) -> Option<Arc<Nv12Image>> {
-        self.stores.get(source).and_then(|store| {
-            let read = store.read_at(now);
-            match (read.state().is_live(), read.frame()) {
-                (true, Some(frame)) => Some(Arc::clone(frame)),
-                _ => None,
-            }
-        })
+        self.stores
+            .get(source)
+            .and_then(|store| Self::fresh_store_frame(store, now))
+    }
+
+    /// A store's fresh frame at `now`, or `None` when it is not live.
+    fn fresh_store_frame(store: &TileStore<Nv12Image>, now: MediaTime) -> Option<Arc<Nv12Image>> {
+        let read = store.read_at(now);
+        match (read.state().is_live(), read.frame()) {
+            (true, Some(frame)) => Some(Arc::clone(frame)),
+            _ => None,
+        }
     }
 
     /// Sample one cell's image and state without blocking: the bound source's

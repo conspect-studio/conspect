@@ -215,7 +215,10 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
   selections and AUTOs cannot move the clock (chaos test
   `a_transition_command_flood_never_moves_the_output_clock`: 600 ticks, one
   frame per tick, zero repeats, full mailbox met, at most 16 commands a tick).
-- **#1/#10 (stinger, §5):** the clip is one more full-canvas tile; the player
+- **#1/#10 (stinger, §5):** the clip is one more full-canvas tile, and a clip
+  start keeps the registered player store's `Arc` (a pointer clone, no copy
+  of the id, pinned by
+  `tests/switcher_stinger.rs::a_clip_start_reuses_the_registered_store_and_copies_nothing`); the player
   roll is one wait-free `fetch_or` into a fixed 64-bit pending mask read by
   an off-clock worker. Chaos test
   `tests/switcher_stinger.rs::a_stinger_command_flood_never_moves_the_output_clock`
