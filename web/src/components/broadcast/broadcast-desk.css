@@ -398,6 +398,9 @@
 .production-desk .bd-wall-heading h2{margin:0}
 .bd-wall-heading>span{font-size:12px;color:var(--bd-muted)}
 .bd-route-link{display:inline-flex;align-items:center;min-height:44px;margin-left:auto;padding:0 12px;border:1px solid var(--bd-line2);border-radius:6px}
+/* #419: the desk "Add source" entry point keeps the page's 48px touch target. */
+.bd-add-source-link{min-height:48px;margin-left:0}
+.bd-add-source-link+.bd-route-link{margin-left:0}
 .production-desk .bd-wall-tile{cursor:pointer;color:var(--bd-text);text-align:left;overflow:hidden;padding:0;display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-rows:minmax(0,1fr) 32px;min-height:60px}
 .production-desk .bd-wall-tile>b,.production-desk .bd-wall-tile>span:last-child{position:relative;grid-row:2;z-index:1;background:#0a0c0fe8;padding:2px 6px;line-height:14px;white-space:normal;overflow-wrap:anywhere;align-self:stretch;display:flex;align-items:center;font-size:11px}
 .production-desk .bd-wall-tile>b{grid-column:1}

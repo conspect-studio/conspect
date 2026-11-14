@@ -22,6 +22,7 @@ import { SourceDemandBadge } from '../../components/SourceDemandBadge';
 import { SourceLifecycleActions } from '../../components/SourceLifecycleActions';
 import { TileStateBadge } from '../../components/TileStateBadge';
 import { TouchAction } from '../../components/broadcast';
+import { isNotLiveStreamReason, YoutubeVtClipHint } from '../../components/YoutubeVtClipHint';
 import type { LiveTile } from '../../realtime/useEngineEvents';
 import type { SourceView } from '../../resources/types';
 import type { ProgramTally } from './useProgramTally';
@@ -70,16 +71,35 @@ export interface SourcesSurfaceProps {
 function RetryButton({ id, name }: { readonly id: string; readonly name: string }): JSX.Element {
   const { t } = useLingui();
   const action = useSourceAction();
+  const [refusal, setRefusal] = useState<string | null>(null);
   return (
-    <button
-      type="button"
-      className="act-btn retry"
-      disabled={action.isPending}
-      aria-label={t`Retry ${name}`}
-      onClick={(): void => { action.mutate({ id, action: 'start' }); }}
-    >
-      <RotateCw aria-hidden="true" /><Trans>Retry</Trans>
-    </button>
+    <span className="inline-flex flex-col gap-1">
+      <button
+        type="button"
+        className="act-btn retry"
+        disabled={action.isPending}
+        aria-label={t`Retry ${name}`}
+        onClick={(): void => {
+          setRefusal(null);
+          action.mutate(
+            { id, action: 'start' },
+            {
+              // Start can answer 409 with a problem `detail` (e.g. "applies on
+              // restart" for a stored-not-applied source) — surface that exact
+              // text, never a generic failure.
+              onError: (error) => { setRefusal(error.detail ?? error.message); },
+            },
+          );
+        }}
+      >
+        <RotateCw aria-hidden="true" /><Trans>Retry</Trans>
+      </button>
+      {refusal !== null ? (
+        <span role="alert" className="text-xs text-destructive" data-testid={`source-retry-refused-${id}`}>
+          {refusal}
+        </span>
+      ) : null}
+    </span>
   );
 }
 
@@ -146,6 +166,13 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
     if (d?.phase !== 'failed') return null;
     const manual = d.consumers.some((c) => c.kind === 'manual');
     const hasReason = d.detail !== undefined && d.detail !== null && d.detail !== '';
+    // #419 item 4: a `youtube` source failing because the video is not live
+    // (status was_live/not_live/post_live) gets the VT-clip redirect hint
+    // instead of leaving the operator to guess what "not a live stream" means.
+    const tileReason = props.tileFor(source.id)?.reason;
+    const notLive =
+      source.rawKind === 'youtube' &&
+      (isNotLiveStreamReason(d.detail) || isNotLiveStreamReason(tileReason));
     return (
       <div className="src-fail" data-testid={`source-failure-box-${source.id}`}>
         {hasReason ? (
@@ -153,6 +180,7 @@ export function SourcesSurface(props: SourcesSurfaceProps): JSX.Element {
         ) : (
           <p className="src-fail-reason"><Trans>Failed — no reason reported.</Trans></p>
         )}
+        {notLive ? <YoutubeVtClipHint /> : null}
         {manual ? null : <RetryButton id={source.id} name={source.name} />}
       </div>
     );
