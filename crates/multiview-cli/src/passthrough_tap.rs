@@ -256,6 +256,97 @@ fn extradata_sps(extradata: &[u8]) -> Option<&[u8]> {
     idr::h264_nal_of_type(extradata, NalFraming::AnnexB, 7).filter(|s| s.len() <= MAX_SPS_BYTES)
 }
 
+/// The first SPS and PPS of H.264 extradata (an avcC record or Annex-B
+/// sets), each bounded by [`MAX_SPS_BYTES`]; `None` when either is missing,
+/// truncated or over the bound.
+fn extradata_sets(extradata: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    if extradata.first() == Some(&1) {
+        let mut at = 5_usize;
+        let sps_count = extradata.get(at)? & 0x1F;
+        at += 1;
+        let mut sps: Option<&[u8]> = None;
+        for _ in 0..sps_count {
+            let len = usize::from(u16::from_be_bytes([
+                *extradata.get(at)?,
+                *extradata.get(at + 1)?,
+            ]));
+            let set = extradata.get(at + 2..at.checked_add(2)?.checked_add(len)?)?;
+            sps = sps.or(Some(set));
+            at += 2 + len;
+        }
+        let pps_count = *extradata.get(at)?;
+        at += 1;
+        let mut pps: Option<&[u8]> = None;
+        for _ in 0..pps_count {
+            let len = usize::from(u16::from_be_bytes([
+                *extradata.get(at)?,
+                *extradata.get(at + 1)?,
+            ]));
+            let set = extradata.get(at + 2..at.checked_add(2)?.checked_add(len)?)?;
+            pps = pps.or(Some(set));
+            at += 2 + len;
+        }
+        let (sps, pps) = (sps?, pps?);
+        return (sps.len() <= MAX_SPS_BYTES
+            && pps.len() <= MAX_SPS_BYTES
+            && !sps.is_empty()
+            && !pps.is_empty())
+        .then(|| (sps.to_vec(), pps.to_vec()));
+    }
+    let sps = idr::h264_nal_of_type(extradata, NalFraming::AnnexB, 7)?;
+    let pps = idr::h264_nal_of_type(extradata, NalFraming::AnnexB, 8)?;
+    (sps.len() <= MAX_SPS_BYTES && pps.len() <= MAX_SPS_BYTES).then(|| (sps.to_vec(), pps.to_vec()))
+}
+
+/// An Annex-B IDR `au` that lacks its parameter sets, with `sps` and `pps`
+/// inserted after a leading access unit delimiter (or at the front), in one
+/// exact-size allocation. `None` when the result would exceed `max_bytes`.
+fn with_sets(au: &[u8], sps: &[u8], pps: &[u8], max_bytes: usize) -> Option<Arc<[u8]>> {
+    // An AUD, when it is the first NAL, stays first (H.264 7.4.1.2.3):
+    // insert after it, at the next start code.
+    let first_nal_at = au.windows(3).position(|w| w == [0, 0, 1]).map(|p| p + 3)?;
+    let split = if au.get(first_nal_at).is_some_and(|&b| b & 0x1F == 9) {
+        au.get(first_nal_at..)?
+            .windows(3)
+            .position(|w| w == [0, 0, 1])
+            .map_or(au.len(), |p| {
+                // Back up over a 4-byte start code's leading zero.
+                let sc = first_nal_at + p;
+                if au.get(sc - 1) == Some(&0) {
+                    sc - 1
+                } else {
+                    sc
+                }
+            })
+    } else {
+        0
+    };
+    let total = au
+        .len()
+        .checked_add(8)?
+        .checked_add(sps.len())?
+        .checked_add(pps.len())?;
+    if total > max_bytes {
+        return None;
+    }
+    let mut out: Arc<[u8]> = std::iter::repeat_n(0_u8, total).collect();
+    let dst = Arc::get_mut(&mut out)?;
+    let mut at = 0_usize;
+    for part in [
+        au.get(..split)?,
+        &[0, 0, 0, 1],
+        sps,
+        &[0, 0, 0, 1],
+        pps,
+        au.get(split..)?,
+    ] {
+        dst.get_mut(at..at.checked_add(part.len())?)?
+            .copy_from_slice(part);
+        at += part.len();
+    }
+    Some(out)
+}
+
 fn code_point(v: i32) -> Option<u8> {
     // 2 = "unspecified" (ISO/IEC 23091-2); 0 and above 255 are not tags either.
     (v != 2 && v > 0).then(|| u8::try_from(v).ok()).flatten()
@@ -353,6 +444,10 @@ pub struct TapWriter {
     /// The SPS the published traits were derived from.
     traits_sps: Option<Vec<u8>>,
     last_sets: Option<Vec<u8>>,
+    /// The current H.264 SPS/PPS: from the extradata at connect, replaced by
+    /// any in-band SPS/PPS as they pass. Prepended to an IDR that lacks
+    /// them (an avcC source carries them only in extradata).
+    current_sets: Option<(Vec<u8>, Vec<u8>)>,
     gen: u64,
     connection: u64,
     /// The run's monotonic clock in nanoseconds (`None` = no run seeded).
@@ -405,7 +500,12 @@ impl TapWriter {
             CodecKind::H264 => extradata_sps(&facts.extradata).map(<[u8]>::to_vec),
             _ => None,
         };
+        let current_sets = match facts.codec {
+            CodecKind::H264 => extradata_sets(&facts.extradata),
+            _ => None,
+        };
         let mut writer = Self {
+            current_sets,
             tap,
             facts,
             traits_sps: None,
@@ -428,6 +528,34 @@ impl TapWriter {
             time_base: self.facts.time_base,
             traits,
         })));
+    }
+
+    /// In-band sets replace the cached ones; an H.264 IDR that carries
+    /// neither SPS nor PPS gets the current ones prepended (never a
+    /// duplicate). `None` when the completed AU would exceed `MAX_AU_BYTES`.
+    fn complete_idr(&mut self, bytes: Arc<[u8]>) -> Option<Arc<[u8]>> {
+        let framing = NalFraming::AnnexB;
+        if self.facts.codec != CodecKind::H264 || !idr::is_idr(&bytes, CodecKind::H264, framing) {
+            return Some(bytes);
+        }
+        let bounded =
+            |t| idr::h264_nal_of_type(&bytes, framing, t).filter(|s| s.len() <= MAX_SPS_BYTES);
+        match (bounded(7), bounded(8), self.current_sets.as_mut()) {
+            (Some(sps), Some(pps), _) => {
+                self.current_sets = Some((sps.to_vec(), pps.to_vec()));
+                Some(bytes)
+            }
+            (None, None, Some((sps, pps))) => with_sets(&bytes, sps, pps, MAX_AU_BYTES),
+            (Some(sps), None, Some((cached, _))) => {
+                *cached = sps.to_vec();
+                Some(bytes)
+            }
+            (None, Some(pps), Some((_, cached))) => {
+                *cached = pps.to_vec();
+                Some(bytes)
+            }
+            _ => Some(bytes),
+        }
     }
 
     /// The connection generation.
@@ -471,8 +599,12 @@ impl TapWriter {
                 return;
             }
         };
-        let data = &bytes[..];
         let framing = NalFraming::AnnexB;
+        let Some(bytes) = self.complete_idr(bytes) else {
+            self.tap.oversize.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let data = &bytes[..];
         let strict_idr = idr::is_self_contained_idr(data, codec, framing);
         if key || strict_idr {
             match owned_sets(data, codec, framing) {
@@ -801,5 +933,169 @@ mod tests {
         w.on_packet(&many, Some(1), Some(1), false);
         assert_eq!(tap.oversize(), 2);
         assert!(reader.try_recv().is_none());
+    }
+
+    /// A libx264 mp4 (avcC: SPS/PPS only in extradata, `repeat-headers=0`).
+    fn avcc_clip(path: &std::path::Path) {
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg("testsrc2=size=160x120:rate=25:duration=2")
+            .args(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-x264-params"])
+            .arg("keyint=10:min-keyint=10:scenecut=0:bframes=0:repeat-headers=0")
+            .args(["-f", "mp4"])
+            .arg(path)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+    }
+
+    fn open_facts(
+        codec: CodecKind,
+        framing: NalFraming,
+        time_base: Rational,
+        raw: multiview_ffmpeg::VideoStreamFacts,
+    ) -> OpenFacts {
+        OpenFacts {
+            codec,
+            framing,
+            time_base,
+            frame_rate: Rational::new(25, 1),
+            profile: raw.profile,
+            level: raw.level,
+            width: raw.width,
+            height: raw.height,
+            color_primaries: raw.color_primaries,
+            color_trc: raw.color_trc,
+            color_space: raw.color_space,
+            color_range: raw.color_range,
+            field_order: raw.field_order,
+            bits_per_raw_sample: raw.bits_per_raw_sample,
+            extradata: raw.extradata,
+            extradata_oversize: raw.extradata_oversize,
+        }
+    }
+
+    /// #344 D2a review R1-M-1: an avcC source (MP4/avc1) carries its SPS/PPS
+    /// only in extradata, so its IDR packets are not self-contained. The
+    /// tap prepends the cached sets to such IDRs: every IDR AU is strict, a
+    /// passthrough clock starts a run on it, and the emitted AUs decode.
+    #[test]
+    fn an_avcc_source_starts_a_run_and_its_aus_decode() {
+        use multiview_output::passthrough::{Emission, PassthroughClock, RepeatSource, SlotGate};
+        struct Open;
+        impl SlotGate for Open {
+            fn matches(&self, _: u64) -> bool {
+                true
+            }
+            fn matched_slate_ready(&self, _: u64) -> bool {
+                true
+            }
+        }
+        struct NoRepeat;
+        impl RepeatSource for NoRepeat {
+            fn repeat_after(&mut self, _: &TapAu) -> Option<Arc<[u8]>> {
+                None
+            }
+        }
+        multiview_ffmpeg::ensure_initialized().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avcc.mp4");
+        avcc_clip(&path);
+        let mut input = ffmpeg_next::format::input(&path).unwrap();
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .unwrap();
+        let index = stream.index();
+        let params = stream.parameters();
+        let (codec, framing) = multiview_ffmpeg::stream_framing(&params).unwrap();
+        assert!(matches!(framing, NalFraming::LengthPrefixed { .. }), "avcC");
+        let f = open_facts(
+            codec,
+            framing,
+            multiview_ffmpeg::from_ff_rational(stream.time_base()),
+            multiview_ffmpeg::video_stream_facts(&params),
+        );
+        drop(params);
+        let tap = Arc::new(SourceTap::new());
+        let reader = tap.tap().subscribe().unwrap();
+        let mut w = TapWriter::connect(Arc::clone(&tap), f, clock());
+        let mut raw_idrs_without_sets = 0;
+        for (s, packet) in input.packets() {
+            if s.index() != index {
+                continue;
+            }
+            let bytes = packet.data().unwrap();
+            if packet.is_key() && !idr::is_self_contained_idr(bytes, CodecKind::H264, framing) {
+                raw_idrs_without_sets += 1;
+            }
+            w.on_packet(bytes, packet.dts(), packet.pts(), packet.is_key());
+        }
+        assert!(
+            raw_idrs_without_sets >= 4,
+            "the source IDRs lack in-band sets"
+        );
+        let aus: Vec<TapAu> = reader.drain().collect();
+        assert_eq!(aus.len(), 50);
+        let idrs: Vec<&TapAu> = aus
+            .iter()
+            .filter(|a| idr::is_idr(&a.data, CodecKind::H264, NalFraming::AnnexB))
+            .collect();
+        assert!(idrs.len() >= 4);
+        assert!(idrs.iter().all(|a| a.strict_idr), "every IDR is strict");
+        assert!(aus.iter().all(|a| a.params_gen == aus[0].params_gen));
+        // A clock starts a run on the first IDR and passes every AU through.
+        let mut c = PassthroughClock::new(Rational::new(25, 1));
+        c.arm();
+        let mut emitted = Vec::new();
+        let mut it = aus.into_iter();
+        for tick in 0..60_u64 {
+            let next: Vec<TapAu> = it.next().into_iter().collect();
+            if let Emission::Au { data, .. } =
+                c.on_tick(tick, 7, next.into_iter(), &Open, &mut NoRepeat)
+            {
+                emitted.push(data);
+            }
+        }
+        assert!(emitted.len() >= 45, "a run started: {} AUs", emitted.len());
+        let mut dec = multiview_ffmpeg::H264PacketDecoder::new(Rational::new(1, 25)).unwrap();
+        let mut frames = 0;
+        for (i, au) in emitted.iter().enumerate() {
+            dec.push(au, Some(i64::try_from(i).unwrap())).unwrap();
+            while dec.receive_frame().unwrap().is_some() {
+                frames += 1;
+            }
+        }
+        dec.send_eof().unwrap();
+        while dec.receive_frame().unwrap().is_some() {
+            frames += 1;
+        }
+        assert_eq!(frames, emitted.len(), "every emitted AU decodes");
+    }
+
+    /// The cached sets go after a leading AUD and before the IDR slice.
+    #[test]
+    fn sets_are_inserted_after_a_leading_aud() {
+        let au = annexb(&[&[0x09, 0x10], &[0x65, 0x88, 0x80]]);
+        let full = with_sets(&au, SPS, PPS, MAX_AU_BYTES).unwrap();
+        assert_eq!(
+            &full[..],
+            &annexb(&[&[0x09, 0x10], SPS, PPS, &[0x65, 0x88, 0x80]])[..]
+        );
+        let bare = annexb(&[&[0x65, 0x88, 0x80]]);
+        let full = with_sets(&bare, SPS, PPS, MAX_AU_BYTES).unwrap();
+        assert_eq!(&full[..], &annexb(&[SPS, PPS, &[0x65, 0x88, 0x80]])[..]);
+        assert!(
+            with_sets(&bare, SPS, PPS, bare.len() + 8).is_none(),
+            "bounded"
+        );
     }
 }
