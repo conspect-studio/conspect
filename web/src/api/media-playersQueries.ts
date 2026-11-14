@@ -18,6 +18,7 @@ import {
   cancelMediaPlayerExit,
   cueMediaPlayer,
   getPlayerLoadOperation,
+  isTerminalLoadOperationState,
   listMediaPlayers,
   loadMediaPlayer,
   loadMediaPlayerArtifact,
@@ -39,6 +40,8 @@ import type {
 } from './media-players';
 
 export type { MediaPlayer, ArtifactRef, LoadOperation, LoadResponse, LoadThen, NativeLoadAck } from './media-players';
+export { isTerminalLoadOperationState } from './media-players';
+export type { LoadOperationState } from './media-players';
 export { OperationApiError } from './operations';
 
 /** Connection options threaded into the media-player hooks. */
@@ -166,15 +169,12 @@ export function mediaPlayerLoadOperationKey(
   return ['media-players', playerId, 'load-operations', operation] as const;
 }
 
-/** Lifecycle states where the native load commit is still in flight. */
-function isPendingLoadOperationState(state: string): boolean {
-  return state === 'pending' || state === 'queued' || state === 'in_progress';
-}
-
 /**
  * Poll one player's native load operation
  * (`GET .../load-operations/{operation}`) on a ~2s interval, stopping once
- * its `state` leaves the pending set (e.g. `committed`/`failed`/`superseded`).
+ * its `state` is terminal (`completed`/`failed`/`superseded` —
+ * {@link isTerminalLoadOperationState}; the actual state set this provider
+ * reports, `crates/multiview-cli/src/player/provider.rs::classify`).
  */
 export function useMediaPlayerLoadOperation(
   playerId: string | undefined,
@@ -191,7 +191,7 @@ export function useMediaPlayerLoadOperation(
     },
     enabled: playerId !== undefined && operation !== undefined,
     refetchInterval: (query): number | false =>
-      query.state.data !== undefined && !isPendingLoadOperationState(query.state.data.state)
+      query.state.data !== undefined && isTerminalLoadOperationState(query.state.data.state)
         ? false
         : 2000,
   });

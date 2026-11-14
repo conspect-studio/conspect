@@ -25,9 +25,20 @@
 // refuses `steps` capture combined with the wind overlay) so the UI hides
 // and forces realtime for Wind. In steps mode `frames` is ignored
 // server-side, so the frames field is hidden; the nominal total frame count
-// (`max_steps * round(frame_ms * fps / 1000) + round(end_hold_ms * fps /
-// 1000)`) must stay <= 600 (the server's hard cap), validated client-side
-// below.
+// (`max_steps * max(1, framesAt(frame_ms, fps)) + framesAt(end_hold_ms,
+// fps)`, half-up integer rounding exactly like the server) must stay <= 600
+// (the server's hard cap), validated client-side below.
+//
+// IDENTITY (capture attempt / load key): one capture ATTEMPT is an immutable
+// {Idempotency-Key, CaptureBody} pair, minted fresh only on an explicit new
+// attempt (first submit, Re-capture, or a changed parameter) and otherwise
+// kept verbatim so a lost-response Retry resends the identical pair — the
+// server replays the same job rather than starting a second one. Likewise
+// the artifact-load Idempotency-Key is minted fresh once per NEW succeeded
+// capture job and reused only for a retry of that same load; reusing it
+// across two different jobs would send two different `artifactRef`s under
+// one key, which the server refuses with "load key reused with different
+// request" (`crates/multiview-cli/src/player/provider.rs`).
 import { useEffect, useRef, useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
@@ -72,6 +83,14 @@ type StepTiming = NonNullable<CaptureView['timing']>;
 /** The server's hard cap on nominal total frames for any one capture. */
 const MAX_NOMINAL_FRAMES = 600;
 
+/**
+ * Stable id of the frame-cap error, linked from every contributing input's
+ * `aria-describedby` (fps, frame duration, end hold, max steps) while it is
+ * `aria-invalid` (finding 5), so a screen reader announces the one error at
+ * each field it is caused by.
+ */
+const FRAME_CAP_ERROR_ID = 'windy-frame-cap-error';
+
 /** Default steps-mode per-step duration, ms (`View.frame_ms`). */
 const DEFAULT_FRAME_MS = 600;
 
@@ -82,14 +101,29 @@ const DEFAULT_END_HOLD_MS = 1000;
 const DEFAULT_MAX_STEPS = 12;
 
 /**
+ * Half-up integer frame count for a duration at `fps`, bit-for-bit identical
+ * to the server's `frames_for_ms` (`crates/multiview-webengine/src/capture.rs`)
+ * and its JS mirror `framesAt` (`crates/multiview-webengine/src/step_plan.cjs`):
+ * `floor((ms * fps + 500) / 1000)`. Every input here is a small safe integer
+ * (`frame_ms` <= 5000, `fps` <= 30, `end_hold_ms` <= 10000), so this integer
+ * formula is exact — never `Math.round`, which is float-based and not what
+ * either server implementation computes.
+ */
+function framesAtHalfUp(ms: number, fps: number): number {
+  return Math.floor((ms * fps + 500) / 1000);
+}
+
+/**
  * The nominal total frame count the server computes for a steps-mode
- * capture: `max_steps * round(frame_ms * fps / 1000) + round(end_hold_ms *
- * fps / 1000)`. Mirrors the server-side cap check so the client can refuse
- * a doomed submit before it round-trips.
+ * capture: `max_steps * max(1, framesAt(frame_ms, fps)) + framesAt(end_hold_ms,
+ * fps)` (`capture.rs` ~226, `step_plan.cjs` `validateOptions`). The `max(1,
+ * …)` matters: a short `frame_ms` at a low `fps` can round to zero steps,
+ * which the server still counts as one. Mirrors the server-side cap check so
+ * the client can refuse a doomed submit before it round-trips.
  */
 function nominalStepsFrames(fps: number, frameMs: number, endHoldMs: number, maxSteps: number): number {
-  const perStep = Math.round((frameMs * fps) / 1000);
-  const hold = Math.round((endHoldMs * fps) / 1000);
+  const perStep = Math.max(1, framesAtHalfUp(frameMs, fps));
+  const hold = framesAtHalfUp(endHoldMs, fps);
   return maxSteps * perStep + hold;
 }
 
@@ -239,6 +273,20 @@ export interface WindyFillDialogProps {
 }
 
 /**
+ * One immutable capture attempt: the `Idempotency-Key` minted for it and the
+ * exact `CaptureBody` sent with that key. Kept until a brand-new attempt
+ * (submit from scratch, or Re-capture) replaces it — never discarded on a
+ * failed/unknown POST outcome, so "Retry" can resend the IDENTICAL key+body
+ * and let the server replay the same job rather than starting a second one
+ * (`crates/multiview-control/src/routes/web_capture.rs`: "same key and body
+ * replays the same job").
+ */
+interface CaptureAttempt {
+  readonly key: string;
+  readonly body: CaptureBody;
+}
+
+/**
  * The "Fill from web…" dialog for one player: capture a bounded Windy view,
  * then load the finished artifact into that player.
  */
@@ -256,6 +304,13 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
   const [draft, setDraft] = useState<FillDraft>(() => (player !== null ? loadDraft(player.id) : DEFAULT_DRAFT));
   const [termsAccepted, setTermsAccepted] = useState(false);
   const [jobId, setJobId] = useState<number | undefined>(undefined);
+  // The immutable {key, body} of the current capture attempt (finding 2):
+  // kept across a lost-response retry, replaced only by a brand-new attempt.
+  const [captureAttempt, setCaptureAttempt] = useState<CaptureAttempt | undefined>(undefined);
+  // The load key for THIS capture attempt's artifact (finding 1): minted once
+  // per jobId (i.e. once per new succeeded capture), reused only for a retry
+  // of that same load. A brand-new capture (Re-capture, or a changed-params
+  // submit) always gets a brand-new jobId and therefore a brand-new load key.
   const [loadKey, setLoadKey] = useState<string | undefined>(undefined);
   const [loadOperation, setLoadOperation] = useState<number | undefined>(undefined);
   const [loadError, setLoadError] = useState<string | undefined>(undefined);
@@ -271,27 +326,19 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
   const terminalCaptureState =
     jobState === 'succeeded' || jobState === 'failed' || jobState === 'cancelled' || jobState === 'uncertain';
 
-  // On a fresh success, submit the artifact load exactly once per attempt.
-  useEffect(() => {
-    if (
-      player === null
-      || jobState !== 'succeeded'
-      || job.data?.artifact_id === undefined
-      || job.data.artifact_id === null
-      || jobId === undefined
-      || loadTriggeredRef.current
-    ) {
-      return;
-    }
-    loadTriggeredRef.current = true;
+  /**
+   * POST the artifact load with an EXPLICIT key (finding 1): the caller
+   * decides fresh-vs-reuse, this function never mints one itself. Used both
+   * by the one-shot auto-trigger below and by a same-key load Retry.
+   */
+  const submitLoad = (key: string, currentJobId: number, artifactId: string): void => {
+    if (player === null) return;
     setLoadStarted(true);
     setLoadError(undefined);
-    const key = loadKey ?? newIdempotencyKey();
-    setLoadKey(key);
     loadArtifact.mutate(
       {
         id: player.id,
-        artifactRef: { captureJobId: jobId, artifactId: job.data.artifact_id },
+        artifactRef: { captureJobId: currentJobId, artifactId },
         then: draft.then,
         idempotencyKey: key,
       },
@@ -310,8 +357,29 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
         },
       },
     );
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- loadTriggeredRef gates re-entry; draft/loadArtifact/loadKey are stable enough for this one-shot trigger.
-  }, [player, jobState, job.data, jobId]);
+  };
+
+  // On a fresh success, submit the artifact load exactly once per attempt,
+  // minting a BRAND-NEW load key for this (job, artifact) pair — never the
+  // previous attempt's key, which was bound to a different artifactRef and
+  // would be refused by the server ("load key reused with different
+  // request", finding 1).
+  useEffect(() => {
+    if (
+      jobState !== 'succeeded'
+      || job.data?.artifact_id === undefined
+      || job.data.artifact_id === null
+      || jobId === undefined
+      || loadTriggeredRef.current
+    ) {
+      return;
+    }
+    loadTriggeredRef.current = true;
+    const key = newIdempotencyKey();
+    setLoadKey(key);
+    submitLoad(key, jobId, job.data.artifact_id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- loadTriggeredRef gates re-entry; draft/submitLoad are stable enough for this one-shot trigger.
+  }, [jobState, job.data, jobId]);
 
   if (player === null) {
     return <></>;
@@ -349,8 +417,8 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
     : draft.frames;
   const frameCapExceeded = isStepsMode && nominalFrames > MAX_NOMINAL_FRAMES;
 
-  const submit = (): void => {
-    if (!termsAccepted || !capsAvailable || frameCapExceeded) return;
+  /** Build the current draft's `CaptureBody` (never submits by itself). */
+  const buildCaptureBody = (): CaptureBody => {
     const view: CaptureView = {
       lat: draft.lat,
       lon: draft.lon,
@@ -366,36 +434,67 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
         ? { timing: draft.timing, frame_ms: draft.frameMs, end_hold_ms: draft.endHoldMs, max_steps: draft.maxSteps }
         : {}),
     };
-    const body: CaptureBody = {
+    return {
       fill_id: windyFillId(playerId),
       target_player: playerId,
       view,
       terms: { accepted: true, version: WINDY_TERMS_VERSION },
     };
-    saveDraft(playerId, draft);
-    const key = newIdempotencyKey();
-    setJobId(undefined);
-    setLoadOperation(undefined);
-    setLoadError(undefined);
-    setLoadStarted(false);
-    loadTriggeredRef.current = false;
+  };
+
+  /**
+   * POST one capture attempt's {key, body} — never mints a new pair itself.
+   * Both a definite server error AND a lost response (network error: the
+   * `fetch` in `createCapture` throws, which `useMutation` surfaces as this
+   * same `onError`) land here with NO new key minted (finding 2): the
+   * attempt's key+body survive untouched in `captureAttempt`, so "Retry"
+   * resends the identical pair and the server either replays the admitted
+   * job or runs it for the first time — never a second, differently-keyed
+   * capture of the same operator intent.
+   */
+  const submitAttempt = (attempt: CaptureAttempt): void => {
     createCapture.mutate(
-      { body, idempotencyKey: key },
+      { body: attempt.body, idempotencyKey: attempt.key },
       {
         onSuccess: (accepted): void => {
+          // A NEW succeeded job always gets a NEW load key (finding 1): the
+          // artifact differs from any prior attempt's, so the previous load
+          // key — bound to a different artifactRef — must never be reused.
+          setLoadKey(undefined);
           setJobId(accepted.job_id);
         },
       },
     );
   };
 
-  const recapture = (): void => {
+  /** A brand-new capture attempt: mint a fresh key+body pair and submit it. */
+  const submit = (): void => {
+    if (!termsAccepted || !capsAvailable || frameCapExceeded) return;
+    saveDraft(playerId, draft);
+    const attempt: CaptureAttempt = { key: newIdempotencyKey(), body: buildCaptureBody() };
+    setCaptureAttempt(attempt);
     setJobId(undefined);
     setLoadOperation(undefined);
     setLoadError(undefined);
     setLoadStarted(false);
     loadTriggeredRef.current = false;
+    submitAttempt(attempt);
+  };
+
+  /** Re-capture: always a brand-new attempt (new key, new body, new job). */
+  const recapture = (): void => {
     submit();
+  };
+
+  /**
+   * Retry the CURRENT attempt's POST with its IDENTICAL key+body (finding
+   * 2): used only when the previous POST's outcome is unknown or failed —
+   * never mints a new idempotency key, so an admitted-but-lost first attempt
+   * replays the same job rather than starting a second capture.
+   */
+  const retrySubmit = (): void => {
+    if (captureAttempt === undefined) return;
+    submitAttempt(captureAttempt);
   };
 
   const captureJobLabel = (state: string | undefined): string => {
@@ -417,14 +516,20 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
     }
   };
 
+  /**
+   * Labels for the native load operation's ACTUAL state set — `pending`
+   * (in flight), `completed`, `failed`, `superseded`
+   * (`crates/multiview-cli/src/player/provider.rs::classify`; finding 3). No
+   * other provider state (`queued`/`in_progress`/`committed`) is ever
+   * reported by this server; an unrecognised value still renders (its raw
+   * name) rather than silently becoming "Unknown".
+   */
   const loadOperationLabel = (state: string | undefined): string => {
     switch (state) {
       case 'pending':
-      case 'queued':
-      case 'in_progress':
         return t`Committing`;
-      case 'committed':
-        return t`Committed`;
+      case 'completed':
+        return t`Completed`;
       case 'failed':
         return t`Failed`;
       case 'superseded':
@@ -615,6 +720,8 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                   max={30}
                   step={1}
                   value={draft.fps}
+                  aria-invalid={frameCapExceeded}
+                  {...(frameCapExceeded ? { 'aria-describedby': FRAME_CAP_ERROR_ID } : {})}
                   onChange={(e): void => {
                     setDraft((d) => ({ ...d, fps: Number(e.target.value) }));
                   }}
@@ -770,6 +877,8 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                         max={5000}
                         step={1}
                         value={draft.frameMs}
+                        aria-invalid={frameCapExceeded}
+                        {...(frameCapExceeded ? { 'aria-describedby': FRAME_CAP_ERROR_ID } : {})}
                         onChange={(e): void => {
                           setDraft((d) => ({ ...d, frameMs: Number(e.target.value) }));
                         }}
@@ -786,6 +895,8 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                         max={10000}
                         step={1}
                         value={draft.endHoldMs}
+                        aria-invalid={frameCapExceeded}
+                        {...(frameCapExceeded ? { 'aria-describedby': FRAME_CAP_ERROR_ID } : {})}
                         onChange={(e): void => {
                           setDraft((d) => ({ ...d, endHoldMs: Number(e.target.value) }));
                         }}
@@ -802,6 +913,8 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                         max={48}
                         step={1}
                         value={draft.maxSteps}
+                        aria-invalid={frameCapExceeded}
+                        {...(frameCapExceeded ? { 'aria-describedby': FRAME_CAP_ERROR_ID } : {})}
                         onChange={(e): void => {
                           setDraft((d) => ({ ...d, maxSteps: Number(e.target.value) }));
                         }}
@@ -810,7 +923,7 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                   </div>
 
                   {frameCapExceeded ? (
-                    <p role="alert" className="text-xs text-destructive">
+                    <p id={FRAME_CAP_ERROR_ID} role="alert" className="text-xs text-destructive">
                       <Trans>
                         This would capture {nominalFrames} frames, above the
                         server's cap of {MAX_NOMINAL_FRAMES}. Lower max
@@ -886,7 +999,7 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
             </div>
           </fieldset>
 
-          {createCapture.isError ? (
+          {createCapture.isError && jobId === undefined ? (
             <p role="alert" className="text-sm text-destructive">
               {errorText(createCapture.error)}
             </p>
@@ -916,22 +1029,45 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
               {loadStarted ? (
                 <div className="mt-2 border-t pt-2">
                   <p className="flex items-center gap-2">
-                    {loadOp.data?.state === 'committed' ? (
-                      <CheckCircle2 className="size-4 text-green-600" aria-hidden="true" />
-                    ) : loadOp.data?.state === 'failed' ? (
-                      <XCircle className="size-4 text-destructive" aria-hidden="true" />
-                    ) : (
-                      <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-                    )}
+                    {
+                      // The real terminal states this provider reports are
+                      // `completed`/`failed`/`superseded` — never `committed`
+                      // (finding 3). No state renders a spinner once terminal.
+                      loadOp.data?.state === 'completed' ? (
+                        <CheckCircle2 className="size-4 text-green-600" aria-hidden="true" />
+                      ) : loadOp.data?.state === 'failed' || loadOp.data?.state === 'superseded' ? (
+                        <XCircle className="size-4 text-destructive" aria-hidden="true" />
+                      ) : (
+                        <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                      )
+                    }
                     <Trans>Load</Trans>:{' '}
                     {loadOperation !== undefined
                       ? loadOperationLabel(loadOp.data?.state)
                       : t`Accepted`}
                   </p>
                   {loadError !== undefined ? (
-                    <p role="alert" className="mt-1 text-destructive">
-                      {loadError}
-                    </p>
+                    <div className="mt-1 flex items-center gap-2">
+                      <p role="alert" className="text-destructive">
+                        {loadError}
+                      </p>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={loadArtifact.isPending}
+                        onClick={(): void => {
+                          // Resend this SAME load key (never a fresh one):
+                          // the server replays the same operation rather
+                          // than starting a second commit (finding 1).
+                          if (loadKey !== undefined && job.data?.artifact_id) {
+                            submitLoad(loadKey, jobId, job.data.artifact_id);
+                          }
+                        }}
+                      >
+                        <Trans>Retry load</Trans>
+                      </Button>
+                    </div>
                   ) : null}
                   {loadOp.isError ? (
                     <p role="alert" className="mt-1 text-destructive">
@@ -968,7 +1104,15 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
           <Button type="button" variant="outline" onClick={close}>
             <Trans>Close</Trans>
           </Button>
-          {jobId === undefined || (terminalCaptureState && jobState !== 'succeeded') ? (
+          {jobId === undefined && createCapture.isError ? (
+            // The POST failed or its response was lost: offer the SAME
+            // attempt's key+body as a Retry (finding 2), never a fresh
+            // Capture that would mint a new key and risk a duplicate job.
+            <Button type="button" disabled={submitting} onClick={retrySubmit}>
+              {submitting ? <Loader2 className="mr-2 size-4 animate-spin" aria-hidden="true" /> : null}
+              <Trans>Retry</Trans>
+            </Button>
+          ) : jobId === undefined || (terminalCaptureState && jobState !== 'succeeded') ? (
             <Button
               type="button"
               disabled={!termsAccepted || !capsAvailable || submitting || frameCapExceeded}

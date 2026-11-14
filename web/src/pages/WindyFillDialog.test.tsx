@@ -210,9 +210,102 @@ describe('WindyFillDialog', () => {
       expect(screen.getByText(/above the server's cap of 600/i)).toBeInTheDocument();
     });
     expect(captureButton).toBeDisabled();
+
+    // Finding 5: the contributing step-loop inputs are marked invalid and
+    // described by the SAME stable error id while the cap is exceeded.
+    const errorId = screen.getByText(/above the server's cap of 600/i).id;
+    expect(errorId).toBeTruthy();
+    for (const field of [
+      screen.getByLabelText(/^fps$/i),
+      frameMs,
+      screen.getByLabelText(/end hold/i),
+      maxSteps,
+    ]) {
+      expect(field).toHaveAttribute('aria-invalid', 'true');
+      expect(field.getAttribute('aria-describedby')).toBe(errorId);
+    }
   });
 
-  it('runs the happy path: capture -> succeeded -> artifact load -> committed', async () => {
+  it('frame-cap boundary: fps=1, frame_ms=100, max_steps=12, hold=0 -> exactly 12 frames (allowed)', async () => {
+    server.use(capabilitiesHandler());
+    renderDialog();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+
+    const fps = screen.getByLabelText(/^fps$/i);
+    await userEvent.clear(fps);
+    await userEvent.type(fps, '1');
+
+    const frameMs = screen.getByLabelText(/frame duration/i);
+    await userEvent.clear(frameMs);
+    await userEvent.type(frameMs, '100');
+
+    const endHoldMs = screen.getByLabelText(/end hold/i);
+    await userEvent.clear(endHoldMs);
+    await userEvent.type(endHoldMs, '0');
+
+    const maxSteps = screen.getByLabelText(/max steps/i);
+    await userEvent.clear(maxSteps);
+    await userEvent.type(maxSteps, '12');
+
+    // framesAt(100, 1) = floor((100*1+500)/1000) = 0, so max(1, 0) = 1 per
+    // step; 12 steps * 1 + framesAt(0, 1) = 12 + 0 = 12 total.
+    await waitFor(() => {
+      expect(screen.getByText(/Nominal total frames: 12 /)).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: 'Capture' })).toBeEnabled();
+  });
+
+  it('frame-cap boundary: exactly 600 nominal frames is allowed, 601 is blocked', async () => {
+    server.use(capabilitiesHandler());
+    renderDialog();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+
+    // fps=10, frame_ms=1500 -> framesAt(1500,10) = floor((15000+500)/1000)
+    // = 15 frames/step; max_steps=40 (within the 2-48 UI range);
+    // end_hold_ms=0 -> 0 hold frames. Nominal total: 40*15+0 = 600 — the
+    // cap, exactly allowed.
+    const fps = screen.getByLabelText(/^fps$/i);
+    await userEvent.clear(fps);
+    await userEvent.type(fps, '10');
+
+    const frameMs = screen.getByLabelText(/frame duration/i);
+    await userEvent.clear(frameMs);
+    await userEvent.type(frameMs, '1500');
+
+    const endHoldMs = screen.getByLabelText(/end hold/i);
+    await userEvent.clear(endHoldMs);
+    await userEvent.type(endHoldMs, '0');
+
+    const maxSteps = screen.getByLabelText(/max steps/i);
+    await userEvent.clear(maxSteps);
+    await userEvent.type(maxSteps, '40');
+
+    await waitFor(() => {
+      expect(screen.getByText(/Nominal total frames: 600 /)).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: 'Capture' })).toBeEnabled();
+
+    // Add one hold frame (end_hold_ms=50 -> framesAt(50,10) =
+    // floor((500+500)/1000) = 1) to push the nominal total to 601 — one
+    // over the cap, blocked.
+    await userEvent.clear(endHoldMs);
+    await userEvent.type(endHoldMs, '50');
+
+    await waitFor(() => {
+      expect(screen.getByText(/above the server's cap of 600/i)).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: 'Capture' })).toBeDisabled();
+  });
+
+  it('runs the happy path: capture -> succeeded -> artifact load -> completed', async () => {
     let createCalls = 0;
     server.use(
       capabilitiesHandler(),
@@ -237,9 +330,12 @@ describe('WindyFillDialog', () => {
         return HttpResponse.json({ operation: 7, state: 'pending' }, { status: 202 });
       }),
       http.get('*/api/v1/media/players/vt-1/load-operations/7', () =>
+        // The real terminal success state this provider reports is
+        // `completed` — never the fabricated `committed`
+        // (`crates/multiview-cli/src/player/provider.rs::classify`).
         HttpResponse.json({
           operation: 7,
-          state: 'committed',
+          state: 'completed',
           native: {
             cadence_num: 25,
             cadence_den: 1,
@@ -272,14 +368,138 @@ describe('WindyFillDialog', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText(/Committed/)).toBeInTheDocument();
+      expect(screen.getByText(/Completed/)).toBeInTheDocument();
     });
 
-    // The native ack (geometry + audio presence) is shown once committed.
+    // The native ack (geometry + audio presence) is shown once completed.
     expect(screen.getByText(/60 frames/)).toBeInTheDocument();
     expect(screen.getByText(/silent/i)).toBeInTheDocument();
 
     expect(screen.getByRole('button', { name: 'Re-capture' })).toBeInTheDocument();
+  });
+
+  it('shows the terminal superseded load state with no spinner', async () => {
+    server.use(
+      capabilitiesHandler(),
+      http.post('*/api/v1/media/captures', () =>
+        HttpResponse.json({ job_id: 50, status_url: '/api/v1/media/captures/50' }, { status: 202 })),
+      http.get('*/api/v1/media/captures/50', () =>
+        HttpResponse.json({ job_id: 50, fill_id: 'vt-vt-1-windy', state: 'succeeded', artifact_id: 'art-50' })),
+      http.post('*/api/v1/media/players/vt-1/load', () =>
+        HttpResponse.json({ operation: 9, state: 'pending' }, { status: 202 })),
+      http.get('*/api/v1/media/players/vt-1/load-operations/9', () =>
+        HttpResponse.json({ operation: 9, state: 'superseded', native: null })),
+    );
+
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Superseded/)).toBeInTheDocument();
+    });
+    // Terminal: no spinner (`animate-spin`) anywhere in the load status row.
+    expect(document.querySelector('.animate-spin')).not.toBeInTheDocument();
+  });
+
+  it('shows the terminal failed load state with no spinner', async () => {
+    server.use(
+      capabilitiesHandler(),
+      http.post('*/api/v1/media/captures', () =>
+        HttpResponse.json({ job_id: 51, status_url: '/api/v1/media/captures/51' }, { status: 202 })),
+      http.get('*/api/v1/media/captures/51', () =>
+        HttpResponse.json({ job_id: 51, fill_id: 'vt-vt-1-windy', state: 'succeeded', artifact_id: 'art-51' })),
+      http.post('*/api/v1/media/players/vt-1/load', () =>
+        HttpResponse.json({ operation: 10, state: 'pending' }, { status: 202 })),
+      http.get('*/api/v1/media/players/vt-1/load-operations/10', () =>
+        HttpResponse.json({ operation: 10, state: 'failed', native: null })),
+    );
+
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+
+    await waitFor(() => {
+      // "Load: Failed" — scope to the load row, distinct from a capture-job failure.
+      expect(screen.getByText(/Load:/)).toBeInTheDocument();
+    });
+    await waitFor(() => {
+      const loadRow = screen.getByText(/Load:/).closest('p');
+      expect(loadRow).toHaveTextContent(/Failed/);
+    });
+    expect(document.querySelector('.animate-spin')).not.toBeInTheDocument();
+  });
+
+  it('mints a distinct load key per new capture->load cycle, and a retried load reuses its key', async () => {
+    const loadKeysByOperation = new Map<number, string>();
+    let loadCalls = 0;
+    server.use(
+      capabilitiesHandler(),
+      http.post('*/api/v1/media/captures', () =>
+        HttpResponse.json({ job_id: 60, status_url: '/api/v1/media/captures/60' }, { status: 202 })),
+      http.get('*/api/v1/media/captures/60', () =>
+        HttpResponse.json({ job_id: 60, fill_id: 'vt-vt-1-windy', state: 'succeeded', artifact_id: 'art-60' })),
+      http.post('*/api/v1/media/players/vt-1/load', ({ request }) => {
+        loadCalls += 1;
+        const key = request.headers.get('idempotency-key');
+        expect(key).toBeTruthy();
+        loadKeysByOperation.set(100, key ?? '');
+        return HttpResponse.json({ operation: 100, state: 'pending' }, { status: 202 });
+      }),
+      http.get('*/api/v1/media/players/vt-1/load-operations/100', () =>
+        HttpResponse.json({ operation: 100, state: 'completed', native: null })),
+    );
+
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+    await waitFor(() => {
+      expect(screen.getByText(/Completed/)).toBeInTheDocument();
+    });
+
+    expect(loadCalls).toBe(1);
+    const firstKey = loadKeysByOperation.get(100);
+    expect(firstKey).toBeTruthy();
+
+    // Second full capture -> load cycle (Re-capture): a different job
+    // produces a different artifact, so this MUST mint a distinct load key
+    // (finding 1), never reuse the first job's key.
+    server.use(
+      http.post('*/api/v1/media/captures', () =>
+        HttpResponse.json({ job_id: 61, status_url: '/api/v1/media/captures/61' }, { status: 202 })),
+      http.get('*/api/v1/media/captures/61', () =>
+        HttpResponse.json({ job_id: 61, fill_id: 'vt-vt-1-windy', state: 'succeeded', artifact_id: 'art-61' })),
+      http.post('*/api/v1/media/players/vt-1/load', ({ request }) => {
+        loadCalls += 1;
+        const key = request.headers.get('idempotency-key');
+        expect(key).toBeTruthy();
+        loadKeysByOperation.set(101, key ?? '');
+        return HttpResponse.json({ operation: 101, state: 'pending' }, { status: 202 });
+      }),
+      http.get('*/api/v1/media/players/vt-1/load-operations/101', () =>
+        HttpResponse.json({ operation: 101, state: 'completed', native: null })),
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Re-capture' }));
+    await waitFor(() => {
+      expect(loadCalls).toBe(2);
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/Completed/)).toBeInTheDocument();
+    });
+
+    const secondKey = loadKeysByOperation.get(101);
+    expect(secondKey).toBeTruthy();
+    expect(secondKey).not.toBe(firstKey);
   });
 
   it('shows the problem-detail text on a capture create failure', async () => {
@@ -335,5 +555,89 @@ describe('WindyFillDialog', () => {
     });
     expect(screen.queryByLabelText(/Premium \(authenticated\) capture/i)).not.toBeInTheDocument();
     expect(screen.getByText(/Premium Windy capture is not configured/i)).toBeInTheDocument();
+  });
+
+  it('a lost capture-create response (network error) offers Retry, which resends the SAME key+body', async () => {
+    let postCalls = 0;
+    const keysSeen: (string | null)[] = [];
+    const bodiesSeen: unknown[] = [];
+    server.use(
+      capabilitiesHandler(),
+      http.post('*/api/v1/media/captures', async ({ request }) => {
+        postCalls += 1;
+        keysSeen.push(request.headers.get('idempotency-key'));
+        bodiesSeen.push(await request.json());
+        if (postCalls === 1) {
+          // Simulate a lost response: the POST may have been admitted
+          // server-side, but this client never sees a reply.
+          return HttpResponse.error();
+        }
+        return HttpResponse.json({ job_id: 70, status_url: '/api/v1/media/captures/70' }, { status: 202 });
+      }),
+      http.get('*/api/v1/media/captures/70', () =>
+        HttpResponse.json({ job_id: 70, fill_id: 'vt-vt-1-windy', state: 'queued' })),
+    );
+
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+
+    const retryButton = await screen.findByRole('button', { name: 'Retry' });
+    await userEvent.click(retryButton);
+
+    await waitFor(() => {
+      expect(postCalls).toBe(2);
+    });
+    // Finding 2: the SAME idempotency key and the SAME body on the retry —
+    // never a freshly-minted key, which would risk a duplicate capture if
+    // the first (lost-response) POST had actually been admitted.
+    expect(keysSeen[1]).toBe(keysSeen[0]);
+    expect(keysSeen[0]).toBeTruthy();
+    expect(bodiesSeen[1]).toEqual(bodiesSeen[0]);
+  });
+
+  it('a lost artifact-load response offers Retry load, which resends the SAME load key', async () => {
+    let loadCalls = 0;
+    const loadKeysSeen: (string | null)[] = [];
+    server.use(
+      capabilitiesHandler(),
+      http.post('*/api/v1/media/captures', () =>
+        HttpResponse.json({ job_id: 80, status_url: '/api/v1/media/captures/80' }, { status: 202 })),
+      http.get('*/api/v1/media/captures/80', () =>
+        HttpResponse.json({ job_id: 80, fill_id: 'vt-vt-1-windy', state: 'succeeded', artifact_id: 'art-80' })),
+      http.post('*/api/v1/media/players/vt-1/load', ({ request }) => {
+        loadCalls += 1;
+        loadKeysSeen.push(request.headers.get('idempotency-key'));
+        if (loadCalls === 1) {
+          return HttpResponse.error();
+        }
+        return HttpResponse.json({ operation: 200, state: 'pending' }, { status: 202 });
+      }),
+      http.get('*/api/v1/media/players/vt-1/load-operations/200', () =>
+        HttpResponse.json({ operation: 200, state: 'completed', native: null })),
+    );
+
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+
+    const retryLoadButton = await screen.findByRole('button', { name: 'Retry load' });
+    await userEvent.click(retryLoadButton);
+
+    await waitFor(() => {
+      expect(loadCalls).toBe(2);
+    });
+    expect(loadKeysSeen[1]).toBe(loadKeysSeen[0]);
+    expect(loadKeysSeen[0]).toBeTruthy();
+
+    await waitFor(() => {
+      expect(screen.getByText(/Completed/)).toBeInTheDocument();
+    });
   });
 });

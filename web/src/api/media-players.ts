@@ -217,6 +217,22 @@ export async function getPlayerLoadOperation(
 }
 
 /**
+ * The native load operation states this server actually reports
+ * (`crates/multiview-cli/src/player/provider.rs::classify`): the pending
+ * in-flight state, and three terminal outcomes. A different `PlayerLoadProvider`
+ * is free to report a `state` outside this set — {@link isTerminalLoadOperationState}
+ * treats anything it does not recognise as still pending (never assumes an
+ * unrecognised value is already terminal, which would stop polling early and
+ * mislabel the operation as stuck).
+ */
+export type LoadOperationState = 'pending' | 'completed' | 'failed' | 'superseded';
+
+/** Whether `state` is one of this provider's three terminal load outcomes. */
+export function isTerminalLoadOperationState(state: string): boolean {
+  return state === 'completed' || state === 'failed' || state === 'superseded';
+}
+
+/**
  * Cue a player to its in-point, or to `frame` when given
  * (`POST .../cue`, body `{ frame? }`).
  */
