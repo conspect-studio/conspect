@@ -2238,11 +2238,10 @@ async fn apply_layout_with_a_switcher_is_switcher_owns_program_and_reserves_no_k
         detail.contains("POST /api/v1/routing/output/take"),
         "{detail}"
     );
-    assert!(
-        detail.contains("POST /api/v1/switcher/commands/select_preview"),
-        "{detail}"
-    );
-    assert!(detail.contains("switcher source"), "{detail}");
+    // Review M3: a layout is not yet a switcher source (the next PR of #307),
+    // so the refusal never advertises selecting one.
+    assert!(!detail.contains("select_preview"), "{detail}");
+    assert!(detail.contains("target"), "{detail}");
     assert_eq!(
         rig.state.idempotency.usage().0,
         reserved,
@@ -2414,4 +2413,98 @@ async fn apply_layout_target_and_the_output_take_share_one_idempotency_namespace
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     assert_eq!(rig.fake.takes().len(), 2);
+}
+
+/// #307 review A1 round 2: a raw key that spells another route's scoped
+/// path inside it must not move either request into a different namespace.
+/// Only the real path field is canonicalized, in both directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crafted_raw_key_never_splits_the_slot0_take_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"), true);
+    store_layout(&rig, "NewsOne", layout_body(640, 1.0));
+    store_layout(&rig, "NewsTwo", layout_body(640, 1.0));
+    let alias = |layout: &str, output: &str| serde_json::json!({"layout": layout, "target": {"output": output}});
+    let mut enqueued = 0;
+    for (n, crafted) in [
+        "x:20:/routing/output/take:y",
+        "x:11:/patch/take:y",
+        "x:22:/commands/apply-layout:y",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let layout = if n % 2 == 0 { "NewsOne" } else { "NewsTwo" };
+        let other = if n % 2 == 0 { "NewsTwo" } else { "NewsOne" };
+        // Past the per-output rate window before each fresh take.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let resp = send(
+            &rig.router,
+            apply_layout(OPERATOR_TOKEN, Some(crafted), &alias(layout, "output-1")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "{crafted}");
+        let first = body_json(resp).await;
+        enqueued += 1;
+        let resp = send(
+            &rig.router,
+            take(
+                &rig,
+                OPERATOR_TOKEN,
+                crafted,
+                "output-1",
+                serde_json::json!({"layout": layout}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "{crafted}");
+        let replay = body_json(resp).await;
+        assert_eq!(replay["operation_id"], first["operation_id"], "{crafted}");
+        assert_eq!(rig.fake.takes().len(), enqueued, "{crafted}: one enqueue");
+        let resp = send(
+            &rig.router,
+            take(
+                &rig,
+                OPERATOR_TOKEN,
+                crafted,
+                "output-1",
+                serde_json::json!({"layout": other}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{crafted}");
+
+        // And the output take first under a fresh crafted key.
+        let reverse = format!("r{crafted}");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let resp = send(
+            &rig.router,
+            take(
+                &rig,
+                OPERATOR_TOKEN,
+                &reverse,
+                "output-1",
+                serde_json::json!({"layout": layout}),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "{reverse}");
+        let first = body_json(resp).await;
+        enqueued += 1;
+        let resp = send(
+            &rig.router,
+            apply_layout(OPERATOR_TOKEN, Some(&reverse), &alias(layout, "output-1")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "{reverse}");
+        let replay = body_json(resp).await;
+        assert_eq!(replay["operation_id"], first["operation_id"], "{reverse}");
+        let resp = send(
+            &rig.router,
+            apply_layout(OPERATOR_TOKEN, Some(&reverse), &alias(other, "output-1")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{reverse}");
+        assert_eq!(rig.fake.takes().len(), enqueued, "{reverse}: one enqueue");
+    }
 }

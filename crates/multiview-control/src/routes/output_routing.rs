@@ -1416,17 +1416,51 @@ pub(crate) fn slot0_take_key(scoped: &str) -> String {
         "/patch/take",
         "/commands/apply-layout",
     ];
-    for path in ALIASES {
-        let needle = format!(":{}:{path}:", path.len());
-        if let Some(at) = scoped.find(&needle) {
-            let shared = "output-slot0-take";
-            return format!(
-                "{}:{}:{shared}:{}",
-                &scoped[..at],
-                shared.len(),
-                &scoped[at + needle.len()..]
-            );
-        }
+    // The scope is `{len}:{method}:{len}:{key_id}:{len}:{path}:{len}:{raw}`
+    // (`IdempotencyKey`). Walk the length prefixes to the REAL path field:
+    // a substring search could match a path spelled inside the client's raw
+    // token and split one key into two namespaces (#307 review A1 r2).
+    let Some((path_start, path_end)) = scope_path_span(scoped) else {
+        return scoped.to_owned();
+    };
+    let (Some(head), Some(path), Some(tail)) = (
+        scoped.get(..path_start),
+        scoped.get(path_start..path_end),
+        scoped.get(path_end..),
+    ) else {
+        return scoped.to_owned();
+    };
+    if !ALIASES.contains(&path) {
+        return scoped.to_owned();
     }
-    scoped.to_owned()
+    // `head` ends with `{path.len()}:`; replace that prefix and the path.
+    let Some(prefix) = head
+        .strip_suffix(':')
+        .and_then(|h| h.strip_suffix(path.len().to_string().as_str()))
+    else {
+        return scoped.to_owned();
+    };
+    let shared = "output-slot0-take";
+    format!("{prefix}{}:{shared}{tail}", shared.len())
+}
+
+/// The byte span of the path field (the third length-prefixed field) of an
+/// `IdempotencyKey` scope, or `None` when the scope is not well formed.
+fn scope_path_span(scoped: &str) -> Option<(usize, usize)> {
+    let mut at = 0_usize;
+    for field in 0..3 {
+        let rest = scoped.get(at..)?;
+        let colon = rest.find(':')?;
+        let len: usize = rest.get(..colon)?.parse().ok()?;
+        let start = at.checked_add(colon)?.checked_add(1)?;
+        let end = start.checked_add(len)?;
+        if scoped.get(end..end.checked_add(1)?)? != ":" {
+            return None;
+        }
+        if field == 2 {
+            return Some((start, end));
+        }
+        at = end + 1;
+    }
+    None
 }

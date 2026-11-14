@@ -156,7 +156,11 @@ M/E are still refused (`SwitcherCanvasRefusal::Overlays`). `boot_admission` adds
   It asserts one frame per tick, contiguous ticks, PTS = tick x 40 ms, no
   repeat, one full-canvas bound source on Program (never the wall), both
   queues filled and never blocked, at most `MAX_COMMANDS_PER_TICK`+1 M/E
-  outcomes per tick, and a final Cut that completes after the flood;
+  outcomes per tick, a per-tick command intake of at most twice the bus
+  capacity, and a final Cut (Preview forced to the off-air source first) that
+  completes and changes the Program picture. Review round 2 bounded
+  `CommandReceiver::try_drain` to the bus capacity per call (it drained until
+  empty while producers refilled), with a unit test under a refilling producer;
 - `multiview validate <config>`, which now also checks what `multiview run` will
   start from (`.multiview/desired.json` when it exists) and exits non-zero with
   start-up's reason. Run it as the deploy preflight. It also warns while an

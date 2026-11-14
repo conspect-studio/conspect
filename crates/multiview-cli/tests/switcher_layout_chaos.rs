@@ -47,6 +47,11 @@ const LOSS_TO: u64 = 350;
 /// The floods stop here; the final Cut proves Program still rebinds.
 const FLOOD_UNTIL: u64 = 480;
 const FINAL_CUT_AT: u64 = 500;
+/// After the flood: Preview is set to the source NOT on Program here, so the
+/// final Cut must visibly change Program.
+const FINAL_PVW_AT: u64 = 490;
+/// The command bus capacity (the binary's default order of magnitude).
+const BUS: usize = 64;
 
 /// A two-cell wall (`a | b`) with one M/E (Program `a`, Preview `b`) and a
 /// salvo recalling a cell source: `Pipeline::build` gives it the synthesized
@@ -183,7 +188,6 @@ async fn a_layout_and_switcher_flood_on_the_synthesized_program_canvas_never_mov
     // block.
     let control_publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
     let _stalled = control_publisher.subscribe();
-    const BUS: usize = 64;
     let (sender, commands) = command_bus(BUS);
     let drain = multiview_cli::control::command_drain(
         commands,
@@ -292,9 +296,13 @@ async fn a_layout_and_switcher_flood_on_the_synthesized_program_canvas_never_mov
     let mut seen = HashSet::new();
     let mut per_tick: HashMap<u64, usize> = HashMap::new();
     let mut final_cut: Option<(bool, Option<String>)> = None;
+    let mut final_pvw: Option<(bool, Option<String>)> = None;
+    let mut cut_from: Option<String> = None;
+    let mut sent_at_tick: Vec<u64> = Vec::new();
     let mut lagged = 0_u64;
     let pace = Arc::clone(&clock);
     let cut_handle = handle.clone();
+    let bus_sent_cb = Arc::clone(&bus_sent);
     let stop_flood = Arc::clone(&flooding);
     let mut producer = Some(producer);
     runtime
@@ -323,6 +331,9 @@ async fn a_layout_and_switcher_flood_on_the_synthesized_program_canvas_never_mov
                             if event.operation_id == "final-cut" {
                                 final_cut = Some((event.completed, event.error.clone()));
                             }
+                            if event.operation_id == "final-pvw" {
+                                final_pvw = Some((event.completed, event.error.clone()));
+                            }
                         }
                         Err(multiview_engine::isolation::TryRecvError::Lagged(n)) => lagged += n,
                         Err(_) => break,
@@ -331,6 +342,19 @@ async fn a_layout_and_switcher_flood_on_the_synthesized_program_canvas_never_mov
                 if index + 1 == FLOOD_UNTIL {
                     stop_flood.store(false, Ordering::Release);
                     producer.take().unwrap().join().unwrap();
+                }
+                sent_at_tick.push(bus_sent_cb.load(Ordering::Relaxed));
+                if index + 1 == FINAL_PVW_AT {
+                    let on_air = cut_handle.snapshot().unwrap().program.as_str().to_owned();
+                    let other = if on_air == "a" { "b" } else { "a" };
+                    cut_from = Some(on_air);
+                    cut_handle
+                        .try_send(SwitcherCommand {
+                            operation_id: "final-pvw".into(),
+                            scene_version: 1,
+                            verb: SwitcherVerb::SelectPreview(SourceRef::new(other)),
+                        })
+                        .unwrap();
                 }
                 if index + 1 == FINAL_CUT_AT {
                     cut_handle
@@ -412,17 +436,39 @@ async fn a_layout_and_switcher_flood_on_the_synthesized_program_canvas_never_mov
         seen.len()
     );
 
-    // Program still rebinds after the floods: the final Cut completes and the
-    // last frame shows the final snapshot's Program source.
+    // The drain's per-tick command intake is bounded (invariant #1): between
+    // two frames a producer can submit at most the free bus slots plus what one
+    // bounded `try_drain` took, so never more than twice the capacity, even
+    // though the producer refills the bus while the drain runs.
+    let max_intake = sent_at_tick.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+    assert!(
+        max_intake <= 2 * u64::try_from(BUS).unwrap(),
+        "per-tick command intake {max_intake} exceeds 2 x {BUS}"
+    );
+
+    // Program still rebinds after the floods: with Preview forced to the
+    // source not on air, the final Cut completes and Program shows it.
+    let from = cut_from.expect("Program source before the final Cut");
+    let (completed, error) = final_pvw.expect("the final select has an outcome");
+    assert!(completed, "the final select completed: {error:?}");
     let (completed, error) = final_cut.expect("the final Cut has an outcome");
     assert!(completed, "the final Cut completed: {error:?}");
-    let snapshot = handle.snapshot().unwrap();
-    let expected = if snapshot.program.as_str() == "a" {
-        LUMA_A
+    let (before, after) = if from == "a" {
+        (LUMA_A, LUMA_B)
     } else {
-        LUMA_B
+        (LUMA_B, LUMA_A)
     };
-    assert!(near(frames.last().unwrap().2, expected));
+    let at = usize::try_from(FINAL_CUT_AT).unwrap();
+    assert!(
+        near(frames[at - 1].2, before),
+        "Program shows {from} before the Cut"
+    );
+    let snapshot = handle.snapshot().unwrap();
+    assert_ne!(snapshot.program.as_str(), from, "the Cut moved Program");
+    assert!(
+        near(frames.last().unwrap().2, after),
+        "Program shows the cut source"
+    );
 }
 
 /// Alternate the route target between a wall cell and the M/E's own Program

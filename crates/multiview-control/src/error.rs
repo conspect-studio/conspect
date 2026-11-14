@@ -200,10 +200,7 @@ impl ControlError {
                 "The switcher is on: the Program canvas is the M/E bus, so layout {layout:?} \
                  cannot replace it. To show the layout on an output, take it there with \
                  POST /api/v1/routing/output/take (feed {{\"layout\":\"{layout}\"}}) or send \
-                 apply-layout with target {{\"output\":\"<id>\"}}; to cut it to Program, \
-                 select it as a switcher source with \
-                 POST /api/v1/switcher/commands/select_preview (layout:{layout}). \
-                 Nothing was changed."
+                 apply-layout with target {{\"output\":\"<id>\"}}. Nothing was changed."
             )),
             Self::SwitcherOwnsCells(operation) => Problem::new(
                 422,
