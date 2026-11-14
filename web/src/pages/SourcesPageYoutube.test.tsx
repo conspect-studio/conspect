@@ -54,7 +54,9 @@ async function openYoutubeForm(): Promise<void> {
     throw new Error('no Kind select trigger found');
   }
   await userEvent.click(kindTrigger);
-  await userEvent.click(await screen.findByRole('option', { name: 'youtube' }));
+  // #419: the Kind select now shows a human label with the raw id as
+  // secondary text ("YouTube live (youtube)"), not the bare raw id.
+  await userEvent.click(await screen.findByRole('option', { name: 'YouTube live (youtube)' }));
 }
 
 describe('YouTube source form (ADR-0015)', () => {
