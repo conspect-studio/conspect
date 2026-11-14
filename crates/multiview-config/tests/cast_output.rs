@@ -294,7 +294,7 @@ fn a_canvas_above_30_fps_refuses_a_cast_output_until_per_output_rates() {
 }
 
 #[test]
-fn slots_are_one_h264_video_and_one_program_audio() {
+fn slots_are_one_h264_video_and_any_number_of_audio() {
     let video = |codec: &str| format!("{CAST}[[outputs.slots.video]]\ncodec = \"{codec}\"\n");
     for good in ["h264", "avc", "libx264", "h264_nvenc"] {
         load_hd(&video(good)).unwrap();
@@ -321,14 +321,12 @@ fn slots_are_one_h264_video_and_one_program_audio() {
         "{err}"
     );
     load_hd(&format!("{CAST}[[outputs.slots.audio]]\n")).unwrap();
-    let err = load_hd(&format!(
+    // #418: a cast output carries N audio renditions (behaviour of ADR-0111's
+    // first slice, "one program audio slot", intentionally removed).
+    load_hd(&format!(
         "{CAST}[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"eng\"\n{TRACKS}"
     ))
-    .unwrap_err();
-    assert!(
-        err.contains("declares 2 audio slot(s); this medium carries 1"),
-        "{err}"
-    );
+    .unwrap();
 }
 
 const TRACKS: &str = r#"
@@ -341,24 +339,21 @@ target_track = "eng"
 "#;
 
 #[test]
-fn discrete_audio_tracks_are_not_selectable_on_a_cast_output() {
+fn discrete_audio_tracks_are_selectable_on_a_cast_output_like_hls() {
+    // #418: the "program audio only" refusal is intentionally removed; a cast
+    // output follows the HLS rules (N renditions, the player plays one).
     let out: Output = toml::from_str("kind = \"cast\"\nid = \"c\"\n").unwrap();
     let cap = out.audio_capability();
-    assert_eq!(cap.delivery, TrackDelivery::None);
-    assert_eq!(cap.discrete_capacity, TrackCapacity::AtMost(0));
+    assert_eq!(cap.delivery, TrackDelivery::SelectOne);
+    assert_eq!(cap.discrete_capacity, TrackCapacity::Unlimited);
     // The output's own selection.
     let doc = format!("{CAST}audio = {{ mode = \"tracks\", tracks = [\"eng\"] }}\n{TRACKS}");
-    let err = load_hd(&doc).unwrap_err();
-    assert!(err.contains("cast cast-1"), "{err}");
-    // A routed `tracks` feed, even a single track.
+    load_hd(&doc).unwrap();
+    // A routed single-track `tracks` feed.
     let doc = format!(
         "{CAST}{TRACKS}\n[[routing.output]]\noutput = \"cast-1\"\naudio = {{ tracks = [\"eng\"] }}\n"
     );
-    let err = load_hd(&doc).unwrap_err();
-    assert!(
-        err.contains("a cast output carries the program audio only"),
-        "{err}"
-    );
+    load_hd(&doc).unwrap();
     // Program audio is fine, selected or routed.
     load_hd(&format!("{CAST}audio = {{ mode = \"program\" }}\n")).unwrap();
     load_hd(&format!(
@@ -490,7 +485,8 @@ fn the_video_key_is_shared_only_without_an_own_format_codec_or_bit_rate() {
     let out: Output = toml::from_str("kind = \"cast\"\nid = \"c\"\n").unwrap();
     assert!(out.format().is_none() && out.slots().is_none());
     let cap = out.slot_capability();
-    assert_eq!((cap.video_max, cap.audio_max), (1, Some(1)));
+    // #418: any number of audio renditions (was `Some(1)`, intentionally removed).
+    assert_eq!((cap.video_max, cap.audio_max), (1, None));
     assert!(cap.format_convertible && !cap.raw_video);
 }
 
