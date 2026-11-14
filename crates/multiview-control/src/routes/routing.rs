@@ -152,6 +152,7 @@ pub(crate) async fn plan_route(
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to take this crosspoint.", body = crate::problem::Problem),
             (status = 404, description = "Unknown crosspoint kind.", body = crate::problem::Problem),
+            (status = 422, description = "`switcher-owns-program`: a video→cell take while a switcher M/E is declared (Program is the M/E bus and the take would not change the stored layout; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Refused before the Idempotency-Key is reserved.", body = crate::problem::Problem),
             (status = 503, description = "Engine command bus at capacity; shed.", body = crate::problem::Problem),
         ),
     )
@@ -182,6 +183,14 @@ pub(crate) async fn take_route(
     // within its object allowlist — checked before any classify/submit side effect
     // (a missing/out-of-scope id fails closed).
     crate::auth::authorize_object(&principal, &req.source.input_id)?;
+    // #307 review M1: a video→cell take under a switcher M/E would change
+    // neither Program nor the stored layout — refused after authorization and
+    // before the idempotency reservation. Audio/subtitle takes are unaffected.
+    if matches!(req.target, RouteTarget::VideoCell { .. })
+        && crate::routes::switcher_declared(&state)?
+    {
+        return Err(ControlError::SwitcherOwnsCells("a video→cell route take"));
+    }
 
     // Classify against the destination's pinned params (inv #11: surfaced first).
     let plan = classify_request(&state, &req);

@@ -72,14 +72,6 @@ function cellCount(layout: Layout): number {
   return model?.cells.length ?? 0;
 }
 
-/** The authored cell count of any placement kind (grid or absolute). */
-function authoredCellCount(layout: Layout): number {
-  const body: unknown = layout.body;
-  if (typeof body !== 'object' || body === null) return 0;
-  const cells = (body as { cells?: unknown }).cells;
-  return Array.isArray(cells) ? cells.length : 0;
-}
-
 function useColumns(
   onRequestDelete: (layout: Layout) => void,
   onApply: (layout: Layout) => void,
@@ -140,9 +132,9 @@ function useColumns(
         header: t`Actions`,
         cell: (ctx): JSX.Element => {
           const layout = ctx.row.original;
-          // #317: known in advance — with the switcher on, a multi-cell layout
-          // cannot be the Program canvas. Disabled WITH the reason in text.
-          const blocked = blockedBySwitcher(switcherOn, authoredCellCount(layout));
+          // #307: known in advance — with the switcher on, the Program canvas
+          // is the M/E bus. Disabled WITH the reason in text.
+          const blocked = blockedBySwitcher(switcherOn);
           const reasonId = `apply-blocked-${layout.id}`;
           return (
             <div className="flex items-center gap-2">
@@ -167,7 +159,11 @@ function useColumns(
                   data-testid="layout-apply-blocked-reason"
                 >
                   <Trans>
-                    The switcher is on: a multi-cell layout cannot be the Program canvas.
+                    The switcher is on: Program is the M/E bus. Take this layout to an output from{' '}
+                    <Link to="/outputs" className="underline underline-offset-2">
+                      Outputs
+                    </Link>
+                    .
                   </Trans>
                 </span>
               ) : null}
