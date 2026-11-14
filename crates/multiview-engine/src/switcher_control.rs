@@ -18,7 +18,7 @@ use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::keyer::{
     KeyerAction, KeyerCounters, KeyerDef, KeyerDefinition, KeyerDefinitions, KeyerDraw, KeyerEvent,
-    KeyerReadback,
+    KeyerReadback, REFUSE_KEYER_SET_DEADLINE,
     KeyerRuntime, KeyerSnapshot, KeyerTally, OpSink, TieEnvelope, MAX_DSK,
 };
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
@@ -62,6 +62,13 @@ pub const COMMAND_CAPACITY: usize = 64;
 /// Output ticks a take may wait for its incoming source's first fresh frame
 /// before it is refused (ADR-0104). The clock never waits; the take does.
 pub const TAKE_PRIME_DEADLINE_TICKS: u64 = 50;
+/// Ticks after admission (the clock's last composed tick when the control
+/// plane built the verb) within which a queued `keyer_set` must be drained;
+/// drained at or after its deadline tick it is refused and never applies
+/// (review H4, mirroring [`TAKE_PRIME_DEADLINE_TICKS`]). Once the clock has
+/// composed the deadline tick, the command can no longer apply, so the
+/// control plane's settlement always reaches a terminal answer.
+pub const KEYER_SET_DEADLINE_TICKS: u64 = TAKE_PRIME_DEADLINE_TICKS;
 
 /// Typed refusal: the incoming source had no fresh frame before the deadline.
 pub const REFUSE_NO_FRESH_FRAME: &str =
@@ -175,6 +182,9 @@ pub enum SwitcherVerb {
         readback: KeyerReadback,
         /// `on_air = "allow"`: the fill or key of a keyer on air may change.
         allow_on_air: bool,
+        /// Drained at or after this tick, the verb is refused
+        /// ([`REFUSE_KEYER_SET_DEADLINE`]) and never applies (review H4).
+        deadline: u64,
     },
     /// The mixer half of an atomic multi-crosspoint set (ADR-0110 §12.8,
     /// #308): validated and primed here, then applied only at the adoption
@@ -393,6 +403,13 @@ impl SwitcherControl {
             .map_err(tokio::sync::mpsc::error::TrySendError::into_inner)
     }
 
+    /// Whether the engine side of the mailbox is gone (the run ended): no
+    /// queued command can apply any more.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Publish an immutable pair after validating its layout geometry. This is
     /// control-side only; a later edit cannot mutate a previously published pair.
     ///
@@ -535,7 +552,9 @@ impl SwitcherControl {
 
     /// Build the [`SwitcherVerb::KeyerSet`] for `def` at `keyer`, admitted
     /// against the committed definitions `base`: prepares the readback the
-    /// committing tick publishes (off the clock, review H6).
+    /// committing tick publishes (off the clock, review H6) and stamps the
+    /// deadline tick (the last composed tick + [`KEYER_SET_DEADLINE_TICKS`],
+    /// review H4).
     #[must_use]
     pub fn keyer_set_verb(
         &self,
@@ -550,6 +569,9 @@ impl SwitcherControl {
             def,
             readback,
             allow_on_air,
+            deadline: self
+                .applied_tick()
+                .saturating_add(KEYER_SET_DEADLINE_TICKS),
         }
     }
 
@@ -1206,8 +1228,19 @@ impl SwitcherTickDriver {
                 def,
                 readback,
                 allow_on_air,
+                deadline,
             } = command.verb
             {
+                if tick.index >= deadline {
+                    // Expired in the mailbox: never applied (review H4).
+                    self.publish_outcome(
+                        command.operation_id,
+                        tick.index,
+                        false,
+                        Some(REFUSE_KEYER_SET_DEADLINE.into()),
+                    );
+                    continue;
+                }
                 let before = self.keyers.def_version();
                 self.keyers.define(
                     keyer,

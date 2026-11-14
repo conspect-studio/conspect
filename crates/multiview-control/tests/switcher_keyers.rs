@@ -918,6 +918,66 @@ async fn defining_the_first_dsk_while_clean_is_routed_is_refused() {
     assert!(rig.handle.keyer_definitions().unwrap().any());
 }
 
+/// Review H4: a `keyer_set` still queued when the control plane's old
+/// wall-clock settle deadline passed must never apply, and nothing may be
+/// released while it still could. Settlement holds the leases and the DSK
+/// reservation until a terminal engine outcome; the engine refuses a
+/// `keyer_set` drained after its deadline tick (as a held take's
+/// `TAKE_PRIME_DEADLINE_TICKS`), so it never applies and leaves nothing
+/// behind: no definition, no lease, no reservation, nothing persisted.
+#[tokio::test(start_paused = true)]
+async fn a_keyer_set_held_past_its_deadline_never_applies_and_leaves_nothing() {
+    let doc = DOC.split("[[switcher.downstream_keyers]]").next().unwrap();
+    let (_dir, path) = temp_boot(doc);
+    let mut rig = build(&path, doc, false);
+    let mut outcomes = rig.handle.outcomes();
+    let verb = body("keyer_set", json!({"keyer":"dsk1","fill":"gfx"}));
+    let response = command(&rig, FULL, "late", &verb).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let op = body_json(response).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The clock does not drain it for longer than any wall-clock deadline.
+    // Paused time: the sleep auto-advances once every task is idle, so the
+    // settle task runs past any wall-clock deadline it might hold.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(
+        *rig.leases.live.lock().unwrap(),
+        vec!["keyer:main/dsk1:gfx".to_owned()],
+        "the command can still apply: its leases are held"
+    );
+    assert!(
+        rig.handle
+            .dsk_defined_cell()
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the command can still apply: Clean stays excluded"
+    );
+    // The clock drains it only after its deadline tick: refused, never applied.
+    let late = 2 + multiview_engine::switcher_control::KEYER_SET_DEADLINE_TICKS;
+    tick(&mut rig.driver, late);
+    let outcome = outcomes.try_recv().unwrap().event;
+    assert_eq!(outcome.operation_id, op);
+    assert!(!outcome.completed);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(multiview_engine::keyer::REFUSE_KEYER_SET_DEADLINE)
+    );
+    assert!(!rig.handle.keyer_definitions().unwrap().any());
+    wait_for(|| rig.leases.live.lock().unwrap().is_empty()).await;
+    wait_for(|| {
+        !rig.handle
+            .dsk_defined_cell()
+            .load(std::sync::atomic::Ordering::Acquire)
+    })
+    .await;
+    assert!(persisted(&rig.state)
+        .switcher
+        .unwrap()
+        .downstream_keyers
+        .is_empty());
+}
+
 async fn next_keyer(
     s: &mut SessionStream,
 ) -> Option<(Option<String>, multiview_events::SwitcherKeyer)> {

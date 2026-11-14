@@ -14,7 +14,7 @@ mod rig;
 
 use multiview_engine::keyer::{
     KeyerReason, REFUSE_KEYER_CAPACITY, REFUSE_KEYER_DEFINITION, REFUSE_KEYER_ON_AIR_PROTECTED,
-    REFUSE_KEYER_STALE,
+    REFUSE_KEYER_SET_DEADLINE, REFUSE_KEYER_STALE,
 };
 use multiview_engine::switcher_control::SwitcherVerb;
 use rig::{cmd, drain, dsk, probe, step, tick, Rig, LUMA_A, LUMA_B, LUMA_FILL, SIDE};
@@ -274,4 +274,47 @@ fn a_keyer_set_admitted_on_a_stale_base_is_refused() {
         "the tick published the prepared readback"
     );
     assert!(published.defs[1].is_none());
+}
+
+/// Review H4: a `keyer_set` drained at or after its deadline tick (the
+/// clock's last composed tick at admission + `KEYER_SET_DEADLINE_TICKS`) is
+/// refused and never applies, like a held take past
+/// `TAKE_PRIME_DEADLINE_TICKS`; one drained the tick before still applies.
+#[test]
+fn a_keyer_set_drained_past_its_deadline_never_applies() {
+    use multiview_engine::switcher_control::KEYER_SET_DEADLINE_TICKS;
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[], 9.0, "a", "b");
+    let mut outcomes = handle.outcomes();
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    let verb = |id: &str, slot: u8, z: i32| {
+        handle.keyer_set_verb(
+            &handle.keyer_definitions().unwrap(),
+            slot,
+            handle.resolve_keyer(&dsk(id, "gfx", None, z)).unwrap(),
+            false,
+        )
+    };
+    let late = verb("dsk1", 0, 1);
+    handle.try_send(cmd("late", late)).unwrap();
+    // The clock skips to the deadline tick: drained there, refused.
+    fresh(&rig, KEYER_SET_DEADLINE_TICKS);
+    step(&mut hook, &mut drive, KEYER_SET_DEADLINE_TICKS);
+    let outcome = drain(&mut outcomes).0;
+    assert_eq!(
+        outcome[0].error.as_deref(),
+        Some(REFUSE_KEYER_SET_DEADLINE)
+    );
+    assert!(!handle.keyer_definitions().unwrap().any());
+    assert!(hook.driver.keyers().is_empty());
+    // Admitted now (deadline = this tick + the bound), drained one tick
+    // before its deadline: applied.
+    let now = KEYER_SET_DEADLINE_TICKS;
+    handle.try_send(cmd("in-time", verb("dsk1", 0, 1))).unwrap();
+    let last = now + KEYER_SET_DEADLINE_TICKS - 1;
+    fresh(&rig, last);
+    step(&mut hook, &mut drive, last);
+    assert!(drain(&mut outcomes).0[0].completed);
+    assert!(handle.keyer_definitions().unwrap().any());
 }

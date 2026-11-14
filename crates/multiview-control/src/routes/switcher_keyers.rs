@@ -984,10 +984,14 @@ fn other_refs(req: &super::switcher::SwitcherRequest) -> bool {
 }
 
 /// A pending `keyer_set`: the leases it took (make-before-break) and the
-/// definition it enqueued, settled by its outcome or the deadline.
+/// definition it enqueued, settled only by a terminal engine answer (its
+/// outcome, or the clock past its deadline tick, or the run ended).
 struct PendingSet {
     op: String,
     def: Arc<multiview_engine::keyer::KeyerDef>,
+    /// The verb's engine deadline tick: once the clock composed it, the
+    /// command can no longer apply (review H4).
+    deadline: u64,
     /// Held until the outcome settles (RAII; dropping releases them).
     #[allow(dead_code)]
     // reason: an RAII lease vector, kept only for its `Drop`.
@@ -995,9 +999,10 @@ struct PendingSet {
     holds_dsk: bool,
 }
 
-/// How long a `keyer_set` holds its leases waiting for the engine outcome
-/// before it is reconciled against the committed definitions.
-pub const KEYER_SET_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often a settling `keyer_set` that has seen no outcome re-reads the
+/// clock's composed tick (a lagged outcome ring, or a stopped run). Not a
+/// deadline: settlement never ends before a terminal engine answer.
+pub const KEYER_SET_RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Enqueue a checked keyer verb (`POST /api/v1/switcher/commands/{kind}`),
 /// after [`authorize`]: typed refusals as 409, the `Idempotency-Key` (a
@@ -1045,7 +1050,7 @@ pub fn submit(
         Reservation::Fresh(op) => op,
     };
     let mut pending = None;
-    if let SwitcherVerb::KeyerSet { def, .. } = &checked.verb {
+    if let SwitcherVerb::KeyerSet { def, deadline, .. } = &checked.verb {
         let holds_dsk = checked.defines_first;
         if holds_dsk && !reserve_first_dsk(state, handle) {
             state.idempotency.release(Some(key), &op);
@@ -1069,6 +1074,7 @@ pub fn submit(
         pending = Some(PendingSet {
             op: op.to_string(),
             def: Arc::clone(&def.0),
+            deadline: *deadline,
             leases,
             holds_dsk,
         });
@@ -1109,11 +1115,14 @@ fn accepted(operation_id: String, kind: &str) -> Response {
         .into_response()
 }
 
-/// Settle one `keyer_set` off the clock: wait for its outcome (or the
-/// deadline), decide from the committed definitions (the authority, so a
-/// lagged outcome ring cannot mislead it), then on `applied` republish the
-/// keyer demand set and persist the definitions; in every case release the
-/// leases it took and recompute `dsk_defined`.
+/// Settle one `keyer_set` off the clock: wait for a terminal engine answer
+/// — its outcome, or the clock having composed its deadline tick (the engine
+/// refuses it from then on, so it can no longer apply), or the run ended —
+/// never a wall-clock deadline (review H4: releasing while the command could
+/// still apply orphaned it). Then decide from the committed definitions (the
+/// authority, so a lagged outcome ring cannot mislead it); on `applied`
+/// republish the keyer demand set and persist the definitions; in every case
+/// release the leases it took and recompute `dsk_defined`.
 async fn settle_set(
     state: AppState,
     handle: SwitcherControl,
@@ -1122,16 +1131,23 @@ async fn settle_set(
     >,
     pending: PendingSet,
 ) {
-    let wait = async {
-        loop {
-            match outcomes.recv().await {
-                Ok(item) if item.event.operation_id == pending.op => break,
-                Ok(_) | Err(multiview_engine::isolation::RecvError::Lagged(_)) => {}
-                Err(multiview_engine::isolation::RecvError::Closed) => break,
+    // Terminal without an outcome: the clock composed the deadline tick (a
+    // drain at or after it refuses the verb; every earlier drain has
+    // committed or been rejected by then), or the run is gone.
+    let settled = |handle: &SwitcherControl| {
+        handle.applied_tick() >= pending.deadline || handle.is_closed()
+    };
+    loop {
+        match tokio::time::timeout(KEYER_SET_RECHECK, outcomes.recv()).await {
+            Ok(Ok(item)) if item.event.operation_id == pending.op => break,
+            Ok(Err(multiview_engine::isolation::RecvError::Closed)) => break,
+            Ok(Ok(_) | Err(multiview_engine::isolation::RecvError::Lagged(_))) | Err(_) => {
+                if settled(&handle) {
+                    break;
+                }
             }
         }
-    };
-    let _ = tokio::time::timeout(KEYER_SET_DEADLINE, wait).await;
+    }
     let applied = handle.keyer_definitions().is_some_and(|defs| {
         defs.defs
             .iter()

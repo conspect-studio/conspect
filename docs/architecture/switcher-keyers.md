@@ -796,8 +796,17 @@ keyers.
   tick.
 - **Make-before-break.** A `keyer_set` takes leases on its fill and key (label
   `keyer:<program>/<keyer>`) before the enqueue. A settle task subscribed before the enqueue
-  waits for the outcome (deadline 10 s) and then decides from the committed definitions, not
-  the event, so a lagged ring cannot mislead it.
+  waits for a terminal engine answer and then decides from the committed definitions, not the
+  event, so a lagged ring cannot mislead it.
+  - **Engine deadline (review round 1 H4).** The verb carries `deadline` = the clock's last
+    composed tick at admission + `KEYER_SET_DEADLINE_TICKS` (= `TAKE_PRIME_DEADLINE_TICKS`,
+    50). A `keyer_set` drained at or after that tick is refused `keyer-set-deadline` and never
+    applies. Settlement has no wall-clock deadline any more. It ends only on the outcome,
+    once `applied_tick >= deadline` (from then on the command cannot apply), or when the
+    mailbox is closed (the run ended). Until then it re-reads the composed tick every 500 ms
+    (`KEYER_SET_RECHECK`). It therefore never releases leases or the DSK reservation while
+    the command could still apply. The old 10 s timeout released both and left an applied
+    definition unpersisted, with its demand unpublished and Clean reopened.
   - **Applied.** It republishes the run's `keyer` demand set (`ConsumerSet::publish`, which
     leases the new set before it releases the old one), persists the definitions, and only
     then drops the request's leases.
@@ -865,7 +874,8 @@ keyers.
     refusal over budget, on-air guard with protect and allow, a rejected frame restoring the
     definition, and id/z clashes; a definition-changing tick builds no readback on the clock,
     and a set admitted on a stale base is refused while the published readback is the
-    prepared `Arc` (H6).
+    prepared `Arc` (H6); a set drained at its deadline tick is refused and one drained the
+    tick before applies (H4).
   - `multiview-control` `tests/switcher_keyers.rs` (9):
     - the BOLA matrix for each verb on plan and command, for the M/E, program, keyer and
       source grants and a viewer, with no key burned;
@@ -879,6 +889,9 @@ keyers.
     - `capacity` generic for scoped callers, totals for unscoped, a repeated refusal leaving
       nothing behind, and `max_source` raise admission;
     - `on-air-protected` and make-before-break leases;
+    - a `keyer_set` held past any wall-clock deadline keeps its leases and Clean exclusion,
+      is refused `keyer-set-deadline` when drained past its deadline tick, and leaves no
+      definition, lease, reservation or persisted keyer (H4, paused tokio time);
     - the Clean rule;
     - GET/events parity and redaction for scoped principals;
     - persistence and a restart.

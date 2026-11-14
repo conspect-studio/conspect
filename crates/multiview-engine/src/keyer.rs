@@ -80,6 +80,10 @@ pub const REFUSE_KEYER_DEFINITION: &str =
 pub const REFUSE_KEYER_STALE: &str =
     "keyer-definitions-changed: the committed keyer definitions changed since this keyer_set \
      was admitted; re-plan it";
+/// Typed refusal: a `keyer_set` drained at or after its deadline tick
+/// (review H4): it never applies; the caller re-plans.
+pub const REFUSE_KEYER_SET_DEADLINE: &str =
+    "keyer-set-deadline: the keyer_set was not drained before its deadline tick; re-plan it";
 /// Typed refusal: a held keyer command expired while Program repeated.
 pub const REFUSE_KEYER_REPEAT_DEADLINE: &str =
     "keyer take deadline expired while program repeated last-good";
