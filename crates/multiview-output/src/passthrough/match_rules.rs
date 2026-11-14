@@ -85,8 +85,12 @@ impl ColourTags {
 pub struct SourceTraits {
     /// Codec.
     pub codec: PassCodec,
-    /// `profile_idc` (H.264) / `general_profile_idc` (HEVC).
+    /// `profile_idc` (H.264) / `general_profile_idc` (HEVC) / `seq_profile`
+    /// (AV1).
     pub profile: u8,
+    /// H.264 `constraint_set0..5_flag` as the SPS byte after `profile_idc`
+    /// (bit 7 = set0, bit 6 = set1, ...); 0 for other codecs.
+    pub constraint_flags: u8,
     /// `level_idc` (H.264) / `general_level_idc` (HEVC).
     pub level: u8,
     /// Coded width in pixels (after cropping).
@@ -110,8 +114,9 @@ pub struct SourceTraits {
 pub struct SlotSpec {
     /// Codec.
     pub codec: PassCodec,
-    /// Highest accepted profile indicator (numeric compare; for H.264 the
-    /// common ladder 66 < 77 < 100 < 110 < 122 < 244 is monotonic in tools).
+    /// Highest accepted profile indicator. Compared through an explicit
+    /// per-codec compatibility ladder ([`profile_rank`]), never numerically;
+    /// a profile outside the ladder never matches.
     pub max_profile: u8,
     /// Highest accepted level indicator.
     pub max_level: u8,
@@ -413,6 +418,64 @@ fn covers(tb: Rational, from: i64, to: i64) -> bool {
     span.saturating_mul(i128::from(tb.num)) >= i128::from(METER_WINDOW_SECS) * i128::from(tb.den)
 }
 
+/// The rank of a profile on its codec's decoder-compatibility ladder: a
+/// decoder for rank `r` decodes every stream of rank `<= r` (R2-M5). `None`
+/// for a profile outside the allowlist (fail closed).
+///
+/// * H.264: Baseline (66) < Constrained Baseline (66 with `constraint_set1`)
+///   < Main (77) < High (100) < High 10 (110) < High 4:2:2 (122) < High
+///   4:4:4 Predictive (244). Plain Baseline (FMO/ASO/redundant slices) goes
+///   only into a Baseline slot. Extended (88, SP/SI slices), the scalable /
+///   multiview / stereo families and CAVLC 4:4:4 Intra are not on the ladder.
+/// * HEVC: Main Still Picture (3) < Main (1) < Main 10 (2); range extensions
+///   and later families are not on the ladder.
+/// * AV1: Main (0) < High (1) < Professional (2).
+#[must_use]
+pub fn profile_rank(codec: PassCodec, profile: u8, constraint_flags: u8) -> Option<u8> {
+    match codec {
+        PassCodec::H264 => match profile {
+            66 if constraint_flags & 0x40 != 0 => Some(1),
+            66 => Some(0),
+            77 => Some(2),
+            100 => Some(3),
+            110 => Some(4),
+            122 => Some(5),
+            244 => Some(6),
+            _ => None,
+        },
+        PassCodec::Hevc => match profile {
+            3 => Some(0),
+            1 => Some(1),
+            2 => Some(2),
+            _ => None,
+        },
+        PassCodec::Av1 => (profile <= 2).then_some(profile),
+        PassCodec::Other => None,
+    }
+}
+
+/// Whether a source profile is decodable by a decoder for the slot's
+/// `max_profile` (both on the codec's ladder, [`profile_rank`]).
+fn profile_ok(codec: PassCodec, profile: u8, constraint_flags: u8, max_profile: u8) -> bool {
+    let Some(src) = profile_rank(codec, profile, constraint_flags) else {
+        return false;
+    };
+    // An H.264 Baseline slot (66) decodes Baseline and Constrained Baseline.
+    let ceiling = if codec == PassCodec::H264 && max_profile == 66 {
+        Some(1)
+    } else {
+        profile_rank(codec, max_profile, 0)
+    };
+    let Some(ceiling) = ceiling else {
+        return false;
+    };
+    // Plain Baseline (may use FMO/ASO) only into a Baseline slot.
+    if codec == PassCodec::H264 && src == 0 {
+        return max_profile == 66;
+    }
+    src <= ceiling
+}
+
 /// Evaluate the match rules; `Ok(())` when the source can be passed through.
 ///
 /// # Errors
@@ -425,7 +488,12 @@ pub fn evaluate(
     if traits.codec != slot.codec {
         return Err(MatchMiss::CodecDiffers);
     }
-    if traits.profile > slot.max_profile {
+    if !profile_ok(
+        traits.codec,
+        traits.profile,
+        traits.constraint_flags,
+        slot.max_profile,
+    ) {
         return Err(MatchMiss::ProfileAbove);
     }
     if traits.level > slot.max_level {
@@ -493,10 +561,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn profiles_match_by_an_explicit_compatibility_ladder() {
+        // R2-M5: a numerically lower profile is not a decodable subset.
+        use PassCodec::{Av1, Hevc, Other, H264};
+        let cases: &[(PassCodec, u8, u8, u8, bool)] = &[
+            // (codec, source profile, constraint flags, slot max, accepted)
+            (H264, 88, 0, 100, false), // Extended (SP/SI) into High
+            (H264, 88, 0, 244, false),
+            (H264, 83, 0, 100, false),   // Scalable Baseline
+            (H264, 44, 0, 244, false),   // CAVLC 4:4:4 Intra
+            (H264, 118, 0, 244, false),  // Multiview High
+            (H264, 66, 0, 100, false),   // Baseline (FMO/ASO) into High
+            (H264, 66, 0x40, 100, true), // Constrained Baseline into High
+            (H264, 66, 0, 66, true),
+            (H264, 66, 0x40, 66, true),
+            (H264, 77, 0, 66, false),
+            (H264, 77, 0, 100, true),
+            (H264, 100, 0, 100, true),
+            (H264, 110, 0, 100, false),
+            (H264, 100, 0, 244, true),
+            (H264, 100, 0, 88, false), // a slot ceiling off the ladder
+            (Hevc, 1, 0, 2, true),
+            (Hevc, 3, 0, 1, true),
+            (Hevc, 2, 0, 1, false),
+            (Hevc, 4, 0, 4, false), // range extensions
+            (Av1, 0, 0, 1, true),
+            (Av1, 2, 0, 1, false),
+            (Av1, 3, 0, 3, false),
+            (Other, 0, 0, 0, false),
+        ];
+        for &(codec, profile, flags, max, ok) in cases {
+            assert_eq!(
+                profile_ok(codec, profile, flags, max),
+                ok,
+                "{codec:?} {profile} flags {flags:#x} into {max}"
+            );
+        }
+        // Through `evaluate`: Extended 88 against a High 100 slot.
+        let mut t = traits();
+        t.profile = 88;
+        assert_eq!(
+            evaluate(&t, &StreamMeter::new(), &slot()).err(),
+            Some(MatchMiss::ProfileAbove)
+        );
+    }
+
     fn traits() -> SourceTraits {
         SourceTraits {
             codec: PassCodec::H264,
             profile: 100,
+            constraint_flags: 0,
             level: 40,
             width: 1920,
             height: 1080,

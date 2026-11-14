@@ -2125,7 +2125,9 @@ A formatted output falls back to its own base key (Program at its format).
 ### 12.5 Passthrough and invariant #1
 
 **Match rules** (all required; any miss means P1-P3): a constant frame rate (every source DTS
-delta exactly one frame period over the last 10 s); codec equal; profile and level within the
+delta exactly one frame period over the last 10 s); codec equal; profile on the codec's explicit
+decoder-compatibility ladder at or below the slot's (Extended, scalable, multiview and other
+profiles off the ladder never match; plain Baseline only into a Baseline slot) and level within the
 slot's settings; coded size equal to the slot's; frame rate exactly equal (as a rational) to the
 output's; scan equal; all four colour tags equal (primaries, transfer, matrix, range; untagged is
 not equal); bit depth and chroma equal; the source's measured GOP not longer than the medium allows
