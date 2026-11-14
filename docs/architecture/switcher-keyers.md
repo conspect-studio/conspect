@@ -737,7 +737,10 @@ keyers.
     `keyer` ids to indices through the committed definitions. K4 adds
     `SwitcherVerb::KeyerSet {keyer, def, allow_on_air}`.
 - **BOLA (plan and command, before any existence answer or key).** The checks run in
-  `authorize_refs` after the role gate (`Read` for plan, `Write` for command):
+  `authorize_refs` after the role gate. A keyer verb needs `Write` (Operator) on plan as well as
+  on command: a keyer plan rehearses the command (cost, on-air state, the refusal it would
+  answer), so a Viewer or ReadOnly key is 403 on `/plan` too (review round 1 H1; background
+  verbs keep `Read` for plan). Then:
   `authorize_object(me)`, `Program(program)`, `authorize_object("<program>/<keyer>")` and
   `authorize_object` on every named `fill`/`key`. The control plane has one object axis, so
   `Control` and `Read` on an id are both that grant, and the role separates them (as for
@@ -850,6 +853,8 @@ keyers.
   - `multiview-control` `tests/switcher_keyers.rs` (9):
     - the BOLA matrix for each verb on plan and command, for the M/E, program, keyer and
       source grants and a viewer, with no key burned;
+    - a Viewer and a ReadOnly key holding every grant are 403 on `/plan` for all four verbs
+      (H1);
     - 202 plus outcome, replay and ramp refusal;
     - 503 on a full mailbox, releasing the key and the leases;
     - `in:<n>` refused with 422;

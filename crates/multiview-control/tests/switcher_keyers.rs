@@ -118,11 +118,15 @@ const NO_PROGRAM: &str = "k-no-program.k-no-program-secret";
 const ADMIN: &str = support::OPERATOR_TOKEN;
 /// A viewer (Read only).
 const VIEWER: &str = support::VIEWER_TOKEN;
+/// A Viewer holding every object and Program grant FULL holds.
+const SCOPED_VIEWER: &str = "k-viewer.k-viewer-secret";
+/// A ReadOnly principal holding every object and Program grant FULL holds.
+const SCOPED_READ_ONLY: &str = "k-read-only.k-read-only-secret";
 
 fn keys() -> ApiKeyStore {
     let mut keys = support::seeded_keys();
     let all = ["me1", "main/dsk1", "main/dsk2", "a", "b", "gfx", "gfx2"];
-    let mut add = |id: &str, without: Option<&str>, program: bool| {
+    let mut add_as = |id: &str, without: Option<&str>, program: bool, role: Role| {
         let objects: Vec<String> = all
             .iter()
             .filter(|o| Some(**o) != without)
@@ -133,7 +137,7 @@ fn keys() -> ApiKeyStore {
             &format!("{id}-secret"),
             Principal {
                 key_id: id.to_owned(),
-                role: Role::Operator,
+                role,
                 scoped_object_ids: Some(objects),
                 scoped_output_ids: Some(if program {
                     vec!["program:main".to_owned()]
@@ -144,11 +148,16 @@ fn keys() -> ApiKeyStore {
             },
         );
     };
+    let mut add = |id: &str, without: Option<&str>, program: bool| {
+        add_as(id, without, program, Role::Operator);
+    };
     add("k-full", None, true);
     add("k-no-keyer", Some("main/dsk1"), true);
     add("k-no-fill", Some("gfx"), true);
     add("k-no-me", Some("me1"), true);
     add("k-no-program", None, false);
+    add_as("k-viewer", None, true, Role::Viewer);
+    add_as("k-read-only", None, true, Role::ReadOnly);
     keys
 }
 
@@ -511,6 +520,39 @@ async fn every_keyer_verb_is_authorized_per_object_on_plan_and_command() {
     // The denied keys were never burned: the same key now succeeds.
     let response = command(&rig, FULL, "bola", &cut).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+/// Review H1: a keyer plan is a control-plane rehearsal of a command, so it
+/// needs the command's role (`Write`), not `Read`: a Viewer or ReadOnly
+/// principal holding every object grant is refused 403 on `/plan` for all
+/// four verbs, before any existence or admission answer.
+#[tokio::test]
+async fn viewer_and_read_only_cannot_plan_any_keyer_verb() {
+    let (_dir, path) = temp_boot(DOC);
+    let rig = rig(&path);
+    let verbs = [
+        body("keyer_cut", json!({ "keyer": "dsk1", "on": true })),
+        body("keyer_auto", json!({ "keyer": "dsk1", "on": true })),
+        body("keyer_tie", json!({ "keyer": "dsk1", "tie": true })),
+        body("keyer_set", json!({ "keyer": "dsk1", "rate": 20 })),
+        // A keyer not defined yet: still 403, never an admission answer.
+        body("keyer_set", json!({ "keyer": "dsk2", "fill": "gfx2" })),
+    ];
+    for verb in &verbs {
+        for token in [SCOPED_VIEWER, SCOPED_READ_ONLY, VIEWER] {
+            assert_eq!(
+                plan(&rig, token, verb).await.status(),
+                StatusCode::FORBIDDEN,
+                "{token} {verb}"
+            );
+        }
+        // The same grants with the Operator role plan normally.
+        assert_ne!(
+            plan(&rig, FULL, verb).await.status(),
+            StatusCode::FORBIDDEN,
+            "{verb}"
+        );
+    }
 }
 
 #[tokio::test]

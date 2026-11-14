@@ -364,15 +364,24 @@ pub(crate) async fn get_switcher(
 }
 
 /// Dry-run command admission, including BOLA on every referenced object.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, description = "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).", body = SwitcherPlan), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer).", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer` (a keyer the caller may read is not defined).", body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, description = "Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`.", body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, description = "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).", body = SwitcherPlan), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer` (a keyer the caller may read is not defined).", body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, description = "Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`.", body = crate::problem::Problem))))]
 pub(crate) async fn plan_switcher(
     State(state): State<AppState>,
     principal: Principal,
     Json(req): Json<SwitcherRequest>,
 ) -> ControlResult<Response> {
-    principal.role.require(Action::Read)?;
+    // A keyer plan rehearses a command (it reports admission cost, the
+    // on-air state and the refusal the command would answer), so it needs
+    // the command's role, before any object check or existence answer
+    // (#389 review H1).
+    let keyer_verb = super::switcher_keyers::is_keyer_verb(&req.action);
+    principal.role.require(if keyer_verb {
+        Action::Write
+    } else {
+        Action::Read
+    })?;
     authorize_refs(&principal, &req)?;
-    if super::switcher_keyers::is_keyer_verb(&req.action) {
+    if keyer_verb {
         validate_me(&req)?;
         let handle = engine(&state)?;
         return super::switcher_keyers::plan(&state, &principal, handle, &req);
