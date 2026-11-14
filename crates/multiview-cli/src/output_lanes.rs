@@ -25,8 +25,9 @@
 //! wedged or failed lane clock, worker, consumer or sink ends only its outputs;
 //! nothing on the Program side ever waits on a lane. Run end: the bake
 //! consumer marks the last Program frame as soon as it published it; after
-//! Program's egress joined, each lane runs on until it passed that frame
-//! (bounded), then stops; every join is bounded and detaches beyond its grace.
+//! Program's egress joined, each lane is stopped on its own once it passed
+//! that frame, and every lane drain and join shares ONE bounded deadline
+//! (detached beyond it).
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
@@ -46,7 +47,7 @@ use multiview_output::sink::{EncodeConfig, VideoRenditionEncoder};
 
 use super::{
     codec_for_encoder, recovery_gate, run_one_output, OutputClockMetrics, PipelineError,
-    PipelineVideoWorker, RunnableOutput, SinkRunOutcome, SinkRunner, SINK_WEDGE_GRACE,
+    PipelineVideoWorker, RunnableOutput, SinkRunOutcome, SinkRunner,
 };
 use crate::binding_delivery::{
     BindingDelivery, BindingPolicy, BindingStatus, DeliveryLimits, WindowDelivery,
@@ -67,8 +68,13 @@ const LANE_VIDEO_QUEUE: usize = 64;
 /// larger gap fails that output alone.
 const LANE_GAP_SECONDS: u64 = 2;
 /// At run end, how long (wall time) a lane may take to pass the last Program
-/// frame before it is stopped anyway: the latch delay plus a wide margin.
+/// frame before it is stopped anyway: the latch delay plus a wide margin
+/// (never more than half the shutdown budget).
 const LANE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// The ONE total wall-time budget for every lane's drain and join at run end
+/// (#343 review I1), capped by an armed process-exit deadline: lanes beyond
+/// it are detached and reported, never awaited.
+const LANE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(3);
 /// The lane consumer's receive step (it also runs the staging watchdog).
 const CONSUMER_STEP: Duration = Duration::from_millis(5);
 
@@ -1125,11 +1131,21 @@ impl RunningLanes {
     }
 
     /// Run end, after Program's egress joined (every Program frame is
-    /// published): let each lane pass the last Program frame (at most
-    /// [`LANE_DRAIN_GRACE`]), stop the clocks, then join every consumer and
-    /// sink with a bounded grace each (detached beyond it). Returns one report
-    /// line per clock and per output; a lane failure is a line, never an error.
+    /// published; the bake consumer normally marked the end already). Within
+    /// ONE total deadline ([`LANE_SHUTDOWN_BUDGET`], never past an armed exit
+    /// deadline): each clock is stopped on its own as soon as it passed the
+    /// last Program frame (or at the drain deadline), so a healthy lane
+    /// finalises without waiting for a wedged sibling; every clock, consumer
+    /// and sink is polled together, and whatever has not ended at the
+    /// deadline is reported and detached. Returns one report line per clock
+    /// and per output; a lane failure is a line, never an error.
     pub(super) fn shutdown(self) -> Vec<String> {
+        let budget = crate::exit_watchdog::remaining()
+            .map_or(LANE_SHUTDOWN_BUDGET, |left| left.min(LANE_SHUTDOWN_BUDGET));
+        self.shutdown_within(budget)
+    }
+
+    fn shutdown_within(self, budget: Duration) -> Vec<String> {
         let RunningLanes {
             stop,
             end,
@@ -1140,21 +1156,38 @@ impl RunningLanes {
             metrics: _,
             mut lines,
         } = self;
-        // Normally marked by the bake consumer already (#343 review M1).
         end.mark_once(final_pts_ns(&latch, program_cadence));
-        let drain_until = Instant::now() + LANE_DRAIN_GRACE;
-        while Instant::now() < drain_until
-            && !clocks
-                .iter()
-                .all(|c| c.passed_end.load(Ordering::Acquire) || c.handle.is_finished())
-        {
+        let started = Instant::now();
+        let deadline = started + budget;
+        let drain_deadline = started + LANE_DRAIN_GRACE.min(budget / 2);
+        let mut stopped = vec![false; clocks.len()];
+        loop {
+            let now = Instant::now();
+            for (clock, stopped) in clocks.iter().zip(stopped.iter_mut()) {
+                if !*stopped
+                    && (clock.passed_end.load(Ordering::Acquire)
+                        || clock.handle.is_finished()
+                        || now >= drain_deadline)
+                {
+                    clock.handle.stop();
+                    *stopped = true;
+                }
+            }
+            let done = clocks.iter().all(|c| c.handle.is_finished())
+                && outputs
+                    .iter()
+                    .all(|o| o.consumer.is_finished() && o.sink.is_finished());
+            if done || now >= deadline {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
         stop.stop();
         for clock in clocks {
             let stats = clock.handle.stats();
             let label = rate_label(clock.rate);
-            let outcome = clock.handle.join_within(SINK_WEDGE_GRACE);
+            // Finished = resolves at once; else detached (no further wait).
+            let outcome = clock.handle.join_within(Duration::ZERO);
             lines.push(format!(
                 "output clock {label} ({}): {} ticks, {} skipped{}",
                 clock.ids.join(", "),
@@ -1173,19 +1206,13 @@ impl RunningLanes {
     }
 }
 
-/// Join one rate output's consumer then sink, each within
-/// [`SINK_WEDGE_GRACE`]; never an unbounded join.
+/// Collect one rate output's consumer then sink. The shared shutdown deadline
+/// already passed or both ended: a thread still running is reported WEDGED
+/// and detached, never awaited.
 fn join_output(output: RunningOutput) -> Vec<String> {
     let RunningOutput { id, consumer, sink } = output;
     let mut lines = Vec::new();
-    let wait = |handle: &dyn Fn() -> bool| {
-        let deadline = Instant::now() + SINK_WEDGE_GRACE;
-        while !handle() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        handle()
-    };
-    if wait(&|| consumer.is_finished()) {
+    if consumer.is_finished() {
         match consumer.join() {
             Ok(Ok(bindings)) => {
                 for line in super::binding_report_lines(&bindings) {
@@ -1201,7 +1228,7 @@ fn join_output(output: RunningOutput) -> Vec<String> {
     } else {
         lines.push(format!("{id}: rate output consumer WEDGED (detached)"));
     }
-    if wait(&|| sink.is_finished()) {
+    if sink.is_finished() {
         match sink.join() {
             Ok(Ok(outcome)) => {
                 if let Some((path, text)) = outcome.playlist {

@@ -923,6 +923,99 @@ fn a_slow_program_sink_finalisation_adds_no_rate_frame_past_program_end() {
     );
 }
 
+/// #343 review I1: one lane clock wedges for good (its outputs cannot end)
+/// beside a healthy lane at another rate. The healthy lane is stopped on its
+/// own once it passed the last Program frame and finalises normally (no
+/// failure line, every frame up to the end); the wedged lane is reported and
+/// detached; the whole run end stays inside one shared shutdown budget (3 s)
+/// instead of a drain grace plus a grace per clock, consumer and sink.
+#[test]
+fn a_wedged_lane_never_holds_a_healthy_lane_or_the_run_end() {
+    const TICKS: u64 = 150;
+    const WEDGE_AT: u64 = 30;
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let wedged = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&wedged);
+    let doc = Doc {
+        second_rate: true,
+        ..Doc::default()
+    };
+    let hooks = Hooks {
+        on_tick: Some(Arc::new(move |tick| {
+            let lane = std::thread::current().name().map(str::to_owned);
+            if tick >= WEDGE_AT && lane.as_deref() == Some("clock-out-24") {
+                flag.store(true, Ordering::Release);
+                // Wedged until the test is over (bounded for the test binary).
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(60));
+            }
+        })),
+        ..Hooks::default()
+    };
+    let ended = Arc::new(Mutex::new(None::<Instant>));
+    let mark = Arc::clone(&ended);
+    let run = drive("lanes_shut", doc, TICKS, hooks, move |ctl| {
+        let start = Instant::now();
+        while ctl.observer.load(Ordering::Acquire) < TICKS {
+            assert!(start.elapsed() < Duration::from_secs(40), "Program ends");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *mark.lock().unwrap() = Some(Instant::now());
+    });
+    let run_end = ended.lock().unwrap().expect("Program ended").elapsed();
+    drop(release_tx);
+    assert!(wedged.load(Ordering::Acquire), "the 24 fps lane wedged");
+    assert_program(&run, TICKS);
+    assert_rate_video(&run, TICKS);
+    let lines = |id: &str| -> Vec<&String> {
+        run.lines
+            .iter()
+            .filter(|l| l.starts_with(&format!("{id}:")))
+            .collect()
+    };
+    assert!(
+        lines("out_rate")
+            .iter()
+            .all(|l| !l.contains("FAILED") && !l.contains("WEDGED")),
+        "the healthy lane finalised normally: {:#?}",
+        run.lines
+    );
+    assert!(
+        lines("out_rate")
+            .iter()
+            .any(|l| l.contains("test rate sink")),
+        "the healthy lane's sink completed: {:#?}",
+        run.lines
+    );
+    assert!(
+        lines("out_rate24").iter().any(|l| l.contains("WEDGED")),
+        "the wedged lane is reported: {:#?}",
+        run.lines
+    );
+    assert!(
+        run.lines
+            .iter()
+            .any(|l| l.starts_with("output clock 24/1") && l.contains("detached")),
+        "the wedged clock is detached: {:#?}",
+        run.lines
+    );
+    let wedged_frames = run.rate24.video.len();
+    assert!(
+        (1..=usize::try_from(WEDGE_AT).unwrap()).contains(&wedged_frames),
+        "the wedged lane carried {wedged_frames} frames"
+    );
+    // The lanes' budget is 3 s; the rest of the run end (Program's egress,
+    // the ingest teardown) is sub-second. Without one shared budget this was
+    // at least 2 s drain + 2 s clock + 2 s consumer + 2 s sink.
+    assert!(
+        run_end < Duration::from_secs(6),
+        "run end took {run_end:?} after Program's last tick"
+    );
+}
+
 /// Chaos: the lane encoder panics at output tick 30. Only that output ends
 /// (its report line says FAILED); Program and its Program-rate sibling
 /// complete fully, one frame per tick.
