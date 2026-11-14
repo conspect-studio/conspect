@@ -1467,7 +1467,10 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_sampler_cannot_freeze_subtitles_for_long() {
+    fn a_dead_sampler_stops_subtitles_at_the_last_confirmed_instant() {
+        // Fail closed (MED4-1): a sampler whose watermark freezes at 0.96 s
+        // never has its open cue published past that instant, however many
+        // segments close; every withholding close past the lag bound counts.
         let stats = SubtitleStats::default();
         let mut held = SlotCues::default();
         let mut open = cue(0, 500, 0, &["A"]);
@@ -1480,33 +1483,34 @@ mod tests {
             pieces.extend(held.publish(start, end, confirmed, &stats));
             held.retire_before(end);
         }
-        // [0.5, 0.96), nothing for MAX_WATERMARK_LAG_SEGMENTS segments, then
-        // forced pieces from the uncovered point, contiguous.
         let spans: Vec<_> = pieces.iter().map(|c| (c.start, c.end)).collect();
         assert_eq!(
             spans,
-            [
-                (ms(500), ms(960)),
-                (ms(960), ms(4_000)),
-                (ms(4_000), ms(5_000)),
-                (ms(5_000), ms(6_000)),
-            ]
+            [(ms(500), ms(960))],
+            "nothing past the confirmed point"
         );
+        // Segments 1 and 2 are within the lag bound; 3, 4 and 5 count.
         assert_eq!(stats.watermark_stale(), 3);
-        // An absent watermark is lag too.
+        assert_eq!(
+            held.len(),
+            1,
+            "only the held cue's last published end is kept"
+        );
+        // An absent watermark publishes nothing at all, and counts too.
         let stats = SubtitleStats::default();
         let mut held = SlotCues::default();
         let mut open = cue(0, 0, 0, &["B"]);
         open.end = SubtitleCue::OPEN_END;
         held.push(open, &stats);
         let mut n = 0;
-        for seg in 0..3 {
+        for seg in 0..4 {
             n += held
                 .publish(ms(seg * 1_000), ms((seg + 1) * 1_000), None, &stats)
                 .len();
         }
-        assert_eq!(n, 1, "only the forced segment publishes");
-        assert_eq!(stats.watermark_stale(), 1);
+        assert_eq!(n, 0, "no confirmation, no display");
+        // Absent from the first close: closes 3 and 4 exceed the bound.
+        assert_eq!(stats.watermark_stale(), 2);
     }
 
     #[test]
