@@ -433,6 +433,7 @@ fn cast_plan_gate(
     use crate::output_routing::PlanRefusal;
     use crate::routes::output_routing::{
         aux_capacity_text, capacity_text, refusal_problem, routing_unavailable, unroutable_kind,
+        CLEAN_UNAVAILABLE_WITH_DSK, CLEAN_WITH_DSK_TEXT,
     };
     let Some(control) = state.output_routing.as_ref() else {
         return Some(routing_unavailable());
@@ -442,6 +443,13 @@ fn cast_plan_gate(
             409,
             "switcher-required",
             "Preview and Clean need a switcher (M/E) in this run".to_owned(),
+        )),
+        // ADR-0113 K2a: a cast of Clean is refused while a DSK is defined,
+        // exactly as the take route refuses it.
+        Err(PlanRefusal::CleanUnavailableWithDsk) => Some(refusal_problem(
+            409,
+            CLEAN_UNAVAILABLE_WITH_DSK,
+            CLEAN_WITH_DSK_TEXT.to_owned(),
         )),
         Err(PlanRefusal::OutputKindUnroutable) => Some(unroutable_kind()),
         Err(PlanRefusal::AuxCapacity { active, max }) => Some(refusal_problem(
