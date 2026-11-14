@@ -71,7 +71,7 @@ pub fn alloc_video(format: Pixel, width: u32, height: u32) -> Result<Video> {
     if size_ok < 0 {
         return Err(FfmpegError::FrameLayout("libav rejects the frame size"));
     }
-    let mut frame = Video::empty();
+    let mut frame = new_frame();
     #[allow(unsafe_code)]
     // SAFETY: `as_mut_ptr` returns the frame's own `AVFrame` pointer (from
     // `av_frame_alloc`); it is checked for null before any dereference, and
@@ -116,6 +116,224 @@ pub fn alloc_video(format: Pixel, width: u32, height: u32) -> Result<Video> {
         }
     }
     Ok(frame)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test fault seam: when set, the next [`new_frame`] on this thread
+    /// behaves as if `av_frame_alloc` returned null (out of memory).
+    static FAIL_NEXT_FRAME_ALLOC: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Test fault seam: make the next frame allocation on this thread fail as
+/// if `av_frame_alloc` returned null.
+#[cfg(test)]
+pub(crate) fn fail_next_frame_alloc() {
+    FAIL_NEXT_FRAME_ALLOC.with(|f| f.set(true));
+}
+
+/// `Video::empty()` (`av_frame_alloc`), whose pointer may be null; every
+/// caller null-checks it before any accessor runs.
+fn new_frame() -> Video {
+    #[cfg(test)]
+    if FAIL_NEXT_FRAME_ALLOC.with(|f| f.replace(false)) {
+        #[allow(unsafe_code)]
+        // SAFETY: a non-owning wrapper around null is exactly the state
+        // `Video::empty()` produces when `av_frame_alloc` fails; its `Drop`
+        // frees nothing, and `alloc_video` rejects it before any access.
+        return unsafe { Video::wrap(core::ptr::null_mut()) };
+    }
+    Video::empty()
+}
+
+/// A privately owned, checked CPU frame for reuse across conversions
+/// ([`crate::Scaler::run_into`], the media player's alpha scratch, #391).
+///
+/// Only [`ScratchFrame::alloc`] creates one (through [`alloc_video`], so the
+/// `AVFrame` is non-null and every plane is allocated), and the inner frame
+/// is never handed out mutably, so its format, size and buffers cannot be
+/// changed behind the wrapper (e.g. raising the height with the safe
+/// `Video::set_height` over a small allocation). Plane access still
+/// re-validates the span against the frame's own buffers
+/// ([`ScratchFrame::plane`], [`ScratchFrame::plane_mut`]); writes also
+/// require the buffers to be writable (`av_frame_is_writable`).
+pub struct ScratchFrame {
+    frame: Video,
+}
+
+impl core::fmt::Debug for ScratchFrame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ScratchFrame")
+            .field("format", &self.format())
+            .field("width", &self.width())
+            .field("height", &self.height())
+            .finish()
+    }
+}
+
+impl ScratchFrame {
+    /// Allocate a checked `format` frame of `width x height`.
+    ///
+    /// # Errors
+    /// As [`alloc_video`].
+    pub fn alloc(format: Pixel, width: u32, height: u32) -> Result<Self> {
+        Ok(Self {
+            frame: alloc_video(format, width, height)?,
+        })
+    }
+
+    /// The frame, read-only (for `plane_rows`, PTS, reading the geometry).
+    #[must_use]
+    pub const fn frame(&self) -> &Video {
+        &self.frame
+    }
+
+    /// Pixel format.
+    #[must_use]
+    pub fn format(&self) -> Pixel {
+        self.frame.format()
+    }
+
+    /// Width in pixels.
+    #[must_use]
+    pub fn width(&self) -> u32 {
+        self.frame.width()
+    }
+
+    /// Height in pixels.
+    #[must_use]
+    pub fn height(&self) -> u32 {
+        self.frame.height()
+    }
+
+    /// Whether this frame is a `format` frame of `width x height`.
+    #[must_use]
+    pub fn matches(&self, format: Pixel, width: u32, height: u32) -> bool {
+        self.format() == format && self.width() == width && self.height() == height
+    }
+
+    /// `plane` as one validated forward span plus its stride: the slice
+    /// covers rows `0..plane_height`, the last one only up to the row's
+    /// active bytes, and lies inside one of the frame's buffers.
+    ///
+    /// # Errors
+    /// [`FfmpegError::FrameLayout`] when the plane fails validation.
+    pub fn plane(&self, plane: usize) -> Result<(&[u8], usize)> {
+        let (ptr, len, stride) = writable_span(&self.frame, plane)?;
+        #[allow(unsafe_code)]
+        // SAFETY: `writable_span` proved `[ptr, ptr + len)` lies inside one
+        // `AVBufferRef` the frame holds (initialized libav memory); the
+        // shared borrow of `self` keeps the frame alive and unmutated.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr.cast_const(), len) };
+        Ok((bytes, stride))
+    }
+
+    /// `plane` as one validated, writable forward span plus its stride (see
+    /// [`Self::plane`]).
+    ///
+    /// # Errors
+    /// [`FfmpegError::FrameLayout`] when the plane fails validation or the
+    /// buffers are shared (not writable).
+    pub fn plane_mut(&mut self, plane: usize) -> Result<(&mut [u8], usize)> {
+        self.check_writable()?;
+        let (ptr, len, stride) = writable_span(&self.frame, plane)?;
+        #[allow(unsafe_code)]
+        // SAFETY: as `plane`, and the buffers are exclusively ours
+        // (`av_frame_is_writable`, checked above); `&mut self` makes this
+        // the only live view of them.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+        Ok((bytes, stride))
+    }
+
+    /// Validate every plane of the format as a writable destination for a
+    /// full-frame write (libswscale): positive linesize, every row's active
+    /// bytes inside the frame's own buffers, buffers not shared.
+    ///
+    /// # Errors
+    /// [`FfmpegError::FrameLayout`] naming the first failure.
+    pub fn check_destination(&mut self) -> Result<()> {
+        self.check_writable()?;
+        let planes = format_planes(self.frame.format())?;
+        for plane in 0..planes {
+            writable_span(&self.frame, plane)?;
+        }
+        Ok(())
+    }
+
+    /// The raw frame, for a libav call that writes the already-validated
+    /// planes ([`Self::check_destination`]) without changing the frame's
+    /// format, size or buffers.
+    pub(crate) fn video_mut(&mut self) -> &mut Video {
+        &mut self.frame
+    }
+
+    fn check_writable(&mut self) -> Result<()> {
+        #[allow(unsafe_code)]
+        // SAFETY: the pointer is this frame's own `AVFrame`, null-checked;
+        // `av_frame_is_writable` only reads the buffer refcounts.
+        let writable = unsafe {
+            let raw = self.frame.as_mut_ptr();
+            !raw.is_null() && ffi::av_frame_is_writable(raw) > 0
+        };
+        if writable {
+            Ok(())
+        } else {
+            Err(FfmpegError::FrameLayout("frame buffers are not writable"))
+        }
+    }
+
+    /// Test seam: wrap an arbitrary frame, bypassing [`Self::alloc`], to
+    /// prove the plane validation catches a malformed one.
+    #[cfg(test)]
+    pub(crate) fn from_video_unchecked(frame: Video) -> Self {
+        Self { frame }
+    }
+}
+
+/// The number of planes of `format`.
+fn format_planes(format: Pixel) -> Result<usize> {
+    #[allow(unsafe_code)]
+    // SAFETY: `av_pix_fmt_count_planes` only reads the static format table.
+    let planes = unsafe { ffi::av_pix_fmt_count_planes(ffi::AVPixelFormat::from(format)) };
+    match usize::try_from(planes) {
+        Ok(n) if (1..=8).contains(&n) => Ok(n),
+        _ => Err(FfmpegError::FrameLayout("unknown pixel format")),
+    }
+}
+
+/// `(first byte, span length, stride)` of `plane` of `frame`, a forward
+/// (positive linesize) plane whose every row's active bytes
+/// (`av_image_get_linesize`) lie in one buffer the frame owns — checked by
+/// [`plane_rows`] — and whose span `stride * (rows - 1) + row_bytes`
+/// therefore lies in that same contiguous buffer.
+fn writable_span(frame: &Video, plane: usize) -> Result<(*mut u8, usize, usize)> {
+    let planes = format_planes(frame.format())?;
+    if plane >= planes {
+        return Err(FfmpegError::FrameLayout("plane is not part of the format"));
+    }
+    let width = libc::c_int::try_from(frame.width())
+        .map_err(|_| FfmpegError::FrameLayout("frame width overflows"))?;
+    let index =
+        libc::c_int::try_from(plane).map_err(|_| FfmpegError::FrameLayout("plane index"))?;
+    #[allow(unsafe_code)]
+    // SAFETY: `av_image_get_linesize` reads the static format table; a
+    // negative result (invalid plane/width) is rejected below.
+    let row_bytes = unsafe {
+        ffi::av_image_get_linesize(ffi::AVPixelFormat::from(frame.format()), width, index)
+    };
+    let row_bytes =
+        usize::try_from(row_bytes).map_err(|_| FfmpegError::FrameLayout("plane row size"))?;
+    let rows = plane_rows(frame, plane, row_bytes)?;
+    if rows.rows == 0 || row_bytes == 0 {
+        return Err(FfmpegError::FrameLayout("plane is empty"));
+    }
+    let stride = usize::try_from(rows.linesize)
+        .map_err(|_| FfmpegError::FrameLayout("plane is not laid out top-down"))?;
+    let len = stride
+        .checked_mul(rows.rows - 1)
+        .and_then(|v| v.checked_add(row_bytes))
+        .ok_or(FfmpegError::FrameLayout("plane span overflows"))?;
+    Ok((rows.first.cast_mut(), len, stride))
 }
 
 /// The `AVFrame::format` code of `format` (an `AVPixelFormat` discriminant).

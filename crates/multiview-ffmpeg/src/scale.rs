@@ -17,7 +17,7 @@ use ffmpeg::util::frame::Video;
 use ffmpeg_next as ffmpeg;
 
 use crate::error::{FfmpegError, Result};
-use crate::frame::{alloc_video, plane_rows};
+use crate::frame::{alloc_video, plane_rows, ScratchFrame};
 
 /// A `(format, width, height)` description of a scaler endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,19 +173,25 @@ impl Scaler {
 
     /// Convert `input` into the caller-owned `output`, reusing its buffers.
     ///
-    /// `output` is (re)allocated only when it is empty or does not match the
-    /// destination spec, so a steady per-frame caller converts with no heap
-    /// allocation after the first frame (the media player's alpha scale,
-    /// #391). The allocation is checked ([`alloc_video`]): a failure is an
-    /// error before any plane is touched or libswscale runs. An identity spec
-    /// copies the planes into `output` row by row through validated row views
-    /// ([`plane_rows`]), so a bottom-up (negative linesize) input is fine.
+    /// `output` is a [`ScratchFrame`]: only [`ScratchFrame::alloc`] (the
+    /// checked [`alloc_video`](crate::frame::alloc_video)) creates one and
+    /// its frame is never exposed mutably, so a reused destination cannot be
+    /// a null frame, an unallocated one, or a small allocation whose height
+    /// was raised afterwards. It is reallocated only when it does not match
+    /// the destination spec, so a steady per-frame caller converts with no
+    /// heap allocation after the first frame (the media player's alpha
+    /// scale, #391). Before anything is written every destination plane is
+    /// re-validated against the frame's own buffers and the buffers must be
+    /// writable (`av_frame_is_writable`); a failure is an error, never a
+    /// write. An identity spec copies the planes row by row through
+    /// validated row views ([`plane_rows`]), so a bottom-up (negative
+    /// linesize) input is fine.
     ///
     /// # Errors
     /// As [`Self::run`], plus [`FfmpegError::FrameLayout`] /
-    /// [`FfmpegError::FrameAlloc`] from the output allocation or a malformed
-    /// input plane.
-    pub fn run_into(&mut self, input: &Video, output: &mut Video) -> Result<()> {
+    /// [`FfmpegError::FrameAlloc`] from the output allocation, a destination
+    /// plane that fails validation, or a malformed input plane.
+    pub fn run_into(&mut self, input: &Video, output: &mut ScratchFrame) -> Result<()> {
         if input.format() != self.src.format
             || input.width() != self.src.width
             || input.height() != self.src.height
@@ -194,19 +200,16 @@ impl Scaler {
                 "input geometry/format differs from the scaler's source spec",
             ));
         }
-        if output.format() != self.dst.format
-            || output.width() != self.dst.width
-            || output.height() != self.dst.height
-            || !has_cpu_planes(output)
-        {
-            *output = alloc_video(self.dst.format, self.dst.width, self.dst.height)?;
+        if !output.matches(self.dst.format, self.dst.width, self.dst.height) {
+            *output = ScratchFrame::alloc(self.dst.format, self.dst.width, self.dst.height)?;
         }
+        output.check_destination()?;
         if self.src == self.dst {
             // Never the libswscale no-op path (Defect A, see `run`).
             let width = libc::c_int::try_from(self.dst.width)
                 .map_err(|_| FfmpegError::FrameLayout("frame width overflows"))?;
             let format = ffmpeg::ffi::AVPixelFormat::from(self.dst.format);
-            for plane in 0..output.planes() {
+            for plane in 0..output.frame().planes() {
                 let index = libc::c_int::try_from(plane)
                     .map_err(|_| FfmpegError::FrameLayout("plane index"))?;
                 #[allow(unsafe_code)]
@@ -216,9 +219,8 @@ impl Scaler {
                 let bytes = unsafe { ffmpeg::ffi::av_image_get_linesize(format, width, index) };
                 let bytes = usize::try_from(bytes)
                     .map_err(|_| FfmpegError::FrameLayout("plane row size"))?;
-                let d_stride = output.stride(plane);
                 let rows = plane_rows(input, plane, bytes)?;
-                let dst = output.data_mut(plane);
+                let (dst, d_stride) = output.plane_mut(plane)?;
                 for (r, src) in rows.enumerate() {
                     let start = r
                         .checked_mul(d_stride)
@@ -233,27 +235,124 @@ impl Scaler {
             }
             return Ok(());
         }
-        self.sws.run(input, output).map_err(FfmpegError::Convert)
+        // `check_destination` proved every plane of the (unchanged) frame
+        // is writable, forward and inside its own buffers for the spec's
+        // geometry, which is exactly what `sws_scale` writes.
+        self.sws
+            .run(input, output.video_mut())
+            .map_err(FfmpegError::Convert)
     }
 }
 
-/// Whether `frame` holds every plane of its format with a positive linesize,
-/// so `stride`/`data_mut` describe real, forward-laid-out memory.
-fn has_cpu_planes(frame: &Video) -> bool {
-    let format = ffmpeg::ffi::AVPixelFormat::from(frame.format());
-    #[allow(unsafe_code)]
-    // SAFETY: `av_pix_fmt_count_planes` reads the static format table; the
-    // frame pointer is `frame`'s own live `AVFrame`, read-only here, and
-    // `planes <= AV_NUM_DATA_POINTERS`.
-    unsafe {
-        let planes = usize::try_from(ffmpeg::ffi::av_pix_fmt_count_planes(format)).unwrap_or(0);
-        let raw = frame.as_ptr();
-        planes > 0
-            && planes <= 8
-            && !raw.is_null()
-            && (0..planes).all(|p| {
-                (*raw).data.get(p).is_some_and(|d| !d.is_null())
-                    && (*raw).linesize.get(p).is_some_and(|&l| l > 0)
-            })
+#[cfg(test)]
+mod run_into_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    fn gray(w: u32, h: u32) -> Video {
+        let mut frame = alloc_video(Pixel::GRAY8, w, h).unwrap();
+        let stride = frame.stride(0);
+        for (i, b) in frame.data_mut(0).iter_mut().enumerate() {
+            *b = u8::try_from((i % stride) * 30 % 256).unwrap();
+        }
+        frame
+    }
+
+    /// A small allocation whose height was raised afterwards with the safe
+    /// `Video::set_height` — the shape a caller could pass as a reused
+    /// output before `run_into` took a `ScratchFrame`.
+    fn undersized(w: u32, small_h: u32, claimed_h: u32) -> ScratchFrame {
+        let mut frame = alloc_video(Pixel::GRAY8, w, small_h).unwrap();
+        frame.set_height(claimed_h);
+        ScratchFrame::from_video_unchecked(frame)
+    }
+
+    /// R3 round 2 #1: an output that matches the destination spec but whose
+    /// buffers are smaller than its claimed geometry is an error before
+    /// libswscale (or the identity copy) writes a byte; it used to SIGSEGV.
+    #[test]
+    fn an_undersized_matching_output_is_an_error_not_ub() {
+        let src = gray(4, 2);
+        let mut scale = Scaler::new(
+            ScaleSpec::new(Pixel::GRAY8, 4, 2),
+            ScaleSpec::new(Pixel::GRAY8, 4, 512),
+        )
+        .unwrap();
+        let mut out = undersized(4, 1, 512);
+        let err = scale.run_into(&src, &mut out).unwrap_err();
+        assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
+
+        let tall = gray(4, 512);
+        let mut identity = Scaler::new(
+            ScaleSpec::new(Pixel::GRAY8, 4, 512),
+            ScaleSpec::new(Pixel::GRAY8, 4, 512),
+        )
+        .unwrap();
+        let mut out = undersized(4, 1, 512);
+        let err = identity.run_into(&tall, &mut out).unwrap_err();
+        assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
+    }
+
+    /// R3 round 2 #1: a destination whose buffers are shared with another
+    /// frame (not `av_frame_is_writable`) is refused, never written through.
+    #[test]
+    fn a_shared_output_buffer_is_refused() {
+        let src = gray(4, 2);
+        let mut scale = Scaler::new(
+            ScaleSpec::new(Pixel::GRAY8, 4, 2),
+            ScaleSpec::new(Pixel::GRAY8, 8, 4),
+        )
+        .unwrap();
+        let mut out = ScratchFrame::alloc(Pixel::GRAY8, 8, 4).unwrap();
+        let mut other = Video::empty();
+        #[allow(unsafe_code)]
+        // SAFETY: both frames are live and owned here; `other` is empty, as
+        // `av_frame_ref` requires, and takes a second reference to `out`'s
+        // buffers (freed by `other`'s Drop).
+        let ret = unsafe { ffmpeg::ffi::av_frame_ref(other.as_mut_ptr(), out.frame().as_ptr()) };
+        assert_eq!(ret, 0);
+        let before = other.data(0).to_vec();
+        let err = scale.run_into(&src, &mut out).unwrap_err();
+        assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
+        assert_eq!(other.data(0), &before[..], "a shared buffer was written");
+        drop(other);
+        // Once the other holder lets go, the same frame is reused.
+        scale.run_into(&src, &mut out).unwrap();
+    }
+
+    /// R3 round 2 #2: a failed `av_frame_alloc` (null `AVFrame`) is an
+    /// allocation error; no `ScratchFrame` (hence no `run_into` output)
+    /// can hold a null frame, so no accessor ever reads through one.
+    #[test]
+    fn a_null_frame_allocation_never_becomes_a_scratch_frame() {
+        crate::frame::fail_next_frame_alloc();
+        let err = ScratchFrame::alloc(Pixel::GRAY8, 8, 4).unwrap_err();
+        assert!(matches!(err, FfmpegError::FrameAlloc(_)), "{err}");
+        // The seam is one-shot: the next allocation succeeds and converts.
+        let mut out = ScratchFrame::alloc(Pixel::GRAY8, 8, 4).unwrap();
+        let mut scale = Scaler::new(
+            ScaleSpec::new(Pixel::GRAY8, 4, 2),
+            ScaleSpec::new(Pixel::GRAY8, 8, 4),
+        )
+        .unwrap();
+        scale.run_into(&gray(4, 2), &mut out).unwrap();
+    }
+
+    /// A spec change reallocates through the checked path; a failure there
+    /// is an error and leaves no half-built output.
+    #[test]
+    fn a_failed_reallocation_is_an_error() {
+        let mut out = ScratchFrame::alloc(Pixel::GRAY8, 2, 2).unwrap();
+        let mut scale = Scaler::new(
+            ScaleSpec::new(Pixel::GRAY8, 4, 2),
+            ScaleSpec::new(Pixel::GRAY8, 8, 4),
+        )
+        .unwrap();
+        let src = gray(4, 2);
+        crate::frame::fail_next_frame_alloc();
+        let err = scale.run_into(&src, &mut out).unwrap_err();
+        assert!(matches!(err, FfmpegError::FrameAlloc(_)), "{err}");
+        assert_eq!((out.width(), out.height()), (2, 2), "output left intact");
     }
 }

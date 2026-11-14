@@ -14,6 +14,7 @@ use ffmpeg::format::{Pixel, Sample};
 use ffmpeg::util::frame::{Audio, Video};
 use ffmpeg::ChannelLayout;
 use ffmpeg_next as ffmpeg;
+use multiview_ffmpeg::frame::ScratchFrame;
 use multiview_ffmpeg::{ResampleSpec, Resampler, ScaleSpec, Scaler};
 
 const W: u32 = 64;
@@ -108,20 +109,21 @@ fn run_into_reuses_the_output_frame_for_scale_and_identity() {
         ScaleSpec::new(Pixel::GRAY8, 14, 10),
     )
     .unwrap();
-    let mut out = Video::empty();
+    // Mismatched on purpose: the first run_into reallocates it.
+    let mut out = ScratchFrame::alloc(Pixel::GRAY8, 1, 1).unwrap();
     scaler.run_into(&src, &mut out).unwrap();
     assert_eq!(
         (out.format(), out.width(), out.height()),
         (Pixel::GRAY8, 14, 10)
     );
-    let buffer = out.data(0).as_ptr();
+    let buffer = out.frame().data(0).as_ptr();
     scaler.run_into(&src, &mut out).unwrap();
     assert_eq!(
-        out.data(0).as_ptr(),
+        out.frame().data(0).as_ptr(),
         buffer,
         "steady state must reuse the frame"
     );
-    assert!(out.data(0)[0] <= 8 && out.data(0)[13] >= 247);
+    assert!(out.frame().data(0)[0] <= 8 && out.frame().data(0)[13] >= 247);
 
     // Identity copies the active samples in place (never the sws no-op).
     let mut identity = Scaler::new(
@@ -129,12 +131,13 @@ fn run_into_reuses_the_output_frame_for_scale_and_identity() {
         ScaleSpec::new(Pixel::GRAY8, 7, 5),
     )
     .unwrap();
-    let mut same = Video::empty();
+    // Mismatched on purpose: the first run_into reallocates it.
+    let mut same = ScratchFrame::alloc(Pixel::GRAY8, 1, 1).unwrap();
     identity.run_into(&src, &mut same).unwrap();
     for y in 0..5 {
-        let (s, d) = (src.stride(0), same.stride(0));
+        let (s, d) = (src.stride(0), same.frame().stride(0));
         assert_eq!(
-            &same.data(0)[y * d..y * d + 7],
+            &same.frame().data(0)[y * d..y * d + 7],
             &src.data(0)[y * s..y * s + 7]
         );
     }
@@ -169,14 +172,19 @@ fn run_into_identity_copies_a_bottom_up_frame_in_display_order() {
         ScaleSpec::new(Pixel::GRAY8, w, h),
     )
     .unwrap();
-    let mut out = Video::empty();
+    // Mismatched on purpose: the first run_into reallocates it.
+    let mut out = ScratchFrame::alloc(Pixel::GRAY8, 1, 1).unwrap();
     identity.run_into(&src, &mut out).unwrap();
-    let d = out.stride(0);
+    let d = out.frame().stride(0);
     for y in 0..rows {
         let expected: Vec<u8> = (0..cols)
             .map(|x| u8::try_from(10 * (3 - y) + x).unwrap())
             .collect();
-        assert_eq!(&out.data(0)[y * d..y * d + cols], &expected[..], "row {y}");
+        assert_eq!(
+            &out.frame().data(0)[y * d..y * d + cols],
+            &expected[..],
+            "row {y}"
+        );
     }
 }
 
