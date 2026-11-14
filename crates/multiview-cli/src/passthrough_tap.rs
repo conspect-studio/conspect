@@ -7,7 +7,9 @@
 //! * Without a consumer the writer does one atomic load per packet
 //!   ([`multiview_output::passthrough::CompressedTap::has_consumers`]) and
 //!   returns: no copy, no classification, no allocation.
-//! * With a consumer it copies the packet bytes once into an `Arc<[u8]>`,
+//! * With a consumer it copies the packet bytes once into an `Arc<[u8]>`
+//!   (re-framed to Annex B in that copy; the size and NAL count are checked
+//!   first, so nothing over `MAX_AU_BYTES` is ever allocated),
 //!   classifies it with pure header parsers and `offer`s it; `offer` only
 //!   `try_lock`s / `try_send`s (D1), so the reader thread never waits.
 //! * The registry is a [`SwapCell`] of an immutable map: a lookup is one
@@ -59,8 +61,9 @@ pub struct SourceTap {
     oversize: AtomicU64,
     /// Connections refused because their extradata exceeded the bound.
     refused_extradata: AtomicU64,
-    /// Packets skipped because they carried no DTS/PTS, no run clock existed,
-    /// or a length-prefixed packet was malformed.
+    /// Packets skipped because their length prefixes were malformed.
+    malformed: AtomicU64,
+    /// Packets skipped because they carried no DTS/PTS or no run clock existed.
     unstamped: AtomicU64,
 }
 
@@ -90,6 +93,7 @@ impl SourceTap {
             params_gen: AtomicU64::new(0),
             oversize: AtomicU64::new(0),
             refused_extradata: AtomicU64::new(0),
+            malformed: AtomicU64::new(0),
             unstamped: AtomicU64::new(0),
         }
     }
@@ -124,6 +128,12 @@ impl SourceTap {
     #[must_use]
     pub fn refused_extradata(&self) -> u64 {
         self.refused_extradata.load(Ordering::Relaxed)
+    }
+
+    /// Packets skipped for malformed length prefixes (never re-framed).
+    #[must_use]
+    pub fn malformed(&self) -> u64 {
+        self.malformed.load(Ordering::Relaxed)
     }
 
     /// Packets the writer skipped for a missing timestamp or run clock.
@@ -445,13 +455,21 @@ impl TapWriter {
         // Every tap AU is Annex B (the one copy re-frames a length-prefixed
         // packet), so a reader never depends on a connection's framing and
         // the bytes go straight into an MPEG-TS muxer.
-        let bytes: Arc<[u8]> = if self.facts.framing == NalFraming::AnnexB {
-            Arc::from(data)
-        } else if let Some(v) = idr::to_annex_b(data, self.facts.framing) {
-            Arc::from(v)
-        } else {
-            self.tap.unstamped.fetch_add(1, Ordering::Relaxed);
-            return;
+        // The re-framed size and NAL count are checked before allocating:
+        // an expansion past MAX_AU_BYTES (1/2-byte prefixes) is counted as
+        // oversize here, never built and then dropped by the offer.
+        let bytes: Arc<[u8]> = match idr::annex_b_size(data, self.facts.framing, MAX_AU_BYTES)
+            .map(|_| idr::to_annex_b(data, self.facts.framing, MAX_AU_BYTES))
+        {
+            Ok(Some(bytes)) => bytes,
+            Err(idr::ReframeError::TooLarge) => {
+                self.tap.oversize.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Ok(None) | Err(idr::ReframeError::Malformed) => {
+                self.tap.malformed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         };
         let data = &bytes[..];
         let framing = NalFraming::AnnexB;
@@ -737,5 +755,51 @@ mod tests {
         let mut huge = vec![1, 0x64, 0, 0x1F, 0xFF, 0xE1, 0x20, 0x00];
         huge.extend(std::iter::repeat_n(0x67, 0x2000));
         assert_eq!(extradata_sps(&huge), None, "over MAX_SPS_BYTES");
+    }
+
+    /// #344 D2a review R1-A-2: a length-prefixed packet within `MAX_AU_BYTES`
+    /// whose Annex-B form would exceed it is refused before re-framing and
+    /// counted as oversize at once; so is one over the NAL budget.
+    #[test]
+    fn length_prefixed_expansion_past_the_cap_is_counted_oversize_before_allocating() {
+        let tap = Arc::new(SourceTap::new());
+        let reader = tap.tap().subscribe().unwrap();
+        let mut f = facts();
+        f.framing = NalFraming::LengthPrefixed { nal_length_size: 2 };
+        let mut w = TapWriter::connect(Arc::clone(&tap), f, clock());
+        // 2-byte prefixes of 0xFFFF-byte NALs: input under the cap, Annex-B
+        // form (+2 bytes per NAL) over it.
+        // 127 NALs of 0xFFFF bytes plus one filler NAL: exactly MAX_AU_BYTES
+        // in, MAX_AU_BYTES + 256 out (each NAL grows by 2 bytes).
+        let nal = 0xFFFF_usize;
+        let mut lp = Vec::with_capacity(MAX_AU_BYTES);
+        for _ in 0..127 {
+            lp.extend_from_slice(&[0xFF, 0xFF, 0x41]);
+            lp.resize(lp.len() + nal - 1, 0x11);
+        }
+        let filler = MAX_AU_BYTES - lp.len() - 2;
+        lp.extend_from_slice(&u16::try_from(filler).unwrap().to_be_bytes());
+        lp.push(0x41);
+        lp.resize(MAX_AU_BYTES, 0x11);
+        assert_eq!(lp.len(), MAX_AU_BYTES);
+        assert_eq!(
+            idr::annex_b_size(
+                &lp,
+                NalFraming::LengthPrefixed { nal_length_size: 2 },
+                usize::MAX
+            ),
+            Ok(MAX_AU_BYTES + 2 * 128)
+        );
+        w.on_packet(&lp, Some(0), Some(0), false);
+        assert_eq!(tap.oversize(), 1);
+        assert!(reader.try_recv().is_none());
+        // 1-byte prefixes, 2000 one-byte NALs: over the NAL budget.
+        let mut g = facts();
+        g.framing = NalFraming::LengthPrefixed { nal_length_size: 1 };
+        let mut w = TapWriter::connect(Arc::clone(&tap), g, clock());
+        let many: Vec<u8> = (0..2000).flat_map(|_| [1_u8, 0x41]).collect();
+        w.on_packet(&many, Some(1), Some(1), false);
+        assert_eq!(tap.oversize(), 2);
+        assert!(reader.try_recv().is_none());
     }
 }

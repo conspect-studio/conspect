@@ -182,7 +182,7 @@ pub use log_bridge::{
 #[cfg(feature = "ffmpeg")]
 pub use log_bridge::install as install_log_bridge;
 
-pub use idr::{is_idr, CodecKind, NalFraming};
+pub use idr::{is_idr, CodecKind, NalFraming, ReframeError};
 
 pub use hwdecode::{
     cuvid_decoder, cuvid_resize_option, decode_surface_pool, nvdec_disabled, nvdec_resize_target,

@@ -286,40 +286,115 @@ pub fn h264_nal_of_type(au: &[u8], framing: NalFraming, nal_type: u8) -> Option<
     found
 }
 
-/// `au` re-framed as Annex B (a 4-byte start code before each NAL), for a
-/// muxer that carries H.264/HEVC in band (MPEG-TS). `None` when `framing`
-/// is OBU, or a length-prefixed `au` is malformed (a length past the
-/// buffer). An Annex-B `au` is returned unchanged.
-#[must_use]
-pub fn to_annex_b(au: &[u8], framing: NalFraming) -> Option<Vec<u8>> {
+/// Most NAL units one access unit may carry for re-framing (as D1's
+/// `h264_repeat` parse bound). Real AUs carry a handful (AUD, SEI, SPS, PPS,
+/// slices); more is hostile.
+pub const MAX_AU_NALS: usize = 1024;
+
+/// Why an access unit cannot be re-framed ([`annex_b_size`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReframeError {
+    /// The Annex-B result would exceed the byte cap, or the AU has more than
+    /// [`MAX_AU_NALS`] NALs: too large.
+    TooLarge,
+    /// OBU framing, or a zero / truncated length prefix.
+    Malformed,
+}
+
+/// The exact size of `au` re-framed as Annex B ([`to_annex_b`]), computed
+/// with checked arithmetic and without allocating. Fails with
+/// [`ReframeError::TooLarge`] when the result exceeds `max_bytes` or the AU
+/// has more than [`MAX_AU_NALS`] NALs (checked as the prefixes are walked,
+/// so the walk itself is bounded), and [`ReframeError::Malformed`] for OBU
+/// framing or a zero / truncated length. An Annex-B `au` is its own length.
+///
+/// # Errors
+/// See above.
+pub fn annex_b_size(
+    au: &[u8],
+    framing: NalFraming,
+    max_bytes: usize,
+) -> Result<usize, ReframeError> {
     match framing {
-        NalFraming::AnnexB => Some(au.to_vec()),
-        NalFraming::Obu => None,
+        NalFraming::AnnexB if au.len() <= max_bytes => Ok(au.len()),
+        NalFraming::AnnexB => Err(ReframeError::TooLarge),
+        NalFraming::Obu => Err(ReframeError::Malformed),
         NalFraming::LengthPrefixed { nal_length_size } => {
             let size = usize::from(nal_length_size);
             if !(1..=4).contains(&size) {
-                return None;
+                return Err(ReframeError::Malformed);
             }
-            let mut out = Vec::with_capacity(au.len().saturating_add(16));
+            let mut total = 0_usize;
+            let mut nals = 0_usize;
             let mut offset = 0_usize;
             while offset < au.len() {
-                let len_bytes = au.get(offset..offset.checked_add(size)?)?;
-                let nal_len = len_bytes
+                let len_end = offset.checked_add(size).ok_or(ReframeError::Malformed)?;
+                let nal_len = au
+                    .get(offset..len_end)
+                    .ok_or(ReframeError::Malformed)?
                     .iter()
                     .fold(0_usize, |acc, &b| (acc << 8) | usize::from(b));
-                let start = offset + size;
-                let end = start.checked_add(nal_len)?;
-                let nal = au.get(start..end)?;
                 if nal_len == 0 {
-                    return None;
+                    return Err(ReframeError::Malformed);
                 }
-                out.extend_from_slice(&[0, 0, 0, 1]);
-                out.extend_from_slice(nal);
+                nals += 1;
+                if nals > MAX_AU_NALS {
+                    return Err(ReframeError::TooLarge);
+                }
+                let end = len_end
+                    .checked_add(nal_len)
+                    .filter(|&e| e <= au.len())
+                    .ok_or(ReframeError::Malformed)?;
+                total = total
+                    .checked_add(4)
+                    .and_then(|t| t.checked_add(nal_len))
+                    .filter(|&t| t <= max_bytes)
+                    .ok_or(ReframeError::TooLarge)?;
                 offset = end;
             }
-            Some(out)
+            Ok(total)
         }
     }
+}
+
+/// `au` re-framed as Annex B (a 4-byte start code before each NAL), for a
+/// muxer that carries H.264/HEVC in band (MPEG-TS), written once into the
+/// final shared buffer. The output size is checked against `max_bytes` and
+/// the NAL count against [`MAX_AU_NALS`] **before** allocating
+/// ([`annex_b_size`]); `None` on any refusal. An Annex-B `au` is copied as is.
+#[must_use]
+pub fn to_annex_b(
+    au: &[u8],
+    framing: NalFraming,
+    max_bytes: usize,
+) -> Option<std::sync::Arc<[u8]>> {
+    let total = annex_b_size(au, framing, max_bytes).ok()?;
+    let NalFraming::LengthPrefixed { nal_length_size } = framing else {
+        return Some(std::sync::Arc::from(au));
+    };
+    let size = usize::from(nal_length_size);
+    // One allocation of the exact size (`repeat_n` is `TrustedLen`, so the
+    // `Arc<[u8]>` is allocated once with no intermediate Vec), then filled
+    // in place through the unique handle: the packet bytes are copied once.
+    let mut out: std::sync::Arc<[u8]> = std::iter::repeat_n(0_u8, total).collect();
+    let dst = std::sync::Arc::get_mut(&mut out)?;
+    let (mut offset, mut at) = (0_usize, 0_usize);
+    while offset < au.len() {
+        let len_end = offset.checked_add(size)?;
+        let nal_len = au
+            .get(offset..len_end)?
+            .iter()
+            .fold(0_usize, |acc, &b| (acc << 8) | usize::from(b));
+        let end = len_end.checked_add(nal_len)?;
+        dst.get_mut(at..at.checked_add(4)?)?
+            .copy_from_slice(&[0, 0, 0, 1]);
+        at += 4;
+        dst.get_mut(at..at.checked_add(nal_len)?)?
+            .copy_from_slice(au.get(len_end..end)?);
+        at += nal_len;
+        offset = end;
+    }
+    (at == total).then_some(out)
 }
 
 /// Every NAL unit of `au` under `framing` (empty NALs skipped).
@@ -370,27 +445,31 @@ fn for_each_nal<'a>(
 /// Iterate Annex-B NAL units (split on `00 00 01` start codes, tolerating a
 /// 4-byte `00 00 00 01` variant), returning `true` on the first `pred` hit.
 fn annexb_any_nal<'a>(au: &'a [u8], pred: &mut impl FnMut(&'a [u8]) -> bool) -> bool {
-    let mut starts: Vec<usize> = Vec::new();
+    // Streaming: one pending NAL body start, never a vector of offsets (an
+    // AU of start codes would otherwise allocate one entry per 3 bytes).
+    let mut pending: Option<usize> = None;
     let mut i = 0_usize;
     // Find every `00 00 01` prefix; the NAL body begins just after it.
     while let Some(window) = au.get(i..i + 3) {
         if window == [0x00, 0x00, 0x01] {
-            starts.push(i + 3);
+            if let Some(body_start) = pending {
+                // The NAL runs to this start code (minus any trailing 00 of a
+                // 4-byte start prefix).
+                if let Some(nal) = au.get(body_start..i) {
+                    if !nal.is_empty() && pred(nal) {
+                        return true;
+                    }
+                }
+            }
+            pending = Some(i + 3);
             i += 3;
         } else {
             i += 1;
         }
     }
-    for (n, &body_start) in starts.iter().enumerate() {
-        // The NAL runs to the next start code (minus any trailing 00 of a
-        // 4-byte start prefix) or the end of the buffer.
-        let body_end = starts
-            .get(n + 1)
-            .map_or(au.len(), |&next_start| next_start.saturating_sub(3));
-        if let Some(nal) = au.get(body_start..body_end) {
-            if !nal.is_empty() && pred(nal) {
-                return true;
-            }
+    if let Some(nal) = pending.and_then(|body_start| au.get(body_start..)) {
+        if !nal.is_empty() && pred(nal) {
+            return true;
         }
     }
     false
@@ -538,8 +617,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        h264_is_reference, h264_nal_of_type, is_idr, is_self_contained_idr, mpeg2_sequence_header,
-        parameter_sets, read_leb128, to_annex_b, CodecKind, NalFraming,
+        annex_b_size, h264_is_reference, h264_nal_of_type, is_idr, is_self_contained_idr,
+        mpeg2_sequence_header, parameter_sets, read_leb128, to_annex_b, CodecKind, NalFraming,
+        MAX_AU_NALS,
     };
 
     #[test]
@@ -817,16 +897,61 @@ mod tests {
         let lp = NalFraming::LengthPrefixed { nal_length_size: 4 };
         let au = [0, 0, 0, 2, 0x67, 0xAA, 0, 0, 0, 1, 0x65];
         assert_eq!(
-            to_annex_b(&au, lp),
+            to_annex_b(&au, lp, usize::MAX).map(|a| a.to_vec()),
             Some(vec![0, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x65])
         );
-        assert_eq!(to_annex_b(&[0, 0, 0, 9, 0x65], lp), None, "past the end");
         assert_eq!(
-            to_annex_b(&[0, 0, 1, 0x65], NalFraming::AnnexB)
+            to_annex_b(&[0, 0, 0, 9, 0x65], lp, usize::MAX),
+            None,
+            "past the end"
+        );
+        assert_eq!(
+            to_annex_b(&[0, 0, 1, 0x65], NalFraming::AnnexB, usize::MAX)
                 .unwrap()
                 .len(),
             4
         );
-        assert_eq!(to_annex_b(&[1], NalFraming::Obu), None);
+        assert_eq!(to_annex_b(&[1], NalFraming::Obu, usize::MAX), None);
+    }
+
+    /// #344 D2a review R1-A-2: the re-framed size is computed (checked)
+    /// before any allocation, so 1- and 2-byte prefixes that would expand an
+    /// AU past the cap are refused up front, and the NAL count is budgeted.
+    #[test]
+    fn reframing_is_bounded_before_allocation() {
+        let one = NalFraming::LengthPrefixed { nal_length_size: 1 };
+        let two = NalFraming::LengthPrefixed { nal_length_size: 2 };
+        // 1-byte prefix, 1-byte NALs: every 2 input bytes become 5 output bytes.
+        let au1: Vec<u8> = (0..2000).flat_map(|_| [1_u8, 0x41]).collect();
+        assert_eq!(
+            annex_b_size(&au1, one, usize::MAX),
+            Err(super::ReframeError::TooLarge),
+            "over the NAL budget"
+        );
+        let au1: Vec<u8> = (0..MAX_AU_NALS).flat_map(|_| [1_u8, 0x41]).collect();
+        assert_eq!(annex_b_size(&au1, one, usize::MAX), Ok(MAX_AU_NALS * 5));
+        assert_eq!(
+            annex_b_size(&au1, one, MAX_AU_NALS * 5 - 1),
+            Err(super::ReframeError::TooLarge),
+            "over the cap"
+        );
+        assert!(to_annex_b(&au1, one, MAX_AU_NALS * 5 - 1).is_none());
+        assert_eq!(
+            to_annex_b(&au1, one, MAX_AU_NALS * 5).unwrap().len(),
+            MAX_AU_NALS * 5
+        );
+        // 2-byte prefix: one 3-byte NAL grows by 2.
+        let au2 = [0_u8, 3, 0x65, 0x88, 0x80];
+        assert_eq!(annex_b_size(&au2, two, 7), Ok(7));
+        assert_eq!(
+            annex_b_size(&au2, two, 6),
+            Err(super::ReframeError::TooLarge)
+        );
+        assert_eq!(
+            &to_annex_b(&au2, two, 7).unwrap()[..],
+            &[0, 0, 0, 1, 0x65, 0x88, 0x80]
+        );
+        // Annex B passes through, still bounded by the cap.
+        assert!(to_annex_b(&[0, 0, 1, 0x65], NalFraming::AnnexB, 3).is_none());
     }
 }

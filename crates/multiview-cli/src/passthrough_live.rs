@@ -43,7 +43,7 @@ use multiview_ffmpeg::idr::{self, CodecKind, NalFraming, ParameterSetScan, RapPa
 use multiview_ffmpeg::EncodedPacket;
 use multiview_output::passthrough::{
     BridgeReason, ClockState, Emission, PassthroughClock, RepeatSource, SlateLoop, SlotGate, TapAu,
-    TapReader,
+    TapReader, MAX_AU_BYTES,
 };
 
 use crate::output_routing::LiveEncoder;
@@ -247,8 +247,8 @@ pub fn bake_slate(
             if p.is_keyframe() && !out.is_empty() {
                 return true;
             }
-            if let Some(annexb) = idr::to_annex_b(bytes, framing) {
-                out.push(annexb);
+            if let Some(annexb) = idr::to_annex_b(bytes, framing, MAX_AU_BYTES) {
+                out.push(annexb.to_vec());
             }
             if out.len() >= gop {
                 return true;
