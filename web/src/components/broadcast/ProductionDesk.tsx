@@ -1,12 +1,13 @@
 import { busKeyReason, deskControlReason, tallyForSource } from './deskSafety';
-import { Info, TriangleAlert } from 'lucide-react';
+import { Info, SlidersHorizontal, TriangleAlert } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { commandSwitcher, getSwitcher, planSwitcher } from '../../api/switcher';
-import type { SwitcherAction, SwitcherRequest } from '../../api/switcher';
+import { WIPE_PATTERNS } from '../../api/switcher';
+import type { SwitcherAction, SwitcherRequest, TransitionDescriptor, WipePattern } from '../../api/switcher';
 import { newIdempotencyKey } from '../../api/operations';
 import { createApiClient } from '../../api/client';
 import { useLayouts } from '../../api/queries';
@@ -116,6 +117,95 @@ function SourcePicture({ id, demand }: { readonly id: string; readonly demand: S
   return <span data-testid="tile-no-frame"><Trans>No confirmed frame</Trans></span>;
 }
 
+type TransitionKind = 'mix' | 'wipe' | 'dip';
+/** Desk-side draft of the transition parameters; the engine's selection is the truth. */
+/**
+ * `borderColor` is absent while neither the selection nor the operator set one: a
+ * positive-width band without a colour draws nothing, and the desk must not invent one.
+ */
+interface TransitionDraft { readonly pattern: WipePattern; readonly reverse: boolean; readonly softness: number; readonly borderWidth: number; readonly borderColor?: string; readonly dipColor: string }
+const DEFAULT_DRAFT: TransitionDraft = { pattern: 'linear_edge', reverse: false, softness: 0, borderWidth: 0, dipColor: '#000000' };
+/** What the colour picker shows (and what a border-control edit adopts) when no colour is set. */
+const DEFAULT_BORDER_COLOR = '#ffffff';
+
+function isWipePattern(pattern: string): pattern is WipePattern {
+  return (WIPE_PATTERNS as readonly string[]).includes(pattern);
+}
+
+/** The draft the engine's confirmed selection implies (defaults for what it does not carry). */
+function draftFromSelection(transition: TransitionDescriptor | undefined): TransitionDraft {
+  if (transition?.kind === 'wipe') {
+    return {
+      ...DEFAULT_DRAFT,
+      ...(isWipePattern(transition.pattern) ? { pattern: transition.pattern } : {}),
+      reverse: transition.reverse ?? false,
+      softness: transition.softness ?? 0,
+      borderWidth: transition.border_width ?? 0,
+      ...(transition.border_color ? { borderColor: transition.border_color } : {}),
+    };
+  }
+  if (transition?.kind === 'dip' && transition.color) return { ...DEFAULT_DRAFT, dipColor: transition.color };
+  return DEFAULT_DRAFT;
+}
+
+const DRAFT_KEYS = ['pattern', 'reverse', 'softness', 'borderWidth', 'borderColor', 'dipColor'] as const satisfies readonly (keyof TransitionDraft)[];
+
+/**
+ * The unsaved local edits of `next` against the confirmed draft: only fields
+ * that differ. Reconciling with a new engine selection keeps every edit the
+ * engine does not now match (never overwritten) and drops the ones it does.
+ */
+function unsavedEdits(next: Partial<TransitionDraft>, confirmed: TransitionDraft): Partial<TransitionDraft> {
+  let edits: Partial<TransitionDraft> = {};
+  for (const key of DRAFT_KEYS) {
+    const value = next[key];
+    if (value !== undefined && value !== confirmed[key]) edits = { ...edits, [key]: value };
+  }
+  return edits;
+}
+
+/**
+ * The descriptor `set_transition` sends; AUTO replaces `rate` with its own frames.
+ * Fields of the confirmed selection the desk does not expose (`position_xy`,
+ * `switch_point`, …) are kept when the kind is unchanged.
+ */
+function transitionDescriptor(kind: TransitionKind, draft: TransitionDraft, rate: number, confirmed?: TransitionDescriptor): TransitionDescriptor {
+  if (kind === 'mix') return { kind: 'mix', rate };
+  if (kind === 'dip') return { ...(confirmed?.kind === 'dip' ? confirmed : {}), kind: 'dip', rate: Math.max(2, rate), color: draft.dipColor };
+  const wipe: TransitionDescriptor = { ...(confirmed?.kind === 'wipe' ? confirmed : {}), kind: 'wipe', pattern: draft.pattern, rate, reverse: draft.reverse, softness: draft.softness, border_width: draft.borderWidth };
+  // No band: drop a confirmed border colour rather than send a stale one. A band
+  // keeps the colour only when the selection or the operator set one (P3R2-A).
+  if (draft.borderWidth > 0 && draft.borderColor !== undefined) return { ...wipe, border_color: draft.borderColor };
+  delete wipe.border_color;
+  return wipe;
+}
+
+/** The engine's selected kind for the desk keys; a selected CUT makes AUTO a MIX. */
+function selectedKind(transition: TransitionDescriptor | undefined): TransitionKind {
+  return transition?.kind === 'wipe' || transition?.kind === 'dip' ? transition.kind : 'mix';
+}
+
+/** The engine's selected wipe pattern, if the selection is a wipe. */
+function selectedPattern(transition: TransitionDescriptor | undefined): string | undefined {
+  return transition?.kind === 'wipe' ? transition.pattern : undefined;
+}
+
+/** A ~50% progress thumbnail of a wipe pattern: incoming (light) revealed over outgoing (dark). */
+export function WipeThumbnail({ pattern, reverse, label }: { readonly pattern: WipePattern; readonly reverse: boolean; readonly label?: string }): JSX.Element {
+  const shape = pattern === 'linear_edge' ? <rect x="0" y="0" width="16" height="18" />
+    : pattern === 'vertical' ? <rect x="0" y="0" width="32" height="9" />
+      : pattern === 'diagonal' ? <polygon points="0,0 32,0 0,18" />
+        : pattern === 'box' ? <rect x="8" y="4.5" width="16" height="9" />
+          : <circle cx="16" cy="9" r="7" />;
+  // Reverse mirrors the field: the other side, or closing in from the outside.
+  const flip = reverse && (pattern === 'linear_edge' || pattern === 'vertical' || pattern === 'diagonal');
+  const inverted = reverse && !flip;
+  return <svg className="bd-wipe-thumb" viewBox="0 0 32 18" width="32" height="18" role={label ? 'img' : undefined} aria-label={label} aria-hidden={label ? undefined : true} data-pattern={pattern} data-reverse={reverse}>
+    <rect width="32" height="18" fill={inverted ? '#d8dee8' : '#2a2f3a'} />
+    <g fill={inverted ? '#2a2f3a' : '#d8dee8'} transform={flip ? (pattern === 'vertical' ? 'matrix(1 0 0 -1 0 18)' : 'matrix(-1 0 0 -1 32 18)') : undefined}>{shape}</g>
+  </svg>;
+}
+
 /** Real bus state and correlated commands inside the approved desk composition. */
 export function ProductionDesk(): JSX.Element {
   return <WallStreamProvider><ProductionDeskBody /></WallStreamProvider>;
@@ -126,6 +216,9 @@ function WallNote() {
   if (wall.live) return <p className="bd-still-note" data-testid="wall-live-note" data-transport={wall.transport} data-ice-pair={wall.icePair ?? 'none'}>{wall.transport === 'moq' ? <Trans>Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still.</Trans> : <Trans>Wall tiles are live video from one shared WebRTC session; a tile without a live cell shows its still.</Trans>}</p>;
   return <p className="bd-still-note" data-testid="wall-still-note"><Trans>Wall tiles are still previews refreshed every ~2 s — not live video.</Trans>{wall.reason ? <> <span data-testid="wall-still-reason">({wall.reason})</span></> : null}</p>;
 }
+
+/** One desk command: a select carries a source, `set_transition` a descriptor. */
+interface DeskCommand { readonly action: SwitcherAction; readonly source?: string; readonly transition?: TransitionDescriptor }
 
 function ProductionDeskBody(): JSX.Element {
   const { t } = useLingui();
@@ -149,6 +242,20 @@ function ProductionDeskBody(): JSX.Element {
   const [failure, setFailure] = useState<string>();
   const [confirm, setConfirm] = useState<{ action: SwitcherAction; source?: string }>();
   const [frames, setFrames] = useState('30');
+  // The draft is the engine's confirmed selection overlaid with unsaved local edits.
+  const confirmedTransition = state.data?.transition;
+  const confirmedKey = JSON.stringify(confirmedTransition ?? null);
+  const confirmedDraft = draftFromSelection(confirmedTransition);
+  const [edits, setEdits] = useState<Partial<TransitionDraft>>({});
+  // Reconcile once per changed engine selection (by value: each poll is a fresh object),
+  // adjusting state during render rather than in an effect.
+  const [reconciledKey, setReconciledKey] = useState(confirmedKey);
+  if (reconciledKey !== confirmedKey) {
+    setReconciledKey(confirmedKey);
+    setEdits(unsavedEdits(edits, confirmedDraft));
+  }
+  const draft: TransitionDraft = { ...confirmedDraft, ...edits };
+  const setDraft = (next: TransitionDraft): void => { setEdits(unsavedEdits(next, confirmedDraft)); };
   const [help, setHelp] = useState(false);
   const [now, setNow] = useState(Date.now);
   // 'sending' from click until the tracker record is terminal; then the operation id.
@@ -169,10 +276,10 @@ function ProductionDeskBody(): JSX.Element {
   const fresh = tickConfirmed(advancedAt, state.dataUpdatedAt, now, state.isError);
   const baseReason = deskControlReason(!!state.data, status === 'open', fresh, state.data?.in_flight ?? false, operationId !== undefined && !settled);
   const reason = baseReason ?? (inFlight ? 'Command in flight' : undefined);
-  const mutate = useMutation({ mutationFn: async ({ action, source }: { action: SwitcherAction; source?: string }) => {
+  const mutate = useMutation({ mutationFn: async ({ action, source, transition }: DeskCommand) => {
     if (!lock.current) throw new Error('Command guard not held');
     if (baseReason) throw new Error(baseReason);
-    const req: SwitcherRequest = { me: 'me1', program: 'main', action, ...(source ? { source } : {}), ...(action === 'auto' ? { duration_frames: Number(frames) } : {}) };
+    const req: SwitcherRequest = { me: 'me1', program: 'main', action, ...(source ? { source } : {}), ...(action === 'auto' ? { duration_frames: Number(frames) } : {}), ...(transition ? { transition } : {}) };
     const plan = await planSwitcher(req);
     if (!plan.can_take) throw new Error(t`The engine refused this plan`);
     return submit(() => commandSwitcher(action, req, { idempotencyKey: newIdempotencyKey() }), { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
@@ -184,7 +291,7 @@ function ProductionDeskBody(): JSX.Element {
   // Synchronous guard: state is not committed between two same-turn clicks, so a ref gates the second.
   // Held from before mutate until the command is terminal; released by the effect below or on error.
   const lock = useRef(false);
-  const send = (command: { action: SwitcherAction; source?: string }): void => {
+  const send = (command: DeskCommand): void => {
     if (lock.current || disabled) return;
     lock.current = true;
     setGuard(SENDING);
@@ -197,6 +304,13 @@ function ProductionDeskBody(): JSX.Element {
     else send(command);
   };
   useEffect(() => { if (!inFlight && !mutate.isPending) lock.current = false; }, [inFlight, mutate.isPending]);
+  const kind = selectedKind(state.data?.transition);
+  const kindLabel = kind === 'wipe' ? 'WIPE' : kind === 'dip' ? 'DIP' : 'MIX';
+  const rate = framesValid ? Number(frames) : 30;
+  // Selecting is not a take: no confirmation, but the same guard and plan → command path.
+  const select = (next: TransitionKind, nextDraft: TransitionDraft = draft): void => { send({ action: 'set_transition', transition: transitionDescriptor(next, nextDraft, rate, confirmedTransition) }); };
+  const transitionReason = framesValid ? undefined : t`Enter 1–1000 frames`;
+  const patternName = (pattern: WipePattern): string => pattern === 'linear_edge' ? t`Horizontal wipe` : pattern === 'vertical' ? t`Vertical wipe` : pattern === 'diagonal' ? t`Diagonal wipe` : pattern === 'box' ? t`Box wipe` : t`Circle wipe`;
   const name = (id: string | undefined): string | undefined => sources.data?.find((s) => s.id === id)?.name ?? id;
   const deskStyle: CSSProperties & Record<`--desk-${string}`, number> = { '--desk-inputs': Math.max(1, sources.data?.length ?? 1), '--desk-columns': (sources.data?.length ?? 0) > 12 ? 8 : 6, '--desk-rows': Math.max(1, Math.ceil((sources.data?.length ?? 0) / ((sources.data?.length ?? 0) > 12 ? 8 : 6))) };
   return <section className="production-desk" aria-label={t`Production desk`} data-dense={(sources.data?.length ?? 0) > 12} style={deskStyle}>
@@ -208,10 +322,21 @@ function ProductionDeskBody(): JSX.Element {
       <section className="bd-wall"><div className="bd-wall-heading"><h2><Trans>Multiview wall</Trans></h2><span><Trans>Select a source to Preview</Trans></span><Link className="bd-route-link bd-add-source-link" to="/sources?new=1" aria-label={t`Add a source — opens the New source dialog`}><Trans>Add source</Trans></Link><Link className="bd-route-link" to="/routing"><Trans>Route / patch</Trans></Link></div><div className="bd-wall-grid">{sources.data?.map((source) => { const keyReason = reason ?? busKeyReason('preview', source.id, state.data, demand.data?.get(source.id)?.phase); return <button type="button" className="bd-wall-tile" key={source.id} aria-disabled={disabled || keyReason !== undefined} aria-describedby={`desk-tally-${source.id} desk-signal-${source.id} desk-reason-${source.id}`} aria-label={t`Preview ${source.name}`} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === 'preview'} title={keyReason} onClick={() => { if (!disabled && keyReason === undefined) request('select_preview', source.id); }} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} demand={demand.data?.get(source.id)} /><small id={`desk-tally-${source.id}`}>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span className="sr-only" id={`desk-reason-${source.id}`}>{keyReason}</span><span id={`desk-signal-${source.id}`}><TileLabel tile={tileForSource(tiles, source.id)} /></span></button>; })}</div><WallNote />{sources.isError || !sources.data?.length ? <p>{sources.isError ? t`Source catalog unavailable` : t`No source catalog available`}</p> : null}</section>
       <section className="bd-switcher"><h2><Trans>M/E 1 — Switcher</Trans></h2>
         <div className="bd-buses">{(['preview', 'program'] as const).map((bus) => <div className={`bd-bus bd-bus-${bus}`} key={bus} role="group" aria-label={bus === 'program' ? t`PGM bus — direct taps always confirm` : t`PVW bus`}><b>{bus === 'program' ? 'PGM' : 'PVW'}</b><div>{sources.data?.map((source, index) => { const keyReason = reason ?? busKeyReason(bus, source.id, state.data, demand.data?.get(source.id)?.phase); return <button key={source.id} aria-label={source.name} disabled={disabled || keyReason !== undefined} data-key-reason={keyReason} title={keyReason ? `${source.name} — ${keyReason}` : source.name} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === bus} onClick={() => { request(bus === 'program' ? 'select_program' : 'select_preview', source.id); }}><span className="bd-key-name">{sources.data.length > 12 ? Array.from(source.name).slice(0, 10).join('') : source.name}</span><i className="bd-idx" aria-hidden="true">{index + 1}</i></button>; })}{!sources.data?.length && <span><Trans>No sources available</Trans></span>}</div></div>)}</div>
-        <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type`}><button disabled aria-pressed="true" title={t`MIX is the only supported transition`}>MIX</button><button disabled title={t`WIPE and DIP have no supported control contract`}>WIPE</button><button disabled title={t`WIPE and DIP have no supported control contract`}>DIP</button></div><button className="bd-auto" disabled={disabled || autoReason !== undefined} title={autoReason ? `AUTO — ${autoReason}` : t`AUTO mix over ${frames} frames`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled || sameBuses} title={sameBuses ? t`CUT — Preview and Program carry the same source` : undefined} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span></div></div>
-        <div className="bd-more"><label><Trans>AUTO frames</Trans><input aria-label={t`Auto frames`} value={frames} type="number" min="1" max="1000" disabled={disabled} onChange={(e) => { setFrames(e.target.value); }} /></label></div>
+        <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type`}>{(['mix', 'wipe', 'dip'] as const).map((k) => <button key={k} disabled={disabled || transitionReason !== undefined} aria-pressed={kind === k} title={transitionReason ?? (k === 'mix' ? t`Select a MIX for the next AUTO` : k === 'wipe' ? t`Select a WIPE for the next AUTO` : t`Select a DIP for the next AUTO`)} onClick={() => { select(k); }}>{k.toUpperCase()}</button>)}</div><button className="bd-auto" disabled={disabled || autoReason !== undefined} title={autoReason ? `AUTO — ${autoReason}` : t`AUTO ${kindLabel} over ${frames} frames`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled || sameBuses} title={sameBuses ? t`CUT — Preview and Program carry the same source` : undefined} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span></div></div>
+        <div className="bd-more"><label><Trans>AUTO frames</Trans><input aria-label={t`Auto frames`} value={frames} type="number" min="1" max="1000" disabled={disabled} onChange={(e) => { setFrames(e.target.value); }} /></label>
+          <details className="bd-transition-menu"><summary aria-label={t`Transition parameters`} title={t`Transition parameters`}><SlidersHorizontal aria-hidden="true" size={16} className="bd-transition-menu-icon" /><span className="bd-transition-menu-label"><Trans>Transition parameters</Trans></span></summary><fieldset className="bd-transition-params" disabled={disabled || transitionReason !== undefined} data-testid="transition-params"><legend className="sr-only"><Trans>Transition parameters</Trans></legend>
+            <div className="bd-patterns" role="group" aria-label={t`Wipe pattern`}>{WIPE_PATTERNS.map((pattern) => <button type="button" key={pattern} aria-label={patternName(pattern)} title={patternName(pattern)} aria-pressed={selectedPattern(state.data?.transition) === pattern} onClick={() => { const next = { ...draft, pattern }; setDraft(next); select('wipe', next); }}><WipeThumbnail pattern={pattern} reverse={draft.reverse} /></button>)}</div>
+            <div className="bd-wipe-preview" data-testid="transition-preview"><WipeThumbnail pattern={draft.pattern} reverse={draft.reverse} label={t`Preview of ${patternName(draft.pattern)} at 50%`} /></div>
+            <label><input type="checkbox" checked={draft.reverse} onChange={(e) => { setDraft({ ...draft, reverse: e.target.checked }); }} /><Trans>Reverse</Trans></label>
+            <label><Trans>Softness</Trans><input type="range" aria-label={t`Wipe softness`} min="0" max="0.5" step="0.01" value={draft.softness} onChange={(e) => { setDraft({ ...draft, softness: Number(e.target.value) }); }} /></label>
+            <label><Trans>Border width</Trans><input type="range" aria-label={t`Wipe border width`} min="0" max="0.2" step="0.005" value={draft.borderWidth} onChange={(e) => { setDraft({ ...draft, borderWidth: Number(e.target.value), borderColor: draft.borderColor ?? DEFAULT_BORDER_COLOR }); }} /></label>
+            <label><Trans>Border colour</Trans><input type="color" aria-label={t`Wipe border colour`} value={draft.borderColor ?? DEFAULT_BORDER_COLOR} onChange={(e) => { setDraft({ ...draft, borderColor: e.target.value }); }} /></label>
+            <label><Trans>Dip colour</Trans><input type="color" aria-label={t`Dip colour`} value={draft.dipColor} onChange={(e) => { setDraft({ ...draft, dipColor: e.target.value }); }} /></label>
+            <button type="button" className="bd-apply-transition" onClick={() => { select(kind); }}><Trans>Apply to {kindLabel}</Trans></button>
+          </fieldset></details>
+        </div>
       </section>
-      <details className="bd-desk-status"><summary><Trans>Tally & engine status</Trans></summary><aside className="bd-rail"><section><h2><Trans>Tally legend</Trans></h2><p className="bd-red"><Trans>● Red — PROGRAM</Trans></p><p className="bd-amber"><Trans>● Amber — PREVIEW</Trans></p><p><Trans>○ Dark — neither bus</Trans></p><small><Trans>Tally is separate from signal and output transmission.</Trans></small></section><section><h2><Trans>Alarms & engine health</Trans></h2><div className="bd-alarm-summary" role="region" aria-label={t`Active system alarm summary`}><p><Trans>Active system alarms only</Trans></p>{alarms.isError ? <p><Trans>Alarm summary unavailable</Trans></p> : alarms.isPending ? <p><Trans>Loading alarm summary</Trans></p> : alarms.data.length === 0 ? <p><Trans>No active system alarms reported</Trans></p> : <ul>{alarms.data.slice(0, 3).map((alarm) => <li key={alarm.id} title={`${alarm.severity} · ${alarm.kind}`}><span>{alarm.severity}</span> · {alarm.kind}</li>)}</ul>}</div><Link className="bd-btn" to="/alarms"><Trans>Open alarms</Trans></Link></section><section><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tilesKnown ? tiles.size : '—'}</p><p><Trans>Tally follows the engine bus IDs; source presence does not prove signal.</Trans></p><p><Trans>WIPE, DIP, USK, DSK and AUX have no supported control contract.</Trans></p><Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></section></aside></details>
+      <details className="bd-desk-status"><summary><Trans>Tally & engine status</Trans></summary><aside className="bd-rail"><section><h2><Trans>Tally legend</Trans></h2><p className="bd-red"><Trans>● Red — PROGRAM</Trans></p><p className="bd-amber"><Trans>● Amber — PREVIEW</Trans></p><p><Trans>○ Dark — neither bus</Trans></p><small><Trans>Tally is separate from signal and output transmission.</Trans></small></section><section><h2><Trans>Alarms & engine health</Trans></h2><div className="bd-alarm-summary" role="region" aria-label={t`Active system alarm summary`}><p><Trans>Active system alarms only</Trans></p>{alarms.isError ? <p><Trans>Alarm summary unavailable</Trans></p> : alarms.isPending ? <p><Trans>Loading alarm summary</Trans></p> : alarms.data.length === 0 ? <p><Trans>No active system alarms reported</Trans></p> : <ul>{alarms.data.slice(0, 3).map((alarm) => <li key={alarm.id} title={`${alarm.severity} · ${alarm.kind}`}><span>{alarm.severity}</span> · {alarm.kind}</li>)}</ul>}</div><Link className="bd-btn" to="/alarms"><Trans>Open alarms</Trans></Link></section><section><p><Trans>Layouts</Trans>: {layouts.isError ? t`Unavailable` : layouts.data?.length ?? '—'} · <Trans>Observed tiles</Trans>: {tilesKnown ? tiles.size : '—'}</p><p><Trans>Tally follows the engine bus IDs; source presence does not prove signal.</Trans></p><p><Trans>USK, DSK and AUX have no supported control contract.</Trans></p><Link className="bd-link48" to="/monitoring"><Trans>Open live monitoring</Trans></Link></section></aside></details>
     </div>
     <Dialog open={confirm !== undefined} onOpenChange={(open) => { if (!open) setConfirm(undefined); }}><DialogContent touchScroll><DialogTitle><Trans>Confirm program change</Trans></DialogTitle><p>{confirm?.action.toUpperCase()} · {name(state.data?.program_source) ?? t`Unknown`} → {name(confirm?.source ?? state.data?.preview_source) ?? t`Unknown`}</p><p><Trans>The program bus changes what viewers see. Acceptance is not completion.</Trans></p><button disabled={disabled} onClick={() => { if (confirm) send(confirm); setConfirm(undefined); }}><Trans>Confirm take</Trans></button><button onClick={() => { setConfirm(undefined); }}><Trans>Cancel</Trans></button></DialogContent></Dialog>
   </section>;

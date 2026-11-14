@@ -16824,6 +16824,16 @@
           }
         }
       },
+      "DveDirectionDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of [`multiview_core::switcher::DveDirection`].",
+        "enum": [
+          "left",
+          "right",
+          "up",
+          "down"
+        ]
+      },
       "DwellDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of `multiview_config::Dwell` (raise/clear debounce\nmilliseconds).",
@@ -24508,6 +24518,27 @@
           }
         }
       },
+      "SwitchPointDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of the dip switch point: an exact rational `num/den`\nstrictly inside `(0, 1)`. Unknown fields are refused.",
+        "required": [
+          "num",
+          "den"
+        ],
+        "properties": {
+          "den": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Denominator."
+          },
+          "num": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Numerator."
+          }
+        },
+        "additionalProperties": false
+      },
       "SwitcherAccepted": {
         "type": "object",
         "description": "A 202 means queued, not yet on-air; operation completion arrives on a\ncorrelated engine outcome at its actual tick.",
@@ -24562,7 +24593,7 @@
         "properties": {
           "action": {
             "type": "string",
-            "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`; the action is part of the same validated request."
+            "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`, `set_transition`; the action is part of the same\nvalidated request."
           },
           "duration_frames": {
             "type": [
@@ -24610,6 +24641,17 @@
               "null"
             ],
             "description": "Referenced source for `select_program`/`select_preview`."
+          },
+          "transition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TransitionDescriptorDoc",
+                "description": "The transition `set_transition` selects for the next AUTO (ADR-0112\n§4), required by it and refused on every other action. Tagged on\n`kind`: `{\"kind\":\"cut\"}`; `{\"kind\":\"mix\",\"rate\":N}`;\n`{\"kind\":\"dip\",\"rate\":N,\"color\":\"#rrggbb\",\"switch_point\":{\"num\":1,\"den\":2}}`\n(rate >= 2, switch point strictly inside (0, 1)); `{\"kind\":\"wipe\",\n\"pattern\":\"linear_edge\"|\"vertical\"|\"diagonal\"|\"box\"|\"circle\",\"rate\":N,\n\"reverse\":bool,\"softness\":0..1,\"border_width\":0..1,\"border_color\":\"#rrggbb\",\n\"position_xy\":[0..1,0..1]}`. `rate` is 1..=1000 frames; AUTO replaces it\nwith its own `duration_frames`. Refused with `unsupported-transition`:\n`stinger`, DVE kinds, a dip through a source, `flip_flop` and\n`border_fill_source`; with `invalid-transition`: anything that does not\nparse or is out of range.\n\nParsed from raw JSON so a malformed descriptor is a typed 422; the\ndocumented shape is [`crate::openapi_schemas::TransitionDescriptorDoc`]."
+              }
+            ]
           }
         }
       },
@@ -24620,7 +24662,8 @@
           "tick",
           "program_source",
           "preview_source",
-          "in_flight"
+          "in_flight",
+          "transition"
         ],
         "properties": {
           "in_flight": {
@@ -24640,6 +24683,10 @@
             "format": "int64",
             "description": "Applied output tick.",
             "minimum": 0
+          },
+          "transition": {
+            "$ref": "#/components/schemas/TransitionDescriptorDoc",
+            "description": "The operator's selected transition, as the engine applied it\n(ADR-0112 §4); an AUTO's own rate never replaces it. Same shape as\nthe request's `transition`."
           }
         }
       },
@@ -25476,6 +25523,261 @@
           }
         }
       },
+      "TransitionDescriptorDoc": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Atomic frame-boundary swap.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "cut"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Dissolve.",
+            "required": [
+              "rate",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "mix"
+                ]
+              },
+              "rate": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Duration in output frames.",
+                "minimum": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Two chained mixes through a solid colour (or, not rendered yet, a source).",
+            "required": [
+              "rate",
+              "kind"
+            ],
+            "properties": {
+              "color": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The colour dipped through, `\"#rrggbb\"`; absent means black."
+              },
+              "dip_source": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Source dipped through (refused: not rendered yet)."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "dip"
+                ]
+              },
+              "rate": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Duration in output frames (at least 2).",
+                "minimum": 2
+              },
+              "switch_point": {
+                "$ref": "#/components/schemas/SwitchPointDoc",
+                "description": "Where the outgoing/incoming swap happens; default `1/2`."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Masked wipe.",
+            "required": [
+              "pattern",
+              "rate",
+              "kind"
+            ],
+            "properties": {
+              "border_color": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Border band colour, `\"#rrggbb\"`; absent means no band."
+              },
+              "border_fill_source": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Source filling the border band (refused: not rendered yet)."
+              },
+              "border_width": {
+                "type": "number",
+                "format": "float",
+                "description": "Border band width, a fraction of the canvas height in `[0, 1]`.",
+                "maximum": 1,
+                "minimum": 0
+              },
+              "flip_flop": {
+                "type": "boolean",
+                "description": "Alternate the direction on successive takes (refused: not rendered yet)."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "wipe"
+                ]
+              },
+              "pattern": {
+                "$ref": "#/components/schemas/WipePatternDoc",
+                "description": "The mask shape."
+              },
+              "position_xy": {
+                "type": "array",
+                "items": {
+                  "type": "number",
+                  "format": "float"
+                },
+                "description": "Box/circle origin `[x, y]`, each in `[0, 1]`; default centre."
+              },
+              "rate": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Duration in output frames.",
+                "minimum": 1
+              },
+              "reverse": {
+                "type": "boolean",
+                "description": "Mirror the travel direction."
+              },
+              "softness": {
+                "type": "number",
+                "format": "float",
+                "description": "Edge softness, a fraction of the canvas height in `[0, 1]`.",
+                "maximum": 1,
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Animated translate (not rendered yet).",
+            "required": [
+              "direction",
+              "rate",
+              "kind"
+            ],
+            "properties": {
+              "direction": {
+                "$ref": "#/components/schemas/DveDirectionDoc",
+                "description": "Travel direction."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "dve_push"
+                ]
+              },
+              "rate": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Duration in output frames.",
+                "minimum": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Animated scale (not rendered yet).",
+            "required": [
+              "direction",
+              "rate",
+              "kind"
+            ],
+            "properties": {
+              "direction": {
+                "$ref": "#/components/schemas/DveDirectionDoc",
+                "description": "Travel direction."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "dve_squeeze"
+                ]
+              },
+              "rate": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Duration in output frames.",
+                "minimum": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Media transition (not rendered yet).",
+            "required": [
+              "player",
+              "pre_roll",
+              "clip_duration",
+              "trigger_point",
+              "mix_rate",
+              "kind"
+            ],
+            "properties": {
+              "clip_duration": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Clip length in frames.",
+                "minimum": 1
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "stinger"
+                ]
+              },
+              "mix_rate": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Mix window in frames.",
+                "minimum": 1
+              },
+              "player": {
+                "type": "string",
+                "description": "The bound media player's id."
+              },
+              "pre_roll": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Pre-roll frames.",
+                "minimum": 1
+              },
+              "trigger_point": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Frame the underlying mix starts on.",
+                "minimum": 1
+              }
+            }
+          }
+        ],
+        "description": "`OpenAPI` mirror of [`multiview_core::switcher::TransitionDescriptor`]\n(ADR-0055 §3, ADR-0112 §4).\n\nSerde-equivalent: internally tagged on `kind`, `snake_case`, unknown\nfields (and fields of another kind) refused. Durations (`rate`, …) are\nwhole output frames, at least 1; colours are `\"#rgb\"`/`\"#rrggbb\"`.\nThe control API selects only what the Program drive renders (`cut`,\n`mix`, `dip` to a colour, `wipe` without `flip_flop`/`border_fill_source`)\nwith a rate of at most 1000 frames; the other kinds are documented\nbecause the engine's descriptor carries them."
+      },
       "TransitionDoc": {
         "type": "object",
         "description": "A transition preset.",
@@ -26063,6 +26365,17 @@
         "enum": [
           "seven_day",
           "today"
+        ]
+      },
+      "WipePatternDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of [`multiview_core::switcher::WipePattern`] (ADR-0112 §3).",
+        "enum": [
+          "linear_edge",
+          "vertical",
+          "diagonal",
+          "box",
+          "circle"
         ]
       },
       "WsTicketResponse": {

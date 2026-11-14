@@ -5142,6 +5142,11 @@ export interface components {
             removed: string[];
         };
         /**
+         * @description `OpenAPI` mirror of [`multiview_core::switcher::DveDirection`].
+         * @enum {string}
+         */
+        DveDirectionDoc: "left" | "right" | "up" | "down";
+        /**
          * @description `OpenAPI` mirror of `multiview_config::Dwell` (raise/clear debounce
          *     milliseconds).
          */
@@ -8724,6 +8729,22 @@ export interface components {
             tile: string;
         };
         /**
+         * @description `OpenAPI` mirror of the dip switch point: an exact rational `num/den`
+         *     strictly inside `(0, 1)`. Unknown fields are refused.
+         */
+        SwitchPointDoc: {
+            /**
+             * Format: int64
+             * @description Denominator.
+             */
+            den: number;
+            /**
+             * Format: int64
+             * @description Numerator.
+             */
+            num: number;
+        };
+        /**
          * @description A 202 means queued, not yet on-air; operation completion arrives on a
          *     correlated engine outcome at its actual tick.
          */
@@ -8752,7 +8773,8 @@ export interface components {
         SwitcherRequest: {
             /**
              * @description Action to classify on `/plan`, one of `select_program`, `select_preview`,
-             *     `cut`, `auto`; the action is part of the same validated request.
+             *     `cut`, `auto`, `set_transition`; the action is part of the same
+             *     validated request.
              */
             action: string;
             /**
@@ -8776,6 +8798,7 @@ export interface components {
             program: string;
             /** @description Referenced source for `select_program`/`select_preview`. */
             source?: string | null;
+            transition?: null | components["schemas"]["TransitionDescriptorDoc"];
         };
         /** @description Engine-owned bus selection and current tick, never guessed from request. */
         SwitcherStateResponse: {
@@ -8790,6 +8813,12 @@ export interface components {
              * @description Applied output tick.
              */
             tick: number;
+            /**
+             * @description The operator's selected transition, as the engine applied it
+             *     (ADR-0112 §4); an AUTO's own rate never replaces it. Same shape as
+             *     the request's `transition`.
+             */
+            transition: components["schemas"]["TransitionDescriptorDoc"];
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_config::SyncGroup`] (ADR-M008/M010): the
@@ -9178,6 +9207,119 @@ export interface components {
             /** @description `setup`, `serving` or `expired` (serving an expired certificate). */
             state: string;
         };
+        /**
+         * @description `OpenAPI` mirror of [`multiview_core::switcher::TransitionDescriptor`]
+         *     (ADR-0055 §3, ADR-0112 §4).
+         *
+         *     Serde-equivalent: internally tagged on `kind`, `snake_case`, unknown
+         *     fields (and fields of another kind) refused. Durations (`rate`, …) are
+         *     whole output frames, at least 1; colours are `"#rgb"`/`"#rrggbb"`.
+         *     The control API selects only what the Program drive renders (`cut`,
+         *     `mix`, `dip` to a colour, `wipe` without `flip_flop`/`border_fill_source`)
+         *     with a rate of at most 1000 frames; the other kinds are documented
+         *     because the engine's descriptor carries them.
+         */
+        TransitionDescriptorDoc: {
+            /** @enum {string} */
+            kind: "cut";
+        } | {
+            /** @enum {string} */
+            kind: "mix";
+            /**
+             * Format: int32
+             * @description Duration in output frames.
+             */
+            rate: number;
+        } | {
+            /** @description The colour dipped through, `"#rrggbb"`; absent means black. */
+            color?: string | null;
+            /** @description Source dipped through (refused: not rendered yet). */
+            dip_source?: string | null;
+            /** @enum {string} */
+            kind: "dip";
+            /**
+             * Format: int32
+             * @description Duration in output frames (at least 2).
+             */
+            rate: number;
+            /** @description Where the outgoing/incoming swap happens; default `1/2`. */
+            switch_point?: components["schemas"]["SwitchPointDoc"];
+        } | {
+            /** @description Border band colour, `"#rrggbb"`; absent means no band. */
+            border_color?: string | null;
+            /** @description Source filling the border band (refused: not rendered yet). */
+            border_fill_source?: string | null;
+            /**
+             * Format: float
+             * @description Border band width, a fraction of the canvas height in `[0, 1]`.
+             */
+            border_width?: number;
+            /** @description Alternate the direction on successive takes (refused: not rendered yet). */
+            flip_flop?: boolean;
+            /** @enum {string} */
+            kind: "wipe";
+            /** @description The mask shape. */
+            pattern: components["schemas"]["WipePatternDoc"];
+            /** @description Box/circle origin `[x, y]`, each in `[0, 1]`; default centre. */
+            position_xy?: number[];
+            /**
+             * Format: int32
+             * @description Duration in output frames.
+             */
+            rate: number;
+            /** @description Mirror the travel direction. */
+            reverse?: boolean;
+            /**
+             * Format: float
+             * @description Edge softness, a fraction of the canvas height in `[0, 1]`.
+             */
+            softness?: number;
+        } | {
+            /** @description Travel direction. */
+            direction: components["schemas"]["DveDirectionDoc"];
+            /** @enum {string} */
+            kind: "dve_push";
+            /**
+             * Format: int32
+             * @description Duration in output frames.
+             */
+            rate: number;
+        } | {
+            /** @description Travel direction. */
+            direction: components["schemas"]["DveDirectionDoc"];
+            /** @enum {string} */
+            kind: "dve_squeeze";
+            /**
+             * Format: int32
+             * @description Duration in output frames.
+             */
+            rate: number;
+        } | {
+            /**
+             * Format: int32
+             * @description Clip length in frames.
+             */
+            clip_duration: number;
+            /** @enum {string} */
+            kind: "stinger";
+            /**
+             * Format: int32
+             * @description Mix window in frames.
+             */
+            mix_rate: number;
+            /** @description The bound media player's id. */
+            player: string;
+            /**
+             * Format: int32
+             * @description Pre-roll frames.
+             */
+            pre_roll: number;
+            /**
+             * Format: int32
+             * @description Frame the underlying mix starts on.
+             */
+            trigger_point: number;
+        };
         /** @description A transition preset. */
         TransitionDoc: {
             /**
@@ -9487,6 +9629,11 @@ export interface components {
          * @enum {string}
          */
         WeatherTemplateDoc: "seven_day" | "today";
+        /**
+         * @description `OpenAPI` mirror of [`multiview_core::switcher::WipePattern`] (ADR-0112 §3).
+         * @enum {string}
+         */
+        WipePatternDoc: "linear_edge" | "vertical" | "diagonal" | "box" | "circle";
         /**
          * @description The `POST /api/v1/ws/ticket` response: a short-lived, single-use realtime auth
          *     ticket the browser passes as `?ticket=` on the WS/SSE upgrade (ADR-RT011).

@@ -72,6 +72,32 @@ pub fn mixer_inputs(me: &MixEffectsConfig) -> Result<Option<MixerInputs>, String
     .map(Some)
 }
 
+/// The M/E value machine at boot: the starting buses and the persisted
+/// transition selection (ADR-0112 §4), applied before the clock starts so the
+/// first AUTO already uses it.
+///
+/// # Errors
+/// A persisted selection the machine refuses (a validated document never
+/// carries one: config validation applies the same rule).
+pub fn boot_machine(
+    me: &MixEffectsConfig,
+    program: SourceRef,
+    preview: SourceRef,
+) -> Result<SwitcherState, PipelineError> {
+    let mut machine = SwitcherState::new(program, preview, vec![]);
+    if let Some(transition) = &me.transition {
+        if !transition.is_rendered() {
+            return Err(PipelineError::Engine(
+                multiview_engine::switcher_control::REFUSE_UNSUPPORTED_TRANSITION.into(),
+            ));
+        }
+        machine
+            .set_transition(transition.clone())
+            .map_err(|e| PipelineError::Engine(format!("switcher transition: {e}")))?;
+    }
+    Ok(machine)
+}
+
 /// Attach the declared first-slice M/E, if this document declares one.
 ///
 /// `demand` is this run's control-plane demand provider (the same one the
@@ -105,7 +131,7 @@ pub fn attach_first_slice(
             SourceRef::new(&me.preview_source),
         ),
     };
-    let (control, mut driver) = SwitcherControl::new(SwitcherState::new(program, preview, vec![]));
+    let (control, mut driver) = SwitcherControl::new(boot_machine(&me, program, preview)?);
     // Shares the already-allocated stores; the driver only samples `is_primed`.
     driver.set_prime_stores(pipeline.preview_stores());
     if let Some(inputs) = inputs {
@@ -197,5 +223,50 @@ number = 5
         let mut legacy = me;
         legacy.inputs.clear();
         assert!(mixer_inputs(&legacy).unwrap().is_none());
+    }
+
+    /// ADR-0112 §4 restart truth: a persisted selection boots the machine
+    /// with it; none keeps the engine default; an unrendered one is refused.
+    #[test]
+    fn a_persisted_transition_boots_the_machine_with_it() {
+        let text = r##"
+id = "me1"
+program = "main"
+program_source = "vt1"
+preview_source = "abc-news"
+[transition]
+kind = "wipe"
+pattern = "diagonal"
+rate = 20
+softness = 0.05
+reverse = true
+border_width = 0.01
+border_color = "#00ff00"
+"##;
+        let me: MixEffectsConfig = toml::from_str(text).unwrap();
+        let me: MixEffectsConfig = toml::from_str(&toml::to_string(&me).unwrap()).unwrap();
+        let machine = boot_machine(&me, SourceRef::new("vt1"), SourceRef::new("abc-news")).unwrap();
+        assert_eq!(Some(machine.transition()), me.transition.as_ref());
+        let mut legacy = me.clone();
+        legacy.transition = None;
+        let machine =
+            boot_machine(&legacy, SourceRef::new("vt1"), SourceRef::new("abc-news")).unwrap();
+        assert_eq!(
+            machine.transition(),
+            &multiview_core::switcher::TransitionDescriptor::Cut
+        );
+        let mut unrendered = me;
+        unrendered.transition = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "wipe", "pattern": "box", "rate": 10, "flip_flop": true
+            }))
+            .unwrap(),
+        );
+        assert!(boot_machine(
+            &unrendered,
+            SourceRef::new("vt1"),
+            SourceRef::new("abc-news")
+        )
+        .is_err());
     }
 }

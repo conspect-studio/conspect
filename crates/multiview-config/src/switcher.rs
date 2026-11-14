@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use multiview_core::switcher::TransitionDescriptor;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -20,7 +21,7 @@ pub const INPUT_REF_PREFIX: &str = "in:";
 pub const MAX_MIXER_INPUT_LABEL: usize = 64;
 
 /// One mix/effects stage inside a program. The first runtime admits exactly one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MixEffectsConfig {
     /// Unique M/E id, currently `me1`.
@@ -45,6 +46,11 @@ pub struct MixEffectsConfig {
     /// Starting PVW input number; required exactly when `inputs` is non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_input: Option<u16>,
+    /// The selected transition the next AUTO uses (ADR-0112 §4), re-applied
+    /// at boot. Absent means the engine default (an AUTO is a MIX). Written
+    /// back by the control plane after the engine applied a selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<TransitionDescriptor>,
 }
 
 /// One numbered mixer input slot `me1.in<N>` and its patched video source.
@@ -106,6 +112,29 @@ impl MixEffectsConfig {
             .iter()
             .find(|input| input.number == number)
             .and_then(MixerInput::source)
+    }
+
+    /// A persisted selection must be one the engine accepts and renders: the
+    /// same rule as `SwitcherVerb::SetTransition` (ADR-0112).
+    fn validate_transition(&self) -> Result<(), ConfigError> {
+        let Some(transition) = &self.transition else {
+            return Ok(());
+        };
+        if !transition.is_valid() {
+            return Err(ConfigError::Validation(format!(
+                "switcher M/E {:?} transition has an out-of-range parameter \
+                 (dip rate >= 2 and switch point in (0, 1); wipe numbers in [0, 1])",
+                self.id
+            )));
+        }
+        if !transition.is_rendered() {
+            return Err(ConfigError::Validation(format!(
+                "switcher M/E {:?} transition is unsupported: this engine renders cut, mix, \
+                 dip to a colour and wipe without flip_flop or border_fill_source",
+                self.id
+            )));
+        }
+        Ok(())
     }
 
     fn validate_inputs(&self, sources: &[&str]) -> Result<(), ConfigError> {
@@ -226,6 +255,7 @@ impl SwitcherConfig {
                 }
             }
             me.validate_inputs(sources)?;
+            me.validate_transition()?;
         }
         Ok(())
     }
@@ -260,6 +290,7 @@ mod tests {
             ],
             program_input: Some(1),
             preview_input: Some(2),
+            transition: None,
         }
     }
 
@@ -395,5 +426,100 @@ number = 3
         legacy.preview_input = None;
         let out = toml::to_string(&legacy).unwrap();
         assert!(!out.contains("input"), "{out}");
+    }
+
+    #[test]
+    fn a_selected_transition_round_trips_through_toml() {
+        let mut selected = me();
+        selected.transition = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "wipe", "pattern": "circle", "rate": 25, "softness": 0.1,
+                "border_width": 0.02, "border_color": "#ff8000", "reverse": true,
+                "position_xy": [0.25, 0.75]
+            }))
+            .unwrap(),
+        );
+        check(selected.clone()).unwrap();
+        let text = toml::to_string(&selected).unwrap();
+        let again: MixEffectsConfig = toml::from_str(&text).unwrap();
+        assert_eq!(again, selected, "{text}");
+        let mut dip = me();
+        dip.transition = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "dip", "rate": 30, "color": "#ffffff",
+                "switch_point": {"num": 1, "den": 3}
+            }))
+            .unwrap(),
+        );
+        let text = toml::to_string(&dip).unwrap();
+        assert_eq!(toml::from_str::<MixEffectsConfig>(&text).unwrap(), dip);
+        // No selection serializes nothing (byte-compatible documents).
+        assert!(!toml::to_string(&me()).unwrap().contains("transition"));
+    }
+
+    #[test]
+    fn an_invalid_or_unrendered_transition_is_refused() {
+        for (value, needle) in [
+            (
+                serde_json::json!({"kind": "dip", "rate": 1}),
+                "out-of-range",
+            ),
+            (
+                serde_json::json!({"kind": "dip", "rate": 10, "switch_point": {"num": 1, "den": 1}}),
+                "out-of-range",
+            ),
+            (
+                serde_json::json!({"kind": "wipe", "pattern": "box", "rate": 10, "softness": 1.5}),
+                "out-of-range",
+            ),
+            (
+                serde_json::json!({"kind": "wipe", "pattern": "box", "rate": 10, "flip_flop": true}),
+                "unsupported",
+            ),
+            (
+                serde_json::json!({"kind": "wipe", "pattern": "box", "rate": 10, "border_fill_source": "vt1"}),
+                "unsupported",
+            ),
+            (
+                serde_json::json!({"kind": "dip", "rate": 10, "dip_source": "vt1"}),
+                "unsupported",
+            ),
+            (
+                serde_json::json!({"kind": "stinger", "player": "mp1", "pre_roll": 1,
+                    "clip_duration": 30, "trigger_point": 5, "mix_rate": 10}),
+                "unsupported",
+            ),
+        ] {
+            let mut bad = me();
+            bad.transition = Some(serde_json::from_value(value).unwrap());
+            refused(bad, needle);
+        }
+        // An unknown kind or field never parses.
+        assert!(toml::from_str::<MixEffectsConfig>(
+            "id = \"me1\"\nprogram = \"main\"\nprogram_source = \"a\"\npreview_source = \"b\"\n[transition]\nkind = \"spin\"\n"
+        )
+        .is_err());
+    }
+
+    /// MED-P3-4: a persisted selection with an unknown field, a field of
+    /// another variant or an unknown nested field is refused at load.
+    #[test]
+    fn a_persisted_transition_with_an_unknown_field_is_refused_at_load() {
+        let head = "id = \"me1\"\nprogram = \"main\"\nprogram_source = \"a\"\npreview_source = \"b\"\n[transition]\n";
+        for body in [
+            "kind = \"mix\"\nrate = 10\nreverse = true\n",
+            "kind = \"cut\"\nrate = 10\n",
+            "kind = \"dip\"\nrate = 10\npattern = \"box\"\n",
+            "kind = \"wipe\"\npattern = \"box\"\nrate = 10\ncolor = \"#ffffff\"\n",
+            "kind = \"dip\"\nrate = 10\nswitch_point = { num = 1, den = 2, x = 0 }\n",
+        ] {
+            let error = toml::from_str::<MixEffectsConfig>(&format!("{head}{body}"));
+            assert!(error.is_err(), "{body}");
+        }
+        // The known shapes still load.
+        assert!(toml::from_str::<MixEffectsConfig>(&format!(
+            "{head}kind = \"dip\"\nrate = 10\nswitch_point = {{ num = 1, den = 3 }}\n"
+        ))
+        .is_ok());
     }
 }

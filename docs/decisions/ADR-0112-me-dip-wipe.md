@@ -24,7 +24,10 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    frozen for the whole flight) and refused with `unsupported-transition` for a
    kind or option the drive does not render. `AUTO(rate)` keeps its own rate and
    uses the selected kind (`SwitcherState::transition_with_rate`); a selected
-   `cut` makes AUTO a MIX, as before.
+   `cut` makes AUTO a MIX, as before. The AUTO's descriptor is the flight's
+   own (`SwitcherState::auto_with` / `active_transition`), cleared when the
+   take completes, is cut or aborted: the selection itself never changes by
+   an AUTO, and the drive renders the flight's descriptor.
 2. **DIP to a colour.** `Dip` gains `color` (`"#rrggbb"`, default black);
    `dip_source` becomes optional and a dip through a source is refused until it
    is rendered. With `t = elapsed / duration` and the exact rational switch
@@ -67,11 +70,52 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    so a soft edge or border band has the same pixel width on every side. `border_fill_source` and `flip_flop` are refused until rendered.
    Edge pixels may differ between CPU and GPU by f32 rounding; the GPU test
    bounds that to 1 % of luma samples by more than 3 code values.
-4. **Control API and desk** (third PR): `/api/v1/switcher/plan` and
-   `/commands/set_transition` carry the descriptor, with the same BOLA,
-   idempotency and 202-means-queued rules as `auto`; `GET /api/v1/switcher/me1`
-   reports the selected transition; the desk enables MIX/WIPE/DIP with a pattern
-   picker and the AUTO rate.
+4. **Control API, persistence and desk** (third PR): action `set_transition`
+   on `/api/v1/switcher/plan` and `/commands/set_transition` carries the
+   descriptor in `transition`. It has the same BOLA, Idempotency-Key, bounded
+   `try_send` (`engine-busy`) and 202-means-queued rules as `auto`. Every
+   other action that carries a `transition` is refused, and `set_transition`
+   forbids `source`/`input`/`duration_frames`. A source named inside the
+   descriptor (`dip_source`, `border_fill_source`, `player`) is authorized
+   before the body is parsed. The route answers with typed 422s:
+   `unsupported-transition` for what the drive does not render (stinger,
+   DVE, a dip through a source, `flip_flop`, `border_fill_source`), and
+   `invalid-transition` for a shape or number the machine refuses, an
+   unknown field or a field of another kind (the descriptor and its switch
+   point deny unknown fields, in the API and in a persisted config alike), or
+   a rate above 1000 frames, including a number JSON cannot carry (`1e400`,
+   `NaN`) inside `transition`; other malformed bodies keep the body
+   extractor's rejection. A selection while a take is in flight is refused
+   before enqueue, and the engine re-checks every rule at the tick. A retry
+   with an already-reserved Idempotency-Key is answered with its original
+   202 after authorization and static validation, before the transient
+   bus/active-take/scene checks; a fresh key passes every check first. The
+   checks are shared, not copied: `TransitionDescriptor::is_valid` /
+   `is_rendered`. `GET /api/v1/switcher/me1` reports the engine snapshot's
+   `transition`. The OpenAPI document publishes the descriptor as a
+   `oneOf` tagged on `kind` (`TransitionDescriptorDoc`, a serde-equivalent
+   mirror in `multiview-control`, pinned to the core type by a round-trip
+   test); the route still parses the raw JSON so a malformed body is a typed
+   422, and the web client uses the generated type. The snapshot compares the descriptor every committed tick
+   and clones it only on a changed tick. The selection is machine state, so
+   it is persisted as `switcher.mix_effects[0].transition`. Config
+   validation applies the same two rules. The persist relay writes the
+   selection off the clock, under the config-mutation lock, after the
+   engine applied it and only while no take is in flight. The snapshot's
+   `transition` is the selection, never the AUTO's flight descriptor, so a
+   completed or interrupted AUTO persists the selection with its own rate.
+   The first-slice
+   launcher sets the persisted selection on the machine before the clock
+   starts. The desk enables MIX/WIPE/DIP (pressed state from GET). Its
+   parameter draft starts from the confirmed selection in GET; a later
+   engine change updates every field without an unsaved local edit, and
+   applying keeps the selection's fields the desk does not expose
+   (`position_xy`, `switch_point`). A band without a `border_color` stays
+   colourless until the operator sets the border colour or width. It has a
+   picker with the five patterns as SVG thumbnails, reverse, softness,
+   border width/colour and a dip colour, a 50 % preview thumbnail, and an
+   AUTO title naming the selected kind. AUTO still sends only its
+   `duration_frames`. T-bar remains out of scope.
 
 ## Invariants
 
