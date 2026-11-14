@@ -1535,7 +1535,8 @@ impl MultiviewConfig {
         if keys > rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM {
             return Err(ConfigError::Validation(format!(
                 "{SLOT_FORMAT_UNSUPPORTED}: the outputs need {keys} distinct video encoders \
-                 (one per distinct codec, format and settings); at most {} per program",
+                 (one per distinct codec, format and settings, and one per output at its own \
+                 rate); at most {} per program",
                 rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM
             )));
         }

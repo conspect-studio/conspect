@@ -515,6 +515,37 @@ fn a_non_program_audio_feed_onto_a_rate_output_is_slot_format_unsupported() {
     .expect("silence on a Program-rate output");
 }
 
+/// #343 review A1: every rate output opens its own encoder, so identical
+/// rate outputs count one encoder each toward the per-program ceiling.
+#[test]
+fn identical_rate_outputs_count_one_encoder_each() {
+    let rate = |id: usize| {
+        format!(
+            "\n[[outputs]]\nkind = \"hls\"\nid = \"r{id}\"\npath = \"/srv/r{id}\"\ncodec = \"h264\"\n\
+             [outputs.format]\nwidth = 1280\nheight = 720\nfps = \"25/1\"\n"
+        )
+    };
+    let with = |n: usize| format!("{PLAIN}{}", (0..n).map(rate).collect::<String>());
+    let max = multiview_config::rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM;
+    // Program's encoder + (max - 1) rate encoders fit.
+    let fits = parse(&with(max - 1));
+    assert_eq!(
+        multiview_config::rendition::distinct_base_video_keys(&fits),
+        max
+    );
+    fits.validate().expect("at the ceiling");
+    assert_code(
+        &with(max),
+        SLOT_FORMAT_UNSUPPORTED,
+        "distinct video encoders",
+    );
+    assert_code(
+        &with(100),
+        SLOT_FORMAT_UNSUPPORTED,
+        "distinct video encoders",
+    );
+}
+
 #[test]
 fn colour_different_from_canvas_is_slot_format_unsupported() {
     assert_code(
