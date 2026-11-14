@@ -485,8 +485,12 @@ fn the_video_key_is_shared_only_without_an_own_format_codec_or_bit_rate() {
     let out: Output = toml::from_str("kind = \"cast\"\nid = \"c\"\n").unwrap();
     assert!(out.format().is_none() && out.slots().is_none());
     let cap = out.slot_capability();
-    // #418: any number of audio renditions (was `Some(1)`, intentionally removed).
-    assert_eq!((cap.video_max, cap.audio_max), (1, None));
+    // #418: up to 16 audio renditions, the packager's bound (was `Some(1)`,
+    // then unlimited; review INV418-1 bounds it so nothing is truncated).
+    assert_eq!(
+        (cap.video_max, cap.audio_max),
+        (1, Some(multiview_config::MAX_CAST_AUDIO_RENDITIONS))
+    );
     assert!(cap.format_convertible && !cap.raw_video);
 }
 
