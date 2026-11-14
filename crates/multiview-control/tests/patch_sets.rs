@@ -1453,8 +1453,7 @@ async fn a_config_salvo_with_a_subtitle_crosspoint_is_refused_by_plan_and_take_a
         1,
     );
     let doc = format!(
-        "{}\n[[salvos]]\nid = \"subs\"\n[[salvos.patch]]\nplane = \"subtitle\"\ndestination = {{ output = \"output-0\", slot = 0 }}\nsource = {{ source = \"bars\" }}\n",
-        doc
+        "{doc}\n[[salvos]]\nid = \"subs\"\n[[salvos.patch]]\nplane = \"subtitle\"\ndestination = {{ output = \"output-0\", slot = 0 }}\nsource = {{ source = \"bars\" }}\n"
     );
     let rig = rig_with(&dir.path().join("boot.toml"), &doc);
     let resp = send(
