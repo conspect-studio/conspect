@@ -6,8 +6,9 @@
 //! the CPU reference composite of the expected tile stack byte for byte, for
 //! an opaque clip and for an alpha clip (`AlphaPlanePool::attach`). A stale
 //! player is skipped and the take completes on schedule. The player roll is
-//! one bounded `try_send`: a roll worker that blocks or panics never touches
-//! the clock. Plus a stinger command flood against the clock (#1, #10).
+//! one wait-free `fetch_or` into a fixed pending mask: a roll worker that
+//! blocks, panics or never drains never touches the clock. Plus a stinger
+//! command flood against the clock (#1, #10).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,7 +25,7 @@ use multiview_core::layout::{Canvas, Cell, Layout};
 use multiview_core::switcher::{FrameCount, SourceRef, TransitionDescriptor};
 use multiview_core::time::{MediaTime, Rational};
 use multiview_engine::clock::{ManualTimeSource, Tick};
-use multiview_engine::player_roll::{PlayerRollSender, PLAYER_ROLL_CAPACITY};
+use multiview_engine::player_roll::{PlayerRollSender, MAX_ROLL_PLAYERS};
 use multiview_engine::runtime::FrameControl;
 use multiview_engine::switcher::SwitcherState;
 use multiview_engine::switcher_control::{
@@ -403,26 +404,23 @@ fn a_stale_player_is_skipped_and_the_take_completes_on_schedule() {
 }
 
 /// The AUTO rolls the bound player exactly once, on its tick, through the
-/// bounded queue; a full queue drops (and counts) instead of waiting.
+/// fixed pending mask; a roll whose player is still pending coalesces (and
+/// is counted) instead of waiting or growing.
 #[test]
 fn the_auto_rolls_its_player_once_through_a_bounded_queue() {
-    let (roll, rx) = PlayerRollSender::channel(["p".to_owned(), "q".to_owned()]);
+    let (roll, mut rx) = PlayerRollSender::channel(["p".to_owned(), "q".to_owned()]);
     let probe = roll.clone();
     let mut rig = rig(Some(roll));
     rig.send("set", SwitcherVerb::SetTransition(stinger(2, 4, 1, 2)));
     rig.step(0, None);
-    assert!(rx.try_recv().is_err(), "selecting does not roll");
+    assert!(rx.try_recv().is_none(), "selecting does not roll");
     rig.send("auto", SwitcherVerb::Auto(FrameCount::try_from(5).unwrap()));
     rig.step(1, None);
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        0,
-        "rolled player p on the AUTO tick"
-    );
+    assert_eq!(rx.try_recv(), Some(0), "rolled player p on the AUTO tick");
     for index in 2..8 {
         rig.step(index, None);
     }
-    assert!(rx.try_recv().is_err(), "rolled exactly once");
+    assert!(rx.try_recv().is_none(), "rolled exactly once");
     assert_eq!(probe.sent(), 1);
     // A plain MIX never rolls.
     rig.send(
@@ -438,14 +436,117 @@ fn the_auto_rolls_its_player_once_through_a_bounded_queue() {
     for index in 8..12 {
         rig.step(index, None);
     }
-    assert!(rx.try_recv().is_err());
-    // Nobody drains: the queue fills, then every roll is dropped, and the
-    // caller never blocks.
-    for _ in 0..PLAYER_ROLL_CAPACITY + 3 {
+    assert!(rx.try_recv().is_none());
+    // Nobody drains: the first roll of q is pending, every later one
+    // coalesces into it, and the caller never blocks.
+    for _ in 0..7 {
         probe.roll(&SourceRef::new("q"));
     }
-    assert_eq!(probe.dropped(), 3);
+    assert_eq!(probe.sent(), 2);
+    assert_eq!(probe.coalesced(), 6);
     assert!(!probe.roll(&SourceRef::new("not-a-player")));
+    assert_eq!(probe.dropped(), 1);
+    assert_eq!(
+        rx.try_recv(),
+        Some(1),
+        "q rolls once for the coalesced burst"
+    );
+    assert!(rx.try_recv().is_none());
+    // A player registered beyond the mask's width is dropped, never rolled.
+    let ids: Vec<String> = (0..=MAX_ROLL_PLAYERS).map(|i| format!("m{i}")).collect();
+    let (wide, mut wide_rx) = PlayerRollSender::channel(ids);
+    assert!(wide.roll(&SourceRef::new(format!("m{}", MAX_ROLL_PLAYERS - 1))));
+    assert!(!wide.roll(&SourceRef::new(format!("m{MAX_ROLL_PLAYERS}"))));
+    assert_eq!(wide.dropped(), 1);
+    assert_eq!(wide_rx.try_recv(), Some(MAX_ROLL_PLAYERS - 1));
+}
+
+/// SA-1 chaos: the receiver is suspended for the whole run (held, never
+/// drained), while the real runtime emits 300 ticks with a stinger AUTO
+/// every 12 ticks. Every tick completes, in order, with no repeat; every
+/// AUTO's roll is accounted as sent or coalesced, and the pending state
+/// stays one bit per player, so nothing grows and nothing waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_suspended_roll_receiver_never_stalls_the_tick() {
+    const TICKS: u64 = 300;
+    let (roll, mut rx) = PlayerRollSender::channel(["p".to_owned()]);
+    let probe = roll.clone();
+    let rig = rig(Some(roll));
+    let (a, b, p) = (Arc::clone(&rig.a), Arc::clone(&rig.b), Arc::clone(&rig.p));
+    let pool = Arc::clone(&rig.pool);
+    let handle = rig.handle.clone();
+    handle
+        .try_send(SwitcherCommand {
+            operation_id: "set".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::SetTransition(stinger(1, 8, 2, 3)),
+        })
+        .unwrap();
+    let clock = Arc::new(ManualTimeSource::new());
+    let ts: Arc<dyn TimeSource> = clock.clone();
+    let mut runtime = EngineRuntime::new(
+        OutputClock::new(Rational::new(25, 1)).unwrap(),
+        rig.drive,
+        ts,
+        CooperativePacer,
+    );
+    let repeated = runtime.frames_repeated_counter();
+    let publisher = EnginePublisher::<u8, ()>::new(16);
+    let mut indices = Vec::new();
+    let mut autos = 0_u64;
+    let pace = Arc::clone(&clock);
+    a.publish(solid(A_Y), MediaTime::ZERO);
+    b.publish(solid(B_Y), MediaTime::ZERO);
+    p.publish(clip_frame(Clip::Alpha, &pool), MediaTime::ZERO);
+    let started = std::time::Instant::now();
+    runtime
+        .run_for_with_frame_control(
+            &publisher,
+            &StopSignal::new(),
+            TICKS,
+            |frame| {
+                indices.push(frame.tick.index);
+                if frame.tick.index % 12 == 1 {
+                    let sent = handle.try_send(SwitcherCommand {
+                        operation_id: format!("auto-{}", frame.tick.index),
+                        scene_version: 1,
+                        verb: SwitcherVerb::Auto(FrameCount::try_from(5).unwrap()),
+                    });
+                    autos += u64::from(sent.is_ok());
+                }
+                pace.advance(std::time::Duration::from_millis(40));
+                let next =
+                    MediaTime::from_nanos(i64::try_from(frame.tick.index + 1).unwrap() * TICK_NS);
+                a.publish(solid(A_Y), next);
+                b.publish(solid(B_Y), next);
+                p.publish(clip_frame(Clip::Alpha, &pool), next);
+                0
+            },
+            |_| None,
+            rig.hook,
+        )
+        .await
+        .unwrap();
+    assert_eq!(u64::try_from(indices.len()).unwrap(), TICKS);
+    assert!(
+        indices.windows(2).all(|w| w[1] == w[0] + 1),
+        "contiguous ticks"
+    );
+    assert_eq!(repeated.load(Ordering::Acquire), 0, "no repeated frame");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "nothing waited for the receiver"
+    );
+    let completions = handle.snapshot().unwrap().completion_count;
+    assert!(completions >= 20, "stingers ran: {completions}");
+    // Exactly one roll became pending; every later AUTO coalesced into it.
+    assert_eq!(probe.sent(), 1);
+    assert_eq!(probe.coalesced(), completions - 1);
+    assert!(autos >= completions);
+    assert_eq!(probe.dropped(), 0);
+    // The receiver resumes: one pending roll, nothing queued behind it.
+    assert_eq!(rx.try_recv(), Some(0));
+    assert!(rx.try_recv().is_none());
 }
 
 /// A roll worker that blocks forever, or panics, never affects the tick:
@@ -493,7 +594,7 @@ fn a_blocking_or_panicking_roll_never_affects_the_tick() {
             rig.step(index, Some(Clip::Alpha));
         }
         assert_eq!(rig.handle.snapshot().unwrap().program.as_str(), "a");
-        assert_eq!(probe.sent() + probe.dropped(), 2);
+        assert_eq!(probe.sent() + probe.coalesced(), 2);
         drop(held);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while calls.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
@@ -719,12 +820,12 @@ async fn a_stinger_command_flood_never_moves_the_output_clock() {
         "bounded work per tick: {:?}",
         per_tick.values().max()
     );
-    // Stingers ran and rolled; the wedged worker made the roll queue fill and
-    // drop rather than wait.
+    // Stingers ran and rolled; the wedged worker made later rolls coalesce
+    // into the one pending bit rather than wait or grow.
     assert!(probe.sent() >= 1, "at least one stinger rolled");
     assert!(
-        probe.sent() <= u64::try_from(PLAYER_ROLL_CAPACITY).unwrap() + 1,
-        "a wedged worker holds at most one roll plus the queue: {}",
+        probe.sent() <= 2,
+        "a wedged worker holds at most one roll plus one pending: {}",
         probe.sent()
     );
     let selection = handle.snapshot().unwrap().transition.clone();

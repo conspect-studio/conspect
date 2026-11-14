@@ -156,11 +156,18 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
      completes on schedule.
    - **Roll.** `PlayerRollSender` (engine, `player_roll.rs`) is set on the
      tick driver at boot by the CLI, beside `set_prime_stores`. On the
-     AUTO's tick the driver calls `roll(player)`: a lookup among the ids
-     registered at boot and one `try_send` of an index on a 4-slot
-     `sync_channel` — no allocation, no lock, no wait; a full or closed
-     queue drops and counts. A dedicated `stinger-roll` thread runs the CLI
-     callback, which submits `Cue { frame: None }` then `Play` to the
+     AUTO's tick the driver calls `roll(player)`: a lookup among the (at
+     most 64) ids registered at boot and one `fetch_or` of the player's bit
+     into a single preallocated `AtomicU64` pending mask — no allocation, no
+     lock, no syscall, no wait. A roll for a player whose bit is still
+     pending coalesces into it (counted); an unregistered player is dropped
+     (counted). `std::sync::mpsc::SyncSender::try_send` was rejected: its
+     bounded channel wakes the receiver through a mutex-protected waker, so a
+     descheduled worker could stall the tick (review SA-1). The tick never
+     wakes the worker (no `unpark`); a dedicated `stinger-roll` thread polls
+     the mask every 2 ms with `park_timeout`, swaps it to zero and runs the CLI
+     callback for each bit, well inside the smallest (one-frame) pre-roll. The
+     callback submits `Cue { frame: None }` then `Play` to the
      player's existing bounded transport mailbox (ADR-0057/0097); a callback
      panic is contained per roll. A worker that blocks or panics cannot
      reach the clock.
@@ -196,11 +203,15 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
   `a_transition_command_flood_never_moves_the_output_clock`: 600 ticks, one
   frame per tick, zero repeats, full mailbox met, at most 16 commands a tick).
 - **#1/#10 (stinger, §5):** the clip is one more full-canvas tile; the player
-  roll is one `try_send` on a 4-slot queue to an off-clock worker. Chaos test
+  roll is one wait-free `fetch_or` into a fixed 64-bit pending mask read by
+  an off-clock worker. Chaos test
   `tests/switcher_stinger.rs::a_stinger_command_flood_never_moves_the_output_clock`
   floods stinger selections/AUTOs/CUTs for 600 ticks with a roll worker that
-  never returns: one frame per tick, zero repeats, the roll queue fills and
-  drops. `a_blocking_or_panicking_roll_never_affects_the_tick` pins the
+  never returns: one frame per tick, zero repeats, later rolls coalesce into
+  the pending bit. `a_suspended_roll_receiver_never_stalls_the_tick` holds
+  the receiver and never drains it for 300 ticks of repeated stingers: every
+  tick completes, one roll is pending and every later one is counted as
+  coalesced. `a_blocking_or_panicking_roll_never_affects_the_tick` pins the
   per-frame output with a blocked and a panicking worker.
 
 ## Alternatives considered
