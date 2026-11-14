@@ -2448,6 +2448,9 @@ pub struct Pipeline {
     /// reads decoder configuration in band (MPEG-TS), so a routing move onto
     /// changed parameter sets may splice (output-routing.md §4.2 step 4).
     output_inband_sets: Vec<bool>,
+    /// Per runnable output (same order): a live format reset may reach it
+    /// (#342 B3 review M-1: HLS with TS segments only).
+    output_live_reset: Vec<bool>,
     output_audio_tracks: Vec<Vec<usize>>,
     /// Outputs that EXPLICITLY declared an audio selection (per output: the id
     /// and its full declared track list). Drives the run-time truthful binding:
@@ -3313,7 +3316,7 @@ impl Pipeline {
             format: encoder.format,
             cadence,
             gop,
-            bit_rate: 4_000_000,
+            bit_rate: usize::try_from(DEFAULT_VIDEO_KBPS).unwrap_or(4_000) * 1000,
             // AUD-4: video-only until the program-audio path is wired through
             // drive_streaming (subsequent slice); `None` keeps the muxer
             // single-stream so the existing run output is unchanged.
@@ -3368,6 +3371,7 @@ impl Pipeline {
         };
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         let mut output_inband_sets = Vec::with_capacity(outputs.len());
+        let mut output_live_reset = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
@@ -3435,6 +3439,9 @@ impl Pipeline {
             output_inband_sets.push(!ll_hls && inband_parameter_changes_ok(output));
             // A cast stream carries the program audio only (track 0).
             let cast_audio = multiview_output::AudioSelection::default();
+            // Only a TS-segment HLS sink rebuilds its muxer at a flagged
+            // change (#342 B3 review M-1).
+            output_live_reset.push(!ll_hls && matches!(output, RunnableOutput::Hls { .. }));
             let audio_selection = match output {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
@@ -3637,6 +3644,7 @@ impl Pipeline {
             output_formats,
             output_video_keys,
             output_inband_sets,
+            output_live_reset,
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
@@ -3898,6 +3906,12 @@ impl Pipeline {
                 // The routed audio rides the binding's program-audio slot
                 // (track 0, present only when this run encodes program audio).
                 program_audio: audio_tracks.get(index).is_some_and(|t| t.contains(&0)),
+                // #342 B3: a live format reset keeps the running encoder.
+                codec_name: self
+                    .rendition_configs
+                    .get(settings)
+                    .map(|cfg| cfg.codec_name.clone())
+                    .unwrap_or_default(),
             })
             .collect()
     }
@@ -3906,6 +3920,9 @@ impl Pipeline {
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
     /// [`Self::output_routing`]. Nothing here runs per tick.
+    #[allow(clippy::too_many_lines)]
+    // reason: one linear wiring of a run's routing (aux thread, router,
+    // openers, handle, boot takes); splitting it would scatter the order.
     fn build_output_routing(
         &self,
         binding_ids: &[Option<String>],
@@ -3956,7 +3973,9 @@ impl Pipeline {
             self.rendition_configs.clone(),
             self.rendition_formats.clone(),
         );
-        let (router, handle) = crate::output_routing::OutputRouter::new_with_bus(
+        let reformat_open =
+            reformat_opener(self.encode_cfg.clone(), self.rendition_configs.clone());
+        let (router, handle) = crate::output_routing::OutputRouter::new_with_openers(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -3967,6 +3986,7 @@ impl Pipeline {
                 has_preview,
                 max_aux_canvases: self.max_aux_canvases,
                 formats: self.output_formats.clone(),
+                live_reset: self.output_live_reset.clone(),
                 boot_retry: self.boot_retry,
             },
             crate::output_routing::AuxWiring {
@@ -3981,6 +4001,7 @@ impl Pipeline {
                 sizing: Some(Arc::clone(&self.aux_sizing)),
             },
             open,
+            Some(reformat_open),
         )
         .map_err(spawn_err)?;
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
@@ -4792,6 +4813,8 @@ impl Pipeline {
                 self.output_formats.insert(0, hls_format);
                 // The anchor is a `program.ts` file: MPEG-TS, in band.
                 self.output_inband_sets.insert(0, true);
+                // The internal `program.ts` anchor is a file: never reset.
+                self.output_live_reset.insert(0, false);
                 self.output_audio_tracks
                     .insert(0, hls_audio.unwrap_or_default());
             }
@@ -7882,6 +7905,47 @@ struct ConsumerRouting {
 /// End-of-run bound for the routing reaper to finish closed live encoders.
 const ROUTING_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
+/// The opener of a live format reset's ad-hoc settings (#342 B3): the run's
+/// encode config with the new codec name (unchanged), size and bit rate; a
+/// Program/Clean key at a non-canvas format converts on its own worker; a
+/// routed source/PVW arrives already at the new feed format.
+fn reformat_opener(
+    base: EncodeConfig,
+    configs: Vec<EncodeConfig>,
+) -> crate::output_routing::ReformatOpenFn {
+    Box::new(move |settings, bus| {
+        // The encoder's input format follows the codec name; reuse the
+        // run's own config for that codec when present.
+        let mut cfg = configs
+            .iter()
+            .find(|c| c.codec_name == settings.codec_name)
+            .cloned()
+            .unwrap_or_else(|| base.clone());
+        cfg.codec_name.clone_from(&settings.codec_name);
+        cfg.width = settings.width;
+        cfg.height = settings.height;
+        cfg.bit_rate = settings.bit_rate;
+        cfg.audio = None;
+        let encoder = VideoRenditionEncoder::new(&cfg).map_err(|e| e.to_string())?;
+        let live: Box<dyn crate::output_routing::LiveEncoder> =
+            Box::new(PipelineVideoWorker(encoder));
+        // Program, Clean and a routed layout are canvas-sized pictures (#368);
+        // a non-canvas base format converts on the new key's own worker.
+        let canvas_bus = matches!(
+            bus,
+            crate::routing_aux::PictureBus::Program
+                | crate::routing_aux::PictureBus::Clean
+                | crate::routing_aux::PictureBus::Layout(_)
+        );
+        match settings.base_format {
+            Some(format) if canvas_bus => Ok(Box::new(crate::format_convert::ConvertLive::new(
+                format, live,
+            ))),
+            _ => Ok(live),
+        }
+    })
+}
+
 /// The routing opener (ADR-0108, #342): opens a live encoder for a rendition
 /// settings index. A Program/Clean key at a non-canvas format converts on its
 /// own worker (never erroring: it repeats or blacks). A routed source/PVW
@@ -7965,6 +8029,10 @@ impl crate::output_routing::LiveEncoder for PipelineVideoWorker {
     fn parameter_sets(&self) -> Option<crate::rendition_dispatch::ParameterSets> {
         let params = self.0.codec_params().clone();
         Some(Box::new(move |packet| params.rap_parameter_sets(packet)))
+    }
+
+    fn stream_params(&self) -> Option<multiview_ffmpeg::StreamCodecParameters> {
+        Some(self.0.codec_params().clone())
     }
 }
 
@@ -8682,6 +8750,9 @@ fn consumer_main<D: WindowDelivery>(
         // published before the router tick so a Clean encoder gets frame T
         // this tick. One bool check when nothing selects Clean.
         router.publish_clean(item.tick_index, &item.canvas);
+        // A reformatted output's base key reads the BAKED Program picture
+        // (#342 B3); it is published once baked, below (one bool check when
+        // no output was reformatted).
         router
             .on_tick(item.tick_index, tick_pts, &mut dispatcher, &mut delivery)
             .map_err(|e| PipelineError::Output {
@@ -8724,6 +8795,7 @@ fn consumer_main<D: WindowDelivery>(
             None
         };
         let overlaid = baker.bake(&item)?;
+        router.publish_program(item.tick_index, &overlaid);
         // NO-FALTER: fill any ticks this consumer missed (a transient stall
         // shed them from the hot queue) with frame substitution — the last
         // good baked canvas restamped at each missing tick's index. The
@@ -12671,6 +12743,15 @@ fn round_f64_to_i32(v: f64) -> i32 {
     }
 }
 
+/// The video bitrate of an output whose video slot 0 names none, kbit/s
+/// (the run's base encode default).
+pub(crate) const DEFAULT_VIDEO_KBPS: u32 = multiview_control::output_routing::DEFAULT_VIDEO_KBPS;
+
+/// The configured codec token of an output (`None` for raw kinds).
+pub(crate) fn configured_codec(output: &Output) -> Option<&str> {
+    output_codec(output)
+}
+
 fn output_codec(output: &Output) -> Option<&str> {
     match output {
         Output::RtspServer { codec, .. }
@@ -14216,6 +14297,8 @@ struct StreamingPacketSource {
     /// The current window opened a decoder-configuration change not yet
     /// reported to the sink (reported once per lease).
     config_change_unreported: bool,
+    /// That change's new video stream parameters (#342 B3 review V2).
+    config_params_unreported: Option<multiview_ffmpeg::StreamCodecParameters>,
 }
 
 impl StreamingPacketSource {
@@ -14226,6 +14309,7 @@ impl StreamingPacketSource {
             delivered: 0,
             last_lease: std::sync::Weak::new(),
             config_change_unreported: false,
+            config_params_unreported: None,
         }
     }
 }
@@ -14244,6 +14328,7 @@ impl PacketSource for StreamingPacketSource {
         if !self.last_lease.ptr_eq(&lease) {
             self.last_lease = lease;
             self.config_change_unreported = leased.permit.decoder_config_changed();
+            self.config_params_unreported = leased.permit.decoder_config_params();
         }
         self.current_permit = Some(leased.permit);
         self.delivered = self.delivered.saturating_add(1);
@@ -14252,6 +14337,10 @@ impl PacketSource for StreamingPacketSource {
 
     fn take_decoder_config_change(&mut self) -> bool {
         std::mem::take(&mut self.config_change_unreported)
+    }
+
+    fn take_decoder_config_params(&mut self) -> Option<multiview_ffmpeg::StreamCodecParameters> {
+        self.config_params_unreported.take()
     }
 }
 
