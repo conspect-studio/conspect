@@ -312,7 +312,11 @@ fn tick(driver: &mut SwitcherTickDriver, index: u64) {
 }
 
 fn rig(path: &Path) -> Rig {
-    let doc = doc();
+    rig_with(path, &doc())
+}
+
+fn rig_with(path: &Path, doc: &str) -> Rig {
+    let doc = doc.to_owned();
     std::fs::write(path, &doc).unwrap();
     let config = MultiviewConfig::load_from_toml(&doc).unwrap();
     config.validate().unwrap();
@@ -1433,4 +1437,58 @@ async fn refused_and_replayed_sets_refund_their_limiter_charge() {
     )
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+}
+
+/// #345 x #308 (merge review F1): a config-stored salvo with a subtitle
+/// crosspoint is refused by `plan` exactly as its `take` refuses it (sets
+/// carry no subtitle crosspoints), never a plan that says it can be taken.
+#[tokio::test]
+async fn a_config_salvo_with_a_subtitle_crosspoint_is_refused_by_plan_and_take_alike() {
+    let dir = tempfile::tempdir().unwrap();
+    // output-0 (the doc's first output) declares one subtitle slot, so the
+    // subtitle crosspoint itself is valid: only the set path refuses it.
+    let doc = doc().replacen(
+        "segment_ms = 1000\n",
+        "segment_ms = 1000\n[[outputs.slots.subtitle]]\nlanguage = \"en\"\n",
+        1,
+    );
+    let doc = format!(
+        "{}\n[[salvos]]\nid = \"subs\"\n[[salvos.patch]]\nplane = \"subtitle\"\ndestination = {{ output = \"output-0\", slot = 0 }}\nsource = {{ source = \"bars\" }}\n",
+        doc
+    );
+    let rig = rig_with(&dir.path().join("boot.toml"), &doc);
+    let resp = send(
+        &rig.router,
+        post("/api/v1/salvos/subs/plan", OPERATOR_TOKEN, None, &json!({})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let plan = body_json(resp).await;
+    assert!(
+        plan["type"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("slot-medium-mismatch"),
+        "{plan}"
+    );
+    let resp = send(
+        &rig.router,
+        post(
+            "/api/v1/salvos/subs/take",
+            OPERATOR_TOKEN,
+            Some("subs-1"),
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let take = body_json(resp).await;
+    assert!(
+        take["type"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("slot-medium-mismatch"),
+        "{take}"
+    );
+    assert!(rig.fake.sets().is_empty(), "nothing enqueued");
 }

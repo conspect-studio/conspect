@@ -502,6 +502,16 @@ pub(crate) async fn plan_salvo(
         ));
     }
     let req = crate::routes::patch_set::salvo_request(&salvo);
+    // A salvo always takes through the set path, which carries no subtitle
+    // crosspoints (#345 routes them on their own): plan answers the take's
+    // refusal instead of a subtitle plan that could never be taken.
+    if crate::routes::patch_subtitle::has_subtitle(&req) {
+        return Ok(crate::routes::patch::problem(
+            422,
+            "slot-medium-mismatch",
+            "a salvo cannot carry subtitle crosspoints: take them with POST /patch/take",
+        ));
+    }
     crate::routes::patch::plan_request(&state, &principal, &req).await
 }
 
