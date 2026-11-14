@@ -11,7 +11,9 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::as_conversions,
+    clippy::cast_precision_loss
 )]
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::pipeline::{self, CanvasColor, Nv12Image, Tile};
@@ -263,9 +265,10 @@ fn unrendered_or_invalid_transitions_are_refused_and_change_nothing() {
         serde_json::json!({"kind": "dip", "rate": 10, "dip_source": "bars"}),
     )
     .unwrap();
-    let wipe: TransitionDescriptor =
-        serde_json::from_value(serde_json::json!({"kind": "wipe", "pattern": "box", "rate": 10}))
-            .unwrap();
+    let wipe: TransitionDescriptor = serde_json::from_value(
+        serde_json::json!({"kind": "dve_push", "direction": "left", "rate": 10}),
+    )
+    .unwrap();
     rig.send("src", SwitcherVerb::SetTransition(through_source));
     rig.send("wipe", SwitcherVerb::SetTransition(wipe));
     // A one-frame dip has no switch point (ADR-0055 §3).
@@ -408,7 +411,14 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
                     2 => SwitcherVerb::SetTransition(TransitionDescriptor::Mix {
                         rate: FrameCount::try_from(6).unwrap(),
                     }),
-                    3 => SwitcherVerb::SetTransition(dip(1, None, Rational::new(1, 2))),
+                    3 if n % 2 == 0 => {
+                        SwitcherVerb::SetTransition(dip(1, None, Rational::new(1, 2)))
+                    }
+                    3 => SwitcherVerb::SetTransition(wipe(
+                        6,
+                        ["box", "circle", "diagonal"][usize::try_from(n % 3).unwrap()],
+                        &serde_json::json!({"softness": 0.1, "border_width": 0.02, "border_color": "#00ff00"}),
+                    )),
                     _ => SwitcherVerb::Cut,
                 };
                 let command = SwitcherCommand {
@@ -647,6 +657,11 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
                         Rational::new(1, 3),
                     )),
                     1 => SwitcherVerb::Auto(FrameCount::try_from(6).unwrap()),
+                    _ if n % 2 == 0 => SwitcherVerb::SetTransition(wipe(
+                        6,
+                        "circle",
+                        &serde_json::json!({"softness": 0.05, "border_width": 0.02, "border_color": "#0000ff"}),
+                    )),
                     _ => SwitcherVerb::SetTransition(dip(1, None, Rational::new(1, 2))),
                 };
                 let command = SwitcherCommand {
@@ -726,4 +741,136 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
         full: full.load(Ordering::Relaxed),
         completions: handle.snapshot().map_or(0, |s| s.completion_count),
     }
+}
+
+fn wipe(rate: u32, pattern: &str, extra: &serde_json::Value) -> TransitionDescriptor {
+    let mut value = serde_json::json!({"kind": "wipe", "pattern": pattern, "rate": rate});
+    if let (Some(map), Some(more)) = (value.as_object_mut(), extra.as_object()) {
+        for (k, v) in more {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::from_value(value).unwrap()
+}
+
+/// The CPU reference of one wipe frame: outgoing, optional border band,
+/// incoming through the mask.
+fn wipe_reference(
+    mask: multiview_compositor::mask::WipeMask,
+    border: Option<(Rgb8, f32)>,
+) -> Nv12Image {
+    let a = solid(A_Y);
+    let b = solid(B_Y);
+    let mut fill = None;
+    let mut tiles = vec![Tile::scaled(&a, 0, 0, W, W, 1.0)];
+    if let Some((c, _)) = border {
+        fill = Some(Nv12Image::solid_rgb(2, 2, c.r, c.g, c.b, CanvasColor::default()).unwrap());
+    }
+    if let (Some(f), Some((_, width))) = (fill.as_ref(), border) {
+        tiles.push(Tile::scaled(f, 0, 0, W, W, 1.0).with_mask(mask.expanded(width)));
+    }
+    tiles.push(Tile::scaled(&b, 0, 0, W, W, 1.0).with_mask(mask));
+    pipeline::composite(
+        W,
+        W,
+        CanvasColor::default(),
+        LinearRgba::TRANSPARENT,
+        &tiles,
+    )
+    .unwrap()
+}
+
+/// ADR-0112 §3: every pattern, rendered through the switcher, equals the CPU
+/// reference composite of the expected masked tile stack at the start, a
+/// quarter, half way and the end of a 10-frame AUTO.
+#[test]
+fn every_wipe_pattern_matches_the_cpu_reference_through_the_switcher() {
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    for (pattern, shape) in [
+        ("linear_edge", MaskShape::Horizontal),
+        ("vertical", MaskShape::Vertical),
+        ("diagonal", MaskShape::Diagonal),
+        ("box", MaskShape::Box),
+        ("circle", MaskShape::Circle),
+    ] {
+        for (extra, reverse, softness, border) in [
+            (serde_json::json!({}), false, 0.0, None),
+            (
+                serde_json::json!({"reverse": true, "softness": 0.1, "border_width": 0.05, "border_color": "#ffd000"}),
+                true,
+                0.1,
+                Some((Rgb8::new(255, 208, 0), 0.05)),
+            ),
+        ] {
+            let (_, frames) = run_dip(wipe(10, pattern, &extra));
+            for (index, elapsed) in [(2_usize, 0_u32), (4, 2), (7, 5)] {
+                let mask = WipeMask::new(
+                    shape,
+                    elapsed as f32 / 10.0,
+                    W,
+                    W,
+                    [0.5, 0.5],
+                    reverse,
+                    softness,
+                    border.map_or(0.0, |(_, w)| w),
+                );
+                assert_frame(
+                    &frames[index],
+                    &wipe_reference(mask, border),
+                    &format!("{pattern} reverse={reverse} elapsed {elapsed}"),
+                );
+            }
+            assert_frame(&frames[12], &solid_canvas(B_Y), &format!("{pattern}: end"));
+        }
+    }
+}
+
+#[test]
+fn out_of_range_or_unrendered_wipe_options_are_refused() {
+    let mut rig = rig();
+    let mut outcomes = rig.handle.outcomes();
+    rig.send(
+        "soft",
+        SwitcherVerb::SetTransition(wipe(10, "box", &serde_json::json!({"softness": 2.0}))),
+    );
+    rig.send(
+        "origin",
+        SwitcherVerb::SetTransition(wipe(
+            10,
+            "circle",
+            &serde_json::json!({"position_xy": [0.5, -1.0]}),
+        )),
+    );
+    rig.send(
+        "fill",
+        SwitcherVerb::SetTransition(wipe(
+            10,
+            "box",
+            &serde_json::json!({"border_fill_source": "bars"}),
+        )),
+    );
+    rig.send(
+        "ff",
+        SwitcherVerb::SetTransition(wipe(10, "box", &serde_json::json!({"flip_flop": true}))),
+    );
+    rig.send(
+        "ok",
+        SwitcherVerb::SetTransition(wipe(10, "box", &serde_json::json!({}))),
+    );
+    rig.step(0);
+    let mut errors = HashMap::new();
+    while let Ok(item) = outcomes.try_recv() {
+        errors.insert(item.event.operation_id.clone(), item.event.error.clone());
+    }
+    for op in ["soft", "origin"] {
+        assert!(errors[op].is_some(), "{op}");
+    }
+    for op in ["fill", "ff"] {
+        assert_eq!(
+            errors[op].as_deref(),
+            Some(REFUSE_UNSUPPORTED_TRANSITION),
+            "{op}"
+        );
+    }
+    assert_eq!(errors["ok"], None);
 }

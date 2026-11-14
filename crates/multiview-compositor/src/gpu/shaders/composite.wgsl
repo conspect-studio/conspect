@@ -25,7 +25,9 @@ struct TileParams {
     // this rect (scale-at-composite); equal to src w,h for a 1:1 tile.
     // z: has-alpha flag (1 = sample `a_planes`, 0 = opaque). w: alpha layer.
     dst_size: vec4<u32>,
-    // x: opacity [0,1]. y: tile transfer id. z,w: padding.
+    // x: opacity [0,1]. y: tile transfer id. z: wipe shape id (0 = none).
+    // w: wipe reverse. The .w lanes of range/yuv2rgb*/prim0..1 carry the rest
+    // of the wipe mask (softness, origin, extent, radius, expand).
     opacity_transfer: vec4<f32>,
     // Range expand: luma = (Y*255 - luma_off)/luma_scale,
     //               chroma = (C*255 - 128)/chroma_scale.
@@ -62,6 +64,43 @@ fn sample_tile_alpha(t: TileParams, sx: u32, sy: u32) -> f32 {
         return 1.0;
     }
     return textureLoad(a_planes, vec2<i32>(i32(sx), i32(sy)), i32(t.dst_size.w), 0).r;
+}
+
+// Wipe-mask coverage at canvas pixel (px, py) (ADR-0112 §3). Mirrors
+// `mask::WipeMask::coverage` exactly; shape id 0 is "no mask". Parameters ride
+// the spare .z/.w lanes of TileParams (see `TileParams::with_mask`).
+fn wipe_coverage(t: TileParams, px: u32, py: u32, cw: u32, ch: u32) -> f32 {
+    let shape = u32(t.opacity_transfer.z + 0.5);
+    if shape == 0u {
+        return 1.0;
+    }
+    let aspect = f32(max(cw, 1u)) / f32(max(ch, 1u));
+    let u = (f32(px) + 0.5) / f32(max(cw, 1u));
+    let v = (f32(py) + 0.5) / f32(max(ch, 1u));
+    let origin = vec2<f32>(t.yuv2rgb0.w, t.yuv2rgb1.w);
+    let extent = t.yuv2rgb2.w;
+    let inv_sqrt2 = 0.70710678118654752;
+    var f = 0.0;
+    switch shape {
+        case 1u: { f = u * aspect; }
+        case 2u: { f = v; }
+        case 3u: { f = (u * aspect + v) * inv_sqrt2; }
+        case 4u: { f = max(abs(u - origin.x), abs(v - origin.y)); }
+        default: {
+            let dx = (u - origin.x) * aspect;
+            let dy = v - origin.y;
+            f = sqrt(dx * dx + dy * dy);
+        }
+    }
+    if t.opacity_transfer.w > 0.5 {
+        f = extent - f;
+    }
+    let d = t.prim0.w - f + t.prim1.w;
+    let softness = t.range.w;
+    if softness > 0.0 {
+        return clamp(d / softness + 0.5, 0.0, 1.0);
+    }
+    return select(0.0, 1.0, d >= 0.0);
 }
 
 // Nearest-neighbour NV12 fetch at integer tile-local (sx, sy), matching the
@@ -148,7 +187,8 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // 5. premultiplied-alpha source-over in linear light. Straight
         //    per-pixel alpha folds into the opacity here, premultiplied ONCE.
-        let a = clamp(t.opacity_transfer.x, 0.0, 1.0) * sample_tile_alpha(t, sx, sy);
+        let a = clamp(t.opacity_transfer.x, 0.0, 1.0) * sample_tile_alpha(t, sx, sy)
+            * wipe_coverage(t, px, py, cw, ch);
         let src = vec4<f32>(lin * a, a);
         let inv = 1.0 - src.a;
         acc = src + acc * inv;
