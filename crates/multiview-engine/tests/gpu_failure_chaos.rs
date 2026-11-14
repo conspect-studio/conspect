@@ -13,7 +13,13 @@
 //!   device to idle).
 //!
 //! Only counts and design bounds with generous slack (loaded macOS runner,
-//! #321/#284) — no percentiles.
+//! #321/#284) — no percentiles. Every assertion is either exact per-frame
+//! provenance (each emitted fresh frame is accounted to the GPU or the CPU
+//! fallback by the backend's own counters, sampled at emission) or liveness
+//! measured in ticks: a run continues past `TICKS` until the required fresh
+//! frames have arrived, failing only if they do not within `MAX_TICKS`. How
+//! many ticks a starved worker misses is host scheduling, not behaviour
+//! (issue #447).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -42,8 +48,35 @@ use multiview_engine::{
 };
 
 const TICKS: u64 = 150;
+/// The liveness cap: a run that has not met its fresh-frame goal after this
+/// many ticks (120 s at 30 fps) fails. A healthy host stops at `TICKS` + a
+/// few; a single core starved by 3 busy loops at nice 15 needed up to 1206.
+const MAX_TICKS: u64 = 3600;
+/// Fresh frames a recovered (or CPU-fallback) path must deliver.
+const FRESH_GOAL: usize = 20;
+/// Fresh frames of the same provenance that must ALSO arrive after the
+/// minimum `TICKS` window (review R1): a path that recovers and then stops
+/// delivering for good never meets this and fails at `MAX_TICKS`.
+const CONTINUING_GOAL: usize = 10;
+
+/// The liveness goal: `FRESH_GOAL` fresh `which` frames from `from` on, and
+/// `CONTINUING_GOAL` of them after the minimum `TICKS` window.
+fn goal_met(seen: &[Seen], from: u64, which: fn(&Seen, &Seen) -> bool) -> bool {
+    count_fresh(seen, from, which) >= FRESH_GOAL
+        && count_fresh(seen, TICKS, which) >= CONTINUING_GOAL
+}
+
+/// `goal_met`, asserted with the counts in the message.
+fn assert_goal(seen: &[Seen], from: u64, which: fn(&Seen, &Seen) -> bool, what: &str) {
+    let total = count_fresh(seen, from, which);
+    let continuing = count_fresh(seen, TICKS, which);
+    assert!(
+        total >= FRESH_GOAL && continuing >= CONTINUING_GOAL,
+        "{what}: {total} fresh from tick {from} (need {FRESH_GOAL}), \
+         {continuing} after tick {TICKS} (need {CONTINUING_GOAL})"
+    );
+}
 const FAULT_AT: u64 = 30;
-const TAIL: usize = 30;
 /// The longest gap between two emitted frames the design allows, with slack
 /// for a loaded runner: the clock waits at most `period / 2` for the GPU job,
 /// so a stuck GPU can never hold a frame back for anything near this.
@@ -58,7 +91,45 @@ struct Seen {
     pts_nanos: i64,
     repeat: bool,
     gpu_frames: u64,
+    /// The backend's CPU-fallback count right after this frame was composed:
+    /// a fresh frame that raised it by one is a CPU composite; a fresh frame
+    /// that left it unchanged came from the GPU worker.
+    cpu_fallbacks: u64,
+    /// Whether the backend had recorded the device as lost at this frame.
+    lost: bool,
     at: Instant,
+}
+
+impl Seen {
+    /// Whether this fresh frame was composited by the CPU fallback, given the
+    /// frame before it.
+    fn is_cpu(&self, prev: &Self) -> bool {
+        !self.repeat && self.cpu_fallbacks == prev.cpu_fallbacks + 1
+    }
+
+    /// Whether this fresh frame came from the GPU worker.
+    fn is_gpu(&self, prev: &Self) -> bool {
+        !self.repeat && self.cpu_fallbacks == prev.cpu_fallbacks
+    }
+}
+
+/// Every frame's provenance is exact: a repeat never counts a CPU fallback,
+/// and a fresh frame counts at most one (no fallback is ever counted for a
+/// frame that is not emitted, and none is emitted uncounted).
+fn assert_provenance(seen: &[Seen]) {
+    for (i, pair) in seen.windows(2).enumerate() {
+        let (prev, cur) = (&pair[0], &pair[1]);
+        let delta = cur.cpu_fallbacks - prev.cpu_fallbacks;
+        if cur.repeat {
+            assert_eq!(delta, 0, "tick {}: a repeat counted a CPU fallback", i + 1);
+        } else {
+            assert!(
+                delta <= 1,
+                "tick {}: one fresh frame counted {delta} CPU fallbacks",
+                i + 1
+            );
+        }
+    }
 }
 
 struct Report {
@@ -101,11 +172,13 @@ fn drive(backend: RunBackend, cadence: Rational) -> CompositorDrive<Nv12Image> {
     .with_backend(backend)
 }
 
-/// Run `TICKS` at 30 fps; `fault(control, tick)` runs before each compose.
-/// After the run, `before_teardown` runs, then the runtime (and with it the
-/// backend) is dropped ON THE CLOCK THREAD and the drop is timed.
+/// Run at 30 fps for at least `TICKS` and until `done(seen)` holds (at most
+/// `MAX_TICKS`); `fault(control, tick)` runs before each compose. After the
+/// run, `before_teardown` runs, then the runtime (and with it the backend)
+/// is dropped ON THE CLOCK THREAD and the drop is timed.
 fn run(
     fault: impl FnMut(&SimulatedGpuControl, Tick) + Send + 'static,
+    done: impl Fn(&[Seen]) -> bool + Send + 'static,
     before_teardown: impl FnOnce(&SimulatedGpuControl) + Send + 'static,
 ) -> (Report, SimulatedGpuControl) {
     let cadence = Rational::new(30, 1);
@@ -127,18 +200,24 @@ fn run(
             let mut seen: Vec<Seen> = Vec::new();
             let observe = gpu.clone();
             let steer = gpu.clone();
+            let stop = StopSignal::new();
             let outcome = clock_thread::block_on(runtime.run_for_with_tick_control(
                 &publisher,
-                &StopSignal::new(),
-                TICKS,
+                &stop,
+                MAX_TICKS,
                 |f: &CompositedFrame| {
                     seen.push(Seen {
                         index: f.tick.index,
                         pts_nanos: f.tick.pts.as_nanos(),
                         repeat: f.repeat,
                         gpu_frames: observe.gpu_frames(),
+                        cpu_fallbacks: observe.cpu_fallback_frames(),
+                        lost: observe.is_lost(),
                         at: Instant::now(),
                     });
+                    if u64::try_from(seen.len()).unwrap() >= TICKS && done(&seen) {
+                        stop.stop();
+                    }
                 },
                 |_f: &CompositedFrame| None::<()>,
                 move |_d: &mut CompositorDrive<Nv12Image>, tick: Tick| fault(&steer, tick),
@@ -168,11 +247,16 @@ fn run(
 }
 
 /// Every tick emitted, contiguous indices, strictly increasing PTS, and no
-/// gap between two emitted frames beyond the design bound.
+/// gap between two emitted frames beyond the design bound. The run ended
+/// because its goal was met (`Stopped`), not at the `MAX_TICKS` cap.
 fn assert_cadence(r: &Report) {
-    assert_eq!(r.stop, RunStop::Completed);
-    assert_eq!(r.ticks, TICKS);
-    assert_eq!(u64::try_from(r.seen.len()).unwrap(), TICKS);
+    assert_eq!(
+        r.stop,
+        RunStop::Stopped,
+        "the fresh-frame goal was not met within {MAX_TICKS} ticks"
+    );
+    assert!(r.ticks >= TICKS);
+    assert_eq!(u64::try_from(r.seen.len()).unwrap(), r.ticks);
     for (i, s) in r.seen.iter().enumerate() {
         assert_eq!(s.index, u64::try_from(i).unwrap(), "contiguous ticks");
     }
@@ -181,19 +265,41 @@ fn assert_cadence(r: &Report) {
         assert!(pair[1].pts_nanos > pair[0].pts_nanos, "PTS must increase");
         max_gap = max_gap.max(pair[1].at.duration_since(pair[0].at));
     }
-    println!("max emit gap {max_gap:?}");
+    println!("ticks {} max emit gap {max_gap:?}", r.ticks);
     assert!(
         max_gap < MAX_EMIT_GAP,
         "the clock was held back {max_gap:?} by the GPU"
     );
 }
 
-fn tail_fresh(r: &Report) -> usize {
-    r.seen[r.seen.len() - TAIL..]
-        .iter()
-        .filter(|s| !s.repeat)
+/// Fresh frames from index `from` on whose provenance is `which`.
+fn count_fresh(seen: &[Seen], from: u64, which: fn(&Seen, &Seen) -> bool) -> usize {
+    seen.windows(2)
+        .filter(|p| p[1].index >= from && which(&p[1], &p[0]))
         .count()
 }
+
+/// Release a blocked submit once it has been blocked for `SUBMIT_BLOCK` AND
+/// the CPU fallback has delivered `CPU_BEFORE_RELEASE` frames, so the CPU
+/// phase is observed however slowly the host schedules the workers (a
+/// watchdog releases it after 60 s; the run then fails its assertions).
+fn release_after_cpu_phase(gpu: &SimulatedGpuControl) {
+    let gpu = gpu.clone();
+    std::thread::spawn(move || {
+        let blocked = Instant::now();
+        while blocked.elapsed() < SUBMIT_BLOCK
+            || (gpu.cpu_fallback_frames() < CPU_BEFORE_RELEASE
+                && blocked.elapsed() < Duration::from_secs(60))
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        gpu.unblock_submit();
+    });
+}
+
+/// CPU-fallback frames a blocked-submit scenario must see before the submit
+/// returns.
+const CPU_BEFORE_RELEASE: u64 = 3;
 
 /// The device is lost mid-run (its poll panics like wgpu's). The clock never
 /// panics or ends; every later frame is composed on the CPU for good.
@@ -205,35 +311,58 @@ fn device_loss_never_panics_the_clock_and_falls_back_to_cpu_for_good() {
                 gpu.lose_device();
             }
         },
+        |seen| goal_met(seen, FAULT_AT, Seen::is_cpu),
         |_| {},
     );
     assert_cadence(&r);
+    assert_provenance(&r.seen);
     let gpu_at_loss = r.seen[usize::try_from(FAULT_AT).unwrap()].gpu_frames;
+    let cpu_after = count_fresh(&r.seen, FAULT_AT, Seen::is_cpu);
+    let gpu_after = count_fresh(&r.seen, FAULT_AT, Seen::is_gpu);
     println!(
-        "device loss: cpu_fallbacks={} gpu_frames={} (at loss {gpu_at_loss}) lost={} tail_fresh={}",
-        r.cpu_fallbacks,
-        r.gpu_frames,
-        r.lost,
-        tail_fresh(&r)
+        "device loss: cpu_fallbacks={} gpu_frames={} (at loss {gpu_at_loss}) lost={} \
+         cpu_after={cpu_after} gpu_after={gpu_after}",
+        r.cpu_fallbacks, r.gpu_frames, r.lost
     );
     assert!(r.lost, "the backend must record the device loss");
+    // No GPU frame reaches the output from the loss on: every fresh frame is
+    // a CPU composite, and everything else is a repeat of last-good.
     assert_eq!(
-        r.gpu_frames, gpu_at_loss,
-        "no GPU frame is produced after the device is lost"
+        gpu_after, 0,
+        "a GPU frame was emitted after the device loss"
+    );
+    // Once the backend has recorded the loss it is permanent, and the GPU is
+    // never used again. The count is sampled at the first frame that saw the
+    // loss recorded, not at the fault tick: a GPU job still in flight from an
+    // earlier tick can finish its readback before the fault and count it
+    // after (its result is discarded, `gpu_after` above). GPU jobs run one at
+    // a time on the one GPU worker, so none can finish after the job that
+    // recorded the loss.
+    let first_lost = r.seen.iter().position(|s| s.lost).unwrap();
+    assert!(
+        r.seen[first_lost..].iter().all(|s| s.lost),
+        "loss is permanent"
+    );
+    assert_eq!(
+        r.gpu_frames, r.seen[first_lost].gpu_frames,
+        "no GPU frame is produced after the device loss is recorded"
     );
     assert!(
-        r.cpu_fallbacks >= TICKS - FAULT_AT - u64::try_from(TAIL).unwrap(),
-        "frames after the loss are composed on the CPU"
+        r.gpu_frames <= gpu_at_loss + 1,
+        "at most the one in-flight job"
     );
-    assert!(
-        tail_fresh(&r) >= TAIL * 2 / 3,
-        "fresh CPU frames after loss"
+    assert_goal(
+        &r.seen,
+        FAULT_AT,
+        Seen::is_cpu,
+        "fresh CPU frames after the loss",
     );
 }
 
-/// "Submit" blocks for 1.5 s (a driver-side `queue.submit` that does not
-/// return). The clock keeps its cadence: it never waits on the submit, and
-/// frames move on the CPU after the stall hold.
+/// "Submit" blocks for at least 1.5 s (a driver-side `queue.submit` that
+/// does not return). The clock keeps its cadence: it never waits on the
+/// submit, frames move on the CPU after the stall hold, and the GPU path
+/// recovers by itself once the submit returns.
 #[test]
 fn blocked_submit_never_holds_the_clock() {
     let started = Arc::new(AtomicBool::new(false));
@@ -241,32 +370,30 @@ fn blocked_submit_never_holds_the_clock() {
         move |gpu, tick| {
             if tick.index >= FAULT_AT && !started.swap(true, Ordering::AcqRel) {
                 gpu.block_submit();
-                let gpu = gpu.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(SUBMIT_BLOCK);
-                    gpu.unblock_submit();
-                });
+                release_after_cpu_phase(gpu);
             }
         },
+        |seen| goal_met(seen, FAULT_AT, Seen::is_gpu),
         |_| {},
     );
     assert_cadence(&r);
+    assert_provenance(&r.seen);
+    let cpu_after = count_fresh(&r.seen, FAULT_AT, Seen::is_cpu);
+    let gpu_after = count_fresh(&r.seen, FAULT_AT, Seen::is_gpu);
     println!(
-        "blocked submit: cpu_fallbacks={} gpu_frames={} tail_fresh={}",
-        r.cpu_fallbacks,
-        r.gpu_frames,
-        tail_fresh(&r)
+        "blocked submit: cpu_fallbacks={} gpu_frames={} cpu_after={cpu_after} gpu_after={gpu_after}",
+        r.cpu_fallbacks, r.gpu_frames
     );
     assert!(
-        r.cpu_fallbacks > 0,
+        cpu_after >= usize::try_from(CPU_BEFORE_RELEASE).unwrap(),
         "a GPU stuck past the stall hold composites on the CPU"
     );
     assert!(!r.lost, "a slow submit is not a device loss");
-    let tail = &r.seen[r.seen.len() - TAIL..];
-    let tail_gpu = tail.last().unwrap().gpu_frames - tail.first().unwrap().gpu_frames;
-    assert!(
-        usize::try_from(tail_gpu).unwrap() >= TAIL * 2 / 3,
-        "the GPU path recovers by itself ({tail_gpu} GPU frames in the tail)"
+    assert_goal(
+        &r.seen,
+        FAULT_AT,
+        Seen::is_gpu,
+        "the GPU path recovers by itself",
     );
 }
 
@@ -279,6 +406,7 @@ fn teardown_with_a_hung_gpu_is_bounded_and_off_the_clock_thread() {
     let release_late = Arc::clone(&release);
     let (r, gpu) = run(
         |_, _| {},
+        |_| true,
         move |gpu| {
             gpu.block_submit();
             // Watchdog so a regression ends instead of hanging the suite.
@@ -320,7 +448,8 @@ fn teardown_with_a_hung_gpu_is_bounded_and_off_the_clock_thread() {
 /// Review INV-2: the GPU is stuck from the very first tick (submit blocked)
 /// and the CPU fallback is slower than a tick. There is no last-good yet, but
 /// the first tick is still emitted on time (a black stand-in, never an inline
-/// composite on the clock), every tick follows, and fresh frames arrive.
+/// composite on the clock), every tick follows, the slow CPU fallback
+/// delivers, and fresh GPU frames arrive once the submit returns.
 #[test]
 fn a_gpu_stuck_from_tick_zero_with_a_slow_cpu_still_emits_every_tick() {
     let started = Arc::new(AtomicBool::new(false));
@@ -329,27 +458,25 @@ fn a_gpu_stuck_from_tick_zero_with_a_slow_cpu_still_emits_every_tick() {
             if !started.swap(true, Ordering::AcqRel) {
                 gpu.set_cpu_fallback_cost(Duration::from_millis(50));
                 gpu.block_submit();
-                let gpu = gpu.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(SUBMIT_BLOCK);
-                    gpu.unblock_submit();
-                });
+                release_after_cpu_phase(gpu);
             }
         },
+        |seen| goal_met(seen, 0, Seen::is_gpu),
         |_| {},
     );
     assert_cadence(&r);
+    assert_provenance(&r.seen);
+    let cpu = count_fresh(&r.seen, 0, Seen::is_cpu);
+    let gpu = count_fresh(&r.seen, 0, Seen::is_gpu);
     println!(
-        "tick-zero stall: first repeat={} cpu_fallbacks={} gpu_frames={} tail_fresh={}",
-        r.seen[0].repeat,
-        r.cpu_fallbacks,
-        r.gpu_frames,
-        tail_fresh(&r)
+        "tick-zero stall: first repeat={} cpu_fallbacks={} gpu_frames={} cpu={cpu} gpu={gpu}",
+        r.seen[0].repeat, r.cpu_fallbacks, r.gpu_frames
     );
     assert!(r.seen[0].repeat, "tick 0 is the stand-in, not a composite");
-    assert!(r.cpu_fallbacks > 0, "the slow CPU fallback still delivers");
+    assert_eq!(r.seen[0].cpu_fallbacks, 0, "tick 0 is never composited");
     assert!(
-        tail_fresh(&r) >= TAIL * 2 / 3,
-        "fresh frames after recovery"
+        cpu >= usize::try_from(CPU_BEFORE_RELEASE).unwrap(),
+        "the slow CPU fallback still delivers"
     );
+    assert_goal(&r.seen, 0, Seen::is_gpu, "fresh GPU frames after recovery");
 }
