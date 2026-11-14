@@ -24,7 +24,7 @@ use crate::error::ControlResult;
 use crate::state::AppState;
 
 /// A cumulative reading of the Program's counters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProgramCounters {
     /// The lateness histogram.
     pub lateness: LatenessSnapshot,
@@ -32,6 +32,27 @@ pub struct ProgramCounters {
     pub frames_repeated: u64,
     /// Wake latency and compose-phase histograms (#311).
     pub phases: PhasesSnapshot,
+    /// The run's per-output clocks (#343; empty without a rate output).
+    pub output_clocks: Vec<OutputClockCounters>,
+}
+
+/// A cumulative reading of one per-output clock (#343, output-routing §12.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutputClockCounters {
+    /// The clock's rate, `num/den`.
+    pub fps: String,
+    /// The config ids of the outputs on this clock.
+    pub outputs: Vec<String>,
+    /// Lateness of each tick's wake against its deadline.
+    pub lateness: LatenessSnapshot,
+    /// Tick indices skipped by the catch-up (a wedged or starved lane).
+    pub skipped_ticks: u64,
+    /// Offers a full or ended output worker refused.
+    pub dropped_offers: u64,
+    /// Ticks whose latched Program frame was more than one Program period old.
+    pub late_latches: u64,
+    /// Program audio events dropped on this clock's outputs (summed).
+    pub dropped_audio: u64,
 }
 
 /// Reads the running Program's counters (wait-free loads).
@@ -84,7 +105,7 @@ impl ProgramMetrics {
     pub fn report(&self) -> Option<ProgramMetricsReport> {
         let now = self.source.read()?;
         let ring = self.ring.lock().unwrap_or_else(PoisonError::into_inner);
-        let oldest = ring.front().copied().unwrap_or_default();
+        let oldest = ring.front().cloned().unwrap_or_default();
         let window = now.lateness.since(&oldest.lateness);
         let ms = |ns: Option<u64>| ns.filter(|ns| *ns != u64::MAX).map(ns_to_ms);
         Some(ProgramMetricsReport {
@@ -117,6 +138,19 @@ impl ProgramMetrics {
                 &now.phases.compose,
                 &now.phases.compose.since(&oldest.phases.compose),
             ),
+            output_clocks: now
+                .output_clocks
+                .iter()
+                .map(|clock| {
+                    let before = oldest
+                        .output_clocks
+                        .iter()
+                        .find(|o| o.fps == clock.fps)
+                        .map(|o| o.lateness)
+                        .unwrap_or_default();
+                    OutputClockReport::of(clock, &clock.lateness.since(&before))
+                })
+                .collect(),
             compose_phases: ComposePhases {
                 hook: PhaseHistogram::of(
                     &now.phases.hook,
@@ -254,6 +288,60 @@ pub struct ProgramMetricsReport {
     pub compose_duration: PhaseHistogram,
     /// `compose_duration` split into its four parts.
     pub compose_phases: ComposePhases,
+    /// The per-output clocks of outputs at a rate other than Program's
+    /// (#343, output-routing §12.6). Empty when every output runs at
+    /// Program's rate.
+    #[serde(default)]
+    pub output_clocks: Vec<OutputClockReport>,
+}
+
+/// One per-output clock in [`ProgramMetricsReport::output_clocks`] (#343).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct OutputClockReport {
+    /// The clock's output rate, `num/den` (e.g. `25/1`).
+    pub fps: String,
+    /// The config ids of the outputs on this clock.
+    pub outputs: Vec<String>,
+    /// Ticks emitted since the run started.
+    pub ticks_total: u64,
+    /// Ticks in the window (about the last 10 s).
+    pub window_ticks: u64,
+    /// p50 wake lateness over the window: the upper edge of its bucket, ms.
+    pub lateness_p50_ms: Option<f64>,
+    /// p99 wake lateness over the window: the upper edge of its bucket, ms.
+    pub lateness_p99_ms: Option<f64>,
+    /// Largest wake lateness since the run started, ms.
+    pub lateness_max_ms: f64,
+    /// Tick indices skipped by the catch-up (the clock was late by more than
+    /// 8 ticks; the outputs repeat their last picture over the gap).
+    pub skipped_ticks: u64,
+    /// Offers a full or ended output worker refused (the output fills).
+    pub dropped_offers: u64,
+    /// Ticks whose latched Program frame was more than one Program period
+    /// old (Program fell behind the latch delay).
+    pub late_latches: u64,
+    /// Program audio events dropped on this clock's outputs.
+    pub dropped_audio: u64,
+}
+
+impl OutputClockReport {
+    fn of(clock: &OutputClockCounters, window: &LatenessSnapshot) -> Self {
+        let ms = |ns: Option<u64>| ns.filter(|ns| *ns != u64::MAX).map(ns_to_ms);
+        Self {
+            fps: clock.fps.clone(),
+            outputs: clock.outputs.clone(),
+            ticks_total: clock.lateness.count,
+            window_ticks: window.count,
+            lateness_p50_ms: ms(window.quantile_upper_ns(500)),
+            lateness_p99_ms: ms(window.quantile_upper_ns(990)),
+            lateness_max_ms: ns_to_ms(clock.lateness.max_ns),
+            skipped_ticks: clock.skipped_ticks,
+            dropped_offers: clock.dropped_offers,
+            late_latches: clock.late_latches,
+            dropped_audio: clock.dropped_audio,
+        }
+    }
 }
 
 /// Start the 1 s sampler (control-plane task; ends with the runtime).
@@ -314,6 +402,7 @@ mod tests {
                 lateness: self.0.snapshot(),
                 frames_repeated: self.1.load(std::sync::atomic::Ordering::Relaxed),
                 phases: PhasesSnapshot::default(),
+                output_clocks: Vec::new(),
             })
         }
     }

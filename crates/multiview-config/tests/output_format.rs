@@ -393,7 +393,7 @@ fn fps_different_from_canvas_is_accepted_on_a_converting_kind() {
 
 #[test]
 fn an_invalid_output_rate_is_slot_format_unsupported() {
-    for fps in ["24000/1000", "121/1", "0/1", "25/2", "240000/1001"] {
+    for fps in ["24000/1000", "121/1", "0/1", "25/2", "240000/1001", "3/1"] {
         assert_code(
             &format!(
                 "{PLAIN}{}",

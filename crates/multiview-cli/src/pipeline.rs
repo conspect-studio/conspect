@@ -115,6 +115,11 @@ use multiview_output::sink::{
 };
 use multiview_output::{display_matrix, DisplayMatrix};
 
+/// Rate lanes: outputs at a frame rate other than Program's (#343).
+#[path = "output_lanes.rs"]
+mod output_lanes;
+
+
 /// The per-subscriber drop-oldest depth of the engine's outbound event stream.
 /// The pipeline has no realtime consumers wired here, but the publisher still
 /// needs a positive ring (invariant #10).
@@ -2130,6 +2135,26 @@ pub struct ProgramMetricsHandles {
     pub phases: Arc<multiview_engine::lateness::TickPhases>,
     /// Cumulative last-good repeats.
     pub frames_repeated: Arc<std::sync::atomic::AtomicU64>,
+    /// The run's per-output clocks (#343; empty without a rate output).
+    pub output_clocks: Vec<OutputClockMetrics>,
+}
+
+/// One per-output clock's wait-free counters (#343, output-routing §12.6).
+#[derive(Debug, Clone)]
+pub struct OutputClockMetrics {
+    /// The clock's output rate.
+    pub cadence: Rational,
+    /// The config ids of the outputs on this clock.
+    pub outputs: Vec<String>,
+    /// Ticks, skipped ticks and the lateness histogram.
+    pub stats: Arc<multiview_engine::OutputLaneStats>,
+    /// Offers a full (or ended) output worker refused.
+    pub dropped_offers: Arc<AtomicU64>,
+    /// Ticks whose latched Program frame was older than one Program period
+    /// before the tick (or older than every retained frame).
+    pub late_latches: Arc<AtomicU64>,
+    /// Per output: Program audio events dropped on its lane.
+    pub dropped_audio: Vec<Arc<AtomicU64>>,
 }
 
 /// Where a run publishes its [`ProgramMetricsHandles`].
@@ -2414,6 +2439,11 @@ pub struct Pipeline {
     /// thread before each convert (a chaos test wedges it). Always `None`
     /// outside tests.
     convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// Outputs at a rate other than Program's (#343): they run in rate lanes,
+    /// outside the Program egress. Taken by the run.
+    rate_outputs: Vec<output_lanes::LaneOutputSpec>,
+    /// Test seams of the rate lanes (empty in production).
+    lane_hooks: output_lanes::LaneHooks,
     /// Per runnable output (same order as `output_video_keys`): the format a
     /// routed source/PVW is composed at for it (#342 review M3).
     output_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
@@ -3333,6 +3363,9 @@ impl Pipeline {
         let discrete_track_inputs: Vec<String> =
             discrete_tracks.iter().map(|t| t.input_id.clone()).collect();
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
+        // #343: an output at a rate other than Program's leaves the Program
+        // egress (its runner, key and binding) and runs in a rate lane.
+        let (outputs, rate_runnables) = output_lanes::split_rate_outputs(outputs, config);
         let mut rendition_configs = Vec::<EncodeConfig>::new();
         // #342: per rendition key, the picture format its worker converts the
         // Program canvas to (`None` = the canvas, the zero-copy path).
@@ -3457,6 +3490,14 @@ impl Pipeline {
                 declared_audio_outputs.push((output.id().to_owned(), tracks));
             }
         }
+
+        let rate_outputs = output_lanes::rate_output_specs(
+            rate_runnables,
+            config,
+            &cfg,
+            aux_canvas,
+            &mut declared_audio_outputs,
+        )?;
 
         // Derive the PER-SOURCE per-tick audio-loudness timelines off the
         // build path: decode each file-backed source's OWN audio with
@@ -3612,6 +3653,8 @@ impl Pipeline {
             rendition_configs,
             rendition_formats,
             convert_hook: None,
+            rate_outputs,
+            lane_hooks: output_lanes::LaneHooks::default(),
             output_formats,
             output_video_keys,
             output_inband_sets,
@@ -3883,6 +3926,10 @@ impl Pipeline {
                     .map(|cfg| cfg.codec_name.clone())
                     .unwrap_or_default(),
             })
+            // #343: a rate output is addressable but never routable: takes
+            // onto it answer `unroutable` (a follow-up). Its index is past
+            // every router output, so the engine refuses it too.
+            .chain(self.rate_outputs.iter().map(output_lanes::unroutable_run_output))
             .collect()
     }
 
@@ -3991,6 +4038,7 @@ impl Pipeline {
                 inband_sets: self.output_inband_sets.clone(),
                 base_formats: self.rendition_formats.clone(),
                 convert_hook: self.convert_hook.clone(),
+                lane_taps: output_lanes::ProgramTaps::default(),
             },
             aux_tx,
             preview_selection,
@@ -4387,6 +4435,12 @@ impl Pipeline {
     #[cfg(test)]
     pub(crate) fn set_convert_hook(&mut self, hook: crate::format_convert::ConvertHook) {
         self.convert_hook = Some(hook);
+    }
+
+    /// Test seam (#343): the rate lanes' hooks and fake sinks.
+    #[cfg(test)]
+    pub(crate) fn set_lane_hooks(&mut self, hooks: output_lanes::LaneHooks) {
+        self.lane_hooks = hooks;
     }
 
     /// How many distinct video rendition configs (= Program encoder keys)
@@ -5444,12 +5498,38 @@ impl Pipeline {
         let routing = self.build_output_routing(&binding_ids, &enforced_audio_tracks)?;
         self.issue_boot_audio_takes();
         let RunRouting {
-            consumer: consumer_routing,
+            consumer: mut consumer_routing,
             aux_tx,
             preview_selection,
             aux: _routing_aux,
             program_lateness,
         } = routing;
+        // #343: open the rate lanes' encoders now (off the clock); they
+        // start once Program's seed is known. Program's taps feed them.
+        let lanes = output_lanes::prepare(
+            std::mem::take(&mut self.rate_outputs),
+            self.cadence,
+            self.aux_canvas(),
+            output_lanes::LaneAudio {
+                program: audio_encoder
+                    .as_ref()
+                    .map(|encoder| (encoder.codec_params().clone(), encoder.time_base())),
+                tracks: audio_encoder
+                    .as_ref()
+                    .map_or_else(Vec::new, AudioRenditionEncoder::track_streams),
+            },
+            std::mem::take(&mut self.lane_hooks),
+        );
+        let prepared_lanes = lanes.map(|(prepared, taps)| {
+            consumer_routing.lane_taps = taps;
+            let links = prepared.push_links();
+            if !links.is_empty() {
+                let mut all = (*self.push_links.load()).clone();
+                all.extend(links);
+                self.push_links.store(Arc::new(all));
+            }
+            prepared
+        });
         demand.start();
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
@@ -5499,6 +5579,7 @@ impl Pipeline {
         // source to bracket its wall reads on the SAME timeline tick 0 is
         // seeded on; clone the handle before the program takes ownership.
         let ts_for_anchor = Arc::clone(&ts);
+        let ts_for_lanes = Arc::clone(&ts);
         let mut program =
             MultiviewProgram::new(&self.program_spec, clock, drive, ts, pacer, stop.clone())
                 .map_err(|e| PipelineError::Program {
@@ -5508,11 +5589,18 @@ impl Pipeline {
         // Publish the Program's wait-free counters for the metrics route
         // (one store per run, never per tick).
         program_lateness.store(Some(program.lateness()));
+        // #343: the rate lanes' clocks start on Program's seed (tick 0 of
+        // every output clock is aligned with Program tick 0).
+        let running_lanes =
+            prepared_lanes.map(|lanes| lanes.start(&ts_for_lanes, program.seed_nanos()));
         self.program_metrics
             .store(Some(Arc::new(ProgramMetricsHandles {
                 lateness: program.lateness(),
                 phases: program.phases(),
                 frames_repeated: program.frames_repeated_counter(),
+                output_clocks: running_lanes
+                    .as_ref()
+                    .map_or_else(Vec::new, output_lanes::RunningLanes::metrics),
             })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
         // the shared slot — a single lock-free store the off-hot-path
@@ -5966,6 +6054,10 @@ impl Pipeline {
             crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
         }
         stage("egress-joined");
+        // #343: the rate lanes end after Program's egress (every Program frame
+        // is latched by now); bounded, and a lane failure is a report line.
+        let lane_lines = running_lanes.map_or_else(Vec::new, output_lanes::RunningLanes::shutdown);
+        stage("rate-lanes-joined");
         // Then tear ingest down (signal + bounded join per producer). Producers
         // blocked in libav network reads use their full grace here; the exit
         // watchdog bounds the total.
@@ -5988,7 +6080,7 @@ impl Pipeline {
             canvas_width: self.layout.canvas.width,
             canvas_height: self.layout.canvas.height,
             encoder: self.encoder.name.clone(),
-            outputs: egress_out.lines,
+            outputs: egress_out.lines.into_iter().chain(lane_lines).collect(),
             // Honest falter (ADR-0025): a live run that shed frames faltered;
             // offline never drops, so it never falters here.
             dropped: dropped_count,
@@ -7705,6 +7797,9 @@ struct ConsumerRouting {
     /// Chaos/test hook run on every convert thread before each convert
     /// (#342 review I3); `None` in production.
     convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// The rate lanes' Program taps (#343): the latch the bake consumer
+    /// publishes to and the audio fan-out. Empty = zero work.
+    lane_taps: output_lanes::ProgramTaps,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
@@ -8253,6 +8348,7 @@ fn consumer_main<D: WindowDelivery>(
         inband_sets,
         base_formats,
         convert_hook,
+        lane_taps,
     } = routing;
     // #342 review I1/I2: one `format-convert` thread per distinct non-canvas
     // base format, fed non-blocking right after the bake. Empty (no thread,
@@ -8432,6 +8528,8 @@ fn consumer_main<D: WindowDelivery>(
             let tail_preview = optional.clone();
             let specs = audio_specs.clone();
             let bases = audio_bases.clone();
+            let taps = lane_taps.clone();
+            let tail_taps = lane_taps.clone();
             Some(crate::rendition_workers::AudioEncodeWorker::spawn(
                 ProgramAudioWork { encoder },
                 move |tick, packets| {
@@ -8439,6 +8537,9 @@ fn consumer_main<D: WindowDelivery>(
                     if let Some(preview) = preview.as_ref() {
                         preview.audio(&event);
                     }
+                    // #343: the rate lanes carry these very packets (bounded
+                    // try_send per lane; never waits).
+                    taps.fan_audio(&event);
                     tx.send(event).map_err(|e| PipelineError::Output {
                         kind: "audio-dispatch",
                         reason: e.to_string(),
@@ -8449,6 +8550,7 @@ fn consumer_main<D: WindowDelivery>(
                     if let Some(preview) = tail_preview.as_ref() {
                         preview.audio(&event);
                     }
+                    tail_taps.fan_audio(&event);
                     tail_tx.send(event).map_err(|e| PipelineError::Output {
                         kind: "audio-dispatch",
                         reason: e.to_string(),
@@ -8610,6 +8712,12 @@ fn consumer_main<D: WindowDelivery>(
         // fails the run explicitly (never silently skips forward).
         for missing_tick in missing {
             let canvas = last_baked.as_ref().unwrap_or(&overlaid);
+            // #343: the rate lanes latch substituted ticks too (wait-free).
+            lane_taps.publish(
+                missing_tick,
+                MediaTime::from_tick(i64::try_from(missing_tick).unwrap_or(i64::MAX), cadence),
+                canvas,
+            );
             convert_stages.offer(missing_tick, canvas);
             for worker in &workers {
                 worker
@@ -8635,6 +8743,8 @@ fn consumer_main<D: WindowDelivery>(
         // #342: the non-canvas base formats' convert threads get it first
         // (try_send, never blocks; a full queue drops and counts).
         convert_stages.offer(item.tick_index, &overlaid);
+        // #343: one wait-free latch publish for the rate lanes (no-op without).
+        lane_taps.publish(item.tick_index, tick_pts, &overlaid);
         for worker in &workers {
             worker
                 .offer_within(

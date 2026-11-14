@@ -734,6 +734,30 @@ impl multiview_control::program_metrics::ProgramMetricsSource for ProgramMetrics
             frames_repeated: handles
                 .frames_repeated
                 .load(std::sync::atomic::Ordering::Acquire),
+            // #343: one entry per per-output clock (wait-free loads).
+            output_clocks: handles
+                .output_clocks
+                .iter()
+                .map(
+                    |clock| multiview_control::program_metrics::OutputClockCounters {
+                        fps: format!("{}/{}", clock.cadence.num, clock.cadence.den),
+                        outputs: clock.outputs.clone(),
+                        lateness: clock.stats.lateness().snapshot(),
+                        skipped_ticks: clock.stats.skipped_ticks(),
+                        dropped_offers: clock
+                            .dropped_offers
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        late_latches: clock
+                            .late_latches
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        dropped_audio: clock
+                            .dropped_audio
+                            .iter()
+                            .map(|d| d.load(std::sync::atomic::Ordering::Relaxed))
+                            .sum(),
+                    },
+                )
+                .collect(),
         })
     }
 }

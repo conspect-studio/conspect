@@ -495,13 +495,15 @@ fn unsupported(output: &Output, detail: &str) -> ConfigError {
     ))
 }
 
-/// Slowest per-output rate (#343), frames per second.
-pub const MIN_OUTPUT_FPS: i64 = 1;
+/// Slowest per-output rate (#343), frames per second: the engine's window
+/// assembler (one atomic A/V window per output tick) requires a tick of at
+/// most 250 ms.
+pub const MIN_OUTPUT_FPS: i64 = 4;
 /// Fastest per-output rate (#343), frames per second.
 pub const MAX_OUTPUT_FPS: i64 = 120;
 
 /// Whether `fps` is a rate an output clock and its encoder produce (#343):
-/// positive `num/den` with `den` 1 or 1001 and 1..=120 fps.
+/// positive `num/den` with `den` 1 or 1001 and 4..=120 fps.
 #[must_use]
 pub fn is_output_rate(fps: Fps) -> bool {
     let r = fps.rational();
