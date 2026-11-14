@@ -21,6 +21,7 @@ pub use clock::{
     SlateLoop, SlotGate, MAX_PRESENTATION_DELAY,
 };
 pub use match_rules::{
-    evaluate, evaluate_traits, profile_rank, MatchMiss, SlotSpec, SourceTraits, StreamMeter,
+    evaluate, evaluate_relaxed, evaluate_traits, profile_rank, MatchMiss, SlotSpec, SourceTraits,
+    StreamMeter,
 };
 pub use tap::{CompressedTap, TapAu, TapReader, MAX_AU_BYTES, MAX_TAP_CONSUMERS, TAP_CAPACITY};

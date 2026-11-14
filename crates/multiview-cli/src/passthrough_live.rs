@@ -43,8 +43,8 @@ use multiview_ffmpeg::idr::{self, CodecKind, NalFraming, ParameterSetScan, RapPa
 use multiview_ffmpeg::EncodedPacket;
 use multiview_output::passthrough::clock::MAX_DRAIN_PER_TICK;
 use multiview_output::passthrough::{
-    evaluate, BridgeReason, ClockState, Emission, MatchMiss, PassthroughClock, RepeatSource,
-    SlateLoop, SlotGate, SlotSpec, SourceTraits, StreamMeter, TapAu, TapReader, MAX_AU_BYTES,
+    BridgeReason, ClockState, Emission, MatchMiss, PassthroughClock, RepeatSource, SlateLoop,
+    SlotGate, SlotSpec, SourceTraits, StreamMeter, TapAu, TapReader, MAX_AU_BYTES,
 };
 
 use crate::output_routing::LiveEncoder;
@@ -549,7 +549,7 @@ pub type NowNs = Box<dyn Fn() -> u64 + Send>;
 pub type TraitsFn = Box<dyn Fn() -> Option<SourceTraits> + Send>;
 
 /// The D2b match rules on the key's own worker: every drained AU feeds the
-/// meter, and the shared predicate [`evaluate`] is re-run at most once per
+/// meter, and the shared predicate (`evaluate_relaxed`) is re-run at most once per
 /// [`VERDICT_EVERY`] ticks (bounded work per tick).
 struct Matcher {
     slot: SlotSpec,
@@ -776,17 +776,13 @@ impl PassthroughLive {
             {
                 m.last_eval = Some(tick);
                 let relaxed = m.matched_gen.is_some() && m.matched_gen == m.meter_gen;
-                let verdict = (m.traits)()
-                    .map_or(Err(MatchMiss::NotEnoughHistory), |traits| {
-                        evaluate(&traits, &m.meter, &m.slot)
-                    })
-                    .or_else(|miss| {
-                        if relaxed && miss == MatchMiss::NotCfr {
-                            Ok(())
-                        } else {
-                            Err(miss)
-                        }
-                    });
+                // Only the CFR rule is relaxed (a stall's gap); every other
+                // rule runs (review R2-M-1a).
+                let verdict = (m.traits)().map_or(Err(MatchMiss::NotEnoughHistory), |traits| {
+                    multiview_output::passthrough::evaluate_relaxed(
+                        &traits, &m.meter, &m.slot, relaxed,
+                    )
+                });
                 if verdict.is_ok() && m.matched_gen.is_none() {
                     m.matched_gen = m.meter_gen;
                 }
@@ -1704,6 +1700,28 @@ mod tests {
             feed_tick(&tap, &mut live, &now, k, (0, false, 2));
         }
         assert_eq!(status.verdict(), Some(Err(MatchMiss::NotEnoughHistory)));
+    }
+
+    /// Review R2-M-1a: after a stall gap (the window is not CFR), a source
+    /// whose bitrate rises above the ceiling in the SAME window stops
+    /// matching: relaxing CFR never skips the rules after it.
+    #[test]
+    fn a_gap_never_hides_a_later_rule() {
+        let (tap, mut live, now) = matched_key();
+        let status = live.status();
+        for k in 0..300 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.verdict(), Some(Ok(())));
+        // A gap, then heavy frames while the gap is still in the window.
+        for k in 320..400 {
+            feed_tick(&tap, &mut live, &now, k, (4_000, false, 1));
+        }
+        assert_eq!(
+            status.verdict(),
+            Some(Err(MatchMiss::BitrateAbove)),
+            "the gap does not hide the bitrate rule"
+        );
     }
 
     /// #344 D2b: the published delay is the emitted AU's exact source-time

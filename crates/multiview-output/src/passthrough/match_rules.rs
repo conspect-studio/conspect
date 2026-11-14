@@ -485,8 +485,25 @@ pub fn evaluate(
     meter: &StreamMeter,
     slot: &SlotSpec,
 ) -> Result<(), MatchMiss> {
+    evaluate_relaxed(traits, meter, slot, false)
+}
+
+/// [`evaluate`] with the constant-frame-rate rule optionally relaxed
+/// (`relax_cfr`): the caller's generation already matched and a stall left
+/// a DTS gap in the window (#344 D2b). Only that one rule is skipped; every
+/// other rule (traits, GOP, strict RAPs, bitrate, B-frames) still runs, and
+/// the window must still hold 10 s of history.
+///
+/// # Errors
+/// The first [`MatchMiss`], as [`evaluate`].
+pub fn evaluate_relaxed(
+    traits: &SourceTraits,
+    meter: &StreamMeter,
+    slot: &SlotSpec,
+    relax_cfr: bool,
+) -> Result<(), MatchMiss> {
     evaluate_traits(traits, slot)?;
-    evaluate_measured(meter, slot)
+    evaluate_measured(meter, slot, relax_cfr)
 }
 
 /// The static half of [`evaluate`]: every rule decided by the stream's
@@ -531,15 +548,19 @@ pub fn evaluate_traits(traits: &SourceTraits, slot: &SlotSpec) -> Result<(), Mat
 
 /// The measured half of [`evaluate`] (GOP, CFR, strict RAPs, bitrate,
 /// B-frames over the meter's window).
-fn evaluate_measured(meter: &StreamMeter, slot: &SlotSpec) -> Result<(), MatchMiss> {
+fn evaluate_measured(
+    meter: &StreamMeter,
+    slot: &SlotSpec,
+    relax_cfr: bool,
+) -> Result<(), MatchMiss> {
     // A GOP already longer than allowed is decisive with any history.
     if meter.since_last_idr() > slot.max_gop_ticks {
         return Err(MatchMiss::GopTooLong);
     }
     match meter.is_cfr(slot.fps) {
         None => return Err(MatchMiss::NotEnoughHistory),
-        Some(false) => return Err(MatchMiss::NotCfr),
-        Some(true) => {}
+        Some(false) if !relax_cfr => return Err(MatchMiss::NotCfr),
+        Some(_) => {}
     }
     if !meter.has_strict_rap() {
         return Err(MatchMiss::NoStrictRap);
@@ -666,6 +687,60 @@ mod tests {
             m.push(i * PERIOD, i * PERIOD, size, i % gop == 0, TB);
         }
         m
+    }
+
+    /// A metered source with a DTS gap (a stall) inside its window, then
+    /// `tail` more AUs built by `au(i) -> (pts offset, size, idr)`.
+    fn gapped(tail: i64, au: impl Fn(i64) -> (i64, usize, bool)) -> StreamMeter {
+        let mut m = StreamMeter::new();
+        for i in 0..200 {
+            m.push(i * PERIOD, i * PERIOD, 25_000, i % 60 == 0, TB);
+        }
+        // 15 frames missing (a stall), then the tail.
+        for k in 0..tail {
+            let i = 215 + k;
+            let (po, size, idr) = au(k);
+            m.push(i * PERIOD, i * PERIOD + po, size, idr, TB);
+        }
+        m
+    }
+
+    /// #344 D2b review R2-M-1a: relaxing CFR (a gap after a stall in a
+    /// generation that already matched) skips ONLY the CFR rule: every
+    /// other measured rule still runs in the same window.
+    #[test]
+    fn relaxed_cfr_keeps_every_other_measured_rule() {
+        let s = slot();
+        let t = traits();
+        // The gap alone: not CFR strictly, a match when relaxed.
+        let gap = gapped(200, |k| (0, 25_000, k % 60 == 0));
+        assert_eq!(evaluate(&t, &gap, &s), Err(MatchMiss::NotCfr));
+        assert_eq!(evaluate_relaxed(&t, &gap, &s, true), Ok(()));
+        // Gap + bitrate above the ceiling.
+        let fat = gapped(400, |k| (0, 200_000, k % 60 == 0));
+        assert_eq!(
+            evaluate_relaxed(&t, &fat, &s, true),
+            Err(MatchMiss::BitrateAbove)
+        );
+        // Gap + a historical GOP longer than allowed (an IDR after 150).
+        let long = gapped(400, |k| (0, 25_000, k == 0 || k == 150 || k == 210));
+        assert_eq!(
+            evaluate_relaxed(&t, &long, &s, true),
+            Err(MatchMiss::GopTooLong)
+        );
+        // Gap + B-frames where the medium forbids them.
+        let mut no_b = slot();
+        no_b.b_frames_allowed = false;
+        let bframes = gapped(400, |k| {
+            (if k % 2 == 0 { PERIOD } else { 0 }, 25_000, k % 60 == 0)
+        });
+        assert_eq!(
+            evaluate_relaxed(&t, &bframes, &no_b, true),
+            Err(MatchMiss::BFramesNotAllowed)
+        );
+        // Gap + no strict RAP in the window (only the first, pushed out).
+        let norap = gapped(400, |_| (0, 25_000, false));
+        assert!(evaluate_relaxed(&t, &norap, &s, true).is_err());
     }
 
     #[test]
