@@ -556,11 +556,15 @@ struct Matcher {
     traits: TraitsFn,
     meter: StreamMeter,
     last_eval: Option<u64>,
-    /// The measured rules passed once (the key earned P0): from then on only
-    /// the static traits are re-checked. A stall or a reconnect leaves a DTS
-    /// gap in the 10 s window (`not-cfr` for 10 s); the clock's own 30 / 300
-    /// on-time ticks decide the return instead (§12.5).
-    latched: bool,
+    /// The parameter generation the meter measures (a new one, a reconnect
+    /// included, restarts the measurement from scratch).
+    meter_gen: Option<u64>,
+    /// The generation whose full verdict passed once. For it, and only for
+    /// it, `not-cfr` is not a miss: a stall leaves a DTS gap in the 10 s
+    /// window, and the clock's own 30 / 300 on-time ticks decide the return
+    /// (§12.5). Every other rule (GOP, strict RAPs, bitrate, B-frames,
+    /// traits) is checked on every evaluation (review R1-M-1).
+    matched_gen: Option<u64>,
 }
 
 /// Ticks between two verdict evaluations.
@@ -677,7 +681,8 @@ impl PassthroughLive {
             traits,
             meter: StreamMeter::new(),
             last_eval: None,
-            latched: false,
+            meter_gen: None,
+            matched_gen: None,
         });
         self
     }
@@ -756,6 +761,13 @@ impl PassthroughLive {
         }
         if let Some(m) = self.matcher.as_mut() {
             for au in drained.iter().take(n).filter_map(Option::as_ref) {
+                if m.meter_gen != Some(au.params_gen) {
+                    m.meter_gen = Some(au.params_gen);
+                    m.meter = StreamMeter::new();
+                    m.matched_gen = None;
+                    // Re-evaluate at once: never act on the old verdict.
+                    m.last_eval = None;
+                }
                 m.meter
                     .push(au.dts, au.pts, au.data.len(), au.strict_idr, au.time_base);
             }
@@ -763,14 +775,21 @@ impl PassthroughLive {
                 .is_none_or(|t| tick.saturating_sub(t) >= VERDICT_EVERY)
             {
                 m.last_eval = Some(tick);
-                let verdict = (m.traits)().map_or(Err(MatchMiss::NotEnoughHistory), |traits| {
-                    if m.latched {
-                        multiview_output::passthrough::evaluate_traits(&traits, &m.slot)
-                    } else {
+                let relaxed = m.matched_gen.is_some() && m.matched_gen == m.meter_gen;
+                let verdict = (m.traits)()
+                    .map_or(Err(MatchMiss::NotEnoughHistory), |traits| {
                         evaluate(&traits, &m.meter, &m.slot)
-                    }
-                });
-                m.latched |= verdict.is_ok();
+                    })
+                    .or_else(|miss| {
+                        if relaxed && miss == MatchMiss::NotCfr {
+                            Ok(())
+                        } else {
+                            Err(miss)
+                        }
+                    });
+                if verdict.is_ok() && m.matched_gen.is_none() {
+                    m.matched_gen = m.meter_gen;
+                }
                 self.gate.verdict_ok = verdict.is_ok();
                 let code = verdict.map_or_else(miss_code, |()| 1);
                 self.status.verdict.store(code, Ordering::Release);
@@ -1550,5 +1569,140 @@ mod tests {
         assert!(run.iter().any(|(s, _)| *s == PassthroughState::Repeat));
         let frames = decoded_frames(run.iter().map(|(_, au)| au.as_slice()));
         assert_eq!(frames, run.len(), "every AU and repeat decodes");
+    }
+
+    fn matched_key() -> (CompressedTap, PassthroughLive, Arc<AtomicU64>) {
+        use multiview_output::passthrough::match_rules::{ColourTags, PassCodec, Scan};
+        let tags = ColourTags {
+            primaries: Some(1),
+            transfer: Some(1),
+            matrix: Some(1),
+            range: Some(0),
+        };
+        let slot = SlotSpec {
+            codec: PassCodec::H264,
+            max_profile: 100,
+            max_level: 51,
+            width: 16,
+            height: 16,
+            fps: CADENCE,
+            scan: Scan::Progressive,
+            colour: tags,
+            bit_depth: 8,
+            chroma: 1,
+            bitrate_ceiling_kbps: 50,
+            max_gop_ticks: 60,
+            b_frames_allowed: true,
+        };
+        let traits = SourceTraits {
+            codec: PassCodec::H264,
+            profile: 100,
+            constraint_flags: 0,
+            level: 31,
+            width: 16,
+            height: 16,
+            frame_rate: CADENCE,
+            scan: Scan::Progressive,
+            colour: tags,
+            bit_depth: 8,
+            chroma: 1,
+        };
+        let tap = CompressedTap::new();
+        let reader = tap.subscribe().unwrap();
+        let now = Arc::new(AtomicU64::new(0));
+        let clock_now = Arc::clone(&now);
+        let live = PassthroughLive::new(
+            PassthroughSpec {
+                cadence: CADENCE,
+                codec: CodecKind::H264,
+                stream_params: None,
+            },
+            reader,
+            &slate(),
+            Box::new(move || clock_now.load(Ordering::Acquire)),
+        )
+        .unwrap()
+        .with_matcher(slot, Box::new(move || Some(traits.clone())));
+        (tap, live, now)
+    }
+
+    /// Feed frame `k` (IDR every 30 unless `no_idr`, `pad` extra bytes) and
+    /// encode tick `k`.
+    fn feed_tick(
+        tap: &CompressedTap,
+        live: &mut PassthroughLive,
+        now: &AtomicU64,
+        k: u64,
+        (pad, no_idr, gen): (usize, bool, u64),
+    ) {
+        now.store(k * TICK_NS, Ordering::Release);
+        let key = !no_idr && k % 30 == 0;
+        let mut data = if key { idr_au(SPS_A, 1) } else { p_au(1) };
+        data.extend(std::iter::repeat_n(0x55_u8, pad));
+        let dts = i64::try_from(k).unwrap() * FRAME;
+        tap.offer(TapAu {
+            data: Arc::from(data),
+            dts,
+            pts: dts,
+            time_base: Rational::new(1, 90_000),
+            strict_idr: key,
+            reference: true,
+            params_gen: gen,
+            arrival_ns: k * TICK_NS,
+        });
+        let canvas = Arc::new(
+            Nv12Image::solid(
+                2,
+                2,
+                16,
+                128,
+                128,
+                multiview_core::color::ColorInfo::default(),
+            )
+            .unwrap(),
+        );
+        live.encode(BakedTick { tick: k, canvas }).unwrap();
+    }
+
+    /// Review R1-M-1: after the verdict first passed, the measured rules
+    /// still hold: a source whose bitrate rises above the ceiling, or that
+    /// stops sending IDRs, stops matching; a DTS gap (a stall) alone does
+    /// not; a new parameter generation is measured again from scratch.
+    #[test]
+    fn the_verdict_keeps_checking_bitrate_gop_and_raps_after_it_passed() {
+        let (tap, mut live, now) = matched_key();
+        let status = live.status();
+        for k in 0..300 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.verdict(), Some(Ok(())), "matched after 10 s");
+        // A stall: 20 frames missing. The gap alone keeps the match.
+        for k in 320..400 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.verdict(), Some(Ok(())), "a DTS gap is not a miss");
+        // Bitrate far above 50 kbit/s for 12 s: no longer matches.
+        for k in 400..700 {
+            feed_tick(&tap, &mut live, &now, k, (4_000, false, 1));
+        }
+        assert_eq!(
+            status.verdict(),
+            Some(Err(MatchMiss::BitrateAbove)),
+            "the bitrate is still checked"
+        );
+        // Back to a low rate (12 s) matches again; then no IDR for 3 s.
+        for k in 700..1000 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.verdict(), Some(Ok(())));
+        for k in 1000..1100 {
+            feed_tick(&tap, &mut live, &now, k, (0, true, 1));
+        }
+        assert_eq!(status.verdict(), Some(Err(MatchMiss::GopTooLong)));
+        // A new parameter generation starts the measurement over.
+        for k in 1100..1110 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 2));
+        }
+        assert_eq!(status.verdict(), Some(Err(MatchMiss::NotEnoughHistory)));
     }
 }
