@@ -529,15 +529,19 @@ impl SwitcherTickDriver {
     /// applying the fresh gate, the loss policy and the last-good pair, and
     /// recording the tally. `auto_p` is the background AUTO's tie envelope
     /// while one is in flight (MIX: `p` going on, `1 − p` going off; DIP: `i`
-    /// going on, `1 − d` going off). Called by the frame hook after the
-    /// background is staged. Wait-free; allocation-free.
+    /// going on, `1 − d` going off). `incoming_drawn` says whether the
+    /// transition's incoming tile contributes to this frame (the PVW role's
+    /// PROGRAM tally). Called by the frame hook after the background is
+    /// staged. Wait-free; allocation-free.
     pub fn resolve_keyers(
         &mut self,
         tick: Tick,
         auto_p: Option<TieEnvelope>,
+        incoming_drawn: bool,
         out: &mut [Option<KeyerDraw>; MAX_DSK],
     ) {
-        self.keyers.resolve(tick, auto_p, out, &self.outcomes);
+        self.keyers
+            .resolve(tick, auto_p, incoming_drawn, out, &self.outcomes);
     }
 
     /// After [`Self::reject_composed_tick`]: bring the committed keyer draws

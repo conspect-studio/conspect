@@ -162,6 +162,25 @@ impl MixOverlay {
         ))
     }
 
+    /// The weight of the incoming (Preview) picture on this step: the MIX
+    /// opacity, the DIP incoming contribution `i` (0 before the switch
+    /// point), or the WIPE edge position (0 covers nothing). Zero means the
+    /// incoming source does not contribute to the frame (tally, review F4).
+    #[must_use]
+    pub fn incoming_weight(&self) -> f32 {
+        match self.style {
+            TransitionStyle::Mix | TransitionStyle::Wipe { .. } => self.opacity(),
+            TransitionStyle::Dip { switch_point, .. } => {
+                multiview_core::switcher::kernel::dip_weights(
+                    self.elapsed,
+                    self.duration,
+                    switch_point,
+                )
+                .1
+            }
+        }
+    }
+
     /// The weights a tied downstream keyer draws on this step (ADR-0113 §4):
     /// MIX `p` going on and `1 − p` going off, with `p` the same opacity the
     /// incoming tile uses; DIP the incoming contribution `i` going on and
@@ -419,6 +438,25 @@ impl<T> CompositorDrive<T> {
     /// a rejected frame (weights only; no allocation).
     pub fn keyer_draws_mut(&mut self) -> &mut [Option<KeyerDraw>; MAX_DSK] {
         &mut self.keyers
+    }
+
+    /// Whether the transition's incoming tile contributes to the frame
+    /// composed at `now`: an overlay with incoming weight > 0 whose source
+    /// reads live (the same test `push_transition_tiles` applies). One
+    /// wait-free `read_at`; `false` without an overlay.
+    #[must_use]
+    pub fn transition_incoming_drawn(&self, now: MediaTime) -> bool {
+        let Some(mix) = self.mix_overlay.as_ref() else {
+            return false;
+        };
+        let weight = mix.incoming_weight();
+        if weight.is_nan() || weight <= 0.0 {
+            return false;
+        }
+        self.stores.get(&mix.source).is_some_and(|store| {
+            let read = store.read_at(now);
+            read.state().is_live() && read.frame().is_some()
+        })
     }
 
     /// The cumulative number of times the per-tick resolve **scratch pool** has

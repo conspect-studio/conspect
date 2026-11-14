@@ -1069,8 +1069,10 @@ impl KeyerRuntime {
 
     /// Resolve this tick's keyer draws (in ascending z), the loss policy, the
     /// last-good pair and the tally. `auto_p` is the background AUTO's tie
-    /// envelope while one is in flight. Wait-free: atomic loads, `Arc`
-    /// refcounts and fixed arrays only.
+    /// envelope while one is in flight; `incoming_drawn` says whether the
+    /// transition's incoming (Preview) tile contributes to this frame
+    /// (weight > 0 and a fresh frame, review F4). Wait-free: atomic loads,
+    /// `Arc` refcounts and fixed arrays only.
     #[allow(clippy::too_many_lines)]
     // reason: one linear per-keyer pass (read, pair, loss, weight, tally);
     // splitting it would thread the same borrowed slot through helpers.
@@ -1078,6 +1080,7 @@ impl KeyerRuntime {
         &mut self,
         tick: Tick,
         auto_p: Option<TieEnvelope>,
+        incoming_drawn: bool,
         out: &mut [Option<KeyerDraw>; MAX_DSK],
         outcomes: &EventStream<SwitcherOutcome>,
     ) {
@@ -1086,7 +1089,9 @@ impl KeyerRuntime {
         }
         let mut program = TallySet::default();
         program.insert(TallyRole::Program);
-        if auto_p.is_some() {
+        if incoming_drawn {
+            // From the composed tiles, not the envelope's existence: PVW is
+            // not on air at MIX p = 0 or before a DIP's switch point.
             program.insert(TallyRole::Preview);
         }
         let mut preview = TallySet::default();

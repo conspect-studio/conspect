@@ -176,8 +176,9 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // opacity, DIP weights), then one buffer swap into the drive (the
         // previous tick's `Arc`s come back and drop on the next resolve).
         let envelope = drive.mix_overlay().map(MixOverlay::tie_envelope);
+        let incoming_drawn = drive.transition_incoming_drawn(tick.pts);
         self.driver
-            .resolve_keyers(tick, envelope, &mut self.keyer_buf);
+            .resolve_keyers(tick, envelope, incoming_drawn, &mut self.keyer_buf);
         drive.set_keyer_draws(&mut self.keyer_buf);
     }
 

@@ -562,3 +562,62 @@ fn a_fill_and_key_pair_is_program_tallied_and_draws_in_z_order() {
         "a self key has no key role"
     );
 }
+
+/// Review F4: the PVW role is PROGRAM-tallied only on a frame where the
+/// transition's incoming tile contributes: never at MIX `p = 0`, never on a
+/// DIP's outgoing-only (colour) ticks before the switch point.
+fn preview_tally_follows_the_incoming_tile(dip: bool) {
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[dsk("dsk1", "gfx", None, 1)], 3.0, "a", "b");
+    let n = 8_u32;
+    let half = Rational::new(1, 2);
+    if dip {
+        let descriptor: TransitionDescriptor = serde_json::from_value(serde_json::json!({
+            "kind": "dip",
+            "rate": n,
+            "switch_point": {"num": half.num, "den": half.den},
+        }))
+        .unwrap();
+        handle
+            .try_send(cmd("set", SwitcherVerb::SetTransition(descriptor)))
+            .unwrap();
+    }
+    let rate = FrameCount::try_from(n).unwrap();
+    handle
+        .try_send(cmd("auto", SwitcherVerb::Auto(rate)))
+        .unwrap();
+    let mut pre = 0;
+    for k in 0..u64::from(n) {
+        keep_fresh(&rig, k);
+        step(&mut hook, &mut drive, k);
+        let elapsed = u32::try_from(k).unwrap();
+        let incoming = if dip {
+            kernel::dip_weights(elapsed, n, half).1
+        } else {
+            kernel::opacity(Progress::new(elapsed, rate))
+        };
+        let tally = hook.driver.keyers().tally();
+        assert_eq!(
+            tally.program.contains(TallyRole::Preview),
+            incoming > 0.0,
+            "tick {k}: incoming weight {incoming}"
+        );
+        if incoming <= 0.0 {
+            pre += 1;
+        }
+    }
+    assert!(pre >= 1, "the run covers a tick with no incoming picture");
+    if dip {
+        assert!(pre > 1, "the DIP's colour-only ticks are covered");
+    }
+}
+
+#[test]
+fn preview_is_not_program_tallied_at_mix_p_zero() {
+    preview_tally_follows_the_incoming_tile(false);
+}
+
+#[test]
+fn preview_is_not_program_tallied_before_a_dip_switch_point() {
+    preview_tally_follows_the_incoming_tile(true);
+}
