@@ -6556,6 +6556,60 @@ export interface components {
              */
             ptp_domain?: number | null;
         };
+        /** @description One per-output clock in [`ProgramMetricsReport::output_clocks`] (#343). */
+        OutputClockReport: {
+            /**
+             * Format: int64
+             * @description Program audio events dropped on this clock's outputs.
+             */
+            dropped_audio: number;
+            /**
+             * Format: int64
+             * @description Offers a full or ended output worker refused (the output fills).
+             */
+            dropped_offers: number;
+            /** @description The clock's output rate, `num/den` (e.g. `25/1`). */
+            fps: string;
+            /**
+             * Format: int64
+             * @description Ticks whose latched Program frame was more than one Program period
+             *     old (Program fell behind the latch delay).
+             */
+            late_latches: number;
+            /**
+             * Format: double
+             * @description Largest wake lateness since the run started, ms.
+             */
+            lateness_max_ms: number;
+            /**
+             * Format: double
+             * @description p50 wake lateness over the window: the upper edge of its bucket, ms.
+             */
+            lateness_p50_ms?: number | null;
+            /**
+             * Format: double
+             * @description p99 wake lateness over the window: the upper edge of its bucket, ms.
+             */
+            lateness_p99_ms?: number | null;
+            /** @description The config ids of the outputs on this clock. */
+            outputs: string[];
+            /**
+             * Format: int64
+             * @description Tick indices skipped by the catch-up (the clock was late by more than
+             *     8 ticks; the outputs repeat their last picture over the gap).
+             */
+            skipped_ticks: number;
+            /**
+             * Format: int64
+             * @description Ticks emitted since the run started.
+             */
+            ticks_total: number;
+            /**
+             * Format: int64
+             * @description Ticks in the window (about the last 10 s).
+             */
+            window_ticks: number;
+        };
         /**
          * @description `OpenAPI` mirror of `multiview_config::OutputFlip` (ADR-0089 §2.2). A flip is
          *     pixel-only (no container "flip" tag), so it forces the pixels path.
@@ -7364,6 +7418,12 @@ export interface components {
              * @description p99 lateness over the window: the upper edge of its bucket, ms.
              */
             lateness_p99_ms?: number | null;
+            /**
+             * @description The per-output clocks of outputs at a rate other than Program's
+             *     (#343, output-routing §12.6). Empty when every output runs at
+             *     Program's rate.
+             */
+            output_clocks?: components["schemas"]["OutputClockReport"][];
             /**
              * Format: int64
              * @description Ticks emitted since the run started.

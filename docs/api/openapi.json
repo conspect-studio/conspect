@@ -19798,6 +19798,91 @@
         ],
         "description": "`OpenAPI` mirror of `multiview_config::Output` (tagged by `kind`) — the body\naccepted by `POST`/`PUT /api/v1/outputs/{id}`."
       },
+      "OutputClockReport": {
+        "type": "object",
+        "description": "One per-output clock in [`ProgramMetricsReport::output_clocks`] (#343).",
+        "required": [
+          "fps",
+          "outputs",
+          "ticks_total",
+          "window_ticks",
+          "lateness_max_ms",
+          "skipped_ticks",
+          "dropped_offers",
+          "late_latches",
+          "dropped_audio"
+        ],
+        "properties": {
+          "dropped_audio": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Program audio events dropped on this clock's outputs.",
+            "minimum": 0
+          },
+          "dropped_offers": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Offers a full or ended output worker refused (the output fills).",
+            "minimum": 0
+          },
+          "fps": {
+            "type": "string",
+            "description": "The clock's output rate, `num/den` (e.g. `25/1`)."
+          },
+          "late_latches": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks whose latched Program frame was more than one Program period\nold (Program fell behind the latch delay).",
+            "minimum": 0
+          },
+          "lateness_max_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "Largest wake lateness since the run started, ms."
+          },
+          "lateness_p50_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "p50 wake lateness over the window: the upper edge of its bucket, ms."
+          },
+          "lateness_p99_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "p99 wake lateness over the window: the upper edge of its bucket, ms."
+          },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The config ids of the outputs on this clock."
+          },
+          "skipped_ticks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Tick indices skipped by the catch-up (the clock was late by more than\n8 ticks; the outputs repeat their last picture over the gap).",
+            "minimum": 0
+          },
+          "ticks_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks emitted since the run started.",
+            "minimum": 0
+          },
+          "window_ticks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks in the window (about the last 10 s).",
+            "minimum": 0
+          }
+        }
+      },
       "OutputFlipDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of `multiview_config::OutputFlip` (ADR-0089 §2.2). A flip is\npixel-only (no container \"flip\" tag), so it forces the pixels path.",
@@ -21312,6 +21397,13 @@
             ],
             "format": "double",
             "description": "p99 lateness over the window: the upper edge of its bucket, ms."
+          },
+          "output_clocks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OutputClockReport"
+            },
+            "description": "The per-output clocks of outputs at a rate other than Program's\n(#343, output-routing §12.6). Empty when every output runs at\nProgram's rate."
           },
           "ticks_total": {
             "type": "integer",
