@@ -333,6 +333,9 @@ pub struct AudioRoutingCounters {
     /// Private buses closed after their output returned to the shared
     /// program stream (§5.2).
     pub returned: u64,
+    /// Steps of a passthrough output's source-time audio delay (#344 D2b):
+    /// each repeated or skipped one tick of PCM at a tick boundary.
+    pub source_delay_steps: u64,
 }
 
 /// Test observation of routed audio: the PCM handed to the shared program
@@ -373,6 +376,58 @@ struct OutputAudio {
     /// it); a refused set closes it and nothing fades. At most one.
     staged: Option<Staged>,
     watch: Option<Watch>,
+    /// Audio by source time (#344 D2b): while the output is on a
+    /// passthrough key, the key's published delay `d` (clamped to
+    /// [`MAX_SOURCE_DELAY_TICKS`]) and the source's last blocks.
+    delay: SourceDelay,
+}
+
+/// Longest source-time delay applied to a passthrough output's audio, in
+/// ticks (the passthrough clock's jitter bound).
+pub(crate) const MAX_SOURCE_DELAY_TICKS: u32 = 8;
+
+/// One passthrough output's source-time audio delay (#344 D2b): a bounded
+/// ring of the source's last `MAX_SOURCE_DELAY_TICKS + 1` blocks. The
+/// routed audio of tick `t` is the source's block of tick `t - d`. A step
+/// in `d` (a drift correction or a new run) repeats or skips exactly one
+/// tick of PCM at that tick boundary (counted).
+#[derive(Default)]
+struct SourceDelay {
+    /// The delay to apply (`None`: not on a passthrough key).
+    target: Option<u32>,
+    /// The delay applied on the last fed tick.
+    applied: Option<u32>,
+    /// The source id the ring holds.
+    source: Option<String>,
+    /// Newest last; at most `MAX_SOURCE_DELAY_TICKS + 1` blocks.
+    ring: std::collections::VecDeque<AudioBlock>,
+}
+
+impl SourceDelay {
+    /// Record `block` (the source's block of this tick) and return the
+    /// block of tick `t - d` (the oldest held when fewer are held), or
+    /// `None` when no delay applies.
+    fn delayed(&mut self, id: &str, block: Option<&AudioBlock>) -> Option<AudioBlock> {
+        let d = self.target?;
+        if self.source.as_deref() != Some(id) {
+            self.source = Some(id.to_owned());
+            self.ring.clear();
+        }
+        let Some(block) = block else {
+            // No strip this tick: silence enters the ring like a block.
+            self.ring.clear();
+            return None;
+        };
+        self.ring.push_back(block.clone());
+        let cap = usize::try_from(MAX_SOURCE_DELAY_TICKS).unwrap_or(8) + 1;
+        while self.ring.len() > cap {
+            self.ring.pop_front();
+        }
+        let d = usize::try_from(d)
+            .unwrap_or(0)
+            .min(self.ring.len().saturating_sub(1));
+        self.ring.get(self.ring.len() - 1 - d).cloned()
+    }
 }
 
 struct Staged {
@@ -383,6 +438,7 @@ struct Staged {
 }
 
 /// One tick's PCM inputs, shared by every bus `feed` feeds.
+#[derive(Clone, Copy)]
 struct FeedCtx<'a> {
     program: &'a AudioBlock,
     inputs: &'a [(&'a str, &'a AudioBlock)],
@@ -453,6 +509,7 @@ impl RoutedAudio {
                     bus: None,
                     staged: None,
                     watch: None,
+                    delay: SourceDelay::default(),
                 })
                 .collect(),
             events_tx,
@@ -464,6 +521,19 @@ impl RoutedAudio {
             tap: None,
             #[cfg(test)]
             worker_hook: None,
+        }
+    }
+
+    /// Set output `output`'s source-time delay for the coming feed (#344
+    /// D2b): `Some(d)` while it is on a passthrough key (clamped to
+    /// [`MAX_SOURCE_DELAY_TICKS`]), `None` otherwise (the ring is dropped).
+    pub(crate) fn set_source_delay(&mut self, output: usize, delay: Option<u32>) {
+        if let Some(o) = self.outputs.get_mut(output) {
+            let delay = delay.map(|d| d.min(MAX_SOURCE_DELAY_TICKS));
+            if delay.is_none() && o.delay.target.is_some() {
+                o.delay = SourceDelay::default();
+            }
+            o.delay.target = delay;
         }
     }
 
@@ -1279,12 +1349,36 @@ impl RoutedAudio {
         let mut refused = Vec::new();
         let mut staged_failed = Vec::new();
         for (output, o) in self.outputs.iter_mut().enumerate() {
+            // Audio by source time (#344 D2b): a passthrough output's own
+            // source is read `d` ticks back from its bounded ring.
+            let delayed = Self::delay_source(o, inputs, &mut self.counters);
+            let swapped: Vec<(&str, &AudioBlock)>;
+            let ctx_delayed;
+            let ctx = if let Some((id, block)) = delayed.as_ref() {
+                swapped = inputs
+                    .iter()
+                    .map(|(i, b)| {
+                        if *i == id.as_str() {
+                            (*i, block)
+                        } else {
+                            (*i, *b)
+                        }
+                    })
+                    .collect();
+                ctx_delayed = FeedCtx {
+                    inputs: &swapped,
+                    ..ctx
+                };
+                &ctx_delayed
+            } else {
+                &ctx
+            };
             if let Some(bus) = o.bus.as_mut() {
                 let fed = Self::feed_bus(
                     output,
                     bus,
                     o.watch.as_mut(),
-                    &ctx,
+                    ctx,
                     &mut self.scratch,
                     dispatcher,
                     #[cfg(test)]
@@ -1301,7 +1395,7 @@ impl RoutedAudio {
                     output,
                     &mut st.bus,
                     None,
-                    &ctx,
+                    ctx,
                     &mut self.scratch,
                     dispatcher,
                     #[cfg(test)]
@@ -1326,6 +1420,34 @@ impl RoutedAudio {
             self.fail_staged(output, dispatcher);
         }
         self.settle(dispatcher);
+    }
+
+    /// The delayed source block of a passthrough output (#344 D2b): its
+    /// current source read `d` ticks back from its ring, `None` when no
+    /// delay applies (not on a key, a fade in progress, another source).
+    fn delay_source(
+        o: &mut OutputAudio,
+        inputs: &[(&str, &AudioBlock)],
+        counters: &mut AudioRoutingCounters,
+    ) -> Option<(String, AudioBlock)> {
+        let delayed = o
+            .bus
+            .as_ref()
+            .and_then(|bus| match (&bus.current, &bus.fade) {
+                (AudioSource::Source(id), None) if o.delay.target.is_some() => {
+                    let block = inputs.iter().find(|(i, _)| *i == id).map(|(_, b)| *b);
+                    let id = id.clone();
+                    o.delay.delayed(&id, block).map(|b| (id, b))
+                }
+                _ => None,
+            });
+        let held = u32::try_from(o.delay.ring.len().saturating_sub(1)).unwrap_or(0);
+        let applied = delayed.as_ref().and(o.delay.target).map(|d| d.min(held));
+        if applied.is_some() && o.delay.applied.is_some() && applied != o.delay.applied {
+            counters.source_delay_steps = counters.source_delay_steps.saturating_add(1);
+        }
+        o.delay.applied = applied;
+        delayed
     }
 
     /// Feed one tick of PCM to one bus (its fade, queued change and
@@ -1789,6 +1911,63 @@ mod tests {
             vec![v; frames * 2],
         )
         .unwrap()
+    }
+
+    /// #344 D2b: the source-time delay ring is bounded (9 blocks), `d` is
+    /// clamped to 8, tick `t` reads the source block of tick `t - d` (the
+    /// oldest held while the ring fills), and a step in `d` repeats or
+    /// skips exactly one block.
+    #[test]
+    fn passthrough_source_delay_ring_is_bounded_and_clamped() {
+        let mut r = SourceDelay {
+            target: Some(3),
+            ..SourceDelay::default()
+        };
+        let mut got = Vec::new();
+        for t in 0..20_u16 {
+            let b = block(f32::from(t), 4);
+            let out = r.delayed("cam", Some(&b)).unwrap();
+            got.push(out.interleaved()[0]);
+            assert!(r.ring.len() <= usize::try_from(MAX_SOURCE_DELAY_TICKS).unwrap() + 1);
+        }
+        assert_eq!(&got[..4], &[0.0, 0.0, 0.0, 0.0], "fills from the oldest");
+        assert_eq!(got[10], 7.0, "tick 10 reads tick 7");
+        // Step 3 -> 2 at tick 20: the block of tick 17 is skipped.
+        r.target = Some(2);
+        let next = r.delayed("cam", Some(&block(20.0, 4))).unwrap();
+        assert_eq!(
+            next.interleaved()[0],
+            18.0,
+            "one tick skipped (17 -> 18 at once)"
+        );
+        // Step 2 -> 3: one tick repeated.
+        r.target = Some(3);
+        let again = r.delayed("cam", Some(&block(21.0, 4))).unwrap();
+        assert_eq!(again.interleaved()[0], 18.0, "one tick repeated");
+        // The router clamps d to the ring bound.
+        let mut audio = RoutedAudio::new(
+            1,
+            AudioEncodeConfig::aac(48_000, 2, 128_000),
+            Rational::new(25, 1),
+            None,
+            Arc::new(|_: &str| 1.0),
+            None,
+        );
+        audio.set_source_delay(0, Some(1000));
+        assert_eq!(audio.outputs[0].delay.target, Some(MAX_SOURCE_DELAY_TICKS));
+        audio.set_source_delay(0, None);
+        assert_eq!(audio.outputs[0].delay.target, None);
+        assert!(audio.outputs[0].delay.ring.is_empty(), "ring dropped");
+        // Another source resets the ring.
+        let mut r = SourceDelay {
+            target: Some(8),
+            ..SourceDelay::default()
+        };
+        for t in 0..5_u16 {
+            let _ = r.delayed("a", Some(&block(f32::from(t), 4)));
+        }
+        let b = r.delayed("b", Some(&block(99.0, 4))).unwrap();
+        assert_eq!(b.interleaved()[0], 99.0);
     }
 
     #[test]

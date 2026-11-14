@@ -1513,7 +1513,16 @@ impl OutputRouter {
         inputs: &[(&str, &multiview_audio::format::AudioBlock)],
         dispatcher: &mut RenditionDispatcher,
     ) {
+        // #344 D2b: an output on a passthrough key with `follow` audio reads
+        // its source's PCM at the emitted AU's source time.
+        let delays: Vec<Option<u32>> = (0..self.outputs.len())
+            .map(|i| self.passthrough_audio_delay(i))
+            .collect();
         if let Some(audio) = self.audio.as_mut() {
+            for (i, d) in delays.into_iter().enumerate() {
+                let follow = audio.choice(i) == AudioChoice::Follow;
+                audio.set_source_delay(i, d.filter(|_| follow));
+            }
             let before = (audio.private_buses(), audio.counters());
             audio.feed(tick, program, inputs, dispatcher);
             if (audio.private_buses(), audio.counters()) != before {

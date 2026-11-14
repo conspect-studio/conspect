@@ -141,8 +141,9 @@ pub fn reason_from_code(code: u8) -> Option<BridgeReason> {
 pub struct PassthroughStatus {
     state: AtomicU8,
     reason: AtomicU8,
-    /// Ticks between the emitted AU's source time and the tick (the clock's
-    /// jitter-buffer depth at emission; 0 on the slate).
+    /// Ticks between the emitted AU's arrival (its source time on the run's
+    /// clock) and the tick it is emitted on (D2b: exact, from the AU's own
+    /// `arrival_ns`; a repeat keeps the previous AU's; 0 on the slate).
     delay_ticks: AtomicU32,
     /// The last tick emitted.
     last_tick: AtomicU64,
@@ -588,7 +589,16 @@ pub struct PassthroughLive {
     slate_raps: bool,
     /// The last re-arm request served.
     rearm_seen: u64,
+    /// The arrival time of the AUs drained recently (bounded: the clock
+    /// holds at most `JITTER_MAX` plus one tick's drain), to find the
+    /// emitted AU's source time by identity.
+    arrivals: std::collections::VecDeque<(Arc<[u8]>, u64)>,
+    /// The delay of the last emitted source AU (a repeat keeps it).
+    last_delay: u32,
 }
+
+/// Arrival entries kept ([`PassthroughLive::arrivals`]).
+const ARRIVALS: usize = multiview_output::passthrough::clock::JITTER_MAX + MAX_DRAIN_PER_TICK;
 
 impl std::fmt::Debug for PassthroughLive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -652,6 +662,8 @@ impl PassthroughLive {
             matcher: None,
             slate_raps: true,
             rearm_seen: 0,
+            arrivals: std::collections::VecDeque::with_capacity(ARRIVALS + 1),
+            last_delay: 0,
         })
     }
 
@@ -730,6 +742,13 @@ impl PassthroughLive {
             *slot = Some(au);
             n += 1;
         }
+        for au in drained.iter().take(n).filter_map(Option::as_ref) {
+            self.arrivals
+                .push_back((Arc::clone(&au.data), au.arrival_ns));
+            if self.arrivals.len() > ARRIVALS {
+                self.arrivals.pop_front();
+            }
+        }
         if let Some(last) = drained.get(n.wrapping_sub(1)).and_then(Option::as_ref) {
             self.status
                 .latest_gen
@@ -773,7 +792,7 @@ impl PassthroughLive {
         s.drift_drops.store(c.drift_drops, Ordering::Relaxed);
         s.stable.store(self.clock.stable_ticks(), Ordering::Release);
         s.last_tick.store(tick, Ordering::Release);
-        let depth = u32::try_from(self.clock.last_depth()).unwrap_or(u32::MAX);
+        let period_ns = period_ns(self.cadence);
         let (packet, state, reason, delay) = match emission {
             Emission::Au {
                 data,
@@ -794,11 +813,17 @@ impl PassthroughLive {
                     s.run_gen.store(params_gen, Ordering::Release);
                 }
                 s.aus.fetch_add(1, Ordering::Relaxed);
+                // Exact source-time delay: ticks since this AU arrived.
+                if let Some(&(_, arrived)) =
+                    self.arrivals.iter().find(|(d, _)| Arc::ptr_eq(d, &data))
+                {
+                    self.last_delay = delay_ticks(now, arrived, period_ns);
+                }
                 (
                     Self::packet(&data, dts, pts, keyframe),
                     PassthroughState::Passthrough,
                     0,
-                    depth,
+                    self.last_delay,
                 )
             }
             Emission::Repeat { data, dts, pts } => {
@@ -808,7 +833,7 @@ impl PassthroughLive {
                     Self::packet(&data, dts, pts, false),
                     PassthroughState::Repeat,
                     0,
-                    depth,
+                    self.last_delay,
                 )
             }
             Emission::Bridge { dts, pts, reason } => {
@@ -841,6 +866,26 @@ impl PassthroughLive {
         s.delay_ticks.store(delay, Ordering::Release);
         Ok(packet)
     }
+}
+
+/// One output tick in nanoseconds (integer, rounded down; 0 for a degenerate
+/// cadence).
+fn period_ns(cadence: Rational) -> u64 {
+    let (num, den) = (i128::from(cadence.num), i128::from(cadence.den));
+    if num <= 0 || den <= 0 {
+        return 0;
+    }
+    u64::try_from(1_000_000_000 * den / num).unwrap_or(0)
+}
+
+/// Whole ticks from `arrived` to `now` (rounded to the nearest tick, 0 when
+/// it arrived in the future or the period is unknown).
+fn delay_ticks(now: u64, arrived: u64, period_ns: u64) -> u32 {
+    if period_ns == 0 {
+        return 0;
+    }
+    let age = now.saturating_sub(arrived);
+    u32::try_from(age.saturating_add(period_ns / 2) / period_ns).unwrap_or(u32::MAX)
 }
 
 impl VideoEncodeWorker for PassthroughLive {

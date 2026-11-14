@@ -319,6 +319,14 @@ fn a_matching_source_moves_onto_p0_after_metering_and_the_encoder_lingers_out() 
     // on the moved output (bridge -> P0 included).
     let pts: Vec<i64> = p.packets(1).iter().map(|x| x.0).collect();
     assert!(pts.windows(2).all(|w| w[1] > w[0]), "monotonic: {pts:?}");
+    // Audio by source time: the key publishes the emitted AU's exact delay
+    // (it arrived on its tick and waits the clock's target depth).
+    let d = p.x.r.passthrough_audio_delay(1);
+    assert_eq!(
+        d,
+        Some(u32::try_from(multiview_output::passthrough::clock::TARGET_DEPTH).unwrap())
+    );
+    assert_eq!(p.x.r.passthrough_audio_delay(0), None, "not on a key");
     // The other output stayed on Program.
     assert_eq!(p.view(0).bus, "program");
     assert!(p.view(0).passthrough.is_none());

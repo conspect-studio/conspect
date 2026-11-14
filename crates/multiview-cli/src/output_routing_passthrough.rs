@@ -349,7 +349,6 @@ impl PassState {
 
     /// The passthrough key status of output `output` (the audio rail and
     /// tests read it).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn status_of(&self, output: usize) -> Option<Arc<PassthroughStatus>> {
         self.get(output)
             .and_then(|c| c.key.as_ref())
@@ -446,6 +445,22 @@ impl OutputRouter {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn passthrough_status(&self, index: usize) -> Option<Arc<PassthroughStatus>> {
         self.pass.status_of(index)
+    }
+
+    /// The source-time delay of output `index`'s audio (#344 D2b): the
+    /// key's published delay while the output reads its passthrough key and
+    /// the key passes the source through, else `None`.
+    pub(super) fn passthrough_audio_delay(&self, index: usize) -> Option<u32> {
+        let key = self.outputs.get(index)?.key;
+        if !self.pass.on_key(index, key) {
+            return None;
+        }
+        let status = self.pass.status_of(index)?;
+        matches!(
+            status.state(),
+            PassthroughState::Passthrough | PassthroughState::Repeat
+        )
+        .then(|| status.delay_ticks())
     }
 
     /// A new video take on output `index` towards `bus`: an existing
