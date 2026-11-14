@@ -189,7 +189,7 @@ export interface paths {
          * `POST /api/v1/cast/sessions` — start an ad-hoc cast session (role: write).
          * @description When the engine runs a cast output (ADR-0111) the session creates its own
          *     cast stream (`feed` / `output` as `POST /cast/streams` takes them, same
-         *     authorization, owner = the caller), LAUNCHes the configured receiver app
+         *     authorization, owner = the caller), launches the configured receiver app
          *     (the registered custom receiver, else the Default Media Receiver
          *     `CC1AD845`) and LOADs `{control.cast_media_base}/cast/<token>/master.m3u8`
          *     (fMP4, LIVE). The session owns the stream: stopping the session revokes
