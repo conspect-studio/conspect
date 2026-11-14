@@ -1259,3 +1259,97 @@ async fn applied_definitions_persist_and_a_restart_comes_up_with_keyers_off() {
         .pending
         .is_none());
 }
+
+/// A rail driver that never runs anything: the J1 test only reads what the
+/// keyer demand set was last published with (the manager is never started).
+struct NoRails;
+impl multiview_engine::RailDriver<Nv12Image> for NoRails {
+    fn store(&self, _id: &str) -> Option<Arc<TileStore<Nv12Image>>> {
+        None
+    }
+    fn transition(
+        &self,
+        _id: &str,
+        _from: multiview_engine::Rails,
+        to: multiview_engine::Rails,
+        _requested: Option<multiview_engine::RequestedSize>,
+    ) -> Result<multiview_engine::Rails, multiview_engine::RailFailure> {
+        Ok(to)
+    }
+    fn resolve(&self, _id: &str, asked: multiview_engine::Rails) -> multiview_engine::Rails {
+        asked
+    }
+    fn progress(&self, _id: &str, _rails: multiview_engine::Rails) -> u64 {
+        0
+    }
+}
+
+/// Review J1: two applied `keyer_set`s settle concurrently. A (version N)
+/// is paused after its outcome, B (N+1) applies and settles in full, then
+/// A resumes. Neither the durable document nor the keyer demand set may go
+/// back to N: reconciliation reads the latest committed definitions inside
+/// its serialization. Deterministic: the settlement seam, no sleeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_settlement_never_overwrites_a_newer_definition() {
+    use multiview_control::routes::switcher_keyers::settle_seam;
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = rig(&path);
+    let manager = multiview_engine::DemandManager::new(
+        multiview_engine::SourceRegistry::new(),
+        Arc::new(NoRails),
+        multiview_engine::DemandConfig::default(),
+    );
+    let demand = manager.consumer_set(
+        multiview_engine::ConsumerClass::Keyer,
+        multiview_engine::Rails::VIDEO,
+    );
+    rig.handle.set_keyer_demand(demand.clone());
+    let mut outcomes = rig.handle.outcomes();
+    let define = |fill: &str| {
+        body(
+            "keyer_set",
+            json!({"keyer":"dsk2","fill":fill,"fly":{"x":0,"y":0,"w":16,"h":16},
+                   "max_source":{"w":16,"h":16}}),
+        )
+    };
+    let op_of = |v: Value| v["operation_id"].as_str().unwrap().to_owned();
+    // A defines dsk2 on gfx (version N) and pauses after its outcome.
+    let a = op_of(body_json(command(&rig, FULL, "a", &define("gfx")).await).await);
+    let pause_a = settle_seam::pause(&a);
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    pause_a.reached.await.unwrap();
+    let n = rig.handle.keyer_definitions().unwrap().version;
+    // B moves dsk2 to gfx2 (N + 1) and settles in full while A is paused.
+    let b = op_of(body_json(command(&rig, FULL, "b", &define("gfx2")).await).await);
+    let pause_b = settle_seam::pause(&b);
+    pause_b.release.send(()).unwrap();
+    tick(&mut rig.driver, 2);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    pause_b.done.await.unwrap();
+    assert_eq!(rig.handle.keyer_definitions().unwrap().version, n + 1);
+    // A resumes and finishes last.
+    pause_a.release.send(()).unwrap();
+    pause_a.done.await.unwrap();
+    let dsk2_fill = |config: MultiviewConfig| {
+        config
+            .switcher
+            .unwrap()
+            .downstream_keyers
+            .into_iter()
+            .find(|d| d.id == "dsk2")
+            .map(|d| d.fill)
+    };
+    assert_eq!(
+        dsk2_fill(persisted(&rig.state)).as_deref(),
+        Some("gfx2"),
+        "the durable document went back to an older definition"
+    );
+    let items = demand.items();
+    let dsk2: Vec<&str> = items
+        .iter()
+        .filter(|i| &*i.label == "main/dsk2")
+        .map(|i| &*i.id)
+        .collect();
+    assert_eq!(dsk2, vec!["gfx2"], "the demand set went back to N");
+}

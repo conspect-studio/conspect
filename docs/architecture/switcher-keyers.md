@@ -810,6 +810,13 @@ keyers.
   - **Applied.** It republishes the run's `keyer` demand set (`ConsumerSet::publish`, which
     leases the new set before it releases the old one), persists the definitions, and only
     then drops the request's leases.
+  - **Serialized reconciliation (review round 2 J1).** Republish and persist run together
+    under the config-mutation lock, and the definitions are read *inside* the lock
+    (`reconcile_keyers`), never captured before it. Committed definitions only move
+    forward, so the settlement that runs last writes the newest version. Before, a
+    settlement captured version N, was descheduled while N+1 applied, published and
+    persisted, and then republished N's demand (releasing sources the engine still keys) and
+    persisted N last, so a restart came back with stale keyers.
   - **Refused or busy.** The leases drop at once.
 - **Clean rule (review round 1 H3: one counted admission point).** One `CleanDskGate`
   (`multiview_engine::clean_gate`) is shared by the switcher (`SwitcherControl::clean_gate`),
@@ -904,7 +911,7 @@ keyers.
     and a set admitted on a stale base is refused while the published readback is the
     prepared `Arc` (H6); a set drained at its deadline tick is refused and one drained the
     tick before applies (H4).
-  - `multiview-control` `tests/switcher_keyers.rs` (9):
+  - `multiview-control` `tests/switcher_keyers.rs` (15):
     - the BOLA matrix for each verb on plan and command, for the M/E, program, keyer and
       source grants and a viewer, with no key burned;
     - a Viewer and a ReadOnly key holding every grant are 403 on `/plan` for all four verbs
@@ -921,6 +928,9 @@ keyers.
       is refused `keyer-set-deadline` when drained past its deadline tick, and leaves no
       definition, lease, reservation or persisted keyer (H4, paused tokio time);
     - the Clean rule;
+    - a settlement paused after its outcome while a newer `keyer_set` applies and settles
+      leaves both the durable document and the demand set at the newer version (J1,
+      deterministic through the `_test-seams` `settle_seam`);
     - GET/events parity and redaction for scoped principals;
     - persistence and a restart.
   - Lib unit tests: tally resolution, row filtering and redaction, and the `Keyer` scope.

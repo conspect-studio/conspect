@@ -1117,8 +1117,9 @@ fn accepted(operation_id: String, kind: &str) -> Response {
 /// never a wall-clock deadline (review H4: releasing while the command could
 /// still apply orphaned it). Then decide from the committed definitions (the
 /// authority, so a lagged outcome ring cannot mislead it); on `applied`
-/// republish the keyer demand set and persist the definitions; in every case
-/// release the leases and the DSK reservation it took.
+/// reconcile the demand set and the durable document from the latest
+/// committed definitions ([`reconcile_keyers`], serialized; review J1); in
+/// every case release the leases and the DSK reservation it took.
 async fn settle_set(
     state: AppState,
     handle: SwitcherControl,
@@ -1150,19 +1151,130 @@ async fn settle_set(
             .any(|d| Arc::ptr_eq(d, &pending.def))
     });
     if applied {
-        if let Some(defs) = handle.keyer_definitions() {
-            if let Some(set) = handle.keyer_demand() {
-                set.publish(demand_items(&defs));
-            }
-            if let Err(error) = persist_keyers(&state, &defs).await {
-                tracing::warn!(%error, "keyer_set: applied definition not persisted");
-            }
-        }
+        settle_seam::point(&pending.op).await;
+        reconcile_keyers(&state, &handle).await;
     }
     // The demand set now holds the new sources (make-before-break): the
     // request's own leases are released here, and its DSK reservation (an
     // applied definition already set the gate's committed bit at its tick).
+    let op = pending.op.clone();
     drop(pending);
+    settle_seam::done(&op);
+}
+
+/// Test seam (deterministic interleaving of `keyer_set` settlements, review
+/// J1): a test registers an operation id; its settlement then signals when it
+/// reaches the point after its outcome was observed and waits for a release,
+/// and signals again once it settled. Unregistered ids pass straight through.
+/// Compiled only for tests and the `_test-seams` feature.
+#[cfg(any(test, feature = "_test-seams"))]
+#[doc(hidden)]
+pub mod settle_seam {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::sync::oneshot;
+
+    struct Entry {
+        reached: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+        done: Option<oneshot::Sender<()>>,
+    }
+
+    fn table() -> &'static Mutex<HashMap<String, Entry>> {
+        static T: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
+        T.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// The test's side of one registered settlement.
+    pub struct Pause {
+        /// Fires when the settlement reached the seam point.
+        pub reached: oneshot::Receiver<()>,
+        /// Send to let it continue.
+        pub release: oneshot::Sender<()>,
+        /// Fires once the settlement finished.
+        pub done: oneshot::Receiver<()>,
+    }
+
+    /// Register `op`: its settlement pauses at the seam point.
+    #[must_use]
+    pub fn pause(op: &str) -> Pause {
+        let (reached_tx, reached) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let (done_tx, done) = oneshot::channel();
+        table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                op.to_owned(),
+                Entry {
+                    reached: Some(reached_tx),
+                    release: Some(release_rx),
+                    done: Some(done_tx),
+                },
+            );
+        Pause {
+            reached,
+            release,
+            done,
+        }
+    }
+
+    pub(super) async fn point(op: &str) {
+        let release = {
+            let mut table = table()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(entry) = table.get_mut(op) else {
+                return;
+            };
+            if let Some(reached) = entry.reached.take() {
+                let _ = reached.send(());
+            }
+            entry.release.take()
+        };
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+    }
+
+    pub(super) fn done(op: &str) {
+        let entry = table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(op);
+        if let Some(done) = entry.and_then(|mut e| e.done.take()) {
+            let _ = done.send(());
+        }
+    }
+}
+
+/// Production builds: the seam is a no-op.
+#[cfg(not(any(test, feature = "_test-seams")))]
+mod settle_seam {
+    #[allow(clippy::unused_async)]
+    // reason: mirrors the test seam's signature; inlined away.
+    pub(super) async fn point(_op: &str) {}
+    pub(super) fn done(_op: &str) {}
+}
+
+/// Republish the keyer demand set and persist the definitions from the
+/// LATEST committed definitions, serialized under the config-mutation lock
+/// (review J1). Each settlement reads the definitions only inside the lock,
+/// and committed definitions only move forward, so whichever settlement runs
+/// last writes the newest version: a settlement descheduled after its
+/// outcome can never republish or persist an older definition over a newer
+/// one (stale demand could release sources the engine still keys).
+async fn reconcile_keyers(state: &AppState, handle: &SwitcherControl) {
+    let mutation = state.lock_config_mutation().await;
+    let Some(defs) = handle.keyer_definitions() else {
+        return;
+    };
+    if let Some(set) = handle.keyer_demand() {
+        set.publish(demand_items(&defs));
+    }
+    if let Err(error) = persist_keyers_locked(state, &defs, &mutation).await {
+        tracing::warn!(%error, "keyer_set: applied definition not persisted");
+    }
 }
 
 /// The `keyer` demand items of the committed definitions (one lease per fill
@@ -1190,10 +1302,20 @@ pub fn demand_items(defs: &KeyerDefinitions) -> Vec<multiview_engine::SetItem> {
 /// # Errors
 /// The accepted document cannot be read, validated or committed.
 pub async fn persist_keyers(state: &AppState, defs: &KeyerDefinitions) -> ControlResult<()> {
+    let mutation = state.lock_config_mutation().await;
+    persist_keyers_locked(state, defs, &mutation).await
+}
+
+/// [`persist_keyers`] for a caller already holding the config-mutation lock
+/// (the guard is the proof).
+async fn persist_keyers_locked(
+    state: &AppState,
+    defs: &KeyerDefinitions,
+    _mutation: &tokio::sync::OwnedMutexGuard<()>,
+) -> ControlResult<()> {
     if state.boot_model.is_none() {
         return Ok(());
     }
-    let _mutation = state.lock_config_mutation().await;
     let mut config: multiview_config::MultiviewConfig =
         serde_json::from_value(crate::boot_model::current_desired_config(state)?)
             .map_err(|e| ControlError::Repository(format!("desired configuration: {e}")))?;
