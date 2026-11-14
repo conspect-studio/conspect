@@ -1427,6 +1427,9 @@ fn youtube_audio_master(
     stop: &AtomicBool,
     use_cached: bool,
 ) -> Option<String> {
+    if stop.load(Ordering::Acquire) {
+        return None;
+    }
     if let Some(master) =
         crate::youtube_status::master(&plan.id, &plan.location).filter(|_| use_cached)
     {
@@ -1470,6 +1473,34 @@ fn youtube_cached_master_failed(
     decoded_for: Duration,
 ) -> bool {
     opened_master && !already_fresh && decoded_for < Duration::from_secs(10)
+}
+
+/// Run `work` on a helper thread and wait for it, polling `stop` every 50 ms.
+/// `None` when `stop` was raised first (the helper is detached; it finishes
+/// its own bounded work and its result is dropped) or the helper could not
+/// start; else `Some(result)`.
+fn run_until_stop<T, F>(stop: &AtomicBool, work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("multiview-audio-pin".to_owned())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .ok()?;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(result) => return Some(result),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
 }
 
 /// How long [`await_shared_url`] waits for the video's fetcher.
@@ -1632,6 +1663,13 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
             None
         };
         let shared_fetch = shared.is_some();
+        // A stop or a retired lifecycle during the shared-fetch wait ends the
+        // rail here, before any fallback network work starts.
+        if stop.load(Ordering::Acquire)
+            || (plan.lifecycle != 0 && crate::pipeline::live_lifecycle(&plan.id) != plan.lifecycle)
+        {
+            return;
+        }
         // A `YouTube` rail opens a resolved master, never its watch URL.
         let youtube_master = if plan.youtube && shared.is_none() {
             youtube_audio_master(plan, stop, !youtube_cache_failed)
@@ -1642,9 +1680,19 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         let origin = youtube_master.as_deref().unwrap_or(&plan.location);
         let pinned = if shared.is_some() {
             shared
+        } else if plan.live && is_hls && !skip_connection && plan.youtube {
+            // The master fetch for the pin runs on a helper thread so a stop
+            // abandons it at once (the helper ends within its own timeout).
+            let origin = origin.to_owned();
+            let headers = plan.http_headers.clone();
+            match run_until_stop(stop, move || {
+                crate::pipeline::resolve_hls_audio_url_with_headers(&origin, &headers)
+            }) {
+                Some(pin) => pin.or_else(|| youtube_master.clone()),
+                None => return,
+            }
         } else if plan.live && is_hls && !skip_connection {
             crate::pipeline::resolve_hls_audio_url_with_headers(origin, &plan.http_headers)
-                .or_else(|| youtube_master.clone())
         } else {
             None
         };
@@ -2875,8 +2923,34 @@ mod shared_url_wait_tests {
 
 #[cfg(test)]
 mod youtube_audio_helper_tests {
-    use super::{log_location, youtube_cached_master_failed};
-    use std::time::Duration;
+    use super::{log_location, run_until_stop, youtube_cached_master_failed};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Review TEARDOWN-01: a stop abandons a stalled pin fetch at once.
+    #[test]
+    fn a_stop_abandons_stalled_fallback_work_promptly() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let raiser = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            raiser.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let got = run_until_stop(&stop, || {
+            std::thread::sleep(Duration::from_secs(5));
+            7
+        });
+        assert_eq!(got, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let idle = AtomicBool::new(false);
+        assert_eq!(run_until_stop(&idle, || 7), Some(7));
+    }
 
     #[test]
     fn a_signed_master_is_logged_without_its_signature() {

@@ -78,7 +78,24 @@ pub fn sanitize_uri(uri: &str) -> String {
             .any(|key| segment.eq_ignore_ascii_case(key))
     });
     let tail = if signed_host || signed_path {
-        let last = tail.rsplit('/').next().unwrap_or_default();
+        // Keep the final segment only when it is not itself a credential
+        // value (the segment after a credential key, or a googlevideo path
+        // with no file name).
+        let mut segments = tail.rsplit('/');
+        let last = segments.next().unwrap_or_default();
+        let after_key = segments.next().is_some_and(|prev| {
+            PATH_CREDENTIAL_KEYS
+                .iter()
+                .any(|key| prev.eq_ignore_ascii_case(key))
+        });
+        let is_key = PATH_CREDENTIAL_KEYS
+            .iter()
+            .any(|key| last.eq_ignore_ascii_case(key));
+        let last = if after_key || is_key || (signed_host && !last.contains('.')) {
+            "<redacted>"
+        } else {
+            last
+        };
         if prefix.is_some() {
             format!("/…/{last}")
         } else {
@@ -467,6 +484,18 @@ mod tests {
             "https://cdn.example/…/1.ts"
         );
         assert_eq!(sanitize_uri("seg/signature/SECRET/2.ts"), "…/2.ts");
+        // A terminal credential value is never kept (review round 7).
+        for uri in [
+            "https://cdn.example/live/token/SECRET",
+            "https://rr3.googlevideo.com/videoplayback/lsig/SECRET",
+            "https://rr3.googlevideo.com/videoplayback/signature/SECRET",
+            "https://rr3.googlevideo.com/videoplayback/sq/42/SECRET",
+            "seg/signature/SECRET",
+        ] {
+            let clean = sanitize_uri(uri);
+            assert!(!clean.contains("SECRET"), "{uri} -> {clean}");
+            assert!(clean.ends_with("<redacted>"), "{uri} -> {clean}");
+        }
     }
 
     #[test]

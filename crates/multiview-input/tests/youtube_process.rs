@@ -284,3 +284,30 @@ fn operator_message_redacts_whole_urls_with_sub_delimiters() {
         assert!(message.contains("<url>"), "{message}");
     }
 }
+
+/// Review round 7: the startup `--version` probe is capped and redacted too.
+#[tokio::test]
+async fn the_version_probe_is_capped_and_redacted() {
+    use multiview_input::youtube::probe_version;
+    let _serial = EXEC_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let flood = fake_yt_dlp(dir.path(), "exec head -c 1073741824 /dev/zero");
+    let cfg = ResolverConfig::new(flood.to_str().unwrap(), Duration::from_secs(20));
+    let started = std::time::Instant::now();
+    assert!(probe_version(&cfg).await.is_err());
+    assert!(started.elapsed() < Duration::from_secs(15));
+
+    let dir = tempfile::tempdir().unwrap();
+    let failing = fake_yt_dlp(
+        dir.path(),
+        "echo 'ERROR: see https://h.test/signature/SECRET/x' >&2; exit 1",
+    );
+    let cfg = ResolverConfig::new(failing.to_str().unwrap(), Duration::from_secs(10));
+    let err = probe_version(&cfg).await.unwrap_err();
+    assert!(!err.to_string().contains("SECRET"), "{err}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let ok = fake_yt_dlp(dir.path(), "echo 2026.10.26");
+    let cfg = ResolverConfig::new(ok.to_str().unwrap(), Duration::from_secs(10));
+    assert_eq!(probe_version(&cfg).await.unwrap(), "2026.10.26");
+}

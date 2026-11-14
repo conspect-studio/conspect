@@ -331,7 +331,7 @@ where
             Err(e) => {
                 tracing::info!(
                     yt_dlp_path = %resolver_config.yt_dlp_path,
-                    error = %e,
+                    error = %multiview_ffmpeg::sanitize_line(&e.to_string()),
                     "yt-dlp not found/usable; youtube sources will report unavailable until it is installed"
                 );
                 None

@@ -177,38 +177,31 @@ fn bounded_text(text: &str) -> String {
 /// [`YoutubeError::Unavailable`] when the binary cannot be spawned, times out, or
 /// exits non-zero (the capability is simply reported unavailable).
 pub async fn probe_version(config: &ResolverConfig) -> Result<String, YoutubeError> {
-    let spawn = Command::new(&config.yt_dlp_path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output();
-
-    let output = match timeout(config.timeout, spawn).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(YoutubeError::Unavailable(e.to_string())),
-        Err(_) => {
+    // The same capped, deadline-bounded run as `-J` (both pipes drained under
+    // byte caps; the child is killed on overflow or timeout).
+    let stdout = match run_once(config, &["--version".to_owned()]).await {
+        Ok(stdout) => stdout,
+        Err(YoutubeError::Resolve(stderr)) => {
+            return Err(YoutubeError::Unavailable(format!(
+                "yt-dlp --version exited unsuccessfully: {}",
+                super::redact_urls(&stderr)
+            )))
+        }
+        Err(YoutubeError::Unavailable(reason)) => {
             return Err(YoutubeError::Unavailable(
-                "yt-dlp --version timed out".to_owned(),
+                reason.replace("yt-dlp -J", "yt-dlp --version"),
             ))
         }
+        Err(other) => return Err(other),
     };
-
-    if !output.status.success() {
-        return Err(YoutubeError::Unavailable(format!(
-            "yt-dlp --version exited unsuccessfully: {}",
-            bounded_stderr(&output.stderr)
-        )));
-    }
-
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if version.is_empty() {
+    // A version is one short line; anything else is not a usable yt-dlp.
+    let version = stdout.trim();
+    if version.is_empty() || version.len() > 64 || version.contains(char::is_control) {
         return Err(YoutubeError::Unavailable(
-            "yt-dlp --version produced no output".to_owned(),
+            "yt-dlp --version produced no usable version".to_owned(),
         ));
     }
-    Ok(version)
+    Ok(version.to_owned())
 }
 
 /// Read `pipe` to its end, keeping at most `cap` bytes; `Err` once more than

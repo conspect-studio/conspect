@@ -125,7 +125,7 @@ impl YoutubeError {
 }
 
 /// Replace every `http://` / `https://` URL token in `text` with `<url>`.
-fn redact_urls(text: &str) -> String {
+pub(crate) fn redact_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     loop {
