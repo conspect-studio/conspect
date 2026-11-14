@@ -121,14 +121,15 @@ impl MediaAlpha {
 /// The libav decoder a media player must open for `stream_index` to keep its
 /// alpha, when the default decoder would drop it: `libvpx-vp9` for VP9 with
 /// the `WebM` `alpha_mode=1` tag (libav's native `vp9` ignores the alpha side
-/// stream). `None` for every other stream, and for non-player sources (they
-/// stay opaque, ADR-0058 §5), and when `libvpx-vp9` is not linked.
+/// stream). `None` for every other stream and for non-player sources (they
+/// stay opaque, ADR-0058 §5). An alpha stream whose decoder is not linked
+/// also yields `None` but logs a warning (ADR-0112 §5): it plays opaque.
 pub(super) fn vp9_alpha_decoder(
+    id: &str,
     is_player: bool,
     input: &ffmpeg_next::format::context::Input,
     stream_index: usize,
 ) -> Option<&'static str> {
-    const LIBVPX_VP9: &str = "libvpx-vp9";
     if !is_player {
         return None;
     }
@@ -138,7 +139,65 @@ pub(super) fn vp9_alpha_decoder(
         .metadata()
         .get("alpha_mode")
         .is_some_and(|v| v.trim() == "1");
-    (vp9 && alpha && ffmpeg_next::decoder::find_by_name(LIBVPX_VP9).is_some()).then_some(LIBVPX_VP9)
+    let linked = ffmpeg_next::decoder::find_by_name(LIBVPX_VP9).is_some();
+    choose_vp9_alpha(
+        id,
+        StreamAlpha {
+            player: is_player,
+            vp9,
+            alpha_mode: alpha,
+        },
+        linked,
+    )
+}
+
+const LIBVPX_VP9: &str = "libvpx-vp9";
+
+/// Whether a media player's stream needs (and can get) the alpha decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vp9Alpha {
+    /// Not a player VP9 alpha stream: the default decoder, no warning.
+    NotAlpha,
+    /// VP9 with alpha and `libvpx-vp9` linked: open it.
+    Decoder(&'static str),
+    /// VP9 with alpha but no alpha-capable decoder: plays opaque.
+    NoAlphaDecoder,
+}
+
+/// What the demuxer says about a stream, for the alpha-decoder decision.
+#[derive(Debug, Clone, Copy)]
+struct StreamAlpha {
+    /// The source is a media player.
+    player: bool,
+    /// The stream is VP9.
+    vp9: bool,
+    /// The `WebM` `alpha_mode=1` tag is present.
+    alpha_mode: bool,
+}
+
+fn classify_vp9_alpha(stream: StreamAlpha, libvpx_linked: bool) -> Vp9Alpha {
+    let alpha_stream = stream.player && stream.vp9 && stream.alpha_mode;
+    match (alpha_stream, libvpx_linked) {
+        (false, _) => Vp9Alpha::NotAlpha,
+        (true, true) => Vp9Alpha::Decoder(LIBVPX_VP9),
+        (true, false) => Vp9Alpha::NoAlphaDecoder,
+    }
+}
+
+/// [`classify_vp9_alpha`] plus the ADR-0112 §5 warning, emitted once per
+/// open (this runs once per `open_and_stream`, never per frame).
+fn choose_vp9_alpha(id: &str, stream: StreamAlpha, libvpx_linked: bool) -> Option<&'static str> {
+    match classify_vp9_alpha(stream, libvpx_linked) {
+        Vp9Alpha::NotAlpha => None,
+        Vp9Alpha::Decoder(name) => Some(name),
+        Vp9Alpha::NoAlphaDecoder => {
+            tracing::warn!(
+                source = %id, decoder = LIBVPX_VP9,
+                "VP9 alpha asset but no alpha-capable decoder is linked; the asset plays opaque"
+            );
+            None
+        }
+    }
 }
 
 /// Open the software decoder `name`, logging and returning `None` on failure
@@ -367,6 +426,80 @@ mod tests {
             assert!(row[..6].iter().all(|&v| v <= 8), "left {row:?}");
             assert!(row[9..].iter().all(|&v| v >= 247), "right {row:?}");
         }
+    }
+
+    /// A `tracing` writer capturing formatted events into a shared buffer.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    fn warnings_from(f: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn stream(player: bool, vp9: bool, alpha_mode: bool) -> StreamAlpha {
+        StreamAlpha {
+            player,
+            vp9,
+            alpha_mode,
+        }
+    }
+
+    /// PB-5: a VP9-alpha asset without `libvpx-vp9` plays opaque *with a
+    /// warning* (ADR-0112 §5); ordinary opaque streams stay silent.
+    #[test]
+    fn vp9_alpha_without_an_alpha_decoder_warns_and_opaque_streams_do_not() {
+        let mut chosen = Some("unset");
+        let logs = warnings_from(|| {
+            chosen = choose_vp9_alpha("stinger", stream(true, true, true), false);
+        });
+        assert_eq!(chosen, None);
+        assert!(
+            logs.contains("WARN") && logs.contains("plays opaque") && logs.contains("stinger"),
+            "missing warning: {logs:?}"
+        );
+        for (player, vp9, alpha) in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (true, false, false),
+        ] {
+            let mut chosen = Some("unset");
+            let logs = warnings_from(|| {
+                chosen = choose_vp9_alpha("plain", stream(player, vp9, alpha), false);
+            });
+            assert_eq!(chosen, None);
+            assert!(logs.is_empty(), "{player} {vp9} {alpha}: {logs:?}");
+        }
+        let logs = warnings_from(|| {
+            chosen = choose_vp9_alpha("stinger", stream(true, true, true), true);
+        });
+        assert_eq!(chosen, Some(LIBVPX_VP9));
+        assert!(logs.is_empty(), "{logs:?}");
     }
 
     /// PB-2: an alpha scratch frame whose size cannot be allocated is an

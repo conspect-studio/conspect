@@ -115,12 +115,30 @@ tile. No switcher or drive code changes.
   `AlphaPlanePool` (`attach_with` writes it in place); the decoded-size and
   tile-size scratch frames and the alpha scaler are reused across frames
   (`Scaler::run_into`) and rebuilt only on a geometry change, so the steady
-  state does not grow the heap. Opaque assets build none of it.
+  state does not grow the heap. Opaque assets build none of it. Returning
+  a plane never waits: the frame's `Drop` (possibly on the output clock
+  thread) only `try_lock`s the pool and frees the plane on contention, and
+  `attach_with` holds the lock only to take the spare, never across the
+  copy/scale/extract (invariants #1/#10).
+- **FFI safety.** Scratch frames come from the checked
+  `multiview_ffmpeg::frame::alloc_video` (dimension cap, CPU format,
+  `av_frame_get_buffer` result), never the unchecked `Video::new`. Decoded
+  alpha is read through `frame::plane_rows`, which validates the plane,
+  its signed linesize, its subsampled height and that every row lies in
+  one of the frame's own buffers before yielding single-row slices, so a
+  bottom-up (negative linesize) frame copies in display order instead of
+  forming an out-of-bounds slice.
 - **Tests.** Pure: `multiview-core` `alpha::tests` (odd sizes, padded
   strides, 10/16-bit rescale, packed channels, bad input as errors).
-  Compositor: `tests/nv12_alpha.rs` pool reuse with no growth. Player path
+  Compositor: `tests/nv12_alpha.rs` pool reuse with no growth, and
+  `pipeline::alpha_pool_tests` (dropping an alpha frame while another thread
+  holds the pool lock completes and frees the plane). FFI:
+  `multiview-ffmpeg` `frame::tests`, `alpha::tests` (negative linesize,
+  mismatched layout) and `tests/scale_resample.rs` (bottom-up identity
+  `run_into`). Player path
   (ffmpeg): `pipeline::media_alpha::tests` (yuva → NV12+A, rgba/argb/bgra
-  → NV12+A, odd-size scaling, steady-state reuse) and
+  → NV12+A, odd-size scaling, steady-state reuse, an unallocatable scratch
+  frame as an error, the no-alpha-decoder warning) and
   `pipeline::media_alpha::player_tests`, which encode tiny qtrle, ProRes
   4444, PNG-in-MOV and VP9-alpha clips with the `ffmpeg` CLI at test time
   (printing `SKIP` when an encoder is missing), play them through the real

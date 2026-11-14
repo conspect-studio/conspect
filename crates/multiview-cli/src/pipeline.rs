@@ -17138,7 +17138,8 @@ fn open_and_stream(
     // A media player's VP9-with-alpha asset (WebM `alpha_mode=1`) opens
     // `libvpx-vp9`, the only libav decoder that merges the alpha side stream
     // (ADR-0058 §3, #391); without it the asset plays opaque, as today.
-    let vp9_alpha = media_alpha::vp9_alpha_decoder(plan.player.is_some(), &input, stream_index);
+    let vp9_alpha =
+        media_alpha::vp9_alpha_decoder(&plan.id, plan.player.is_some(), &input, stream_index);
     let (decoder, used_hw) = match vp9_alpha
         .and_then(|name| media_alpha::open_named(&plan.id, params.clone(), time_base, name))
     {
