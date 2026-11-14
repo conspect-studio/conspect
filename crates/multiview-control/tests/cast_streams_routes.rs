@@ -929,6 +929,48 @@ async fn media_types_cache_cors_range_head_and_scope() {
     assert!(doc["fetches"]["segments"].as_u64().unwrap() >= 3);
 }
 
+/// #418: a `WebVTT` subtitle segment of the stream is served as `text/vtt`
+/// under the same token checks and counted as a segment fetch; another
+/// subtitle extension is not served.
+#[tokio::test]
+async fn webvtt_segments_are_served_as_text_vtt_and_counted_as_segments() {
+    let rig = rig();
+    let (_, a) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let ta = token_of(&a);
+    let dir = rig.dir.path().join("cast-1");
+    std::fs::write(dir.join("sub0-1-0.vtt"), "WEBVTT\n\n").unwrap();
+    std::fs::write(dir.join("sub0-1-0.srt"), "1\n").unwrap();
+    let r = send(
+        &rig.router,
+        public("GET", &format!("/cast/{ta}/sub0-1-0.vtt"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()[header::CONTENT_TYPE], "text/vtt");
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(body_bytes(r).await, b"WEBVTT\n\n");
+    let (status, body) = fetch(&rig, &format!("/cast/{ta}/sub0-1-0.srt")).await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::NOT_FOUND, &b"not found\n"[..])
+    );
+    let (status, _) = fetch(&rig, &format!("/cast/{}/sub0-1-0.vtt", "B".repeat(43))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let id = a["id"].as_str().unwrap();
+    let doc = body_json(
+        send(
+            &rig.router,
+            support::get(&format!("/api/v1/cast/streams/{id}"), OPERATOR_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(doc["fetches"]["segments"], 1, "{doc}");
+    assert_eq!(doc["fetches"]["playlists"], 0, "{doc}");
+}
+
 fn report_req(token: &str, body: Vec<u8>) -> Request<Body> {
     public("POST", &format!("/cast/{token}/report"))
         .header(header::CONTENT_TYPE, "application/json")
