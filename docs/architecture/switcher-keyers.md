@@ -2,7 +2,8 @@
 
 Decision record: [ADR-0113](../decisions/ADR-0113-keyers-on-the-program-drive.md). Model
 background: [ADR-0056](../decisions/ADR-0056.md), [production-switcher.md §6](../research/production-switcher.md#6-keyers).
-This note is the build plan on main as of `1b59d254`. It is design only: nothing here is built yet.
+This note is the build plan on main as of `1b59d254`. §14 records what each slice built and where it
+deviates.
 
 Vocabulary: **USK** is an upstream keyer. It belongs to the M/E scene and can change state with
 a background transition. **DSK** is a downstream keyer. It belongs to the program and stays on
@@ -461,3 +462,50 @@ as-built drive and assume a render-plan resolver that was not built.
 FTB, multi-M/E, aux buses, compositions as keyer fills, shaped (premultiplied) fills, keyer
 borders, shadows and bilinear or sub-pixel scaling (SW-25 #51), keyer audio, and a T-bar for
 keyers.
+
+## 14. As built
+
+### K1 (#386): CPU oracle
+
+- `multiview_compositor::key`: `TileKey` (`KeyKind::{Linear, Luma}`, optional key source, invert,
+  `KeyMask` in fill-source pixels), `TileGroup::{Top, Scene {member, merge}}`, `SceneMember::{Both,
+  Out, In}` and `SceneMerge::{Mix, Dip}`. `Tile` gains `key` and `group` (`with_key`, `in_group`);
+  `Tile::placed`/`scaled` keep `key: None, group: Top`, so every existing caller is byte-for-byte
+  unchanged (the oracle-equivalence and scratch-reuse suites pass unmodified).
+- Coverage is `opacity × fill_alpha × mask × matte`, premultiplied once at the existing step. The
+  key source is sampled with its own nearest-neighbour map, and its Y is range-expanded with its own
+  range. A NaN or negative gain reads as 0 and a NaN weight as 0, so a bad parameter never poisons
+  a pixel.
+- Groups: a run of grouped tiles folds into two pooled per-band accumulators (`BandScratch`
+  `scene_out`/`scene_in`, grow-only, counted in `scratch_alloc_count`) and merges at the next `Top`
+  tile or the end of the list. While any tile is grouped the band's accumulator spans the whole
+  band, because a DIP merge colours pixels no tile covers. Frames with no grouped tile keep the
+  covered-span path unchanged.
+- **Deviation: WIPE merge and the GPU key path are not in K1.** `SceneMerge::Wipe` lands with K3 on
+  top of lane `transitions`' mask. The WGSL key path (`key_params`, binding 6) is not merged before
+  #395. Until it is, `GpuCompositor` refuses a frame with a keyed or grouped tile with a typed
+  `GpuLimit`, and `RunBackend` routes a keyed or grouped frame (an allocation-free scan, before
+  any GPU work) to a **persistent** CPU reference owned by the GPU compositor, whose LUT cache and
+  band/scene scratch survive across ticks (counted in `gpu_cpu_fallback_frames`; its pool is what
+  `scratch_alloc_count` reports on a GPU backend). It is never drawn without its key. A genuine
+  GPU failure falls back through the same persistent backend. The LUT cache checks a frame's transfer set
+  in place (no per-frame list is built unless the set changed). The parallel CPU path still spawns
+  its scoped band threads each frame, as it did before K1: a fixed, bounded cost, tracked in #416
+  (persistent band workers). #395 (the bounded GPU readback, PR #424) merged after K1 was written; the
+  persistent fallback is now main's `cpu_fallback_backend`, and the WGSL key path is the next GPU
+  step (owed, tracked on #386). ADR-0113 §9 already bounds this:
+  the default budget is 1 full-canvas DSK until the mda001 run passes.
+- Tests: `tests/keyers_cpu.rs` (20: goldens for linear self key with alpha used once, linear key
+  source, luma clip/gain/invert, luma on a key source, mask with a flying key, unequal fill/key
+  sizes up and down, mixed ranges, premultiply-once after primaries, weight; a monotonic and
+  bounded clip/gain property; exact MIX and DIP scene merges against an independent per-pixel
+  computation written out in the test (never the production helpers), both DIP legs; a NaN weight
+  reads as 0; the tile-driven kernel equal to the oracle with keys and groups at 1-4 threads, on a
+  small canvas (proptest) and on a 320x256 canvas above the parallel threshold with tiles across
+  band edges; no scratch growth over 50 grouped composites) and `tests/keyers_gpu_fallback.rs`
+  (`wgpu`: the refusal, the oracle-equal fallback, and no scratch growth or LUT rebuild over 20
+  repeated keyed and grouped fallback frames).
+- Bench: `examples/keyer_composite_bench.rs`. CPU figures from a shared 56-core devcontainer (not
+  the target host; median ms at 1080p): 0 keyers 30.0, 1 full-canvas alpha DSK 41.1, 2 full-canvas
+  keyers 54.5, 2 flying 576x324 31.2, 1080p source in a 128x72 fly 27.6, key-changing MIX + DSK
+  58.9. The calibration of `u` and `fold` on the RTX 4060 is owed with the GPU key path.
