@@ -26,6 +26,8 @@ export declare class ChromeCastMediaInfo {
   hlsSegmentFormat?: string;
   hlsVideoSegmentFormat?: string;
   metadata?: ChromeCastMediaMetadata;
+  /** The media's audio/text/video tracks, as published by the receiver (`chrome.cast.media.MediaInfo.tracks`). */
+  tracks?: readonly ChromeCastTrack[] | null;
 }
 
 export declare class ChromeCastGenericMediaMetadata {
@@ -50,14 +52,13 @@ export interface ChromeCastTrack {
 }
 
 export interface ChromeCastMedia {
+  /** The loaded `MediaInfo`; its `tracks` field carries the audio/text/video tracks (`chrome.cast.media.Media.media`). */
   readonly media?: ChromeCastMediaInfo;
   /** `chrome.cast.media.PlayerState` (`IDLE`, `PLAYING`, `PAUSED`, `BUFFERING`). */
   readonly playerState?: string;
   /** `chrome.cast.media.IdleReason` when `playerState` is `IDLE`. */
   readonly idleReason?: string | null;
-  /** The media session's tracks (audio/text/video), from `media.tracks` in MEDIA_STATUS. */
-  readonly tracks?: readonly ChromeCastTrack[] | null;
-  /** The currently active track ids (one per kind that has a selection). */
+  /** The currently active track ids (one per kind that has a selection); lives on `Media` itself, not `Media.media`. */
   readonly activeTrackIds?: readonly number[] | null;
   addUpdateListener: (listener: (isAlive?: boolean) => void) => void;
   removeUpdateListener: (listener: (isAlive?: boolean) => void) => void;

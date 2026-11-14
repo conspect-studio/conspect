@@ -4,14 +4,22 @@ import { describe, expect, it } from 'vitest';
 
 import { messages } from '../locales/en/messages';
 import { EMPTY_TRACKS, MAX_TRACKS, deriveTracks } from './castTracks';
-import type { ChromeCastMedia, ChromeCastTrack } from './castTypes';
+import type { ChromeCastMedia, ChromeCastMediaInfo, ChromeCastTrack } from './castTypes';
 
 i18n.load('en', messages);
 i18n.activate('en');
 
 function media(tracks: readonly ChromeCastTrack[] | null, activeTrackIds: readonly number[] | null): ChromeCastMedia {
-  return {
+  // Real SDK shape: tracks live on the nested `MediaInfo` (`Media.media`),
+  // not on `Media` itself; only `activeTrackIds` is on the outer `Media`.
+  const mediaInfo: ChromeCastMediaInfo = {
+    contentId: 'content',
+    contentType: 'application/vnd.apple.mpegurl',
+    streamType: 'LIVE',
     tracks,
+  };
+  return {
+    media: mediaInfo,
     activeTrackIds,
     addUpdateListener: () => undefined,
     removeUpdateListener: () => undefined,

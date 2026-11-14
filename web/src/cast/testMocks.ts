@@ -12,6 +12,7 @@ import type {
   CastSessionStateEventData,
   CastVolumeEventData,
   ChromeCastMedia,
+  ChromeCastMediaInfo,
   ChromeCastMediaNamespace,
   ChromeCastNamespace,
   ChromeCastTrack,
@@ -30,6 +31,7 @@ class MockMediaInfo {
   hlsSegmentFormat?: string;
   hlsVideoSegmentFormat?: string;
   metadata?: { metadataType: number; title?: string };
+  tracks?: readonly ChromeCastTrack[] | null;
   constructor(contentId: string, contentType: string) {
     this.contentId = contentId;
     this.contentType = contentType;
@@ -115,11 +117,19 @@ export function installMockCastSdk(options: { deviceName?: string } = {}): MockC
       successCallback?.();
     },
   );
-  // The real `chrome.cast.media.Media` exposes its state as properties.
+  // The real `chrome.cast.media.Media` exposes its state as properties; the
+  // tracks list lives on the nested `media` (`MediaInfo`), not on `Media`
+  // itself — only `activeTrackIds` is on the outer `Media`.
+  const nestedMediaInfo: ChromeCastMediaInfo = {
+    contentId: '',
+    contentType: '',
+    streamType: '',
+    tracks: null,
+  };
   const mediaSession: ChromeCastMedia & { playerState?: string; idleReason?: string | null } = {
+    media: nestedMediaInfo,
     playerState: 'PLAYING',
     idleReason: null,
-    tracks: null,
     activeTrackIds: null,
     addUpdateListener: (listener: (isAlive?: boolean) => void) => {
       mediaUpdateListener = listener;
@@ -132,7 +142,7 @@ export function installMockCastSdk(options: { deviceName?: string } = {}): MockC
     }),
     editTracksInfo,
   };
-  const mutableMedia = mediaSession as { tracks?: readonly ChromeCastTrack[] | null; activeTrackIds?: readonly number[] | null };
+  const mutableMedia = mediaSession as { activeTrackIds?: readonly number[] | null };
 
   const device: CastDevice = { friendlyName: deviceName };
 
@@ -287,7 +297,7 @@ export function installMockCastSdk(options: { deviceName?: string } = {}): MockC
       notifyVolume();
     },
     emitTracks: (tracks, activeTrackIds): void => {
-      mutableMedia.tracks = tracks;
+      nestedMediaInfo.tracks = tracks;
       mutableMedia.activeTrackIds = activeTrackIds;
       mediaUpdateListener?.(true);
     },

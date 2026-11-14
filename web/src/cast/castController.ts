@@ -132,7 +132,7 @@ const DEFAULT_API: CastStreamApi = {
 
 /** How long after LOAD a TV that fetched nothing is reported as unable to reach us. */
 export const TV_UNREACHABLE_MS = 10_000;
-const POLL_MS = 2_000;
+export const POLL_MS = 2_000;
 const STORAGE_KEY = 'conspect.cast.active';
 /** Remembered audio/text language+name choice (bounded field length, like `StoredCast`). */
 const PREFS_STORAGE_KEY = 'conspect.cast.trackPrefs';
@@ -486,18 +486,20 @@ export class CastController {
         return;
       }
       this.emit({ status: 'loading' });
+      // Keep the OLD watch attached (polling the old stream, listening to the
+      // old media session) until LOAD actually succeeds: a rejected LOAD must
+      // leave the old stream as the active one, with no gap in watching it.
+      // Only install the replacement watch after that success (MEDIA-2).
+      await session.loadMedia(buildLoadRequest(playable, name, loadCustomDataFor(readTrackPrefs())));
+      if (!current()) {
+        abandon();
+        return;
+      }
       watch.detach();
       if (this.watch === watch) this.watch = null;
       const newWatch = this.makeWatch(context, session, playable.id, receiver.namespace);
       this.watch = newWatch;
       newWatch.start();
-      await session.loadMedia(buildLoadRequest(playable, name, loadCustomDataFor(readTrackPrefs())));
-      if (!current()) {
-        newWatch.detach();
-        if (this.watch === newWatch) this.watch = null;
-        abandon();
-        return;
-      }
       newWatch.attachMedia();
       newWatch.ping();
       this.loadedAt = this.now();

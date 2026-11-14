@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { i18n } from '@lingui/core';
 
 import { messages } from '../locales/en/messages';
-import { CastController, TV_UNREACHABLE_MS } from './castController';
+import { CastController, POLL_MS, TV_UNREACHABLE_MS } from './castController';
 import type { CastTarget } from './castController';
 import { CAST_NAMESPACE } from './castReport';
 import { resetCastSdkLoaderForTests } from './sdkLoader';
@@ -521,6 +521,42 @@ describe('CastController', () => {
       expect(snap.output).toBe('cast-1');
       expect(snap.streamId).toBe('cs-1');
       expect(sdk.loadMedia).toHaveBeenCalledTimes(1);
+    });
+
+    it('a rejected LOAD keeps watching the old stream and leaves track selection working on it (MEDIA-2)', async () => {
+      api = fakeApi(streamDoc({ id: 'cs-1', output: 'cast-1' }), () => streamDoc({ id: 'cs-1', output: 'cast-1' }));
+      make();
+      await controller.start(PROGRAM);
+
+      api.create.mockImplementationOnce(() => Promise.resolve(streamDoc({ id: 'cs-2', output: 'cast-2' })));
+      sdk.loadMedia.mockRejectedValueOnce(new Error('LOAD refused by receiver'));
+
+      await controller.switchOutput('cast-2', 'Output 2');
+
+      // The old stream is still the active one; the replacement was deleted,
+      // the old one was never removed.
+      const snap = controller.getSnapshot();
+      expect(snap.output).toBe('cast-1');
+      expect(snap.streamId).toBe('cs-1');
+      expect(api.remove).toHaveBeenCalledWith('cs-2');
+      expect(api.remove).not.toHaveBeenCalledWith('cs-1');
+
+      // The poll still targets the OLD stream (cs-1), not the deleted cs-2.
+      api.get.mockClear();
+      await vi.advanceTimersByTimeAsync(POLL_MS);
+      expect(api.get).toHaveBeenCalledWith('cs-1');
+      expect(api.get).not.toHaveBeenCalledWith('cs-2');
+
+      // Track selection still works: editTracksInfo fires on the OLD media
+      // session (the only one the SDK mock tracks), not a dangling replacement.
+      sdk.emitTracks([{ trackId: 1, type: 'AUDIO', name: 'English', language: 'en' }], [1]);
+      await controller.selectAudio(1);
+      expect(sdk.editTracksInfo).toHaveBeenCalledWith(
+        expect.objectContaining({ activeTrackIds: [1] }),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(controller.getSnapshot().trackError).toBeNull();
     });
   });
 });

@@ -1,6 +1,8 @@
 // Track model derived from the CAF sender's media session
-// (`chrome.cast.media.Media.tracks` / `.activeTrackIds`), as published by the
-// receiver in MEDIA_STATUS (DESIGN-418 decision 6/7). Pure, framework-agnostic.
+// (`chrome.cast.media.Media.media.tracks` — the nested `MediaInfo` — and
+// `Media.activeTrackIds`, which stays on the outer `Media`), as published by
+// the receiver in MEDIA_STATUS (DESIGN-418 decision 6/7). Pure,
+// framework-agnostic.
 import { t } from '@lingui/core/macro';
 
 import type { ChromeCastMedia, ChromeCastTrack } from './castTypes';
@@ -45,7 +47,7 @@ function toOption(track: ChromeCastTrack): CastTrackOption {
  */
 export function deriveTracks(media: ChromeCastMedia | null | undefined): CastTracksSnapshot {
   if (media == null) return EMPTY_TRACKS;
-  const raw = media.tracks;
+  const raw = media.media?.tracks;
   if (raw == null) return EMPTY_TRACKS;
   const active = new Set(media.activeTrackIds ?? []);
   const audioTracks: CastTrackOption[] = [];
