@@ -26,7 +26,9 @@ pub mod account;
 pub mod alarms;
 pub mod audio;
 pub mod audit;
+pub mod cast_public;
 pub mod cast_sessions;
+pub mod cast_streams;
 pub(crate) mod catalogue;
 pub mod cloudflare;
 pub mod config;
@@ -1081,19 +1083,52 @@ pub(crate) fn authenticate_principal(
     parts: &axum::http::request::Parts,
     state: &AppState,
 ) -> Result<Principal, ControlError> {
+    authenticate(parts, state).map(|(principal, _)| principal)
+}
+
+/// Authenticate the request once and return the [`Principal`] together with
+/// HOW it authenticated (ABUSE-3): the provenance is the branch that
+/// actually succeeded, in the same step, never inferred later by verifying
+/// the credential again (a key revoked in between would otherwise read as
+/// "not a native key, so a JWT").
+pub(crate) fn authenticate(
+    parts: &axum::http::request::Parts,
+    state: &AppState,
+) -> Result<(Principal, crate::cast_streams::AuthOrigin), ControlError> {
+    use crate::cast_streams::AuthOrigin;
     // Auth disabled (explicit trusted-network mode): every request is a local
     // admin, no credential required.
     if state.auth_disabled {
-        return Ok(Principal::local_admin());
+        return Ok((Principal::local_admin(), AuthOrigin::LocalAdmin));
     }
     let header = header_value(&parts.headers, header::AUTHORIZATION);
     // Primary: native API key. If that fails and a JWT validator is
     // configured, fall back to OAuth2/JWT (the alternative authn path).
     match state.api_keys.verify_authorization(header.as_deref()) {
-        Ok(principal) => Ok(principal),
+        Ok(principal) => Ok((principal, AuthOrigin::ApiKey)),
         Err(api_key_err) => state
             .authenticate_jwt(header.as_deref())
-            .ok_or(api_key_err)?,
+            .ok_or(api_key_err)?
+            .map(|principal| (principal, AuthOrigin::Jwt)),
+    }
+}
+
+/// An authenticated request: its [`Principal`] and the provenance of that
+/// very authentication ([`authenticate`]; ABUSE-3). For handlers that record
+/// how their caller authenticated (cast stream creation).
+#[derive(Debug, Clone)]
+pub(crate) struct Authenticated(pub Principal, pub crate::cast_streams::AuthOrigin);
+
+impl axum::extract::FromRequestParts<AppState> for Authenticated {
+    type Rejection = ControlError;
+
+    fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(
+            authenticate(parts, state).map(|(principal, origin)| Self(principal, origin)),
+        )
     }
 }
 
@@ -1338,6 +1373,17 @@ fn device_router() -> Router<AppState> {
         .route(
             "/cast/sessions/{id}/volume",
             post(cast_sessions::set_cast_volume),
+        )
+        // Cast stream tokens for the browser sender (ADR-0111): the cast
+        // config, and token-scoped streams of one cast output each.
+        .route("/cast/config", get(cast_streams::get_cast_config))
+        .route(
+            "/cast/streams",
+            get(cast_streams::list_cast_streams).post(cast_streams::create_cast_stream),
+        )
+        .route(
+            "/cast/streams/{id}",
+            get(cast_streams::get_cast_stream).delete(cast_streams::delete_cast_stream),
         )
         // mDNS device discovery (ADR-M008 §6 / ADR-0041): kick a time-bounded
         // browse (202 + device.discovered events) and read the untrusted

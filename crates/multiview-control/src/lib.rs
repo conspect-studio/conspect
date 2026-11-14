@@ -48,6 +48,8 @@ pub mod audit;
 pub mod auth;
 pub mod automation;
 pub mod boot_model;
+pub mod cast_engine;
+pub mod cast_streams;
 pub mod catalogue;
 #[cfg(all(feature = "tls", unix))]
 pub mod certificate_source;
@@ -302,6 +304,7 @@ pub fn router_with(state: AppState, surface: Surface) -> Router {
             output_routing::spawn_outcome_relay(&state, control);
         }
         patch::spawn_persist_relay(&state);
+        cast_streams::lifecycle::spawn_sweeper(&state);
         if let Some(metrics) = state.program_metrics.as_ref() {
             program_metrics::spawn_sampler(metrics);
         }
@@ -374,7 +377,11 @@ pub fn router_with(state: AppState, surface: Surface) -> Router {
         .merge(nmos::nmos_router())
         // Public IPTV playlist + guide (epg-playlist): outside `/api/v1`, the
         // same unauthenticated delivery model as the `/hls/{output}` mounts.
-        .merge(routes::iptv::public_router());
+        .merge(routes::iptv::public_router())
+        // Public cast media, receiver reports and the receiver app (ADR-0111):
+        // token-scoped, inside the per-IP and concurrency caps, ahead of the
+        // SPA fallback (an unknown token is the route's own 404).
+        .merge(routes::cast_public::public_router());
 
     #[cfg(feature = "openapi")]
     let app = app.merge(openapi::openapi_router());

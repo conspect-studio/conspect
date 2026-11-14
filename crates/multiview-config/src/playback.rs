@@ -360,6 +360,19 @@ impl Output {
                 ],
                 vlc_command: None,
             }],
+            // A cast output has no public URL at all: its files exist only
+            // while a cast stream is active and are served through that
+            // stream's private token (never under `/hls`).
+            Output::Cast { .. } => vec![PlaybackUrl {
+                label: "Playback URL".to_owned(),
+                url: None,
+                notes: vec![
+                    "a cast output has no playback URL: start a cast from the Cast page and \
+                     the receiver is given a private, expiring stream address"
+                        .to_owned(),
+                ],
+                vlc_command: None,
+            }],
         }
     }
 }
