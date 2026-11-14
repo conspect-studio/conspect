@@ -2340,6 +2340,22 @@ once that muxer writes its rule.)
   - With a consumer, the bytes are copied once into an `Arc<[u8]>`. A
     length-prefixed packet is re-framed as Annex B in that same copy, so every
     `TapAu` is Annex B and a reconnect cannot change framing under a reader.
+    `idr::annex_b_size` computes the re-framed size before anything is
+    allocated, with checked arithmetic and a 1024-NAL budget. A result over
+    `MAX_AU_BYTES` is counted as oversize at once; a malformed prefix is
+    counted separately. `to_annex_b` then writes into a single `Arc<[u8]>` of
+    the exact size (review R1-A-2).
+  - For an H.264 source, the writer caches the connection's SPS/PPS: from the
+    avcC or Annex-B extradata first, then replaced by in-band sets as they
+    pass. Each set is bounded to 4 KiB. When an IDR carries neither set, the
+    writer adds the current ones (after a leading AUD) before classifying it.
+    An MP4/avc1 source, whose sets live only in extradata, therefore yields
+    strict IDRs and can pass through. A reconnect starts from its own
+    extradata (review R1-M-1).
+  - Extradata over 64 KiB (`multiview_ffmpeg::MAX_FACTS_EXTRADATA`, checked on
+    the length) is never copied. That connection gets no writer, so
+    passthrough is off for it, and the refusal is counted as
+    `refused_extradata`. A configuration is never truncated (review R1-A-1).
   - Each `TapAu` is classified: `strict_idr` through `idr::is_self_contained_idr`
     and `reference` through `idr::h264_is_reference` (`nal_ref_idc`).
     `arrival_ns` comes from the run's monotonic `TimeSource`.
@@ -2361,8 +2377,10 @@ once that muxer writes its rule.)
   `dts = tick`. That packet is one of:
   - the source AU: its bytes unchanged, `pts = tick + source reorder + the
     clock's bounded delay`;
-  - an H.264 repeat AU: one `RepeatAuBuilder` per `params_gen`, built from
-    that generation's in-band SPS/PPS;
+  - an H.264 repeat AU. There is one `RepeatAuBuilder` per `params_gen`,
+    primed from that generation's strict-IDR SPS/PPS as the key drains the
+    AUs, because the AU a repeat follows is usually a P without sets. A new
+    generation drops the builder (review R1-M-2);
   - the **format slate**: one closed black GOP, baked once by `bake_slate`
     with `VideoRenditionEncoder` at the slot's `EncodeConfig`. The encoder is
     dropped right after, so no session is held. The slate is always entered at
