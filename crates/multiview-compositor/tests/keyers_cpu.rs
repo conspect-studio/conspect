@@ -602,28 +602,13 @@ fn a_nan_weight_reads_as_zero_and_never_poisons_the_layers_beneath() {
     }
 }
 
-#[test]
-fn a_malformed_wipe_mask_covers_nothing_and_never_poisons_the_layers_beneath() {
-    // Merge review R-1: `WipeMask` has public fields, so a NaN or out-of-range
-    // field must not reach the premultiply. A malformed mask covers nothing,
-    // on a plain tile and on a keyed one, on both kernels.
+/// Masks a caller could build from public fields that no `WipeMask::new` for
+/// an 8x8 canvas produces (merge reviews R-1..R-5).
+fn malformed_masks(
+    good: multiview_compositor::mask::WipeMask,
+) -> Vec<multiview_compositor::mask::WipeMask> {
     use multiview_compositor::mask::{MaskShape, WipeMask};
-    let c = bt709(ColorRange::Limited);
-    let bg = solid(8, 8, 140, 100, 160, c);
-    let k = solid(8, 8, 220, 128, 128, c);
-    let base = comp(8, 8, &[Tile::placed(&bg, 0, 0, 1.0)]);
-    let good = WipeMask::new(
-        MaskShape::Horizontal,
-        0.5,
-        8,
-        8,
-        [0.0, 0.0],
-        false,
-        0.1,
-        0.0,
-    );
-    assert!(good.is_well_formed());
-    let malformed = [
+    vec![
         WipeMask {
             pinned: Some(f32::NAN),
             ..good
@@ -654,9 +639,68 @@ fn a_malformed_wipe_mask_covers_nothing_and_never_poisons_the_layers_beneath() {
         },
         WipeMask { width: 0, ..good },
         WipeMask { height: 0, ..good },
-    ];
+        // R-6: finite fields whose intermediates overflow (`extent - radius`).
+        WipeMask {
+            shape: MaskShape::Circle,
+            origin: [f32::MAX, 0.0],
+            extent: f32::MAX,
+            radius: -f32::MAX,
+            reverse: true,
+            softness: 1.0,
+            ..good
+        },
+        WipeMask {
+            radius: 1.0e30,
+            ..good
+        },
+        WipeMask {
+            softness: 2.0,
+            ..good
+        },
+        WipeMask {
+            aspect: 0.0,
+            ..good
+        },
+        WipeMask {
+            aspect: -1.0,
+            ..good
+        },
+        WipeMask {
+            aspect: 2.0,
+            ..good
+        },
+        WipeMask {
+            width: 16,
+            height: 16,
+            ..good
+        },
+    ]
+}
+
+#[test]
+fn a_malformed_wipe_mask_covers_nothing_and_never_poisons_the_layers_beneath() {
+    // Merge review R-1: `WipeMask` has public fields, so a NaN or out-of-range
+    // field must not reach the premultiply. A malformed mask covers nothing,
+    // on a plain tile and on a keyed one, on both kernels.
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    let c = bt709(ColorRange::Limited);
+    let bg = solid(8, 8, 140, 100, 160, c);
+    let k = solid(8, 8, 220, 128, 128, c);
+    let base = comp(8, 8, &[Tile::placed(&bg, 0, 0, 1.0)]);
+    let good = WipeMask::new(
+        MaskShape::Horizontal,
+        0.5,
+        8,
+        8,
+        [0.0, 0.0],
+        false,
+        0.1,
+        0.0,
+    );
+    assert!(good.is_valid_for(8, 8));
+    let malformed = malformed_masks(good);
     for mask in malformed {
-        assert!(!mask.is_well_formed(), "{mask:?}");
+        assert!(!mask.is_valid_for(8, 8), "{mask:?}");
         for keyed in [false, true] {
             let tile = Tile::placed(&k, 0, 0, 1.0).with_mask(mask);
             let tile = if keyed {
@@ -860,4 +904,127 @@ fn keys_and_groups_across_band_boundaries_match_the_oracle_on_every_thread_count
             "no growth after warmup"
         );
     }
+}
+
+proptest! {
+    /// Every mask the engine can build (`WipeMask::new`, and `expanded` for
+    /// the border band) is valid for its own canvas, so the R-1..R-6 checks
+    /// never suppress a real wipe.
+    #[test]
+    fn every_constructed_wipe_mask_is_valid_for_its_canvas(
+        shape in 0_usize..5,
+        progress in -0.5_f32..1.5,
+        w in 1_u32..4096,
+        h in 1_u32..4096,
+        ox in -0.5_f32..1.5,
+        oy in -0.5_f32..1.5,
+        reverse in any::<bool>(),
+        softness in -0.5_f32..1.5,
+        border in -0.5_f32..1.5,
+    ) {
+        use multiview_compositor::mask::{MaskShape, WipeMask};
+        let shape = [
+            MaskShape::Horizontal,
+            MaskShape::Vertical,
+            MaskShape::Diagonal,
+            MaskShape::Box,
+            MaskShape::Circle,
+        ][shape];
+        let mask = WipeMask::new(shape, progress, w, h, [ox, oy], reverse, softness, border);
+        prop_assert!(mask.is_valid_for(w, h), "{:?}", mask);
+        prop_assert!(mask.expanded(border).is_valid_for(w, h));
+    }
+}
+
+/// Merge review R-7: a valid mask with a tiny positive softness never overflows
+/// the edge (`d / softness`); it draws as the hard edge of the same wipe.
+#[test]
+fn a_tiny_softness_wipe_draws_as_a_hard_edge() {
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    let c = bt709(ColorRange::Limited);
+    let bg = solid(16, 2, 140, 100, 160, c);
+    let k = solid(16, 2, 220, 128, 128, c);
+    let tiny = WipeMask::new(
+        MaskShape::Horizontal,
+        0.75,
+        16,
+        2,
+        [0.0, 0.0],
+        false,
+        f32::MIN_POSITIVE,
+        0.0,
+    );
+    assert!(tiny.is_valid_for(16, 2));
+    let hard = WipeMask::new(
+        MaskShape::Horizontal,
+        0.75,
+        16,
+        2,
+        [0.0, 0.0],
+        false,
+        0.0,
+        0.0,
+    );
+    for x in 0..16 {
+        assert!(tiny.coverage(x, 0).is_finite());
+        assert_eq!(tiny.coverage(x, 0), hard.coverage(x, 0), "x={x}");
+    }
+    let draw = |m| {
+        comp(
+            16,
+            2,
+            &[
+                Tile::placed(&bg, 0, 0, 1.0),
+                Tile::placed(&k, 0, 0, 1.0).with_mask(m),
+            ],
+        )
+    };
+    assert_eq!(draw(tiny), draw(hard));
+}
+
+/// Merge review R-8: a subnormal softness is a hard edge on both paths (a GPU
+/// may flush it to zero): a pixel exactly on the edge reads 1, as with
+/// softness 0, never an overflow or a 0.5 the GPU could not reproduce.
+#[test]
+fn a_subnormal_softness_is_a_hard_edge() {
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    let sub = WipeMask::new(
+        MaskShape::Horizontal,
+        0.25,
+        2,
+        2,
+        [0.0, 0.0],
+        false,
+        f32::from_bits(1),
+        0.0,
+    );
+    let hard = WipeMask::new(
+        MaskShape::Horizontal,
+        0.25,
+        2,
+        2,
+        [0.0, 0.0],
+        false,
+        0.0,
+        0.0,
+    );
+    assert!(sub.is_valid_for(2, 2));
+    // Pixel (0, 0) has u = 0.25 = radius: exactly on the edge (d = 0).
+    assert_eq!(sub.radius, 0.25);
+    for x in 0..2 {
+        assert_eq!(sub.coverage(x, 0), hard.coverage(x, 0), "x={x}");
+    }
+    assert_eq!(sub.coverage(0, 0), 1.0);
+    // The smallest normal softness is soft: the on-edge pixel reads 0.5.
+    let normal = WipeMask::new(
+        MaskShape::Horizontal,
+        0.25,
+        2,
+        2,
+        [0.0, 0.0],
+        false,
+        f32::MIN_POSITIVE,
+        0.0,
+    );
+    assert_eq!(normal.coverage(0, 0), 0.5);
 }

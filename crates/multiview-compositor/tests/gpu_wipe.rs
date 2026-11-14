@@ -99,6 +99,70 @@ fn gpu_wipe_masks_match_the_cpu_reference() {
     }
 }
 
+/// Masks a caller could build from public fields that `WipeMask::new` for a
+/// `W x H` canvas never produces (PR #406 merge reviews R-1..R-6).
+fn malformed(good: WipeMask) -> Vec<WipeMask> {
+    vec![
+        WipeMask {
+            pinned: Some(f32::NAN),
+            ..good
+        },
+        WipeMask {
+            pinned: Some(2.0),
+            ..good
+        },
+        WipeMask {
+            radius: f32::NAN,
+            ..good
+        },
+        WipeMask {
+            softness: f32::INFINITY,
+            ..good
+        },
+        WipeMask {
+            pinned: Some(0.5),
+            ..good
+        },
+        WipeMask { width: 0, ..good },
+        WipeMask { height: 0, ..good },
+        // R-6: finite fields whose intermediates overflow (`extent - radius`).
+        WipeMask {
+            shape: MaskShape::Circle,
+            origin: [f32::MAX, 0.0],
+            extent: f32::MAX,
+            radius: -f32::MAX,
+            reverse: true,
+            softness: 1.0,
+            ..good
+        },
+        WipeMask {
+            radius: 1.0e30,
+            ..good
+        },
+        WipeMask {
+            softness: 2.0,
+            ..good
+        },
+        WipeMask {
+            aspect: 0.0,
+            ..good
+        },
+        WipeMask {
+            aspect: -1.0,
+            ..good
+        },
+        WipeMask {
+            aspect: 2.0,
+            ..good
+        },
+        WipeMask {
+            width: W * 2,
+            height: H * 2,
+            ..good
+        },
+    ]
+}
+
 /// Merge review R-1 (PR #406): a malformed public mask draws nothing on the
 /// GPU, as on the CPU reference, and never poisons the layer beneath.
 #[test]
@@ -125,30 +189,7 @@ fn gpu_malformed_wipe_mask_draws_nothing_like_the_cpu_reference() {
         &only_out,
     )
     .unwrap();
-    for mask in [
-        WipeMask {
-            pinned: Some(f32::NAN),
-            ..good
-        },
-        WipeMask {
-            pinned: Some(2.0),
-            ..good
-        },
-        WipeMask {
-            radius: f32::NAN,
-            ..good
-        },
-        WipeMask {
-            softness: f32::INFINITY,
-            ..good
-        },
-        WipeMask {
-            pinned: Some(0.5),
-            ..good
-        },
-        WipeMask { width: 0, ..good },
-        WipeMask { height: 0, ..good },
-    ] {
+    for mask in malformed(good) {
         let tiles = [
             Tile::scaled(&out, 0, 0, W, H, 1.0),
             Tile::scaled(&inc, 0, 0, W, H, 1.0).with_mask(mask),
@@ -162,7 +203,60 @@ fn gpu_malformed_wipe_mask_draws_nothing_like_the_cpu_reference() {
                 &tiles,
             )
             .unwrap();
+        assert!(!mask.is_valid_for(W, H), "{mask:?}");
         let m = mismatch(base.y_plane(), got.y_plane(), 3);
-        assert!(m == 0.0, "{mask:?}: {m}");
+        assert!(m == 0.0, "GPU {mask:?}: {m}");
+        let cpu = composite(
+            W,
+            H,
+            CanvasColor::default(),
+            LinearRgba::TRANSPARENT,
+            &tiles,
+        )
+        .unwrap();
+        assert_eq!(cpu, base, "CPU {mask:?}");
     }
+}
+
+/// Merge review R-7: a tiny positive softness draws the same on the GPU as
+/// on the CPU reference (no overflow in the edge).
+#[test]
+fn gpu_tiny_softness_wipe_matches_the_cpu_reference() {
+    let Some(gpu) = try_gpu() else { return };
+    let out = solid(40, 110, 140);
+    let inc = solid(200, 150, 100);
+    let mask = WipeMask::new(
+        MaskShape::Horizontal,
+        0.6,
+        W,
+        H,
+        [0.0, 0.0],
+        false,
+        f32::MIN_POSITIVE,
+        0.0,
+    );
+    assert!(mask.is_valid_for(W, H));
+    let tiles = [
+        Tile::scaled(&out, 0, 0, W, H, 1.0),
+        Tile::scaled(&inc, 0, 0, W, H, 1.0).with_mask(mask),
+    ];
+    let cpu = composite(
+        W,
+        H,
+        CanvasColor::default(),
+        LinearRgba::TRANSPARENT,
+        &tiles,
+    )
+    .unwrap();
+    let got = gpu
+        .composite(
+            W,
+            H,
+            CanvasColor::default(),
+            LinearRgba::TRANSPARENT,
+            &tiles,
+        )
+        .unwrap();
+    let m = mismatch(cpu.y_plane(), got.y_plane(), 3);
+    assert!(m <= 0.01, "{m}");
 }

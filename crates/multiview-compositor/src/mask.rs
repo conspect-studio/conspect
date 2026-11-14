@@ -154,26 +154,39 @@ impl WipeMask {
         self
     }
 
-    /// Whether the mask is one [`WipeMask::new`] can build: a non-zero
-    /// geometry, every float field finite, and `pinned` (if set) exactly `0`
-    /// or `1` (the only endpoints `new` pins; the GPU maps them exactly). `WipeMask` has public fields; [`WipeMask::new`] always builds a
-    /// well-formed one. A malformed mask draws nothing on the CPU reference and
-    /// on the GPU alike, so it can never poison the layers beneath.
+    /// Whether this mask may be drawn on a `canvas_w x canvas_h` canvas: it is
+    /// one [`WipeMask::new`] builds for that canvas (the same width, height,
+    /// aspect and extent bit for bit; origin, softness and expand in `[0, 1]`;
+    /// a finite radius within the travel `new` gives), and `pinned` (if set)
+    /// is exactly `0` or `1` (the only endpoints `new` pins; the GPU maps
+    /// them exactly). `WipeMask` has public fields; a mask that fails this
+    /// draws nothing on the CPU reference and on the GPU alike, so the two
+    /// paths never disagree and the layers beneath are never poisoned.
     #[must_use]
-    pub fn is_well_formed(&self) -> bool {
-        [
-            self.aspect,
-            self.origin[0],
-            self.origin[1],
-            self.extent,
-            self.radius,
-            self.softness,
-            self.expand,
-        ]
-        .iter()
-        .all(|v| v.is_finite())
-            && self.width > 0
-            && self.height > 0
+    pub fn is_valid_for(&self, canvas_w: u32, canvas_h: u32) -> bool {
+        if self.width != canvas_w || self.height != canvas_h || canvas_w == 0 || canvas_h == 0 {
+            return false;
+        }
+        let aspect = aspect(canvas_w, canvas_h);
+        if self.aspect.to_bits() != aspect.to_bits() {
+            return false;
+        }
+        // A bounded geometry domain (merge review R-6): finite fields alone can
+        // still overflow (`extent - radius`, a circle's distance), so every
+        // field must lie where `new`/`expanded` put it. Within it every
+        // intermediate of `coverage` and the shader is finite.
+        let unit = |v: f32| (0.0..=1.0).contains(&v);
+        let scale = 1.0_f32.max(1.0 / aspect);
+        // `new`'s radius spans `[-margin, extent + softness/2·scale + margin]`
+        // with `margin <= 1.5·scale`; 2·scale + 1 is a strict superset.
+        let reach = self.extent + 2.0 * scale + 1.0;
+        unit(self.origin[0])
+            && unit(self.origin[1])
+            && self.extent.to_bits() == extent(self.shape, aspect, self.origin).to_bits()
+            && unit(self.softness)
+            && unit(self.expand)
+            && self.radius.is_finite()
+            && self.radius.abs() <= reach
             && self.pinned.is_none_or(|c| {
                 c.to_bits() == 0.0_f32.to_bits() || c.to_bits() == 1.0_f32.to_bits()
             })
@@ -208,8 +221,23 @@ impl WipeMask {
 /// Coverage of a signed distance `d` (positive inside) through an edge of
 /// width `softness` (`0` is hard). Mirrors `wipe_edge` in `composite.wgsl`.
 fn edge(d: f32, softness: f32) -> f32 {
-    if softness > 0.0 {
-        (d / softness + 0.5).clamp(0.0, 1.0)
+    // A subnormal softness is a hard edge (merge review R-8): a GPU may flush
+    // it to zero, so both paths treat it so and never disagree.
+    if softness >= f32::MIN_POSITIVE {
+        // Saturate outside the band before dividing (merge reviews R-7, R-8):
+        // a tiny softness would overflow `d / softness`. `2·d` is exact (the
+        // geometry is bounded far below overflow) where `softness / 2` can
+        // round for a subnormal softness, so the band test is exactly the old
+        // clamp boundary; inside it the ratio is bounded by 0.5 and `d = 0`
+        // still reads 0.5.
+        let d2 = d * 2.0;
+        if d2 >= softness {
+            1.0
+        } else if d2 <= -softness {
+            0.0
+        } else {
+            (d / softness + 0.5).clamp(0.0, 1.0)
+        }
     } else if d >= 0.0 {
         1.0
     } else {
