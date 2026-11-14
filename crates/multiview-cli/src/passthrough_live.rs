@@ -1724,4 +1724,338 @@ mod tests {
             multiview_output::passthrough::clock::TARGET_DEPTH
         );
     }
+
+    /// #344 D2b (f), end to end with real media: a libx264 file (made by the
+    /// ffmpeg CLI: 29.97 fps, GOP 30, no B-frames, 160x120) is demuxed by
+    /// libav into the real `TapWriter`; a real `PassthroughLive` (its own
+    /// matcher on, slate baked by libx264 when linked) emits one packet per
+    /// tick at the 30000/1001 cadence, through a source stall; the packets
+    /// are muxed to live TS HLS by the real segment sink; `ffprobe` reads
+    /// the segments: every video packet's DTS delta is exactly one tick
+    /// (3003 at 90 kHz), and the passthrough AUs are the source AUs
+    /// byte for byte. Without libx264 (CI's LGPL image) the slate bake must
+    /// fail (no key opens: the documented no-slate behaviour, the output
+    /// stays on its encoded path); the rest runs on a slate cut from the
+    /// fixture's own first GOP so the muxing and cadence are still proven.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    // reason: one end-to-end scenario (fixture, demux, key, mux, probe).
+    fn hls_p0_end_to_end_dts_is_one_tick_and_aus_are_the_source_bytes() {
+        struct Feed(std::vec::IntoIter<EncodedPacket>);
+        impl multiview_output::sink::PacketSource for Feed {
+            fn next_packet(&mut self) -> multiview_output::Result<Option<EncodedPacket>> {
+                Ok(self.0.next())
+            }
+        }
+        use multiview_output::passthrough::match_rules::{ColourTags, PassCodec, Scan};
+        const FPS: Rational = Rational::new(30_000, 1_001);
+        const TICK: u64 = 33_366_667; // ns, rounded
+        multiview_ffmpeg::ensure_initialized().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        if let Ok(keep) = std::env::var("P0_E2E_KEEP") {
+            let _ = std::fs::remove_dir_all(&keep);
+            std::fs::create_dir_all(&keep).unwrap();
+            eprintln!("keeping {keep}");
+        }
+        let src = dir.path().join("src.ts");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg("testsrc2=size=160x120:rate=30000/1001:duration=30")
+            .args([
+                "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast",
+            ])
+            .args([
+                "-x264-params",
+                "keyint=30:min-keyint=30:scenecut=0:bframes=0:repeat-headers=1:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv",
+            ])
+            .args([
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
+            ])
+            .args(["-color_range", "tv", "-b:v", "300k", "-f", "mpegts"])
+            .arg(&src)
+            .status()
+            .expect("spawn ffmpeg (the CLI has libx264 in CI)");
+        assert!(status.success());
+        // Demux every video packet into the real tap writer.
+        let mut input = ffmpeg_next::format::input(&src).unwrap();
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .unwrap();
+        let index = stream.index();
+        let params = stream.parameters();
+        let (codec, framing) = multiview_ffmpeg::stream_framing(&params).unwrap();
+        let raw = multiview_ffmpeg::video_stream_facts(&params);
+        let mux_params =
+            multiview_ffmpeg::StreamCodecParameters::from_parameters(&params, Some((160, 120)));
+        let facts = crate::passthrough_tap::OpenFacts {
+            codec,
+            framing,
+            time_base: multiview_ffmpeg::from_ff_rational(stream.time_base()),
+            frame_rate: FPS,
+            profile: raw.profile,
+            level: raw.level,
+            width: raw.width,
+            height: raw.height,
+            color_primaries: raw.color_primaries,
+            color_trc: raw.color_trc,
+            color_space: raw.color_space,
+            color_range: raw.color_range,
+            field_order: raw.field_order,
+            bits_per_raw_sample: raw.bits_per_raw_sample,
+            extradata: raw.extradata,
+            extradata_oversize: raw.extradata_oversize,
+        };
+        drop(params);
+        let tap = Arc::new(crate::passthrough_tap::SourceTap::new());
+        let reader = tap.tap().subscribe().unwrap();
+        let arrival = Arc::new(AtomicU64::new(0));
+        let a = Arc::clone(&arrival);
+        let mut writer = crate::passthrough_tap::TapWriter::connect(
+            Arc::clone(&tap),
+            facts,
+            Box::new(move || Some(a.load(Ordering::Acquire))),
+        );
+        let packets: Vec<(Vec<u8>, i64, i64, bool)> = input
+            .packets()
+            .filter(|(s, _)| s.index() == index)
+            .map(|(_, p)| {
+                (
+                    p.data().unwrap().to_vec(),
+                    p.dts().unwrap(),
+                    p.pts().unwrap(),
+                    p.is_key(),
+                )
+            })
+            .collect();
+        assert!(packets.len() >= 890, "{} packets", packets.len());
+        // The slate: libx264 when linked; otherwise the documented failure.
+        let slot_cfg = multiview_output::sink::EncodeConfig {
+            codec_name: "libx264".to_owned(),
+            width: 160,
+            height: 120,
+            format: ffmpeg_next::format::Pixel::YUV420P,
+            cadence: FPS,
+            gop: 30,
+            bit_rate: 300_000,
+            audio: None,
+            cuda_ordinal: None,
+        };
+        let black = Nv12Image::solid(
+            160,
+            120,
+            16,
+            128,
+            128,
+            multiview_core::color::ColorInfo::default(),
+        )
+        .unwrap();
+        let baked = bake_slate(&slot_cfg, &black, CodecKind::H264);
+        let x264 = ffmpeg_next::encoder::find_by_name("libx264").is_some();
+        let slate = if x264 {
+            baked.expect("libx264 linked: the slate bakes")
+        } else {
+            assert!(baked.is_err(), "no libx264: the bake fails (no key opens)");
+            // A stand-in slate for the mux check: the fixture's first GOP.
+            let mut gop = Vec::new();
+            for (data, ..) in packets.iter().take(30) {
+                gop.push(
+                    idr::to_annex_b(data, framing, MAX_AU_BYTES)
+                        .unwrap()
+                        .to_vec(),
+                );
+            }
+            FormatSlate::new(gop, CodecKind::H264).unwrap()
+        };
+        let now = Arc::new(AtomicU64::new(0));
+        let n2 = Arc::clone(&now);
+        let tags = ColourTags {
+            primaries: Some(1),
+            transfer: Some(1),
+            matrix: Some(1),
+            range: Some(0),
+        };
+        let slot = SlotSpec {
+            codec: PassCodec::H264,
+            max_profile: 100,
+            max_level: 51,
+            width: 160,
+            height: 120,
+            fps: FPS,
+            scan: Scan::Progressive,
+            colour: tags,
+            bit_depth: 8,
+            chroma: 1,
+            bitrate_ceiling_kbps: 2_000,
+            max_gop_ticks: 60,
+            b_frames_allowed: true,
+        };
+        let traits_tap = Arc::clone(&tap);
+        let mut live = PassthroughLive::new(
+            PassthroughSpec {
+                cadence: FPS,
+                codec: CodecKind::H264,
+                stream_params: None,
+            },
+            reader,
+            &slate,
+            Box::new(move || n2.load(Ordering::Acquire)),
+        )
+        .unwrap()
+        .with_matcher(
+            slot,
+            Box::new(move || traits_tap.stream().map(|s| s.traits.clone())),
+        )
+        .with_slate_move_points(false);
+        let status = live.status();
+        live.start_at(0);
+        // Frame k arrives on tick k, except a 15-frame stall at 370 (after
+        // the first match: 10 s of history is 300 frames).
+        let canvas = Arc::new(
+            Nv12Image::solid(
+                2,
+                2,
+                16,
+                128,
+                128,
+                multiview_core::color::ColorInfo::default(),
+            )
+            .unwrap(),
+        );
+        let ticks = u64::try_from(packets.len()).unwrap();
+        let mut out = Vec::new();
+        let mut emitted: Vec<(PassthroughState, Vec<u8>)> = Vec::new();
+        for t in 0..ticks {
+            let t_ns = t * TICK;
+            now.store(t_ns, Ordering::Release);
+            arrival.store(t_ns, Ordering::Release);
+            if !(370..385).contains(&t) {
+                let (data, dts, pts, key) = &packets[usize::try_from(t).unwrap()];
+                writer.on_packet(data, Some(*dts), Some(*pts), *key);
+            }
+            let p = live
+                .encode(BakedTick {
+                    tick: t,
+                    canvas: Arc::clone(&canvas),
+                })
+                .unwrap();
+            assert_eq!(p.len(), 1, "tick {t}: one packet");
+            assert_eq!(p[0].dts(), Some(i64::try_from(t).unwrap()));
+            emitted.push((status.state(), p[0].payload().unwrap().to_vec()));
+            out.extend(p);
+        }
+        assert_eq!(
+            status.verdict(),
+            Some(Ok(())),
+            "the real source matches its slot"
+        );
+        assert!(
+            status.runs.load(Ordering::Relaxed) >= 2,
+            "a run, a stall and a return"
+        );
+        assert!(status.stalls.load(Ordering::Relaxed) >= 1);
+        // Passthrough AU bytes are the source AU bytes (Annex B, as the
+        // tap re-frames; TS input is Annex B already).
+        let source: std::collections::HashSet<Vec<u8>> = packets
+            .iter()
+            .map(|(d, ..)| idr::to_annex_b(d, framing, MAX_AU_BYTES).unwrap().to_vec())
+            .collect();
+        let passed: Vec<&Vec<u8>> = emitted
+            .iter()
+            .filter(|(s, _)| *s == PassthroughState::Passthrough)
+            .map(|(_, d)| d)
+            .collect();
+        assert!(passed.len() > 300, "{} AUs passed through", passed.len());
+        assert!(
+            passed.iter().all(|d| source.contains(*d)),
+            "every passthrough AU equals a source AU byte for byte"
+        );
+        // The whole emitted sequence (slate, source runs, slate across the
+        // stall, the return run) is decodable by libav as one stream.
+        assert_eq!(
+            decoded_frames(emitted.iter().map(|(_, d)| d.as_slice())),
+            emitted.len(),
+            "every emitted packet (slate and source) decodes"
+        );
+        // Mux to live TS HLS and probe the segments.
+        let hls = std::env::var("P0_E2E_KEEP")
+            .map_or_else(|_| dir.path().join("hls"), std::path::PathBuf::from);
+        std::fs::create_dir_all(&hls).unwrap();
+        let sink = multiview_output::sink::PacketMuxSink::segment_live(
+            &hls,
+            "seg",
+            hls.join("index.m3u8"),
+            1_000,
+            multiview_output::SharedEpoch::new(),
+        );
+        sink.run(&mut Feed(out.into_iter()), &mux_params, live.time_base())
+            .unwrap();
+        // The segments the published media playlist lists (complete ones).
+        let playlist = std::fs::read_dir(&hls)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("video-g")
+                        && std::path::Path::new(n)
+                            .extension()
+                            .is_some_and(|x| x.eq_ignore_ascii_case("m3u8"))
+                })
+            })
+            .unwrap_or_else(|| hls.join("index.m3u8"));
+        let text = std::fs::read_to_string(&playlist).unwrap();
+        let segs: Vec<std::path::PathBuf> = text
+            .lines()
+            .filter(|l| {
+                !l.starts_with('#')
+                    && std::path::Path::new(l)
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("ts"))
+            })
+            .map(|l| hls.join(l))
+            .collect();
+        assert!(segs.len() >= 20, "{segs:?}");
+        // Probed as a player reads them, as one stream (a segment cut short
+        // at a run start is too small for ffprobe alone to find the stream).
+        let joined = dir.path().join("joined.ts");
+        let mut bytes = Vec::new();
+        for seg in &segs {
+            bytes.extend(std::fs::read(seg).unwrap());
+        }
+        std::fs::write(&joined, bytes).unwrap();
+        let o = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+            .args(["packet=dts", "-of", "csv=p=0"])
+            .arg(&joined)
+            .output()
+            .expect("spawn ffprobe");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let dts: Vec<i64> = String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| l.trim().trim_end_matches(',').parse::<i64>().ok())
+            .collect();
+        // The listed segments cover the run (window 1000 keeps all; the
+        // last, still open segment may be unlisted).
+        assert!(
+            u64::try_from(dts.len()).unwrap() + 2 * 30 >= ticks,
+            "{} of {ticks} packets in the listed segments",
+            dts.len()
+        );
+        for w in dts.windows(2) {
+            assert_eq!(w[1] - w[0], 3003, "DTS delta = one tick at 90 kHz: {w:?}");
+        }
+    }
 }
