@@ -2554,6 +2554,12 @@ pub struct Pipeline {
     /// source a cell actually binds. Derived once from the configuration —
     /// never invented — and cloned per binding with that binding's own output id.
     window_dependencies: Arc<Vec<crate::output_window_registry::Dependency>>,
+    /// Test seam (never in a non-test build): stall the shared bake consumer
+    /// ONCE, at the first hot item at or after this tick, for this long. Taken
+    /// by the next run. Lets an isolation test prove its assertions detect a
+    /// stall in the path every output shares (negative control).
+    #[cfg(test)]
+    consumer_stall_for_test: Option<(u64, Duration)>,
 }
 
 type HashMapStores = std::collections::HashMap<String, Arc<TileStore<Nv12Image>>>;
@@ -3690,6 +3696,8 @@ impl Pipeline {
             program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
+            #[cfg(test)]
+            consumer_stall_for_test: None,
         })
     }
 
@@ -4864,6 +4872,14 @@ impl Pipeline {
         Arc::clone(&self.cast_outputs)
     }
 
+    /// Test seam: the next run's shared bake consumer sleeps ONCE for `stall`
+    /// at the first hot item at or after tick `at` (a stall in the path every
+    /// output shares, unlike a stall inside one sink).
+    #[cfg(test)]
+    pub(crate) fn stall_consumer_once_for_test(&mut self, at: u64, stall: Duration) {
+        self.consumer_stall_for_test = Some((at, stall));
+    }
+
     /// Tell the pipeline the engine's state directory: a cast output with no
     /// configured `dir` writes to `<state dir>/cast/<id>`. Call before the
     /// run starts (nothing is created here).
@@ -5627,7 +5643,12 @@ impl Pipeline {
         // The consumer owns a Send `BakeContext` and builds its own (non-Send)
         // overlay baker from it, plus the single `ProgramEncoder`; the bake +
         // encode math moved off the hot loop, never onto it.
-        let bake_ctx = self.bake_context();
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut bake_ctx = self.bake_context();
+        #[cfg(test)]
+        {
+            bake_ctx.consumer_stall = self.consumer_stall_for_test.take();
+        }
         #[cfg(feature = "overlay")]
         let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
         // Output routing (ADR-0108 slice 1): the clock's aux tick sender (inert
@@ -6300,6 +6321,8 @@ impl Pipeline {
                 .demand
                 .as_ref()
                 .map(|manager| (manager.activity_reader(), Arc::clone(&self.catalogue))),
+            #[cfg(test)]
+            consumer_stall: None,
         }
     }
 
@@ -6308,7 +6331,10 @@ impl Pipeline {
     #[cfg(not(feature = "overlay"))]
     #[allow(clippy::unused_self)]
     fn bake_context(&self) -> BakeContext {
-        BakeContext {}
+        BakeContext {
+            #[cfg(test)]
+            consumer_stall: None,
+        }
     }
 }
 
@@ -6367,6 +6393,11 @@ struct BakeContext {
         multiview_engine::ActivityReader,
         crate::source_rails::Catalogue,
     )>,
+    /// Test seam: `(tick, stall)` — the consumer sleeps once for `stall` at
+    /// the first hot item at or after `tick` (see
+    /// [`Pipeline::stall_consumer_once_for_test`]).
+    #[cfg(test)]
+    consumer_stall: Option<(u64, Duration)>,
 }
 
 impl BakeContext {
@@ -8453,6 +8484,12 @@ fn consumer_main<D: WindowDelivery>(
     // base format, fed non-blocking right after the bake. Empty (no thread,
     // no work) for a run whose base keys are all at the canvas format.
     let mut convert_stages = crate::format_convert::ConvertStages::default();
+    #[cfg(test)]
+    let (ctx, mut test_stall) = {
+        let mut ctx = ctx;
+        let stall = ctx.consumer_stall.take();
+        (ctx, stall)
+    };
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
     if video_encoders.is_empty() {
@@ -8696,6 +8733,13 @@ fn consumer_main<D: WindowDelivery>(
         in_flight.fetch_sub(1, Ordering::AcqRel);
         #[cfg(feature = "_chaos-test-seams")]
         chaos_stall.maybe_stall(item.tick_index);
+        #[cfg(test)]
+        if let Some((at, stall)) = test_stall {
+            if item.tick_index >= at {
+                test_stall = None;
+                std::thread::sleep(stall);
+            }
+        }
         // Live-opened encoders' windows first: a live window T must be staged
         // before base window T closes, or a move onto it is refused.
         router
@@ -22635,6 +22679,7 @@ mod live_overlay_bake_tests {
             canvas_height: 180,
             overlay_apply: Some(Arc::clone(slot)),
             activity: None,
+            consumer_stall: None,
         }
     }
 

@@ -1,7 +1,10 @@
 //! A cast output through the real streaming pipeline: the real output clock
 //! (`ManualTimeSource` + `CooperativePacer`), the real bake consumer, a real
 //! libx264 encoder and AAC program audio, the real cast sink (gate, ring,
-//! packager, directory). The HLS output next to it is a recording fake.
+//! packager, directory). The HLS output next to it is the HLS binding
+//! (recording sink): the real binding of the configured HLS output, whose
+//! sink runner is replaced by one that records every packet it is handed
+//! (video PTS, audio count) instead of writing a playlist.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -80,6 +83,11 @@ struct Ctl {
     routing: Arc<OutputRoutingHandle>,
     /// Output ticks emitted so far (incremented on the hot loop).
     ticks: Arc<AtomicU64>,
+    /// The run's output-clock time source (advanced 40 ms per 40 ms of wall
+    /// time by the run's clock thread).
+    clock: Arc<multiview_engine::ManualTimeSource>,
+    /// Raised once the run returned (a fatal run ends before its last tick).
+    ended: Arc<AtomicBool>,
     stop: StopSignal,
 }
 
@@ -104,6 +112,33 @@ impl Ctl {
         self.wait_tick(self.tick() + seconds * FPS);
     }
 
+    /// Sample `(clock time ns, ticks emitted)` until the clock has emitted
+    /// `until` ticks. A sample is kept only when the clock did not move while
+    /// the tick count was read, so it pairs the count with the clock time it
+    /// was emitted under; samples at the run's last tick are not kept (the
+    /// clock stops ticking there while time goes on). Also returns when the
+    /// run ended early (a fatal error).
+    fn sample_progress(&self, until: u64) -> Vec<(i64, u64)> {
+        use multiview_engine::TimeSource as _;
+        let mut samples = Vec::new();
+        let start = Instant::now();
+        loop {
+            let before = self.clock.now_nanos();
+            let tick = self.tick();
+            if tick >= until || self.ended.load(Ordering::Acquire) {
+                return samples;
+            }
+            if self.clock.now_nanos() == before {
+                samples.push((before, tick));
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "timed out sampling to tick {until}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait until the gate reports `ready`.
     fn wait_ready(&self, bound: Duration) {
         wait_for("the cast stream to be ready", bound, || {
@@ -125,8 +160,13 @@ fn wait_for<T>(what: &str, bound: Duration, mut f: impl FnMut() -> Option<T>) ->
 
 /// What one run produced.
 struct Run {
+    /// The fatal error the run ended in (only with [`Setup::keep_fatal`]).
+    fatal: Option<String>,
     /// Output ticks emitted.
     frames: u64,
+    /// Composited frames shed at the hot queue (the bake consumer fell
+    /// behind the clock); always 0 under `BlockForExact`.
+    dropped: u64,
     /// Video PTS the HLS sink received, in order.
     hls_video_pts: Vec<i64>,
     /// Audio packets the HLS sink received.
@@ -140,6 +180,38 @@ struct Run {
     /// The cast directory (inside `_root`).
     cast_dir: PathBuf,
     _root: tempfile::TempDir,
+}
+
+/// How a run is set up.
+#[derive(Clone, Copy)]
+struct Setup {
+    /// How the clock hands ticks to the bake consumer.
+    policy: SendPolicy,
+    /// The cast output has no configured `dir` and the pipeline is told its
+    /// state directory (`<root>/.multiview`).
+    default_dir: bool,
+    /// Stall the shared bake consumer once: `(at tick, for)`.
+    consumer_stall: Option<(u64, Duration)>,
+    /// A run that ends in a fatal pipeline error returns it in
+    /// [`Run::fatal`] instead of failing the test (negative controls only).
+    keep_fatal: bool,
+}
+
+impl Setup {
+    /// Exact-N offline delivery: the tests that assert exact packet equality
+    /// between bindings and claim nothing about live isolation.
+    const EXACT: Self = Self {
+        policy: SendPolicy::BlockForExact,
+        default_dir: false,
+        consumer_stall: None,
+        keep_fatal: false,
+    };
+    /// The production live policy: a full hot queue sheds (and counts), the
+    /// clock never waits for the consumer.
+    const LIVE: Self = Self {
+        policy: SendPolicy::DropOnOverload,
+        ..Self::EXACT
+    };
 }
 
 /// How a run ends.
@@ -159,17 +231,16 @@ fn drive<F>(prefix: &str, until: Until, control: F) -> Run
 where
     F: FnOnce(&Ctl) + Send + 'static,
 {
-    drive_in(prefix, until, false, |_| {}, control)
+    drive_in(prefix, until, Setup::EXACT, |_| {}, control)
 }
 
-/// As [`drive`]. With `default_dir` the cast output has no configured `dir`
-/// and the pipeline is told its state directory (`<root>/.multiview`).
-/// `prepare` sees the run's root directory before the pipeline is built.
+/// As [`drive`], set up as `setup` says. `prepare` sees the run's root
+/// directory before the pipeline is built.
 #[allow(clippy::too_many_lines)] // One linear set-up of the real pipeline, its clock and its controller.
 fn drive_in<F>(
     prefix: &str,
     until: Until,
-    default_dir: bool,
+    setup: Setup,
     prepare: impl FnOnce(&Path),
     control: F,
 ) -> Run
@@ -178,6 +249,7 @@ where
 {
     let root = tempfile::tempdir().unwrap();
     prepare(root.path());
+    let default_dir = setup.default_dir;
     let template = if default_dir {
         CONFIG.replace("dir = \"%/cast\"\n", "")
     } else {
@@ -197,6 +269,9 @@ where
         root.path().join("cast")
     };
     pipeline.enable_program_audio();
+    if let Some((at, stall)) = setup.consumer_stall {
+        pipeline.stall_consumer_once_for_test(at, stall);
+    }
     let rendition_configs = pipeline.rendition_config_count();
     let cast_slot: CastOutputsSlot = pipeline.cast_outputs();
     let routing_slot: OutputRoutingSlot = pipeline.output_routing();
@@ -232,9 +307,11 @@ where
         });
     }
     let ticks = Arc::new(AtomicU64::new(0));
+    let ended = Arc::new(AtomicBool::new(false));
     let stop = StopSignal::new();
     let controller = {
-        let (ticks, stop) = (Arc::clone(&ticks), stop.clone());
+        let (ticks, stop, clock) = (Arc::clone(&ticks), stop.clone(), Arc::clone(&clock));
+        let ended = Arc::clone(&ended);
         let (cast_slot, routing_slot) = (Arc::clone(&cast_slot), Arc::clone(&routing_slot));
         std::thread::spawn(move || {
             let cast = wait_for("the cast output", Duration::from_secs(30), || {
@@ -247,6 +324,8 @@ where
                 cast,
                 routing,
                 ticks,
+                clock,
+                ended,
                 stop,
             };
             control(&ctl);
@@ -260,21 +339,25 @@ where
         .enable_all()
         .build()
         .unwrap();
-    let result = runtime
-        .block_on(pipeline.drive_streaming_with_cast_for_test(
-            StreamTestParams {
-                time: clock,
-                pacer: multiview_engine::CooperativePacer,
-                max_ticks: Some(max_ticks),
-                policy: SendPolicy::BlockForExact,
-                runners: vec![hls],
-                hot_tick_observer: Some(Arc::clone(&ticks)),
-                consumer_fault_after_ticks: None,
-                shed_at_tick: None,
-            },
-            &stop,
-        ))
-        .unwrap();
+    let result = runtime.block_on(pipeline.drive_streaming_with_cast_for_test(
+        StreamTestParams {
+            time: clock,
+            pacer: multiview_engine::CooperativePacer,
+            max_ticks: Some(max_ticks),
+            policy: setup.policy,
+            runners: vec![hls],
+            hot_tick_observer: Some(Arc::clone(&ticks)),
+            consumer_fault_after_ticks: None,
+            shed_at_tick: None,
+        },
+        &stop,
+    ));
+    let (result, fatal) = match result {
+        Ok(result) => (Some(result), None),
+        Err(error) if setup.keep_fatal => (None, Some(format!("{error:?}"))),
+        Err(error) => panic!("the run failed: {error:?}"),
+    };
+    ended.store(true, Ordering::Release);
     stop_clock.store(true, Ordering::Release);
     controller.join().expect("controller thread");
     assert!(
@@ -282,10 +365,27 @@ where
         "the cast outputs are withdrawn when the run ends"
     );
     let hls_video_pts = std::mem::take(&mut *video_pts.lock().unwrap());
+    let hls_audio_packets = usize::try_from(audio_packets.load(Ordering::Acquire)).unwrap();
+    let Some(result) = result else {
+        return Run {
+            fatal,
+            frames: ticks.load(Ordering::Acquire),
+            dropped: 0,
+            hls_video_pts,
+            hls_audio_packets,
+            cast_packets: 0,
+            rendition_configs,
+            lines: Vec::new(),
+            cast_dir,
+            _root: root,
+        };
+    };
     Run {
+        fatal,
         frames: result.report.frames,
+        dropped: result.report.dropped,
         hls_video_pts,
-        hls_audio_packets: usize::try_from(audio_packets.load(Ordering::Acquire)).unwrap(),
+        hls_audio_packets,
         cast_packets: result.sink_frames[1],
         rendition_configs,
         lines: result.report.outputs,
@@ -484,7 +584,9 @@ fn b_an_activation_publishes_a_valid_stream_within_the_deadline() {
         let report = validated(ctl);
         assert!(report.video_segments >= 5 && report.has_audio, "{report:?}");
         assert_eq!(report.audio_segments, report.video_segments);
-        assert_eq!(report.target_duration, 2);
+        // MEDIA-1: EXT-X-TARGETDURATION is fixed for the packager's
+        // lifetime at 2x the nominal 2 s segment.
+        assert_eq!(report.target_duration, 4);
         assert_eq!(report.discontinuities, 0);
         let names = files(ctl.dir());
         for name in [
@@ -710,8 +812,9 @@ fn last_video_tfdt_seconds(dir: &Path) -> f64 {
 }
 
 /// Run `f` on its own thread and fail (instead of hanging the test binary)
-/// when it does not return within `bound`: a run that never ends is a run
-/// whose pipeline was paced by a sink.
+/// when it does not return within `bound`. A hang guard only: it proves
+/// nothing about isolation (the counts and the in-fault tick progress of
+/// [`isolation_violations`] do), it just turns a wedged run into a failure.
 fn bounded<T: Send + 'static>(bound: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
@@ -735,85 +838,165 @@ fn bounded<T: Send + 'static>(bound: Duration, f: impl FnOnce() -> T + Send + 's
 const CHAOS_TICKS: u64 = 300;
 /// The tick at which the chaos runs activate the cast output.
 const CHAOS_AT: u64 = 60;
+/// Ticks the clock may be behind its due count at one sample: the sampler
+/// reads the tick counter while the manual clock stands still, but the clock
+/// thread may not have run yet for the latest 40 ms step (one tick), and a
+/// loaded runner may deschedule it for a few more. 5 ticks = 200 ms.
+const PROGRESS_SLACK: u64 = 5;
 
 /// What a chaos run observed besides its [`Run`].
 #[derive(Default)]
 struct ChaosSeen {
-    /// Wall time from the fault to the last tick, and the ticks in between.
-    after_fault: Option<(Duration, u64)>,
+    /// `(clock ns, ticks emitted)` sampled from the moment the fault was in
+    /// place (the sink reached its hook) to the end of the run.
+    progress: Vec<(i64, u64)>,
     status: Option<super::CastGateStatus>,
 }
 
-/// Drive `CHAOS_TICKS` ticks; at `CHAOS_AT` install `hook` on the cast sink
-/// and activate the output; `entered` fires when the sink first reaches the
-/// hook. Returns the run and what the controller saw.
+/// Drive `CHAOS_TICKS` ticks set up as `setup`; at `CHAOS_AT` install `hook`
+/// on the cast sink and activate the output; `entered` fires when the sink
+/// first reaches the hook. Returns the run and what the controller saw.
 fn chaos_run(
     prefix: &'static str,
+    setup: Setup,
     hook: Option<super::CastTestHook>,
     entered: Option<std::sync::mpsc::Receiver<()>>,
 ) -> (Run, ChaosSeen) {
     let seen = Arc::new(Mutex::new(ChaosSeen::default()));
     let record = Arc::clone(&seen);
     let run = bounded(Duration::from_secs(90), move || {
-        drive(prefix, Until::Ticks(CHAOS_TICKS), move |ctl| {
-            ctl.wait_tick(CHAOS_AT);
-            // The control run (no hook) leaves the cast output inactive and
-            // measures the same tick span.
-            if let Some(hook) = hook {
-                ctl.cast.gate.set_test_hook(Some(hook));
-                ctl.cast.gate.activate(true).unwrap();
-            }
-            if let Some(entered) = entered {
-                entered
-                    .recv_timeout(Duration::from_secs(30))
-                    .expect("the cast sink reached its disk write");
-            }
-            let (from, at) = (Instant::now(), ctl.tick());
-            ctl.wait_tick(CHAOS_TICKS);
-            let mut seen = record.lock().unwrap();
-            seen.after_fault = Some((from.elapsed(), CHAOS_TICKS - at));
-            seen.status = Some(ctl.cast.gate.status());
-        })
+        drive_in(
+            prefix,
+            Until::Ticks(CHAOS_TICKS),
+            setup,
+            |_| {},
+            move |ctl| {
+                ctl.wait_tick(CHAOS_AT);
+                // The control run (no hook) leaves the cast output inactive and
+                // samples the same tick span.
+                if let Some(hook) = hook {
+                    ctl.cast.gate.set_test_hook(Some(hook));
+                    ctl.cast.gate.activate(true).unwrap();
+                }
+                if let Some(entered) = entered {
+                    entered
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("the cast sink reached its disk write");
+                }
+                let progress = ctl.sample_progress(CHAOS_TICKS);
+                let mut seen = record.lock().unwrap();
+                seen.progress = progress;
+                seen.status = Some(ctl.cast.gate.status());
+            },
+        )
     });
     let seen = std::mem::take(&mut *seen.lock().unwrap());
     (run, seen)
 }
 
-/// The HLS output of a chaos run must be the control run's, packet for
-/// packet, and the clock must have emitted every tick. These counts are the
-/// proof; the wall-clock check after them only rules out a paced pipeline.
+/// Every way `run` (of `ticks` ticks, under the live policy) shows that a
+/// fault reached the path the clock and the HLS binding share; empty when
+/// it is isolated:
+/// - the hot queue shed nothing (`dropped == 0`): the shared bake consumer
+///   never fell behind the clock, at any moment of the run;
+/// - the clock emitted every tick, and the HLS binding (recording sink)
+///   received contiguous video PTS `0..ticks` and, when a control run is
+///   given, exactly its audio packet count;
+/// - while the fault was in place, the tick counter advanced at the clock's
+///   cadence: over every window of at least 1 s of output-clock time
+///   between two samples, ticks advanced by the due count less
+///   [`PROGRESS_SLACK`], and the samples cover at least `min_span_s` seconds.
+fn isolation_violations(
+    run: &Run,
+    ticks: u64,
+    control_audio: Option<usize>,
+    progress: &[(i64, u64)],
+    min_span_s: i64,
+) -> Vec<String> {
+    const SECOND: i64 = 1_000_000_000;
+    let mut violations = Vec::new();
+    if let Some(fatal) = &run.fatal {
+        violations.push(format!("the run ended in a fatal error: {fatal}"));
+    }
+    if run.dropped != 0 {
+        violations.push(format!(
+            "the hot queue shed {} frame(s): the shared consumer fell behind the clock",
+            run.dropped
+        ));
+    }
+    if run.frames != ticks {
+        violations.push(format!("{} of {ticks} ticks emitted", run.frames));
+    }
+    let expected: Vec<i64> = (0..i64::try_from(ticks).unwrap()).collect();
+    if run.hls_video_pts != expected {
+        let first_gap = run
+            .hls_video_pts
+            .iter()
+            .zip(&expected)
+            .position(|(got, want)| got != want);
+        violations.push(format!(
+            "HLS binding video PTS not contiguous 0..{ticks}: {} packet(s), first gap at {first_gap:?}",
+            run.hls_video_pts.len()
+        ));
+    }
+    if let Some(audio) = control_audio {
+        if run.hls_audio_packets != audio {
+            violations.push(format!(
+                "HLS binding received {} audio packet(s), the control run {audio}",
+                run.hls_audio_packets
+            ));
+        }
+    }
+    let span = match (progress.first(), progress.last()) {
+        (Some(first), Some(last)) => last.0 - first.0,
+        _ => 0,
+    };
+    if span < min_span_s * SECOND {
+        violations.push(format!(
+            "tick progress sampled over {span} ns of clock time, less than {min_span_s} s"
+        ));
+    }
+    for (i, &(from_ns, from_tick)) in progress.iter().enumerate() {
+        let Some(&(to_ns, to_tick)) = progress[i..].iter().find(|(ns, _)| ns - from_ns >= SECOND)
+        else {
+            break;
+        };
+        let due = u64::try_from((to_ns - from_ns) * i64::try_from(FPS).unwrap() / SECOND).unwrap();
+        if to_tick - from_tick + PROGRESS_SLACK < due {
+            violations.push(format!(
+                "the clock stalled under the fault: {} tick(s) from {from_ns} ns to {to_ns} ns, {due} due",
+                to_tick - from_tick
+            ));
+            break;
+        }
+    }
+    violations
+}
+
+/// The control run must itself be clean, and the chaos run must show no
+/// isolation violation at all.
 fn assert_unaffected(control: &(Run, ChaosSeen), run: &Run, seen: &ChaosSeen) {
     let (control, control_seen) = control;
-    let ticks = i64::try_from(CHAOS_TICKS).unwrap();
-    assert_eq!(control.frames, CHAOS_TICKS);
-    assert_eq!(control.hls_video_pts, (0..ticks).collect::<Vec<_>>());
-    assert_eq!(run.frames, CHAOS_TICKS, "every output tick emitted");
     assert_eq!(
-        run.hls_video_pts,
-        (0..ticks).collect::<Vec<_>>(),
-        "contiguous PTS at the HLS output, no gap"
+        isolation_violations(control, CHAOS_TICKS, None, &control_seen.progress, 6),
+        Vec::<String>::new(),
+        "the control run"
+    );
+    assert!(
+        control.hls_audio_packets > 0,
+        "the run carries program audio"
     );
     assert_eq!(
-        run.hls_audio_packets, control.hls_audio_packets,
-        "the HLS output lost no audio packet"
-    );
-    // Not paced: compared with the control run's time for the same ticks on
-    // this machine (twice that, plus two delivery graces), never with a
-    // fixed speed. A bake consumer that waited on the faulty sink would pay
-    // one delivery grace (2 s) for every window it offered: more than 200
-    // windows in this span, so several hundred seconds against a bound of
-    // tens.
-    let (elapsed, ticks_left) = seen.after_fault.expect("the controller saw the fault");
-    let (control_elapsed, control_ticks) = control_seen.after_fault.expect("the control span");
-    assert!(
-        ticks_left > 200 && control_ticks > 200,
-        "{ticks_left} / {control_ticks}"
-    );
-    let bound = control_elapsed * 2 + crate::binding_delivery::PUMP_WEDGE_GRACE * 2;
-    assert!(
-        elapsed < bound,
-        "{ticks_left} ticks after the fault took {elapsed:?}; the control run took \
-         {control_elapsed:?} for {control_ticks} (bound {bound:?})"
+        isolation_violations(
+            run,
+            CHAOS_TICKS,
+            Some(control.hls_audio_packets),
+            &seen.progress,
+            6
+        ),
+        Vec::<String>::new(),
+        "{:?}",
+        run.lines
     );
 }
 
@@ -822,7 +1005,7 @@ fn assert_unaffected(control: &(Run, ChaosSeen), run: &Run, seen: &ChaosSeen) {
 /// packets.
 #[test]
 fn e_a_blocked_cast_sink_costs_the_clock_zero_ticks_and_the_hls_output_zero_packets() {
-    let control = chaos_run("cast_e0", None, None);
+    let control = chaos_run("cast_e0", Setup::LIVE, None, None);
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let release_rx = Mutex::new(release_rx);
@@ -831,7 +1014,7 @@ fn e_a_blocked_cast_sink_costs_the_clock_zero_ticks_and_the_hls_output_zero_pack
         // Wedge until the test drops the sender (after the run returned).
         let _ = release_rx.lock().unwrap().recv();
     });
-    let (run, seen) = chaos_run("cast_e1", Some(hook), Some(entered_rx));
+    let (run, seen) = chaos_run("cast_e1", Setup::LIVE, Some(hook), Some(entered_rx));
     assert_unaffected(&control, &run, &seen);
     let status = seen.status.unwrap();
     assert!(status.active && !status.ready, "{status:?}");
@@ -850,13 +1033,13 @@ fn e_a_blocked_cast_sink_costs_the_clock_zero_ticks_and_the_hls_output_zero_pack
 /// the HLS output are untouched, and the output says why it is unusable.
 #[test]
 fn e_a_panicking_cast_sink_disables_only_the_cast_output() {
-    let control = chaos_run("cast_e2", None, None);
+    let control = chaos_run("cast_e2", Setup::LIVE, None, None);
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let hook: super::CastTestHook = Arc::new(move || {
         let _ = entered_tx.try_send(());
         panic!("injected cast sink panic");
     });
-    let (run, seen) = chaos_run("cast_e3", Some(hook), Some(entered_rx));
+    let (run, seen) = chaos_run("cast_e3", Setup::LIVE, Some(hook), Some(entered_rx));
     assert_unaffected(&control, &run, &seen);
     let status = seen.status.unwrap();
     assert!(!status.active && !status.ready, "{status:?}");
@@ -886,7 +1069,8 @@ fn e_a_panicking_cast_sink_disables_only_the_cast_output() {
 /// (f) Drop when full: the cast sink stalls for longer than the delivery
 /// waits, then comes back. The packets it missed are counted, the stream
 /// declares the gap as a discontinuity, the directory validates, and the
-/// HLS output never noticed.
+/// HLS binding (recording sink) never noticed: under the live policy the
+/// hot queue shed nothing and the clock kept its cadence through the stall.
 #[test]
 fn f_a_stalled_then_released_cast_sink_declares_the_gap_and_still_validates() {
     const TICKS: u64 = 700;
@@ -905,30 +1089,41 @@ fn f_a_stalled_then_released_cast_sink_declares_the_gap_and_still_validates() {
     let seen = Arc::new(Mutex::new(None));
     let record = Arc::clone(&seen);
     let run = bounded(Duration::from_secs(120), move || {
-        drive("cast_f", Until::Ticks(TICKS), move |ctl| {
-            ctl.wait_tick(11 * FPS);
-            ctl.cast.gate.set_test_hook(Some(hook));
-            let generation = ctl.cast.gate.activate(true).unwrap();
-            ctl.wait_ready(Duration::from_secs(5));
-            let before = validated(ctl);
-            assert_eq!(before.discontinuities, 0);
-            stall.store(true, Ordering::Release);
-            wait_for("the stall", Duration::from_secs(5), || {
-                stalled.load(Ordering::Acquire).then_some(())
-            });
-            // Stalled for 4 s, then 8 s of healthy stream.
-            ctl.run_seconds(12);
-            let after = validated(ctl);
-            let status = ctl.cast.gate.status();
-            *record.lock().unwrap() = Some((generation, before, after, status));
-        })
+        drive_in(
+            "cast_f",
+            Until::Ticks(TICKS),
+            Setup::LIVE,
+            |_| {},
+            move |ctl| {
+                ctl.wait_tick(11 * FPS);
+                ctl.cast.gate.set_test_hook(Some(hook));
+                let generation = ctl.cast.gate.activate(true).unwrap();
+                ctl.wait_ready(Duration::from_secs(5));
+                let before = validated(ctl);
+                assert_eq!(before.discontinuities, 0);
+                stall.store(true, Ordering::Release);
+                wait_for("the stall", Duration::from_secs(5), || {
+                    stalled.load(Ordering::Acquire).then_some(())
+                });
+                // Stalled for 4 s (the tick progress is sampled through it),
+                // then 8 s of healthy stream in all.
+                let progress = ctl.sample_progress(ctl.tick() + 6 * FPS);
+                ctl.run_seconds(6);
+                let after = validated(ctl);
+                let status = ctl.cast.gate.status();
+                *record.lock().unwrap() = Some((generation, before, after, status, progress));
+            },
+        )
     });
-    let (generation, before, after, status) = seen.lock().unwrap().take().unwrap();
-    // The HLS output and the clock never noticed.
-    assert_eq!(run.frames, TICKS);
+    let (generation, before, after, status, progress) = seen.lock().unwrap().take().unwrap();
+    // The HLS binding and the clock never noticed: no shed, every tick,
+    // contiguous PTS, and the clock's cadence held through the 4 s stall.
+    assert!(run.hls_audio_packets > 0, "the run carries program audio");
     assert_eq!(
-        run.hls_video_pts,
-        (0..i64::try_from(TICKS).unwrap()).collect::<Vec<_>>()
+        isolation_violations(&run, TICKS, None, &progress, 5),
+        Vec::<String>::new(),
+        "{:?}",
+        run.lines
     );
     // The gap is counted and declared; the same stream goes on.
     assert!(status.dropped_packets > 0, "{status:?}");
@@ -957,6 +1152,57 @@ fn f_a_stalled_then_released_cast_sink_declares_the_gap_and_still_validates() {
             .any(|line| line.starts_with("binding 1:") && line.contains("windows lost")),
         "{:?}",
         run.lines
+    );
+}
+
+/// The negative controls' stall of the shared bake consumer: 30 output
+/// ticks, far past both the live hot queue (4 frames = 160 ms) and the
+/// encoder's admitted lateness (8 ticks), and short of the dispatcher's 2 s
+/// staging watchdog. Under exact-N delivery it holds the clock for about
+/// 1 s.
+const SHARED_STALL: Duration = Duration::from_millis(1200);
+
+/// Negative control for [`isolation_violations`]: a 1.2 s stall of the SHARED
+/// bake consumer (not of one sink), under the same live policy, is caught.
+/// The live pipeline reports such a stall in one of two ways, both
+/// violations: the hot queue sheds (counted in `dropped`), or the encoder
+/// finds the output beyond its admitted lateness and ends the run fatally
+/// (the report, and with it the shed count, is then lost). Proves the
+/// isolation assertions of (e)/(f) see a stall in the path the outputs
+/// share.
+#[test]
+fn n_a_shared_consumer_stall_fails_the_isolation_assertions() {
+    let setup = Setup {
+        consumer_stall: Some((CHAOS_AT + FPS, SHARED_STALL)),
+        keep_fatal: true,
+        ..Setup::LIVE
+    };
+    let (run, seen) = chaos_run("cast_n0", setup, None, None);
+    let violations = isolation_violations(&run, CHAOS_TICKS, None, &seen.progress, 6);
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("the hot queue shed") || v.contains("fatal error")),
+        "a shared stall must be detected: {violations:?}"
+    );
+}
+
+/// Negative control for the in-fault tick-progress check: the same shared
+/// stall under exact-N delivery back-pressures the clock, and the sampled
+/// progress shows it stalled (this is what final exact-N counts alone could
+/// not tell from an unaffected run).
+#[test]
+fn n_a_shared_consumer_stall_under_exact_delivery_fails_the_progress_check() {
+    let setup = Setup {
+        consumer_stall: Some((CHAOS_AT + FPS, SHARED_STALL)),
+        keep_fatal: true,
+        ..Setup::EXACT
+    };
+    let (run, seen) = chaos_run("cast_n1", setup, None, None);
+    let violations = isolation_violations(&run, CHAOS_TICKS, None, &seen.progress, 6);
+    assert!(
+        violations.iter().any(|v| v.contains("the clock stalled")),
+        "a paced clock must be detected: {violations:?}"
     );
 }
 
@@ -994,7 +1240,10 @@ fn the_default_directory_is_under_the_state_dir_and_created_on_activation() {
     let run = drive_in(
         "cast_g",
         Until::Stop,
-        true,
+        Setup {
+            default_dir: true,
+            ..Setup::EXACT
+        },
         |_| {},
         |ctl| {
             ctl.wait_tick(2 * FPS);
@@ -1044,45 +1293,51 @@ fn a_foreign_directory_disables_the_cast_output_without_touching_it_or_the_run()
     };
     let adapter = Arc::new(Mutex::new(None));
     let keep = Arc::clone(&adapter);
-    let run = drive_in("cast_h", Until::Ticks(TICKS), false, populate, move |ctl| {
-        // The adapter the control plane uses, over a slot of this run.
-        let slot = super::cast_outputs_slot();
-        slot.store(Arc::new(vec![ctl.cast.clone()]));
-        let engine = super::CastEngineAdapter(Arc::clone(&slot));
-        let outputs = engine.outputs();
-        assert_eq!(outputs.len(), 1);
-        let status = &outputs[0];
-        assert_eq!(
-            (status.id.as_str(), status.active, status.ready),
-            ("cast-1", false, false)
-        );
-        assert_eq!((status.width, status.height), (160, 90));
-        assert_eq!((status.fps_num, status.fps_den), (25, 1));
-        let reason = status
-            .last_error
-            .clone()
-            .expect("the reason is in the status");
-        assert!(
-            reason.contains("cast output \"cast-1\"")
-                && reason.contains(
-                    "holds files this engine did not write; point `dir` at an \
+    let run = drive_in(
+        "cast_h",
+        Until::Ticks(TICKS),
+        Setup::EXACT,
+        populate,
+        move |ctl| {
+            // The adapter the control plane uses, over a slot of this run.
+            let slot = super::cast_outputs_slot();
+            slot.store(Arc::new(vec![ctl.cast.clone()]));
+            let engine = super::CastEngineAdapter(Arc::clone(&slot));
+            let outputs = engine.outputs();
+            assert_eq!(outputs.len(), 1);
+            let status = &outputs[0];
+            assert_eq!(
+                (status.id.as_str(), status.active, status.ready),
+                ("cast-1", false, false)
+            );
+            assert_eq!((status.width, status.height), (160, 90));
+            assert_eq!((status.fps_num, status.fps_den), (25, 1));
+            let reason = status
+                .last_error
+                .clone()
+                .expect("the reason is in the status");
+            assert!(
+                reason.contains("cast output \"cast-1\"")
+                    && reason.contains(
+                        "holds files this engine did not write; point `dir` at an \
                                     empty directory or remove `dir`"
-                ),
-            "{reason}"
-        );
-        assert_eq!(
-            engine.activate("cast-1", true),
-            Err(CastEngineError::Unavailable(reason))
-        );
-        assert_eq!(engine.deactivate("cast-1"), Ok(()));
-        assert_eq!(
-            engine.activate("nope", true),
-            Err(CastEngineError::UnknownOutput("nope".to_owned()))
-        );
-        ctl.wait_tick(TICKS - 10);
-        assert_eq!(files(ctl.dir()), foreign);
-        *keep.lock().unwrap() = Some((engine, slot));
-    });
+                    ),
+                "{reason}"
+            );
+            assert_eq!(
+                engine.activate("cast-1", true),
+                Err(CastEngineError::Unavailable(reason))
+            );
+            assert_eq!(engine.deactivate("cast-1"), Ok(()));
+            assert_eq!(
+                engine.activate("nope", true),
+                Err(CastEngineError::UnknownOutput("nope".to_owned()))
+            );
+            ctl.wait_tick(TICKS - 10);
+            assert_eq!(files(ctl.dir()), foreign);
+            *keep.lock().unwrap() = Some((engine, slot));
+        },
+    );
     // The run was not affected.
     assert_eq!(run.frames, TICKS);
     assert_eq!(
