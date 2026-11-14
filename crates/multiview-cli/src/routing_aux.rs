@@ -1279,7 +1279,10 @@ mod tests {
         .unwrap();
         cam.publish(gradient(1920, 1080, canvas().color), tick(0).pts);
         tx.offer(tick(0));
-        assert!(wait_for(|| store.sequence() == 1));
+        // `sequence()` moves before the ring append and the arrival stamp
+        // (publish order), so wait for what is asserted: a readable frame.
+        assert!(wait_for(|| store.read_at(tick(0).pts).frame().is_some()));
+        assert_eq!(store.sequence(), 1);
         let read = store.read_at(tick(0).pts);
         let frame = read.frame().expect("composed at the tick pts").clone();
         assert_eq!((frame.width(), frame.height()), (1920, 1080));
@@ -1291,8 +1294,9 @@ mod tests {
             store: Arc::clone(&store),
         }]));
         tx.offer(tick(1));
-        assert!(wait_for(|| store.sequence() == 2));
-        assert!(store.state_at(tick(1).pts).is_live());
+        assert!(wait_for(|| store.sequence() == 2
+            && store.read_at(tick(1).pts).frame().is_some()
+            && store.state_at(tick(1).pts).is_live()));
         // Unregistered: the store is no longer fed (it ages on Program).
         set.store(Arc::new(Vec::new()));
         tx.offer(tick(2));
@@ -1448,7 +1452,7 @@ mod tests {
         let cam_frame = gradient(1920, 1080, canvas().color);
         cam.publish(cam_frame.clone(), tick(0).pts);
         tx.offer(tick(0));
-        assert!(wait_for(|| wall.sequence() == 1));
+        assert!(wait_for(|| wall.read_at(tick(0).pts).frame().is_some()));
         let before = wall
             .read_at(tick(0).pts)
             .frame()
@@ -1467,7 +1471,12 @@ mod tests {
         }]));
         cam.publish(cam_frame, tick(1).pts);
         tx.offer(tick(1));
-        assert!(wait_for(|| wall.sequence() == 2));
+        // The ring append follows the sequence bump: wait for the frame.
+        assert!(wait_for(|| wall.sequence() == 2
+            && wall
+                .read_at(tick(1).pts)
+                .frame()
+                .is_some_and(|f| f.y_plane()[1000 * 1920 + 1800] != 16)));
         let after = wall
             .read_at(tick(1).pts)
             .frame()
