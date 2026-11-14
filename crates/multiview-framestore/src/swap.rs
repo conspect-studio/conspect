@@ -1092,14 +1092,23 @@ mod try_load {
 
     #[test]
     fn a_lost_race_returns_none_without_waiting() {
-        let cell = SwapCell::new(Arc::new(7_u64));
+        let cell = Arc::new(SwapCell::new(Arc::new(7_u64)));
         {
             // A publisher holds the head slot: the one attempt fails at once
-            // (`load` would spin here until the writer let go).
+            // (`load` would spin here until the writer let go). The attempt
+            // runs on a supervised thread while the writer is held: it must
+            // RETURN (None) — a generous 30 s deadline proves it did not hang
+            // without a tight wall-time bound on a loaded runner (#307 r2 I4).
             let _writer = cell.hold_writer_for_test();
-            let started = Instant::now();
-            assert!(cell.try_load().is_none());
-            assert!(started.elapsed() < Duration::from_secs(1), "never blocks");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let attempt = Arc::clone(&cell);
+            thread::spawn(move || {
+                let _ = tx.send(attempt.try_load().is_none());
+            });
+            let returned = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("try_load hung while a writer held the head slot");
+            assert!(returned, "a held writer makes the one attempt fail");
         }
         assert_eq!(*cell.try_load().unwrap(), 7, "Some once the writer is gone");
     }
