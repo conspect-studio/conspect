@@ -106,3 +106,21 @@ fn clean_is_refused_while_a_dsk_is_defined() {
     legacy.routing.as_mut().unwrap().output[0].bus = OutputBus::Clean;
     legacy.validate().unwrap();
 }
+
+/// Review F3: a DSK is keyed on its program's M/E drive. A document that
+/// defines a DSK but no M/E on that program would validate, then boot would
+/// install no keyer (no `on_at_start`, leases held, Clean refused for
+/// nothing), so validation refuses it.
+#[test]
+fn a_dsk_without_a_mix_effects_on_its_program_is_refused() {
+    let without_me = BASE.replace(
+        "[[switcher.mix_effects]]\nid = \"me1\"\nprogram = \"main\"\nprogram_source = \"a\"\npreview_source = \"b\"\n",
+        "",
+    );
+    assert!(!without_me.contains("mix_effects"), "fixture edit applied");
+    let cfg = MultiviewConfig::load_from_toml(&format!("{without_me}{DSK}")).unwrap();
+    let error = cfg.validate().unwrap_err().to_string();
+    assert!(error.contains("dsk-requires-mix-effects"), "{error}");
+    // The same document with the M/E validates.
+    load(DSK).validate().unwrap();
+}

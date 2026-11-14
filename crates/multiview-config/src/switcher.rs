@@ -601,6 +601,16 @@ impl SwitcherConfig {
         let mut zs = HashSet::with_capacity(self.downstream_keyers.len());
         for dsk in &self.downstream_keyers {
             dsk.validate(sources, programs, canvas_w, canvas_h)?;
+            // Review F3: a DSK is keyed on its program's M/E drive; without
+            // that M/E boot would install nothing (no `on_at_start`, leases
+            // held for nothing, Clean refused for nothing). Refuse it.
+            if !self.mix_effects.iter().any(|me| me.program == dsk.program) {
+                return Err(ConfigError::Validation(format!(
+                    "downstream keyer {:?} needs a [[switcher.mix_effects]] on program {:?} \
+                     (dsk-requires-mix-effects)",
+                    dsk.id, dsk.program
+                )));
+            }
             if !ids.insert((dsk.program.as_str(), dsk.id.as_str())) {
                 return Err(ConfigError::Validation(format!(
                     "downstream keyer {:?} is declared twice",
