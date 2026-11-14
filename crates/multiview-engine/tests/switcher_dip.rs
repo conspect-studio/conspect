@@ -755,14 +755,14 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
                         Some(Rgb8::new(u8::try_from(n % 251).unwrap(), 0, 0)),
                         Rational::new(1, 3),
                     )),
-                    1 => SwitcherVerb::Auto(FrameCount::try_from(6).unwrap()),
                     2 if n % 8 == 2 => SwitcherVerb::SetTransition(wipe(
                         6,
                         "circle",
                         &serde_json::json!({"softness": 0.05, "border_width": 0.02, "border_color": "#0000ff"}),
                     )),
                     2 => SwitcherVerb::SetTransition(dip(1, None, Rational::new(1, 2))),
-                    // Every WIPE selection (n % 8 == 2) is followed by an AUTO.
+                    // n % 4 == 1 or 3: an AUTO, so every WIPE selection
+                    // (n % 8 == 2) is followed by an AUTO.
                     _ => SwitcherVerb::Auto(FrameCount::try_from(6).unwrap()),
                 };
                 let command = SwitcherCommand {
