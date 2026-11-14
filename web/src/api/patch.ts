@@ -45,7 +45,8 @@ export type PatchPlanResponse = PatchPlan & { readonly set?: SetCost };
 /** One mixer input as the engine reports it. */
 export interface MixerInputView {
   readonly number: number;
-  readonly label: string | null;
+  /** Absent is accepted as "no label" (the guard admits it); readers fall back with `??`. */
+  readonly label?: string | null | undefined;
   /** `{source}`, `{redacted: true}` for a source the caller cannot read, or null (unpatched). */
   readonly video: { readonly source: string } | { readonly redacted: true } | null;
   readonly on_program: boolean;
@@ -94,7 +95,7 @@ export interface OutputSubtitleSlotView {
 /** One output's format + live slots, as `GET /patch` `outputs[]` reports it. */
 export interface OutputPatchView {
   readonly output: string;
-  readonly format: { readonly width?: number; readonly height?: number; readonly fit?: string } | null;
+  readonly format?: { readonly width?: number; readonly height?: number; readonly fit?: string } | null | undefined;
   readonly video: readonly OutputVideoSlotView[];
   readonly audio: readonly OutputAudioSlotView[];
   /** patch-f (#345) fills this later; absent/empty renders the Subtitle tab's empty state. */
@@ -118,7 +119,9 @@ function isVideo(value: unknown): value is MixerInputView['video'] {
 function isInput(value: unknown): value is MixerInputView {
   return isRecord(value) && typeof value.number === 'number'
     && (value.label === null || value.label === undefined || typeof value.label === 'string')
-    && isVideo(value.video ?? null)
+    // `video` is required (null = unpatched): an omitted field is malformed,
+    // never normalized, so every reader can rely on `null | object` (E3-07).
+    && 'video' in value && isVideo(value.video)
     && typeof value.on_program === 'boolean' && typeof value.on_preview === 'boolean';
 }
 function isMixer(value: unknown): value is MixerPatchView {
@@ -161,7 +164,8 @@ function isOutput(value: unknown): value is OutputPatchView {
     && Array.isArray(value.audio) && value.audio.every(isAudioSlot)
     && (value.subtitle === undefined || value.subtitle === null || (Array.isArray(value.subtitle) && value.subtitle.every(isSubtitleSlot)));
 }
-function isView(value: unknown): value is PatchView {
+/** Runtime guard for a `GET /patch` body: every field the matrix dereferences is checked. */
+export function isPatchView(value: unknown): value is PatchView {
   return isRecord(value) && Array.isArray(value.mixer) && value.mixer.every(isMixer)
     && (value.outputs === undefined || (Array.isArray(value.outputs) && value.outputs.every(isOutput)));
 }
@@ -253,7 +257,7 @@ export async function getPatch(options: RequestOptions = {}): Promise<PatchView>
   const response = await fetch(apiUrl(options, '/api/v1/patch'), { headers: buildHeaders(options, false) });
   if (!response.ok) throw await readPendingProblem(response);
   const body: unknown = await response.json();
-  if (!isView(body)) throw new OperationApiError('Invalid patch readback');
+  if (!isPatchView(body)) throw new OperationApiError('Invalid patch readback');
   return body;
 }
 

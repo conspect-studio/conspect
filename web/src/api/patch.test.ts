@@ -1,7 +1,7 @@
 // Runtime guards for the patch API (E3-07): every nested field the matrix
 // dereferences is validated, so a malformed body is an error, not a crash.
 import { describe, expect, it } from 'vitest';
-import { isPatchPlanResponse, parseCrosspoints } from './patch';
+import { isPatchPlanResponse, isPatchView, parseCrosspoints } from './patch';
 
 describe('isPatchPlanResponse', () => {
   const good = {
@@ -39,5 +39,22 @@ describe('parseCrosspoints', () => {
       ],
       invalid: 2,
     });
+  });
+});
+
+describe('isPatchView (E3-07 round 2)', () => {
+  const input = { number: 1, label: 'in1', video: { source: 'x' }, on_program: false, on_preview: false };
+  const view = (inputs: unknown[]) => ({ mixer: [{ me: 'me1', inputs, inputs_version: 1, tick: 3 }], outputs: [] });
+  it('accepts a patched, redacted or unpatched (null) input', () => {
+    expect(isPatchView(view([input, { ...input, video: { redacted: true } }, { ...input, video: null }]))).toBe(true);
+  });
+  it('rejects an input whose video field is omitted (never normalized to unpatched)', () => {
+    const withoutVideo: Record<string, unknown> = { ...input };
+    delete withoutVideo.video;
+    expect(isPatchView(view([withoutVideo]))).toBe(false);
+  });
+  it('rejects an input whose video is undefined or a non-source object', () => {
+    expect(isPatchView(view([{ ...input, video: undefined }]))).toBe(false);
+    expect(isPatchView(view([{ ...input, video: {} }]))).toBe(false);
   });
 });
