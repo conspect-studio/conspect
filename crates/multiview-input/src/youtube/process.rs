@@ -46,8 +46,9 @@ pub struct ResolverConfig {
     /// resolve it on `PATH`.
     pub yt_dlp_path: String,
     /// Hard per-invocation deadline; on expiry the child is killed. A resolve
-    /// may run up to three invocations (default clients, js-runtime retry,
-    /// fallback clients), each under this deadline.
+    /// runs at most four invocations (default clients and fallback clients,
+    /// each possibly repeated once without `--js-runtimes` on an old
+    /// `yt-dlp`), each under this deadline.
     pub timeout: Duration,
     /// The JavaScript runtime handed to `yt-dlp` as `--js-runtimes node:<path>`
     /// (an absolute path). `None` passes no runtime flag. [`Self::default`] and
@@ -210,33 +211,77 @@ pub async fn probe_version(config: &ResolverConfig) -> Result<String, YoutubeErr
     Ok(version)
 }
 
+/// Read `pipe` to its end, keeping at most `cap` bytes; `Err` once more than
+/// `cap` arrive (the caller then kills the child). Never allocates past `cap`.
+async fn read_capped<R>(pipe: Option<R>, cap: usize) -> Result<Vec<u8>, ()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return Ok(Vec::new());
+    };
+    let mut kept = Vec::new();
+    let mut chunk = vec![0_u8; 8192];
+    loop {
+        let n = pipe.read(&mut chunk).await.map_err(|_| ())?;
+        if n == 0 {
+            return Ok(kept);
+        }
+        if kept.len().saturating_add(n) > cap {
+            return Err(());
+        }
+        kept.extend_from_slice(chunk.get(..n).unwrap_or_default());
+    }
+}
+
+/// Upper bound on the stderr bytes read from one `yt-dlp` run; only the
+/// first [`bounded_stderr`] characters are kept for the message.
+const MAX_STDERR_BYTES: usize = 256 * 1024;
+
 /// One `yt-dlp -J` run: `Ok(stdout)` on success, else the classified error
 /// ([`YoutubeError::Unavailable`] for spawn failure/timeout,
-/// [`YoutubeError::Resolve`] carrying bounded stderr for a non-zero exit).
+/// [`YoutubeError::Resolve`] carrying bounded stderr for a non-zero exit or
+/// an over-limit output). Both pipes are drained concurrently under byte caps
+/// while the child runs; on overflow, timeout or cancellation the child is
+/// killed (`kill_on_drop`) and reaped by tokio.
 async fn run_once(config: &ResolverConfig, args: &[String]) -> Result<String, YoutubeError> {
-    let spawn = Command::new(&config.yt_dlp_path)
+    let mut child = Command::new(&config.yt_dlp_path)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .output();
-
-    let output = match timeout(config.timeout, spawn).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(YoutubeError::Unavailable(e.to_string())),
-        Err(_) => return Err(YoutubeError::Unavailable("yt-dlp -J timed out".to_owned())),
+        .spawn()
+        .map_err(|e| YoutubeError::Unavailable(e.to_string()))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // One deadline over draining both pipes AND reaping the child.
+    let run = async {
+        let (out, err) = tokio::join!(
+            read_capped(stdout, MAX_STDOUT_BYTES),
+            read_capped(stderr, MAX_STDERR_BYTES)
+        );
+        let (Ok(out), Ok(err)) = (out, err) else {
+            return Err(YoutubeError::Resolve(format!(
+                "yt-dlp -J output exceeded {MAX_STDOUT_BYTES} bytes"
+            )));
+        };
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| YoutubeError::Unavailable(e.to_string()))?;
+        Ok((status, out, err))
     };
-
-    if !output.status.success() {
-        return Err(YoutubeError::Resolve(bounded_stderr(&output.stderr)));
+    // On timeout or overflow `run` is dropped, and with it `child`, which
+    // kills the process (`kill_on_drop`).
+    let (status, out, err) = timeout(config.timeout, run)
+        .await
+        .map_err(|_| YoutubeError::Unavailable("yt-dlp -J timed out".to_owned()))??;
+    if !status.success() {
+        return Err(YoutubeError::Resolve(bounded_stderr(&err)));
     }
-    if output.stdout.len() > MAX_STDOUT_BYTES {
-        return Err(YoutubeError::Resolve(format!(
-            "yt-dlp -J output exceeded {MAX_STDOUT_BYTES} bytes"
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// One attempt with a given client list, retrying once without

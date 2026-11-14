@@ -370,3 +370,24 @@ fn normalize_context_address_rewrites_only_the_pointer() {
     ));
     assert_eq!(normalize_context_address(""), "");
 }
+
+/// Issue #420 review: libav names the segment it failed to open; a signed CDN
+/// URL (path or query signature) never survives into the emitted line.
+#[test]
+fn sanitize_line_reduces_urls_to_scheme_and_host() {
+    let line = "[hls @ 0x55] Error when loading first segment 'https://user:pw@rr1.googlevideo.com/videoplayback/signature/PATHSIG/seg.ts?sig=QSIG#F'\n";
+    let clean = sanitize_line(line);
+    assert_eq!(
+        clean,
+        "[hls @ 0x55] Error when loading first segment 'https://rr1.googlevideo.com/…'"
+    );
+    for secret in ["PATHSIG", "QSIG", "pw"] {
+        assert!(!clean.contains(secret), "{secret} leaked: {clean}");
+    }
+    assert_eq!(
+        sanitize_line("Opening 'http://[::1]:8080' for reading"),
+        "Opening 'http://[::1]:8080' for reading"
+    );
+    assert_eq!(sanitize_line("a :// b"), "a :// b");
+    assert_eq!(sanitize_line("x rtsp://cam/main y"), "x rtsp://cam/… y");
+}

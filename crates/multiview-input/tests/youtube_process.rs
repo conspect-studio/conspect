@@ -245,3 +245,26 @@ async fn a_stop_during_a_hung_resolve_ends_the_reresolve_loop_promptly() {
         started.elapsed()
     );
 }
+
+/// A `yt-dlp` that floods stdout is cut off at the byte cap while still
+/// running (killed, not buffered to its end), and the resolve fails cleanly.
+#[tokio::test]
+async fn an_over_limit_output_is_refused_while_the_child_runs() {
+    let _serial = EXEC_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    // ~1 GiB of output if never stopped; far past the 16 MiB cap.
+    let bin = fake_yt_dlp(dir.path(), "exec head -c 1073741824 /dev/zero");
+    let cfg =
+        ResolverConfig::new(bin.to_str().unwrap(), Duration::from_secs(20)).with_js_runtime(None);
+    let started = std::time::Instant::now();
+    let err = resolve_url(&cfg, "https://youtu.be/x").await.unwrap_err();
+    assert!(
+        matches!(&err, YoutubeError::Resolve(m) if m.contains("exceeded")),
+        "{err:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+}

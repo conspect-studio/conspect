@@ -133,13 +133,18 @@ pub fn map_av_level(av_level: i32) -> BridgeLevel {
 /// * strips trailing ASCII whitespace (the libav newline);
 /// * replaces interior control characters (other than ordinary space) with a
 ///   space so the record stays one clean printable line;
+/// * reduces every `scheme://…` URL to `scheme://host/…` (userinfo, path,
+///   query and fragment dropped): libav names the playlist or segment it
+///   failed to open, and a signed CDN URL (a `YouTube` googlevideo master
+///   carries `/signature/<sig>/` in its path) must never reach the log;
 /// * truncates to [`MAX_LINE_LEN`] at a UTF-8 character boundary.
 ///
-/// It allocates a single bounded `String` and is panic-free for any input
+/// It allocates a bounded `String` and is panic-free for any input
 /// (including empty, `%`-containing, NUL-containing, or oversized text).
 #[must_use]
 pub fn sanitize_line(raw: &str) -> String {
-    let trimmed = raw.trim_end();
+    let redacted = redact_line_urls(raw.trim_end());
+    let trimmed = redacted.as_str();
     let mut out = String::with_capacity(trimmed.len().min(MAX_LINE_LEN));
     for ch in trimmed.chars() {
         if out.len().saturating_add(ch.len_utf8()) > MAX_LINE_LEN {
@@ -154,6 +159,47 @@ pub fn sanitize_line(raw: &str) -> String {
             out.push(ch);
         }
     }
+    out
+}
+
+/// `line` with every `scheme://…` URL reduced to `scheme://host/…` (see
+/// [`sanitize_line`]). A URL ends at whitespace or a quote/bracket character.
+fn redact_line_urls(line: &str) -> String {
+    const END: &[char] = &['\'', '"', '<', '>', '(', ')', '[', ']', '`'];
+    let mut out = String::with_capacity(line.len().min(MAX_LINE_LEN));
+    let mut rest = line;
+    while let Some(at) = rest.find("://") {
+        let (before, after) = rest.split_at(at);
+        // The scheme is the run of URL-scheme characters right before `://`.
+        let scheme_len = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            .map(char::len_utf8)
+            .sum::<usize>();
+        let after = after.get(3..).unwrap_or_default();
+        let url_len = after
+            .find(|c: char| c.is_whitespace() || END.contains(&c))
+            .unwrap_or(after.len());
+        let (url, tail) = after.split_at(url_len);
+        out.push_str(before);
+        if scheme_len == 0 {
+            out.push_str("://");
+            out.push_str(url);
+        } else {
+            let authority = url.split(['/', '?', '#']).next().unwrap_or_default();
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            out.push_str("://");
+            out.push_str(host);
+            if url.len() > authority.len() || authority.len() != host.len() {
+                out.push_str("/…");
+            }
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
     out
 }
 
