@@ -542,6 +542,116 @@ fn a_failed_compose_restores_the_committed_keyer_draws() {
     assert_committed(&hook, &drive, &fill, "failed compose");
 }
 
+/// #443 review INV-MC-1: a compose deadline miss that changes nothing (a
+/// steady on-air DSK; the GPU readback or a slow CPU fallback is late) keeps
+/// the scene epoch, so the late off-clock result can still be adopted; before
+/// the fix every miss bumped it and a fallback slower than the clock was never
+/// adopted (Program froze). A miss whose rollback does change the draws (a
+/// staged off rolled back) still bumps it.
+#[test]
+fn a_deadline_miss_with_unchanged_keyer_draws_keeps_the_scene_epoch() {
+    use multiview_engine::runtime::FrameControl;
+    let (rig, _handle, mut hook, mut drive, _fill) = on_air_with_failing_cut();
+    // Steady state: tick 1 composes the same on-air DSK (same fill frame).
+    rig.publish_background(1);
+    let frame = step(&mut hook, &mut drive, 1);
+    assert!(probe(&frame).abs_diff(LUMA_FILL) < 8);
+    for t in 2..12 {
+        // Fresh sources every tick: nothing but the fill frame changes.
+        rig.publish_background(t);
+        rig.publish("gfx", LUMA_FILL, t);
+        hook.before_compose(&mut drive, rig::tick(t));
+        let epoch = drive.scene_epoch();
+        hook.on_compose_failed(&mut drive, rig::tick(t), "readback deadline");
+        assert_eq!(
+            drive.scene_epoch(),
+            epoch,
+            "a miss that changes no keyer draw keeps the epoch (tick {t})"
+        );
+    }
+}
+
+#[test]
+fn a_deadline_miss_whose_rollback_changes_the_keyer_draws_bumps_the_scene_epoch() {
+    use multiview_engine::runtime::FrameControl;
+    let (rig, handle, mut hook, mut drive, _fill) = on_air_with_failing_cut();
+    rig.publish_background(1);
+    let _ = step(&mut hook, &mut drive, 1);
+    // Tick 2 stages the DSK off (its draw goes), then its compose misses: the
+    // rollback puts the on-air draw back, a different scene than tick 2's.
+    handle
+        .try_send(cmd(
+            "off",
+            SwitcherVerb::KeyerCut {
+                keyer: 0,
+                on: false,
+            },
+        ))
+        .unwrap();
+    rig.publish_background(2);
+    rig.publish("gfx", LUMA_FILL, 2);
+    hook.before_compose(&mut drive, rig::tick(2));
+    assert!(
+        drive.keyer_draws()[0].is_none(),
+        "tick 2 staged the DSK off"
+    );
+    let epoch = drive.scene_epoch();
+    hook.on_compose_failed(&mut drive, rig::tick(2), "readback deadline");
+    assert!(
+        drive.keyer_draws()[0].is_some(),
+        "the on-air draw is restored"
+    );
+    assert_ne!(
+        drive.scene_epoch(),
+        epoch,
+        "the restored scene is a new epoch"
+    );
+}
+
+/// #443 review INV-MC-1, end to end: the real hook on a GPU backend whose
+/// CPU fallback (where keyed frames compose, K1) is slower than the clock's
+/// wait. Every tick's compose misses and the runtime calls
+/// `on_compose_failed`; the late keyed result must still be adopted within a
+/// bound, so Program keeps delivering keyed frames instead of freezing.
+#[test]
+fn a_slow_keyed_fallback_is_still_adopted_through_the_hook() {
+    use multiview_compositor::backend::RunBackend;
+    use multiview_engine::runtime::FrameControl;
+    use std::time::{Duration, Instant};
+    let (rig, handle, mut hook, drive, _fill) = on_air_with_failing_cut();
+    drop(handle);
+    let (backend, gpu) = RunBackend::simulated_gpu(Duration::ZERO).unwrap();
+    // Well past the clock's wait (3/4 of the 40 ms tick here).
+    gpu.set_cpu_fallback_cost(Duration::from_millis(120));
+    let mut drive = drive.with_backend(backend);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut t = 1;
+    let delivered = loop {
+        assert!(
+            Instant::now() < deadline,
+            "no keyed frame delivered: Program froze"
+        );
+        rig.publish_background(t);
+        rig.publish("gfx", LUMA_FILL, t);
+        hook.before_compose(&mut drive, rig::tick(t));
+        match drive.compose(rig::tick(t)) {
+            Ok(frame) => {
+                hook.after_compose(&frame);
+                if !frame.repeat {
+                    break frame;
+                }
+            }
+            Err(e) => hook.on_compose_failed(&mut drive, rig::tick(t), &e.to_string()),
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        t += 1;
+    };
+    assert!(
+        probe(&delivered).abs_diff(LUMA_FILL) < 8,
+        "the adopted frame carries the on-air DSK"
+    );
+}
+
 /// Review round 2 G1 rig: a tied DSK on air from tick 0, then a DIP AUTO
 /// (n = 10, switch point 1/2) from tick 1 takes it off: from the switch point
 /// (tick 6) its going-off weight `1 − d` is 0, so the committed tick 6 has

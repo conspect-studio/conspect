@@ -62,7 +62,7 @@ use multiview_framestore::TileStore;
 
 use crate::clock::Tick;
 use crate::error::{Error, Result};
-use crate::keyer::{KeyerDraw, KeyerParams, TieEnvelope, MAX_DSK};
+use crate::keyer::{KeyerDraw, KeyerFly, KeyerParams, TieEnvelope, MAX_DSK};
 use crate::slate::{failover_slate_image, FailoverSlate};
 
 /// Scratch slots reserved for keyer tiles on every compose (fill and key per
@@ -466,14 +466,30 @@ impl<T> CompositorDrive<T> {
         &self.keyers
     }
 
-    /// The installed keyer draws, for the hook to settle them in place after
-    /// a rejected frame (weights only; no allocation).
+    /// Settle the installed keyer draws in place after a rejected frame
+    /// (`settle` changes weights or rebuilds resting draws; no allocation).
     ///
-    /// Bumps the scene epoch (issue #415): the caller may change any draw,
-    /// so a late off-clock result of the unsettled draws is never adopted.
-    pub fn keyer_draws_mut(&mut self) -> &mut [Option<KeyerDraw>; MAX_DSK] {
-        self.scene_epoch = self.scene_epoch.wrapping_add(1);
-        &mut self.keyers
+    /// Bumps the scene epoch (issue #415) only when the settled draws differ
+    /// from the installed ones: a late off-clock result of a scene the settle
+    /// changed is never adopted, while a deadline miss that changes nothing
+    /// (the steady state, or no keyers at all) keeps the epoch, so a slow
+    /// CPU-fallback job can still be adopted (#443 review INV-MC-1).
+    pub fn settle_keyer_draws_with(
+        &mut self,
+        settle: impl FnOnce(&mut [Option<KeyerDraw>; MAX_DSK]),
+    ) {
+        let before: [Option<KeyerSceneKey>; MAX_DSK] = self
+            .keyers
+            .each_ref()
+            .map(|d| d.as_ref().map(KeyerSceneKey::of));
+        settle(&mut self.keyers);
+        let changed = before
+            .iter()
+            .zip(self.keyers.iter())
+            .any(|(old, new)| *old != new.as_ref().map(KeyerSceneKey::of));
+        if changed {
+            self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        }
     }
 
     /// Whether the transition's incoming tile contributes to the frame
@@ -590,6 +606,14 @@ impl<T> CompositorDrive<T> {
     pub fn effective_cell_source(&self, cell_id: &str) -> Option<String> {
         let index = *self.cell_index.get(cell_id)?;
         self.layout.cells.get(index).and_then(|c| c.source.clone())
+    }
+
+    /// The scene epoch (issue #415): bumped by every change to what a
+    /// composite draws other than source frame contents. Test seam.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn scene_epoch(&self) -> u64 {
+        self.scene_epoch
     }
 
     /// Replace the compositor backend the per-tick composite dispatches through.
@@ -1275,16 +1299,43 @@ struct Placement {
 /// rectangle, weight, parameters and key presence. The fill and key frames
 /// themselves are source content, as a cell's frame is.
 fn same_keyer_scene(a: Option<&KeyerDraw>, b: Option<&KeyerDraw>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => {
-            a.keyer == b.keyer
-                && a.rect == b.rect
-                && a.weight.to_bits() == b.weight.to_bits()
-                && a.params == b.params
-                && a.key.is_some() == b.key.is_some()
+    a.map(KeyerSceneKey::of) == b.map(KeyerSceneKey::of)
+}
+
+/// What of a keyer draw changes the composed scene (issue #415 epoch): all
+/// but the fill and key frame contents, which are source content. `Copy`, so
+/// a before/after comparison allocates nothing.
+/// Floats compare by bits, so a NaN parameter never reads as a change on
+/// every tick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct KeyerSceneKey {
+    keyer: u8,
+    rect: KeyerFly,
+    weight_bits: u32,
+    /// `KeyKind` as (luma?, clip bits, gain bits).
+    kind: (bool, u32, u32),
+    invert: bool,
+    mask: Option<multiview_compositor::key::KeyMask>,
+    has_key: bool,
+}
+
+impl KeyerSceneKey {
+    fn of(d: &KeyerDraw) -> Self {
+        let kind = match d.params.kind {
+            multiview_compositor::key::KeyKind::Luma { clip, gain } => {
+                (true, clip.to_bits(), gain.to_bits())
+            }
+            _ => (false, 0, 0),
+        };
+        Self {
+            keyer: d.keyer,
+            rect: d.rect,
+            weight_bits: d.weight.to_bits(),
+            kind,
+            invert: d.params.invert,
+            mask: d.params.mask,
+            has_key: d.key.is_some(),
         }
-        _ => false,
     }
 }
 

@@ -161,7 +161,8 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             // draws (this tick never resolved), so an on-air DSK stays in
             // the frame exactly as committed. Only a tied keyer whose
             // transition the reject cancelled goes to its resting weight.
-            self.driver.settle_keyer_draws(drive.keyer_draws_mut());
+            let driver = &self.driver;
+            drive.settle_keyer_draws_with(|draws| driver.settle_keyer_draws(draws));
             // Keep the drive coherent with the restored machine (SW2-03): if
             // this tick re-pointed the cell before failing, point it back.
             let (restored, _) = self.driver.resolved_selections();
@@ -259,7 +260,8 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // the committed ones out into `keyer_buf`; swap them back, then
         // settle them against the restored state.
         drive.set_keyer_draws(&mut self.keyer_buf);
-        self.driver.settle_keyer_draws(drive.keyer_draws_mut());
+        let driver = &self.driver;
+        drive.settle_keyer_draws_with(|draws| driver.settle_keyer_draws(draws));
         let (restored, _) = self.driver.resolved_selections();
         if self.last_program.as_ref() != Some(restored)
             && drive.rebind_cell(&self.cell_id, restored.as_str()).is_ok()
