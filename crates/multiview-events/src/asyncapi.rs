@@ -1608,7 +1608,7 @@ fn route_output_event_schema() -> Value {
             "tick": { "type": "integer", "format": "uint64", "description": "Program tick at which the outcome was decided." },
             "outcome": {
                 "type": "string",
-                "enum": ["applied", "superseded", "refused:feed-not-fresh", "refused:capacity", "refused:encoder-not-ready", "refused:unroutable", "refused:format-mismatch", "fallback:aux-failed", "fallback:encoder-failed"]
+                "enum": ["applied", "superseded", "refused:feed-not-fresh", "refused:capacity", "refused:encoder-not-ready", "refused:unroutable", "refused:format-mismatch", "fallback:aux-failed", "fallback:encoder-failed", "subtitle:applied", "subtitle:refused:not-in-run"]
             }
         }
     })

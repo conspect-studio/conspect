@@ -6221,3 +6221,97 @@ fn a_reformatted_layout_output_follows_edits_back_off_and_a_delete() {
     let o0 = x.windows_of(0);
     assert!(o0.windows(2).all(|w| w[1] == w[0] + 1), "no gap: {o0:?}");
 }
+
+/// Slice F #345 part F2: a subtitle take through the control adapter
+/// re-points the run's route table (published on the handle, keyed by
+/// output config id) and the off-clock sampler uses the new source on the
+/// very next tick: the old source's cue closes at T and the new one opens at
+/// T. Between runs the adapter answers `Busy`; an output the run does not
+/// sample (or a slot beyond its table) is `NotInRun` and changes nothing.
+#[test]
+fn a_subtitle_take_repoints_the_route_table_for_the_next_sampler_tick() {
+    use crate::subtitle_slots::{subtitle_routes, CueResolver, SubtitleOutputSampler, SubtitleRun};
+    use multiview_control::output_routing::{
+        OutputRouting, SubtitleTakeError, SubtitleTakeRequest,
+    };
+    use multiview_output::hls::subtitle::subtitle_feed_with_capacity;
+    let (_r, h, _aux) = router(1, 6, Box::new(|_| Err("never".to_owned())));
+    let routes = subtitle_routes(vec![Some("cam_a".to_owned()), None]);
+    let tick = Arc::new(AtomicU64::new(0));
+    let h = h
+        .with_outputs(vec![RunOutput {
+            id: Some("hls-1".into()),
+            settings: 0,
+            feed_format: None,
+            base_format: None,
+            routable: true,
+            program_audio: true,
+            codec_name: String::new(),
+        }])
+        .with_subtitles(
+            vec![("hls-1".to_owned(), Arc::clone(&routes))],
+            Arc::clone(&tick),
+        );
+    let slot = output_routing_slot();
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let request = |output: &str, slots: Vec<(usize, Option<String>)>| SubtitleTakeRequest {
+        operation_id: "op".to_owned(),
+        output: output.to_owned(),
+        slots,
+        principal: "p".to_owned(),
+    };
+    // No run: Busy, and no live table.
+    assert_eq!(
+        adapter.try_take_subtitles(request("hls-1", vec![(0, None)])),
+        Err(SubtitleTakeError::Busy)
+    );
+    assert_eq!(adapter.subtitle_routes("hls-1"), None);
+    slot.store(Some(Arc::new(h)));
+    let (feed, rx) = subtitle_feed_with_capacity(16);
+    let resolve: CueResolver = Box::new(|id, _| match id {
+        "cam_a" => Some(vec!["from a".to_owned()]),
+        "cam_b" => Some(vec!["from b".to_owned()]),
+        _ => None,
+    });
+    let mut run = SubtitleRun::new(
+        vec![SubtitleOutputSampler::new(Arc::clone(&routes), feed, 2)],
+        resolve,
+        CADENCE,
+    )
+    .with_tick_cell(Arc::clone(&tick));
+    run.tick(10);
+    run.tick(11);
+    assert_eq!(tick.load(Ordering::Acquire), 11);
+    // The take: slot 0 → cam_b; it lands by the next tick (12).
+    assert_eq!(
+        adapter.try_take_subtitles(request("hls-1", vec![(0, Some("cam_b".to_owned()))])),
+        Ok(12)
+    );
+    assert_eq!(
+        adapter.subtitle_routes("hls-1"),
+        Some(vec![Some("cam_b".to_owned()), None])
+    );
+    run.tick(12);
+    let at = |t: i64| MediaTime::from_tick(t, CADENCE);
+    let cues = rx.drain();
+    assert_eq!(cues.len(), 3, "{cues:?}");
+    assert_eq!((cues[1].start, cues[1].end), (at(10), at(12)));
+    assert_eq!(cues[1].lines[0], "from a");
+    assert_eq!(
+        (cues[2].start, cues[2].lines[0].as_str()),
+        (at(12), "from b")
+    );
+    // Not in this run / a slot beyond the table: refused, table unchanged.
+    assert_eq!(
+        adapter.try_take_subtitles(request("other", vec![(0, None)])),
+        Err(SubtitleTakeError::NotInRun)
+    );
+    assert_eq!(
+        adapter.try_take_subtitles(request("hls-1", vec![(0, None), (5, None)])),
+        Err(SubtitleTakeError::NotInRun)
+    );
+    assert_eq!(
+        adapter.subtitle_routes("hls-1"),
+        Some(vec![Some("cam_b".to_owned()), None])
+    );
+}

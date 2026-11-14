@@ -501,6 +501,13 @@ pub struct OutputRoutingHandle {
     /// [`OutputRoutingHandle::with_pictures`].
     pictures: Option<PlanPictures>,
     max_aux_canvases: usize,
+    /// The run's subtitle slots (slice F #345 part F2): per output config id,
+    /// its route table, which the patch API re-points live. Empty until
+    /// [`OutputRoutingHandle::with_subtitles`].
+    subtitles: Arc<[(String, crate::subtitle_slots::SubtitleRoutes)]>,
+    /// The last output tick the subtitle sampler ran (a re-point is used
+    /// from the next one at the latest).
+    subtitle_tick: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// What the plan reads to tell an identity picture (P2) from a convert
@@ -638,6 +645,35 @@ impl OutputRoutingHandle {
     pub fn with_pictures(mut self, pictures: PlanPictures) -> Self {
         self.pictures = Some(pictures);
         self
+    }
+
+    /// Attach the run's subtitle route tables (per output config id) and the
+    /// sampler's tick cell (slice F #345 part F2).
+    #[must_use]
+    pub fn with_subtitles(
+        mut self,
+        tables: Vec<(String, crate::subtitle_slots::SubtitleRoutes)>,
+        tick: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.subtitles = tables.into();
+        self.subtitle_tick = tick;
+        self
+    }
+
+    /// The subtitle route table of the output whose config id is `id`.
+    #[must_use]
+    pub fn subtitle_routes(&self, id: &str) -> Option<&crate::subtitle_slots::SubtitleRoutes> {
+        self.subtitles
+            .iter()
+            .find(|(output, _)| output == id)
+            .map(|(_, routes)| routes)
+    }
+
+    /// The last output tick the subtitle sampler ran.
+    #[must_use]
+    pub fn subtitle_tick(&self) -> u64 {
+        self.subtitle_tick
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The run's store lookup and canvas, when attached.
@@ -1233,6 +1269,8 @@ impl OutputRouter {
             has_preview: cfg.has_preview,
             pictures: None,
             max_aux_canvases: cfg.max_aux_canvases,
+            subtitles: Arc::from(Vec::new()),
+            subtitle_tick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let mut router = Self {
             cfg,

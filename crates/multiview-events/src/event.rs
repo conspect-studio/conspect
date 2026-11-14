@@ -968,7 +968,8 @@ pub struct RouteOutputEvent {
     /// `applied` | `superseded` | `refused:feed-not-fresh` | `refused:capacity` |
     /// `refused:encoder-not-ready` | `refused:unroutable` | `refused:format-mismatch` |
     /// `fallback:aux-failed` |
-    /// `fallback:encoder-failed`.
+    /// `fallback:encoder-failed` | `subtitle:applied` |
+    /// `subtitle:refused:not-in-run` (a subtitle re-patch, #345 F2).
     pub outcome: String,
 }
 

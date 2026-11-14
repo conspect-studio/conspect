@@ -2081,7 +2081,7 @@ restart".
   drops, held drops, truncations and written segments (`PacketMuxSink::subtitle_stats`).
 - **Engine** (`multiview-cli::subtitle_slots`). Each HLS output with subtitle slots gets a route
   table `Arc<SwapCell<Arc<[Option<String>]>>>` (slot → source, from config `source`; F2
-  re-points it live). Once per item the **bake consumer** (never the output clock; the hot-loop
+  re-points it live, see §12.8 "As built in slice F (#345, part F2)"). Once per item the **bake consumer** (never the output clock; the hot-loop
   projection gains no work) reads the table, asks the source's caption store for the text cue at
   the picture the compositor latches for that tick (`TileStore::peek_at_with_source_time`: the same
   selection as `read_at`, without moving the prune watermark) and
@@ -2091,7 +2091,8 @@ restart".
   segment it covers. A re-point lands on one tick: the old source's cue ends at tick T and the new
   source's cue may start at T. A source without a caption store yields no cues.
 - **Follow-ups:** LL-HLS WebVTT (fMP4 parts), CEA-608 in A53 SEI for TS/RTMP, DVB subtitles;
-  the patch API plane, live re-patch and persistence (F2); the Outputs editor and matrix tab (F3).
+  the Outputs editor and matrix tab (F3). The patch API plane, live re-patch and persistence
+  landed in F2 (§12.8).
 
 ### 12.4 The cheapest path per crosspoint
 
@@ -2454,7 +2455,7 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   Other requests are refused:
   - video slot ≥ 1 → 422 `unknown-slot`;
   - other audio slots → 422 `slot-medium-mismatch` (they are fixed by config in this slice);
-  - `subtitle` → 422 `slot-medium-mismatch` (#345);
+  - `subtitle` crosspoints: see part F2 below (#345);
   - a layout or bus on a mixer input → 422 `unknown-source` (#307).
 
   A request carries either mixer-input crosspoints or one output's crosspoints. Two outputs, or a
@@ -2488,6 +2489,48 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   size, is opaque and carries the canvas colour; any fit of an equal-size picture is the identity.
 - **Audio slot 0 in `GET /patch`.** It reports the output's accepted audio feed exactly as
   `GET /routing` projects and redacts it (default `follow`).
+
+**As built in slice F (#345, part F2): live subtitle re-patch.**
+- **Request.** `POST /patch/plan` and `/patch/take` accept plane `subtitle` crosspoints,
+  destination `{output, slot}`, source `{"source": id}` or `"none"` (unpatch). A request with a
+  subtitle crosspoint carries ONLY subtitle crosspoints of ONE output, each slot once; mixing
+  with video/audio, a second output or a repeated slot → 422 `unknown-slot`. A slot ≥ the
+  output's declared `slots.subtitle` count → 422 `unknown-slot`; an output kind whose medium
+  carries no subtitles (`subtitle_max = 0`) → 422 `slot-medium-mismatch`; a `{layout}` or
+  `{bus}` → 422 `slot-medium-mismatch` (subtitle essences come from sources).
+- **Authorization** is the video output path's, in the same order: role Write, then for every
+  crosspoint `authorize_output_end` (object AND output axis) and Read on the named source, all
+  BEFORE shape and any existence answer (review T-A1): a denied caller gets 403, never 404 or
+  a 422 that reveals the output or source. A replay re-authorizes.
+- **Plan.** Each crosspoint has path `subtitle`. An unknown source is an `unknown-source`
+  refusal in the plan (422 `unknown-feed` on take, the video take's mapping). A source that
+  declares no `captions` (absent or `off`) gets `note: "source-has-no-captions"`: not a
+  refusal, the slot then carries an empty track.
+- **Take.** The take-scoped idempotency store under the slot-0 key namespace
+  (`slot0_take_key`): a key is bound to the whole take (output + slot→source map, sorted by
+  slot), so the same key with another body, or with a video take, is 409 `conflict`; a replay
+  answers its first operation and never re-applies. One request is one take against the
+  per-output 2/s and per-principal 10/s limiter. `202 {operation_id, status: "accepted"}`.
+- **Engine.** `OutputRouting::try_take_subtitles` (wait-free, no channel). The run publishes
+  its route tables, keyed by output config id, on the `OutputRoutingHandle`
+  (`with_subtitles`), so they are published and replaced with the handle between runs. The
+  adapter RCU-replaces the output's `SubtitleRoutes` table (`subtitle_slots::repoint`, writers
+  serialized by a control-plane mutex the sampler never takes; the sampler only loads the
+  table once per tick). `subtitle:applied` is reported at once, after the swap: the sampler
+  applies it at its next output tick (the answered `tick` is the last sampled tick + 1, at the
+  latest), so the old source's cue ends at T and the new one may start at T. No running engine
+  → 503 `engine-busy` (the key freed); an output the run does not sample (not in this run, or
+  slots declared after it started) → `subtitle:refused:not-in-run`, nothing changes. Without
+  an output-routing seam the routes answer 409 `routing-unavailable` as the video path does.
+  The outcome rides `route.output`.
+- **Persistence.** After `applied` (and only then), each named slot's
+  `slots.subtitle[i].source` is written into the accepted state under the config-mutation
+  lock, keeping the accepted output identities (`persist_subtitle_routes`), off the handler.
+  A run builds each slot's route from it, so a restart starts from the persisted source.
+- **`GET /patch`.** Each output gains `subtitle: [{slot, format, language, name, live,
+  source}]`: from the engine's live route table when the run samples the output (`live:
+  true`), else from the accepted config (`live: false`). A source the caller cannot Read is
+  `{redacted: true}`; an unpatched slot is `null`.
 
 ### 12.9 The Routing page (#308)
 

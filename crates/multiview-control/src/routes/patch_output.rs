@@ -275,6 +275,7 @@ pub(crate) fn plan(
             on_air: false,
             cost: if video { cost.clone() } else { None },
             refusal: if video { refused.clone() } else { None },
+            note: None,
         });
     }
     Ok(Ok(PatchPlan {
@@ -416,6 +417,8 @@ pub(crate) async fn outputs_view(
                 "degraded": readback.is_some_and(|r| r.degraded),
             }],
             "audio": audio,
+            // Subtitle slots (#345 F2): the live route table, else config.
+            "subtitle": super::patch_subtitle::output_view(state, principal, &body),
         }));
     }
     Ok(out)

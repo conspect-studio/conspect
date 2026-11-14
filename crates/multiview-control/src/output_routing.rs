@@ -402,6 +402,32 @@ pub struct OutputOutcome {
     pub audio: Option<RoutedAudio>,
 }
 
+/// A live subtitle re-patch of one output (slice F #345 part F2), already
+/// authorized, validated and rate-limited by the HTTP layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleTakeRequest {
+    /// The operation id minted for the take (echoed in its outcome).
+    pub operation_id: String,
+    /// The output's config id.
+    pub output: String,
+    /// Slot index → its new source (`None` = unpatched), each slot once.
+    pub slots: Vec<(usize, Option<String>)>,
+    /// The authenticated key id the take is attributed to.
+    pub principal: String,
+}
+
+/// Why the engine did not apply a subtitle re-patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleTakeError {
+    /// No running engine run (between runs, or the run ended): 503
+    /// `engine-busy`, the key freed.
+    Busy,
+    /// The run does not sample this output's subtitle slots (the output is
+    /// not in this run, or the slot was declared after the run started:
+    /// restart-pending). Reported as `subtitle:refused:not-in-run`.
+    NotInRun,
+}
+
 /// The engine seam the binary implements (all calls non-blocking).
 pub trait OutputRouting: Send + Sync {
     /// Predict a take's cost and refusals.
@@ -499,6 +525,27 @@ pub trait OutputRouting: Send + Sync {
             converts: u8::from(cost.needs_encoder),
         })
     }
+
+    /// Re-patch subtitle slots of one output live (slice F #345 part F2):
+    /// the engine replaces that output's route table (RCU, wait-free, never
+    /// waits on the sampler) and answers the output tick from which the
+    /// sampler uses it (at the latest; the off-clock sampler reads the table
+    /// once per tick, so the re-patch lands on one tick). The default answers
+    /// `Busy` (an engine without subtitle slots).
+    ///
+    /// # Errors
+    /// [`SubtitleTakeError`] when it was not applied.
+    fn try_take_subtitles(&self, take: SubtitleTakeRequest) -> Result<u64, SubtitleTakeError> {
+        let _ = take;
+        Err(SubtitleTakeError::Busy)
+    }
+
+    /// The live subtitle route table of `output` (slot → source) from the
+    /// running engine, `None` when no run samples it.
+    fn subtitle_routes(&self, output: &str) -> Option<Vec<Option<String>>> {
+        let _ = output;
+        None
+    }
 }
 
 /// Shared handle to an installed [`OutputRouting`].
@@ -567,6 +614,9 @@ pub struct PendingTake {
     pub feed: Option<RoutedFeed>,
     /// The audio choice the take carries, if any.
     pub audio: Option<RoutedAudio>,
+    /// A subtitle re-patch (slice F #345 part F2): slot → source, sorted by
+    /// slot, so the key binds the whole take; `None` for a video/audio take.
+    pub subtitles: Option<Vec<(usize, Option<String>)>>,
 }
 
 /// A take's record for the life of its `Idempotency-Key` (or until it is
@@ -1225,6 +1275,55 @@ pub async fn persist_route(
     crate::boot_model::commit_desired(state, config, layouts).await
 }
 
+/// Persist an applied subtitle re-patch (slice F #345 part F2): each named
+/// slot's `slots.subtitle[i].source` of the output whose config id is
+/// `output`, under the config-mutation lock, exactly as an applied video take
+/// is persisted ([`persist_route`]). Start-up builds each slot's route from
+/// it, so a restart starts from the persisted source. A slot the accepted
+/// output no longer declares is skipped (the take was validated against the
+/// state it read).
+///
+/// # Errors
+/// The accepted document cannot be read, validated or committed.
+pub async fn persist_subtitle_routes(
+    state: &crate::AppState,
+    output: &str,
+    slots: &[(usize, Option<String>)],
+) -> crate::ControlResult<()> {
+    if state.boot_model.is_none() {
+        return Ok(());
+    }
+    let _mutation = state.lock_config_mutation().await;
+    let mut config: multiview_config::MultiviewConfig =
+        serde_json::from_value(crate::boot_model::current_desired_config(state)?)
+            .map_err(|e| crate::ControlError::Repository(format!("desired configuration: {e}")))?;
+    let Some(target) = config.outputs.iter_mut().find(|o| o.id() == output) else {
+        return Ok(());
+    };
+    let Some(declared) = target.slots_mut().as_mut() else {
+        return Ok(());
+    };
+    let mut changed = false;
+    for (slot, source) in slots {
+        if let Some(entry) = declared.subtitle.get_mut(*slot) {
+            if entry.source != *source {
+                entry.source.clone_from(source);
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    config
+        .validate()
+        .map_err(|e| crate::ControlError::Validation(e.to_string()))?;
+    // Only a slot's body changed, never the output list: keep the accepted
+    // output identities (an id-less output's body edit must not re-derive
+    // them).
+    crate::boot_model::commit_keeping_output_ids(state, config).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1272,6 +1371,7 @@ mod tests {
             api_id: "o".to_owned(),
             feed: Some(RoutedFeed::Program),
             audio: None,
+            subtitles: None,
         };
         let mut ops = Vec::new();
         for i in 0..3 {
@@ -1307,6 +1407,7 @@ mod tests {
             api_id: "o".to_owned(),
             feed: Some(RoutedFeed::Program),
             audio: None,
+            subtitles: None,
         }
     }
 

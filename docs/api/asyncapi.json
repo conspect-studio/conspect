@@ -1836,7 +1836,9 @@
               "refused:unroutable",
               "refused:format-mismatch",
               "fallback:aux-failed",
-              "fallback:encoder-failed"
+              "fallback:encoder-failed",
+              "subtitle:applied",
+              "subtitle:refused:not-in-run"
             ],
             "type": "string"
           },

@@ -3980,6 +3980,8 @@ impl Pipeline {
         let aux_canvas = self.aux_canvas();
         let plan_stores = Arc::clone(&stores);
         let subtitle_stores = Arc::clone(&stores);
+        // Slice F part F2: the sampler publishes its tick for the patch API.
+        let subtitle_tick = Arc::new(AtomicU64::new(0));
         // Filled once this run's Program exists (§7 back-off input).
         let program_lateness: crate::routing_aux::ProgramLateness =
             Arc::new(multiview_framestore::SwapCell::empty());
@@ -4035,13 +4037,24 @@ impl Pipeline {
         )
         .map_err(spawn_err)?;
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
-        let handle = Arc::new(handle.with_outputs(run_outputs).with_pictures(
-            crate::output_routing::PlanPictures {
-                stores: plan_stores,
-                canvas: aux_canvas,
-                preview_selection: preview_selection.clone(),
-            },
-        ));
+        // Slice F part F2: the run's subtitle route tables, keyed by output
+        // config id, ride the handle the adapter reads (published and
+        // replaced with it between runs), so `/patch/take` re-points them.
+        let subtitle_tables = self
+            .subtitle_outputs
+            .iter()
+            .map(|plan| (plan.output_id.clone(), Arc::clone(&plan.routes)))
+            .collect();
+        let handle = Arc::new(
+            handle
+                .with_outputs(run_outputs)
+                .with_pictures(crate::output_routing::PlanPictures {
+                    stores: plan_stores,
+                    canvas: aux_canvas,
+                    preview_selection: preview_selection.clone(),
+                })
+                .with_subtitles(subtitle_tables, Arc::clone(&subtitle_tick)),
+        );
         enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
         self.output_routing.store(Some(handle));
         Ok(RunRouting {
@@ -4051,7 +4064,10 @@ impl Pipeline {
                 inband_sets: self.output_inband_sets.clone(),
                 base_formats: self.rendition_formats.clone(),
                 convert_hook: self.convert_hook.clone(),
-                subtitles: Box::new(self.subtitle_run(subtitle_stores)),
+                subtitles: Box::new(
+                    self.subtitle_run(subtitle_stores)
+                        .with_tick_cell(subtitle_tick),
+                ),
             },
             aux_tx,
             preview_selection,
@@ -13253,6 +13269,75 @@ pub(crate) struct SubtitleOutputPlan {
     routes: crate::subtitle_slots::SubtitleRoutes,
     feed: multiview_output::hls::SubtitleFeed,
     slots: usize,
+}
+
+#[cfg(test)]
+mod subtitle_route_boot_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+
+    /// Slice F #345 part F2: a re-patch is persisted as the slots' `source`
+    /// in the accepted state, and a run builds each HLS output's route table
+    /// from it, so a restart starts every subtitle slot on its persisted
+    /// source (an absent source = unpatched).
+    #[test]
+    fn a_restart_starts_each_subtitle_slot_from_its_persisted_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.m3u8");
+        let toml = format!(
+            r##"
+schema_version = 1
+[canvas]
+width = 640
+height = 360
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "cam_a"
+kind = "bars"
+[[sources]]
+id = "cam_b"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "cam_a"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs.slots.subtitle]]
+language = "en"
+source = "cam_b"
+[[outputs.slots.subtitle]]
+language = "es"
+"##,
+            path.display()
+        );
+        let config = MultiviewConfig::load_from_toml(&toml).expect("parse");
+        config.validate().expect("validates");
+        let epoch = multiview_output::SharedEpoch::default();
+        let output = &config.outputs[0];
+        let (_built, plan) =
+            build_hls_output(output, &path.display().to_string(), &epoch).expect("builds");
+        let plan = plan.expect("an HLS output with subtitle slots has a plan");
+        assert_eq!(plan.output_id, output.id());
+        assert_eq!(plan.slots, 2);
+        assert_eq!(
+            plan.routes.load().to_vec(),
+            vec![Some("cam_b".to_owned()), None]
+        );
+    }
 }
 
 /// A fresh link-status record for a push sink: listener mode is read from the

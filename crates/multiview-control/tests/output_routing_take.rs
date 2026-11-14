@@ -1025,6 +1025,7 @@ fn fill_take_store(
                 api_id: "output-0".to_owned(),
                 feed: Some(RoutedFeed::Program),
                 audio: None,
+                subtitles: None,
             },
         );
         assert!(
@@ -1651,6 +1652,7 @@ fn concurrent_reservations_of_one_key_with_two_takes_never_share_an_operation() 
                         api_id: output.to_owned(),
                         feed: Some(feed),
                         audio: None,
+                        subtitles: None,
                     },
                 )
             })
