@@ -2238,3 +2238,87 @@ fn a_run_ends_its_subtitle_routing_when_it_returns() {
         Err(SubtitleTakeError::Busy)
     );
 }
+
+/// What the teardown hook observed: (live, table unchanged, take, readback, table).
+type TeardownSeen = (
+    bool,
+    bool,
+    Result<u64, multiview_control::output_routing::SubtitleTakeError>,
+    Option<Vec<Option<String>>>,
+    Vec<Option<String>>,
+);
+
+/// Review INV2-1 through the real pipeline: teardown is paused after the
+/// bake consumer exited (egress joined) and before ingest teardown and the
+/// run's return. There, a subtitle take is `Busy`, the run's table is
+/// unchanged and there is no live readback (GET /patch: `live: false`).
+#[test]
+fn a_subtitle_take_during_teardown_after_the_consumer_exited_is_busy() {
+    use multiview_control::output_routing::{
+        OutputRouting, SubtitleTakeError, SubtitleTakeRequest,
+    };
+    let template = CONFIG.replacen(
+        "segment_ms = 1000\n[[outputs]]",
+        "segment_ms = 1000\n[[outputs.slots.subtitle]]\nlanguage = \"en\"\nsource = \"@_a\"\n[[outputs]]",
+        1,
+    );
+    assert_ne!(template, CONFIG, "out0 declares a subtitle slot");
+    let seen: Arc<Mutex<Option<TeardownSeen>>> = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let live_during_run = Arc::new(AtomicBool::new(false));
+    let live_flag = Arc::clone(&live_during_run);
+    let run = drive_prepared(
+        &template,
+        false,
+        false,
+        "sub_teardown",
+        30,
+        move |pipeline| {
+            let slot = pipeline.output_routing();
+            pipeline.set_teardown_hook(Box::new(move || {
+                let handle = slot.load().expect("the run published its handle");
+                let routes = handle
+                    .subtitle_routes_for_test("out0")
+                    .expect("out0 has a route table");
+                let before = routes.load().to_vec();
+                let adapter =
+                    crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+                let take = adapter.try_take_subtitles(SubtitleTakeRequest {
+                    operation_id: "late".to_owned(),
+                    output: "out0".to_owned(),
+                    slots: vec![(0, None)],
+                    principal: "p".to_owned(),
+                });
+                let after = routes.load().to_vec();
+                *record.lock().unwrap() = Some((
+                    handle.subtitles_live(),
+                    before == after,
+                    take,
+                    adapter.subtitle_routes("out0"),
+                    after,
+                ));
+            }));
+        },
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            live_flag.store(
+                handle.subtitles_live() && handle.subtitle_table("out0").is_some(),
+                Ordering::Release,
+            );
+        },
+    );
+    assert_eq!(run.frames, 30);
+    assert!(
+        live_during_run.load(Ordering::Acquire),
+        "live during the run"
+    );
+    let (live, unchanged, take, readback, table) =
+        seen.lock().unwrap().take().expect("the teardown hook ran");
+    assert!(!live, "admission ended before the run returned");
+    assert_eq!(take, Err(SubtitleTakeError::Busy));
+    assert!(unchanged, "the ended run's table is untouched: {table:?}");
+    assert_eq!(table, vec![Some("sub_teardown_a".to_owned())]);
+    assert_eq!(readback, None, "no live readback (GET /patch live:false)");
+}

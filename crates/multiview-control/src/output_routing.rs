@@ -528,11 +528,13 @@ pub trait OutputRouting: Send + Sync {
 
     /// Re-patch subtitle slots of one output live (slice F #345 part F2):
     /// the engine replaces that output's route table (RCU, wait-free, never
-    /// waits on the sampler) and answers the last output tick the sampler
-    /// finished BEFORE the swap. The new table is used from the first tick
-    /// the sampler samples after that one (one tick, but not a promised
-    /// index: the bake consumer may shed ticks). A run that ended or was
-    /// replaced is never mutated: `Busy`. Called under the control plane's
+    /// waits on the sampler). `Ok(tick)` means the table was swapped; `tick`
+    /// is a completed-tick lower bound observed before the swap (`0`:
+    /// possibly no tick completed yet), not a landing tick. A sample already
+    /// in flight finishes on the old table; the first table read that starts
+    /// after the swap sees the new route, unless a later take supersedes it
+    /// first (then it is never sampled) or the run ends first. A run that
+    /// ended, is tearing down or was replaced is never mutated: `Busy`. Called under the control plane's
     /// subtitle serialization; must not block. The default answers `Busy`
     /// (an engine without subtitle slots).
     ///

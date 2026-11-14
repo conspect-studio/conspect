@@ -2414,6 +2414,10 @@ pub struct Pipeline {
     /// thread before each convert (a chaos test wedges it). Always `None`
     /// outside tests.
     convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// Test seam (review INV2-1): run in teardown after the egress join
+    /// (the bake consumer has exited) and before ingest teardown.
+    #[cfg(test)]
+    teardown_hook: Option<Box<dyn Fn() + Send + Sync>>,
     /// Per runnable output (same order as `output_video_keys`): the format a
     /// routed source/PVW is composed at for it (#342 review M3).
     output_formats: Vec<Option<crate::routing_aux::AuxFormat>>,
@@ -3616,6 +3620,8 @@ impl Pipeline {
             rendition_configs,
             rendition_formats,
             convert_hook: None,
+            #[cfg(test)]
+            teardown_hook: None,
             output_formats,
             output_video_keys,
             output_inband_sets,
@@ -4060,6 +4066,9 @@ impl Pipeline {
         // exit path drops this guard), so a take can no longer re-point an
         // ended or replaced run, and its live readback is gone.
         let subtitle_end = crate::output_routing::SubtitleRunEnd(Arc::clone(&handle));
+        // Review INV2-1: the bake consumer holds this; its exit, for any
+        // reason, ends subtitle admission wait-free.
+        let subtitle_exit = handle.subtitle_consumer_exit();
         self.output_routing.store(Some(handle));
         Ok(RunRouting {
             subtitle_end,
@@ -4073,6 +4082,7 @@ impl Pipeline {
                     self.subtitle_run(subtitle_stores)
                         .with_tick_cell(subtitle_tick),
                 ),
+                subtitle_exit,
             },
             aux_tx,
             preview_selection,
@@ -4462,6 +4472,13 @@ impl Pipeline {
     #[must_use]
     pub fn window_subscriptions(&self) -> crate::output_window_registry::WindowSubscriptionSlot {
         Arc::clone(&self.window_subscriptions)
+    }
+
+    /// Test seam (review INV2-1): run `hook` in teardown once the bake
+    /// consumer has exited, before ingest teardown and the run's return.
+    #[cfg(test)]
+    pub(crate) fn set_teardown_hook(&mut self, hook: Box<dyn Fn() + Send + Sync>) {
+        self.teardown_hook = Some(hook);
     }
 
     /// Test seam (#342 review I3): run `hook` on every `format-convert`
@@ -5526,7 +5543,7 @@ impl Pipeline {
         let routing = self.build_output_routing(&binding_ids, &enforced_audio_tracks)?;
         self.issue_boot_audio_takes();
         let RunRouting {
-            subtitle_end: _subtitle_end,
+            subtitle_end,
             consumer: consumer_routing,
             aux_tx,
             preview_selection,
@@ -6022,6 +6039,10 @@ impl Pipeline {
             crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
         }
         stage("clock-returned");
+        // Review INV2-1: no subtitle re-point is admitted once teardown
+        // starts (before the egress join and the ingest teardown); the
+        // guard still ends it on every other exit path.
+        subtitle_end.0.end_subtitles();
         if let Some(cause) = crate::exit_watchdog::armed() {
             tracing::info!(?cause, "exit deadline armed; finalising outputs first");
         }
@@ -6049,6 +6070,10 @@ impl Pipeline {
             crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
         }
         stage("egress-joined");
+        #[cfg(test)]
+        if let Some(hook) = self.teardown_hook.as_ref() {
+            hook();
+        }
         // Then tear ingest down (signal + bounded join per producer). Producers
         // blocked in libav network reads use their full grace here; the exit
         // watchdog bounds the total.
@@ -7793,6 +7818,8 @@ struct ConsumerRouting {
     /// The subtitle-slot cue sampler (slice F #345), ticked once per item.
     /// Boxed for `clippy::large_futures`, like the router.
     subtitles: Box<crate::subtitle_slots::SubtitleRun>,
+    /// Ends subtitle admission when the consumer exits (review INV2-1).
+    subtitle_exit: crate::output_routing::SubtitleConsumerExit,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
@@ -8342,7 +8369,11 @@ fn consumer_main<D: WindowDelivery>(
         base_formats,
         convert_hook,
         mut subtitles,
+        subtitle_exit,
     } = routing;
+    // Dropped when this function returns (any path, a panic included):
+    // the consumer samples no subtitle table after that (review INV2-1).
+    let _subtitle_exit = subtitle_exit;
     // #342 review I1/I2: one `format-convert` thread per distinct non-canvas
     // base format, fed non-blocking right after the bake. Empty (no thread,
     // no work) for a run whose base keys are all at the canvas format.

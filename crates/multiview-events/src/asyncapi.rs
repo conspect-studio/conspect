@@ -1605,7 +1605,7 @@ fn route_output_event_schema() -> Value {
         "properties": {
             "output": { "type": "string", "description": "Output API id (matches the envelope `id`)." },
             "operation_id": { "type": "string", "description": "The take's operation id (empty for a fallback)." },
-            "tick": { "type": "integer", "format": "uint64", "description": "Program tick at which the outcome was decided. For subtitle:* the last tick the subtitle sampler finished before the re-patch; it lands on the first tick sampled after it (no particular tick is promised: shed ticks are not sampled); 0 when refused." },
+            "tick": { "type": "integer", "format": "uint64", "description": "Program tick at which the outcome was decided. For subtitle:applied (the route table was swapped): a completed-tick lower bound observed before the swap (0: possibly no tick completed yet), not a landing tick; a sample in flight finishes on the old table, and the first table read starting after the swap sees the new route unless a later take supersedes it first (then it is never sampled) or the run ends. 0 when refused." },
             "outcome": {
                 "type": "string",
                 "enum": ["applied", "superseded", "refused:feed-not-fresh", "refused:capacity", "refused:encoder-not-ready", "refused:unroutable", "refused:format-mismatch", "fallback:aux-failed", "fallback:encoder-failed", "subtitle:applied", "subtitle:refused:not-in-run"]

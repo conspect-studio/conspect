@@ -2516,19 +2516,25 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   (`with_subtitles`), behind a per-run subtitle gate (a control-plane mutex the sampler never
   takes; the sampler holds its own tables and only loads them once per tick). The adapter
   RCU-replaces the output's `SubtitleRoutes` table under that gate
-  (`OutputRoutingHandle::repoint_subtitles` → `subtitle_slots::repoint`). The run's teardown
-  ends the gate (`SubtitleRunEnd`, dropped on every exit path of `drive_streaming`), so a take
-  that loaded the handle before the run ended or was replaced is refused and never mutates the
-  obsolete table, and the live readback of an ended run is gone. No running engine, or an
+  (`OutputRoutingHandle::repoint_subtitles` → `subtitle_slots::repoint`). Admission ends as soon
+  as the run can no longer sample: teardown ends the gate the moment the clock returns (before
+  the egress join and ingest teardown), the bake consumer ends it wait-free on any exit (it
+  holds `SubtitleConsumerExit`, one atomic swap; a re-point that loses that race restores the
+  table it replaced and is refused), and `SubtitleRunEnd` still ends it on every other exit path
+  of `drive_streaming`. A take that loaded the handle before the run ended or was replaced is
+  refused and never mutates the obsolete table, and the live readback of an ended run is gone. No running engine, or an
   ended run → 503 `engine-busy` (key freed, rate slot refunded); an output the run does not
   sample (not in this run, or slots declared after it started) → `subtitle:refused:not-in-run`,
   nothing changes. Without an output-routing seam the routes answer 409 `routing-unavailable`
   as the video path does.
-- **Landing tick (honest contract).** The outcome's `tick` is the last tick the sampler
-  FINISHED before the swap (it publishes a tick only after reading every table of that tick).
-  The re-patch lands on one tick: the first tick sampled after the reported one, where the old
-  source's cue ends and the new one may start. No particular index is promised: the bake
-  consumer may shed items, and shed ticks are not sampled.
+- **Landing tick (honest contract).** `subtitle:applied` means the route table was swapped. The
+  outcome's `tick` is a completed-tick lower bound observed before the swap (the sampler
+  publishes a tick only after reading every table of that tick; `0` means possibly no tick
+  completed yet); it is not a landing tick. A sample already in flight finishes on the old
+  table; the first table read that STARTS after the swap sees the new route (its old cue ends
+  and the new one may start at that tick), unless a later take supersedes it first (then this
+  one is never sampled) or the run ends first. Shed items are not sampled, so no tick index is
+  promised.
 - **Ordering and bounded persistence.** One serialization (the control plane's subtitle queue
   lock) covers admission, the engine swap, the take's settlement and the enqueue of its
   outcome with a monotonic sequence, so the queue order is the swap order. The queue is

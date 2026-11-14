@@ -6524,3 +6524,159 @@ fn a_concurrent_subtitle_repoint_lands_after_the_answered_tick() {
         .expect("the old cue closed");
     assert_eq!(closed.end, landed);
 }
+
+/// Review INV2-1: the bake consumer's exit (its guard dropped, for any
+/// reason) ends subtitle admission wait-free: a later take is `Busy`, the
+/// table is unchanged and there is no live readback.
+#[test]
+fn the_consumer_exit_ends_subtitle_admission() {
+    use multiview_control::output_routing::{OutputRouting, SubtitleTakeError};
+    let (h, routes, _tick) = subtitle_run_handle();
+    let h = Arc::new(h);
+    let exit = h.subtitle_consumer_exit();
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::clone(&h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    assert!(adapter.subtitle_routes("hls-1").is_some());
+    drop(exit);
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))]
+        )),
+        Err(SubtitleTakeError::Busy)
+    );
+    assert_eq!(routes.load().to_vec(), vec![Some("cam_a".to_owned()), None]);
+    assert_eq!(adapter.subtitle_routes("hls-1"), None);
+    assert!(!h.subtitles_live());
+}
+
+/// Review COR2-1 / INV2-2, deterministic: a sample of tick 11 loads the OLD
+/// table and is paused in its resolver; a take swaps (answering the
+/// completed lower bound 10); tick 11 completes with the old source; the
+/// first table read that starts after the swap (tick 12) uses the new one.
+/// Before any sample the answered bound is 0.
+#[test]
+fn an_in_flight_sample_finishes_on_the_old_table_and_the_next_read_sees_the_take() {
+    use crate::subtitle_slots::{CueResolver, SubtitleOutputSampler, SubtitleRun};
+    use multiview_control::output_routing::OutputRouting;
+    use multiview_output::hls::subtitle::subtitle_feed_with_capacity;
+    use std::sync::Barrier;
+    let (h, routes, tick) = subtitle_run_handle();
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = Arc::new(crate::output_routing_control::OutputRoutingAdapter::new(
+        Arc::clone(&slot),
+    ));
+    let (feed, rx) = subtitle_feed_with_capacity(64);
+    // The resolver parks tick 11 (after its table load) on two barriers.
+    let paused = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let (p, r) = (Arc::clone(&paused), Arc::clone(&resume));
+    let at = |t: i64| MediaTime::from_tick(t, CADENCE);
+    let tick11 = at(11);
+    let resolve: CueResolver = Box::new(move |id, now| {
+        if now == tick11 && id == "cam_a" {
+            p.wait();
+            r.wait();
+        }
+        match id {
+            "cam_a" => Some(vec!["from a".to_owned()]),
+            "cam_b" => Some(vec!["from b".to_owned()]),
+            _ => None,
+        }
+    });
+    let mut run = SubtitleRun::new(
+        vec![SubtitleOutputSampler::new(Arc::clone(&routes), feed, 2)],
+        resolve,
+        CADENCE,
+    )
+    .with_tick_cell(Arc::clone(&tick));
+    run.tick(10);
+    let sampler = std::thread::spawn(move || {
+        run.tick(11);
+        run
+    });
+    paused.wait();
+    // Tick 11 is in flight on the old table: the take swaps now.
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))]
+        )),
+        Ok(10),
+        "a completed-tick lower bound observed before the swap"
+    );
+    resume.wait();
+    let mut run = sampler.join().unwrap();
+    assert_eq!(tick.load(Ordering::Acquire), 11);
+    // Tick 11 finished on the old source: no change, no cue.
+    let cues = rx.drain();
+    assert_eq!(cues.len(), 1, "only tick 10's open cue: {cues:?}");
+    assert_eq!(cues[0].lines[0], "from a");
+    run.tick(12);
+    let cues = rx.drain();
+    assert_eq!(cues.len(), 2, "{cues:?}");
+    assert_eq!((cues[0].start, cues[0].end), (at(10), at(12)));
+    assert_eq!(
+        (cues[1].start, cues[1].lines[0].as_str()),
+        (at(12), "from b")
+    );
+
+    // Pre-first-sample: the bound is 0 (no tick need have completed).
+    let (h2, _routes2, _tick2) = subtitle_run_handle();
+    assert_eq!(
+        h2.repoint_subtitles("hls-1", &[(0, None)]),
+        Ok(0),
+        "0 before any completed sample"
+    );
+}
+
+/// Review COR2-1 / INV2-2: two takes before the next table read — both
+/// answer `applied` (each swapped the table), but the superseded one is
+/// never sampled: the next read sees only the last.
+#[test]
+fn a_take_superseded_before_the_next_read_is_never_sampled() {
+    use crate::subtitle_slots::{CueResolver, SubtitleOutputSampler, SubtitleRun};
+    use multiview_control::output_routing::OutputRouting;
+    use multiview_output::hls::subtitle::subtitle_feed_with_capacity;
+    let (h, routes, tick) = subtitle_run_handle();
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let (feed, rx) = subtitle_feed_with_capacity(64);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let resolve: CueResolver = Box::new(move |id, _| {
+        log.lock().unwrap().push(id.to_owned());
+        Some(vec![format!("from {id}")])
+    });
+    let mut run = SubtitleRun::new(
+        vec![SubtitleOutputSampler::new(Arc::clone(&routes), feed, 2)],
+        resolve,
+        CADENCE,
+    )
+    .with_tick_cell(Arc::clone(&tick));
+    run.tick(10);
+    for source in ["cam_b", "cam_c"] {
+        assert_eq!(
+            adapter.try_take_subtitles(subtitle_request(
+                "hls-1",
+                vec![(0, Some(source.to_owned()))]
+            )),
+            Ok(10)
+        );
+    }
+    run.tick(11);
+    assert_eq!(
+        *asked.lock().unwrap(),
+        vec!["cam_a", "cam_c"],
+        "cam_b never read"
+    );
+    let cues = rx.drain();
+    assert!(
+        cues.iter().all(|cue| cue.lines[0] != "from cam_b"),
+        "{cues:?}"
+    );
+    assert_eq!(cues.last().unwrap().lines[0], "from cam_c");
+}

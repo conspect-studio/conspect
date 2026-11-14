@@ -15,8 +15,10 @@
 //! and the per-output 2/s and per-principal 10/s limiter (one request = one
 //! take). The engine re-points the output's route table wait-free (an RCU
 //! swap, no channel); the off-clock sampler reads it at its next tick, so
-//! the re-patch lands on one tick (the first sampled tick after the
-//! reported one; the consumer may shed ticks, so no tick is promised). The
+//! the re-patch lands on one tick: the first table read that starts after
+//! the swap, unless a later take supersedes it first (`applied` means the
+//! table was swapped; the reported tick is only a completed-tick lower
+//! bound observed before the swap). The
 //! swap and its queued outcome share one serialization with a bounded,
 //! single-consumer persistence queue: a full queue refuses the take before
 //! any route changes; the consumer persists the latest slot sources (in

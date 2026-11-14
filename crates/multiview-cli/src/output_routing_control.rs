@@ -644,11 +644,11 @@ impl OutputRouting for OutputRoutingAdapter {
 
     /// Slice F part F2: re-point the output's subtitle route table (RCU,
     /// wait-free for the off-clock sampler, no channel), under the run's
-    /// subtitle gate: a run that ended (or was replaced) refuses `Busy` and
-    /// is never mutated (review INV-1). The answer is the last tick the
-    /// sampler finished before the swap; the new table is used from the
-    /// first sampled tick after it (no particular tick is promised: the
-    /// consumer may shed ticks, review INV-2).
+    /// subtitle gate: a run that ended, is tearing down, whose consumer
+    /// exited, or was replaced refuses `Busy` and is never mutated (review
+    /// INV-1, INV2-1). The answer is a completed-tick lower bound observed
+    /// before the swap (`0`: possibly none), not a landing tick; see
+    /// [`OutputRoutingHandle::repoint_subtitles`] (review COR2-1/INV2-2).
     fn try_take_subtitles(&self, take: SubtitleTakeRequest) -> Result<u64, SubtitleTakeError> {
         let handle = self.slot.load().ok_or(SubtitleTakeError::Busy)?;
         handle
