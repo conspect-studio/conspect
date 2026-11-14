@@ -530,3 +530,47 @@ fn tap_points_are_internally_tagged() {
         assert_eq!(serde_json::to_value(parsed).unwrap(), doc);
     }
 }
+
+#[test]
+fn rgb8_parses_short_and_long_hex_and_round_trips_as_long_hex() {
+    use multiview_core::switcher::Rgb8;
+    assert_eq!(Rgb8::parse("#fff"), Some(Rgb8::new(255, 255, 255)));
+    assert_eq!(Rgb8::parse("#C81e00"), Some(Rgb8::new(200, 30, 0)));
+    for bad in ["fff", "#ff", "#fffff", "#ggg", "#ffffffff", ""] {
+        assert_eq!(Rgb8::parse(bad), None, "{bad}");
+    }
+    let value: Rgb8 = serde_json::from_value(json!("#abc")).unwrap();
+    assert_eq!(serde_json::to_value(value).unwrap(), json!("#aabbcc"));
+    assert!(serde_json::from_value::<Rgb8>(json!("red")).is_err());
+}
+
+#[test]
+fn a_dip_to_a_colour_round_trips_and_defaults_to_no_source() {
+    let case = json!({"kind": "dip", "rate": 20, "color": "#102030", "switch_point": {"num": 1, "den": 3}});
+    let parsed: TransitionDescriptor = serde_json::from_value(case.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), case);
+    if let TransitionDescriptor::Dip { dip_source, .. } = parsed {
+        assert!(dip_source.is_none());
+    } else {
+        panic!("expected a dip descriptor");
+    }
+}
+
+#[test]
+fn dip_weights_split_exactly_at_the_switch_point() {
+    use multiview_core::switcher::kernel::dip_weights;
+    let half = Rational::new(1, 2);
+    assert_eq!(dip_weights(0, 10, half), (0.0, 0.0));
+    assert_eq!(dip_weights(2, 10, half), (0.4, 0.0));
+    // 5 of 10 at 1/2 is exactly the switch: the colour is opaque.
+    assert_eq!(dip_weights(5, 10, half), (1.0, 0.0));
+    assert_eq!(dip_weights(8, 10, half), (1.0, 0.6));
+    assert_eq!(dip_weights(10, 10, half), (1.0, 1.0));
+    // An odd rate: 1/2 of 7 frames is 3.5, decided in integers.
+    assert_eq!(dip_weights(3, 7, half).1, 0.0);
+    assert!(dip_weights(4, 7, half).1 > 0.0);
+    // Degenerate inputs never divide by zero.
+    assert_eq!(dip_weights(3, 0, half), (0.0, 1.0));
+    assert_eq!(dip_weights(3, 10, Rational::new(1, 1)), (0.0, 1.0));
+    assert_eq!(dip_weights(3, 10, Rational::new(0, 1)), (0.0, 1.0));
+}

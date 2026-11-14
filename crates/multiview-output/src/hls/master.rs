@@ -124,6 +124,12 @@ impl MasterPlaylist {
         self.audio.push(rendition);
     }
 
+    /// The audio-only renditions listed, in order.
+    #[must_use]
+    pub fn audio_renditions(&self) -> &[AudioRendition] {
+        &self.audio
+    }
+
     /// Number of variants listed.
     #[must_use]
     pub fn variant_count(&self) -> usize {

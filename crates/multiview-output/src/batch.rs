@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use multiview_ffmpeg::{is_idr, CodecKind, EncodedPacket, NalFraming, StreamKind};
+use multiview_ffmpeg::{
+    is_idr, CodecKind, EncodedPacket, NalFraming, StreamCodecParameters, StreamKind,
+};
 
 /// Maximum encoded packets in a single atomic collection window.
 pub const MAX_BATCH_PACKETS: usize = 256;
@@ -248,6 +250,7 @@ struct Queued {
     offered_at: Instant,
     generation: u64,
     decoder_config_changed: bool,
+    config_params: Option<StreamCodecParameters>,
 }
 
 /// One queue's locally owned admission state. Operations never wait for clients.
@@ -268,6 +271,10 @@ pub struct BoundedBatchQueue {
     /// A `mark_discontinuity(DecoderConfigChanged)` whose generation has not
     /// admitted its first window yet: that window's lease reports it.
     config_change_pending: bool,
+    /// The new decoder configuration's video stream parameters, when the
+    /// change came with them (#342 B3: a live format reset), carried on the
+    /// same lease so a muxer rebuilt there is seeded from them.
+    config_params_pending: Option<StreamCodecParameters>,
 }
 
 impl Default for BoundedBatchQueue {
@@ -297,6 +304,7 @@ impl BoundedBatchQueue {
             recovery_gate: None,
             closed: false,
             config_change_pending: false,
+            config_params_pending: None,
         }
     }
 
@@ -328,6 +336,7 @@ impl BoundedBatchQueue {
         // ClockReversed/NeedsRecoveryPoint) must not let a later window
         // steal a flag that was meant for this one.
         let decoder_config_changed = std::mem::take(&mut self.config_change_pending);
+        let config_params = self.config_params_pending.take();
         if self.closed {
             return Err(OfferError::Closed);
         }
@@ -402,6 +411,7 @@ impl BoundedBatchQueue {
             offered_at: now,
             generation: self.generation(),
             decoder_config_changed,
+            config_params,
         });
         Ok(())
     }
@@ -435,6 +445,7 @@ impl BoundedBatchQueue {
             batch: entry.batch,
             generation: entry.generation,
             decoder_config_changed: entry.decoder_config_changed,
+            config_params: std::sync::Mutex::new(entry.config_params),
             reservations: Arc::clone(&self.reservations),
         }))
     }
@@ -476,6 +487,18 @@ impl BoundedBatchQueue {
         if !self.closed {
             self.invalidate(reason);
         }
+    }
+
+    /// [`Self::mark_discontinuity`] with `DecoderConfigChanged` carrying the
+    /// new configuration's video stream parameters (#342 B3): the lease that
+    /// reports the change also yields them
+    /// ([`BatchLease::decoder_config_params`]).
+    pub fn mark_config_change(&mut self, params: Option<StreamCodecParameters>) {
+        if self.closed || self.needs_keyframe {
+            return;
+        }
+        self.config_params_pending = params;
+        self.mark_discontinuity(OfferError::DecoderConfigChanged);
     }
 
     /// Declare a mux discontinuity WITHOUT a loss: the next admitted window
@@ -633,6 +656,7 @@ pub struct BatchLease {
     batch: Arc<PacketBatch>,
     generation: u64,
     decoder_config_changed: bool,
+    config_params: std::sync::Mutex<Option<StreamCodecParameters>>,
     reservations: Arc<Reservations>,
 }
 
@@ -663,6 +687,18 @@ impl BatchLease {
     #[must_use]
     pub fn decoder_config_changed(&self) -> bool {
         self.decoder_config_changed
+    }
+
+    /// The new decoder configuration's video stream parameters, when this
+    /// lease opens a change that carried them (#342 B3). A copy: the lease
+    /// is shared across threads, and the snapshot (a raw `AVCodecParameters`
+    /// owner) is `Send` but not `Sync`, so it is held behind a mutex.
+    #[must_use]
+    pub fn decoder_config_params(&self) -> Option<StreamCodecParameters> {
+        self.config_params
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// False after a loss invalidated this lease while a worker held it.
