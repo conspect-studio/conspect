@@ -313,4 +313,4 @@ impl LayoutOverlayBake {
 
 #[cfg(test)]
 #[path = "aux_overlays_tests.rs"]
-mod tests;
+pub(crate) mod tests;

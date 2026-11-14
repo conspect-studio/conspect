@@ -25,7 +25,7 @@ const TALLY_GREEN: OverlayColor = OverlayColor::opaque(0.1, 0.85, 0.2);
 
 /// A `NewsOne`-like 1 + 8 layout: one big cell top-left, three down the right,
 /// five along the bottom. Source `s<i>` is bound to cell `i`.
-fn newsone(overlays: LayoutOverlays, w: u32, h: u32) -> Arc<RoutedLayout> {
+pub(crate) fn newsone(overlays: LayoutOverlays, w: u32, h: u32) -> Arc<RoutedLayout> {
     let cell = |i: usize, x: f32, y: f32, cw: f32, ch: f32| Cell {
         x,
         y,
@@ -61,7 +61,7 @@ fn newsone(overlays: LayoutOverlays, w: u32, h: u32) -> Arc<RoutedLayout> {
     })
 }
 
-fn spec(w: u32, h: u32) -> LayoutCanvasSpec {
+pub(crate) fn spec(w: u32, h: u32) -> LayoutCanvasSpec {
     LayoutCanvasSpec {
         width: w,
         height: h,
@@ -70,7 +70,7 @@ fn spec(w: u32, h: u32) -> LayoutCanvasSpec {
     }
 }
 
-fn labels() -> LabelLookup {
+pub(crate) fn labels() -> LabelLookup {
     // s3 has no name: the bake falls back to its id.
     Arc::new(|id: &str| (id != "s3").then(|| format!("Name {id}")))
 }
@@ -91,7 +91,11 @@ fn tile(w: u32, h: u32, luma: u8) -> Nv12Image {
 }
 
 /// Stores for `s0..s8` except `missing`, each with one frame at t=0.
-fn stores(missing: &[&str], w: u32, h: u32) -> (StoreLookup, Vec<Arc<TileStore<Nv12Image>>>) {
+pub(crate) fn stores(
+    missing: &[&str],
+    w: u32,
+    h: u32,
+) -> (StoreLookup, Vec<Arc<TileStore<Nv12Image>>>) {
     let all: Vec<Arc<TileStore<Nv12Image>>> = (0..9)
         .map(|i| Arc::new(TileStore::<Nv12Image>::with_defaults(format!("s{i}"))))
         .collect();
@@ -109,7 +113,7 @@ fn stores(missing: &[&str], w: u32, h: u32) -> (StoreLookup, Vec<Arc<TileStore<N
     (lookup, all)
 }
 
-fn signals() -> AuxOverlaySignals {
+pub(crate) fn signals() -> AuxOverlaySignals {
     let mut out = AuxOverlaySignals::default();
     out.meters
         .insert("s0".to_owned(), MeterChannels::from_db(&[-3.0, -9.0]));
