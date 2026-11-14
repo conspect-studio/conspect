@@ -1740,12 +1740,13 @@ segment_ms = 1000
 /// the luma sample windows, so Program's pixels are not the sources' pixels.
 const LAYOUT_LUMA: (i64, i64) = (16 + 219 * 0x20 / 255, 16 + 219 * 0xe0 / 255);
 
-/// The mean luma of the 16x48 window inset 8 px into the 32 px half of a
-/// 64x64 plane that starts at column `x0` (clear of the cell edge).
-fn half_mean(plane: &[u8], x0: usize) -> i64 {
+/// The mean luma of rows `rows` of the 16 px column window inset 8 px into
+/// the 32 px half of a 64x64 plane that starts at column `x0` (clear of the
+/// cell edge).
+fn window_mean(plane: &[u8], x0: usize, rows: std::ops::Range<usize>) -> i64 {
     let mut sum = 0i64;
     let mut n = 0i64;
-    for row in 8..56 {
+    for row in rows {
         for x in x0 + 8..x0 + 24 {
             sum += i64::from(plane[row * 64 + x]);
             n += 1;
@@ -1754,19 +1755,31 @@ fn half_mean(plane: &[u8], x0: usize) -> i64 {
     sum / n
 }
 
-/// Program's halves on the 64x64 canvas. In a build without `overlay`
-/// Program has no baked chrome, so its halves must be the sources' luma: this
-/// keeps the [`LAYOUT_LUMA`] oracle tied to the real composed picture.
-fn program_halves(plane: &[u8]) -> (i64, i64) {
-    let halves = (half_mean(plane, 0), half_mean(plane, 32));
-    if !cfg!(feature = "overlay") {
-        let (a, b) = LAYOUT_LUMA;
-        assert!(
-            (halves.0 - a).abs() <= 6 && (halves.1 - b).abs() <= 6,
-            "Program's halves {halves:?} are the sources' luma ({a}, {b})"
-        );
-    }
-    halves
+/// The mean luma of the 16x48 window (rows 8..56) of the half at `x0`.
+fn half_mean(plane: &[u8], x0: usize) -> i64 {
+    window_mean(plane, x0, 8..56)
+}
+
+/// Program's picture is the sources' luma: asserted on the full window in a
+/// build without `overlay`, and in an `overlay` build on rows 56..64, below
+/// the program-wide clock chrome (its readout at y 6, the reference badge at
+/// y 36, ending above row 52 on this canvas). Cells this small (32 px) draw
+/// no per-tile chrome (`MIN_TILE_PX`).
+fn assert_program_is_the_sources(t: i64, plane: &[u8]) {
+    let rows = if cfg!(feature = "overlay") {
+        56..64
+    } else {
+        8..56
+    };
+    let halves = (
+        window_mean(plane, 0, rows.clone()),
+        window_mean(plane, 32, rows),
+    );
+    let (a, b) = LAYOUT_LUMA;
+    assert!(
+        (halves.0 - a).abs() <= 6 && (halves.1 - b).abs() <= 6,
+        "tick {t}: Program's halves {halves:?} are the sources' luma ({a}, {b})"
+    );
 }
 
 /// A routed layout for the 64x64 test canvas: the Program grid with its two
@@ -1921,7 +1934,7 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
     assert!(compared.len() >= 15, "decoded {} pictures", compared.len());
     for t in &compared {
         let (p, r) = (&program[t], &routed[t]);
-        program_halves(p);
+        assert_program_is_the_sources(*t, p);
         let (pl, pr) = LAYOUT_LUMA;
         let (rl, rr) = (half_mean(r, 0), half_mean(r, 32));
         assert!(
@@ -2020,7 +2033,7 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         let (Some(p), Some(r)) = (program.get(&t), routed.get(&t)) else {
             continue;
         };
-        program_halves(p);
+        assert_program_is_the_sources(t, p);
         let (pl, pr) = LAYOUT_LUMA;
         let (rl, rr) = (half_mean(r, 0), half_mean(r, 32));
         if (rl - pr).abs() <= 6 && (rr - pl).abs() <= 6 {
