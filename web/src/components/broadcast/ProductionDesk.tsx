@@ -12,6 +12,7 @@ import { newIdempotencyKey } from '../../api/operations';
 import { createApiClient } from '../../api/client';
 import { useLayouts } from '../../api/queries';
 import { useAlarms } from '../../api/alarmsQueries';
+import { useMediaPlayers } from '../../api/media-playersQueries';
 import { useSources } from '../../resources/queries';
 import { useSourceStatus } from '../../api/sourceStatus';
 import type { SourceDemand } from '../../api/sourceStatus';
@@ -117,14 +118,20 @@ function SourcePicture({ id, demand }: { readonly id: string; readonly demand: S
   return <span data-testid="tile-no-frame"><Trans>No confirmed frame</Trans></span>;
 }
 
-type TransitionKind = 'mix' | 'wipe' | 'dip';
+type TransitionKind = 'mix' | 'wipe' | 'dip' | 'stinger';
+/** Longest frame count a stinger carries in any field (ADR-0112 §5). */
+const MAX_STINGER_FRAMES = 1000;
 /** Desk-side draft of the transition parameters; the engine's selection is the truth. */
 /**
  * `borderColor` is absent while neither the selection nor the operator set one: a
  * positive-width band without a colour draws nothing, and the desk must not invent one.
  */
-interface TransitionDraft { readonly pattern: WipePattern; readonly reverse: boolean; readonly softness: number; readonly borderWidth: number; readonly borderColor?: string; readonly dipColor: string }
-const DEFAULT_DRAFT: TransitionDraft = { pattern: 'linear_edge', reverse: false, softness: 0, borderWidth: 0, dipColor: '#000000' };
+interface TransitionDraft {
+  readonly pattern: WipePattern; readonly reverse: boolean; readonly softness: number; readonly borderWidth: number; readonly borderColor?: string; readonly dipColor: string;
+  /** Stinger (ADR-0112 §5): the media player (`''` = the first configured one) and its frame counts. */
+  readonly player: string; readonly preRoll: number; readonly clipDuration: number; readonly triggerPoint: number; readonly mixRate: number;
+}
+const DEFAULT_DRAFT: TransitionDraft = { pattern: 'linear_edge', reverse: false, softness: 0, borderWidth: 0, dipColor: '#000000', player: '', preRoll: 5, clipDuration: 50, triggerPoint: 20, mixRate: 10 };
 /** What the colour picker shows (and what a border-control edit adopts) when no colour is set. */
 const DEFAULT_BORDER_COLOR = '#ffffff';
 
@@ -145,10 +152,20 @@ function draftFromSelection(transition: TransitionDescriptor | undefined): Trans
     };
   }
   if (transition?.kind === 'dip' && transition.color) return { ...DEFAULT_DRAFT, dipColor: transition.color };
+  if (transition?.kind === 'stinger') return { ...DEFAULT_DRAFT, player: transition.player, preRoll: transition.pre_roll, clipDuration: transition.clip_duration, triggerPoint: transition.trigger_point, mixRate: transition.mix_rate };
   return DEFAULT_DRAFT;
 }
 
-const DRAFT_KEYS = ['pattern', 'reverse', 'softness', 'borderWidth', 'borderColor', 'dipColor'] as const satisfies readonly (keyof TransitionDraft)[];
+const DRAFT_KEYS = ['pattern', 'reverse', 'softness', 'borderWidth', 'borderColor', 'dipColor', 'player', 'preRoll', 'clipDuration', 'triggerPoint', 'mixRate'] as const satisfies readonly (keyof TransitionDraft)[];
+
+/** Why the draft is not a stinger the engine renders, or `undefined` when it is (ADR-0112 §5). */
+function stingerProblem(draft: TransitionDraft, player: string | undefined): 'no-player' | 'range' | 'window' | undefined {
+  if (player === undefined || player === '') return 'no-player';
+  const counts = [draft.preRoll, draft.clipDuration, draft.triggerPoint, draft.mixRate];
+  if (!counts.every((n) => Number.isInteger(n) && n >= 1 && n <= MAX_STINGER_FRAMES)) return 'range';
+  if (draft.triggerPoint + draft.mixRate > draft.clipDuration) return 'window';
+  return undefined;
+}
 
 /**
  * The unsaved local edits of `next` against the confirmed draft: only fields
@@ -169,8 +186,10 @@ function unsavedEdits(next: Partial<TransitionDraft>, confirmed: TransitionDraft
  * Fields of the confirmed selection the desk does not expose (`position_xy`,
  * `switch_point`, …) are kept when the kind is unchanged.
  */
-function transitionDescriptor(kind: TransitionKind, draft: TransitionDraft, rate: number, confirmed?: TransitionDescriptor): TransitionDescriptor {
+function transitionDescriptor(kind: TransitionKind, draft: TransitionDraft, rate: number, confirmed?: TransitionDescriptor, player = draft.player): TransitionDescriptor {
   if (kind === 'mix') return { kind: 'mix', rate };
+  // A stinger keeps its own timing; AUTO's frames do not replace it (ADR-0112 §5).
+  if (kind === 'stinger') return { kind: 'stinger', player, pre_roll: draft.preRoll, clip_duration: draft.clipDuration, trigger_point: draft.triggerPoint, mix_rate: draft.mixRate };
   if (kind === 'dip') return { ...(confirmed?.kind === 'dip' ? confirmed : {}), kind: 'dip', rate: Math.max(2, rate), color: draft.dipColor };
   const wipe: TransitionDescriptor = { ...(confirmed?.kind === 'wipe' ? confirmed : {}), kind: 'wipe', pattern: draft.pattern, rate, reverse: draft.reverse, softness: draft.softness, border_width: draft.borderWidth };
   // No band: drop a confirmed border colour rather than send a stale one. A band
@@ -182,7 +201,7 @@ function transitionDescriptor(kind: TransitionKind, draft: TransitionDraft, rate
 
 /** The engine's selected kind for the desk keys; a selected CUT makes AUTO a MIX. */
 function selectedKind(transition: TransitionDescriptor | undefined): TransitionKind {
-  return transition?.kind === 'wipe' || transition?.kind === 'dip' ? transition.kind : 'mix';
+  return transition?.kind === 'wipe' || transition?.kind === 'dip' || transition?.kind === 'stinger' ? transition.kind : 'mix';
 }
 
 /** The engine's selected wipe pattern, if the selection is a wipe. */
@@ -232,6 +251,7 @@ function ProductionDeskBody(): JSX.Element {
   const alarms = useAlarms({ active: true, scope: 'system' });
   const client = useMemo(() => createApiClient(), []);
   const layouts = useLayouts(client);
+  const players = useMediaPlayers();
   const tiles = useLiveTiles();
   // The tile cache is seeded {} before any snapshot; an empty map means no snapshot yet, not zero tiles.
   const tilesKnown = tiles.size > 0;
@@ -305,11 +325,21 @@ function ProductionDeskBody(): JSX.Element {
   };
   useEffect(() => { if (!inFlight && !mutate.isPending) lock.current = false; }, [inFlight, mutate.isPending]);
   const kind = selectedKind(state.data?.transition);
-  const kindLabel = kind === 'wipe' ? 'WIPE' : kind === 'dip' ? 'DIP' : 'MIX';
+  const kindLabel = kind === 'wipe' ? 'WIPE' : kind === 'dip' ? 'DIP' : kind === 'stinger' ? 'STINGER' : 'MIX';
   const rate = framesValid ? Number(frames) : 30;
+  // The stinger's player: the draft's, else the first configured media player.
+  const stingerPlayer = draft.player !== '' ? draft.player : players.data?.[0]?.id;
+  const stingProblem = stingerProblem(draft, stingerPlayer);
+  const stingReason = stingProblem === 'no-player' ? t`Configure a media player to use a stinger` : stingProblem === 'range' ? t`Stinger frame counts are 1–1000` : stingProblem === 'window' ? t`The mix must end inside the clip (trigger point + mix frames ≤ clip frames)` : undefined;
   // Selecting is not a take: no confirmation, but the same guard and plan → command path.
-  const select = (next: TransitionKind, nextDraft: TransitionDraft = draft): void => { send({ action: 'set_transition', transition: transitionDescriptor(next, nextDraft, rate, confirmedTransition) }); };
+  const select = (next: TransitionKind, nextDraft: TransitionDraft = draft): void => { send({ action: 'set_transition', transition: transitionDescriptor(next, nextDraft, rate, confirmedTransition, stingerPlayer ?? '') }); };
   const transitionReason = framesValid ? undefined : t`Enter 1–1000 frames`;
+  const keyReason = (k: TransitionKind): string | undefined => k === 'stinger' ? stingReason : transitionReason;
+  // A stinger runs for its own pre-roll plus clip, whatever AUTO's frames say.
+  const confirmedStinger = state.data?.transition?.kind === 'stinger' ? state.data.transition : undefined;
+  const autoFrames = confirmedStinger ? String(confirmedStinger.pre_roll + confirmedStinger.clip_duration) : frames;
+  const keyTitle = (k: TransitionKind): string => k === 'mix' ? t`Select a MIX for the next AUTO` : k === 'wipe' ? t`Select a WIPE for the next AUTO` : k === 'dip' ? t`Select a DIP for the next AUTO` : t`Select a STINGER for the next AUTO`;
+  const stepFrames = (field: 'preRoll' | 'clipDuration' | 'triggerPoint' | 'mixRate') => (e: { target: { value: string } }): void => { setDraft({ ...draft, [field]: Number(e.target.value) }); };
   const patternName = (pattern: WipePattern): string => pattern === 'linear_edge' ? t`Horizontal wipe` : pattern === 'vertical' ? t`Vertical wipe` : pattern === 'diagonal' ? t`Diagonal wipe` : pattern === 'box' ? t`Box wipe` : t`Circle wipe`;
   const name = (id: string | undefined): string | undefined => sources.data?.find((s) => s.id === id)?.name ?? id;
   const deskStyle: CSSProperties & Record<`--desk-${string}`, number> = { '--desk-inputs': Math.max(1, sources.data?.length ?? 1), '--desk-columns': (sources.data?.length ?? 0) > 12 ? 8 : 6, '--desk-rows': Math.max(1, Math.ceil((sources.data?.length ?? 0) / ((sources.data?.length ?? 0) > 12 ? 8 : 6))) };
@@ -322,7 +352,7 @@ function ProductionDeskBody(): JSX.Element {
       <section className="bd-wall"><div className="bd-wall-heading"><h2><Trans>Multiview wall</Trans></h2><span><Trans>Select a source to Preview</Trans></span><Link className="bd-route-link" to="/routing"><Trans>Route / patch</Trans></Link></div><div className="bd-wall-grid">{sources.data?.map((source) => { const keyReason = reason ?? busKeyReason('preview', source.id, state.data, demand.data?.get(source.id)?.phase); return <button type="button" className="bd-wall-tile" key={source.id} aria-disabled={disabled || keyReason !== undefined} aria-describedby={`desk-tally-${source.id} desk-signal-${source.id} desk-reason-${source.id}`} aria-label={t`Preview ${source.name}`} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === 'preview'} title={keyReason} onClick={() => { if (!disabled && keyReason === undefined) request('select_preview', source.id); }} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} demand={demand.data?.get(source.id)} /><small id={`desk-tally-${source.id}`}>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span className="sr-only" id={`desk-reason-${source.id}`}>{keyReason}</span><span id={`desk-signal-${source.id}`}><TileLabel tile={tileForSource(tiles, source.id)} /></span></button>; })}</div><WallNote />{sources.isError || !sources.data?.length ? <p>{sources.isError ? t`Source catalog unavailable` : t`No source catalog available`}</p> : null}</section>
       <section className="bd-switcher"><h2><Trans>M/E 1 — Switcher</Trans></h2>
         <div className="bd-buses">{(['preview', 'program'] as const).map((bus) => <div className={`bd-bus bd-bus-${bus}`} key={bus} role="group" aria-label={bus === 'program' ? t`PGM bus — direct taps always confirm` : t`PVW bus`}><b>{bus === 'program' ? 'PGM' : 'PVW'}</b><div>{sources.data?.map((source, index) => { const keyReason = reason ?? busKeyReason(bus, source.id, state.data, demand.data?.get(source.id)?.phase); return <button key={source.id} aria-label={source.name} disabled={disabled || keyReason !== undefined} data-key-reason={keyReason} title={keyReason ? `${source.name} — ${keyReason}` : source.name} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === bus} onClick={() => { request(bus === 'program' ? 'select_program' : 'select_preview', source.id); }}><span className="bd-key-name">{sources.data.length > 12 ? Array.from(source.name).slice(0, 10).join('') : source.name}</span><i className="bd-idx" aria-hidden="true">{index + 1}</i></button>; })}{!sources.data?.length && <span><Trans>No sources available</Trans></span>}</div></div>)}</div>
-        <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type`}>{(['mix', 'wipe', 'dip'] as const).map((k) => <button key={k} disabled={disabled || transitionReason !== undefined} aria-pressed={kind === k} title={transitionReason ?? (k === 'mix' ? t`Select a MIX for the next AUTO` : k === 'wipe' ? t`Select a WIPE for the next AUTO` : t`Select a DIP for the next AUTO`)} onClick={() => { select(k); }}>{k.toUpperCase()}</button>)}</div><button className="bd-auto" disabled={disabled || autoReason !== undefined} title={autoReason ? `AUTO — ${autoReason}` : t`AUTO ${kindLabel} over ${frames} frames`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled || sameBuses} title={sameBuses ? t`CUT — Preview and Program carry the same source` : undefined} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span></div></div>
+        <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type`}>{(['mix', 'wipe', 'dip', 'stinger'] as const).map((k) => <button key={k} disabled={disabled || keyReason(k) !== undefined} aria-pressed={kind === k} aria-label={k === 'stinger' ? 'STING' : undefined} title={keyReason(k) ?? keyTitle(k)} onClick={() => { select(k); }}>{k === 'stinger' ? 'STING' : k.toUpperCase()}</button>)}</div><button className="bd-auto" disabled={disabled || autoReason !== undefined} title={autoReason ? `AUTO — ${autoReason}` : t`AUTO ${kindLabel} over ${autoFrames} frames`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled || sameBuses} title={sameBuses ? t`CUT — Preview and Program carry the same source` : undefined} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span></div></div>
         <div className="bd-more"><label><Trans>AUTO frames</Trans><input aria-label={t`Auto frames`} value={frames} type="number" min="1" max="1000" disabled={disabled} onChange={(e) => { setFrames(e.target.value); }} /></label>
           <details className="bd-transition-menu"><summary title={t`Transition parameters`}><Trans>Transition parameters</Trans></summary><fieldset className="bd-transition-params" disabled={disabled || transitionReason !== undefined} data-testid="transition-params"><legend className="sr-only"><Trans>Transition parameters</Trans></legend>
             <div className="bd-patterns" role="group" aria-label={t`Wipe pattern`}>{WIPE_PATTERNS.map((pattern) => <button type="button" key={pattern} aria-label={patternName(pattern)} title={patternName(pattern)} aria-pressed={selectedPattern(state.data?.transition) === pattern} onClick={() => { const next = { ...draft, pattern }; setDraft(next); select('wipe', next); }}><WipeThumbnail pattern={pattern} reverse={draft.reverse} /></button>)}</div>
@@ -332,7 +362,15 @@ function ProductionDeskBody(): JSX.Element {
             <label><Trans>Border width</Trans><input type="range" aria-label={t`Wipe border width`} min="0" max="0.2" step="0.005" value={draft.borderWidth} onChange={(e) => { setDraft({ ...draft, borderWidth: Number(e.target.value), borderColor: draft.borderColor ?? DEFAULT_BORDER_COLOR }); }} /></label>
             <label><Trans>Border colour</Trans><input type="color" aria-label={t`Wipe border colour`} value={draft.borderColor ?? DEFAULT_BORDER_COLOR} onChange={(e) => { setDraft({ ...draft, borderColor: e.target.value }); }} /></label>
             <label><Trans>Dip colour</Trans><input type="color" aria-label={t`Dip colour`} value={draft.dipColor} onChange={(e) => { setDraft({ ...draft, dipColor: e.target.value }); }} /></label>
-            <button type="button" className="bd-apply-transition" onClick={() => { select(kind); }}><Trans>Apply to {kindLabel}</Trans></button>
+            <fieldset className="bd-stinger-params" data-testid="stinger-params"><legend><Trans>Stinger</Trans></legend>
+              <label><Trans>Media player</Trans><select aria-label={t`Stinger media player`} value={stingerPlayer ?? ''} onChange={(e) => { setDraft({ ...draft, player: e.target.value }); }}>{players.data?.length ? players.data.map((player) => <option key={player.id} value={player.id}>{player.name}</option>) : <option value="">{players.isError ? t`Media players unavailable` : t`No media players configured`}</option>}</select></label>
+              <label><Trans>Pre-roll</Trans><input type="number" aria-label={t`Stinger pre-roll frames`} min="1" max={MAX_STINGER_FRAMES} value={draft.preRoll} onChange={stepFrames('preRoll')} /></label>
+              <label><Trans>Clip</Trans><input type="number" aria-label={t`Stinger clip frames`} min="1" max={MAX_STINGER_FRAMES} value={draft.clipDuration} onChange={stepFrames('clipDuration')} /></label>
+              <label><Trans>Trigger</Trans><input type="number" aria-label={t`Stinger trigger point frame`} min="1" max={MAX_STINGER_FRAMES} value={draft.triggerPoint} onChange={stepFrames('triggerPoint')} /></label>
+              <label><Trans>Mix</Trans><input type="number" aria-label={t`Stinger mix frames`} min="1" max={MAX_STINGER_FRAMES} value={draft.mixRate} onChange={stepFrames('mixRate')} /></label>
+              {stingReason !== undefined ? <small role="note" data-testid="stinger-reason">{stingReason}</small> : null}
+            </fieldset>
+            <button type="button" className="bd-apply-transition" disabled={keyReason(kind) !== undefined} title={keyReason(kind)} onClick={() => { select(kind); }}><Trans>Apply to {kindLabel}</Trans></button>
           </fieldset></details>
         </div>
       </section>

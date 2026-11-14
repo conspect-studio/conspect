@@ -59,9 +59,12 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     const { container } = page();
     await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
     const keys = [...container.querySelectorAll('.bd-takes button')];
-    expect(keys.map((key) => key.textContent)).toEqual(['MIX', 'WIPE', 'DIP', 'AUTO', 'CUT · cam-2']);
+    expect(keys.map((key) => key.textContent)).toEqual(['MIX', 'WIPE', 'DIP', 'STING', 'AUTO', 'CUT · cam-2']);
     // ADR-0112 §4: the transition keys are a supported control contract now.
     for (const key of keys.slice(0, 3)) expect(key).not.toBeDisabled();
+    // ADR-0112 §5: no configured media player, so STING says why it is off.
+    expect(screen.getByRole('button', { name: 'STING' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'STING' }).title).toContain('Configure a media player');
     expect(screen.getByRole('button', { name: 'MIX' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: 'AUTO' })).not.toBeDisabled();
     expect(screen.getByRole('button', { name: 'AUTO' }).title).toContain('AUTO MIX over 30 frames');
@@ -403,5 +406,50 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     await userEvent.click(apply);
     await waitFor(() => { expect(commandCount).toBe(1); });
     expect(bodies[0]).toMatchObject({ action: 'set_transition', transition: { kind: 'wipe', border_width: 0.05, border_color: '#ff0000' } });
+  });
+
+  // ADR-0112 §5: STING selects a stinger through a configured media player,
+  // with the popover's parameters; AUTO's title names the stinger's own length.
+  it('STING sends set_transition with the media player and the stinger parameters', async () => {
+    const bodies: unknown[] = [];
+    const engine: { selection?: Record<string, unknown> } = {};
+    server.use(
+      http.get('*/api/v1/media/players', () => HttpResponse.json([{ id: 'vt1', name: 'VT 1', body: { id: 'vt1' } }, { id: 'vt2', name: 'VT 2', body: { id: 'vt2' } }])),
+      http.get('*/api/v1/switcher/me1', () => { polls += 1; return HttpResponse.json({ ...state, tick: state.tick + polls, ...(engine.selection ? { transition: engine.selection } : {}) }); }),
+      http.post('*/api/v1/switcher/plan', () => HttpResponse.json({ can_take: true, class: 'class1', scene_version: 1 })),
+      http.post('*/api/v1/switcher/commands/set_transition', async ({ request }) => { bodies.push(await request.json()); commandCount += 1; return HttpResponse.json({ operation_id: 'op-s', kind: 'set_transition' }, { status: 202 }); }),
+    );
+    page();
+    const sting = await screen.findByRole('button', { name: 'STING' });
+    await waitFor(() => { expect(sting).not.toBeDisabled(); }, { timeout: 6000 });
+    // Parameters: the second player, a 3-frame pre-roll, a cut on frame 12 of 40.
+    fireEvent.change(screen.getByRole('combobox', { name: 'Stinger media player' }), { target: { value: 'vt2' } });
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Stinger pre-roll frames' }), { target: { value: '3' } });
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Stinger clip frames' }), { target: { value: '40' } });
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Stinger trigger point frame' }), { target: { value: '12' } });
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Stinger mix frames' }), { target: { value: '1' } });
+    await userEvent.click(sting);
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(screen.queryByRole('button', { name: 'Confirm take' })).not.toBeInTheDocument();
+    expect(bodies[0]).toMatchObject({ action: 'set_transition', transition: { kind: 'stinger', player: 'vt2', pre_roll: 3, clip_duration: 40, trigger_point: 12, mix_rate: 1 } });
+    expect(bodies[0]).not.toHaveProperty('duration_frames');
+    // The engine applied it: STING is pressed and AUTO names the stinger's own length.
+    engine.selection = { kind: 'stinger', player: 'vt2', pre_roll: 3, clip_duration: 40, trigger_point: 12, mix_rate: 1 };
+    await waitFor(() => { expect(sting).toHaveAttribute('aria-pressed', 'true'); }, { timeout: 6000 });
+    expect(screen.getByRole('button', { name: 'AUTO' }).title).toContain('AUTO STINGER over 43 frames');
+  });
+
+  it('STING is refused locally when the mix would end after the clip', async () => {
+    server.use(http.get('*/api/v1/media/players', () => HttpResponse.json([{ id: 'vt1', name: 'VT 1', body: { id: 'vt1' } }])));
+    page();
+    const sting = await screen.findByRole('button', { name: 'STING' });
+    await waitFor(() => { expect(sting).not.toBeDisabled(); }, { timeout: 6000 });
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Stinger trigger point frame' }), { target: { value: '45' } });
+    expect(sting).toBeDisabled();
+    expect(sting.title).toContain('The mix must end inside the clip');
+    expect(screen.getByTestId('stinger-reason').textContent).toContain('The mix must end inside the clip');
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Stinger trigger point frame' }), { target: { value: '1001' } });
+    expect(sting.title).toContain('1–1000');
+    expect(commandCount).toBe(0);
   });
 });
