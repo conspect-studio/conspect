@@ -73,6 +73,7 @@ fn env(gated: bool, queue: usize) -> Env {
         node,
         browser: stub.clone(),
         ffmpeg: stub,
+        gl: multiview_webengine::capture::BrowserGl::Default,
     };
     let service = Service::start(
         tools,
@@ -114,6 +115,7 @@ fn req(k: &FillKey) -> Result<Request, ()> {
             windy: None,
             background: Background::Opaque,
             document: "doc".into(),
+            capture: multiview_webengine::capture::CaptureOptions::default(),
         },
         maximum_bytes: 1000,
         timeout: Duration::from_secs(60),

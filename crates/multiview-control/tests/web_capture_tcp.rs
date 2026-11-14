@@ -60,7 +60,7 @@ async fn capture_flow(real_browser: bool) {
     let producer = root.path().join("node");
     // This test exercises HTTP/service/artifact integration, not the Chrome codec.
     // Real Chrome/FFmpeg capture is proved by the runtime's required browser tests.
-    std::fs::write(&producer,"#!/bin/sh\ncat >/dev/null\nprintf 'actual-producer-bytes'\nprintf '%s\\n' '{\"event\":\"capture_complete\",\"frames\":2}' >&2\n").unwrap();
+    std::fs::write(&producer,"#!/bin/sh\ncat >/dev/null\nprintf 'actual-producer-bytes'\nprintf '%s\\n' '{\"event\":\"capture_complete\",\"frames\":2,\"steps_kept\":2}' >&2\n").unwrap();
     std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
     let find_tool = |name: &str| {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -131,6 +131,7 @@ sys.exit(subprocess.run([{}]+sys.argv[1:],input=json.dumps(request).encode()).re
                 } else {
                     "/bin/sh".into()
                 },
+                gl: multiview_webengine::capture::BrowserGl::Default,
             },
             store,
             Config {

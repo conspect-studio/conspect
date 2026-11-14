@@ -1,6 +1,7 @@
 'use strict';
 const movColor = (() => { const module = {exports:{}}; /*MOV_COLOR*/; return module.exports; })();
 const windyTemplate = (() => { const module = {exports:{}}; /*WINDY_TEMPLATE*/; return module.exports; })();
+const stepPlan = (() => { const module = {exports:{}}; /*STEP_PLAN*/; return module.exports; })();
 // Internal producer host. stdout contains only encoded media; never protocol or
 // credentials. The Rust owner supplies trusted job configuration over stdin.
 const {spawn} = require('node:child_process');
@@ -8,6 +9,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {once} = require('node:events');
 const {finished} = require('node:stream/promises');
+const crypto = require('node:crypto');
+// Deployment-selected GL flags (never from HTTP). Never --disable-gpu.
+const GL_FLAGS = {default: [], swiftshader: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
+  egl: ['--use-gl=angle', '--use-angle=gl-egl']};
+const HOST_START = Date.now();
+const HOST_DEADLINE_MS = 120000;
+const STEP_DEADLINE_MS = 15000;
+const STEP_SETTLE_MS = 300;
 const children = new Set();
 let profile;
 function launch(bin, args, options = {}) {
@@ -104,6 +113,11 @@ async function main() {
       || req.frames < 2 || req.frames > 600 || !Number.isSafeInteger(req.fps)
       || req.fps < 1 || req.fps > 30) throw new Error('invalid capture limits');
   if (!req.browser || !req.ffmpeg) throw new Error('tool missing');
+  if (!Object.hasOwn(GL_FLAGS, req.gl ?? 'default')) throw new Error('invalid capture limits');
+  if (req.capture !== 'steps' && req.capture !== 'realtime') throw new Error('invalid capture limits');
+  const steps = req.capture === 'steps';
+  if (steps) stepPlan.validateOptions(req, req.fps);
+  if (steps && req.background !== 'opaque') throw new Error('invalid capture limits');
   if (req.background !== 'transparent' && req.background !== 'opaque') throw new Error('invalid capture limits');
   const alpha = req.background === 'transparent';
   const isWindy = req.source.kind === 'windy';
@@ -112,12 +126,14 @@ async function main() {
   if (isWindy) {
     windyTemplate.validate(req.source.view);
     if (!req.source.view.terms_accepted || req.width < 1024) throw new Error('Windy acceptance or geometry missing');
+    // The step timeline is the radar calendar; wind particles are captured in realtime.
+    if (steps && req.source.view.overlay !== 'radar') throw new Error('invalid capture limits');
   } else if (typeof req.source.document !== 'string' || Buffer.byteLength(req.source.document) > 128 * 1024)
     throw new Error('document limit');
   if (typeof req.profile !== 'string' || !path.isAbsolute(req.profile)) throw new Error('private profile required');
   profile = req.profile;
   fs.chmodSync(profile, 0o700);
-  const args = ['--remote-debugging-pipe', '--user-data-dir=' + profile,
+  const args = [...GL_FLAGS[req.gl ?? 'default'], '--remote-debugging-pipe', '--user-data-dir=' + profile,
     '--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check',
     '--disable-background-networking', '--disable-component-update',
     ...(!isWindy ? ['--host-resolver-rules=MAP * ~NOTFOUND'] : []),
@@ -189,8 +205,10 @@ async function main() {
       await sleep(250);
     }
     await send('Runtime.evaluate', {expression:`(()=>{const s=document.createElement('style');s.textContent=${JSON.stringify(windyTemplate.CLEAN)};document.head.appendChild(s)})()`});
-    await send('Runtime.evaluate', {expression:"document.querySelector('.play-pause')?.click()"});
-    await sleep(1500);
+    if (!steps) {
+      await send('Runtime.evaluate', {expression:"document.querySelector('.play-pause')?.click()"});
+      await sleep(1500);
+    }
   } else {
     if (alpha) await send('Emulation.setDefaultBackgroundColorOverride', {color: {r: 0, g: 0, b: 0, a: 0}});
     const {frameTree} = await send('Page.getFrameTree');
@@ -216,8 +234,57 @@ async function main() {
   encoderExit.catch(() => {});
   const inputComplete = finished(encoder.stdin, {readable: false});
   inputComplete.catch(() => {});
-  let last;
-  for (let i = 0; i < req.frames; i++) {
+  const expectedOverlay = isWindy ? req.source.view.overlay : null;
+  const evalJson = async expression => {
+    const r = await send('Runtime.evaluate', {expression, returnByValue: true});
+    if (r.exceptionDetails) return null;
+    try { return JSON.parse(r.result?.value); } catch { return null; }
+  };
+  const screenshot = async () => {
+    const result = await send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
+    if (!result.data || result.data.length > 15 * 1024 * 1024) throw new Error('screenshot limit');
+    return Buffer.from(result.data, 'base64');
+  };
+  const writeFrame = async png => { if (!encoder.stdin.write(png)) await once(encoder.stdin, 'drain'); };
+  let written = 0;
+  let report = {capture: req.capture};
+  if (steps) {
+    // Radar STEP loop: drive the page's own timeline, never wall-clock recording.
+    if (isWindy) {
+      // Windy radar is WebGL: without a GL backend the layer renders empty, so fail loudly.
+      const gl = await send('Runtime.evaluate', {expression: windyTemplate.WEBGL_EXPRESSION, returnByValue: true});
+      if (gl.result?.value !== true) throw new Error('radar layer did not render (GL unavailable?)');
+    }
+    const timeline = stepPlan.selectSteps(await evalJson(windyTemplate.CALENDAR_EXPRESSION), req.max_steps);
+    const shots = [];
+    for (const t of timeline) {
+      const remaining = HOST_START + HOST_DEADLINE_MS - 10000 - Date.now();
+      if (remaining <= 0) throw new Error('radar step did not settle');
+      const stepDeadline = Date.now() + Math.min(STEP_DEADLINE_MS, remaining);
+      await send('Runtime.evaluate', {expression: windyTemplate.setTimestampExpression(t)});
+      let state;
+      for (;;) {
+        state = await evalJson(windyTemplate.statusExpression(expectedOverlay ?? 'radar'));
+        if (state && state.canvases === 0) throw new Error('radar layer did not render (GL unavailable?)');
+        if (state && state.timestamp === t && state.tilesPending === 0 && !state.noData
+            && (expectedOverlay === null || state.overlay === expectedOverlay)
+            && inflight.size === 0 && Date.now() - networkChanged >= STEP_SETTLE_MS) break;
+        if (Date.now() >= stepDeadline) throw new Error('radar step did not settle');
+        await sleep(100);
+      }
+      await sleep(STEP_SETTLE_MS);
+      const png = await screenshot();
+      shots.push({t, png, hash: crypto.createHash('sha256').update(png).digest('hex')});
+    }
+    const {kept, dropped} = stepPlan.dedupe(shots);
+    const plan = stepPlan.planFrames({timestamps: kept.map(k => k.t), timing: req.timing,
+      frameMs: req.frame_ms, endHoldMs: req.end_hold_ms, fps: req.fps});
+    for (let i = 0; i < kept.length; i++)
+      for (let r = 0; r < plan.counts[i]; r++) { await writeFrame(kept[i].png); written++; }
+    report = {capture: 'steps', steps_found: timeline.length, steps_kept: kept.length,
+      steps_dropped_duplicate: dropped, timing: req.timing, frame_ms: req.frame_ms,
+      end_hold_ms: req.end_hold_ms, hold_frames: plan.holdFrames};
+  } else for (let i = 0; i < req.frames; i++) {
     // Authored templates can expose this hook for deterministic capture.
     if (isWindy) {
       await sleep(Math.round(1000 / req.fps));
@@ -230,16 +297,15 @@ async function main() {
       expression: `typeof window.mvCaptureFrame === 'function' ? window.mvCaptureFrame(${i},${req.fps}) : null`,
       awaitPromise: true, returnByValue: true});
     if (tick.exceptionDetails) throw new Error('template frame hook failed');
-    const result = await send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
-    if (!result.data || result.data.length > 15 * 1024 * 1024) throw new Error('screenshot limit');
-    last = Buffer.from(result.data, 'base64');
-    if (!encoder.stdin.write(last)) await once(encoder.stdin, 'drain');
+    await writeFrame(await screenshot());
+    written++;
   }
+  if (written < 2 || written > stepPlan.LIMITS.maxFrames) throw new Error('invalid capture limits');
   encoder.stdin.end();
   await inputComplete;
   await encoderExit;
   movColor.tagLimitedSrgb(spool);
-  // Planned (req.frames) must equal actual encoded frames, with real alpha.
+  // Actually written frames must equal encoded frames, with real alpha.
   if (fs.statSync(spool).size >= SPOOL_MAX) throw new Error('encoded size limit');
   const planeBytes = req.width * req.height;
   const probe = await runFfmpeg(req.ffmpeg, ['-hide_banner', '-f', 'mov', '-protocol_whitelist', 'file', '-enable_drefs', '0', '-i', spool], 0);
@@ -249,8 +315,8 @@ async function main() {
   // which fails outright when the encoder stripped it.
   const vf = alpha ? 'alphaextract,format=gray' : 'format=gray';
   const decoded = await runFfmpeg(req.ffmpeg, ['-nostdin', '-hide_banner', '-loglevel', 'error', '-f', 'mov', '-protocol_whitelist', 'file', '-enable_drefs', '0', '-i', spool,
-    '-map', '0:v:0', '-vf', vf, '-f', 'rawvideo', 'pipe:1'], planeBytes * req.frames + 1);
-  if (decoded.code !== 0 || decoded.bytes !== planeBytes * req.frames) throw new Error('encoded frame count mismatch');
+    '-map', '0:v:0', '-vf', vf, '-f', 'rawvideo', 'pipe:1'], planeBytes * written + 1);
+  if (decoded.code !== 0 || decoded.bytes !== planeBytes * written) throw new Error('encoded frame count mismatch');
   await new Promise((resolve, reject) => {
     const rs = fs.createReadStream(spool);
     process.stdout.once('error', reject);
@@ -259,7 +325,7 @@ async function main() {
     rs.pipe(process.stdout, {end: false});
   });
   try { fs.unlinkSync(spool); } catch {}
-  process.stderr.write(JSON.stringify({event: 'capture_complete', frames: req.frames,
+  process.stderr.write(JSON.stringify({event: 'capture_complete', frames: written, ...report,
     fps: req.fps, width: req.width, height: req.height, codec: 'ffv1', alpha,
     pix_fmt: pixFmt, color: 'bt709/srgb/limited'}) + '\n');
 }
@@ -277,7 +343,9 @@ function runFfmpeg(bin, args, cap) {
 const timeout = setTimeout(() => { cleanup().finally(() => process.exit(124)); }, 120000);
 main().then(async () => { clearTimeout(timeout); await cleanup(); process.exitCode = 0; })
   .catch(async error => { clearTimeout(timeout);
-    const safe = new Set(['authenticated Windy session required','Windy login form unavailable','Windy requested layer unavailable','Windy map requests did not settle','Windy changed or incomplete during capture']);
+    const safe = new Set(['authenticated Windy session required','Windy login form unavailable','Windy requested layer unavailable','Windy map requests did not settle','Windy changed or incomplete during capture',
+      'radar layer did not render (GL unavailable?)','radar step did not settle','radar timeline unavailable',
+      'radar loop has fewer than 2 distinct frames','step loop exceeds frame cap']);
     process.stderr.write((safe.has(error.message) ? error.message : 'capture failed') + '\n');
     await cleanup(); process.exitCode = 1;
   });

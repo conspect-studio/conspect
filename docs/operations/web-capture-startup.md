@@ -16,6 +16,16 @@ CONSPECT_WEB_BROWSER=/opt/chromium/chrome-headless-shell
 CONSPECT_WEB_FFMPEG=/opt/multiview-ffmpeg/bin/ffmpeg
 ```
 
+Optional `CONSPECT_WEB_BROWSER_GL` selects the browser GL backend (deployment-only, never from HTTP; any other value aborts startup):
+
+| Value | Flags | Use |
+|---|---|---|
+| unset / `default` | none | browser's own selection |
+| `swiftshader` | `--use-angle=swiftshader --enable-unsafe-swiftshader` | GPU-less host; Windy radar is WebGL and renders empty without a GL backend |
+| `egl` | `--use-gl=angle --use-angle=gl-egl` | host with a real GPU/EGL stack |
+
+No mode adds `--disable-gpu`. A radar step capture without a working WebGL context fails with `radar layer did not render (GL unavailable?)` instead of committing a blank loop.
+
 The FFmpeg build needs PNG decoding, image2pipe input, FFV1 encoding and MOV muxing. No GPL encoder is required. The browser sandbox must function; this integration does not insert `--no-sandbox`.
 
 Configuring these values does not prove deployment. Build and test the actual binary, coordinate its restart with the host owner, then verify the service on the actual public management URL. Keep a rollback binary and the previous desired configuration.
@@ -25,6 +35,8 @@ Configuring these values does not prove deployment. Build and test the actual bi
 `GET /api/v1/media/captures/capabilities` reports actual configured availability and unavailable reasons. Do not treat unavailable Premium or URL fetch as a successful feature.
 
 `POST /api/v1/media/captures` accepts a bounded Windy view, fill identity, optional target-player identity and explicit acceptance of the current terms version. It never accepts HTML, JavaScript, browser executable paths, passwords or arbitrary URLs. Mutations require an authenticated write-capable actor and object authorization. Idempotency and durable acceptance are release gates in this candidate.
+
+Capture mode (`view` fields, all optional): `capture` = `steps` (default for `overlay = "radar"`; radar only) iterates the radar timeline and writes one frame per distinct step, or `realtime` (default for wind) records `frames` wall-clock screenshots. Steps-mode knobs: `timing` = `equal` (default; every step `frame_ms`) or `proportional` (duration follows the real gap between radar timestamps, mean `frame_ms`, clamped to `[frame_ms/4, frame_ms*4]`); `frame_ms` 100–5000 (default 600); `end_hold_ms` 0–10000 (default 1000, held on the newest step); `max_steps` 2–48 (default 12 most recent steps). The clip stays constant-rate FFV1 MOV at `fps`: each step PNG is repeated `round(duration*fps/1000)` times (at least once, cumulative integer rounding), the total is capped at 600 frames, and in steps mode `frames` is ignored. Byte-identical consecutive steps are dropped; fewer than two distinct steps fails with `radar loop has fewer than 2 distinct frames`. Each step waits at most 15 s for the map to settle. The producer's `capture_complete` record reports `steps_found`, `steps_kept`, `steps_dropped_duplicate`, `frames`, `timing` and `hold_frames`.
 
 Every capture and cancel POST requires an `Idempotency-Key`. The actor, request digest and acceptance receipt persist before acknowledgement. The same key and body replay the original job; a different body produces a conflict.
 
