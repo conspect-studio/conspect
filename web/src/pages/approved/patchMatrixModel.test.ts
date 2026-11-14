@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   affectsProgram,
+  audioCell,
+  audioRows,
   buildRows,
+  crosspointOf,
+  crosspointsAffectProgram,
+  displayCell,
   crosspointsOf,
   groupOf,
   hasSubtitleData,
@@ -12,8 +17,10 @@ import {
   outputSlotCell,
   outputSubtitleColumns,
   outputVideoColumns,
+  selectionProblem,
   sourceOfRow,
   subtitleRows,
+  takePathOf,
 } from './patchMatrixModel';
 import type { ArmedSelection } from './patchMatrixModel';
 import type { MixerPatchView, OutputPatchView } from '../../api/patch';
@@ -203,5 +210,90 @@ describe('crosspointsOf / isSetSelection / affectsProgram', () => {
     const sel: ArmedSelection = { column: { kind: 'output', output: 'hls-1', slot: 0, label: 'hls-1' }, rowId: 'source:x', plane: 'video' };
     expect(affectsProgram([sel], undefined, new Set(['hls-1']))).toBe(true);
     expect(affectsProgram([sel], undefined, new Set(['srt-1']))).toBe(false);
+  });
+});
+
+describe('E3-09 displayCell: armed selection + plan member', () => {
+  const base = { state: 'available' } as const;
+  it('is planned with the plan path glyph once the armed member is planned', () => {
+    expect(displayCell(base, true, { path: 'P3', refusal: null })).toEqual({ state: 'planned', path: 'converted' });
+  });
+  it('is disabled with the typed refusal for a refused member', () => {
+    const refusal = { type: 'capacity', detail: 'needs 1 encoder, 0 free' };
+    expect(displayCell(base, true, { path: 'P2', refusal })).toEqual({
+      state: 'disabled', disabledReason: 'refused', refusal, path: 'passthrough',
+    });
+  });
+  it('is planned + needs confirmation when only the on-air guard refused it', () => {
+    expect(displayCell(base, true, { path: 'mixer-input', refusal: { type: 'on-air-protected', detail: 'on Program' } }))
+      .toEqual({ state: 'planned', needsConfirm: true });
+  });
+  it('keeps the readback state for an unarmed cell or an armed one with no plan yet', () => {
+    expect(displayCell(base, false, { path: 'P1', refusal: null })).toEqual(base);
+    expect(displayCell(base, true, undefined)).toEqual(base);
+  });
+});
+
+describe('E3-10 audio plane rows and builders', () => {
+  const rows = audioRows([{ id: 'cam-1', name: 'Camera 1' }]);
+  it('lists follow, program mix, silence, then sources — not video buses/layouts', () => {
+    expect(rows.map((r) => r.id)).toEqual(['audio:follow', 'audio:program', 'audio:none', 'source:cam-1']);
+  });
+  it('slot 0: follow is available, every other feed is disabled as fixed by configuration', () => {
+    const slot = { slot: 0, source: 'program' };
+    expect(audioCell(rows[0]!, slot)).toEqual({ state: 'available' });
+    expect(audioCell(rows[1]!, slot)).toEqual({ state: 'on-air' });
+    expect(audioCell(rows[3]!, slot)).toEqual({ state: 'disabled', disabledReason: 'audio-fixed' });
+  });
+  it('a track slot (> 0) is never patchable, even to follow', () => {
+    expect(audioCell(rows[0]!, { slot: 1, track: 'fr', source: { track: 'fr' } }))
+      .toEqual({ state: 'disabled', disabledReason: 'audio-fixed' });
+  });
+  it('an on-air follow shows on air', () => {
+    expect(audioCell(rows[0]!, { slot: 0, source: 'follow' })).toEqual({ state: 'on-air' });
+  });
+  it('emits only output audio slot 0 `follow`; never a plane-video crosspoint for audio', () => {
+    const col = { kind: 'output', output: 'hls-1', slot: 0, label: 'hls-1' } as const;
+    expect(crosspointOf({ column: col, rowId: 'audio:follow', plane: 'audio' }))
+      .toEqual({ plane: 'audio', destination: { output: 'hls-1', slot: 0 }, source: 'follow' });
+    expect(crosspointOf({ column: col, rowId: 'source:cam-1', plane: 'audio' })).toBeUndefined();
+    expect(crosspointOf({ column: { ...col, slot: 1 }, rowId: 'audio:follow', plane: 'audio' })).toBeUndefined();
+  });
+  it('a subtitle selection never emits a crosspoint (no plane video)', () => {
+    const col = { kind: 'output', output: 'hls-1', slot: 0, label: 'English' } as const;
+    expect(crosspointOf({ column: col, rowId: 'source:cam-1', plane: 'subtitle' })).toBeUndefined();
+  });
+  it('audio follow without its output video take is a selection problem', () => {
+    const col = { kind: 'output', output: 'hls-1', slot: 0, label: 'hls-1' } as const;
+    expect(selectionProblem([{ column: col, rowId: 'audio:follow', plane: 'audio' }])).toBe('audio-needs-video');
+    expect(selectionProblem([
+      { column: col, rowId: 'audio:follow', plane: 'audio' },
+      { column: col, rowId: 'source:cam-1', plane: 'video' },
+    ])).toBeUndefined();
+  });
+});
+
+describe('E3-04 takePathOf: the event family a take settles on', () => {
+  const out = (output: string) => ({ plane: 'video' as const, destination: { output, slot: 0 }, source: { source: 'x' } });
+  const mix = { plane: 'video' as const, destination: { mixer: 'me1', input: 1 }, source: 'none' as const };
+  it('one output (video + audio follow) settles on route.output', () => {
+    expect(takePathOf([out('a'), { plane: 'audio', destination: { output: 'a', slot: 0 }, source: 'follow' }])).toBe('output');
+  });
+  it('mixer inputs alone settle on switcher.operation', () => {
+    expect(takePathOf([mix, { ...mix, destination: { mixer: 'me1', input: 2 } }])).toBe('mixer');
+  });
+  it('two outputs, or mixer + output, are a set (patch.take)', () => {
+    expect(takePathOf([out('a'), out('b')])).toBe('set');
+    expect(takePathOf([mix, out('a')])).toBe('set');
+  });
+});
+
+describe('E3-01 crosspointsAffectProgram (recalled salvo members)', () => {
+  it('flags a member on the Program input or a Program-tallied output', () => {
+    const mix = { plane: 'video' as const, destination: { mixer: 'me1', input: 1 }, source: 'none' as const };
+    expect(crosspointsAffectProgram([mix], 1, new Set())).toBe(true);
+    expect(crosspointsAffectProgram([mix], 2, new Set())).toBe(false);
+    const out = { plane: 'video' as const, destination: { output: 'hls-1', slot: 0 }, source: { source: 'x' } };
+    expect(crosspointsAffectProgram([out], undefined, new Set(['hls-1']))).toBe(true);
   });
 });

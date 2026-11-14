@@ -18,7 +18,7 @@ import { mixerCrosspoint, outputAudioCrosspoint, outputVideoCrosspoint } from '.
 export interface MatrixRow {
   readonly id: string;
   readonly label: string;
-  readonly group: 'buses' | 'layouts' | 'players' | 'cg' | 'generators' | 'sources';
+  readonly group: 'feeds' | 'buses' | 'layouts' | 'players' | 'cg' | 'generators' | 'sources';
 }
 
 /** A matrix column: a mixer input, or one output's one slot. */
@@ -36,14 +36,22 @@ export type CellState =
   | 'na'
   | 'unknown';
 
-/** A disabled cell's reason, exactly §8's vocabulary. */
+/**
+ * A disabled cell's reason: §8's vocabulary, plus the E2 API limits the
+ * matrix must state rather than send (audio slots fixed by configuration,
+ * audio `follow` riding a video take, subtitle routing not yet patchable).
+ * The page translates each code at render.
+ */
 export type DisabledReason =
   | 'not-fresh'
   | 'would-cycle'
   | 'capacity'
   | 'not-authorized'
   | 'switcher-required'
-  | 'unroutable-output';
+  | 'unroutable-output'
+  | 'audio-fixed'
+  | 'subtitle-unsupported'
+  | 'refused';
 
 /** The path glyph suffix (§12.9): passthrough, shared or converted. */
 export type CellPath = 'passthrough' | 'shared' | 'converted' | undefined;
@@ -53,6 +61,10 @@ export interface MatrixCell {
   readonly state: CellState;
   readonly path?: CellPath;
   readonly disabledReason?: DisabledReason;
+  /** The plan's typed refusal for this armed member (`disabledReason: 'refused'`), detail as the server worded it. */
+  readonly refusal?: { readonly type: string; readonly detail: string };
+  /** An armed, planned member whose only refusal is the on-air guard: a confirmed take may still apply it. */
+  readonly needsConfirm?: boolean;
   readonly heldTicks?: number;
 }
 
@@ -93,6 +105,42 @@ export function buildRows(
     group: groupOf(source.id, source.rawKind, playerIds),
   }));
   return [...busRows, ...layoutRows, ...sourceRows];
+}
+
+/** The Audio tab's feed rows: `follow` (the only patchable audio feed in this release), then the fixed feeds it can show on air. */
+export function audioRows(
+  sources: readonly { readonly id: string; readonly name: string }[],
+): readonly MatrixRow[] {
+  return [
+    { id: 'audio:follow', label: 'Follow', group: 'feeds' },
+    { id: 'audio:program', label: 'Program mix', group: 'feeds' },
+    { id: 'audio:none', label: 'Silence', group: 'feeds' },
+    ...sources.map((source): MatrixRow => ({ id: `source:${source.id}`, label: source.name, group: 'sources' })),
+  ];
+}
+
+/** The row id an audio slot's accepted feed corresponds to (Audio tab). */
+function audioRowIdOf(value: unknown): string | undefined {
+  if (value === 'follow') return 'audio:follow';
+  if (value === 'program') return 'audio:program';
+  if (value === 'none') return 'audio:none';
+  if (isRecord(value) && typeof value.source === 'string') return `source:${value.source}`;
+  return undefined;
+}
+
+/**
+ * One Audio-tab cell. E2 accepts only output audio slot 0 with `"follow"`
+ * (riding that output's video take, `patch_output::shape`); every other
+ * feed/slot is fixed by configuration, so it is shown (on air when it is the
+ * accepted feed) but disabled with that reason.
+ */
+export function audioCell(row: MatrixRow, slot: OutputAudioSlotView): MatrixCell {
+  if (isRecord(slot.source) && slot.source.redacted === true) return { state: 'unknown' };
+  const onAir = audioRowIdOf(slot.source) === row.id;
+  if (slot.slot !== 0 || row.id !== 'audio:follow') {
+    return onAir ? { state: 'on-air' } : { state: 'disabled', disabledReason: 'audio-fixed' };
+  }
+  return onAir ? { state: 'on-air' } : { state: 'available' };
 }
 
 /** Build mixer input columns from one M/E's live bank. */
@@ -148,8 +196,8 @@ function rowIdOfSource(value: unknown): string | undefined {
   return undefined;
 }
 
-/** Map an engine `path` (`P1`/`P2`/`P3`) to the §12.9 glyph suffix. */
-function pathGlyph(path: string | null): CellPath {
+/** Map an engine `path` (`P1`/`P2`/`P3`) to the §12.9 glyph suffix (readback or plan member). */
+export function pathGlyph(path: string | null | undefined): CellPath {
   if (path === 'P1') return 'shared';
   if (path === 'P2') return 'passthrough';
   if (path === 'P3') return 'converted';
@@ -199,9 +247,9 @@ export function outputSlotCell(
   return { state: 'available' };
 }
 
-/** Build a bus/layout/source crosspoint source value from a matrix row id. */
 const BUSES = ['program', 'preview', 'clean'] as const;
 
+/** Build a bus/layout/source crosspoint source value from a matrix row id. */
 export function sourceOfRow(rowId: string): PatchSource {
   if (rowId.startsWith('bus:')) {
     const name = rowId.slice('bus:'.length);
@@ -219,24 +267,70 @@ export interface ArmedSelection {
   readonly plane: 'video' | 'audio' | 'subtitle';
 }
 
-/** Compose the crosspoints for an armed selection set (the salvo/plan/take body). */
-export function crosspointsOf(selections: readonly ArmedSelection[]): readonly PatchCrosspoint[] {
-  return selections.map((sel) => {
-    const source = sourceOfRow(sel.rowId);
-    if (sel.column.kind === 'mixer') {
-      return mixerCrosspoint(
-        sel.column.me,
-        sel.column.input,
-        typeof source === 'object' && 'source' in source ? source.source : undefined,
-      );
-    }
-    return sel.plane === 'audio'
-      ? outputAudioCrosspoint(sel.column.output, sel.column.slot, source)
-      : outputVideoCrosspoint(sel.column.output, sel.column.slot, source);
+/** A destination's identity within one plane (audio slot 0 and video slot 0 of one output are distinct cells). */
+export function selectionKey(plane: ArmedSelection['plane'], column: MatrixColumn): string {
+  return column.kind === 'mixer'
+    ? `${plane}:mixer:${column.me}:${String(column.input)}`
+    : `${plane}:output:${column.output}:${String(column.slot)}`;
+}
+
+/**
+ * The crosspoint one selection sends, or `undefined` when the E2 API cannot
+ * take it: audio only as output slot 0 `"follow"`, never subtitle (#345), and
+ * never a plane-video crosspoint for a non-video selection.
+ */
+export function crosspointOf(sel: ArmedSelection): PatchCrosspoint | undefined {
+  if (sel.plane === 'subtitle') return undefined;
+  if (sel.plane === 'audio') {
+    if (sel.column.kind !== 'output' || sel.column.slot !== 0 || sel.rowId !== 'audio:follow') return undefined;
+    return outputAudioCrosspoint(sel.column.output, 0, 'follow');
+  }
+  const source = sourceOfRow(sel.rowId);
+  if (sel.column.kind === 'mixer') {
+    return mixerCrosspoint(
+      sel.column.me,
+      sel.column.input,
+      typeof source === 'object' && 'source' in source ? source.source : undefined,
+    );
+  }
+  return outputVideoCrosspoint(sel.column.output, sel.column.slot, source);
+}
+
+/** The takeable members of a selection, in request order (plan `crosspoints[i]` answers `members[i]`). */
+export function membersOf(
+  selections: readonly ArmedSelection[],
+): readonly { readonly selection: ArmedSelection; readonly crosspoint: PatchCrosspoint }[] {
+  return selections.flatMap((selection) => {
+    const crosspoint = crosspointOf(selection);
+    return crosspoint === undefined ? [] : [{ selection, crosspoint }];
   });
 }
 
-/** True when 2+ distinct destinations are armed (an atomic set, not a single take). */
+/** Compose the crosspoints for an armed selection set (the salvo/plan/take body). */
+export function crosspointsOf(selections: readonly ArmedSelection[]): readonly PatchCrosspoint[] {
+  return membersOf(selections).map((member) => member.crosspoint);
+}
+
+/**
+ * Which terminal event a take of these crosspoints settles on (OpenAPI
+ * `POST /patch/take` 202): `patch.take` for a set (two or more distinct
+ * outputs, or mixer inputs together with an output — `patch_set::is_set`),
+ * `route.output` for one output, `switcher.operation` for mixer inputs alone.
+ */
+export type TakePath = 'set' | 'output' | 'mixer';
+
+export function takePathOf(crosspoints: readonly PatchCrosspoint[]): TakePath {
+  const outputs = new Set<string>();
+  let mixer = false;
+  for (const xp of crosspoints) {
+    if ('mixer' in xp.destination) mixer = true;
+    else outputs.add(xp.destination.output);
+  }
+  if (outputs.size >= 2 || (mixer && outputs.size > 0)) return 'set';
+  return outputs.size === 1 ? 'output' : 'mixer';
+}
+
+/** True when 2+ distinct destinations are armed ("Take all"); the settle path is {@link takePathOf}'s. */
 export function isSetSelection(selections: readonly ArmedSelection[]): boolean {
   const keys = new Set(
     selections.map((sel) =>
@@ -244,6 +338,19 @@ export function isSetSelection(selections: readonly ArmedSelection[]): boolean {
     ),
   );
   return keys.size >= 2;
+}
+
+/** Why the armed selection cannot be sent as is, or `undefined` when it can. */
+export type SelectionProblem = 'audio-needs-video';
+
+export function selectionProblem(selections: readonly ArmedSelection[]): SelectionProblem | undefined {
+  const videoOutputs = new Set(
+    selections.flatMap((sel) => (sel.plane === 'video' && sel.column.kind === 'output' ? [sel.column.output] : [])),
+  );
+  const orphan = selections.some(
+    (sel) => sel.plane === 'audio' && sel.column.kind === 'output' && !videoOutputs.has(sel.column.output),
+  );
+  return orphan ? 'audio-needs-video' : undefined;
 }
 
 /** Whether an armed selection changes Program (take-lock confirm gate, §8). */
@@ -256,6 +363,45 @@ export function affectsProgram(
     if (sel.column.kind === 'mixer') return sel.column.input === programInput;
     return programOutputTallies.has(sel.column.output);
   });
+}
+
+/** Whether stored crosspoints (a recalled salvo's members) change Program, resolved against the current readback. */
+export function crosspointsAffectProgram(
+  crosspoints: readonly PatchCrosspoint[],
+  programInput: number | undefined,
+  programOutputTallies: ReadonlySet<string>,
+): boolean {
+  return crosspoints.some((xp) =>
+    'mixer' in xp.destination
+      ? xp.destination.input === programInput
+      : programOutputTallies.has(xp.destination.output),
+  );
+}
+
+/** One plan member's answer for an armed cell (`PlannedCrosspoint`: path + refusal). */
+export interface PlannedMember {
+  readonly path: string;
+  readonly refusal: { readonly type: string; readonly detail: string } | null;
+}
+
+/** The refusal type the on-air guard answers; under the take lock it means "needs confirmation", not "cannot". */
+export const ON_AIR_REFUSAL = 'on-air-protected';
+
+/**
+ * Merge an armed cell with its plan member (§8): `planned` (with the plan's
+ * path glyph) once planned, `planned` + needs-confirmation when only the
+ * on-air guard refused it, `disabled` with the typed refusal otherwise. An
+ * armed cell with no plan yet keeps its readback state.
+ */
+export function displayCell(base: MatrixCell, armed: boolean, member: PlannedMember | undefined): MatrixCell {
+  if (!armed || member === undefined) return base;
+  const path = pathGlyph(member.path);
+  const withPath = path !== undefined ? { path } : {};
+  if (member.refusal !== null && member.refusal.type !== ON_AIR_REFUSAL) {
+    return { state: 'disabled', disabledReason: 'refused', refusal: member.refusal, ...withPath };
+  }
+  if (member.refusal !== null) return { state: 'planned', needsConfirm: true, ...withPath };
+  return { state: 'planned', ...withPath };
 }
 
 /** Columns + rows for the empty-state check (Subtitle tab, patch-f note). */
