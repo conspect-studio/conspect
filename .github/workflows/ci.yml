@@ -60,6 +60,8 @@ jobs:
     outputs:
       # 'true' when at least one changed file is NOT in the prose allowlist.
       code: ${{ steps.filter.outputs.code }}
+      # 'true' when a file the cast playback proof covers changed (job cast-proof).
+      cast: ${{ steps.filter.outputs.cast }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -129,6 +131,10 @@ jobs:
               # excluded nowhere above → matches `**`, fails no negation →
               # `code = true` → spec validation runs. (asyncapi.json is also
               # include_str!'d into the multiview-control binary.)
+            # One brace pattern: predicate-quantifier `every` applies to every
+            # filter, so several positive patterns would have to ALL match.
+            cast:
+              - '{crates/multiview-output/src/hls/**,crates/multiview-output/examples/cast_*,crates/multiview-cli/src/cast_output*,crates/multiview-cli/src/cast_output/**,crates/multiview-control/src/cast*,crates/multiview-control/src/cast*/**,crates/multiview-control/src/routes/cast*,tools/cast-proof/**,web/src/cast/**,.github/workflows/ci.yml}'
 
   lint:
     name: fmt + clippy
@@ -756,6 +762,127 @@ jobs:
             2>&1 | tee native-avc-metadata.log
           grep -Eq '^test result: ok\. 1 passed; 0 failed;' native-avc-metadata.log
           TRIXIE
+
+  # Cast playback proof (ADR-0111, tools/cast-proof/README.md): the REAL engine
+  # (libx264 + AAC, 30000/1001) feeds its cast output; headless Chrome plays it
+  # with Shaka 4.15.56 at the Cast SDK defaults, with the real CAF receiver SDK +
+  # the engine-served receiver app on a fake Cast platform, and as the Default
+  # Media Receiver (cross-origin, engine CORS); takes, revoke and authz run
+  # against the engine's own routes. Needs outbound HTTPS to www.gstatic.com and
+  # ajax.googleapis.com: the SDK and its Shaka build load from Google, as on a
+  # device. Runs inside the pinned Trixie container like
+  # avc-metadata-native-gpl (the GPL FFmpeg prefix is built for Trixie), on the
+  # host network (the engine binds [::1]; Docker's bridge has no IPv6 loopback).
+  # Browser: Debian's chromium (H.264 + AAC; check-browser.mjs asserts
+  # MediaSource.isTypeSupported first and fails with a clear message if not).
+  # Size and status, measured on the dev host under taskset to 4 cores
+  # (tools/cast-proof/README.md): 1920x1080 fails there (the engine stops
+  # itself, "fell N ticks behind the clock", 0 of 8 runs); 1280x720 passes
+  # 2 of 8 and 960x540 2 of 6: the receiver's 6-10 s latency window and
+  # Shaka's continuity criteria miss by under 1 s when two software decoders
+  # share 4 cores with the encoder. No size passes 5 of 5 on 4 cores, so this
+  # job runs 960x540 and the playback result is reported (warning, step
+  # summary, artifact), not a gate, until a larger runner exists; never widen
+  # a criterion to make it pass. The cast pipeline + chaos tests ARE a gate (38 passed, 3 of 3,
+  # 61 s each on 4 cores). What CI does NOT prove: 1080p decode pacing; the
+  # full-size proof is tools/cast-proof/run.sh on a host with 8+ cores. A
+  # device test proves the rest (certificate trust, the device's hardware
+  # decoder, the Cast picker).
+  cast-proof:
+    name: Cast playback proof (engine -> Shaka + CAF receiver)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.cast == 'true' }}
+    permissions:
+      contents: read
+      packages: read
+    env:
+      FFMPEG_TAG: 9.0.2-gpl
+      FFMPEG_PREFIX: /opt/multiview-ffmpeg
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cast-proof
+      - uses: docker/login-action@v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract the published pinned GPL FFmpeg image
+        run: |
+          set -euo pipefail
+          image="$(scripts/resolve-ffmpeg-image.sh "${{ github.repository_owner }}" "${FFMPEG_TAG}")"
+          docker pull "${image}"
+          cid="$(docker create "${image}" /nonexistent)"
+          trap 'docker rm "${cid}" >/dev/null' EXIT
+          sudo mkdir -p "$(dirname "${FFMPEG_PREFIX}")"
+          sudo docker cp "${cid}:${FFMPEG_PREFIX}" "${FFMPEG_PREFIX}"
+      - name: Build, cast pipeline tests, playback proof (Trixie container)
+        run: |
+          set -euo pipefail
+          toolchain_bin="$(dirname "$(rustup which cargo)")"
+          docker run --rm -i --network host --shm-size 2g \
+            -v "$PWD:$PWD" -w "$PWD" \
+            -v "$HOME/.cargo:/cargo" -v "$HOME/.rustup:/rustup:ro" \
+            -v "${FFMPEG_PREFIX}:${FFMPEG_PREFIX}:ro" \
+            -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup -e CARGO_TERM_COLOR=always \
+            -v "$(dirname "${toolchain_bin}"):/selected-rust:ro" \
+            -e PATH=/selected-rust/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            -e FFMPEG_PREFIX="${FFMPEG_PREFIX}" \
+            debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6 \
+            bash -s <<'TRIXIE'
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates build-essential pkg-config clang libclang-dev nasm \
+            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 libx264-dev libx265-dev \
+            libnuma1 libdrm2 libgnutls30t64 \
+            nodejs npm chromium curl openssl python3 procps util-linux
+          export PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig"
+          export LD_LIBRARY_PATH="${FFMPEG_PREFIX}/lib"
+          # Release: a debug engine cannot hold the 29.97 fps cadence on 4 vCPU
+          # beside two software Chrome decoders (measured: it stops itself,
+          # "output fell 12 ticks behind the clock", even at 960x540).
+          cargo build --locked --release -p multiview-cli --features gpl-codecs
+          cargo build --locked --release -p multiview-output --example cast_validate
+          # The cast pipeline + chaos tests (real libx264, 160x90, real time).
+          cargo test --locked -p multiview-cli --features gpl-codecs --lib -- cast_output binding_delivery \
+            2>&1 | tee cast-pipeline-tests.log
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed;' cast-pipeline-tests.log
+          npm ci --prefix tools/cast-proof --no-audit --no-fund
+          export CHROME_PATH=/usr/bin/chromium
+          status=0
+          # Playback proof: reported, not gating (see the job comment).
+          tools/cast-proof/run.sh --size 960x540 --serial \
+            --engine target/release/multiview --validator target/release/examples/cast_validate \
+            --out tools/cast-proof/out || status=$?
+          mkdir -p tools/cast-proof/out
+          echo "${status}" > tools/cast-proof/out/exit-code
+          chmod -R a+rX tools/cast-proof/out || true
+          TRIXIE
+      - name: Report the playback proof (not gating on 4 vCPU)
+        if: always()
+        run: |
+          status="$(cat tools/cast-proof/out/exit-code 2>/dev/null || echo missing)"
+          if [ "${status}" = 0 ]; then
+            echo "cast-proof: all required playback checks passed at 960x540" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=cast-proof::playback proof at 960x540 reported ${status} failed check(s) on a 4 vCPU runner (load-sensitive, see tools/cast-proof/README.md); the artifact cast-proof-out holds the numbers"
+            echo "cast-proof: ${status} failed playback check(s) (not gating on 4 vCPU)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload the proof output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cast-proof-out
+          path: |
+            tools/cast-proof/out
+            cast-pipeline-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   feature-clippy-ffmpeg-webrtc:
     name: ffmpeg-linked webrtc clippy
