@@ -10046,7 +10046,8 @@ fn cast_audio_renditions(
             routes.program = Some(renditions.len());
             renditions.push(CastAudioRendition {
                 config,
-                name: program_language.unwrap_or("Program").to_owned(),
+                // The menu label stays "Program"; the language goes in LANGUAGE.
+                name: "Program".to_owned(),
                 language: program_language.map(str::to_owned),
                 default: false,
             });
