@@ -116,7 +116,10 @@ with Google's defaults and reports nothing. CSP of the receiver page: `media-src
    clock zero ticks and the HLS output zero packets; a stalled sink declares its gap.
 3. `tools/cast-proof/`: the real engine, a stream created through the API, 60 s in Shaka 4.15.56 with the SDK's
    defaults and with the receiver's settings, 60 s through the real receiver SDK and the receiver app against an
-   emulated platform channel, fault cases, and the validator on the directory. CI job `cast-proof`.
+   emulated platform channel, takes, revoke, authorization and the validator on the directory (fault cases:
+   `run.sh --reference`). CI job `cast-proof`: the pipeline and chaos tests gate; the playback proof runs at
+   960x540 and is reported, not gating, on the 4 vCPU runner (no size passed 5 of 5 on 4 cores, see the tool's
+   README); the full-size run needs 8 or more cores.
 4. A device test by the operator (runbook `docs/runbooks/cast.md`).
 
 What the automated proof does not cover is listed in section 1.
