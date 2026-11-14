@@ -28,20 +28,24 @@ import {
   LayoutApiError,
   updateLayout,
   fetchLayoutEtag,
+  fetchLayoutWithEtag,
 } from './layouts';
-import type { Layout, LayoutInput } from './layouts';
+import type { Layout, LayoutInput, LayoutWithEtag } from './layouts';
 
-export type { Layout, LayoutInput } from './layouts';
+export type { Layout, LayoutInput, LayoutWithEtag } from './layouts';
 
 /** A failed API call, normalized to a single human-readable message. */
 export class ApiError extends Error {
   /** The HTTP status code, when the failure carried an RFC 9457 problem body. */
   readonly status: number | undefined;
+  /** The RFC 9457 problem `detail`, when the server returned one. */
+  readonly detail: string | undefined;
 
-  constructor(message: string, status?: number) {
+  constructor(message: string, status?: number, detail?: string) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.detail = detail;
   }
 }
 
@@ -87,12 +91,29 @@ export interface MutationContext {
 
 function toApiError(error: unknown): ApiError {
   if (error instanceof LayoutApiError) {
-    return new ApiError(error.message, error.status);
+    return new ApiError(error.message, error.status, error.detail);
   }
   if (error instanceof Error) {
     return new ApiError(error.message);
   }
   return new ApiError('Unknown error');
+}
+
+/**
+ * Read a single layout AND its `ETag` from the SAME response — for a
+ * partial-field editor (e.g. the Layers dialog) that must base its edit on a
+ * fresh read, never a list-derived snapshot, and must send exactly that same
+ * `ETag` as `If-Match` on save (see {@link useSaveLayout}'s `ifMatch`).
+ */
+export async function fetchLayoutForEdit(
+  client: MultiviewApiClient,
+  id: string,
+): Promise<LayoutWithEtag> {
+  try {
+    return await fetchLayoutWithEtag(client, id);
+  } catch (error) {
+    throw toApiError(error);
+  }
 }
 
 /**
@@ -115,6 +136,14 @@ export interface SaveLayoutVars {
    * otherwise a create.
    */
   readonly create?: boolean;
+  /**
+   * An explicit `If-Match` ETag that wins over the cached/fetched one. Use
+   * this when the caller already holds a fresher read of the SAME resource
+   * than the list/cache (e.g. a partial-field editor that GETs the layout
+   * right before editing it) — sending the cache's possibly-stale ETag
+   * instead would risk a silent overwrite of a concurrent save.
+   */
+  readonly ifMatch?: string;
 }
 
 interface SaveSnapshot {
@@ -134,16 +163,24 @@ export function useSaveLayout(
 ): UseMutationResult<Layout, ApiError, SaveLayoutVars, SaveSnapshot> {
   const queryClient = useQueryClient();
   return useMutation<Layout, ApiError, SaveLayoutVars, SaveSnapshot>({
-    mutationFn: async ({ input, id, create }): Promise<Layout> => {
+    mutationFn: async ({ input, id, create, ifMatch: explicitIfMatch }): Promise<Layout> => {
       const etags = readEtags(queryClient);
       let result;
       try {
-        // Decide create vs update: explicit `create` flag wins; a cached ETag
-        // means update. With neither (a reloaded session editing an existing
-        // layout — the list carries no ETags), ask the server: a current ETag
-        // means update with it as If-Match; a 404 means create.
-        let ifMatch = etags[id];
-        let isCreate = create;
+        // An explicit `ifMatch` (the caller's own fresh same-resource read)
+        // always wins — it is strictly fresher than anything the cache could
+        // hold. Otherwise decide create vs update: explicit `create` flag
+        // wins; a cached ETag means update. With neither (a reloaded session
+        // editing an existing layout — the list carries no ETags), ask the
+        // server: a current ETag means update with it as If-Match; a 404
+        // means create.
+        // A caller that asked for a conditional write must never get an
+        // unconditional one: an empty explicit tag is refused, not dropped.
+        if (explicitIfMatch?.trim() === '') {
+          throw new ApiError('Missing ETag for a conditional save', 428);
+        }
+        let ifMatch = explicitIfMatch ?? etags[id];
+        let isCreate = explicitIfMatch !== undefined ? false : create;
         if (isCreate === undefined && ifMatch === undefined) {
           ifMatch = await fetchLayoutEtag(context.api, id);
           isCreate = ifMatch === undefined;

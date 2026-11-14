@@ -1815,6 +1815,72 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
 - **Salvos** do not drive output takes on main (`Salvo` has no output recall); layout feeds in
   salvos belong to #308.
 
+### 10.2 Routed layouts carry the multiview overlay layers
+
+A routed layout is a multiview in its own right, so its aux canvas carries the same per-cell
+chrome as Program: the source name, the per-input audio meter, the state flag (LIVE / STALE /
+RECONNECTING / NO SIGNAL / IDLE…) and content-fault badge (BLACK / FROZEN / NO AUDIO), the tally
+border, the clock, and optional safe-area markers.
+
+- **Per-layout setting.** A stored layout body may carry
+  `"overlays": {"labels", "meters", "flags", "tally", "clock", "safe_area"}` (booleans,
+  `LayoutOverlays`). Absent, or a key absent, is the default: every layer on except `safe_area`.
+  Unknown keys are refused at solve. All six off is a **clean** layout: no bake runs at all.
+  It is edited on the Layouts page (Layers). A live edit swaps the body like any other edit (§10.1).
+  A separate "clean variant of the same layout" feed is not built: a second stored layout with
+  every layer off gives the same picture.
+- **Where it runs.** On the `routing-aux` thread, right after the integer compose of that layout
+  (`aux_overlays::LayoutOverlayBake`), with Program's `OverlayBaker` and region-limited
+  `apply_overlays_to_nv12`. Never on the clock and never on the bake consumer. One bake per layout
+  canvas: every output on `aux:<id>` shares the one baked frame (+0 for a second subscriber).
+- **Inputs, all wait-free.** The cell states come from the same `TileStore::read_at` the compose
+  made this tick. Meters, content faults and the Program source set come from one
+  `SwapCell` snapshot the bake consumer publishes after its own bake, only while some routed layout
+  bakes (one relaxed load otherwise). Preview tally comes from the M/E PVW selection slot. The aux
+  thread reads the newest snapshot; it never waits for the consumer. Meters and tally are
+  normally one tick behind Program's; while the consumer falls behind, the snapshot ages with it
+  (no bound is claimed — the picture never waits for it).
+- **Content faults.** For a source on Program the badge is exactly Program's own verdict (its
+  declared probes, latches and silence). For a source shown only on routed layouts, the layout
+  detects BLACK / FROZEN itself on the aux thread, from the frames the compose already read, with
+  the source's declared black/freeze probe (threshold, zone, dwell, latch) or Program's defaults,
+  built by the same helpers (`fault_probes.rs`). NO AUDIO and the meters come from the program
+  bus's per-input taps only: a source on no audio route shows an empty meter and no silence badge.
+- **Cell budget.** A layout with more than 64 cells composes and publishes without overlays
+  (warned once, counted); the layouts API is unchanged.
+- **Draw order and occlusion.** Cell chrome is emitted in the compositor's draw order (ascending
+  `z`), so higher cells' chrome paints last; a cell wholly covered by one opaque higher cell draws
+  no chrome. A partly covered cell keeps its full chrome, drawn over the covering picture. Labels
+  are capped at 64 characters (Program too).
+- **Bounded signals.** The aux thread publishes the set of sources its baking layouts bind
+  (only when that set changes); the consumer's snapshot holds only those sources, and its live
+  meter map forgets a source 5 s after it leaves the bus.
+- **Tally.** Red border for a source on Program, green for a source on Preview; with flags on,
+  the state chip also reads `PGM` / `PVW` (meaning is never colour alone).
+- **Failure.** A bake error publishes the un-overlaid picture (counted, warned once); it never
+  holds the bus. A panic in a bake is a panic of the aux tick: the existing §4.4 fall-back to
+  Program applies. A source dying mid-bake shows its slate and NO SIGNAL; the layout keeps one
+  frame per tick.
+- **Parallel bakes.** The aux thread composes every layout first, then bakes them: one layout
+  bakes on the aux thread itself; two or more bake in a `std::thread::scope`, one scoped thread
+  (`routing-aux-bake`) per layout beyond the first, at most `MAX_AUX_CANVASES_LIMIT` (8). The
+  scope joins before anything is published, so each layout still publishes exactly one frame per
+  tick. Composes stay sequential, so an aux tick costs the sum of the composes plus the slowest
+  bake plus the scope's spawn overhead. A panic in a scoped bake propagates out of the scope and raises `failed` (§4.4).
+- **Cost, measured** (release build, shared and loaded 56-core host, 1920x1080, a 1+8 NewsOne
+  layout, every default layer): compose 3.7–5.8 ms, bake 17.6–26.5 ms (mostly the region blend of
+  `apply_overlays_to_nv12`). Two such layouts, parallel: mean 21–26 ms per aux tick, worst
+  29–34 ms (sequential would be 36 ms mean, 82–108 ms worst). That fits a 25 fps tick; at
+  29.97/30 fps a loaded host can reach the §7 back-off (every second tick, routed pictures hold),
+  never Program. Clock isolation is pinned by `two_baking_layouts_never_hold_the_live_clock`
+  (live drop-on-overload policy: the clock counts every tick, every tick is delivered or accounted
+  as shed, both layouts bake); `two_routed_layouts_with_overlays_never_cost_program_a_window` is
+  the exact-delivery variant. A cheaper bake (GPU overlay or a cached static chrome layer) is a
+  follow-up.
+- **Layout as an M/E source** (#307, lane layout-me): the composed `layout:<id>` source runs the same
+  bake before it is published, so a layout taken to Program through the M/E carries its layers.
+  Built with that slice, not here.
+
 ---
 
 ## 11. Interactions and open points
