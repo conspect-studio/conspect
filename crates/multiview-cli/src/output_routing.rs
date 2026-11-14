@@ -579,18 +579,25 @@ impl OutputRoutingHandle {
 
     /// Enqueue an atomic multi-crosspoint set without waiting (§12.8, #308):
     /// the same bounded mailbox as [`Self::try_take`] (one slot per set).
-    /// Every member carries the set's `operation_id` and `principal`.
+    /// Every member carries the set's `operation_id` and `principal`: the
+    /// members' own (unchecked) id strings are dropped here, before the
+    /// enqueue, so the mailbox never retains them (review B-3).
     ///
     /// # Errors
     /// [`TakeBusy`] when the mailbox is full or the run ended, an id is too
     /// long, or the set has no or more than [`MAX_SET_MEMBERS`] members.
-    pub fn try_take_set(&self, set: TakeSet) -> Result<(), TakeBusy> {
+    pub fn try_take_set(&self, mut set: TakeSet) -> Result<(), TakeBusy> {
         if set.principal.len() > MAX_TAKE_ID_BYTES
             || set.operation_id.len() > MAX_TAKE_ID_BYTES
             || set.members.is_empty()
             || set.members.len() > MAX_SET_MEMBERS
         {
             return Err(TakeBusy);
+        }
+        for m in &mut set.members {
+            // Replaced (old storage freed); the router stamps the set's ids.
+            m.operation_id = String::new();
+            m.principal = String::new();
         }
         self.takes
             .try_send(RouterMsg::Set(set))
@@ -1178,6 +1185,14 @@ pub struct OutputRouter {
     first_tick: Option<u64>,
     /// Atomic multi-crosspoint sets (#308).
     sets: sets::SetState,
+    /// Mailbox messages drained (takes and sets), monotonic (test
+    /// observation of the per-tick budget).
+    #[cfg(test)]
+    takes_drained: u64,
+    /// Test seam: called after each drained mailbox message (a lockstep
+    /// concurrent producer refills the mailbox from here).
+    #[cfg(test)]
+    drain_hook: Option<Box<dyn FnMut() + Send>>,
 }
 
 /// The router's start-up (boot) take state, O(outputs).
@@ -1225,6 +1240,7 @@ impl OutputRouter {
     ///
     /// # Errors
     /// The OS error if a helper thread cannot be spawned.
+    #[allow(clippy::too_many_lines)]
     pub fn new_with_openers(
         cfg: RouterConfig,
         aux: AuxWiring,
@@ -1327,6 +1343,10 @@ impl OutputRouter {
             boot: BootTakes::default(),
             first_tick: None,
             sets: sets::SetState::default(),
+            #[cfg(test)]
+            takes_drained: 0,
+            #[cfg(test)]
+            drain_hook: None,
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -1352,6 +1372,15 @@ impl OutputRouter {
         #[cfg(test)]
         if let Some(audio) = self.audio.as_mut() {
             audio.tap = Some(Arc::clone(&self.audio_tap));
+        }
+    }
+
+    /// Test seam: the program encoder's codec configuration a private bus
+    /// must match to bind (a mismatch refuses its audio move).
+    #[cfg(test)]
+    pub(crate) fn set_audio_program_config(&mut self, config: Option<Vec<u8>>) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.program_config = config;
         }
     }
 
@@ -1961,94 +1990,128 @@ impl OutputRouter {
         // unused key (never retired under a move still landing).
     }
 
+    /// Drain the take mailbox: at most [`TAKE_MAILBOX`] messages (takes and
+    /// sets combined) per tick, so a producer refilling it concurrently can
+    /// never starve the rest of the tick (review C-1). Ops deferred behind a
+    /// set the clock owns run first, once that set resolved.
     fn drain_takes(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
-        loop {
-            let take = match self.takes.try_recv() {
-                Ok(RouterMsg::Take(take)) => take,
-                Ok(RouterMsg::Set(set)) => {
-                    self.admit_set(set, tick, dispatcher);
-                    continue;
-                }
+        self.run_deferred(tick, dispatcher);
+        for _ in 0..TAKE_MAILBOX {
+            match self.takes.try_recv() {
+                Ok(RouterMsg::Take(take)) => self.process_take(take, tick, dispatcher),
+                Ok(RouterMsg::Set(set)) => self.admit_set(set, tick, dispatcher),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
-            };
-            let index = take.output_index;
-            // A boot take enters its retry window; an operator take on the
-            // same output replaces the boot intent for good. One slot per
-            // output, allocated on the first take (bounded by the outputs).
-            if self.boot.slots.len() < self.outputs.len() {
-                self.boot.slots.resize_with(self.outputs.len(), || None);
             }
-            // Any later take on the output replaces a queued boot audio too.
-            self.boot.audio_after.retain(|b| b.output_index != index);
-            if let Some(slot) = self.boot.slots.get_mut(index) {
-                *slot = is_boot_video_take(&take.operation_id).then(|| BootRetry {
-                    take: take.clone(),
-                    issued: tick,
-                    due: None,
-                });
-            }
-            let needs_switcher = matches!(take.bus, Some(PictureBus::Preview | PictureBus::Clean));
-            // §7 rule 1, checked again here (the plan's answer can be stale):
-            // a layout not composing yet needs a free aux canvas.
-            if let Some(PictureBus::Layout(layout)) = &take.bus {
-                if self.layout_take_is_stale(layout) {
-                    self.emit(
-                        take.operation_id,
-                        take.output_index,
-                        tick,
-                        TakeResult::Refused(RefuseReason::Unroutable),
-                    );
-                    continue;
-                }
-                self.remember_state(LayoutChange::Edited(layout.clone()));
-                // A re-take of a composing layout carries its latest body
-                // (an edited layout): the canvas follows it from this tick.
-                let _ = self.refresh_layout_body(layout, tick);
-                if !self.admit_aux_canvas(layout, take.output_index, dispatcher) {
-                    self.emit(
-                        take.operation_id,
-                        take.output_index,
-                        tick,
-                        TakeResult::Refused(RefuseReason::Capacity),
-                    );
-                    continue;
+            #[cfg(test)]
+            {
+                self.takes_drained = self.takes_drained.saturating_add(1);
+                if let Some(hook) = self.drain_hook.as_mut() {
+                    hook();
                 }
             }
-            // Audio rides the output's program-audio slot (§5.5): a run
-            // without program audio, or an output without that slot (NDI,
-            // AES67, display), cannot take an audio choice.
-            let audio_ok = take.audio.is_none()
-                || (self.audio.is_some() && dispatcher.has_program_audio(index));
-            let routable = index < self.outputs.len()
-                && (!needs_switcher || self.cfg.has_preview)
-                && (take.bus.is_some() || take.audio.is_some())
-                && audio_ok;
-            if !routable {
+        }
+    }
+
+    /// One single take from the mailbox (or deferred).
+    pub(super) fn process_take(
+        &mut self,
+        take: OutputTake,
+        tick: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let index = take.output_index;
+        // Newest wins over an older deferred op on this output; while a set
+        // the clock owns holds the output, this take is deferred too.
+        self.supersede_deferred(&[index], tick);
+        if self.output_owned(index, dispatcher) {
+            self.defer(sets::DeferredOp::Take(take));
+            return;
+        }
+        // A boot take enters its retry window; an operator take on the
+        // same output replaces the boot intent for good. One slot per
+        // output, allocated on the first take (bounded by the outputs).
+        if self.boot.slots.len() < self.outputs.len() {
+            self.boot.slots.resize_with(self.outputs.len(), || None);
+        }
+        // Any later take on the output replaces a queued boot audio too.
+        self.boot.audio_after.retain(|b| b.output_index != index);
+        if let Some(slot) = self.boot.slots.get_mut(index) {
+            *slot = is_boot_video_take(&take.operation_id).then(|| BootRetry {
+                take: take.clone(),
+                issued: tick,
+                due: None,
+            });
+        }
+        let needs_switcher = matches!(take.bus, Some(PictureBus::Preview | PictureBus::Clean));
+        // §7 rule 1, checked again here (the plan's answer can be stale):
+        // a layout not composing yet needs a free aux canvas.
+        if let Some(PictureBus::Layout(layout)) = &take.bus {
+            if self.layout_take_is_stale(layout) {
                 self.emit(
                     take.operation_id,
-                    index,
+                    take.output_index,
                     tick,
                     TakeResult::Refused(RefuseReason::Unroutable),
                 );
-                continue;
+                return;
             }
-            self.supersede(index, tick, dispatcher);
-            let audio_only = take.bus.is_none();
-            let Some(out) = self.outputs.get_mut(index) else {
-                continue;
-            };
-            out.pending = Some(Pending {
-                take,
-                started: tick,
-                phase: Phase::Priming,
-                group: None,
-            });
-            self.dirty = true;
-            if audio_only {
-                // Adopted at this drain tick: no fresh gate for audio (a
-                // source without audio is silence, §5.1).
-                self.start_audio_take(index, tick, dispatcher);
+            self.remember_state(LayoutChange::Edited(layout.clone()));
+            // A re-take of a composing layout carries its latest body
+            // (an edited layout): the canvas follows it from this tick.
+            let _ = self.refresh_layout_body(layout, tick);
+            if !self.admit_aux_canvas(layout, take.output_index, dispatcher) {
+                self.emit(
+                    take.operation_id,
+                    take.output_index,
+                    tick,
+                    TakeResult::Refused(RefuseReason::Capacity),
+                );
+                return;
             }
+        }
+        // Audio rides the output's program-audio slot (§5.5): a run
+        // without program audio, or an output without that slot (NDI,
+        // AES67, display), cannot take an audio choice.
+        let audio_ok =
+            take.audio.is_none() || (self.audio.is_some() && dispatcher.has_program_audio(index));
+        let routable = index < self.outputs.len()
+            && (!needs_switcher || self.cfg.has_preview)
+            && (take.bus.is_some() || take.audio.is_some())
+            && audio_ok;
+        if !routable {
+            self.emit(
+                take.operation_id,
+                index,
+                tick,
+                TakeResult::Refused(RefuseReason::Unroutable),
+            );
+            return;
+        }
+        // A member of a set the clock already owns (applying or committed
+        // at its tick) is never split: the take waits until the set
+        // resolves (review A-1).
+        if let Some(group) = self.group_of(index) {
+            if !self.try_supersede_set(group, dispatcher) {
+                self.defer(sets::DeferredOp::Take(take));
+                return;
+            }
+        }
+        self.supersede(index, tick, dispatcher);
+        let audio_only = take.bus.is_none();
+        let Some(out) = self.outputs.get_mut(index) else {
+            return;
+        };
+        out.pending = Some(Pending {
+            take,
+            started: tick,
+            phase: Phase::Priming,
+            group: None,
+        });
+        self.dirty = true;
+        if audio_only {
+            // Adopted at this drain tick: no fresh gate for audio (a
+            // source without audio is silence, §5.1).
+            self.start_audio_take(index, tick, dispatcher);
         }
     }
 
@@ -2779,7 +2842,15 @@ impl OutputRouter {
                 Phase::Priming => {
                     let current = self.outputs.get(index).map(|o| o.bus.clone());
                     if group.is_some() && current.as_ref() == Some(&bus) {
-                        // A no-op member: already on air, it lands with the set.
+                        // A no-op member: already on air, it lands with the
+                        // set. An audio change it carries is admitted (its
+                        // private bus opened and warming) now, so it can
+                        // switch at the set's tick (review A-3).
+                        if choice.is_some() {
+                            if let Some(audio) = self.audio.as_mut() {
+                                audio.admit(index, &bus, choice.as_ref(), tick, dispatcher);
+                            }
+                        }
                         let key = self.outputs.get(index).map_or(0, |o| o.key);
                         self.member_ready(index, key);
                         continue;

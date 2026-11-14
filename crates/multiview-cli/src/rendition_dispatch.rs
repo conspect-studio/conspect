@@ -86,6 +86,17 @@ pub(crate) enum MoveRefusal {
     FormatMismatch,
 }
 
+/// [`RenditionDispatcher::preflight_group`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupPreflight {
+    /// Every member's destination keeps its output's container valid.
+    Ready,
+    /// A destination has not staged a RAP yet: ask again next tick.
+    Pending,
+    /// A member would change an out-of-band decoder configuration.
+    FormatMismatch,
+}
+
 /// Result of a requested video move or of a failure fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoveOutcome {
@@ -382,6 +393,10 @@ struct VideoMeta {
     failed: bool,
     gate: Option<MoveGate>,
     params: Option<ParameterSets>,
+    /// The decoder configuration of the key's last staged RAP (`None`: no
+    /// RAP seen yet, or no extractor): an atomic set preflights it against
+    /// an out-of-band output before proposing its tick (#308 review A-2).
+    last_rap: Option<RapParameterSets>,
     /// The key's video stream parameters (#342 B3 review V2): handed to an
     /// output's delivery with a decoder-config change onto this key.
     stream: Option<multiview_ffmpeg::StreamCodecParameters>,
@@ -679,6 +694,7 @@ impl RenditionDispatcher {
                 failed: false,
                 gate: gates.next().flatten(),
                 params: None,
+                last_rap: None,
                 stream: None,
                 generation: 0,
             })
@@ -891,11 +907,16 @@ impl RenditionDispatcher {
                     return Err(DispatchError::InvalidEvent);
                 }
                 let _ = tick; // Tick alone does not close delayed DTS.
+                let mut rap = None;
                 for p in packets {
                     if p.kind() != StreamKind::Video {
                         return Err(DispatchError::InvalidEvent);
                     }
+                    rap = self.rap_sets(key_index, &p).or(rap);
                     self.put_video(key_index, p, now)?;
+                }
+                if let (Some(rap), Some(meta)) = (rap, self.video_meta.get_mut(key_index)) {
+                    meta.last_rap = Some(rap);
                 }
                 let stage = self
                     .video
@@ -1009,6 +1030,10 @@ impl RenditionDispatcher {
             .get(key)
             .ok_or(DispatchError::InvalidEvent)?;
         let cadence = self.cadence;
+        let mut rap = None;
+        for p in &packets {
+            rap = self.rap_sets(key, p).or(rap);
+        }
         let result = (|| -> Result<(), DispatchError> {
             let stage = self.video.get_mut(key).ok_or(DispatchError::InvalidEvent)?;
             if stage.finished || timebase.is_some_and(|t| !tb.matches(t)) {
@@ -1034,8 +1059,19 @@ impl RenditionDispatcher {
         if result.is_err() {
             // A live key's fault is its own: never the program's.
             self.fail_dynamic(key);
+        } else if let (Some(rap), Some(meta)) = (rap, self.video_meta.get_mut(key)) {
+            meta.last_rap = Some(rap);
         }
         Ok(())
+    }
+    /// The decoder configuration of `packet` when it is a RAP of `key` and
+    /// the key has an extractor (once per GOP, never per packet otherwise).
+    fn rap_sets(&self, key: usize, packet: &EncodedPacket) -> Option<RapParameterSets> {
+        if !packet.is_keyframe() {
+            return None;
+        }
+        let f = self.video_meta.get(key)?.params.as_ref()?;
+        Some(f(packet))
     }
     fn fail_dynamic(&mut self, key: usize) {
         if let Some(meta) = self.video_meta.get_mut(key) {
@@ -1314,6 +1350,15 @@ impl RenditionDispatcher {
             if !pending || !usable {
                 return Some(Err(MoveRefusal::EncoderNotReady));
             }
+            if b.video_key == Some(key) {
+                // A member that stays on its key (its audio changes at `at`,
+                // review A-3): no RAP, no decoder-config decision, but window
+                // `at` must not have gone out yet.
+                if b.pending.front().is_some_and(|head| head.index > g.at) {
+                    return Some(Err(MoveRefusal::EncoderNotReady));
+                }
+                continue;
+            }
             let full = b.pending.len() >= MAX_PENDING_WINDOWS;
             if b.pending.front().is_some_and(|head| head.index > g.at) {
                 // Window `at` already went out on this output.
@@ -1485,6 +1530,29 @@ impl RenditionDispatcher {
                         b.mv = None;
                     }
                 }
+            }
+            if let Some(m) = b
+                .mv
+                .filter(|m| index >= m.at_tick && m.group.is_some() && b.video_key == Some(m.key))
+            {
+                // A grouped member staying on its key (review A-3): the group
+                // decided to apply, so it lands at `at` with nothing to cut;
+                // the audio move gated on it may now land in this window.
+                if let Some(am) = b.audio_mv.as_mut() {
+                    if am.after_video == Some((m.key, m.generation)) {
+                        am.after_video = None;
+                    }
+                }
+                push_outcome(
+                    &mut self.outcomes,
+                    MoveOutcome::Applied {
+                        output_index: b.output_index,
+                        key: m.key,
+                        tick: u64::try_from(index).unwrap_or(u64::MAX),
+                        parameter_sets_changed: false,
+                    },
+                );
+                b.mv = None;
             }
             if let Some(mut m) = b.mv {
                 if index >= m.at_tick {
@@ -1969,6 +2037,7 @@ impl RenditionDispatcher {
                 failed: false,
                 gate: Some(gate),
                 params: None,
+                last_rap: None,
                 stream: None,
                 generation,
             };
@@ -1983,6 +2052,7 @@ impl RenditionDispatcher {
             failed: false,
             gate: Some(gate),
             params: None,
+            last_rap: None,
             stream: None,
             generation,
         });
@@ -2153,11 +2223,14 @@ impl RenditionDispatcher {
     /// `arm`, the moves apply only once the set's mixer half committed at
     /// `at_tick`. Each member's previous pending move is superseded.
     /// All-or-nothing registration: an invalid member registers nothing.
+    /// A member already reading its key stays on it (no cut): it carries an
+    /// audio change that must land with the set (review A-3), gated on this
+    /// move like any other member's audio.
     ///
     /// # Errors
-    /// `InvalidConfig` for an empty or oversized set, a duplicate output, a
-    /// member already reading its key, an unknown output, an unusable or
-    /// gate-less key, or [`MAX_MOVE_GROUPS`] groups already held.
+    /// `InvalidConfig` for an empty or oversized set, a duplicate output, an
+    /// unknown output, an unusable or gate-less key, or [`MAX_MOVE_GROUPS`]
+    /// groups already held.
     pub(crate) fn rebind_group(
         &mut self,
         group: u64,
@@ -2174,20 +2247,19 @@ impl RenditionDispatcher {
         }
         let mut resolved = Vec::with_capacity(members.len());
         for (i, &(output, key)) in members.iter().enumerate() {
-            let meta = self
-                .video_meta
-                .get(key)
-                .filter(|m| !m.failed && !m.retired && m.gate.is_some())
-                .ok_or(DispatchError::InvalidConfig)?;
             let b = self
                 .bindings
                 .iter()
                 .find(|b| b.output_index == output)
                 .ok_or(DispatchError::InvalidConfig)?;
-            if b.video_key.is_none()
-                || b.video_key == Some(key)
-                || members.iter().take(i).any(|&(o, _)| o == output)
-            {
+            // A staying member cuts nothing: it needs no gate.
+            let stays = b.video_key == Some(key);
+            let meta = self
+                .video_meta
+                .get(key)
+                .filter(|m| !m.failed && !m.retired && (stays || m.gate.is_some()))
+                .ok_or(DispatchError::InvalidConfig)?;
+            if b.video_key.is_none() || members.iter().take(i).any(|&(o, _)| o == output) {
                 return Err(DispatchError::InvalidConfig);
             }
             resolved.push((output, key, meta.generation));
@@ -2247,6 +2319,46 @@ impl RenditionDispatcher {
             self.reconcile_audio_gates();
         }
         dropped
+    }
+    /// Whether `group` is registered and not decided yet (its moves can
+    /// still be cancelled without splitting the set).
+    pub(crate) fn group_undecided(&self, group: u64) -> bool {
+        self.groups
+            .iter()
+            .any(|g| g.id == group && g.decision.is_none())
+    }
+    /// Preflight an atomic set's moves before its tick is proposed (review
+    /// A-2): the rule `judge_group` applies at the decision window, against
+    /// each destination key's last staged RAP. A member whose output carries
+    /// its decoder configuration out of band (`!inband_ok`) and whose
+    /// destination's configuration differs from the output's refuses the
+    /// whole set `FormatMismatch` before anything is armed. A destination
+    /// with an extractor but no RAP seen yet is `Pending`.
+    pub(crate) fn preflight_group(&self, members: &[(usize, usize)]) -> GroupPreflight {
+        let mut pending = false;
+        for &(output, key) in members {
+            let Some(b) = self.bindings.iter().find(|b| b.output_index == output) else {
+                continue;
+            };
+            if b.inband_ok || b.video_key == Some(key) {
+                continue;
+            }
+            let Some(meta) = self.video_meta.get(key).filter(|m| m.params.is_some()) else {
+                continue;
+            };
+            match meta.last_rap.as_ref() {
+                None => pending = true,
+                Some(sets) if sets_change(b.last_sets.as_ref(), sets) => {
+                    return GroupPreflight::FormatMismatch;
+                }
+                Some(_) => {}
+            }
+        }
+        if pending {
+            GroupPreflight::Pending
+        } else {
+            GroupPreflight::Ready
+        }
     }
     /// Grouped moves held now (test observation).
     #[cfg(test)]

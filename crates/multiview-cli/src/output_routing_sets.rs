@@ -24,6 +24,8 @@ use super::{
     PictureBus, RefuseReason, RenditionDispatcher, TakeResult, BOOT_PRINCIPAL, FORCE_FLOOR_TICKS,
     OPEN_DEADLINE_TICKS, OPEN_QUEUE,
 };
+use crate::rendition_dispatch::GroupPreflight;
+use crate::routing_audio::{AudioPrep, AudioTakeStart};
 
 /// Output members of one set at most (the control plane's 64-crosspoint
 /// bound, §12.8).
@@ -66,6 +68,25 @@ pub(super) struct ActiveSet {
     reserved: usize,
     /// The proposed adoption tick.
     proposed: Option<u64>,
+    /// A grouped dispatcher move was registered for the proposal.
+    grouped: bool,
+}
+
+/// A take or set that arrived for an output a set owned by the clock still
+/// holds (review A-1): run once that set resolved.
+pub(super) enum DeferredOp {
+    Take(OutputTake),
+    Set(TakeSet),
+}
+
+impl DeferredOp {
+    /// The outputs this op names (one per take, one per set member).
+    fn outputs(&self) -> Vec<usize> {
+        match self {
+            Self::Take(t) => vec![t.output_index],
+            Self::Set(s) => s.members.iter().map(|m| m.output_index).collect(),
+        }
+    }
 }
 
 /// The router's set state (bounded: a set holds at least one output and a
@@ -79,6 +100,10 @@ pub(super) struct SetState {
     pub(super) partial: u64,
     /// The clock's last composed tick (the switcher's applied tick).
     clock: Option<Arc<AtomicU64>>,
+    /// Ops deferred behind a clock-owned set: at most one per output (no two
+    /// share an output; a newer op on an output supersedes the older), so
+    /// bounded by the outputs.
+    pub(super) deferred: Vec<DeferredOp>,
 }
 
 impl SetState {
@@ -100,6 +125,7 @@ const fn arm_result(reason: SetRefusal) -> TakeResult {
         SetRefusal::UnknownSlot | SetRefusal::UnknownSource | SetRefusal::Invalid => {
             TakeResult::Refused(RefuseReason::Unroutable)
         }
+        SetRefusal::FormatMismatch => TakeResult::Refused(RefuseReason::FormatMismatch),
     }
 }
 
@@ -111,7 +137,8 @@ const fn arm_reason(result: TakeResult) -> SetRefusal {
         TakeResult::Refused(RefuseReason::OnAirProtected) => SetRefusal::OnAirProtected,
         TakeResult::Refused(RefuseReason::Unroutable) => SetRefusal::Invalid,
         TakeResult::Superseded => SetRefusal::Superseded,
-        TakeResult::Refused(RefuseReason::EncoderNotReady | RefuseReason::FormatMismatch)
+        TakeResult::Refused(RefuseReason::FormatMismatch) => SetRefusal::FormatMismatch,
+        TakeResult::Refused(RefuseReason::EncoderNotReady)
         | TakeResult::Applied
         | TakeResult::Fallback(_)
         | TakeResult::ResetApplied
@@ -148,6 +175,126 @@ impl OutputRouter {
                 },
             )
         })
+    }
+
+    /// Encoders charged to `principal`: live keys, opens in flight and its
+    /// sets' unissued reservations.
+    fn principal_held(&self, principal: &str) -> usize {
+        self.dynamic
+            .iter()
+            .filter(|d| d.principal == principal)
+            .count()
+            + self
+                .opens
+                .values()
+                .filter(|o| o.principal == principal)
+                .count()
+            + self.set_reservations(principal).1
+    }
+
+    /// Whether output `index` is held by a set the clock owns: its mixer
+    /// half is applying or committed at `T`, or (no mixer half) its grouped
+    /// dispatcher move is decided or partly applied. Such a set is never
+    /// superseded (review A-1); a later op on its outputs is deferred.
+    pub(super) fn output_owned(&self, index: usize, dispatcher: &RenditionDispatcher) -> bool {
+        self.group_of(index)
+            .and_then(|g| self.sets.get(g))
+            .is_some_and(|set| match set.arm.as_ref() {
+                Some(arm) => matches!(arm.state(), ArmState::Applying | ArmState::Committed),
+                None => {
+                    set.proposed.is_some() && set.grouped && !dispatcher.group_undecided(set.id)
+                }
+            })
+    }
+
+    /// Win the refusal of set `group` before anything of it is cancelled
+    /// (review A-1). `true`: the set may be superseded now (its arm is
+    /// refused, or it has none and its group is undecided). `false`: the
+    /// clock owns it (the refusal lost to `begin_apply`/`commit`, or its
+    /// dispatcher group is decided): it finishes its `T` decision.
+    pub(super) fn try_supersede_set(&self, group: u64, dispatcher: &RenditionDispatcher) -> bool {
+        let Some(set) = self.sets.get(group) else {
+            return true;
+        };
+        match set.arm.as_ref() {
+            Some(arm) => {
+                arm.refuse(SetRefusal::Superseded)
+                    || !matches!(arm.state(), ArmState::Applying | ArmState::Committed)
+            }
+            None => !(set.proposed.is_some() && set.grouped && !dispatcher.group_undecided(group)),
+        }
+    }
+
+    /// Park `op` until the set holding its outputs resolved. Newest wins:
+    /// an older deferred op sharing an output was already superseded by the
+    /// caller ([`Self::supersede_deferred`]).
+    pub(super) fn defer(&mut self, op: DeferredOp) {
+        self.sets.deferred.push(op);
+        self.dirty = true;
+    }
+
+    /// Supersede every deferred op naming one of `outputs` (newest wins):
+    /// each of its members reports `Superseded`, a set's arm is refused.
+    pub(super) fn supersede_deferred(&mut self, outputs: &[usize], tick: u64) {
+        if self.sets.deferred.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.sets.deferred.len() {
+            let hit = self
+                .sets
+                .deferred
+                .get(i)
+                .is_some_and(|op| op.outputs().iter().any(|o| outputs.contains(o)));
+            if !hit {
+                i += 1;
+                continue;
+            }
+            match self.sets.deferred.swap_remove(i) {
+                DeferredOp::Take(t) => {
+                    self.emit(t.operation_id, t.output_index, tick, TakeResult::Superseded);
+                }
+                DeferredOp::Set(set) => {
+                    if let Some(arm) = set.arm.as_ref() {
+                        let _ = arm.refuse(SetRefusal::Superseded);
+                    }
+                    for m in &set.members {
+                        self.emit(
+                            set.operation_id.clone(),
+                            m.output_index,
+                            tick,
+                            TakeResult::Superseded,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run every deferred op whose outputs no clock-owned set holds any
+    /// more (bounded: at most one op per output).
+    pub(super) fn run_deferred(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        if self.sets.deferred.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.sets.deferred.len() {
+            let free = self.sets.deferred.get(i).is_some_and(|op| {
+                op.outputs()
+                    .iter()
+                    .all(|&o| !self.output_owned(o, dispatcher))
+            });
+            if !free {
+                i += 1;
+                continue;
+            }
+            match self.sets.deferred.swap_remove(i) {
+                DeferredOp::Take(take) => self.process_take(take, tick, dispatcher),
+                DeferredOp::Set(set) => self.admit_set(set, tick, dispatcher),
+            }
+            // Processing may defer again or supersede others: restart.
+            i = 0;
+        }
     }
 
     /// Refuse a set that never entered the take state machine: one outcome
@@ -199,6 +346,23 @@ impl OutputRouter {
             self.refuse_unadmitted(&set, RefuseReason::Unroutable, tick);
             return;
         }
+        // Newest wins over older deferred ops on these outputs; while a set
+        // the clock owns holds one of them, this set waits for it (A-1).
+        let outputs: Vec<usize> = set.members.iter().map(|m| m.output_index).collect();
+        self.supersede_deferred(&outputs, tick);
+        if outputs.iter().any(|&o| self.output_owned(o, dispatcher)) {
+            self.defer(DeferredOp::Set(set));
+            return;
+        }
+        let mut groups: Vec<u64> = outputs.iter().filter_map(|&o| self.group_of(o)).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        for group in groups {
+            if !self.try_supersede_set(group, dispatcher) {
+                self.defer(DeferredOp::Set(set));
+                return;
+            }
+        }
         // A later set supersedes what is pending on its outputs (a whole
         // set included), releasing those reservations before it reserves.
         for m in &set.members {
@@ -223,6 +387,11 @@ impl OutputRouter {
             usize,
             Option<super::ReformatSettings>,
         )> = Vec::new();
+        // Ownership transfers (review B-1): an unheld lingering key another
+        // principal owns is re-attributed to this set's principal when a
+        // member adopts it, so it counts against that principal's cap
+        // (deduplicated). Held and reformat keys keep their attribution.
+        let mut adopts: Vec<usize> = Vec::new();
         for m in &set.members {
             let index = m.output_index;
             let Some(bus) = m.bus.clone() else { continue };
@@ -236,14 +405,28 @@ impl OutputRouter {
             }
             let (settings, reset) = (out.settings, out.reset.clone());
             let format = self.feed_key(index, &bus).1;
-            let live = self.dynamic.iter().any(|d| {
-                d.bus == bus
-                    && d.format == format
-                    && d.settings == settings
-                    && d.reset == reset
-                    && !d.reformat
-                    && !dispatcher.is_key_failed(d.key)
-            });
+            let live = self
+                .dynamic
+                .iter()
+                .find(|d| {
+                    d.bus == bus
+                        && d.format == format
+                        && d.settings == settings
+                        && d.reset == reset
+                        && !d.reformat
+                        && !dispatcher.is_key_failed(d.key)
+                })
+                .map(|d| (d.key, d.principal != set.principal));
+            if let Some((key, foreign)) = live {
+                if foreign
+                    && set.principal != BOOT_PRINCIPAL
+                    && self.subscribers(key) == 0
+                    && !adopts.contains(&key)
+                {
+                    adopts.push(key);
+                }
+            }
+            let live = live.is_some();
             let in_flight = self
                 .opens
                 .values()
@@ -254,24 +437,17 @@ impl OutputRouter {
             }
         }
         let needed = opens.len();
+        let adopted = adopts.len();
         let fits = |router: &Self| {
-            let (all, mine) = router.set_reservations(&set.principal);
+            let (all, _) = router.set_reservations(&set.principal);
             let total = router.dynamic.len() + router.opens.len() + all;
-            let held = router
-                .dynamic
-                .iter()
-                .filter(|d| d.principal == set.principal)
-                .count()
-                + router
-                    .opens
-                    .values()
-                    .filter(|o| o.principal == set.principal)
-                    .count()
-                + mine;
+            let held = router.principal_held(&set.principal);
             total + needed <= router.cfg.max_encoders
-                && held + needed <= router.cfg.max_per_principal
+                && held + needed + adopted <= router.cfg.max_per_principal
                 && router.opens.len() + all + needed <= OPEN_QUEUE
         };
+        // Closing lingers only makes room for new opens (an adopted key is
+        // itself a linger: closing it would not make room for adopting it).
         while needed > 0 && !fits(self) {
             if !self.close_oldest_linger(dispatcher, None) {
                 break;
@@ -315,6 +491,7 @@ impl OutputRouter {
             admitted: tick,
             reserved: needed,
             proposed: None,
+            grouped: false,
         });
         self.dirty = true;
     }
@@ -360,10 +537,22 @@ impl OutputRouter {
         };
         if let Some(key) = existing {
             // A lingering key nobody subscribes is adopted (re-attributed);
-            // a held key stays with its holder (+0 for the set).
+            // a held key stays with its holder (+0 for the set). Adopting
+            // another principal's key moves it onto this principal's cap:
+            // re-validated here (review B-1), the admission counted it.
             let unheld = self.subscribers(key) == 0;
+            let transfer = unheld
+                && principal != BOOT_PRINCIPAL
+                && self
+                    .dynamic
+                    .iter()
+                    .any(|d| d.key == key && d.principal != principal && !d.reformat);
+            if transfer && self.principal_held(principal) >= self.cfg.max_per_principal {
+                self.refuse_pending(index, tick, RefuseReason::Capacity, dispatcher);
+                return;
+            }
             if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
-                if unheld && principal != BOOT_PRINCIPAL {
+                if unheld && principal != BOOT_PRINCIPAL && !d.reformat {
                     principal.clone_into(&mut d.principal);
                 }
                 d.linger_deadline = None;
@@ -442,13 +631,21 @@ impl OutputRouter {
         let Some(pos) = self.sets.active.iter().position(|s| s.id == group) else {
             return;
         };
+        // The refusal is tried BEFORE anything is cancelled (review A-1): a
+        // supersede never reaches here for a set the clock owns (callers win
+        // `try_supersede_set` first), so a lost refusal below is a genuine
+        // fault after the commit (an encoder died), never a supersede.
         let set = self.sets.active.swap_remove(pos);
+        let mut result = result;
+        let refused = set
+            .arm
+            .as_ref()
+            .is_none_or(|arm| arm.refuse(arm_reason(result)));
         if set.proposed.is_some() {
             dispatcher.cancel_group(group);
         }
-        let mut result = result;
-        if let Some(arm) = set.arm.as_ref() {
-            if !arm.refuse(arm_reason(result)) {
+        if let (false, Some(arm)) = (refused, set.arm.as_ref()) {
+            {
                 match arm.state() {
                     ArmState::Refused => {
                         if let (TakeResult::Refused(_), Some(reason)) = (result, arm.reason()) {
@@ -600,8 +797,10 @@ impl OutputRouter {
         self.propose_set(id, tick, deadline, &pending, dispatcher);
     }
 
-    /// A no-op member (already on its bus) lands at the set's tick `at`; an
-    /// audio choice it carries then starts as an audio-only take.
+    /// A no-op member (already on its bus, carrying no audio change the
+    /// set had to switch) lands at the set's tick `at`. Its audio choice, if
+    /// any, is recorded: the output already carries that audio (an audio
+    /// change is a grouped member, review A-3), so nothing fades.
     fn finish_noop_member(
         &mut self,
         index: usize,
@@ -609,23 +808,24 @@ impl OutputRouter {
         tick: u64,
         dispatcher: &mut RenditionDispatcher,
     ) {
-        let has_audio = self
+        let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) else {
+            return;
+        };
+        let bus = self
             .outputs
-            .get_mut(index)
-            .and_then(|o| o.pending.as_mut())
-            .map(|p| {
-                p.group = None;
-                p.take.audio.is_some()
-            });
-        match has_audio {
-            Some(true) => self.start_audio_take(index, tick, dispatcher),
-            Some(false) => {
-                if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
-                    self.emit(p.take.operation_id, index, at, TakeResult::Applied);
+            .get(index)
+            .map_or(PictureBus::Program, |o| o.bus.clone());
+        if let (Some(choice), Some(audio)) = (p.take.audio, self.audio.as_mut()) {
+            match audio.take_audio(index, choice, &bus, tick, dispatcher) {
+                AudioTakeStart::Unchanged | AudioTakeStart::Refused => {}
+                AudioTakeStart::Started => {
+                    // The carried audio changed after the preflight: never
+                    // a step; the change lands as soon as it can.
+                    audio.finish_take(index, true, &bus, tick, dispatcher);
                 }
             }
-            None => {}
         }
+        self.emit(p.take.operation_id, index, at, TakeResult::Applied);
     }
 
     /// Pick `T`, force an IDR at `T` on every member key, register the
@@ -666,6 +866,56 @@ impl OutputRouter {
                 _ => None,
             })
             .collect();
+        // Preflight before anything is armed (review A-2): an out-of-band
+        // output whose destination carries another decoder configuration
+        // refuses the whole set; the arm is refused, the mixer never moves.
+        match dispatcher.preflight_group(&moves) {
+            GroupPreflight::Ready => {}
+            GroupPreflight::Pending => return,
+            GroupPreflight::FormatMismatch => {
+                self.end_set(
+                    id,
+                    TakeResult::Refused(RefuseReason::FormatMismatch),
+                    tick,
+                    dispatcher,
+                );
+                return;
+            }
+        }
+        // Members staying on their video that change audio (review A-3):
+        // part of the shared decision, their audio prepared before `T`.
+        let mut stays: Vec<(usize, usize)> = Vec::new();
+        for &(i, p) in pending {
+            let Phase::Ready { key } = p else { continue };
+            let Some((bus, Some(choice))) = self
+                .outputs
+                .get(i)
+                .filter(|o| o.key == key)
+                .and_then(|o| o.pending.as_ref())
+                .map(|p| (p.take.bus.clone(), p.take.audio.clone()))
+            else {
+                continue;
+            };
+            let bus = bus.unwrap_or(PictureBus::Program);
+            let prep = self
+                .audio
+                .as_mut()
+                .map_or(AudioPrep::Failed, |a| a.prepare(i, &bus, &choice));
+            match prep {
+                AudioPrep::Unchanged => {}
+                AudioPrep::Ready => stays.push((i, key)),
+                AudioPrep::Pending => return,
+                AudioPrep::Failed => {
+                    self.end_set(
+                        id,
+                        TakeResult::Refused(RefuseReason::EncoderNotReady),
+                        tick,
+                        dispatcher,
+                    );
+                    return;
+                }
+            }
+        }
         // Keying at T: a key other outputs already watch counts the force
         // against its 2 s floor; the set waits for the floor (≤ 60 ticks).
         for &(_, key) in &moves {
@@ -696,9 +946,11 @@ impl OutputRouter {
             }
             self.last_forced.insert(key, at);
         }
-        if !moves.is_empty()
+        let mut group: Vec<(usize, usize)> = moves.clone();
+        group.extend_from_slice(&stays);
+        if !group.is_empty()
             && dispatcher
-                .rebind_group(id, at, &moves, arm.clone())
+                .rebind_group(id, at, &group, arm.clone())
                 .is_err()
         {
             self.end_set(
@@ -718,8 +970,9 @@ impl OutputRouter {
         }
         if let Some(s) = self.sets.active.iter_mut().find(|s| s.id == id) {
             s.proposed = Some(at);
+            s.grouped = !group.is_empty();
         }
-        for &(index, key) in &moves {
+        for &(index, key) in &group {
             let (bus, choice) = self
                 .outputs
                 .get(index)
@@ -742,6 +995,7 @@ impl OutputRouter {
             return;
         };
         set.proposed = None;
+        set.grouped = false;
         let members = set.members.clone();
         for index in members {
             let phase = self

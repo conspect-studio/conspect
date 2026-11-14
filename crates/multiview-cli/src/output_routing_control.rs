@@ -20,7 +20,8 @@ use multiview_control::output_routing::{
 
 use crate::output_routing::{
     FallbackReason, OutputRoutingHandle, OutputRoutingSlot, OutputTake, ReformatRefusal,
-    RefuseReason, TakeOutcome, TakeResult, TakeSet, DEFAULT_MAX_ENCODERS,
+    RefuseReason, TakeOutcome, TakeResult, TakeSet, DEFAULT_MAX_ENCODERS, MAX_SET_MEMBERS,
+    MAX_TAKE_ID_BYTES,
 };
 use crate::routing_audio::AudioChoice;
 use crate::routing_aux::PictureBus;
@@ -621,6 +622,15 @@ impl OutputRouting for OutputRoutingAdapter {
     }
 
     fn try_take_set(&self, set: OutputTakeSet) -> Result<(), TakeSubmitError> {
+        // Bounds before anything is allocated or converted (review B-2),
+        // answered as the engine handle would (busy).
+        if set.members.is_empty()
+            || set.members.len() > MAX_SET_MEMBERS
+            || set.operation_id.len() > MAX_TAKE_ID_BYTES
+            || set.principal.len() > MAX_TAKE_ID_BYTES
+        {
+            return Err(TakeSubmitError::Busy);
+        }
         let handle = self.handle().ok_or(TakeSubmitError::Busy)?;
         let mut members = Vec::with_capacity(set.members.len());
         for member in set.members {

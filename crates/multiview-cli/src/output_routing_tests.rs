@@ -6749,3 +6749,535 @@ fn the_control_adapter_maps_a_set_onto_its_members_and_refuses_it_whole() {
         "one outcome per member, under the set's id"
     );
 }
+
+// ---- Review r1 regressions (#308) ----
+
+/// Drive a two-member set with a mixer half until the router proposed `T`.
+fn proposed_set(x: &mut Harness, arm: &Arc<SetArm>) -> u64 {
+    assert!(arm.switcher_ready());
+    x.h.try_take_set(take_set(
+        "salvo",
+        "p",
+        &[(1, src()), (2, cam2())],
+        Some(arm),
+    ))
+    .unwrap();
+    let mut t = 1;
+    while arm.state() != ArmState::Proposed && t < 100 {
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(arm.state(), ArmState::Proposed);
+    t
+}
+
+/// A-1: a single take superseding a member after the clock claimed (or
+/// committed) `T` never splits the set: every output lands at `T` with
+/// healthy encoders, no set-partial, and the later take applies afterwards.
+fn a_supersede_racing_the_clock_never_splits_the_set(commit_first: bool) {
+    let mut x = harness(3, 6, None);
+    x.tick(0);
+    let arm = Arc::new(SetArm::new());
+    let mut t = proposed_set(&mut x, &arm);
+    let at = arm.tick();
+    assert!(arm.begin_apply(at), "the clock claims T");
+    if commit_first {
+        assert!(arm.commit(at));
+    }
+    // The later take arrives while the clock owns the set.
+    x.h.try_take(take("later", 2, PictureBus::Program)).unwrap();
+    x.tick(t);
+    t += 1;
+    if !commit_first {
+        assert!(arm.commit(at), "the clock composed T");
+    }
+    let mut got = Vec::new();
+    for u in t..t + 60 {
+        x.tick(u);
+        got.extend(
+            x.outcomes
+                .try_iter()
+                .map(|o| (o.operation_id, o.output_index, o.tick, o.outcome)),
+        );
+    }
+    for o in [1, 2] {
+        assert!(
+            got.contains(&("salvo".to_owned(), o, at, TakeResult::Applied)),
+            "output {o} landed at T={at}: {got:?}"
+        );
+    }
+    let later: Vec<_> = got.iter().filter(|g| g.0 == "later").collect();
+    assert_eq!(later.len(), 1, "{got:?}");
+    assert_eq!(later[0].3, TakeResult::Applied);
+    assert!(later[0].2 >= at, "the later take applies after the set");
+    assert!(
+        !got.iter().any(|g| g.3 == TakeResult::Superseded),
+        "{got:?}"
+    );
+    assert_eq!(x.h.snapshot().set_partial, 0, "never a split");
+    assert_eq!(arm.state(), ArmState::Committed);
+    assert_ne!(x.d.binding_video_key(1), Some(0), "output 1 moved at T");
+    assert_eq!(
+        x.d.binding_video_key(2),
+        Some(0),
+        "output 2 back on Program"
+    );
+    assert_eq!(x.r.sets.deferred.len(), 0);
+}
+
+#[test]
+fn a_supersede_racing_begin_apply_never_splits_the_set() {
+    a_supersede_racing_the_clock_never_splits_the_set(false);
+}
+
+#[test]
+fn a_supersede_racing_commit_never_splits_the_set() {
+    a_supersede_racing_the_clock_never_splits_the_set(true);
+}
+
+/// A-1: at most one deferred op per output, newest wins (the older one
+/// reports Superseded), applied once the set resolved.
+#[test]
+fn deferred_takes_behind_an_owned_set_keep_only_the_newest() {
+    let mut x = harness(3, 6, None);
+    x.tick(0);
+    let arm = Arc::new(SetArm::new());
+    let mut t = proposed_set(&mut x, &arm);
+    assert!(arm.begin_apply(arm.tick()));
+    for op in ["d1", "d2", "d3"] {
+        x.h.try_take(take(op, 2, PictureBus::Program)).unwrap();
+    }
+    x.tick(t);
+    t += 1;
+    assert_eq!(x.r.sets.deferred.len(), 1, "one deferred op per output");
+    assert!(arm.commit(arm.tick()));
+    let mut got = Vec::new();
+    for u in t..t + 60 {
+        x.tick(u);
+        got.extend(x.outcomes.try_iter().map(|o| (o.operation_id, o.outcome)));
+    }
+    assert!(
+        got.contains(&("d1".into(), TakeResult::Superseded)),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("d2".into(), TakeResult::Superseded)),
+        "{got:?}"
+    );
+    assert!(got.contains(&("d3".into(), TakeResult::Applied)), "{got:?}");
+    assert_eq!(x.h.snapshot().set_partial, 0);
+}
+
+/// A live encoder whose RAPs carry a decoder configuration unlike the
+/// output's (a different SPS/PPS).
+struct OtherSetsEnc(FakeEnc);
+impl VideoEncodeWorker for OtherSetsEnc {
+    fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+        self.0.encode(item)
+    }
+    fn reorder_bound(&self) -> ReorderBound {
+        ReorderBound::NoReorder
+    }
+    fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+        Ok(Vec::new())
+    }
+    fn force_keyframe(&mut self) {
+        self.0.force_keyframe();
+    }
+}
+impl LiveEncoder for OtherSetsEnc {
+    fn start_at(&mut self, t0: u64) {
+        self.0.start_at(t0);
+    }
+    fn time_base(&self) -> Rational {
+        Rational::new(1, 5)
+    }
+    fn move_gate(&self) -> MoveGate {
+        self.0.move_gate()
+    }
+    fn parameter_sets(&self) -> Option<ParameterSets> {
+        Some(Box::new(|p: &EncodedPacket| {
+            if p.is_keyframe() {
+                multiview_ffmpeg::idr::RapParameterSets::Sets(vec![7, 7])
+            } else {
+                multiview_ffmpeg::idr::RapParameterSets::Absent
+            }
+        }))
+    }
+}
+
+/// A-2: an out-of-band output whose destination carries another decoder
+/// configuration refuses the whole set before `T` is proposed: every member
+/// `FormatMismatch`, the arm refused (the mixer never commits), nothing moved.
+#[test]
+fn a_format_mismatch_is_found_before_the_set_is_proposed() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(OtherSetsEnc(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        }));
+        Ok(enc)
+    });
+    let mut x = harness(3, 6, Some(open));
+    // Output 2 carries its configuration out of band (fMP4, FLV, SDP); the
+    // base key's RAPs carry sets [1].
+    x.d = RenditionDispatcher::new(DispatchConfig {
+        video_count: 1,
+        audio_count: 0,
+        video_time_base: vec![DtsTimeBase { num: 1, den: 5 }],
+        audio_time_base: Vec::new(),
+        bindings: (0..3)
+            .map(|i| BindingConfig {
+                output_index: i,
+                video_key: Some(0),
+                audio_tracks: Vec::new(),
+                inband_parameter_changes_ok: i != 2,
+            })
+            .collect(),
+        first_tick: 0,
+        cadence: CADENCE,
+        video_move_gates: vec![Some(Box::new(|p: &EncodedPacket| p.is_keyframe()))],
+    })
+    .unwrap();
+    x.d.set_parameter_sets(
+        0,
+        Box::new(|p: &EncodedPacket| {
+            if p.is_keyframe() {
+                multiview_ffmpeg::idr::RapParameterSets::Sets(vec![1])
+            } else {
+                multiview_ffmpeg::idr::RapParameterSets::Absent
+            }
+        }),
+    )
+    .unwrap();
+    for t in 0..7 {
+        x.tick(t);
+    }
+    let arm = Arc::new(SetArm::new());
+    assert!(arm.switcher_ready());
+    x.h.try_take_set(take_set(
+        "salvo",
+        "p",
+        &[(1, src()), (2, cam2())],
+        Some(&arm),
+    ))
+    .unwrap();
+    let mut got = Vec::new();
+    let mut proposed = false;
+    for t in 7..80 {
+        x.tick(t);
+        proposed |= matches!(arm.state(), ArmState::Proposed | ArmState::Applying);
+        clock_composes(&arm, t);
+        got.extend(x.outcomes.try_iter().map(|o| (o.output_index, o.outcome)));
+    }
+    let refused = TakeResult::Refused(RefuseReason::FormatMismatch);
+    assert_eq!(got, vec![(1, refused), (2, refused)], "{got:?}");
+    assert!(!proposed, "never proposed");
+    assert_eq!(arm.reason(), Some(SetRefusal::FormatMismatch));
+    assert_eq!(x.d.binding_video_key(1), Some(0));
+    assert_eq!(x.d.binding_video_key(2), Some(0));
+    assert_eq!(x.d.move_groups(), 0);
+}
+
+/// A-3: a member already on its video bus carrying an audio change switches
+/// that audio at the set's `T`, inside the shared decision.
+#[test]
+fn a_set_member_staying_on_its_video_switches_its_audio_at_t() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(3, CADENCE, open);
+    let mut t = x.run(0, 4);
+    let arm = Arc::new(SetArm::new());
+    assert!(arm.switcher_ready());
+    let mut set = take_set(
+        "salvo",
+        "p",
+        &[(1, src()), (2, PictureBus::Program)],
+        Some(&arm),
+    );
+    set.members[1].audio = Some(bars_src());
+    x.h.try_take_set(set).unwrap();
+    let mut got = Vec::new();
+    for _ in 0..120 {
+        x.tick(t);
+        clock_composes(&arm, t);
+        got.extend(
+            x.outcomes
+                .try_iter()
+                .map(|o| (o.output_index, o.tick, o.outcome, o.audio)),
+        );
+        t += 1;
+        if got.len() >= 2 {
+            break;
+        }
+    }
+    assert_eq!(arm.state(), ArmState::Committed);
+    let at = arm.tick();
+    assert!(
+        got.contains(&(1, at, TakeResult::Applied, Some(AudioChoice::Follow))),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&(2, at, TakeResult::Applied, Some(bars_src()))),
+        "the audio member lands at T: {got:?}"
+    );
+    // Its crossfade was scheduled at T's grid boundary, with the set.
+    let moves: Vec<u64> = x
+        .tap
+        .lock()
+        .unwrap()
+        .moves
+        .iter()
+        .filter(|m| m.0 == 2)
+        .map(|m| m.1)
+        .collect();
+    assert_eq!(
+        moves,
+        vec![grid_ceil(x.clock.total_at(at), AAC_FRAME_SAMPLES)],
+        "one fade, at T"
+    );
+    t = x.run(t, 6);
+    let _ = t;
+    assert!(x.d.binding_audio_key(2).is_some(), "on its private bus");
+    assert_eq!(x.d.binding_video_key(2), Some(0), "video unchanged");
+}
+
+/// A-3: when the staying member's audio cannot be prepared, the whole set is
+/// refused before `T`: nothing moves and the mixer is unchanged.
+#[test]
+fn a_set_whose_staying_member_audio_cannot_be_prepared_is_refused_whole() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(3, CADENCE, open);
+    // The private bus's encoder reports another codec configuration.
+    x.r.set_audio_program_config(Some(vec![0xde, 0xad]));
+    let t = x.run(0, 4);
+    let arm = Arc::new(SetArm::new());
+    assert!(arm.switcher_ready());
+    let mut set = take_set(
+        "salvo",
+        "p",
+        &[(1, src()), (2, PictureBus::Program)],
+        Some(&arm),
+    );
+    set.members[1].audio = Some(bars_src());
+    x.h.try_take_set(set).unwrap();
+    let mut got = Vec::new();
+    let mut proposed = false;
+    for t in t..t + 80 {
+        x.tick(t);
+        proposed |= arm.state() == ArmState::Proposed;
+        clock_composes(&arm, t);
+        got.extend(x.outcomes.try_iter().map(|o| (o.output_index, o.outcome)));
+    }
+    let refused = TakeResult::Refused(RefuseReason::EncoderNotReady);
+    assert_eq!(got, vec![(1, refused), (2, refused)], "{got:?}");
+    assert!(!proposed, "refused before T was proposed");
+    assert_eq!(
+        arm.reason(),
+        Some(SetRefusal::EncoderNotReady),
+        "mixer unchanged"
+    );
+    assert_eq!(x.d.binding_video_key(1), Some(0));
+    assert!(x.d.binding_audio_key(2).is_none(), "audio unchanged");
+}
+
+/// B-1: adopting another principal's unheld lingering key moves it onto the
+/// adopter's cap: `p` at its cap is refused Capacity and its count is
+/// unchanged; `q`'s key keeps its attribution.
+#[test]
+fn adopting_another_principals_linger_counts_against_the_cap() {
+    let mut x = harness(5, 6, None);
+    x.tick(0);
+    // `q` opens cam2 on output 3, then moves away: cam2 lingers, unheld.
+    let mut q_take = take("q-cam2", 3, cam2());
+    q_take.principal = "q".to_owned();
+    x.h.try_take(q_take).unwrap();
+    let mut t = 1;
+    while x.d.binding_video_key(3) == Some(0) && t < 60 {
+        x.tick(t);
+        t += 1;
+    }
+    let mut back = take("q-back", 3, PictureBus::Program);
+    back.principal = "q".to_owned();
+    x.h.try_take(back).unwrap();
+    // `p` holds one encoder; its cap is one.
+    x.h.try_take(take("p1", 1, src())).unwrap();
+    let start = t;
+    while (x.d.binding_video_key(1) == Some(0) || x.d.binding_video_key(3) != Some(0))
+        && t < start + 60
+    {
+        x.tick(t);
+        t += 1;
+    }
+    x.r.cfg.max_per_principal = 1;
+    let held = |x: &Harness, who: &str| x.r.dynamic.iter().filter(|d| d.principal == who).count();
+    assert_eq!(held(&x, "p"), 1, "p at its cap");
+    assert_eq!(held(&x, "q"), 1, "q's lingering cam2");
+    assert!(x
+        .r
+        .dynamic
+        .iter()
+        .any(|d| d.bus == cam2() && d.linger_deadline.is_some()));
+    let _ = x.results();
+    x.h.try_take_set(take_set("adopt", "p", &[(4, cam2())], None))
+        .unwrap();
+    x.tick(t);
+    let got: Vec<_> = x
+        .outcomes
+        .try_iter()
+        .map(|o| (o.output_index, o.outcome))
+        .collect();
+    assert_eq!(got, vec![(4, TakeResult::Refused(RefuseReason::Capacity))]);
+    assert_eq!(held(&x, "p"), 1, "p's count unchanged");
+    assert_eq!(held(&x, "q"), 1, "q keeps its attribution");
+    assert_eq!(x.d.binding_video_key(4), Some(0));
+}
+
+/// B-3: the handle drops the members' own id strings before the enqueue.
+#[test]
+fn a_queued_set_retains_no_member_id_strings() {
+    let (mut r, h, _aux) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let mut set = take_set(
+        "salvo",
+        "p",
+        &[(0, PictureBus::Program), (1, PictureBus::Program)],
+        None,
+    );
+    for m in &mut set.members {
+        m.operation_id = "x".repeat(4096);
+        m.principal = "y".repeat(4096);
+    }
+    h.try_take_set(set).unwrap();
+    let Ok(RouterMsg::Set(queued)) = r.takes.try_recv() else {
+        panic!("the set was queued");
+    };
+    for m in &queued.members {
+        assert!(m.operation_id.is_empty() && m.principal.is_empty());
+        assert_eq!((m.operation_id.capacity(), m.principal.capacity()), (0, 0));
+    }
+    let _ = &mut r;
+}
+
+/// B-2: the adapter refuses an empty, oversized or overlong-id set before it
+/// converts anything (no run index lookup can be reached).
+#[test]
+fn the_control_adapter_bounds_a_set_before_converting_it() {
+    use multiview_control::output_routing::{
+        OutputRouting, OutputTakeRequest, OutputTakeSet, RoutedFeed, TakeSubmitError,
+    };
+    // No run at all: a bounds failure answers before the handle is read.
+    let slot = output_routing_slot();
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let member = || OutputTakeRequest {
+        operation_id: String::new(),
+        output: "nope".into(),
+        video: Some(RoutedFeed::Program),
+        audio: None,
+        layout: None,
+        principal: String::new(),
+    };
+    let set = |members: Vec<OutputTakeRequest>, id: String| OutputTakeSet {
+        operation_id: id,
+        principal: "p".into(),
+        members,
+        arm: None,
+    };
+    assert_eq!(
+        adapter.try_take_set(set(Vec::new(), "s".into())),
+        Err(TakeSubmitError::Busy)
+    );
+    let many: Vec<_> = (0..=MAX_SET_MEMBERS).map(|_| member()).collect();
+    assert_eq!(
+        adapter.try_take_set(set(many, "s".into())),
+        Err(TakeSubmitError::Busy)
+    );
+    assert_eq!(
+        adapter.try_take_set(set(vec![member()], "s".repeat(MAX_TAKE_ID_BYTES + 1))),
+        Err(TakeSubmitError::Busy)
+    );
+}
+
+/// C-1: a concurrent producer keeps the take mailbox full while `on_tick`
+/// runs; each tick drains at most one mailbox's worth, so the rest of the
+/// tick (here a freshness deadline) still runs on time.
+#[test]
+fn a_producer_refilling_the_mailbox_never_starves_a_tick() {
+    let budget = u64::try_from(TAKE_MAILBOX).unwrap();
+    let total = 10 * budget;
+    let (mut r, h, _aux) = router(2, 6, Box::new(|_| Err("never".to_owned())));
+    let _outcomes = h.outcomes().unwrap();
+    let mut d = dispatcher(2);
+    // A take whose freshness deadline must fire on time despite the flood.
+    h.try_take(take("ghost", 1, PictureBus::Source("ghost".to_owned())))
+        .unwrap();
+    // The producer thread refills the mailbox in lockstep with every
+    // drained message (deterministic whatever the scheduling), up to `total`.
+    let (go_tx, go_rx) = mpsc::sync_channel::<()>(1);
+    let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+    let producer_h = h.clone();
+    let producer = std::thread::spawn(move || {
+        let mut sent = 0_u64;
+        let fill = |sent: &mut u64| {
+            while *sent < total
+                && producer_h
+                    .try_take(take(&sent.to_string(), 0, PictureBus::Program))
+                    .is_ok()
+            {
+                *sent += 1;
+            }
+        };
+        fill(&mut sent);
+        let _ = ack_tx.send(());
+        while go_rx.recv().is_ok() {
+            fill(&mut sent);
+            if ack_tx.send(()).is_err() {
+                break;
+            }
+        }
+        sent
+    });
+    ack_rx.recv().unwrap();
+    r.drain_hook = Some(Box::new(move || {
+        if go_tx.send(()).is_ok() {
+            let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }));
+    let mut last = 0_u64;
+    let mut per_tick = Vec::new();
+    let mut refused_at = None;
+    for t in 0..=TAKE_PRIME_DEADLINE_TICKS + 2 {
+        r.on_tick(t, MediaTime::from_nanos(0), &mut d, &mut NoDelivery)
+            .unwrap();
+        per_tick.push(r.takes_drained - last);
+        last = r.takes_drained;
+        if refused_at.is_none() && r.outputs[1].pending.is_none() {
+            refused_at = Some(t);
+        }
+    }
+    assert!(per_tick.iter().all(|&n| n <= budget), "{per_tick:?}");
+    assert_eq!(per_tick[0], budget, "the first tick met a full mailbox");
+    assert_eq!(per_tick[1], budget, "and so did the next: it was refilled");
+    assert_eq!(
+        refused_at,
+        Some(TAKE_PRIME_DEADLINE_TICKS),
+        "the freshness deadline fired on time"
+    );
+    r.drain_hook = None;
+    drop(h);
+    let sent = producer.join().unwrap();
+    assert!(sent > 2 * budget, "the producer kept refilling: {sent}");
+}

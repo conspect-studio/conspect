@@ -107,6 +107,10 @@ pub enum SetRefusal {
     Invalid = 9,
     /// Another set is already armed on the M/E (`engine-busy`).
     Busy = 10,
+    /// An output member's destination decoder configuration differs from
+    /// what its out-of-band container carries (`format-mismatch`); found
+    /// before the adoption tick was proposed.
+    FormatMismatch = 11,
 }
 
 impl SetRefusal {
@@ -122,6 +126,7 @@ impl SetRefusal {
             Self::Deadline => 8,
             Self::Invalid => 9,
             Self::Busy => 10,
+            Self::FormatMismatch => 11,
         }
     }
 
@@ -137,6 +142,7 @@ impl SetRefusal {
             8 => Some(Self::Deadline),
             9 => Some(Self::Invalid),
             10 => Some(Self::Busy),
+            11 => Some(Self::FormatMismatch),
             _ => None,
         }
     }
@@ -155,6 +161,7 @@ impl SetRefusal {
             Self::Deadline => "deadline",
             Self::Invalid => "invalid",
             Self::Busy => "engine-busy",
+            Self::FormatMismatch => "format-mismatch",
         }
     }
 

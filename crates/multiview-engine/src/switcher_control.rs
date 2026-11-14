@@ -777,6 +777,10 @@ impl SwitcherTickDriver {
                 let _ = armed.arm.unpropose();
             }
         }
+        // Sustained repeats (no fresh drain) still bound the armed set: its
+        // deadlines expire here too (review C-2). `Applying`/`Committed`
+        // belong to the composed-tick path and are never touched here.
+        self.expire_armed(tick);
         if self
             .pending_take
             .as_ref()
@@ -1054,6 +1058,40 @@ impl SwitcherTickDriver {
                 _ => error,
             };
             self.publish_outcome(armed.operation_id, tick.index, false, Some(error));
+        }
+    }
+
+    /// Deadline expiry of the armed slot without a fresh drain (a repeat
+    /// tick): O(1), never validates or applies. A router refusal frees the
+    /// slot; a `Pending` set expires `feed-not-fresh` at its deadline, a
+    /// `SwitcherReady` one `deadline` at the grace backstop. `Applying` and
+    /// `Committed` are owned by the commit/reject path and left alone.
+    fn expire_armed(&mut self, tick: Tick) {
+        let Some(armed) = self.armed.as_ref() else {
+            return;
+        };
+        if armed.applied_at.is_some() {
+            return;
+        }
+        let deadline = armed.deadline;
+        match armed.arm.state() {
+            ArmState::Refused => {
+                let code = armed.arm.reason().map_or("invalid", SetRefusal::code);
+                self.refuse_armed(tick, SetRefusal::Invalid, format!("refused:{code}"));
+            }
+            ArmState::Pending if tick.index >= deadline => {
+                self.refuse_armed(tick, SetRefusal::FeedNotFresh, REFUSE_NO_FRESH_FRAME.into());
+            }
+            ArmState::SwitcherReady
+                if tick.index >= deadline.saturating_add(SET_SWITCHER_GRACE_TICKS) =>
+            {
+                self.refuse_armed(
+                    tick,
+                    SetRefusal::Deadline,
+                    "refused:deadline: the set was not adopted in time".into(),
+                );
+            }
+            _ => {}
         }
     }
 

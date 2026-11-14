@@ -302,3 +302,68 @@ fn a_router_refusal_frees_the_slot_and_is_reported_once() {
     run(&mut driver, 8);
     assert_eq!(next.state(), ArmState::SwitcherReady, "slot freed");
 }
+
+/// Review C-2: with the router gone and the clock only repeating ticks (no
+/// fresh drain), the armed set still reaches a terminal state within the
+/// switcher backstop, and a set the clock is applying is never touched.
+#[test]
+fn sustained_repeat_ticks_still_expire_an_armed_set_but_never_an_applying_one() {
+    use multiview_engine::switcher_control::SET_SWITCHER_GRACE_TICKS;
+    let backstop = 1 + SET_ADOPT_DEADLINE_TICKS + SET_SWITCHER_GRACE_TICKS;
+    // SwitcherReady, proposed once, then the router vanishes.
+    let (handle, mut driver) = with_inputs();
+    let mut outcomes = handle.outcomes();
+    run(&mut driver, 0);
+    let (verb, arm) = armed(&[(4, "b")], false);
+    handle.try_send(command("set", verb)).unwrap();
+    run(&mut driver, 1);
+    assert_eq!(arm.state(), ArmState::SwitcherReady);
+    assert!(arm.propose(5));
+    let mut ended = None;
+    for t in 2..=backstop + 1 {
+        driver.repeat_tick(tick(t));
+        if arm.state().is_terminal() {
+            ended = Some(t);
+            break;
+        }
+    }
+    assert_eq!(ended, Some(backstop), "terminal exactly at the backstop");
+    assert_eq!(arm.reason(), Some(SetRefusal::Deadline));
+    let refused = outcomes.try_recv().unwrap().event;
+    assert!(!refused.completed);
+    assert!(outcomes.try_recv().is_err(), "exactly one outcome");
+    assert_eq!(input(&handle, 4), None, "table unchanged");
+
+    // Pending (cold Program source) under repeats: feed-not-fresh at 150.
+    let (handle, mut driver) = with_inputs();
+    run(&mut driver, 0);
+    let (verb, cold) = armed(&[(1, "d")], true);
+    handle.try_send(command("cold", verb)).unwrap();
+    run(&mut driver, 1);
+    let mut ended = None;
+    for t in 2..=backstop {
+        driver.repeat_tick(tick(t));
+        if cold.state().is_terminal() {
+            ended = Some(t);
+            break;
+        }
+    }
+    assert_eq!(ended, Some(1 + SET_ADOPT_DEADLINE_TICKS));
+    assert_eq!(cold.reason(), Some(SetRefusal::FeedNotFresh));
+
+    // Applying is the clock's: repeats past every deadline never move it.
+    let (handle, mut driver) = with_inputs();
+    run(&mut driver, 0);
+    let (verb, held) = armed(&[(4, "a")], false);
+    handle.try_send(command("held", verb)).unwrap();
+    run(&mut driver, 1);
+    assert!(held.propose(2));
+    driver.drain_at_tick(tick(2));
+    assert_eq!(held.state(), ArmState::Applying);
+    for t in 3..=backstop + 4 {
+        driver.repeat_tick(tick(t));
+        assert_eq!(held.state(), ArmState::Applying, "tick {t}");
+    }
+    driver.commit_composed_tick(tick(2));
+    assert_eq!((held.state(), held.tick()), (ArmState::Committed, 2));
+}

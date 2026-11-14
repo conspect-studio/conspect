@@ -276,6 +276,20 @@ pub(crate) enum AudioTakeStart {
     Refused,
 }
 
+/// Whether an atomic set member's audio change can land at the set's tick
+/// (#308 review A-3), asked before the tick is proposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AudioPrep {
+    /// The output already carries that audio: nothing to switch.
+    Unchanged,
+    /// Its private bus runs, warm, with the program's codec configuration.
+    Ready,
+    /// The bus's encoder has not reported its configuration yet.
+    Pending,
+    /// No bus could be opened, it failed, or its configuration differs.
+    Failed,
+}
+
 /// Progress of an audio-only take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AudioTakeProgress {
@@ -357,7 +371,7 @@ pub(crate) struct RoutedAudio {
     config: AudioEncodeConfig,
     clock: SampleClock,
     cadence: Rational,
-    program_config: Option<Vec<u8>>,
+    pub(crate) program_config: Option<Vec<u8>>,
     route_gain: RouteGain,
     preview: Option<Arc<SwapCell<Option<Arc<str>>>>>,
     channels: usize,
@@ -505,6 +519,55 @@ impl RoutedAudio {
             if let Some(bus) = self.outputs.get_mut(output).and_then(|o| o.bus.as_mut()) {
                 bus.reserved = true;
             }
+        }
+    }
+
+    /// Whether the output's audio can become `choice` (resolved against its
+    /// video `target`) at a set's tick: its private bus (opened by
+    /// [`Self::admit`]) must be live and bindable now, so the change never
+    /// fails after the other members moved.
+    pub(crate) fn prepare(
+        &mut self,
+        output: usize,
+        target: &PictureBus,
+        choice: &AudioChoice,
+    ) -> AudioPrep {
+        let to = choice.resolve(target);
+        let program_config = self.program_config.clone();
+        let Some(o) = self.outputs.get_mut(output) else {
+            return AudioPrep::Failed;
+        };
+        let Some(bus) = o.bus.as_mut() else {
+            return if to == AudioSource::Program {
+                AudioPrep::Unchanged
+            } else {
+                AudioPrep::Failed
+            };
+        };
+        if bus.failed.load(Ordering::Acquire) {
+            return AudioPrep::Failed;
+        }
+        if *bus.target() == to && bus.bind.on_air() {
+            return AudioPrep::Unchanged;
+        }
+        // Warm (rule 2): the bus coded WARM_FRAMES before any `G` it may
+        // fade at, so the change lands at the set's tick, not later.
+        let warm = bus
+            .start
+            .saturating_add(WARM_FRAMES.saturating_mul(AAC_FRAME_SAMPLES));
+        if bus.fed < warm {
+            return AudioPrep::Pending;
+        }
+        if matches!(bus.config_seen, ConfigState::Pending) {
+            match bus.config.try_recv() {
+                Ok(cfg) => bus.config_seen = ConfigState::Known(cfg),
+                Err(TryRecvError::Empty) => return AudioPrep::Pending,
+                Err(TryRecvError::Disconnected) => bus.config_seen = ConfigState::Known(None),
+            }
+        }
+        match &bus.config_seen {
+            ConfigState::Known(Some(c)) if program_config.as_ref() == Some(c) => AudioPrep::Ready,
+            _ => AudioPrep::Failed,
         }
     }
 
