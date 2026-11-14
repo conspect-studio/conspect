@@ -18,8 +18,7 @@ use ffmpeg_next as ffmpeg;
 
 use crate::error::{FfmpegError, Result};
 use crate::frame::{
-    alloc_video, check_source, check_swscale_destination, check_swscale_source, plane_rows,
-    ScratchFrame,
+    alloc_video, check_source, check_swscale_destination, check_swscale_source, ScratchFrame,
 };
 
 /// A `(format, width, height)` description of a scaler endpoint.
@@ -211,8 +210,14 @@ impl Scaler {
     /// also requires the 16 bytes libswscale may access past every source
     /// and destination plane in the same buffer ([`check_swscale_source`],
     /// [`ScratchFrame::check_swscale_destination`]). An identity spec
-    /// copies the planes row by row through validated row views
-    /// ([`plane_rows`]), so a bottom-up (negative linesize) input is fine.
+    /// copies the planes with libav's `av_frame_copy` (`av_image_copy`
+    /// semantics: each plane's active bytes, row by row, either linesize
+    /// sign), so a bottom-up (negative linesize) input is fine.
+    ///
+    /// No Rust slice is ever built over `input` (review PB-14): it is a
+    /// caller-supplied frame whose format, width and height the safe
+    /// `Video::set_*` setters may have widened over bytes nobody wrote, so
+    /// only the bounds are checked here and libav reads it, in C.
     ///
     /// # Errors
     /// As [`Self::run`], plus [`FfmpegError::FrameLayout`] /
@@ -236,33 +241,27 @@ impl Scaler {
         }
         output.check_destination()?;
         if self.src == self.dst {
-            // Never the libswscale no-op path (Defect A, see `run`).
-            let width = libc::c_int::try_from(self.dst.width)
-                .map_err(|_| FfmpegError::FrameLayout("frame width overflows"))?;
-            let format = ffmpeg::ffi::AVPixelFormat::from(self.dst.format);
-            for plane in 0..output.frame().planes() {
-                let index = libc::c_int::try_from(plane)
-                    .map_err(|_| FfmpegError::FrameLayout("plane index"))?;
-                #[allow(unsafe_code)]
-                // SAFETY: `av_image_get_linesize` only reads the static
-                // pixel-format table; it returns a negative error code for
-                // an invalid plane or width, which is rejected below.
-                let bytes = unsafe { ffmpeg::ffi::av_image_get_linesize(format, width, index) };
-                let bytes = usize::try_from(bytes)
-                    .map_err(|_| FfmpegError::FrameLayout("plane row size"))?;
-                let rows = plane_rows(input, plane, bytes)?;
-                let (dst, d_stride) = output.plane_mut(plane)?;
-                for (r, src) in rows.enumerate() {
-                    let start = r
-                        .checked_mul(d_stride)
-                        .ok_or(FfmpegError::FrameLayout("plane offset overflows"))?;
-                    let end = start
-                        .checked_add(bytes)
-                        .ok_or(FfmpegError::FrameLayout("plane offset overflows"))?;
-                    dst.get_mut(start..end)
-                        .ok_or(FfmpegError::FrameLayout("output plane too short"))?
-                        .copy_from_slice(src);
-                }
+            // Never the libswscale no-op path (Defect A, see `run`). The
+            // copy runs in libav (review PB-14): `input` is caller-supplied,
+            // so no Rust slice may view it (see the method docs).
+            let dst = output.video_mut();
+            #[allow(unsafe_code)]
+            // SAFETY: both pointers are live `AVFrame`s, `input` borrowed
+            // shared and `dst` (the scratch's own frame) exclusively; they
+            // are distinct frames. They have the same format, width and
+            // height (the source spec match above, and the destination
+            // spec, equal to it, which `output.matches` enforced), which is
+            // what `av_frame_copy` requires (it refuses a mismatch with a
+            // negative code). It reads, for every plane of the format,
+            // `av_image_get_linesize(format, width)` bytes of each of the
+            // plane's rows at the signed linesize: `check_source` proved
+            // exactly those spans lie in one of `input`'s own refcounted
+            // buffers, and `check_destination` proved the same spans of
+            // `dst` lie in its own, writable (not shared), forward buffers.
+            // It changes no format, size or buffer of `dst`.
+            let copied = unsafe { ffmpeg::ffi::av_frame_copy(dst.as_mut_ptr(), input.as_ptr()) };
+            if copied < 0 {
+                return Err(FfmpegError::FrameMismatch("identity plane copy failed"));
             }
             return Ok(());
         }
@@ -562,7 +561,7 @@ mod run_into_tests {
 
     /// The same frames with the documented 16 bytes after the last row
     /// convert; so does a normally allocated frame. The identity paths read
-    /// only active bytes (`av_frame_copy`, row copy), so they need none.
+    /// only active bytes (`av_frame_copy` in both), so they need none.
     #[test]
     fn a_source_with_swscale_padding_converts() {
         for flip in [false, true] {
@@ -584,7 +583,8 @@ mod run_into_tests {
 
     /// R3 round 4: libswscale may write past the last destination row as
     /// well, so a destination without 16 bytes after its last row is
-    /// refused before `sws_scale`; the identity row copy still uses it.
+    /// refused before `sws_scale`; the identity copy (`av_frame_copy`) still
+    /// uses it.
     #[test]
     fn a_destination_without_swscale_padding_is_refused() {
         let src = gray(4, 2);
@@ -608,6 +608,96 @@ mod run_into_tests {
         let mut identity = Scaler::new(spec, spec).unwrap();
         let mut out = ScratchFrame::from_video_unchecked(tight_gray(64, 4, 0, 0, false));
         identity.run_into(&gray(64, 4), &mut out).unwrap();
+    }
+
+    /// A decoder-like `RGBA` frame of `w x h` whose every owned byte
+    /// (active rows, stride padding, padded tail) holds a known pattern,
+    /// then widened by one pixel and heightened by one row with the safe
+    /// `Video::set_width`/`set_height`, both still inside its allocation
+    /// (review PB-14): the shape that used to reach a Rust row slice over
+    /// unwritten padding.
+    fn widened_rgba(w: u32, h: u32) -> Video {
+        let mut frame = alloc_video(Pixel::RGBA, w, h).unwrap();
+        for (i, b) in frame.data_mut(0).iter_mut().enumerate() {
+            *b = u8::try_from(i % 251).unwrap();
+        }
+        frame.set_width(w + 1);
+        frame.set_height(h + 1);
+        frame
+    }
+
+    /// Review PB-14: an identity `run_into` over a caller-supplied source
+    /// whose geometry was expanded inside its allocation never builds a
+    /// Rust slice over it: libav (`av_frame_copy`) copies it, in C, after the
+    /// bounds checks. Not observable directly, so the output is pinned to
+    /// `av_image_copy` semantics — the same planes copied by libav into an
+    /// independent buffer — and the bounds checks still refuse an expansion
+    /// past the allocation.
+    #[test]
+    fn an_expanded_identity_source_is_copied_by_libav_not_read_in_rust() {
+        let (w, h) = (5_u32, 2_u32);
+        let src = widened_rgba(w, h);
+        assert!(src.stride(0) >= 32, "decoder-like padded stride");
+        let spec = ScaleSpec::new(Pixel::RGBA, w + 1, h + 1);
+        let mut identity = Scaler::new(spec, spec).unwrap();
+        let mut out = ScratchFrame::alloc(Pixel::RGBA, w + 1, h + 1).unwrap();
+        // `check_source` passes: every expanded row is inside the buffer.
+        identity.run_into(&src, &mut out).unwrap();
+
+        // Reference: `av_image_copy` of the same frame into a fresh,
+        // tightly strided buffer.
+        let row = usize::try_from(4 * (w + 1)).unwrap();
+        let rows = usize::try_from(h + 1).unwrap();
+        let mut expected = vec![0_u8; row * rows];
+        #[allow(unsafe_code)]
+        // SAFETY: `expected` holds `row * rows` bytes, exactly one tight
+        // `RGBA` plane of the copied geometry; the source planes were
+        // proved in-buffer by the `run_into` above (`check_source`), and
+        // `src` outlives the call.
+        unsafe {
+            let raw = src.as_ptr();
+            let dst_data = [
+                expected.as_mut_ptr(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            ];
+            let dst_lines = [libc::c_int::try_from(row).unwrap(), 0, 0, 0];
+            let src_data = [
+                (*raw).data[0].cast_const(),
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+            ];
+            let src_lines = [(*raw).linesize[0], 0, 0, 0];
+            ffmpeg::ffi::av_image_copy(
+                dst_data.as_ptr(),
+                dst_lines.as_ptr(),
+                src_data.as_ptr(),
+                src_lines.as_ptr(),
+                ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGBA,
+                libc::c_int::try_from(w + 1).unwrap(),
+                libc::c_int::try_from(h + 1).unwrap(),
+            );
+        }
+        let (plane, stride) = out.plane(0).unwrap();
+        for r in 0..rows {
+            assert_eq!(
+                &plane[r * stride..r * stride + row],
+                &expected[r * row..(r + 1) * row],
+                "row {r} differs from av_image_copy"
+            );
+        }
+
+        // An expansion past the allocation is still refused before libav
+        // reads: the bounds checks are unchanged.
+        let mut tall = alloc_video(Pixel::RGBA, w, h).unwrap();
+        tall.set_height(4096);
+        let spec = ScaleSpec::new(Pixel::RGBA, w, 4096);
+        let mut identity = Scaler::new(spec, spec).unwrap();
+        let mut out = ScratchFrame::alloc(Pixel::RGBA, w, 4096).unwrap();
+        let err = identity.run_into(&tall, &mut out).unwrap_err();
+        assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
     }
 
     /// A spec change reallocates through the checked path; a failure there

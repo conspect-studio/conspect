@@ -79,14 +79,71 @@ pub fn alpha_layout(format: Pixel) -> Option<AlphaLayout> {
 
 /// A decoded frame whose pixel format carries straight alpha, kept beside its
 /// NV12 conversion so a media player can publish NV12+A.
+///
+/// # Trusted provenance (review PB-14)
+/// [`Self::copy_to`] builds Rust row slices over the frame through the
+/// crate-private `frame::plane_rows`, whose row width and count come from
+/// the frame's own format, width and height. Those must be the ones its
+/// bytes were written for: the safe `Video::set_width`/`set_height` could
+/// otherwise widen a decoder frame over its unwritten stride padding (or
+/// its padded extra rows) inside the same allocation, and the copy would
+/// read uninitialised memory. So the fields are private and only two
+/// provenances exist:
+///
+/// * the decoder inside this crate ([`crate::decode_stream`]), which moves
+///   its output frame in untouched;
+/// * [`Self::from_checked`], from a [`ScratchFrame`] (allocated and
+///   zero-initialised by `alloc_video`, its geometry never mutable).
+///
+/// Afterwards only `&Video` is handed out ([`Self::frame`]), so nothing can
+/// change the geometry. An arbitrary `Video` cannot become an
+/// `AlphaSource` outside this crate:
+///
+/// ```compile_fail,E0451
+/// use ffmpeg_next::format::Pixel;
+/// use ffmpeg_next::util::frame::Video;
+/// use multiview_ffmpeg::alpha::{alpha_layout, AlphaSource};
+/// let mut frame = Video::new(Pixel::RGBA, 5, 2);
+/// frame.set_width(6); // widened over the stride padding
+/// let layout = alpha_layout(Pixel::RGBA).unwrap();
+/// let source = AlphaSource { frame, layout }; // private fields
+/// ```
+///
+/// ```compile_fail,E0624
+/// use ffmpeg_next::format::Pixel;
+/// use ffmpeg_next::util::frame::Video;
+/// use multiview_ffmpeg::alpha::{alpha_layout, AlphaSource};
+/// let frame = Video::new(Pixel::RGBA, 5, 2);
+/// let layout = alpha_layout(Pixel::RGBA).unwrap();
+/// let source = AlphaSource::from_decoder(frame, layout); // crate-private
+/// ```
+///
+/// ```compile_fail,E0596
+/// use ffmpeg_next::format::Pixel;
+/// use multiview_ffmpeg::alpha::{alpha_layout, AlphaSource};
+/// use multiview_ffmpeg::frame::ScratchFrame;
+/// let scratch = ScratchFrame::alloc(Pixel::RGBA, 5, 2).unwrap();
+/// let source = AlphaSource::from_checked(scratch, alpha_layout(Pixel::RGBA).unwrap());
+/// source.frame().set_width(6); // only a shared reference is handed out
+/// ```
 pub struct AlphaSource {
-    /// The decoder's own output frame (pre-NV12), at the decoded size.
-    pub frame: Video,
+    /// The decoder's own output frame (pre-NV12), at the decoded size, or a
+    /// checked scratch frame; its geometry is never changed after
+    /// construction.
+    frame: Video,
     /// Where its alpha samples live.
-    pub layout: AlphaLayout,
+    layout: AlphaLayout,
 }
 
 impl AlphaSource {
+    /// The decoder's own output frame, moved in untouched: its format,
+    /// width and height are the ones the decoder wrote its rows for, which
+    /// [`Self::copy_to`] relies on (see the type docs). Only the decoder in
+    /// this crate may call it.
+    pub(crate) const fn from_decoder(frame: Video, layout: AlphaLayout) -> Self {
+        Self { frame, layout }
+    }
+
     /// An alpha source over a [`ScratchFrame`]: allocated by the checked
     /// `alloc_video` (every owned byte zero-initialised, review PB-12) and
     /// never exposed mutably, so its geometry is still the allocation's and
@@ -118,7 +175,7 @@ impl AlphaSource {
     ///
     /// The frame's layout is validated before any of its memory is viewed:
     /// `layout` must be the one its pixel format maps to, and the alpha plane
-    /// is read through [`crate::frame::plane_rows`] (signed linesize, plane
+    /// is read through `frame::plane_rows` (signed linesize, plane
     /// height and every row span checked against the frame's own buffers), one
     /// row at a time, so a negative (bottom-up) linesize is copied in display
     /// order rather than becoming a huge slice.

@@ -11,11 +11,22 @@
 //! * [`alloc_video`] allocates a frame and checks the dimensions, the pixel
 //!   format and the allocation result before returning it, so a frame it
 //!   hands back always has every plane of its format.
-//! * [`plane_rows`] validates a plane's layout — plane index, signed stride,
-//!   plane height from the format's chroma subsampling, and that every row's
-//!   span lies inside one of the frame's own reference-counted buffers — and
-//!   only then yields the rows one at a time, in display order, whatever the
-//!   stride's sign. No slice longer than one row is ever constructed.
+//! * `plane_rows` (crate-private) validates a plane's layout — plane index,
+//!   signed stride, plane height from the format's chroma subsampling, and
+//!   that every row's span lies inside one of the frame's own
+//!   reference-counted buffers — and only then yields the rows one at a
+//!   time, in display order, whatever the stride's sign. No slice longer
+//!   than one row is ever constructed. It is not public (review PB-14): the
+//!   row width it trusts comes from the frame's *current* format and width,
+//!   which the safe `Video::set_width`/`set_height`/`set_format` can raise
+//!   over a decoder frame's unwritten stride padding or padded extra rows,
+//!   so only frames with trusted metadata may reach it.
+//! * Public paths never build a Rust slice over a caller-supplied
+//!   [`Video`]: [`crate::Scaler`] hands such frames to libav (`sws_scale`,
+//!   `av_frame_copy`) after the bounds checks below, and the public
+//!   slice views ([`ScratchFrame::plane`]/[`ScratchFrame::plane_mut`],
+//!   [`crate::alpha::AlphaSource::copy_to`]) exist only over frames whose
+//!   geometry no caller can change.
 //! * [`check_swscale_source`] / [`check_swscale_destination`] add the
 //!   libswscale contract on top: `libavutil/frame.h` documents that
 //!   "swscale can read up to 16 bytes beyond the planes", so
@@ -240,7 +251,17 @@ impl ScratchFrame {
         })
     }
 
-    /// The frame, read-only (for `plane_rows`, PTS, reading the geometry).
+    /// The frame, read-only (for libav reads, PTS, reading the geometry).
+    ///
+    /// Only a shared reference is ever handed out, so the geometry stays the
+    /// one [`Self::alloc`] gave it:
+    ///
+    /// ```compile_fail,E0596
+    /// # use multiview_ffmpeg::frame::ScratchFrame;
+    /// # use ffmpeg_next::format::Pixel;
+    /// let scratch = ScratchFrame::alloc(Pixel::RGBA, 5, 2).unwrap();
+    /// scratch.frame().set_width(6); // cannot borrow as mutable
+    /// ```
     #[must_use]
     pub const fn frame(&self) -> &Video {
         &self.frame
@@ -402,7 +423,7 @@ const PALETTE_BYTES: usize = 256 * 4;
 /// format, the row size from `av_image_get_linesize` (format + width), the
 /// plane height with chroma subsampling applied and the signed linesize
 /// must put every row inside one of the frame's own reference-counted
-/// buffers ([`plane_rows`]); a paletted format's `data[1]` palette must lie
+/// buffers (the `plane_rows` bounds); a paletted format's `data[1]` palette must lie
 /// in one too. Either linesize sign is accepted (libswscale and
 /// `av_image_copy` read bottom-up planes). A frame with no refcounted
 /// buffers (nothing to bound it against), zero dimensions or a
@@ -560,8 +581,8 @@ fn descriptor_flags(format: ffi::AVPixelFormat) -> Option<u64> {
 
 /// The rows of one plane of a frame, validated up front: each item is the
 /// first `row_bytes` bytes of a row, top row first, whatever the sign of the
-/// plane's linesize.
-pub struct PlaneRows<'a> {
+/// plane's linesize. Crate-private, like [`plane_rows`] (review PB-14).
+pub(crate) struct PlaneRows<'a> {
     first: *const u8,
     linesize: isize,
     rows: usize,
@@ -700,13 +721,30 @@ fn owned_buffers<'a>(raw: *const ffi::AVFrame) -> OwnedBuffers<'a> {
 /// lie inside one buffer the frame holds a reference to. A frame without
 /// refcounted buffers is refused.
 ///
+/// # Trusted metadata only (review PB-14)
+/// The bounds above prove every row lies in the frame's memory, not that
+/// its bytes are initialised. The active row width comes from the frame's
+/// *current* format and width, and the row count from its current height;
+/// the safe `Video::set_width`/`set_height`/`set_format` can raise those
+/// over a decoder frame's unwritten stride padding or padded extra rows
+/// (still inside the allocation, so every check passes). Callers must
+/// therefore pass only frames whose metadata is trusted: produced by a
+/// decoder inside this crate and never handed out mutably since
+/// ([`crate::alpha::AlphaSource`]), or allocated by [`alloc_video`]
+/// (zero-initialised, e.g. a [`ScratchFrame`]). That is why this is
+/// `pub(crate)`; external code cannot call it:
+///
+/// ```compile_fail,E0603
+/// use multiview_ffmpeg::frame::plane_rows; // private function
+/// ```
+///
 /// # Errors
 /// [`FfmpegError::FrameLayout`] naming the first check that failed.
-pub fn plane_rows(frame: &Video, plane: usize, row_bytes: usize) -> Result<PlaneRows<'_>> {
+pub(crate) fn plane_rows(frame: &Video, plane: usize, row_bytes: usize) -> Result<PlaneRows<'_>> {
     padded_plane_rows(frame, plane, row_bytes, 0)
 }
 
-/// [`plane_rows`], additionally requiring `pad` bytes after the plane's
+/// `plane_rows`, additionally requiring `pad` bytes after the plane's
 /// highest active byte (the end of the last row for a forward plane, of
 /// row 0 for a bottom-up one) inside the same owning buffer as the rows.
 /// The rows yielded never include the padding.
@@ -907,5 +945,25 @@ mod tests {
         // An unallocated frame has no rows to give.
         let empty = Video::empty();
         assert!(plane_rows(&empty, 0, 1).is_err());
+    }
+
+    /// Review PB-14: `plane_rows`' bounds come from the frame's *current*
+    /// metadata. A padded frame widened with the safe `Video::set_width`
+    /// (inside its allocation) passes every check and yields rows that
+    /// include its stride padding — which is why `plane_rows` is
+    /// `pub(crate)` and only fed frames with trusted metadata (a decoder's
+    /// untouched output in `AlphaSource`, or `alloc_video`). This pins the
+    /// precondition; it is not a promise to external callers.
+    #[test]
+    fn plane_rows_trusts_the_frame_metadata() {
+        let mut frame = alloc_video(Pixel::RGBA, 5, 2).unwrap();
+        assert!(frame.stride(0) >= 32);
+        assert!(plane_rows(&frame, 0, 24).is_err(), "20 active bytes");
+        frame.set_width(6);
+        assert_eq!(
+            plane_rows(&frame, 0, 24).unwrap().count(),
+            2,
+            "widened metadata is believed: callers must trust it"
+        );
     }
 }

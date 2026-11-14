@@ -507,10 +507,9 @@ impl StreamVideoDecoder {
         let (nv12, alpha) = match crate::alpha::alpha_layout(decoded.format()) {
             Some(layout) => {
                 let nv12 = self.convert_to_nv12(&decoded)?;
-                let alpha = crate::alpha::AlphaSource {
-                    frame: decoded,
-                    layout,
-                };
+                // Straight from the decoder, metadata untouched: the
+                // trusted provenance `AlphaSource::copy_to` needs (PB-14).
+                let alpha = crate::alpha::AlphaSource::from_decoder(decoded, layout);
                 (nv12, Some(alpha))
             }
             None => (self.ensure_nv12(decoded)?, None),

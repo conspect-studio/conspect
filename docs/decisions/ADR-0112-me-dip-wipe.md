@@ -138,8 +138,8 @@ tile. No switcher or drive code changes.
   be raised over a small allocation) and re-validates every destination
   plane against the frame's own buffers, and that the buffers are writable,
   before libswscale or the identity copy writes. Both `Scaler::run` and
-  `run_into` validate every source plane the same way before libswscale,
-  `av_frame_copy` or the identity row copy reads it (`frame::check_source`:
+  `run_into` validate every source plane the same way before libswscale
+  or `av_frame_copy` (both identity paths) reads it (`frame::check_source`:
   row bytes from the format and width, subsampled plane height, signed
   linesize, every row inside one of the frame's own refcounted buffers; a
   frame without such buffers is an error), so a source whose geometry was
@@ -152,6 +152,14 @@ tile. No switcher or drive code changes.
   checked even for `alloc_video` outputs, not assumed), so an exact-size
   allocation whose padding became active rows is an error. The buffer scan
   walks `buf[]`/`extended_buf` in place, allocation-free.
+  No public path builds a Rust slice over a caller-supplied `Video`, whose
+  geometry the safe `Video::set_width`/`set_height`/`set_format` could widen
+  over unwritten padding inside its allocation (review PB-14): the identity
+  `run_into` copies in libav (`av_frame_copy`), `plane_rows` is
+  crate-private and only sees frames with trusted metadata, and
+  `alpha::AlphaSource` has private fields — it is built only by the decoder
+  in this crate (its untouched output frame) or from a zero-initialised
+  `ScratchFrame` (`AlphaSource::from_checked`), and hands out only `&Video`.
   Decoded alpha is read through `frame::plane_rows`, which validates the plane,
   its signed linesize, its subsampled height and that every row lies in
   one of the frame's own buffers before yielding single-row slices, so a

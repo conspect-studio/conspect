@@ -143,9 +143,10 @@ fn run_into_reuses_the_output_frame_for_scale_and_identity() {
     }
 }
 
-/// PB-1/PB-2: the identity `run_into` copy walks a bottom-up (negative
-/// linesize) input row by row in display order, never as one
-/// `linesize * height` slice, and its output allocation is checked.
+/// PB-1/PB-2: the identity `run_into` copy (libav `av_frame_copy`, PB-14)
+/// walks a bottom-up (negative linesize) input row by row in display order,
+/// never as one `linesize * height` slice, and its output allocation is
+/// checked.
 #[test]
 fn run_into_identity_copies_a_bottom_up_frame_in_display_order() {
     let (w, h) = (6_u32, 4_u32);
