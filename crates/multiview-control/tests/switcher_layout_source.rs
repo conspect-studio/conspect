@@ -688,7 +688,8 @@ async fn deleting_a_layout_on_the_me_is_refused() {
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert!(problem_type(response).await.ends_with("layout-on-air"));
     assert_eq!(rig.registered(), vec!["wall".to_owned()]);
-    // Off the M/E (but still registered, lingering): the delete unregisters.
+    // Off the M/E but still registered (lingering): still refused (#307
+    // review A3); once the linger sweep released it, the delete commits.
     let response = submit(
         &rig,
         OPERATOR_TOKEN,
@@ -698,6 +699,20 @@ async fn deleting_a_layout_on_the_me_is_refused() {
     .await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     rig.tick();
+    let response = send(
+        &rig.router,
+        delete_if_match("/api/v1/layouts/wall", ADMIN_TOKEN, Some("W/\"1\"")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(rig.registered(), vec!["wall".to_owned()]);
+    let swept = rig
+        .state
+        .me_layouts
+        .as_ref()
+        .unwrap()
+        .sweep(|_| false, Instant::now() + ME_LAYOUT_LINGER);
+    assert_eq!(swept, 1);
     let response = send(
         &rig.router,
         delete_if_match("/api/v1/layouts/wall", ADMIN_TOKEN, Some("W/\"1\"")),
