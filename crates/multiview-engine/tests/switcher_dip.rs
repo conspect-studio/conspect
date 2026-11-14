@@ -634,14 +634,14 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
     assert!(u64::try_from(seen.len()).unwrap() >= TICKS);
     // ADR-0112 §4: under the flood the published selection is always one
     // the engine accepted (never a refused or unrendered descriptor).
-    let published = handle.snapshot().unwrap().transition.clone();
+    let selection = handle.snapshot().unwrap().transition.clone();
     assert!(
-        published.is_rendered() && published.is_valid(),
-        "{published:?}"
+        selection.is_rendered() && selection.is_valid(),
+        "{selection:?}"
     );
     assert!(
-        !matches!(published, TransitionDescriptor::Cut),
-        "{published:?}"
+        !matches!(selection, TransitionDescriptor::Cut),
+        "{selection:?}"
     );
     // The seeded bordered wipe was composed on its first tick and again on
     // the next one, after the flood's first 16 commands were drained (the
