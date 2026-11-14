@@ -429,6 +429,12 @@ pub enum WarningCode {
     /// lifetime remains, or the served certificate has expired (critical).
     /// Cleared when a renewal succeeds. Carries no secret.
     TlsCertificate,
+    /// An edit of the watched boot file removed sources, outputs, the switcher
+    /// or audio routes that the operator's accepted state had (#367). The
+    /// message names what was removed and where a copy of the state before the
+    /// edit was kept (`.multiview/rejected/replaced-*.json`). **Latched**
+    /// critical: the removal stands until someone restores it.
+    ConfigFileRemovedAccepted,
 }
 
 /// Which end of a RIST link a [`RistLinkStats`] sample describes.
@@ -564,6 +570,7 @@ impl WarningCode {
             Self::CatalogueLinkAttention => "catalogue-link-attention",
             Self::AcceptedStateRejected => "accepted-state-rejected",
             Self::TlsCertificate => "tls-certificate",
+            Self::ConfigFileRemovedAccepted => "config-file-removed-accepted",
         }
     }
 }
