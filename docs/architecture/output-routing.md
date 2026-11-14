@@ -2061,31 +2061,56 @@ restart".
   - every other kind: any subtitle slot is `slot-medium-mismatch`.
   - An unknown `source` is refused at document validation (`subtitle slot i names unknown
     source`). An output without subtitle slots serializes exactly as before.
+  - The effective menu labels (`SubtitleSlot::effective_name`: the name, else the language, else
+    "Subtitles i+1") must be distinct within an output (RFC 8216 §4.3.4.1.1: every member of a
+    group has a different `NAME`): two slots with `language = "en"` and no name, two equal names,
+    or a name equal to another slot's fallback are `slot-format-unsupported` (`subtitle slot i
+    name "…" repeats slot j's`).
 - **Sink** (`multiview-output::hls::subtitle`, `PacketMuxSink::with_subtitles`). A subtitle slot
   forces the master/rendition layout like an audio rendition does. Slot `i` is a media playlist
   `subs<i>-g<gen>.m3u8` in the master's `GROUP-ID="subs"` (`DEFAULT=NO,AUTOSELECT=YES`,
-  `NAME` = the slot name, else its language, else "Subtitles i+1"); every `EXT-X-STREAM-INF`
+  `NAME` = the slot's effective name; the sink also disambiguates any duplicate that reaches it
+  unvalidated, deterministically, with a ` (i+1)` suffix); every `EXT-X-STREAM-INF`
   names `SUBTITLES="subs"`, and the master is published only once every subtitle playlist exists.
   At every video segment close each slot writes `subs<i>-<index>.vtt` (tmp + rename; the TS
   segment's index) and pushes it with the video segment's duration and start PTS, so the media
-  sequence, discontinuities and PDT match the video playlist. Each file starts
-  `WEBVTT` / `X-TIMESTAMP-MAP=MPEGTS:<n>,LOCAL:00:00:00.000`, where `n` is the 90 kHz PTS the
-  segment's first video PES carries **as written** (read back from the video rendition's `.ts`,
-  so the muxer's own offset is included; a test checks it against the real TS) and LOCAL zero is
-  the segment start. Then the cues overlapping the segment, clipped to it, relative to its start,
-  with `&`, `<`, `>` escaped. An empty segment gets a header-only file. Old `.vtt` files and
-  `subs*` playlists retire with the TS grace (`prune_prior_*`).
-- **Bounds.** The engine-to-sink `SubtitleFeed` is a 256-cue channel: the sampler only
-  `try_send`s (drop and count, never blocks). The sink holds at most 64 cues per slot (drops the
-  first-ending one), a cue keeps at most 4 lines and 512 bytes. `SubtitleStats` counts feed
-  drops, held drops, truncations and written segments (`PacketMuxSink::subtitle_stats`).
+  sequence, discontinuities and PDT match the video playlist. Each rendition has one shared,
+  non-negative `WebVTT` timeline: LOCAL zero is its first segment's start. Each file starts
+  `WEBVTT` / `X-TIMESTAMP-MAP=MPEGTS:<n>,LOCAL:<l>`, where `l` is the segment start on that
+  timeline (to the millisecond) and `n` is the 90 kHz PTS the segment's first video PES carries
+  **as written** (read back from the video rendition's `.ts`, so the muxer's own offset is
+  included; a test checks it against the real TS), moved back by the sub-millisecond remainder
+  modulo 2^33 so the pair is exact and a 33-bit PTS wrap between segments stays on one timeline.
+  Then every cue overlapping the segment with its **total** display interval on that timeline
+  (RFC 8216 §3.5; never clipped), so a cue spanning segments has identical timestamps in each,
+  with `&`, `<`, `>` escaped. A cue whose end is not known yet (still open at the segment close)
+  is ended at the segment end and re-emitted with the same start, extended, in the next segment
+  (with its real end once the close arrives). An empty segment gets a header-only file. Old
+  `.vtt` files retire with the TS grace (`prune_prior_*`); rendition cleanup removes only
+  manifests matching the exact generated grammar `subs<slot>-g<generation>.m3u8` (parsed
+  numbers), so e.g. `subtitles.m3u8` or `subscriptions.m3u8` are never touched.
+- **Bounds.** Cue text is bounded to 4 lines and 512 bytes (`bound_cue_lines`: UTF-8 boundary
+  safe, blank lines dropped, a fresh exact-size allocation, never the source's capacity)
+  **before** the engine retains, compares or enqueues it: the resolver projects the active cue
+  while borrowing it from the cue-store snapshot (`CaptionCueStore::with_active_at_generation`,
+  `subtitle_slots::text_cue_lines`), so a bitmap cue is skipped without copying its pixels and
+  a 256 KiB text cue costs a 512-byte copy. `SubtitleFeed::try_offer`/`offer` re-project any
+  payload that is not already compact (defence at the public boundary), and `SlotCues::push`
+  does too. The engine-to-sink `SubtitleFeed` is a 256-cue channel the sampler only `try_send`s
+  into (never blocks). A change the full feed refuses is kept in a per-slot pending queue (at
+  most 4) and retried non-blockingly on every later tick until accepted, so a close is never
+  lost to a transient sink stall, even when silence follows; on overflow an unsent open cue
+  superseded by its close goes first, then the oldest unsent closed cue (counted as a feed
+  drop), never the close of a cue the sink holds open. The sink holds at most 64 cues per slot
+  (drops the first-ending one). `SubtitleStats` counts feed drops, held drops, truncations and
+  written segments (`PacketMuxSink::subtitle_stats`).
 - **Engine** (`multiview-cli::subtitle_slots`). Each HLS output with subtitle slots gets a route
   table `Arc<SwapCell<Arc<[Option<String>]>>>` (slot → source, from config `source`; F2
   re-points it live). Once per item the **bake consumer** (never the output clock; the hot-loop
   projection gains no work) reads the table, asks the source's caption store for the text cue at
   the picture the compositor latches for that tick (`TileStore::peek_at_with_source_time`: the same
-  selection as `read_at`, without moving the prune watermark) and
-  `CueStore::active_at_generation(pts, generation)`. `SubtitleSlotSampler` turns the samples
+  selection as `read_at`, without moving the prune watermark) and the bounded text projection of
+  `CueStore::with_active_at_generation(pts, generation, ..)`. `SubtitleSlotSampler` turns the samples
   into cue changes on the output timeline (`MediaTime::from_tick`): an open cue when text
   appears, the closed cue when it changes. A cue spanning segment boundaries is written into each
   segment it covers. A re-point lands on one tick: the old source's cue ends at tick T and the new

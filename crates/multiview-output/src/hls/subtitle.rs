@@ -16,7 +16,8 @@
 //!   exact-size allocations), applied by the sampler before it retains,
 //!   compares or enqueues text and again (defensively) at the feed boundary.
 //! - [`render_vtt`] — one `.vtt` segment: the `X-TIMESTAMP-MAP` header and the
-//!   cues overlapping the segment, clipped and made relative to its start.
+//!   cues overlapping the segment on the rendition's shared `WebVTT` timeline
+//!   (RFC 8216 §3.5: a cue carries its total display interval).
 //! - [`unique_rendition_names`] — distinct `NAME`s for the `subs` group.
 //! - [`first_video_pts_90k`] — the 90 kHz PTS the first video PES of a written
 //!   MPEG-TS segment actually carries (the `MPEGTS` side of the map).
@@ -169,8 +170,10 @@ pub fn unique_rendition_names(renditions: &[SubtitleRendition]) -> Vec<String> {
 /// The engine sends a cue twice: **open** when it starts (`end` =
 /// [`SubtitleCue::OPEN_END`]) and **closed** when it changes (the real end).
 /// The sink merges the two by `(slot, start)`, so a cue that spans a segment
-/// boundary is written into every segment it covers (an open cue is clipped
-/// to the closing segment's end and kept).
+/// boundary is written into every segment it covers with its total display
+/// interval (an open cue, whose end is not known yet, is ended at the
+/// closing segment's end and re-emitted with the same start, extended, in
+/// the next segment).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleCue {
     /// The subtitle slot (index into the sink's renditions).
@@ -460,32 +463,58 @@ pub fn pts_90k_of(at: MediaTime) -> u64 {
     u64::try_from(ticks.rem_euclid(1 << 33)).unwrap_or(0)
 }
 
-/// Render one `.vtt` segment for `[seg_start, seg_end)`: the header with
-/// `X-TIMESTAMP-MAP=MPEGTS:<mpegts>,LOCAL:00:00:00.000` (LOCAL zero = the
-/// segment start), then every cue overlapping the segment, clipped to it,
-/// with times relative to its start. No cue ⇒ a header-only (valid) file.
+/// Render one `.vtt` segment for `[seg_start, seg_end)` of a rendition whose
+/// shared `WebVTT` timeline starts at `base` (LOCAL zero = output instant
+/// `base`, the rendition's first segment start; every segment of the
+/// rendition uses it, so a cue has identical timestamps in every segment it
+/// appears in).
+///
+/// The header maps the segment start: `X-TIMESTAMP-MAP=MPEGTS:<m>,LOCAL:<l>`
+/// with `l = seg_start - base` cut to the millisecond and `m` = `mpegts` (the
+/// 90 kHz PTS of `seg_start`) moved back by the sub-millisecond remainder,
+/// modulo 2^33 — so the pair is exact and a 33-bit PTS wrap between segments
+/// stays consistent (players resolve `MPEGTS` modulo 2^33).
+///
+/// Every cue overlapping the segment follows with its **total** display
+/// interval on that timeline (RFC 8216 §3.5), never clipped to the segment.
+/// The one exception is a cue still open (end unknown): it is ended at the
+/// segment end and re-emitted with the same start, extended, in the next
+/// segment (and with its real end once its close arrives). A cue that started
+/// before `base` (before this rendition's first segment) starts at LOCAL zero.
+/// No cue ⇒ a header-only (valid) file.
 #[must_use]
 pub fn render_vtt(
     cues: &[&SubtitleCue],
     seg_start: MediaTime,
     seg_end: MediaTime,
+    base: MediaTime,
     mpegts: u64,
 ) -> String {
+    let local = |at: MediaTime| at.as_nanos().saturating_sub(base.as_nanos()).max(0);
+    let seg_local = local(seg_start);
+    let remainder_ns = seg_local % 1_000_000;
+    let shift = u64::try_from(multiview_core::time::rescale(
+        remainder_ns,
+        multiview_core::time::Rational::new(1, 1_000_000_000),
+        multiview_core::time::Rational::new(1, 90_000),
+    ))
+    .unwrap_or(0);
+    let wrap = 1u64 << 33;
+    let mpegts = (mpegts % wrap + wrap - shift % wrap) % wrap;
     let mut out = String::new();
     let _ = writeln!(out, "WEBVTT");
-    let _ = writeln!(out, "X-TIMESTAMP-MAP=MPEGTS:{mpegts},LOCAL:00:00:00.000");
-    let span = seg_end.as_nanos().saturating_sub(seg_start.as_nanos());
+    let _ = writeln!(
+        out,
+        "X-TIMESTAMP-MAP=MPEGTS:{mpegts},LOCAL:{}",
+        vtt_time(seg_local - remainder_ns)
+    );
     for cue in cues {
-        let start = cue
-            .start
-            .as_nanos()
-            .saturating_sub(seg_start.as_nanos())
-            .max(0);
-        let end = cue
-            .end
-            .as_nanos()
-            .saturating_sub(seg_start.as_nanos())
-            .min(span);
+        let start = local(cue.start);
+        let end = if cue.is_open() {
+            local(seg_end)
+        } else {
+            local(cue.end)
+        };
         if end <= start || cue.lines.is_empty() {
             continue;
         }
@@ -563,7 +592,7 @@ mod tests {
     #[test]
     fn vtt_header_escaping_and_relative_times() {
         let a = cue(0, 2_500, 3_000, &["Tom & <Jerry>", "a --> b"]);
-        let text = render_vtt(&[&a], ms(2_000), ms(4_000), 900_000);
+        let text = render_vtt(&[&a], ms(2_000), ms(4_000), ms(2_000), 900_000);
         assert_eq!(
             text,
             "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n\
@@ -575,7 +604,7 @@ mod tests {
     fn vtt_clips_cues_to_the_segment() {
         let before = cue(0, 1_000, 2_500, &["spans in"]);
         let after = cue(0, 3_500, 9_000, &["spans out"]);
-        let text = render_vtt(&[&before, &after], ms(2_000), ms(4_000), 0);
+        let text = render_vtt(&[&before, &after], ms(2_000), ms(4_000), ms(2_000), 0);
         assert!(
             text.contains("00:00:00.000 --> 00:00:00.500\nspans in\n"),
             "{text}"
@@ -590,7 +619,7 @@ mod tests {
 
     #[test]
     fn empty_segment_is_a_valid_header_only_file() {
-        let text = render_vtt(&[], ms(0), ms(2_000), 126_000);
+        let text = render_vtt(&[], ms(0), ms(2_000), ms(0), 126_000);
         assert_eq!(
             text,
             "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:126000,LOCAL:00:00:00.000\n"
@@ -622,7 +651,13 @@ mod tests {
         let mut held = SlotCues::default();
         held.push(open.clone(), &stats);
         // Segment [0, 1000) closes with the cue still open: clipped to it.
-        let text = render_vtt(&held.overlapping(ms(0), ms(1_000)), ms(0), ms(1_000), 0);
+        let text = render_vtt(
+            &held.overlapping(ms(0), ms(1_000)),
+            ms(0),
+            ms(1_000),
+            ms(0),
+            0,
+        );
         assert!(
             text.contains("00:00:00.500 --> 00:00:01.000\nlong\n"),
             "{text}"
@@ -636,6 +671,7 @@ mod tests {
             &held.overlapping(ms(1_000), ms(2_000)),
             ms(1_000),
             ms(2_000),
+            ms(1_000),
             0,
         );
         assert!(
@@ -706,6 +742,90 @@ mod tests {
         assert_eq!(first_video_pts_90k(&p), Some(pts));
         assert_eq!(first_video_pts_90k(&[]), None);
         assert_eq!(pts_90k_of(MediaTime::from_nanos(1_000_000_000)), 90_000);
+    }
+
+    #[test]
+    fn a_closed_cue_spanning_segments_has_identical_timestamps_in_each() {
+        let long = cue(0, 1_500, 5_200, &["spans three"]);
+        let base = ms(1_000);
+        let mut lines = Vec::new();
+        for (i, seg) in [(1_000, 3_000), (3_000, 5_000), (5_000, 7_000)]
+            .into_iter()
+            .enumerate()
+        {
+            let mpegts = 90_000 + 180_000 * u64::try_from(i).unwrap();
+            let text = render_vtt(&[&long], ms(seg.0), ms(seg.1), base, mpegts);
+            let local = vtt_time((seg.0 - 1_000) * 1_000_000);
+            assert!(
+                text.starts_with(&format!(
+                    "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{mpegts},LOCAL:{local}\n"
+                )),
+                "{text}"
+            );
+            let timing = text
+                .lines()
+                .find(|l| l.contains("-->"))
+                .unwrap_or_else(|| panic!("{text}"))
+                .to_owned();
+            lines.push(timing);
+        }
+        assert_eq!(lines[0], "00:00:00.500 --> 00:00:04.200");
+        assert!(lines.windows(2).all(|w| w[0] == w[1]), "{lines:?}");
+    }
+
+    #[test]
+    fn the_map_stays_consistent_across_a_33_bit_pts_wrap() {
+        let wrap = 1u64 << 33;
+        // Segment A maps LOCAL 1.000 to just below the wrap; segment B (1 s
+        // later) carries a wrapped PTS. Both maps describe one timeline:
+        // MPEGTS - LOCAL*90k is the same modulo 2^33.
+        let a_pts = wrap - 45_000;
+        let b_pts = (a_pts + 90_000) % wrap;
+        let header = |text: &str| -> (u64, i64) {
+            let line = text.lines().nth(1).unwrap();
+            let rest = line.strip_prefix("X-TIMESTAMP-MAP=MPEGTS:").unwrap();
+            let (m, l) = rest.split_once(",LOCAL:").unwrap();
+            let parts: Vec<i64> = l.split([':', '.']).map(|p| p.parse().unwrap()).collect();
+            let ms = ((parts[0] * 60 + parts[1]) * 60 + parts[2]) * 1000 + parts[3];
+            (m.parse().unwrap(), ms)
+        };
+        let c = cue(0, 1_500, 2_500, &["across the wrap"]);
+        let a = render_vtt(&[&c], ms(2_000), ms(3_000), ms(1_000), a_pts);
+        let b = render_vtt(&[&c], ms(3_000), ms(4_000), ms(1_000), b_pts);
+        let (am, al) = header(&a);
+        let (bm, bl) = header(&b);
+        assert!(bm < am, "segment B's PTS wrapped: {am} {bm}");
+        let origin = |m: u64, l: i64| {
+            let l90 = u64::try_from(l).unwrap() * 90;
+            (m + wrap - l90 % wrap) % wrap
+        };
+        assert_eq!(origin(am, al), origin(bm, bl));
+        assert!(a.contains("00:00:00.500 --> 00:00:01.500\nacross the wrap\n"));
+        assert!(b.contains("00:00:00.500 --> 00:00:01.500\nacross the wrap\n"));
+        // A sub-millisecond segment start moves MPEGTS back by the remainder
+        // (modulo 2^33), so the pair stays exact; at PTS 0 it wraps.
+        let odd = render_vtt(
+            &[],
+            MediaTime::from_nanos(1_000_500_000),
+            ms(2_000),
+            ms(0),
+            45,
+        );
+        assert!(
+            odd.contains(&format!("MPEGTS:{},LOCAL:00:00:01.000", 0)),
+            "{odd}"
+        );
+        let wrapped = render_vtt(
+            &[],
+            MediaTime::from_nanos(1_000_500_000),
+            ms(2_000),
+            ms(0),
+            0,
+        );
+        assert!(
+            wrapped.contains(&format!("MPEGTS:{},LOCAL:00:00:01.000", wrap - 45)),
+            "{wrapped}"
+        );
     }
 
     #[test]

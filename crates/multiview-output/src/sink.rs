@@ -2385,6 +2385,9 @@ struct SubtitleSlotState {
     live: LivePlaylist,
     prefix: String,
     held: crate::hls::subtitle::SlotCues,
+    /// The rendition's shared `WebVTT` timeline origin (LOCAL zero): its
+    /// first segment's start, set at the first segment close (MED-2).
+    base: Option<MediaTime>,
 }
 
 /// One audio-only MPEG-TS muxer, opened ONCE at the run's first video keyframe
@@ -2610,6 +2613,7 @@ impl<'a> SegmentState<'a> {
                 live: subs_live,
                 prefix: format!("subs{i}-"),
                 held: crate::hls::subtitle::SlotCues::default(),
+                base: None,
             });
         }
         let sub_counters = self
@@ -3443,10 +3447,12 @@ impl<'a> SegmentState<'a> {
             .or_else(|| read_first_video_pts(main_ts))
             .unwrap_or_else(|| crate::hls::subtitle::pts_90k_of(start));
         for sub in &mut renditions.subtitles {
+            let base = *sub.base.get_or_insert(start);
             let text = crate::hls::subtitle::render_vtt(
                 &sub.held.overlapping(start, end),
                 start,
                 end,
+                base,
                 mpegts,
             );
             let path = self.dir.join(format!("{}{index}.vtt", sub.prefix));
