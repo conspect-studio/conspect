@@ -82,6 +82,7 @@ fn command(op: usize, verb: SwitcherVerb) -> SwitcherCommand {
         operation_id: op.to_string(),
         scene_version: 1,
         verb,
+        expect: None,
     }
 }
 fn pair() -> (
@@ -291,6 +292,7 @@ fn single_full_canvas_scene_is_source_agnostic_but_multi_cell_scenes_are_not() {
             operation_id: "3".into(),
             scene_version: 2,
             verb: SwitcherVerb::SelectPreview(source("c")),
+            expect: None,
         })
         .unwrap();
     driver.drain_at_tick(tick(2));

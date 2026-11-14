@@ -621,26 +621,6 @@ pub(crate) fn me_refusal(refusal: FeedRefusal) -> Response {
         .into_response()
 }
 
-/// Read on stored layout `id` AND on every source its CURRENT stored body
-/// binds, from a fresh read: what a CUT/AUTO taking `layout:<id>` from
-/// Preview, or a select of an input patched to it, needs (#307). One
-/// generic 403; a layout that no longer exists fails closed.
-///
-/// # Errors
-/// 403; `EngineBusy` without a read permit; repository errors.
-pub(crate) async fn authorize_me_layout(
-    state: &AppState,
-    principal: &Principal,
-    id: &str,
-) -> ControlResult<()> {
-    crate::auth::authorize_object(principal, id)?;
-    let read = read_layout(state, id).await?;
-    match read.body.as_ref() {
-        Some(body) => authorize_document_closure(principal, body),
-        None => Err(closure_forbidden()),
-    }
-}
-
 /// Resolve a stored layout body for an M/E source edit (#307): the edit's
 /// NEW body must stay admissible. No authorization here (the edit route
 /// authorizes). `Err` is the 422 detail.

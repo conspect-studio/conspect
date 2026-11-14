@@ -151,6 +151,7 @@ fn patch(
             members,
             allow_on_air,
         }),
+        expect: None,
     }
 }
 

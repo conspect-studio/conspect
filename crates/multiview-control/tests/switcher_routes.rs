@@ -758,6 +758,7 @@ fn engine_refuses_cut_with_identical_buses() {
             operation_id: "noop".into(),
             scene_version: 1,
             verb: multiview_engine::switcher_control::SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     let tick = Tick {

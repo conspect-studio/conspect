@@ -539,6 +539,7 @@ async fn engine_busy_releases_the_key() {
                 operation_id: format!("fill-{i}"),
                 scene_version: 1,
                 verb: SwitcherVerb::Cut,
+                expect: None,
             })
             .unwrap();
     }

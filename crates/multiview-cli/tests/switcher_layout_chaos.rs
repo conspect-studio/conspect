@@ -280,6 +280,7 @@ async fn a_layout_and_switcher_flood_on_the_synthesized_program_canvas_never_mov
                     operation_id: op.clone(),
                     scene_version: 1,
                     verb,
+                    expect: None,
                 };
                 if handle.try_send(me).is_ok() {
                     me_accepted.lock().unwrap().push(op);
@@ -353,6 +354,7 @@ async fn a_layout_and_switcher_flood_on_the_synthesized_program_canvas_never_mov
                             operation_id: "final-pvw".into(),
                             scene_version: 1,
                             verb: SwitcherVerb::SelectPreview(SourceRef::new(other)),
+                            expect: None,
                         })
                         .unwrap();
                 }
@@ -362,6 +364,7 @@ async fn a_layout_and_switcher_flood_on_the_synthesized_program_canvas_never_mov
                             operation_id: "final-cut".into(),
                             scene_version: 1,
                             verb: SwitcherVerb::Cut,
+                            expect: None,
                         })
                         .unwrap();
                 }

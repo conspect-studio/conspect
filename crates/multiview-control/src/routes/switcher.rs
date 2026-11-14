@@ -6,7 +6,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use multiview_core::switcher::{FrameCount, SourceRef};
-use multiview_engine::switcher_control::{SwitcherCommand, SwitcherControl, SwitcherVerb};
+use multiview_engine::switcher_control::{
+    SelectionGuard, SwitcherCommand, SwitcherControl, SwitcherVerb,
+};
 use multiview_events::AuthzScope;
 use serde::{Deserialize, Serialize};
 
@@ -278,46 +280,85 @@ fn resolve_target(
     }))
 }
 
+/// Read on stored layout `id` and on every source its REGISTERED body binds
+/// (what the engine composes), returning that body's revision for the
+/// command's [`SelectionGuard`] (#307 review A1): the engine refuses the
+/// command if it holds another body by then. A layout that is not
+/// registered any more is 409 `layout-changed` (fail closed).
+fn authorize_registered_layout(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> ControlResult<u64> {
+    authorize_object(principal, id)?;
+    let body = state
+        .me_layouts
+        .as_ref()
+        .and_then(|registry| registry.registered_body(id))
+        .ok_or_else(|| ControlError::LayoutChanged(id.to_owned()))?;
+    super::output_routing::authorize_layout_sources(principal, &body.0.layout)?;
+    Ok(body.0.revision)
+}
+
 /// The input-resolved source a select puts on a bus must still be readable:
 /// `authorize_refs` checked a named `source`; an `input` names one indirectly.
 /// A `layout:<id>` source (#307) needs Read on the layout and on every source
-/// its current stored body binds (one generic 403).
-async fn authorize_target(
+/// its registered body binds (one generic 403). Returns the guard the
+/// command carries: the resolved source authorized, and for a layout reached
+/// through an input its registered body revision (a named `layout` select
+/// fills the revision after its registration).
+fn authorize_target(
     state: &AppState,
     principal: &Principal,
     req: &SwitcherRequest,
     target: Option<&Target>,
-) -> ControlResult<()> {
+) -> ControlResult<Option<SelectionGuard>> {
     let Some(target) = target else {
-        return Ok(());
+        return Ok(None);
     };
-    match target.source.strip_prefix("layout:") {
+    let layout_revision = match target.source.strip_prefix("layout:") {
         // A named `layout` was authorized (id + closure) by `resolve_layout_select`.
-        Some(id) if req.layout.as_deref() == Some(id) => Ok(()),
-        Some(id) => super::output_routing::authorize_me_layout(state, principal, id).await,
-        None => authorize_object(principal, &target.source),
-    }
+        Some(id) if req.layout.as_deref() == Some(id) => None,
+        Some(id) => Some(authorize_registered_layout(state, principal, id)?),
+        None => {
+            authorize_object(principal, &target.source)?;
+            None
+        }
+    };
+    Ok(Some(SelectionGuard {
+        preview: None,
+        target: Some(SourceRef::new(&target.source)),
+        layout_revision,
+    }))
 }
 
-/// A CUT/AUTO whose Preview is `layout:<id>` takes that layout to Program
-/// (#307): the caller needs Read on the layout and on every source it binds
-/// (one generic 403), re-read now.
-async fn authorize_take_of_layout(
+/// A CUT/AUTO authorizes the Preview of the snapshot it read, and carries it
+/// as its [`SelectionGuard`] (#307 review A1): a select or re-patch queued
+/// before it, or a body edit, makes the engine refuse it rather than take an
+/// unauthorized source. When that Preview is `layout:<id>` the caller needs
+/// Read on the layout and on every source its registered body binds (one
+/// generic 403). `None` for any other verb, or before the first snapshot.
+fn authorize_take_of_layout(
     state: &AppState,
     principal: &Principal,
     handle: &SwitcherControl,
     req: &SwitcherRequest,
-) -> ControlResult<()> {
+) -> ControlResult<Option<SelectionGuard>> {
     if !matches!(req.action.as_str(), "cut" | "auto") {
-        return Ok(());
+        return Ok(None);
     }
     let Some(snapshot) = handle.snapshot() else {
-        return Ok(());
+        return Ok(None);
     };
-    match snapshot.preview.as_str().strip_prefix("layout:") {
-        Some(id) => super::output_routing::authorize_me_layout(state, principal, id).await,
-        None => Ok(()),
-    }
+    let layout_revision = match snapshot.preview.as_str().strip_prefix("layout:") {
+        Some(id) => Some(authorize_registered_layout(state, principal, id)?),
+        None => None,
+    };
+    Ok(Some(SelectionGuard {
+        preview: Some(snapshot.preview.clone()),
+        target: None,
+        layout_revision,
+    }))
 }
 
 /// A `layout` select (#307): read the stored layout once, authorize its
@@ -444,12 +485,12 @@ pub(crate) async fn plan_switcher(
     if let Some(Err(response)) = resolve_layout_select(&state, &principal, &req).await? {
         return Ok(response);
     }
-    authorize_take_of_layout(&state, &principal, handle, &req).await?;
+    authorize_take_of_layout(&state, &principal, handle, &req)?;
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
     };
-    authorize_target(&state, &principal, &req, target.as_ref()).await?;
+    authorize_target(&state, &principal, &req, target.as_ref())?;
     validate_buses(handle, &req, target.as_ref())?;
     let version = handle
         .scene_version()
@@ -507,12 +548,12 @@ pub(crate) async fn submit_switcher(
         }
         (_, registry) => registry,
     };
-    authorize_take_of_layout(&state, &principal, handle, &req).await?;
+    let take_guard = authorize_take_of_layout(&state, &principal, handle, &req)?;
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
     };
-    authorize_target(&state, &principal, &req, target.as_ref()).await?;
+    let mut expect = authorize_target(&state, &principal, &req, target.as_ref())?.or(take_guard);
     validate_buses(handle, &req, target.as_ref())?;
     let scene_version = handle
         .scene_version()
@@ -534,15 +575,23 @@ pub(crate) async fn submit_switcher(
             // A layout select registers the layout as an M/E source first
             // (the registry leases its bound sources; no per-select lease).
             if let (Some(body), Some(registry)) = (layout_body, registry) {
+                // The engine must compose exactly the body authorized here;
+                // a newer registered one makes it refuse `selection-changed`.
+                let authorized = body.0.revision;
                 if let Err(error) =
                     registry.ensure(body, demand.as_ref(), std::time::Instant::now())
                 {
                     state.idempotency.release(Some(key), &op);
-                    return Ok(
-                        crate::problem::Problem::new(409, error.kind(), "Selection refused")
-                            .with_detail(error.detail())
-                            .into_response(),
-                    );
+                    return Ok(crate::problem::Problem::new(
+                        409,
+                        error.kind(),
+                        "Selection refused",
+                    )
+                    .with_detail(error.detail())
+                    .into_response());
+                }
+                if let Some(guard) = expect.as_mut() {
+                    guard.layout_revision = Some(authorized);
                 }
                 // The command is drained after the frame hook adopted the
                 // store (bounded wait, off the clock), so PVW shows it at once.
@@ -590,6 +639,7 @@ pub(crate) async fn submit_switcher(
                 operation_id: op.to_string(),
                 scene_version,
                 verb,
+                expect: expect.take(),
             };
             let admitted = if let Some((target, lease)) = lease {
                 let enqueue = || {

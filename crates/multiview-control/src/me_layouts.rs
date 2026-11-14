@@ -117,6 +117,10 @@ pub const ME_LAYOUT_ON_AIR_DETAIL: &str =
 
 struct Entry {
     revision: u64,
+    /// The registered body (what the engine composes): a CUT/AUTO of it or a
+    /// select of an input patched to it authorizes this body's closure and
+    /// sends its revision (#307 review A1).
+    body: LayoutBody,
     leases: Vec<Box<dyn SourceDemandLease>>,
     last_referenced: Instant,
 }
@@ -136,7 +140,11 @@ struct Fences {
 
 impl Fences {
     fn get(&self, id: &str) -> u64 {
-        self.by_id.get(id).copied().unwrap_or(self.floor).max(self.floor)
+        self.by_id
+            .get(id)
+            .copied()
+            .unwrap_or(self.floor)
+            .max(self.floor)
     }
 
     fn set(&mut self, id: &str, value: u64) {
@@ -318,6 +326,10 @@ impl MeLayoutRegistry {
     /// order: entries → adapter writer; the adapter never calls back), so a
     /// registration can never interleave with a removal of the same id.
     ///
+    /// Returns the revision of the registered body afterwards: `body`'s own
+    /// revision, or a higher one when a newer body was already registered
+    /// (then `body` was not adopted; the caller authorized `body` only).
+    ///
     /// # Errors
     /// [`MeLayoutError::Changed`] (the body predates the layout's fence),
     /// [`MeLayoutError::Capacity`] (full) or [`MeLayoutError::Lease`];
@@ -327,7 +339,7 @@ impl MeLayoutRegistry {
         body: LayoutBody,
         demand: Option<&SharedSourceDemand>,
         now: Instant,
-    ) -> Result<(), MeLayoutError> {
+    ) -> Result<u64, MeLayoutError> {
         let id = body.0.id.clone();
         let mut inner = self.lock();
         // A body read before a committed (or committing) edit/delete of
@@ -340,7 +352,7 @@ impl MeLayoutRegistry {
             entry.last_referenced = now;
             // Already registered: a newer read swaps the body like an edit.
             self.swap_body(&id, entry, body, demand);
-            return Ok(());
+            return Ok(entry.revision);
         }
         if entries.len() >= MAX_ME_LAYOUT_SOURCES {
             return Err(MeLayoutError::Capacity);
@@ -348,17 +360,18 @@ impl MeLayoutRegistry {
         let leases = lease_all(demand, &id, &body)?;
         let revision = body.0.revision;
         self.sources
-            .register(body)
+            .register(body.clone())
             .map_err(|MeLayoutRefusal::Capacity| MeLayoutError::Capacity)?;
         entries.insert(
             id,
             Entry {
                 revision,
+                body,
                 leases,
                 last_referenced: now,
             },
         );
-        Ok(())
+        Ok(revision)
     }
 
     /// Swap a registered entry's body (caller holds the entries lock).
@@ -383,6 +396,7 @@ impl MeLayoutRegistry {
             );
         }
         entry.revision = body.0.revision;
+        entry.body = body.clone();
         if self.sources.register(body).is_err() {
             tracing::warn!(layout = %id, "M/E layout source: the edited body was not adopted");
         }
@@ -426,6 +440,12 @@ impl MeLayoutRegistry {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// The registered body of `id` (what the engine composes), if any.
+    #[must_use]
+    pub fn registered_body(&self, id: &str) -> Option<LayoutBody> {
+        self.lock().entries.get(id).map(|entry| entry.body.clone())
     }
 
     /// Whether `id` is registered.

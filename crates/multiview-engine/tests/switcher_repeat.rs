@@ -80,6 +80,7 @@ fn repeat_ticks_never_claim_cut_before_fresh_frame() {
             operation_id: "cut-repeat".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     for i in 1..20 {

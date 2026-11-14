@@ -89,6 +89,7 @@ async fn owned_hook_cut_changes_actual_composited_program_without_false_202() {
             operation_id: "one".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     let pace = Arc::clone(&clock);
@@ -169,6 +170,7 @@ fn failed_rebind_rolls_back_selection_and_never_airs_later() {
             operation_id: "failed-cut".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     hook.before_compose(
@@ -274,6 +276,7 @@ fn repatching_the_program_input_rebinds_the_program_cell_on_the_same_tick() {
                         members: vec![(1, Some(SourceRef::new("b")))],
                         allow_on_air: true,
                     }),
+                    expect: None,
                 })
                 .unwrap();
         }

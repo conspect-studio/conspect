@@ -776,6 +776,7 @@ pub(crate) async fn take_patch(
                 .collect(),
             allow_on_air: req.on_air == OnAir::Allow,
         }),
+        expect: None,
     };
     let [program_lease, preview_lease] = leases;
     let owner = &state.switcher_preview_lease;

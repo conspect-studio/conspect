@@ -102,7 +102,7 @@ impl Rig {
 
     fn register(&self) {
         self.sources.publish(LayoutSourceSet {
-            entries: vec![(Arc::from(KEY), Arc::clone(&self.layout_store))],
+            entries: vec![(Arc::from(KEY), Arc::clone(&self.layout_store), 1)],
         });
     }
 
@@ -209,6 +209,7 @@ fn cmd(op: String, verb: SwitcherVerb) -> SwitcherCommand {
         operation_id: op,
         scene_version: 1,
         verb,
+        expect: None,
     }
 }
 
@@ -264,7 +265,7 @@ async fn a_layout_source_flood_keeps_one_frame_per_tick() {
                     republished += 1;
                 } else if n % 16 == 15 {
                     sources.publish(LayoutSourceSet {
-                        entries: vec![(Arc::from(KEY), Arc::clone(&store))],
+                        entries: vec![(Arc::from(KEY), Arc::clone(&store), 1)],
                     });
                     republished += 1;
                 }

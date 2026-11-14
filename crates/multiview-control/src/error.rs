@@ -121,6 +121,11 @@ pub enum ControlError {
     #[error("layout {0:?} is on the M/E")]
     LayoutOnAir(String),
 
+    /// A stored layout an operation names changed (or was released) while
+    /// the request was in flight (#307 review A1/A3): 409 `layout-changed`.
+    #[error("layout {0:?} changed while the request was in flight")]
+    LayoutChanged(String),
+
     /// A stored layout (an M/E source, #307) is not admissible: 422
     /// `layout-not-admissible`.
     #[error("layout not admissible: {0}")]
@@ -232,6 +237,12 @@ impl ControlError {
                 Problem::new(409, "layout-on-air", "Layout is on the M/E").with_detail(format!(
                     "layout {layout:?}: {}",
                     crate::me_layouts::ME_LAYOUT_ON_AIR_DETAIL
+                ))
+            }
+            Self::LayoutChanged(layout) => {
+                Problem::new(409, "layout-changed", "Layout changed").with_detail(format!(
+                    "layout {layout:?}: {}",
+                    crate::me_layouts::MeLayoutError::Changed.detail()
                 ))
             }
             Self::LayoutNotAdmissible(detail) => Problem::new(

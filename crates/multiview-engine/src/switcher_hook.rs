@@ -90,13 +90,16 @@ impl<C> SwitcherFrameHook<C> {
         if generation != self.seen_generation {
             self.seen_generation = generation;
             let set = sources.load();
-            for (key, store) in &set.entries {
+            for (key, store, revision) in &set.entries {
                 let current = drive.store(key);
-                if current.is_some_and(|existing| Arc::ptr_eq(existing, store)) {
+                if current.is_some_and(|existing| Arc::ptr_eq(existing, store))
+                    && self.driver.source_revision(key) == Some(*revision)
+                {
                     continue;
                 }
                 drive.insert_store(key.as_ref(), Arc::clone(store));
-                self.driver.insert_prime_store(key, Arc::clone(store));
+                self.driver
+                    .insert_prime_store(key, Arc::clone(store), *revision);
                 if let Some(stores) = self.preview_stores.as_mut() {
                     stores.insert(key.to_string(), Arc::clone(store));
                 }
@@ -390,7 +393,7 @@ mod tests {
     impl Rig {
         fn register(&self) {
             self.sources.publish(LayoutSourceSet {
-                entries: vec![(Arc::from(KEY), Arc::clone(&self.store))],
+                entries: vec![(Arc::from(KEY), Arc::clone(&self.store), 1)],
             });
         }
 
@@ -416,11 +419,7 @@ mod tests {
 
         fn send(&self, verb: SwitcherVerb) {
             self.handle
-                .try_send(SwitcherCommand {
-                    operation_id: format!("op-{}", self.next),
-                    scene_version: 1,
-                    verb,
-                })
+                .try_send(SwitcherCommand::new(format!("op-{}", self.next), 1, verb))
                 .unwrap();
         }
 
@@ -454,7 +453,7 @@ mod tests {
         // A body swap (same key, new store) replaces the Arc in place.
         let swapped = Arc::new(TileStore::<Nv12Image>::with_defaults(KEY));
         rig.sources.publish(LayoutSourceSet {
-            entries: vec![(Arc::from(KEY), Arc::clone(&swapped))],
+            entries: vec![(Arc::from(KEY), Arc::clone(&swapped), 2)],
         });
         rig.step(false);
         assert!(Arc::ptr_eq(rig.drive.store(KEY).unwrap(), &swapped));

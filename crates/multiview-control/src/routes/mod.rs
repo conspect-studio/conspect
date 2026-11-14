@@ -450,7 +450,9 @@ async fn update_layout(
         &principal,
         &id,
         &input.body,
-        fence.as_ref().is_some_and(crate::me_layouts::LayoutFence::registered),
+        fence
+            .as_ref()
+            .is_some_and(crate::me_layouts::LayoutFence::registered),
     )?;
     let versioned = if state.boot_model.is_some() {
         let mut layouts = crate::boot_model::layout_library(&state)?;

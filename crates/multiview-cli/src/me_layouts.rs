@@ -82,7 +82,7 @@ impl MeLayoutAdapter {
         let generation = self.engine.publish_generation(LayoutSourceSet {
             entries: entries
                 .iter()
-                .map(|e| (Arc::clone(&e.key), Arc::clone(&e.store)))
+                .map(|e| (Arc::clone(&e.key), Arc::clone(&e.store), e.body.revision))
                 .collect(),
         });
         self.published.store(generation, Ordering::Release);

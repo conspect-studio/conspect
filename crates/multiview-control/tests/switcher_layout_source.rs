@@ -312,9 +312,17 @@ impl Rig {
     /// One engine tick, with every registered layout's store primed (what
     /// the frame hook's adoption plus the aux compose provide in a run).
     fn tick(&mut self) {
-        for id in self.sources.registered() {
+        let registered: Vec<(String, u64)> = self
+            .sources
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, body)| (id.clone(), body.0.revision))
+            .collect();
+        for (id, revision) in registered {
             let key = format!("layout:{id}");
-            self.driver.insert_prime_store(&key, store(&key));
+            self.driver.insert_prime_store(&key, store(&key), revision);
         }
         let tick = Tick {
             index: self.next_tick,
@@ -935,7 +943,10 @@ async fn an_old_read_is_refused_after_an_edit_commits() {
         registry.ensure(old, None, Instant::now()),
         Err(multiview_control::me_layouts::MeLayoutError::Changed)
     );
-    assert!(rig.sources.registered().is_empty(), "the old body never registers");
+    assert!(
+        rig.sources.registered().is_empty(),
+        "the old body never registers"
+    );
     let fresh = routed_rev(
         "wall",
         multiview_control::output_routing::next_layout_revision(),
@@ -952,7 +963,10 @@ fn a_committing_edit_refuses_every_registration() {
     let registry = MeLayoutRegistry::new(shared(&sources));
     let fence = registry.begin_edit("x");
     assert!(!fence.registered());
-    let during = routed_rev("x", multiview_control::output_routing::next_layout_revision());
+    let during = routed_rev(
+        "x",
+        multiview_control::output_routing::next_layout_revision(),
+    );
     assert_eq!(
         registry.ensure(during.clone(), None, Instant::now()),
         Err(multiview_control::me_layouts::MeLayoutError::Changed)
@@ -963,7 +977,10 @@ fn a_committing_edit_refuses_every_registration() {
         Err(multiview_control::me_layouts::MeLayoutError::Changed),
         "read during the commit stays refused"
     );
-    let after = routed_rev("x", multiview_control::output_routing::next_layout_revision());
+    let after = routed_rev(
+        "x",
+        multiview_control::output_routing::next_layout_revision(),
+    );
     registry.ensure(after, None, Instant::now()).unwrap();
     assert_eq!(registry.ids(), vec!["x".to_owned()]);
 }
@@ -1047,4 +1064,154 @@ async fn deleting_a_registered_but_unreferenced_layout_is_refused() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+/// The engine's outcome for operation `op` (from a subscription taken before
+/// the request).
+fn outcome_of(
+    outcomes: &mut multiview_engine::EventSubscription<
+        multiview_engine::switcher_control::SwitcherOutcome,
+    >,
+    op: &str,
+) -> multiview_engine::switcher_control::SwitcherOutcome {
+    while let Ok(event) = outcomes.try_recv() {
+        if event.event.operation_id == op {
+            return (*event.event).clone();
+        }
+    }
+    panic!("no outcome for {op}");
+}
+
+async fn accepted_op(response: axum::response::Response) -> String {
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    body_json(response).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// #307 review A1: an unrestricted operator queues `secret-wall` on Preview;
+/// a scoped operator (no Read on `secret`) CUTs before the tick. The CUT was
+/// authorized for the old Preview, so the engine refuses it.
+#[tokio::test]
+async fn a_scoped_cut_cannot_take_a_preview_queued_after_its_authorization() {
+    let mut rig = Rig::new(false);
+    let mut outcomes = rig.handle.outcomes();
+    let response = submit(
+        &rig,
+        OPERATOR_TOKEN,
+        "q1",
+        select("select_preview", "secret-wall"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let cut = json!({"me": "me1", "program": "main", "action": "cut"});
+    let op = accepted_op(submit(&rig, LIMITED, "q2", cut).await).await;
+    rig.tick();
+    let outcome = outcome_of(&mut outcomes, &op);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("selection-changed")),
+        "{outcome:?}"
+    );
+    assert_eq!(rig.handle.snapshot().unwrap().program.as_str(), "a");
+}
+
+/// #307 review A1: a select of a numbered input authorized for its old patch
+/// is refused when a re-patch queued before it lands first.
+#[tokio::test]
+async fn an_input_select_after_a_queued_repatch_is_refused() {
+    let mut rig = Rig::new(true);
+    let mut outcomes = rig.handle.outcomes();
+    let patched = send(
+        &rig.router,
+        keyed(
+            post_json(
+                "/api/v1/patch/take",
+                OPERATOR_TOKEN,
+                &patch_xp(3, json!({"source": "b"})),
+            ),
+            "rp0",
+        ),
+    )
+    .await;
+    assert_eq!(patched.status(), StatusCode::ACCEPTED);
+    rig.tick();
+    // Queue a re-patch of input 3 to `secret`, then (before the tick) a
+    // scoped select of input 3, authorized against its patch `b`.
+    let repatch = send(
+        &rig.router,
+        keyed(
+            post_json(
+                "/api/v1/patch/take",
+                OPERATOR_TOKEN,
+                &patch_xp(3, json!({"source": "secret"})),
+            ),
+            "rp1",
+        ),
+    )
+    .await;
+    assert_eq!(repatch.status(), StatusCode::ACCEPTED);
+    let pgm = json!({"me": "me1", "program": "main", "action": "select_program", "input": 3});
+    let op = accepted_op(submit(&rig, LIMITED, "rp2", pgm).await).await;
+    rig.tick();
+    let outcome = outcome_of(&mut outcomes, &op);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("selection-changed")),
+        "{outcome:?}"
+    );
+    assert_eq!(rig.handle.snapshot().unwrap().program.as_str(), "a");
+}
+
+/// #307 review A1: a CUT of `layout:wall` authorized for its registered body
+/// is refused when the body is edited (and adopted) before it executes.
+#[tokio::test]
+async fn a_cut_of_a_layout_edited_after_authorization_is_refused() {
+    let mut rig = Rig::new(false);
+    let mut outcomes = rig.handle.outcomes();
+    let response = submit(
+        &rig,
+        OPERATOR_TOKEN,
+        "be0",
+        select("select_preview", "wall"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    rig.tick();
+    let cut = json!({"me": "me1", "program": "main", "action": "cut"});
+    let op = accepted_op(submit(&rig, LIMITED, "be1", cut.clone()).await).await;
+    let response = send(
+        &rig.router,
+        put_json(
+            "/api/v1/layouts/wall",
+            OPERATOR_TOKEN,
+            Some("W/\"1\""),
+            &json!({ "name": "wall", "body": layout_body(&[("b", 1.0)], 64) }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    rig.tick();
+    let outcome = outcome_of(&mut outcomes, &op);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("selection-changed")),
+        "{outcome:?}"
+    );
+    assert_eq!(rig.handle.snapshot().unwrap().program.as_str(), "a");
+    // Re-planned against the edited body, the CUT takes it.
+    let op = accepted_op(submit(&rig, LIMITED, "be2", cut).await).await;
+    rig.tick();
+    assert_eq!(outcome_of(&mut outcomes, &op).error, None);
+    assert_eq!(
+        rig.handle.snapshot().unwrap().program.as_str(),
+        "layout:wall"
+    );
 }

@@ -24,8 +24,10 @@ pub const MAX_ME_LAYOUT_SOURCES: usize = 4;
 /// One immutable set of layout-source stores, keyed `layout:<id>`.
 #[derive(Debug, Default)]
 pub struct LayoutSourceSet {
-    /// `(source key "layout:<id>", its composed-picture store)`.
-    pub entries: Vec<(Arc<str>, Arc<TileStore<Nv12Image>>)>,
+    /// `(source key "layout:<id>", its composed-picture store, the body
+    /// revision it composes)`. The revision is what a command's
+    /// `SelectionGuard::layout_revision` is checked against (#307 review A1).
+    pub entries: Vec<(Arc<str>, Arc<TileStore<Nv12Image>>, u64)>,
 }
 
 impl LayoutSourceSet {
@@ -35,8 +37,8 @@ impl LayoutSourceSet {
     pub fn get(&self, key: &str) -> Option<&Arc<TileStore<Nv12Image>>> {
         self.entries
             .iter()
-            .find(|(k, _)| k.as_ref() == key)
-            .map(|(_, store)| store)
+            .find(|(k, _, _)| k.as_ref() == key)
+            .map(|(_, store, _)| store)
     }
 }
 
@@ -120,7 +122,7 @@ mod tests {
         assert!(sources.load().entries.is_empty());
         let store = Arc::new(TileStore::with_defaults("layout:a"));
         sources.publish(LayoutSourceSet {
-            entries: vec![(Arc::from("layout:a"), Arc::clone(&store))],
+            entries: vec![(Arc::from("layout:a"), Arc::clone(&store), 1)],
         });
         assert_eq!(sources.generation(), 1);
         assert_eq!(sources.adopted_generation(), 0);
@@ -129,7 +131,7 @@ mod tests {
         assert_eq!(sources.publish_generation(LayoutSourceSet::default()), 2);
         assert!(sources.load().entries.is_empty());
         sources.publish(LayoutSourceSet {
-            entries: vec![(Arc::from("layout:a"), Arc::clone(&store))],
+            entries: vec![(Arc::from("layout:a"), Arc::clone(&store), 1)],
         });
         let set = sources.load();
         assert!(Arc::ptr_eq(set.get("layout:a").unwrap(), &store));
