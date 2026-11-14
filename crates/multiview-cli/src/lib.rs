@@ -413,6 +413,12 @@ pub mod webrtc_unified;
 
 /// A routed stored layout's integer aux canvas (ADR-0108 slice 3).
 pub mod aux_layout;
+/// The multiview overlay layers on a routed layout's aux canvas.
+#[cfg(feature = "overlay")]
+pub mod aux_overlays;
+/// Content-fault probe construction shared by Program and routed layouts.
+#[cfg(feature = "overlay")]
+pub mod fault_probes;
 /// Per-output format convert with a shared per-tick cache (#342).
 pub mod format_convert;
 /// Pure-integer NV12 cell scaler (monitor wall, routing aux canvases).
@@ -421,6 +427,9 @@ pub mod nv12_blit;
 pub mod output_fit;
 /// The `routing-aux` thread: routed feeds (ADR-0108 slices 1 and 3).
 pub mod routing_aux;
+/// Subtitle slots on outputs (slice F #345): the off-clock cue sampler that
+/// fills HLS WebVTT renditions from each slot's patched source.
+pub mod subtitle_slots;
 
 /// The shared monitor wall (ADR-0103): one composed, once-encoded MoQ stream.
 #[cfg(feature = "moq-output")]

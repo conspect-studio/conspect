@@ -806,6 +806,7 @@ async fn serve_control_plane(
     let live_capability = if ingest.is_some() {
         multiview_control::LiveSourceCapability::synthetic_and_network()
             .with_rist(cfg!(feature = "rist"))
+            .with_youtube(cfg!(feature = "youtube"))
     } else {
         multiview_control::LiveSourceCapability::synthetic_only()
     };

@@ -556,6 +556,10 @@ pub fn run_capture_observed(
         "width":capture.width,"height":capture.height,"fps":capture.fps,"frames":capture.frames,
         "source": source,
         "background": capture.background,
+        "gl": tools.gl,
+        "capture": capture.effective_capture(),
+        "timing": capture.capture.timing, "frame_ms": capture.capture.frame_ms,
+        "end_hold_ms": capture.capture.end_hold_ms, "max_steps": capture.capture.max_steps,
     }))?;
     let mut command = Command::new(&tools.node);
     command
@@ -563,7 +567,8 @@ pub fn run_capture_observed(
             "-e",
             &HOST
                 .replace("/*WINDY_TEMPLATE*/", include_str!("template_windy.cjs"))
-                .replace("/*MOV_COLOR*/", include_str!("mov_color.cjs")),
+                .replace("/*MOV_COLOR*/", include_str!("mov_color.cjs"))
+                .replace("/*STEP_PLAN*/", include_str!("step_plan.cjs")),
         ])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -590,9 +595,21 @@ pub fn run_capture_observed(
         .ok_or_else(|| io::Error::other("capture completion missing"))?;
     let marker: serde_json::Value = serde_json::from_slice(&line)
         .map_err(|_| io::Error::other("capture completion missing"))?;
+    // Realtime writes exactly `frames`; steps writes a producer-derived count
+    // that is still bounded by the frame cap and reports at least two kept steps.
+    let frames = marker.get("frames").and_then(serde_json::Value::as_u64);
+    let frames_ok = match capture.effective_capture() {
+        crate::capture::CaptureMode::Realtime => frames == Some(u64::from(capture.frames)),
+        crate::capture::CaptureMode::Steps => {
+            frames.is_some_and(|f| (2..=u64::from(crate::capture::MAX_FRAMES)).contains(&f))
+                && marker
+                    .get("steps_kept")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|k| k >= 2)
+        }
+    };
     if marker.get("event").and_then(serde_json::Value::as_str) != Some("capture_complete")
-        || marker.get("frames").and_then(serde_json::Value::as_u64)
-            != Some(u64::from(capture.frames))
+        || !frames_ok
         || (capture.background == crate::capture::Background::Transparent
             && marker.get("alpha").and_then(serde_json::Value::as_bool) != Some(true))
     {

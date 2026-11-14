@@ -11114,7 +11114,7 @@
         },
         "responses": {
           "201": {
-            "description": "The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file) on a full-engine run — `restart` otherwise (ndi/youtube/aes67, or a run without the decoder; ADR-W018).",
+            "description": "The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file, and youtube on a build with the `youtube` feature) on a full-engine run — `restart` otherwise (ndi/aes67, or a run without the decoder; ADR-W018).",
             "content": {
               "application/json": {
                 "schema": {
@@ -11360,7 +11360,7 @@
             }
           },
           "409": {
-            "description": "This run cannot start sources.",
+            "description": "This run cannot start sources, or the source is saved but applies on restart (the detail says which).",
             "content": {
               "application/json": {
                 "schema": {
@@ -15803,6 +15803,14 @@
           }
         },
         "additionalProperties": false
+      },
+      "CaptureMode": {
+        "type": "string",
+        "description": "How the page animation becomes frames.",
+        "enum": [
+          "steps",
+          "realtime"
+        ]
       },
       "CastConfigDoc": {
         "type": "object",
@@ -24680,6 +24688,14 @@
           }
         }
       },
+      "StepTiming": {
+        "type": "string",
+        "description": "Steps-mode duration rule.",
+        "enum": [
+          "equal",
+          "proportional"
+        ]
+      },
       "StreamDescriptorDoc": {
         "allOf": [
           {
@@ -26269,10 +26285,33 @@
           "frames"
         ],
         "properties": {
+          "capture": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CaptureMode",
+                "description": "`steps` iterates the radar timeline (default for radar; radar only);\n`realtime` records `frames` wall-clock screenshots (default for wind)."
+              }
+            ]
+          },
+          "end_hold_ms": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Steps-mode hold of the newest step in ms, 0 through 10000 (default 1000).",
+            "minimum": 0
+          },
           "fps": {
             "type": "integer",
             "format": "int32",
             "description": "Capture cadence.",
+            "minimum": 0
+          },
+          "frame_ms": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Steps-mode per-step duration in ms, 100 through 5000 (default 600).",
             "minimum": 0
           },
           "frames": {
@@ -26297,6 +26336,12 @@
             "format": "double",
             "description": "Longitude."
           },
+          "max_steps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Steps-mode count of most recent radar steps, 2 through 48 (default 12).",
+            "minimum": 0
+          },
           "overlay": {
             "type": "string",
             "description": "Radar or wind."
@@ -26304,6 +26349,10 @@
           "public": {
             "type": "boolean",
             "description": "Explicitly use the public unauthenticated page. Default requests Premium."
+          },
+          "timing": {
+            "$ref": "#/components/schemas/StepTiming",
+            "description": "Steps-mode per-step duration rule (default `equal`)."
           },
           "width": {
             "type": "integer",

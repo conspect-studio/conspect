@@ -153,6 +153,12 @@ msgstr ""
 msgid "{0} observations were dropped since this server started, so this history has gaps."
 msgstr ""
 
+#. placeholder {0}: summary.on
+#. placeholder {1}: summary.total
+#: src/pages/LayoutsPage.tsx:122
+msgid "{0} of {1}"
+msgstr ""
+
 #. placeholder {0}: link.dropped
 #: src/pages/OutputsPage.tsx:277
 msgid "{0} packets dropped"
@@ -766,7 +772,7 @@ msgid "About display nodes"
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:300
-#: src/pages/LayoutsPage.tsx:247
+#: src/pages/LayoutsPage.tsx:657
 msgid "About layouts"
 msgstr ""
 
@@ -839,7 +845,7 @@ msgstr ""
 msgid "Accept the publisher's audio (Opus)"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:323
+#: src/pages/LayoutsPage.tsx:733
 msgid "Accessible editing path: Cells form + Inspector in the editor"
 msgstr ""
 
@@ -889,12 +895,16 @@ msgstr ""
 msgid "Action log"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:461
+msgid "Action/graphics safe-area guide lines."
+msgstr ""
+
 #: src/pages/AlarmsPage.tsx:221
 #: src/pages/approved/SourcesSurface.tsx:370
 #: src/pages/CastPage.tsx:393
 #: src/pages/DevicesPage.tsx:634
 #: src/pages/graphics/DataView.tsx:365
-#: src/pages/LayoutsPage.tsx:94
+#: src/pages/LayoutsPage.tsx:132
 #: src/pages/OverlaysPage.tsx:194
 #: src/pages/ProbesPage.tsx:452
 #: src/pages/SyncGroupsPage.tsx:295
@@ -1195,6 +1205,7 @@ msgstr ""
 
 #: src/events/JournalPanel.tsx:85
 #: src/pages/approved/SourcesSurface.tsx:319
+#: src/pages/LayoutsPage.tsx:118
 msgid "All"
 msgstr ""
 
@@ -1202,7 +1213,7 @@ msgstr ""
 msgid "All cells showing this source"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:290
+#: src/pages/LayoutsPage.tsx:700
 msgid "All configured layouts."
 msgstr ""
 
@@ -1429,7 +1440,7 @@ msgid "Applies on the next restart."
 msgstr ""
 
 #: src/iptv/SourceLinks.tsx:359
-#: src/pages/LayoutsPage.tsx:115
+#: src/pages/LayoutsPage.tsx:153
 msgid "Apply"
 msgstr ""
 
@@ -1437,7 +1448,7 @@ msgstr ""
 msgid "Apply filter"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:107
+#: src/pages/LayoutsPage.tsx:145
 msgid "Apply layout to engine"
 msgstr ""
 
@@ -1604,6 +1615,10 @@ msgstr ""
 
 #: src/iptv/ProbeSummary.tsx:60
 msgid "Audio languages"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:414
+msgid "Audio meters"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:60
@@ -2059,7 +2074,8 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1211
 #: src/pages/graphics/DataView.tsx:320
 #: src/pages/graphics/LibraryView.tsx:155
-#: src/pages/LayoutsPage.tsx:361
+#: src/pages/LayoutsPage.tsx:499
+#: src/pages/LayoutsPage.tsx:771
 #: src/pages/MediaPlayersPage.tsx:894
 #: src/pages/OutputFeedRow.tsx:458
 #: src/pages/OutputsPage.tsx:1604
@@ -2158,6 +2174,10 @@ msgstr ""
 #: src/pages/CapabilitiesPage.tsx:285
 #: src/pages/DeviceDetailPage.tsx:491
 msgid "Capabilities"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:405
+msgid "Caption each cell with its bound source's name."
 msgstr ""
 
 #: src/pages/SourcesPage.tsx:817
@@ -2327,7 +2347,7 @@ msgstr ""
 #: src/docs/registry.ts:143
 #: src/layout/components/LayoutEditor.tsx:360
 #: src/pages/docs/ConfigPage.tsx:185
-#: src/pages/LayoutsPage.tsx:87
+#: src/pages/LayoutsPage.tsx:105
 msgid "Cells"
 msgstr ""
 
@@ -2536,8 +2556,16 @@ msgstr ""
 msgid "Clauses"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:120
+msgid "Clean"
+msgstr ""
+
 #: src/pages/OutputFeedRow.tsx:310
 msgid "CLEAN"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:480
+msgid "Clean (no overlays)"
 msgstr ""
 
 #: src/cast/CastFeedPicker.tsx:37
@@ -2602,6 +2630,7 @@ msgid "Clip-ready selection"
 msgstr ""
 
 #: src/events/JournalPanel.tsx:31
+#: src/pages/LayoutsPage.tsx:450
 #: src/pages/SourcesPage.tsx:102
 msgid "Clock"
 msgstr ""
@@ -3112,7 +3141,7 @@ msgstr ""
 msgid "Could not acknowledge alarm"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:193
+#: src/pages/LayoutsPage.tsx:603
 msgid "Could not apply layout"
 msgstr ""
 
@@ -3173,7 +3202,7 @@ msgstr ""
 msgid "Could not delete"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:226
+#: src/pages/LayoutsPage.tsx:636
 msgid "Could not delete layout"
 msgstr ""
 
@@ -3243,7 +3272,7 @@ msgstr ""
 msgid "Could not load graphics channels."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:274
+#: src/pages/LayoutsPage.tsx:684
 msgid "Could not load layouts:"
 msgstr ""
 
@@ -3349,6 +3378,10 @@ msgstr ""
 msgid "Could not load the ticket:"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:388
+msgid "Could not load this layout's current layers. Close and try again."
+msgstr ""
+
 #: src/pages/SupportPage.tsx:303
 msgid "Could not load tickets:"
 msgstr ""
@@ -3394,6 +3427,14 @@ msgstr ""
 
 #: src/pages/CastPage.tsx:204
 msgid "Could not save as a device"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:359
+msgid "Could not save layers"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:358
+msgid "Could not save layers: this layout is routed"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:94
@@ -3532,7 +3573,7 @@ msgstr ""
 msgid "Create today source"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:284
+#: src/pages/LayoutsPage.tsx:694
 msgid "Create your first layout"
 msgstr ""
 
@@ -3867,8 +3908,8 @@ msgid "Degraded event evidence: information may be incomplete."
 msgstr ""
 
 #: src/pages/approved/SourcesSurface.tsx:277
-#: src/pages/LayoutsPage.tsx:147
-#: src/pages/LayoutsPage.tsx:364
+#: src/pages/LayoutsPage.tsx:196
+#: src/pages/LayoutsPage.tsx:774
 #: src/pages/OutputsPage.tsx:1103
 #: src/pages/OutputsPage.tsx:1221
 #: src/pages/OutputsPage.tsx:1661
@@ -3893,11 +3934,11 @@ msgstr ""
 msgid "Delete {0}? If it is on air it is cut off air."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:141
+#: src/pages/LayoutsPage.tsx:190
 msgid "Delete layout"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:338
+#: src/pages/LayoutsPage.tsx:748
 msgid "Delete layout?"
 msgstr ""
 
@@ -4513,7 +4554,7 @@ msgid "EBU R128 (−23 LUFS)"
 msgstr ""
 
 #: src/pages/approved/SourcesSurface.tsx:274
-#: src/pages/LayoutsPage.tsx:135
+#: src/pages/LayoutsPage.tsx:173
 #: src/pages/OutputsPage.tsx:1093
 #: src/pages/OutputsPage.tsx:1211
 #: src/pages/SalvosPage.tsx:296
@@ -5683,7 +5724,7 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1032
 #: src/pages/DeviceDetailPage.tsx:1135
 #: src/pages/DevicesPage.tsx:113
-#: src/pages/LayoutsPage.tsx:78
+#: src/pages/LayoutsPage.tsx:96
 #: src/pages/OutputsPage.tsx:1557
 #: src/pages/OverlaysPage.tsx:268
 #: src/pages/ProbesPage.tsx:520
@@ -6179,12 +6220,23 @@ msgstr ""
 msgid "Layering over a looped video background"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:112
+#: src/pages/LayoutsPage.tsx:179
+#: src/pages/LayoutsPage.tsx:185
+#: src/pages/LayoutsPage.tsx:372
+msgid "Layers"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:348
+msgid "Layers saved"
+msgstr ""
+
 #: src/docs/registry.ts:133
 #: src/pages/docs/ConfigPage.tsx:110
 msgid "Layout"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:185
+#: src/pages/LayoutsPage.tsx:595
 msgid "Layout applied live"
 msgstr ""
 
@@ -6192,7 +6244,7 @@ msgstr ""
 msgid "layout cell"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:222
+#: src/pages/LayoutsPage.tsx:632
 msgid "Layout deleted"
 msgstr ""
 
@@ -6201,7 +6253,7 @@ msgstr ""
 msgid "Layout name"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:192
+#: src/pages/LayoutsPage.tsx:602
 msgid "Layout not applied: the switcher is on"
 msgstr ""
 
@@ -6235,7 +6287,7 @@ msgstr ""
 #: src/docs/registry.ts:227
 #: src/pages/DashboardPage.tsx:58
 #: src/pages/docs/FeaturesPage.tsx:25
-#: src/pages/LayoutsPage.tsx:238
+#: src/pages/LayoutsPage.tsx:648
 #: src/pages/OutputFeedRow.tsx:323
 msgid "Layouts"
 msgstr ""
@@ -6391,6 +6443,10 @@ msgstr ""
 
 #: src/pages/docs/concepts/ResiliencePage.tsx:35
 msgid "LIVE"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:426
+msgid "LIVE / STALE / NO SIGNAL and BLACK / FROZEN / NO AUDIO badges."
 msgstr ""
 
 #: src/docs/registry.ts:198
@@ -6563,7 +6619,7 @@ msgstr ""
 msgid "Loading layout…"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:270
+#: src/pages/LayoutsPage.tsx:680
 msgid "Loading layouts…"
 msgstr ""
 
@@ -6650,6 +6706,10 @@ msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:392
 msgid "Loading the catalogue…"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:384
+msgid "Loading the current layers…"
 msgstr ""
 
 #: src/events/JournalPanel.tsx:118
@@ -7255,7 +7315,7 @@ msgstr ""
 #: src/pages/graphics/LibraryView.tsx:117
 #: src/pages/graphics/PlayoutView.tsx:467
 #: src/pages/IptvPage.tsx:253
-#: src/pages/LayoutsPage.tsx:69
+#: src/pages/LayoutsPage.tsx:87
 #: src/pages/OutputsPage.tsx:1569
 #: src/pages/OverlaysPage.tsx:168
 #: src/pages/OverlaysPage.tsx:280
@@ -7396,7 +7456,7 @@ msgid "New instances blocked"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:338
-#: src/pages/LayoutsPage.tsx:261
+#: src/pages/LayoutsPage.tsx:671
 msgid "New layout"
 msgstr ""
 
@@ -7636,7 +7696,7 @@ msgstr ""
 msgid "No layout cells found — enter the cell id to watch."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:279
+#: src/pages/LayoutsPage.tsx:689
 msgid "No layouts are defined yet."
 msgstr ""
 
@@ -8027,7 +8087,7 @@ msgid "Nothing loaded — no bytes at risk"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:128
-#: src/pages/LayoutsPage.tsx:195
+#: src/pages/LayoutsPage.tsx:605
 msgid "Nothing was changed; the current layout keeps running."
 msgstr ""
 
@@ -8330,7 +8390,7 @@ msgstr ""
 
 #: src/api/operationStatus.ts:24
 #: src/pages/LayoutEditorPage.tsx:118
-#: src/pages/LayoutsPage.tsx:186
+#: src/pages/LayoutsPage.tsx:596
 #: src/pages/SalvosPage.tsx:154
 #: src/pages/TallyPage.tsx:142
 msgid "Operation id"
@@ -8602,6 +8662,10 @@ msgstr ""
 
 #: src/pages/SystemActionsPage.tsx:103
 msgid "Pending actions"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:415
+msgid "Per-cell audio level meters."
 msgstr ""
 
 #. placeholder {0}: h.host
@@ -9363,6 +9427,10 @@ msgstr ""
 msgid "Red"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:440
+msgid "Red = on Program, green = on Preview."
+msgstr ""
+
 #: src/pages/SupportPage.tsx:494
 msgid "Redactions in this pack"
 msgstr ""
@@ -9626,6 +9694,10 @@ msgstr ""
 
 #: src/pages/docs/ContainerPage.tsx:98
 msgid "Requires the NVIDIA driver and the NVIDIA Container Toolkit on the host. The modern path requests devices through CDI; NVENC and NVDEC also need the <0>video</0> driver capability."
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:491
+msgid "Reset to defaults"
 msgstr ""
 
 #: src/pages/RoutingPage.tsx:191
@@ -9940,6 +10012,10 @@ msgstr ""
 msgid "Safe technical details"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:460
+msgid "Safe-area markers"
+msgstr ""
+
 #: src/pages/DataPage.tsx:132
 msgid "Salted digests and a signed lease request — never raw serials, MAC addresses, or media. The exhaustive list:"
 msgstr ""
@@ -9984,6 +10060,7 @@ msgstr ""
 #: src/components/broadcast/library/VTReferenceSummary.tsx:246
 #: src/pages/CastPage.tsx:609
 #: src/pages/IptvPage.tsx:125
+#: src/pages/LayoutsPage.tsx:502
 #: src/pages/OutputsPage.tsx:1611
 #: src/pages/SalvosPage.tsx:398
 #: src/pages/SettingsPage.tsx:218
@@ -10566,6 +10643,10 @@ msgstr ""
 msgid "Source live preview"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:404
+msgid "Source names"
+msgstr ""
+
 #: src/preview/SourcePreviewButton.tsx:20
 msgid "Source preview"
 msgstr ""
@@ -10608,7 +10689,7 @@ msgstr ""
 msgid "Sources & library"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:241
+#: src/pages/LayoutsPage.tsx:651
 msgid "Sources → Layouts → Outputs. The accessible editor offers a form-based path equivalent to the drag-and-drop canvas. Save keeps a layout; apply asks the running engine to use it now. Saved layouts are not separate live renderers."
 msgstr ""
 
@@ -10752,6 +10833,10 @@ msgstr ""
 #: src/iptv/Controls.tsx:51
 #: src/iptv/IptvOrgPage.tsx:350
 msgid "State / province"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:424
+msgid "State & fault flags"
 msgstr ""
 
 #: src/layout/components/CellPropertiesPanel.tsx:245
@@ -11165,7 +11250,7 @@ msgid "Takes are locked and this one changes what is on program (the current PGM
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:118
-#: src/pages/LayoutsPage.tsx:186
+#: src/pages/LayoutsPage.tsx:596
 msgid "Takes effect at the next frame boundary."
 msgstr ""
 
@@ -11200,6 +11285,10 @@ msgstr ""
 
 #: src/pages/OverlaysPage.tsx:134
 msgid "Tally binding (optional)"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:438
+msgid "Tally borders"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:215
@@ -11710,6 +11799,10 @@ msgstr ""
 msgid "The MPEG transport stream is the container broadcast infrastructure speaks: a self-synchronizing packet format that multiplexes video, audio, subtitles, and data on numbered PIDs. Sent over UDP — usually to a multicast group so one sender feeds any number of receivers on the network — it is the classic in-facility distribution method, with latency well under a second."
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:451
+msgid "The on-screen clock."
+msgstr ""
+
 #: src/pages/docs/concepts/GlossaryPage.tsx:361
 msgid "The open standard for playing a WebRTC stream from a browser: the player POSTs an SDP offer to a single URL and receives the answer, then media flows over the peer connection. Conspect serves WHEP for <0>webrtc</0> outputs and for the sub-second in-app live preview."
 msgstr ""
@@ -11855,7 +11948,7 @@ msgstr ""
 msgid "The stream becomes an ordinary source linked to its IPTV-ORG entry. The Sources page opens the create dialog next with this choice already set; nothing is saved until you confirm there."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:123
+#: src/pages/LayoutsPage.tsx:161
 msgid "The switcher is on: Program is the M/E bus. Take this layout to an output from <0>Outputs</0>."
 msgstr ""
 
@@ -12049,6 +12142,10 @@ msgstr ""
 msgid "This is the lowest-latency way to reach a web page (well under a second, glass to glass) and the transport the in-app live preview uses when the build supports it, falling back to a ~1 fps still image otherwise. Reaching viewers across restrictive networks can need a TURN relay; that is configured by the operator on the server, not in the browser. A <0>webrtc</0> output is published at a derived WHEP URL and a <1>webrtc</1> source is published to at a derived WHIP URL — the forms show both so a publisher or viewer can be configured without reading the protocol specs."
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:394
+msgid "This layout changed elsewhere since it was opened here. Reopen Layers to edit the current version — nothing was overwritten."
+msgstr ""
+
 #: src/pages/LayoutEditorPage.tsx:290
 msgid "This layout uses the factory preset \"{preset}\". To edit it, convert it to an editable form first — nothing changes until you save."
 msgstr ""
@@ -12089,7 +12186,7 @@ msgstr ""
 msgid "This page is not served over HTTPS. A TV only plays an HTTPS address with a valid certificate."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:341
+#: src/pages/LayoutsPage.tsx:751
 msgid "This permanently removes the layout. Running outputs are not affected until a new layout is applied."
 msgstr ""
 
@@ -12811,7 +12908,7 @@ msgstr ""
 msgid "Video using a brightness curve (PQ or HLG) and usually the BT.2020 gamut that represents far brighter highlights and deeper shadows than standard dynamic range (SDR). HDR tiles must be tone-mapped onto an SDR canvas or they look dim and grey."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:255
+#: src/pages/LayoutsPage.tsx:665
 msgid "View current engine program"
 msgstr ""
 
@@ -13154,6 +13251,10 @@ msgstr ""
 
 #: src/pages/CapabilitiesPage.tsx:243
 msgid "Whether this server can resolve a live YouTube source (ADR-0015): the build feature plus the `yt-dlp` resolver found at startup."
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:375
+msgid "Which multiview layers {layoutName} bakes when a routed output shows it."
 msgstr ""
 
 #: src/pages/docs/concepts/CodecsPage.tsx:159

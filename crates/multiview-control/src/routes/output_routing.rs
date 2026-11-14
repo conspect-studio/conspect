@@ -571,6 +571,7 @@ fn resolve_layout(
         id: id.to_owned(),
         slates: resolved.document.cell_slates(),
         audio: resolved.document.audio.clone(),
+        overlays: resolved.document.overlays,
         layout: resolved.solved,
         revision,
     };
@@ -672,6 +673,7 @@ pub(crate) fn notify_layout_change(state: &AppState, id: &str, body: Option<&ser
             id: id.to_owned(),
             slates: resolved.document.cell_slates(),
             audio: resolved.document.audio.clone(),
+            overlays: resolved.document.overlays,
             layout: resolved.solved,
             revision: crate::output_routing::next_layout_revision(),
         };
