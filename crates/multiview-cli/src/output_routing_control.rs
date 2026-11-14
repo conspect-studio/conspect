@@ -661,6 +661,9 @@ impl multiview_control::program_metrics::ProgramMetricsSource for ProgramMetrics
             frames_repeated: handles
                 .frames_repeated
                 .load(std::sync::atomic::Ordering::Acquire),
+            compose_deadline_misses: handles
+                .compose_deadline_misses
+                .load(std::sync::atomic::Ordering::Acquire),
         })
     }
 }

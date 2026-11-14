@@ -39,6 +39,8 @@
 //!   swash shaping/rasterization into an etagere shelf-packed, byte-capped,
 //!   LRU-evicting glyph atlas with bundled OFL fonts (ADR-0016 §3.2). Pure-Rust,
 //!   GPU-free; the GPU sub-pass and CPU-reference blit consume it.
+//! - [`readback`] — the bounded GPU readback deadline/stall state machine
+//!   (issue #395) and its GPU-free simulated-device test seam.
 //! - [`error`] — the per-crate [`Error`] taxonomy.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -55,6 +57,7 @@ pub mod overlay;
 pub mod pipeline;
 pub mod primaries;
 pub mod range;
+pub mod readback;
 pub mod transfer;
 pub mod transfer_lut;
 

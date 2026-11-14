@@ -336,6 +336,70 @@ run was contended, a mean wake at most half the default run's (measured
 later than 1 ms. Single worst samples are not compared: on a GitHub runner the
 two runs' maxima tied (2.98 vs 2.96 ms).
 
+### 9. GPU readback deadline (#395)
+
+Before #395 the wgpu compositor waited for its readback with
+`device.poll(PollType::wait_indefinitely())` plus a blocking `recv()` **on the
+clock thread**, so a hung or slow GPU stalled Program forever, and any compose
+error ended the run loop. Now the wait is bounded and a miss is a counted
+last-good repeat.
+
+* **One bounded wait per frame, measured from submit.** After `queue.submit`
+  (keeping its `SubmissionIndex`) both readback buffers (Y, UV) are
+  `map_async`ed, then polled with `PollType::Wait { submission_index,
+  timeout: remaining }` and a non-blocking `try_recv` on each map callback until
+  both are mapped or the deadline passes. No `wait_indefinitely` and no blocking
+  `recv()` remain in the compositor.
+* **Deadline** `readback_deadline(period) = min(10 ms, period / 2)`
+  (`MAX_READBACK_DEADLINE` = 10 ms, the default before a period is known): 10 ms
+  at 25/29.97/30/50 fps, 8.33 ms at 60, 4.17 ms at 120. The 1080p GPU round trip
+  on the test server is ~4 ms (§8), so 10 ms is 2.5× healthy headroom; half a
+  period leaves the other half for wake + hook + project, so a miss never makes
+  the tick itself late by more than half a period and never cascades into
+  ADR-T018 catch-up. `CompositorDrive::with_backend` / `set_layout` set it from
+  the canvas cadence (`RunBackend::set_frame_period`).
+* **Miss ⇒ `Error::GpuDeadline` ⇒ repeat last-good.** The run backend does not
+  re-composite a deadline miss on the CPU (the budget is spent). The drive maps
+  it to the engine's `Error::ComposeDeadline`; the runtime emits last-good under
+  that tick exactly like a cadence-hold repeat (fresh tick and PTS,
+  `repeat = true`, published, lateness recorded), counts it in
+  `compose_deadline_misses` and `frames_repeated`, and calls
+  `FrameControl::on_compose_failed` so a switcher take staged for the tick is
+  rolled back (the same rollback as its own rejected-frame path). With no
+  last-good (the very first tick) the tick is composed on the CPU reference, so
+  the first frame always exists. Other compose errors keep their behaviour.
+* **Stall, fail fast, CPU after `STALL_HOLD` (500 ms), automatic recovery.** The
+  missed readback (buffers, map receivers, submission index, start instant) is
+  held. Every later frame first does a non-blocking `PollType::Poll` +
+  `try_recv`: still outstanding for < 500 ms ⇒ `GpuDeadline` at once, with no
+  GPU work and without touching the mid-map buffers; outstanding ≥ 500 ms ⇒
+  `GpuRuntime`, which the run backend composites on the CPU reference (counted
+  in `cpu_fallback_frames`), so a GPU that never answers freezes the picture for
+  at most half a second; completed or failed ⇒ unmap, clear, log `info` and
+  compose on the GPU again. Entering a stall logs `warn` once (rate-limited to
+  power-of-two stall counts), never per tick.
+* **Counters.** Compositor `readback_deadline_misses`
+  (`RunBackend::gpu_deadline_misses`); runtime `compose_deadline_misses`, exposed
+  as `compose_deadline_misses_total` / `_window` on `GET /api/v1/metrics/program`
+  (also counted in `frames_repeated_*`).
+* **Not bounded by this change.** wgpu 30 `Device::poll` panics
+  (`handle_error_fatal`) on a non-timeout device error such as device loss; the
+  clock thread's `catch_unwind` (§5) reports it, but it ends the run (tracking
+  issue). `wgpu::Queue` drop waits for the device to idle, so a hung GPU wedges
+  program teardown (the clock thread is detached at the grace, §5).
+  `queue.submit` / `write_texture` are not deadline-bounded (driver-side,
+  normally non-blocking).
+* **Tests.** The state machine lives in `multiview-compositor/src/readback.rs`
+  (always compiled) behind a `PendingReadback` trait; its unit tests drive a
+  simulated device GPU-free (on time, slow ⇒ miss within the deadline, fail-fast
+  while stalled, CPU after the hold, recovery). The R3 chaos test
+  `crates/multiview-engine/tests/gpu_readback_chaos.rs` runs a real clock thread
+  at 30 fps over `RunBackend::simulated_gpu` (the same state machine with a fake
+  device): healthy ⇒ hung 40 ticks ⇒ slow (60 ms) 10 ticks ⇒ healthy, and
+  asserts every tick emitted with contiguous indices and increasing PTS, misses
+  counted and repeated, CPU fallback during the hang, and fresh GPU frames after
+  recovery — counts and design bounds only.
+
 ## Rationale
 
 A thread removes both measured causes at once: no shared worker (a busy or

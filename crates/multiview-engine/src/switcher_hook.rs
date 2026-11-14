@@ -170,4 +170,23 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         (self.legacy)(drive);
         self.driver.repeat_tick(tick);
     }
+
+    /// The compose of `tick` missed its GPU readback deadline (#395) and was
+    /// re-emitted as last-good: roll the staged take back exactly as the
+    /// rebind-failure path above does.
+    fn on_compose_failed(
+        &mut self,
+        drive: &mut CompositorDrive<Nv12Image>,
+        tick: Tick,
+        reason: &str,
+    ) {
+        self.driver.reject_composed_tick(tick, reason);
+        let _ = drive.set_mix_overlay(None);
+        let (restored, _) = self.driver.resolved_selections();
+        if self.last_program.as_ref() != Some(restored)
+            && drive.rebind_cell(&self.cell_id, restored.as_str()).is_ok()
+        {
+            self.last_program = Some(restored.clone());
+        }
+    }
 }
