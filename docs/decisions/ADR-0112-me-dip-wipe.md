@@ -73,6 +73,60 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    reports the selected transition; the desk enables MIX/WIPE/DIP with a pattern
    picker and the AUTO rate.
 
+### 5. Stinger media — PR B: alpha decode (#391 subset)
+
+A media player whose asset has an alpha channel publishes NV12 plus a
+straight, full-resolution R8 alpha plane on every frame (ADR-0058 NV12+A).
+This is a general media-player output, not stinger-private: the plane is
+the existing `Nv12Image::alpha_plane` in `multiview-compositor`, so the
+stinger (PR A) and keyers K6 (ADR-0113 `fill_alpha`) consume the same
+tile. No switcher or drive code changes.
+
+- **Shared types.** The pure "where is the alpha sample" description and
+  the copy/rescale routine live in `multiview-core::alpha`
+  (`AlphaLayout`, `AlphaDepth`, `extract_alpha`; no libav, unit-tested in
+  the default build). `multiview-ffmpeg::alpha` maps libav pixel formats
+  to a layout (`alpha_layout`) and `DecodedVideoFrame::alpha` carries the
+  decoder's own pre-NV12 frame (a moved `AVFrame` reference, not a copy)
+  when the format has alpha, `None` otherwise.
+- **Formats.** Planar `yuva420p/422p/444p` at 8/9/10/12/16 bits (ProRes
+  4444 decodes to `yuva444p10le`/`yuva444p12le`, `libvpx-vp9` to
+  `yuva420p`), `gbrap*`, packed `argb/rgba/abgr/bgra` (`qtrle` is `argb`,
+  PNG `rgba`, TGA `bgra`), `rgba64/bgra64` (16-bit PNG) and `ya8/ya16`.
+  Deeper samples round to nearest 8-bit (`(v*255 + max/2)/max`). VP9 with
+  alpha (WebM `alpha_mode=1`) opens the BSD-licensed `libvpx-vp9` decoder
+  for player sources only, because libav's native `vp9` drops the alpha
+  side stream; if it is not linked or fails to open the asset plays opaque
+  with a warning. Not covered: paletted `pal8` (PNG/GIF palette alpha),
+  HEVC alpha (libav decodes it opaque; ADR-0058 §3 rejects it at import),
+  and alpha in non-player sources (ADR-0058 §5: NDI and ordinary video
+  stay opaque).
+- **Colour.** Unchanged: the NV12 conversion is the same libswscale
+  same-size conversion followed by the same `TileScaler`, so matrix, range
+  and order are exactly today's. Alpha is coverage, so it is never
+  range-mapped or linearized; the compositor premultiplies once in linear
+  light (ADR-0058 §2). Every supported decoder emits straight alpha and
+  none marks premultiplied output, so nothing is un-premultiplied; a
+  premultiplied-authored asset must be normalized at import (ADR-0057).
+- **Scale.** Alpha uses the luma's scaler geometry: decoded size to tile
+  size with the same Lanczos + accurate-rounding filter, `GRAY8` to `GRAY8`
+  (no colour step). Same-size frames copy straight into the pooled plane.
+- **Memory.** One pooled plane per frame from the bounded
+  `AlphaPlanePool` (`attach_with` writes it in place); the decoded-size and
+  tile-size scratch frames and the alpha scaler are reused across frames
+  (`Scaler::run_into`) and rebuilt only on a geometry change, so the steady
+  state does not grow the heap. Opaque assets build none of it.
+- **Tests.** Pure: `multiview-core` `alpha::tests` (odd sizes, padded
+  strides, 10/16-bit rescale, packed channels, bad input as errors).
+  Compositor: `tests/nv12_alpha.rs` pool reuse with no growth. Player path
+  (ffmpeg): `pipeline::media_alpha::tests` (yuva → NV12+A, rgba/argb/bgra
+  → NV12+A, odd-size scaling, steady-state reuse) and
+  `pipeline::media_alpha::player_tests`, which encode tiny qtrle, ProRes
+  4444, PNG-in-MOV and VP9-alpha clips with the `ffmpeg` CLI at test time
+  (printing `SKIP` when an encoder is missing), play them through the real
+  player executor and check the alpha at band centres, plus an opaque
+  MPEG-2 asset that publishes no alpha plane.
+
 ## Invariants
 
 - **#1:** a DIP or a bordered WIPE adds at most one tile to a dissolve's
