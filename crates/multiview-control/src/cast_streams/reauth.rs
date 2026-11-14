@@ -22,7 +22,9 @@
 //! slot source of the accepted config). Tracks and slots are resolved in
 //! the accepted config AND the run-bound one the engine started with (#418
 //! review ABUSE-1-R2/ABUSE-2-R2: an output PUT is restart-pending, the
-//! running sink keeps its renditions). A subtitle re-patch commits through
+//! running sink keeps its renditions) — snapshotted when the cast engine
+//! attaches, so store-only runs have one too; without any run-bound view
+//! the closure fails closed (ABUSE-STORE-R3). A subtitle re-patch commits through
 //! [`before_subtitle_change`] before the engine swaps its route table.
 //! A token whose owner fails, or whose owner can no longer be resolved, is
 //! revoked at once: its next request is the same `404` as any dead token,
@@ -374,12 +376,18 @@ fn closure(
     };
     let config = desired(state)?;
     let run = running(state);
-    let views: Vec<&multiview_config::MultiviewConfig> =
-        std::iter::once(&config).chain(run.as_ref()).collect();
+    // ABUSE-STORE-R3: no run-bound view declaring this output ⇒ what the
+    // running sink packages cannot be established: fail closed.
+    if !run.iter().any(|view| output_of(view, config_id).is_some()) {
+        return None;
+    }
+    let views: Vec<&multiview_config::MultiviewConfig> = std::iter::once(&config)
+        .chain(run.iter().map(AsRef::as_ref))
+        .collect();
     let mut needs = video_needs(state, video, layout)?;
     needs.extend(audio_needs(&config, config_id, audio)?);
     needs.extend(carried_track_needs(&views, config_id)?);
-    needs.extend(subtitle_needs(state, &views, config_id, subtitles)?);
+    needs.extend(subtitle_needs(state, &config, &run, config_id, subtitles)?);
     Some(needs)
 }
 
@@ -388,16 +396,23 @@ fn desired(state: &AppState) -> Option<multiview_config::MultiviewConfig> {
     serde_json::from_value(crate::boot_model::current_desired_config(state).ok()?).ok()
 }
 
-/// The run-bound configuration (#418 review ABUSE-1-R2/ABUSE-2-R2): the
-/// document the engine STARTED with — the boot model's adopted snapshot,
-/// whose outputs and audio routing are never advanced after start (only
-/// landed source/overlay/layout deltas are). A restart-pending output PUT
-/// changes the accepted document but not what the running cast sink
-/// packages (its renditions and subtitle slots are fixed per run), so the
-/// closure is the union of both views. `None`: no boot model (a store-only
-/// run, whose accepted document is what it runs).
-fn running(state: &AppState) -> Option<multiview_config::MultiviewConfig> {
-    Some(state.boot_model.as_ref()?.adopted_config())
+/// The run-bound views (#418 review ABUSE-1-R2/ABUSE-2-R2/ABUSE-STORE-R3):
+/// what the engine STARTED with, never the mutable accepted stores. A
+/// restart-pending output PUT changes the accepted document but not what
+/// the running cast sink packages (its renditions and subtitle slots are
+/// fixed per run), so the closure is the union of the accepted view and
+/// these. Two sources, each immutable per run: the start document
+/// snapshotted when the cast engine seam attached ([`AppState::cast_run`],
+/// present in boot-model and store-only runs alike) and the boot model's
+/// adopted snapshot (outputs and audio routing never advanced after start).
+/// Empty: no run view — the closure fails closed.
+fn running(state: &AppState) -> Vec<std::sync::Arc<multiview_config::MultiviewConfig>> {
+    let mut views: Vec<std::sync::Arc<multiview_config::MultiviewConfig>> =
+        state.cast_run.iter().cloned().collect();
+    if let Some(model) = &state.boot_model {
+        views.push(std::sync::Arc::new(model.adopted_config()));
+    }
+    views
 }
 
 /// The output `config_id` in `config` (`None`: not declared — fail closed).
@@ -471,12 +486,14 @@ fn live_subtitles(state: &AppState, config_id: &str) -> Option<Vec<Option<String
 /// re-patches), `patch`'s new source of a re-patched slot, and every slot
 /// source of the accepted config (where re-patches persist; a
 /// restart-pending slot set). When the engine reports no live table, the
-/// run-bound config's slot sources stand in for it (what the run started
-/// sampling), so a slot removed from the accepted config before the run
-/// reports its table still counts. An output no view declares fails closed.
+/// run-bound views' slot sources stand in for it (what the run started
+/// sampling), so a slot removed from the accepted config still counts;
+/// with no run view declaring the output it fails closed, never empty
+/// (#418 review ABUSE-STORE-R3).
 fn subtitle_needs(
     state: &AppState,
-    views: &[&multiview_config::MultiviewConfig],
+    accepted: &multiview_config::MultiviewConfig,
+    run: &[std::sync::Arc<multiview_config::MultiviewConfig>],
     config_id: &str,
     patch: Option<&[(usize, Option<String>)]>,
 ) -> Option<Vec<Need>> {
@@ -494,16 +511,20 @@ fn subtitle_needs(
                 .unwrap_or_default()
         })
     };
-    let (accepted, run) = (views.first()?, views.get(1));
-    let accepted = slot_sources(accepted);
-    let run = run.and_then(|config| slot_sources(config));
-    if accepted.is_none() && run.is_none() {
-        return None;
-    }
-    let mut sources = accepted.unwrap_or_default();
-    match live_subtitles(state, config_id) {
-        Some(live) => sources.extend(live),
-        None => sources.extend(run.unwrap_or_default()),
+    let mut sources = slot_sources(accepted).unwrap_or_default();
+    if let Some(live) = live_subtitles(state, config_id) {
+        sources.extend(live);
+    } else {
+        let mut declared = false;
+        for view in run {
+            if let Some(slots) = slot_sources(view) {
+                declared = true;
+                sources.extend(slots);
+            }
+        }
+        if !declared {
+            return None;
+        }
     }
     sources.extend(patch.unwrap_or_default().iter().map(|(_, s)| s.clone()));
     let mut needs = Vec::new();

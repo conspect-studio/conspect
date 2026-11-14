@@ -336,6 +336,22 @@ fn rig_with(adjust: impl FnOnce(AppState) -> AppState) -> Rig {
 
 /// [`rig_with`] over the configuration `doc`.
 fn rig_doc(doc: &str, adjust: impl FnOnce(AppState) -> AppState) -> Rig {
+    rig_mode(doc, Mode::Modeled, adjust)
+}
+
+/// How the rig's control plane is bound to the run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// A config-file run: the start document and a boot model.
+    Modeled,
+    /// A store-only run (no boot model) given its start document.
+    StoreOnly,
+    /// A store-only run with no start document at all (no run view).
+    Bare,
+}
+
+/// [`rig_doc`] in `mode`.
+fn rig_mode(doc: &str, mode: Mode, adjust: impl FnOnce(AppState) -> AppState) -> Rig {
     let tmp = tempfile::tempdir().unwrap();
     let mut dirs = HashMap::new();
     for id in ["cast-1", "cast-2"] {
@@ -362,29 +378,34 @@ fn rig_doc(doc: &str, adjust: impl FnOnce(AppState) -> AppState) -> Rig {
     let streams = Arc::new(CastStreams::with_clock(Arc::new(move || {
         clock_now.load(Ordering::SeqCst)
     })));
-    let state = AppState::new(
+    let mut state = AppState::new(
         Arc::clone(&engine),
         sender,
         Arc::new(InMemoryRepository::new()),
         Arc::new(keys()),
     )
-    .with_seeded_resources(seeded)
-    .with_base_document(serde_json::to_value(&config).unwrap())
-    .with_boot_model(Arc::new(BootModel::new(
-        tmp.path().join("multiview.toml"),
-        config.clone(),
-        config,
-        StartMode::Boot,
-        false,
-        None,
-    )))
-    .with_output_routing({
-        let seam: Arc<dyn OutputRouting> = routing.clone();
-        seam
-    })
-    .with_cast_engine(cast.clone())
-    .with_cast_streams(streams)
-    .with_cast_app_id(Some("1A2B3C4D".to_owned()));
+    .with_seeded_resources(seeded);
+    if mode != Mode::Bare {
+        state = state.with_base_document(serde_json::to_value(&config).unwrap());
+    }
+    if mode == Mode::Modeled {
+        state = state.with_boot_model(Arc::new(BootModel::new(
+            tmp.path().join("multiview.toml"),
+            config.clone(),
+            config,
+            StartMode::Boot,
+            false,
+            None,
+        )));
+    }
+    let state = state
+        .with_output_routing({
+            let seam: Arc<dyn OutputRouting> = routing.clone();
+            seam
+        })
+        .with_cast_engine(cast.clone())
+        .with_cast_streams(streams)
+        .with_cast_app_id(Some("1A2B3C4D".to_owned()));
     let state = adjust(state);
     Rig {
         router: multiview_control::router(state.clone()),
@@ -2618,5 +2639,137 @@ async fn a_recheck_revokes_on_running_dependencies_the_accepted_config_dropped()
         let (status, body) = fetch(&rig, &format!("/cast/{token}/master.m3u8")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{doc}");
         assert_eq!(body, b"not found\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #418 review ABUSE-STORE-R3: a store-only run (no boot model) keeps a
+// run-bound view of what its cast outputs package — the start document
+// snapshotted when the cast engine attaches — so a restart-pending output
+// PUT cannot hide a running dependency; without any run view the closure
+// fails closed.
+// ---------------------------------------------------------------------------
+
+/// The carried-dependency documents: explicit `slots.audio` track, `auto`
+/// selection, a private subtitle slot.
+fn store_only_docs() -> [String; 3] {
+    let slots = "[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"secret-trk\"\n";
+    [
+        doc_with(slots, SECRET_TRACK),
+        doc_with("audio = { mode = \"auto\" }\n", SECRET_TRACK),
+        subtitle_doc("secret-cam"),
+    ]
+}
+
+/// ABUSE-STORE-R3: in a store-only run, a restart-pending PUT dropping a
+/// private explicit track, the `auto` selection or a subtitle slot before
+/// the first token does not let a principal without Read on it create one
+/// (no live subtitle table: the run's slot sources stand in, never empty).
+#[tokio::test]
+async fn a_store_only_restart_pending_removal_still_needs_the_running_dependencies() {
+    for doc in &store_only_docs() {
+        let rig = rig_mode(doc, Mode::StoreOnly, |s| s);
+        assert!(rig.state.boot_model.is_none());
+        assert!(rig.state.cast_run.is_some());
+        put_cast_1(&rig, drop_slots).await;
+        let (status, created) = create(
+            &rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{doc}: {created}");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+        let (status, created) = create(
+            &rig,
+            OPERATOR_2,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{doc}: {created}");
+    }
+}
+
+/// ABUSE-STORE-R3: in a store-only run, an existing token whose owner loses
+/// Read on a dependency the RUN still packages is revoked by the re-check
+/// and then refused at the media barrier, although a restart-pending PUT
+/// dropped it from the accepted stores.
+#[tokio::test]
+async fn a_store_only_recheck_revokes_on_running_dependencies_the_put_dropped() {
+    for doc in &store_only_docs() {
+        let rig = rig_mode(doc, Mode::StoreOnly, |s| s);
+        let (status, created) = create(
+            &rig,
+            FRESH,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let token = token_of(&created);
+        put_cast_1(&rig, drop_slots).await;
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+            StatusCode::OK,
+            "{doc}"
+        );
+        assert!(rig.state.api_keys.set_principal(
+            "cs-fresh",
+            Principal {
+                key_id: "cs-fresh".to_owned(),
+                role: Role::Operator,
+                scoped_object_ids: Some(vec!["output-0".to_owned(), "a".to_owned()]),
+                scoped_output_ids: Some(vec!["output-0".to_owned(), "program:main".to_owned()]),
+                scoped_discovery_domains: None,
+            },
+        ));
+        multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/master.m3u8")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{doc}");
+        assert_eq!(body, b"not found\n");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+    }
+}
+
+/// ABUSE-STORE-R3: in a store-only run, a live subtitle swap to a private
+/// source after the restart-pending removal is caught by the media barrier.
+#[tokio::test]
+async fn a_store_only_media_barrier_revokes_on_a_live_slot_the_put_removed() {
+    let rig = rig_mode(&subtitle_doc("a"), Mode::StoreOnly, |s| s);
+    let (status, created) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let token = token_of(&created);
+    put_cast_1(&rig, drop_slots).await;
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+    let (status, body) = fetch(&rig, &format!("/cast/{token}/sub0-1-0.vtt")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found\n");
+    assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+}
+
+/// ABUSE-STORE-R3: with no run-bound view at all (no start document, no
+/// boot model) what the cast output packages cannot be established:
+/// creation fails closed, even for an unscoped operator.
+#[tokio::test]
+async fn without_a_run_view_cast_creation_fails_closed() {
+    let rig = rig_mode(&subtitle_doc("a"), Mode::Bare, |s| s);
+    assert!(rig.state.cast_run.is_none());
+    for key in [SCOPED, OPERATOR_2] {
+        let (status, created) = create(
+            &rig,
+            key,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{created}");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
     }
 }
