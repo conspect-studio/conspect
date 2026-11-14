@@ -288,3 +288,49 @@ async fn connect_outside_prefix_is_404_and_session_end_by_fin() {
     let (resp, _) = fetch(&mut client.send, request(http::Method::GET, "/after")).await;
     assert_eq!(resp.status(), 200);
 }
+
+/// #382: an offer with no protocol the server speaks is refused with 400
+/// BEFORE `admit`, so a single-use ticket survives for a retry with a
+/// usable offer; the connection's session slot stays free; Chrome's sf-list
+/// offer selects the client's most preferred supported entry; no offer at
+/// all is accepted without `wt-protocol`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offer_without_a_common_protocol_is_400_before_admit() {
+    let mut h = harness(None).await;
+    let handler_admitted = || Counters::get(&h.server.endpoint.counters().wt_sessions);
+    let mut client = h3_client(&h.server).await;
+    let ask = async |client: &mut Client, offer: Option<&str>| {
+        let fut = async {
+            let mut stream = client
+                .send
+                .send_request(connect_request("/moq/x?ticket=t", offer))
+                .await
+                .unwrap();
+            let resp = stream.recv_response().await.unwrap();
+            (resp, stream)
+        };
+        tokio::time::timeout(TIMEOUT, fut).await.unwrap()
+    };
+    let (resp, mut refused) = ask(&mut client, Some(r#""moq-transport-16", "moq-00""#)).await;
+    assert_eq!(resp.status(), 400);
+    assert!(!resp.headers().contains_key("wt-protocol"));
+    let end = tokio::time::timeout(TIMEOUT, refused.recv_data())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(end.is_none(), "the 400 stream was not finished");
+    assert_eq!(handler_admitted(), 0);
+    assert_eq!(Counters::get(&h.server.endpoint.counters().wt_refused), 1);
+    // The client's order wins: moq-lite-03 is listed before moqt-15.
+    let (resp, _connect) = ask(&mut client, Some(r#""zz", "moq-lite-03", "moqt-15""#)).await;
+    assert_eq!(resp.status(), 200, "the slot stayed free");
+    assert_eq!(resp.headers()["wt-protocol"], "\"moq-lite-03\"");
+    let (token, protocol) = recv(&mut h.sessions).await;
+    assert_eq!(token, "ticket=t");
+    assert_eq!(protocol.as_deref(), Some("moq-lite-03"));
+    // No offer: accepted on a fresh connection, no wt-protocol.
+    let mut other = h3_client(&h.server).await;
+    let (resp, _c2) = ask(&mut other, None).await;
+    assert_eq!(resp.status(), 200);
+    assert!(!resp.headers().contains_key("wt-protocol"));
+}
