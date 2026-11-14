@@ -258,6 +258,8 @@ pub(super) fn rate_output_specs(
                 );
                 indexes
             }
+            // Config refuses a cast output at another rate (#343).
+            RunnableOutput::Cast { .. } => Vec::new(),
             // Config admits only converting kinds as rate outputs; WebRTC is
             // never one (#343), nor are NDI and AES67, so they carry no lane audio.
             #[cfg(feature = "webrtc-native")]
