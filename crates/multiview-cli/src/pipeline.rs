@@ -2889,11 +2889,24 @@ impl Pipeline {
     /// source's clip cannot be generated, an NDI/unsupported source kind is
     /// declared, no runnable output is declared, or the encoder cannot be
     /// resolved.
+    pub fn build(config: &MultiviewConfig) -> Result<Self, PipelineError> {
+        Self::build_with_player_state(config, None)
+    }
+
+    /// Build with exclusive durable player runtime ownership.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::build`], plus a refusal when the durable player journal is
+    /// already owned by another runtime.
     #[allow(clippy::too_many_lines)]
     // reason: a sequential constructor that solves the layout, builds one store +
     // ingest plan per source, wires native captions, and assembles the outputs —
     // each step is in-scope and splitting it would only scatter the wiring.
-    pub fn build(config: &MultiviewConfig) -> Result<Self, PipelineError> {
+    pub fn build_with_player_state(
+        config: &MultiviewConfig,
+        player_state: Option<&Path>,
+    ) -> Result<Self, PipelineError> {
         // #317: a failed build may already have reserved live lifecycle
         // epochs/anchor slots/fetch registrations for its sources
         // (process-wide registries). Release ONLY the ids this build created
@@ -2905,7 +2918,7 @@ impl Pipeline {
             .map(|source| source.id.as_str())
             .filter(|id| live_lifecycle(id) == 0)
             .collect();
-        let built = Self::build_inner(config);
+        let built = Self::build_inner(config, player_state);
         if built.is_err() {
             for id in unreserved {
                 if live_lifecycle(id) != 0 {
@@ -2917,8 +2930,11 @@ impl Pipeline {
     }
 
     #[allow(clippy::too_many_lines)]
-    // reason: see `build`.
-    fn build_inner(config: &MultiviewConfig) -> Result<Self, PipelineError> {
+    // reason: see `build_with_player_state`.
+    fn build_inner(
+        config: &MultiviewConfig,
+        player_state: Option<&Path>,
+    ) -> Result<Self, PipelineError> {
         // Fail-closed (#103): an AES67 PCM-audio source in a non-`aes67` build is a
         // config this binary cannot honour — reject it clearly up front, never wire
         // it dark (the same contract as a `display` source/output in a non-
@@ -3230,7 +3246,13 @@ impl Pipeline {
         // a registered transport mailbox the control-plane command drain submits
         // verbs to. A player channel is a source like any other — the engine only
         // samples its store per tick (inv #1/#10).
-        let media_player_boot = build_media_player_boot(config, &layout, cadence, canvas_color);
+        let media_player_boot = build_media_player_boot_with_state(
+            config,
+            &layout,
+            cadence,
+            canvas_color,
+            player_state,
+        );
         let player_mailboxes = media_player_boot.mailboxes;
         for (id, store) in media_player_boot.stores {
             stores.insert(id, store);
@@ -10184,6 +10206,10 @@ impl FaultDetector {
 /// raises the stop flag and joins every thread, so a bounded run tears ingest
 /// down deterministically rather than leaking threads.
 struct IngestSupervisor {
+    /// Player-specific handles retain exceptional native bundles until a
+    /// control/supervisor thread joins them; generic live detachment remains.
+    #[cfg(feature = "ffmpeg")]
+    players: Vec<(Arc<AtomicBool>, PlayerJoin, PlayerPermit)>,
     /// One (stop flag, join handle) per spawned thread. Per-thread flags
     /// (ADR-W018) let a live `RemoveSource` tear down exactly one startup
     /// producer via the shared stop registry; shutdown raises every flag.
@@ -10237,6 +10263,8 @@ impl IngestSupervisor {
         caption_plans: Vec<crate::captions::CaptionPlan>,
         registry: &crate::live_sources::StopRegistry,
     ) -> Self {
+        #[cfg(feature = "ffmpeg")]
+        let mut players = Vec::with_capacity(2);
         let mut producers = Vec::with_capacity(
             plans
                 .len()
@@ -10245,6 +10273,18 @@ impl IngestSupervisor {
                 .saturating_add(player_audio_plans.len())
                 .saturating_add(caption_plans.len()),
         );
+        // A slot without an audio producer must never retain an unadoptable deck.
+        #[cfg(feature = "ffmpeg")]
+        for plan in &plans {
+            if let Some(runtime) = plan.player.as_ref().and_then(|p| p.runtime.as_ref()) {
+                if !player_audio_plans
+                    .iter()
+                    .any(|(audio, _)| audio.id == plan.id)
+                {
+                    drop(runtime.audio_commit.close());
+                }
+            }
+        }
         for plan in plans {
             // IN-5b: spawn the PROACTIVE youtube re-resolution loop as a supervised
             // SIBLING of this source's decode thread (before the decode thread takes
@@ -10300,6 +10340,17 @@ impl IngestSupervisor {
             // The decode thread itself — the SAME supervised producer the live
             // hub spawns (ADR-W018 level 2): `spawn_ingest_producer` registers
             // the per-source stop flag and runs `ingest_loop`.
+            #[cfg(feature = "ffmpeg")]
+            if plan
+                .player
+                .as_ref()
+                .is_some_and(|handle| handle.runtime.is_some())
+            {
+                if let Some((stop, handle, permit)) = spawn_player_producer(plan, registry) {
+                    players.push((stop, handle, permit));
+                }
+                continue;
+            }
             if let Some((stop, handle)) = spawn_ingest_producer(plan, registry) {
                 producers.push((stop, handle));
             }
@@ -10377,6 +10428,7 @@ impl IngestSupervisor {
             {
                 let builder =
                     std::thread::Builder::new().name(format!("multiview-player-audio-{id}"));
+                let slot_on_failure = plan.commit.clone();
                 match builder.spawn(move || {
                     let _exit = exit_guard;
                     crate::audio::player_audio_loop(&plan, &store, &thread_stop);
@@ -10387,6 +10439,9 @@ impl IngestSupervisor {
                         // skipped: its channel loops video normally and rides audio
                         // silence (best-effort — invariant #1; never gates output).
                         tracing::error!(error = %e, player = %id, "could not spawn media-player audio loop thread");
+                        if let Some(slot) = &slot_on_failure {
+                            let _ = slot.close();
+                        }
                     }
                 }
             }
@@ -10423,7 +10478,11 @@ impl IngestSupervisor {
                 }
             }
         }
-        Self { producers }
+        Self {
+            #[cfg(feature = "ffmpeg")]
+            players,
+            producers,
+        }
     }
 
     /// Signal every ingest thread to stop and join them.
@@ -10450,6 +10509,10 @@ impl IngestSupervisor {
         for (stop, _) in &self.producers {
             stop.store(true, Ordering::Release);
         }
+        #[cfg(feature = "ffmpeg")]
+        for (stop, _, _) in &self.players {
+            stop.store(true, Ordering::Release);
+        }
         // #309: never past an armed process exit deadline.
         let grace = crate::exit_watchdog::remaining()
             .map_or(INGEST_JOIN_GRACE, |left| left.min(INGEST_JOIN_GRACE));
@@ -10470,7 +10533,86 @@ impl IngestSupervisor {
                 tracing::error!(thread = %name, "ingest thread panicked during join");
             }
         }
+        #[cfg(feature = "ffmpeg")]
+        for (_, handle, permit) in self.players.drain(..) {
+            if handle.is_finished() {
+                match handle.join() {
+                    Ok(Some(bundle)) => {
+                        // The supervisor, never ingest, owns this exceptional
+                        // bundle and drops its native contexts here.
+                        drop(bundle);
+                    }
+                    Ok(None) => {}
+                    Err(_) => tracing::error!("player ingest panicked during join"),
+                }
+            } else {
+                quarantine_player_handle(handle, permit);
+            }
+        }
     }
+}
+
+/// Global player-ingest permit, acquired *before* spawn and released only after
+/// its `JoinHandle` is joined on a control thread. A wedged owner retains admission
+/// across supervisor recreation; never create a third player thread.
+#[cfg(feature = "ffmpeg")]
+struct PlayerPermit;
+#[cfg(feature = "ffmpeg")]
+static PLAYER_PERMITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "ffmpeg")]
+impl PlayerPermit {
+    #[allow(deprecated)] // fetch_update is MSRV 1.85; try_update requires 1.95.
+    fn acquire() -> Option<Self> {
+        PLAYER_PERMITS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < 2).then_some(n + 1)
+            })
+            .ok()?;
+        Some(Self)
+    }
+}
+#[cfg(feature = "ffmpeg")]
+impl Drop for PlayerPermit {
+    fn drop(&mut self) {
+        PLAYER_PERMITS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+type PlayerJoin = JoinHandle<Option<[Option<crate::player::StagedClip>; 3]>>;
+#[cfg(feature = "ffmpeg")]
+fn player_quarantine() -> &'static std::sync::Mutex<Vec<(PlayerJoin, PlayerPermit)>> {
+    static ROOT: std::sync::OnceLock<std::sync::Mutex<Vec<(PlayerJoin, PlayerPermit)>>> =
+        std::sync::OnceLock::new();
+    ROOT.get_or_init(|| std::sync::Mutex::new(Vec::with_capacity(2)))
+}
+#[cfg(feature = "ffmpeg")]
+fn reap_finished_players() {
+    let mut held = player_quarantine()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut i = 0;
+    while i < held.len() {
+        if held.get(i).is_some_and(|(handle, _)| handle.is_finished()) {
+            let (done, permit) = held.swap_remove(i);
+            if let Ok(Some(bundle)) = done.join() {
+                drop(bundle);
+            }
+            drop(permit);
+        } else {
+            i += 1;
+        }
+    }
+}
+/// Process-lifetime bounded ownership for player threads blocked in native
+/// reads after supervisor stop. No extra reaper threads.
+#[cfg(feature = "ffmpeg")]
+fn quarantine_player_handle(handle: PlayerJoin, permit: PlayerPermit) {
+    let mut held = player_quarantine()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The permit ceiling guarantees at most two entries globally.
+    held.push((handle, permit));
 }
 
 impl Drop for IngestSupervisor {
@@ -10538,6 +10680,33 @@ impl IngestSupervisor {
 /// A thread that cannot spawn is logged and yields `None`: its tile simply
 /// rides `NO_SIGNAL` (slate) rather than failing the run (invariant #1 — the
 /// output clock is independent of inputs).
+#[cfg(feature = "ffmpeg")]
+fn spawn_player_producer(
+    plan: IngestPlan,
+    registry: &crate::live_sources::StopRegistry,
+) -> Option<(Arc<AtomicBool>, PlayerJoin, PlayerPermit)> {
+    reap_finished_players();
+    let permit = PlayerPermit::acquire()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let id = plan.id.clone();
+    let exited = crate::live_sources::register_stop(registry, &id, &stop);
+    let exit_guard = crate::live_sources::ExitGuard::new(&exited);
+    let thread_stop = Arc::clone(&stop);
+    match std::thread::Builder::new()
+        .name(format!("multiview-ingest-{id}"))
+        .spawn(move || {
+            let _exit = exit_guard;
+            let handle = plan.player.as_ref()?;
+            player_runtime_loop(&plan, handle, &thread_stop)
+        }) {
+        Ok(handle) => Some((stop, handle, permit)),
+        Err(error) => {
+            tracing::error!(player = %id, %error, "player ingest spawn failed");
+            None
+        }
+    }
+}
+
 fn spawn_ingest_producer(
     plan: IngestPlan,
     registry: &crate::live_sources::StopRegistry,
@@ -14594,6 +14763,7 @@ struct MediaPlayerBoot {
 // the store + mailbox + handle, and constructs the (feature-gated) player
 // `IngestPlan` literal: inherently long and clearer kept whole than split across
 // helpers that would each take most of these locals.
+#[cfg(test)]
 #[allow(clippy::too_many_lines)]
 fn build_media_player_boot(
     config: &MultiviewConfig,
@@ -14601,6 +14771,19 @@ fn build_media_player_boot(
     cadence: Rational,
     canvas_color: CanvasColor,
 ) -> MediaPlayerBoot {
+    build_media_player_boot_with_state(config, layout, cadence, canvas_color, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_media_player_boot_with_state(
+    config: &MultiviewConfig,
+    layout: &Layout,
+    cadence: Rational,
+    canvas_color: CanvasColor,
+    state_root: Option<&std::path::Path>,
+) -> MediaPlayerBoot {
+    #[cfg(not(feature = "ffmpeg"))]
+    let _ = state_root;
     let mut boot = MediaPlayerBoot {
         plans: Vec::new(),
         stores: Vec::new(),
@@ -14618,53 +14801,75 @@ fn build_media_player_boot(
         boot.mailboxes
             .insert(player.id.clone(), Arc::clone(&mailbox));
 
-        // Resolve the default asset (if any) and require a declared out-point to
-        // boot a rolling channel.
-        let Some(asset_id) = player.default.as_deref() else {
-            tracing::info!(player = %player.id, "media player boots idle (no default asset)");
-            continue;
-        };
-        let asset = library.and_then(|l| l.assets.iter().find(|a| a.id == asset_id));
-        let Some(asset) = asset else {
-            tracing::warn!(
-                player = %player.id, asset = %asset_id,
-                "media player boots idle: default asset not found in the media library"
-            );
-            continue;
-        };
-        let Some(out_point) = asset.out_point_frames else {
-            tracing::warn!(
-                player = %player.id, asset = %asset_id,
-                "media player boots idle: default asset declares no out_point_frames \
-                 (probe-at-load is post-MVP)"
-            );
-            continue;
-        };
-        let in_point = asset.in_point_frames.unwrap_or(0);
-        // The vamp window defaults to the whole trimmed clip when unset.
-        let vamp_in = asset.vamp_in_frames.unwrap_or(in_point);
-        let vamp_out = asset.vamp_out_frames.unwrap_or(out_point);
-        let geometry = match crate::player::PlayoutGeometry::new(
-            in_point, out_point, vamp_in, vamp_out, cadence,
-        ) {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(
-                    player = %player.id, asset = %asset_id, error = %e,
-                    "media player boots idle: invalid playout geometry"
-                );
+        // Every declared player owns a slot; an absent/invalid default stays NA.
+        // The boot default is resolved into the SAME staged load path as a runtime
+        // verb, so cadence, trims and alpha are validated by one opener.
+        #[cfg(feature = "ffmpeg")]
+        let journal = state_root.map(|root| crate::player::BindingJournal::new(root, &player.id));
+        // Acquire before reading or opening anything. A conflicting engine must
+        // not expose a second executor for this durable player identity.
+        #[cfg(feature = "ffmpeg")]
+        let runtime_owner = match journal
+            .as_ref()
+            .map(super::player::BindingJournal::claim_runtime)
+            .transpose()
+        {
+            Ok(owner) => owner,
+            Err(error) => {
+                tracing::error!(player = %player.id, %error, "player journal already owned; boot refused");
                 continue;
             }
         };
-
-        // Resolve the asset path against the library root.
-        let path = match root {
-            Some(r) => std::path::Path::new(r).join(&asset.path),
-            None => std::path::PathBuf::from(&asset.path),
+        #[cfg(feature = "ffmpeg")]
+        let recovered_operation = journal
+            .as_ref()
+            .and_then(|journal| journal.recover().ok().flatten())
+            .and_then(|(_, operation)| operation);
+        #[cfg(feature = "ffmpeg")]
+        let recovered = journal.as_ref().map(super::player::BindingJournal::load);
+        #[cfg(feature = "ffmpeg")]
+        let boot_asset = match &recovered {
+            Some(Ok(Some(snapshot))) => match &snapshot.reference {
+                Some(crate::player::SlotReference::Asset { id }) => Some(id.as_str()),
+                _ => None, // Explicit unloaded or unresolved immutable artifact: fail closed.
+            },
+            Some(Err(error)) => {
+                tracing::error!(player = %player.id, %error, "player journal refused; default suppressed");
+                None
+            }
+            _ => player.default.as_deref(),
         };
-        // The libav-openable audio location (the SAME media as the video; the audio
-        // peer opens its own `!Send` libav context) for the player audio loop.
-        let audio_location = path.to_string_lossy().into_owned();
+        #[cfg(not(feature = "ffmpeg"))]
+        let boot_asset = player.default.as_deref();
+        let default = boot_asset.and_then(|asset_id| {
+            let asset = library?.assets.iter().find(|asset| asset.id == asset_id)?;
+            let path = root.map_or_else(
+                || std::path::PathBuf::from(&asset.path),
+                |root| std::path::Path::new(root).join(&asset.path),
+            );
+            let mut spec = crate::player::ClipSpec::new(path, crate::player::LoadThen::Resume);
+            spec.asset_id = Some(asset_id.to_owned());
+            spec.reference = Some(crate::player::SlotReference::Asset {
+                id: asset_id.to_owned(),
+            });
+            spec.in_point = asset.in_point_frames;
+            spec.out_point = asset.out_point_frames;
+            spec.vamp_in = asset.vamp_in_frames;
+            spec.vamp_out = asset.vamp_out_frames;
+            Some(spec)
+        });
+        let path = default
+            .as_ref()
+            .map_or_else(std::path::PathBuf::new, |spec| spec.path.clone());
+        // A one-frame sentinel belongs only to the pure core until the first
+        // real clip is probed and jointly committed.
+        let geometry = match crate::player::PlayoutGeometry::new(0, 1, 0, 1, cadence) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                tracing::error!(player = %player.id, %error, "invalid player canvas cadence");
+                continue;
+            }
+        };
 
         let (tile_w, tile_h) = cell_pixel_size(layout, &player.id)
             .unwrap_or((config.canvas.width, config.canvas.height));
@@ -14674,7 +14879,19 @@ fn build_media_player_boot(
             NoSignalPolicy::HoldForever,
         ));
         let eof_policy = map_eof_policy(player.eof_policy);
-        let handle = crate::player::PlayerHandle::new(
+        let na_image = match multiview_engine::slate::failover_slate_image(
+            multiview_engine::slate::FailoverSlate::NoSignal,
+            tile_w,
+            tile_h,
+            canvas_color,
+        ) {
+            Ok(image) => Arc::new(image),
+            Err(error) => {
+                tracing::error!(player = %player.id, %error, "media player NA image failed");
+                continue;
+            }
+        };
+        let mut handle = crate::player::PlayerHandle::new(
             player.id.clone(),
             geometry,
             eof_policy,
@@ -14688,18 +14905,116 @@ fn build_media_player_boot(
         // audio rail samples the video's authoritative transport state and wraps/
         // exits on the same instant by construction. A silent asset rides silence
         // (the deck primes empty).
+        handle.na_image = Some(Arc::clone(&na_image));
+        #[cfg(feature = "ffmpeg")]
+        {
+            let coordinator = Arc::new(crate::player::LoadCoordinator::new());
+            let audio_commit = Arc::new(crate::player::AudioCommitSlot::new());
+            if let Some(owner) = runtime_owner {
+                coordinator.retain_runtime_owner(Arc::clone(&owner));
+                audio_commit.retain_runtime_owner(owner);
+            }
+            let mut recovered_snapshot = recovered
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(Clone::clone)
+                .unwrap_or_default();
+            if recovered_snapshot.reference.is_some() && default.is_none() {
+                // A durable identity is not proof of an available decoder/pin.
+                // Preserve fail-closed boot policy, but never publish a phantom load.
+                tracing::warn!(player = %player.id, "recovered player binding unavailable; default suppressed");
+                recovered_snapshot.reference = None;
+            }
+            // Even a resolvable boot request is pending, not an active binding.
+            recovered_snapshot.reference = None;
+            coordinator.resume_after(recovered_snapshot.generation);
+            let opener = Arc::new(crate::player::PlayerOpener::new(
+                player.id.clone(),
+                Arc::clone(&coordinator),
+                crate::player::OpenerConfig::new(cadence).with_tile(tile_w, tile_h, canvas_color),
+            ));
+            if let Err(error) = opener.start() {
+                tracing::error!(player = %player.id, %error, "player opener unavailable; loads refused");
+            } else if let Some(spec) = default.clone() {
+                if let Err(error) = opener.request(spec) {
+                    tracing::warn!(player = %player.id, ?error, "boot default load refused");
+                }
+            }
+            handle.runtime = Some(crate::player::PlayerRuntime {
+                opener,
+                assets: Arc::new(
+                    library
+                        .map(|l| {
+                            l.assets
+                                .iter()
+                                .map(|asset| {
+                                    let path = root.map_or_else(
+                                        || PathBuf::from(&asset.path),
+                                        |r| Path::new(r).join(&asset.path),
+                                    );
+                                    let mut spec = crate::player::ClipSpec::new(
+                                        path,
+                                        crate::player::LoadThen::Cue,
+                                    );
+                                    spec.reference = Some(crate::player::SlotReference::Asset {
+                                        id: asset.id.clone(),
+                                    });
+                                    spec.in_point = asset.in_point_frames;
+                                    spec.out_point = asset.out_point_frames;
+                                    spec.vamp_in = asset.vamp_in_frames;
+                                    spec.vamp_out = asset.vamp_out_frames;
+                                    (asset.id.clone(), spec)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
+                coordinator,
+                audio_commit,
+                detach: Arc::new(recovered_operation.map_or_else(
+                    crate::player::DetachPort::default,
+                    |request| {
+                        crate::player::DetachPort::recovered(request, recovered_snapshot.generation)
+                    },
+                )),
+                journal,
+                na_image: Arc::clone(&na_image),
+                binding: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                    recovered_snapshot.clone(),
+                )),
+                native: Arc::new(multiview_framestore::SwapCell::empty()),
+                status: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                    crate::player::PlayerStatus::default(),
+                )),
+                #[cfg(test)]
+                panic_after_commit: Arc::new(AtomicBool::new(false)),
+                #[cfg(test)]
+                observer: None,
+                #[cfg(test)]
+                trace: None,
+            });
+        }
+        #[cfg(feature = "ffmpeg")]
+        if let Some(runtime) = &handle.runtime {
+            crate::player::runtime_provider().register(player.id.clone(), runtime.clone());
+        }
         let audio_control_bus = Arc::clone(&handle.control_bus);
         let audio_store = crate::audio::new_store();
         boot.audio_stores
             .push((player.id.clone(), Arc::clone(&audio_store)));
         boot.audio_plans.push(crate::audio::PlayerAudioPlan {
             id: player.id.clone(),
-            location: audio_location,
+            location: path.to_string_lossy().into_owned(),
             vamp_in_frames: geometry.vamp_in(),
             vamp_out_frames: geometry.vamp_out(),
             cadence: geometry.cadence(),
             output_cadence: cadence,
             control_bus: audio_control_bus,
+            #[cfg(feature = "ffmpeg")]
+            commit: handle
+                .runtime
+                .as_ref()
+                .map(|runtime| Arc::clone(&runtime.audio_commit)),
         });
 
         boot.stores.push((player.id.clone(), Arc::clone(&store)));
@@ -14744,10 +15059,9 @@ fn build_media_player_boot(
             youtube_yt_dlp_path: None,
         });
         tracing::info!(
-            player = %player.id, asset = %asset_id,
-            in_point, out_point, vamp_in, vamp_out,
-            looping = player.loop_default,
-            "media player boot-spawned"
+            player = %player.id,
+            default_asset = ?player.default,
+            "media player slot boot-spawned with NA heartbeat"
         );
     }
     boot
@@ -15694,7 +16008,1047 @@ fn ingest_resource_scope(id: &str) -> multiview_ffmpeg::ResourceGuard {
     multiview_ffmpeg::ResourceGuard::enter(multiview_ffmpeg::ResourceContext::source(id))
 }
 
+/// Player-only ingest executor: NA heartbeat, bounded off-thread stage commit,
+/// output-origin exact rational stamps. No file open or libav teardown runs on
+/// this thread; every mode polls mailbox and staging at every cadence period.
+#[cfg(feature = "ffmpeg")]
+#[allow(clippy::too_many_lines)]
+fn player_runtime_loop(
+    plan: &IngestPlan,
+    handle: &crate::player::PlayerHandle,
+    stop: &AtomicBool,
+) -> Option<[Option<crate::player::StagedClip>; 3]> {
+    // These fixed owners outlive the unwind boundary. The supervisor transfers
+    // them to the already-running opener on both normal exit and Rust panic.
+    let mut current = None;
+    let mut pending_retire = None;
+    let mut pending_stage = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        player_runtime_body(
+            plan,
+            handle,
+            stop,
+            &mut current,
+            &mut pending_retire,
+            &mut pending_stage,
+        );
+    }));
+    let runtime = handle.runtime.as_ref()?;
+    // The provider must not pin this runtime (and its journal flock) past stop.
+    crate::player::runtime_provider().unregister(&plan.id, runtime);
+    runtime.detach.stopped(runtime.binding.load().generation);
+    if result.is_err() {
+        tracing::error!(player = %plan.id, "player ingest panic; native owners retained for opener retirement");
+    }
+    let bundle = [
+        current.take(),
+        pending_stage.take().map(|s| s.clip),
+        pending_retire.take(),
+    ];
+    let exceptional = runtime.coordinator.put_shutdown_bundle(bundle).err();
+    runtime.opener.wake();
+    runtime.opener.stop();
+    exceptional
+}
+
+/// Test-only deterministic barrier in the player worker's seek handler, keyed per
+/// runtime (by its opener `Arc` address — never a process-global switch, so
+/// parallel tests cannot race). Production code is untouched: the call sites are
+/// `#[cfg(test)]` and the seek/flush ordering is unchanged.
+#[cfg(all(test, feature = "ffmpeg"))]
+pub(crate) mod seek_barrier {
+    #![allow(clippy::expect_used)] // Test-only barrier poisoning is a fixture failure.
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// One runtime's barrier: the worker parks in `pause_before_seek` until released.
+    #[derive(Default)]
+    pub(crate) struct Gate {
+        state: Mutex<(bool, bool, bool)>, // (entered, released, passed)
+        cv: Condvar,
+    }
+
+    impl Gate {
+        fn wait_flag(&self, pick: fn(&(bool, bool, bool)) -> bool, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut g = self
+                .state
+                .lock()
+                .expect("test barrier must not be poisoned");
+            while !pick(&g) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "hang deadline: {what}");
+                g = self
+                    .cv
+                    .wait_timeout(g, left)
+                    .expect("test barrier must not be poisoned")
+                    .0;
+            }
+        }
+        /// Block until the worker is parked before its actual seek.
+        pub(crate) fn wait_entered(&self) {
+            self.wait_flag(|s| s.0, "worker never reached the seek barrier");
+        }
+        /// Whether the worker is parked and has NOT yet seeked.
+        pub(crate) fn blocked(&self) -> bool {
+            let g = self
+                .state
+                .lock()
+                .expect("test barrier must not be poisoned");
+            g.0 && !g.1
+        }
+        /// Let the native seek/flush proceed.
+        pub(crate) fn release(&self) {
+            self.state
+                .lock()
+                .expect("test barrier must not be poisoned")
+                .1 = true;
+            self.cv.notify_all();
+        }
+        /// Block until the worker has resumed past the barrier.
+        pub(crate) fn wait_passed(&self) {
+            self.wait_flag(|s| s.2, "worker never resumed after release");
+        }
+    }
+
+    fn registry() -> &'static Mutex<HashMap<usize, Arc<Gate>>> {
+        static R: OnceLock<Mutex<HashMap<usize, Arc<Gate>>>> = OnceLock::new();
+        R.get_or_init(Mutex::default)
+    }
+
+    fn key(runtime: &crate::player::PlayerRuntime) -> usize {
+        Arc::as_ptr(&runtime.opener).addr()
+    }
+
+    /// Arm a barrier for exactly this runtime.
+    pub(crate) fn arm(runtime: &crate::player::PlayerRuntime) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        registry()
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .insert(key(runtime), Arc::clone(&gate));
+        gate
+    }
+
+    /// Worker side: park before the actual seek if this runtime is armed.
+    pub(crate) fn pause_before_seek(runtime: &crate::player::PlayerRuntime) {
+        let gate = registry()
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .remove(&key(runtime));
+        let Some(gate) = gate else { return };
+        gate.state
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .0 = true;
+        gate.cv.notify_all();
+        gate.wait_flag(|s| s.1, "barrier never released");
+        gate.state
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .2 = true;
+        gate.cv.notify_all();
+    }
+}
+
+/// Attempts at the durable precommit before a generation is retired.
+#[cfg(feature = "ffmpeg")]
+const PRECOMMIT_MAX_ATTEMPTS: u32 = 3;
+
+#[cfg(feature = "ffmpeg")]
+#[allow(clippy::too_many_lines)]
+fn player_runtime_body(
+    plan: &IngestPlan,
+    handle: &crate::player::PlayerHandle,
+    stop: &AtomicBool,
+    current: &mut Option<crate::player::StagedClip>,
+    pending_retire: &mut Option<crate::player::StagedClip>,
+    pending_stage: &mut Option<crate::player::Staged<crate::player::StagedClip>>,
+) {
+    use crate::player::{PlayerAction, TransportVerb};
+    let Some(runtime) = handle.runtime.as_ref() else {
+        return;
+    };
+    let opener = &runtime.opener;
+    let coordinator = &runtime.coordinator;
+    let audio_slot = &runtime.audio_commit;
+    let na = &runtime.na_image;
+    let cadence = plan.cadence;
+    let pacer = crate::player::OriginPacer::new(cadence);
+    let period = Duration::from_nanos(
+        u64::try_from(MediaTime::from_tick(1, cadence).as_nanos())
+            .unwrap_or(40_000_000)
+            .max(1),
+    );
+    let period_ns = u64::try_from(period.as_nanos()).unwrap_or(u64::MAX).max(1);
+    let na_period = (250_000_000_u64 / period_ns).max(1);
+    let na_n = u32::try_from(na_period).unwrap_or(1);
+    let mut player = match crate::player::MediaPlayer::idle(cadence, handle.eof_policy) {
+        Ok(p) => p,
+        Err(error) => {
+            tracing::error!(player = %plan.id, %error, "invalid player cadence");
+            return;
+        }
+    };
+    let mut last: Arc<Nv12Image> = Arc::clone(na);
+    let mut frame_index = 0_u64;
+    let mut eof_draining = false;
+    let mut eof_drained_frames = 0_u64;
+    let mut first = true;
+    let mut journal_refusal = None;
+    // Generation whose audio deck is parked in the commit slot (two-phase
+    // PREPARE sent, COMMIT not yet done). Ingest-local; never crosses threads.
+    let mut prepared_audio: Option<crate::player::Generation> = None;
+    // Bounded precommit retry: (generation, failed attempts).
+    let mut precommit_failures: (crate::player::Generation, u32) =
+        (crate::player::Generation::NONE, 0);
+    // A taken detach ticket whose cancellation was deferred by a held gate.
+    let mut deferred_detach: Option<Arc<crate::player::DetachTicket>> = None;
+    let mut warmup_packets = 0_u32;
+    let mut warmup_started = None;
+    let mut last_audio_control = None;
+    let mut armed_anchor = None;
+    let mut last_stamp = MediaTime::ZERO;
+    let mut detaching: Option<(
+        Arc<crate::player::DetachTicket>,
+        crate::player::Generation,
+        Option<u64>,
+    )> = None;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let Some(origin) = plan.output_origin.load().clone() else {
+            sleep_interruptible(period, stop);
+            continue;
+        };
+        let run_now = MediaTime::from_nanos(
+            origin
+                .time()
+                .now_nanos()
+                .saturating_sub(origin.seed_nanos()),
+        );
+        if first {
+            player.start_at(pacer.min_tick(run_now));
+            first = false;
+        }
+        player.catch_up(pacer.min_tick(run_now));
+        if detaching.is_none() {
+            if let Some(ticket) = deferred_detach.take().or_else(|| runtime.detach.take()) {
+                let binding = runtime.binding.load();
+                if ticket.recovery_generation == Some(binding.generation)
+                    && binding.reference.is_none()
+                    && current.is_none()
+                {
+                    // The exclusive journal lease excludes the old engine. Still
+                    // require THIS boot's opener quiescence and silent audio tail.
+                    let generation = binding.generation;
+                    audio_slot.request_retirement(generation);
+                    handle.control_bus.publish_commit(
+                        crate::player::AudioTransport::Stopped,
+                        generation,
+                        run_now,
+                    );
+                    detaching = Some((ticket, generation, None));
+                    opener.wake();
+                } else if binding.generation != ticket.request.expected || current.is_none() {
+                    crate::player::DetachPort::finish(
+                        &ticket,
+                        crate::player::DetachAck::Stale(binding.generation),
+                    );
+                } else {
+                    let proposed = crate::player::SlotSnapshot {
+                        generation: crate::player::Generation(
+                            coordinator.latest().0.saturating_add(1),
+                        ),
+                        reference: None,
+                    };
+                    if runtime.journal.as_ref().is_some_and(|journal| {
+                        journal.store_detach(&proposed, ticket.request).is_err()
+                    }) {
+                        crate::player::DetachPort::finish(
+                            &ticket,
+                            crate::player::DetachAck::JournalFailed,
+                        );
+                        continue;
+                    }
+                    #[cfg(test)]
+                    if let Some(marker) =
+                        std::env::var_os("MULTIVIEW_TEST_CRASH_AT_DETACH_PRECOMMIT")
+                    {
+                        std::fs::write(marker, b"durable-before-native-and-audio-retirement")
+                            .unwrap();
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                    let Some(generation) = coordinator.try_cancel_pending() else {
+                        // Gate held by a management submit: keep the durable
+                        // intent and the taken ticket; retry next tick.
+                        deferred_detach = Some(ticket);
+                        sleep_interruptible(period, stop);
+                        continue;
+                    };
+                    prepared_audio = None;
+                    audio_slot.request_retirement(generation);
+                    player = match crate::player::MediaPlayer::idle(cadence, handle.eof_policy) {
+                        Ok(player) => player,
+                        Err(_) => return,
+                    };
+                    player.start_at(pacer.min_tick(run_now));
+                    last = Arc::clone(na);
+                    handle.control_bus.publish_commit(
+                        crate::player::AudioTransport::Stopped,
+                        generation,
+                        run_now,
+                    );
+                    runtime.binding.store(Arc::new(crate::player::SlotSnapshot {
+                        generation,
+                        reference: None,
+                    }));
+                    detaching = Some((ticket, generation, None));
+                    opener.wake();
+                }
+            }
+        }
+        for verb in handle.mailbox.drain() {
+            match verb {
+                TransportVerb::Load { asset } => {
+                    if let Some(spec) = runtime.assets.get(&asset) {
+                        if let Err(error) = opener.request(spec.clone()) {
+                            tracing::warn!(player = %plan.id, ?error, "legacy configured asset load refused");
+                        }
+                    } else {
+                        tracing::warn!(player = %plan.id, "unknown configured player asset; picture retained");
+                    }
+                }
+                TransportVerb::Play => player.play(last_stamp),
+                TransportVerb::Vamp => player.vamp(last_stamp),
+                TransportVerb::Pause => player.pause(),
+                TransportVerb::Stop => player.stop(),
+                TransportVerb::ArmExit | TransportVerb::TakeExit => player.arm_exit(),
+                TransportVerb::CancelExit => player.cancel_exit(),
+                TransportVerb::Cue { frame } => {
+                    let target = frame.unwrap_or(player.geometry().in_point());
+                    if let Some(clip) = current.as_mut() {
+                        #[cfg(test)]
+                        seek_barrier::pause_before_seek(runtime);
+                        let micros = multiview_core::time::rescale(
+                            i64::try_from(target).unwrap_or(i64::MAX),
+                            Rational::new(cadence.den, cadence.num),
+                            Rational::new(1, 1_000_000),
+                        );
+                        let _seek_budget = clip
+                            .demuxer
+                            .phase_deadline(crate::player::OpenerConfig::READ_TIMEOUT);
+                        if clip.demuxer.seek(micros).is_ok() && clip.decoder.flush().is_ok() {
+                            eof_draining = false;
+                            eof_drained_frames = 0;
+                            warmup_packets = 0;
+                            warmup_started = None;
+                            frame_index = target;
+                        } else {
+                            tracing::warn!(player = %plan.id, target, "player cue seek failed; held until next load");
+                            player.pause();
+                            let epoch = handle.control_bus.load().clip_epoch.0;
+                            crate::player::publish_status(&runtime.status, |status| {
+                                status.after_seek_failure(epoch, target)
+                            });
+                        }
+                    }
+                }
+                TransportVerb::Seek { frame } => {
+                    if let Some(clip) = current.as_mut() {
+                        #[cfg(test)]
+                        seek_barrier::pause_before_seek(runtime);
+                        let micros = multiview_core::time::rescale(
+                            i64::try_from(frame).unwrap_or(i64::MAX),
+                            Rational::new(cadence.den, cadence.num),
+                            Rational::new(1, 1_000_000),
+                        );
+                        let _seek_budget = clip
+                            .demuxer
+                            .phase_deadline(crate::player::OpenerConfig::READ_TIMEOUT);
+                        if clip.demuxer.seek(micros).is_ok() && clip.decoder.flush().is_ok() {
+                            eof_draining = false;
+                            eof_drained_frames = 0;
+                            warmup_packets = 0;
+                            warmup_started = None;
+                            frame_index = frame;
+                        } else {
+                            tracing::warn!(player = %plan.id, frame, "player seek failed; held until next load");
+                            player.pause();
+                            let epoch = handle.control_bus.load().clip_epoch.0;
+                            crate::player::publish_status(&runtime.status, |status| {
+                                status.after_seek_failure(epoch, frame)
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(old) = pending_retire.take() {
+            *pending_retire = coordinator.retire(old).err();
+            opener.wake();
+        }
+        if let Some((ticket, generation, barrier)) = detaching.as_mut() {
+            // Keep every owner in the existing fixed slots until the opener accepts it.
+            if pending_retire.is_none() {
+                if let Some(clip) = current.take() {
+                    *pending_retire = coordinator.retire(clip).err();
+                }
+            }
+            if pending_retire.is_none() {
+                if let Some(staged) = pending_stage.take() {
+                    *pending_retire = coordinator.retire(staged.clip).err();
+                }
+            }
+            if current.is_none() && pending_stage.is_none() && pending_retire.is_none() {
+                let native = *barrier.get_or_insert_with(|| coordinator.retirement_barrier());
+                if coordinator.retirement_complete(native)
+                    && coordinator.is_quiescent(*generation)
+                    && audio_slot.retirement_complete(*generation)
+                {
+                    crate::player::DetachPort::finish(
+                        ticket,
+                        crate::player::DetachAck::Retired(*generation),
+                    );
+                    detaching = None;
+                }
+            }
+            opener.wake();
+        }
+        if pending_retire.is_none()
+            && pending_stage
+                .as_ref()
+                .is_some_and(|s| coordinator.is_superseded(s.generation))
+        {
+            let reclaimed = match pending_stage.as_mut() {
+                Some(stale) if prepared_audio == Some(stale.generation) => {
+                    match audio_slot.reclaim(stale.generation) {
+                        Ok(deck) => {
+                            if let Some(deck) = deck {
+                                stale.clip.audio = deck.deck;
+                                stale.clip.audio_lease = deck.lease;
+                            }
+                            true
+                        }
+                        Err(()) => false,
+                    }
+                }
+                _ => true,
+            };
+            if reclaimed {
+                prepared_audio = None;
+                if let Some(stale) = pending_stage.take() {
+                    *pending_retire = coordinator.retire(stale.clip).err();
+                    opener.wake();
+                }
+            }
+        }
+        if detaching.is_none() && pending_retire.is_none() {
+            if pending_stage.is_none() {
+                *pending_stage = coordinator.try_take(audio_slot);
+            }
+            if let Some(staged) = pending_stage.as_mut() {
+                let snapshot = crate::player::SlotSnapshot {
+                    generation: staged.generation,
+                    reference: staged.clip.reference.clone(),
+                };
+                let mut superseded_in_flight = false;
+                let audio_unavailable = audio_slot.is_closed() && staged.clip.probed.has_audio;
+                let already_prepared = prepared_audio == Some(snapshot.generation);
+                let refusal = if audio_unavailable {
+                    // Fail closed BEFORE any durable write: an audio-bearing clip
+                    // with a dead audio rail can never satisfy the A/V contract.
+                    Some(crate::player::PlayerFault::AudioUnavailable {
+                        generation: snapshot.generation.0,
+                    })
+                } else if already_prepared {
+                    None
+                } else {
+                    runtime.journal.as_ref().and_then(|journal| {
+                        if snapshot.reference.is_none() {
+                            Some(crate::player::PlayerFault::LoadReferenceMissing {
+                                generation: snapshot.generation.0,
+                            })
+                        } else {
+                            // Latest-wins: re-check AFTER the record is durable and
+                            // restore the prior binding if a newer request raced in.
+                            match journal.store_if_current(&snapshot, None, || {
+                                coordinator.claim_commit(snapshot.generation)
+                            }) {
+                                Ok(true) => None,
+                                Ok(false) => {
+                                    superseded_in_flight = true;
+                                    None
+                                }
+                                Err(_) => Some(crate::player::PlayerFault::LoadJournalFailed {
+                                    generation: snapshot.generation.0,
+                                }),
+                            }
+                        }
+                    })
+                };
+                if superseded_in_flight {
+                    if let Some(stale) = pending_stage.take() {
+                        *pending_retire = coordinator.retire(stale.clip).err();
+                        opener.wake();
+                    }
+                    continue;
+                }
+                if matches!(
+                    refusal,
+                    Some(crate::player::PlayerFault::AudioUnavailable { .. })
+                ) {
+                    // Terminal for this generation: retire the clip, keep the old one.
+                    prepared_audio = None;
+                    if let Some(fault) = refusal {
+                        tracing::warn!(player = %plan.id, ?fault, "audio-bearing load refused: audio rail closed; live binding unchanged");
+                        runtime.status.store(Arc::new(crate::player::PlayerStatus {
+                            clip_epoch: runtime.binding.load().generation.0,
+                            fault: Some(fault),
+                        }));
+                    }
+                    if let Some(stale) = pending_stage.take() {
+                        *pending_retire = coordinator.retire(stale.clip).err();
+                        opener.wake();
+                    }
+                    continue;
+                }
+                if let Some(fault) = refusal {
+                    if precommit_failures.0 != snapshot.generation {
+                        precommit_failures = (snapshot.generation, 0);
+                    }
+                    precommit_failures.1 += 1;
+                    if precommit_failures.1 >= PRECOMMIT_MAX_ATTEMPTS {
+                        // Bounded: terminal fault, retire the clip, accept no
+                        // further writes for this generation. Binding unchanged.
+                        tracing::error!(player = %plan.id, ?fault, "player load precommit failed terminally; clip retired");
+                        runtime.status.store(Arc::new(crate::player::PlayerStatus {
+                            clip_epoch: runtime.binding.load().generation.0,
+                            fault: Some(fault),
+                        }));
+                        journal_refusal = Some(fault);
+                        if let Some(stale) = pending_stage.take() {
+                            *pending_retire = coordinator.retire(stale.clip).err();
+                            opener.wake();
+                        }
+                        continue;
+                    }
+                    if journal_refusal != Some(fault) {
+                        tracing::warn!(player = %plan.id, ?fault, "player load precommit refused; live binding unchanged");
+                        runtime.status.store(Arc::new(crate::player::PlayerStatus {
+                            clip_epoch: runtime.binding.load().generation.0,
+                            fault: Some(fault),
+                        }));
+                        journal_refusal = Some(fault);
+                    }
+                    // Keep current video/audio owners unchanged on precommit failure.
+                    sleep_interruptible(period, stop);
+                    continue;
+                }
+                // Two-phase joint A/V commit. Audio-bearing clips: PREPARE parks
+                // the deck in the slot (video and old audio untouched); COMMIT
+                // (video swap + epoch publish) runs only after the live audio
+                // rail acknowledged PREPARE, polled nonblockingly on later
+                // iterations. A rail closed before COMMIT fails the load with A
+                // retained (refusal path above). Audio-less clips commit at once.
+                let epoch = staged.generation;
+                let has_audio = staged.clip.probed.has_audio;
+                // Held from the closed/prepared validation until the epoch is
+                // published (atomics and pointer swaps only): `close` cannot
+                // interleave, so close-after-claim is a runtime failure and
+                // close-before-claim fails B with A retained.
+                let mut commit_claim = None;
+                let audio_result: Result<(), crate::player::StagedAudio> = if has_audio {
+                    if audio_slot.is_closed() {
+                        // Raced a close: next tick takes the fail-closed refusal.
+                        continue;
+                    }
+                    if prepared_audio == Some(epoch) {
+                        match audio_slot.try_claim_commit(epoch) {
+                            Ok(claim) => {
+                                commit_claim = Some(claim);
+                                Ok(())
+                            }
+                            Err(crate::player::ClaimRefusal::Closed) => {
+                                // Next tick takes the fail-closed refusal.
+                                continue;
+                            }
+                            Err(_) => {
+                                sleep_interruptible(period, stop);
+                                continue;
+                            }
+                        }
+                    } else {
+                        let audio = crate::player::StagedAudio {
+                            deck: std::mem::replace(
+                                &mut staged.clip.audio,
+                                multiview_audio::LoopDeck::empty(crate::audio::canonical_format()),
+                            ),
+                            lease: staged.clip.audio_lease.take(),
+                            artifact_lease: staged.clip.artifact_lease.clone(),
+                        };
+                        match audio_slot.put(epoch, audio) {
+                            Ok(()) => {
+                                prepared_audio = Some(epoch);
+                                sleep_interruptible(period, stop);
+                            }
+                            Err(returned) => {
+                                staged.clip.audio = returned.deck;
+                                staged.clip.audio_lease = returned.lease;
+                            }
+                        }
+                        continue;
+                    }
+                } else if audio_slot.is_closed() {
+                    Ok(())
+                } else {
+                    let audio = crate::player::StagedAudio {
+                        deck: std::mem::replace(
+                            &mut staged.clip.audio,
+                            multiview_audio::LoopDeck::empty(crate::audio::canonical_format()),
+                        ),
+                        lease: staged.clip.audio_lease.take(),
+                        artifact_lease: staged.clip.artifact_lease.clone(),
+                    };
+                    audio_slot.put(epoch, audio)
+                };
+                match audio_result {
+                    Ok(()) => {
+                        prepared_audio = None;
+                        let commit_tick = pacer.min_tick(run_now);
+                        let anchor =
+                            player.rebind(staged.clip.geometry, staged.clip.then, commit_tick);
+                        let Some(staged) = pending_stage.take() else {
+                            continue;
+                        };
+                        let old = current.replace(staged.clip);
+                        if let Some(old) = old {
+                            *pending_retire = coordinator.retire(old).err();
+                            opener.wake();
+                        }
+                        if let Some(clip) = current.as_ref() {
+                            last = Arc::clone(&clip.first_image);
+                            frame_index = clip.geometry.in_point();
+                            eof_draining = false;
+                            eof_drained_frames = 0;
+                            warmup_packets = 0;
+                            warmup_started = None;
+                        }
+                        // Publish the primed first picture BEFORE publishing the
+                        // epoch. A reader that observes the new control generation
+                        // must never observe the old tile image at the same time.
+                        let at = match player.on_decoded(frame_index) {
+                            PlayerAction::Publish { at } | PlayerAction::Hold { at } => at,
+                            _ => MediaTime::from_tick(anchor, cadence),
+                        };
+                        plan.store
+                            .publish_arc_with_source_time(Arc::clone(&last), at, None);
+                        #[cfg(test)]
+                        if let Some(observer) = &runtime.observer {
+                            let _ = observer.try_send((at, run_now, Arc::clone(&last)));
+                        }
+                        last_stamp = at;
+                        frame_index = frame_index.saturating_add(1);
+                        handle.control_bus.publish_commit(
+                            crate::player::AudioTransport::Stopped,
+                            epoch,
+                            MediaTime::from_tick(anchor, cadence),
+                        );
+                        // Epoch visible: the audio gate is released before any
+                        // native/journal work.
+                        drop(commit_claim.take());
+                        if let Some(clip) = current.as_ref() {
+                            runtime.native.store(Some(Arc::new(
+                                multiview_control::player_load::NativeLoadAck {
+                                    operation: epoch.0,
+                                    generation: epoch.0,
+                                    source_id: match &clip.reference {
+                                        Some(
+                                            crate::player::SlotReference::Artifact { id, .. }
+                                            | crate::player::SlotReference::Asset { id },
+                                        ) => id.clone(),
+                                        None => String::new(),
+                                    },
+                                    duration_frames: clip.probed.frames,
+                                    duration_ns: clip.probed.frames.map(|n| {
+                                        multiview_core::time::rescale(
+                                            i64::try_from(n).unwrap_or(i64::MAX),
+                                            Rational::new(
+                                                clip.probed.cadence.den,
+                                                clip.probed.cadence.num,
+                                            ),
+                                            Rational::new(1, 1_000_000_000),
+                                        )
+                                    }),
+                                    cadence_num: clip.probed.cadence.num,
+                                    cadence_den: clip.probed.cadence.den,
+                                    width: clip.probed.width,
+                                    height: clip.probed.height,
+                                    has_audio: clip.probed.has_audio,
+                                    timeline_ns: at.as_nanos(),
+                                },
+                            )));
+                        }
+                        let committed = crate::player::SlotSnapshot {
+                            generation: epoch,
+                            reference: current.as_ref().and_then(|clip| clip.reference.clone()),
+                        };
+                        runtime.binding.store(Arc::new(committed.clone()));
+                        crate::player::publish_status(&runtime.status, |status| {
+                            status.after_commit(epoch.0)
+                        });
+                        // Finalize Prepared -> Committed only after the actual
+                        // video+audio commit, on the ingest executor (off the
+                        // output clock). A crash before this recovers the old
+                        // binding; a failure here leaves it Prepared (old-safe).
+                        if let Some(journal) = runtime.journal.as_ref() {
+                            if let Err(error) = journal.commit(&committed) {
+                                tracing::warn!(player = %plan.id, %error, "player journal finalize failed; boot recovers previous binding");
+                            }
+                        }
+                        last_audio_control = None;
+                    }
+                    Err(returned) => {
+                        staged.clip.audio = returned.deck;
+                        staged.clip.audio_lease = returned.lease;
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        assert!(
+            !(current.is_some() && runtime.panic_after_commit.swap(false, Ordering::AcqRel)),
+            "injected player panic after native commit"
+        );
+        // Control verbs must reach the audio rail even while the next video
+        // picture is stamped in the future and decode admission waits. This
+        // transition is operator-rate and independent of output tick emission.
+        armed_anchor = if player.exit_armed() {
+            Some(armed_anchor.unwrap_or(last_stamp))
+        } else {
+            None
+        };
+        publish_audio_control(
+            handle,
+            player.state(),
+            armed_anchor.unwrap_or(last_stamp),
+            &mut last_audio_control,
+        );
+        // Release admission runs BEFORE packet consumption or transport stamp
+        // advance. Advancing then failing `may_release` silently loses that
+        // source frame forever and can leave an idle/held tile frozen while the
+        // decoder races arbitrarily far into the future of a paused run clock.
+        if !pacer.may_release(player.next_stamp_tick(), run_now) {
+            sleep_interruptible(period, stop);
+            continue;
+        }
+        let action = if current.is_none() {
+            player.on_heartbeat_n(na_n)
+        } else if player.is_playing_state() {
+            if let Some(clip) = current.as_mut() {
+                let remaining = warmup_started.map_or(
+                    crate::player::OpenerConfig::READ_TIMEOUT,
+                    |started: std::time::Instant| {
+                        crate::player::OpenerConfig::READ_TIMEOUT.saturating_sub(started.elapsed())
+                    },
+                );
+                let _read_budget = clip.demuxer.phase_deadline(remaining);
+                let packet = if eof_draining {
+                    Ok(None)
+                } else {
+                    clip.demuxer.read_packet_for(clip.stream_index)
+                };
+                match packet {
+                    Ok(Some(packet)) => {
+                        if clip.decoder.send_packet(&packet.packet).is_err() {
+                            player.pause();
+                            player.on_heartbeat()
+                        } else {
+                            match clip.decoder.receive_frame() {
+                                Ok(Some(decoded)) => {
+                                    warmup_packets = 0;
+                                    warmup_started = None;
+                                    let index = frame_index;
+                                    frame_index = frame_index.saturating_add(1);
+                                    match player.on_decoded(index) {
+                                        PlayerAction::Publish { at } => {
+                                            if let Ok(image) = clip.scaler.convert(
+                                                &decoded.frame,
+                                                plan.canvas_color.output_tag(),
+                                            ) {
+                                                last = Arc::new(image);
+                                            }
+                                            PlayerAction::Publish { at }
+                                        }
+                                        PlayerAction::SeekFlushTo { frame } => {
+                                            // libav seek and flush are on the ingest thread only for
+                                            // the already-open current clip; never on the output clock.
+                                            let micros = multiview_core::time::rescale(
+                                                i64::try_from(frame).unwrap_or(i64::MAX),
+                                                Rational::new(cadence.den, cadence.num),
+                                                Rational::new(1, 1_000_000),
+                                            );
+                                            if clip.demuxer.seek(micros).is_ok() {
+                                                let _ = clip.decoder.flush();
+                                                frame_index = frame;
+                                            } else {
+                                                player.pause();
+                                            }
+                                            player.on_heartbeat()
+                                        }
+                                        _ => player.on_heartbeat(),
+                                    }
+                                }
+                                // Decoder reorder warm-up is not a source frame.
+                                // Consume the next packet without advancing the stamp
+                                // or republishing the pre-seek picture as a new frame.
+                                Ok(None) => {
+                                    warmup_packets = warmup_packets.saturating_add(1);
+                                    let started =
+                                        warmup_started.get_or_insert_with(std::time::Instant::now);
+                                    if warmup_packets >= 64
+                                        || started.elapsed()
+                                            >= crate::player::OpenerConfig::READ_TIMEOUT
+                                    {
+                                        tracing::warn!(player = %plan.id, "player decoder warm-up budget exhausted; paused");
+                                        player.pause();
+                                    }
+                                    // No output frame means no stamp advance or stale republish.
+                                    continue;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(player = %plan.id, %error, "player decode failed");
+                                    player.pause();
+                                    player.on_heartbeat()
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Send EOF through the decoder before deciding the lap:
+                        // reordered codecs may still hold delayed frames.
+                        if !eof_draining {
+                            if let Err(error) = clip.decoder.send_eof() {
+                                tracing::warn!(player = %plan.id, %error, "player EOF flush failed");
+                                player.pause();
+                            }
+                            eof_draining = true;
+                            eof_drained_frames = 0;
+                        }
+                        let drain_cap = clip.geometry.out_point().saturating_add(256);
+                        if eof_drained_frames >= drain_cap {
+                            tracing::warn!(player = %plan.id, drain_cap, "player EOF drain exceeded bound");
+                            player.pause();
+                        }
+                        match clip.decoder.receive_frame() {
+                            Ok(Some(decoded)) if player.is_playing_state() => {
+                                eof_drained_frames = eof_drained_frames.saturating_add(1);
+                                let index = frame_index;
+                                frame_index = frame_index.saturating_add(1);
+                                match player.on_decoded(index) {
+                                    PlayerAction::Publish { at } => {
+                                        if let Ok(image) = clip
+                                            .scaler
+                                            .convert(&decoded.frame, plan.canvas_color.output_tag())
+                                        {
+                                            last = Arc::new(image);
+                                        }
+                                        PlayerAction::Publish { at }
+                                    }
+                                    _ => player.on_heartbeat(),
+                                }
+                            }
+                            Ok(None) if player.is_playing_state() => {
+                                // All delayed frames drained, now safe to seek a new lap.
+                                eof_draining = false;
+                                eof_drained_frames = 0;
+                                let target = if matches!(
+                                    player.state(),
+                                    crate::player::MediaPlayerState::Vamping { .. }
+                                ) {
+                                    clip.geometry.vamp_in()
+                                } else {
+                                    clip.geometry.in_point()
+                                };
+                                if matches!(handle.eof_policy, crate::player::EofPolicy::Loop)
+                                    || matches!(
+                                        player.state(),
+                                        crate::player::MediaPlayerState::Vamping {
+                                            exit_armed: false
+                                        }
+                                    )
+                                {
+                                    // One cumulative I/O budget covers the
+                                    // seek AND all reorder-prime reads.
+                                    let _lap_deadline = clip
+                                        .demuxer
+                                        .phase_deadline(crate::player::OpenerConfig::READ_TIMEOUT);
+                                    let micros = multiview_core::time::rescale(
+                                        i64::try_from(target).unwrap_or(i64::MAX),
+                                        Rational::new(cadence.den, cadence.num),
+                                        Rational::new(1, 1_000_000),
+                                    );
+                                    if clip.demuxer.seek(micros).is_ok()
+                                        && clip.decoder.flush().is_ok()
+                                    {
+                                        frame_index = target;
+                                        // Re-prime one frame in this SAME output
+                                        // tick. A seek-only heartbeat repeats the
+                                        // last picture and loses a frame at every
+                                        // lap seam. No open or teardown here.
+                                        let mut primed = None;
+                                        // The aggregate phase deadline persists
+                                        // through each per-read arm/disarm. A
+                                        // malicious 64-packet stream cannot turn
+                                        // 2 s reads into a 128 s tile stall.
+                                        for _ in 0..64 {
+                                            if stop.load(Ordering::Acquire) {
+                                                break;
+                                            }
+                                            match clip.decoder.receive_frame() {
+                                                Ok(Some(decoded)) => {
+                                                    primed = Some(decoded);
+                                                    break;
+                                                }
+                                                Ok(None) => {}
+                                                Err(error) => {
+                                                    tracing::warn!(player = %plan.id, %error, "lap prime decode failed");
+                                                    break;
+                                                }
+                                            }
+                                            match clip.demuxer.read_packet_for(clip.stream_index) {
+                                                Ok(Some(packet))
+                                                    if clip
+                                                        .decoder
+                                                        .send_packet(&packet.packet)
+                                                        .is_ok() => {}
+                                                _ => break,
+                                            }
+                                        }
+                                        match primed {
+                                            Some(decoded) => {
+                                                let index = frame_index;
+                                                frame_index = frame_index.saturating_add(1);
+                                                match player.on_decoded(index) {
+                                                    PlayerAction::Publish { at } => {
+                                                        if let Ok(image) = clip.scaler.convert(
+                                                            &decoded.frame,
+                                                            plan.canvas_color.output_tag(),
+                                                        ) {
+                                                            last = Arc::new(image);
+                                                        }
+                                                        PlayerAction::Publish { at }
+                                                    }
+                                                    _ => player.on_heartbeat(),
+                                                }
+                                            }
+                                            None => player.on_heartbeat(),
+                                        }
+                                    } else {
+                                        player.pause();
+                                        player.on_heartbeat()
+                                    }
+                                } else {
+                                    player.pause();
+                                    player.on_heartbeat()
+                                }
+                            }
+                            Ok(None | Some(_)) => player.on_heartbeat(),
+                            Err(error) => {
+                                tracing::warn!(player = %plan.id, %error, "player EOF drain failed");
+                                player.pause();
+                                player.on_heartbeat()
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(player = %plan.id, %error, "player read failed");
+                        player.pause();
+                        player.on_heartbeat()
+                    }
+                }
+            } else {
+                player.on_heartbeat()
+            }
+        } else {
+            player.on_heartbeat()
+        };
+        let at = match action {
+            PlayerAction::Publish { at } | PlayerAction::Hold { at } => at,
+            PlayerAction::Ended | PlayerAction::SeekFlushTo { .. } => {
+                sleep_interruptible(period, stop);
+                continue;
+            }
+        };
+        last_stamp = at;
+        #[cfg(test)]
+        if let Some(trace) = &runtime.trace {
+            let _ = trace.try_send((
+                run_now,
+                player.next_stamp_tick(),
+                eof_draining,
+                pacer.may_release(player.last_tick().unwrap_or(0), run_now),
+            ));
+        }
+        if player.last_tick().is_some()
+            && pacer.may_release(player.last_tick().unwrap_or(0), run_now)
+        {
+            plan.store
+                .publish_arc_with_source_time(Arc::clone(&last), at, None);
+            #[cfg(test)]
+            if let Some(observer) = &runtime.observer {
+                let _ = observer.try_send((at, run_now, Arc::clone(&last)));
+            }
+        }
+        armed_anchor = if player.exit_armed() {
+            Some(armed_anchor.unwrap_or(last_stamp))
+        } else {
+            None
+        };
+        publish_audio_control(
+            handle,
+            player.state(),
+            armed_anchor.unwrap_or(last_stamp),
+            &mut last_audio_control,
+        );
+        sleep_interruptible(period, stop);
+    }
+}
+
+#[cfg(not(feature = "ffmpeg"))]
+fn player_runtime_loop(plan: &IngestPlan, handle: &crate::player::PlayerHandle, stop: &AtomicBool) {
+    let Some(na) = handle.na_image.as_ref() else {
+        return;
+    };
+    let period = Duration::from_nanos(
+        u64::try_from(MediaTime::from_tick(1, plan.cadence).as_nanos())
+            .unwrap_or(40_000_000)
+            .max(1),
+    );
+    let mut tick = 0_i64;
+    while !stop.load(Ordering::Acquire) {
+        for verb in handle.mailbox.drain() {
+            if matches!(verb, crate::player::TransportVerb::Load { .. }) {
+                tracing::warn!(player = %plan.id, "runtime player load unsupported without ffmpeg");
+            }
+        }
+        plan.store
+            .publish_arc(Arc::clone(na), MediaTime::from_tick(tick, plan.cadence));
+        tick = tick.saturating_add(1);
+        sleep_interruptible(period, stop);
+    }
+}
+
 fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
+    #[cfg(not(feature = "ffmpeg"))]
+    if let Some(handle) = &plan.player {
+        player_runtime_loop(plan, handle, stop);
+        return;
+    }
     // ADR-0060: run this source's whole decode/reconnect region inside a resource
     // scope so our own logs (via the `source` span) AND libav's synchronous lines
     // (via the thread-local ResourceContext the bridge resolves) name this source
@@ -19105,14 +20459,14 @@ pub(crate) fn program_bus_gains<'a>(
 
 /// Lazily-built scaler from a decoded NV12 frame's geometry to the tile size,
 /// emitting an [`Nv12Image`] tagged like the canvas.
-struct TileScaler {
+pub(crate) struct TileScaler {
     tile_w: u32,
     tile_h: u32,
     scaler: Option<Scaler>,
 }
 
 impl TileScaler {
-    fn new(tile_w: u32, tile_h: u32) -> Self {
+    pub(crate) fn new(tile_w: u32, tile_h: u32) -> Self {
         Self {
             tile_w,
             tile_h,
@@ -19122,7 +20476,7 @@ impl TileScaler {
 
     /// Scale `frame` (NV12 or P010 host frame) to the tile size as NV12 and wrap
     /// it as a tagged [`Nv12Image`].
-    fn convert(
+    pub(crate) fn convert(
         &mut self,
         frame: &Video,
         tag: multiview_core::color::ColorInfo,
@@ -23447,6 +24801,326 @@ loop_default = true
         MultiviewConfig::load_from_toml(doc).expect("parse media-player config")
     }
 
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    #[allow(clippy::too_many_lines)] // one end-to-end scenario: NA → A → failed load → B
+    fn real_runtime_load_a_then_b_failed_load_keeps_picture_and_epochs() {
+        use crate::player::{ClipSpec, LoadThen, TransportVerb};
+        use multiview_core::time::MediaTime;
+        use multiview_engine::{ManualTimeSource, TimeSource};
+        use multiview_ffmpeg::test_fixtures::{generate_player_clip, PlayerClipSpec};
+        use multiview_framestore::tile::TileRead;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let _budget = crate::player::budget_test_guard();
+
+        let mut config = config_with_player();
+        config.media_players[0].default = None;
+        let layout = config.solve_layout().unwrap();
+        let cadence = config.canvas.fps.rational();
+        let boot =
+            super::build_media_player_boot(&config, &layout, cadence, CanvasColor::default());
+        let plan = boot.plans.into_iter().next().unwrap();
+        let handle = plan.player.as_ref().unwrap().clone();
+        let runtime = handle.runtime.as_ref().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str, luma: u8, level: f32| {
+            let path = dir.path().join(format!("{name}.mov"));
+            let mut spec = PlayerClipSpec::ffv1(cadence, 25, luma);
+            spec.audio_level = Some(level);
+            generate_player_clip(&path, &spec).unwrap();
+            path
+        };
+        let a = make("a", 30, 0.25);
+        let b = make("b", 140, 0.75);
+        let clock = Arc::new(ManualTimeSource::new());
+        clock.set(1_000_000_000);
+        let source: Arc<dyn TimeSource> = clock.clone();
+        plan.output_origin
+            .store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+                source,
+                1_000_000_000,
+            ))));
+        let audio_store = Arc::clone(&boot.audio_stores[0].1);
+        let audio_plan = boot.audio_plans.into_iter().next().unwrap();
+        let audio_stop = Arc::new(AtomicBool::new(false));
+        let running_audio_stop = Arc::clone(&audio_stop);
+        let audio_for_thread = Arc::clone(&audio_store);
+        let audio_worker = std::thread::spawn(move || {
+            crate::audio::player_audio_loop(&audio_plan, &audio_for_thread, &running_audio_stop);
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let running_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            super::player_runtime_loop(&plan, plan.player.as_ref().unwrap(), &running_stop)
+        });
+        let guard = Instant::now();
+        let wait = |what: &str, condition: &dyn Fn() -> bool| {
+            while !condition() {
+                assert!(
+                    guard.elapsed() < Duration::from_secs(15),
+                    "hang guard: {what}"
+                );
+                std::thread::yield_now();
+            }
+        };
+        wait("first NA publish", &|| {
+            !matches!(
+                boot.stores[0].1.read_at(MediaTime::ZERO),
+                TileRead::NoSignal
+            )
+        });
+        let store = Arc::clone(&boot.stores.first().expect("player fixture store").1);
+        let na_y = match store.read_at(MediaTime::ZERO) {
+            TileRead::Fresh { frame } | TileRead::Held { frame, .. } => frame.y_plane()[0],
+            _ => 0,
+        };
+        runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A audio/video epoch", &|| {
+            handle.control_bus.load().clip_epoch.0 >= 1
+        });
+        let epoch_a = handle.control_bus.load().clip_epoch;
+        wait("committed A reference snapshot", &|| {
+            runtime.binding.load().generation == epoch_a
+        });
+        assert_eq!(
+            runtime.binding.load().reference,
+            None,
+            "legacy path does not leak as identity"
+        );
+        assert_eq!(epoch_a.0, 1);
+        wait("actual audio rail adopts A", &|| {
+            runtime.audio_commit.ready_for_commit()
+        });
+        let charge_a = crate::player::player_audio_budget().used();
+        assert!(charge_a > 0, "adopted A deck remains charged");
+        let a_anchor = handle.control_bus.load().start_anchor.unwrap();
+        clock.set(1_000_000_000 + a_anchor.as_nanos());
+        let a_y = match store.read_at(a_anchor) {
+            TileRead::Fresh { frame } | TileRead::Held { frame, .. } => frame.y_plane()[0],
+            _ => 0,
+        };
+        assert_ne!(a_y, na_y);
+        handle.mailbox.submit(TransportVerb::Vamp);
+        wait("A transport vamps", &|| {
+            matches!(
+                handle.control_bus.load().state,
+                crate::player::AudioTransport::Vamping
+            )
+        });
+        let mut a_pcm = None;
+        while a_pcm.is_none() {
+            audio_store.seek_to(24_000);
+            let block = audio_store.read(32);
+            if block.interleaved().iter().any(|sample| sample.abs() > 0.1) {
+                a_pcm = Some(block.interleaved()[0]);
+            }
+            assert!(
+                guard.elapsed() < Duration::from_secs(3),
+                "A PCM missing: control={:?} cursor={} opener={:?} charge={} first={:?}",
+                handle.control_bus.load(),
+                audio_store.read_cursor(),
+                runtime.opener.status(),
+                crate::player::player_audio_budget().used(),
+                block.interleaved().first()
+            );
+            std::thread::yield_now();
+        }
+        let a_sample = a_pcm.unwrap();
+        assert!((a_sample - 0.25).abs() < 0.08, "A PCM sample={a_sample}");
+        runtime
+            .opener
+            .request(ClipSpec::new(dir.path().join("missing.mov"), LoadThen::Cue))
+            .unwrap();
+        wait("bad load report", &|| {
+            runtime.opener.status().last_failure.is_some()
+        });
+        assert_eq!(handle.control_bus.load().clip_epoch, epoch_a);
+        clock
+            .set(1_000_000_000 + a_anchor.as_nanos() + MediaTime::from_tick(2, cadence).as_nanos());
+        runtime
+            .opener
+            .request(ClipSpec::new(&b, LoadThen::Cue))
+            .unwrap();
+        wait("B audio/video epoch", &|| {
+            handle.control_bus.load().clip_epoch.0 > epoch_a.0
+        });
+        let b_anchor = handle.control_bus.load().start_anchor.unwrap();
+        assert!(b_anchor > a_anchor);
+        let b_y = match store.read_at(b_anchor) {
+            TileRead::Fresh { frame } | TileRead::Held { frame, .. } => frame.y_plane()[0],
+            _ => 0,
+        };
+        assert_ne!(b_y, a_y);
+        wait("actual audio rail adopts B", &|| {
+            runtime.audio_commit.ready_for_commit()
+        });
+        assert!(crate::player::player_audio_budget().used() > 0);
+        handle.mailbox.submit(TransportVerb::Vamp);
+        wait("B transport vamps", &|| {
+            matches!(
+                handle.control_bus.load().state,
+                crate::player::AudioTransport::Vamping
+            )
+        });
+        let b_sample_frame =
+            (b_anchor.as_nanos().saturating_mul(48_000) / 1_000_000_000).saturating_add(500);
+        let mut b_pcm = None;
+        while b_pcm.is_none() {
+            audio_store.seek_to(b_sample_frame);
+            let block = audio_store.read(32);
+            let value = block.interleaved().first().copied().unwrap_or(0.0);
+            if value.abs() > 0.5 {
+                b_pcm = Some(value);
+            }
+            assert!(
+                guard.elapsed() < Duration::from_secs(5),
+                "B PCM missing: control={:?} cursor={} got={value}",
+                handle.control_bus.load(),
+                audio_store.read_cursor()
+            );
+            std::thread::yield_now();
+        }
+        assert!((b_pcm.unwrap() - 0.75).abs() < 0.08);
+        audio_stop.store(true, Ordering::Release);
+        audio_worker.join().unwrap();
+        stop.store(true, Ordering::Release);
+        let exceptional = worker.join().unwrap();
+        assert!(exceptional.is_none(), "normal shutdown uses opener handoff");
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn audio_bearing_load_with_closed_audio_rail_fails_closed_not_pending() {
+        use crate::player::{ClipSpec, LoadThen, PlayerFault};
+        use multiview_engine::{ManualTimeSource, TimeSource};
+        use multiview_ffmpeg::test_fixtures::{generate_player_clip, PlayerClipSpec};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let _budget = crate::player::budget_test_guard();
+        let mut config = config_with_player();
+        config.media_players[0].default = None;
+        let layout = config.solve_layout().unwrap();
+        let cadence = config.canvas.fps.rational();
+        let boot =
+            super::build_media_player_boot(&config, &layout, cadence, CanvasColor::default());
+        let plan = boot.plans.into_iter().next().unwrap();
+        let handle = plan.player.as_ref().unwrap().clone();
+        let runtime = handle.runtime.as_ref().unwrap().clone();
+        drop(runtime.audio_commit.close());
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("a.mov");
+        let mut spec = PlayerClipSpec::ffv1(cadence, 25, 30);
+        spec.audio_level = Some(0.25);
+        generate_player_clip(&clip, &spec).unwrap();
+        let clock = Arc::new(ManualTimeSource::new());
+        clock.set(1_000_000_000);
+        let source: Arc<dyn TimeSource> = clock.clone();
+        plan.output_origin
+            .store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+                source,
+                1_000_000_000,
+            ))));
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            super::player_runtime_loop(&plan, plan.player.as_ref().unwrap(), &s2)
+        });
+        let generation = runtime
+            .opener
+            .request(ClipSpec::new(&clip, LoadThen::Cue))
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        while !matches!(
+            runtime.status.load().fault,
+            Some(PlayerFault::AudioUnavailable { .. })
+        ) {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(15),
+                "never terminal"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            runtime.status.load().fault.unwrap().generation(),
+            generation.0
+        );
+        assert_eq!(handle.control_bus.load().clip_epoch.0, 0, "no video commit");
+        assert!(runtime.native.load().is_none(), "no fake ACK");
+        assert_eq!(runtime.binding.load().reference, None);
+        stop.store(true, Ordering::Release);
+        assert!(worker.join().unwrap().is_none());
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn stop_unregisters_provider_so_same_state_dir_restart_claims_journal() {
+        let _budget = crate::player::budget_test_guard();
+        let mut config = config_with_player();
+        config.media_players[0].default = None;
+        config.media_players[0].id = "restart-vt".into();
+        let layout = config.solve_layout().unwrap();
+        let cadence = config.canvas.fps.rational();
+        let state = tempfile::tempdir().unwrap();
+        let boot = super::build_media_player_boot_with_state(
+            &config,
+            &layout,
+            cadence,
+            CanvasColor::default(),
+            Some(state.path()),
+        );
+        assert_eq!(boot.plans.len(), 1);
+        assert!(crate::player::runtime_provider().is_registered("restart-vt"));
+        let second = super::build_media_player_boot_with_state(
+            &config,
+            &layout,
+            cadence,
+            CanvasColor::default(),
+            Some(state.path()),
+        );
+        assert!(
+            second.plans.is_empty(),
+            "live owner excludes a second claim"
+        );
+        let plan = boot.plans.into_iter().next().unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let exceptional = super::player_runtime_loop(&plan, plan.player.as_ref().unwrap(), &stop);
+        assert!(exceptional.is_none());
+        assert!(!crate::player::runtime_provider().is_registered("restart-vt"));
+        drop(plan);
+        drop(boot.audio_plans);
+        drop(second);
+        // The opener thread (last native owner) exits asynchronously after
+        // stop; the claim must succeed once it has, with no provider pin.
+        let t0 = std::time::Instant::now();
+        let third = loop {
+            let attempt = super::build_media_player_boot_with_state(
+                &config,
+                &layout,
+                cadence,
+                CanvasColor::default(),
+                Some(state.path()),
+            );
+            if !attempt.plans.is_empty() {
+                break attempt;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(10),
+                "restart never claimed the journal after stop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            third.plans.len(),
+            1,
+            "restart claims the journal after stop"
+        );
+    }
+
     #[test]
     fn build_media_player_boot_spawns_a_rolling_player_with_geometry_and_mailbox() {
         let config = config_with_player();
@@ -23478,10 +25152,11 @@ loop_default = true
             .as_ref()
             .expect("the plan carries a player handle");
         // The geometry is the asset's declared window (the vamp sub-window loops).
+        // Dynamic load: boot geometry is a one-frame sentinel; the first probed,
+        // jointly committed clip (default asset spec carries 0..100 / vamp 10..90)
+        // supplies the real window.
         assert_eq!(handle.geometry.in_point(), 0);
-        assert_eq!(handle.geometry.out_point(), 100);
-        assert_eq!(handle.geometry.vamp_in(), 10);
-        assert_eq!(handle.geometry.vamp_out(), 90);
+        assert_eq!(handle.geometry.out_point(), 1);
         assert_eq!(handle.geometry.cadence(), cadence);
         assert!(
             handle.loop_on_start,
@@ -23514,10 +25189,11 @@ loop_default = true
             "audio decodes the SAME asset as the video"
         );
         assert_eq!(
-            ap.vamp_in_frames, 10,
+            ap.vamp_in_frames,
+            handle.geometry.vamp_in(),
             "audio loops the SAME vamp window as the video"
         );
-        assert_eq!(ap.vamp_out_frames, 90);
+        assert_eq!(ap.vamp_out_frames, handle.geometry.vamp_out());
         assert_eq!(
             ap.cadence, cadence,
             "audio uses the asset cadence for the frame→sample map"
@@ -23541,21 +25217,16 @@ loop_default = true
         let cadence = config.canvas.fps.rational();
         let boot =
             super::build_media_player_boot(&config, &layout, cadence, CanvasColor::default());
-        assert!(boot.plans.is_empty(), "no default asset ⇒ no rolling plan");
+        // With the native `ffmpeg` runtime an idle player keeps a dynamic plan, audio
+        // store and loop so a later explicit load can open, probe and commit a clip.
+        let dynamic = cfg!(feature = "ffmpeg");
+        assert_eq!(boot.plans.len(), usize::from(dynamic));
         assert!(
             boot.mailboxes.contains_key("vt-1"),
             "an idle player still registers its mailbox"
         );
-        // An idle player contributes no audio store/plan either (ADR-T019): nothing
-        // to loop until a load command binds an asset (probe-at-load is post-MVP).
-        assert!(
-            boot.audio_stores.is_empty(),
-            "an idle player has no audio store"
-        );
-        assert!(
-            boot.audio_plans.is_empty(),
-            "an idle player has no audio loop plan"
-        );
+        assert_eq!(boot.audio_stores.len(), usize::from(dynamic));
+        assert_eq!(boot.audio_plans.len(), usize::from(dynamic));
     }
 }
 
@@ -26628,5 +28299,1156 @@ mod chaos {
                 }
             }
         }
+    }
+}
+
+/// Actual capture artifact -> capture-service lease -> HTTP load -> native player.
+#[cfg(all(test, feature = "ffmpeg", target_os = "linux"))]
+mod artifact_adoption_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use multiview_compositor::pipeline::CanvasColor;
+    use multiview_config::MultiviewConfig;
+    use multiview_control::{
+        command_bus,
+        web_capture::Provider,
+        web_capture_store::{DurableTerms, Ledger},
+        ApiKeyStore, AppState, EngineStateSnapshot, InMemoryMediaPlayerStore, InMemoryRepository,
+        Principal, ResourceInput, ResourceRepository, Role,
+    };
+    use multiview_core::time::MediaTime;
+    use multiview_engine::{EnginePublisher, ManualTimeSource, TimeSource};
+    use multiview_events::Event;
+    use multiview_framestore::tile::TileRead;
+    use multiview_webengine::{
+        artifact::{ArtifactStore, Limits},
+        capture::Tools,
+        service::{Config, Service},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PLAYER: &str = "vt-art";
+    const OWNER: &str = "owner-token.owner-secret";
+    const FOREIGN: &str = "foreign-token.foreign-secret";
+
+    async fn http(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+        token: &str,
+        key: &str,
+    ) -> (u16, serde_json::Value, String) {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let text = format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nIdempotency-Key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        s.write_all(text.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let code = out.split(' ').nth(1).unwrap().parse().unwrap();
+        let raw = out.split_once("\r\n\r\n").map_or("", |x| x.1).to_owned();
+        (code, serde_json::from_str(&raw).unwrap_or_default(), out)
+    }
+
+    fn producer(dir: &Path, name: &str, artifact: &Path) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\ncat >/dev/null\ncat '{}'\nprintf '%s\\n' '{{\"event\":\"capture_complete\",\"frames\":25}}' >&2\n", artifact.display())).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        p
+    }
+
+    fn config() -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 48
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "{PLAYER}"
+[media_library]
+root = "/srv/media"
+[[media_players]]
+id = "{PLAYER}"
+loop_default = true
+"##
+        );
+        MultiviewConfig::load_from_toml(&doc).expect("config")
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn actual_capture_artifact_loads_into_native_player_over_http() {
+        use multiview_ffmpeg::test_fixtures::{
+            generate_player_clip, write_corrupt_clip, PlayerClipSpec,
+        };
+        let _budget = crate::player::budget_test_guard();
+        let cfg = config();
+        let layout = cfg.solve_layout().unwrap();
+        let cadence = cfg.canvas.fps.rational();
+        let boot = super::build_media_player_boot(&cfg, &layout, cadence, CanvasColor::default());
+        let plan = boot.plans.into_iter().next().unwrap();
+        let handle = plan.player.as_ref().unwrap().clone();
+        let runtime = handle.runtime.as_ref().unwrap().clone();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut a_spec = PlayerClipSpec::ffv1(cadence, 25, 30);
+        a_spec.audio_level = Some(0.25);
+        let clip_a = dir.path().join("a.mov");
+        generate_player_clip(&clip_a, &a_spec).unwrap();
+        let clip_b = dir.path().join("b.mov");
+        generate_player_clip(&clip_b, &PlayerClipSpec::ffv1(cadence, 25, 140)).unwrap();
+        let bad = dir.path().join("bad.mov");
+        write_corrupt_clip(&bad, 4096).unwrap();
+
+        // Player rails on real threads with a manual output clock.
+        let clock = Arc::new(ManualTimeSource::new());
+        clock.set(1_000_000_000);
+        let source: Arc<dyn TimeSource> = clock.clone();
+        plan.output_origin
+            .store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+                source,
+                1_000_000_000,
+            ))));
+        let audio_store = Arc::clone(&boot.audio_stores[0].1);
+        let audio_plan = boot.audio_plans.into_iter().next().unwrap();
+        let audio_stop = Arc::new(AtomicBool::new(false));
+        let (s1, st) = (Arc::clone(&audio_stop), Arc::clone(&audio_store));
+        let audio_worker =
+            std::thread::spawn(move || crate::audio::player_audio_loop(&audio_plan, &st, &s1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            super::player_runtime_loop(&plan, plan.player.as_ref().unwrap(), &s2)
+        });
+        let store = Arc::clone(&boot.stores.first().expect("player fixture store").1);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mk_service = |name: &str, tool: PathBuf| {
+                let path = dir.path().join(name);
+                std::fs::create_dir(&path).unwrap();
+                let st = ArtifactStore::open(&path, Limits { bytes: 128 << 20, count: 20 }).unwrap();
+                Arc::new(Service::start_durable(
+                    Tools { node: tool, browser: "/bin/sh".into(), ffmpeg: "/bin/sh".into() },
+                    st,
+                    Config { queue_capacity: 4, history: 16, max_fills: 8 },
+                    &dir.path().join(format!("{name}.journal")),
+                ).unwrap())
+            };
+            // One actual capture service per produced artifact keeps each producer
+            // deterministic; the control route still resolves through the service.
+            let _ = &mk_service;
+            // Single service, producer picks the artifact named by a control file.
+            let selector = dir.path().join("selected.mov");
+            std::fs::copy(&clip_a, &selector).unwrap();
+            let node = producer(dir.path(), "node", &selector);
+            let service = mk_service("store", node);
+            let mut keys = ApiKeyStore::new(b"pepper-xyz".to_vec());
+            for (id, tok) in [("owner-token", "owner-secret"), ("foreign-token", "foreign-secret")] {
+                keys.register(id, tok, Principal {
+                    key_id: id.to_owned(), role: Role::Operator,
+                    scoped_object_ids: None, scoped_output_ids: None, scoped_discovery_domains: None,
+                });
+            }
+            let players = InMemoryMediaPlayerStore::new();
+            players.create(PLAYER, ResourceInput { name: PLAYER.into(), body: serde_json::json!({"id": PLAYER, "eof_policy": "hold_last_frame"}) }).unwrap();
+            let players: Arc<dyn ResourceRepository> = Arc::new(players);
+            let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(8));
+            let (tx, rx) = command_bus(8);
+            let mut state = AppState::new(publisher, tx, Arc::new(InMemoryRepository::new()), Arc::new(keys))
+                .with_media_player_store(players)
+                .with_web_capture(Provider::configured(
+                    service.clone(),
+                    Arc::new(DurableTerms::open(&dir.path().join("terms.log")).unwrap()),
+                    Arc::new(Ledger::durable(&dir.path().join("idem.log")).unwrap()),
+                ));
+            state.player_load = crate::player::runtime_provider();
+            let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (done_tx, done) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(multiview_control::serve(listener, state, async move { let _ = done.await; }));
+
+            let mut n = 0u32;
+            let mut capture = |fill: &'static str| {
+                n += 1;
+                let body = serde_json::json!({"fill_id": fill, "view": {"lat": -33.9, "lon": 150.3, "zoom": 10, "overlay": "radar", "width": 1280, "height": 720, "fps": 25, "frames": 25, "public": true}, "terms": {"accepted": true, "version": "windy-2023-09-01"}}).to_string();
+                (body, format!("cap-{n}"))
+            };
+            let mut produce = |fill: &'static str| {
+                let (body, key) = capture(fill);
+                async move {
+                    let (code, v, raw) = http(addr, "POST", "/api/v1/media/captures", &body, OWNER, &key).await;
+                    assert_eq!(code, 202, "{raw}");
+                    let id = v["job_id"].as_u64().unwrap();
+                    let started = Instant::now();
+                    loop {
+                        let (_, s, _) = http(addr, "GET", &format!("/api/v1/media/captures/{id}"), "", OWNER, "g").await;
+                        match s["state"].as_str() {
+                            Some("succeeded") => return (id, s["artifact_id"].as_str().unwrap().to_owned()),
+                            Some("failed" | "uncertain") => panic!("capture failed {s}"),
+                            _ => {}
+                        }
+                        assert!(started.elapsed() < Duration::from_secs(20));
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            };
+            let load_body = |job: u64, art: &str| serde_json::json!({"artifactRef": {"captureJobId": job, "artifactId": art}, "then": "cue"}).to_string();
+            let poll = |op: u64| async move {
+                let started = Instant::now();
+                loop {
+                    let (code, v, raw) = http(addr, "GET", &format!("/api/v1/media/players/{PLAYER}/load-operations/{op}"), "", OWNER, "p").await;
+                    assert_eq!(code, 200, "{raw}");
+                    if v["state"] != "pending" { return v; }
+                    assert!(started.elapsed() < Duration::from_secs(20), "operation stuck pending {v}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+
+            // --- A: audio-bearing artifact -> native adoption ---
+            let (job_a, art_a) = produce("fill-a").await;
+            let (code, v, raw) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_a, &art_a), OWNER, "load-a").await;
+            assert_eq!(code, 202, "{raw}");
+            let op_a = v["operation"].as_u64().unwrap();
+            let done_a = poll(op_a).await;
+            assert_eq!(done_a["state"], "completed", "{done_a}");
+            let ack = &done_a["native"];
+            assert_eq!(ack["width"], 64);
+            assert_eq!(ack["height"], 48);
+            assert_eq!(ack["cadence_num"], 25);
+            assert_eq!(ack["cadence_den"], 1);
+            assert_eq!(ack["has_audio"], true);
+            assert_eq!(ack["source_id"].as_str().unwrap(), art_a);
+            assert_eq!(ack["duration_frames"], 25);
+            // No raw path leaks.
+            assert!(!raw.contains("/proc/") && !raw.contains(dir.path().to_str().unwrap()));
+            let epoch_a = handle.control_bus.load().clip_epoch;
+            let anchor_a = handle.control_bus.load().start_anchor.unwrap();
+            clock.set(1_000_000_000 + anchor_a.as_nanos());
+            let (a_y, a_color) = match store.read_at(anchor_a) {
+                TileRead::Fresh { frame } | TileRead::Held { frame, .. } => (frame.y_plane()[0], frame.color()),
+                other => panic!("no A frame {:?}", std::mem::discriminant(&other)),
+            };
+            assert_eq!(a_y, 46, "A first-frame luma: fixture base 30 + video-range offset 16");
+            assert_ne!(a_color.range, multiview_core::color::ColorRange::Unspecified);
+            let _ = rx;
+            // Matching PCM from the actual artifact.
+            handle.mailbox.submit(crate::player::TransportVerb::Vamp);
+            let started = Instant::now();
+            while !matches!(handle.control_bus.load().state, crate::player::AudioTransport::Vamping) {
+                assert!(started.elapsed() < Duration::from_secs(5), "A never vamps");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let started = Instant::now();
+            let sample = loop {
+                // The rail publishes a window relative to the committed anchor;
+                // scan a span after it for the constant-level artifact PCM.
+                let base: i64 = anchor_a.as_nanos().saturating_mul(48_000) / 1_000_000_000;
+                let mut hit = None;
+                for off in [500i64, 4_000, 12_000, 24_000, 36_000] {
+                    audio_store.seek_to(base + off);
+                    let blk = audio_store.read(32);
+                    if let Some(x) = blk.interleaved().iter().find(|x| x.abs() > 0.1) { hit = Some(*x); break; }
+                }
+                audio_store.seek_to(24_000);
+                let blk = audio_store.read(32);
+                if let Some(x) = hit { break x; }
+                assert!(started.elapsed() < Duration::from_secs(5), "A PCM missing: control={:?} cursor={} first={:?}", handle.control_bus.load(), audio_store.read_cursor(), blk.interleaved().first());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            assert!((sample - 0.25).abs() < 0.08, "A PCM {sample}");
+
+            // --- foreign owner: 404 (job invisible), no path in body ---
+            let (code, _, raw) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_a, &art_a), FOREIGN, "load-x").await;
+            assert!(code == 403 || code == 404, "{raw}");
+            assert!(!raw.contains("/proc/") && !raw.contains(dir.path().to_str().unwrap()));
+            let (code, _, _) = http(addr, "GET", &format!("/api/v1/media/players/{PLAYER}/load-operations/{op_a}"), "", FOREIGN, "x").await;
+            assert!(code == 403 || code == 404 || code == 503);
+            // Mismatched artifact id -> conflict.
+            let (code, _, _) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_a, "a0000000000000fff"), OWNER, "load-m").await;
+            assert_eq!(code, 409);
+
+            // --- failed B keeps A ---
+            std::fs::copy(&bad, &selector).unwrap();
+            let (job_bad, art_bad) = produce("fill-bad").await;
+            let (code, v, raw) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_bad, &art_bad), OWNER, "load-bad").await;
+            assert_eq!(code, 202, "{raw}");
+            let failed = poll(v["operation"].as_u64().unwrap()).await;
+            assert_eq!(failed["state"], "failed", "{failed}");
+            assert_eq!(handle.control_bus.load().clip_epoch, epoch_a, "failed load keeps A");
+            let still = match store.read_at(anchor_a) {
+                TileRead::Fresh { frame } | TileRead::Held { frame, .. } => frame.y_plane()[0],
+                _ => 0,
+            };
+            assert_eq!(still, a_y, "previous good picture retained");
+
+            // --- B: video-only artifact -> explicit silence ---
+            clock.set(1_000_000_000 + anchor_a.as_nanos() + MediaTime::from_tick(2, cadence).as_nanos());
+            std::fs::copy(&clip_b, &selector).unwrap();
+            let (job_b, art_b) = produce("fill-b").await;
+            let (code, v, raw) = http(addr, "POST", &format!("/api/v1/media/players/{PLAYER}/load"), &load_body(job_b, &art_b), OWNER, "load-b").await;
+            assert_eq!(code, 202, "{raw}");
+            let done_b = poll(v["operation"].as_u64().unwrap()).await;
+            assert_eq!(done_b["state"], "completed", "{done_b}");
+            assert_eq!(done_b["native"]["has_audio"], false);
+            let anchor_b = handle.control_bus.load().start_anchor.unwrap();
+            assert!(anchor_b > anchor_a);
+            let b_y = match store.read_at(anchor_b) {
+                TileRead::Fresh { frame } | TileRead::Held { frame, .. } => frame.y_plane()[0],
+                _ => 0,
+            };
+            assert_ne!(b_y, a_y, "B picture replaced A");
+            assert!(runtime.audio_commit.has_adopted(handle.control_bus.load().clip_epoch));
+
+            done_tx.send(()).unwrap();
+            server.await.unwrap().unwrap();
+            service.shutdown();
+        });
+        audio_stop.store(true, Ordering::Release);
+        audio_worker.join().unwrap();
+        stop.store(true, Ordering::Release);
+        assert!(worker.join().unwrap().is_none());
+    }
+}
+
+/// R3 causal chaos proofs for explicit artifact player adoption (invariants #1/#10).
+///
+/// Every test drives the ACTUAL output-clock path — [`OutputClock`] ticks into the
+/// production [`CompositorDrive::compose`] over the SAME `TileStore` the real native
+/// player worker publishes into — while a real native worker thread is deliberately
+/// held (deterministic per-runtime barrier, never a wall-clock sleep) or stressed.
+/// A hang deadline is the only wall-clock use, and it fails, never passes.
+#[cfg(all(test, feature = "ffmpeg"))]
+mod player_adoption_chaos_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use crate::player::{ClipSpec, LoadThen, SlotReference, TransportVerb};
+    use multiview_compositor::pipeline::CanvasColor;
+    use multiview_config::MultiviewConfig;
+    use multiview_engine::{ManualTimeSource, OutputClock, TimeSource};
+    use multiview_ffmpeg::test_fixtures::{generate_player_clip, PlayerClipSpec};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    const PLAYER: &str = "vt-1";
+
+    fn config_doc(library: &str, asset: &str, default: bool) -> String {
+        format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 48
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "{PLAYER}"
+{library}
+{asset}
+[[media_players]]
+id = "{PLAYER}"
+loop_default = true
+{}
+"##,
+            if default { "default = \"dflt\"" } else { "" }
+        )
+    }
+
+    fn plain_config() -> MultiviewConfig {
+        MultiviewConfig::load_from_toml(&config_doc("", "", false)).unwrap()
+    }
+
+    fn wait(what: &str, condition: &dyn Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !condition() {
+            assert!(Instant::now() < deadline, "hang deadline: {what}");
+            std::thread::yield_now();
+        }
+    }
+
+    fn clip(dir: &std::path::Path, name: &str, luma: u8, audio: Option<f32>) -> PathBuf {
+        let path = dir.join(name);
+        let mut spec = PlayerClipSpec::ffv1(Rational::new(25, 1), 25, luma);
+        spec.audio_level = audio;
+        generate_player_clip(&path, &spec).unwrap();
+        path
+    }
+
+    /// A real boot + real player worker + real audio rail on threads, with the
+    /// output origin on a manual clock.
+    struct Rig {
+        handle: crate::player::PlayerHandle,
+        runtime: crate::player::PlayerRuntime,
+        clock: Arc<ManualTimeSource>,
+        store: Arc<TileStore<Nv12Image>>,
+        layout: Layout,
+        cadence: Rational,
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<Option<[Option<crate::player::StagedClip>; 3]>>>,
+        audio_stop: Arc<AtomicBool>,
+        audio_worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Rig {
+        fn start(config: &MultiviewConfig, state: Option<&std::path::Path>) -> Option<Self> {
+            let layout = config.solve_layout().unwrap();
+            let cadence = config.canvas.fps.rational();
+            let boot = build_media_player_boot_with_state(
+                config,
+                &layout,
+                cadence,
+                CanvasColor::default(),
+                state,
+            );
+            let plan = boot.plans.into_iter().next()?;
+            let handle = plan.player.as_ref().unwrap().clone();
+            let runtime = handle.runtime.as_ref().unwrap().clone();
+            let clock = Arc::new(ManualTimeSource::new());
+            clock.set(1_000_000_000);
+            let source: Arc<dyn TimeSource> = clock.clone();
+            plan.output_origin
+                .store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+                    source,
+                    1_000_000_000,
+                ))));
+            let store = Arc::clone(&boot.stores.first().expect("player fixture store").1);
+            let audio_store =
+                Arc::clone(&boot.audio_stores.first().expect("audio fixture store").1);
+            let audio_plan = boot.audio_plans.into_iter().next().unwrap();
+            let audio_stop = Arc::new(AtomicBool::new(false));
+            let a_stop = Arc::clone(&audio_stop);
+            let audio_worker = std::thread::spawn(move || {
+                crate::audio::player_audio_loop(&audio_plan, &audio_store, &a_stop);
+            });
+            let stop = Arc::new(AtomicBool::new(false));
+            let w_stop = Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                player_runtime_loop(&plan, plan.player.as_ref().unwrap(), &w_stop)
+            });
+            Some(Self {
+                handle,
+                runtime,
+                clock,
+                store,
+                layout,
+                cadence,
+                stop,
+                worker: Some(worker),
+                audio_stop,
+                audio_worker: Some(audio_worker),
+            })
+        }
+
+        /// Run the ACTUAL output clock + production compositor for `count` ticks
+        /// beginning at tick `first`. Returns `(tick, canvas centre luma)` per tick.
+        /// Advances the shared manual time to each tick's deadline.
+        fn drive(&self, first: u64, count: u64) -> Vec<(multiview_engine::Tick, u8)> {
+            let (w, h) = (self.layout.canvas.width, self.layout.canvas.height);
+            let mut stores = std::collections::HashMap::new();
+            stores.insert(PLAYER.to_owned(), Arc::clone(&self.store));
+            let card = multiview_engine::slate::failover_slate_image(
+                multiview_engine::slate::FailoverSlate::NoSignal,
+                w,
+                h,
+                CanvasColor::default(),
+            )
+            .unwrap();
+            let drive = CompositorDrive::new(
+                Arc::new(self.layout.clone()),
+                stores,
+                card,
+                CanvasColor::default(),
+                LinearRgba::TRANSPARENT,
+            )
+            .unwrap();
+            let mut clock = OutputClock::new(self.cadence).unwrap();
+            clock.skip_to(first);
+            (0..count)
+                .map(|_| {
+                    let tick = clock.tick();
+                    self.clock.set(1_000_000_000 + tick.pts.as_nanos());
+                    let frame = drive.compose(tick).expect("a valid frame every tick");
+                    assert_eq!(frame.tick, tick);
+                    assert_eq!(frame.canvas.width(), w);
+                    assert_eq!(frame.canvas.height(), h);
+                    let centre = usize::try_from(h / 2 * w + w / 2).unwrap();
+                    (
+                        tick,
+                        *frame
+                            .canvas
+                            .y_plane()
+                            .get(centre)
+                            .expect("canvas centre pixel"),
+                    )
+                })
+                .collect()
+        }
+
+        fn first_tick_after_anchor(&self) -> u64 {
+            let anchor = self.handle.control_bus.load().start_anchor.unwrap();
+            let t = (0_i64..1_000_000)
+                .find(|i| MediaTime::from_tick(*i, self.cadence) >= anchor)
+                .unwrap();
+            u64::try_from(t).unwrap()
+        }
+
+        fn shutdown(mut self) -> Option<[Option<crate::player::StagedClip>; 3]> {
+            self.audio_stop.store(true, Ordering::Release);
+            self.audio_worker.take().unwrap().join().unwrap();
+            self.stop.store(true, Ordering::Release);
+            self.worker.take().unwrap().join().unwrap()
+        }
+    }
+
+    fn center(store: &TileStore<Nv12Image>, at: MediaTime) -> u8 {
+        use multiview_framestore::tile::TileRead;
+        match store.read_at(at) {
+            TileRead::Fresh { frame } | TileRead::Held { frame, .. } => {
+                let (w, h) = (frame.width(), frame.height());
+                *frame
+                    .y_plane()
+                    .get(usize::try_from(h / 2 * w + w / 2).unwrap())
+                    .expect("frame centre pixel")
+            }
+            _ => 0,
+        }
+    }
+
+    /// #1/#10: the worker is parked deterministically BEFORE its actual native
+    /// seek/flush after A committed. The real output clock + compositor keeps
+    /// emitting exactly N valid, tick-derived frames holding A. No success is
+    /// inferred from wall time: the worker is proven still blocked afterwards.
+    #[test]
+    fn output_clock_emits_exact_ticks_while_player_worker_is_blocked_before_native_seek() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+                && rig.runtime.native.load().is_some()
+                && rig.runtime.audio_commit.ready_for_commit()
+        });
+        let first = rig.first_tick_after_anchor();
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let a_center = center(&rig.store, anchor);
+        let na_center = rig.runtime.na_image.y_plane()[usize::try_from(
+            rig.runtime.na_image.height() / 2 * rig.runtime.na_image.width()
+                + rig.runtime.na_image.width() / 2,
+        )
+        .unwrap()];
+        assert_ne!(a_center, na_center, "A must be distinguishable from NA");
+
+        // Arm the per-runtime barrier, then ask the REAL worker to seek.
+        let gate = seek_barrier::arm(&rig.runtime);
+        rig.handle.mailbox.submit(TransportVerb::Seek { frame: 3 });
+        gate.wait_entered();
+        assert!(gate.blocked());
+
+        // Output clock + compositor while the worker cannot make progress.
+        let n: u64 = 120;
+        let frames = rig.drive(first, n);
+        assert!(gate.blocked(), "worker stayed blocked for every tick");
+        assert_eq!(frames.len(), 120);
+        for (i, (tick, luma)) in frames.iter().enumerate() {
+            let i = u64::try_from(i).unwrap();
+            assert_eq!(tick.index, first + i);
+            assert_eq!(
+                tick.pts,
+                MediaTime::from_tick(i64::try_from(first + i).unwrap(), rig.cadence)
+            );
+            assert_eq!(*luma, a_center, "tick {i} must hold committed A, not NA");
+        }
+
+        // Release: the actual native seek/flush then proceeds and the worker lives.
+        gate.release();
+        gate.wait_passed();
+        assert!(
+            rig.runtime.status.load().fault.is_none(),
+            "seek completed without fault"
+        );
+        let more = rig.drive(first + n, 5);
+        assert_eq!(more.len(), 5);
+        assert!(
+            rig.shutdown().is_none(),
+            "clean handoff after barrier release"
+        );
+    }
+
+    /// 10k load requests against the actual opener + worker while the output
+    /// clock runs: staging/retirement stay bounded, the clock is exact, and the
+    /// last-committed picture is a legitimate clip frame (never NA).
+    #[test]
+    fn load_storm_through_real_opener_stays_bounded_and_clock_exact() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, None);
+        let b = clip(dir.path(), "b.mov", 140, None);
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+        });
+        let first = rig.first_tick_after_anchor();
+        let mut last = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        for i in 0..10_000u32 {
+            let path = if i % 2 == 0 { &a } else { &b };
+            last = rig
+                .runtime
+                .opener
+                .request(ClipSpec::new(path, LoadThen::Cue))
+                .unwrap();
+            if i % 500 == 0 {
+                assert!(
+                    rig.runtime.coordinator.retired_len() <= 2,
+                    "retirement bound"
+                );
+                let f = rig.drive(first + u64::from(i), 2);
+                assert_eq!(f[1].0.index, f[0].0.index + 1);
+            }
+        }
+        assert_eq!(rig.runtime.coordinator.latest(), last);
+        wait("storm settled", &|| {
+            rig.runtime.opener.status().finished >= last
+        });
+        assert!(rig.runtime.coordinator.retired_len() <= 2);
+        let frames = rig.drive(first + 20_000, 50);
+        assert!(frames.iter().all(|(_, l)| *l != 0));
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// A native panic after commit is contained: the clock/compositor is unaffected
+    /// while the worker dies, owners transfer to the opener (no bundle returned).
+    #[test]
+    fn worker_panic_after_commit_isolated_from_output_clock() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, None);
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .panic_after_commit
+            .store(true, Ordering::Release);
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("worker panicked and handed off", &|| {
+            rig.worker.as_ref().unwrap().is_finished()
+        });
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let first = (0_i64..1_000_000)
+            .find(|i| MediaTime::from_tick(*i, rig.cadence) >= anchor)
+            .map(|t| u64::try_from(t).unwrap())
+            .unwrap();
+        let frames = rig.drive(first, 60);
+        for (i, (tick, _)) in frames.iter().enumerate() {
+            assert_eq!(tick.index, first + u64::try_from(i).unwrap());
+        }
+        assert!(
+            !crate::player::runtime_provider().is_registered(PLAYER),
+            "panicked worker unregistered its runtime"
+        );
+        drop(rig.shutdown());
+    }
+
+    /// A stuck opener (peer accepts and never answers HTTP) cannot stall the
+    /// output clock, and a newer load cancels it via the owned interrupt token.
+    #[test]
+    fn stuck_http_opener_never_stalls_clock_and_newer_load_cancels_it() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, None);
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            listener.set_nonblocking(false).unwrap();
+            while let Ok((s, _)) = listener.accept() {
+                held.push(s);
+                if held.len() >= 4 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(8));
+        });
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        let g = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(
+                format!("http://[::1]:{port}/x.mov"),
+                LoadThen::Cue,
+            ))
+            .unwrap();
+        wait("opener entered the stuck open", &|| {
+            rig.runtime.opener.status().open_in_progress == g
+        });
+        let frames = rig.drive(0, 100);
+        assert_eq!(frames.len(), 100);
+        assert_eq!(
+            rig.runtime.opener.status().open_in_progress,
+            g,
+            "still stuck, clock exact"
+        );
+        let t0 = Instant::now();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed after cancelling stuck open", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+        });
+        assert!(
+            t0.elapsed() < Duration::from_secs(4),
+            "cancel beat the 5 s open deadline"
+        );
+        drop(rig.shutdown());
+        drop(silent);
+    }
+
+    /// Causal joint-A/V barrier: B's deck is parked and the audio rail has not
+    /// acknowledged PREPARE, so video stays on A. The rail then closes after
+    /// `put` and before adoption: B fails terminally, A's video/control/binding
+    /// are retained, and nothing stays pending.
+    #[test]
+    fn audio_close_after_put_before_adopt_fails_b_and_retains_a() {
+        use crate::player::PlayerFault;
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let b = clip(dir.path(), "b.mov", 140, Some(0.25));
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed and adopted", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+                && rig
+                    .runtime
+                    .audio_commit
+                    .has_adopted(rig.handle.control_bus.load().clip_epoch)
+        });
+        let a_epoch = rig.handle.control_bus.load().clip_epoch;
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let a_center = center(&rig.store, anchor);
+        rig.runtime.audio_commit.hold_prepare_for_test(true);
+        let b_gen = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&b, LoadThen::Cue))
+            .unwrap();
+        wait("B deck parked (PREPARE sent)", &|| {
+            rig.runtime.audio_commit.pending_generation() == b_gen
+        });
+        // PREPARE unacknowledged: video must not have swapped, over many ticks.
+        let first = rig.first_tick_after_anchor();
+        for (_, luma) in rig.drive(first, 30) {
+            assert_eq!(luma, a_center, "A video retained while B only prepared");
+        }
+        assert_eq!(rig.handle.control_bus.load().clip_epoch, a_epoch);
+        // Rail dies after put, before adopt.
+        drop(rig.runtime.audio_commit.close());
+        wait("B failed closed", &|| {
+            matches!(
+                rig.runtime.status.load().fault,
+                Some(PlayerFault::AudioUnavailable { generation }) if generation == b_gen.0
+            )
+        });
+        for (_, luma) in rig.drive(first + 30, 30) {
+            assert_eq!(luma, a_center, "A video retained after B failed");
+        }
+        assert_eq!(rig.handle.control_bus.load().clip_epoch, a_epoch);
+        assert_eq!(rig.runtime.binding.load().generation, a_epoch);
+        assert_eq!(
+            rig.runtime.native.load().as_ref().unwrap().generation,
+            a_epoch.0
+        );
+        assert!(
+            rig.runtime.coordinator.is_superseded(b_gen)
+                || rig.runtime.coordinator.latest() == b_gen
+        );
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Deterministic interleave: the rail closes AFTER the PREPARE ack and
+    /// BEFORE the claim returns. The stale prepared flag must not commit B's
+    /// video without audio: B fails closed, A is retained everywhere.
+    #[test]
+    fn audio_close_after_prepare_ack_before_claim_fails_b_and_retains_a() {
+        use crate::player::PlayerFault;
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let b = clip(dir.path(), "b.mov", 140, Some(0.25));
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed and adopted", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+                && rig
+                    .runtime
+                    .audio_commit
+                    .has_adopted(rig.handle.control_bus.load().clip_epoch)
+        });
+        let a_epoch = rig.handle.control_bus.load().clip_epoch;
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let a_center = center(&rig.store, anchor);
+        let slot = Arc::clone(&rig.runtime.audio_commit);
+        let closer = Arc::clone(&slot);
+        slot.before_claim_for_test(Box::new(move || {
+            assert!(
+                closer.is_prepared(closer.pending_generation()),
+                "closed after the PREPARE ack"
+            );
+            drop(closer.close());
+        }));
+        let b_gen = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&b, LoadThen::Cue))
+            .unwrap();
+        wait("B failed closed", &|| {
+            matches!(
+                rig.runtime.status.load().fault,
+                Some(PlayerFault::AudioUnavailable { generation }) if generation == b_gen.0
+            )
+        });
+        let first = rig.first_tick_after_anchor();
+        for (_, luma) in rig.drive(first, 30) {
+            assert_eq!(luma, a_center, "A video retained; B never committed");
+        }
+        assert_eq!(rig.handle.control_bus.load().clip_epoch, a_epoch);
+        assert_eq!(rig.runtime.binding.load().generation, a_epoch);
+        assert_eq!(
+            rig.runtime.native.load().as_ref().unwrap().generation,
+            a_epoch.0
+        );
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// While the audio gate is held (a contending close/take), the ingest claim
+    /// defers without waiting: the output clock ticks exactly, every frame is
+    /// valid and still A; once released B commits jointly.
+    #[test]
+    fn contended_claim_gate_never_stalls_the_output_clock() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let b = clip(dir.path(), "b.mov", 140, Some(0.25));
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        rig.runtime
+            .opener
+            .request(ClipSpec::new(&a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed and adopted", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1
+                && rig
+                    .runtime
+                    .audio_commit
+                    .has_adopted(rig.handle.control_bus.load().clip_epoch)
+        });
+        let a_epoch = rig.handle.control_bus.load().clip_epoch;
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let a_center = center(&rig.store, anchor);
+        let gate = rig.runtime.audio_commit.hold_gate_for_test();
+        let b_gen = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&b, LoadThen::Cue))
+            .unwrap();
+        // put() is contended too, so B waits unparked; the clock must not care.
+        let first = rig.first_tick_after_anchor();
+        let ticks = rig.drive(first, 60);
+        for (i, (tick, luma)) in ticks.iter().enumerate() {
+            assert_eq!(
+                tick.index,
+                first + u64::try_from(i).unwrap(),
+                "clock ticks exact"
+            );
+            assert_eq!(*luma, a_center, "A video while the gate is contended");
+        }
+        assert_eq!(rig.handle.control_bus.load().clip_epoch, a_epoch);
+        drop(gate);
+        wait("B committed after release", &|| {
+            rig.handle.control_bus.load().clip_epoch == b_gen
+        });
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// A persistently failing durable precommit retires the generation after a
+    /// bounded number of attempts; no further writes are accepted for it.
+    #[test]
+    fn persistent_journal_failure_is_terminal_and_retires_clip() {
+        use crate::player::PlayerFault;
+        use std::os::unix::fs::PermissionsExt;
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let a = clip(dir.path(), "a.mov", 30, None);
+        let b = clip(dir.path(), "b.mov", 140, None);
+        let rig = Rig::start(&plain_config(), Some(&state)).unwrap();
+        let mut spec = ClipSpec::new(&a, LoadThen::Cue);
+        spec.reference = Some(SlotReference::Asset { id: "a".into() });
+        rig.runtime.opener.request(spec).unwrap();
+        wait("A committed", &|| {
+            rig.runtime.binding.load().reference.is_some()
+        });
+        let a_epoch = rig.runtime.binding.load().generation;
+        let bindings = state.join("player-bindings");
+        wait("A journal finalized", &|| {
+            std::fs::read_dir(&bindings).is_ok_and(|mut d| {
+                d.any(|e| {
+                    let p = e.unwrap().path();
+                    p.extension().is_some_and(|x| x == "json")
+                        && std::fs::read_to_string(p).is_ok_and(|t| {
+                            t.contains("\"prepared\":null")
+                                && t.contains("\"committed_present\":true")
+                        })
+                })
+            })
+        });
+        let record = std::fs::read(
+            std::fs::read_dir(&bindings)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|x| x == "json"))
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bindings, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut spec = ClipSpec::new(&b, LoadThen::Cue);
+        spec.reference = Some(SlotReference::Asset { id: "b".into() });
+        let b_gen = rig.runtime.opener.request(spec).unwrap();
+        wait("terminal journal fault", &|| {
+            matches!(
+                rig.runtime.status.load().fault,
+                Some(PlayerFault::LoadJournalFailed { generation }) if generation == b_gen.0
+            )
+        });
+        // Clip retired: nothing staged for the failed generation keeps retrying.
+        // The fault is first published on attempt 1; the generation is retired
+        // after PRECOMMIT_MAX_ATTEMPTS ticks (40 ms each). Keep the journal
+        // failing well past that, so only a retry-forever bug could succeed later.
+        std::thread::sleep(Duration::from_millis(1000));
+        wait("retired queue drained", &|| {
+            rig.runtime.coordinator.retired_len() == 0
+        });
+        std::fs::set_permissions(&bindings, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        let after = std::fs::read(
+            std::fs::read_dir(&bindings)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|x| x == "json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after, record, "no write accepted for the failed generation");
+        assert_eq!(rig.runtime.binding.load().generation, a_epoch, "A retained");
+        assert_eq!(rig.handle.control_bus.load().clip_epoch, a_epoch);
+        drop(rig.shutdown());
+    }
+
+    /// The ingest thread never waits on the commit/request gate: a held gate
+    /// defers (never loses) the taken detach ticket; it retires once released.
+    #[test]
+    fn detach_with_held_gate_defers_without_blocking_then_retires() {
+        use crate::player::{DetachAck, DetachRequest};
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let rig = Rig::start(&plain_config(), Some(&state)).unwrap();
+        let mut spec = ClipSpec::new(&a, LoadThen::Cue);
+        spec.reference = Some(SlotReference::Asset { id: "a".into() });
+        rig.runtime.opener.request(spec).unwrap();
+        wait("A committed", &|| {
+            rig.runtime.binding.load().reference.is_some()
+        });
+        wait("A adopted", &|| {
+            rig.runtime
+                .audio_commit
+                .has_adopted(rig.runtime.binding.load().generation)
+        });
+        let a_epoch = rig.runtime.binding.load().generation;
+        let held = rig.runtime.coordinator.hold_gate_for_test();
+        let ticket = rig
+            .runtime
+            .detach
+            .submit(DetachRequest {
+                operation: 9,
+                expected: a_epoch,
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            ticket.acknowledgement().is_none(),
+            "deferred, not lost or acked"
+        );
+        assert_eq!(rig.runtime.binding.load().generation, a_epoch, "A retained");
+        assert!(
+            !rig.worker.as_ref().unwrap().is_finished(),
+            "ingest not blocked or dead"
+        );
+        // Output keeps producing while the gate is held.
+        assert_eq!(rig.drive(25, 10).len(), 10);
+        drop(held);
+        wait("detach retired", &|| ticket.acknowledgement().is_some());
+        assert!(matches!(
+            ticket.acknowledgement(),
+            Some(DetachAck::Retired(_))
+        ));
+        assert!(rig.runtime.binding.load().reference.is_none());
+        drop(rig.shutdown());
+    }
+
+    /// The boot sentinel geometry (0,1) is legitimate; the REAL geometry comes from
+    /// the probed default asset and is carried by the native acknowledgement.
+    #[test]
+    fn default_asset_probe_adopts_real_geometry() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        clip(dir.path(), "d.mov", 90, Some(0.25));
+        let doc = config_doc(
+            &format!("[media_library]\nroot = \"{}\"", dir.path().display()),
+            "[[media_library.assets]]\nid = \"dflt\"\nkind = \"clip\"\npath = \"d.mov\"\n",
+            true,
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).unwrap();
+        let rig = Rig::start(&config, None).unwrap();
+        assert_eq!(rig.handle.geometry.out_point(), 1, "sentinel until probed");
+        wait("default adopted", &|| rig.runtime.native.load().is_some());
+        let ack = rig.runtime.native.load().clone().unwrap();
+        assert_eq!(ack.duration_frames, Some(25));
+        assert_eq!((ack.cadence_num, ack.cadence_den), (25, 1));
+        assert_eq!((ack.width, ack.height), (64, 48));
+        assert!(ack.has_audio);
+        assert_eq!(ack.source_id, "dflt");
+        assert_eq!(ack.duration_ns, Some(1_000_000_000));
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        assert!(center(&rig.store, anchor) > 0, "first primed image adopted");
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Killed-child flock recovery on the CURRENT code path: a child process
+    /// journals a detach intent then parks at the precommit hook; the parent
+    /// proves the live owner excludes a second boot, SIGKILLs it, then recovers
+    /// the pending detach and requires fresh opener+audio quiescence to retire.
+    #[test]
+    fn killed_child_flock_recovery_requires_boot_quiescence() {
+        use crate::player::{DetachAck, DetachRequest, Generation};
+        let _budget = crate::player::budget_test_guard();
+        let child_root = std::env::var_os("MULTIVIEW_TEST_RECOVERY_CHILD");
+        let is_child = child_root.is_some();
+        let tmp = child_root.is_none().then(|| tempfile::tempdir().unwrap());
+        let directory =
+            child_root.map_or_else(|| tmp.as_ref().unwrap().path().to_owned(), PathBuf::from);
+        let state = directory.join("state");
+        let marker = directory.join("precommit");
+        let config = plain_config();
+        let request = DetachRequest {
+            operation: 701,
+            expected: Generation(1),
+        };
+        if !is_child {
+            clip(&directory, "fixture.mov", 30, Some(0.25));
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::player_adoption_chaos_tests::killed_child_flock_recovery_requires_boot_quiescence",
+                    "--nocapture",
+                ])
+                .env("MULTIVIEW_TEST_RECOVERY_CHILD", &directory)
+                .env("MULTIVIEW_TEST_CRASH_AT_DETACH_PRECOMMIT", &marker)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(40);
+            while !marker.exists() {
+                if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child failed to reach durable precommit");
+                }
+                std::thread::yield_now();
+            }
+            assert!(
+                Rig::start(&config, Some(&state)).is_none(),
+                "live process still owns the journal flock"
+            );
+            child.kill().unwrap();
+            assert!(!child.wait().unwrap().success());
+        }
+        let rig = Rig::start(&config, Some(&state)).expect("boot after owner exit");
+        if is_child {
+            let mut spec = ClipSpec::new(directory.join("fixture.mov"), LoadThen::Cue);
+            spec.reference = Some(SlotReference::Asset { id: "a".into() });
+            rig.runtime.opener.request(spec).unwrap();
+            wait("child committed", &|| {
+                rig.runtime.binding.load().reference.is_some()
+            });
+            wait("audio ready", &|| {
+                rig.runtime.audio_commit.ready_for_commit()
+            });
+            rig.runtime.detach.submit(request).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let ticket = rig.runtime.detach.submit(request).unwrap();
+        assert_eq!(ticket.acknowledgement(), None, "no pre-quiescence proof");
+        wait("recovered detach retired", &|| {
+            ticket.acknowledgement().is_some()
+        });
+        let retired = rig.runtime.binding.load().generation;
+        assert_eq!(ticket.acknowledgement(), Some(DetachAck::Retired(retired)));
+        assert!(rig.runtime.coordinator.is_quiescent(retired));
+        assert!(rig.runtime.audio_commit.retirement_complete(retired));
+        drop(rig.shutdown());
     }
 }

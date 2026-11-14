@@ -218,6 +218,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::media_players::list_players,
         crate::routes::media_players::get_player,
         crate::routes::media_players::load_player,
+        crate::routes::media_players::load_operation,
         crate::routes::media_players::cue_player,
         crate::routes::media_players::play_player,
         crate::routes::media_players::pause_player,

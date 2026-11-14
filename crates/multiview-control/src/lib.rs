@@ -83,6 +83,7 @@ pub mod notify;
 pub mod output_routing;
 pub mod patch;
 pub mod pending_actions;
+pub mod player_load;
 pub mod preview;
 pub mod problem;
 pub mod program_metrics;

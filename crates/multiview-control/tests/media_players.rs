@@ -77,6 +77,44 @@ fn harness_with_players(ids: &[&str]) -> (support::Harness, Arc<dyn ResourceRepo
     (h, store)
 }
 
+/// An explicit artifact selector must never fall through to legacy command admission.
+#[tokio::test]
+async fn artifact_load_requires_real_capture_and_rejects_ambiguous_selectors() {
+    let (mut h, _) = harness_with_players(&["vt-1"]);
+    for (body, status) in [
+        (
+            json!({"artifactRef":{"captureJobId":1,"artifactId":"missing"},"asset":"a"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"artifactRef":{"captureJobId":1,"artifactId":"missing"},"then":"cue"}),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            json!({"artifactRef":{"captureJobId":1,"artifactId":"missing","path":"/etc/passwd"}}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"artifactRef":{"captureJobId":1,"artifactId":"missing"},"path":"/etc/passwd"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/media/players/vt-1/load")
+            .header(header::AUTHORIZATION, format!("Bearer {OPERATOR_TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", "artifact-one")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(send(&h.router, req).await.status(), status);
+        assert!(
+            h.commands.try_drain().is_empty(),
+            "no fake legacy load command"
+        );
+    }
+}
+
 /// `POST /api/v1/media/players/{id}/play` returns `202` + an operation id and
 /// the matching `Command::MediaTransport { verb: Play }` reaches the engine.
 #[tokio::test]

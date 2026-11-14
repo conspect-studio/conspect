@@ -89,6 +89,8 @@ pub struct CancelResult {
 #[cfg(unix)]
 mod provider;
 #[cfg(unix)]
+pub use multiview_webengine::artifact::Lease as ArtifactLease;
+#[cfg(unix)]
 pub use provider::Provider;
 #[cfg(not(unix))]
 mod provider_unavailable;

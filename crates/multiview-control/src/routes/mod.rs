@@ -1441,6 +1441,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/media/players", get(media_players::list_players))
         .route("/media/players/{id}", get(media_players::get_player))
         .route("/media/players/{id}/load", post(media_players::load_player))
+        .route("/media/players/{id}/load-operations/{operation}", get(media_players::load_operation))
         .route("/media/players/{id}/cue", post(media_players::cue_player))
         .route("/media/players/{id}/play", post(media_players::play_player))
         .route("/media/players/{id}/pause", post(media_players::pause_player))

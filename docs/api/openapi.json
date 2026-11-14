@@ -6492,6 +6492,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required for artifactRef; stable actor-scoped retry key.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -6506,11 +6515,11 @@
         },
         "responses": {
           "202": {
-            "description": "Load accepted; outcome on the realtime stream.",
+            "description": "Legacy load returns an accepted command; artifactRef load returns an operation whose completion requires native video and audio adoption.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AcceptedBody"
+                  "$ref": "#/components/schemas/LoadResponse"
                 }
               }
             }
@@ -6557,6 +6566,89 @@
           },
           "503": {
             "description": "Engine command bus at capacity; shed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media/players/{id}/load-operations/{operation}": {
+      "get": {
+        "tags": [
+          "media-players"
+        ],
+        "summary": "Read one actor- and player-scoped native load operation.",
+        "operationId": "get_player_load_operation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Authorized player identity.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "operation",
+            "in": "path",
+            "description": "Native load generation.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Actual native load outcome.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoadOperation"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Player access denied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Operation is unknown or belongs to another actor.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Native player provider unavailable.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14387,6 +14479,27 @@
           }
         }
       },
+      "ArtifactRef": {
+        "type": "object",
+        "description": "Exact immutable completed capture selector; no path or owner override.",
+        "required": [
+          "captureJobId",
+          "artifactId"
+        ],
+        "properties": {
+          "artifactId": {
+            "type": "string",
+            "description": "Exact artifact ID returned by that job."
+          },
+          "captureJobId": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Actor-owned completed capture job.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "AudioChannelsDoc": {
         "oneOf": [
           {
@@ -18320,6 +18433,58 @@
         },
         "additionalProperties": false
       },
+      "LoadOperation": {
+        "type": "object",
+        "description": "Bounded operation view; completion needs native video and audio adoption.",
+        "required": [
+          "operation",
+          "state"
+        ],
+        "properties": {
+          "native": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NativeLoadAck",
+                "description": "Native facts once adopted."
+              }
+            ]
+          },
+          "operation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Operation id.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "Lifecycle state name."
+          }
+        }
+      },
+      "LoadResponse": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AcceptedBody",
+            "description": "Existing command-bus receipt, not proof of native adoption."
+          },
+          {
+            "$ref": "#/components/schemas/LoadOperation",
+            "description": "Native operation and its actual adoption state."
+          }
+        ],
+        "description": "Wire responses of the legacy command and explicit native artifact load."
+      },
+      "LoadThen": {
+        "type": "string",
+        "description": "Commit landing intent.",
+        "enum": [
+          "cue",
+          "resume"
+        ]
+      },
       "LogLevelDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of [`multiview_telemetry::LogLevel`] (ADR-0060): the five\n`tracing` severities. Serde-equivalent: a unit enum rendered lowercase.",
@@ -18958,6 +19123,87 @@
           "track": {
             "type": "string",
             "description": "Stable rendition identity inside the family (the published track name)."
+          }
+        }
+      },
+      "NativeLoadAck": {
+        "type": "object",
+        "description": "Actual native facts, never acceptance-derived metadata.",
+        "required": [
+          "operation",
+          "generation",
+          "source_id",
+          "cadence_num",
+          "cadence_den",
+          "width",
+          "height",
+          "has_audio",
+          "timeline_ns"
+        ],
+        "properties": {
+          "cadence_den": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cadence denominator."
+          },
+          "cadence_num": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cadence numerator."
+          },
+          "duration_frames": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Probed duration in whole frames, if known.",
+            "minimum": 0
+          },
+          "duration_ns": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Actual probed duration converted with the exact rational cadence."
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Load generation the player committed.",
+            "minimum": 0
+          },
+          "has_audio": {
+            "type": "boolean",
+            "description": "Whether the clip carries adopted audio."
+          },
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Frame height in pixels.",
+            "minimum": 0
+          },
+          "operation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Operation id of the load.",
+            "minimum": 0
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Source id the player adopted."
+          },
+          "timeline_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Timeline position in nanoseconds."
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Frame width in pixels.",
+            "minimum": 0
           }
         }
       },
@@ -25385,6 +25631,17 @@
         "type": "object",
         "description": "The optional JSON body a transport verb may carry: an `asset` (for `load`)\nand/or a `frame` (for `cue`/`seek`). All fields are optional so a verb that\nneeds no body (`play`/`pause`/`stop`, or `cue`/`seek` to the in-point) may\ncarry an empty body.",
         "properties": {
+          "artifactRef": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArtifactRef",
+                "description": "Exact completed capture identity; mutually exclusive with legacy asset."
+              }
+            ]
+          },
           "asset": {
             "type": [
               "string",
@@ -25400,8 +25657,13 @@
             "format": "int64",
             "description": "The target frame, asset-relative, integer frames at the output cadence\n(ADR-T015); used by `cue`/`seek`. Absent cues/seeks to the in-point.",
             "minimum": 0
+          },
+          "then": {
+            "$ref": "#/components/schemas/LoadThen",
+            "description": "Native commit landing intent; defaults to cue."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "TransportParams": {
         "type": "object",

@@ -37,14 +37,53 @@
 //! non-negotiable (a decoder-state hazard independent of the stamping
 //! timeline).
 
+mod audio_budget;
+mod clip;
 mod control;
+mod detach;
 mod handle;
+#[cfg(feature = "ffmpeg")]
+mod journal;
+mod load;
 mod mailbox;
+#[cfg(feature = "ffmpeg")]
+mod opener;
+mod pacer;
+mod probe;
 mod transport;
 
-pub use control::{AudioTransport, PlayerControl, PlayerControlBus};
-pub use handle::PlayerHandle;
-pub use mailbox::{TransportMailbox, TransportVerb};
-pub use transport::{
-    EofPolicy, MediaPlayer, MediaPlayerState, PlayerAction, PlayoutGeometry, PlayoutGeometryError,
+#[cfg(all(test, feature = "ffmpeg"))]
+pub(crate) use audio_budget::budget_test_guard;
+pub use audio_budget::{
+    player_audio_budget, AudioDeckBudget, AudioDeckLease, PLAYER_PCM_BUDGET_BYTES,
 };
+pub use clip::{ClipSpec, ImmutableArtifactLease, SlotReference, SlotSnapshot};
+pub use control::{Adoption, AudioTransport, EpochAdopter, PlayerControl, PlayerControlBus};
+pub use detach::{DetachAck, DetachAdmissionError, DetachPort, DetachRequest, DetachTicket};
+pub use handle::{PlayerFault, PlayerHandle, PlayerStatus};
+pub use load::{
+    AudioCommitSlot, ClaimRefusal, CommitClaim, Generation, LoadCoordinator, LoadRequest, Staged,
+    RETIRE_CAPACITY,
+};
+pub use mailbox::{TransportMailbox, TransportVerb};
+pub use pacer::{OriginPacer, STAMP_LEAD_TICKS};
+pub use probe::{ProbeError, ProbedClip};
+pub use transport::{
+    EofPolicy, LoadThen, MediaPlayer, MediaPlayerState, PlayerAction, PlayerMode, PlayoutGeometry,
+    PlayoutGeometryError,
+};
+
+#[cfg(feature = "ffmpeg")]
+pub use handle::{publish_status, PlayerRuntime};
+#[cfg(feature = "ffmpeg")]
+pub use journal::BindingJournal;
+#[cfg(feature = "ffmpeg")]
+pub use opener::{
+    LoadFailure, LoadFailureReason, OpenerConfig, OpenerStatus, PlayerOpener, RequestError,
+    StagedAudio, StagedClip,
+};
+
+#[cfg(feature = "ffmpeg")]
+mod provider;
+#[cfg(feature = "ffmpeg")]
+pub use provider::runtime_provider;

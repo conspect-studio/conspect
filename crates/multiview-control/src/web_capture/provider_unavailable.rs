@@ -113,6 +113,20 @@ impl Provider {
         Err(ControlError::EngineBusy)
     }
 
+    /// No artifacts exist, so nothing can be adopted by a native player.
+    /// # Errors
+    /// Missing role, or [`ControlError::EngineBusy`].
+    pub fn pin_for_player(
+        &self,
+        p: &Principal,
+        job_id: u64,
+        _artifact_id: &str,
+    ) -> ControlResult<ArtifactLease> {
+        p.role.require(Action::Write)?;
+        let _ = self.status(p, job_id)?;
+        Err(ControlError::EngineBusy)
+    }
+
     /// No jobs exist.
     /// # Errors
     /// Always: as [`status`](Self::status).
