@@ -193,7 +193,7 @@ msgstr ""
 
 #. placeholder {0}: preset.width
 #. placeholder {1}: preset.height
-#: src/pages/OutputFormatFields.tsx:75
+#: src/pages/OutputFormatFields.tsx:89
 msgid "{0}×{1} cover centre"
 msgstr ""
 
@@ -1042,6 +1042,10 @@ msgstr ""
 msgid "Add stream {title} as source from details"
 msgstr ""
 
+#: src/pages/OutputFormatFields.tsx:279
+msgid "Add subtitle slot"
+msgstr ""
+
 #: src/layout/components/SourcePalette.tsx:159
 msgid "Add to layout"
 msgstr ""
@@ -1241,7 +1245,7 @@ msgstr ""
 msgid "All screens"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:590
+#: src/pages/RoutingPage.tsx:591
 msgid "Allow a confirmed down/up-mix to the pinned layout"
 msgstr ""
 
@@ -1345,7 +1349,7 @@ msgstr ""
 msgid "Analysis unavailable — stale, unbound or invalid measured data."
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:133
+#: src/pages/OutputFormatFields.tsx:147
 msgid "Anchor"
 msgstr ""
 
@@ -1363,6 +1367,10 @@ msgstr ""
 
 #: src/resources/FormControls.tsx:80
 msgid "Another route already uses this input."
+msgstr ""
+
+#: src/pages/OutputFormatFields.tsx:364
+msgid "Another slot already uses this menu label (name, else language); give this slot a distinct name or language."
 msgstr ""
 
 #: src/pages/LogsPage.tsx:127
@@ -1431,11 +1439,11 @@ msgstr ""
 
 #. placeholder {0}: outcome.applied.class
 #. placeholder {1}: outcome.applied.operation_id
-#: src/pages/RoutingPage.tsx:324
+#: src/pages/RoutingPage.tsx:325
 msgid "Applied as {0}. Operation {1}."
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:201
+#: src/pages/OutputFormatFields.tsx:216
 msgid "Applies on the next restart."
 msgstr ""
 
@@ -1465,7 +1473,7 @@ msgstr ""
 msgid "Apply to {kindLabel}"
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:197
+#: src/pages/OutputFormatFields.tsx:212
 msgid "Applying resets this output (about 1 s); Program and other outputs are not affected."
 msgstr ""
 
@@ -1650,16 +1658,16 @@ msgid "Audio silence"
 msgstr ""
 
 #. placeholder {0}: slot.track ?? '—'
-#: src/pages/OutputFormatFields.tsx:184
+#: src/pages/OutputFormatFields.tsx:198
 msgid "Audio slot {index}: track {0}"
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:176
-#: src/pages/OutputFormatFields.tsx:182
+#: src/pages/OutputFormatFields.tsx:190
+#: src/pages/OutputFormatFields.tsx:196
 msgid "Audio slot 0: program mix"
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:173
+#: src/pages/OutputFormatFields.tsx:187
 msgid "Audio slots"
 msgstr ""
 
@@ -2091,10 +2099,10 @@ msgstr ""
 #: src/pages/LayoutsPage.tsx:771
 #: src/pages/MediaPlayersPage.tsx:894
 #: src/pages/OutputFeedRow.tsx:458
-#: src/pages/OutputsPage.tsx:1604
-#: src/pages/OutputsPage.tsx:1653
+#: src/pages/OutputsPage.tsx:1609
+#: src/pages/OutputsPage.tsx:1658
 #: src/pages/RelayManagementPage.tsx:80
-#: src/pages/RoutingPage.tsx:659
+#: src/pages/RoutingPage.tsx:660
 #: src/pages/SalvosPage.tsx:281
 #: src/pages/SalvosPage.tsx:395
 #: src/pages/SalvosPage.tsx:433
@@ -2341,7 +2349,7 @@ msgid "Cell"
 msgstr ""
 
 #. placeholder {0}: index + 1
-#: src/pages/RoutingPage.tsx:241
+#: src/pages/RoutingPage.tsx:242
 msgid "Cell {0}"
 msgstr ""
 
@@ -2561,11 +2569,11 @@ msgstr ""
 msgid "Class"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:186
+#: src/pages/RoutingPage.tsx:187
 msgid "Class-1 — hot, seamless at a frame boundary"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:197
+#: src/pages/RoutingPage.tsx:198
 msgid "Class-2 — make-before-break migration (asynchronous)"
 msgstr ""
 
@@ -2827,6 +2835,10 @@ msgstr ""
 msgid "Concepts"
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:270
+msgid "config"
+msgstr ""
+
 #: src/docs/registry.ts:117
 #: src/pages/docs/ConfigPage.tsx:24
 msgid "Config-as-code"
@@ -2899,7 +2911,7 @@ msgstr ""
 msgid "Confirm"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:641
+#: src/pages/RoutingPage.tsx:642
 msgid "Confirm a program-affecting take?"
 msgstr ""
 
@@ -2917,7 +2929,7 @@ msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:342
 #: src/pages/OutputFeedRow.tsx:466
-#: src/pages/RoutingPage.tsx:662
+#: src/pages/RoutingPage.tsx:663
 msgid "Confirm take"
 msgstr ""
 
@@ -3022,7 +3034,7 @@ msgstr ""
 msgid "Conspect's own playout endpoints: small computers that turn ordinary displays into managed, frame-accurate wall heads."
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:121
+#: src/pages/OutputFormatFields.tsx:135
 msgid "Contain (letterbox)"
 msgstr ""
 
@@ -3412,7 +3424,7 @@ msgstr ""
 msgid "Could not measure"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:292
+#: src/pages/RoutingPage.tsx:293
 msgid "Could not plan the take"
 msgstr ""
 
@@ -3503,7 +3515,7 @@ msgstr ""
 msgid "Could not stop the cast session"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:335
+#: src/pages/RoutingPage.tsx:336
 msgid "Could not take"
 msgstr ""
 
@@ -3532,7 +3544,7 @@ msgstr ""
 msgid "Country"
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:123
+#: src/pages/OutputFormatFields.tsx:137
 msgid "Cover (zoom and crop)"
 msgstr ""
 
@@ -3552,7 +3564,7 @@ msgstr ""
 
 #: src/pages/DeviceDetailPage.tsx:1095
 #: src/pages/DeviceDetailPage.tsx:1214
-#: src/pages/OutputsPage.tsx:1611
+#: src/pages/OutputsPage.tsx:1616
 #: src/resources/CrudPage.tsx:383
 msgid "Create"
 msgstr ""
@@ -3929,7 +3941,7 @@ msgstr ""
 #: src/pages/LayoutsPage.tsx:774
 #: src/pages/OutputsPage.tsx:1103
 #: src/pages/OutputsPage.tsx:1221
-#: src/pages/OutputsPage.tsx:1661
+#: src/pages/OutputsPage.tsx:1666
 #: src/pages/SalvosPage.tsx:307
 #: src/pages/SalvosPage.tsx:436
 #: src/pages/TallyPage.tsx:392
@@ -4000,7 +4012,7 @@ msgstr ""
 msgid "Delete this relay? Active clients can disconnect. Imported resources also require explicit deletion."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1630
+#: src/pages/OutputsPage.tsx:1635
 #: src/resources/CrudPage.tsx:402
 msgid "Delete this resource?"
 msgstr ""
@@ -4043,7 +4055,7 @@ msgstr ""
 msgid "Destination"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:543
+#: src/pages/RoutingPage.tsx:544
 msgid "destination id"
 msgstr ""
 
@@ -4230,7 +4242,7 @@ msgstr ""
 msgid "Discrete track name (route {row})"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:556
+#: src/pages/RoutingPage.tsx:557
 msgid "Discrete-track channel count (optional)"
 msgstr ""
 
@@ -4432,7 +4444,7 @@ msgstr ""
 msgid "DVB teletext page"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:525
+#: src/pages/RoutingPage.tsx:526
 msgid "e.g. 0"
 msgstr ""
 
@@ -4441,7 +4453,7 @@ msgid "e.g. black-cam-1"
 msgstr ""
 
 #: src/devices/InputStreamsInspector.tsx:62
-#: src/pages/RoutingPage.tsx:468
+#: src/pages/RoutingPage.tsx:469
 #: src/pages/SourcesPage.tsx:1325
 msgid "e.g. cam-north"
 msgstr ""
@@ -4458,7 +4470,7 @@ msgstr ""
 msgid "e.g. cell-1"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:543
+#: src/pages/RoutingPage.tsx:544
 msgid "e.g. cell-a"
 msgstr ""
 
@@ -4470,7 +4482,7 @@ msgstr ""
 msgid "e.g. dev-foyer"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:522
+#: src/pages/RoutingPage.tsx:523
 msgid "e.g. eng"
 msgstr ""
 
@@ -4511,7 +4523,7 @@ msgstr ""
 msgid "e.g. Sydney"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:524
+#: src/pages/RoutingPage.tsx:525
 msgid "e.g. v/pid:256"
 msgstr ""
 
@@ -5072,7 +5084,7 @@ msgstr ""
 msgid "Files and synthetic sources"
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:125
+#: src/pages/OutputFormatFields.tsx:139
 msgid "Fill (stretch)"
 msgstr ""
 
@@ -5110,11 +5122,11 @@ msgstr ""
 
 #: src/layout/components/CellsForm.tsx:397
 #: src/layout/components/GridLayoutEditor.tsx:719
-#: src/pages/OutputFormatFields.tsx:115
+#: src/pages/OutputFormatFields.tsx:129
 msgid "Fit"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1599
+#: src/pages/OutputsPage.tsx:1604
 #: src/resources/CrudPage.tsx:375
 msgid "Fix the highlighted fields, then save again."
 msgstr ""
@@ -5188,7 +5200,11 @@ msgstr ""
 msgid "Forecast product"
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:57
+#: src/pages/OutputFormatFields.tsx:294
+msgid "Format"
+msgstr ""
+
+#: src/pages/OutputFormatFields.tsx:71
 msgid "Format presets"
 msgstr ""
 
@@ -5560,7 +5576,7 @@ msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:331
 #: src/layout/components/LayoutEditor.tsx:243
-#: src/pages/OutputFormatFields.tsx:105
+#: src/pages/OutputFormatFields.tsx:119
 #: src/pages/OutputsPage.tsx:695
 msgid "Height (px)"
 msgstr ""
@@ -6148,6 +6164,7 @@ msgstr ""
 
 #: src/components/LocaleSwitcher.tsx:35
 #: src/iptv/IptvOrgPage.tsx:452
+#: src/pages/OutputFormatFields.tsx:304
 #: src/pages/SettingsPage.tsx:172
 msgid "Language"
 msgstr ""
@@ -6156,7 +6173,11 @@ msgstr ""
 msgid "Language (route {row})"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:510
+#: src/pages/OutputFormatFields.tsx:354
+msgid "Language must be 1–35 characters of letters, digits and hyphens."
+msgstr ""
+
+#: src/pages/RoutingPage.tsx:511
 msgid "Language tag"
 msgstr ""
 
@@ -6355,7 +6376,7 @@ msgstr ""
 msgid "leave blank to require a Write API key"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:563
+#: src/pages/RoutingPage.tsx:564
 msgid "leave blank to route onto a program-bus channel"
 msgstr ""
 
@@ -6463,6 +6484,10 @@ msgstr ""
 
 #: src/pages/OutputsPage.tsx:202
 msgid "Listening, no caller attached"
+msgstr ""
+
+#: src/components/routing/SubtitlePatchPanel.tsx:270
+msgid "live"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:68
@@ -7111,7 +7136,7 @@ msgstr ""
 msgid "Metadata for one library asset."
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:328
+#: src/pages/RoutingPage.tsx:329
 msgid "Migration accepted"
 msgstr ""
 
@@ -7343,6 +7368,7 @@ msgstr ""
 #: src/pages/graphics/PlayoutView.tsx:467
 #: src/pages/IptvPage.tsx:253
 #: src/pages/LayoutsPage.tsx:87
+#: src/pages/OutputFormatFields.tsx:313
 #: src/pages/OutputsPage.tsx:1569
 #: src/pages/OverlaysPage.tsx:168
 #: src/pages/OverlaysPage.tsx:280
@@ -7358,6 +7384,10 @@ msgstr ""
 
 #: src/pages/CastPage.tsx:509
 msgid "Name (optional)"
+msgstr ""
+
+#: src/pages/OutputFormatFields.tsx:360
+msgid "Name must be at most 64 printable characters, no quotes."
 msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:505
@@ -7823,6 +7853,10 @@ msgstr ""
 msgid "No pending actions."
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:333
+msgid "No pending change"
+msgstr ""
+
 #: src/pages/approved/ShowPage.tsx:67
 msgid "No planned cue."
 msgstr ""
@@ -7895,6 +7929,10 @@ msgstr ""
 msgid "No source catalog available"
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:233
+msgid "No source declares captions."
+msgstr ""
+
 #: src/events/SourceEventsButton.tsx:158
 msgid "No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile."
 msgstr ""
@@ -7918,6 +7956,10 @@ msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:583
 msgid "No streams match. Loosen a filter or choose another place."
+msgstr ""
+
+#: src/pages/OutputFormatFields.tsx:284
+msgid "No subtitle slots."
 msgstr ""
 
 #: src/pages/SyncGroupsPage.tsx:332
@@ -7972,6 +8014,10 @@ msgstr ""
 msgid "Nodes enrol with a keypair identity: the node proves itself with its key, not with a network address, so a node keeps its identity across DHCP changes and re-images. That is why the management address is optional for the <0>displaynode</0> driver — an enrolled node finds the controller and authenticates itself. After a network loss the node reconnects with its enrolled identity, re-pulls its stream, and re-converges its sync offset before un-muting its output."
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:304
+msgid "none"
+msgstr ""
+
 #: src/pages/MediaPlayersPage.tsx:328
 #: src/pages/SalvosPage.tsx:240
 msgid "None"
@@ -7987,6 +8033,10 @@ msgstr ""
 
 #: src/pages/SourcesPage.tsx:721
 msgid "None (no captions decoded)"
+msgstr ""
+
+#: src/components/routing/SubtitlePatchPanel.tsx:281
+msgid "None (unpatch)"
 msgstr ""
 
 #: src/events/AutomationPanel.tsx:142
@@ -8074,6 +8124,10 @@ msgstr ""
 
 #: src/events/SourceEventsButton.tsx:89
 msgid "Not supported for this source kind: only HLS (and YouTube, an HLS wrapper) sources carry cue surfaces this tracker understands."
+msgstr ""
+
+#: src/pages/OutputFormatFields.tsx:342
+msgid "Not supported yet on this output kind (follow-up #{issue})."
 msgstr ""
 
 #: src/pages/SyncGroupsPage.tsx:50
@@ -8406,7 +8460,7 @@ msgstr ""
 #. placeholder {0}: accepted.operation_id
 #. placeholder {0}: outcome.accepted.operation_id
 #: src/pages/DeviceDetailPage.tsx:911
-#: src/pages/RoutingPage.tsx:329
+#: src/pages/RoutingPage.tsx:330
 msgid "Operation {0}; the outcome arrives on the realtime stream."
 msgstr ""
 
@@ -8644,8 +8698,19 @@ msgstr ""
 msgid "Paste this command into a terminal to open the stream in VLC."
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:266
+msgid "patch"
+msgstr ""
+
 #: src/components/switcher/MixerInputBank.tsx:70
 msgid "Patch"
+msgstr ""
+
+#. placeholder {0}: source.name
+#. placeholder {1}: column.name
+#. placeholder {2}: slot.slot
+#: src/components/routing/SubtitlePatchPanel.tsx:261
+msgid "Patch {0} to {1} slot {2}"
 msgstr ""
 
 #: src/pages/approved/RoutingSurface.tsx:81
@@ -8655,6 +8720,10 @@ msgstr ""
 #. placeholder {0}: input.number
 #: src/components/switcher/MixerInputBank.tsx:65
 msgid "Patch source for input {0}"
+msgstr ""
+
+#: src/components/routing/SubtitlePatchPanel.tsx:266
+msgid "patched"
 msgstr ""
 
 #: src/components/broadcast/library/AssetAuditionControls.tsx:165
@@ -8685,6 +8754,10 @@ msgstr ""
 
 #: src/pages/MeshPage.tsx:177
 msgid "Peers discovered"
+msgstr ""
+
+#: src/components/routing/SubtitlePatchPanel.tsx:198
+msgid "pending"
 msgstr ""
 
 #: src/pages/SystemActionsPage.tsx:103
@@ -8757,7 +8830,7 @@ msgstr ""
 msgid "Picked up {0}."
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:55
+#: src/pages/OutputFormatFields.tsx:69
 msgid "Picture format and slots"
 msgstr ""
 
@@ -8785,7 +8858,7 @@ msgstr ""
 msgid "Plan — nothing selected"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:628
+#: src/pages/RoutingPage.tsx:629
 msgid "Plan (dry run)"
 msgstr ""
 
@@ -8813,7 +8886,7 @@ msgstr ""
 
 #. placeholder {0}: form.inputId.trim()
 #. placeholder {1}: form.target.trim()
-#: src/pages/RoutingPage.tsx:411
+#: src/pages/RoutingPage.tsx:412
 msgid "Plan: {0} → {1}"
 msgstr ""
 
@@ -9124,9 +9197,9 @@ msgstr ""
 msgid "Program bus only"
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:90
-#: src/pages/OutputFormatFields.tsx:98
-#: src/pages/OutputFormatFields.tsx:107
+#: src/pages/OutputFormatFields.tsx:104
+#: src/pages/OutputFormatFields.tsx:112
+#: src/pages/OutputFormatFields.tsx:121
 msgid "Program canvas"
 msgstr ""
 
@@ -9463,6 +9536,10 @@ msgstr ""
 msgid "Red = on Program, green = on Preview."
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:252
+msgid "redacted"
+msgstr ""
+
 #: src/pages/SupportPage.tsx:494
 msgid "Redactions in this pack"
 msgstr ""
@@ -9566,6 +9643,7 @@ msgstr ""
 
 #: src/layout/components/CellsForm.tsx:377
 #: src/layout/components/GridLayoutEditor.tsx:538
+#: src/pages/OutputFormatFields.tsx:381
 #: src/pages/SyncGroupsPage.tsx:170
 msgid "Remove"
 msgstr ""
@@ -9608,6 +9686,11 @@ msgstr ""
 
 #: src/events/AutomationPanel.tsx:100
 msgid "Remove rule"
+msgstr ""
+
+#. placeholder {0}: index + 1
+#: src/pages/OutputFormatFields.tsx:375
+msgid "Remove subtitle slot {0}"
 msgstr ""
 
 #: src/pages/DeviceDetailPage.tsx:866
@@ -9732,7 +9815,7 @@ msgstr ""
 msgid "Reset to defaults"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:191
+#: src/pages/RoutingPage.tsx:192
 msgid "Reset-lite — a brief controlled reset"
 msgstr ""
 
@@ -9969,6 +10052,10 @@ msgstr ""
 msgid "Rows"
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:212
+msgid "Rows are sources that declare captions; columns are output subtitle slots."
+msgstr ""
+
 #: src/docs/registry.ts:416
 #: src/docs/registry.ts:723
 #: src/pages/docs/concepts/GlossaryPage.tsx:256
@@ -10097,7 +10184,7 @@ msgstr ""
 #: src/pages/CastPage.tsx:609
 #: src/pages/IptvPage.tsx:125
 #: src/pages/LayoutsPage.tsx:502
-#: src/pages/OutputsPage.tsx:1611
+#: src/pages/OutputsPage.tsx:1616
 #: src/pages/SalvosPage.tsx:398
 #: src/pages/SettingsPage.tsx:218
 #: src/resources/CrudPage.tsx:383
@@ -10440,7 +10527,7 @@ msgstr ""
 msgid "Serves the canvas at a <0>mount</0> with a <1>latency_profile</1> hint."
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:570
+#: src/pages/RoutingPage.tsx:571
 msgid "Set a channel count to route onto a discrete track; leave it blank to route onto the named program-bus channel."
 msgstr ""
 
@@ -10605,7 +10692,11 @@ msgstr ""
 msgid "Skip to content"
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:152
+#: src/components/routing/SubtitlePatchPanel.tsx:222
+msgid "slot"
+msgstr ""
+
+#: src/pages/OutputFormatFields.tsx:166
 msgid "Slots"
 msgstr ""
 
@@ -10638,11 +10729,13 @@ msgstr ""
 msgid "Sort order"
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:217
 #: src/layout/components/CellsForm.tsx:398
 #: src/layout/components/GridLayoutEditor.tsx:667
 #: src/pages/approved/ShowPage.tsx:90
 #: src/pages/approved/SourcesSurface.tsx:365
 #: src/pages/IptvPage.tsx:232
+#: src/pages/OutputFormatFields.tsx:321
 #: src/pages/SwitcherPage.tsx:137
 msgid "Source"
 msgstr ""
@@ -10683,7 +10776,7 @@ msgstr ""
 msgid "source id"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:462
+#: src/pages/RoutingPage.tsx:463
 msgid "Source input id"
 msgstr ""
 
@@ -10716,6 +10809,10 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1071
 #: src/pages/SourcesPage.tsx:232
 msgid "Source URL"
+msgstr ""
+
+#: src/components/routing/SubtitlePatchPanel.tsx:191
+msgid "source-has-no-captions"
 msgstr ""
 
 #. placeholder {0}: s.name
@@ -10899,6 +10996,7 @@ msgstr ""
 msgid "Station WMO id (optional)"
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:324
 #: src/pages/DataPage.tsx:88
 #: src/pages/graphics/DataView.tsx:356
 #: src/pages/MeshPage.tsx:62
@@ -11048,11 +11146,11 @@ msgstr ""
 msgid "Stream"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:512
+#: src/pages/RoutingPage.tsx:513
 msgid "Stream id"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:508
+#: src/pages/RoutingPage.tsx:509
 msgid "Stream index"
 msgstr ""
 
@@ -11060,7 +11158,7 @@ msgstr ""
 msgid "Stream removed"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:479
+#: src/pages/RoutingPage.tsx:480
 msgid "Stream selector"
 msgstr ""
 
@@ -11105,8 +11203,17 @@ msgstr ""
 msgid "Subtitle layers"
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:206
+#: src/components/routing/SubtitlePatchPanel.tsx:208
+msgid "Subtitle patch"
+msgstr ""
+
 #: src/components/SourceDemandBadge.tsx:21
 msgid "subtitle route"
+msgstr ""
+
+#: src/pages/OutputFormatFields.tsx:269
+msgid "Subtitle slots"
 msgstr ""
 
 #: src/pages/SourcesPage.tsx:729
@@ -11238,7 +11345,7 @@ msgstr ""
 
 #: src/pages/OutputAudioRow.tsx:373
 #: src/pages/OutputFeedRow.tsx:414
-#: src/pages/RoutingPage.tsx:632
+#: src/pages/RoutingPage.tsx:633
 #: src/pages/SalvosPage.tsx:269
 msgid "Take"
 msgstr ""
@@ -11247,7 +11354,7 @@ msgstr ""
 msgid "TAKE"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:323
+#: src/pages/RoutingPage.tsx:324
 msgid "Take applied"
 msgstr ""
 
@@ -11259,6 +11366,7 @@ msgstr ""
 msgid "Take exit"
 msgstr ""
 
+#: src/components/routing/SubtitlePatchPanel.tsx:168
 #: src/pages/OutputAudioRow.tsx:279
 #: src/pages/OutputFeedRow.tsx:239
 msgid "Take failed"
@@ -11268,7 +11376,7 @@ msgstr ""
 msgid "Take feed to {outputName}"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:431
+#: src/pages/RoutingPage.tsx:432
 msgid "Take kind"
 msgstr ""
 
@@ -11297,7 +11405,7 @@ msgstr ""
 msgid "Takes are locked and {outputName} currently carries Program. Confirm to change its feed."
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:644
+#: src/pages/RoutingPage.tsx:645
 msgid "Takes are locked and this one changes what is on program (the current PGM source or the audio program bus). Confirm to apply it."
 msgstr ""
 
@@ -11399,7 +11507,7 @@ msgstr ""
 msgid "Target mode"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:349
+#: src/pages/RoutingPage.tsx:350
 msgid "Target program-bus channel or discrete track"
 msgstr ""
 
@@ -11411,7 +11519,7 @@ msgstr ""
 msgid "Target skew (ms)"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:351
+#: src/pages/RoutingPage.tsx:352
 msgid "Target subtitle layer"
 msgstr ""
 
@@ -11419,7 +11527,7 @@ msgstr ""
 msgid "Target time of day"
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:347
+#: src/pages/RoutingPage.tsx:348
 msgid "Target video cell"
 msgstr ""
 
@@ -11543,7 +11651,7 @@ msgstr ""
 msgid "The applied event was not observed on the realtime stream. The command may or may not have been applied."
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:170
+#: src/pages/OutputFormatFields.tsx:184
 msgid "The bitrate must be a whole number from 1 to 1000000 kbit/s."
 msgstr ""
 
@@ -12170,6 +12278,14 @@ msgstr ""
 msgid "This field is required."
 msgstr ""
 
+#: src/pages/OutputFormatFields.tsx:347
+msgid "This format does not match this output's medium."
+msgstr ""
+
+#: src/pages/OutputFormatFields.tsx:340
+msgid "This format is not supported on this output kind."
+msgstr ""
+
 #: src/pages/LayoutEditorPage.tsx:221
 msgid "This grid layout's body could not be parsed (its track or area lists are malformed). Fix the stored document via the API."
 msgstr ""
@@ -12230,6 +12346,10 @@ msgstr ""
 msgid "This output already carries this feed"
 msgstr ""
 
+#: src/pages/OutputFormatFields.tsx:249
+msgid "This output's medium carries no subtitles."
+msgstr ""
+
 #: src/pages/OverlaysPage.tsx:148
 msgid "This overlay kind has no configurable parameters in this build. Parameters authored in a config file are preserved unchanged."
 msgstr ""
@@ -12250,7 +12370,7 @@ msgstr ""
 msgid "This permanently removes the salvo definition."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1633
+#: src/pages/OutputsPage.tsx:1638
 #: src/resources/CrudPage.tsx:405
 msgid "This permanently removes the stored resource. The running engine is not affected until a new configuration is applied."
 msgstr ""
@@ -12307,7 +12427,7 @@ msgstr ""
 msgid "This stored sidecar is not decoded per source. Use the legacy command-line subtitle option instead."
 msgstr ""
 
-#: src/pages/RoutingPage.tsx:610
+#: src/pages/RoutingPage.tsx:611
 msgid "This take would be coerced to Class-1 with degradation (a pinned-layout mix)."
 msgstr ""
 
@@ -12769,7 +12889,14 @@ msgstr ""
 msgid "Unmute the TV"
 msgstr ""
 
+#. placeholder {0}: column.name
+#. placeholder {1}: slot.slot
+#: src/components/routing/SubtitlePatchPanel.tsx:299
+msgid "Unpatch {0} slot {1}"
+msgstr ""
+
 #: src/components/switcher/MixerInputBank.tsx:35
+#: src/pages/OutputFormatFields.tsx:326
 msgid "Unpatched"
 msgstr ""
 
@@ -12946,7 +13073,7 @@ msgstr ""
 msgid "Video"
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:160
+#: src/pages/OutputFormatFields.tsx:174
 msgid "Video bitrate (kbit/s)"
 msgstr ""
 
@@ -12967,7 +13094,7 @@ msgid "Video RTP arrived, but no decoded frames were reported."
 msgstr ""
 
 #. placeholder {0}: form.codec || '—'
-#: src/pages/OutputFormatFields.tsx:156
+#: src/pages/OutputFormatFields.tsx:170
 msgid "Video slot 0: codec {0}"
 msgstr ""
 
@@ -13369,12 +13496,12 @@ msgstr ""
 #: src/layout/components/CellPropertiesPanel.tsx:266
 #: src/layout/components/GridLayoutEditor.tsx:310
 #: src/layout/components/LayoutEditor.tsx:222
-#: src/pages/OutputFormatFields.tsx:96
+#: src/pages/OutputFormatFields.tsx:110
 #: src/pages/OutputsPage.tsx:683
 msgid "Width (px)"
 msgstr ""
 
-#: src/pages/OutputFormatFields.tsx:144
+#: src/pages/OutputFormatFields.tsx:158
 msgid "Width and height must both be even numbers from 16 to 8192, at most 3840 × 2160 pixels in area."
 msgstr ""
 

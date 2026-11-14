@@ -239,31 +239,121 @@ pub enum PlayerAction {
     Ended,
 }
 
+/// What a [`MediaPlayer::rebind`] lands on after a clip commit.
+///
+/// `Cue` is the API `Load` contract ("does not start playout"); `Resume` is the
+/// internal refresh caller: a playing or vamping player keeps doing so on the
+/// new clip (design 2.2, decision 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LoadThen {
+    /// Park on the new in-point, `Cued`.
+    Cue,
+    /// Continue `Playing` / `Vamping` on the new clip; anything else lands `Cued`.
+    Resume,
+}
+
+/// What the ingest thread is doing this frame period (design 2.3).
+///
+/// Every mode drains the mailbox and polls the staged slot once per frame
+/// period; `stop` is the only exit. No mode returns an error, so the thread
+/// cannot die on a decode or read failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PlayerMode {
+    /// No clip has ever committed: the NA heartbeat. `LIVE` by construction.
+    NoClip,
+    /// Reading and decoding the current clip.
+    Decoding,
+    /// Republishing the last good frame each period. `LIVE` by construction.
+    Held,
+    /// `auto_off`: nothing is published; the store ages by design.
+    Released,
+}
+
+impl PlayerMode {
+    /// Every mode drains the mailbox (a verb is never stranded).
+    #[must_use]
+    pub const fn drains_mailbox(self) -> bool {
+        true
+    }
+
+    /// Every mode polls the staged slot, so a load can commit from any mode.
+    #[must_use]
+    pub const fn polls_staged_slot(self) -> bool {
+        true
+    }
+
+    /// Whether the mode publishes a frame each period (`Released` does not).
+    #[must_use]
+    pub const fn publishes(self) -> bool {
+        !matches!(self, Self::Released)
+    }
+
+    /// Whether the tile is `LIVE` by construction (no IO on the thread).
+    #[must_use]
+    pub const fn live_by_construction(self) -> bool {
+        matches!(self, Self::NoClip | Self::Held)
+    }
+
+    /// The mode after a decode or read error: hold the last good frame, or
+    /// fall back to the NA heartbeat when no frame was ever published. Never
+    /// an exit.
+    #[must_use]
+    pub const fn after_error(has_frame: bool) -> Self {
+        if has_frame {
+            Self::Held
+        } else {
+            Self::NoClip
+        }
+    }
+
+    /// The mode after a [`PlayerAction`] from a decoding player.
+    #[must_use]
+    pub const fn after_action(self, action: PlayerAction) -> Self {
+        match action {
+            PlayerAction::Ended => Self::Released,
+            PlayerAction::Hold { .. } => match self {
+                Self::Decoding => Self::Held,
+                other => other,
+            },
+            PlayerAction::Publish { .. } | PlayerAction::SeekFlushTo { .. } => self,
+        }
+    }
+
+    /// The mode after a commit: a freshly committed clip decodes again.
+    #[must_use]
+    pub const fn after_commit() -> Self {
+        Self::Decoding
+    }
+}
+
 /// The pure media-player transport state machine.
 ///
-/// Construct with [`MediaPlayer::new`]; drive transport with the verb methods;
-/// feed each decoded source frame to [`MediaPlayer::on_decoded`] and perform the
-/// returned [`PlayerAction`]. Heartbeat ticks (when no new frame decoded, e.g.
-/// paused or EOF-held) go through [`MediaPlayer::on_heartbeat`].
+/// Construct with [`MediaPlayer::new`] (a clip bound) or [`MediaPlayer::idle`]
+/// (no clip yet); drive transport with the verb methods; feed each decoded
+/// source frame to [`MediaPlayer::on_decoded`] and perform the returned
+/// [`PlayerAction`]. Heartbeat ticks go through [`MediaPlayer::on_heartbeat`]
+/// / [`MediaPlayer::on_heartbeat_n`].
+///
+/// **Stamps are output tick indices** (design 4.1): the cursor is an integer
+/// tick `k`, and the stamp is `MediaTime::from_tick(k, cadence)`, so a step of
+/// `n` ticks advances the stamp by exactly `from_tick(k+n) - from_tick(k)` with
+/// no per-step rounding. One private path (`advance`) owns the cursor.
 #[derive(Debug, Clone)]
 pub struct MediaPlayer {
     state: MediaPlayerState,
     geometry: PlayoutGeometry,
     eof_policy: EofPolicy,
-    /// The output media time of the start tick — the anchor for stamping.
-    anchor: MediaTime,
-    /// Count of frames published since the current `anchor` (monotonic across
-    /// laps within an anchor epoch); the `k` in
-    /// `publish_at(k) = anchor + k × frame_period`.
+    /// The output tick index the current anchor epoch starts at.
+    anchor_tick: i64,
+    /// Ticks consumed since the current anchor.
     emitted: u64,
-    /// The output media time most recently emitted (for the heartbeat cadence
-    /// and the **strict-monotonic guarantee**: a re-anchor — play/vamp after a
-    /// frame was already emitted — must never rewind the published timeline, so
-    /// every stamp is floored at `last_at + frame_period`).
-    last_at: MediaTime,
-    /// Whether any frame has been emitted yet (so the very first frame stamps
-    /// exactly at `anchor`, while every later frame respects the monotone floor).
-    emitted_any: bool,
+    /// The tick most recently stamped. `None` until the first stamp. A re-anchor
+    /// never rewinds it: every stamp is at least `last_tick + n`.
+    last_tick: Option<i64>,
+    /// How many times the cursor jumped forward because the thread fell behind.
+    stamp_skips: u64,
 }
 
 impl MediaPlayer {
@@ -273,13 +363,86 @@ impl MediaPlayer {
     pub fn new(geometry: PlayoutGeometry, eof_policy: EofPolicy, anchor: MediaTime) -> Self {
         Self {
             state: MediaPlayerState::Cued,
+            anchor_tick: anchor.to_tick(geometry.cadence()),
             geometry,
             eof_policy,
-            anchor,
             emitted: 0,
-            last_at: anchor,
-            emitted_any: false,
+            last_tick: None,
+            stamp_skips: 0,
         }
+    }
+
+    /// Construct a player with no clip: state `Idle`, a one-frame sentinel
+    /// geometry (a [`PlayoutGeometry`] cannot be empty). Its stamps run from
+    /// tick 0 until [`MediaPlayer::start_at`] seeds the output-anchored tick.
+    ///
+    /// # Errors
+    ///
+    /// [`PlayoutGeometryError::Cadence`] if `cadence` is not a positive rational.
+    pub fn idle(cadence: Rational, eof_policy: EofPolicy) -> Result<Self, PlayoutGeometryError> {
+        let geometry = PlayoutGeometry::new(0, 1, 0, 1, cadence)?;
+        let mut player = Self::new(geometry, eof_policy, MediaTime::ZERO);
+        player.state = MediaPlayerState::Idle;
+        Ok(player)
+    }
+
+    /// Anchor the first publish at output tick `tick` (the origin anchor,
+    /// design 4.1). Call before the first stamp; it never lowers the monotone
+    /// floor once a frame has been stamped.
+    pub const fn start_at(&mut self, tick: i64) {
+        self.anchor_tick = tick;
+        self.emitted = 0;
+    }
+
+    /// Commit a new clip: swap the geometry, land per `then`, clear any armed
+    /// exit, and re-anchor at `max(commit_tick, last_tick + 1)`. Keeps
+    /// `last_tick`, so there is no gap and no rewind. Returns the tick the next
+    /// stamp is anchored at (the audio `start_anchor` uses the same tick).
+    pub fn rebind(&mut self, geometry: PlayoutGeometry, then: LoadThen, commit_tick: i64) -> i64 {
+        self.state = match (then, self.state) {
+            (LoadThen::Resume, MediaPlayerState::Playing) => MediaPlayerState::Playing,
+            (LoadThen::Resume, MediaPlayerState::Vamping { .. }) => {
+                MediaPlayerState::Vamping { exit_armed: false }
+            }
+            _ => MediaPlayerState::Cued,
+        };
+        self.geometry = geometry;
+        let anchor = match self.last_tick {
+            Some(last) => commit_tick.max(last.saturating_add(1)),
+            None => commit_tick,
+        };
+        self.anchor_tick = anchor;
+        self.emitted = 0;
+        anchor
+    }
+
+    /// If the next stamp would be earlier than `min_tick` (the thread fell
+    /// behind output time), jump the cursor forward to `min_tick` and count it.
+    /// A `min_tick` at or behind the cursor is a no-op: stamps never go back.
+    pub fn catch_up(&mut self, min_tick: i64) {
+        if self.next_tick(1) < min_tick {
+            self.anchor_tick = min_tick;
+            self.emitted = 0;
+            self.stamp_skips = self.stamp_skips.saturating_add(1);
+        }
+    }
+
+    /// The tick most recently stamped, if any.
+    #[must_use]
+    pub const fn last_tick(&self) -> Option<i64> {
+        self.last_tick
+    }
+
+    /// The tick the next single-step stamp would take.
+    #[must_use]
+    pub fn next_stamp_tick(&self) -> i64 {
+        self.next_tick(1)
+    }
+
+    /// How many forward jumps [`MediaPlayer::catch_up`] has made.
+    #[must_use]
+    pub const fn stamp_skips(&self) -> u64 {
+        self.stamp_skips
     }
 
     /// The current transport state.
@@ -419,6 +582,19 @@ impl MediaPlayer {
         }
     }
 
+    /// As [`MediaPlayer::on_heartbeat`], advancing `n` ticks at once (the NA
+    /// cadence of design 2.1): the stamp moves by exactly
+    /// `from_tick(k + n) - from_tick(k)`. `n == 0` is treated as 1.
+    #[must_use]
+    pub fn on_heartbeat_n(&mut self, n: u32) -> PlayerAction {
+        match self.state {
+            MediaPlayerState::Ended => PlayerAction::Ended,
+            _ => PlayerAction::Hold {
+                at: self.advance(n),
+            },
+        }
+    }
+
     // ---- internals ------------------------------------------------------
 
     /// Re-anchor the output-anchored timeline at `anchor` (a fresh play/vamp).
@@ -428,51 +604,47 @@ impl MediaPlayer {
     /// `anchor` (the published timeline is strictly monotone across any command
     /// sequence — the data-plane never-rewind guarantee, inv #1/#3).
     fn reanchor(&mut self, anchor: MediaTime) {
-        self.anchor = anchor;
+        self.anchor_tick = anchor.to_tick(self.geometry.cadence());
         self.emitted = 0;
     }
 
-    /// The output-anchored stamp for the `emitted`-th frame of the current
-    /// anchor epoch: `anchor + emitted × frame_period` (media-playout §7.2).
-    /// Exact integer arithmetic — never float, never wall-clock.
-    fn anchored_stamp(&self) -> MediaTime {
-        // `emitted` is a frame counter; it fits i64 for any realistic run. Clamp
-        // (never panic) rather than `as`-cast (lint policy / safety rule 3).
-        let k = i64::try_from(self.emitted).unwrap_or(i64::MAX);
-        let offset = k.saturating_mul(self.geometry.frame_period_ns);
-        self.anchor.saturating_add(MediaTime::from_nanos(offset))
+    /// The tick an `n`-step advance would stamp: the first stamp of an epoch
+    /// lands on the anchor; later ones on `max(anchor + emitted + n - 1,
+    /// last + n)`, so a re-anchor can never rewind or stall the timeline.
+    fn next_tick(&self, n: u32) -> i64 {
+        let step = i64::from(n.max(1));
+        let emitted = i64::try_from(self.emitted).unwrap_or(i64::MAX);
+        let anchored = self
+            .anchor_tick
+            .saturating_add(emitted)
+            .saturating_add(step - 1);
+        match self.last_tick {
+            Some(last) => anchored.max(last.saturating_add(step)),
+            None => self.anchor_tick.saturating_add(emitted),
+        }
     }
 
-    /// Compute the stamp for the next frame to emit and advance the cursors,
-    /// **strictly monotone by construction**: the very first frame stamps at
-    /// `anchor`; every later frame is `max(anchored_stamp, last_at +
-    /// frame_period)` so a re-anchor can never rewind or stall the published
-    /// timeline (the store's monotonic guard would otherwise clamp a rewind into
-    /// a frozen tile).
-    fn next_at(&mut self) -> MediaTime {
-        let anchored = self.anchored_stamp();
-        let at = if self.emitted_any {
-            let floor = self
-                .last_at
-                .saturating_add(MediaTime::from_nanos(self.geometry.frame_period_ns));
-            if anchored.as_nanos() > floor.as_nanos() {
-                anchored
-            } else {
-                floor
-            }
+    /// The single path that owns the stamp (L1): decoded, held and heartbeat
+    /// stamps all come from here. Advances `n` ticks and returns the exact
+    /// `from_tick` of the new cursor. Integer arithmetic only, no allocation.
+    fn advance(&mut self, n: u32) -> MediaTime {
+        let tick = self.next_tick(n);
+        let consumed = if self.last_tick.is_some() {
+            u64::from(n.max(1))
         } else {
-            anchored
+            1
         };
-        self.emitted = self.emitted.saturating_add(1);
-        self.emitted_any = true;
-        self.last_at = at;
-        at
+        self.emitted = self.emitted.saturating_add(consumed);
+        self.last_tick = Some(tick);
+        MediaTime::from_tick(tick, self.geometry.cadence())
     }
 
     /// Publish the current frame at the next (strictly-monotone, output-anchored)
     /// stamp and advance the emitted-frame cursor.
     fn publish(&mut self) -> PlayerAction {
-        PlayerAction::Publish { at: self.next_at() }
+        PlayerAction::Publish {
+            at: self.advance(1),
+        }
     }
 
     /// Wrap a loop: seek the open container back to `frame`, discard the
@@ -517,6 +689,6 @@ impl MediaPlayer {
     /// monotone path so the republished frame reads LIVE (strictly-increasing
     /// stamps), never aged or rewound.
     fn advance_stamp(&mut self) -> MediaTime {
-        self.next_at()
+        self.advance(1)
     }
 }
