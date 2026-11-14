@@ -526,6 +526,20 @@ impl Default for LiveSourceCapability {
     }
 }
 
+/// The accepted-state exit fence (#367).
+#[derive(Debug, Default)]
+struct AcceptedFence {
+    /// Set once the run decided to exit: from then on no commit writes the
+    /// accepted state (`desired.json`). Checked by the durable write under
+    /// [`Self::gate`], right before the rename. One-way; never cleared.
+    frozen: std::sync::atomic::AtomicBool,
+    /// The commit gate: held across "check the freeze, then rename
+    /// `desired.json`" (never across an fsync or an `.await`). The freeze
+    /// itself never takes it (wait-free); the exit path waits on it, bounded,
+    /// to know no rename is still in flight.
+    gate: std::sync::Mutex<()>,
+}
+
 /// The shared application state.
 ///
 /// Cloned cheaply (`Arc`) into every handler via axum's `State` extractor. It
@@ -960,6 +974,9 @@ pub struct AppState {
     /// across the engine bus — it serializes two rare admin operations and can
     /// never back-pressure the engine (invariant #10).
     config_mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The accepted-state exit fence (#367): the freeze flag and the commit
+    /// gate. See [`AcceptedFence`].
+    accepted_fence: Arc<AcceptedFence>,
     /// The coalescing **Running-changed** signal (ADR-W024 §3): a one-permit
     /// [`tokio::sync::Notify`] fired by [`AppState::audit`] — the ONE choke
     /// point every successful mutation passes through — that the debounced
@@ -1019,6 +1036,9 @@ fn system_ack_clock() -> MediaTime {
 impl AppState {
     /// Assemble an [`AppState`] from its parts, with an in-memory alarm store and
     /// the system acknowledgement clock.
+    // One initializer per field of a wide state struct: its length tracks the
+    // field count, not branching logic.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     #[allow(clippy::too_many_lines)] // one flat field-per-line struct literal
     pub fn new(
@@ -1172,6 +1192,7 @@ impl AppState {
             watch_handle: Arc::new(std::sync::RwLock::new(None)),
             // The promote/revert mutation serial (ADR-W024 MAJOR-C2/C3).
             config_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            accepted_fence: Arc::default(),
             // Honest default: nothing applies live until the binary declares
             // what the running engine can take (ADR-W022).
             live_apply: crate::live_apply::LiveApplyCaps::default(),
@@ -1309,6 +1330,68 @@ impl AppState {
     /// engine bus (invariant #10).
     pub async fn lock_config_mutation(&self) -> tokio::sync::OwnedMutexGuard<()> {
         Arc::clone(&self.config_mutation_lock).lock_owned().await
+    }
+
+    /// Freeze the accepted state (#367): the run decided to exit, so no commit
+    /// may write `desired.json` any more. Wait-free (one atomic store; safe on
+    /// a runtime worker and before the exit watchdog is armed); call it at
+    /// every exit decision. One-way. A writer whose freeze check ran before
+    /// this store may still be inside its rename: wait for it with
+    /// [`Self::await_accepted_commits`] where the exit path can afford a
+    /// bounded wait.
+    pub fn freeze_accepted_state(&self) {
+        self.accepted_fence
+            .frozen
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Run `commit` (the `desired.json` rename) only while the accepted state
+    /// is not frozen. `None` when frozen; `commit` did not run. The check and
+    /// `commit` run under the commit gate, so once the state is frozen and
+    /// [`Self::await_accepted_commits`] returned `true`, no rename is in
+    /// flight and none can start. Keep `commit` short: no fsync.
+    pub fn commit_unless_frozen<R>(&self, commit: impl FnOnce() -> R) -> Option<R> {
+        let _gate = self.lock_commit_gate();
+        if self.accepted_state_frozen() {
+            return None;
+        }
+        Some(commit())
+    }
+
+    /// Wait, at most `bound`, until no `desired.json` rename is in flight
+    /// (#367). Blocking (it polls the commit gate every millisecond): call it
+    /// off the async runtime workers, after the exit watchdog is armed, so a
+    /// stalled filesystem can delay the exit only up to `bound`. `true` when
+    /// the gate was free within the bound; after a freeze that means no
+    /// accepted-state commit can land any more.
+    #[must_use]
+    pub fn await_accepted_commits(&self, bound: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            match self.accepted_fence.gate.try_lock() {
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => return true,
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn lock_commit_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.accepted_fence.gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Whether [`Self::freeze_accepted_state`] ran.
+    #[must_use]
+    pub fn accepted_state_frozen(&self) -> bool {
+        self.accepted_fence
+            .frozen
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Declare what the **running** engine can take live (ADR-W022). The

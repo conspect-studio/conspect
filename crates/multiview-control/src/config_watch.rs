@@ -22,6 +22,16 @@
 //!   truth) and latches a `config-file-requires-restart` warning naming it.
 //!   The new file then becomes the baseline.
 //!
+//! **#367 (ADR-W020 §3a/§3b):** the edit applied is the change from the
+//! PREVIOUS FILE to the new file, merged onto the ACCEPTED state
+//! ([`multiview_config::merge_file_edit`]) — never the whole file over it.
+//! Untouched sections keep the accepted value. An edit that removes accepted
+//! sources/outputs/switcher/audio routes first keeps a copy of the accepted
+//! state under `.multiview/rejected/replaced-*.json` and raises the latched
+//! `config-file-removed-accepted` alarm. Nothing is committed once the run
+//! decided to stop or the engine's command bus is closed (checked under the
+//! config-mutation lock, after waiting for it).
+//!
 //! Isolation (invariants #1 + #10): every engine submission is the
 //! non-blocking `try_submit`. A full bus sheds the submission — the watcher
 //! then leaves the baseline AND the applied fingerprint **un-advanced**,
@@ -810,6 +820,19 @@ async fn watch_loop(
     // clobbers the resumed Running state. An edit landing in the boot window
     // differs from the seed and still applies.
     let mut last_observed: Option<String> = options.initial_observed.clone();
+    // #367: the previous FILE document — what the boot file said before the
+    // edit being applied. A file edit carries only what changed between this
+    // and the new file (`merge_file_edit`), never the whole file over the
+    // accepted state. Seeded from the boot-load text (the file the run
+    // started from); a test spawn without one starts from the baseline (the
+    // file IS the baseline there).
+    let mut files = FileDocs::new(
+        options
+            .initial_observed
+            .as_deref()
+            .and_then(|text| parse_validated(text).ok())
+            .unwrap_or_else(|| baseline.clone()),
+    );
     // How the loop waits between polls: the wall-clock interval (production) or
     // a test's manual tick (the deterministic seam, task #131). Either way the
     // poll/debounce/apply body below is identical.
@@ -880,6 +903,9 @@ async fn watch_loop(
                 // sections the engine actually applied LIVE, so a shed left it at
                 // the adopted state — there is no global gate to unstick.
                 let _mutation = state.lock_config_mutation().await;
+                if shutting_down(&state, &handle) {
+                    return;
+                }
                 if let Err(error) = commit_watched_desired(&state, &baseline).await {
                     reject(
                         &state,
@@ -947,6 +973,7 @@ async fn watch_loop(
         };
         if handle.consume_expected_for(&text) {
             if adopt_expected_text(&path, &text, &mut baseline) {
+                files = FileDocs::new(baseline.clone());
                 applied = Some(now);
                 rejected = None;
                 last_observed = Some(text);
@@ -986,6 +1013,9 @@ async fn watch_loop(
                 // adoption already kept it at the adopted state through the
                 // shed).
                 let _mutation = state.lock_config_mutation().await;
+                if shutting_down(&state, &handle) {
+                    return;
+                }
                 if let Err(error) = commit_watched_desired(&state, &baseline).await {
                     reject(
                         &state,
@@ -1011,14 +1041,26 @@ async fn watch_loop(
         // re-entrancy.
         let apply_result = {
             let _mutation = state.lock_config_mutation().await;
-            apply_change(
+            // #367: never commit once shutdown has begun or the engine's bus is
+            // closed — checked UNDER the mutation lock, after any wait for it,
+            // so a commit can never start after the decision to stop.
+            if shutting_down(&state, &handle) {
+                tracing::info!(
+                    path = %path.display(),
+                    "config-file change seen during shutdown; not applied (it applies \
+                     on the next start from the file edit, never over the accepted state)"
+                );
+                return;
+            }
+            Box::pin(apply_change(
                 &path,
                 &text,
                 &mut baseline,
+                &mut files,
                 &state,
                 &mut invalid_active,
                 &mut incomplete_active,
-            )
+            ))
             .await
         };
         match apply_result {
@@ -1090,6 +1132,172 @@ enum ApplyResult {
     Retry,
 }
 
+/// The two file documents a file edit is judged against (#367).
+struct FileDocs {
+    /// The previous file document: what the boot file said before the edit
+    /// being applied. An unchanged document carries no edit.
+    previous: MultiviewConfig,
+    /// The file document whose edit was last COMMITTED to the accepted state.
+    /// Equal to `previous` except while a shed apply is pending: then the
+    /// accepted state already carries the newer edit, so the next file content
+    /// (a retry of it, or a revert) merges against this one.
+    committed: MultiviewConfig,
+}
+
+impl FileDocs {
+    fn new(file: MultiviewConfig) -> Self {
+        Self {
+            previous: file.clone(),
+            committed: file,
+        }
+    }
+}
+
+/// Merge the file edit onto the accepted state and validate the result:
+/// `(accepted, merged)`. A merged document that does not validate is refused
+/// and latched ([`ApplyResult::RejectedInvalid`]); a failed read of the
+/// accepted state is retried ([`ApplyResult::Retry`]). Both are warned.
+fn merge_onto_accepted(
+    path: &Path,
+    file_next: &MultiviewConfig,
+    baseline: &MultiviewConfig,
+    files: &FileDocs,
+    state: &AppState,
+    invalid_active: &mut bool,
+) -> Result<(MultiviewConfig, MultiviewConfig), ApplyResult> {
+    // #367: the base the edit applies onto is the ACCEPTED state (what the
+    // operator built through the API/UI), not the file. The live diff below
+    // still runs from the watcher's running `baseline`: every per-section
+    // apply is idempotent, so a section the API already changed since the
+    // baseline re-applies to the same value, and a shed retry re-submits the
+    // same commands (the accepted state already carries the committed edit).
+    let accepted = match accepted_config(state) {
+        Ok(Some(accepted)) => accepted,
+        Ok(None) => baseline.clone(),
+        Err(error) => {
+            reject(
+                state,
+                path,
+                &format!("reading the accepted state: {error}"),
+                invalid_active,
+            );
+            return Err(ApplyResult::Retry);
+        }
+    };
+    // Section by section (item by item for id-keyed lists): only what the
+    // FILE edit changed is applied; every untouched section keeps the
+    // accepted value.
+    let next = multiview_config::merge_file_edit(&files.committed, file_next, &accepted);
+    if let Err(error) = next.validate() {
+        reject(
+            state,
+            path,
+            &format!(
+                "the edit does not combine with the accepted state (the edited sections \
+                 conflict with what was accepted through the API): {error}"
+            ),
+            invalid_active,
+        );
+        return Err(ApplyResult::RejectedInvalid);
+    }
+    Ok((accepted, next))
+}
+
+/// #367 (3): an edit that removes sources, outputs, the switcher or audio
+/// routes the accepted state has keeps a copy of the accepted state first.
+/// Returns what is removed and where the copy is; `Err` (warned) when a copy
+/// was needed and could not be kept: no copy, no commit.
+async fn guard_removals(
+    path: &Path,
+    accepted: &MultiviewConfig,
+    next: &MultiviewConfig,
+    state: &AppState,
+    invalid_active: &mut bool,
+) -> Result<(Vec<String>, Option<String>), ()> {
+    let removed = multiview_config::removed_accepted_items(accepted, next);
+    if removed.is_empty() {
+        return Ok((removed, None));
+    }
+    match keep_replaced_copy(state, accepted).await {
+        Ok(kept) => Ok((removed, kept)),
+        Err(error) => {
+            reject(
+                state,
+                path,
+                &format!(
+                    "the edit removes accepted items ({}) and no copy of the accepted \
+                     state could be kept: {error}",
+                    removed.join(", ")
+                ),
+                invalid_active,
+            );
+            Err(())
+        }
+    }
+}
+
+/// Settle a change that needs no live apply: the file document did not change
+/// (`no_edit`: a touch or reformat), or the merged edit equals the running
+/// baseline. Re-converges a pending shed apply (the file was reverted).
+#[allow(clippy::too_many_arguments)]
+async fn settle_without_apply(
+    path: &Path,
+    no_edit: bool,
+    next: MultiviewConfig,
+    file_next: MultiviewConfig,
+    baseline: &mut MultiviewConfig,
+    files: &mut FileDocs,
+    state: &AppState,
+    invalid_active: &mut bool,
+    incomplete_active: &mut bool,
+) -> ApplyResult {
+    // A touch / rewrite with identical content: adopt silently. If a
+    // partial (shed) apply was pending, the file was REVERTED to the
+    // running baseline: nothing is pending for the engine any more, but
+    // the stores may have followed the abandoned content — re-converge
+    // them to the file before clearing the interim warning.
+    if *incomplete_active {
+        if let Err(error) = commit_watched_desired(state, &next).await {
+            reject(
+                state,
+                path,
+                &format!("restoring desired state: {error}"),
+                invalid_active,
+            );
+            return ApplyResult::Retry;
+        }
+        resync_all_stores(state, ACTOR, &next);
+        clear_apply_incomplete(state, path, incomplete_active);
+    }
+    // #367: a real file edit whose content the accepted state already
+    // carries (e.g. the operator wrote back what runs) is TAKEN, not
+    // ignored: count it, so the edit is never indistinguishable from a
+    // suppressed one. A pure touch (same document) stays silent.
+    if !no_edit {
+        *baseline = next;
+        state.config_watch.record_applied(
+            now_ms(state),
+            "the file edit is already in the accepted state; nothing to apply",
+        );
+    }
+    files.previous.clone_from(&file_next);
+    files.committed = file_next;
+    clear_invalid(
+        state,
+        path,
+        "a subsequent valid write applied",
+        invalid_active,
+    );
+    // MAJOR-B round 5: an identical (empty-diff) rewrite changes nothing the
+    // engine runs, so the adopted snapshot is already correct — no wholesale
+    // adoption (that was the round-4 over-adoption). Re-fire so a pending
+    // persist (e.g. after the incomplete re-converge above) captures the
+    // already-correct snapshot.
+    state.running_changed.notify_one();
+    tracing::debug!(path = %path.display(), "config file rewritten with identical content");
+    ApplyResult::Settled
+}
+
 /// Handle one settled external change: whole-document validate, per-section
 /// diff, apply through the one machinery, advance the baseline — unless a
 /// command was shed, in which case NOTHING advances and the apply is retried
@@ -1098,54 +1306,48 @@ async fn apply_change(
     path: &Path,
     text: &str,
     baseline: &mut MultiviewConfig,
+    files: &mut FileDocs,
     state: &AppState,
     invalid_active: &mut bool,
     incomplete_active: &mut bool,
 ) -> ApplyResult {
-    let next = match parse_validated(text) {
+    let file_next = match parse_validated(text) {
         Ok(next) => next,
         Err(reason) => {
             reject(state, path, &reason, invalid_active);
             return ApplyResult::RejectedInvalid;
         }
     };
+    let (accepted, next) =
+        match merge_onto_accepted(path, &file_next, baseline, files, state, invalid_active) {
+            Ok(merged) => merged,
+            Err(result) => return result,
+        };
     let diff = ConfigDiff::between(baseline, &next);
-    if diff.is_empty() {
-        // A touch / rewrite with identical content: adopt silently. If a
-        // partial (shed) apply was pending, the file was REVERTED to the
-        // running baseline: nothing is pending for the engine any more, but
-        // the stores may have followed the abandoned content — re-converge
-        // them to the file before clearing the interim warning.
-        if *incomplete_active {
-            if let Err(error) = commit_watched_desired(state, &next).await {
-                reject(
-                    state,
-                    path,
-                    &format!("restoring desired state: {error}"),
-                    invalid_active,
-                );
-                return ApplyResult::Retry;
-            }
-            resync_all_stores(state, ACTOR, &next);
-            clear_apply_incomplete(state, path, incomplete_active);
-        }
-        *baseline = next;
-        clear_invalid(
-            state,
+    // #367: a file whose DOCUMENT did not change carries no edit (a touch, a
+    // reformat): nothing is applied even where the running baseline and the
+    // accepted state differ — that gap is the operator's, not the file's.
+    let no_edit = files.previous == file_next;
+    if no_edit || diff.is_empty() {
+        return settle_without_apply(
             path,
-            "a subsequent valid write applied",
+            no_edit,
+            next,
+            file_next,
+            baseline,
+            files,
+            state,
             invalid_active,
-        );
-        // MAJOR-B round 5: an identical (empty-diff) rewrite changes nothing the
-        // engine runs, so the adopted snapshot is already correct — no wholesale
-        // adoption (that was the round-4 over-adoption). Re-fire so a pending
-        // persist (e.g. after the incomplete re-converge above) captures the
-        // already-correct snapshot.
-        state.running_changed.notify_one();
-        tracing::debug!(path = %path.display(), "config file rewritten with identical content");
-        return ApplyResult::Settled;
+            incomplete_active,
+        )
+        .await;
     }
-    // The file is external intent. Publish its whole validated envelope before
+    let Ok((removed, kept_copy)) =
+        guard_removals(path, &accepted, &next, state, invalid_active).await
+    else {
+        return ApplyResult::Retry;
+    };
+    // The file is external intent. Publish the merged validated envelope before
     // any control store or command changes, so an I/O refusal leaves state intact.
     // A shed command does not undo accepted intent; the poll retries its live apply.
     if let Err(error) = commit_watched_desired(state, &next).await {
@@ -1164,6 +1366,15 @@ async fn apply_change(
         } else {
             ApplyResult::Retry
         };
+    }
+    if !removed.is_empty() {
+        publish_removed_accepted(state, path, &removed, kept_copy.as_deref());
+    }
+    // The accepted state now carries this edit (a store-only run has no
+    // accepted envelope: there the running baseline is the merge base, and it
+    // advances only with a complete apply).
+    if state.boot_model.is_some() {
+        files.committed.clone_from(&file_next);
     }
     let outcome = apply_document_diff(state, ACTOR, &diff, &next);
     // The document is valid either way — the invalid latch clears even when
@@ -1192,6 +1403,10 @@ async fn apply_change(
         return ApplyResult::Retry;
     }
     *baseline = next;
+    // Only a COMPLETE apply advances the previous file document: a shed retry
+    // must see the same edit again (the merge onto the accepted state, which
+    // already carries the committed edit, is idempotent).
+    files.previous = file_next;
     clear_apply_incomplete(state, path, incomplete_active);
     state.running_changed.notify_one();
     state
@@ -1232,6 +1447,92 @@ async fn commit_watched_desired(
         .set_locations(crate::routes::graphics::weather_specs(&graphics));
     state.graphics.set_config(graphics);
     Ok(())
+}
+
+/// Whether the watcher must not commit any more (#367 (2)). The exit
+/// decision is the signal: the run stops the watcher and freezes the accepted
+/// state at every exit decision (stop signal, fatal fault, drive-loop return).
+/// A closed command bus (the engine's receiver already dropped) is only a
+/// backstop. The durable write re-checks the freeze under its write serial,
+/// so a commit already past this check when the exit is decided never lands.
+fn shutting_down(state: &AppState, handle: &ConfigWatchHandle) -> bool {
+    handle.stop.load(Ordering::Acquire)
+        || state.accepted_state_frozen()
+        || state.commands.is_closed()
+}
+
+/// The accepted configuration a file edit applies onto (#367): the
+/// committed envelope when one exists, else (before the first commit, or a
+/// store-only run) `None` and the caller uses its baseline.
+fn accepted_config(state: &AppState) -> Result<Option<MultiviewConfig>, String> {
+    let Some(model) = state.boot_model.as_ref() else {
+        return Ok(None);
+    };
+    Ok(model.accepted()?.map(|desired| desired.config.clone()))
+}
+
+/// Keep a copy of the accepted envelope a file edit is about to shrink
+/// (#367 (3)), under `.multiview/rejected/replaced-<ms>-<n>.json` (bounded).
+/// `Ok(None)` when there is no envelope to copy (nothing durable is lost).
+async fn keep_replaced_copy(
+    state: &AppState,
+    accepted: &MultiviewConfig,
+) -> Result<Option<String>, String> {
+    let Some(model) = state.boot_model.as_ref() else {
+        return Ok(None);
+    };
+    let Some(envelope) = model.accepted()? else {
+        // No envelope yet: keep the document the run accepted instead.
+        let json = serde_json::to_string(accepted).map_err(|e| e.to_string())?;
+        return keep_bytes(model, json, now_ms(state)).await.map(Some);
+    };
+    let json = serde_json::to_string(envelope.as_ref()).map_err(|e| e.to_string())?;
+    keep_bytes(model, json, now_ms(state)).await.map(Some)
+}
+
+/// Write `json` into the bounded replaced-state directory off the reactor.
+async fn keep_bytes(
+    model: &Arc<crate::boot_model::BootModel>,
+    json: String,
+    now_ms: i64,
+) -> Result<String, String> {
+    let dir = model.state_dir().join(crate::boot_model::REJECTED_DIR);
+    tokio::task::spawn_blocking(move || {
+        crate::boot_model::keep_state_copy(&dir, "replaced", &json, now_ms)
+            .map(|kept| kept.display().to_string())
+    })
+    .await
+    .map_err(|e| format!("copy task failed: {e}"))?
+}
+
+/// Raise the `config-file-removed-accepted` alarm (#367 (3)): a boot-file
+/// edit removed items the operator's accepted state had. Latched (not
+/// cleared by a later write): the removal stands until someone restores it.
+fn publish_removed_accepted(state: &AppState, path: &Path, removed: &[String], kept: Option<&str>) {
+    let listed = removed.join(", ");
+    let copy = kept.map_or_else(
+        || "no earlier saved state existed to copy".to_owned(),
+        |kept| format!("a copy of the state before the edit is kept at {kept}"),
+    );
+    let message = crate::bounded_warning_text(&format!(
+        "An edit of the config file {} removed from the saved configuration: {listed}; {copy}.",
+        path.display()
+    ));
+    tracing::error!(code = "config-file-removed-accepted", %message, "a boot-file edit removed accepted items");
+    state
+        .engine
+        .publish_event(Event::HealthWarningRaised(HealthWarning {
+            code: WarningCode::ConfigFileRemovedAccepted,
+            severity: WarningSeverity::Critical,
+            subsystem: "config".to_owned(),
+            message,
+            remediation: "If the removal was not intended, restore the items through the API or \
+                          the UI, or copy the kept state back to .multiview/desired.json with \
+                          the engine stopped (validate it with `multiview validate` first)."
+                .to_owned(),
+            since: now_nanos(state),
+            active: true,
+        }));
 }
 
 /// What one document apply did: the human summary, the restart-only sections,

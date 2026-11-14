@@ -26352,7 +26352,8 @@
           "container-no-host-networking",
           "catalogue-link-attention",
           "accepted-state-rejected",
-          "tls-certificate"
+          "tls-certificate",
+          "config-file-removed-accepted"
         ]
       },
       "WarningSeverityDoc": {
