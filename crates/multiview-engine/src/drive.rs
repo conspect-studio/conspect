@@ -819,11 +819,7 @@ impl CompositorDrive<Nv12Image> {
         // A transition adds at most two full-canvas tiles (the DIP colour and
         // the incoming picture) and a stinger one more (its clip), so the
         // pool is sized once for all three.
-        scratch.begin(
-            cell_count
-                + 2 * usize::from(self.mix_overlay.is_some())
-                + usize::from(self.stinger_clip.is_some()),
-        );
+        scratch.begin(cell_count + self.overlay_tiles());
         let ComposeScratch {
             held,
             placements,
@@ -869,26 +865,7 @@ impl CompositorDrive<Nv12Image> {
         if let Some(mix) = &self.mix_overlay {
             self.push_transition_tiles(mix, now, canvas.width, canvas.height, held, placements);
         }
-        // The stinger clip (ADR-0112 §5): its fresh frame on top of the take,
-        // through its own alpha plane when it carries one (the compositor's
-        // per-pixel tile alpha), else opaque. A stale or missing frame is
-        // skipped: Program shows the take beneath, never a slate.
-        if let Some(frame) = self
-            .stinger_clip
-            .as_deref()
-            .and_then(|store| Self::fresh_store_frame(store, now))
-        {
-            held.push(frame);
-            placements.push(Placement {
-                image_index: held.len().saturating_sub(1),
-                dst_x: 0,
-                dst_y: 0,
-                dst_w: canvas.width,
-                dst_h: canvas.height,
-                opacity: 1.0,
-                mask: None,
-            });
-        }
+        self.push_stinger_clip(now, canvas.width, canvas.height, held, placements);
 
         // Hand the compositor the held images as owned `Arc`s plus each cell's
         // DESTINATION rect (no pixel copy): a GPU backend composites the frame
@@ -1091,6 +1068,43 @@ impl CompositorDrive<Nv12Image> {
         self.stores
             .get(source)
             .and_then(|store| Self::fresh_store_frame(store, now))
+    }
+
+    /// Full-canvas tiles drawn above the layout: two for a transition (a
+    /// DIP colour or WIPE band plus the incoming picture), one for a stinger
+    /// clip.
+    fn overlay_tiles(&self) -> usize {
+        2 * usize::from(self.mix_overlay.is_some()) + usize::from(self.stinger_clip.is_some())
+    }
+
+    /// The stinger clip (ADR-0112 §5): its fresh frame on top of the take,
+    /// through its own alpha plane when it carries one (the compositor's
+    /// per-pixel tile alpha), else opaque. A stale or missing frame is
+    /// skipped: Program shows the take beneath, never a slate.
+    fn push_stinger_clip(
+        &self,
+        now: MediaTime,
+        width: u32,
+        height: u32,
+        held: &mut Vec<Arc<Nv12Image>>,
+        placements: &mut Vec<Placement>,
+    ) {
+        if let Some(frame) = self
+            .stinger_clip
+            .as_deref()
+            .and_then(|store| Self::fresh_store_frame(store, now))
+        {
+            held.push(frame);
+            placements.push(Placement {
+                image_index: held.len().saturating_sub(1),
+                dst_x: 0,
+                dst_y: 0,
+                dst_w: width,
+                dst_h: height,
+                opacity: 1.0,
+                mask: None,
+            });
+        }
     }
 
     /// A store's fresh frame at `now`, or `None` when it is not live.
