@@ -4,8 +4,13 @@
 //! boot file. Off the output clock: the relay wakes on the switcher's bounded
 //! drop-oldest outcome ring and reads the change-only readback; a lagged ring
 //! is harmless because the readback (not the event) is the source of truth.
+//!
+//! The same relay persists the M/E's selected transition (ADR-0112 §4) as
+//! `switcher.mix_effects[0].transition`, read from the change-only engine
+//! snapshot once no take is in flight, so a restart re-applies it.
 
 use multiview_config::{MixerInputVideo, MultiviewConfig};
+use multiview_core::switcher::TransitionDescriptor;
 use multiview_engine::isolation::RecvError;
 use multiview_engine::switcher_control::{SwitcherControl, SwitcherSnapshot};
 use multiview_engine::switcher_inputs::InputsReadback;
@@ -17,7 +22,7 @@ pub(crate) fn spawn_persist_relay(state: &AppState) {
     let Some(control) = state.switcher.clone() else {
         return;
     };
-    if state.boot_model.is_none() || control.inputs().is_none() {
+    if state.boot_model.is_none() {
         return;
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -33,25 +38,81 @@ async fn persist_relay(state: AppState, control: SwitcherControl) {
     let mut outcomes = control.outcomes();
     // The boot table is the accepted one; only later versions are persisted.
     let mut persisted = control.inputs().map_or(0, |table| table.version);
+    // The boot selection is the accepted one (absent = the engine default).
+    let mut persisted_transition = accepted_transition(&state);
     loop {
         match outcomes.recv().await {
             Ok(_) | Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => break,
         }
-        let Some(table) = control.inputs() else {
+        let snapshot = control.snapshot();
+        if let Some(table) = control.inputs().filter(|t| t.version != persisted) {
+            match persist_inputs(&state, &table, snapshot.as_deref()).await {
+                Ok(()) => persisted = table.version,
+                Err(error) => {
+                    tracing::warn!(%error, version = table.version, "mixer patch: applied patch not persisted");
+                }
+            }
+        }
+        // A flight's descriptor carries the AUTO's rate; persist what the
+        // machine holds once the take is over, not mid-flight.
+        let Some(snapshot) = snapshot.filter(|s| !s.in_flight) else {
             continue;
         };
-        if table.version == persisted {
+        if persisted_transition.as_ref() == Some(&snapshot.transition) {
             continue;
         }
-        let snapshot = control.snapshot();
-        match persist_inputs(&state, &table, snapshot.as_deref()).await {
-            Ok(()) => persisted = table.version,
+        match persist_transition(&state, &snapshot.transition).await {
+            Ok(()) => persisted_transition = Some(snapshot.transition.clone()),
             Err(error) => {
-                tracing::warn!(%error, version = table.version, "mixer patch: applied patch not persisted");
+                tracing::warn!(%error, "switcher: applied transition selection not persisted");
             }
         }
     }
+}
+
+/// The accepted document's selection as the engine booted it: the persisted
+/// descriptor, or the machine default (`cut`) when none is persisted. `None`
+/// when the document cannot be read (the first applied selection is written).
+fn accepted_transition(state: &AppState) -> Option<TransitionDescriptor> {
+    let config: MultiviewConfig =
+        serde_json::from_value(crate::boot_model::current_desired_config(state).ok()?).ok()?;
+    let me = config.switcher?.mix_effects.into_iter().next()?;
+    Some(me.transition.unwrap_or(TransitionDescriptor::Cut))
+}
+
+/// Write `transition` as `switcher.mix_effects[0].transition` of the accepted
+/// state, under the config-mutation lock, off the output clock (ADR-0112 §4).
+///
+/// # Errors
+/// The accepted document cannot be read, validated or committed.
+pub async fn persist_transition(
+    state: &AppState,
+    transition: &TransitionDescriptor,
+) -> ControlResult<()> {
+    if state.boot_model.is_none() {
+        return Ok(());
+    }
+    let _mutation = state.lock_config_mutation().await;
+    let mut config: MultiviewConfig =
+        serde_json::from_value(crate::boot_model::current_desired_config(state)?)
+            .map_err(|e| ControlError::Repository(format!("desired configuration: {e}")))?;
+    let Some(me) = config
+        .switcher
+        .as_mut()
+        .and_then(|switcher| switcher.mix_effects.first_mut())
+    else {
+        return Ok(());
+    };
+    if me.transition.as_ref() == Some(transition) {
+        return Ok(());
+    }
+    me.transition = Some(transition.clone());
+    config
+        .validate()
+        .map_err(|e| ControlError::Validation(e.to_string()))?;
+    let layouts = crate::boot_model::layout_library(state)?;
+    crate::boot_model::commit_desired(state, config, layouts).await
 }
 
 /// Write `table` as `switcher.mix_effects[0].inputs` of the accepted state.

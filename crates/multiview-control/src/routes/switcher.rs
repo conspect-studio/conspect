@@ -5,7 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use multiview_core::switcher::{FrameCount, SourceRef};
+use multiview_core::switcher::{FrameCount, SourceRef, TransitionDescriptor};
 use multiview_engine::switcher_control::{SwitcherCommand, SwitcherControl, SwitcherVerb};
 use multiview_events::AuthzScope;
 use serde::{Deserialize, Serialize};
@@ -38,12 +38,32 @@ pub struct SwitcherRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     /// Action to classify on `/plan`, one of `select_program`, `select_preview`,
-    /// `cut`, `auto`; the action is part of the same validated request.
+    /// `cut`, `auto`, `set_transition`; the action is part of the same
+    /// validated request.
     pub action: String,
     /// AUTO duration at the output's exact cadence; no floating milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_frames: Option<u32>,
+    /// The transition `set_transition` selects for the next AUTO (ADR-0112
+    /// §4), required by it and refused on every other action. Tagged on
+    /// `kind`: `{"kind":"cut"}`; `{"kind":"mix","rate":N}`;
+    /// `{"kind":"dip","rate":N,"color":"#rrggbb","switch_point":{"num":1,"den":2}}`
+    /// (rate >= 2, switch point strictly inside (0, 1)); `{"kind":"wipe",
+    /// "pattern":"linear_edge"|"vertical"|"diagonal"|"box"|"circle","rate":N,
+    /// "reverse":bool,"softness":0..1,"border_width":0..1,"border_color":"#rrggbb",
+    /// "position_xy":[0..1,0..1]}`. `rate` is 1..=1000 frames; AUTO replaces it
+    /// with its own `duration_frames`. Refused with `unsupported-transition`:
+    /// `stinger`, DVE kinds, a dip through a source, `flip_flop` and
+    /// `border_fill_source`; with `invalid-transition`: anything that does not
+    /// parse or is out of range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+    pub transition: Option<serde_json::Value>,
 }
+
+/// Longest transition rate the control API admits, in output frames (the
+/// desk's AUTO bound: 40 s at 25 fps).
+pub const MAX_TRANSITION_FRAMES: u32 = 1000;
 
 /// A dry-run result, including the scene generation the take must recheck.
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +100,11 @@ pub struct SwitcherStateResponse {
     pub preview_source: String,
     /// Active AUTO status.
     pub in_flight: bool,
+    /// The selected transition (during an AUTO, the flight's own, carrying
+    /// the AUTO's rate), as the engine applied it (ADR-0112 §4). Same shape
+    /// as the request's `transition`.
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub transition: TransitionDescriptor,
 }
 
 fn engine(state: &AppState) -> ControlResult<&SwitcherControl> {
@@ -112,7 +137,52 @@ pub fn authorize_refs(principal: &Principal, req: &SwitcherRequest) -> ControlRe
     if let Some(output) = &req.output {
         authorize_output(principal, output)?;
     }
+    // A transition may name a source (a dip source, a border fill, a stinger
+    // player). Each is authorized before the descriptor is parsed or refused
+    // as unrendered, so a denied id never learns whether it exists.
+    if let Some(transition) = req.transition.as_ref().and_then(|t| t.as_object()) {
+        for field in ["dip_source", "border_fill_source", "player"] {
+            if let Some(id) = transition.get(field).and_then(serde_json::Value::as_str) {
+                authorize_object(principal, id)?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Parse and check `set_transition`'s descriptor against the engine's own
+/// rules (ADR-0112): typed 422 `invalid-transition` for a shape or number
+/// the machine refuses, `unsupported-transition` for a kind or option the
+/// Program drive does not render. The engine re-checks at the tick.
+fn parse_transition(req: &SwitcherRequest) -> Result<Option<TransitionDescriptor>, Box<Response>> {
+    let Some(value) = req.transition.as_ref() else {
+        return Ok(None);
+    };
+    let invalid = |detail: String| Box::new(typed("invalid-transition", detail));
+    let descriptor: TransitionDescriptor =
+        serde_json::from_value(value.clone()).map_err(|e| invalid(e.to_string()))?;
+    if !descriptor.is_rendered() {
+        return Err(Box::new(typed(
+            "unsupported-transition",
+            multiview_engine::switcher_control::REFUSE_UNSUPPORTED_TRANSITION,
+        )));
+    }
+    if !descriptor.is_valid() {
+        return Err(invalid(
+            "a dip needs rate >= 2 and a switch point strictly inside (0, 1); wipe softness, \
+             border_width and position_xy are finite and in [0, 1]"
+                .into(),
+        ));
+    }
+    if descriptor
+        .rate()
+        .is_some_and(|rate| rate.get() > MAX_TRANSITION_FRAMES)
+    {
+        return Err(invalid(format!(
+            "rate must be at most {MAX_TRANSITION_FRAMES} frames"
+        )));
+    }
+    Ok(Some(descriptor))
 }
 
 fn validate_first_slice(req: &SwitcherRequest, kind: &str) -> ControlResult<()> {
@@ -123,6 +193,11 @@ fn validate_first_slice(req: &SwitcherRequest, kind: &str) -> ControlResult<()> 
     }
     if req.layout.is_some() || req.output.is_some() {
         return Err(ControlError::Validation("layout selection and output binding are not yet attached to the switcher frame provider".into()));
+    }
+    if kind != "set_transition" && req.transition.is_some() {
+        return Err(ControlError::Validation(
+            "only set_transition carries a transition; AUTO uses the selected one".into(),
+        ));
     }
     match kind {
         "select_program" | "select_preview"
@@ -141,13 +216,26 @@ fn validate_first_slice(req: &SwitcherRequest, kind: &str) -> ControlResult<()> 
         {
             Ok(())
         }
+        "set_transition"
+            if req.source.is_none()
+                && req.input.is_none()
+                && req.duration_frames.is_none()
+                && req.transition.is_some() =>
+        {
+            Ok(())
+        }
         _ => Err(ControlError::Validation(
             "invalid switcher verb or references".into(),
         )),
     }
 }
 
-fn verb(req: &SwitcherRequest, kind: &str, target: Option<&Target>) -> ControlResult<SwitcherVerb> {
+fn verb(
+    req: &SwitcherRequest,
+    kind: &str,
+    target: Option<&Target>,
+    transition: Option<TransitionDescriptor>,
+) -> ControlResult<SwitcherVerb> {
     let target = || {
         target
             .map(|t| t.engine_ref.clone())
@@ -157,6 +245,9 @@ fn verb(req: &SwitcherRequest, kind: &str, target: Option<&Target>) -> ControlRe
         "select_program" => Ok(SwitcherVerb::SelectProgram(target()?)),
         "select_preview" => Ok(SwitcherVerb::SelectPreview(target()?)),
         "cut" => Ok(SwitcherVerb::Cut),
+        "set_transition" => transition
+            .map(SwitcherVerb::SetTransition)
+            .ok_or_else(|| ControlError::Validation("transition required".into())),
         "auto" => Ok(SwitcherVerb::Auto(
             FrameCount::try_from(
                 req.duration_frames
@@ -299,6 +390,11 @@ fn validate_buses(
         "auto" if snapshot.in_flight => Err(ControlError::Validation(
             "cannot start a second AUTO during an active take".into(),
         )),
+        // The flight's descriptor is frozen (ADR-0112 §1); the engine
+        // re-checks at the tick.
+        "set_transition" if snapshot.in_flight => Err(ControlError::Validation(
+            "cannot change the transition during an active take".into(),
+        )),
         _ => Ok(()),
     }
 }
@@ -330,6 +426,7 @@ pub(crate) async fn get_switcher(
             program_source: snapshot.program.as_str().to_owned(),
             preview_source: snapshot.preview.as_str().to_owned(),
             in_flight: snapshot.in_flight,
+            transition: snapshot.transition.clone(),
         }),
     )
         .into_response())
@@ -346,6 +443,9 @@ pub(crate) async fn plan_switcher(
     authorize_refs(&principal, &req)?;
     validate_source_configured(&state, &req)?;
     validate_first_slice(&req, &req.action)?;
+    if let Err(response) = parse_transition(&req) {
+        return Ok(*response);
+    }
     let handle = engine(&state)?;
     if req.action == "auto" && !handle.supports_auto() {
         return Err(ControlError::Validation(
@@ -393,6 +493,10 @@ pub(crate) async fn submit_switcher(
         ));
     }
     validate_first_slice(&req, &kind)?;
+    let transition = match parse_transition(&req) {
+        Ok(transition) => transition,
+        Err(response) => return Ok(*response),
+    };
     let handle = engine(&state)?;
     if req.action == "auto" && !handle.supports_auto() {
         return Err(ControlError::Validation(
@@ -408,7 +512,7 @@ pub(crate) async fn submit_switcher(
     let scene_version = handle
         .scene_version()
         .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;
-    let verb = verb(&req, &kind, target.as_ref())?;
+    let verb = verb(&req, &kind, target.as_ref(), transition)?;
     // The request's lease is acquired only on the Fresh reservation arm below;
     // a replay never changes PVW demand. Keep the old lease through admission.
     let demand = state.source_demand.clone();

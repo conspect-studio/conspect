@@ -24447,7 +24447,7 @@
         "properties": {
           "action": {
             "type": "string",
-            "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`; the action is part of the same validated request."
+            "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`, `set_transition`; the action is part of the same\nvalidated request."
           },
           "duration_frames": {
             "type": [
@@ -24495,6 +24495,13 @@
               "null"
             ],
             "description": "Referenced source for `select_program`/`select_preview`."
+          },
+          "transition": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The transition `set_transition` selects for the next AUTO (ADR-0112\n§4), required by it and refused on every other action. Tagged on\n`kind`: `{\"kind\":\"cut\"}`; `{\"kind\":\"mix\",\"rate\":N}`;\n`{\"kind\":\"dip\",\"rate\":N,\"color\":\"#rrggbb\",\"switch_point\":{\"num\":1,\"den\":2}}`\n(rate >= 2, switch point strictly inside (0, 1)); `{\"kind\":\"wipe\",\n\"pattern\":\"linear_edge\"|\"vertical\"|\"diagonal\"|\"box\"|\"circle\",\"rate\":N,\n\"reverse\":bool,\"softness\":0..1,\"border_width\":0..1,\"border_color\":\"#rrggbb\",\n\"position_xy\":[0..1,0..1]}`. `rate` is 1..=1000 frames; AUTO replaces it\nwith its own `duration_frames`. Refused with `unsupported-transition`:\n`stinger`, DVE kinds, a dip through a source, `flip_flop` and\n`border_fill_source`; with `invalid-transition`: anything that does not\nparse or is out of range."
           }
         }
       },
@@ -24505,7 +24512,8 @@
           "tick",
           "program_source",
           "preview_source",
-          "in_flight"
+          "in_flight",
+          "transition"
         ],
         "properties": {
           "in_flight": {
@@ -24525,6 +24533,10 @@
             "format": "int64",
             "description": "Applied output tick.",
             "minimum": 0
+          },
+          "transition": {
+            "type": "object",
+            "description": "The selected transition (during an AUTO, the flight's own, carrying\nthe AUTO's rate), as the engine applied it (ADR-0112 §4). Same shape\nas the request's `transition`."
           }
         }
       },

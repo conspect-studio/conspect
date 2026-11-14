@@ -8719,7 +8719,8 @@ export interface components {
         SwitcherRequest: {
             /**
              * @description Action to classify on `/plan`, one of `select_program`, `select_preview`,
-             *     `cut`, `auto`; the action is part of the same validated request.
+             *     `cut`, `auto`, `set_transition`; the action is part of the same
+             *     validated request.
              */
             action: string;
             /**
@@ -8743,6 +8744,21 @@ export interface components {
             program: string;
             /** @description Referenced source for `select_program`/`select_preview`. */
             source?: string | null;
+            /**
+             * @description The transition `set_transition` selects for the next AUTO (ADR-0112
+             *     §4), required by it and refused on every other action. Tagged on
+             *     `kind`: `{"kind":"cut"}`; `{"kind":"mix","rate":N}`;
+             *     `{"kind":"dip","rate":N,"color":"#rrggbb","switch_point":{"num":1,"den":2}}`
+             *     (rate >= 2, switch point strictly inside (0, 1)); `{"kind":"wipe",
+             *     "pattern":"linear_edge"|"vertical"|"diagonal"|"box"|"circle","rate":N,
+             *     "reverse":bool,"softness":0..1,"border_width":0..1,"border_color":"#rrggbb",
+             *     "position_xy":[0..1,0..1]}`. `rate` is 1..=1000 frames; AUTO replaces it
+             *     with its own `duration_frames`. Refused with `unsupported-transition`:
+             *     `stinger`, DVE kinds, a dip through a source, `flip_flop` and
+             *     `border_fill_source`; with `invalid-transition`: anything that does not
+             *     parse or is out of range.
+             */
+            transition?: Record<string, never> | null;
         };
         /** @description Engine-owned bus selection and current tick, never guessed from request. */
         SwitcherStateResponse: {
@@ -8757,6 +8773,12 @@ export interface components {
              * @description Applied output tick.
              */
             tick: number;
+            /**
+             * @description The selected transition (during an AUTO, the flight's own, carrying
+             *     the AUTO's rate), as the engine applied it (ADR-0112 §4). Same shape
+             *     as the request's `transition`.
+             */
+            transition: Record<string, never>;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_config::SyncGroup`] (ADR-M008/M010): the
