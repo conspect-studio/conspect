@@ -260,7 +260,7 @@ msgstr "{label} PGM (include in the program mix)"
 
 #. placeholder {0}: col.label
 #. placeholder {1}: stateLabel(cell)
-#: src/pages/approved/PatchMatrix.tsx:269
+#: src/pages/approved/PatchMatrix.tsx:290
 msgid "{label} to {0}: {1}"
 msgstr "{label} to {0}: {1}"
 
@@ -499,7 +499,7 @@ msgstr "● AMBER — preview"
 msgid "● ON AIR — PROGRAM"
 msgstr "● ON AIR — PROGRAM"
 
-#: src/pages/approved/PatchMatrix.tsx:289
+#: src/pages/approved/PatchMatrix.tsx:310
 msgid "● on air · ◐ planned · ◌ pending · ○ available · ⊘ disabled · — n/a · ? unknown. Path: ⇢ passthrough · = shared · ◇ converted."
 msgstr "● on air · ◐ planned · ◌ pending · ○ available · ⊘ disabled · — n/a · ? unknown. Path: ⇢ passthrough · = shared · ◇ converted."
 
@@ -1581,7 +1581,7 @@ msgstr "Attached automatically"
 #: src/app/navigation.tsx:58
 #: src/components/broadcast/BroadcastShell.tsx:34
 #: src/components/broadcast/library/Chips.tsx:139
-#: src/pages/approved/PatchMatrix.tsx:788
+#: src/pages/approved/PatchMatrix.tsx:892
 #: src/pages/OutputAudioRow.tsx:307
 #: src/pages/OutputFeedRow.tsx:434
 #: src/pages/OutputsPage.tsx:897
@@ -1600,12 +1600,12 @@ msgstr "Audio change on {outputName}"
 msgid "Audio feed for {outputName}"
 msgstr "Audio feed for {outputName}"
 
-#: src/pages/approved/PatchMatrix.tsx:169
+#: src/pages/approved/PatchMatrix.tsx:190
 msgid "Audio feeds"
 msgstr "Audio feeds"
 
-#: src/pages/approved/PatchMatrix.tsx:644
-#: src/pages/approved/PatchMatrix.tsx:656
+#: src/pages/approved/PatchMatrix.tsx:708
+#: src/pages/approved/PatchMatrix.tsx:720
 msgid "Audio Follow rides its output's video take: also arm that output's video"
 msgstr "Audio Follow rides its output's video take: also arm that output's video"
 
@@ -1783,7 +1783,7 @@ msgstr "AV1 is the open, royalty-free codec developed by the Alliance for Open M
 msgid "Availability"
 msgstr "Availability"
 
-#: src/pages/approved/PatchMatrix.tsx:201
+#: src/pages/approved/PatchMatrix.tsx:222
 msgid "available"
 msgstr "available"
 
@@ -2044,8 +2044,8 @@ msgstr "Bus"
 msgid "Bus setup"
 msgstr "Bus setup"
 
-#: src/pages/approved/PatchMatrix.test.tsx:714
-#: src/pages/approved/PatchMatrix.tsx:170
+#: src/pages/approved/PatchMatrix.test.tsx:739
+#: src/pages/approved/PatchMatrix.tsx:191
 #: src/pages/OutputFeedRow.tsx:322
 msgid "Buses"
 msgstr "Buses"
@@ -2066,8 +2066,8 @@ msgstr "cadence unknown"
 msgid "Camera 1"
 msgstr "Camera 1"
 
-#: src/pages/approved/PatchMatrix.tsx:634
-#: src/pages/approved/PatchMatrix.tsx:757
+#: src/pages/approved/PatchMatrix.tsx:698
+#: src/pages/approved/PatchMatrix.tsx:856
 msgid "Can take."
 msgstr "Can take."
 
@@ -2081,8 +2081,8 @@ msgstr "Can take."
 #: src/iptv/SourceLinks.tsx:420
 #: src/layout/components/GridLayoutEditor.tsx:882
 #: src/layout/components/LayoutEditor.tsx:426
-#: src/pages/approved/PatchMatrix.tsx:970
-#: src/pages/approved/PatchMatrix.tsx:999
+#: src/pages/approved/PatchMatrix.tsx:1075
+#: src/pages/approved/PatchMatrix.tsx:1104
 #: src/pages/CastPage.tsx:459
 #: src/pages/CastPage.tsx:520
 #: src/pages/CastPage.tsx:569
@@ -2162,12 +2162,12 @@ msgid "Cannot rename: area(s) {0} would no longer be a rectangle."
 msgstr "Cannot rename: area(s) {0} would no longer be a rectangle."
 
 #. placeholder {0}: refusal.detail
-#: src/pages/approved/PatchMatrix.tsx:634
-#: src/pages/approved/PatchMatrix.tsx:636
+#: src/pages/approved/PatchMatrix.tsx:698
+#: src/pages/approved/PatchMatrix.tsx:700
 msgid "Cannot take: {0}"
 msgstr "Cannot take: {0}"
 
-#: src/pages/approved/PatchMatrix.tsx:757
+#: src/pages/approved/PatchMatrix.tsx:856
 msgid "Cannot take."
 msgstr "Cannot take."
 
@@ -2205,7 +2205,7 @@ msgstr "Canvas width in pixels."
 msgid "Capabilities"
 msgstr "Capabilities"
 
-#: src/pages/approved/PatchMatrix.tsx:184
+#: src/pages/approved/PatchMatrix.tsx:205
 msgid "capacity"
 msgstr "capacity"
 
@@ -2352,7 +2352,7 @@ msgstr "Centre x (px)"
 msgid "Centre y (px)"
 msgstr "Centre y (px)"
 
-#: src/pages/approved/PatchMatrix.tsx:173
+#: src/pages/approved/PatchMatrix.tsx:194
 msgid "CG"
 msgstr "CG"
 
@@ -2376,8 +2376,8 @@ msgstr "Change mode…"
 msgid "Changes"
 msgstr "Changes"
 
-#: src/pages/approved/PatchMatrix.tsx:628
-#: src/pages/approved/PatchMatrix.tsx:758
+#: src/pages/approved/PatchMatrix.tsx:692
+#: src/pages/approved/PatchMatrix.tsx:857
 msgid "Changes Program: needs confirmation."
 msgstr "Changes Program: needs confirmation."
 
@@ -2434,6 +2434,10 @@ msgstr "Check all token pages"
 msgid "Checked from this server."
 msgstr "Checked from this server."
 
+#: src/pages/approved/PatchMatrix.tsx:482
+msgid "Checking permission…"
+msgstr "Checking permission…"
+
 #: src/pages/SwitcherPage.tsx:115
 msgid "Checking switcher engine…"
 msgstr "Checking switcher engine…"
@@ -2454,12 +2458,12 @@ msgstr "Choose a feed and plan it first"
 msgid "Choose a feed…"
 msgstr "Choose a feed…"
 
-#: src/pages/approved/PatchMatrix.tsx:692
-#: src/pages/approved/PatchMatrix.tsx:933
+#: src/pages/approved/PatchMatrix.tsx:761
+#: src/pages/approved/PatchMatrix.tsx:1038
 msgid "Choose a salvo first"
 msgstr "Choose a salvo first"
 
-#: src/pages/approved/PatchMatrix.tsx:921
+#: src/pages/approved/PatchMatrix.tsx:1026
 msgid "Choose a salvo…"
 msgstr "Choose a salvo…"
 
@@ -2547,7 +2551,7 @@ msgstr "Class"
 #. placeholder {1}: String(set.new_encoders)
 #. placeholder {2}: set.new_encoders === 1 ? '' : 's'
 #. placeholder {3}: set.fits ? t`fits` : t`does not fit`
-#: src/pages/approved/PatchMatrix.tsx:635
+#: src/pages/approved/PatchMatrix.tsx:699
 msgid "class {0} · +{1} encoder{2} · {3}"
 msgstr "class {0} · +{1} encoder{2} · {3}"
 
@@ -2559,19 +2563,19 @@ msgstr "Class-1 — hot, seamless at a frame boundary"
 msgid "Class-2 — make-before-break migration (asynchronous)"
 msgstr "Class-2 — make-before-break migration (asynchronous)"
 
-#: src/pages/approved/PatchMatrix.tsx:936
+#: src/pages/approved/PatchMatrix.tsx:1041
 msgid "Classify salvo"
 msgstr "Classify salvo"
 
-#: src/pages/approved/PatchMatrix.tsx:862
+#: src/pages/approved/PatchMatrix.tsx:966
 msgid "Classify selection"
 msgstr "Classify selection"
 
-#: src/pages/approved/PatchMatrix.tsx:696
+#: src/pages/approved/PatchMatrix.tsx:765
 msgid "Classify the salvo first"
 msgstr "Classify the salvo first"
 
-#: src/pages/approved/PatchMatrix.tsx:648
+#: src/pages/approved/PatchMatrix.tsx:712
 msgid "Classify the selection first"
 msgstr "Classify the selection first"
 
@@ -2579,7 +2583,7 @@ msgstr "Classify the selection first"
 msgid "Clauses"
 msgstr "Clauses"
 
-#: src/pages/approved/PatchMatrix.tsx:462
+#: src/pages/approved/PatchMatrix.tsx:519
 #: src/pages/LayoutsPage.tsx:120
 msgid "Clean"
 msgstr "Clean"
@@ -2622,7 +2626,7 @@ msgid "Clear place"
 msgstr "Clear place"
 
 #: src/components/broadcast/library/LibraryBrowser.tsx:333
-#: src/pages/approved/PatchMatrix.tsx:889
+#: src/pages/approved/PatchMatrix.tsx:993
 msgid "Clear selection"
 msgstr "Clear selection"
 
@@ -2902,7 +2906,7 @@ msgstr "configured: {label} (not on air)"
 msgid "Confirm"
 msgstr "Confirm"
 
-#: src/pages/approved/PatchMatrix.tsx:982
+#: src/pages/approved/PatchMatrix.tsx:1087
 #: src/pages/RoutingPage.tsx:644
 msgid "Confirm a program-affecting take?"
 msgstr "Confirm a program-affecting take?"
@@ -2920,7 +2924,7 @@ msgid "Confirm program change"
 msgstr "Confirm program change"
 
 #: src/components/broadcast/ProductionDesk.tsx:216
-#: src/pages/approved/PatchMatrix.tsx:1010
+#: src/pages/approved/PatchMatrix.tsx:1115
 #: src/pages/OutputFeedRow.tsx:466
 #: src/pages/RoutingPage.tsx:665
 msgid "Confirm take"
@@ -4137,7 +4141,7 @@ msgstr "direct: {id}"
 msgid "Direction"
 msgstr "Direction"
 
-#: src/pages/approved/PatchMatrix.tsx:204
+#: src/pages/approved/PatchMatrix.tsx:225
 msgid "disabled"
 msgstr "disabled"
 
@@ -4149,7 +4153,7 @@ msgstr "Disabled — any previously configured URL/channel id is retained for la
 msgid "Disabled (no guide fetched for this source)"
 msgstr "Disabled (no guide fetched for this source)"
 
-#: src/pages/approved/PatchMatrix.tsx:204
+#: src/pages/approved/PatchMatrix.tsx:225
 msgid "disabled: {reason}"
 msgstr "disabled: {reason}"
 
@@ -4175,11 +4179,11 @@ msgstr "Discard the source wall-clock"
 
 #: src/app/AppLayout.tsx:17
 #: src/components/ConnectionStatus.tsx:47
-#: src/pages/approved/PatchMatrix.tsx:748
+#: src/pages/approved/PatchMatrix.tsx:847
 msgid "Disconnected"
 msgstr "Disconnected"
 
-#: src/pages/approved/PatchMatrix.tsx:427
+#: src/pages/approved/PatchMatrix.tsx:484
 msgid "Disconnected: takes are disabled until the connection is back"
 msgstr "Disconnected: takes are disabled until the connection is back"
 
@@ -4283,7 +4287,7 @@ msgstr "Document shape"
 msgid "Documentation"
 msgstr "Documentation"
 
-#: src/pages/approved/PatchMatrix.tsx:635
+#: src/pages/approved/PatchMatrix.tsx:699
 msgid "does not fit"
 msgstr "does not fit"
 
@@ -4730,11 +4734,11 @@ msgstr "Engine default (mixed program bus)"
 msgid "Engine default (reclock to house)"
 msgstr "Engine default (reclock to house)"
 
-#: src/pages/approved/PatchMatrix.tsx:747
+#: src/pages/approved/PatchMatrix.tsx:845
 msgid "Engine not confirming (stale)"
 msgstr "Engine not confirming (stale)"
 
-#: src/pages/approved/PatchMatrix.tsx:769
+#: src/pages/approved/PatchMatrix.tsx:868
 msgid "Engine not confirming: the tick has not advanced for over 2 s. Crosspoints show as unknown; takes stay enabled."
 msgstr "Engine not confirming: the tick has not advanced for over 2 s. Crosspoints show as unknown; takes stay enabled."
 
@@ -5112,7 +5116,7 @@ msgstr "first declared rendition"
 msgid "Fit"
 msgstr "Fit"
 
-#: src/pages/approved/PatchMatrix.tsx:635
+#: src/pages/approved/PatchMatrix.tsx:699
 msgid "fits"
 msgstr "fits"
 
@@ -5130,7 +5134,7 @@ msgstr "Fix these before saving:"
 msgid "Fix these problems before saving:"
 msgstr "Fix these problems before saving:"
 
-#: src/pages/approved/PatchMatrix.tsx:188
+#: src/pages/approved/PatchMatrix.tsx:209
 msgid "fixed by the output's configuration; only audio slot 0 Follow is patchable in this release"
 msgstr "fixed by the output's configuration; only audio slot 0 Follow is patchable in this release"
 
@@ -5146,7 +5150,7 @@ msgstr "Focus player transport"
 msgid "Focus transport"
 msgstr "Focus transport"
 
-#: src/pages/approved/PatchMatrix.tsx:463
+#: src/pages/approved/PatchMatrix.tsx:520
 #: src/pages/OutputAudioRow.tsx:193
 #: src/pages/OutputAudioRow.tsx:201
 #: src/pages/OutputAudioRow.tsx:296
@@ -5281,7 +5285,7 @@ msgstr "Gaps (px)"
 msgid "Gaps must be whole pixel counts (0 or more)."
 msgstr "Gaps must be whole pixel counts (0 or more)."
 
-#: src/pages/approved/PatchMatrix.tsx:174
+#: src/pages/approved/PatchMatrix.tsx:195
 #: src/pages/OutputFeedRow.tsx:325
 msgid "Generators"
 msgstr "Generators"
@@ -5878,7 +5882,7 @@ msgstr "In sync"
 msgid "In the layout, place a media player (looping clip) cell and the weather cell over the same area, with the weather cell on a higher z. Set the weather cell’s opacity (for example 0.9) to taste. Transparent graphics composite on the CPU path; opaque ones also run on the GPU."
 msgstr "In the layout, place a media player (looping clip) cell and the weather cell over the same area, with the weather cell on a higher z. Set the weather cell’s opacity (for example 0.9) to taste. Transparent graphics composite on the CPU path; opaque ones also run on the GPU."
 
-#: src/pages/approved/PatchMatrix.tsx:805
+#: src/pages/approved/PatchMatrix.tsx:909
 msgid "In this release only an output's audio slot 0 can be patched, and only to Follow, which rides that output's video take: arm both. Other audio feeds are fixed by the output's configuration."
 msgstr "In this release only an output's audio slot 0 can be patched, and only to Follow, which rides that output's video take: arm both. Other audio feeds are fixed by the output's configuration."
 
@@ -6319,7 +6323,7 @@ msgstr "layout: {id}"
 #: src/app/navigation.tsx:53
 #: src/components/broadcast/ProductionDesk.tsx:214
 #: src/docs/registry.ts:227
-#: src/pages/approved/PatchMatrix.tsx:171
+#: src/pages/approved/PatchMatrix.tsx:192
 #: src/pages/DashboardPage.tsx:58
 #: src/pages/docs/FeaturesPage.tsx:25
 #: src/pages/LayoutsPage.tsx:648
@@ -6473,7 +6477,7 @@ msgstr "Listening, no caller attached"
 #: src/components/SystemFooter.tsx:27
 #: src/components/TileStateBadge.tsx:29
 #: src/iptv/Badges.tsx:96
-#: src/pages/approved/PatchMatrix.tsx:746
+#: src/pages/approved/PatchMatrix.tsx:844
 msgid "Live"
 msgstr "Live"
 
@@ -6598,7 +6602,7 @@ msgstr "Load older records"
 msgid "Loaded"
 msgstr "Loaded"
 
-#: src/pages/approved/PatchMatrix.tsx:745
+#: src/pages/approved/PatchMatrix.tsx:843
 #: src/pages/MediaPlayersPage.tsx:635
 msgid "Loading"
 msgstr "Loading"
@@ -7820,6 +7824,10 @@ msgstr "No production rundown API exists, so there is no cue list to take, hold 
 msgid "No published source has an upstream EPG."
 msgstr "No published source has an upstream EPG."
 
+#: src/pages/approved/PatchMatrix.tsx:873
+msgid "No readback tick is visible to your role, so the engine cannot be confirmed live. Crosspoints show as unknown; takes stay enabled."
+msgstr "No readback tick is visible to your role, so the engine cannot be confirmed live. Crosspoints show as unknown; takes stay enabled."
+
 #: src/pages/docs/concepts/TransportsPage.tsx:313
 msgid "No recovery; loss = glitch"
 msgstr "No recovery; loss = glitch"
@@ -7837,7 +7845,7 @@ msgstr "No results."
 msgid "No routes yet — without routes Conspect carries no managed audio."
 msgstr "No routes yet — without routes Conspect carries no managed audio."
 
-#: src/pages/approved/PatchMatrix.tsx:219
+#: src/pages/approved/PatchMatrix.tsx:240
 msgid "No rows or columns to show yet."
 msgstr "No rows or columns to show yet."
 
@@ -7905,11 +7913,11 @@ msgstr "No streams cached for this input yet — it appears once the input has b
 msgid "No streams match. Loosen a filter or choose another place."
 msgstr "No streams match. Loosen a filter or choose another place."
 
-#: src/pages/approved/PatchMatrix.tsx:214
+#: src/pages/approved/PatchMatrix.tsx:235
 msgid "No subtitle columns or caption sources yet: the Subtitle tab fills in once outputs declare subtitle slots."
 msgstr "No subtitle columns or caption sources yet: the Subtitle tab fills in once outputs declare subtitle slots."
 
-#: src/pages/approved/PatchMatrix.tsx:825
+#: src/pages/approved/PatchMatrix.tsx:929
 msgid "No subtitle slots yet: this build has not declared any output's subtitle renditions (#345 fills this tab)."
 msgstr "No subtitle slots yet: this build has not declared any output's subtitle renditions (#345 fills this tab)."
 
@@ -8003,11 +8011,11 @@ msgstr "Not 24/7"
 msgid "Not a member of any sync group."
 msgstr "Not a member of any sync group."
 
-#: src/pages/approved/PatchMatrix.tsx:206
+#: src/pages/approved/PatchMatrix.tsx:227
 msgid "not applicable"
 msgstr "not applicable"
 
-#: src/pages/approved/PatchMatrix.tsx:185
+#: src/pages/approved/PatchMatrix.tsx:206
 msgid "not authorized"
 msgstr "not authorized"
 
@@ -8032,7 +8040,7 @@ msgstr "not currently declared"
 msgid "Not editable in this UI"
 msgstr "Not editable in this UI"
 
-#: src/pages/approved/PatchMatrix.tsx:182
+#: src/pages/approved/PatchMatrix.tsx:203
 msgid "not fresh"
 msgstr "not fresh"
 
@@ -8106,8 +8114,8 @@ msgstr "Nothing enumerated yet — streams appear once the device's driver has p
 msgid "Nothing enumerated yet — the list fills in once the device's driver has probed it."
 msgstr "Nothing enumerated yet — the list fills in once the device's driver has probed it."
 
-#: src/pages/approved/PatchMatrix.tsx:646
-#: src/pages/approved/PatchMatrix.tsx:658
+#: src/pages/approved/PatchMatrix.tsx:710
+#: src/pages/approved/PatchMatrix.tsx:722
 msgid "Nothing in this selection can be taken in this release"
 msgstr "Nothing in this selection can be taken in this release"
 
@@ -8247,7 +8255,7 @@ msgstr "On"
 msgid "on {0}"
 msgstr "on {0}"
 
-#: src/pages/approved/PatchMatrix.tsx:196
+#: src/pages/approved/PatchMatrix.tsx:217
 #: src/pages/OutputFeedRow.tsx:382
 msgid "on air"
 msgstr "on air"
@@ -8664,7 +8672,7 @@ msgstr "Patch a source to a destination. Plan classifies the take without applyi
 msgid "Patch source for input {0}"
 msgstr "Patch source for input {0}"
 
-#: src/pages/approved/PatchMatrix.tsx:896
+#: src/pages/approved/PatchMatrix.tsx:1000
 msgid "Patch take"
 msgstr "Patch take"
 
@@ -8698,12 +8706,12 @@ msgstr "Peer connection failed. The cause is unknown."
 msgid "Peers discovered"
 msgstr "Peers discovered"
 
-#: src/pages/approved/PatchMatrix.tsx:200
+#: src/pages/approved/PatchMatrix.tsx:221
 msgid "pending"
 msgstr "pending"
 
 #. placeholder {0}: cell.heldTicks
-#: src/pages/approved/PatchMatrix.tsx:199
+#: src/pages/approved/PatchMatrix.tsx:220
 msgid "pending ({0} of 50 ticks)"
 msgstr "pending ({0} of 50 ticks)"
 
@@ -8719,6 +8727,10 @@ msgstr "Per-cell audio level meters."
 #: src/iptv/NetworkDialog.tsx:177
 msgid "Per-family result for {0}"
 msgstr "Per-family result for {0}"
+
+#: src/pages/approved/PatchMatrix.tsx:481
+msgid "Permission unavailable (retrying)"
+msgstr "Permission unavailable (retrying)"
 
 #: src/components/switcher/MixerInputBank.tsx:64
 #: src/pages/AudioPage.tsx:477
@@ -8801,7 +8813,7 @@ msgstr "Pixels at or below this 8-bit luma count as black (16 = broadcast black)
 msgid "Plain UDP has no recovery at all: a lost packet is a glitch on screen. That is acceptable on a managed facility LAN and wrong for the internet (use SRT there, which wraps the same transport stream in a recovering envelope). Multicast group management is IPv6-first: receivers join groups via MLDv2, with IPv4/IGMP as the legacy path."
 msgstr "Plain UDP has no recovery at all: a lost packet is a glitch on screen. That is acceptable on a managed facility LAN and wrong for the internet (use SRT there, which wraps the same transport stream in a recovering envelope). Multicast group management is IPv6-first: receivers join groups via MLDv2, with IPv4/IGMP as the legacy path."
 
-#: src/pages/approved/PatchMatrix.tsx:851
+#: src/pages/approved/PatchMatrix.tsx:955
 #: src/pages/approved/RoutingSurface.tsx:360
 msgid "Plan — nothing selected"
 msgstr "Plan — nothing selected"
@@ -8815,8 +8827,8 @@ msgstr "Plan (dry run)"
 msgid "Plan a source → {0}"
 msgstr "Plan a source → {0}"
 
-#: src/pages/approved/PatchMatrix.tsx:582
-#: src/pages/approved/PatchMatrix.tsx:712
+#: src/pages/approved/PatchMatrix.tsx:640
+#: src/pages/approved/PatchMatrix.tsx:797
 #: src/pages/OutputAudioRow.tsx:260
 #: src/pages/OutputFeedRow.tsx:217
 msgid "Plan failed"
@@ -8841,11 +8853,11 @@ msgid "Plan: {0} → {1}"
 msgstr "Plan: {0} → {1}"
 
 #. placeholder {0}: String(selections.length)
-#: src/pages/approved/PatchMatrix.tsx:851
+#: src/pages/approved/PatchMatrix.tsx:955
 msgid "Plan: {0} crosspoint(s)"
 msgstr "Plan: {0} crosspoint(s)"
 
-#: src/pages/approved/PatchMatrix.tsx:197
+#: src/pages/approved/PatchMatrix.tsx:218
 msgid "planned"
 msgstr "planned"
 
@@ -8857,7 +8869,7 @@ msgstr "Planned"
 msgid "Planned cue in"
 msgstr "Planned cue in"
 
-#: src/pages/approved/PatchMatrix.tsx:197
+#: src/pages/approved/PatchMatrix.tsx:218
 msgid "planned, needs on-air confirmation"
 msgstr "planned, needs on-air confirmation"
 
@@ -8901,7 +8913,7 @@ msgstr "Playback URLs are unavailable: this server does not provide them yet (ba
 msgid "Player"
 msgstr "Player"
 
-#: src/pages/approved/PatchMatrix.tsx:172
+#: src/pages/approved/PatchMatrix.tsx:193
 #: src/pages/OutputFeedRow.tsx:324
 msgid "Players"
 msgstr "Players"
@@ -8967,7 +8979,7 @@ msgid "preview"
 msgstr "preview"
 
 #: src/layout/components/GridLayoutEditor.tsx:552
-#: src/pages/approved/PatchMatrix.tsx:461
+#: src/pages/approved/PatchMatrix.tsx:518
 #: src/pages/OutputFeedRow.tsx:178
 #: src/preview/SourcePreviewButton.tsx:16
 msgid "Preview"
@@ -9118,8 +9130,8 @@ msgstr "Profiles"
 msgid "PROG"
 msgstr "PROG"
 
-#: src/pages/approved/PatchMatrix.test.tsx:717
-#: src/pages/approved/PatchMatrix.tsx:460
+#: src/pages/approved/PatchMatrix.test.tsx:742
+#: src/pages/approved/PatchMatrix.tsx:517
 #: src/pages/MonitoringPage.tsx:210
 msgid "Program"
 msgstr "Program"
@@ -9178,7 +9190,7 @@ msgstr "PROGRAM master gain — unavailable"
 msgid "Program meters"
 msgstr "Program meters"
 
-#: src/pages/approved/PatchMatrix.tsx:464
+#: src/pages/approved/PatchMatrix.tsx:521
 #: src/pages/AudioPage.tsx:1226
 #: src/pages/OutputAudioRow.tsx:207
 #: src/pages/OutputAudioRow.tsx:297
@@ -9387,7 +9399,7 @@ msgstr "Reachable. DEGRADED means the device itself reports a fault — a stalle
 msgid "Read the in-app documentation"
 msgstr "Read the in-app documentation"
 
-#: src/pages/approved/PatchMatrix.tsx:749
+#: src/pages/approved/PatchMatrix.tsx:848
 msgid "Read-only"
 msgstr "Read-only"
 
@@ -9395,11 +9407,11 @@ msgstr "Read-only"
 msgid "Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Lifecycle timers use the source presentation clock. Marker times are predictions from the clock each one names, and their countdowns run against this browser's clock."
 msgstr "Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Lifecycle timers use the source presentation clock. Marker times are predictions from the clock each one names, and their countdowns run against this browser's clock."
 
-#: src/pages/approved/PatchMatrix.tsx:425
+#: src/pages/approved/PatchMatrix.tsx:478
 msgid "Read-only: your role lacks Write"
 msgstr "Read-only: your role lacks Write"
 
-#: src/pages/approved/PatchMatrix.tsx:750
+#: src/pages/approved/PatchMatrix.tsx:849
 msgid "Readback unavailable"
 msgstr "Readback unavailable"
 
@@ -9437,7 +9449,7 @@ msgstr "Reboot this device?"
 msgid "Reboot…"
 msgstr "Reboot…"
 
-#: src/pages/approved/PatchMatrix.tsx:908
+#: src/pages/approved/PatchMatrix.tsx:1012
 msgid "Recall a stored salvo"
 msgstr "Recall a stored salvo"
 
@@ -9530,15 +9542,15 @@ msgstr "Refresh (exact rational)"
 msgid "Refresh relay status"
 msgstr "Refresh relay status"
 
-#: src/pages/approved/PatchMatrix.tsx:901
+#: src/pages/approved/PatchMatrix.tsx:1005
 msgid "Refused by the engine"
 msgstr "Refused by the engine"
 
-#: src/pages/approved/PatchMatrix.tsx:900
+#: src/pages/approved/PatchMatrix.tsx:1004
 msgid "Refused by the engine: {reason}"
 msgstr "Refused by the engine: {reason}"
 
-#: src/pages/approved/PatchMatrix.tsx:190
+#: src/pages/approved/PatchMatrix.tsx:211
 msgid "refused by the plan"
 msgstr "refused by the plan"
 
@@ -10086,13 +10098,13 @@ msgid "Salted digests and a signed lease request — never raw serials, MAC addr
 msgstr "Salted digests and a signed lease request — never raw serials, MAC addresses, or media. The exhaustive list:"
 
 #: src/docs/registry.ts:733
-#: src/pages/approved/PatchMatrix.tsx:911
+#: src/pages/approved/PatchMatrix.tsx:1015
 #: src/pages/docs/concepts/GlossaryPage.tsx:279
 msgid "Salvo"
 msgstr "Salvo"
 
 #. placeholder {0}: String(selections.length)
-#: src/pages/approved/PatchMatrix.tsx:765
+#: src/pages/approved/PatchMatrix.tsx:864
 msgid "Salvo arming ({0} selected)"
 msgstr "Salvo arming ({0} selected)"
 
@@ -10104,7 +10116,7 @@ msgstr "Salvo created"
 msgid "Salvo deleted"
 msgstr "Salvo deleted"
 
-#: src/pages/approved/PatchMatrix.tsx:965
+#: src/pages/approved/PatchMatrix.tsx:1070
 msgid "Salvo id"
 msgstr "Salvo id"
 
@@ -10112,7 +10124,7 @@ msgstr "Salvo id"
 msgid "Salvo saved"
 msgstr "Salvo saved"
 
-#: src/pages/approved/PatchMatrix.tsx:896
+#: src/pages/approved/PatchMatrix.tsx:1000
 msgid "Salvo take"
 msgstr "Salvo take"
 
@@ -10387,8 +10399,8 @@ msgstr "Select and copy the value manually."
 msgid "Select cell"
 msgstr "Select cell"
 
-#: src/pages/approved/PatchMatrix.tsx:642
-#: src/pages/approved/PatchMatrix.tsx:654
+#: src/pages/approved/PatchMatrix.tsx:706
+#: src/pages/approved/PatchMatrix.tsx:718
 msgid "Select crosspoints first"
 msgstr "Select crosspoints first"
 
@@ -10596,7 +10608,7 @@ msgstr "Signal unconfirmed"
 msgid "Signal unknown"
 msgstr "Signal unknown"
 
-#: src/pages/approved/PatchMatrix.tsx:465
+#: src/pages/approved/PatchMatrix.tsx:522
 #: src/pages/OutputAudioRow.tsx:208
 #: src/pages/OutputAudioRow.tsx:298
 msgid "Silence"
@@ -10660,7 +10672,7 @@ msgstr "Sort order"
 msgid "Source"
 msgstr "Source"
 
-#: src/pages/approved/PatchMatrix.tsx:231
+#: src/pages/approved/PatchMatrix.tsx:252
 #: src/pages/approved/RoutingSurface.tsx:180
 msgid "Source ↓ / Dest →"
 msgstr "Source ↓ / Dest →"
@@ -10743,7 +10755,7 @@ msgstr "Source: {0} ({1})"
 #: src/docs/registry.ts:138
 #: src/docs/registry.ts:232
 #: src/layout/components/SourcePalette.tsx:203
-#: src/pages/approved/PatchMatrix.tsx:175
+#: src/pages/approved/PatchMatrix.tsx:196
 #: src/pages/docs/ConfigPage.tsx:141
 #: src/pages/docs/FeaturesPage.tsx:38
 #: src/pages/OutputAudioRow.tsx:299
@@ -10997,7 +11009,7 @@ msgstr "Stop this cast session?"
 msgid "Stopped"
 msgstr "Stopped"
 
-#: src/pages/approved/PatchMatrix.tsx:880
+#: src/pages/approved/PatchMatrix.tsx:984
 msgid "Store as salvo…"
 msgstr "Store as salvo…"
 
@@ -11005,11 +11017,11 @@ msgstr "Store as salvo…"
 msgid "Store credential securely"
 msgstr "Store credential securely"
 
-#: src/pages/approved/PatchMatrix.tsx:973
+#: src/pages/approved/PatchMatrix.tsx:1078
 msgid "Store salvo"
 msgstr "Store salvo"
 
-#: src/pages/approved/PatchMatrix.tsx:956
+#: src/pages/approved/PatchMatrix.tsx:1061
 msgid "Store this selection as a salvo"
 msgstr "Store this selection as a salvo"
 
@@ -11115,7 +11127,7 @@ msgstr "Subject"
 msgid "Subsystem:"
 msgstr "Subsystem:"
 
-#: src/pages/approved/PatchMatrix.tsx:789
+#: src/pages/approved/PatchMatrix.tsx:893
 msgid "Subtitle"
 msgstr "Subtitle"
 
@@ -11123,11 +11135,11 @@ msgstr "Subtitle"
 msgid "Subtitle layers"
 msgstr "Subtitle layers"
 
-#: src/pages/approved/PatchMatrix.tsx:189
+#: src/pages/approved/PatchMatrix.tsx:210
 msgid "subtitle patching is not available in this release (#345)"
 msgstr "subtitle patching is not available in this release (#345)"
 
-#: src/pages/approved/PatchMatrix.tsx:833
+#: src/pages/approved/PatchMatrix.tsx:937
 msgid "Subtitle patching is not available in this release (#345): this tab shows what is on air only."
 msgstr "Subtitle patching is not available in this release (#345): this tab shows what is on air only."
 
@@ -11212,7 +11224,7 @@ msgstr "Switcher"
 msgid "Switcher operation rejected"
 msgstr "Switcher operation rejected"
 
-#: src/pages/approved/PatchMatrix.tsx:186
+#: src/pages/approved/PatchMatrix.tsx:207
 msgid "switcher required"
 msgstr "switcher required"
 
@@ -11277,7 +11289,7 @@ msgstr "Take"
 msgid "TAKE"
 msgstr "TAKE"
 
-#: src/pages/approved/PatchMatrix.tsx:870
+#: src/pages/approved/PatchMatrix.tsx:974
 msgid "Take all"
 msgstr "Take all"
 
@@ -11293,8 +11305,8 @@ msgstr "Take audio to {outputName}"
 msgid "Take exit"
 msgstr "Take exit"
 
-#: src/pages/approved/PatchMatrix.tsx:600
-#: src/pages/approved/PatchMatrix.tsx:729
+#: src/pages/approved/PatchMatrix.tsx:664
+#: src/pages/approved/PatchMatrix.tsx:827
 #: src/pages/OutputAudioRow.tsx:279
 #: src/pages/OutputFeedRow.tsx:239
 msgid "Take failed"
@@ -11316,12 +11328,12 @@ msgstr "Take next"
 msgid "take pending"
 msgstr "take pending"
 
-#: src/pages/approved/PatchMatrix.tsx:944
+#: src/pages/approved/PatchMatrix.tsx:1049
 #: src/pages/SalvosPage.tsx:263
 msgid "Take salvo"
 msgstr "Take salvo"
 
-#: src/pages/approved/PatchMatrix.tsx:870
+#: src/pages/approved/PatchMatrix.tsx:974
 msgid "Take this crosspoint"
 msgstr "Take this crosspoint"
 
@@ -11342,11 +11354,11 @@ msgstr "Takes are locked and {outputName} currently carries Program. Confirm to 
 msgid "Takes are locked and this one changes what is on program (the current PGM source or the audio program bus). Confirm to apply it."
 msgstr "Takes are locked and this one changes what is on program (the current PGM source or the audio program bus). Confirm to apply it."
 
-#: src/pages/approved/PatchMatrix.tsx:985
+#: src/pages/approved/PatchMatrix.tsx:1090
 msgid "Takes are locked and this salvo changes a crosspoint that currently carries Program. Confirm to take it."
 msgstr "Takes are locked and this salvo changes a crosspoint that currently carries Program. Confirm to take it."
 
-#: src/pages/approved/PatchMatrix.tsx:990
+#: src/pages/approved/PatchMatrix.tsx:1095
 msgid "Takes are locked and this set changes a crosspoint that currently carries Program. Confirm to apply it."
 msgstr "Takes are locked and this set changes a crosspoint that currently carries Program. Confirm to apply it."
 
@@ -11891,7 +11903,7 @@ msgstr "The output clock, genlock, PTP, and wall-clock time — how frames are p
 msgid "The patch cannot be taken"
 msgstr "The patch cannot be taken"
 
-#: src/pages/approved/PatchMatrix.tsx:774
+#: src/pages/approved/PatchMatrix.tsx:878
 msgid "The patch readback could not be read."
 msgstr "The patch readback could not be read."
 
@@ -11899,11 +11911,11 @@ msgstr "The patch readback could not be read."
 msgid "the plan is a dry run that classifies the take. Only Take applies it; a Class-2 migration is accepted asynchronously (HTTP 202 is not applied) and its outcome arrives on the realtime stream."
 msgstr "the plan is a dry run that classifies the take. Only Take applies it; a Class-2 migration is accepted asynchronously (HTTP 202 is not applied) and its outcome arrives on the realtime stream."
 
-#: src/pages/approved/PatchMatrix.tsx:700
+#: src/pages/approved/PatchMatrix.tsx:769
 msgid "The plan refuses this salvo"
 msgstr "The plan refuses this salvo"
 
-#: src/pages/approved/PatchMatrix.tsx:650
+#: src/pages/approved/PatchMatrix.tsx:714
 msgid "The plan refuses this take"
 msgstr "The plan refuses this take"
 
@@ -11971,8 +11983,16 @@ msgstr "The rundown is empty. Add items from the library below."
 msgid "The running order as cue cards."
 msgstr "The running order as cue cards."
 
+#: src/pages/approved/PatchMatrix.tsx:819
+msgid "The salvo changed since it was classified: classify it again."
+msgstr "The salvo changed since it was classified: classify it again."
+
+#: src/pages/approved/PatchMatrix.tsx:788
+msgid "The salvo changed while it was being classified: classify it again."
+msgstr "The salvo changed while it was being classified: classify it again."
+
 #. placeholder {0}: String(crosspoints.length)
-#: src/pages/approved/PatchMatrix.tsx:958
+#: src/pages/approved/PatchMatrix.tsx:1063
 msgid "The salvo stores the {0} armed crosspoint(s) with on-air protection by default."
 msgstr "The salvo stores the {0} armed crosspoint(s) with on-air protection by default."
 
@@ -12254,11 +12274,11 @@ msgstr "This playlist declares no guide URL."
 msgid "This requires licence-server connectivity (not yet wired in this build)."
 msgstr "This requires licence-server connectivity (not yet wired in this build)."
 
-#: src/pages/approved/PatchMatrix.tsx:694
+#: src/pages/approved/PatchMatrix.tsx:763
 msgid "This salvo has crosspoints this page cannot read"
 msgstr "This salvo has crosspoints this page cannot read"
 
-#: src/pages/approved/PatchMatrix.tsx:698
+#: src/pages/approved/PatchMatrix.tsx:767
 msgid "This salvo protects on-air crosspoints (stored on-air: protect); a recall cannot override it"
 msgstr "This salvo protects on-air crosspoints (stored on-air: protect); a recall cannot override it"
 
@@ -12649,7 +12669,7 @@ msgstr "Undo draft edits for {label}"
 msgid "unhealthy"
 msgstr "unhealthy"
 
-#: src/pages/approved/PatchMatrix.tsx:207
+#: src/pages/approved/PatchMatrix.tsx:228
 msgid "unknown"
 msgstr "unknown"
 
@@ -12690,6 +12710,10 @@ msgstr "Unknown values mean the browser did not provide evidence. Network blocki
 #: src/pages/approved/AudioSurface.tsx:59
 msgid "Unknown: no current loudness telemetry"
 msgstr "Unknown: no current loudness telemetry"
+
+#: src/pages/approved/PatchMatrix.tsx:846
+msgid "Unknown: no readback tick"
+msgstr "Unknown: no readback tick"
 
 #: src/components/broadcast/library/TranscriptRangeEditor.tsx:390
 msgid "Unlabeled speaker"
@@ -12752,7 +12776,7 @@ msgstr "Unreachable"
 msgid "UNREACHABLE"
 msgstr "UNREACHABLE"
 
-#: src/pages/approved/PatchMatrix.tsx:187
+#: src/pages/approved/PatchMatrix.tsx:208
 msgid "unroutable output"
 msgstr "unroutable output"
 
@@ -12905,7 +12929,7 @@ msgid "Very low (~1 frame)"
 msgstr "Very low (~1 frame)"
 
 #: src/components/broadcast/library/Chips.tsx:139
-#: src/pages/approved/PatchMatrix.tsx:787
+#: src/pages/approved/PatchMatrix.tsx:891
 #: src/pages/OutputFeedRow.tsx:333
 msgid "Video"
 msgstr "Video"
@@ -13351,7 +13375,7 @@ msgstr "WIPE, DIP, USK, DSK and AUX have no supported control contract."
 msgid "Working pixel format: <0>nv12</0> (8-bit) or <1>p010</1> (10-bit)."
 msgstr "Working pixel format: <0>nv12</0> (8-bit) or <1>p010</1> (10-bit)."
 
-#: src/pages/approved/PatchMatrix.tsx:183
+#: src/pages/approved/PatchMatrix.tsx:204
 msgid "would cycle"
 msgstr "would cycle"
 

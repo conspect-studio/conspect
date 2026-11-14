@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { act, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
+import { focusManager } from '@tanstack/react-query';
 import { setupServer } from 'msw/node';
 import type { Envelope } from '../../realtime/envelope';
 
@@ -65,6 +66,24 @@ const patchBody = {
   ],
 };
 
+/**
+ * The default readback carries engine-tick evidence (an advancing mixer tick
+ * with an empty input bank, so no extra columns): §8 `live` needs a tick
+ * advancing, and a readback with none is `no-tick`/unknown (E3-06).
+ */
+let engineTick = 0;
+function liveBody<T extends { mixer: unknown[] }>(body: T): T {
+  engineTick += 30;
+  return { ...body, mixer: [{ me: 'me1', inputs: [], inputs_version: 1, tick: engineTick }] };
+}
+
+/** The stored salvos both `GET /salvos` and `GET /salvos/:id` serve (ETag = `"v<version>"`). */
+let salvoDocs: { doc: Record<string, unknown>; version: number }[] = [];
+function setSalvos(docs: Record<string, unknown>[]): void {
+  salvoDocs = docs.map((doc) => ({ doc, version: 1 }));
+}
+setSalvos([{ id: 'abc-salvo', display_name: 'ABC switch' }]);
+
 function isEmptyPlan(body: unknown): boolean {
   return typeof body === 'object' && body !== null && 'crosspoints' in body
     && Array.isArray(body.crosspoints) && body.crosspoints.length === 0;
@@ -76,7 +95,7 @@ let salvoPut: unknown = null;
 let planResponse: Record<string, unknown> = { can_take: true, class: 'class2', crosspoints: [] };
 
 const server = setupServer(
-  http.get('*/api/v1/patch', () => HttpResponse.json(patchBody)),
+  http.get('*/api/v1/patch', () => HttpResponse.json(liveBody(patchBody))),
   http.get('*/api/v1/sources', () =>
     HttpResponse.json([
       { id: 'cnn-usa', name: 'CNN USA', body: { kind: 'srt', url: 'srt://[::1]:1' } },
@@ -87,7 +106,12 @@ const server = setupServer(
     HttpResponse.json([{ id: 'news-one', name: 'NewsOne', body: { canvas: { width: 1920, height: 1080 }, cells: [] } }]),
   ),
   http.get('*/api/v1/media/players', () => HttpResponse.json([])),
-  http.get('*/api/v1/salvos', () => HttpResponse.json([{ id: 'abc-salvo', display_name: 'ABC switch' }])),
+  http.get('*/api/v1/salvos', () => HttpResponse.json(salvoDocs.map((s) => s.doc))),
+  http.get('*/api/v1/salvos/:id', ({ params }) => {
+    const found = salvoDocs.find((s) => s.doc.id === params.id);
+    if (found === undefined) return HttpResponse.json({ title: 'not found', status: 404 }, { status: 404 });
+    return HttpResponse.json(found.doc, { headers: { ETag: `"v${String(found.version)}"` } });
+  }),
   http.post('*/api/v1/patch/plan', async ({ request }) => {
     const body: unknown = await request.json();
     // The server's role → count order: an empty list is the page's Write
@@ -118,6 +142,7 @@ afterEach(() => {
   planRequests = [];
   salvoPut = null;
   planResponse = { can_take: true, class: 'class2', crosspoints: [] };
+  setSalvos([{ id: 'abc-salvo', display_name: 'ABC switch' }]);
 });
 afterAll(() => { server.close(); });
 
@@ -335,12 +360,12 @@ describe('E3-01 salvo recall goes through the Program confirm gate', () => {
       ],
     };
     let salvoTakes = 0;
+    setSalvos([{
+      id: 'abc-salvo', display_name: 'ABC switch', on_air: 'protect',
+      patch: [{ plane: 'video', destination: { output: 'hls-1', slot: 0 }, source: { source: 'abc-news' } }],
+    }]);
     server.use(
       http.get('*/api/v1/patch', () => HttpResponse.json(programPatch)),
-      http.get('*/api/v1/salvos', () => HttpResponse.json([{
-        id: 'abc-salvo', display_name: 'ABC switch', on_air: 'protect',
-        patch: [{ plane: 'video', destination: { output: 'hls-1', slot: 0 }, source: { source: 'abc-news' } }],
-      }])),
       http.post('*/api/v1/salvos/:id/take', () => {
         salvoTakes += 1;
         return HttpResponse.json({ operation_id: 'salvo-op-1', status: 'accepted' }, { status: 202 });
@@ -601,10 +626,10 @@ describe('E3-08 plans bind to the selection revision', () => {
   });
 
   it('a recall plan does not survive choosing another salvo', async () => {
-    server.use(http.get('*/api/v1/salvos', () => HttpResponse.json([
+    setSalvos([
       { id: 'abc-salvo', display_name: 'ABC switch' },
       { id: 'cnn-salvo', display_name: 'CNN switch' },
-    ])));
+    ]);
     const user = userEvent.setup();
     renderMatrix();
     await screen.findByTestId('cell-video-source:cnn-usa-output:srt-1:0');
@@ -722,5 +747,175 @@ describe('E3-11 group headings and built-in rows go through Lingui', () => {
     } finally {
       i18n.activate('en');
     }
+  });
+});
+
+// ---- Round-2 review findings -------------------------------------------------
+
+describe('E3-07 round 2: a mixer input without video', () => {
+  it('an omitted video field is a readback error, not a render crash', async () => {
+    server.use(http.get('*/api/v1/patch', () => HttpResponse.json({
+      mixer: [{ me: 'me1', inputs_version: 1, tick: 5, inputs: [{ number: 1, label: 'in1', on_program: true, on_preview: false }] }],
+      outputs: patchBody.outputs,
+    })));
+    renderMatrix();
+    await waitFor(() => { expect(screen.getByTestId('matrix-page-state')).toHaveTextContent('Readback unavailable'); });
+    expect(screen.getByTestId('matrix-readback-error')).toHaveTextContent('Invalid patch readback');
+  });
+});
+
+describe('E3-06 round 2: no visible engine tick is unknown, never Live', () => {
+  it('an output-only principal (mixer omitted) shows no-tick and ? on the on-air cell', async () => {
+    server.use(http.get('*/api/v1/patch', () => HttpResponse.json(patchBody)));
+    renderMatrix();
+    const cell = await screen.findByTestId('cell-video-source:cnn-usa-output:srt-1:0');
+    await waitFor(() => { expect(screen.getByTestId('matrix-page-state')).toHaveTextContent('no readback tick'); });
+    expect(screen.getByTestId('matrix-page-state')).not.toHaveTextContent('Live');
+    expect(screen.getByTestId('matrix-no-tick-warning')).toBeInTheDocument();
+    expect(cell).toHaveTextContent('?');
+    expect(cell).toHaveAccessibleName(/CNN USA to srt-1: unknown/);
+  });
+});
+
+describe('E3-03 round 2: only a definite Write answer enables mutations', () => {
+  it('a pending probe shows "checking permission" and keeps every mutation control disabled', async () => {
+    server.use(http.post('*/api/v1/patch/plan', () => new Promise<never>(() => undefined)));
+    renderMatrix();
+    const cell = await screen.findByTestId('cell-video-source:abc-news-output:hls-1:0');
+    expect(cell).toBeDisabled();
+    expect(screen.getAllByText('Checking permission…').length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: 'Classify selection' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Store as salvo…' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Classify salvo' })).toBeDisabled();
+  });
+
+  it('a 503 probe shows "permission unavailable (retrying)", retries, and enables once it answers', async () => {
+    let probes = 0;
+    server.use(http.post('*/api/v1/patch/plan', () => {
+      probes += 1;
+      if (probes === 1) return HttpResponse.json({ title: 'engine-busy', status: 503 }, { status: 503 });
+      return HttpResponse.json({ title: 'validation', status: 422 }, { status: 422 });
+    }));
+    renderMatrix();
+    const cell = await screen.findByTestId('cell-video-source:abc-news-output:hls-1:0');
+    await waitFor(() => { expect(screen.getAllByText('Permission unavailable (retrying)').length).toBeGreaterThan(0); });
+    expect(cell).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Classify salvo' })).toBeDisabled();
+    await waitFor(() => { expect(cell).toBeEnabled(); }, { timeout: 4000 });
+    expect(probes).toBe(2);
+  }, 10_000);
+});
+
+describe('E3-12 an accepted take retires its plan', () => {
+  it('after the take, the taken cell shows pending (held ticks) then on air from readback', async () => {
+    let phase: 'before' | 'pending' | 'applied' = 'before';
+    const slot = (source: unknown, pending: unknown) => ({ slot: 0, live: true, source, path: 'P2', pending, degraded: false });
+    server.use(http.get('*/api/v1/patch', () => {
+      const hls = phase === 'before'
+        ? slot({ layout: 'news-one' }, null)
+        : phase === 'pending'
+          ? slot({ layout: 'news-one' }, { source: { source: 'abc-news' }, held_ticks: 12 })
+          : slot({ source: 'abc-news' }, null);
+      return HttpResponse.json(liveBody({ mixer: [], outputs: [{ ...patchBody.outputs[0]!, video: [hls] }, patchBody.outputs[1]!] }));
+    }));
+    planResponse = { can_take: true, class: 'class2', crosspoints: [{ destination: { output: 'hls-1', slot: 0 }, path: 'P3', on_air: false, refusal: null }] };
+    const user = userEvent.setup();
+    renderMatrix();
+    await armAndClassify(user, 'cell-video-source:abc-news-output:hls-1:0');
+    const cell = screen.getByTestId('cell-video-source:abc-news-output:hls-1:0');
+    await waitFor(() => { expect(cell).toHaveTextContent('◐◇'); });
+    phase = 'pending';
+    await user.click(screen.getByRole('button', { name: 'Take this crosspoint' }));
+    await waitFor(() => { expect(takeRequests).toHaveLength(1); });
+    await waitFor(() => { expect(cell).toHaveTextContent('◌'); }, { timeout: 3000 });
+    expect(cell).toHaveAccessibleName(/pending \(12 of 50 ticks\)/);
+    expect(cell).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.queryByTestId('matrix-plan-line')).toBeNull();
+    phase = 'applied';
+    await waitFor(() => { expect(cell).toHaveTextContent('●⇢'); }, { timeout: 3000 });
+  }, 10_000);
+
+  it('a stale page shows ? even for an armed, planned cell', async () => {
+    server.use(http.get('*/api/v1/patch', () => HttpResponse.json(mixerPatch(7))));
+    planResponse = { can_take: true, class: 'class2', crosspoints: [{ destination: { output: 'hls-1', slot: 0 }, path: 'P3', on_air: false, refusal: null }] };
+    const user = userEvent.setup();
+    renderMatrix();
+    await armAndClassify(user, 'cell-video-source:abc-news-output:hls-1:0');
+    const cell = screen.getByTestId('cell-video-source:abc-news-output:hls-1:0');
+    await waitFor(() => { expect(screen.getByTestId('matrix-plan-line')).toBeInTheDocument(); });
+    await waitFor(() => { expect(screen.getByTestId('matrix-page-state')).toHaveTextContent('stale'); }, { timeout: 5000 });
+    expect(cell).toHaveTextContent('?');
+    expect(cell).toHaveAttribute('aria-pressed', 'true');
+  }, 10_000);
+});
+
+describe('E3-08 round 2: recall plans bind to generation and salvo content', () => {
+  async function chooseSalvo(user: ReturnType<typeof userEvent.setup>, name: string): Promise<void> {
+    await user.click(screen.getByRole('combobox', { name: 'Salvo' }));
+    await user.click(await screen.findByRole('option', { name }));
+  }
+
+  it('a late plan for A after choosing A -> B -> A does not enable Take salvo', async () => {
+    setSalvos([
+      { id: 'abc-salvo', display_name: 'ABC switch' },
+      { id: 'cnn-salvo', display_name: 'CNN switch' },
+    ]);
+    let release: () => void = () => undefined;
+    let planCalls = 0;
+    server.use(http.post('*/api/v1/salvos/:id/plan', async () => {
+      planCalls += 1;
+      await new Promise<void>((resolve) => { release = resolve; });
+      return HttpResponse.json({ can_take: true, class: 'class2', crosspoints: [] });
+    }));
+    const user = userEvent.setup();
+    renderMatrix();
+    await screen.findByTestId('cell-video-source:cnn-usa-output:srt-1:0');
+    await chooseSalvo(user, 'ABC switch');
+    await user.click(screen.getByRole('button', { name: 'Classify salvo' }));
+    await waitFor(() => { expect(planCalls).toBe(1); });
+    await chooseSalvo(user, 'CNN switch');
+    await chooseSalvo(user, 'ABC switch');
+    release();
+    await new Promise((resolve) => { setTimeout(resolve, 200); });
+    expect(screen.queryByTestId('matrix-recall-plan-line')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Take salvo' })).toBeDisabled();
+  });
+
+  it('changed salvo content under the same id drops the old classification', async () => {
+    setSalvos([{ id: 'abc-salvo', display_name: 'ABC switch', on_air: 'protect',
+      patch: [{ plane: 'video', destination: { output: 'srt-1', slot: 0 }, source: { source: 'abc-news' } }] }]);
+    const user = userEvent.setup();
+    renderMatrix();
+    await screen.findByTestId('cell-video-source:cnn-usa-output:srt-1:0');
+    await chooseSalvo(user, 'ABC switch');
+    await user.click(screen.getByRole('button', { name: 'Classify salvo' }));
+    await waitFor(() => { expect(screen.getByTestId('matrix-recall-plan-line')).toHaveTextContent('Can take.'); });
+    salvoDocs = [{ version: 2, doc: { id: 'abc-salvo', display_name: 'ABC switch', on_air: 'protect',
+      patch: [{ plane: 'video', destination: { output: 'hls-1', slot: 0 }, source: { source: 'abc-news' } }] } }];
+    act(() => { focusManager.setFocused(false); });
+    act(() => { focusManager.setFocused(true); });
+    await waitFor(() => { expect(screen.queryByTestId('matrix-recall-plan-line')).toBeNull(); });
+    expect(screen.getByRole('button', { name: 'Take salvo' })).toBeDisabled();
+    act(() => { focusManager.setFocused(undefined); });
+  });
+
+  it('a salvo replaced since classification (new version) is not taken', async () => {
+    let salvoTakes = 0;
+    server.use(http.post('*/api/v1/salvos/:id/take', () => {
+      salvoTakes += 1;
+      return HttpResponse.json({ operation_id: 'salvo-op-1', status: 'accepted' }, { status: 202 });
+    }));
+    const user = userEvent.setup();
+    renderMatrix();
+    await screen.findByTestId('cell-video-source:cnn-usa-output:srt-1:0');
+    await chooseSalvo(user, 'ABC switch');
+    await user.click(screen.getByRole('button', { name: 'Classify salvo' }));
+    await waitFor(() => { expect(screen.getByTestId('matrix-recall-plan-line')).toHaveTextContent('Can take.'); });
+    salvoDocs = [{ version: 2, doc: { id: 'abc-salvo', display_name: 'ABC switch', on_air: 'allow',
+      patch: [{ plane: 'video', destination: { output: 'hls-1', slot: 0 }, source: { source: 'abc-news' } }] } }];
+    await user.click(screen.getByRole('button', { name: 'Take salvo' }));
+    expect(await screen.findByText(/The salvo changed since it was classified/)).toBeInTheDocument();
+    expect(salvoTakes).toBe(0);
+    expect(screen.getByRole('button', { name: 'Take salvo' })).toBeDisabled();
   });
 });

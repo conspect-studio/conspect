@@ -38,9 +38,9 @@ import type { RealtimeStatus } from '../../realtime/connection';
 import { OperationApiError, newIdempotencyKey } from '../../api/operations';
 import { getPatch, parseCrosspoints, planPatch, probePatchWrite, takePatch } from '../../api/patch';
 import type { OnAir, PatchCrosspoint, PatchPlanResponse, PatchRequest, PatchView } from '../../api/patch';
-import { planSalvo, takePatchSalvo } from '../../api/salvos';
+import { getSalvo, planSalvo, takePatchSalvo } from '../../api/salvos';
 import type { Salvo } from '../../api/salvos';
-import { useSalvos, useSaveSalvo } from '../../api/salvosQueries';
+import { salvoKeys, useSalvos, useSaveSalvo } from '../../api/salvosQueries';
 import { useSources } from '../../resources/queries';
 import { useLayouts } from '../../api/queries';
 import { useMediaPlayers } from '../../api/media-playersQueries';
@@ -78,13 +78,16 @@ const WRITE_KEY = ['patch', 'write-capability'] as const;
 const STALE_MS = 2000;
 /** Readback cadence: well under {@link STALE_MS}, so a healthy engine is seen advancing. */
 const READBACK_MS = 1000;
+/** Write-probe retry backoff (E3-03): base and cap, doubling per attempt. */
+const WRITE_RETRY_BASE_MS = 500;
+const WRITE_RETRY_MAX_MS = 15_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
 /** Coarse page state (§8); `salvo-arming` is layered on top once a selection exists. */
-export type MatrixPageState = 'loading' | 'live' | 'stale' | 'disconnected' | 'read-only' | 'error';
+export type MatrixPageState = 'loading' | 'live' | 'stale' | 'no-tick' | 'disconnected' | 'read-only' | 'error';
 
 type Plane = 'video' | 'audio' | 'subtitle';
 
@@ -118,6 +121,24 @@ function columnKey(column: MatrixColumn): string {
 interface BoundPlan {
   readonly key: string;
   readonly plan: PatchPlanResponse;
+}
+
+/**
+ * A recall plan bound to the request that produced it (E3-08): the salvo id,
+ * the request generation (bumped on every choice and every classify), and the
+ * salvo's stored version (ETag) and content at plan time.
+ */
+interface BoundRecallPlan {
+  readonly id: string;
+  readonly generation: number;
+  readonly etag: string | undefined;
+  readonly content: string;
+  readonly plan: PatchPlanResponse;
+}
+
+/** The content identity of a stored salvo: what a take of it would apply. */
+function salvoContentKey(salvo: Salvo | undefined): string {
+  return JSON.stringify({ patch: salvo?.patch ?? null, on_air: salvo?.on_air ?? null, layout: salvo?.layout ?? null });
 }
 
 /** One accepted take the page is waiting on: its id and the event family it settles on (E3-04). */
@@ -295,7 +316,15 @@ function MatrixGrid({
   );
 }
 
-/** The engine tick the readback carries (the mixer's last composed tick), if any. */
+/**
+ * The engine tick the readback carries, if the caller can see one (E3-06).
+ * The only advancing engine clock a Read principal can read is the mixer's
+ * applied tick in `GET /patch` `mixer[].tick`; it is omitted for a principal
+ * without Program scope. `GET /routing` `since_tick` is when a feed went on
+ * air (it does not advance) and `pending.held_ticks` exists only during a
+ * fresh-gate hold, so neither proves the engine is alive. `undefined` means
+ * NO freshness evidence: the page shows `no-tick`, never `live`.
+ */
 function readbackTick(view: PatchView | undefined): number | undefined {
   const ticks = (view?.mixer ?? []).map((m) => m.tick);
   return ticks.length === 0 ? undefined : Math.max(...ticks);
@@ -321,7 +350,15 @@ export function PatchMatrix(): JSX.Element {
   const [storeOpen, setStoreOpen] = useState(false);
   const [storeId, setStoreId] = useState('');
   const [recallId, setRecallId] = useState('');
-  const [recallPlan, setRecallPlan] = useState<{ readonly id: string; readonly plan: PatchPlanResponse } | undefined>();
+  const [recallPlan, setRecallPlan] = useState<BoundRecallPlan | undefined>();
+  /** The latest recall request generation; an older completion is dropped (E3-08). */
+  const recallGeneration = useRef(0);
+  const [recallGen, setRecallGen] = useState(0);
+  const bumpRecallGeneration = (): number => {
+    recallGeneration.current += 1;
+    setRecallGen(recallGeneration.current);
+    return recallGeneration.current;
+  };
   const [recallError, setRecallError] = useState<string | undefined>();
   const [recalling, setRecalling] = useState(false);
 
@@ -333,10 +370,18 @@ export function PatchMatrix(): JSX.Element {
   });
   // §8 `read-only`: the principal lacks Write (E3-03). No role read exists in
   // the API; `probePatchWrite` asks the plan route's first (role) check.
+  // Only a definite `true` enables a mutation control; an inconclusive probe
+  // (network error, 429, 503, …) throws so it is retried with backoff while
+  // the controls say "permission unavailable (retrying)".
   const writeQuery = useQuery({
     queryKey: WRITE_KEY,
-    queryFn: () => probePatchWrite(),
-    retry: false,
+    queryFn: async (): Promise<boolean> => {
+      const answer = await probePatchWrite();
+      if (answer === undefined) throw new Error('Write probe inconclusive');
+      return answer;
+    },
+    retry: true,
+    retryDelay: (attempt) => Math.min(WRITE_RETRY_BASE_MS * 2 ** attempt, WRITE_RETRY_MAX_MS),
     staleTime: 60_000,
   });
   const sources = useSources();
@@ -403,12 +448,18 @@ export function PatchMatrix(): JSX.Element {
     setTickSeen({ tick, at: patchQuery.dataUpdatedAt });
   }
   const tickFrozen = tick !== undefined && tickSeen !== undefined && now - tickSeen.at > STALE_MS;
+  /** No freshness evidence at all (E3-06): live state cannot be confirmed. */
+  const noTick = patchQuery.data !== undefined && tick === undefined;
+  /** Readback cells cannot be trusted as on air: frozen tick, or no tick to judge by (§8 `?`). */
+  const unconfirmed = tickFrozen || noTick;
 
   const readError = patchQuery.error;
   const lacksRead = readError instanceof OperationApiError && readError.status === 403;
-  const canWrite = !lacksRead && writeQuery.data !== false;
+  /** E3-03: only a definite Write answer enables mutation controls. */
+  const canWrite = !lacksRead && writeQuery.data === true;
+  const readOnly = lacksRead || writeQuery.data === false;
   const connected = status === 'open';
-  const pageState: MatrixPageState = lacksRead || writeQuery.data === false
+  const pageState: MatrixPageState = readOnly
     ? 'read-only'
     : !connected && status !== 'connecting'
       ? 'disconnected'
@@ -418,14 +469,20 @@ export function PatchMatrix(): JSX.Element {
           ? 'error'
           : tickFrozen
             ? 'stale'
-            : 'live';
+            : noTick
+              ? 'no-tick'
+              : 'live';
   /** Every take/store/recall/plan control is gated on this (§8: read-only and disconnected disable takes). */
   const canAct = canWrite && connected;
-  const actDisabledReason = !canWrite
+  const actDisabledReason = readOnly
     ? t`Read-only: your role lacks Write`
-    : !connected
-      ? t`Disconnected: takes are disabled until the connection is back`
-      : undefined;
+    : !canWrite
+      ? writeQuery.failureCount > 0
+        ? t`Permission unavailable (retrying)`
+        : t`Checking permission…`
+      : !connected
+        ? t`Disconnected: takes are disabled until the connection is back`
+        : undefined;
 
   const playerIds = useMemo(() => (players.data ?? []).map((p) => ({ id: p.id })), [players.data]);
   const rows = useMemo(
@@ -507,8 +564,8 @@ export function PatchMatrix(): JSX.Element {
     armedKeys.has(`${selectionKey(p, col)}|${row.id}`);
   const withPlan = (p: Plane, row: MatrixRow, col: MatrixColumn, base: MatrixCell): MatrixCell => {
     const armed = isArmedIn(p)(row, col);
-    // §8 `unknown`: no readback, or the tick stopped.
-    const shown: MatrixCell = tickFrozen && base.state !== 'na' && base.state !== 'disabled' ? { state: 'unknown' } : base;
+    // §8 `unknown`: no readback, the tick stopped, or no tick is visible (E3-06).
+    const shown: MatrixCell = unconfirmed && base.state !== 'na' && base.state !== 'disabled' ? { state: 'unknown' } : base;
     return displayCell(shown, armed, armed ? planned.get(selectionKey(p, col)) : undefined);
   };
 
@@ -539,7 +596,8 @@ export function PatchMatrix(): JSX.Element {
       ? `source:${slot.source.source}` : undefined;
     // E2 refuses every subtitle crosspoint (`slot-medium-mismatch`, #345):
     // show what is on air, never arm one.
-    return current === row.id ? { state: 'on-air' } : { state: 'disabled', disabledReason: 'subtitle-unsupported' };
+    if (current !== row.id) return { state: 'disabled', disabledReason: 'subtitle-unsupported' };
+    return unconfirmed ? { state: 'unknown' } : { state: 'on-air' };
   };
 
   const resetArming = (): void => {
@@ -595,6 +653,12 @@ export function PatchMatrix(): JSX.Element {
     clearAwaiting();
     try {
       const accepted = await takePatch(body, { idempotencyKey: newIdempotencyKey() });
+      // E3-12: an accepted take retires its plan and disarms the taken
+      // members, so their cells follow the readback (pending → on air).
+      const taken = new Set(members.map((m) => `${selectionKey(m.selection.plane, m.selection.column)}|${m.selection.rowId}`));
+      setSelections((current) => current.filter((sel) => !taken.has(`${selectionKey(sel.plane, sel.column)}|${sel.rowId}`)));
+      setRevision((r) => r + 1);
+      setPlan(undefined);
       beginAwaiting({ operationId: accepted.operation_id, path, label: 'patch' });
     } catch (error) {
       setTakeError(error instanceof OperationApiError ? (error.detail ?? error.message) : t`Take failed`);
@@ -683,7 +747,12 @@ export function PatchMatrix(): JSX.Element {
   const recalled = (salvos.data ?? []).find((s) => s.id === recallId);
   const recalledMembers = useMemo(() => parseCrosspoints(recalled?.patch), [recalled]);
   const recalledChangesProgram = crosspointsAffectProgram(recalledMembers.crosspoints, programInput, programOutputs);
-  const currentRecallPlan = recallPlan?.id === recallId ? recallPlan.plan : undefined;
+  // Shown only for the latest request, the chosen id, and unchanged content (E3-08).
+  const currentRecallPlan = recallPlan?.id === recallId
+    && recallPlan.generation === recallGen
+    && recallPlan.content === salvoContentKey(recalled)
+    ? recallPlan.plan
+    : undefined;
   const recallProtects = (recalled?.on_air ?? 'protect') === 'protect';
   const recallOnAirRefused = currentRecallPlan?.crosspoints.some((xp) => xp.refusal?.type === ON_AIR_REFUSAL) ?? false;
   const recallNeedsConfirm = locked && (recalledChangesProgram || (currentRecallPlan !== undefined && planNeedsConfirm(currentRecallPlan)));
@@ -703,26 +772,55 @@ export function PatchMatrix(): JSX.Element {
   const onRecallPlan = async (): Promise<void> => {
     if (!canAct || recallId === '') return;
     const id = recallId;
+    const generation = bumpRecallGeneration();
+    const latest = (): boolean => recallGeneration.current === generation;
+    setRecallPlan(undefined);
     setRecalling(true);
     setRecallError(undefined);
     try {
+      // Read the stored version before and after the plan: a salvo replaced
+      // in between makes the answer unattributable, so it is dropped (E3-08).
+      const before = await getSalvo(id);
       const answer = await planSalvo(id);
-      setRecallPlan({ id, plan: answer });
+      const after = await getSalvo(id);
+      if (!latest()) return;
+      if (before.etag !== after.etag || salvoContentKey(before.salvo) !== salvoContentKey(after.salvo)) {
+        setRecallError(t`The salvo changed while it was being classified: classify it again.`);
+        void queryClient.invalidateQueries({ queryKey: salvoKeys.list });
+        return;
+      }
+      setRecallPlan({ id, generation, etag: after.etag, content: salvoContentKey(after.salvo), plan: answer });
+      // The list must show the content this plan answered, else the binding hides it.
+      if (salvoContentKey(after.salvo) !== salvoContentKey(recalled)) void queryClient.invalidateQueries({ queryKey: salvoKeys.list });
     } catch (error) {
+      if (!latest()) return;
       setRecallError(error instanceof OperationApiError ? (error.detail ?? error.message) : t`Plan failed`);
     } finally {
-      setRecalling(false);
+      if (latest()) setRecalling(false);
     }
   };
 
   const runRecallTake = async (): Promise<void> => {
     setConfirm(undefined);
-    if (!canAct || recallId === '' || recallDisabledReason !== undefined) return;
+    if (!canAct || recallId === '' || recallDisabledReason !== undefined || recallPlan === undefined) return;
+    const bound = recallPlan;
+    const generation = recallGeneration.current;
     setRecalling(true);
     setRecallError(undefined);
     clearAwaiting();
     try {
-      const accepted = await takePatchSalvo(recallId);
+      // The take route carries no If-Match: re-read the stored version and
+      // refuse to take a salvo that changed since it was classified (E3-08).
+      const now = await getSalvo(bound.id);
+      if (recallGeneration.current !== generation) return;
+      if (now.etag !== bound.etag || salvoContentKey(now.salvo) !== bound.content) {
+        bumpRecallGeneration();
+        setRecallPlan(undefined);
+        setRecallError(t`The salvo changed since it was classified: classify it again.`);
+        void queryClient.invalidateQueries({ queryKey: salvoKeys.list });
+        return;
+      }
+      const accepted = await takePatchSalvo(bound.id);
       // A patch salvo always settles on `patch.take`, one destination too.
       beginAwaiting({ operationId: accepted.operation_id, path: 'set', label: 'salvo' });
     } catch (error) {
@@ -745,6 +843,7 @@ export function PatchMatrix(): JSX.Element {
       case 'loading': return t`Loading`;
       case 'live': return t`Live`;
       case 'stale': return t`Engine not confirming (stale)`;
+      case 'no-tick': return t`Unknown: no readback tick`;
       case 'disconnected': return t`Disconnected`;
       case 'read-only': return t`Read-only`;
       case 'error': return t`Readback unavailable`;
@@ -767,6 +866,11 @@ export function PatchMatrix(): JSX.Element {
       {pageState === 'stale' ? (
         <p role="alert" data-testid="matrix-stale-warning" className="text-xs">
           <Trans>Engine not confirming: the tick has not advanced for over 2 s. Crosspoints show as unknown; takes stay enabled.</Trans>
+        </p>
+      ) : null}
+      {pageState === 'no-tick' ? (
+        <p role="alert" data-testid="matrix-no-tick-warning" className="text-xs">
+          <Trans>No readback tick is visible to your role, so the engine cannot be confirmed live. Crosspoints show as unknown; takes stay enabled.</Trans>
         </p>
       ) : null}
       {pageState === 'error' ? (
@@ -913,6 +1017,7 @@ export function PatchMatrix(): JSX.Element {
               value={recallId}
               onValueChange={(value): void => {
                 setRecallId(value);
+                bumpRecallGeneration();
                 setRecallPlan(undefined);
                 setRecallError(undefined);
               }}
