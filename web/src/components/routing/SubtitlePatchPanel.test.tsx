@@ -2,8 +2,10 @@
 // redaction and live:false), the plan+take request bodies and
 // Idempotency-Key, the `source-has-no-captions` note, typed refusal display,
 // the realtime `subtitle:applied` / `subtitle:refused:<reason>` outcome
-// (including buffered-before-202 delivery), output-name resolution and the
-// always-present per-column status region.
+// (including buffered-before-202 delivery), output-name resolution, the
+// always-present per-column status region, and per-destination attempt
+// ownership (a column disabled while pending; an older attempt's late
+// response never overwrites a newer attempt's result — review UI2-1).
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -277,6 +279,98 @@ describe('SubtitlePatchPanel', () => {
     for (const region of regions) {
       expect(region.getAttribute('aria-live')).toBe('polite');
     }
+  });
+
+  // UI2-1 (review round 2): two attempts on the SAME destination used to
+  // overwrite each other's feedback regardless of order. The disabled
+  // button (tested separately below) prevents a user-driven double click
+  // from starting a second attempt while one is outstanding, but the
+  // attempt-token guard itself — exercised directly here, independent of
+  // the disabled-button affordance — is the actual fix: a newer attempt's
+  // settled result (here, a plan refusal) must never be clobbered by an
+  // older attempt's late-arriving realtime outcome.
+  it('an older operation id\'s outcome is ignored once a newer attempt on the same destination has settled (UI2-1 fix)', async () => {
+    holdTake = true;
+    takeOperationId = 'op-A';
+    renderWithProviders(<SubtitlePatchPanel />);
+    const cell = await screen.findByTestId('subtitle-cell-cam-1-out-1:1');
+    const button = within(cell).getByRole('button');
+
+    // Attempt A: accepted as op-A, held before the 202 arrives.
+    const clickA = userEvent.click(button);
+    await waitFor(() => {
+      expect(takeBody).not.toBeNull();
+    });
+    expect(screen.getByTestId('subtitle-status-out-1:1').textContent).toBe('pending');
+    expect(button).toBeDisabled();
+
+    // Release A's take response so it resolves (op-A accepted) and settle
+    // it via its own realtime outcome, so the destination becomes editable
+    // again and attempt B can legitimately start.
+    releaseTake?.();
+    await clickA;
+    emit({ operation_id: 'op-A', outcome: 'subtitle:applied', output: 'out-1', tick: 1 });
+    await waitFor(() => {
+      expect(button).not.toBeDisabled();
+    });
+
+    // Attempt B on the SAME destination, now that A is no longer pending:
+    // refused in planning. B is logically newer and must win.
+    planRefusal = { type: 'on-air-protected', detail: 'B refused' };
+    takeOperationId = 'op-B';
+    await userEvent.click(button);
+    await waitFor(() => {
+      expect(screen.getByTestId('subtitle-status-out-1:1').textContent).toBe('B refused');
+    });
+
+    // op-A's outcome now arrives late: it must not overwrite B's refusal,
+    // because the cell's `operationId` was overwritten away from op-A
+    // (first to '' by attempt B's start, then never back to op-A) the
+    // moment attempt B started — the realtime listener's `operationId ===
+    // event.operation_id` match therefore no longer matches this cell.
+    emit({ operation_id: 'op-A', outcome: 'subtitle:applied', output: 'out-1', tick: 1 });
+    expect(screen.getByTestId('subtitle-status-out-1:1').textContent).toBe('B refused');
+  });
+
+  it('disables a destination\'s buttons (aria-disabled) while an attempt on it is pending (UI2-1 fix)', async () => {
+    holdTake = true;
+    renderWithProviders(<SubtitlePatchPanel />);
+    const patchCell = await screen.findByTestId('subtitle-cell-cam-1-out-1:1');
+    const noneCell = screen.getByTestId('subtitle-cell-none-out-1:1');
+    const patchButton = within(patchCell).getByRole('button');
+    const noneButton = within(noneCell).getByRole('button');
+
+    expect(patchButton).not.toBeDisabled();
+    expect(noneButton).not.toBeDisabled();
+    await userEvent.click(patchButton);
+    await waitFor(() => {
+      expect(takeBody).not.toBeNull();
+    });
+    // The whole destination (both the patch button and the None button for
+    // this slot) is disabled while the attempt is in flight.
+    expect(patchButton).toBeDisabled();
+    expect(patchButton.getAttribute('aria-disabled')).toBe('true');
+    expect(noneButton).toBeDisabled();
+    // A different destination (a different slot) is unaffected.
+    const otherSlotButton = within(screen.getByTestId('subtitle-cell-cam-1-out-1:0')).getByRole('button');
+    expect(otherSlotButton).not.toBeDisabled();
+
+    // Releasing the take response lets `takePatch` resolve and the cell's
+    // `operationId` get set, but that happens asynchronously (a few
+    // microtasks through `fetch`/`response.json()`); "pending" alone does
+    // not distinguish "take still in flight" from "accepted, awaiting
+    // outcome" (both read "pending" in the status region), so the outcome
+    // is re-emitted inside `waitFor` until it actually lands on the right
+    // operation id — i.e. until the take's own state update has landed.
+    releaseTake?.();
+    expect(patchButton).toBeDisabled();
+    expect(noneButton).toBeDisabled();
+    await waitFor(() => {
+      emit({ operation_id: takeOperationId, outcome: 'subtitle:applied', output: 'out-1', tick: 2 });
+      expect(screen.getByTestId('subtitle-status-out-1:1').textContent).toBe('subtitle:applied');
+    });
+    expect(patchButton).not.toBeDisabled();
+    expect(noneButton).not.toBeDisabled();
   });
 
   it('every cell button and table header is keyboard-operable and labelled', async () => {

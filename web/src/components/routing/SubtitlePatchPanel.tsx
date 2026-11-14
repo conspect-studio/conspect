@@ -85,6 +85,35 @@ export function SubtitlePatchPanel(): JSX.Element | null {
     refetchInterval: 4000,
   });
   const [cells, setCells] = useState<Readonly<Record<string, CellState>>>({});
+  // One destination (output+slot) accepts only its LATEST attempt's result:
+  // review UI2-1 found that two attempts on the same destination (e.g. a
+  // second click while the first is still awaiting its take response) each
+  // wrote `cells[key]` unconditionally, so an older attempt's late-arriving
+  // 202/outcome could overwrite a newer attempt's already-displayed
+  // refusal. `attemptSeq` is the latest dispatched attempt number per
+  // destination key; every continuation (plan result, take acceptance, the
+  // catch block, and settlement from the buffered/live outcome) re-checks
+  // it against the attempt's own captured number before writing anything,
+  // and ignores itself — never overwrites, never "wins" late — when it is
+  // not the latest.
+  const attemptSeq = useRef(new Map<string, number>());
+  const isLatestAttempt = (key: string, attempt: number): boolean => attemptSeq.current.get(key) === attempt;
+  // Destinations with at least one attempt still in flight (dispatched but
+  // not yet settled by the LATEST attempt): their buttons are disabled
+  // (aria-disabled + a reason in the status region) so a second click
+  // cannot start a second concurrent attempt on the same destination while
+  // one is outstanding.
+  const [pendingKeys, setPendingKeys] = useState<ReadonlySet<string>>(new Set());
+  const setPending = (key: string, pending: boolean): void => {
+    setPendingKeys((current) => {
+      const has = current.has(key);
+      if (has === pending) return current;
+      const next = new Set(current);
+      if (pending) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  };
 
   // Outcomes are buffered by operation id from mount (not from the 202 on):
   // the realtime `route.output` event can arrive before `takePatch`'s HTTP
@@ -130,15 +159,28 @@ export function SubtitlePatchPanel(): JSX.Element | null {
           if (oldest === undefined) break;
           recentOutcomes.current.delete(oldest);
         }
+        // A cell's `operationId` is only ever written by the destination's
+        // latest attempt (every writer below is gated by
+        // `isLatestAttempt`), so matching on it here already excludes a
+        // superseded attempt's operation id without any extra bookkeeping.
+        // The settled keys are collected here and applied to `pendingKeys`
+        // in a separate call, outside the `cells` updater (an updater may
+        // run more than once, e.g. under StrictMode, and must stay a pure
+        // function of its previous state).
+        const settledKeys: string[] = [];
         setCells((current) => {
           let changed: Record<string, CellState> | undefined;
           for (const [key, state] of Object.entries(current)) {
             if (state.operationId === operationId && state.outcome === undefined) {
               changed = { ...(changed ?? current), [key]: { ...state, outcome } };
+              settledKeys.push(key);
             }
           }
           return changed ?? current;
         });
+        for (const key of settledKeys) {
+          setPending(key, false);
+        }
       }),
     [],
   );
@@ -149,19 +191,26 @@ export function SubtitlePatchPanel(): JSX.Element | null {
 
   const runTake = async (output: string, slot: number, source: string | undefined): Promise<void> => {
     const key = cellKey(output, slot);
+    const attempt = (attemptSeq.current.get(key) ?? 0) + 1;
+    attemptSeq.current.set(key, attempt);
+    const isLatest = (): boolean => isLatestAttempt(key, attempt);
+    setPending(key, true);
     setCells((current) => ({ ...current, [key]: { operationId: '' } }));
     try {
       const crosspoint = subtitleCrosspoint(output, slot, source);
       const plan = await planPatch({ crosspoints: [crosspoint] });
+      if (!isLatest()) return; // a newer attempt on this destination has started; ignore.
       const planned = plan.crosspoints[0];
       if (planned?.refusal) {
         setCells((current) => ({
           ...current,
           [key]: { operationId: '', error: planned.refusal?.detail ?? t`Refused` },
         }));
+        setPending(key, false);
         return;
       }
       const accepted = await takePatch({ crosspoints: [crosspoint] });
+      if (!isLatest()) return; // superseded while the take was in flight.
       const note = planned?.note;
       // The outcome may already have arrived (buffered above) while this
       // take's own HTTP response was still in flight.
@@ -173,7 +222,15 @@ export function SubtitlePatchPanel(): JSX.Element | null {
             ? { operationId: accepted.operation_id, note, ...(already !== undefined ? { outcome: already } : {}) }
             : { operationId: accepted.operation_id, ...(already !== undefined ? { outcome: already } : {}) },
       }));
+      // Settled already (the outcome had already been buffered) ⇒ no
+      // longer pending; otherwise stay pending until the realtime listener
+      // above settles it (or a newer attempt supersedes it, in which case
+      // that newer attempt owns the pending flag from here on).
+      if (already !== undefined) {
+        setPending(key, false);
+      }
     } catch (error) {
+      if (!isLatest()) return; // a newer attempt owns this destination now.
       setCells((current) => ({
         ...current,
         [key]: {
@@ -181,6 +238,7 @@ export function SubtitlePatchPanel(): JSX.Element | null {
           error: error instanceof OperationApiError ? (error.detail ?? error.message) : t`Take failed`,
         },
       }));
+      setPending(key, false);
     }
   };
 
@@ -189,12 +247,14 @@ export function SubtitlePatchPanel(): JSX.Element | null {
    * an error (plan refusal or a thrown take) wins over everything else;
    * then a settled outcome; then the `source-has-no-captions` plan note;
    * then "pending" while a take is accepted but not yet settled (a
-   * non-empty operation id with no outcome). `undefined` ⇒ no status to
-   * show (never attempted, or an in-flight plan/take with no operation id
-   * yet and no error).
+   * non-empty operation id with no outcome), or while any attempt on this
+   * destination is still in flight. `undefined` ⇒ no status to show
+   * (never attempted).
    */
-  function statusOf(cellState: CellState | undefined): JSX.Element | undefined {
-    if (cellState === undefined) return undefined;
+  function statusOf(cellState: CellState | undefined, pending: boolean): JSX.Element | undefined {
+    if (cellState === undefined) {
+      return pending ? <span>{t`pending`}</span> : undefined;
+    }
     if (cellState.error !== undefined) {
       return <span className="text-destructive">{cellState.error}</span>;
     }
@@ -208,7 +268,7 @@ export function SubtitlePatchPanel(): JSX.Element | null {
         </span>
       );
     }
-    if (cellState.operationId !== '') {
+    if (pending || cellState.operationId !== '') {
       return (
         <span>
           <Trans>pending</Trans>
@@ -260,6 +320,7 @@ export function SubtitlePatchPanel(): JSX.Element | null {
                     const redacted = subtitleSlotRedacted(slot);
                     const cellId = `subtitle-cell-${source.id}-${key}`;
                     const patched = current === source.id;
+                    const busy = pendingKeys.has(key);
                     return (
                       <TableCell key={key} data-testid={cellId}>
                         {redacted ? (
@@ -271,6 +332,8 @@ export function SubtitlePatchPanel(): JSX.Element | null {
                             type="button"
                             className="h-9 rounded-md border px-2 text-sm"
                             aria-pressed={patched}
+                            disabled={busy}
+                            aria-disabled={busy}
                             aria-label={t`Patch ${source.name} to ${column.name} slot ${slot.slot}`}
                             onClick={(): void => {
                               void runTake(column.output, slot.slot, source.id);
@@ -299,6 +362,7 @@ export function SubtitlePatchPanel(): JSX.Element | null {
                 const current = subtitleSlotSource(slot);
                 const redacted = subtitleSlotRedacted(slot);
                 const cellId = `subtitle-cell-none-${key}`;
+                const busy = pendingKeys.has(key);
                 return (
                   <TableCell key={key} data-testid={cellId}>
                     {redacted ? null : (
@@ -306,6 +370,8 @@ export function SubtitlePatchPanel(): JSX.Element | null {
                         type="button"
                         className="h-9 rounded-md border px-2 text-sm"
                         aria-pressed={current === undefined}
+                        disabled={busy}
+                        aria-disabled={busy}
                         aria-label={t`Unpatch ${column.name} slot ${slot.slot}`}
                         onClick={(): void => {
                           void runTake(column.output, slot.slot, undefined);
@@ -325,7 +391,9 @@ export function SubtitlePatchPanel(): JSX.Element | null {
             zero sources declare captions, so an unpatch failure (no
             captioned row to carry it) is never silently dropped (review
             UI-5). `aria-live="polite"` + `role="status"` announce a change
-            to assistive tech without the cell needing focus.
+            to assistive tech without the cell needing focus. While a
+            column is disabled for a pending attempt (review UI2-1), this
+            region also carries the reason ("pending").
           */}
           <TableRow data-testid="subtitle-status-row">
             <TableCell>
@@ -335,7 +403,8 @@ export function SubtitlePatchPanel(): JSX.Element | null {
               column.slots.map((slot) => {
                 const key = cellKey(column.output, slot.slot);
                 const cellState = cells[key];
-                const content = statusOf(cellState);
+                const busy = pendingKeys.has(key);
+                const content = statusOf(cellState, busy);
                 return (
                   <TableCell key={key} data-testid={`subtitle-status-${key}`}>
                     <span role="status" aria-live="polite" className="text-xs">
