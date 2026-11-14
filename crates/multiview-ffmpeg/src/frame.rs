@@ -329,6 +329,13 @@ impl ScratchFrame {
         check_swscale_destination(&self.frame)
     }
 
+    /// The frame itself, moved out with its trusted metadata (zero-initialised
+    /// by [`alloc_video`], geometry never changed since): the provenance
+    /// [`crate::alpha::AlphaSource::from_checked`] relies on.
+    pub(crate) fn into_video(self) -> Video {
+        self.frame
+    }
+
     /// The raw frame, for a libav call that writes the already-validated
     /// planes ([`Self::check_destination`]) without changing the frame's
     /// format, size or buffers.

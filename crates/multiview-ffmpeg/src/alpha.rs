@@ -18,6 +18,8 @@ use ffmpeg::format::Pixel;
 use ffmpeg::util::frame::Video;
 use ffmpeg_next as ffmpeg;
 
+use crate::frame::ScratchFrame;
+
 pub use multiview_core::alpha::{extract_alpha, AlphaDepth, AlphaError, AlphaLayout};
 
 /// The alpha layout of `format`, or `None` when the format carries no alpha.
@@ -85,6 +87,32 @@ pub struct AlphaSource {
 }
 
 impl AlphaSource {
+    /// An alpha source over a [`ScratchFrame`]: allocated by the checked
+    /// `alloc_video` (every owned byte zero-initialised, review PB-12) and
+    /// never exposed mutably, so its geometry is still the allocation's and
+    /// every row the copy can view is initialised. `layout` is checked
+    /// against the frame's format by [`Self::copy_to`].
+    #[must_use]
+    pub fn from_checked(frame: ScratchFrame, layout: AlphaLayout) -> Self {
+        Self {
+            frame: frame.into_video(),
+            layout,
+        }
+    }
+
+    /// The frame, read-only (geometry, format, a libav read such as
+    /// [`crate::Scaler::run`]).
+    #[must_use]
+    pub const fn frame(&self) -> &Video {
+        &self.frame
+    }
+
+    /// Where the frame's alpha samples live.
+    #[must_use]
+    pub const fn layout(&self) -> AlphaLayout {
+        self.layout
+    }
+
     /// Copy the straight alpha into `dst` as one byte per pixel, rows
     /// `dst_stride` bytes apart, rescaling deeper samples to 8 bits.
     ///

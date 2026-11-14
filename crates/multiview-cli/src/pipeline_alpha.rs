@@ -65,7 +65,7 @@ impl MediaAlpha {
         image: Nv12Image,
         source: &AlphaSource,
     ) -> Result<Nv12Image, String> {
-        let (in_w, in_h) = (source.frame.width(), source.frame.height());
+        let (in_w, in_h) = (source.frame().width(), source.frame().height());
         let (tile_w, tile_h) = (image.width(), image.height());
         let tile_cols = usize::try_from(tile_w).map_err(|_| "width overflow".to_owned())?;
         if (in_w, in_h) == (tile_w, tile_h) {
