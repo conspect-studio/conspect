@@ -34,7 +34,7 @@ master.m3u8
   #EXT-X-STREAM-INF:BANDWIDTH=..,AVERAGE-BANDWIDTH=..,CODECS="avc1.640029,mp4a.40.2",RESOLUTION=1920x1080,FRAME-RATE=29.970,AUDIO="aud"
   video.m3u8
 video.m3u8 / audio.m3u8
-  #EXT-X-TARGETDURATION:2, #EXT-X-MEDIA-SEQUENCE, #EXT-X-MAP:URI="init-v-<gen>-<k>.mp4"
+  #EXT-X-TARGETDURATION:4, #EXT-X-MEDIA-SEQUENCE, #EXT-X-MAP:URI="init-v-<gen>-<k>.mp4"
   #EXT-X-PROGRAM-DATE-TIME + #EXTINF:2.002000 + seg-v-<gen>-<n>.m4s   (10 listed)
 ```
 
@@ -42,6 +42,10 @@ video.m3u8 / audio.m3u8
   video segment is cut at the first IDR at least 2 s (minus half a frame) after its start: two of the shared
   encode's 1 s GOPs, 2.002 s at 29.97 fps. The audio segment with the same sequence number holds the AAC frames
   between the two video cut points, so both playlists always list the same sequence numbers.
+- **Target duration.** `EXT-X-TARGETDURATION` is fixed for a packager's lifetime (RFC 8216 requires it constant
+  for a media playlist): twice the nominal segment, 4 s. A segment that would exceed it (no IDR in time) is a
+  packager error; the stream restarts with a new generation, i.e. new playlist content and file names. Shaka's
+  live delay sums the `EXTINF` of the last three segments, so the larger target does not change latency.
 - **Timestamps.** `tfdt` is the tick-derived timestamp in the stream's own time base, never rebased, never a float.
   `EXTINF` is the exact sum of sample durations.
 - **Discontinuities.** Only for a real change: new SPS/PPS (a take onto another encoder) or lost packets. Both
@@ -49,7 +53,8 @@ video.m3u8 / audio.m3u8
 - **PDT.** One anchor per activation: the shared output epoch, else the wall clock recorded when the packets
   arrived. It never steps inside an activation.
 - **Names.** `<gen>` is unique per activation (at least the Unix time in ms), so a URL is never reused for other
-  bytes and segments can be cached as immutable.
+  bytes. The token routes still send `Cache-Control: no-store` on every response, so no shared cache can serve
+  a revoked or expired token's URL.
 - **Window.** 10 listed; an evicted segment stays on disk for 10 more closes; bounded file count.
 
 ## 3. The engine
@@ -87,6 +92,13 @@ Token rules, limits, expiry and the redaction guarantees are in ADR-0111 decisio
 API has an operation id that starts with `cast:` and is not written to `[[routing.output]]`; when the last
 stream of an output ends, the output goes back to Program after a 10 s linger.
 
+**Takes re-authorize tokens.** Every path that changes what a cast output carries (routing and patch takes, the
+cast API's own take and take-back, a layout edit or delete, the audio-routing PUT) checks each live token on that
+output against its owner's current grants for the new feed's whole closure (source, layout cells and audio,
+audio routes) before the change is published. A token whose owner may not read the new feed, or whose owner no
+longer resolves, is revoked first: its next request is 404, and the owner's `GET` shows `cast-stream-revoked` with
+the reason. Engine fallbacks and a 5 s sweep (which also catches a revoked or re-scoped API key) are backstops.
+
 **Diagnosis without a device log.** The engine records, per stream and for the receiver page, the last fetch
 time and User-Agent (a Cast device contains `CrKey`). No fetch from a Cast device after a cast starts means the
 device never completed DNS or TLS to the host; fetches without a `playing` report mean a playback fault, and
@@ -113,7 +125,14 @@ with Google's defaults and reports nothing. CSP of the receiver page: `media-src
    a strict reader of a cast directory. Unit and integration tests run in the default build.
 2. Pipeline and chaos tests (`crates/multiview-cli/src/cast_output/pipeline_tests.rs`, real clock, libx264):
    inactive writes nothing; pre-roll; validity; take and back; a blocked sink and a panicking sink cost the
-   clock zero ticks and the HLS output zero packets; a stalled sink declares its gap.
+   clock zero ticks and the HLS binding zero packets; a stalled sink declares its gap. The HLS output in the
+   chaos tests is the HLS binding (recording sink): the real binding of the configured HLS output, whose sink
+   runner records every packet it is handed (video PTS, audio count) instead of packaging HLS. The chaos tests
+   run under the live drop-on-overload policy and prove isolation by zero hot-queue shed, every tick emitted,
+   contiguous PTS 0..N and the control run's audio count at that binding, and the clock's tick progress sampled
+   against its own time while the fault is installed (at least 25 - 5 ticks per second of clock time). Two
+   negative controls stall the shared bake consumer and must fail these assertions. The cast binding's drop
+   counter is exact: received + dropped = offered, including queued windows flushed on overload or expiry.
 3. `tools/cast-proof/`: the real engine, a stream created through the API, 60 s in Shaka 4.15.56 with the SDK's
    defaults and with the receiver's settings, 60 s through the real receiver SDK and the receiver app against an
    emulated platform channel, takes, revoke, authorization and the validator on the directory (fault cases:

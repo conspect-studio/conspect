@@ -45,7 +45,7 @@ Read `GET /api/v1/cast/config` and the stream (`GET /api/v1/cast/streams/{id}`),
 | The TV shows the Cast spinner and never the Conspect screen | The TV never loaded the receiver page (`https://cast.conspect.studio/`, or `receiver_last_fetch` stays empty for a self-hosted receiver): DNS, firewall, or the device is not registered for an unpublished app | Open the receiver URL from a phone on the TV's network. Check the device serial in the Console and reboot the device. Check the certificate chain (section 4) |
 | Receiver page fetched, stream `fetches.playlists = 0` | The receiver did not request the stream: the LOAD was rejected (wrong origin or path) | Receiver log (section 5); the page's host must be the host the browser is on |
 | Playlists fetched, no `playing` report, report `error` set | Playback fault | The report's sentence and codes (`shaka 1001` = HTTP status, `3016` = decode) |
-| "The cast stream has ended or its link expired" on the TV | The token was revoked (Stop) or expired (60 s without a playlist fetch, or 12 h) | Start the cast again |
+| "The cast stream has ended or its link expired" on the TV | The token was revoked (Stop, or a take moved the cast output to a feed the cast's owner may not see) or expired (60 s without a playlist fetch, or 12 h) | Start the cast again; `GET /api/v1/cast/streams/{id}` shows `cast-stream-revoked` and the reason |
 | `409 cast-capacity` | Every cast output is in use with other pictures | Stop a cast or declare another cast output |
 | `409 capacity` (routing) | No encoder free for that picture | Stop another routed feed |
 | Cast output shows `last_error` about its directory | `dir` holds files the engine did not write | Point `dir` at an empty directory or remove `dir` |
