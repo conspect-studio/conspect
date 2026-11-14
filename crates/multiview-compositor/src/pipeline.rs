@@ -698,14 +698,14 @@ impl<'a> Tile<'a> {
         self
     }
 
-    /// The mask coverage at canvas pixel `(px, py)`; `1` without a mask.
-    /// `WipeMask` has public fields: a malformed mask
-    /// ([`crate::mask::WipeMask::is_well_formed`]) covers nothing, and any
-    /// coverage is clamped to `[0, 1]` with NaN read as 0, so it can never
-    /// poison the layers beneath.
-    fn mask_coverage(&self, px: u32, py: u32) -> f32 {
+    /// The mask coverage at canvas pixel `(px, py)` of a `canvas_w x canvas_h`
+    /// canvas; `1` without a mask. `WipeMask` has public fields: a mask not
+    /// valid for this canvas ([`crate::mask::WipeMask::is_valid_for`]) covers
+    /// nothing, and any coverage is clamped to `[0, 1]` with NaN read as 0, so
+    /// it can never poison the layers beneath.
+    fn mask_coverage(&self, px: u32, py: u32, canvas_wh: (u32, u32)) -> f32 {
         self.mask.as_ref().map_or(1.0, |mask| {
-            if mask.is_well_formed() {
+            if mask.is_valid_for(canvas_wh.0, canvas_wh.1) {
                 crate::key::unit(mask.coverage(px, py))
             } else {
                 0.0
@@ -1206,6 +1206,7 @@ pub(crate) fn composite_core(
                 w,
                 0,
                 canvas_h,
+                (canvas_w, canvas_h),
                 canvas,
                 background,
                 tiles,
@@ -1221,6 +1222,7 @@ pub(crate) fn composite_core(
             w,
             total_pairs,
             workers,
+            (canvas_w, canvas_h),
             canvas,
             background,
             tiles,
@@ -1292,6 +1294,7 @@ pub fn composite_reference(
         w,
         0,
         canvas_h,
+        (canvas_w, canvas_h),
         canvas,
         background,
         tiles,
@@ -1315,6 +1318,7 @@ fn composite_parallel(
     w: usize,
     total_pairs: usize,
     workers: usize,
+    canvas_wh: (u32, u32),
     canvas: CanvasColor,
     background: LinearRgba,
     tiles: &[Tile<'_>],
@@ -1359,6 +1363,7 @@ fn composite_parallel(
                     w,
                     py_start,
                     band_h,
+                    canvas_wh,
                     canvas,
                     background,
                     tiles,
@@ -1420,6 +1425,7 @@ fn composite_band_reference(
     w: usize,
     py_start: u32,
     band_h: u32,
+    canvas_wh: (u32, u32),
     canvas: CanvasColor,
     background: LinearRgba,
     tiles: &[Tile<'_>],
@@ -1441,7 +1447,9 @@ fn composite_band_reference(
                     }
                 }
                 let src = match tile_dst_offset(tile, px, py) {
-                    Some((ddx, ddy)) => tile_pixel(tile, ddx, ddy, (px, py), canvas, luts)?,
+                    Some((ddx, ddy)) => {
+                        tile_pixel(tile, ddx, ddy, (px, py), canvas_wh, canvas, luts)?
+                    }
                     None => None,
                 };
                 match tile.group {
@@ -1536,6 +1544,7 @@ fn composite_band(
     w: usize,
     py_start: u32,
     band_h: u32,
+    canvas_wh: (u32, u32),
     canvas: CanvasColor,
     background: LinearRgba,
     tiles: &[Tile<'_>],
@@ -1594,6 +1603,7 @@ fn composite_band(
         span_start,
         span_rows,
         py_start,
+        canvas_wh,
     };
     let (acc, covered) = fold_tiles(
         scratch,
@@ -1794,6 +1804,8 @@ struct BandGeom {
     span_start: usize,
     span_rows: usize,
     py_start: u32,
+    /// The whole canvas `(width, height)` (a wipe mask is valid only for it).
+    canvas_wh: (u32, u32),
 }
 
 /// Begin the main accumulator + coverage for a composite over `span_pixels`
@@ -1858,6 +1870,7 @@ fn tile_pixel(
     ddx: u32,
     ddy: u32,
     canvas_px: (u32, u32),
+    canvas_wh: (u32, u32),
     canvas: CanvasColor,
     luts: Option<&LutSet>,
 ) -> Result<Option<PremulRgba>> {
@@ -1876,7 +1889,7 @@ fn tile_pixel(
     // The wipe mask (ADR-0112 §3) multiplies in at the same single premultiply.
     let mut a = crate::key::unit(tile.opacity)
         * tile_alpha(tile.image, sx, sy)
-        * tile.mask_coverage(canvas_px.0, canvas_px.1);
+        * tile.mask_coverage(canvas_px.0, canvas_px.1, canvas_wh);
     if let Some(key) = &tile.key {
         // Post-range-expand fill Y (pipeline step 1) for a luma self key.
         let fill_y = range::expand_luma(y8, range::require_resolved(tile.image.color().range)?);
@@ -1962,7 +1975,8 @@ fn fold_tile_into_band(
                 u32::try_from(gx).unwrap_or(0),
                 u32::try_from(gy).unwrap_or(0),
             );
-            if let Some(src) = tile_pixel(tile, ddx, ddy, canvas_px, canvas, luts)? {
+            if let Some(src) = tile_pixel(tile, ddx, ddy, canvas_px, geom.canvas_wh, canvas, luts)?
+            {
                 fold(row_base + col, src);
             }
             gx += 1;

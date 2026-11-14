@@ -154,26 +154,30 @@ impl WipeMask {
         self
     }
 
-    /// Whether the mask is one [`WipeMask::new`] can build: a non-zero
-    /// geometry, every float field finite, and `pinned` (if set) exactly `0`
-    /// or `1` (the only endpoints `new` pins; the GPU maps them exactly). `WipeMask` has public fields; [`WipeMask::new`] always builds a
-    /// well-formed one. A malformed mask draws nothing on the CPU reference and
-    /// on the GPU alike, so it can never poison the layers beneath.
+    /// Whether this mask may be drawn on a `canvas_w x canvas_h` canvas: it is
+    /// one [`WipeMask::new`] builds for that canvas (the same width, height
+    /// and aspect bit for bit), every float field is finite, and `pinned` (if
+    /// set) is exactly `0` or `1` (the only endpoints `new` pins; the GPU maps
+    /// them exactly). `WipeMask` has public fields; a mask that fails this
+    /// draws nothing on the CPU reference and on the GPU alike, so the two
+    /// paths never disagree and the layers beneath are never poisoned.
     #[must_use]
-    pub fn is_well_formed(&self) -> bool {
-        [
-            self.aspect,
-            self.origin[0],
-            self.origin[1],
-            self.extent,
-            self.radius,
-            self.softness,
-            self.expand,
-        ]
-        .iter()
-        .all(|v| v.is_finite())
-            && self.width > 0
-            && self.height > 0
+    pub fn is_valid_for(&self, canvas_w: u32, canvas_h: u32) -> bool {
+        self.width == canvas_w
+            && self.height == canvas_h
+            && canvas_w > 0
+            && canvas_h > 0
+            && self.aspect.to_bits() == aspect(canvas_w, canvas_h).to_bits()
+            && [
+                self.origin[0],
+                self.origin[1],
+                self.extent,
+                self.radius,
+                self.softness,
+                self.expand,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
             && self.pinned.is_none_or(|c| {
                 c.to_bits() == 0.0_f32.to_bits() || c.to_bits() == 1.0_f32.to_bits()
             })

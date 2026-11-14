@@ -602,28 +602,13 @@ fn a_nan_weight_reads_as_zero_and_never_poisons_the_layers_beneath() {
     }
 }
 
-#[test]
-fn a_malformed_wipe_mask_covers_nothing_and_never_poisons_the_layers_beneath() {
-    // Merge review R-1: `WipeMask` has public fields, so a NaN or out-of-range
-    // field must not reach the premultiply. A malformed mask covers nothing,
-    // on a plain tile and on a keyed one, on both kernels.
-    use multiview_compositor::mask::{MaskShape, WipeMask};
-    let c = bt709(ColorRange::Limited);
-    let bg = solid(8, 8, 140, 100, 160, c);
-    let k = solid(8, 8, 220, 128, 128, c);
-    let base = comp(8, 8, &[Tile::placed(&bg, 0, 0, 1.0)]);
-    let good = WipeMask::new(
-        MaskShape::Horizontal,
-        0.5,
-        8,
-        8,
-        [0.0, 0.0],
-        false,
-        0.1,
-        0.0,
-    );
-    assert!(good.is_well_formed());
-    let malformed = [
+/// Masks a caller could build from public fields that no `WipeMask::new` for
+/// an 8x8 canvas produces (merge reviews R-1..R-5).
+fn malformed_masks(
+    good: multiview_compositor::mask::WipeMask,
+) -> Vec<multiview_compositor::mask::WipeMask> {
+    use multiview_compositor::mask::WipeMask;
+    vec![
         WipeMask {
             pinned: Some(f32::NAN),
             ..good
@@ -654,9 +639,50 @@ fn a_malformed_wipe_mask_covers_nothing_and_never_poisons_the_layers_beneath() {
         },
         WipeMask { width: 0, ..good },
         WipeMask { height: 0, ..good },
-    ];
+        WipeMask {
+            aspect: 0.0,
+            ..good
+        },
+        WipeMask {
+            aspect: -1.0,
+            ..good
+        },
+        WipeMask {
+            aspect: 2.0,
+            ..good
+        },
+        WipeMask {
+            width: 16,
+            height: 16,
+            ..good
+        },
+    ]
+}
+
+#[test]
+fn a_malformed_wipe_mask_covers_nothing_and_never_poisons_the_layers_beneath() {
+    // Merge review R-1: `WipeMask` has public fields, so a NaN or out-of-range
+    // field must not reach the premultiply. A malformed mask covers nothing,
+    // on a plain tile and on a keyed one, on both kernels.
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    let c = bt709(ColorRange::Limited);
+    let bg = solid(8, 8, 140, 100, 160, c);
+    let k = solid(8, 8, 220, 128, 128, c);
+    let base = comp(8, 8, &[Tile::placed(&bg, 0, 0, 1.0)]);
+    let good = WipeMask::new(
+        MaskShape::Horizontal,
+        0.5,
+        8,
+        8,
+        [0.0, 0.0],
+        false,
+        0.1,
+        0.0,
+    );
+    assert!(good.is_valid_for(8, 8));
+    let malformed = malformed_masks(good);
     for mask in malformed {
-        assert!(!mask.is_well_formed(), "{mask:?}");
+        assert!(!mask.is_valid_for(8, 8), "{mask:?}");
         for keyed in [false, true] {
             let tile = Tile::placed(&k, 0, 0, 1.0).with_mask(mask);
             let tile = if keyed {

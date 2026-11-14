@@ -148,6 +148,23 @@ fn gpu_malformed_wipe_mask_draws_nothing_like_the_cpu_reference() {
         },
         WipeMask { width: 0, ..good },
         WipeMask { height: 0, ..good },
+        WipeMask {
+            aspect: 0.0,
+            ..good
+        },
+        WipeMask {
+            aspect: -1.0,
+            ..good
+        },
+        WipeMask {
+            aspect: 2.0,
+            ..good
+        },
+        WipeMask {
+            width: W * 2,
+            height: H * 2,
+            ..good
+        },
     ] {
         let tiles = [
             Tile::scaled(&out, 0, 0, W, H, 1.0),
@@ -162,7 +179,17 @@ fn gpu_malformed_wipe_mask_draws_nothing_like_the_cpu_reference() {
                 &tiles,
             )
             .unwrap();
+        assert!(!mask.is_valid_for(W, H), "{mask:?}");
         let m = mismatch(base.y_plane(), got.y_plane(), 3);
-        assert!(m == 0.0, "{mask:?}: {m}");
+        assert!(m == 0.0, "GPU {mask:?}: {m}");
+        let cpu = composite(
+            W,
+            H,
+            CanvasColor::default(),
+            LinearRgba::TRANSPARENT,
+            &tiles,
+        )
+        .unwrap();
+        assert_eq!(cpu, base, "CPU {mask:?}");
     }
 }

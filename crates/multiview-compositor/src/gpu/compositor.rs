@@ -775,7 +775,7 @@ impl GpuCompositor {
                 canvas,
             )?;
             let params = match &tile.mask {
-                Some(mask) => params.with_mask(mask),
+                Some(mask) => params.with_mask(mask, canvas_w, canvas_h),
                 None => params,
             };
             let params = match img.alpha_plane() {
