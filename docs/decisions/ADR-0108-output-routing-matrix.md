@@ -195,7 +195,9 @@ What is true on main f5f2230e (the full table with citations is in §1 of the no
    - Feed cycles are refused at plan time and at adoption.
    - A PVW/PGM/AUTO select of `layout:L` requires Read on every source L shows, transitively.
    - `first_slice_me_layout_supported` is removed: with a switcher, the Program canvas is the M/E
-     bus, and the configured multi-cell layout becomes the routable stored layout `config`.
+     bus, and the configured multi-cell layout becomes the routable stored layout `config`
+     (as built in #307 PR 1: `MultiviewConfig::program_canvas`; the library id is the seeded
+     working-layout id, see output-routing.md §3).
    - `apply-layout` keeps its meaning without a switcher. With a switcher it answers 422
      `switcher-owns-program` and names the two operations that do what is meant. It can take
      `target: {output}` as an alias of an output take.

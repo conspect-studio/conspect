@@ -774,6 +774,10 @@ impl GpuCompositor {
                 img.color(),
                 canvas,
             )?;
+            let params = match &tile.mask {
+                Some(mask) => params.with_mask(mask),
+                None => params,
+            };
             let params = match img.alpha_plane() {
                 Some(alpha) => {
                     // `AlphaPlanePool::attach` already enforces this; re-check
