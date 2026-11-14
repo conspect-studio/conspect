@@ -62,6 +62,63 @@ impl<C: CastConnector + 'static> DevicePollerFactory for CastSessionFactory<C> {
             );
             return None;
         };
+        // An ephemeral session that plays a cast stream carries its own
+        // target (the token URL) and receiver app: no rendition lookup.
+        let launch = wiring.cast_sessions.launch_of(&device.id);
+        let (target, config, title) = if let Some(launch) = launch {
+            let mut config = self.config;
+            config.app_id = launch.app_id;
+            (launch.media, config, Some(launch.title))
+        } else {
+            (self.resolve_rendition(device)?, self.config, None)
+        };
+        let state_store = Arc::clone(&wiring.cast_sessions);
+        let state_id = device.id.clone();
+        let player_state: super::session::PlayerStateHook =
+            Arc::new(move |mode: &str, reason: Option<&str>| {
+                state_store.set_player_state(&state_id, mode, reason);
+            });
+        // The started-at stamp (DEV-D3.1): at the actor's LOAD-accept moment
+        // (the receiver created our media session — the cast verifiably began)
+        // stamp the ephemeral session record from the control plane's
+        // injectable clock. First-write-wins in the store; a no-op for a
+        // SAVED cast device's id (no ephemeral record to stamp).
+        let stamp_store = Arc::clone(&wiring.cast_sessions);
+        let stamp_clock = Arc::clone(&wiring.clock);
+        let stamp_id = device.id.clone();
+        let mut actor = CastSessionActor::new(
+            &device.id,
+            Arc::clone(&self.connector),
+            address,
+            target,
+            wiring.broadcaster.clone(),
+            config,
+        )
+        .with_load_accepted_hook(Arc::new(move || {
+            stamp_store.mark_started(&stamp_id, (stamp_clock)().as_nanos());
+        }))
+        .with_player_state_hook(player_state);
+        if let Some(title) = title {
+            actor = actor.with_title(&title);
+        }
+        // Spawn inside the ambient Tokio runtime when there is one — the
+        // running control plane (axum handlers, boot seeding) always has one.
+        // A synchronous caller (no ambient runtime: the factory unit tests, a
+        // sync embedding) enters the shared fallback runtime instead, so the
+        // returned handle always carries a RUNNING actor.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            Some(actor.spawn())
+        } else {
+            let runtime = fallback_runtime()?;
+            let _guard = runtime.enter();
+            Some(actor.spawn())
+        }
+    }
+}
+
+impl<C: CastConnector + 'static> CastSessionFactory<C> {
+    /// The served HLS rendition a device's display assignment names.
+    fn resolve_rendition(&self, device: &Device) -> Option<super::media::CastMediaTarget> {
         // Resolve what to cast from the display assignment (ADR-M011: the
         // media path is an existing HLS rendition).
         let Some(assign) = device.display.as_ref().map(|d| &d.assign) else {
@@ -83,37 +140,7 @@ impl<C: CastConnector + 'static> DevicePollerFactory for CastSessionFactory<C> {
             );
             return None;
         };
-        // The started-at stamp (DEV-D3.1): at the actor's LOAD-accept moment
-        // (the receiver created our media session — the cast verifiably began)
-        // stamp the ephemeral session record from the control plane's
-        // injectable clock. First-write-wins in the store; a no-op for a
-        // SAVED cast device's id (no ephemeral record to stamp).
-        let stamp_store = Arc::clone(&wiring.cast_sessions);
-        let stamp_clock = Arc::clone(&wiring.clock);
-        let stamp_id = device.id.clone();
-        let actor = CastSessionActor::new(
-            &device.id,
-            Arc::clone(&self.connector),
-            address,
-            target.clone(),
-            wiring.broadcaster.clone(),
-            self.config,
-        )
-        .with_load_accepted_hook(Arc::new(move || {
-            stamp_store.mark_started(&stamp_id, (stamp_clock)().as_nanos());
-        }));
-        // Spawn inside the ambient Tokio runtime when there is one — the
-        // running control plane (axum handlers, boot seeding) always has one.
-        // A synchronous caller (no ambient runtime: the factory unit tests, a
-        // sync embedding) enters the shared fallback runtime instead, so the
-        // returned handle always carries a RUNNING actor.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            Some(actor.spawn())
-        } else {
-            let runtime = fallback_runtime()?;
-            let _guard = runtime.enter();
-            Some(actor.spawn())
-        }
+        Some(target.clone())
     }
 }
 

@@ -232,12 +232,33 @@ pub(crate) fn authorize_output_end(principal: &Principal, output: &str) -> Contr
 }
 
 /// Program scope + the M/E grant: the rule for every switcher-bus feed.
-fn authorize_bus(principal: &Principal) -> ControlResult<()> {
+pub(crate) fn authorize_bus(principal: &Principal) -> ControlResult<()> {
     crate::auth::authorize_scope(
         principal,
         multiview_events::AuthzScope::Program(multiview_config::MAIN_PROGRAM),
     )?;
     crate::auth::authorize_object(principal, ME_ID)
+}
+
+/// Authorize the video-feed end (§6.3): a source → Read on it; a layout →
+/// Read on the layout id and its whole source closure (from the request's
+/// one pre-read `layout`); a bus → Program scope + the M/E grant. Shared by
+/// the take route and the cast streams API (ADR-0111), so a cast stream is
+/// authorized exactly as a take of the same feed.
+///
+/// # Errors
+/// 403 for any end the principal may not read.
+pub(crate) fn authorize_video_feed(
+    principal: &Principal,
+    feed: &VideoFeed,
+    layout: Option<&LayoutRead>,
+) -> ControlResult<()> {
+    match feed {
+        VideoFeed::Source(id) => crate::auth::authorize_object(principal, id),
+        VideoFeed::Layout(id) => authorize_layout_feed(principal, id, layout),
+        VideoFeed::Bus(_) => authorize_bus(principal),
+        _ => Err(ControlError::Forbidden("unsupported feed kind".to_owned())),
+    }
 }
 
 /// Authorize both ends (§6.3), before any existence check: the output, the
@@ -251,12 +272,8 @@ fn authorize_ends(
     layout: Option<&LayoutRead>,
 ) -> ControlResult<()> {
     authorize_output_end(principal, req.output())?;
-    match &req.feed {
-        None => {}
-        Some(VideoFeed::Source(id)) => crate::auth::authorize_object(principal, id)?,
-        Some(VideoFeed::Layout(id)) => authorize_layout_feed(principal, id, layout)?,
-        Some(VideoFeed::Bus(_)) => authorize_bus(principal)?,
-        Some(_) => return Err(ControlError::Forbidden("unsupported feed kind".to_owned())),
+    if let Some(feed) = &req.feed {
+        authorize_video_feed(principal, feed, layout)?;
     }
     match &req.audio {
         None | Some(AudioFeed::Follow | AudioFeed::None) => {}
@@ -282,7 +299,7 @@ pub(crate) fn routing_unavailable() -> Response {
         .into_response()
 }
 
-fn refusal_problem(status: u16, kind: &str, detail: String) -> Response {
+pub(crate) fn refusal_problem(status: u16, kind: &str, detail: String) -> Response {
     Problem::new(status, kind, "Take refused")
         .with_detail(detail)
         .into_response()
@@ -647,6 +664,7 @@ pub(crate) fn notify_layout_change(state: &AppState, id: &str, body: Option<&ser
     let Some(control) = state.output_routing.as_ref() else {
         return;
     };
+    let actor = "layout-change";
     let resolved = body.and_then(|body| {
         let resolved =
             crate::command::resolve_layout_document(id, body, state.running_canvas.as_ref())
@@ -663,6 +681,30 @@ pub(crate) fn notify_layout_change(state: &AppState, id: &str, body: Option<&ser
             .integer_drawable()
             .then(|| LayoutBody(std::sync::Arc::new(routed)))
     });
+    // ABUSE-1: an output on this layout now carries the new body (or falls
+    // back to Program): re-check its cast tokens before the engine hears.
+    for output in outputs_on_layout(state, id) {
+        match &resolved {
+            Some(body) => crate::cast_streams::reauth::before_change(
+                state,
+                &output,
+                None,
+                Some(&RoutedFeed::Layout(id.to_owned())),
+                Some(body.0.as_ref()),
+                None,
+                actor,
+            ),
+            None => crate::cast_streams::reauth::before_change(
+                state,
+                &output,
+                None,
+                Some(&RoutedFeed::Program),
+                None,
+                None,
+                actor,
+            ),
+        };
+    }
     if !control.routing.layout_changed(id, resolved) {
         tracing::warn!(layout = %id, "output routing: a layout change was not delivered to the engine; outputs on it keep their picture until a re-take");
     }
@@ -1024,7 +1066,7 @@ pub(crate) fn too_many_pub(retry: std::time::Duration) -> Response {
 }
 
 /// `429` + `Retry-After` (whole seconds, at least 1).
-fn too_many(retry: std::time::Duration) -> Response {
+pub(crate) fn too_many(retry: std::time::Duration) -> Response {
     let secs = retry
         .as_secs()
         .saturating_add(u64::from(retry.subsec_nanos() > 0))
@@ -1038,7 +1080,7 @@ fn too_many(retry: std::time::Duration) -> Response {
     response
 }
 
-fn unroutable_kind() -> Response {
+pub(crate) fn unroutable_kind() -> Response {
     refusal_problem(
         409,
         "output-kind-unroutable",
@@ -1064,6 +1106,21 @@ fn audio_gate(
         // The video plan answers the video refusals.
         Err(PlanRefusal::SwitcherRequired | PlanRefusal::AuxCapacity { .. }) | Ok(_) => None,
     }
+}
+
+/// The slot-0 take's admission gates, video plan first then audio (`Some` =
+/// refused): the same order and answers as checking each in turn.
+fn take_gates(
+    control: &crate::output_routing::OutputRoutingControl,
+    principal: &Principal,
+    config_id: &str,
+    feed: Option<&RoutedFeed>,
+    audio: Option<&RoutedAudio>,
+) -> Option<Response> {
+    if let Some(refused) = feed.and_then(|feed| plan_gate(control, principal, config_id, feed)) {
+        return Some(refused);
+    }
+    audio.and_then(|audio| audio_gate(control, config_id, feed, audio))
 }
 
 /// The take-time admission gate from the engine's plan (`Some` = refused).
@@ -1250,21 +1307,21 @@ pub(crate) fn take_output_slot0(
             Err((response, _)) => return Ok(SlotTake::Refused(response)),
         },
     };
-    if let Some(feed) = &feed {
-        if let Some(refused) = plan_gate(&control, principal, &config_id, feed) {
-            return Ok(SlotTake::Refused(refused));
-        }
-    }
-    if let Some(audio) = &audio {
-        if let Some(refused) = audio_gate(&control, &config_id, feed.as_ref(), audio) {
-            return Ok(SlotTake::Refused(refused));
-        }
+    if let Some(refused) = take_gates(
+        &control,
+        principal,
+        &config_id,
+        feed.as_ref(),
+        audio.as_ref(),
+    ) {
+        return Ok(SlotTake::Refused(refused));
     }
     // The record exists before the enqueue, so an outcome never beats it.
     let pending = PendingTake {
         api_id: output_id.to_owned(),
         feed: feed.clone(),
         audio: audio.clone(),
+        subtitles: None,
     };
     let pending_check = pending.clone();
     let op = match control.reserve_take(&key, &principal.key_id, pending) {
@@ -1286,18 +1343,22 @@ pub(crate) fn take_output_slot0(
         }
         TakeReservation::Fresh(op) => op,
     };
-    let take = OutputTakeRequest {
-        operation_id: op.to_string(),
-        output: config_id,
-        video: feed.clone(),
-        audio: audio.clone(),
-        layout,
-        principal: principal.key_id.clone(),
-    };
-    if let Err(error) = control.routing.try_take(take) {
+    if let Err(refused) = enqueue_slot0(
+        state,
+        principal,
+        &control,
+        OutputTakeRequest {
+            operation_id: op.to_string(),
+            output: config_id,
+            video: feed.clone(),
+            audio: audio.clone(),
+            layout,
+            principal: principal.key_id.clone(),
+        },
+    ) {
         // Only this take's own failed enqueue frees its key.
         control.release_take(&key, &op);
-        return Ok(SlotTake::Refused(match error {
+        return Ok(SlotTake::Refused(match refused {
             TakeSubmitError::Busy => ControlError::EngineBusy.into_response(),
             TakeSubmitError::Unroutable => unroutable_kind(),
         }));
@@ -1315,6 +1376,28 @@ pub(crate) fn take_output_slot0(
         })),
     );
     Ok(SlotTake::Accepted(op.to_string()))
+}
+
+/// Enqueue an authorized, reserved slot-0 take: first re-check the live cast
+/// tokens on the output for what it is about to carry (ABUSE-1: a token
+/// keeps its URL only while its owner may read the new feed), then the
+/// bounded `try_send`. On `Err` the caller frees the key.
+fn enqueue_slot0(
+    state: &AppState,
+    principal: &Principal,
+    control: &crate::output_routing::OutputRoutingControl,
+    take: OutputTakeRequest,
+) -> Result<(), TakeSubmitError> {
+    crate::cast_streams::reauth::before_change(
+        state,
+        &take.output,
+        Some(&take.operation_id),
+        take.video.as_ref(),
+        take.layout.as_ref().map(|body| body.0.as_ref()),
+        take.audio.as_ref(),
+        &principal.key_id,
+    );
+    control.routing.try_take(take)
 }
 
 /// A replay of a slot-0 take key: `Some` when the key names THIS take
@@ -1396,7 +1479,7 @@ fn same_take(
 ///
 /// # Errors
 /// A missing `Idempotency-Key` (422).
-fn slot0_key_of(idem: &IdempotencyKey) -> ControlResult<String> {
+pub(crate) fn slot0_key_of(idem: &IdempotencyKey) -> ControlResult<String> {
     idem.0
         .as_deref()
         .map(slot0_take_key)
