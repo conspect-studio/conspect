@@ -63,6 +63,8 @@ pub struct SourceTap {
     refused_extradata: AtomicU64,
     /// Packets skipped because their length prefixes were malformed.
     malformed: AtomicU64,
+    /// Set-less IDRs whose PPS (or its SPS) was unknown: left incomplete.
+    unresolved_sets: AtomicU64,
     /// Packets skipped because they carried no DTS/PTS or no run clock existed.
     unstamped: AtomicU64,
 }
@@ -94,6 +96,7 @@ impl SourceTap {
             oversize: AtomicU64::new(0),
             refused_extradata: AtomicU64::new(0),
             malformed: AtomicU64::new(0),
+            unresolved_sets: AtomicU64::new(0),
             unstamped: AtomicU64::new(0),
         }
     }
@@ -128,6 +131,13 @@ impl SourceTap {
     #[must_use]
     pub fn refused_extradata(&self) -> u64 {
         self.refused_extradata.load(Ordering::Relaxed)
+    }
+
+    /// Set-less IDRs left incomplete because the PPS their slice names (or
+    /// its SPS) was never seen: not strict, so no run starts on them.
+    #[must_use]
+    pub fn unresolved_sets(&self) -> u64 {
+        self.unresolved_sets.load(Ordering::Relaxed)
     }
 
     /// Packets skipped for malformed length prefixes (never re-framed).
@@ -256,46 +266,181 @@ fn extradata_sps(extradata: &[u8]) -> Option<&[u8]> {
     idr::h264_nal_of_type(extradata, NalFraming::AnnexB, 7).filter(|s| s.len() <= MAX_SPS_BYTES)
 }
 
-/// The first SPS and PPS of H.264 extradata (an avcC record or Annex-B
-/// sets), each bounded by [`MAX_SPS_BYTES`]; `None` when either is missing,
-/// truncated or over the bound.
-fn extradata_sets(extradata: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    if extradata.first() == Some(&1) {
-        let mut at = 5_usize;
-        let sps_count = extradata.get(at)? & 0x1F;
-        at += 1;
-        let mut sps: Option<&[u8]> = None;
-        for _ in 0..sps_count {
-            let len = usize::from(u16::from_be_bytes([
-                *extradata.get(at)?,
-                *extradata.get(at + 1)?,
-            ]));
-            let set = extradata.get(at + 2..at.checked_add(2)?.checked_add(len)?)?;
-            sps = sps.or(Some(set));
-            at += 2 + len;
+/// Most SPS / PPS entries a [`SetCache`] keeps (H.264 allows 32 SPS ids and
+/// 256 PPS ids; real streams use one or two).
+pub const MAX_CACHED_SETS: usize = 32;
+
+/// A connection's H.264 parameter sets keyed by id, from the extradata and
+/// then every in-band SPS/PPS (output-routing §12.5, #344 D2a review R2).
+#[derive(Debug, Default, Clone)]
+struct SetCache {
+    /// `(sps_id, SPS NAL)`.
+    sps: Vec<(u32, Vec<u8>)>,
+    /// `(pps_id, sps_id, PPS NAL)`.
+    pps: Vec<(u32, u32, Vec<u8>)>,
+}
+
+/// What [`SetCache::observe`] saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Observed {
+    /// Nothing new (absent, or equal to the cached set).
+    Same,
+    /// A new id was added.
+    Added,
+    /// An existing id now has different bytes, or a set could not be keyed
+    /// and the cache was invalidated: a parameter change.
+    Changed,
+}
+
+impl SetCache {
+    /// The cache of H.264 `extradata` (an avcC record or Annex-B sets).
+    fn from_extradata(extradata: &[u8]) -> Self {
+        let mut cache = Self::default();
+        if extradata.first() == Some(&1) {
+            let _ = cache.load_avcc(extradata);
+        } else {
+            let mut nals: Vec<&[u8]> = Vec::new();
+            // Bounded: extradata is <= MAX_FACTS_EXTRADATA, and the walk stops
+            // at the NAL budget.
+            let mut count = 0_usize;
+            idr_nals(extradata, |nal| {
+                count += 1;
+                if nal.first().is_some_and(|&b| matches!(b & 0x1F, 7 | 8)) {
+                    nals.push(nal);
+                }
+                count > idr::MAX_AU_NALS
+            });
+            for nal in nals {
+                cache.observe(nal);
+            }
         }
-        let pps_count = *extradata.get(at)?;
-        at += 1;
-        let mut pps: Option<&[u8]> = None;
-        for _ in 0..pps_count {
-            let len = usize::from(u16::from_be_bytes([
-                *extradata.get(at)?,
-                *extradata.get(at + 1)?,
-            ]));
-            let set = extradata.get(at + 2..at.checked_add(2)?.checked_add(len)?)?;
-            pps = pps.or(Some(set));
-            at += 2 + len;
-        }
-        let (sps, pps) = (sps?, pps?);
-        return (sps.len() <= MAX_SPS_BYTES
-            && pps.len() <= MAX_SPS_BYTES
-            && !sps.is_empty()
-            && !pps.is_empty())
-        .then(|| (sps.to_vec(), pps.to_vec()));
+        cache
     }
-    let sps = idr::h264_nal_of_type(extradata, NalFraming::AnnexB, 7)?;
-    let pps = idr::h264_nal_of_type(extradata, NalFraming::AnnexB, 8)?;
-    (sps.len() <= MAX_SPS_BYTES && pps.len() <= MAX_SPS_BYTES).then(|| (sps.to_vec(), pps.to_vec()))
+
+    fn load_avcc(&mut self, rec: &[u8]) -> Option<()> {
+        let mut at = 5_usize;
+        let sps_count = rec.get(at)? & 0x1F;
+        at += 1;
+        for round in 0..2 {
+            let count = if round == 0 {
+                sps_count
+            } else {
+                let c = *rec.get(at)?;
+                at += 1;
+                c
+            };
+            for _ in 0..count {
+                let len = usize::from(u16::from_be_bytes([*rec.get(at)?, *rec.get(at + 1)?]));
+                let set = rec.get(at + 2..at.checked_add(2)?.checked_add(len)?)?;
+                self.observe(set);
+                at += 2 + len;
+            }
+        }
+        Some(())
+    }
+
+    /// Take one in-band SPS / PPS NAL (other NALs are ignored).
+    fn observe(&mut self, nal: &[u8]) -> Observed {
+        let Some(&h) = nal.first() else {
+            return Observed::Same;
+        };
+        match h & 0x1F {
+            7 => {
+                let id = idr::h264_sps_id(nal).filter(|_| nal.len() <= MAX_SPS_BYTES);
+                self.put_sps(id, nal)
+            }
+            8 => {
+                let ids = idr::h264_pps_ids(nal).filter(|_| nal.len() <= MAX_SPS_BYTES);
+                self.put_pps(ids, nal)
+            }
+            _ => Observed::Same,
+        }
+    }
+
+    fn put_sps(&mut self, id: Option<u32>, nal: &[u8]) -> Observed {
+        let Some(id) = id else {
+            return self.invalidate();
+        };
+        if let Some((_, cached)) = self.sps.iter_mut().find(|(i, _)| *i == id) {
+            if cached.as_slice() == nal {
+                return Observed::Same;
+            }
+            *cached = nal.to_vec();
+            return Observed::Changed;
+        }
+        if self.sps.len() < MAX_CACHED_SETS {
+            self.sps.push((id, nal.to_vec()));
+            Observed::Added
+        } else {
+            self.invalidate()
+        }
+    }
+
+    fn put_pps(&mut self, ids: Option<(u32, u32)>, nal: &[u8]) -> Observed {
+        let Some((id, sps_id)) = ids else {
+            return self.invalidate();
+        };
+        if let Some((_, s, cached)) = self.pps.iter_mut().find(|(i, _, _)| *i == id) {
+            if cached.as_slice() == nal {
+                return Observed::Same;
+            }
+            *s = sps_id;
+            *cached = nal.to_vec();
+            return Observed::Changed;
+        }
+        if self.pps.len() < MAX_CACHED_SETS {
+            self.pps.push((id, sps_id, nal.to_vec()));
+            Observed::Added
+        } else {
+            self.invalidate()
+        }
+    }
+
+    /// Forget everything (a set that cannot be keyed): no stale set is ever
+    /// inserted afterwards.
+    fn invalidate(&mut self) -> Observed {
+        self.sps.clear();
+        self.pps.clear();
+        Observed::Changed
+    }
+
+    /// The SPS and PPS a slice naming `pps_id` needs, when both are known.
+    fn for_pps(&self, pps_id: u32) -> Option<(&[u8], &[u8])> {
+        let (_, sps_id, pps) = self.pps.iter().find(|(i, _, _)| *i == pps_id)?;
+        let (_, sps) = self.sps.iter().find(|(i, _)| i == sps_id)?;
+        Some((sps.as_slice(), pps.as_slice()))
+    }
+}
+
+/// Visit the Annex-B NALs of `au` until `f` returns `true`.
+fn idr_nals<'a>(au: &'a [u8], mut f: impl FnMut(&'a [u8]) -> bool) {
+    // `h264_nal_of_type` style iteration through the public helpers: walk
+    // start codes directly (bounded by the caller's count).
+    let mut pending: Option<usize> = None;
+    let mut i = 0_usize;
+    while let Some(w) = au.get(i..i + 3) {
+        if w == [0, 0, 1] {
+            if let Some(start) = pending {
+                let end = if i > start && au.get(i - 1) == Some(&0) {
+                    i - 1
+                } else {
+                    i
+                };
+                if let Some(nal) = au.get(start..end).filter(|n| !n.is_empty()) {
+                    if f(nal) {
+                        return;
+                    }
+                }
+            }
+            pending = Some(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    if let Some(nal) = pending.and_then(|s| au.get(s..)).filter(|n| !n.is_empty()) {
+        let _ = f(nal);
+    }
 }
 
 /// An Annex-B IDR `au` that lacks its parameter sets, with `sps` and `pps`
@@ -446,10 +591,11 @@ pub struct TapWriter {
     /// The SPS the published traits were derived from.
     traits_sps: Option<Vec<u8>>,
     last_sets: Option<Vec<u8>>,
-    /// The current H.264 SPS/PPS: from the extradata at connect, replaced by
-    /// any in-band SPS/PPS as they pass. Prepended to an IDR that lacks
-    /// them (an avcC source carries them only in extradata).
-    current_sets: Option<(Vec<u8>, Vec<u8>)>,
+    /// The connection's H.264 SPS/PPS by id: from the extradata at connect,
+    /// updated by every in-band SPS/PPS of every AU. A set-less IDR gets
+    /// exactly the PPS its slice names and that PPS's SPS inserted (an avcC
+    /// source carries them only in extradata).
+    sets: SetCache,
     gen: u64,
     connection: u64,
     /// The run's monotonic clock in nanoseconds (`None` = no run seeded).
@@ -502,12 +648,12 @@ impl TapWriter {
             CodecKind::H264 => extradata_sps(&facts.extradata).map(<[u8]>::to_vec),
             _ => None,
         };
-        let current_sets = match facts.codec {
-            CodecKind::H264 => extradata_sets(&facts.extradata),
-            _ => None,
+        let sets = match facts.codec {
+            CodecKind::H264 => SetCache::from_extradata(&facts.extradata),
+            _ => SetCache::default(),
         };
         let mut writer = Self {
-            current_sets,
+            sets,
             tap,
             facts,
             traits_sps: None,
@@ -532,32 +678,44 @@ impl TapWriter {
         })));
     }
 
-    /// In-band sets replace the cached ones; an H.264 IDR that carries
-    /// neither SPS nor PPS gets the current ones prepended (never a
-    /// duplicate). `None` when the completed AU would exceed `MAX_AU_BYTES`.
-    fn complete_idr(&mut self, bytes: Arc<[u8]>) -> Option<Arc<[u8]>> {
+    /// Observe the in-band SPS/PPS of an H.264 AU (every AU, IDR or not) and
+    /// complete a set-less IDR. A replaced set (same id, new bytes) or an
+    /// unkeyable one bumps `params_gen` before this AU is offered and resets
+    /// the keyframe comparison, so the next IDR does not bump again. An IDR
+    /// that carries neither SPS nor PPS gets exactly the PPS its slice names
+    /// and that PPS's SPS inserted; when either is unknown it stays as is
+    /// (not strict) and is counted ([`SourceTap::unresolved_sets`]).
+    /// `Err(())` when completing would exceed the AU bounds.
+    fn complete_idr(&mut self, bytes: Arc<[u8]>) -> Result<Arc<[u8]>, ()> {
         let framing = NalFraming::AnnexB;
-        if self.facts.codec != CodecKind::H264 || !idr::is_idr(&bytes, CodecKind::H264, framing) {
-            return Some(bytes);
+        if self.facts.codec != CodecKind::H264 {
+            return Ok(bytes);
         }
-        let bounded =
-            |t| idr::h264_nal_of_type(&bytes, framing, t).filter(|s| s.len() <= MAX_SPS_BYTES);
-        match (bounded(7), bounded(8), self.current_sets.as_mut()) {
-            (Some(sps), Some(pps), _) => {
-                self.current_sets = Some((sps.to_vec(), pps.to_vec()));
-                Some(bytes)
+        let mut changed = false;
+        let mut carries_sets = false;
+        idr_nals(&bytes, |nal| {
+            match nal.first().map(|&b| b & 0x1F) {
+                Some(7 | 8) => carries_sets = true,
+                Some(1..=5) => return true,
+                _ => return false,
             }
-            (None, None, Some((sps, pps))) => with_sets(&bytes, sps, pps, MAX_AU_BYTES),
-            (Some(sps), None, Some((cached, _))) => {
-                *cached = sps.to_vec();
-                Some(bytes)
-            }
-            (None, Some(pps), Some((_, cached))) => {
-                *cached = pps.to_vec();
-                Some(bytes)
-            }
-            _ => Some(bytes),
+            changed |= self.sets.observe(nal) == Observed::Changed;
+            false
+        });
+        if changed {
+            self.gen = self.tap.bump_gen();
+            self.last_sets = None;
         }
+        if carries_sets || !idr::is_idr(&bytes, CodecKind::H264, framing) {
+            return Ok(bytes);
+        }
+        if let Some((sps, pps)) =
+            idr::h264_au_pps_id(&bytes, framing).and_then(|id| self.sets.for_pps(id))
+        {
+            return with_sets(&bytes, sps, pps, MAX_AU_BYTES).ok_or(());
+        }
+        self.tap.unresolved_sets.fetch_add(1, Ordering::Relaxed);
+        Ok(bytes)
     }
 
     /// The connection generation.
@@ -602,7 +760,7 @@ impl TapWriter {
             }
         };
         let framing = NalFraming::AnnexB;
-        let Some(bytes) = self.complete_idr(bytes) else {
+        let Ok(bytes) = self.complete_idr(bytes) else {
             self.tap.oversize.fetch_add(1, Ordering::Relaxed);
             return;
         };
@@ -1127,5 +1285,96 @@ mod tests {
         w.on_packet(&full, Some(3600), Some(3600), true);
         assert_eq!(tap.oversize(), 2);
         assert!(reader.try_recv().is_none());
+    }
+
+    // Hand-built H.264 sets for id tests (only the ids are read):
+    // SPS id 0: profile 100, flags 0, level 31, sps_id "1".
+    const SPS0: &[u8] = &[0x67, 0x64, 0x00, 0x1f, 0xac, 0xb2];
+    // PPS id 0 -> SPS 0: "1" "1" + body; two contents with the same id.
+    const PPS0_A: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+    const PPS0_B: &[u8] = &[0x68, 0xcf, 0x3c, 0x80];
+    // PPS id 1 -> SPS 0: "010" "1" = 0b0101_xxxx.
+    const PPS1: &[u8] = &[0x68, 0x5b, 0x3c, 0x80];
+    /// IDR slice using PPS id 0: `first_mb` "1", `slice_type` 7 "0001000", pps "1".
+    const IDR_PPS0: &[u8] = &[0x65, 0x88, 0xc0];
+    /// IDR slice using PPS id 1: ... pps "010".
+    const IDR_PPS1: &[u8] = &[0x65, 0x88, 0x40];
+    /// Non-IDR P slice using PPS id 0: `first_mb` "1", type 5 "00110", pps "1".
+    const P_PPS0: &[u8] = &[0x41, 0x9c];
+
+    fn avcc(spss: &[&[u8]], ppss: &[&[u8]]) -> Vec<u8> {
+        let mut r = vec![
+            1,
+            0x64,
+            0,
+            0x1f,
+            0xFF,
+            0xE0 | u8::try_from(spss.len()).unwrap(),
+        ];
+        for s in spss {
+            r.extend_from_slice(&u16::try_from(s.len()).unwrap().to_be_bytes());
+            r.extend_from_slice(s);
+        }
+        r.push(u8::try_from(ppss.len()).unwrap());
+        for p in ppss {
+            r.extend_from_slice(&u16::try_from(p.len()).unwrap().to_be_bytes());
+            r.extend_from_slice(p);
+        }
+        r
+    }
+
+    /// #344 D2a review R2-M-4: an avcC with PPS id 0 and id 1 and an IDR
+    /// whose slice uses id 1 gets exactly PPS id 1 (and its SPS) inserted,
+    /// never the first PPS of the record.
+    #[test]
+    fn a_multi_pps_avcc_inserts_the_pps_the_slice_names() {
+        assert_eq!(idr::h264_pps_ids(PPS1), Some((1, 0)));
+        assert_eq!(idr::h264_slice_pps_id(IDR_PPS1), Some(1));
+        let tap = Arc::new(SourceTap::new());
+        let reader = tap.tap().subscribe().unwrap();
+        let mut f = facts();
+        f.extradata = avcc(&[SPS0], &[PPS0_A, PPS1]);
+        let mut w = TapWriter::connect(Arc::clone(&tap), f, clock());
+        w.on_packet(&annexb(&[&[0x09, 0x10], IDR_PPS1]), Some(0), Some(0), true);
+        let au = reader.try_recv().unwrap();
+        assert!(au.strict_idr);
+        assert_eq!(
+            &au.data[..],
+            &annexb(&[&[0x09, 0x10], SPS0, PPS1, IDR_PPS1])[..]
+        );
+        w.on_packet(&annexb(&[IDR_PPS0]), Some(3600), Some(3600), true);
+        let au = reader.try_recv().unwrap();
+        assert_eq!(&au.data[..], &annexb(&[SPS0, PPS0_A, IDR_PPS0])[..]);
+        // A slice naming a PPS nobody sent stays set-less (not strict), counted.
+        let ghost: &[u8] = &[0x65, 0x88, 0x30]; // pps "00100" = 3
+        w.on_packet(&annexb(&[ghost]), Some(7200), Some(7200), true);
+        let au = reader.try_recv().unwrap();
+        assert!(!au.strict_idr);
+        assert_eq!(tap.unresolved_sets(), 1);
+    }
+
+    /// #344 D2a review R2-M-3: a replacement PPS (same id) on a non-IDR AU
+    /// updates the cache and bumps `params_gen` before that AU is offered; a
+    /// later set-less IDR gets the new PPS, never the stale one.
+    #[test]
+    fn a_replacement_pps_on_a_non_idr_au_replaces_the_cache_and_bumps() {
+        let tap = Arc::new(SourceTap::new());
+        let reader = tap.tap().subscribe().unwrap();
+        let mut f = facts();
+        f.extradata = avcc(&[SPS0], &[PPS0_A]);
+        let mut w = TapWriter::connect(Arc::clone(&tap), f, clock());
+        w.on_packet(&annexb(&[IDR_PPS0]), Some(0), Some(0), true);
+        let first = reader.try_recv().unwrap();
+        assert_eq!(&first.data[..], &annexb(&[SPS0, PPS0_A, IDR_PPS0])[..]);
+        w.on_packet(&annexb(&[PPS0_B, P_PPS0]), Some(3600), Some(3600), false);
+        let p = reader.try_recv().unwrap();
+        assert!(
+            p.params_gen > first.params_gen,
+            "the replacement is a change"
+        );
+        w.on_packet(&annexb(&[IDR_PPS0]), Some(7200), Some(7200), true);
+        let idr = reader.try_recv().unwrap();
+        assert_eq!(&idr.data[..], &annexb(&[SPS0, PPS0_B, IDR_PPS0])[..]);
+        assert_eq!(idr.params_gen, p.params_gen);
     }
 }
