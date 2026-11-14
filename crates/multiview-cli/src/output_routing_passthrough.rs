@@ -283,6 +283,9 @@ impl Candidate {
 /// The router's passthrough state.
 pub(super) struct PassState {
     traits: Option<TraitsLookup>,
+    /// Per output: a live format reset landed (P0 off for it, review
+    /// R1-M-3); shared with the handle's plan.
+    reset: Arc<[AtomicBool]>,
     candidates: Vec<Candidate>,
     counters: PassthroughCounters,
     /// Counters of closed keys (added to the live ones).
@@ -292,9 +295,10 @@ pub(super) struct PassState {
 }
 
 impl PassState {
-    pub(super) fn new(traits: Option<TraitsLookup>) -> Self {
+    pub(super) fn new(traits: Option<TraitsLookup>, reset: Arc<[AtomicBool]>) -> Self {
         Self {
             traits,
+            reset,
             candidates: Vec::new(),
             counters: PassthroughCounters::default(),
             closed: PassthroughCounters::default(),
@@ -491,6 +495,32 @@ impl OutputRouter {
         }
         c.ending = true;
         self.dirty = true;
+    }
+
+    /// A live format reset of output `index` landed (review R1-M-3): the
+    /// boot slot no longer describes it, so P0 is off for it for the rest
+    /// of the run and its candidate ends (its key closes once unread).
+    pub(super) fn pass_reset_landed(&mut self, index: usize) {
+        if let Some(flag) = self.pass.reset.get(index) {
+            flag.store(true, Ordering::Release);
+        }
+        if let Some(c) = self.pass.get_mut(index) {
+            c.ending = true;
+        }
+        self.dirty = true;
+    }
+
+    /// Output `index`'s eligibility now (none after a live reset).
+    fn eligibility(&self, index: usize) -> Option<PassEligibility> {
+        if self
+            .pass
+            .reset
+            .get(index)
+            .is_some_and(|r| r.load(Ordering::Acquire))
+        {
+            return None;
+        }
+        self.cfg.passthrough.get(index).cloned()
     }
 
     /// The dispatcher fell output `index` back to Program (its key failed or
@@ -862,7 +892,7 @@ impl OutputRouter {
                 continue;
             }
             let source = source.clone();
-            let eligibility = self.cfg.passthrough.get(index).cloned();
+            let eligibility = self.eligibility(index);
             let Some(PassEligibility::Eligible { slot, .. }) = eligibility else {
                 continue;
             };
@@ -924,9 +954,7 @@ impl OutputRouter {
         if take_pending {
             return;
         }
-        let Some(PassEligibility::Eligible { slot, settings }) =
-            self.cfg.passthrough.get(index).cloned()
-        else {
+        let Some(PassEligibility::Eligible { slot, settings }) = self.eligibility(index) else {
             return;
         };
         match (phase, key) {

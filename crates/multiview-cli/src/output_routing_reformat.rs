@@ -389,6 +389,9 @@ impl OutputRouter {
                 }
             }
         }
+        // #344 D2b review R1-M-3: P0 is decided on the boot slot; a reset
+        // output is off P0 for the rest of the run.
+        self.pass_reset_landed(index);
         self.emit(req.operation_id, index, at, TakeResult::ResetApplied);
         true
     }

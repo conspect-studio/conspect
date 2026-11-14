@@ -540,6 +540,9 @@ pub struct OutputRoutingHandle {
     passthrough: Arc<[PassEligibility]>,
     /// The source traits lookup the plan's static match reads (#344 D2b).
     pass_traits: Option<TraitsLookup>,
+    /// Per output: a live format reset landed, so P0 is off for it (review
+    /// R1-M-3; shared with the router).
+    pass_reset: Arc<[AtomicBool]>,
     /// The run's subtitle slots and their admission (slice F #345 F2).
     sub: HandleSubtitles,
 }
@@ -947,6 +950,13 @@ impl OutputRoutingHandle {
     /// Output `index`'s passthrough eligibility (#344 D2b).
     #[must_use]
     pub fn passthrough(&self, index: usize) -> &PassEligibility {
+        if self
+            .pass_reset
+            .get(index)
+            .is_some_and(|r| r.load(Ordering::Acquire))
+        {
+            return &PassEligibility::NotSupported;
+        }
         self.passthrough
             .get(index)
             .unwrap_or(&PassEligibility::NotSupported)
@@ -1592,6 +1602,11 @@ impl OutputRouter {
         let layout_tx = Arc::clone(&layout_changes);
         let (outcomes, outcome_rx) = mpsc::sync_channel(OUTCOME_CAPACITY);
         let can_reformat = reformat_open.is_some();
+        let pass_reset: Arc<[AtomicBool]> = cfg
+            .base_keys
+            .iter()
+            .map(|_| AtomicBool::new(false))
+            .collect();
         let (pass_open, pass_traits) =
             pass.map_or((None, None), |h| (Some(h.open), Some(h.traits)));
         let can_pass = pass_open.is_some();
@@ -1649,9 +1664,10 @@ impl OutputRouter {
                 Vec::new()
             }),
             pass_traits: pass_traits.clone(),
+            pass_reset: Arc::clone(&pass_reset),
             sub: HandleSubtitles::default(),
         };
-        let pass = passthrough::PassState::new(pass_traits);
+        let pass = passthrough::PassState::new(pass_traits, pass_reset);
         let mut router = Self {
             cfg,
             aux,

@@ -398,7 +398,7 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
 }
 
 fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: bool) -> Harness {
-    harness_full(outputs, max, open, has_preview, None, Vec::new())
+    harness_full(outputs, max, open, has_preview, None, Vec::new(), None)
 }
 
 /// [`harness_with`] plus the passthrough wiring (#344 D2b).
@@ -409,7 +409,9 @@ fn harness_full(
     has_preview: bool,
     pass: Option<PassHooks>,
     eligibility: Vec<PassEligibility>,
+    reformat: Option<ReformatOpenFn>,
 ) -> Harness {
+    let live_reset = vec![reformat.is_some(); outputs];
     let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
     let store2 = Arc::new(TileStore::<Nv12Image>::with_defaults("cam2"));
     let lookup = Arc::clone(&store);
@@ -442,7 +444,7 @@ fn harness_full(
             formats: Vec::new(),
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
-            live_reset: Vec::new(),
+            live_reset,
             passthrough: eligibility,
         },
         AuxWiring {
@@ -461,7 +463,7 @@ fn harness_full(
             sizing: None,
         },
         Box::new(move |settings, _bus| open(settings)),
-        None,
+        reformat,
         pass,
     )
     .unwrap();

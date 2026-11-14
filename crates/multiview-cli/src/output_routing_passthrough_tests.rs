@@ -213,6 +213,7 @@ impl P0 {
             false,
             Some(src.hooks(bake)),
             vec![eligible(); outputs],
+            None,
         );
         Self { x, src, t: 0 }
     }
@@ -514,6 +515,7 @@ fn an_ineligible_output_never_gets_a_candidate() {
         false,
         Some(src.hooks(true)),
         vec![PassEligibility::NotSupported],
+        None,
     );
     let mut p = P0 { x, src, t: 0 };
     p.step();
@@ -604,6 +606,7 @@ fn the_plan_reports_p0_from_the_engines_own_predicate() {
         false,
         Some(src.hooks(true)),
         vec![eligible(), PassEligibility::NotSupported],
+        None,
     );
     let mut p = P0 { x, src, t: 0 };
     let run = |id: &str| RunOutput {
@@ -799,4 +802,86 @@ fn a_bridge_never_adopts_another_principals_key_past_the_cap() {
         p.x.r.dynamic.iter().all(|d| d.principal == "other"),
         "never re-attributed"
     );
+}
+
+/// A P0 harness whose router also resets formats live (a fake encoder at
+/// any settings).
+fn p0_reformat(outputs: usize) -> P0 {
+    let src = FakeSource::new(Script::default());
+    let x = harness_full(
+        outputs,
+        6,
+        None,
+        false,
+        Some(src.hooks(true)),
+        vec![eligible(); outputs],
+        Some(Box::new(|_, _| {
+            let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+                forced: false,
+                encoded: Arc::new(AtomicUsize::new(0)),
+            });
+            Ok(enc)
+        })),
+    );
+    P0 { x, src, t: 0 }
+}
+
+fn reformat_req(op: &str, output: usize) -> Reformat {
+    Reformat {
+        operation_id: op.to_owned(),
+        output_index: output,
+        settings: ReformatSettings {
+            codec_name: "h264".to_owned(),
+            width: 8,
+            height: 16,
+            bit_rate: 1_000_000,
+            base_format: None,
+        },
+        feed_format: None,
+        principal: "p".to_owned(),
+    }
+}
+
+fn reset_lands(p: &mut P0) {
+    p.run_until(REFORMAT_DEADLINE_TICKS, |p| {
+        p.x.outcomes
+            .try_iter()
+            .any(|o| o.outcome == TakeResult::ResetApplied)
+    })
+    .expect("the reset lands");
+}
+
+/// Review R1-M-3: P0 eligibility is the boot slot; a live format reset
+/// changes the slot, so it disables P0 for that output (recorded in §12.5):
+/// a reset before the take means no candidate, a reset while on P0 retires
+/// the candidate, and the plan reports the output not supported.
+#[test]
+fn a_live_reset_disables_passthrough_for_that_output() {
+    // Reset before the take: no candidate ever.
+    let mut p = p0_reformat(1);
+    p.step();
+    p.x.h.try_reformat(reformat_req("r", 0)).unwrap();
+    reset_lands(&mut p);
+    p.take_cam(0);
+    p.run_until(120, |_| false);
+    assert!(
+        p.view(0).passthrough.is_none(),
+        "no candidate after a reset"
+    );
+    assert_eq!(p.src.opens.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        p.x.h.passthrough_static(0, "cam"),
+        Err(crate::output_routing::NOT_SUPPORTED_ON_MEDIUM)
+    );
+    // Reset while on P0: the candidate is retired, the output leaves P0.
+    let mut p = p0_reformat(1);
+    p.step();
+    p.take_cam(0);
+    p.run_until(200, |p| p.on_p0(0)).expect("on P0");
+    p.x.h.try_reformat(reformat_req("r", 0)).unwrap();
+    reset_lands(&mut p);
+    p.run_until(10, |_| false);
+    assert!(!p.on_p0(0));
+    assert!(p.view(0).passthrough.is_none());
+    assert_eq!(p.x.h.snapshot().passthrough.keys_live, 0);
 }
