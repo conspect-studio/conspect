@@ -13886,7 +13886,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The layout was deleted (and, if it was registered as an M/E source but off the M/E, unregistered first). */
+            /** @description The layout was deleted. */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -13920,7 +13920,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `layout-on-air`: the switcher M/E has this layout on Program, Preview or a mixer input (#307). */
+            /** @description `layout-on-air`: this layout is registered as an M/E source (#307): it is on Program, Preview or a mixer input, or was within the last 10 s; nothing changed. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -16058,7 +16058,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `aux-capacity` (no free layout canvas), or no source lease. */
+            /** @description `conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `layout-changed` (a mixer input's `{layout}` was edited or deleted while this request was in flight; the key is released, retry), `aux-capacity` (no free layout canvas), or no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -19111,7 +19111,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Switcher unavailable; `capacity` (a fifth stored layout as an M/E source, or a source it shows cannot be leased; key released); no source lease. */
+            /** @description Switcher unavailable; `capacity` (a fifth stored layout as an M/E source, or a source it shows cannot be leased; key released); `layout-changed` (the stored layout was edited or deleted while this request was in flight; key released, retry); no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
