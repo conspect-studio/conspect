@@ -29,6 +29,10 @@ pub(super) struct Entry {
     pub last_playlist_ms: Option<u64>,
     pub fetches: CastFetches,
     pub last_report: Option<ReceiverReport>,
+    /// The owner as authenticated at creation (ABUSE-1): the fallback for an
+    /// owner the API-key store does not hold (a JWT subject, the local
+    /// admin); a store key is always re-resolved from the store.
+    pub principal: Option<crate::auth::Principal>,
 }
 
 impl Entry {
@@ -55,6 +59,16 @@ pub(super) struct Slot {
     pub moved: bool,
     /// When its last stream ended (lingering), `None` while it has streams.
     pub empty_since: Option<u64>,
+}
+
+/// A stream revoked by the server (not by its owner): kept, bounded, so its
+/// owner's `GET` can say why the token stopped working.
+#[derive(Debug, Clone)]
+pub(super) struct Revoked {
+    pub id: String,
+    pub owner: String,
+    pub reason: String,
+    pub at_ms: u64,
 }
 
 /// An output whose last stream ended and whose linger is over.
@@ -132,6 +146,9 @@ pub(super) struct Registry {
     pub receiver_last_fetch: Option<ReceiverFetch>,
     /// Report rate per stream id: last accepted (ms).
     pub last_report_ms: HashMap<String, u64>,
+    /// Server-side revocations, oldest first (at most
+    /// [`super::MAX_REVOKED`]).
+    pub revoked: std::collections::VecDeque<Revoked>,
 }
 
 impl Default for Registry {
@@ -143,6 +160,7 @@ impl Default for Registry {
             limiter: HashMap::new(),
             receiver_last_fetch: None,
             last_report_ms: HashMap::new(),
+            revoked: std::collections::VecDeque::new(),
         }
     }
 }

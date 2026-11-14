@@ -1115,6 +1115,18 @@ async fn relay_one(
     let Some(api_id) = api_id else {
         return;
     };
+    // ABUSE-1 backstop: whatever moved the output (a take, an engine
+    // fallback), its cast tokens must still be readable by their owners.
+    if let Some(feed) = &outcome.feed {
+        crate::cast_streams::reauth::before_change(
+            state,
+            &outcome.output,
+            Some(feed),
+            None,
+            outcome.audio.as_ref(),
+            "engine",
+        );
+    }
     // The feed to persist rides the outcome itself, so an `applied` persists
     // whether or not this process still holds the take's record. An
     // audio-only take (its record says so) keeps the persisted video.

@@ -83,6 +83,17 @@ fn user_agent(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
+/// The cache contract of every token route (ABUSE-2): `no-store`, so no
+/// shared or private cache can answer for a token after it expired or was
+/// revoked. Overrides the public-HLS tiers `serve_file` sets (playlists
+/// `max-age=1`, media a year `immutable`); ordinary `/hls/` mounts keep them.
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 /// The cast CORS contract on any response: reflect the Origin (any), always
 /// `Vary: Origin`, expose the range headers.
 fn with_cors(mut response: Response, origin: Option<&HeaderValue>) -> Response {
@@ -113,7 +124,7 @@ async fn preflight(
         out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, ALLOW_HEADERS);
         out.insert(header::ACCESS_CONTROL_MAX_AGE, MAX_AGE);
     }
-    with_cors(response, headers.get(header::ORIGIN))
+    with_cors(no_store(response), headers.get(header::ORIGIN))
 }
 
 /// The directory of the active cast output `config_id`.
@@ -133,7 +144,7 @@ async fn media(
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Response {
     let origin = headers.get(header::ORIGIN).cloned();
-    let response = serve_media(&state, method, &headers, path).await;
+    let response = no_store(serve_media(&state, method, &headers, path).await);
     with_cors(response, origin.as_ref())
 }
 
@@ -179,7 +190,7 @@ async fn report(
     body: Body,
 ) -> Response {
     let origin = headers.get(header::ORIGIN).cloned();
-    let response = take_report(&state, path, body).await;
+    let response = no_store(take_report(&state, path, body).await);
     with_cors(response, origin.as_ref())
 }
 

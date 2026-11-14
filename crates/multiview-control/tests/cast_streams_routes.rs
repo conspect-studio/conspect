@@ -1173,3 +1173,321 @@ async fn the_hosted_receiver_origin_is_reflected_everywhere() {
     assert_eq!(r.status(), StatusCode::NO_CONTENT);
     assert_eq!(r.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], hosted);
 }
+
+fn route_take(token: &str, key: &str, output: &str, feed: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/routing/output/take")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("Idempotency-Key", key)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "target": {"kind": "output", "output": output, "stream": "video"},
+                "feed": feed,
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+/// ABUSE-1: a principal scoped to source `a` mints a token while output-0
+/// shows `a`; another operator takes output-0 to `secret-cam` through the
+/// ordinary routing take. The token dies BEFORE the new feed is published:
+/// its next playlist and segment requests are the generic 404, and its
+/// owner's GET says why.
+#[tokio::test]
+async fn a_take_to_a_feed_the_owner_may_not_read_revokes_its_token() {
+    let rig = rig();
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    let id = doc["id"].as_str().unwrap().to_owned();
+    assert_eq!(rig.routing.bus("cast-1"), "src:a");
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    let takes_before = rig.routing.takes().len();
+    let r = send(
+        &rig.router,
+        route_take(
+            OPERATOR_TOKEN,
+            "abuse-1-take",
+            "output-0",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert_eq!(rig.routing.takes().len(), takes_before + 1);
+    assert_eq!(rig.routing.bus("cast-1"), "src:secret-cam");
+    for file in ["master.m3u8", "seg-v-1-0.m4s", "init-v-1-0.mp4"] {
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/{file}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{file}");
+        assert_eq!(body, b"not found\n", "{file}");
+    }
+    // The owner learns why; another principal still sees a plain 404.
+    let own = send(
+        &rig.router,
+        support::get(&format!("/api/v1/cast/streams/{id}"), SCOPED),
+    )
+    .await;
+    assert_eq!(own.status(), StatusCode::NOT_FOUND);
+    let own = body_json(own).await;
+    assert_eq!(own["type"], "/problems/cast-stream-revoked", "{own}");
+    assert!(own["detail"].as_str().unwrap().contains("may not read"));
+    let other = body_json(
+        send(
+            &rig.router,
+            support::get(&format!("/api/v1/cast/streams/{id}"), OPERATOR_2),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(other["type"], "/problems/not-found", "{other}");
+    // Audited (without the token).
+    let audit = serde_json::to_string(&rig.state.audit.list(None).unwrap()).unwrap();
+    assert!(audit.contains(&id) && audit.contains("may not read"));
+    assert!(!audit.contains(&token));
+}
+
+/// ABUSE-1, the positive case: an owner authorized for both feeds keeps its
+/// URL across the take (ADR-0111), while a co-viewer of the same output who
+/// is not authorized for the new feed loses its own.
+#[tokio::test]
+async fn a_take_keeps_tokens_whose_owner_may_read_the_new_feed() {
+    let rig = rig();
+    let (status, kept) = create(
+        &rig,
+        OPERATOR_2,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{kept}");
+    let (status, lost) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{lost}");
+    assert_eq!(lost["output"], "output-0");
+    let r = send(
+        &rig.router,
+        route_take(
+            OPERATOR_TOKEN,
+            "abuse-1-keep",
+            "output-0",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let kept_token = token_of(&kept);
+    for file in ["master.m3u8", "seg-v-1-0.m4s"] {
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{kept_token}/{file}")).await.0,
+            StatusCode::OK,
+            "{file}"
+        );
+    }
+    let lost_token = token_of(&lost);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{lost_token}/master.m3u8"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    // Taking it back to a feed both may read revokes nothing more.
+    let r = send(
+        &rig.router,
+        route_take(
+            OPERATOR_TOKEN,
+            "abuse-1-back",
+            "output-0",
+            serde_json::json!({"bus": "program"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{kept_token}/master.m3u8"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+/// ABUSE-1: an owner whose key is revoked (it no longer resolves) loses its
+/// token on the next feed change, even one to a feed anyone may read.
+#[tokio::test]
+async fn a_take_revokes_tokens_whose_owner_no_longer_resolves() {
+    let rig = rig();
+    let (status, doc) = create(
+        &rig,
+        FRESH,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    assert!(rig.state.api_keys.revoke("cs-fresh"));
+    let r = send(
+        &rig.router,
+        route_take(
+            OPERATOR_TOKEN,
+            "abuse-1-owner",
+            "output-0",
+            serde_json::json!({"bus": "program"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let token = token_of(&doc);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// ABUSE-1 backstop: a feed change no take path saw (an engine fallback
+/// carried on the outcome relay) re-checks the output's tokens too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_engine_fallback_to_a_feed_the_owner_may_not_read_revokes_its_token() {
+    let rig = rig();
+    // cs-other may read output-1 and source `a`, but not Program.
+    let (status, doc) = create(
+        &rig,
+        SCOPED_B,
+        serde_json::json!({"output": "output-1", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    rig.routing
+        .tx
+        .send(OutputOutcome {
+            operation_id: String::new(),
+            output: "cast-2".to_owned(),
+            tick: 9,
+            outcome: "fallback:aux-failed".to_owned(),
+            feed: Some(RoutedFeed::Program),
+            audio: None,
+        })
+        .unwrap();
+    for _ in 0..200 {
+        if fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0 == StatusCode::NOT_FOUND {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the token survived a fallback to a feed its owner may not read");
+}
+
+/// ABUSE-2: every token-route response — playlist, segment, init, HEAD,
+/// Range (206), 404 and report — is `Cache-Control: no-store`, so no cache
+/// can answer for a token after it expired or was revoked. CORS unchanged.
+#[tokio::test]
+async fn token_routes_are_no_store_on_every_response() {
+    let rig = rig();
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let token = token_of(&doc);
+    let req = |method: &str, file: &str, range: bool| {
+        let mut r = public(method, &format!("/cast/{token}/{file}"))
+            .header(header::ORIGIN, "https://cast.example");
+        if range {
+            r = r.header(header::RANGE, "bytes=0-99");
+        }
+        r.body(Body::empty()).unwrap()
+    };
+    for (method, file, range, status) in [
+        ("GET", "master.m3u8", false, StatusCode::OK),
+        ("HEAD", "master.m3u8", false, StatusCode::OK),
+        ("GET", "seg-v-1-0.m4s", false, StatusCode::OK),
+        ("HEAD", "seg-v-1-0.m4s", false, StatusCode::OK),
+        ("GET", "seg-v-1-0.m4s", true, StatusCode::PARTIAL_CONTENT),
+        ("GET", "init-v-1-0.mp4", false, StatusCode::OK),
+        ("GET", "seg-v-9-9.m4s", false, StatusCode::NOT_FOUND),
+        ("OPTIONS", "master.m3u8", false, StatusCode::NO_CONTENT),
+    ] {
+        let r = send(&rig.router, req(method, file, range)).await;
+        assert_eq!(r.status(), status, "{method} {file} {range}");
+        assert_eq!(
+            r.headers()[header::CACHE_CONTROL],
+            "no-store",
+            "{method} {file} {range}"
+        );
+        assert_eq!(
+            r.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://cast.example"
+        );
+    }
+    let r = send(&rig.router, report_req(&token, b"{}".to_vec())).await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+    let dead = "C".repeat(43);
+    let r = send(
+        &rig.router,
+        public("GET", &format!("/cast/{dead}/seg-v-1-0.m4s"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+/// ABUSE-2: ordinary public `/hls/` mounts keep the ADR-0032 cache tiers.
+#[tokio::test]
+async fn public_hls_keeps_its_cache_policy() {
+    use tower::ServiceExt;
+    let tmp = tempfile::tempdir().unwrap();
+    write_stream(tmp.path(), "hls");
+    let router = multiview_output::hls::http::hls_router(tmp.path());
+    let get = |path: &str| Request::builder().uri(path).body(Body::empty()).unwrap();
+    let r = router.clone().oneshot(get("/master.m3u8")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        r.headers()[header::CACHE_CONTROL],
+        "max-age=1, must-revalidate"
+    );
+    let r = router.oneshot(get("/seg-v-1-0.m4s")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        r.headers()[header::CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
+}
+
+/// ABUSE-1: the cast API's own take seam (a new stream's take, the take
+/// back to Program) re-checks the output's live tokens before it enqueues.
+#[tokio::test]
+async fn the_cast_api_take_seam_rechecks_live_tokens() {
+    let rig = rig();
+    let (status, doc) = create(
+        &rig,
+        SCOPED_B,
+        serde_json::json!({"output": "output-1", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    multiview_control::cast_streams::lifecycle::submit_take(
+        &rig.state,
+        &multiview_control::cast_streams::lifecycle::cast_operation_id(),
+        "cast-2",
+        &RoutedFeed::Program,
+        None,
+        "cast",
+    )
+    .unwrap();
+    assert_eq!(rig.routing.bus("cast-2"), "program");
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::NOT_FOUND
+    );
+}

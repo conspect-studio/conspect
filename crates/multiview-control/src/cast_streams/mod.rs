@@ -24,6 +24,7 @@
 //! `.await`; nothing here touches an engine channel.
 
 pub mod lifecycle;
+pub(crate) mod reauth;
 mod registry;
 pub mod token;
 
@@ -59,6 +60,9 @@ pub const CREATE_BURST: u32 = 4;
 pub const CREATE_REFILL: Duration = Duration::from_secs(1);
 /// Principals the creation limiter tracks (oldest evicted first).
 pub const MAX_LIMITED_PRINCIPALS: usize = 1024;
+/// Server-side revocations remembered for their owner's `GET` (oldest
+/// forgotten first; each also ages out after [`MAX_LIFETIME`]).
+pub const MAX_REVOKED: usize = 2 * MAX_STREAMS;
 /// The background sweep period (a lazy sweep also runs on every API call).
 pub const SWEEP_PERIOD: Duration = Duration::from_secs(5);
 
@@ -191,7 +195,7 @@ impl CastStreams {
 }
 
 mod api;
-pub use api::SlotView;
+pub use api::{OwnedStream, SlotView};
 
 #[cfg(test)]
 mod tests;

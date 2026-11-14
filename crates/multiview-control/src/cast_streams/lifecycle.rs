@@ -63,6 +63,16 @@ pub fn submit_take(
     let Some(control) = state.output_routing.as_ref() else {
         return Err(TakeSubmitError::Unroutable);
     };
+    // ABUSE-1: the cast API's own feed moves (a take for a new stream, the
+    // take back to Program) re-check every live token on the output first.
+    super::reauth::before_change(
+        state,
+        config_id,
+        Some(feed),
+        layout.as_ref().map(|body| body.0.as_ref()),
+        None,
+        principal,
+    );
     control.routing.try_take(OutputTakeRequest {
         operation_id: operation_id.to_owned(),
         output: config_id.to_owned(),
@@ -164,6 +174,10 @@ pub(crate) fn spawn_sweeper(state: &AppState) {
                 return;
             }
             sweep_now(&state);
+            // Backstop (ABUSE-1): what an output carries now, under each
+            // owner's current grants (a re-scoped or revoked key, a feed
+            // change no take path saw).
+            super::reauth::recheck_all(&state, "cast");
             crate::routes::cast_sessions::reap_streamless_sessions(&state);
         }
     });

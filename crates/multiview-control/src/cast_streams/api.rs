@@ -1,16 +1,31 @@
 //! [`CastStreams`] operations. Every method takes the one lock briefly and
 //! never across an `.await`.
 
-use super::registry::{Claim, ClaimError, Ended, Entry, Registry, ReportError, Slot, StreamView};
+use super::registry::{
+    Claim, ClaimError, Ended, Entry, Registry, ReportError, Revoked, Slot, StreamView,
+};
 use super::{
     bounded_user_agent, token, CastFetches, CastStreams, ReceiverFetch, ReceiverReport,
-    CREATE_BURST, CREATE_REFILL, MAX_LIMITED_PRINCIPALS, MAX_STREAMS, MAX_STREAMS_PER_PRINCIPAL,
-    REPORT_INTERVAL,
+    CREATE_BURST, CREATE_REFILL, MAX_LIFETIME, MAX_LIMITED_PRINCIPALS, MAX_REVOKED, MAX_STREAMS,
+    MAX_STREAMS_PER_PRINCIPAL, REPORT_INTERVAL,
 };
 use crate::output_routing::RoutedFeed;
 
 fn ms(d: std::time::Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A live stream on one output, as the re-authorization reads it (no token).
+#[derive(Debug, Clone)]
+pub struct OwnedStream {
+    /// The stream id.
+    pub id: String,
+    /// The owner key id.
+    pub owner: String,
+    /// The cast output's API id.
+    pub output: String,
+    /// The owner as authenticated at creation, when recorded.
+    pub principal: Option<crate::auth::Principal>,
 }
 
 /// A cast output the registry holds: what it shows and how many streams.
@@ -145,6 +160,7 @@ impl CastStreams {
             last_playlist_ms: None,
             fetches: CastFetches::default(),
             last_report: None,
+            principal: None,
         });
         Ok(Claim { id, token, first })
     }
@@ -164,6 +180,66 @@ impl CastStreams {
         let entry = inner.entries.remove(at);
         inner.last_report_ms.remove(id);
         Some(Registry::view(&entry))
+    }
+
+    /// Record the owner's principal as authenticated at creation (the
+    /// fallback when the API-key store does not hold the owner).
+    pub fn bind_principal(&self, id: &str, principal: crate::auth::Principal) {
+        if let Some(entry) = self.lock().entries.iter_mut().find(|e| e.id == id) {
+            entry.principal = Some(principal);
+        }
+    }
+
+    /// The live streams on the output `config_id`.
+    #[must_use]
+    pub fn live_on(&self, config_id: &str) -> Vec<OwnedStream> {
+        let now = self.now_ms();
+        self.lock()
+            .entries
+            .iter()
+            .filter(|e| e.config_id == config_id && !e.expired(now))
+            .map(|e| OwnedStream {
+                id: e.id.clone(),
+                owner: e.owner.clone(),
+                output: e.output.clone(),
+                principal: e.principal.clone(),
+            })
+            .collect()
+    }
+
+    /// Revoke stream `id` on the server's behalf (not its owner's): the
+    /// token is dead at once and `reason` stays readable by its owner
+    /// ([`Self::revoked`]). `None` when unknown.
+    pub fn revoke(&self, id: &str, reason: &str) -> Option<StreamView> {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let at = inner.entries.iter().position(|e| e.id == id)?;
+        let entry = inner.entries.remove(at);
+        inner.last_report_ms.remove(id);
+        let horizon = now.saturating_sub(ms(MAX_LIFETIME));
+        inner.revoked.retain(|r| r.at_ms >= horizon);
+        while inner.revoked.len() >= MAX_REVOKED {
+            inner.revoked.pop_front();
+        }
+        inner.revoked.push_back(Revoked {
+            id: entry.id.clone(),
+            owner: entry.owner.clone(),
+            reason: reason.to_owned(),
+            at_ms: now,
+        });
+        Some(Registry::view(&entry))
+    }
+
+    /// Why the server revoked stream `id`: `(owner, reason)`.
+    #[must_use]
+    pub fn revoked(&self, id: &str) -> Option<(String, String)> {
+        let horizon = self.now_ms().saturating_sub(ms(MAX_LIFETIME));
+        self.lock()
+            .revoked
+            .iter()
+            .rev()
+            .find(|r| r.id == id && r.at_ms >= horizon)
+            .map(|r| (r.owner.clone(), r.reason.clone()))
     }
 
     /// Undo a claim whose output could not be prepared: the stream goes and,

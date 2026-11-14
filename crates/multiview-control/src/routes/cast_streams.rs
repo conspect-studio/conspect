@@ -270,7 +270,7 @@ pub(crate) async fn list_cast_streams(
         responses(
             (status = 200, description = "The stream (`path` only for its owner).", body = CastStreamDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 404, description = "No such stream, it expired, or it is another principal's.", body = crate::problem::Problem),
+            (status = 404, description = "No such stream, it expired, or it is another principal's; `cast-stream-revoked` (owner or Admin only) when the server revoked its token because its output was taken to a feed the owner may not read, or the owner can no longer be resolved (`detail` says which).", body = crate::problem::Problem),
         ),
     )
 )]
@@ -278,21 +278,23 @@ pub(crate) async fn get_cast_stream(
     State(state): State<AppState>,
     principal: Principal,
     Path(id): Path<String>,
-) -> ControlResult<Json<CastStreamDoc>> {
+) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::cast_streams::lifecycle::sweep_now(&state);
     let Some((view, token)) = state.cast_streams.get(&id) else {
+        // A stream the server revoked tells its owner (or an Admin) why.
+        if let Some((owner, reason)) = state.cast_streams.revoked(&id) {
+            if may_see(&principal, &owner) {
+                return Ok(cast_problem(404, "cast-stream-revoked", reason));
+            }
+        }
         return Err(not_found(&id));
     };
     if !may_see(&principal, &view.owner) {
         return Err(not_found(&id));
     }
     let owner = view.owner == principal.key_id;
-    Ok(Json(stream_doc(
-        &state,
-        view,
-        owner.then_some(token.as_str()),
-    )))
+    Ok(Json(stream_doc(&state, view, owner.then_some(token.as_str()))).into_response())
 }
 
 /// `DELETE /api/v1/cast/streams/{id}` — revoke the token at once (owner or
@@ -690,6 +692,9 @@ async fn open_stream(
             )))
         }
     };
+    state
+        .cast_streams
+        .bind_principal(&claim.id, principal.clone());
     let engine = state.cast_engine.clone();
     let Some(engine) = engine else {
         state.cast_streams.release_claim(&claim.id, claim.first);
