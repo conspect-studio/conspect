@@ -37,6 +37,7 @@ use crate::rendition_workers::{
 pub use crate::routing_audio::AudioChoice;
 use crate::routing_audio::{AudioTakeProgress, AudioTakeStart};
 use crate::routing_aux::{AuxFeed, AuxFeeds, AuxFormat, LayoutRef, PictureBus, PictureBusSlot};
+pub use sets::{TakeSet, MAX_SET_MEMBERS};
 
 /// Longest accepted `principal` / `operation_id`, in bytes.
 pub const MAX_TAKE_ID_BYTES: usize = 128;
@@ -231,6 +232,10 @@ pub enum RefuseReason {
     /// The feed's encoder configuration differs from the output's and the
     /// output's container cannot take it in band (output-routing.md §4.2).
     FormatMismatch,
+    /// An atomic set's mixer half re-patches the input on Program under
+    /// `protect` (or the Program/Preview input during an AUTO), §12.8: every
+    /// member of the set reports it.
+    OnAirProtected,
 }
 
 impl RefuseReason {
@@ -247,6 +252,9 @@ impl RefuseReason {
             Self::FormatMismatch => {
                 "This feed's encoder settings differ from the output's; the take was refused \
                  to avoid a corrupt stream"
+            }
+            Self::OnAirProtected => {
+                "The set would re-patch the mixer input on Program; the take was refused"
             }
         }
     }
@@ -401,6 +409,11 @@ pub struct RoutingSnapshot {
     /// The aux thread composes every second tick because Program is late
     /// (ADR-0108 §7 back-off).
     pub aux_halved: bool,
+    /// Atomic multi-crosspoint sets in flight (#308).
+    pub sets_pending: usize,
+    /// Sets whose mixer half committed but whose output members were then
+    /// refused (an encoder died after the commit, §12.8 residual fault).
+    pub set_partial: u64,
 }
 
 /// The control-plane handle (clone freely).
@@ -414,7 +427,7 @@ pub struct RoutingSnapshot {
 pub struct OutputRoutingHandle {
     #[cfg(test)]
     pub(crate) audio_tap: crate::routing_audio::AudioTapCell,
-    takes: SyncSender<OutputTake>,
+    takes: SyncSender<RouterMsg>,
     layout_changes: LayoutInbox,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
@@ -480,7 +493,29 @@ impl OutputRoutingHandle {
         if take.principal.len() > MAX_TAKE_ID_BYTES || take.operation_id.len() > MAX_TAKE_ID_BYTES {
             return Err(TakeBusy);
         }
-        self.takes.try_send(take).map_err(|_| TakeBusy)
+        self.takes
+            .try_send(RouterMsg::Take(take))
+            .map_err(|_| TakeBusy)
+    }
+
+    /// Enqueue an atomic multi-crosspoint set without waiting (§12.8, #308):
+    /// the same bounded mailbox as [`Self::try_take`] (one slot per set).
+    /// Every member carries the set's `operation_id` and `principal`.
+    ///
+    /// # Errors
+    /// [`TakeBusy`] when the mailbox is full or the run ended, an id is too
+    /// long, or the set has no or more than [`MAX_SET_MEMBERS`] members.
+    pub fn try_take_set(&self, set: TakeSet) -> Result<(), TakeBusy> {
+        if set.principal.len() > MAX_TAKE_ID_BYTES
+            || set.operation_id.len() > MAX_TAKE_ID_BYTES
+            || set.members.is_empty()
+            || set.members.len() > MAX_SET_MEMBERS
+        {
+            return Err(TakeBusy);
+        }
+        self.takes
+            .try_send(RouterMsg::Set(set))
+            .map_err(|_| TakeBusy)
     }
 
     /// Tell the router a stored layout changed. Coalesced per id (the
@@ -863,6 +898,12 @@ struct PendingOpen {
     waiter: Option<usize>,
 }
 
+/// One message on the take mailbox.
+enum RouterMsg {
+    Take(OutputTake),
+    Set(TakeSet),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Waiting for the feed to be fresh.
@@ -877,12 +918,18 @@ enum Phase {
     Moving(usize),
     /// An audio-only take's crossfade is scheduled; refused at `deadline`.
     AudioMoving { deadline: u64 },
+    /// A member of an atomic set (#308) whose destination `key` is warm (or
+    /// already on air): it waits for the set's adoption tick, never moving
+    /// on its own.
+    Ready { key: usize },
 }
 
 struct Pending {
     take: OutputTake,
     started: u64,
     phase: Phase,
+    /// The atomic set this take is a member of (#308).
+    group: Option<u64>,
 }
 
 struct OutputState {
@@ -911,7 +958,7 @@ struct BusHealth {
 pub struct OutputRouter {
     cfg: RouterConfig,
     aux: AuxWiring,
-    takes: Receiver<OutputTake>,
+    takes: Receiver<RouterMsg>,
     layout_changes: LayoutInbox,
     /// The latest known state of each layout seen (bounded): a take carrying
     /// an older body than a later edit or removal is refused.
@@ -963,6 +1010,8 @@ pub struct OutputRouter {
     boot: BootTakes,
     /// The run's first tick (the boot retry window's origin).
     first_tick: Option<u64>,
+    /// Atomic multi-crosspoint sets (#308).
+    sets: sets::SetState,
 }
 
 /// The router's start-up (boot) take state, O(outputs).
@@ -1088,6 +1137,7 @@ impl OutputRouter {
             audio_tap,
             boot: BootTakes::default(),
             first_tick: None,
+            sets: sets::SetState::default(),
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -1285,6 +1335,7 @@ impl OutputRouter {
         self.expire_orphan_opens(tick);
         self.drain_moves(tick, dispatcher);
         self.advance_takes(tick, pts, dispatcher);
+        self.advance_sets(tick, dispatcher);
         self.feed(tick, dispatcher);
         self.check_aux(tick, dispatcher);
         self.linger(tick, dispatcher);
@@ -1482,6 +1533,7 @@ impl OutputRouter {
                 take,
                 started: tick,
                 phase: Phase::Priming,
+                group: None,
             });
             self.dirty = true;
             self.start_audio_take(index, tick, dispatcher);
@@ -1532,6 +1584,7 @@ impl OutputRouter {
                     take,
                     started: tick,
                     phase: Phase::Priming,
+                    group: None,
                 });
                 self.dirty = true;
             }
@@ -1690,7 +1743,11 @@ impl OutputRouter {
     fn drain_takes(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         loop {
             let take = match self.takes.try_recv() {
-                Ok(take) => take,
+                Ok(RouterMsg::Take(take)) => take,
+                Ok(RouterMsg::Set(set)) => {
+                    self.admit_set(set, tick, dispatcher);
+                    continue;
+                }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             };
             let index = take.output_index;
@@ -1763,6 +1820,7 @@ impl OutputRouter {
                 take,
                 started: tick,
                 phase: Phase::Priming,
+                group: None,
             });
             self.dirty = true;
             if audio_only {
@@ -1837,6 +1895,11 @@ impl OutputRouter {
     /// Replace a pending take: the old one is Superseded, an in-dispatcher
     /// move is cancelled by re-asserting the current key.
     fn supersede(&mut self, index: usize, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        // A member of an atomic set: the set is superseded as a whole.
+        if let Some(group) = self.group_of(index) {
+            self.end_set(group, TakeResult::Superseded, tick, dispatcher);
+            return;
+        }
         let Some(old) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) else {
             return;
         };
@@ -1919,6 +1982,10 @@ impl OutputRouter {
             })
             .is_some_and(|k| dispatcher.pending_video_move(index) != Some(k));
         if !stranded {
+            return;
+        }
+        if let Some(group) = self.group_of(index) {
+            self.end_set(group, TakeResult::Superseded, tick, dispatcher);
             return;
         }
         if let Some(old) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
@@ -2084,6 +2151,11 @@ impl OutputRouter {
         reason: RefuseReason,
         dispatcher: &mut RenditionDispatcher,
     ) {
+        // A member of an atomic set: every member gets the same refusal.
+        if let Some(group) = self.group_of(index) {
+            self.end_set(group, TakeResult::Refused(reason), tick, dispatcher);
+            return;
+        }
         let phase = self
             .outputs
             .get(index)
@@ -2356,9 +2428,14 @@ impl OutputRouter {
         live && !self.aux.failed.load(Ordering::Acquire) && self.slot_fresh(feed, tick)
     }
 
+    #[allow(clippy::too_many_lines)]
+    // reason: one per-output phase match (Priming/Opening/Warming/Ready/
+    // Moving); the set-member arms (#308) are two-line branches into
+    // `output_routing_sets`, and splitting the match would scatter the
+    // single take state machine.
     fn advance_takes(&mut self, tick: u64, pts: MediaTime, dispatcher: &mut RenditionDispatcher) {
         for index in 0..self.outputs.len() {
-            let Some((bus, choice, started, phase, principal)) =
+            let Some((bus, choice, started, phase, principal, group)) =
                 self.outputs.get(index).and_then(|o| {
                     o.pending.as_ref().map(|p| {
                         (
@@ -2367,6 +2444,7 @@ impl OutputRouter {
                             p.started,
                             p.phase,
                             p.take.principal.clone(),
+                            p.group,
                         )
                     })
                 })
@@ -2382,6 +2460,11 @@ impl OutputRouter {
             };
             match phase {
                 Phase::Moving(_) | Phase::AudioMoving { .. } => {}
+                Phase::Ready { key } => {
+                    if dispatcher.is_key_failed(key) {
+                        self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
+                    }
+                }
                 Phase::Warming { key, deadline } => {
                     let seen = self
                         .dynamic
@@ -2390,6 +2473,9 @@ impl OutputRouter {
                         .map(|d| d.seen_event);
                     if tick >= deadline || seen.is_none() || dispatcher.is_key_failed(key) {
                         self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
+                    } else if seen == Some(true) && group.is_some() {
+                        // A set member never moves alone: it parks warm.
+                        self.member_ready(index, key);
                     } else if seen == Some(true) {
                         // The key has no subscriber yet: an IDR on it costs no
                         // viewer anything, so the warm-up force skips the floor.
@@ -2428,6 +2514,12 @@ impl OutputRouter {
                 }
                 Phase::Priming => {
                     let current = self.outputs.get(index).map(|o| o.bus.clone());
+                    if group.is_some() && current.as_ref() == Some(&bus) {
+                        // A no-op member: already on air, it lands with the set.
+                        let key = self.outputs.get(index).map_or(0, |o| o.key);
+                        self.member_ready(index, key);
+                        continue;
+                    }
                     if current.as_ref() == Some(&bus) {
                         self.cancel_dispatcher_move(index, dispatcher, tick);
                         if choice.is_some() {
@@ -2453,6 +2545,17 @@ impl OutputRouter {
                         continue;
                     }
                     if self.wait_for_shared_open(index, &bus, started, tick, dispatcher) {
+                        continue;
+                    }
+                    if group.is_some() {
+                        self.member_start(
+                            index,
+                            &bus,
+                            choice.as_ref(),
+                            &principal,
+                            tick,
+                            dispatcher,
+                        );
                         continue;
                     }
                     self.start_move(index, &bus, choice.as_ref(), &principal, tick, dispatcher);
@@ -2573,7 +2676,7 @@ impl OutputRouter {
                     && (o.key == key
                         || matches!(
                             o.pending.as_ref().map(|p| p.phase),
-                            Some(Phase::Moving(k) | Phase::Warming { key: k, .. }) if k == key
+                            Some(Phase::Moving(k) | Phase::Warming { key: k, .. } | Phase::Ready { key: k }) if k == key
                         ))
             });
             if dispatcher.rebind_video(index, key, tick, windows).is_ok() {
@@ -2637,7 +2740,10 @@ impl OutputRouter {
     }
 
     fn has_capacity(&self, principal: &str) -> bool {
-        let total = self.dynamic.len() + self.opens.len();
+        // Opens an admitted set reserved and has not issued yet count too
+        // (#308): a single take never takes a set's reserved slot.
+        let (set_all, set_mine) = self.set_reservations(principal);
+        let total = self.dynamic.len() + self.opens.len() + set_all;
         let mine = self
             .dynamic
             .iter()
@@ -2647,7 +2753,8 @@ impl OutputRouter {
                 .opens
                 .values()
                 .filter(|o| o.principal == principal)
-                .count();
+                .count()
+            + set_mine;
         total < self.cfg.max_encoders && mine < self.cfg.max_per_principal
     }
 
@@ -2658,7 +2765,7 @@ impl OutputRouter {
                 o.key == key
                     || matches!(
                         o.pending.as_ref().map(|p| p.phase),
-                        Some(Phase::Moving(k) | Phase::Warming { key: k, .. }) if k == key
+                        Some(Phase::Moving(k) | Phase::Warming { key: k, .. } | Phase::Ready { key: k }) if k == key
                     )
             })
             .count()
@@ -2992,6 +3099,8 @@ impl OutputRouter {
             move_cancel_failures: self.move_cancel_failures,
             aux_canvases: self.layout_buses(),
             aux_halved: self.aux.halved.load(Ordering::Relaxed),
+            sets_pending: self.sets.active.len(),
+            set_partial: self.sets.partial,
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));
@@ -3254,6 +3363,9 @@ fn aux_composed(bus: &PictureBus) -> bool {
         PictureBus::Preview | PictureBus::Source(_) | PictureBus::Layout(_)
     )
 }
+
+#[path = "output_routing_sets.rs"]
+mod sets;
 
 #[cfg(test)]
 #[path = "output_routing_tests.rs"]
