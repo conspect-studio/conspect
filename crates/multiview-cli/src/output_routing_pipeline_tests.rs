@@ -1729,6 +1729,46 @@ codec = "mpeg2video"
 segment_ms = 1000
 "##;
 
+/// The decoded limited-range (BT.709, 8-bit) luma of [`LAYOUT_CONFIG`]'s two
+/// solid sources: `@_a` = `#202020` (left on Program) and `@_b` = `#e0e0e0`
+/// (right). `Y = 16 + 219 * v / 255` for a grey `v`.
+///
+/// #426: the routed-layout picture tests compare output 1 against these, not
+/// against output 0's decoded picture. In an `overlay` build Program carries
+/// its baked program-wide chrome (the wall-clock readout and its reference
+/// badge, on by default); on the 64x64 test canvas that chrome covers most of
+/// the luma sample windows, so Program's pixels are not the sources' pixels.
+const LAYOUT_LUMA: (i64, i64) = (16 + 219 * 0x20 / 255, 16 + 219 * 0xe0 / 255);
+
+/// The mean luma of the 16x48 window inset 8 px into the 32 px half of a
+/// 64x64 plane that starts at column `x0` (clear of the cell edge).
+fn half_mean(plane: &[u8], x0: usize) -> i64 {
+    let mut sum = 0i64;
+    let mut n = 0i64;
+    for row in 8..56 {
+        for x in x0 + 8..x0 + 24 {
+            sum += i64::from(plane[row * 64 + x]);
+            n += 1;
+        }
+    }
+    sum / n
+}
+
+/// Program's halves on the 64x64 canvas. In a build without `overlay`
+/// Program has no baked chrome, so its halves must be the sources' luma: this
+/// keeps the [`LAYOUT_LUMA`] oracle tied to the real composed picture.
+fn program_halves(plane: &[u8]) -> (i64, i64) {
+    let halves = (half_mean(plane, 0), half_mean(plane, 32));
+    if !cfg!(feature = "overlay") {
+        let (a, b) = LAYOUT_LUMA;
+        assert!(
+            (halves.0 - a).abs() <= 6 && (halves.1 - b).abs() <= 6,
+            "Program's halves {halves:?} are the sources' luma ({a}, {b})"
+        );
+    }
+    halves
+}
+
 /// A routed layout for the 64x64 test canvas: the Program grid with its two
 /// cells swapped (`b` left, `a` right).
 fn swapped_layout(prefix: &str) -> PictureBus {
@@ -1879,20 +1919,11 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
         .filter(|t| routed.contains_key(t) && program.contains_key(t))
         .collect();
     assert!(compared.len() >= 15, "decoded {} pictures", compared.len());
-    let mean = |plane: &[u8], x0: usize| -> i64 {
-        let mut sum = 0i64;
-        let mut n = 0i64;
-        for row in 8..56 {
-            for x in x0 + 8..x0 + 24 {
-                sum += i64::from(plane[row * 64 + x]);
-                n += 1;
-            }
-        }
-        sum / n
-    };
     for t in &compared {
         let (p, r) = (&program[t], &routed[t]);
-        let (pl, pr, rl, rr) = (mean(p, 0), mean(p, 32), mean(r, 0), mean(r, 32));
+        program_halves(p);
+        let (pl, pr) = LAYOUT_LUMA;
+        let (rl, rr) = (half_mean(r, 0), half_mean(r, 32));
         assert!(
             pr - pl > 100,
             "tick {t}: the halves really differ ({pl}, {pr})"
@@ -1980,17 +2011,6 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
     // Before the edit the halves are swapped; after it they match Program.
     let program = decode_luma(&run.video[0]);
     let routed = decode_luma(&run.video[1]);
-    let mean = |plane: &[u8], x0: usize| -> i64 {
-        let mut sum = 0i64;
-        let mut n = 0i64;
-        for row in 8..56 {
-            for x in x0 + 8..x0 + 24 {
-                sum += i64::from(plane[row * 64 + x]);
-                n += 1;
-            }
-        }
-        sum / n
-    };
     let at = i64::try_from(applied.tick).unwrap();
     let fell_tick = i64::try_from(fell.tick).unwrap();
     let mut swapped_seen = 0;
@@ -2000,7 +2020,9 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         let (Some(p), Some(r)) = (program.get(&t), routed.get(&t)) else {
             continue;
         };
-        let (pl, pr, rl, rr) = (mean(p, 0), mean(p, 32), mean(r, 0), mean(r, 32));
+        program_halves(p);
+        let (pl, pr) = LAYOUT_LUMA;
+        let (rl, rr) = (half_mean(r, 0), half_mean(r, 32));
         if (rl - pr).abs() <= 6 && (rr - pl).abs() <= 6 {
             assert!(
                 unswapped_seen == 0,

@@ -1059,6 +1059,25 @@ jobs:
           --
           output_routing routing_aux aux_layout
           --test-threads=2
+      - name: test multiview-cli --features ffmpeg,overlay (output routing lib tests)
+        # The same routing modules in the build that bakes overlays: Program
+        # carries its program-wide chrome and routed layouts bake their own
+        # layers (`aux_overlays`, the operator's routed news layouts). The
+        # ffmpeg,aes67 step above never built `overlay`, so two routed-layout
+        # pipeline tests were red here unseen (issue #426) and the
+        # `#[cfg(feature = "overlay")]` routed-overlay chaos tests never ran.
+        # Scoped to the routing modules, NOT the full ffmpeg suite (#163).
+        if: ${{ success() || steps.audio-lib-tests.outcome == 'failure' }}
+        timeout-minutes: 20
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features ffmpeg,overlay
+          --lib
+          --
+          output_routing routing_aux aux_layout aux_overlays
+          --test-threads=2
       - name: test multiview-cli --features ffmpeg,aes67 (hls_fetch lib tests)
         # Same gap as the audio step above, for the `hls_fetch`-module lib unit
         # tests (live/VOD playlist parsing, byte-range scheduling, 403/429 backoff,
