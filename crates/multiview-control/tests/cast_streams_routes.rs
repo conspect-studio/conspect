@@ -2413,3 +2413,177 @@ async fn a_take_rechecks_the_carried_audio_tracks() {
         StatusCode::OK
     );
 }
+
+// ---------------------------------------------------------------------------
+// #418 review ABUSE-1-R2 / ABUSE-2-R2: an output PUT that changes a cast
+// output's subtitle or audio slots is restart-pending, while the running
+// sink keeps packaging the run's renditions. The token closure covers both.
+// ---------------------------------------------------------------------------
+
+/// PUT output-0 (cast-1) with its body edited by `edit` (restart-pending:
+/// the run keeps what it started with).
+async fn put_cast_1(rig: &Rig, edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) {
+    let r = send(
+        &rig.router,
+        support::get("/api/v1/outputs/output-0", ADMIN_TOKEN),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let etag = r.headers()[header::ETAG].to_str().unwrap().to_owned();
+    let current = body_json(r).await;
+    let mut body = current["body"].as_object().unwrap().clone();
+    edit(&mut body);
+    let r = send(
+        &rig.router,
+        support::put_json(
+            "/api/v1/outputs/output-0",
+            ADMIN_TOKEN,
+            Some(&etag),
+            &serde_json::json!({"name": current["name"], "body": body}),
+        ),
+    )
+    .await;
+    let status = r.status();
+    assert_eq!(status, StatusCode::OK, "{}", body_json(r).await);
+}
+
+/// Drop the output's slots (subtitle and audio) and its audio selection.
+fn drop_slots(body: &mut serde_json::Map<String, serde_json::Value>) {
+    body.remove("slots");
+    body.remove("audio");
+}
+
+/// ABUSE-1-R2: a restart-pending PUT removing a private subtitle slot does
+/// not hide it — whether the run reports its live table or not.
+#[tokio::test]
+async fn a_restart_pending_subtitle_slot_removal_still_needs_its_source() {
+    for live in [false, true] {
+        let rig = rig_doc(&subtitle_doc("secret-cam"), |s| s);
+        if live {
+            rig.routing
+                .subtitles
+                .lock()
+                .unwrap()
+                .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+        }
+        put_cast_1(&rig, drop_slots).await;
+        let (status, doc) = create(
+            &rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "live={live}: {doc}");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+        let (status, doc) = create(
+            &rig,
+            OPERATOR_2,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "live={live}: {doc}");
+    }
+}
+
+/// ABUSE-1-R2: the media barrier re-authorizes against the COMPLETE live
+/// table even when the accepted output no longer declares the slot: a live
+/// swap to a private source after a restart-pending removal revokes.
+#[tokio::test]
+async fn the_media_barrier_revokes_on_a_live_slot_the_accepted_config_removed() {
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("a".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    put_cast_1(&rig, drop_slots).await;
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+    let (status, body) = fetch(&rig, &format!("/cast/{token}/sub0-1-0.vtt")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found\n");
+    assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+}
+
+/// ABUSE-2-R2: a restart-pending PUT making the output program-only does
+/// not hide the private discrete track the running sink still packages —
+/// explicit `slots.audio` and `auto` selection alike.
+#[tokio::test]
+async fn a_restart_pending_audio_change_still_needs_the_running_tracks() {
+    let slots = "[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"secret-trk\"\n";
+    let auto = "audio = { mode = \"auto\" }\n";
+    for carried in [slots, auto] {
+        let rig = rig_doc(&doc_with(carried, SECRET_TRACK), |s| s);
+        put_cast_1(&rig, drop_slots).await;
+        let (status, doc) = create(
+            &rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{carried}: {doc}");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+        let (status, doc) = create(
+            &rig,
+            OPERATOR_2,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{carried}: {doc}");
+    }
+}
+
+/// ABUSE-2-R2 / ABUSE-1-R2: an existing token whose owner loses Read on a
+/// private track or subtitle source the RUN still publishes is revoked by
+/// the re-check (and the media barrier then refuses it), although the
+/// accepted config no longer declares the dependency.
+#[tokio::test]
+async fn a_recheck_revokes_on_running_dependencies_the_accepted_config_dropped() {
+    let slots = "[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"secret-trk\"\n";
+    let docs = [
+        doc_with(slots, SECRET_TRACK),
+        doc_with("audio = { mode = \"auto\" }\n", SECRET_TRACK),
+        subtitle_doc("secret-cam"),
+    ];
+    for doc in &docs {
+        let rig = rig_doc(doc, |s| s);
+        let (status, created) = create(
+            &rig,
+            FRESH,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let token = token_of(&created);
+        put_cast_1(&rig, drop_slots).await;
+        assert!(rig.state.api_keys.set_principal(
+            "cs-fresh",
+            Principal {
+                key_id: "cs-fresh".to_owned(),
+                role: Role::Operator,
+                scoped_object_ids: Some(vec!["output-0".to_owned(), "a".to_owned()]),
+                scoped_output_ids: Some(vec!["output-0".to_owned(), "program:main".to_owned()]),
+                scoped_discovery_domains: None,
+            },
+        ));
+        multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/master.m3u8")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{doc}");
+        assert_eq!(body, b"not found\n");
+    }
+}

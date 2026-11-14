@@ -18,9 +18,12 @@
 //! by [`multiview_config::Output::carried_audio`], the engine's own rule;
 //! Read on the track name and its route input) and the source of every
 //! subtitle slot (#418 review ABUSE-1: Read on the source whose captions the
-//! slot carries, from the engine's live route table, else the accepted
-//! config). A subtitle re-patch commits through [`before_subtitle_change`]
-//! before the engine swaps its route table.
+//! slot carries: every entry of the engine's live route table and every
+//! slot source of the accepted config). Tracks and slots are resolved in
+//! the accepted config AND the run-bound one the engine started with (#418
+//! review ABUSE-1-R2/ABUSE-2-R2: an output PUT is restart-pending, the
+//! running sink keeps its renditions). A subtitle re-patch commits through
+//! [`before_subtitle_change`] before the engine swaps its route table.
 //! A token whose owner fails, or whose owner can no longer be resolved, is
 //! revoked at once: its next request is the same `404` as any dead token,
 //! the reason stays readable by its owner (`GET /cast/streams/{id}`), the
@@ -370,16 +373,31 @@ fn closure(
         &live
     };
     let config = desired(state)?;
+    let run = running(state);
+    let views: Vec<&multiview_config::MultiviewConfig> =
+        std::iter::once(&config).chain(run.as_ref()).collect();
     let mut needs = video_needs(state, video, layout)?;
     needs.extend(audio_needs(&config, config_id, audio)?);
-    needs.extend(carried_track_needs(&config, config_id)?);
-    needs.extend(subtitle_needs(state, &config, config_id, subtitles)?);
+    needs.extend(carried_track_needs(&views, config_id)?);
+    needs.extend(subtitle_needs(state, &views, config_id, subtitles)?);
     Some(needs)
 }
 
 /// The accepted (desired) configuration (`None`: unreadable).
 fn desired(state: &AppState) -> Option<multiview_config::MultiviewConfig> {
     serde_json::from_value(crate::boot_model::current_desired_config(state).ok()?).ok()
+}
+
+/// The run-bound configuration (#418 review ABUSE-1-R2/ABUSE-2-R2): the
+/// document the engine STARTED with — the boot model's adopted snapshot,
+/// whose outputs and audio routing are never advanced after start (only
+/// landed source/overlay/layout deltas are). A restart-pending output PUT
+/// changes the accepted document but not what the running cast sink
+/// packages (its renditions and subtitle slots are fixed per run), so the
+/// closure is the union of both views. `None`: no boot model (a store-only
+/// run, whose accepted document is what it runs).
+fn running(state: &AppState) -> Option<multiview_config::MultiviewConfig> {
+    Some(state.boot_model.as_ref()?.adopted_config())
 }
 
 /// The output `config_id` in `config` (`None`: not declared — fail closed).
@@ -390,33 +408,51 @@ fn output_of<'a>(
     config.outputs.iter().find(|o| o.id() == config_id)
 }
 
+/// Push `need` unless already present.
+fn push_unique(needs: &mut Vec<Need>, need: Need) {
+    if !needs.contains(&need) {
+        needs.push(need);
+    }
+}
+
 /// ABUSE-2 (#418): every discrete track the cast stream packages as an
 /// audio rendition — resolved by the engine's own rule
 /// ([`multiview_config::Output::carried_audio`] against the declared
 /// tracks) — needs Read on the track name and its route input, exactly as
-/// an `AudioFeed::Tracks` choice does.
+/// an `AudioFeed::Tracks` choice does. Resolved in EVERY view (ABUSE-2-R2:
+/// the running run's selection and the accepted, possibly restart-pending
+/// one), each track's input in every view (a live re-point and the run's
+/// own binding). An output no view declares fails closed.
 fn carried_track_needs(
-    config: &multiview_config::MultiviewConfig,
+    views: &[&multiview_config::MultiviewConfig],
     config_id: &str,
 ) -> Option<Vec<Need>> {
-    let output = output_of(config, config_id)?;
-    let declared: Vec<&str> = config
-        .audio
-        .as_ref()
-        .map(multiview_config::AudioRouting::declared_tracks)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|t| *t != multiview_config::PROGRAM_TRACK)
-        .collect();
-    let (_, tracks) = output.carried_audio(&declared);
-    let mut needs = Vec::with_capacity(tracks.len() * 2);
-    for track in tracks {
-        if let Some(input) = crate::routes::output_routing::track_input(config, track) {
-            needs.push(Need::Object(input));
+    let mut declared_anywhere = false;
+    let mut needs = Vec::new();
+    for config in views {
+        let Some(output) = output_of(config, config_id) else {
+            continue;
+        };
+        declared_anywhere = true;
+        let declared: Vec<&str> = config
+            .audio
+            .as_ref()
+            .map(multiview_config::AudioRouting::declared_tracks)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| *t != multiview_config::PROGRAM_TRACK)
+            .collect();
+        let (_, tracks) = output.carried_audio(&declared);
+        for track in tracks {
+            for bound in views {
+                if let Some(input) = crate::routes::output_routing::track_input(bound, track) {
+                    push_unique(&mut needs, Need::Object(input));
+                }
+            }
+            push_unique(&mut needs, Need::Object(track.to_owned()));
         }
-        needs.push(Need::Object(track.to_owned()));
     }
-    Some(needs)
+    declared_anywhere.then_some(needs)
 }
 
 /// The engine's live subtitle route table of `config_id` (slot → source;
@@ -429,33 +465,50 @@ fn live_subtitles(state: &AppState, config_id: &str) -> Option<Vec<Option<String
         .subtitle_routes(config_id)
 }
 
-/// ABUSE-1 (#418): Read on the source of every subtitle slot: `patch`'s
-/// new source for a re-patched slot, else the engine's live route table,
-/// else the accepted config's slot source (F2 persists re-patches there).
+/// ABUSE-1 (#418, round 2): Read on every subtitle source the stream may
+/// publish — every entry of the engine's live route table (all slots,
+/// whatever slot count the accepted output now declares; it follows live
+/// re-patches), `patch`'s new source of a re-patched slot, and every slot
+/// source of the accepted config (where re-patches persist; a
+/// restart-pending slot set). When the engine reports no live table, the
+/// run-bound config's slot sources stand in for it (what the run started
+/// sampling), so a slot removed from the accepted config before the run
+/// reports its table still counts. An output no view declares fails closed.
 fn subtitle_needs(
     state: &AppState,
-    config: &multiview_config::MultiviewConfig,
+    views: &[&multiview_config::MultiviewConfig],
     config_id: &str,
     patch: Option<&[(usize, Option<String>)]>,
 ) -> Option<Vec<Need>> {
-    let output = output_of(config, config_id)?;
-    let Some(slots) = output.slots().map(|s| s.subtitle.as_slice()) else {
-        return Some(Vec::new());
+    let slot_sources = |config: &multiview_config::MultiviewConfig| {
+        output_of(config, config_id).map(|output| {
+            output
+                .slots()
+                .map(|slots| {
+                    slots
+                        .subtitle
+                        .iter()
+                        .map(|slot| slot.source.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
     };
-    let live = live_subtitles(state, config_id);
+    let (accepted, run) = (views.first()?, views.get(1));
+    let accepted = slot_sources(accepted);
+    let run = run.and_then(|config| slot_sources(config));
+    if accepted.is_none() && run.is_none() {
+        return None;
+    }
+    let mut sources = accepted.unwrap_or_default();
+    match live_subtitles(state, config_id) {
+        Some(live) => sources.extend(live),
+        None => sources.extend(run.unwrap_or_default()),
+    }
+    sources.extend(patch.unwrap_or_default().iter().map(|(_, s)| s.clone()));
     let mut needs = Vec::new();
-    for (i, slot) in slots.iter().enumerate() {
-        let patched = patch.and_then(|p| p.iter().find(|(s, _)| *s == i));
-        let source = match (patched, live.as_ref().and_then(|t| t.get(i))) {
-            (Some((_, source)), _) | (None, Some(source)) => source.clone(),
-            (None, None) => slot.source.clone(),
-        };
-        if let Some(source) = source {
-            let need = Need::Object(source);
-            if !needs.contains(&need) {
-                needs.push(need);
-            }
-        }
+    for source in sources.into_iter().flatten() {
+        push_unique(&mut needs, Need::Object(source));
     }
     Some(needs)
 }
