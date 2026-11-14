@@ -1815,6 +1815,72 @@ PR 1 (layout to an output, live) builds, and deviates from §2.3 and §7 as stat
 - **Salvos** do not drive output takes on main (`Salvo` has no output recall); layout feeds in
   salvos belong to #308.
 
+### 10.2 Routed layouts carry the multiview overlay layers
+
+A routed layout is a multiview in its own right, so its aux canvas carries the same per-cell
+chrome as Program: the source name, the per-input audio meter, the state flag (LIVE / STALE /
+RECONNECTING / NO SIGNAL / IDLE…) and content-fault badge (BLACK / FROZEN / NO AUDIO), the tally
+border, the clock, and optional safe-area markers.
+
+- **Per-layout setting.** A stored layout body may carry
+  `"overlays": {"labels", "meters", "flags", "tally", "clock", "safe_area"}` (booleans,
+  `LayoutOverlays`). Absent, or a key absent, is the default: every layer on except `safe_area`.
+  Unknown keys are refused at solve. All six off is a **clean** layout: no bake runs at all.
+  It is edited on the Layouts page (Layers). A live edit swaps the body like any other edit (§10.1).
+  A separate "clean variant of the same layout" feed is not built: a second stored layout with
+  every layer off gives the same picture.
+- **Where it runs.** On the `routing-aux` thread, right after the integer compose of that layout
+  (`aux_overlays::LayoutOverlayBake`), with Program's `OverlayBaker` and region-limited
+  `apply_overlays_to_nv12`. Never on the clock and never on the bake consumer. One bake per layout
+  canvas: every output on `aux:<id>` shares the one baked frame (+0 for a second subscriber).
+- **Inputs, all wait-free.** The cell states come from the same `TileStore::read_at` the compose
+  made this tick. Meters, content faults and the Program source set come from one
+  `SwapCell` snapshot the bake consumer publishes after its own bake, only while some routed layout
+  bakes (one relaxed load otherwise). Preview tally comes from the M/E PVW selection slot. The aux
+  thread reads the newest snapshot; it never waits for the consumer. Meters and tally are
+  normally one tick behind Program's; while the consumer falls behind, the snapshot ages with it
+  (no bound is claimed — the picture never waits for it).
+- **Content faults.** For a source on Program the badge is exactly Program's own verdict (its
+  declared probes, latches and silence). For a source shown only on routed layouts, the layout
+  detects BLACK / FROZEN itself on the aux thread, from the frames the compose already read, with
+  the source's declared black/freeze probe (threshold, zone, dwell, latch) or Program's defaults,
+  built by the same helpers (`fault_probes.rs`). NO AUDIO and the meters come from the program
+  bus's per-input taps only: a source on no audio route shows an empty meter and no silence badge.
+- **Cell budget.** A layout with more than 64 cells composes and publishes without overlays
+  (warned once, counted); the layouts API is unchanged.
+- **Draw order and occlusion.** Cell chrome is emitted in the compositor's draw order (ascending
+  `z`), so higher cells' chrome paints last; a cell wholly covered by one opaque higher cell draws
+  no chrome. A partly covered cell keeps its full chrome, drawn over the covering picture. Labels
+  are capped at 64 characters (Program too).
+- **Bounded signals.** The aux thread publishes the set of sources its baking layouts bind
+  (only when that set changes); the consumer's snapshot holds only those sources, and its live
+  meter map forgets a source 5 s after it leaves the bus.
+- **Tally.** Red border for a source on Program, green for a source on Preview; with flags on,
+  the state chip also reads `PGM` / `PVW` (meaning is never colour alone).
+- **Failure.** A bake error publishes the un-overlaid picture (counted, warned once); it never
+  holds the bus. A panic in a bake is a panic of the aux tick: the existing §4.4 fall-back to
+  Program applies. A source dying mid-bake shows its slate and NO SIGNAL; the layout keeps one
+  frame per tick.
+- **Parallel bakes.** The aux thread composes every layout first, then bakes them: one layout
+  bakes on the aux thread itself; two or more bake in a `std::thread::scope`, one scoped thread
+  (`routing-aux-bake`) per layout beyond the first, at most `MAX_AUX_CANVASES_LIMIT` (8). The
+  scope joins before anything is published, so each layout still publishes exactly one frame per
+  tick. Composes stay sequential, so an aux tick costs the sum of the composes plus the slowest
+  bake plus the scope's spawn overhead. A panic in a scoped bake propagates out of the scope and raises `failed` (§4.4).
+- **Cost, measured** (release build, shared and loaded 56-core host, 1920x1080, a 1+8 NewsOne
+  layout, every default layer): compose 3.7–5.8 ms, bake 17.6–26.5 ms (mostly the region blend of
+  `apply_overlays_to_nv12`). Two such layouts, parallel: mean 21–26 ms per aux tick, worst
+  29–34 ms (sequential would be 36 ms mean, 82–108 ms worst). That fits a 25 fps tick; at
+  29.97/30 fps a loaded host can reach the §7 back-off (every second tick, routed pictures hold),
+  never Program. Clock isolation is pinned by `two_baking_layouts_never_hold_the_live_clock`
+  (live drop-on-overload policy: the clock counts every tick, every tick is delivered or accounted
+  as shed, both layouts bake); `two_routed_layouts_with_overlays_never_cost_program_a_window` is
+  the exact-delivery variant. A cheaper bake (GPU overlay or a cached static chrome layer) is a
+  follow-up.
+- **Layout as an M/E source** (#307, lane layout-me): the composed `layout:<id>` source runs the same
+  bake before it is published, so a layout taken to Program through the M/E carries its layers.
+  Built with that slice, not here.
+
 ---
 
 ## 11. Interactions and open points
@@ -2431,6 +2497,119 @@ once that muxer writes its rule.)
   4 KiB, a 4 KiB slice-header prefix, at most 1024 NALs).
 - *Return after a stall that hid a parameter change.* An IDR whose parameter generation differs
   from the previous run's always needs the 300-tick parameter-change wait.
+
+**As built in slice D, part D2a (#344).** The engine-side pieces under
+`crates/multiview-cli/src/` (all behind `ffmpeg`), with no router decision yet:
+- *Tap at ingest* (`passthrough_tap.rs`). Every config source's `IngestPlan`
+  carries one `SourceTap`. It is registered in a process-wide wait-free registry:
+  a `SwapCell` holding an immutable map, so `lookup` is one load, and it is
+  forgotten on source removal. The demux reader closure in `open_and_stream`
+  hands each video packet to a per-connection `TapWriter`:
+  - With no consumer, that costs one atomic load per packet: no copy, no
+    clock read and no classification (test).
+  - With a consumer, the bytes are copied once into an `Arc<[u8]>`. A
+    length-prefixed packet is re-framed as Annex B in that same copy, so every
+    `TapAu` is Annex B and a reconnect cannot change framing under a reader.
+    `idr::annex_b_size` computes the re-framed size before anything is
+    allocated, with checked arithmetic and a 1024-NAL budget. A result over
+    `MAX_AU_BYTES` is counted as oversize at once; a malformed prefix is
+    counted separately. `to_annex_b` then writes into a single `Arc<[u8]>` of
+    the exact size (review R1-A-2).
+  - For an H.264 source, the writer caches the connection's SPS/PPS by id,
+    at most 32 of each. The cache is filled from every set in the avcC or
+    Annex-B extradata, then from every in-band SPS/PPS of every AU, IDR or not
+    (review R2-M-3).
+    - A set whose id is reused with different bytes bumps `params_gen` before
+      that AU is offered.
+    - A set whose id cannot be read invalidates the whole cache, so a stale
+      set is never inserted.
+    - An IDR that carries neither set gets exactly the PPS its first slice
+      names, plus that PPS's SPS, inserted after a leading AUD and before
+      classification (review R2-M-4).
+    - When that PPS or its SPS is unknown, the IDR stays incomplete: it is not
+      strict, so no run starts on it. It is counted as `unresolved_sets`.
+    - An MP4/avc1 source, whose sets live only in extradata, therefore yields
+      strict IDRs. A reconnect starts from its own extradata (review R1-M-1).
+  - The 1024-NAL budget also holds for Annex-B packets (`annex_b_nal_count`:
+    no allocation, early exit), and it counts the two NALs an insertion adds.
+    `scan_parameter_sets` streams the NALs and returns `Rejected` past the
+    budget, so the demux thread never collects an unbounded list
+    (review R2-A-3).
+  - Extradata over 64 KiB (`multiview_ffmpeg::MAX_FACTS_EXTRADATA`, checked on
+    the length) is never copied. That connection gets no writer, so
+    passthrough is off for it, and the refusal is counted as
+    `refused_extradata`. A configuration is never truncated (review R1-A-1).
+  - Each `TapAu` is classified: `strict_idr` through `idr::is_self_contained_idr`
+    and `reference` through `idr::h264_is_reference` (`nal_ref_idc`).
+    `arrival_ns` comes from the run's monotonic `TimeSource`.
+  - It is then `offer`ed (D1: never blocks).
+  - `params_gen` is per source and bumps on every (re)connect (a reconnect is
+    a parameter change) and on any keyframe whose sets differ from the last
+    ones (a rejected scan also counts as a change).
+  - `SourceTraits` are published per connection with a connection generation.
+    The codec comes from libav. Profile, `constraint_flags` (the SPS byte after
+    `profile_idc`), level, depth, chroma and scan come from the SPS (avcC or
+    Annex-B extradata). When there is no extradata SPS, they are refreshed from
+    the first in-band SPS. The size, the four colour tags (unspecified =
+    untagged) and the declared rate come from the stream parameters, read
+    through a new safe `multiview_ffmpeg::video_stream_facts`.
+  - Packets are skipped (and counted) before a run seeds or when they carry
+    no timestamp.
+- *`PassthroughLive`* (`passthrough_live.rs`) is a `LiveEncoder`. Each `encode`
+  ignores the canvas and returns exactly one packet for the tick, stamped
+  `dts = tick`. That packet is one of:
+  - the source AU: its bytes unchanged, `pts = tick + source reorder + the
+    clock's bounded delay`;
+  - an H.264 repeat AU. There is one `RepeatAuBuilder` per `params_gen`,
+    primed from that generation's strict-IDR SPS/PPS as the key drains the
+    AUs, because the AU a repeat follows is usually a P without sets. A new
+    generation drops the builder (review R1-M-2);
+  - the **format slate**: one closed black GOP, baked once by `bake_slate`
+    with `VideoRenditionEncoder` at the slot's `EncodeConfig`. The encoder is
+    dropped right after, so no session is held. The slate is always entered at
+    its IDR.
+
+  The other `LiveEncoder` contracts:
+  - `move_gate` passes only a run-start strict IDR or a slate IDR. The worker
+    records their DTS in a lock-free ring before the packet leaves it.
+  - A mid-run source IDR keeps `AV_PKT_FLAG_KEY`, so HLS can cut a segment
+    there, but it is not a move point.
+  - `parameter_sets` scans every keyframe.
+  - Status is an `Arc<PassthroughStatus>` of atomics: state, reason code,
+    delay in ticks, AU / repeat / slate / run / stall / parameter-change /
+    drift-drop counters.
+- *Exact watermark.* `VideoEncodeWorker::reorder_bound` gains
+  `ReorderBound::DtsIsTick`. The worker publishes `floor_ns(max emitted DTS + 1)`,
+  derived from DTS and never from PTS. That bound is exact because every packet's
+  DTS is its tick and ticks strictly increase. So a passthrough key closes its
+  windows even with B-frames, and the bound is never too high (test against
+  every later packet).
+- *Dispatcher (behaviour change).* The steady-state loop that tracks the
+  current key's sets now signals exactly one `mark_config_change` on an
+  `inband_ok` output when a keyframe of the current key carries sets that differ
+  from the ones the output carries. A rejected scan leaves the output's sets
+  unknown, so both it and the next keyframe with sets count as changes. Before,
+  such a keyframe was only recorded. Ordinary encoders' sets never change, so they
+  never trigger it (test). Out-of-band outputs still only record.
+
+Deviations from the D2 spec:
+- `PassthroughLive::new` takes a baked `FormatSlate` rather than baking itself.
+  `bake_slate` is the routing-open-thread step the D2b opener calls, which keeps
+  the key testable without an encoder.
+- Tap AUs are Annex B (re-framed at the copy). The spec did not say. This makes
+  the bytes directly muxable to TS and keeps the framing stable across
+  reconnects.
+- The slot gate's `matches` is "every generation" until D2b supplies the router's
+  match verdict (`set_matching`). `matched_slate_ready` is always true because
+  the format slate exists from open.
+- `PassthroughStatus::delay_ticks` is the clock's emission depth (an
+  approximation of source-time delay). D2b's audio may refine it.
+
+Deferred to D2b: the router's P0 decision and eligibility, the passthrough opener
+(`MAX_PASSTHROUGH_KEYS`, no encoder-cap charge), fault handling with the
+on-demand picture bridge, return-to-P0 moves, the readback and plan `path`/`passthrough`
+fields, audio by source time, `/metrics` counters, and the `ffmpeg`
+end-to-end test.
 
 **Audio with passthrough video.** Audio is always decoded and re-encoded on the global AAC grid
 (ADR-0108 §5.2). For lip sync, the audio of a passthrough slot is read at the source time of the

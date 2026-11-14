@@ -21,13 +21,19 @@ import {
   readProblem,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
+import type { OutputVideoFeed } from './outputRouting';
 import type { components } from './types';
 
-/** One live cast session, exactly as the control plane returns it. */
+/**
+ * One live cast session, exactly as the control plane returns it (`media_url`
+ * is redacted, `…/cast/<redacted>/master.m3u8`, for a token stream).
+ */
 export type CastSession = components['schemas']['CastSessionDoc'];
 
-/** The body of a start-cast-session request. */
-export type StartCastSessionRequest = components['schemas']['StartCastSessionRequest'];
+/** The body of a start-cast-session request (`feed`: what to show, as a cast stream takes it). */
+export type StartCastSessionRequest = Omit<components['schemas']['StartCastSessionRequest'], 'feed'> & {
+  readonly feed?: OutputVideoFeed;
+};
 
 /** The body of a save (promote-to-device) request. */
 export type SaveCastSessionRequest = components['schemas']['SaveCastSessionRequest'];

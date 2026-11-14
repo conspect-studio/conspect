@@ -154,6 +154,9 @@ pub struct PictureBusSlot {
     pub latest: SwapCell<Option<Arc<AuxFrame>>>,
     /// Frames published into this slot.
     pub composed: AtomicU64,
+    /// Of those, frames that carry a successful overlay bake (a routed
+    /// layout with overlays; diagnostics and tests).
+    pub baked: AtomicU64,
 }
 
 /// An output picture format a routed feed is composed at (#342): size and fit.
@@ -299,6 +302,10 @@ pub struct AuxInputs {
     pub program_lateness: Option<ProgramLateness>,
     /// The output tick period in nanoseconds (the back-off threshold is half).
     pub tick_ns: u64,
+    /// What a routed layout's overlay bake reads (`None`: layouts are
+    /// published clean, as in builds without the `overlay` feature).
+    #[cfg(feature = "overlay")]
+    pub overlays: Option<crate::aux_overlays::AuxOverlayInputs>,
 }
 
 /// Program's lateness histogram, published once Program runs (the slot the
@@ -461,7 +468,39 @@ fn run(inputs: &AuxInputs, failed: &AtomicBool, halved: &AtomicBool) {
 struct AuxState {
     feeds_seen: Option<Arc<Vec<AuxFeed>>>,
     per_feed: HashMap<Arc<str>, FeedState>,
+    /// Set when the feed set or a layout body changed: `wanted` is
+    /// recomputed at the end of that tick only (never per tick).
+    #[cfg(feature = "overlay")]
+    bakes_changed: bool,
+    /// This tick's composed layouts awaiting their overlay bake. Reused every
+    /// tick (cleared, never shrunk): bounded by the active layout feeds.
+    #[cfg(feature = "overlay")]
+    pending: Vec<PendingBake>,
 }
+
+/// One composed layout picture awaiting its overlay bake this tick. The
+/// feed's canvas and bake are moved out of its [`FeedState`] for the bake
+/// (so several bakes can run at once) and moved back after it.
+#[cfg(feature = "overlay")]
+struct PendingBake {
+    key: Arc<str>,
+    slot: Arc<PictureBusSlot>,
+    generation: u64,
+    picture: Arc<Nv12Image>,
+    canvas: crate::aux_layout::LayoutCanvas,
+    bake: crate::aux_overlays::LayoutOverlayBake,
+    out: Option<Arc<Nv12Image>>,
+}
+
+/// At most this many layout bakes run at once (the aux thread + scoped
+/// threads); config caps routed layouts at the same bound.
+#[cfg(feature = "overlay")]
+pub const MAX_PARALLEL_BAKES: usize = multiview_config::routing::MAX_AUX_CANVASES_LIMIT;
+
+/// The name of a scoped layout-bake thread (the first bake of a tick runs on
+/// `routing-aux` itself).
+#[cfg(feature = "overlay")]
+pub const BAKE_THREAD_NAME: &str = "routing-aux-bake";
 
 #[derive(Default)]
 struct FeedState {
@@ -471,6 +510,10 @@ struct FeedState {
     warned_color: bool,
     /// A routed layout's compose state (rebuilt when the body changes).
     layout: Option<crate::aux_layout::LayoutCanvas>,
+    /// A routed layout's overlay bake (`None`: every layer off, or no
+    /// overlay inputs). Rebuilt with `layout`.
+    #[cfg(feature = "overlay")]
+    bake: Option<crate::aux_overlays::LayoutOverlayBake>,
 }
 
 impl AuxState {
@@ -485,6 +528,10 @@ impl AuxState {
             self.per_feed
                 .retain(|key, _| feeds.iter().any(|f| f.key == *key));
             self.feeds_seen = Some(Arc::clone(&feeds));
+            #[cfg(feature = "overlay")]
+            {
+                self.bakes_changed = true;
+            }
         }
         for feed in feeds.iter() {
             let source: Arc<str> = match &feed.bus {
@@ -529,6 +576,106 @@ impl AuxState {
             })));
             feed.slot.composed.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "overlay")]
+        self.bake_layouts(inputs, tick);
+        #[cfg(feature = "overlay")]
+        self.refresh_wanted(inputs);
+    }
+
+    /// Bake every composed layout of this tick and publish it. One bake runs
+    /// on the aux thread itself (no spawn); with several, each further bake
+    /// runs on its own scoped thread, so the tick's wall time is the slowest
+    /// bake, not the sum. Bounded: at most [`MAX_PARALLEL_BAKES`] at once
+    /// (any beyond run on the aux thread after). A panic in a scoped bake
+    /// propagates out of the scope, so `run`'s `catch_unwind` raises
+    /// `failed` (§4.4).
+    #[cfg(feature = "overlay")]
+    fn bake_layouts(&mut self, inputs: &AuxInputs, tick: AuxTick) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let signals = inputs
+            .overlays
+            .as_ref()
+            .map(|o| o.signals.load())
+            .unwrap_or_default();
+        let preview = inputs.preview_selection.as_ref().and_then(|s| s.load());
+        let preview = preview.as_deref();
+        let signals = signals.as_ref();
+        let run = |item: &mut PendingBake| {
+            item.out = Some(item.bake.bake(
+                &item.picture,
+                tick.pts,
+                item.canvas.cell_states(),
+                item.canvas.cell_frames(),
+                signals,
+                preview,
+            ));
+        };
+        if let Some((first, rest)) = self.pending.split_first_mut() {
+            if rest.is_empty() {
+                run(first);
+            } else {
+                std::thread::scope(|scope| {
+                    for item in rest.iter_mut().take(MAX_PARALLEL_BAKES - 1) {
+                        // A failed spawn leaves `out` empty: baked inline below.
+                        let _spawned = std::thread::Builder::new()
+                            .name(BAKE_THREAD_NAME.to_owned())
+                            .spawn_scoped(scope, || run(item));
+                    }
+                    run(first);
+                });
+            }
+        }
+        for mut item in self.pending.drain(..) {
+            if item.out.is_none() {
+                run(&mut item);
+            }
+            let frame = item.out.take().unwrap_or_else(|| Arc::clone(&item.picture));
+            if !Arc::ptr_eq(&frame, &item.picture) {
+                item.slot.baked.fetch_add(1, Ordering::Relaxed);
+            }
+            item.slot.latest.store(Some(Arc::new(AuxFrame {
+                tick: tick.index,
+                generation: item.generation,
+                frame,
+            })));
+            item.slot.composed.fetch_add(1, Ordering::Relaxed);
+            if let Some(entry) = self.per_feed.get_mut(&item.key) {
+                entry.layout = Some(item.canvas);
+                entry.bake = Some(item.bake);
+            }
+        }
+    }
+
+    /// Raise `wanted` while some active layout feed bakes overlays (the bake
+    /// consumer then publishes its signals). Recomputed only when the feed
+    /// set changed or a body was rebuilt — not per tick.
+    #[cfg(feature = "overlay")]
+    fn refresh_wanted(&mut self, inputs: &AuxInputs) {
+        if !std::mem::take(&mut self.bakes_changed) {
+            return;
+        }
+        if let Some(overlays) = inputs.overlays.as_ref() {
+            // Bounded by construction: at most MAX_PARALLEL_BAKES baking
+            // layouts (config caps routed layouts at the same bound) of at
+            // most MAX_BAKED_CELLS cells each (larger layouts get no bake).
+            let sources: std::collections::HashSet<String> = self
+                .per_feed
+                .values()
+                .filter_map(|f| f.bake.as_ref())
+                .take(MAX_PARALLEL_BAKES)
+                .flat_map(|bake| {
+                    bake.bound_sources()
+                        .take(crate::aux_overlays::MAX_BAKED_CELLS)
+                })
+                .take(crate::aux_overlays::MAX_WANTED_SOURCES)
+                .map(str::to_owned)
+                .collect();
+            let wanted = self.per_feed.values().any(|f| f.bake.is_some());
+            overlays.wanted_sources.store(Arc::new(sources));
+            overlays.wanted.store(wanted, Ordering::Relaxed);
+        }
     }
 }
 
@@ -552,6 +699,30 @@ impl AuxState {
                 inputs.layout_canvas,
             );
             entry.generation = entry.generation.wrapping_add(1);
+            #[cfg(feature = "overlay")]
+            {
+                entry.bake = match (entry.bake.take(), inputs.overlays.as_ref()) {
+                    (_, None) => None,
+                    _ if entry.layout.is_none() => None,
+                    // An edited body of the same layout keeps its fonts and
+                    // meter ballistics.
+                    (Some(mut bake), Some(overlays)) => {
+                        bake.rebuild(&layout.body, &overlays.labels).then_some(bake)
+                    }
+                    (None, Some(overlays)) => {
+                        crate::aux_overlays::LayoutOverlayBake::new(&layout.body, overlays)
+                    }
+                };
+                if let Some(canvas) = entry.layout.as_mut() {
+                    canvas.keep_frames(
+                        entry
+                            .bake
+                            .as_ref()
+                            .is_some_and(crate::aux_overlays::LayoutOverlayBake::wants_frames),
+                    );
+                }
+                self.bakes_changed = true;
+            }
         }
         let Some(canvas) = entry.layout.as_mut() else {
             return; // a layout for another canvas size: never composed (hold)
@@ -559,6 +730,23 @@ impl AuxState {
         let Some(picture) = canvas.compose(&inputs.stores, tick.pts) else {
             return;
         };
+        // A layout with overlays is published after its bake (this tick,
+        // see `bake_layouts`); one without is published now.
+        #[cfg(feature = "overlay")]
+        if entry.bake.is_some() {
+            if let (Some(canvas), Some(bake)) = (entry.layout.take(), entry.bake.take()) {
+                self.pending.push(PendingBake {
+                    key: Arc::clone(&feed.key),
+                    slot: Arc::clone(&feed.slot),
+                    generation: entry.generation,
+                    picture,
+                    canvas,
+                    bake,
+                    out: None,
+                });
+            }
+            return;
+        }
         feed.slot.latest.store(Some(Arc::new(AuxFrame {
             tick: tick.index,
             generation: entry.generation,
@@ -917,6 +1105,8 @@ mod tests {
             },
             program_lateness: None,
             tick_ns: 0,
+            #[cfg(feature = "overlay")]
+            overlays: None,
         })
         .unwrap();
         (tx, handle)
@@ -1197,5 +1387,354 @@ codec = "h264"
             lateness.record(60_000_000, 0);
         }
         assert!(!off.observe(t0 + Duration::from_secs(11), lateness.snapshot()));
+    }
+
+    /// Chaos (overlay builds): a routed layout with overlays on whose source
+    /// dies mid-run. Its store stops publishing and ages to NO SIGNAL; the
+    /// aux thread keeps publishing one baked frame per tick, the dead cell
+    /// reads NO SIGNAL (from the store state compose saw), `failed` stays
+    /// false; `wanted` is raised while the layout bakes. A missing store is
+    /// NO SIGNAL too.
+    #[cfg(feature = "overlay")]
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)] // One chaos scenario.
+    fn a_layout_with_overlays_keeps_publishing_while_a_source_dies() {
+        const TICKS: u64 = 300;
+        use multiview_core::layout::{Canvas, Cell, Layout};
+        use multiview_core::traits::SourceState;
+        let (w, h) = (640u32, 360u32);
+        let color = CanvasColor::default();
+        let live = Arc::new(TileStore::<Nv12Image>::with_defaults("live"));
+        let dying = Arc::new(TileStore::<Nv12Image>::with_defaults("dying"));
+        let (l, d) = (Arc::clone(&live), Arc::clone(&dying));
+        let stores: StoreLookup = Arc::new(move |id: &str| match id {
+            "live" => Some(Arc::clone(&l)),
+            "dying" => Some(Arc::clone(&d)),
+            _ => None,
+        });
+        let cell = |x: f32, source: &str| Cell {
+            x,
+            w: 1.0 / 3.0,
+            h: 1.0,
+            source: Some(source.to_owned()),
+            ..Cell::default()
+        };
+        let body = Arc::new(crate::aux_layout::RoutedLayout {
+            id: "news".to_owned(),
+            layout: Layout {
+                name: "news".to_owned(),
+                canvas: Canvas {
+                    width: w,
+                    height: h,
+                    fps_num: 25,
+                    fps_den: 1,
+                },
+                cells: vec![
+                    cell(0.0, "live"),
+                    cell(1.0 / 3.0, "dying"),
+                    cell(2.0 / 3.0, "gone"),
+                ],
+            },
+            slates: vec![multiview_config::FailoverSlate::Black; 3],
+            audio: multiview_config::LayoutAudio::default(),
+            overlays: multiview_config::LayoutOverlays::default(),
+            revision: 0,
+        });
+        let feed = AuxFeed::new(PictureBus::Layout(LayoutRef::new(Arc::clone(&body))));
+        let slot = Arc::clone(&feed.slot);
+        let wanted = Arc::new(AtomicBool::new(false));
+        let signals = crate::aux_overlays::signals_slot();
+        let mut published = crate::aux_overlays::AuxOverlaySignals::default();
+        published.program.insert("live".to_owned());
+        signals.store(Arc::new(published));
+        let (tx, rx) = aux_tick_channel();
+        tx.active_flag().store(true, Ordering::Release);
+        let handle = spawn_routing_aux(AuxInputs {
+            rx,
+            feeds: Arc::new(SwapCell::from_pointee(vec![feed])),
+            stores,
+            preview_selection: None,
+            canvas: AuxCanvas {
+                width: w,
+                height: h,
+                color: color.output_tag(),
+            },
+            layout_canvas: crate::aux_layout::LayoutCanvasSpec {
+                width: w,
+                height: h,
+                color,
+                background: [16, 128, 128],
+            },
+            program_lateness: None,
+            tick_ns: 0,
+            overlays: Some(crate::aux_overlays::AuxOverlayInputs {
+                signals,
+                wanted: Arc::clone(&wanted),
+                wanted_sources: crate::aux_overlays::wanted_sources(),
+                labels: Arc::new(|id: &str| Some(id.to_uppercase())),
+                watermark: None,
+                wall_clock: crate::wallclock::WallClockSource::system(),
+                canvas_color: color,
+                source_probes: Arc::default(),
+            }),
+        })
+        .unwrap();
+        let frame = |luma: u8| {
+            Nv12Image::solid((w / 3) & !1, h, luma, 128, 128, color.output_tag()).unwrap()
+        };
+        // 25 fps ticks: 40 ms apart. The dying source stops at tick 10; the
+        // store's no-signal threshold is 10 s = 250 ticks after that.
+        let tick25 = |i: u64| AuxTick {
+            index: i,
+            pts: MediaTime::from_nanos(i64::try_from(i).unwrap() * 40_000_000),
+        };
+        for i in 0..TICKS {
+            live.publish(frame(200), tick25(i).pts);
+            if i < 10 {
+                dying.publish(frame(60), tick25(i).pts);
+            }
+            tx.offer(tick25(i));
+            // Deliver every tick (count-based: no frame may be skipped).
+            assert!(
+                wait_for(|| slot.composed.load(Ordering::Relaxed) == i + 1),
+                "tick {i} published"
+            );
+        }
+        assert!(
+            wanted.load(Ordering::Relaxed),
+            "a baking layout wants signals"
+        );
+        assert!(!handle.failed.load(Ordering::Acquire));
+        let last = slot.latest.load().unwrap();
+        assert_eq!(last.tick, TICKS - 1);
+        // The dead cell (middle third) shows its black slate under the chip;
+        // the live cell keeps its picture. Sample below the top chip band and
+        // above the bottom label band, left of the meter column.
+        let (wu, x_mid, x_live) = (
+            usize::try_from(w).unwrap(),
+            usize::try_from(w / 2).unwrap(),
+            40,
+        );
+        let row = usize::try_from(h / 2).unwrap();
+        let y = last.frame.y_plane();
+        assert!(y[row * wu + x_live] > 150, "live cell keeps its picture");
+        assert!(y[row * wu + x_mid] < 40, "dead cell shows its black slate");
+
+        // The cell states the bake read, by store state (re-derived the same
+        // way the aux compose reads them).
+        assert_eq!(
+            dying.read_at(tick25(TICKS - 1).pts).state(),
+            SourceState::NoSignal
+        );
+        assert_eq!(
+            live.read_at(tick25(TICKS - 1).pts).state(),
+            SourceState::Live
+        );
+        drop(tx);
+        assert!(wait_for(|| handle.failed.load(Ordering::Acquire)));
+    }
+
+    /// Spawn the aux thread over `feeds` at 1920x1080 with overlays wired
+    /// (signals published once), on the `aux_overlays` test fixtures.
+    #[cfg(feature = "overlay")]
+    fn spawn_baking(
+        feeds: Vec<AuxFeed>,
+        stores: StoreLookup,
+        wall_clock: crate::wallclock::WallClockSource,
+    ) -> (multiview_engine::AuxTickSender, RoutingAuxHandle) {
+        use crate::aux_overlays::tests as fx;
+        let signals = crate::aux_overlays::signals_slot();
+        signals.store(Arc::new(fx::signals()));
+        let (tx, rx) = aux_tick_channel();
+        tx.active_flag().store(true, Ordering::Release);
+        let handle = spawn_routing_aux(AuxInputs {
+            rx,
+            feeds: Arc::new(SwapCell::from_pointee(feeds)),
+            stores,
+            preview_selection: None,
+            canvas: canvas(),
+            layout_canvas: fx::spec(1920, 1080),
+            program_lateness: None,
+            tick_ns: 0,
+            overlays: Some(crate::aux_overlays::AuxOverlayInputs {
+                signals,
+                wanted: Arc::new(AtomicBool::new(false)),
+                wanted_sources: crate::aux_overlays::wanted_sources(),
+                labels: fx::labels(),
+                watermark: None,
+                wall_clock,
+                canvas_color: CanvasColor::default(),
+                source_probes: Arc::default(),
+            }),
+        })
+        .unwrap();
+        (tx, handle)
+    }
+
+    /// Two `NewsOne` layouts (ids `news-0`, `news-1`) with every default layer.
+    #[cfg(feature = "overlay")]
+    fn two_layout_feeds() -> Vec<AuxFeed> {
+        (0..2)
+            .map(|i| {
+                let mut body = Arc::unwrap_or_clone(crate::aux_overlays::tests::newsone(
+                    multiview_config::LayoutOverlays::default(),
+                    1920,
+                    1080,
+                ));
+                body.id = format!("news-{i}");
+                AuxFeed::new(PictureBus::Layout(LayoutRef::new(Arc::new(body))))
+            })
+            .collect()
+    }
+
+    /// Parallel bakes (overlay builds): two routed layouts with overlays,
+    /// baked on the aux thread and one scoped thread, each get exactly one
+    /// baked frame per tick over N ticks, at that tick; `failed` stays false.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn two_baking_layouts_each_get_one_frame_per_tick() {
+        const TICKS: u64 = 12;
+        let (stores, _keep) = crate::aux_overlays::tests::stores(&[], 1920, 1080);
+        let feeds = two_layout_feeds();
+        let slots: Vec<_> = feeds.iter().map(|f| Arc::clone(&f.slot)).collect();
+        let (tx, handle) = spawn_baking(feeds, stores, crate::wallclock::WallClockSource::system());
+        for i in 0..TICKS {
+            tx.offer(tick(i));
+            assert!(
+                wait_for(|| slots
+                    .iter()
+                    .all(|s| s.composed.load(Ordering::Relaxed) == i + 1)),
+                "tick {i}: both layouts published"
+            );
+            for slot in &slots {
+                let frame = slot.latest.load().unwrap();
+                assert_eq!(frame.tick, i);
+                assert_eq!((frame.frame.width(), frame.frame.height()), (1920, 1080));
+            }
+        }
+        assert!(!handle.failed.load(Ordering::Acquire));
+        for slot in &slots {
+            assert_eq!(
+                slot.composed.load(Ordering::Relaxed),
+                TICKS,
+                "exactly one per tick"
+            );
+        }
+    }
+
+    /// A wall clock that panics when read on a scoped bake thread (the test
+    /// seam for a panicking parallel bake); fine on the aux thread itself.
+    #[cfg(feature = "overlay")]
+    struct PanicOnBakeThread;
+
+    #[cfg(feature = "overlay")]
+    impl crate::wallclock::WallClock for PanicOnBakeThread {
+        fn unix_seconds(&self) -> i64 {
+            assert_ne!(
+                std::thread::current().name(),
+                Some(BAKE_THREAD_NAME),
+                "injected scoped-bake panic"
+            );
+            0
+        }
+
+        fn reference(&self) -> multiview_overlay::clock::TimeRef {
+            multiview_overlay::clock::TimeRef::new(
+                multiview_overlay::clock::RefSource::System,
+                multiview_overlay::clock::RefStatus::Locked,
+            )
+        }
+    }
+
+    /// §4.4 with parallel bakes: a panic inside a scoped bake thread
+    /// propagates out of the scope, so `run`'s `catch_unwind` raises `failed`
+    /// and the thread ends (routed feeds then fall back to Program).
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn a_panicking_scoped_bake_raises_failed() {
+        let (stores, _keep) = crate::aux_overlays::tests::stores(&[], 1920, 1080);
+        let feeds = two_layout_feeds();
+        let clock = crate::wallclock::WallClockSource::new(Arc::new(PanicOnBakeThread));
+        let (tx, mut handle) = spawn_baking(feeds, stores, clock);
+        tx.offer(tick(0));
+        assert!(wait_for(|| handle.failed.load(Ordering::Acquire)));
+        handle.join.take().unwrap().join().unwrap();
+    }
+
+    /// A single baking layout never spawns: its bake runs on the aux thread
+    /// (the same panicking clock is harmless there).
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn a_single_baking_layout_bakes_on_the_aux_thread() {
+        let (stores, _keep) = crate::aux_overlays::tests::stores(&[], 1920, 1080);
+        let mut feeds = two_layout_feeds();
+        feeds.truncate(1);
+        let slot = Arc::clone(&feeds[0].slot);
+        let clock = crate::wallclock::WallClockSource::new(Arc::new(PanicOnBakeThread));
+        let (tx, handle) = spawn_baking(feeds, stores, clock);
+        for i in 0..3 {
+            tx.offer(tick(i));
+            assert!(wait_for(|| slot.composed.load(Ordering::Relaxed) == i + 1));
+        }
+        assert!(
+            !handle.failed.load(Ordering::Acquire),
+            "no scoped thread ran"
+        );
+    }
+
+    /// Cost (no timing assert): two 1+8 `NewsOne` layouts at 1920x1080 with
+    /// every default layer, through the real aux thread with parallel bakes —
+    /// the wall time from offering a tick to both layouts being published.
+    /// Run with `--nocapture`.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn measure_two_layout_aux_tick_wall_time() {
+        const TICKS: u64 = 21;
+        let (stores, _keep) = crate::aux_overlays::tests::stores(&[], 1920, 1080);
+        let feeds = two_layout_feeds();
+        let slots: Vec<_> = feeds.iter().map(|f| Arc::clone(&f.slot)).collect();
+        let (tx, handle) = spawn_baking(feeds, stores, crate::wallclock::WallClockSource::system());
+        let mut total = Duration::ZERO;
+        let mut worst = Duration::ZERO;
+        for i in 0..TICKS {
+            let started = Instant::now();
+            tx.offer(tick(i));
+            // Bounded, yielding wait: a wedged or failed aux thread ends the
+            // measurement with its counters instead of hanging the suite.
+            let deadline = started + Duration::from_secs(30);
+            while !slots
+                .iter()
+                .all(|s| s.composed.load(Ordering::Relaxed) == i + 1)
+            {
+                let counts: Vec<u64> = slots
+                    .iter()
+                    .map(|s| s.composed.load(Ordering::Relaxed))
+                    .collect();
+                assert!(
+                    !handle.failed.load(Ordering::Acquire),
+                    "tick {i}: the aux thread failed (composed {counts:?})"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "tick {i}: timed out waiting for both layouts (composed {counts:?}, \
+                     failed {})",
+                    handle.failed.load(Ordering::Acquire)
+                );
+                std::thread::yield_now();
+            }
+            let elapsed = started.elapsed();
+            if i > 0 {
+                // The first tick builds the canvases and warms the atlases.
+                total += elapsed;
+                worst = worst.max(elapsed);
+            }
+        }
+        println!(
+            "aux tick, 2 x 1920x1080 NewsOne 1+8 layouts with overlays (parallel bakes): \
+             {:.2} ms/tick mean, {:.2} ms worst over {} ticks",
+            total.as_secs_f64() * 1000.0 / 20.0,
+            worst.as_secs_f64() * 1000.0,
+            TICKS - 1,
+        );
     }
 }

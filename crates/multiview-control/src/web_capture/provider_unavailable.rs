@@ -86,6 +86,7 @@ impl Provider {
                 require_premium: false,
                 credentials: None,
             }),
+            capture: body.view.capture_options(),
         };
         capture
             .validate()

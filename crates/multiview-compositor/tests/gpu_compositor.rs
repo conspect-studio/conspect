@@ -295,3 +295,78 @@ fn gpu_readback_deadline_is_bounded_and_recovers() {
     assert!(ok >= 5, "the clocked GPU path must keep producing frames");
     assert_eq!(u64::from(missed), gpu.readback_deadline_misses());
 }
+
+/// Issue #415 on a real device: a lost device (destroyed, as a driver reset
+/// would) never panics the caller. The device-lost callback marks it lost and
+/// every later composite returns the typed `GpuLost` (the run backend then
+/// composites on the CPU for good) — no wgpu `handle_error_fatal` panic.
+#[test]
+fn lost_device_returns_typed_errors_never_panics() {
+    let Some(gpu) = try_gpu() else { return };
+    let canvas = CanvasColor::default();
+    let bg = LinearRgba::TRANSPARENT;
+    gpu.composite(64, 64, canvas, bg, &[])
+        .expect("healthy composite");
+    gpu.destroy_device_for_test();
+    let mut lost = 0_u32;
+    for _ in 0..50 {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gpu.composite(64, 64, canvas, bg, &[])
+        }));
+        match out {
+            Err(payload) => panic!("a lost device must never panic the caller: {payload:?}"),
+            Ok(Err(Error::GpuLost(_))) => {
+                lost += 1;
+                if lost >= 3 {
+                    break;
+                }
+            }
+            // Before the lost callback lands the frame may still fail with
+            // another typed GPU error.
+            Ok(Ok(_)) => println!("after destroy: frame"),
+            Ok(Err(e @ (Error::GpuRuntime(_) | Error::GpuDeadline(_)))) => {
+                println!("after destroy: {e}");
+            }
+            Ok(Err(other)) => panic!("unexpected error on a lost device: {other}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(gpu.is_device_lost(), "the device-lost callback must fire");
+    assert!(lost >= 3, "a lost device must return GpuLost");
+}
+
+/// Issue #415 through the run backend on a real device: once the device is
+/// lost every frame is composited on the CPU reference (counted), forever.
+#[test]
+fn run_backend_composites_on_cpu_for_good_after_device_loss() {
+    use multiview_compositor::backend::{GpuTarget, RunBackend};
+    let backend = RunBackend::select(Some(GpuTarget::none()));
+    if !backend.is_gpu() {
+        println!("SKIP: run backend resolved to CPU (no usable GPU adapter)");
+        return;
+    }
+    let canvas = CanvasColor::default();
+    let bg = LinearRgba::TRANSPARENT;
+    let img = gradient_tile(32, 32, bt709_limited());
+    let tiles = [Tile::placed(&img, 0, 0, 1.0)];
+    backend.composite(32, 32, canvas, bg, &tiles).unwrap();
+    backend.destroy_gpu_device_for_test();
+    for _ in 0..20 {
+        let out = backend.composite(32, 32, canvas, bg, &tiles);
+        assert!(matches!(out, Ok(_) | Err(Error::GpuDeadline(_))), "{out:?}");
+        if backend.gpu_lost() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(backend.gpu_lost());
+    let before = backend.gpu_cpu_fallback_frames();
+    let out = backend.composite(32, 32, canvas, bg, &tiles).unwrap();
+    let cpu = cpu_composite(32, 32, canvas, bg, &tiles).unwrap();
+    assert_eq!(
+        out.y_plane(),
+        cpu.y_plane(),
+        "lost-device frames are CPU frames"
+    );
+    assert_eq!(backend.gpu_cpu_fallback_frames(), before + 1);
+}

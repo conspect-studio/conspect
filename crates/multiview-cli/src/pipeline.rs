@@ -2027,6 +2027,26 @@ enum RunnableOutput {
         /// with the consumer's never-block fan-out and the status snapshot.
         link: Arc<multiview_output::push_link::PushLinkStatus>,
     },
+    /// A cast output (ADR-0111): HLS + CMAF fMP4 written by the pure-Rust
+    /// [`CastPackager`](multiview_output::hls::cast::CastPackager) on this
+    /// output's sink thread, only while its [`CastGate`](crate::cast_output::CastGate)
+    /// is active. Inactive, it writes nothing and keeps a bounded in-memory
+    /// pre-roll. Its delivery drops (and counts) instead of waiting, so a
+    /// stalled disk never paces the bake consumer (invariants #1/#10).
+    Cast {
+        /// The output's stable config id.
+        id: String,
+        /// The activation gate shared with the control plane.
+        gate: Arc<crate::cast_output::CastGate>,
+        /// The directory the stream is written to. For an output with no
+        /// configured `dir` this is the default under the state directory
+        /// (re-resolved by [`Pipeline::set_state_dir`]).
+        dir: PathBuf,
+        /// Whether `dir` is the default (no `dir` in the config).
+        default_dir: bool,
+        /// The pipeline's outbound epoch (`EXT-X-PROGRAM-DATE-TIME`).
+        epoch: multiview_output::SharedEpoch,
+    },
     /// A WebRTC program output (`webrtc` WHEP-serve / `whip_push`): a **mux-free**
     /// sink that re-stamps each coded [`EncodedPacket`] into an
     /// [`EgressSample`](multiview_webrtc::egress::EgressSample) and pushes it onto
@@ -2110,7 +2130,10 @@ impl RunnableOutput {
     /// lines) name the output.
     fn id(&self) -> &str {
         match self {
-            Self::File { id, .. } | Self::Hls { id, .. } | Self::Push { id, .. } => id,
+            Self::File { id, .. }
+            | Self::Hls { id, .. }
+            | Self::Push { id, .. }
+            | Self::Cast { id, .. } => id,
             #[cfg(feature = "webrtc-native")]
             Self::WebRtc { id, .. } => id,
             #[cfg(feature = "ndi-bindings")]
@@ -2255,6 +2278,9 @@ pub struct Pipeline {
     /// [`Pipeline::build_sink_runners`] and projected into the engine-state
     /// snapshot under `outputs.<id>.link` (read lock-free on the hot loop).
     push_links: PushLinkRegistry,
+    /// The current run's cast outputs (ADR-0111), published by
+    /// [`Pipeline::build_sink_runners`] and emptied when the run ends.
+    cast_outputs: crate::cast_output::CastOutputsSlot,
     /// Source-kind audio applicability, refreshed at frame-boundary live edits.
     /// Missing PCM from a decoded source is unknown, not proof of no audio.
     #[cfg(feature = "overlay")]
@@ -2537,6 +2563,12 @@ pub struct Pipeline {
     /// source a cell actually binds. Derived once from the configuration —
     /// never invented — and cloned per binding with that binding's own output id.
     window_dependencies: Arc<Vec<crate::output_window_registry::Dependency>>,
+    /// Test seam (never in a non-test build): stall the shared bake consumer
+    /// ONCE, at the first hot item at or after this tick, for this long. Taken
+    /// by the next run. Lets an isolation test prove its assertions detect a
+    /// stall in the path every output shares (negative control).
+    #[cfg(test)]
+    consumer_stall_for_test: Option<(u64, Duration)>,
 }
 
 type HashMapStores = std::collections::HashMap<String, Arc<TileStore<Nv12Image>>>;
@@ -2639,6 +2671,12 @@ struct IngestPlan {
     live_anchor: LiveAnchorSlot,
     /// Authoritative source lifecycle shared by video, audio and captions.
     lifecycle: u64,
+    /// The source's compressed passthrough tap (output-routing §12.5, #344
+    /// D2a), registered in [`crate::passthrough_tap`]'s wait-free lookup. The
+    /// demux reader offers each video packet to it only while a passthrough
+    /// consumer exists (one atomic load otherwise). `None` for producers with
+    /// no compressed stream (players, synthetic, tests).
+    tap: Option<Arc<crate::passthrough_tap::SourceTap>>,
     /// Whether this is a live (continuous, never-EOF) source. Live sources are
     /// reopened on EOF/error (a transient HLS/RTSP drop reconnects); a finite
     /// file/VOD source plays once and then holds its last frame.
@@ -3430,6 +3468,8 @@ impl Pipeline {
                 .find(|item| item.id() == output.id())
                 .is_some_and(|item| matches!(item, multiview_config::Output::LlHls { .. }));
             output_inband_sets.push(!ll_hls && inband_parameter_changes_ok(output));
+            // A cast stream carries the program audio only (track 0).
+            let cast_audio = multiview_output::AudioSelection::default();
             // Only a TS-segment HLS sink rebuilds its muxer at a flagged
             // change (#342 B3 review M-1).
             output_live_reset.push(!ll_hls && matches!(output, RunnableOutput::Hls { .. }));
@@ -3437,6 +3477,7 @@ impl Pipeline {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
                 | RunnableOutput::Push { sink, .. } => Some(sink.audio_selection()),
+                RunnableOutput::Cast { .. } => Some(&cast_audio),
                 #[cfg(feature = "webrtc-native")]
                 RunnableOutput::WebRtc { .. } => None,
                 #[cfg(feature = "ndi-bindings")]
@@ -3660,6 +3701,7 @@ impl Pipeline {
             #[cfg(feature = "overlay")]
             tile_spec_apply,
             push_links: Arc::new(multiview_framestore::SwapCell::new(Arc::new(Vec::new()))),
+            cast_outputs: crate::cast_output::cast_outputs_slot(),
             #[cfg(feature = "overlay")]
             audio_free_sources,
             #[cfg(feature = "overlay")]
@@ -3682,6 +3724,8 @@ impl Pipeline {
             program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
+            #[cfg(test)]
+            consumer_stall_for_test: None,
         })
     }
 
@@ -3997,6 +4041,10 @@ impl Pipeline {
         // Filled once this run's Program exists (§7 back-off input).
         let program_lateness: crate::routing_aux::ProgramLateness =
             Arc::new(multiview_framestore::SwapCell::empty());
+        // Routed layouts' overlay layers: the consumer publishes its signals
+        // into this wait-free slot only while the aux thread wants them.
+        #[cfg(feature = "overlay")]
+        let (aux_overlays, aux_signals) = self.aux_overlay_inputs(aux_tx.active_flag());
         let aux = crate::routing_aux::spawn_routing_aux(crate::routing_aux::AuxInputs {
             rx: aux_rx,
             feeds: Arc::clone(&feeds),
@@ -4006,6 +4054,8 @@ impl Pipeline {
             layout_canvas: self.layout_canvas_spec(),
             program_lateness: Some(Arc::clone(&program_lateness)),
             tick_ns: u64::try_from(self.encode_cfg.cadence.period_nanos()).unwrap_or(0),
+            #[cfg(feature = "overlay")]
+            overlays: Some(aux_overlays),
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
@@ -4099,7 +4149,53 @@ impl Pipeline {
             preview_selection,
             aux,
             program_lateness,
+            #[cfg(feature = "overlay")]
+            aux_signals,
         })
+    }
+
+    /// The routed-layout overlay inputs for the aux thread and the matching
+    /// consumer-side publisher (cfg `overlay`). Labels: the config display
+    /// names first, then the live catalogue's `display_name` (wait-free
+    /// `SwapCell` load), else `None` (the bake falls back to the id).
+    #[cfg(feature = "overlay")]
+    fn aux_overlay_inputs(
+        &self,
+        active: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        crate::aux_overlays::AuxOverlayInputs,
+        crate::aux_overlays::AuxSignalsPublisher,
+    ) {
+        let signals = crate::aux_overlays::signals_slot();
+        let wanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wanted_sources = crate::aux_overlays::wanted_sources();
+        let config_labels = self.tile_labels.clone();
+        let catalogue = Arc::clone(&self.catalogue);
+        let labels: crate::aux_overlays::LabelLookup = Arc::new(move |id: &str| {
+            config_labels.get(id).cloned().or_else(|| {
+                catalogue
+                    .load()
+                    .get(id)
+                    .and_then(|entry| entry.source().display_name.clone())
+            })
+        });
+        let inputs = crate::aux_overlays::AuxOverlayInputs {
+            signals: Arc::clone(&signals),
+            wanted: Arc::clone(&wanted),
+            wanted_sources: Arc::clone(&wanted_sources),
+            labels,
+            watermark: self.watermark_signal.clone(),
+            wall_clock: crate::wallclock::WallClockSource::system(),
+            canvas_color: self.canvas_color,
+            // The same per-source probe overrides Program's fault detector
+            // resolves, once, shared read-only: an aux-only source honours
+            // its declared black/freeze probe.
+            source_probes: Arc::new(resolve_source_probes(&self.layout, &self.declared_probes)),
+        };
+        (
+            inputs,
+            crate::aux_overlays::AuxSignalsPublisher::new(signals, wanted, wanted_sources, active),
+        )
     }
 
     /// Issue one audio-only take per output whose persisted audio feed is not
@@ -4880,6 +4976,10 @@ impl Pipeline {
             .position(|output| matches!(output, RunnableOutput::Hls { .. }));
         let hls_key = hls_index.and_then(|index| self.output_video_keys.get(index).copied());
         let hls_audio = hls_index.and_then(|index| self.output_audio_tracks.get(index).cloned());
+        // Publish this run's cast outputs (off the clock, before any sink
+        // thread exists): the control plane activates them through the slot.
+        let cast = self.cast_entries(&configured, &self.output_video_keys);
+        self.cast_outputs.store(Arc::new(cast));
         let outputs = maybe_prepend_program_ts(configured, live);
         if !live {
             if let Some(hls_key) = hls_key {
@@ -4912,6 +5012,13 @@ impl Pipeline {
                         links.push((id.clone(), Arc::clone(link)));
                         SinkSendPolicy::DropWhenFull(Arc::clone(link))
                     }
+                    // A cast sink writes to disk only while a cast is
+                    // active and must never pace or fail anything else: its
+                    // delivery drops (counted in the gate) instead of
+                    // waiting, and survives a stalled disk.
+                    RunnableOutput::Cast { gate, .. } => {
+                        SinkSendPolicy::DropCounted(gate.dropped_counter())
+                    }
                     _ => SinkSendPolicy::Bounded,
                 };
                 let runner: SinkRunner = Box::new(move |rx, params, time_base, audio, tracks| {
@@ -4924,6 +5031,71 @@ impl Pipeline {
         // by the per-tick snapshot projection; replaced wholesale per run).
         self.push_links.store(Arc::new(links));
         (runners, binding_ids)
+    }
+
+    /// Where each run publishes its cast outputs (ADR-0111) for the control
+    /// plane: empty before the first run and after each run.
+    #[must_use]
+    pub fn cast_outputs(&self) -> crate::cast_output::CastOutputsSlot {
+        Arc::clone(&self.cast_outputs)
+    }
+
+    /// Test seam: the next run's shared bake consumer sleeps ONCE for `stall`
+    /// at the first hot item at or after tick `at` (a stall in the path every
+    /// output shares, unlike a stall inside one sink). Used only by the cast
+    /// pipeline tests, which need a real encoder (`gpl-codecs`).
+    #[cfg(all(test, feature = "gpl-codecs"))]
+    pub(crate) fn stall_consumer_once_for_test(&mut self, at: u64, stall: Duration) {
+        self.consumer_stall_for_test = Some((at, stall));
+    }
+
+    /// Tell the pipeline the engine's state directory: a cast output with no
+    /// configured `dir` writes to `<state dir>/cast/<id>`. Call before the
+    /// run starts (nothing is created here).
+    pub fn set_state_dir(&mut self, state_dir: &Path) {
+        for output in &mut self.outputs {
+            if let RunnableOutput::Cast {
+                id,
+                dir,
+                default_dir: true,
+                ..
+            } = output
+            {
+                *dir = crate::cast_output::default_cast_dir(state_dir, id);
+            }
+        }
+    }
+
+    /// This run's cast outputs: check each directory (an unusable one
+    /// disables that output only) and describe each for the control plane.
+    /// `keys` is the video key per configured output, in the same order.
+    fn cast_entries(
+        &self,
+        configured: &[RunnableOutput],
+        keys: &[usize],
+    ) -> Vec<crate::cast_output::CastOutputEntry> {
+        configured
+            .iter()
+            .enumerate()
+            .filter_map(|(index, output)| {
+                let RunnableOutput::Cast { id, gate, dir, .. } = output else {
+                    return None;
+                };
+                crate::cast_output::prepare_cast_dir(dir, id, gate);
+                let encode = keys
+                    .get(index)
+                    .and_then(|&key| self.rendition_configs.get(key));
+                Some(crate::cast_output::CastOutputEntry {
+                    id: id.clone(),
+                    dir: dir.clone(),
+                    gate: Arc::clone(gate),
+                    width: encode.map_or(0, |cfg| cfg.width),
+                    height: encode.map_or(0, |cfg| cfg.height),
+                    fps: self.cadence,
+                    codec: encode.map_or_else(String::new, |cfg| cfg.codec_name.clone()),
+                })
+            })
+            .collect()
     }
 
     /// Test seam: shorten the boot-take retry policy (wall-clock bound tests).
@@ -5047,6 +5219,99 @@ impl Pipeline {
         })
     }
 
+    /// **Test seam** (ADR-0111): as [`Self::drive_streaming_for_test`], but
+    /// every cast output keeps its REAL sink (packager, gate, directory) and
+    /// its real delivery policy; `params.runners` replace the other outputs,
+    /// in configured order. Bindings keep their config ids, so a routing
+    /// take addresses an output by the id it has in the document.
+    ///
+    /// # Errors
+    /// See [`Self::drive_streaming_for_test`].
+    #[cfg(all(test, feature = "gpl-codecs"))]
+    pub(crate) async fn drive_streaming_with_cast_for_test<P: Pacer + Send>(
+        &mut self,
+        params: StreamTestParams<P>,
+        stop: &StopSignal,
+    ) -> Result<StreamTestResult, PipelineError> {
+        let StreamTestParams {
+            time,
+            pacer,
+            max_ticks,
+            policy,
+            runners: fakes,
+            consumer_fault_after_ticks,
+            shed_at_tick,
+            hot_tick_observer,
+        } = params;
+        let is_cast: Vec<bool> = self
+            .outputs
+            .iter()
+            .map(|output| matches!(output, RunnableOutput::Cast { .. }))
+            .collect();
+        // Live: no `program.ts` anchor, so runner index == configured index.
+        let (real, binding_ids) = self.build_sink_runners(true);
+        let mut fakes = fakes.into_iter();
+        let runners = real
+            .into_iter()
+            .zip(is_cast)
+            .map(|(real, cast)| {
+                if cast {
+                    return real;
+                }
+                let Some(fake) = fakes.next() else {
+                    return real;
+                };
+                let runner: SinkRunner = Box::new(move |rx, _params, _tb, _audio, _tracks| {
+                    let (tx, plain_rx) = std::sync::mpsc::sync_channel(1);
+                    let bridge = std::thread::spawn(move || {
+                        while let Ok(leased) = rx.recv() {
+                            if tx.send(leased.packet).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    let outcome = fake(plain_rx);
+                    let _ = bridge.join();
+                    Ok(SinkRunOutcome {
+                        line: format!("test sink: {} packet(s)", outcome.frames),
+                        playlist: None,
+                        frames: outcome.frames,
+                    })
+                });
+                (runner, SinkSendPolicy::Bounded)
+            })
+            .collect();
+        let capacity = policy.queue_cap();
+        let plan = StreamPlan {
+            policy,
+            runners,
+            consumer_fault_after_ticks,
+            shed_at_tick,
+            hot_tick_observer,
+            binding_ids,
+        };
+        let publisher = EnginePublisher::<EngineStateSnapshot, Event>::new(EVENT_CAPACITY);
+        let preview = crate::preview::program_slot();
+        let out = self
+            .drive_streaming(
+                time,
+                pacer,
+                stop,
+                max_ticks,
+                plan,
+                &publisher,
+                &preview,
+                |_: &mut CompositorDrive<Nv12Image>| {},
+            )
+            .await?;
+        Ok(StreamTestResult {
+            report: out.report,
+            peak_occupancy: out.peak_occupancy,
+            capacity,
+            sink_frames: out.sink_frames,
+        })
+    }
+
     /// The streaming core shared by `run_for`/`run_until`/the test seam: spawn the
     /// per-sink fan-out threads + the single bake consumer, drive the engine's
     /// protected output core (one composited canvas per tick), stream each tick
@@ -5082,6 +5347,8 @@ impl Pipeline {
         // never go on air silently receiving/emitting silence.
         #[cfg(feature = "aes67")]
         self.ensure_aes67_has_program_audio()?;
+        // The run's cast outputs are published until this function returns.
+        let _cast_run = crate::cast_output::CastRunGuard(Arc::clone(&self.cast_outputs));
         let StreamPlan {
             policy,
             runners,
@@ -5545,7 +5812,12 @@ impl Pipeline {
         // The consumer owns a Send `BakeContext` and builds its own (non-Send)
         // overlay baker from it, plus the single `ProgramEncoder`; the bake +
         // encode math moved off the hot loop, never onto it.
-        let bake_ctx = self.bake_context();
+        #[cfg_attr(not(any(test, feature = "overlay")), allow(unused_mut))]
+        let mut bake_ctx = self.bake_context();
+        #[cfg(test)]
+        {
+            bake_ctx.consumer_stall = self.consumer_stall_for_test.take();
+        }
         #[cfg(feature = "overlay")]
         let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
         // Output routing (ADR-0108 slice 1): the clock's aux tick sender (inert
@@ -5560,7 +5832,13 @@ impl Pipeline {
             preview_selection,
             aux: _routing_aux,
             program_lateness,
+            #[cfg(feature = "overlay")]
+            aux_signals,
         } = routing;
+        #[cfg(feature = "overlay")]
+        {
+            bake_ctx.aux_signals = Some(aux_signals);
+        }
         demand.start();
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
@@ -6228,6 +6506,9 @@ impl Pipeline {
                 .demand
                 .as_ref()
                 .map(|manager| (manager.activity_reader(), Arc::clone(&self.catalogue))),
+            #[cfg(test)]
+            consumer_stall: None,
+            aux_signals: None,
         }
     }
 
@@ -6236,7 +6517,10 @@ impl Pipeline {
     #[cfg(not(feature = "overlay"))]
     #[allow(clippy::unused_self)]
     fn bake_context(&self) -> BakeContext {
-        BakeContext {}
+        BakeContext {
+            #[cfg(test)]
+            consumer_stall: None,
+        }
     }
 }
 
@@ -6295,6 +6579,16 @@ struct BakeContext {
         multiview_engine::ActivityReader,
         crate::source_rails::Catalogue,
     )>,
+    /// Test seam: `(tick, stall)` — the consumer sleeps once for `stall` at
+    /// the first hot item at or after `tick` (see
+    /// [`Pipeline::stall_consumer_once_for_test`]).
+    #[cfg(test)]
+    consumer_stall: Option<(u64, Duration)>,
+    /// Routed layouts' overlay signals: published at most once per baked
+    /// frame, only while a routed layout wants them (one relaxed load
+    /// otherwise). `None` before routing is wired and in tests.
+    #[cfg(feature = "overlay")]
+    aux_signals: Option<crate::aux_overlays::AuxSignalsPublisher>,
 }
 
 impl BakeContext {
@@ -6377,12 +6671,22 @@ struct StreamBaker {
     tile_snapshot: Arc<Vec<crate::overlays::TileSpec>>,
     /// Last per-input audio peak observed by the consumer's live bus meter.
     live_meter_db: std::collections::HashMap<String, crate::overlays::MeterChannels>,
+    /// When each `live_meter_db` entry was last sampled (elapsed ns), so a
+    /// source that left the bus is forgotten (bounded map, A2).
+    live_meter_seen: std::collections::HashMap<String, i64>,
+    /// Elapsed ns of the last prune pass.
+    live_meter_pruned_ns: i64,
     /// Bounded per-input peak/RMS sampler shared with audio telemetry.
     input_meters: crate::meter_telemetry::InputMeters,
 }
 
 #[cfg(not(feature = "overlay"))]
 struct StreamBaker;
+
+/// A live meter not sampled for this long (its source left the program bus)
+/// is forgotten (~5 s).
+#[cfg(feature = "overlay")]
+const LIVE_METER_FORGET_NS: i64 = 5_000_000_000;
 
 #[cfg(feature = "overlay")]
 impl StreamBaker {
@@ -6413,6 +6717,8 @@ impl StreamBaker {
             baker,
             tile_snapshot,
             live_meter_db: std::collections::HashMap::new(),
+            live_meter_seen: std::collections::HashMap::new(),
+            live_meter_pruned_ns: 0,
             input_meters: crate::meter_telemetry::InputMeters::new(),
             canvas_color: ctx.canvas_color,
             cadence: ctx.cadence,
@@ -6460,9 +6766,24 @@ impl StreamBaker {
                     id.clone(),
                     crate::overlays::MeterChannels::from_db(&sample.peak_db),
                 );
+                self.live_meter_seen.insert(id.clone(), now_ns);
             }
         }
+        self.prune_live_meters(now_ns);
         samples
+    }
+
+    /// Forget the live meter of a source not sampled for
+    /// [`LIVE_METER_FORGET_NS`] (it left the program bus), so source churn
+    /// cannot grow the map without bound. At most once per second.
+    fn prune_live_meters(&mut self, now_ns: i64) {
+        if now_ns.saturating_sub(self.live_meter_pruned_ns) < 1_000_000_000 {
+            return;
+        }
+        self.live_meter_pruned_ns = now_ns;
+        let seen = &mut self.live_meter_seen;
+        seen.retain(|_, last| now_ns.saturating_sub(*last) <= LIVE_METER_FORGET_NS);
+        self.live_meter_db.retain(|id, _| seen.contains_key(id));
     }
 
     /// Bake one streamed tick's overlays into its canvas, returning the overlaid
@@ -6534,6 +6855,7 @@ impl StreamBaker {
                     state,
                     fault,
                     activity,
+                    tally: crate::overlays::TileTally::Off,
                 },
             );
             if !captions.contains_key(&spec.source_id) {
@@ -6554,7 +6876,25 @@ impl StreamBaker {
             .map_err(|e| PipelineError::Engine(format!("overlay draw: {e}")))?;
         let overlaid = apply_overlays_to_nv12(&item.canvas, &list, self.canvas_color)
             .map_err(|e| PipelineError::Engine(format!("overlay blend: {e}")))?;
+        self.publish_aux_signals(item);
         Ok(Arc::new(overlaid))
+    }
+
+    /// Hand routed layouts the per-source signals this frame carries (live
+    /// meters, content faults, the sources on Program) — at most once per
+    /// baked frame, and only while some routed layout bakes overlays: one
+    /// relaxed load otherwise. A wait-free store; the aux thread never waits
+    /// on it and this never waits on the aux thread.
+    fn publish_aux_signals(&self, item: &StreamItem) {
+        let Some(publisher) = self.meter.aux_signals.as_ref() else {
+            return;
+        };
+        if !publisher.wanted() {
+            return;
+        }
+        // Only the sources the baking layouts bind (bounded by layouts ×
+        // cells), never the whole tracked map.
+        publisher.publish_for(&self.live_meter_db, &item.faults, &item.source_states);
     }
 }
 
@@ -6957,6 +7297,9 @@ impl StreamEgress {
             .iter()
             .map(|(_, send_policy)| match send_policy {
                 SinkSendPolicy::DropWhenFull(link) => BindingPolicy::Push(Arc::clone(link)),
+                SinkSendPolicy::DropCounted(counter) => {
+                    BindingPolicy::DropCounted(Arc::clone(counter))
+                }
                 SinkSendPolicy::Bounded => BindingPolicy::Bounded,
             })
             .collect();
@@ -7809,6 +8152,9 @@ struct RunRouting {
     aux: crate::routing_aux::RoutingAuxHandle,
     /// Where the run publishes Program's lateness for the aux back-off.
     program_lateness: crate::routing_aux::ProgramLateness,
+    /// The consumer's side of the routed-layout overlay signals.
+    #[cfg(feature = "overlay")]
+    aux_signals: crate::aux_overlays::AuxSignalsPublisher,
 }
 
 /// Output-routing state the bake consumer owns for one run (ADR-0108).
@@ -8390,6 +8736,12 @@ fn consumer_main<D: WindowDelivery>(
     // base format, fed non-blocking right after the bake. Empty (no thread,
     // no work) for a run whose base keys are all at the canvas format.
     let mut convert_stages = crate::format_convert::ConvertStages::default();
+    #[cfg(test)]
+    let (ctx, mut test_stall) = {
+        let mut ctx = ctx;
+        let stall = ctx.consumer_stall.take();
+        (ctx, stall)
+    };
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
     if video_encoders.is_empty() {
@@ -8633,6 +8985,13 @@ fn consumer_main<D: WindowDelivery>(
         in_flight.fetch_sub(1, Ordering::AcqRel);
         #[cfg(feature = "_chaos-test-seams")]
         chaos_stall.maybe_stall(item.tick_index);
+        #[cfg(test)]
+        if let Some((at, stall)) = test_stall {
+            if item.tick_index >= at {
+                test_stall = None;
+                std::thread::sleep(stall);
+            }
+        }
         // Live-opened encoders' windows first: a live window T must be staged
         // before base window T closes, or a move onto it is refused.
         router
@@ -9163,6 +9522,9 @@ enum SinkSendPolicy {
     /// Never wait ([`send_or_drop`]): a resilient live push drops + counts on
     /// a full queue (its link status records the drop).
     DropWhenFull(Arc<multiview_output::push_link::PushLinkStatus>),
+    /// Never wait and never abandon: a sink that stalls and comes back (the
+    /// cast packager's disk writes) loses packets, each added to the counter.
+    DropCounted(Arc<AtomicU64>),
 }
 // scatter the dispatch without reducing complexity.
 #[allow(clippy::too_many_lines)] // Each sink variant seeds its independent mux and transport state.
@@ -9283,6 +9645,15 @@ fn run_one_output(
             rx,
             multiview_output::MuxStream::new(params, time_base),
             (audio, &track_mux),
+        )),
+        RunnableOutput::Cast {
+            id,
+            gate,
+            dir,
+            default_dir: _,
+            epoch,
+        } => Ok(run_cast_output(
+            &id, gate, &dir, epoch, &rx, params, time_base, audio,
         )),
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { id: _, sink, label } => {
@@ -9626,6 +9997,79 @@ where
     }
 }
 
+/// Run a cast output's sink (ADR-0111) over its fan-out channel.
+/// **Infallible**: a cast output can never fail the run.
+///
+/// The packager's video rendition is described by the encoder that feeds
+/// this output (its real size, bit rate and parameter sets), never by the
+/// canvas: an output with its own format is encoded at that format.
+#[allow(clippy::too_many_arguments)] // Each argument is one distinct input of the sink thread.
+fn run_cast_output(
+    id: &str,
+    gate: Arc<crate::cast_output::CastGate>,
+    dir: &Path,
+    epoch: multiview_output::SharedEpoch,
+    rx: &Receiver<LeasedPacket>,
+    params: &StreamCodecParameters,
+    time_base: Rational,
+    audio: Option<&(StreamCodecParameters, Rational)>,
+) -> SinkRunOutcome {
+    use multiview_output::hls::cast::{CastAudioConfig, CastVideoConfig};
+    let (width, height) = params.video_dimensions().unwrap_or((0, 0));
+    let video = CastVideoConfig {
+        time_base,
+        width,
+        height,
+        bit_rate: params.opened_bit_rate().or_else(|| params.bit_rate()),
+        extradata: params.codec_config_bytes(),
+    };
+    let audio = audio.and_then(|(audio_params, audio_tb)| {
+        // The audio time base is `1/sample_rate` (the AAC encoder's).
+        let sample_rate = (audio_tb.num == 1)
+            .then(|| u32::try_from(audio_tb.den).ok())
+            .flatten()?;
+        let asc = audio_params.codec_config_bytes();
+        // AudioSpecificConfig: 5 bits object type, 4 bits rate index, 4 bits
+        // channel configuration. Stereo (the program bus) when absent.
+        let channels = asc
+            .as_deref()
+            .and_then(|bytes| bytes.get(1))
+            .map(|byte| u16::from((byte >> 3) & 0x0F))
+            .filter(|channels| *channels > 0)
+            .unwrap_or(multiview_config::output_format::SLOT_AUDIO_CHANNELS);
+        Some(CastAudioConfig {
+            time_base: *audio_tb,
+            sample_rate,
+            channels,
+            bit_rate: audio_params
+                .opened_bit_rate()
+                .or_else(|| audio_params.bit_rate()),
+            audio_specific_config: asc,
+        })
+    });
+    let setup = crate::cast_output::CastSetup {
+        id: id.to_owned(),
+        dir: dir.to_path_buf(),
+        gate,
+        epoch,
+        video,
+        audio,
+    };
+    let report =
+        crate::cast_output::run_cast_sink(setup, rx, &|packet| params.is_decoder_ready_rap(packet));
+    SinkRunOutcome {
+        line: format!(
+            "cast {id} ({}): {} packet(s), {} restart(s){}",
+            dir.display(),
+            report.packets,
+            report.restarts,
+            if report.panicked { " (disabled)" } else { "" }
+        ),
+        playlist: None,
+        frames: report.packets,
+    }
+}
+
 /// Run a live push sink (SRT / RTMP / RIST / UDP) over its fan-out channel.
 /// **Infallible** by design (returns a [`SinkRunOutcome`], never an error).
 ///
@@ -9701,75 +10145,10 @@ fn sample_caption_bitmaps(
     out
 }
 
-/// An operator-declared probe override for one source, resolved from
-/// `config.probes` (M10): the config [`Probe`](multiview_config::probe::Probe) the
-/// engine builds a config-derived analyser + X.733 lifecycle from, per fault
-/// class. A `None` entry means "no declared probe for this class — use the
-/// hardcoded default".
-///
-/// The first declared probe of each kind for a source wins (duplicate probe ids
-/// are already rejected by config validation; two probes of the same kind on one
-/// source is an unusual config and deterministically resolves to the first).
+/// Per-source declared probe overrides (shared with routed layouts' fault
+/// detection; see [`crate::fault_probes`]).
 #[cfg(feature = "overlay")]
-#[derive(Default, Clone)]
-struct SourceProbeOverride {
-    /// The declared black probe (its `luma_threshold` + `zone` + dwell + severity).
-    black: Option<multiview_config::probe::Probe>,
-    /// The declared freeze probe (its `difference_threshold` + `zone` + dwell + …).
-    freeze: Option<multiview_config::probe::Probe>,
-    /// The declared silence probe (its dwell + severity, and its `level_dbfs`,
-    /// which becomes this source's silence detection floor in place of the shared
-    /// [`SILENCE_FLOOR_DB`]).
-    silence: Option<multiview_config::probe::Probe>,
-}
-
-/// Resolve `config.probes` into per-**source** overrides by mapping each probe's
-/// watched **cell** to its bound source via the solved `layout` (M10).
-///
-/// A probe whose cell is unbound (no `source`) or absent from the layout is
-/// skipped — there is no picture/audio to analyse. Runs once at run start, off the
-/// hot loop.
-#[cfg(feature = "overlay")]
-fn resolve_source_probes(
-    layout: &Layout,
-    probes: &[multiview_config::probe::Probe],
-) -> std::collections::HashMap<String, SourceProbeOverride> {
-    use multiview_config::probe::ProbeKind;
-    let mut out: std::collections::HashMap<String, SourceProbeOverride> =
-        std::collections::HashMap::new();
-    for probe in probes {
-        // The config carries cell ids only on the raw cells, not the solved
-        // `Layout`; the layout cell binds a `source`, and a probe's `cell` field
-        // names a config cell id. The desugared run binds cell id == source id for
-        // the common single-source-per-cell case, so resolve by matching the
-        // probe's cell against a layout cell whose bound source equals it, falling
-        // back to treating the probe's `cell` as the source id directly when no
-        // distinct cell id is carried. Either way an unbound name is skipped.
-        let source = layout
-            .cells
-            .iter()
-            .filter_map(|c| c.source.clone())
-            .find(|s| s == &probe.cell)
-            .unwrap_or_else(|| probe.cell.clone());
-        let entry = out.entry(source).or_default();
-        match probe.kind {
-            ProbeKind::Black { .. } if entry.black.is_none() => {
-                entry.black = Some(probe.clone());
-            }
-            ProbeKind::Freeze { .. } if entry.freeze.is_none() => {
-                entry.freeze = Some(probe.clone());
-            }
-            ProbeKind::Silence { .. } if entry.silence.is_none() => {
-                entry.silence = Some(probe.clone());
-            }
-            // A loudness probe (or a duplicate of an already-captured kind, or a
-            // future kind) does not override one of the three content-fault badge
-            // classes; the loudness alarm rides the meter path elsewhere.
-            _ => {}
-        }
-    }
-    out
-}
+use crate::fault_probes::{resolve_source_probes, SourceProbeOverride};
 
 /// The dBFS floor at/below which the per-input meter is treated as **silent**
 /// for the audio-loss fault. Just above the meter's true floor so a genuinely
@@ -9969,67 +10348,43 @@ impl FaultDetector {
         audio_free_sources: AudioFreeSources,
         source_probes: std::collections::HashMap<String, SourceProbeOverride>,
     ) -> Self {
-        use multiview_engine::{
-            black_config_from_kind, freeze_config_from_kind, AlarmHysteresis, BlackConfig,
-            BlackProbe, FreezeConfig, FreezeProbe,
-        };
-        // Dwell windows on the media timeline. Black/silence raise after ~0.5 s of
-        // the condition and clear after ~0.3 s of its absence; freeze needs a
-        // longer ~2 s of identical frames so a brief genuine still does not trip
-        // it. These give the anti-flap hysteresis without coupling to wall-clock.
-        let dwell = |secs_num: i64, secs_den: i64| -> MediaTime {
-            MediaTime::from_nanos(secs_num.saturating_mul(1_000_000_000) / secs_den.max(1))
-        };
-        let down = dwell(3, 10); // 0.3 s
-                                 // The CLI freeze probe widens only the PER-SAMPLE tolerance vs the engine
-                                 // default — the root cause of the missed badge was tolerance, not the
-                                 // change threshold. Instrumented across the three real demo sources scaled
-                                 // to a 636x356 tile, the changed-fraction with diff_tolerance=6 was:
-                                 //   frozen:  median 0.000%, max 1.27%, 148/150 frames <= 0.1%
-                                 //   silent:  median 0.229%, max 1.91%,   4/150 frames <= 0.1%  (moving)
-                                 //   healthy: median 3.13%,  max 71%,      5/150 frames <= 0.1%
-                                 // diff_tolerance=6 collapses GOP re-quantization noise (the frozen source's
-                                 // per-GOP spike drops from 1.2-4.6% at the default tolerance 2 to <= 1.27%,
-                                 // its steady frames to 0.000%); the engine-default change_threshold (0.1%)
-                                 // is KEPT because at tolerance 6 it already separates a frozen feed (148/150
-                                 // below) from a moving-but-silent feed (only 4/150 below). An earlier 0.5%
-                                 // threshold over-loosened this and wrongly flagged the moving silent tile.
-                                 // The two residual per-GOP spikes the frozen source still shows are absorbed
-                                 // by the debounce window below, not by a looser threshold.
-        let freeze_cfg = FreezeConfig::default().with_tolerance(6);
+        // The default analysers + dwell windows (black/silence raise after
+        // ~0.5 s, freeze after ~2 s, all clear after ~0.3 s — media timeline,
+        // never wall-clock) and the CLI freeze tolerance, shared with routed
+        // layouts' fault detection.
+        //
+        // The CLI freeze probe widens only the PER-SAMPLE tolerance vs the
+        // engine default — the root cause of the missed badge was tolerance,
+        // not the change threshold. Instrumented across the three real demo
+        // sources scaled to a 636x356 tile, the changed-fraction with
+        // diff_tolerance=6 was:
+        //   frozen:  median 0.000%, max 1.27%, 148/150 frames <= 0.1%
+        //   silent:  median 0.229%, max 1.91%,   4/150 frames <= 0.1%  (moving)
+        //   healthy: median 3.13%,  max 71%,      5/150 frames <= 0.1%
+        // diff_tolerance=6 collapses GOP re-quantization noise; the
+        // engine-default change_threshold (0.1%) is KEPT because at tolerance 6
+        // it already separates a frozen feed from a moving-but-silent feed. The
+        // two residual per-GOP spikes the frozen source still shows are absorbed
+        // by the debounce window, not by a looser threshold.
+        let defaults = crate::fault_probes::DefaultProbes::default();
         // Build the per-source config-derived analysers ONCE from any declared
-        // black/freeze probe (its operator-authored threshold + zone). A declared
-        // freeze probe is honoured verbatim — the CLI's codec-noise tolerance/
-        // debounce defaults still apply to it via the shared sample path, but its
-        // change threshold + zone are the operator's. Sources without a declared
-        // probe never appear here and fall back to the shared defaults.
+        // black/freeze probe (its operator-authored threshold + zone). A
+        // declared freeze probe keeps the CLI's codec-noise tolerance; its
+        // change threshold + zone are the operator's. Sources without a
+        // declared probe fall back to the shared defaults.
         let mut declared_black = std::collections::HashMap::new();
         let mut declared_freeze = std::collections::HashMap::new();
         let mut declared_silence_floor = std::collections::HashMap::new();
         for (source, ov) in &source_probes {
-            if let Some(cfg) = ov
-                .black
-                .as_ref()
-                .and_then(|p| black_config_from_kind(&p.kind))
-            {
-                declared_black.insert(source.clone(), BlackProbe::new(cfg));
+            if let Some(probe) = crate::fault_probes::declared_black(ov) {
+                declared_black.insert(source.clone(), probe);
             }
-            if let Some(cfg) = ov
-                .freeze
-                .as_ref()
-                .and_then(|p| freeze_config_from_kind(&p.kind))
-            {
-                // Preserve the CLI's wider per-sample tolerance for real encoded
-                // sources; only the operator-authored change threshold + zone come
-                // from config (the engine `from_kind` keeps the default tolerance,
-                // which we override to the CLI's 6 to match the default path).
-                declared_freeze.insert(source.clone(), FreezeProbe::new(cfg.with_tolerance(6)));
+            if let Some(probe) = crate::fault_probes::declared_freeze(ov) {
+                declared_freeze.insert(source.clone(), probe);
             }
             // A declared silence probe carries the operator-authored level ceiling
-            // (`level_dbfs`); thread it into this source's detection floor so the
-            // instantaneous silence condition uses the operator's threshold rather
-            // than the shared default. Widen `f32 -> f64` exactly (`f64::from`, no
-            // `as` cast) to match the meter timeline scale.
+            // (`level_dbfs`); thread it into this source's detection floor. Widen
+            // `f32 -> f64` exactly (`f64::from`, no `as` cast).
             if let Some(multiview_config::probe::ProbeKind::Silence { level_dbfs }) =
                 ov.silence.as_ref().map(|p| p.kind)
             {
@@ -10043,13 +10398,13 @@ impl FaultDetector {
             cadence,
             audio_free_sources,
             machines: std::collections::HashMap::new(),
-            black: BlackProbe::new(BlackConfig::default()),
-            freeze: FreezeProbe::new(freeze_cfg),
+            black: defaults.black,
+            freeze: defaults.freeze,
             previous: std::collections::HashMap::new(),
             freeze_window: std::collections::HashMap::new(),
-            hysteresis_black: AlarmHysteresis::new(dwell(1, 2), down), // 0.5 s up
-            hysteresis_freeze: AlarmHysteresis::new(dwell(2, 1), down), // 2 s up
-            hysteresis_silence: AlarmHysteresis::new(dwell(1, 2), down), // 0.5 s up
+            hysteresis_black: defaults.black_dwell,
+            hysteresis_freeze: defaults.freeze_dwell,
+            hysteresis_silence: defaults.silence_dwell,
             source_probes,
             declared_black,
             declared_freeze,
@@ -10066,43 +10421,33 @@ impl FaultDetector {
     /// declared probe use the hardcoded default machine, so an undeclared source is
     /// byte-for-byte the prior behaviour.
     fn machines_for(&mut self, id: &str) -> &mut SourceFaultMachines {
-        use multiview_core::alarm::{AlarmId, AlarmKind, AlarmScope, PerceivedSeverity};
-        use multiview_engine::{AlarmHysteresis, AlarmStateMachine};
+        use crate::fault_probes::fault_machine;
+        use multiview_core::alarm::{AlarmKind, PerceivedSeverity};
         let hb = self.hysteresis_black;
         let hf = self.hysteresis_freeze;
         let hs = self.hysteresis_silence;
         let ov = self.source_probes.get(id).cloned().unwrap_or_default();
         self.machines.entry(id.to_owned()).or_insert_with(|| {
-            let mk = |kind: AlarmKind, sev: PerceivedSeverity, hyst: AlarmHysteresis| {
-                AlarmStateMachine::new(
-                    AlarmId::new(format!("{id}:{kind:?}")),
-                    kind,
-                    AlarmScope::Probe { id: id.to_owned() },
-                    sev,
-                    hyst,
-                )
-            };
             // A declared probe's full X.733 lifecycle (id/scope/severity/dwell/
             // latch) via `from_probe`; otherwise the hardcoded default machine.
-            let from_or_default = |probe: &Option<multiview_config::probe::Probe>,
-                                   kind: AlarmKind,
-                                   sev: PerceivedSeverity,
-                                   hyst: AlarmHysteresis| {
-                match probe {
-                    Some(p) => AlarmStateMachine::from_probe(p),
-                    None => mk(kind, sev, hyst),
-                }
-            };
             SourceFaultMachines {
-                black: from_or_default(&ov.black, AlarmKind::Black, PerceivedSeverity::Major, hb),
-                freeze: from_or_default(
-                    &ov.freeze,
+                black: fault_machine(
+                    id,
+                    ov.black.as_ref(),
+                    AlarmKind::Black,
+                    PerceivedSeverity::Major,
+                    hb,
+                ),
+                freeze: fault_machine(
+                    id,
+                    ov.freeze.as_ref(),
                     AlarmKind::Freeze,
                     PerceivedSeverity::Major,
                     hf,
                 ),
-                silence: from_or_default(
-                    &ov.silence,
+                silence: fault_machine(
+                    id,
+                    ov.silence.as_ref(),
                     AlarmKind::Silence,
                     PerceivedSeverity::Minor,
                     hs,
@@ -10888,6 +11233,7 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
             store.filter(|_| self.clear_on_remove)
         });
         let lifecycle = remove_live_lifecycle(id);
+        crate::passthrough_tap::forget(id);
         if let Some(store) = retired_store {
             store.clear();
         }
@@ -12351,51 +12697,10 @@ fn duration_from_nanos(nanos: i64) -> Duration {
     Duration::from_nanos(u64::try_from(nanos.max(0)).unwrap_or(u64::MAX))
 }
 
-/// Resolve source-bound cells into canvas-space tile chrome, in cell order.
+/// Resolve source-bound cells into canvas-space tile chrome, in cell order
+/// (moved to [`crate::overlays`] so a routed layout's aux bake shares it).
 #[cfg(feature = "overlay")]
-pub(crate) fn tile_specs_for_layout(
-    layout: &Layout,
-    labels: &std::collections::HashMap<String, String>,
-) -> Vec<crate::overlays::TileSpec> {
-    use multiview_overlay::geometry::PixelRect;
-    let (cw, ch) = (layout.canvas.width, layout.canvas.height);
-    layout
-        .cells
-        .iter()
-        .filter_map(|cell| {
-            let id = cell.source.as_deref()?;
-            let label = labels.get(id).cloned().unwrap_or_else(|| id.to_owned());
-            // Match the compositor's normalized endpoint quantization, not an
-            // independent truncation of width/height that can spill a pixel.
-            let x = norm_to_px_f32(cell.x, cw);
-            let y = norm_to_px_f32(cell.y, ch);
-            let right = norm_to_px_f32(cell.x + cell.w, cw);
-            let bottom = norm_to_px_f32(cell.y + cell.h, ch);
-            Some(crate::overlays::TileSpec::new(
-                id,
-                label,
-                PixelRect {
-                    x,
-                    y,
-                    width: right - x,
-                    height: bottom - y,
-                },
-            ))
-        })
-        .collect()
-}
-
-/// Convert a normalized fraction in `[0,1]` to a pixel coordinate `f32` against
-/// `extent`, `as`-cast-free, for placing the per-tile overlay surface. Reuses the
-/// exact integer [`crate::display_size::frac_to_px`] then widens losslessly (overlay sizes are well
-/// under 2^24).
-#[cfg(feature = "overlay")]
-fn norm_to_px_f32(frac: f32, extent: u32) -> f32 {
-    let px = crate::display_size::frac_to_px(frac, extent);
-    let high = u16::try_from(px >> 16).unwrap_or(u16::MAX);
-    let low = u16::try_from(px & 0xFFFF).unwrap_or(u16::MAX);
-    f32::from(high) * 65_536.0 + f32::from(low)
-}
+pub(crate) use crate::overlays::tile_specs_for_layout;
 
 /// Whole ticks in one second at `cadence` (`num/den`), rounded to nearest, used
 /// as the GOP / segment length. Exact integer arithmetic (never float fps).
@@ -12601,7 +12906,7 @@ pub fn analog_clocks_from_config(
 }
 
 /// Exact small-`u32` → `f32` widening (canvas sizes are well under `2^24`), no
-/// `as` cast — mirrors [`norm_to_px_f32`]'s widener.
+/// `as` cast — mirrors the overlay tile resolver's widener.
 #[cfg(feature = "overlay")]
 fn u32_to_f32(value: u32) -> f32 {
     let high = u16::try_from(value >> 16).unwrap_or(u16::MAX);
@@ -12671,7 +12976,9 @@ fn output_codec(output: &Output) -> Option<&str> {
         // codec they name (default h264). A webrtc-only config therefore selects
         // h264, not the mpeg2video fallback the SRTP packetizer cannot carry.
         | Output::Webrtc { codec, .. }
-        | Output::WhipPush { codec, .. } => Some(codec.as_str()),
+        | Output::WhipPush { codec, .. }
+        // A cast output consumes an H.264 rendition like an HLS output.
+        | Output::Cast { codec, .. } => Some(codec.as_str()),
         // NDI carries no codec token; a future output kind names none here until
         // explicitly wired (`Output` is `#[non_exhaustive]`).
         Output::Ndi { .. } | _ => None,
@@ -13562,6 +13869,22 @@ fn build_outputs(
                 runnable.push(built);
                 subtitles.extend(plan);
             }
+            // A cast output (ADR-0111): nothing touches the disk here. Its
+            // directory is claimed when the run starts and written only
+            // while a cast stream is active.
+            Output::Cast { id, dir, .. } => {
+                let default_state = multiview_control::boot_model::state_dir_for(Path::new(""));
+                runnable.push(RunnableOutput::Cast {
+                    id: id.clone(),
+                    gate: Arc::new(crate::cast_output::CastGate::new()),
+                    dir: dir.as_ref().map_or_else(
+                        || crate::cast_output::default_cast_dir(&default_state, id),
+                        PathBuf::from,
+                    ),
+                    default_dir: dir.is_none(),
+                    epoch: epoch.clone(),
+                });
+            }
             Output::Rtmp { url, .. } => {
                 runnable.push(build_push_output(output, PushProtocol::Rtmp, url, "rtmp"));
             }
@@ -14078,7 +14401,11 @@ fn handle_ndi_output(
 /// sequence header, SDP, `moov`); raw-frame sinks carry no packets.
 fn inband_parameter_changes_ok(output: &RunnableOutput) -> bool {
     match output {
-        RunnableOutput::Hls { .. } => true,
+        // The cast packager is not a libav muxer with one fixed init: it
+        // reads the parameter sets of every IDR, and on a change it writes a
+        // new init segment and declares `EXT-X-DISCONTINUITY`, so a switch
+        // onto changed sets (always a self-contained RAP) is a clean splice.
+        RunnableOutput::Hls { .. } | RunnableOutput::Cast { .. } => true,
         // `srt` / `rist` mux MPEG-TS; `rtmp` muxes FLV (sequence header).
         RunnableOutput::Push { label, .. } => matches!(*label, "srt" | "rist"),
         RunnableOutput::File { path, .. } => path
@@ -14104,7 +14431,9 @@ fn maybe_prepend_program_ts(mut runnable: Vec<RunnableOutput>, live: bool) -> Ve
         }
         // A push / WebRTC output has no on-disk directory to derive a program
         // file from; only an HLS output anchors the self-contained `program.ts`.
-        RunnableOutput::File { .. } | RunnableOutput::Push { .. } => None,
+        RunnableOutput::File { .. } | RunnableOutput::Push { .. } | RunnableOutput::Cast { .. } => {
+            None
+        }
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { .. } => None,
         // The NDI sink is a raw-canvas consumer, not a packet/disk muxer — it
@@ -14242,6 +14571,8 @@ fn apply_output_audio_selections(
             RunnableOutput::File { id, sink, .. }
             | RunnableOutput::Hls { id, sink, .. }
             | RunnableOutput::Push { id, sink, .. } => (id.as_str(), sink),
+            // Program audio only: nothing to select.
+            RunnableOutput::Cast { .. } => continue,
             #[cfg(feature = "webrtc-native")]
             RunnableOutput::WebRtc { .. } => continue,
             #[cfg(feature = "ndi-bindings")]
@@ -14813,6 +15144,7 @@ fn ingest_plan_for(
         output_origin: crate::timing_status::anchor_slot(),
         live_anchor: live_anchor_slot(&source.id),
         lifecycle: 0,
+        tap: Some(crate::passthrough_tap::source_tap(&source.id)),
         live,
         #[cfg(feature = "overlay")]
         incontainer_sub: None,
@@ -15023,6 +15355,7 @@ fn build_media_player_boot(
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             // A media player is a finite asset played under transport control;
             // it is not a live (reconnect-forever) source — the player loop owns
             // its own loop/hold lifecycle.
@@ -17566,6 +17899,10 @@ fn open_and_stream(
     // error (docs/architecture/local-capture-devices.md).
     let is_device = matches!(plan.location, SourceLocation::Device { .. });
     let mut last_device_frame = Instant::now();
+    // The compressed passthrough tap (output-routing §12.5, #344 D2a): one
+    // writer per connection, fed on the demux thread. Without a consumer it
+    // costs one atomic load per video packet; it never blocks this thread.
+    let mut tap_writer = tap_writer_for(plan, &input, stream_index, declared_fps);
     let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
         let mut packet = ffmpeg::codec::packet::Packet::empty();
         match packet.read(&mut input) {
@@ -17587,6 +17924,9 @@ fn open_and_stream(
                 last_device_frame = Instant::now();
                 if packet.stream() == stream_index {
                     video_fence = video_fence.saturating_add(1);
+                    if let (Some(writer), Some(bytes)) = (tap_writer.as_mut(), packet.data()) {
+                        writer.on_packet(bytes, packet.dts(), packet.pts(), packet.is_key());
+                    }
                 }
                 Some(ReadItem::Packet((video_fence, packet)))
             }
@@ -18574,6 +18914,50 @@ fn heartbeat_player_hold(
             }),
         );
     }
+}
+
+/// The passthrough tap writer for this connection of `plan` (#344 D2a), or
+/// `None` when the plan has no tap or the stream's codec/framing is not one
+/// the strict-IDR classifier models. Bumps the tap's connection generation
+/// and publishes the stream's match-rule traits. Arrival times are read from
+/// the run's monotonic time source (wait-free); before a run seeds the writer
+/// skips packets (counted), so a passthrough clock never sees a mixed base.
+fn tap_writer_for(
+    plan: &IngestPlan,
+    input: &ffmpeg::format::context::Input,
+    stream_index: usize,
+    declared_fps: Rational,
+) -> Option<crate::passthrough_tap::TapWriter> {
+    let tap = plan.tap.as_ref()?;
+    let stream = input.stream(stream_index)?;
+    let params = stream.parameters();
+    let (codec, framing) = multiview_ffmpeg::stream_framing(&params)?;
+    let facts = multiview_ffmpeg::video_stream_facts(&params);
+    let open = crate::passthrough_tap::OpenFacts {
+        codec,
+        framing,
+        time_base: multiview_ffmpeg::from_ff_rational(stream.time_base()),
+        frame_rate: declared_fps,
+        profile: facts.profile,
+        level: facts.level,
+        width: facts.width,
+        height: facts.height,
+        color_primaries: facts.color_primaries,
+        color_trc: facts.color_trc,
+        color_space: facts.color_space,
+        color_range: facts.color_range,
+        field_order: facts.field_order,
+        bits_per_raw_sample: facts.bits_per_raw_sample,
+        extradata: facts.extradata,
+        extradata_oversize: facts.extradata_oversize,
+    };
+    let origin = Arc::clone(&plan.output_origin);
+    let now_ns = Box::new(move || {
+        origin
+            .load()
+            .and_then(|run| u64::try_from(run.time().now_nanos()).ok())
+    });
+    crate::passthrough_tap::TapWriter::try_connect(Arc::clone(tap), open, now_ns)
 }
 
 /// Resolve the best video stream's `(index, codec parameters, time-base,
@@ -22696,6 +23080,8 @@ mod live_overlay_bake_tests {
             canvas_height: 180,
             overlay_apply: Some(Arc::clone(slot)),
             activity: None,
+            consumer_stall: None,
+            aux_signals: None,
         }
     }
 
@@ -22798,6 +23184,47 @@ mod live_overlay_bake_tests {
         assert!(frame.events.is_empty());
         let cleared = baker.bake(&frame).expect("cleared");
         assert_eq!(region_diff(&plain, &cleared, (0, 30, 320, 120)), 0);
+    }
+
+    /// A2: source churn (1000 distinct sources joining and leaving the
+    /// program bus) never grows the live meter map past the sources sampled
+    /// within the forget window.
+    #[test]
+    fn live_meters_of_sources_that_left_the_bus_are_forgotten() {
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+        let mut max_len = 0;
+        // 1000 sources, one live at a time, each for one 40 ms tick.
+        for i in 0..1000u64 {
+            let mut bus = multiview_audio::ProgramBus::new(
+                crate::audio::canonical_format(),
+                Rational::new(25, 1),
+            );
+            let store = crate::audio::new_store();
+            store
+                .publish_samples(&vec![0.25; 1_920 * 2])
+                .expect("samples");
+            bus.add_source(format!("churn-{i}"), store, 0.0);
+            let _ = super::drive_audio_for_item(&mut bus, 0);
+            let elapsed = std::time::Duration::from_millis(40 * i);
+            let _ = baker.sample_input_meters(&bus, elapsed);
+            max_len = max_len.max(baker.live_meter_db.len());
+        }
+        // Bounded: never more than the sources sampled within the forget
+        // window (5 s + the 1 s prune period at 25 ticks/s = 150 ids), and
+        // never more than the sampler tracks.
+        assert!(max_len <= 150, "live meter map bounded: {max_len}");
+        assert!(
+            max_len <= crate::meter_telemetry::MAX_INPUT_TRACKS,
+            "live meter map within the sampler's bound: {max_len}"
+        );
+        assert_eq!(baker.live_meter_db.len(), baker.live_meter_seen.len());
+        // 40 s on, every churned source has been gone > 5 s: forgotten.
+        assert!(
+            baker.live_meter_db.is_empty(),
+            "departed sources are forgotten: {:?}",
+            baker.live_meter_db.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -23388,6 +23815,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -23560,6 +23988,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -23676,6 +24105,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,

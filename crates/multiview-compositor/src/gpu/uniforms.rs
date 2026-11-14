@@ -319,9 +319,16 @@ impl TileParams {
     /// = origin x, origin y, extent; `prim0.w` = radius, `prim1.w` = expand.
     /// The shader derives the aspect from the canvas size, as the CPU does.
     #[must_use]
-    pub fn with_mask(mut self, mask: &crate::mask::WipeMask) -> Self {
+    pub fn with_mask(mut self, mask: &crate::mask::WipeMask, canvas_w: u32, canvas_h: u32) -> Self {
         // Exact endpoints (review MED-01): coverage 0 is zero opacity,
         // coverage 1 is no mask at all; neither depends on float rounding.
+        // A malformed public mask draws nothing, exactly as on the CPU
+        // reference (`WipeMask::is_valid_for`; the shader evaluates the field
+        // on the canvas size, which this pins equal to the mask's own).
+        if !mask.is_valid_for(canvas_w, canvas_h) {
+            self.opacity_transfer[0] = 0.0;
+            return self;
+        }
         match mask.pinned {
             Some(c) if c <= 0.0 => {
                 self.opacity_transfer[0] = 0.0;
