@@ -300,6 +300,11 @@ fn rig() -> Rig {
 
 /// [`rig`] with the `AppState` adjusted by `adjust` (e.g. JWT enabled).
 fn rig_with(adjust: impl FnOnce(AppState) -> AppState) -> Rig {
+    rig_doc(DOC, adjust)
+}
+
+/// [`rig_with`] over the configuration `doc`.
+fn rig_doc(doc: &str, adjust: impl FnOnce(AppState) -> AppState) -> Rig {
     let tmp = tempfile::tempdir().unwrap();
     let mut dirs = HashMap::new();
     for id in ["cast-1", "cast-2"] {
@@ -308,7 +313,7 @@ fn rig_with(adjust: impl FnOnce(AppState) -> AppState) -> Rig {
         dirs.insert(id.to_owned(), dir);
     }
     std::fs::write(tmp.path().join("secret.m3u8"), "#EXTM3U\n#secret\n").unwrap();
-    let config = MultiviewConfig::load_from_toml(DOC).unwrap();
+    let config = MultiviewConfig::load_from_toml(doc).unwrap();
     config.validate().unwrap();
     let seeded = multiview_control::seed_resources(&config).unwrap();
     let engine = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(256));
@@ -2019,4 +2024,102 @@ async fn an_authorized_request_in_flight_across_a_take_is_served() {
             "{file}: {body:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #418 review ABUSE-2: a cast stream carries its output's discrete audio
+// tracks, so its token needs Read on them too.
+// ---------------------------------------------------------------------------
+
+/// [`DOC`] with cast-1 (output-0) carrying `slots` (TOML appended to its
+/// table) and `extra` appended to the document.
+fn doc_with(slots: &str, extra: &str) -> String {
+    let anchor = "id = \"cast-1\"\ncodec = \"h264\"\n";
+    assert!(DOC.contains(anchor));
+    format!(
+        "{}{extra}",
+        DOC.replacen(anchor, &format!("{anchor}{slots}"), 1)
+    )
+}
+
+/// A discrete track `secret-trk` routed from `secret-cam`.
+const SECRET_TRACK: &str = r#"
+[audio]
+sample_rate_hz = 48000
+[[audio.routes]]
+input_id = "secret-cam"
+channels = { kind = "stereo" }
+target_track = "secret-trk"
+"#;
+
+/// ABUSE-2: a discrete track the stream packages (an explicit audio slot,
+/// or `auto`) needs Read on the track and its route input; the routed audio
+/// (`follow`) is not the whole rendition set.
+#[tokio::test]
+async fn create_is_refused_when_the_owner_may_not_read_a_carried_audio_track() {
+    let slots = "[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"secret-trk\"\n";
+    let auto = "audio = { mode = \"auto\" }\n";
+    for carried in [slots, auto] {
+        let rig = rig_doc(&doc_with(carried, SECRET_TRACK), |s| s);
+        let (status, doc) = create(
+            &rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{carried}: {doc}");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+        let (status, doc) = create(
+            &rig,
+            OPERATOR_2,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{carried}: {doc}");
+        let token = token_of(&doc);
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+            StatusCode::OK
+        );
+    }
+    // A program-only cast output declaring no track selection is unaffected.
+    let rig = rig_doc(&doc_with("", SECRET_TRACK), |s| s);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+}
+
+/// ABUSE-2: a video take on an output carrying a private track keeps
+/// requiring it (the closure is complete on every re-check).
+#[tokio::test]
+async fn a_take_rechecks_the_carried_audio_tracks() {
+    let slots = "[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"secret-trk\"\n";
+    let rig = rig_doc(&doc_with(slots, SECRET_TRACK), |s| s);
+    let (status, doc) = create(
+        &rig,
+        OPERATOR_2,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    let r = send(
+        &rig.router,
+        route_take(
+            OPERATOR_TOKEN,
+            "abuse-2-take",
+            "output-0",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
 }

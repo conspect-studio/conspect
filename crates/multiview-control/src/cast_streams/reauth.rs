@@ -11,8 +11,12 @@
 //! source closure, with exactly the rules the take and the create route
 //! apply: the output on both axes, a source (Read), a layout (Read on the id,
 //! every source its cells bind and its `audio` source), a bus (Program scope
-//! and the M/E grant), and the output's audio choice (`program` → the bus
-//! rule, a source → Read, a track → Read on the name and its route input).
+//! and the M/E grant), the output's audio choice (`program` → the bus
+//! rule, a source → Read, a track → Read on the name and its route input),
+//! every discrete audio track the stream packages as a rendition (#418
+//! review ABUSE-2: `slots.audio` / the output's `audio` selection resolved
+//! by [`multiview_config::Output::carried_audio`], the engine's own rule;
+//! Read on the track name and its route input).
 //! A token whose owner fails, or whose owner can no longer be resolved, is
 //! revoked at once: its next request is the same `404` as any dead token,
 //! the reason stays readable by its owner (`GET /cast/streams/{id}`), the
@@ -302,7 +306,8 @@ fn permits(owner: &Principal, output: &str, needs: &[Need]) -> bool {
 }
 
 /// The grants the output's next feed requires (`None`: undeterminable, so
-/// every token fails closed).
+/// every token fails closed): the picture, the audio choice and every
+/// discrete track the stream packages.
 fn closure(
     state: &AppState,
     config_id: &str,
@@ -317,8 +322,52 @@ fn closure(
         live = current_video(state, config_id)?;
         &live
     };
+    let config = desired(state)?;
     let mut needs = video_needs(state, video, layout)?;
-    needs.extend(audio_needs(state, config_id, audio)?);
+    needs.extend(audio_needs(&config, config_id, audio)?);
+    needs.extend(carried_track_needs(&config, config_id)?);
+    Some(needs)
+}
+
+/// The accepted (desired) configuration (`None`: unreadable).
+fn desired(state: &AppState) -> Option<multiview_config::MultiviewConfig> {
+    serde_json::from_value(crate::boot_model::current_desired_config(state).ok()?).ok()
+}
+
+/// The output `config_id` in `config` (`None`: not declared — fail closed).
+fn output_of<'a>(
+    config: &'a multiview_config::MultiviewConfig,
+    config_id: &str,
+) -> Option<&'a multiview_config::Output> {
+    config.outputs.iter().find(|o| o.id() == config_id)
+}
+
+/// ABUSE-2 (#418): every discrete track the cast stream packages as an
+/// audio rendition — resolved by the engine's own rule
+/// ([`multiview_config::Output::carried_audio`] against the declared
+/// tracks) — needs Read on the track name and its route input, exactly as
+/// an `AudioFeed::Tracks` choice does.
+fn carried_track_needs(
+    config: &multiview_config::MultiviewConfig,
+    config_id: &str,
+) -> Option<Vec<Need>> {
+    let output = output_of(config, config_id)?;
+    let declared: Vec<&str> = config
+        .audio
+        .as_ref()
+        .map(multiview_config::AudioRouting::declared_tracks)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| *t != multiview_config::PROGRAM_TRACK)
+        .collect();
+    let (_, tracks) = output.carried_audio(&declared);
+    let mut needs = Vec::with_capacity(tracks.len() * 2);
+    for track in tracks {
+        if let Some(input) = crate::routes::output_routing::track_input(config, track) {
+            needs.push(Need::Object(input));
+        }
+        needs.push(Need::Object(track.to_owned()));
+    }
     Some(needs)
 }
 
@@ -365,18 +414,10 @@ fn video_needs(
 /// The audio choice's own end, as the take authorizes it (`follow` and
 /// `none` add nothing beyond the video).
 fn audio_needs(
-    state: &AppState,
+    config: &multiview_config::MultiviewConfig,
     config_id: &str,
     audio: Option<&RoutedAudio>,
 ) -> Option<Vec<Need>> {
-    let mut config: Option<multiview_config::MultiviewConfig> = None;
-    let mut load = || -> Option<multiview_config::MultiviewConfig> {
-        if config.is_none() {
-            config =
-                serde_json::from_value(crate::boot_model::current_desired_config(state).ok()?).ok();
-        }
-        config.clone()
-    };
     let choice = match audio {
         Some(RoutedAudio::Track { name, input }) => {
             return Some(vec![
@@ -385,7 +426,7 @@ fn audio_needs(
             ]);
         }
         Some(routed) => routed.audio_feed(),
-        None => load()?
+        None => config
             .output_feeds()
             .into_iter()
             .find(|xp| xp.output == config_id)
@@ -396,10 +437,9 @@ fn audio_needs(
         AudioFeed::Program => vec![Need::Bus],
         AudioFeed::Source(id) => vec![Need::Object(id)],
         AudioFeed::Tracks(tracks) => {
-            let config = load()?;
             let mut needs = Vec::new();
             for track in tracks {
-                if let Some(input) = crate::routes::output_routing::track_input(&config, &track) {
+                if let Some(input) = crate::routes::output_routing::track_input(config, &track) {
                     needs.push(Need::Object(input));
                 }
                 needs.push(Need::Object(track));
