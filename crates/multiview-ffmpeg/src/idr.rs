@@ -167,33 +167,51 @@ pub fn scan_parameter_sets(
     if !matches!(codec, CodecKind::H264 | CodecKind::Hevc) {
         return ParameterSetScan::Absent;
     }
-    let mut nals: Vec<&[u8]> = Vec::new();
-    collect_nals(au, framing, &mut nals);
+    // Streaming, bounded by MAX_AU_NALS (fail closed past it): never an
+    // unbounded collection of NAL slices on the demux thread. A parameter
+    // set waits one NAL so its successor's forbidden bit can be checked.
     let mut out = Vec::new();
     let mut last_rank: Option<u8> = None;
     let mut seen_vcl = false;
-    for (n, nal) in nals.iter().enumerate() {
+    let mut count = 0_usize;
+    let mut pending: Option<&[u8]> = None;
+    let mut rejected = false;
+    for_each_nal(au, framing, |nal| {
+        count += 1;
+        if count > MAX_AU_NALS {
+            rejected = true;
+            return true;
+        }
+        if let Some(set) = pending.take() {
+            let forbidden_next = matches!(framing, NalFraming::AnnexB)
+                && nal.first().is_some_and(|&b| b & 0x80 != 0);
+            if forbidden_next {
+                rejected = true;
+                return true;
+            }
+            out.push(set);
+        }
         let r = match classify_nal(nal, codec) {
             NalClass::Vcl => {
                 seen_vcl = true;
-                continue;
+                return false;
             }
-            NalClass::Other => continue,
+            NalClass::Other => return false,
             NalClass::ParameterSet(r) => r,
         };
-        if seen_vcl || last_rank.is_some_and(|last| r <= last) {
-            return ParameterSetScan::Rejected;
+        if seen_vcl || last_rank.is_some_and(|last| r <= last) || nal.len() < 4 {
+            rejected = true;
+            return true;
         }
         last_rank = Some(r);
-        let forbidden_next = matches!(framing, NalFraming::AnnexB)
-            && nals
-                .get(n + 1)
-                .and_then(|next| next.first())
-                .is_some_and(|&b| b & 0x80 != 0);
-        if nal.len() < 4 || forbidden_next {
-            return ParameterSetScan::Rejected;
-        }
-        out.push(*nal);
+        pending = Some(nal);
+        false
+    });
+    if rejected {
+        return ParameterSetScan::Rejected;
+    }
+    if let Some(set) = pending {
+        out.push(set);
     }
     if out.is_empty() {
         ParameterSetScan::Absent
@@ -253,12 +271,282 @@ pub fn mpeg2_sequence_header(au: &[u8]) -> Option<&[u8]> {
     au.get(start..end)
 }
 
-/// Every NAL unit of `au` under `framing` (empty NALs skipped).
-fn collect_nals<'a>(au: &'a [u8], framing: NalFraming, out: &mut Vec<&'a [u8]>) {
-    for_each_nal(au, framing, |nal| {
-        out.push(nal);
-        false
+/// Whether an H.264 access unit is a **reference** picture: its first coded
+/// slice NAL (types 1..=5) has `nal_ref_idc != 0`. `None` when the access unit
+/// carries no slice NAL (or the framing cannot carry one). Other codecs: the
+/// caller treats every picture as a reference (fail safe for passthrough).
+#[must_use]
+pub fn h264_is_reference(au: &[u8], framing: NalFraming) -> Option<bool> {
+    let mut found = None;
+    for_each_nal(au, framing, |nal| match nal.first() {
+        Some(&b) if (1..=5).contains(&(b & 0x1F)) => {
+            found = Some(b & 0x60 != 0);
+            true
+        }
+        _ => false,
     });
+    found
+}
+
+/// The first parameter-set NAL of H.264 type `nal_type` (7 = SPS, 8 = PPS)
+/// in `au` (header byte included), or `None`.
+#[must_use]
+pub fn h264_nal_of_type(au: &[u8], framing: NalFraming, nal_type: u8) -> Option<&[u8]> {
+    let mut found = None;
+    for_each_nal(au, framing, |nal| {
+        if nal.first().is_some_and(|&b| b & 0x1F == nal_type) {
+            found = Some(nal);
+            true
+        } else {
+            false
+        }
+    });
+    found
+}
+
+/// Most NAL units one access unit may carry for re-framing (as D1's
+/// `h264_repeat` parse bound). Real AUs carry a handful (AUD, SEI, SPS, PPS,
+/// slices); more is hostile.
+pub const MAX_AU_NALS: usize = 1024;
+
+/// The number of NAL units of an Annex-B `au`, or `None` as soon as it
+/// exceeds `max` (allocation-free, early exit).
+#[must_use]
+pub fn annex_b_nal_count(au: &[u8], max: usize) -> Option<usize> {
+    let mut count = 0_usize;
+    let over = annexb_any_nal(au, &mut |_| {
+        count += 1;
+        count > max
+    });
+    (!over).then_some(count)
+}
+
+/// A minimal Exp-Golomb reader over the first bytes of an H.264 NAL payload
+/// (emulation-prevention bytes skipped), for reading parameter-set and slice
+/// ids. Bounded: at most 32 payload bytes are ever looked at.
+struct IdReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    zeros: u8,
+    cur: u8,
+    bit: u8,
+}
+
+impl<'a> IdReader<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self {
+            bytes: payload.get(..payload.len().min(32)).unwrap_or(&[]),
+            pos: 0,
+            zeros: 0,
+            cur: 0,
+            bit: 0,
+        }
+    }
+    fn next_byte(&mut self) -> Option<u8> {
+        loop {
+            let b = *self.bytes.get(self.pos)?;
+            self.pos += 1;
+            if self.zeros >= 2 && b == 3 {
+                self.zeros = 0;
+                continue;
+            }
+            self.zeros = if b == 0 {
+                self.zeros.saturating_add(1)
+            } else {
+                0
+            };
+            return Some(b);
+        }
+    }
+    fn bit(&mut self) -> Option<u32> {
+        if self.bit == 0 {
+            self.cur = self.next_byte()?;
+            self.bit = 8;
+        }
+        self.bit -= 1;
+        Some(u32::from((self.cur >> self.bit) & 1))
+    }
+    fn skip(&mut self, n: u32) -> Option<()> {
+        for _ in 0..n {
+            self.bit()?;
+        }
+        Some(())
+    }
+    /// `ue(v)`, refusing anything above `max`.
+    fn ue(&mut self, max: u32) -> Option<u32> {
+        let mut zeros = 0_u32;
+        while self.bit()? == 0 {
+            zeros += 1;
+            if zeros > 16 {
+                return None;
+            }
+        }
+        let mut v = 1_u32;
+        for _ in 0..zeros {
+            v = (v << 1) | self.bit()?;
+        }
+        let v = v - 1;
+        (v <= max).then_some(v)
+    }
+}
+
+/// `(pic_parameter_set_id, seq_parameter_set_id)` of an H.264 PPS NAL
+/// (header byte included).
+#[must_use]
+pub fn h264_pps_ids(nal: &[u8]) -> Option<(u32, u32)> {
+    let (&h, payload) = nal.split_first()?;
+    if h & 0x1F != 8 {
+        return None;
+    }
+    let mut r = IdReader::new(payload);
+    Some((r.ue(255)?, r.ue(31)?))
+}
+
+/// `seq_parameter_set_id` of an H.264 SPS NAL (header byte included).
+#[must_use]
+pub fn h264_sps_id(nal: &[u8]) -> Option<u32> {
+    let (&h, payload) = nal.split_first()?;
+    if h & 0x1F != 7 {
+        return None;
+    }
+    let mut r = IdReader::new(payload);
+    r.skip(24)?; // profile_idc, constraint flags, level_idc
+    r.ue(31)
+}
+
+/// `pic_parameter_set_id` of an H.264 coded slice NAL (types 1..=5).
+#[must_use]
+pub fn h264_slice_pps_id(nal: &[u8]) -> Option<u32> {
+    let (&h, payload) = nal.split_first()?;
+    if !(1..=5).contains(&(h & 0x1F)) {
+        return None;
+    }
+    let mut r = IdReader::new(payload);
+    r.ue(u32::MAX)?; // first_mb_in_slice
+    r.ue(9)?; // slice_type
+    r.ue(255)
+}
+
+/// The `pic_parameter_set_id` of the first coded slice of an H.264 `au`.
+#[must_use]
+pub fn h264_au_pps_id(au: &[u8], framing: NalFraming) -> Option<u32> {
+    let mut found = None;
+    for_each_nal(au, framing, |nal| match nal.first() {
+        Some(&b) if (1..=5).contains(&(b & 0x1F)) => {
+            found = h264_slice_pps_id(nal);
+            true
+        }
+        _ => false,
+    });
+    found
+}
+
+/// Why an access unit cannot be re-framed ([`annex_b_size`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReframeError {
+    /// The Annex-B result would exceed the byte cap, or the AU has more than
+    /// [`MAX_AU_NALS`] NALs: too large.
+    TooLarge,
+    /// OBU framing, or a zero / truncated length prefix.
+    Malformed,
+}
+
+/// The exact size of `au` re-framed as Annex B ([`to_annex_b`]), computed
+/// with checked arithmetic and without allocating. Fails with
+/// [`ReframeError::TooLarge`] when the result exceeds `max_bytes` or the AU
+/// has more than [`MAX_AU_NALS`] NALs (checked as the prefixes are walked,
+/// so the walk itself is bounded), and [`ReframeError::Malformed`] for OBU
+/// framing or a zero / truncated length. An Annex-B `au` is its own length.
+///
+/// # Errors
+/// See above.
+pub fn annex_b_size(
+    au: &[u8],
+    framing: NalFraming,
+    max_bytes: usize,
+) -> Result<usize, ReframeError> {
+    match framing {
+        NalFraming::AnnexB if au.len() > max_bytes => Err(ReframeError::TooLarge),
+        NalFraming::AnnexB => annex_b_nal_count(au, MAX_AU_NALS)
+            .map(|_| au.len())
+            .ok_or(ReframeError::TooLarge),
+        NalFraming::Obu => Err(ReframeError::Malformed),
+        NalFraming::LengthPrefixed { nal_length_size } => {
+            let size = usize::from(nal_length_size);
+            if !(1..=4).contains(&size) {
+                return Err(ReframeError::Malformed);
+            }
+            let mut total = 0_usize;
+            let mut nals = 0_usize;
+            let mut offset = 0_usize;
+            while offset < au.len() {
+                let len_end = offset.checked_add(size).ok_or(ReframeError::Malformed)?;
+                let nal_len = au
+                    .get(offset..len_end)
+                    .ok_or(ReframeError::Malformed)?
+                    .iter()
+                    .fold(0_usize, |acc, &b| (acc << 8) | usize::from(b));
+                if nal_len == 0 {
+                    return Err(ReframeError::Malformed);
+                }
+                nals += 1;
+                if nals > MAX_AU_NALS {
+                    return Err(ReframeError::TooLarge);
+                }
+                let end = len_end
+                    .checked_add(nal_len)
+                    .filter(|&e| e <= au.len())
+                    .ok_or(ReframeError::Malformed)?;
+                total = total
+                    .checked_add(4)
+                    .and_then(|t| t.checked_add(nal_len))
+                    .filter(|&t| t <= max_bytes)
+                    .ok_or(ReframeError::TooLarge)?;
+                offset = end;
+            }
+            Ok(total)
+        }
+    }
+}
+
+/// `au` re-framed as Annex B (a 4-byte start code before each NAL), for a
+/// muxer that carries H.264/HEVC in band (MPEG-TS), written once into the
+/// final shared buffer. The output size is checked against `max_bytes` and
+/// the NAL count against [`MAX_AU_NALS`] **before** allocating
+/// ([`annex_b_size`]); `None` on any refusal. An Annex-B `au` is copied as is.
+#[must_use]
+pub fn to_annex_b(
+    au: &[u8],
+    framing: NalFraming,
+    max_bytes: usize,
+) -> Option<std::sync::Arc<[u8]>> {
+    let total = annex_b_size(au, framing, max_bytes).ok()?;
+    let NalFraming::LengthPrefixed { nal_length_size } = framing else {
+        return Some(std::sync::Arc::from(au));
+    };
+    let size = usize::from(nal_length_size);
+    // One allocation of the exact size (`repeat_n` is `TrustedLen`, so the
+    // `Arc<[u8]>` is allocated once with no intermediate Vec), then filled
+    // in place through the unique handle: the packet bytes are copied once.
+    let mut out: std::sync::Arc<[u8]> = std::iter::repeat_n(0_u8, total).collect();
+    let dst = std::sync::Arc::get_mut(&mut out)?;
+    let (mut offset, mut at) = (0_usize, 0_usize);
+    while offset < au.len() {
+        let len_end = offset.checked_add(size)?;
+        let nal_len = au
+            .get(offset..len_end)?
+            .iter()
+            .fold(0_usize, |acc, &b| (acc << 8) | usize::from(b));
+        let end = len_end.checked_add(nal_len)?;
+        dst.get_mut(at..at.checked_add(4)?)?
+            .copy_from_slice(&[0, 0, 0, 1]);
+        at += 4;
+        dst.get_mut(at..at.checked_add(nal_len)?)?
+            .copy_from_slice(au.get(len_end..end)?);
+        at += nal_len;
+        offset = end;
+    }
+    (at == total).then_some(out)
 }
 
 /// H.264: at least one `nal_unit_type == 5` (IDR slice) NAL is present.
@@ -301,27 +589,31 @@ fn for_each_nal<'a>(
 /// Iterate Annex-B NAL units (split on `00 00 01` start codes, tolerating a
 /// 4-byte `00 00 00 01` variant), returning `true` on the first `pred` hit.
 fn annexb_any_nal<'a>(au: &'a [u8], pred: &mut impl FnMut(&'a [u8]) -> bool) -> bool {
-    let mut starts: Vec<usize> = Vec::new();
+    // Streaming: one pending NAL body start, never a vector of offsets (an
+    // AU of start codes would otherwise allocate one entry per 3 bytes).
+    let mut pending: Option<usize> = None;
     let mut i = 0_usize;
     // Find every `00 00 01` prefix; the NAL body begins just after it.
     while let Some(window) = au.get(i..i + 3) {
         if window == [0x00, 0x00, 0x01] {
-            starts.push(i + 3);
+            if let Some(body_start) = pending {
+                // The NAL runs to this start code (minus any trailing 00 of a
+                // 4-byte start prefix).
+                if let Some(nal) = au.get(body_start..i) {
+                    if !nal.is_empty() && pred(nal) {
+                        return true;
+                    }
+                }
+            }
+            pending = Some(i + 3);
             i += 3;
         } else {
             i += 1;
         }
     }
-    for (n, &body_start) in starts.iter().enumerate() {
-        // The NAL runs to the next start code (minus any trailing 00 of a
-        // 4-byte start prefix) or the end of the buffer.
-        let body_end = starts
-            .get(n + 1)
-            .map_or(au.len(), |&next_start| next_start.saturating_sub(3));
-        if let Some(nal) = au.get(body_start..body_end) {
-            if !nal.is_empty() && pred(nal) {
-                return true;
-            }
+    if let Some(nal) = pending.and_then(|body_start| au.get(body_start..)) {
+        if !nal.is_empty() && pred(nal) {
+            return true;
         }
     }
     false
@@ -469,8 +761,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        is_idr, is_self_contained_idr, mpeg2_sequence_header, parameter_sets, read_leb128,
-        CodecKind, NalFraming,
+        annex_b_size, h264_is_reference, h264_nal_of_type, is_idr, is_self_contained_idr,
+        mpeg2_sequence_header, parameter_sets, read_leb128, to_annex_b, CodecKind, NalFraming,
+        MAX_AU_NALS,
     };
 
     #[test]
@@ -711,5 +1004,140 @@ mod tests {
             CodecKind::Other,
             NalFraming::AnnexB
         ));
+    }
+
+    #[test]
+    fn h264_reference_reads_the_first_slice_nal_ref_idc() {
+        // 3-byte start codes: a 4-byte one leaves its leading zero on the NAL before.
+        let sc = [0u8, 0, 1];
+        let au = |hdrs: &[u8]| -> Vec<u8> {
+            hdrs.iter()
+                .flat_map(|&h| sc.iter().copied().chain([h, 0xAA]))
+                .collect()
+        };
+        // SPS (ref 3) then a non-reference P slice (nal_ref_idc 0, type 1).
+        assert_eq!(
+            h264_is_reference(&au(&[0x67, 0x01]), NalFraming::AnnexB),
+            Some(false)
+        );
+        assert_eq!(
+            h264_is_reference(&au(&[0x09, 0x41]), NalFraming::AnnexB),
+            Some(true)
+        );
+        assert_eq!(
+            h264_is_reference(&au(&[0x67, 0x68]), NalFraming::AnnexB),
+            None
+        );
+        let a = au(&[0x67, 0x68, 0x65]);
+        assert_eq!(
+            h264_nal_of_type(&a, NalFraming::AnnexB, 8),
+            Some(&[0x68, 0xAA][..])
+        );
+        assert_eq!(h264_nal_of_type(&a, NalFraming::AnnexB, 6), None);
+    }
+
+    #[test]
+    fn length_prefixed_access_units_reframe_as_annex_b() {
+        let lp = NalFraming::LengthPrefixed { nal_length_size: 4 };
+        let au = [0, 0, 0, 2, 0x67, 0xAA, 0, 0, 0, 1, 0x65];
+        assert_eq!(
+            to_annex_b(&au, lp, usize::MAX).map(|a| a.to_vec()),
+            Some(vec![0, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x65])
+        );
+        assert_eq!(
+            to_annex_b(&[0, 0, 0, 9, 0x65], lp, usize::MAX),
+            None,
+            "past the end"
+        );
+        assert_eq!(
+            to_annex_b(&[0, 0, 1, 0x65], NalFraming::AnnexB, usize::MAX)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(to_annex_b(&[1], NalFraming::Obu, usize::MAX), None);
+    }
+
+    /// #344 D2a review R1-A-2: the re-framed size is computed (checked)
+    /// before any allocation, so 1- and 2-byte prefixes that would expand an
+    /// AU past the cap are refused up front, and the NAL count is budgeted.
+    #[test]
+    fn reframing_is_bounded_before_allocation() {
+        let one = NalFraming::LengthPrefixed { nal_length_size: 1 };
+        let two = NalFraming::LengthPrefixed { nal_length_size: 2 };
+        // 1-byte prefix, 1-byte NALs: every 2 input bytes become 5 output bytes.
+        let au1: Vec<u8> = (0..2000).flat_map(|_| [1_u8, 0x41]).collect();
+        assert_eq!(
+            annex_b_size(&au1, one, usize::MAX),
+            Err(super::ReframeError::TooLarge),
+            "over the NAL budget"
+        );
+        let au1: Vec<u8> = (0..MAX_AU_NALS).flat_map(|_| [1_u8, 0x41]).collect();
+        assert_eq!(annex_b_size(&au1, one, usize::MAX), Ok(MAX_AU_NALS * 5));
+        assert_eq!(
+            annex_b_size(&au1, one, MAX_AU_NALS * 5 - 1),
+            Err(super::ReframeError::TooLarge),
+            "over the cap"
+        );
+        assert!(to_annex_b(&au1, one, MAX_AU_NALS * 5 - 1).is_none());
+        assert_eq!(
+            to_annex_b(&au1, one, MAX_AU_NALS * 5).unwrap().len(),
+            MAX_AU_NALS * 5
+        );
+        // 2-byte prefix: one 3-byte NAL grows by 2.
+        let au2 = [0_u8, 3, 0x65, 0x88, 0x80];
+        assert_eq!(annex_b_size(&au2, two, 7), Ok(7));
+        assert_eq!(
+            annex_b_size(&au2, two, 6),
+            Err(super::ReframeError::TooLarge)
+        );
+        assert_eq!(
+            &to_annex_b(&au2, two, 7).unwrap()[..],
+            &[0, 0, 0, 1, 0x65, 0x88, 0x80]
+        );
+        // Annex B passes through, still bounded by the cap.
+        assert!(to_annex_b(&[0, 0, 1, 0x65], NalFraming::AnnexB, 3).is_none());
+    }
+
+    /// #344 D2a review R2-A-3: an Annex-B AU is held to the NAL budget too,
+    /// and the parameter-set scan fails closed past it (no unbounded
+    /// collection on the demux thread).
+    #[test]
+    fn annex_b_nal_count_is_budgeted_and_the_set_scan_fails_closed() {
+        let many: Vec<u8> = (0..=MAX_AU_NALS).flat_map(|_| [0_u8, 0, 1, 0x41]).collect();
+        assert_eq!(
+            annex_b_size(&many, NalFraming::AnnexB, usize::MAX),
+            Err(super::ReframeError::TooLarge)
+        );
+        assert_eq!(super::annex_b_nal_count(&many, MAX_AU_NALS), None);
+        let ok: Vec<u8> = (0..MAX_AU_NALS).flat_map(|_| [0_u8, 0, 1, 0x41]).collect();
+        assert_eq!(
+            annex_b_size(&ok, NalFraming::AnnexB, usize::MAX),
+            Ok(ok.len())
+        );
+        assert_eq!(
+            super::annex_b_nal_count(&ok, MAX_AU_NALS),
+            Some(MAX_AU_NALS)
+        );
+        // A huge AU with a parameter set first: the scan is Rejected, not
+        // collected.
+        let mut big = vec![0_u8, 0, 1, 0x67, 0x64, 0, 0x1f, 0xac];
+        big.extend((0..200_000).flat_map(|_| [0_u8, 0, 1, 0x41]));
+        assert_eq!(
+            super::scan_parameter_sets(&big, CodecKind::H264, NalFraming::AnnexB),
+            super::ParameterSetScan::Rejected
+        );
+    }
+
+    #[test]
+    fn h264_ids_are_read_from_the_set_and_slice_headers() {
+        // pps_id 1 (ue "010"), sps_id 0 ("1"): 0b0101_1... = 0x58 + trailing.
+        assert_eq!(super::h264_pps_ids(&[0x68, 0x58, 0x80]), Some((1, 0)));
+        // SPS: profile, flags, level, then sps_id 0 ("1").
+        assert_eq!(super::h264_sps_id(&[0x67, 0x64, 0, 0x1f, 0x80]), Some(0));
+        // IDR slice: first_mb 0 ("1"), slice_type 7 ("0001000"), pps_id 1
+        // ("010"): 1 0001000 010... = 0x88 0x40.
+        assert_eq!(super::h264_slice_pps_id(&[0x65, 0x88, 0x40]), Some(1));
+        assert_eq!(super::h264_slice_pps_id(&[0x67, 0x88]), None, "not a slice");
     }
 }

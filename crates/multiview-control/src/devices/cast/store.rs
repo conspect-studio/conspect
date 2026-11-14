@@ -14,9 +14,48 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use super::media::CastMediaTarget;
+use super::protocol::CastAppId;
+
+/// What a session that plays a cast stream LOADs, instead of the delivery
+/// map's rendition. The URL carries the stream token: its `Debug` is
+/// redacted and it is never served, audited, published or logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionLaunch {
+    /// The absolute token URL (`{cast_media_base}/cast/<token>/master.m3u8`).
+    pub media: CastMediaTarget,
+    /// The receiver app to LAUNCH.
+    pub app_id: CastAppId,
+    /// The LOAD's `customData.title`.
+    pub title: String,
+}
+
+impl std::fmt::Debug for SessionLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionLaunch")
+            .field("media", &redact_cast_url(&self.media.url))
+            .field("app_id", &self.app_id)
+            .field("title", &self.title)
+            .finish()
+    }
+}
+
+/// `…/cast/<token>/file` → `…/cast/<redacted>/file` (any other URL as it is).
+#[must_use]
+pub fn redact_cast_url(url: &str) -> String {
+    let Some(at) = url.find("/cast/") else {
+        return url.to_owned();
+    };
+    let (head, rest) = url.split_at(at + "/cast/".len());
+    match rest.find('/') {
+        Some(end) => format!("{head}<redacted>{}", &rest[end..]),
+        None => format!("{head}<redacted>"),
+    }
+}
+
 /// One ephemeral cast session's descriptive record (the live lifecycle state
 /// rides the latest-wins status registry under the same id).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CastSessionRecord {
     /// The runtime session id (`cast-session-…`, UUID-fresh per start).
     pub id: String,
@@ -26,8 +65,18 @@ pub struct CastSessionRecord {
     pub address: String,
     /// The output id whose rendition the session casts.
     pub output: String,
-    /// The resolved device-reachable media URL the session LOADs.
+    /// The device-reachable media URL the session LOADs; for a cast stream
+    /// session the redacted form `…/cast/<redacted>/master.m3u8`.
     pub media_url: String,
+    /// The cast stream this session owns (stopping the session revokes it).
+    pub stream_id: Option<String>,
+    /// The token URL + receiver app of a cast stream session (secret).
+    pub launch: Option<SessionLaunch>,
+    /// The last published player state (`loading`, `playing`, `buffering`,
+    /// `idle`, `load-failed`, `preempted`, …).
+    pub player_state: Option<String>,
+    /// The receiver's last idle / LOAD-error reason while not playing.
+    pub idle_reason: Option<String>,
     /// When the receiver **accepted** the session's `LOAD` (the first
     /// `MEDIA_STATUS` attributing an active media session to our actor — the
     /// moment the cast verifiably began showing), as Unix nanoseconds from
@@ -87,6 +136,24 @@ impl CastSessionStore {
                 record.started_unix_ns = Some(started_unix_ns);
             }
         }
+    }
+
+    /// Record the player state the actor published (a no-op for an id this
+    /// store does not track).
+    pub fn set_player_state(&self, id: &str, mode: &str, idle_reason: Option<&str>) {
+        let mut guard = self.lock();
+        if let Some(record) = guard.get_mut(id) {
+            if record.player_state.as_deref() != Some(mode) {
+                record.player_state = Some(mode.to_owned());
+            }
+            record.idle_reason = idle_reason.map(str::to_owned);
+        }
+    }
+
+    /// The launch override of session `id` (a cast stream session).
+    #[must_use]
+    pub fn launch_of(&self, id: &str) -> Option<SessionLaunch> {
+        self.lock().get(id).and_then(|r| r.launch.clone())
     }
 
     /// All live session records, id-sorted.

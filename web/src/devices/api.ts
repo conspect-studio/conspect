@@ -379,6 +379,8 @@ export interface DiscoveredServiceView {
   readonly primaryAddress: string;
   readonly endpoints: readonly DiscoveredEndpointView[];
   readonly lastSeenUnixNs: number;
+  /** The advertised mDNS TXT records (untrusted; e.g. Cast `fn` friendly name, `md` model). */
+  readonly txt: Readonly<Record<string, string>>;
 }
 
 function toDiscoveredView(raw: Record<string, unknown>): DiscoveredServiceView | undefined {
@@ -402,7 +404,16 @@ function toDiscoveredView(raw: Record<string, unknown>): DiscoveredServiceView |
       }
     }
   }
+  const txt: Record<string, string> = {};
+  if (Array.isArray(raw.txt)) {
+    for (const record of raw.txt) {
+      if (isRecord(record) && typeof record.key === 'string' && typeof record.value === 'string') {
+        txt[record.key] = record.value;
+      }
+    }
+  }
   return {
+    txt,
     key: raw.key,
     name: raw.name,
     host: typeof raw.host === 'string' ? raw.host : '',

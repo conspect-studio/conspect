@@ -1,0 +1,47 @@
+/* Conspect Cast receiver: state screens over <cast-media-player>. No external images or fonts. */
+html, body {
+  margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
+  background: #000; color: #f2f4f7;
+  font-family: Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+cast-media-player {
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  /* The element's own UI is covered by our overlay; keep its launch screen plain black. */
+  --background: #000; --background-color: #000; --background-image: none;
+  --splash-image: none; --logo-image: none; --spinner-image: none;
+}
+.overlay {
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10;
+  display: flex; align-items: center; justify-content: center;
+  box-sizing: border-box; padding: 5vh 5vw;            /* TV overscan safe area */
+  background: #0b0d12; opacity: 1; visibility: visible;
+  transition: opacity 0.25s linear, visibility 0s linear 0s;
+}
+.overlay[data-state="playing"] {
+  opacity: 0; visibility: hidden;
+  transition: opacity 0.25s linear, visibility 0s linear 0.25s;
+}
+/* A short rebuffer must not flash a full screen: fade the scrim in after 0.6 s, keep the frozen picture visible. */
+.overlay[data-state="buffering"] {
+  background: rgba(11, 13, 18, 0.72);
+  transition: opacity 0.3s linear 0.6s, visibility 0s linear 0s;
+}
+.pane { display: none; text-align: center; max-width: 80vw; }
+.overlay[data-state="idle"] .pane-idle,
+.overlay[data-state="loading"] .pane-busy,
+.overlay[data-state="buffering"] .pane-busy,
+.overlay[data-state="error"] .pane-error { display: block; }
+.wordmark { font-size: 11vh; font-weight: 700; letter-spacing: 0.04em; color: #fff; }
+.wordmark.small { font-size: 5vh; color: #9aa4b2; margin-bottom: 5vh; }
+.line { margin-top: 3vh; font-size: 3.4vh; color: #9aa4b2; }
+.title { margin-top: 5vh; font-size: 5vh; font-weight: 500; color: #fff;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sentence { font-size: 4.6vh; line-height: 1.35; color: #fff; }
+.code { margin-top: 4vh; font-size: 2.6vh; color: #7d8794; font-family: "Roboto Mono", Consolas, monospace; }
+.spinner {
+  display: inline-block; width: 9vh; height: 9vh; box-sizing: border-box;
+  border: 0.9vh solid rgba(255, 255, 255, 0.18); border-top-color: #fff; border-radius: 50%;
+  -webkit-animation: conspect-spin 1s linear infinite; animation: conspect-spin 1s linear infinite;
+}
+@-webkit-keyframes conspect-spin { to { -webkit-transform: rotate(360deg); } }
+@keyframes conspect-spin { to { transform: rotate(360deg); } }

@@ -1729,6 +1729,59 @@ codec = "mpeg2video"
 segment_ms = 1000
 "##;
 
+/// The decoded limited-range (BT.709, 8-bit) luma of [`LAYOUT_CONFIG`]'s two
+/// solid sources: `@_a` = `#202020` (left on Program) and `@_b` = `#e0e0e0`
+/// (right). `Y = 16 + 219 * v / 255` for a grey `v`.
+///
+/// #426: the routed-layout picture tests compare output 1 against these, not
+/// against output 0's decoded picture. In an `overlay` build Program carries
+/// its baked program-wide chrome (the wall-clock readout and its reference
+/// badge, on by default); on the 64x64 test canvas that chrome covers most of
+/// the luma sample windows, so Program's pixels are not the sources' pixels.
+const LAYOUT_LUMA: (i64, i64) = (16 + 219 * 0x20 / 255, 16 + 219 * 0xe0 / 255);
+
+/// The mean luma of rows `rows` of the 16 px column window inset 8 px into
+/// the 32 px half of a 64x64 plane that starts at column `x0` (clear of the
+/// cell edge).
+fn window_mean(plane: &[u8], x0: usize, rows: std::ops::Range<usize>) -> i64 {
+    let mut sum = 0i64;
+    let mut n = 0i64;
+    for row in rows {
+        for x in x0 + 8..x0 + 24 {
+            sum += i64::from(plane[row * 64 + x]);
+            n += 1;
+        }
+    }
+    sum / n
+}
+
+/// The mean luma of the 16x48 window (rows 8..56) of the half at `x0`.
+fn half_mean(plane: &[u8], x0: usize) -> i64 {
+    window_mean(plane, x0, 8..56)
+}
+
+/// Program's picture is the sources' luma: asserted on the full window in a
+/// build without `overlay`, and in an `overlay` build on rows 56..64, below
+/// the program-wide clock chrome (its readout at y 6, the reference badge at
+/// y 36, its backing ending before row 55 on this canvas). Cells this small (32 px) draw
+/// no per-tile chrome (`MIN_TILE_PX`).
+fn assert_program_is_the_sources(t: i64, plane: &[u8]) {
+    let rows = if cfg!(feature = "overlay") {
+        56..64
+    } else {
+        8..56
+    };
+    let halves = (
+        window_mean(plane, 0, rows.clone()),
+        window_mean(plane, 32, rows),
+    );
+    let (a, b) = LAYOUT_LUMA;
+    assert!(
+        (halves.0 - a).abs() <= 6 && (halves.1 - b).abs() <= 6,
+        "tick {t}: Program's halves {halves:?} are the sources' luma ({a}, {b})"
+    );
+}
+
 /// A routed layout for the 64x64 test canvas: the Program grid with its two
 /// cells swapped (`b` left, `a` right).
 fn swapped_layout(prefix: &str) -> PictureBus {
@@ -1879,20 +1932,11 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
         .filter(|t| routed.contains_key(t) && program.contains_key(t))
         .collect();
     assert!(compared.len() >= 15, "decoded {} pictures", compared.len());
-    let mean = |plane: &[u8], x0: usize| -> i64 {
-        let mut sum = 0i64;
-        let mut n = 0i64;
-        for row in 8..56 {
-            for x in x0 + 8..x0 + 24 {
-                sum += i64::from(plane[row * 64 + x]);
-                n += 1;
-            }
-        }
-        sum / n
-    };
     for t in &compared {
         let (p, r) = (&program[t], &routed[t]);
-        let (pl, pr, rl, rr) = (mean(p, 0), mean(p, 32), mean(r, 0), mean(r, 32));
+        assert_program_is_the_sources(*t, p);
+        let (pl, pr) = LAYOUT_LUMA;
+        let (rl, rr) = (half_mean(r, 0), half_mean(r, 32));
         assert!(
             pr - pl > 100,
             "tick {t}: the halves really differ ({pl}, {pr})"
@@ -1980,17 +2024,6 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
     // Before the edit the halves are swapped; after it they match Program.
     let program = decode_luma(&run.video[0]);
     let routed = decode_luma(&run.video[1]);
-    let mean = |plane: &[u8], x0: usize| -> i64 {
-        let mut sum = 0i64;
-        let mut n = 0i64;
-        for row in 8..56 {
-            for x in x0 + 8..x0 + 24 {
-                sum += i64::from(plane[row * 64 + x]);
-                n += 1;
-            }
-        }
-        sum / n
-    };
     let at = i64::try_from(applied.tick).unwrap();
     let fell_tick = i64::try_from(fell.tick).unwrap();
     let mut swapped_seen = 0;
@@ -2000,7 +2033,9 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         let (Some(p), Some(r)) = (program.get(&t), routed.get(&t)) else {
             continue;
         };
-        let (pl, pr, rl, rr) = (mean(p, 0), mean(p, 32), mean(r, 0), mean(r, 32));
+        assert_program_is_the_sources(t, p);
+        let (pl, pr) = LAYOUT_LUMA;
+        let (rl, rr) = (half_mean(r, 0), half_mean(r, 32));
         if (rl - pr).abs() <= 6 && (rr - pl).abs() <= 6 {
             assert!(
                 unswapped_seen == 0,
@@ -2265,6 +2300,135 @@ fn a_live_reformat_resets_one_output_and_leaves_the_other_untouched() {
     assert_eq!(decode_size(&run.video[1][..at_index]), Some((64, 64)));
     assert_eq!(decode_size(&run.video[1][at_index..]), Some((32, 64)));
     assert_eq!(decode_size(&run.video[0]), Some((64, 64)));
+}
+
+/// Review INV-1 through the real pipeline: while the run is live its
+/// subtitle routing is live; when the run returns, its published handle's
+/// subtitle routing is ended (a stale take is refused, no live readback),
+/// although the handle itself stays in the slot.
+#[test]
+fn a_run_ends_its_subtitle_routing_when_it_returns() {
+    use multiview_control::output_routing::{
+        OutputRouting, SubtitleTakeError, SubtitleTakeRequest,
+    };
+    let seen_live = Arc::new(AtomicBool::new(false));
+    let record = Arc::clone(&seen_live);
+    let kept: Arc<Mutex<Option<OutputRoutingSlot>>> = Arc::new(Mutex::new(None));
+    let keep = Arc::clone(&kept);
+    let run = drive("sub_run_end", 30, move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+            slot.load()
+        });
+        record.store(handle.subtitles_live(), Ordering::Release);
+        *keep.lock().unwrap() = Some(slot);
+    });
+    assert_eq!(run.frames, 30);
+    assert!(seen_live.load(Ordering::Acquire), "live during the run");
+    let slot = kept
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the controller kept the slot");
+    let handle = slot.load().expect("the handle stays published");
+    assert!(!handle.subtitles_live(), "ended with the run");
+    assert_eq!(
+        handle.repoint_subtitles("any", &[(0, None)]),
+        Err(super::SubtitleRepoint::Ended)
+    );
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(slot);
+    assert_eq!(
+        adapter.try_take_subtitles(SubtitleTakeRequest {
+            operation_id: "late".to_owned(),
+            output: "any".to_owned(),
+            slots: vec![(0, None)],
+            principal: "p".to_owned(),
+        }),
+        Err(SubtitleTakeError::Busy)
+    );
+}
+
+/// What the teardown hook observed: (live, table unchanged, take, readback, table).
+type TeardownSeen = (
+    bool,
+    bool,
+    Result<u64, multiview_control::output_routing::SubtitleTakeError>,
+    Option<Vec<Option<String>>>,
+    Vec<Option<String>>,
+);
+
+/// Review INV2-1 through the real pipeline: teardown is paused after the
+/// bake consumer exited (egress joined) and before ingest teardown and the
+/// run's return. There, a subtitle take is `Busy`, the run's table is
+/// unchanged and there is no live readback (GET /patch: `live: false`).
+#[test]
+fn a_subtitle_take_during_teardown_after_the_consumer_exited_is_busy() {
+    use multiview_control::output_routing::{
+        OutputRouting, SubtitleTakeError, SubtitleTakeRequest,
+    };
+    let template = CONFIG.replacen(
+        "segment_ms = 1000\n[[outputs]]",
+        "segment_ms = 1000\n[[outputs.slots.subtitle]]\nlanguage = \"en\"\nsource = \"@_a\"\n[[outputs]]",
+        1,
+    );
+    assert_ne!(template, CONFIG, "out0 declares a subtitle slot");
+    let seen: Arc<Mutex<Option<TeardownSeen>>> = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let live_during_run = Arc::new(AtomicBool::new(false));
+    let live_flag = Arc::clone(&live_during_run);
+    let run = drive_prepared(
+        &template,
+        false,
+        false,
+        "sub_teardown",
+        30,
+        move |pipeline| {
+            let slot = pipeline.output_routing();
+            pipeline.set_teardown_hook(Box::new(move || {
+                let handle = slot.load().expect("the run published its handle");
+                let routes = handle
+                    .subtitle_routes_for_test("out0")
+                    .expect("out0 has a route table");
+                let before = routes.load().to_vec();
+                let adapter =
+                    crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+                let take = adapter.try_take_subtitles(SubtitleTakeRequest {
+                    operation_id: "late".to_owned(),
+                    output: "out0".to_owned(),
+                    slots: vec![(0, None)],
+                    principal: "p".to_owned(),
+                });
+                let after = routes.load().to_vec();
+                *record.lock().unwrap() = Some((
+                    handle.subtitles_live(),
+                    before == after,
+                    take,
+                    adapter.subtitle_routes("out0"),
+                    after,
+                ));
+            }));
+        },
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            live_flag.store(
+                handle.subtitles_live() && handle.subtitle_table("out0").is_some(),
+                Ordering::Release,
+            );
+        },
+    );
+    assert_eq!(run.frames, 30);
+    assert!(
+        live_during_run.load(Ordering::Acquire),
+        "live during the run"
+    );
+    let (live, unchanged, take, readback, table) =
+        seen.lock().unwrap().take().expect("the teardown hook ran");
+    assert!(!live, "admission ended before the run returned");
+    assert_eq!(take, Err(SubtitleTakeError::Busy));
+    assert!(unchanged, "the ended run's table is untouched: {table:?}");
+    assert_eq!(table, vec![Some("sub_teardown_a".to_owned())]);
+    assert_eq!(readback, None, "no live readback (GET /patch live:false)");
 }
 
 /// [`LAYOUT_CONFIG`] at 128x96 so a routed layout's overlay chrome fits
