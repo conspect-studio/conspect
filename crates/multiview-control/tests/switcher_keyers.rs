@@ -305,6 +305,10 @@ impl SourceDemandProvider for Demand {
 }
 
 struct Rig {
+    /// The router's Clean reservation when the rig starts with Clean routed
+    /// (the real router holds one per output on or taking Clean).
+    #[allow(dead_code)]
+    clean: Option<multiview_engine::clean_gate::CleanReservation>,
     router: axum::Router,
     state: AppState,
     handle: SwitcherControl,
@@ -388,7 +392,9 @@ fn build(path: &Path, doc: &str, clean_routed: bool) -> Rig {
             "main".into(),
         ),
     );
+    let clean = clean_routed.then(|| handle.clean_gate().try_reserve_clean().unwrap());
     Rig {
+        clean,
         router: multiview_control::router(state.clone()),
         state,
         handle,
@@ -896,8 +902,8 @@ async fn defining_the_first_dsk_while_clean_is_routed_is_refused() {
     assert!(rig.leases.acquired.lock().unwrap().is_empty());
     assert!(
         !rig.handle
-            .dsk_defined_cell()
-            .load(std::sync::atomic::Ordering::Acquire),
+            .clean_gate()
+            .clean_refused(),
         "the refusal holds no Clean reservation"
     );
     // Without a Clean subscriber the first DSK is defined, and the shared
@@ -911,8 +917,8 @@ async fn defining_the_first_dsk_while_clean_is_routed_is_refused() {
     );
     assert!(rig
         .handle
-        .dsk_defined_cell()
-        .load(std::sync::atomic::Ordering::Acquire));
+        .clean_gate()
+            .clean_refused());
     tick(&mut rig.driver, 1);
     assert!(outcomes.try_recv().unwrap().event.completed);
     assert!(rig.handle.keyer_definitions().unwrap().any());
@@ -949,8 +955,8 @@ async fn a_keyer_set_held_past_its_deadline_never_applies_and_leaves_nothing() {
     );
     assert!(
         rig.handle
-            .dsk_defined_cell()
-            .load(std::sync::atomic::Ordering::Acquire),
+            .clean_gate()
+            .clean_refused(),
         "the command can still apply: Clean stays excluded"
     );
     // The clock drains it only after its deadline tick: refused, never applied.
@@ -967,8 +973,8 @@ async fn a_keyer_set_held_past_its_deadline_never_applies_and_leaves_nothing() {
     wait_for(|| rig.leases.live.lock().unwrap().is_empty()).await;
     wait_for(|| {
         !rig.handle
-            .dsk_defined_cell()
-            .load(std::sync::atomic::Ordering::Acquire)
+            .clean_gate()
+            .clean_refused()
     })
     .await;
     assert!(persisted(&rig.state)
@@ -976,6 +982,103 @@ async fn a_keyer_set_held_past_its_deadline_never_applies_and_leaves_nothing() {
         .unwrap()
         .downstream_keyers
         .is_empty());
+}
+
+/// Fill the engine mailbox so the next enqueue fails (503).
+fn fill_mailbox(handle: &SwitcherControl) {
+    use multiview_engine::switcher_control::{SwitcherCommand, SwitcherVerb};
+    while handle
+        .try_send(SwitcherCommand {
+            operation_id: "fill".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::KeyerTie { keyer: 0, tie: true },
+        })
+        .is_ok()
+    {}
+}
+
+/// Review H3(b): request A reserves and queues the first DSK; request B
+/// (also defining a new keyer, no DSK committed yet) reserves too and fails
+/// its enqueue (503). B's settlement must release only its own reservation:
+/// a Clean take stays refused while A is queued, and after A applies the
+/// committed bit keeps it refused.
+#[tokio::test]
+async fn a_failed_sibling_never_releases_a_queued_first_dsk_reservation() {
+    let doc = DOC.split("[[switcher.downstream_keyers]]").next().unwrap();
+    let (_dir, path) = temp_boot(doc);
+    let mut rig = build(&path, doc, false);
+    let mut outcomes = rig.handle.outcomes();
+    let gate = rig.handle.clean_gate();
+    let a = body("keyer_set", json!({"keyer":"dsk1","fill":"gfx"}));
+    assert_eq!(
+        command(&rig, FULL, "a", &a).await.status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(gate.dsk_reservations(), 1, "A holds one reservation");
+    fill_mailbox(&rig.handle);
+    let b = body("keyer_set", json!({"keyer":"dsk2","fill":"gfx2"}));
+    let (status, kind) = kind_of(command(&rig, FULL, "b", &b).await).await;
+    assert_eq!(
+        (status, kind.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "engine-busy")
+    );
+    assert_eq!(gate.dsk_reservations(), 1, "B released only its own");
+    // The Clean take the router would admit now: refused, A is queued.
+    assert!(
+        gate.try_reserve_clean().is_none(),
+        "a Clean take passed while A was queued"
+    );
+    tick(&mut rig.driver, 1);
+    let mine = std::iter::from_fn(|| outcomes.try_recv().ok())
+        .map(|item| item.event)
+        .find(|o| o.operation_id != "fill")
+        .unwrap();
+    assert!(mine.completed, "{mine:?}");
+    assert!(rig.handle.keyer_definitions().unwrap().any());
+    wait_for(|| gate.dsk_reservations() == 0).await;
+    assert!(gate.defined(), "the committed DSK keeps Clean refused");
+    assert!(gate.try_reserve_clean().is_none());
+}
+
+/// Review H3(a), both orders, deterministically at the one admission point:
+/// (1) a Clean take admitted first (the router holds its reservation, the
+/// routing snapshot not yet published) refuses the first DSK with 409 and
+/// leaves nothing behind; (2) a first DSK admitted first (queued, not yet
+/// applied) refuses every Clean take until it settles.
+#[tokio::test]
+async fn clean_and_the_first_dsk_never_both_win_in_either_order() {
+    let doc = DOC.split("[[switcher.downstream_keyers]]").next().unwrap();
+    // (1) Clean first. The rig's routing snapshot shows no Clean: only the
+    // gate knows, as in the window before the router publishes.
+    let (_dir, path) = temp_boot(doc);
+    let rig = build(&path, doc, false);
+    let gate = rig.handle.clean_gate();
+    let clean = gate.try_reserve_clean().unwrap();
+    let verb = body("keyer_set", json!({"keyer":"dsk1","fill":"gfx"}));
+    assert_eq!(
+        body_json(plan(&rig, FULL, &verb).await).await["refusal"]["type"],
+        "clean-unavailable-with-dsk"
+    );
+    let (status, kind) = kind_of(command(&rig, FULL, "dsk", &verb).await).await;
+    assert_eq!(
+        (status, kind.as_str()),
+        (StatusCode::CONFLICT, "clean-unavailable-with-dsk")
+    );
+    assert_eq!(gate.dsk_reservations(), 0);
+    assert!(rig.leases.acquired.lock().unwrap().is_empty());
+    assert!(rig.state.idempotency.peek("dsk").is_none());
+    drop(clean);
+    // (2) The first DSK first: queued, not applied; Clean is refused.
+    let (_dir2, path2) = temp_boot(doc);
+    let mut rig = build(&path2, doc, false);
+    let gate = rig.handle.clean_gate();
+    assert_eq!(
+        command(&rig, FULL, "dsk", &verb).await.status(),
+        StatusCode::ACCEPTED
+    );
+    assert!(gate.try_reserve_clean().is_none(), "Clean while a DSK is queued");
+    tick(&mut rig.driver, 1);
+    assert!(gate.try_reserve_clean().is_none(), "Clean after it applied");
 }
 
 async fn next_keyer(

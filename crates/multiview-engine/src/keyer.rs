@@ -80,6 +80,13 @@ pub const REFUSE_KEYER_DEFINITION: &str =
 pub const REFUSE_KEYER_STALE: &str =
     "keyer-definitions-changed: the committed keyer definitions changed since this keyer_set \
      was admitted; re-plan it";
+/// Typed refusal: a `keyer_set` defining a new keyer while an output
+/// carries Clean or has a take to it pending (the tick's backstop of the
+/// Clean / DSK exclusion, review H3; the same kind the control plane
+/// answers with 409).
+pub const REFUSE_KEYER_CLEAN: &str =
+    "clean-unavailable-with-dsk: an output carries Clean; defining a downstream keyer would put \
+     DSK pixels on it";
 /// Typed refusal: a `keyer_set` drained at or after its deadline tick
 /// (review H4): it never applies; the caller re-plans.
 pub const REFUSE_KEYER_SET_DEADLINE: &str =

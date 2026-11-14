@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use multiview_compositor::pipeline::Nv12Image;
 use multiview_core::time::{MediaTime, Rational};
+use multiview_engine::clean_gate::{CleanDskGate, CleanReservation};
 use multiview_ffmpeg::EncodedPacket;
 use multiview_framestore::{SwapCell, TileStore};
 
@@ -514,10 +515,11 @@ pub struct OutputRoutingHandle {
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
     outputs: Arc<[RunOutput]>,
     has_preview: bool,
-    /// A downstream keyer is defined (ADR-0113, K2a): Program carries DSK
-    /// pixels, so Clean is refused until pre-DSK Clean lands (K2b). Shared
-    /// with the switcher (K4 `keyer_set` defines the first DSK at run time).
-    dsk_defined: Arc<std::sync::atomic::AtomicBool>,
+    /// The Clean / DSK admission point (ADR-0113, K2a; K4 review H3): while
+    /// a DSK is defined or being defined Program carries DSK pixels, so
+    /// Clean is refused until pre-DSK Clean lands (K2b). Shared with the
+    /// switcher (a K4 `keyer_set` defines a DSK at run time).
+    clean_gate: Arc<CleanDskGate>,
     /// What the plan needs to tell an identity picture (P2) from a convert
     /// (P3), #342 B2: the run's store lookup and its canvas. `None` until
     /// [`OutputRoutingHandle::with_pictures`].
@@ -768,30 +770,33 @@ impl OutputRoutingHandle {
     }
 
     /// Mark the run as defining a downstream keyer (ADR-0113, K2a): a take
-    /// to Clean is then refused (`clean-unavailable-with-dsk`).
+    /// to Clean is then refused (`clean-unavailable-with-dsk`). Never clears
+    /// the mark (a `false` is a no-op).
     #[must_use]
     pub fn with_dsk_defined(self, defined: bool) -> Self {
-        self.dsk_defined
-            .store(defined, std::sync::atomic::Ordering::Release);
-        self
-    }
-
-    /// Share the switcher's "DSK defined" cell (K4: a `keyer_set` that
-    /// defines the first DSK sets it before its enqueue), keeping the
-    /// current value when the cell is already set.
-    #[must_use]
-    pub fn with_dsk_cell(mut self, cell: Arc<std::sync::atomic::AtomicBool>) -> Self {
-        if self.dsk_defined() {
-            cell.store(true, std::sync::atomic::Ordering::Release);
+        if defined {
+            self.clean_gate.set_defined();
         }
-        self.dsk_defined = cell;
         self
     }
 
-    /// Whether the run defines a downstream keyer (Clean is unavailable).
+    /// Share the switcher's Clean / DSK gate (K4 review H3), keeping a DSK
+    /// already marked defined on this handle.
+    #[must_use]
+    pub fn with_clean_gate(mut self, gate: Arc<CleanDskGate>) -> Self {
+        if self.clean_gate.defined() {
+            gate.set_defined();
+        }
+        self.clean_gate = gate;
+        self
+    }
+
+    /// Whether a new Clean take is refused now: a downstream keyer is
+    /// defined or being defined (advisory; the router admits through the
+    /// gate itself).
     #[must_use]
     pub fn dsk_defined(&self) -> bool {
-        self.dsk_defined.load(std::sync::atomic::Ordering::Acquire)
+        self.clean_gate.clean_refused()
     }
 
     /// Attach the run's subtitle route tables (per output config id) and the
@@ -1449,10 +1454,13 @@ pub struct OutputRouter {
     /// Whether a Clean feed is active (cached so `publish_clean` costs one
     /// bool load when nothing selects Clean).
     clean_active: bool,
-    /// The shared "DSK defined" cell (the handle's; K4): a Clean take is
-    /// refused here too, so a take that passed the control-plane check just
-    /// before a `keyer_set` defined the first DSK never lands.
-    dsk_defined: Arc<std::sync::atomic::AtomicBool>,
+    /// The shared Clean / DSK gate (the handle's; K4 review H3): a take to
+    /// Clean is admitted only by taking a Clean reservation here, so it and
+    /// a `keyer_set` defining a DSK can never both win.
+    clean_gate: Arc<CleanDskGate>,
+    /// Per output: the Clean reservation it holds while its bus is Clean or
+    /// its pending take targets Clean (released by [`Self::reconcile_clean`]).
+    clean_holds: Vec<Option<CleanReservation>>,
     /// Whether a Program picture feed is active (a dynamic key on Program:
     /// a reformatted output, #342 B3).
     program_active: bool,
@@ -1597,7 +1605,7 @@ impl OutputRouter {
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
             outputs: Arc::from(Vec::new()),
             has_preview: cfg.has_preview,
-            dsk_defined: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            clean_gate: CleanDskGate::new(),
             pictures: None,
             max_aux_canvases: cfg.max_aux_canvases,
             sub: HandleSubtitles::default(),
@@ -1626,7 +1634,8 @@ impl OutputRouter {
             next_generation: 0,
             feeds: HashMap::new(),
             clean_active: false,
-            dsk_defined: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            clean_gate: CleanDskGate::new(),
+            clean_holds: Vec::new(),
             program_active: false,
             live_keys: Vec::new(),
             health: HashMap::new(),
@@ -1652,6 +1661,10 @@ impl OutputRouter {
             #[cfg(test)]
             drain_hook: None,
         };
+        // One Clean slot per output, sized once (never on a tick).
+        router
+            .clean_holds
+            .resize_with(router.outputs.len(), || None);
         router.publish_snapshot();
         Ok((router, handle))
     }
@@ -1884,6 +1897,7 @@ impl OutputRouter {
         self.check_aux(tick, dispatcher);
         self.linger(tick, dispatcher);
         self.sync_feeds();
+        self.reconcile_clean();
         self.sync_live_keys(dispatcher);
         let halved_changed =
             self.aux.halved.load(Ordering::Relaxed) != self.snapshot.load().aux_halved;
@@ -2127,6 +2141,16 @@ impl OutputRouter {
                 }
                 continue;
             }
+            // A re-issued Clean boot take needs its Clean reservation again.
+            let clean = self
+                .boot
+                .slots
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|b| b.take.bus == Some(PictureBus::Clean));
+            if clean && !self.hold_clean(index) {
+                continue;
+            }
             let Some(boot) = self.boot.slots.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
@@ -2294,6 +2318,37 @@ impl OutputRouter {
         // unused key (never retired under a move still landing).
     }
 
+    /// Hold a Clean reservation for output `index` (kept if it already holds
+    /// one): `false` when a downstream keyer is defined or being defined
+    /// (review H3). One CAS; an `Arc` refcount, never an allocation.
+    pub(super) fn hold_clean(&mut self, index: usize) -> bool {
+        if index >= self.outputs.len() {
+            return false;
+        }
+        let Some(slot) = self.clean_holds.get_mut(index) else {
+            return false;
+        };
+        if slot.is_none() {
+            *slot = self.clean_gate.try_reserve_clean();
+        }
+        slot.is_some()
+    }
+
+    /// Release the Clean reservation of every output that neither carries
+    /// Clean nor has a take to it pending (once per tick; O(outputs)).
+    fn reconcile_clean(&mut self) {
+        for (out, hold) in self.outputs.iter().zip(self.clean_holds.iter_mut()) {
+            let needs = out.bus == PictureBus::Clean
+                || out
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.take.bus == Some(PictureBus::Clean));
+            if !needs {
+                *hold = None;
+            }
+        }
+    }
+
     /// Drain the take mailbox: at most [`TAKE_MAILBOX`] messages (takes and
     /// sets combined) per tick, so a producer refilling it concurrently can
     /// never starve the rest of the tick (review C-1). Ops deferred behind a
@@ -2378,8 +2433,9 @@ impl OutputRouter {
         // AES67, display), cannot take an audio choice.
         let audio_ok =
             take.audio.is_none() || (self.audio.is_some() && dispatcher.has_program_audio(index));
-        let clean_refused = take.bus == Some(PictureBus::Clean)
-            && self.dsk_defined.load(std::sync::atomic::Ordering::Acquire);
+        // The one admission point (review H3): the take holds a Clean
+        // reservation from here on, or it is refused.
+        let clean_refused = take.bus == Some(PictureBus::Clean) && !self.hold_clean(index);
         let routable = index < self.outputs.len()
             && !clean_refused
             && (!needs_switcher || self.cfg.has_preview)

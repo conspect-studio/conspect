@@ -811,15 +811,39 @@ keyers.
     leases the new set before it releases the old one), persists the definitions, and only
     then drops the request's leases.
   - **Refused or busy.** The leases drop at once.
-- **Clean rule.** One `AtomicBool` "DSK defined" cell is shared by three holders: the switcher
-  (`SwitcherControl::dsk_defined_cell`, set at attach), the routing handle (plan and take
-  refusal) and the router (refusal at the drain, new).
-  - A `keyer_set` that defines the first DSK is refused while any output carries Clean or has
-    a take to it pending: a plan refusal, or 409 `clean-unavailable-with-dsk`.
-  - Otherwise it sets the cell before the enqueue and rechecks the routing snapshot.
-  - **Either order.** A Clean take planned before the cell was set is refused `unroutable` at
-    the router drain, so the two orders cannot both win.
-  - A refused or busy `keyer_set` recomputes the cell from the committed definitions.
+- **Clean rule (review round 1 H3: one counted admission point).** One `CleanDskGate`
+  (`multiview_engine::clean_gate`) is shared by the switcher (`SwitcherControl::clean_gate`),
+  the routing handle (plan answers) and the router (drain admission). It replaces the old
+  "DSK defined" `AtomicBool`, which raced: the router read `false` while the handler set it
+  and read a routing snapshot that did not yet show the pending Clean take, so both could
+  proceed. A failing request could also clear the bool under a queued sibling.
+  - **One word.** The gate is one `AtomicU64` holding a committed "defined" bit, a count of
+    DSK reservations and a count of Clean reservations. Every reservation is one CAS that
+    checks the other side in the same step. A DSK reservation is refused while any Clean
+    reservation is held. A Clean reservation is refused while a DSK is defined or any DSK
+    reservation is held. Reservations are RAII guards that release exactly their own count,
+    so a request that fails can never release another's. The operations are lock-free and
+    allocation-free.
+  - **Control plane.** A `keyer_set` that defines a new keyer (not only the first one) takes
+    a DSK reservation before its leases and enqueue. A refusal is 409
+    `clean-unavailable-with-dsk`. It holds the reservation in its settle task until a
+    terminal engine answer (H4). A refused, lease-less or busy request drops only its own.
+    The plan answers from the same gate (`clean_reservations() > 0`).
+  - **Router.** A take to Clean is admitted at the drain only by taking a Clean reservation
+    for its output (`hold_clean`). A take set with any Clean member that cannot reserve is
+    refused whole, and a re-issued Clean boot take reserves again. The tick's
+    `reconcile_clean` releases the reservation of every output that neither carries Clean
+    nor has a take to it pending (O(outputs); the slots are sized at construction).
+  - **Engine backstop.** At the tick, a `keyer_set` for a free slot takes its own DSK
+    reservation. If Clean is held it is refused `clean-unavailable-with-dsk`
+    (`REFUSE_KEYER_CLEAN`) and nothing changes. The reservation is held across the compose.
+    The commit sets the "defined" bit before the tick's outcomes, then drops it. A rejected
+    frame drops it without setting the bit. Attach sets the bit for declared DSKs. Nothing
+    clears it (no keyer removal verb).
+  - **Every interleaving.** Each side admits only through its own CAS against the other side's
+    count, so at most one wins. Whoever wins keeps the other excluded until its reservation
+    settles (DSK) or its output leaves Clean (Clean). After a DSK commits, the bit keeps
+    Clean out.
 - **GET.** `GET /api/v1/switcher/{me}` adds:
   - `keyers[]` (design note §8 shape: `id`, `family = "dsk"`, `fill`, `key`, `type`, `fly`,
     `mask`, `on_air`, `tie`, `ramp {start_tick, rate, to_on}`, `rate`, `loss`, `stale`,
@@ -850,7 +874,7 @@ keyers.
     runtime is a no-op per tick), so the first DSK can be defined at run time.
   - The pipeline creates the `keyer` consumer set for every M/E run (seeded only with declared
     DSKs) and hands it to the switcher (`set_keyer_demand`).
-  - The routing handle and the router get the switcher's cell.
+  - The routing handle and the router get the switcher's `CleanDskGate`.
 - **Deviations and choices.**
   - **`arm` is not built.** It needs USKs (K3, #388). USK `keyer_set` fields arrive with K3.
   - **z is fixed after definition.** The design is silent on re-ordering. Changing z would
@@ -867,6 +891,10 @@ keyers.
   - **The +1 decode charge** for a fill or key that is not running (ADR-0110 §10) is not
     computed separately. The lease is refused if the demand manager cannot take it (409
     `capacity`).
+  - **Every new keyer reserves, not only the first (H3).** The brief refuses "the first DSK"
+    while Clean is routed. The gate makes any `keyer_set` that defines a new keyer reserve.
+    While a DSK is already committed Clean cannot be held, so the result is the same. This
+    also closes two first-DSK requests racing on an empty set.
   - **No per-principal fairness** on the switcher routes and the shared idempotency store. It
     is still tracked in #394.
 - **Tests.**
@@ -898,8 +926,16 @@ keyers.
   - Lib unit tests: tally resolution, row filtering and redaction, and the `Keyer` scope.
   - `multiview-events` `authz_scope` (switcher.keyer).
   - `multiview-control` `tests/openapi.rs`: the plan `200` is `SwitcherPlan | KeyerPlan` (H5).
-  - `multiview-cli` `output_routing` (a Clean take refused at the drain once the shared cell is
-    set).
+  - `multiview-cli` `output_routing`: a queued Clean take refused at the drain once a DSK is
+    reserved on the shared gate; a DSK reserved from inside the drain (after the Clean take's
+    admission, before the snapshot shows it) loses; a reserved DSK refuses Clean at the
+    drain, and a Clean take's reservation is released on refusal and on supersession (H3,
+    `drain_hook` seam, no sleeps).
+  - H3 control tests (`switcher_keyers`): A queued, sibling B refused 503, and a Clean
+    reservation stays refused while A is queued and after A applies; both orders at the one
+    admission point. Engine (`keyers_set`): the tick refuses a new keyer while Clean is held
+    and a rejected definition releases the tick's reservation. Lib `clean_gate`: counting,
+    and 2 000 barrier-synchronised races of both orders, never both winning.
 - **Concern.** The GET/events parity test drives the driver without the frame hook, so its
   `tally` is the background roles only. Keyer tally resolution is covered by the lib unit
   test on a constructed snapshot.

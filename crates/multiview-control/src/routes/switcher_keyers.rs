@@ -20,7 +20,6 @@
 //! are both the per-object grant (`authorize_object`); the role gate (`Write`
 //! for a command) is what separates them, as for every other switcher verb.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::response::{IntoResponse, Response};
@@ -274,9 +273,10 @@ pub struct Checked {
     pub verb: SwitcherVerb,
     /// The plan answer.
     pub plan: KeyerPlan,
-    /// For `keyer_set`: whether this defines the first DSK (the Clean rule
-    /// must hold `dsk_defined` before the enqueue).
-    pub defines_first: bool,
+    /// For `keyer_set`: whether this defines a new keyer (the Clean rule
+    /// holds a DSK reservation on the gate from before the enqueue until it
+    /// settles, review H3).
+    pub defines_new: bool,
     /// For `keyer_set`: the fill and key leases the new definition needs.
     pub sources: Vec<String>,
 }
@@ -408,7 +408,7 @@ pub fn check(
     Ok(Ok(Checked {
         verb,
         plan: ctx.plan(Some(index), None, refused),
-        defines_first: false,
+        defines_new: false,
         sources: Vec::new(),
     }))
 }
@@ -573,7 +573,7 @@ fn check_set(
         .and_then(|(i, _)| ctx.row(i))
         .is_some_and(|r| r.on_air || r.ramp.is_some() || r.pending);
     let allow = fields.on_air == Some(KeyerOnAir::Allow);
-    let defines_first = !defs.any();
+    let defines_new = found.is_none();
     let refused = if !fits {
         Some(refusal(
             "capacity",
@@ -591,7 +591,7 @@ fn check_set(
             "on-air-protected",
             multiview_engine::keyer::REFUSE_KEYER_ON_AIR_PROTECTED,
         ))
-    } else if defines_first && clean_routed(state) {
+    } else if defines_new && clean_held(handle) {
         Some(refusal(
             "clean-unavailable-with-dsk",
             "an output carries Clean; defining a downstream keyer would put DSK pixels on it \
@@ -610,7 +610,7 @@ fn check_set(
     Ok(Ok(Checked {
         verb: handle.keyer_set_verb(defs, index, def, allow),
         plan: ctx.plan(found.map(|(i, _)| i), Some(cost), refused),
-        defines_first,
+        defines_new,
         sources,
     }))
 }
@@ -683,38 +683,24 @@ fn merge(cfg: &mut DownstreamKeyerConfig, f: &KeyerFields) {
     }
 }
 
-/// Whether an output carries Clean now (or has a take to it in progress).
-fn clean_routed(state: &AppState) -> bool {
-    let Some(routing) = state.output_routing.as_ref() else {
-        return false;
-    };
-    routing.routing.snapshot().is_some_and(|live| {
-        live.outputs
-            .values()
-            .any(|o| o.bus == "clean" || o.pending.as_ref().is_some_and(|(bus, _)| bus == "clean"))
-    })
+/// Whether an output carries Clean now or has a take to it pending: the
+/// router holds a Clean reservation on the shared gate for each (advisory,
+/// for the plan; the command admits through [`reserve_dsk`]).
+fn clean_held(handle: &SwitcherControl) -> bool {
+    handle.clean_gate().clean_reservations() > 0
 }
 
-/// Hold `dsk_defined` for a `keyer_set` defining the first DSK, then recheck
-/// that no Clean take slipped in (the routing take side reads the same cell),
-/// so the two orders cannot both win. Returns `false` (cell restored) when a
-/// Clean subscriber appeared.
+/// Reserve "a DSK is being defined" on the Clean / DSK gate for a
+/// `keyer_set` defining a new keyer (review H3): one CAS that succeeds only
+/// while no output holds a Clean reservation, and from then on refuses
+/// every Clean take until this reservation drops. Counted, so a sibling
+/// request that fails can never release this one. `None`: Clean is routed
+/// or a take to it is pending.
 #[must_use]
-pub fn reserve_first_dsk(state: &AppState, handle: &SwitcherControl) -> bool {
-    let cell = handle.dsk_defined_cell();
-    let was = cell.swap(true, Ordering::AcqRel);
-    if !was && clean_routed(state) {
-        cell.store(false, Ordering::Release);
-        return false;
-    }
-    true
-}
-
-/// Recompute `dsk_defined` from the committed definitions (after a refused
-/// `keyer_set` that held it, or on any committed change).
-pub fn settle_dsk_defined(handle: &SwitcherControl) {
-    let defined = handle.keyer_definitions().is_some_and(|d| d.any());
-    handle.dsk_defined_cell().store(defined, Ordering::Release);
+pub fn reserve_dsk(
+    handle: &SwitcherControl,
+) -> Option<multiview_engine::clean_gate::DskReservation> {
+    handle.clean_gate().try_reserve_dsk()
 }
 
 /// Take make-before-break leases on a new definition's fill and key before
@@ -996,7 +982,13 @@ struct PendingSet {
     #[allow(dead_code)]
     // reason: an RAII lease vector, kept only for its `Drop`.
     leases: Vec<crate::source_demand::SwitcherPreviewLease>,
-    holds_dsk: bool,
+    /// The DSK reservation of a `keyer_set` defining a new keyer (RAII:
+    /// dropping it releases exactly this count; review H3). Held until a
+    /// terminal engine answer; by then an applied definition has set the
+    /// gate's committed bit at its tick.
+    #[allow(dead_code)]
+    // reason: an RAII reservation, kept only for its `Drop`.
+    dsk: Option<multiview_engine::clean_gate::DskReservation>,
 }
 
 /// How often a settling `keyer_set` that has seen no outcome re-reads the
@@ -1051,20 +1043,25 @@ pub fn submit(
     };
     let mut pending = None;
     if let SwitcherVerb::KeyerSet { def, deadline, .. } = &checked.verb {
-        let holds_dsk = checked.defines_first;
-        if holds_dsk && !reserve_first_dsk(state, handle) {
-            state.idempotency.release(Some(key), &op);
-            return Ok(typed(
-                409,
-                "clean-unavailable-with-dsk",
-                "an output carries Clean; defining a downstream keyer would put DSK pixels on it",
-            ));
-        }
+        // The one admission point for the Clean rule (review H3): the
+        // reservation is taken before the enqueue and lives in `pending`.
+        let dsk = if checked.defines_new {
+            let Some(dsk) = reserve_dsk(handle) else {
+                state.idempotency.release(Some(key), &op);
+                return Ok(typed(
+                    409,
+                    "clean-unavailable-with-dsk",
+                    "an output carries Clean; defining a downstream keyer would put DSK pixels on it",
+                ));
+            };
+            Some(dsk)
+        } else {
+            None
+        };
         let Some(leases) = take_leases(state, &checked.plan.keyer, &checked.sources) else {
             state.idempotency.release(Some(key), &op);
-            if holds_dsk {
-                settle_dsk_defined(handle);
-            }
+            // Dropping `dsk` releases this request's reservation only.
+            drop(dsk);
             return Ok(typed(
                 409,
                 "capacity",
@@ -1076,7 +1073,7 @@ pub fn submit(
             def: Arc::clone(&def.0),
             deadline: *deadline,
             leases,
-            holds_dsk,
+            dsk,
         });
     }
     // Subscribed before the enqueue, so the outcome cannot be missed.
@@ -1088,10 +1085,9 @@ pub fn submit(
     };
     if handle.try_send(command).is_err() {
         state.idempotency.release(Some(key), &op);
-        // Dropping `pending` releases every lease it took.
-        if pending.as_ref().is_some_and(|p| p.holds_dsk) {
-            settle_dsk_defined(handle);
-        }
+        // Dropping `pending` releases every lease and the DSK reservation it
+        // took: this request's own count, never a sibling's (review H3).
+        drop(pending);
         return Err(ControlError::EngineBusy);
     }
     if let (Some(pending), Some(outcomes)) = (pending, outcomes) {
@@ -1122,7 +1118,7 @@ fn accepted(operation_id: String, kind: &str) -> Response {
 /// still apply orphaned it). Then decide from the committed definitions (the
 /// authority, so a lagged outcome ring cannot mislead it); on `applied`
 /// republish the keyer demand set and persist the definitions; in every case
-/// release the leases it took and recompute `dsk_defined`.
+/// release the leases and the DSK reservation it took.
 async fn settle_set(
     state: AppState,
     handle: SwitcherControl,
@@ -1164,11 +1160,9 @@ async fn settle_set(
             }
         }
     }
-    if pending.holds_dsk || applied {
-        settle_dsk_defined(&handle);
-    }
     // The demand set now holds the new sources (make-before-break): the
-    // request's own leases are released here.
+    // request's own leases are released here, and its DSK reservation (an
+    // applied definition already set the gate's committed bit at its tick).
     drop(pending);
 }
 

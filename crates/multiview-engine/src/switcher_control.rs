@@ -15,10 +15,11 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::clock::Tick;
+use crate::clean_gate::{CleanDskGate, DskReservation};
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::keyer::{
     KeyerAction, KeyerCounters, KeyerDef, KeyerDefinition, KeyerDefinitions, KeyerDraw, KeyerEvent,
-    KeyerReadback, REFUSE_KEYER_SET_DEADLINE,
+    KeyerReadback, REFUSE_KEYER_CLEAN, REFUSE_KEYER_SET_DEADLINE,
     KeyerRuntime, KeyerSnapshot, KeyerTally, OpSink, TieEnvelope, MAX_DSK,
 };
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
@@ -291,10 +292,10 @@ pub struct SwitcherControl {
     /// The run's frame stores, published once at attach so `keyer_set` can
     /// resolve a definition off the clock (K4).
     stores: LatestState<HashMap<String, Arc<TileStore<Nv12Image>>>>,
-    /// Whether a downstream keyer is defined (or a `keyer_set` defining the
-    /// first one is in flight): the output router refuses Clean while set
-    /// (K2a deviation until K2b). Shared with the routing handle.
-    dsk_defined: Arc<std::sync::atomic::AtomicBool>,
+    /// The Clean / DSK admission point (review H3): counted DSK and Clean
+    /// reservations plus the committed "defined" bit, shared with the
+    /// routing handle and the router (K2a deviation until K2b).
+    clean_gate: Arc<CleanDskGate>,
     /// The `keyer` demand consumer set (ADR-0113 §4), installed at attach so
     /// a committed `keyer_set` republishes the fill/key leases off the clock.
     keyer_demand: Arc<std::sync::OnceLock<crate::ConsumerSet<Nv12Image>>>,
@@ -353,7 +354,7 @@ impl SwitcherControl {
             keyer_counters: Arc::new(KeyerCounters::default()),
             keyer_defs: LatestState::new(),
             stores: LatestState::new(),
-            dsk_defined: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            clean_gate: CleanDskGate::new(),
             keyer_demand: Arc::new(std::sync::OnceLock::new()),
         };
         let driver = SwitcherTickDriver {
@@ -387,7 +388,8 @@ impl SwitcherControl {
             staged_readback: None,
             definition_builds: 0,
             stores: handle.stores.clone(),
-            dsk_defined: Arc::clone(&handle.dsk_defined),
+            clean_gate: Arc::clone(&handle.clean_gate),
+            staged_dsk: None,
         };
         (handle, driver)
     }
@@ -575,13 +577,15 @@ impl SwitcherControl {
         }
     }
 
-    /// The shared "a downstream keyer is defined" cell (the output router
-    /// refuses Clean while it is set). Set at attach; the control plane sets
-    /// it before enqueueing a `keyer_set` that defines the first DSK and
-    /// recomputes it from [`Self::keyer_definitions`] after the outcome.
+    /// The shared Clean / DSK admission point (review H3). Its "defined"
+    /// bit is set at attach (declared DSKs) and by the commit of a tick that
+    /// defined a keyer. The control plane holds a DSK reservation from
+    /// before it enqueues a `keyer_set` defining a new keyer until that
+    /// command settles. The router holds one Clean reservation per output on
+    /// or taking Clean.
     #[must_use]
-    pub fn dsk_defined_cell(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        Arc::clone(&self.dsk_defined)
+    pub fn clean_gate(&self) -> Arc<CleanDskGate> {
+        Arc::clone(&self.clean_gate)
     }
 
     /// Install the run's `keyer` demand set (once, at attach).
@@ -638,7 +642,11 @@ pub struct SwitcherTickDriver {
     /// allocation on the clock); review H6 pins it at the attach build.
     definition_builds: u64,
     stores: LatestState<HashMap<String, Arc<TileStore<Nv12Image>>>>,
-    dsk_defined: Arc<std::sync::atomic::AtomicBool>,
+    clean_gate: Arc<CleanDskGate>,
+    /// The tick backstop's DSK reservation for this tick's applied
+    /// definition of a new keyer: held until the commit marks the gate
+    /// defined, dropped by a reject.
+    staged_dsk: Option<DskReservation>,
 }
 
 /// Everything a rejected tick must restore (review SW2-03): the machine and
@@ -664,10 +672,9 @@ impl SwitcherTickDriver {
         self.keyer_defs.publish(self.keyers.definitions());
         self.definition_builds += 1;
         self.published_def_version = self.keyers.def_version();
-        self.dsk_defined.store(
-            !self.keyers.is_empty(),
-            std::sync::atomic::Ordering::Release,
-        );
+        if !self.keyers.is_empty() {
+            self.clean_gate.set_defined();
+        }
     }
 
     /// Odometer: committed-definition readbacks built on the clock (one at
@@ -1241,6 +1248,27 @@ impl SwitcherTickDriver {
                     );
                     continue;
                 }
+                // Backstop (review H3): a new keyer is defined only under a
+                // DSK reservation taken here, at the tick, so it cannot land
+                // while an output carries Clean or has a take to it pending,
+                // whatever the caller did. One CAS; no allocation.
+                let new_keyer = self.keyers.def(usize::from(keyer)).is_none();
+                let reservation = if new_keyer {
+                    match self.clean_gate.try_reserve_dsk() {
+                        Some(reservation) => Some(reservation),
+                        None => {
+                            self.publish_outcome(
+                                command.operation_id,
+                                tick.index,
+                                false,
+                                Some(REFUSE_KEYER_CLEAN.into()),
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let before = self.keyers.def_version();
                 self.keyers.define(
                     keyer,
@@ -1259,6 +1287,12 @@ impl SwitcherTickDriver {
                     // Applied: its prepared readback is what the commit
                     // publishes (a move; a later set this tick replaces it).
                     self.staged_readback = Some(readback.0);
+                    // One held reservation excludes Clean until the commit
+                    // marks the gate defined; a second new keyer this tick
+                    // keeps the first one (never a gap between them).
+                    if self.staged_dsk.is_none() {
+                        self.staged_dsk = reservation;
+                    }
                 }
                 continue;
             }
@@ -1685,8 +1719,14 @@ impl SwitcherTickDriver {
                 }
             }
             self.published_def_version = self.keyers.def_version();
+            // Before this tick's outcomes: once a caller sees `applied`, the
+            // gate already refuses Clean for good.
+            if !self.keyers.is_empty() {
+                self.clean_gate.set_defined();
+            }
         }
         self.staged_readback = None;
+        self.staged_dsk = None;
         self.keyers.commit(&self.keyer_events);
         // Readback only on a committed patch tick (allocates; never steady state).
         if self.inputs_version != self.published_inputs_version {
@@ -1715,6 +1755,8 @@ impl SwitcherTickDriver {
         // `staged_success` and are refused below with everything else.
         self.keyers.reject(tick.index, reason, &self.outcomes);
         self.staged_readback = None;
+        // The restored definitions have no new keyer: its reservation goes.
+        self.staged_dsk = None;
         // The armed patch applied on this tick is restored with the table
         // below and goes back to the router (never committed).
         if let Some(armed) = self.armed.as_mut() {

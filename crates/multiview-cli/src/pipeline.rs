@@ -4122,9 +4122,9 @@ impl Pipeline {
         // composed tick: a wait-free atomic load, never a lock on the clock.
         if let Some(control) = self.switcher_control.as_ref() {
             router.set_switcher_clock(control.applied_tick_cell());
-            // K4: one "DSK defined" cell shared by the switcher, the routing
-            // handle (plan) and the router (drain).
-            router.set_dsk_cell(control.dsk_defined_cell());
+            // K4 (review H3): one Clean / DSK gate shared by the switcher,
+            // the routing handle (plan) and the router (drain admission).
+            router.set_clean_gate(control.clean_gate());
         }
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
         // Slice F part F2: the run's subtitle route tables, keyed by output
@@ -4147,10 +4147,10 @@ impl Pipeline {
                 .with_dsk_defined(!self.switcher_keyers.is_empty())
                 .with_subtitles(subtitle_tables, Arc::clone(&subtitle_tick)),
         );
-        // K4: the switcher's cell, so a run-time `keyer_set` defining the
-        // first DSK refuses Clean from the same instant.
+        // K4: the switcher's gate, so a run-time `keyer_set` defining a DSK
+        // and a Clean take are admitted against the same counted word.
         let handle = match self.switcher_control.as_ref() {
-            Some(control) => Arc::new((*handle).clone().with_dsk_cell(control.dsk_defined_cell())),
+            Some(control) => Arc::new((*handle).clone().with_clean_gate(control.clean_gate())),
             None => handle,
         };
         enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);

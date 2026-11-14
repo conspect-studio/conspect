@@ -1968,20 +1968,20 @@ fn an_aux_failure_never_moves_an_output_off_clean() {
     assert_eq!(x.h.snapshot().outputs[1].bus, "clean");
 }
 
-/// ADR-0113 K4: the router shares the switcher's "DSK defined" cell. A
-/// Clean take already queued when a run-time `keyer_set` defines the first
-/// DSK is refused at the drain, and the handle's plan sees the same cell.
+/// ADR-0113 K4: the router shares the switcher's Clean / DSK gate. A Clean
+/// take already queued when a run-time `keyer_set` reserves a DSK is
+/// refused at the drain, and the handle's plan sees the same gate.
 #[test]
 fn a_clean_take_is_refused_at_the_drain_once_the_shared_dsk_cell_is_set() {
     let (mut x, _seen) = ptr_harness(2);
     x.tick(0);
-    let cell = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    x.r.set_dsk_cell(Arc::clone(&cell));
-    let h = x.h.clone().with_dsk_cell(Arc::clone(&cell));
+    let gate = multiview_engine::clean_gate::CleanDskGate::new();
+    x.r.set_clean_gate(Arc::clone(&gate));
+    let h = x.h.clone().with_clean_gate(Arc::clone(&gate));
     assert!(!h.dsk_defined());
     x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
-    cell.store(true, Ordering::Release);
-    assert!(h.dsk_defined(), "the handle reads the shared cell");
+    let _dsk = gate.try_reserve_dsk().unwrap();
+    assert!(h.dsk_defined(), "the handle reads the shared gate");
     x.tick(1);
     assert_eq!(
         x.results(),
@@ -8165,4 +8165,63 @@ fn a_rejected_set_never_switches_a_staying_members_private_bus_audio() {
             "no bars sample ever reached the bus on air (block at {start})"
         );
     }
+}
+
+/// Review H3(a), router first: a `keyer_set` handler running inside the
+/// router's drain (after the Clean take was admitted, before the routing
+/// snapshot shows it pending) cannot reserve its first DSK, because the
+/// router took the Clean reservation at the admission point. Never both.
+#[test]
+fn a_dsk_reserved_inside_the_drain_loses_to_the_admitted_clean_take() {
+    let (mut x, _seen) = ptr_harness(2);
+    x.tick(0);
+    let gate = multiview_engine::clean_gate::CleanDskGate::new();
+    x.r.set_clean_gate(Arc::clone(&gate));
+    let h = x.h.clone().with_clean_gate(Arc::clone(&gate));
+    let won = Arc::new(Mutex::new(None));
+    let (g, w, h2) = (Arc::clone(&gate), Arc::clone(&won), h.clone());
+    x.r.drain_hook = Some(Box::new(move || {
+        // The snapshot the old check read: no Clean pending yet.
+        let stale = h2.snapshot().outputs.iter().all(|o| o.pending.is_none());
+        *w.lock().unwrap() = Some((stale, g.try_reserve_dsk()));
+    }));
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    x.tick(1);
+    x.r.drain_hook = None;
+    let (stale, dsk) = won.lock().unwrap().take().unwrap();
+    assert!(stale, "the handler ran before the snapshot showed the take");
+    assert!(dsk.is_none(), "the first DSK reserved under an admitted Clean take");
+    assert!(x.r.outputs[1].pending.is_some(), "the Clean take proceeds");
+    assert!(!h.dsk_defined());
+}
+
+/// Review H3(a), DSK first: a DSK reserved before the drain refuses the
+/// Clean take there; once that reservation drops (its `keyer_set` refused),
+/// the router's tick reconcile has left nothing held, and a new Clean take is
+/// admitted. A Clean take's reservation is released when it is refused or
+/// superseded, never leaked.
+#[test]
+fn a_reserved_dsk_refuses_clean_at_the_drain_and_releases_cleanly() {
+    let (mut x, _seen) = ptr_harness(2);
+    x.tick(0);
+    let gate = multiview_engine::clean_gate::CleanDskGate::new();
+    x.r.set_clean_gate(Arc::clone(&gate));
+    let dsk = gate.try_reserve_dsk().unwrap();
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    x.tick(1);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Unroutable)]
+    );
+    assert_eq!(gate.clean_reservations(), 0);
+    drop(dsk);
+    x.h.try_take(take("c2", 1, PictureBus::Clean)).unwrap();
+    x.tick(2);
+    assert_eq!(gate.clean_reservations(), 1, "the pending Clean take holds one");
+    assert!(gate.try_reserve_dsk().is_none());
+    // Superseded by a Program take: the reservation goes at the reconcile.
+    x.h.try_take(take("p", 1, PictureBus::Program)).unwrap();
+    x.tick(3);
+    assert_eq!(gate.clean_reservations(), 0);
+    assert!(gate.try_reserve_dsk().is_some());
 }

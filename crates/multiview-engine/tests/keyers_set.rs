@@ -14,7 +14,7 @@ mod rig;
 
 use multiview_engine::keyer::{
     KeyerReason, REFUSE_KEYER_CAPACITY, REFUSE_KEYER_DEFINITION, REFUSE_KEYER_ON_AIR_PROTECTED,
-    REFUSE_KEYER_SET_DEADLINE, REFUSE_KEYER_STALE,
+    REFUSE_KEYER_CLEAN, REFUSE_KEYER_SET_DEADLINE, REFUSE_KEYER_STALE,
 };
 use multiview_engine::switcher_control::SwitcherVerb;
 use rig::{cmd, drain, dsk, probe, step, tick, Rig, LUMA_A, LUMA_B, LUMA_FILL, SIDE};
@@ -38,8 +38,7 @@ fn keyer_set_defines_a_new_keyer_at_one_tick_and_publishes_definitions_on_change
     let before = handle.keyer_definitions().unwrap();
     assert!(!before.any());
     assert!(!handle
-        .dsk_defined_cell()
-        .load(std::sync::atomic::Ordering::Acquire));
+        .clean_gate().clean_refused());
     fresh(&rig, 0);
     step(&mut hook, &mut drive, 0);
     let def = handle.resolve_keyer(&dsk("dsk1", "gfx", None, 1)).unwrap();
@@ -317,4 +316,73 @@ fn a_keyer_set_drained_past_its_deadline_never_applies() {
     step(&mut hook, &mut drive, last);
     assert!(drain(&mut outcomes).0[0].completed);
     assert!(handle.keyer_definitions().unwrap().any());
+}
+
+/// Review H3 backstop: the tick refuses a `keyer_set` defining a new keyer
+/// while the router holds a Clean reservation (whatever the caller did),
+/// applies nothing, and leaves no DSK reservation; a change to an existing
+/// keyer is not a definition and is unaffected. Once Clean is released the
+/// same verb defines the keyer and the gate's committed bit is set.
+#[test]
+fn the_tick_refuses_a_new_keyer_while_clean_is_held() {
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[], 9.0, "a", "b");
+    let mut outcomes = handle.outcomes();
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    let gate = handle.clean_gate();
+    let clean = gate.try_reserve_clean().unwrap();
+    let verb = || {
+        handle.keyer_set_verb(
+            &handle.keyer_definitions().unwrap(),
+            0,
+            handle.resolve_keyer(&dsk("dsk1", "gfx", None, 1)).unwrap(),
+            false,
+        )
+    };
+    handle.try_send(cmd("while-clean", verb())).unwrap();
+    fresh(&rig, 1);
+    step(&mut hook, &mut drive, 1);
+    let outcome = drain(&mut outcomes).0;
+    assert_eq!(outcome[0].error.as_deref(), Some(REFUSE_KEYER_CLEAN));
+    assert!(!handle.keyer_definitions().unwrap().any());
+    assert_eq!(gate.dsk_reservations(), 0);
+    assert!(!gate.defined());
+    drop(clean);
+    handle.try_send(cmd("after", verb())).unwrap();
+    fresh(&rig, 2);
+    step(&mut hook, &mut drive, 2);
+    assert!(drain(&mut outcomes).0[0].completed);
+    assert!(gate.defined(), "the commit marks the DSK defined");
+    assert_eq!(gate.dsk_reservations(), 0, "the tick's reservation is released");
+    assert!(gate.try_reserve_clean().is_none());
+}
+
+/// Review H3 backstop: a rejected frame that restores away a new keyer
+/// drops the tick's DSK reservation and never marks the gate defined.
+#[test]
+fn a_rejected_definition_releases_the_tick_reservation() {
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[], 9.0, "a", "b");
+    let mut outcomes = handle.outcomes();
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    let gate = handle.clean_gate();
+    let verb = handle.keyer_set_verb(
+        &handle.keyer_definitions().unwrap(),
+        0,
+        handle.resolve_keyer(&dsk("dsk1", "gfx", None, 1)).unwrap(),
+        false,
+    );
+    handle.try_send(cmd("set", verb)).unwrap();
+    hook.driver.drain_at_tick(tick(1));
+    assert_eq!(gate.dsk_reservations(), 1, "held across the compose");
+    hook.driver.reject_composed_tick(tick(1), "compose failed");
+    assert_eq!(gate.dsk_reservations(), 0);
+    assert!(!gate.defined());
+    assert!(gate.try_reserve_clean().is_some());
+    assert_eq!(
+        drain(&mut outcomes).0[0].error.as_deref(),
+        Some("compose failed")
+    );
 }
