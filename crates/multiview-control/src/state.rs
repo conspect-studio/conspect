@@ -443,8 +443,15 @@ const DEFAULT_LOG_RING_CAPACITY: usize = 2000;
 ///   full-pipeline / `ffmpeg` run path only; the software engine has no
 ///   decoder).
 ///
-/// Kinds outside both sets (`ndi`, `youtube`, `aes67`) are never live-applied
-/// in this slice and always answer `restart`.
+/// * `youtube` — a `YouTube` source is an HLS wrapper (ADR-0015) that rides the
+///   same supervised `ingest_loop`; live only when the run wired the network
+///   spawner AND the engine build carries the `youtube` feature (issue #420).
+///
+/// Kinds outside these sets (`ndi`, `aes67`) are never live-applied in this
+/// slice and always answer `restart`.
+// Four independent per-kind flags read by one predicate (`is_live`); an enum
+// set would hide which build/run fact sets which flag.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveSourceCapability {
     /// Synthetic kinds (`bars`/`solid`/`clock`) are live-appliable.
@@ -461,6 +468,10 @@ pub struct LiveSourceCapability {
     /// this from `cfg!(feature = "rist")` (via [`Self::with_rist`]) — the
     /// control plane cannot see the engine's compiled features.
     pub rist: bool,
+    /// `YouTube` (`youtube`) is live-appliable. Like RIST it is feature-gated in
+    /// the engine build (`youtube`); the binary sets it with
+    /// [`Self::with_youtube`] from `cfg!(feature = "youtube")`.
+    pub youtube: bool,
 }
 
 impl LiveSourceCapability {
@@ -472,6 +483,7 @@ impl LiveSourceCapability {
             synthetic: true,
             network: false,
             rist: false,
+            youtube: false,
         }
     }
 
@@ -487,6 +499,9 @@ impl LiveSourceCapability {
             synthetic: true,
             network: true,
             rist: true,
+            // Opt-in: only a build with the `youtube` feature can resolve a
+            // watch URL, which the control plane cannot see (`with_youtube`).
+            youtube: false,
         }
     }
 
@@ -495,6 +510,15 @@ impl LiveSourceCapability {
     #[must_use]
     pub const fn with_rist(mut self, rist: bool) -> Self {
         self.rist = rist;
+        self
+    }
+
+    /// Narrow (or widen) the `YouTube` live-apply capability to the engine
+    /// build's `youtube`-feature truth. Never widens past the network
+    /// capability: without a decoder no `YouTube` source can run live.
+    #[must_use]
+    pub const fn with_youtube(mut self, youtube: bool) -> Self {
+        self.youtube = youtube && self.network;
         self
     }
 
@@ -513,7 +537,10 @@ impl LiveSourceCapability {
         if kind.is_network_media() {
             return self.network;
         }
-        // ndi / youtube / aes67 (and any future kind until explicitly wired):
+        if matches!(kind, multiview_config::SourceKind::Youtube { .. }) {
+            return self.youtube && self.network;
+        }
+        // ndi / aes67 (and any future kind until explicitly wired):
         // never live in this slice — restart, honestly.
         false
     }

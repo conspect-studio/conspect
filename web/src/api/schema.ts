@@ -7404,6 +7404,17 @@ export interface components {
             bucket_edges_ms: number[];
             /** @description Cumulative per-bucket counts (edges, then overflow). */
             buckets_total: number[];
+            /**
+             * Format: int64
+             * @description Ticks whose GPU readback missed its deadline since the run started,
+             *     re-emitted as last-good (also counted in `frames_repeated_total`).
+             */
+            compose_deadline_misses_total: number;
+            /**
+             * Format: int64
+             * @description GPU readback deadline misses in the window.
+             */
+            compose_deadline_misses_window: number;
             /** @description Fresh-tick work: `before_compose` through `publish_state` (#311). */
             compose_duration: components["schemas"]["PhaseHistogram"];
             /** @description `compose_duration` split into its four parts. */
@@ -18389,7 +18400,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file) on a full-engine run — `restart` otherwise (ndi/youtube/aes67, or a run without the decoder; ADR-W018). */
+            /** @description The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file, and youtube on a build with the `youtube` feature) on a full-engine run — `restart` otherwise (ndi/aes67, or a run without the decoder; ADR-W018). */
             201: {
                 headers: {
                     [name: string]: unknown;
@@ -18600,7 +18611,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description This run cannot start sources. */
+            /** @description This run cannot start sources, or the source is saved but applies on restart (the detail says which). */
             409: {
                 headers: {
                     [name: string]: unknown;
