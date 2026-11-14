@@ -11,6 +11,8 @@ peer-reachable panic (a truncated DATA frame, then `poll_next` asserted):
 
 1. `src/frame.rs` `FrameStream::poll_data`: end of stream with DATA payload
    still owed returns `FrameStreamError::UnexpectedEnd` (H3_FRAME_ERROR).
+   A WebTransport bidi stream keeps its `usize::MAX` (unbounded) sentinel
+   instead of decrementing it, so payload then FIN still ends cleanly.
 2. `src/frame.rs` `FrameStream::poll_next`: the `remaining_data` `assert!`
    becomes `FrameStreamError::Proto(Malformed)`.
 3. `src/buf.rs` `BufList::push_bytes`: a `debug_assert!` becomes an early return.

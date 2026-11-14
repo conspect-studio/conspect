@@ -12,7 +12,7 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -99,11 +99,22 @@ async fn connection_task_panic_ends_only_that_connection() {
     // first connection only.
     let armed = Arc::new(AtomicBool::new(true));
     let hook_armed = Arc::clone(&armed);
+    // Live server-side connections, as the peers hook sees them: the guard's
+    // "down" call runs when a connection task ends (also on unwind).
+    let live = Arc::new(AtomicUsize::new(0));
+    let hook_live = Arc::clone(&live);
     let hook: PeersHook = Arc::new(move |_remote, up| {
+        // The panic fires inside the "up" call, before the server builds the
+        // peer guard, so that connection is never counted live.
         assert!(
             !(up && hook_armed.swap(false, Ordering::SeqCst)),
             "injected connection-task panic"
         );
+        if up {
+            hook_live.fetch_add(1, Ordering::SeqCst);
+        } else {
+            hook_live.fetch_sub(1, Ordering::SeqCst);
+        }
     });
     let limits = H3Limits {
         // One connection per source: a panic that leaked the cap slot would
@@ -127,8 +138,25 @@ async fn connection_task_panic_ends_only_that_connection() {
         let (resp, body) = fetch(&mut client.send, request(http::Method::GET, &path)).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(body, format!("hello {path}").into_bytes());
+        // With one connection per source, the next client is admitted only
+        // once the server has ended this one: close it and wait for that,
+        // rather than racing the close frame.
+        client.conn.close(0u32.into(), b"done");
+        drop(client);
+        wait_until(|| live.load(Ordering::SeqCst) == 0).await;
     }
     let counters = server.endpoint.counters();
     assert_eq!(Counters::get(&counters.connection_panics), 1);
     assert_eq!(Counters::get(&counters.request_panics), 0);
+}
+
+/// Polls `cond` until it holds, failing after `TIMEOUT`.
+async fn wait_until(cond: impl Fn() -> bool) {
+    tokio::time::timeout(TIMEOUT, async {
+        while !cond() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("condition not reached within TIMEOUT");
 }

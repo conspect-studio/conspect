@@ -31,7 +31,9 @@ unchanged; patch record `vendor/h3/CONSPECT-PATCH.md`). Upstream `master` still 
    request-body consumer's next step (trailers, `poll_next`) hit
    `assert!(remaining_data == 0)` — the fuzz crash `JAEI+/dQATjR9/EAFg==`
    (HEADERS, then a DATA frame declaring 22 bytes, then FIN). A WebTransport
-   stream (unbounded payload, `usize::MAX`) still ends cleanly.
+   stream (unbounded payload, `usize::MAX`) still ends cleanly: the
+   sentinel is no longer decremented per chunk, so payload followed by FIN
+   is a clean end (test `poll_data_webtransport_payload_then_fin`).
 2. `src/frame.rs` `FrameStream::poll_next`: the `assert!` becomes
    `FrameStreamError::Proto(Malformed)`, so no other caller order can panic
    on peer-driven state. Its upstream `#[should_panic]` unit test now asserts

@@ -124,13 +124,20 @@ where
             (None, true) => Poll::Ready(Ok(None)),
             (None, false) => Poll::Pending,
             (Some(d), true)
-                if d.remaining() < self.remaining_data
+                if self.remaining_data != usize::MAX
+                    && d.remaining() < self.remaining_data
                     && !self.stream.buf_mut().has_remaining() =>
             {
                 Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
             }
             (Some(d), _) => {
-                self.remaining_data -= d.remaining();
+                // conspect patch (issue #403): keep the WebTransport
+                // `usize::MAX` sentinel (unbounded payload) instead of
+                // decrementing it, so the end-of-stream checks above still
+                // recognise the stream after its first payload chunk.
+                if self.remaining_data != usize::MAX {
+                    self.remaining_data -= d.remaining();
+                }
                 Poll::Ready(Ok(Some(d)))
             }
         }
@@ -502,6 +509,41 @@ mod tests {
             |cx| stream.poll_next(cx),
             Err(FrameStreamError::Proto(FrameProtocolError::Malformed))
         );
+    }
+
+    // conspect patch (issue #403): a WebTransport bidi stream has no payload
+    // length; payload then FIN (in the same or a later chunk) ends cleanly.
+    #[tokio::test]
+    async fn poll_data_webtransport_payload_then_fin() {
+        for split in [false, true] {
+            let mut recv = FakeRecv::default();
+            let mut buf = BytesMut::with_capacity(64);
+            FrameType::WEBTRANSPORT_BI_STREAM.encode(&mut buf);
+            VarInt::from(0u32).encode(&mut buf);
+            if split {
+                recv.chunk(buf.split().freeze());
+                recv.chunk(Bytes::from_static(b"abc"));
+                recv.chunk(Bytes::from_static(b"de"));
+            } else {
+                buf.extend_from_slice(b"abcde");
+                recv.chunk(buf.freeze());
+            }
+            let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+            assert_poll_matches!(
+                |cx| stream.poll_next(cx),
+                Ok(Some(Frame::WebTransportStream(_)))
+            );
+            let mut got = 0;
+            loop {
+                match poll_fn(|cx| to_bytes(stream.poll_data(cx))).await {
+                    Ok(Some(b)) => got += b.len(),
+                    Ok(None) => break,
+                    Err(e) => panic!("split={split}: unexpected error {e:?}"),
+                }
+            }
+            assert_eq!(got, 5, "split={split}");
+        }
     }
 
     #[tokio::test]
