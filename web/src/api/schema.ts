@@ -7167,7 +7167,7 @@ export interface components {
         PatchCrosspoint: {
             /** @description Where the source is patched. */
             destination: components["schemas"]["PatchDestination"];
-            /** @description `video` (this slice), `audio` or `subtitle`. */
+            /** @description `video`, `audio` or `subtitle` (output subtitle slots, #345). */
             plane: string;
             /**
              * @description A mixer input: `{"source": id}`, `{"layout": id}` (a stored layout as
@@ -7175,7 +7175,8 @@ export interface components {
              *     it must solve on the running canvas with opaque cells and bind no other
              *     layout or bus) or `"none"`; `{"bus": ..}` is refused. An output video slot 0:
              *     `{"source": id}`, `{"layout": id}` (a stored layout; Read on it AND on
-             *     every source its cells bind) or `{"bus": ..}`; audio slot 0: `"follow"`.
+             *     every source its cells bind) or `{"bus": ..}`; audio slot 0: `"follow"`;
+             *     an output subtitle slot: `{"source": id}` or `"none"`.
              */
             source: Record<string, never>;
         };
@@ -7195,7 +7196,8 @@ export interface components {
             output?: string | null;
             /**
              * Format: int32
-             * @description Output slot index: video and audio slot 0 in this release.
+             * @description Output slot index: video and audio slot 0 in this release; a
+             *     subtitle slot below the output's declared `slots.subtitle` count.
              */
             slot?: number | null;
         };
@@ -7350,11 +7352,18 @@ export interface components {
             cost?: null | components["schemas"]["SlotCost"];
             /** @description The destination as requested. */
             destination: components["schemas"]["PatchDestination"];
+            /**
+             * @description A non-refusing remark: `source-has-no-captions` (a subtitle slot
+             *     patched to a source that declares no `captions` carries an empty
+             *     track). Absent otherwise.
+             */
+            note?: string | null;
             /** @description Whether the destination input is on Program now (mixer inputs). */
             on_air: boolean;
             /**
              * @description The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`
-             *     (§12.4), or `follow` (an audio slot riding the video take).
+             *     (§12.4), `follow` (an audio slot riding the video take) or
+             *     `subtitle` (a subtitle slot's route-table re-point).
              */
             path: string;
             refusal?: null | components["schemas"]["PatchRefusal"];
@@ -16458,7 +16467,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ] } ] }`. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`"follow"` by default, else `"program"`, `"none"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{"redacted": true}`. */
+            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`"follow"` by default, else `"program"`, `"none"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{"redacted": true}`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -16544,7 +16553,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a bus on a mixer input, an unknown source or stored layout; an unknown feed), `layout-not-admissible` (a mixer input's `{layout}`: not on the running canvas, a translucent cell, or a cell binding another layout or a bus — nested layouts and buses are not M/E sources), or not 1..=64 crosspoints, or two different stored layouts in one request. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A plan never registers a mixer input's layout. */
+            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; two outputs, mixer + output, or subtitle crosspoints mixed with video/audio ones: multi-destination sets arrive with patch salvos #308), `unknown-source` (a bus on a mixer input, an unknown source or stored layout; an unknown feed), `layout-not-admissible` (a mixer input's `{layout}`: not on the running canvas, a translucent cell, or a cell binding another layout or a bus — nested layouts and buses are not M/E sources), or not 1..=64 crosspoints, or two different stored layouts in one request. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A plan never registers a mixer input's layout. A subtitle slot (`{"source": id}` or `"none"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -16606,7 +16615,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `layout-changed` (a mixer input's `{layout}` was edited or deleted while this request was in flight; the key is released, retry), `aux-capacity` (no free layout canvas), or no source lease. */
+            /** @description `conflict` (an output take's Idempotency-Key first used for another output, feed or subtitle slot map; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `layout-changed` (a mixer input's `{layout}` was edited or deleted while this request was in flight; the key is released, retry), `aux-capacity` (no free layout canvas), or no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -16615,7 +16624,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` / `layout-not-admissible` (an output slot's or a mixer input's layout), missing Idempotency-Key, or not 1..=64 crosspoints. */
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's or a mixer input's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run`, after an applied one is persisted as the slots' `source` (in swap order). `subtitle:applied` means the route table was swapped. The outcome's `tick` is a completed-tick lower bound observed before the swap: the subtitle sampler had completed that tick (`0`: possibly none yet) before the swap; it is not a landing tick. A sample already in flight finishes on the old table; the first table read that starts after the swap sees the new route, unless a later take supersedes it first (then this one is never sampled) or the run ends first. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -16633,7 +16642,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy` (the key and leases are released; or a `{layout}` could not be read now: every layout-read slot is in use; or the output clock did not adopt a newly registered mixer-input layout within 1 s) or `idempotency-capacity`. */
+            /** @description `engine-busy` (the key and leases are released; a subtitle take between engine runs or after the run ended, or while the bounded subtitle persistence queue is full: nothing changed, the key freed and the rate slot refunded; or a `{layout}` could not be read now: every layout-read slot is in use; or the output clock did not adopt a newly registered mixer-input layout within 1 s) or `idempotency-capacity`. */
             503: {
                 headers: {
                     [name: string]: unknown;
