@@ -110,6 +110,9 @@ pub struct RoutedLayout {
     /// The layout's `audio` attribute: what an output carries when it routes
     /// this layout and its audio follows (§5.1).
     pub audio: multiview_config::LayoutAudio,
+    /// The layout's `overlays` attribute: which multiview overlay layers the
+    /// engine bakes onto this layout's aux canvas.
+    pub overlays: multiview_config::LayoutOverlays,
     /// Resolution order ([`next_layout_revision`]): a body resolved later
     /// (after a later committed edit) has a higher revision, so the engine
     /// never lets an older body replace a newer one.

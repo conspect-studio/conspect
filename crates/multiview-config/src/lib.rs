@@ -102,7 +102,7 @@ pub use iptv::{
     IptvConfig, IptvEntry, IptvEntryKind, DEFAULT_GUIDE_REFRESH_MINUTES, MAX_GUIDE_REFRESH_MINUTES,
     MAX_IPTV_ENTRIES, MIN_GUIDE_REFRESH_MINUTES,
 };
-pub use layout_doc::{LayoutAudio, LayoutCanvas, LayoutDocument};
+pub use layout_doc::{LayoutAudio, LayoutCanvas, LayoutDocument, LayoutOverlays};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
     MediaPlayerAudio,

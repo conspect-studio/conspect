@@ -395,4 +395,34 @@ describe('lossless extras (absolute editor)', () => {
     const cells = body.cells as Record<string, unknown>[];
     expect(cells[0]?.source).toEqual({});
   });
+
+  // PR-B: `overlays` is an unknown root key to this editor (the engine owns
+  // it, see ./overlays.ts), so it must round-trip through rootExtra exactly
+  // like any other unrendered root key (operator_note above).
+  it('preserves a root-level overlays object through fromLayoutBody → toLayoutBody', () => {
+    const body = {
+      schema_version: 1,
+      canvas: { width: 1920, height: 1080, fps: '25/1' },
+      layout: { kind: 'absolute' },
+      overlays: { labels: true, meters: false, flags: true, tally: true, clock: true, safe_area: false },
+      cells: [
+        {
+          id: 'a',
+          label: 'a',
+          rect: { x: 0, y: 0, w: 0.5, h: 0.5 },
+          z: 0,
+          rotation: 0,
+          fit: 'contain',
+          source: {},
+        },
+      ],
+    };
+    const restored = fromLayoutBody('lay', 'Studio', body);
+    expect(restored).toBeDefined();
+    if (restored === undefined) {
+      return;
+    }
+    expect(restored.rootExtra.overlays).toEqual(body.overlays);
+    expect(toLayoutBody(restored)).toEqual(body);
+  });
 });

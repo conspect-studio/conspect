@@ -47,6 +47,73 @@ pub struct View {
     /// Explicitly use the public unauthenticated page. Default requests Premium.
     #[serde(default)]
     pub public: bool,
+    /// `steps` iterates the radar timeline (default for radar; radar only);
+    /// `realtime` records `frames` wall-clock screenshots (default for wind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureMode>,
+    /// Steps-mode per-step duration rule (default `equal`).
+    #[serde(default)]
+    pub timing: StepTiming,
+    /// Steps-mode per-step duration in ms, 100 through 5000 (default 600).
+    #[serde(default = "default_frame_ms")]
+    pub frame_ms: u32,
+    /// Steps-mode hold of the newest step in ms, 0 through 10000 (default 1000).
+    #[serde(default = "default_end_hold_ms")]
+    pub end_hold_ms: u32,
+    /// Steps-mode count of most recent radar steps, 2 through 48 (default 12).
+    #[serde(default = "default_max_steps")]
+    pub max_steps: u32,
+}
+const fn default_frame_ms() -> u32 {
+    multiview_webengine::capture::DEFAULT_FRAME_MS
+}
+const fn default_end_hold_ms() -> u32 {
+    multiview_webengine::capture::DEFAULT_END_HOLD_MS
+}
+const fn default_max_steps() -> u32 {
+    multiview_webengine::capture::DEFAULT_MAX_STEPS
+}
+/// How the page animation becomes frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    /// One screenshot per radar timestamp; identical consecutive steps dropped.
+    Steps,
+    /// Wall-clock screenshots `1000/fps` ms apart.
+    Realtime,
+}
+/// Steps-mode duration rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum StepTiming {
+    /// Every step lasts `frame_ms`.
+    #[default]
+    Equal,
+    /// Proportional to the real gap between radar timestamps, mean `frame_ms`,
+    /// clamped to `[frame_ms/4, frame_ms*4]`.
+    Proportional,
+}
+impl View {
+    /// The engine capture options this view requests.
+    #[must_use]
+    pub fn capture_options(&self) -> multiview_webengine::capture::CaptureOptions {
+        use multiview_webengine::capture as c;
+        c::CaptureOptions {
+            mode: self.capture.map(|m| match m {
+                CaptureMode::Steps => c::CaptureMode::Steps,
+                CaptureMode::Realtime => c::CaptureMode::Realtime,
+            }),
+            timing: match self.timing {
+                StepTiming::Equal => c::StepTiming::Equal,
+                StepTiming::Proportional => c::StepTiming::Proportional,
+            },
+            frame_ms: self.frame_ms,
+            end_hold_ms: self.end_hold_ms,
+            max_steps: self.max_steps,
+        }
+    }
 }
 /// Explicit versioned site-terms acceptance.
 #[derive(Deserialize, Serialize)]

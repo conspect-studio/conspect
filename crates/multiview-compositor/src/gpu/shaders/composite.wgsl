@@ -117,7 +117,21 @@ fn wipe_coverage(t: TileParams, px: u32, py: u32, cw: u32, ch: u32) -> f32 {
 // Coverage of signed distance d through an edge of width softness (0 = hard).
 // Mirrors `mask::edge`.
 fn wipe_edge(d: f32, softness: f32) -> f32 {
-    if softness > 0.0 {
+    // A subnormal softness is a hard edge (mirrors `mask::edge`): the GPU may
+    // flush it to zero, so both paths treat it so. 1.17549435e-38 is
+    // f32::MIN_POSITIVE, the smallest normal f32.
+    if softness >= 1.17549435e-38 {
+        // Saturate before dividing (mirrors `mask::edge`): a tiny softness
+        // would overflow `d / softness`. `2·d` is exact where `softness / 2`
+        // can round, so this is the old clamp boundary; inside it the ratio
+        // is <= 0.5.
+        let d2 = d * 2.0;
+        if d2 >= softness {
+            return 1.0;
+        }
+        if d2 <= -softness {
+            return 0.0;
+        }
         return clamp(d / softness + 0.5, 0.0, 1.0);
     }
     return select(0.0, 1.0, d >= 0.0);
