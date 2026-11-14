@@ -3956,7 +3956,7 @@ impl Pipeline {
         );
         let reformat_open =
             reformat_opener(self.encode_cfg.clone(), self.rendition_configs.clone());
-        let (router, handle) = crate::output_routing::OutputRouter::new_with_openers(
+        let (mut router, handle) = crate::output_routing::OutputRouter::new_with_openers(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -3985,6 +3985,11 @@ impl Pipeline {
             Some(reformat_open),
         )
         .map_err(spawn_err)?;
+        // Atomic sets (#308) pick their adoption tick after the clock's last
+        // composed tick: a wait-free atomic load, never a lock on the clock.
+        if let Some(control) = self.switcher_control.as_ref() {
+            router.set_switcher_clock(control.applied_tick_cell());
+        }
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
         let handle = Arc::new(handle.with_outputs(run_outputs).with_pictures(
             crate::output_routing::PlanPictures {

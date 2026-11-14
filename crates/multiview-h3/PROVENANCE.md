@@ -9,10 +9,46 @@ vendored file.
 | `h3-quinn` | 0.0.10 | `8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4` | `src/noq_adapter/mod.rs` (`src/lib.rs`), `src/noq_adapter/datagram.rs` (`src/datagram.rs`) |
 | `h3-webtransport` | 0.1.2 | `2d91a50fd582a5d67b1f756fba3cd9c66367ff4f23e1017c882f664d63b350a7` | `src/webtransport.rs` (derived from `src/server.rs` and `src/stream.rs`) |
 
-Used as dependencies, unmodified: `h3 =0.0.8`
-(`10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be`) and
-`h3-datagram =0.0.2`
+Used as a dependency, unmodified: `h3-datagram =0.0.2`
 (`9d2c9f77921668673721ae40f17c729fc48b9e38a663858097cea547484fdf0f`).
+
+`h3 =0.0.8` (`.crate` sha256
+`10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be`, upstream
+commit `22c1aa3f44d1463cd7644c8f654fffc9a6da305c`, path `h3`) is vendored
+whole at `vendor/h3` and selected by the root `[patch.crates-io]` (and the
+fuzz workspace's), because of a peer-reachable panic (issue #403); see below.
+
+## h3 0.0.8 → `vendor/h3` (issue #403)
+
+The published archive, copied unchanged except for these edits, each marked
+`conspect patch (issue #403)` in the source (`.cargo-ok` dropped; `LICENSE`
+unchanged; patch record `vendor/h3/CONSPECT-PATCH.md`). Upstream `master` still carries the panic as of 2026-11-14; reported as https://github.com/hyperium/h3/issues/386.
+
+1. `src/frame.rs` `FrameStream::poll_data`: when the stream ends while a
+   DATA frame still owes payload bytes, return
+   `FrameStreamError::UnexpectedEnd` (H3_FRAME_ERROR, RFC 9114 section 7.1)
+   instead of `Ok(None)`. Upstream left `remaining_data` non-zero, so the
+   request-body consumer's next step (trailers, `poll_next`) hit
+   `assert!(remaining_data == 0)` — the fuzz crash `JAEI+/dQATjR9/EAFg==`
+   (HEADERS, then a DATA frame declaring 22 bytes, then FIN). A WebTransport
+   stream (unbounded payload, `usize::MAX`) still ends cleanly: the
+   sentinel is no longer decremented per chunk, so payload followed by FIN
+   is a clean end (test `poll_data_webtransport_payload_then_fin`).
+2. `src/frame.rs` `FrameStream::poll_next`: the `assert!` becomes
+   `FrameStreamError::Proto(Malformed)`, so no other caller order can panic
+   on peer-driven state. Its upstream `#[should_panic]` unit test now asserts
+   the error, and a test for the truncated frame is added.
+3. `src/buf.rs` `BufList::push_bytes`: the `debug_assert!` on a non-empty
+   transport chunk becomes an early return.
+
+Audit of the remaining panics in `h3` reachable from a server request: the
+`expect`s in `stream.rs` `into_stream` and `connection.rs` run only after
+`poll_type` resolved (guarded by construction); `proto/frame.rs`'s
+`unreachable!` is behind the DATA/WebTransport early returns; the
+`AsyncRead` `assert!`s in `stream.rs` compare a chunk taken with the
+destination's length as its cap; the varint `unwrap`/`unreachable!` are on
+encode paths or behind length checks. None is reachable from peer bytes.
+Panic containment for anything missed is in the server (edit below).
 
 ## h3-quinn 0.0.10 → `noq_adapter`
 

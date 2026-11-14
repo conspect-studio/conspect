@@ -2227,7 +2227,9 @@ A formatted output falls back to its own base key (Program at its format).
 ### 12.5 Passthrough and invariant #1
 
 **Match rules** (all required; any miss means P1-P3): a constant frame rate (every source DTS
-delta exactly one frame period over the last 10 s); codec equal; profile and level within the
+delta exactly one frame period over the last 10 s); codec equal; profile on the codec's explicit
+decoder-compatibility ladder at or below the slot's (Extended, scalable, multiview and other
+profiles off the ladder never match; plain Baseline only into a Baseline slot) and level within the
 slot's settings; coded size equal to the slot's; frame rate exactly equal (as a rational) to the
 output's; scan equal; all four colour tags equal (primaries, transfer, matrix, range; untagged is
 not equal); bit depth and chroma equal; the source's measured GOP not longer than the medium allows
@@ -2350,6 +2352,48 @@ continuous PCR from those timestamps. The rule then depends only on the paramete
 (ADR-0108's slice-1 behaviour of refusing parameter-set changes on non-TS outputs ends, per medium,
 once that muxer writes its rule.)
 
+**As built in slice D, part D1 (#344).** The core is pure Rust and always compiled:
+`crates/multiview-output/src/passthrough/` (`tap.rs`, `match_rules.rs`, `clock.rs`) and
+`crates/multiview-ffmpeg/src/h264_repeat.rs`. Differences from the text above:
+- *The tap.* `CompressedTap` gives each consumer (8 at most) its own bounded
+  `sync_channel` of 64 AUs. The writer only `try_send`s and the clock only `try_recv`s. A full
+  channel drops the **newest** AU for that consumer only, and the drop is counted. That happens
+  when the consumer's clock is dead or wedged, and also for a live clock when a demux burst puts
+  more than 64 unread AUs in its channel between two of its ticks (a clock takes at most 16 per
+  tick). The drop-oldest bound is the clock's jitter buffer (8 AUs), where ordinary jitter is
+  absorbed. Any AU loss is a DTS gap for that clock: a stall at the missing AU's tick, so the slot
+  bridges and returns after 30 on-time ticks; it never emits a picture that references a lost one.
+  The writer never blocks: it `try_lock`s its sender list (held only by `subscribe`, which builds
+  its channel first) and drops the AU, counted as `contended`, when it is held; a reader's `Drop`
+  never locks (the writer prunes disconnected senders). An AU over `MAX_AU_BYTES` (8 MiB) is
+  dropped and counted, at the tap and in the clock.
+- *Timestamps.* Conversion to ticks is relative to a per-stream epoch (the first AU's DTS,
+  re-anchored after a malformed AU, a time-base change or a DTS off the epoch's grid), so an
+  absolute source DTS need not be a whole number of frame periods. All offset arithmetic is
+  checked; an overflow, or a converted magnitude above 2^62 ticks, is `malformed`.
+- *Presentation delay.* After a run with B-frames the bridge carries one constant presentation
+  delay (`pts = tick + d`, `d = max(0, max emitted PTS + 1 - t)`), so a bridge picture never
+  presents at or before a picture already emitted; a new run adds the smallest constant delay that
+  puts its IDR after everything emitted (at most 8 ticks, else the slot stays bridged with
+  `presentation-delay` until the output signals a discontinuity and the timeline is reset).
+- *Start of a run.* The first IDR of a run gets `dts' = max(tick, arrival tick + 3)`, so it waits
+  `TARGET_DEPTH` ticks in the buffer (the bridge fills those ticks) and the run starts with
+  3 ticks of depth.
+- *Too deep with B-frames.* The drop set is the decode-order suffix before the IDR. It starts at
+  the queued AU with the highest PTS among the AUs after the previous IDR. For IBBP that is the
+  last P and the B after it. For a P-only source it is the AU before the IDR. The IDR and
+  everything after it shift back by the size of the drop set. This is applied only if every AU
+  kept before the IDR presents before the IDR's new PTS; otherwise it waits for the next IDR.
+- *Repeat AU.* H.264 only. HEVC has no repeat AU yet, so an HEVC underrun stalls and bridges.
+  The H.264 repeat sets `num_ref_idx_l0_active` to 1, so it copies `RefPicList0[0]`. That is the
+  previous picture only when the previous picture is a short-term reference marked by the sliding
+  window, so it returns `None` (and the clock does not correct) after a non-reference picture,
+  adaptive reference marking (any MMCO), or a long-term IDR, and also for POC type 1, MBAFF, FMO,
+  separate colour planes and intra-only profiles. Its parsing is bounded (parameter sets up to
+  4 KiB, a 4 KiB slice-header prefix, at most 1024 NALs).
+- *Return after a stall that hid a parameter change.* An IDR whose parameter generation differs
+  from the previous run's always needs the 300-tick parameter-change wait.
+
 **Audio with passthrough video.** Audio is always decoded and re-encoded on the global AAC grid
 (ADR-0108 §5.2). For lip sync, the audio of a passthrough slot is read at the source time of the
 video AU emitted on the tick (the tap carries each AU's source PTS on the ingest timeline,
@@ -2429,6 +2473,18 @@ slots at the grid boundary G(T).
   carries its previous source.
 - If any member fails, nothing changes and every member gets the same refusal. A single take for a
   member that lands first supersedes the set as a whole (ADR-0108 §6.2).
+- **Audio of a member that keeps its video** (#308 reviews A-3, A-4). Its audio change is part of
+  the shared decision: the slot move is gated on that member's grouped (no-cut) move, and the set
+  is proposed only once that audio is ready (bus warm for 2 AAC frames, `AudioSpecificConfig`
+  identical to the program's), else the set waits or is refused whole. An output that reads the
+  shared program stage gets a new private bus. An output that already reads a private bus gets a
+  **staged** second bus. It is opened at preparation carrying the same audio as the bus on air,
+  and it is the only bus that fades to the new audio at G(T). The bus on air is never touched
+  before the decision. When the group applies, the slot moves onto the staged bus at G(T) and the
+  old bus closes. When the group is refused, superseded or failed, the staged bus closes, the
+  output keeps its old audio, nothing fades and the choice is restored. There is at most one staged
+  bus per output (a newer change replaces it), and it counts as a live private bus against the
+  dynamic audio-stage cap.
 
 **Admission of a multi-crosspoint take (per principal; §4.3 and §6.4 carried forward).**
 
@@ -2544,6 +2600,57 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   size, is opaque and carries the canvas colour; any fit of an equal-size picture is the identity.
 - **Audio slot 0 in `GET /patch`.** It reports the output's accepted audio feed exactly as
   `GET /routing` projects and redacts it (default `follow`).
+
+**As built in slice E1 (#308, engine half; the HTTP/salvo/UI PRs follow).**
+- **Handshake.** A set's two halves meet in one `SetArm` (`multiview-engine/src/patch_set.rs`), a
+  cell of atomics written only by `compare_exchange`, so the clock never locks, allocates or awaits
+  to take part. States: `Pending → SwitcherReady → Proposed(T) → Applying(T) → Committed`, with
+  `Refused(reason)` reachable from `Pending`, `SwitcherReady` and `Proposed`; the reason rides in the
+  same byte, so refusal and reason are one CAS and the first terminal write wins. `Applying` is the
+  switcher's claim on `T` before it touches the input table, so a refusal racing in from the router
+  either wins (nothing applied) or loses (the patch commits at `T`); a mixer patch composed at `T` is
+  never contradicted. A missed or repeated `T` (`Proposed` → `SwitcherReady`) and a rejected frame at
+  `T` (`Applying` → `SwitcherReady`, the table restored) hand the set back to the router.
+- **Switcher.** `SwitcherVerb::PatchArmed { set, arm }` lives in its own one-set slot beside the held
+  take, so an armed salvo never blocks a Cut or AUTO; a second armed set while one is held is refused
+  `engine-busy`. It is validated at drain, marked `SwitcherReady` once its new Program source (if
+  any) is fresh, and applied only on the drain of `T`, after the tick's commands, re-validated there
+  (a Cut that moved PGM onto a member's input refuses the set `on-air-protected`). Work per tick is
+  O(1) except one O(members) validation on `T`. Its outcome is published on `T`'s commit.
+- **Router.** `OutputRoutingHandle::try_take_set(TakeSet)` uses the existing bounded mailbox (one
+  slot per set; ≤ 64 members, distinct outputs). Admission at drain refuses the set whole when a
+  member is unroutable or when its new encoder opens exceed the principal's or the global cap
+  (0-subscriber lingers are closed first). The opens are reserved at admission; single takes
+  (`has_capacity`) count the reservations, and every reservation is released on refusal, supersede
+  or deadline. Members prime/open/warm through the take machinery and park in `Phase::Ready`; a
+  no-op member (already on its bus) parks at once. When every member is ready and the arm is
+  `SwitcherReady`, `T = max(router tick + 2, clock's last composed tick + 3)`, delayed to the 60-tick
+  force floor of any member key other outputs watch, never past the deadline. The router forces an
+  IDR at `T` on every member key, registers one grouped dispatcher move and proposes `T`. A single
+  take or set on any member output supersedes the whole set. Freshness keeps its 50-tick and opens
+  their 90-tick member bounds; a set not adopted within `SET_ADOPT_DEADLINE_TICKS = 150` ticks of
+  admission is refused with its first cause.
+- **Dispatcher group commit.** `rebind_group` registers every member move at window `T` exactly, and
+  the group is decided once for every member. It applies iff the arm committed at `T` (or the set has
+  no mixer half) and every member key is usable, its window `T` complete, opening on a gated RAP and
+  within the output's parameter-set rule. A member window that is not complete yet holds the
+  decision. That member's binding and every other member binding wait at window `T`, at most
+  `MAX_PENDING_WINDOWS`; then the group is refused. Window `T` is never delivered before the
+  decision. Bindings with no grouped move are never held; at most 64 groups.
+- **Residual fault.** If a member's encoder dies after the mixer half committed at `T`, the outputs
+  cannot follow: each output member reports `refused:encoder-not-ready`. The router counts it in
+  `set_partial` (snapshot) and logs `set-partial`. This is an encoder fault after commit, not an
+  admission refusal; Program and every other output are unaffected.
+- **Seam.** `OutputRouting::try_take_set(OutputTakeSet)` is defaulted to refuse (`Unroutable`); the
+  run's adapter implements it, mapping each member like a single take. One `OutputOutcome` per member
+  carries the set's `operation_id`. The pipeline hands the router the switcher's applied-tick cell
+  (`SwitcherControl::applied_tick_cell`).
+- **Deviations from the E1 design note.** These are recorded here and in the note:
+  - the extra `Applying` state, which closes the commit-vs-refusal race;
+  - the switcher's own deadline backstop for a ready-but-never-proposed set: 150 + 16 ticks
+    (`SET_SWITCHER_GRACE_TICKS`; the router normally refuses first);
+  - `refused:on-air-protected` added to the router's refusal kinds;
+  - per-member freshness and open bounds reuse the single-take constants.
 
 ### 12.9 The Routing page (#308)
 
