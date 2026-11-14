@@ -119,6 +119,11 @@ use multiview_output::{display_matrix, DisplayMatrix};
 #[path = "output_lanes.rs"]
 mod output_lanes;
 
+/// Rate lanes end to end through the real pipeline (#343).
+#[cfg(test)]
+#[path = "output_lanes_tests.rs"]
+mod output_lanes_tests;
+
 /// The per-subscriber drop-oldest depth of the engine's outbound event stream.
 /// The pipeline has no realtime consumers wired here, but the publisher still
 /// needs a positive ring (invariant #10).
@@ -6596,7 +6601,7 @@ struct StreamItem {
 
 /// The human report line + optional playlist text one sink runner produced, plus
 /// the number of frames it consumed (for the test seam's observability).
-struct SinkRunOutcome {
+pub(crate) struct SinkRunOutcome {
     /// The human-facing report line for this output (path + packet/segment counts).
     line: String,
     /// For an HLS sink, the rendered media playlist text + its on-disk path to
