@@ -79,23 +79,30 @@ fn wipe_coverage(t: TileParams, px: u32, py: u32, cw: u32, ch: u32) -> f32 {
     let v = (f32(py) + 0.5) / f32(max(ch, 1u));
     let origin = vec2<f32>(t.yuv2rgb0.w, t.yuv2rgb1.w);
     let extent = t.yuv2rgb2.w;
+    var radius = t.prim0.w;
+    var sign = 1.0;
+    if t.opacity_transfer.w > 0.5 {
+        radius = extent - radius;
+        sign = -1.0;
+    }
     let inv_sqrt2 = 0.70710678118654752;
-    var f = 0.0;
+    // Signed distance to the edge in canvas-height units, positive inside
+    // (mirrors `mask::inside`).
+    var inside = 0.0;
     switch shape {
-        case 1u: { f = u * aspect; }
-        case 2u: { f = v; }
-        case 3u: { f = (u * aspect + v) * inv_sqrt2; }
-        case 4u: { f = max(abs(u - origin.x), abs(v - origin.y)); }
+        case 1u: { inside = radius - u * aspect; }
+        case 2u: { inside = radius - v; }
+        case 3u: { inside = radius - (u * aspect + v) * inv_sqrt2; }
+        case 4u: {
+            inside = min(aspect * (radius - abs(u - origin.x)), radius - abs(v - origin.y));
+        }
         default: {
             let dx = (u - origin.x) * aspect;
             let dy = v - origin.y;
-            f = sqrt(dx * dx + dy * dy);
+            inside = radius - sqrt(dx * dx + dy * dy);
         }
     }
-    if t.opacity_transfer.w > 0.5 {
-        f = extent - f;
-    }
-    let d = t.prim0.w - f + t.prim1.w;
+    let d = sign * inside + t.prim1.w;
     let softness = t.range.w;
     if softness > 0.0 {
         return clamp(d / softness + 0.5, 0.0, 1.0);

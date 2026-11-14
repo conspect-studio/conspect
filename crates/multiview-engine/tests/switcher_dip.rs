@@ -31,7 +31,7 @@ use multiview_engine::switcher_control::{
 use multiview_engine::switcher_hook::SwitcherFrameHook;
 use multiview_engine::{
     CompositorDrive, CooperativePacer, EnginePublisher, EngineRuntime, OutputClock, StopSignal,
-    TimeSource,
+    TimeSource, TransitionStyle,
 };
 use multiview_framestore::TileStore;
 use std::collections::{HashMap, HashSet};
@@ -369,6 +369,66 @@ fn repeated_dips_build_the_colour_once_and_never_grow_the_scratch_pool() {
     assert_eq!(rig.handle.snapshot().unwrap().completion_count, 5);
 }
 
+/// Counts the ticks composed as a bordered WIPE flight (review INV-01): the
+/// drive carries a mix overlay in the wipe style with a border colour.
+struct CountWipes<H> {
+    inner: H,
+    wipes: Arc<AtomicU64>,
+}
+
+fn is_bordered_wipe(drive: &CompositorDrive<Nv12Image>) -> bool {
+    drive.mix_overlay().is_some()
+        && matches!(
+            drive.transition_style(),
+            TransitionStyle::Wipe {
+                border_color: Some(_),
+                ..
+            }
+        )
+}
+
+impl<H: FrameControl> FrameControl for CountWipes<H> {
+    fn before_compose(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
+        self.inner.before_compose(drive, tick);
+        if is_bordered_wipe(drive) {
+            self.wipes.fetch_add(1, Ordering::Release);
+        }
+    }
+    fn after_compose(&mut self, frame: &multiview_engine::CompositedFrame) {
+        self.inner.after_compose(frame);
+    }
+    fn on_repeat(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
+        self.inner.on_repeat(drive, tick);
+    }
+}
+
+/// The flood's seed (review INV-01): a bordered WIPE and an AUTO queued ahead
+/// of every flood command, so a wipe flight certainly runs under the flood.
+fn seed_bordered_wipe(handle: &SwitcherControl, rate: u32) {
+    for (op, verb) in [
+        (
+            "seed-wipe",
+            SwitcherVerb::SetTransition(wipe(
+                rate,
+                "circle",
+                &serde_json::json!({"softness": 0.05, "border_width": 0.03, "border_color": "#00ff00"}),
+            )),
+        ),
+        (
+            "seed-auto",
+            SwitcherVerb::Auto(FrameCount::try_from(rate).unwrap()),
+        ),
+    ] {
+        handle
+            .try_send(SwitcherCommand {
+                operation_id: op.into(),
+                scene_version: 1,
+                verb,
+            })
+            .unwrap();
+    }
+}
+
 /// A flood of transition selections and AUTOs (valid, invalid, unsupported)
 /// from another thread while the real runtime emits 600 ticks: exactly one
 /// frame per tick, no repeat, the producer meets a full mailbox instead of
@@ -393,10 +453,19 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
     let done = Arc::new(AtomicBool::new(false));
     let accepted = Arc::new(Mutex::new(Vec::<String>::new()));
     let full = Arc::new(AtomicU64::new(0));
+    let wipes = Arc::new(AtomicU64::new(0));
+    // A 30-frame bordered wipe; the flood starts once its first tick has been
+    // composed (a flood CUT drained in the same tick would end it first), so
+    // the rest of the flight runs under the flood.
+    seed_bordered_wipe(&handle, 30);
     let producer = {
         let handle = handle.clone();
         let (done, accepted, full) = (Arc::clone(&done), Arc::clone(&accepted), Arc::clone(&full));
+        let started = Arc::clone(&wipes);
         std::thread::spawn(move || {
+            while started.load(Ordering::Acquire) == 0 && !done.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
             let mut n: u64 = 0;
             while !done.load(Ordering::Acquire) {
                 let op = format!("op-{n}");
@@ -419,7 +488,11 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
                         ["box", "circle", "diagonal"][usize::try_from(n % 3).unwrap()],
                         &serde_json::json!({"softness": 0.1, "border_width": 0.02, "border_color": "#00ff00"}),
                     )),
-                    _ => SwitcherVerb::Cut,
+                    // The WIPE selection (n % 5 == 3, odd n) is followed by an
+                    // AUTO; a CUT (which ends any flight) once per 50 commands,
+                    // so wipe flights stay on air across flood ticks.
+                    _ if n % 50 == 49 => SwitcherVerb::Cut,
+                    _ => SwitcherVerb::Auto(FrameCount::try_from(6).unwrap()),
                 };
                 let command = SwitcherCommand {
                     operation_id: op.clone(),
@@ -468,7 +541,10 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
                 0
             },
             |_| None,
-            rig.hook,
+            CountWipes {
+                inner: rig.hook,
+                wipes: Arc::clone(&wipes),
+            },
         )
         .await
         .unwrap();
@@ -497,6 +573,14 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
         per_tick.values().max()
     );
     assert!(u64::try_from(seen.len()).unwrap() >= TICKS);
+    // The seeded bordered wipe was composed on its first tick and again on
+    // the next one, after the flood's first 16 commands were drained (the
+    // first CUT is command 49, at least three drains later).
+    assert!(
+        wipes.load(Ordering::Relaxed) >= 2,
+        "bordered wipe ticks: {}",
+        wipes.load(Ordering::Relaxed)
+    );
 }
 
 /// The real-time variant of the flood (review INV1-01): a monotonic clock and
@@ -519,7 +603,13 @@ fn a_transition_flood_on_a_real_clock_keeps_cadence_with_a_stalled_consumer() {
         run.repeats
     );
     assert!(run.full > 0, "the flood met a full mailbox");
-    assert!(run.completions > 0, "dips really ran");
+    assert!(run.completions > 0, "takes really ran");
+    assert!(
+        run.wipes >= 4,
+        "bordered wipe ticks under the flood (seeded 8-frame flight, no CUT; \
+         catch-up repeats are not counted): {}",
+        run.wipes
+    );
 }
 
 /// Negative control: the same watchdog with a hook that blocks 3 s once, in
@@ -560,6 +650,7 @@ struct RealRun {
     repeats: u64,
     full: u64,
     completions: u64,
+    wipes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -574,6 +665,7 @@ struct Stall<H> {
     inner: H,
     block: Block,
     injected: Arc<AtomicBool>,
+    wipes: Arc<AtomicU64>,
 }
 
 impl<H> Stall<H> {
@@ -599,6 +691,9 @@ impl<H: FrameControl> FrameControl for Stall<H> {
         }
         self.block_once(tick);
         self.inner.before_compose(drive, tick);
+        if is_bordered_wipe(drive) {
+            self.wipes.fetch_add(1, Ordering::Relaxed);
+        }
     }
     fn after_compose(&mut self, frame: &multiview_engine::CompositedFrame) {
         self.inner.after_compose(frame);
@@ -633,6 +728,10 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
     let finished = Arc::new(AtomicBool::new(false));
     let injected = Arc::new(AtomicBool::new(false));
     let full = Arc::new(AtomicU64::new(0));
+    let wipes = Arc::new(AtomicU64::new(0));
+    // No CUT in this flood: during the seeded flight every selection and AUTO
+    // is refused, so the 8-frame bordered wipe runs under the flood.
+    seed_bordered_wipe(&handle, 8);
     // Sources publish fresh frames on real time, off the clock.
     let feeder = {
         let (done, time) = (Arc::clone(&done), Arc::clone(&time));
@@ -650,19 +749,21 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
         std::thread::spawn(move || {
             let mut n: u64 = 0;
             while !done.load(Ordering::Acquire) {
-                let verb = match n % 3 {
+                let verb = match n % 4 {
                     0 => SwitcherVerb::SetTransition(dip(
                         6,
                         Some(Rgb8::new(u8::try_from(n % 251).unwrap(), 0, 0)),
                         Rational::new(1, 3),
                     )),
                     1 => SwitcherVerb::Auto(FrameCount::try_from(6).unwrap()),
-                    _ if n % 2 == 0 => SwitcherVerb::SetTransition(wipe(
+                    2 if n % 8 == 2 => SwitcherVerb::SetTransition(wipe(
                         6,
                         "circle",
                         &serde_json::json!({"softness": 0.05, "border_width": 0.02, "border_color": "#0000ff"}),
                     )),
-                    _ => SwitcherVerb::SetTransition(dip(1, None, Rational::new(1, 2))),
+                    2 => SwitcherVerb::SetTransition(dip(1, None, Rational::new(1, 2))),
+                    // Every WIPE selection (n % 8 == 2) is followed by an AUTO.
+                    _ => SwitcherVerb::Auto(FrameCount::try_from(6).unwrap()),
                 };
                 let command = SwitcherCommand {
                     operation_id: format!("rt-{n}"),
@@ -685,6 +786,7 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
             inner: rig.hook,
             block,
             injected: Arc::clone(&injected),
+            wipes: Arc::clone(&wipes),
         };
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -740,6 +842,7 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
         repeats: repeated.load(Ordering::Acquire),
         full: full.load(Ordering::Relaxed),
         completions: handle.snapshot().map_or(0, |s| s.completion_count),
+        wipes: wipes.load(Ordering::Relaxed),
     }
 }
 
@@ -873,4 +976,103 @@ fn out_of_range_or_unrendered_wipe_options_are_refused() {
         );
     }
     assert_eq!(errors["ok"], None);
+}
+
+/// Review ABU-01: typed wipes carrying NaN, infinities or out-of-range
+/// geometry (values JSON cannot carry) are refused and leave the selected
+/// transition unchanged.
+#[test]
+fn malformed_typed_wipes_are_refused_and_change_nothing() {
+    let mut rig = rig();
+    let mut outcomes = rig.handle.outcomes();
+    let good = wipe(
+        10,
+        "box",
+        &serde_json::json!({"border_width": 0.1, "border_color": "#ff0000"}),
+    );
+    rig.send("good", SwitcherVerb::SetTransition(good.clone()));
+    rig.step(0);
+    let mut cases = Vec::new();
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5, 1.5] {
+        for field in 0..4 {
+            let mut d = good.clone();
+            if let TransitionDescriptor::Wipe {
+                softness,
+                border_width,
+                position_xy,
+                ..
+            } = &mut d
+            {
+                match field {
+                    0 => *softness = bad,
+                    1 => *border_width = bad,
+                    2 => position_xy[0] = bad,
+                    _ => position_xy[1] = bad,
+                }
+            }
+            cases.push(d);
+        }
+    }
+    let mut index = 1;
+    for (n, d) in cases.into_iter().enumerate() {
+        rig.send(&format!("bad-{n}"), SwitcherVerb::SetTransition(d));
+        rig.step(index);
+        index += 1;
+        let mut error = None;
+        while let Ok(item) = outcomes.try_recv() {
+            if item.event.operation_id == format!("bad-{n}") {
+                error = item.event.error.clone();
+            }
+        }
+        assert!(error.is_some(), "case {n} refused");
+        // An AUTO now must still run the good bordered box wipe.
+    }
+    rig.send("auto", SwitcherVerb::Auto(FrameCount::try_from(4).unwrap()));
+    rig.step(index);
+    rig.step(index + 1);
+    assert!(
+        matches!(
+            rig.drive.transition_style(),
+            multiview_engine::TransitionStyle::Wipe {
+                border_color: Some(c),
+                ..
+            } if c == Rgb8::new(255, 0, 0)
+        ),
+        "the good wipe is still selected"
+    );
+}
+
+/// Review ABU-01 / INV-01: repeated bordered wipes build the border colour
+/// once and never grow the scratch pool (the DIP allocation gate, for WIPE).
+#[test]
+fn repeated_bordered_wipes_build_the_border_once_and_never_grow_the_scratch_pool() {
+    let mut rig = rig();
+    rig.send(
+        "set",
+        SwitcherVerb::SetTransition(wipe(
+            4,
+            "circle",
+            &serde_json::json!({"softness": 0.1, "border_width": 0.05, "border_color": "#00ff00"}),
+        )),
+    );
+    rig.step(0);
+    let mut index = 1;
+    let mut reservations = None;
+    for round in 0..5 {
+        rig.send(
+            &format!("auto-{round}"),
+            SwitcherVerb::Auto(FrameCount::try_from(4).unwrap()),
+        );
+        for _ in 0..6 {
+            rig.step(index);
+            index += 1;
+        }
+        let now = rig.drive.scratch_reservations();
+        if let Some(before) = reservations {
+            assert_eq!(now, before, "round {round}: the scratch pool did not grow");
+        }
+        reservations = Some(now);
+    }
+    assert_eq!(rig.drive.transition_fill_builds(), 1);
+    assert_eq!(rig.handle.snapshot().unwrap().completion_count, 5);
 }

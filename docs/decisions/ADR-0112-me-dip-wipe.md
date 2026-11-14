@@ -57,7 +57,10 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    fill drawn through the edge grown by `border_width`, under the incoming
    picture; the travel is lengthened by the soft half-width and the border so
    progress 0 shows nothing of either and progress 1 shows only the incoming
-   picture. `border_fill_source` and `flip_flop` are refused until rendered.
+   picture, and both endpoints are pinned exactly (coverage 0 / 1 for the whole
+   canvas, whatever the origin or rounding). The signed distance to the edge is
+   measured in canvas-height units for every shape, the box's sides included,
+   so a soft edge or border band has the same pixel width on every side. `border_fill_source` and `flip_flop` are refused until rendered.
    Edge pixels may differ between CPU and GPU by f32 rounding; the GPU test
    bounds that to 1 % of luma samples by more than 3 code values.
 4. **Control API and desk** (third PR): `/api/v1/switcher/plan` and

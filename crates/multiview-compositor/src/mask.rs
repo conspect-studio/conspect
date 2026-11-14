@@ -10,8 +10,14 @@
 //! Geometry: canvas coordinates are normalised to `u = (px + 0.5) / width`,
 //! `v = (py + 0.5) / height`. Each shape is a distance field `f(u, v) >= 0`
 //! whose largest value on the canvas is `extent`; the revealed region is
-//! `f < radius`. `reverse` mirrors the field (`extent - f`): the other side
-//! for an edge, closing in from the outside for a box or circle.
+//! `f <= radius`. `reverse` mirrors it: the region outside the shape of radius
+//! `extent - radius` (the other side for an edge, closing in from the outside
+//! for a box or circle). The signed distance to the edge is measured in
+//! canvas-height units for every shape (the box's sides included), so a soft
+//! edge or a border band has the same pixel width on every side.
+//!
+//! The endpoints are exact (review MED-01): progress `<= 0` covers nothing and
+//! progress `>= 1` covers everything, whatever the origin or rounding.
 
 /// The mask family (the compositor's own copy, so this crate never matches on
 /// the non-exhaustive switcher descriptor).
@@ -61,13 +67,18 @@ pub struct WipeMask {
     pub reverse: bool,
     /// The field's largest value on the canvas.
     pub extent: f32,
-    /// The edge position: pixels with `f < radius` are revealed.
+    /// The edge position in field units: pixels with `f <= radius` are
+    /// revealed.
     pub radius: f32,
-    /// The soft-edge width in field units (`0` is a hard edge).
+    /// The soft-edge width in canvas-height units (`0` is a hard edge).
     pub softness: f32,
-    /// Grow the revealed region by this much (the border band's draw uses the
+    /// Grow the revealed region by this much, in canvas-height units (the
+    /// border band's draw uses the
     /// border width; the incoming picture uses `0`).
     pub expand: f32,
+    /// An exact coverage for the whole canvas at an endpoint: `Some(0.0)` at
+    /// progress `<= 0`, `Some(1.0)` at progress `>= 1`, else `None`.
+    pub pinned: Option<f32>,
 }
 
 impl WipeMask {
@@ -95,8 +106,23 @@ impl WipeMask {
         let extent = extent(shape, aspect, origin);
         let softness = clamp01(softness);
         let border = clamp01(border);
-        let margin = softness * 0.5 + border;
-        let radius = -margin + clamp01(progress) * (extent + softness * 0.5 + margin);
+        // The radius is in field units; the margin is in height units. A box
+        // side's height-unit distance is `aspect * (radius - |du|)`, so on a
+        // portrait canvas the margin is scaled up to clear both axes.
+        let scale = match shape {
+            MaskShape::Box => 1.0_f32.max(1.0 / aspect),
+            _ => 1.0,
+        };
+        let margin = (softness * 0.5 + border) * scale;
+        let progress = clamp01(progress);
+        let radius = -margin + progress * (extent + softness * 0.5 * scale + margin);
+        let pinned = if progress <= 0.0 {
+            Some(0.0)
+        } else if progress >= 1.0 {
+            Some(1.0)
+        } else {
+            None
+        };
         Self {
             shape,
             width: width.max(1),
@@ -108,10 +134,12 @@ impl WipeMask {
             radius,
             softness,
             expand: 0.0,
+            pinned,
         }
     }
 
-    /// The same edge grown by `expand` (field units): the border band's draw.
+    /// The same edge grown by `expand` (canvas-height units): the border
+    /// band's draw.
     #[must_use]
     pub const fn expanded(mut self, expand: f32) -> Self {
         self.expand = expand;
@@ -122,13 +150,17 @@ impl WipeMask {
     /// to `wipe_coverage` in `composite.wgsl`.
     #[must_use]
     pub fn coverage(&self, px: u32, py: u32) -> f32 {
+        if let Some(pinned) = self.pinned {
+            return pinned;
+        }
         let u = (u32_to_f32(px) + 0.5) / u32_to_f32(self.width);
         let v = (u32_to_f32(py) + 0.5) / u32_to_f32(self.height);
-        let mut f = field(self.shape, self.aspect, self.origin, u, v);
-        if self.reverse {
-            f = self.extent - f;
-        }
-        let d = self.radius - f + self.expand;
+        let (radius, sign) = if self.reverse {
+            (self.extent - self.radius, -1.0)
+        } else {
+            (self.radius, 1.0)
+        };
+        let d = sign * inside(self.shape, self.aspect, self.origin, radius, u, v) + self.expand;
         if self.softness > 0.0 {
             (d / self.softness + 0.5).clamp(0.0, 1.0)
         } else if d >= 0.0 {
@@ -161,18 +193,23 @@ fn aspect(width: u32, height: u32) -> f32 {
 
 const INV_SQRT2: f32 = core::f32::consts::FRAC_1_SQRT_2;
 
-/// The distance field of `shape` at `(u, v)`. Units: the canvas height for
-/// the edges and the circle; the normalised half-size for the box.
-fn field(shape: MaskShape, aspect: f32, origin: [f32; 2], u: f32, v: f32) -> f32 {
+/// The signed distance, in canvas-height units, from `(u, v)` to the edge of
+/// the shape of field radius `radius` (positive inside). Must stay identical
+/// to the `switch` in `wipe_coverage` (`composite.wgsl`).
+fn inside(shape: MaskShape, aspect: f32, origin: [f32; 2], radius: f32, u: f32, v: f32) -> f32 {
     match shape {
-        MaskShape::Horizontal => u * aspect,
-        MaskShape::Vertical => v,
-        MaskShape::Diagonal => (u * aspect + v) * INV_SQRT2,
-        MaskShape::Box => (u - origin[0]).abs().max((v - origin[1]).abs()),
+        MaskShape::Horizontal => radius - u * aspect,
+        MaskShape::Vertical => radius - v,
+        MaskShape::Diagonal => radius - (u * aspect + v) * INV_SQRT2,
+        // A canvas-aspect rectangle of normalised half-size `radius`: its
+        // side distances in height units (review MED-02).
+        MaskShape::Box => {
+            (aspect * (radius - (u - origin[0]).abs())).min(radius - (v - origin[1]).abs())
+        }
         MaskShape::Circle => {
             let dx = (u - origin[0]) * aspect;
             let dy = v - origin[1];
-            (dx * dx + dy * dy).sqrt()
+            radius - (dx * dx + dy * dy).sqrt()
         }
     }
 }

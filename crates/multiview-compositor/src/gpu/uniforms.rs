@@ -320,6 +320,16 @@ impl TileParams {
     /// The shader derives the aspect from the canvas size, as the CPU does.
     #[must_use]
     pub fn with_mask(mut self, mask: &crate::mask::WipeMask) -> Self {
+        // Exact endpoints (review MED-01): coverage 0 is zero opacity,
+        // coverage 1 is no mask at all; neither depends on float rounding.
+        match mask.pinned {
+            Some(c) if c <= 0.0 => {
+                self.opacity_transfer[0] = 0.0;
+                return self;
+            }
+            Some(_) => return self,
+            None => {}
+        }
         self.opacity_transfer[2] = shape_lane(mask.shape.id());
         self.opacity_transfer[3] = if mask.reverse { 1.0 } else { 0.0 };
         self.range[3] = mask.softness;

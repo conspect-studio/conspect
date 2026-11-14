@@ -213,3 +213,81 @@ fn degenerate_parameters_never_panic_and_stay_in_range() {
         }
     }
 }
+
+/// Review MED-01: progress 0 covers nothing and progress 1 covers everything
+/// even when a box or circle origin falls exactly on a pixel centre, with a
+/// border band (the expanded draw) and reversed.
+#[test]
+fn endpoints_are_exact_for_a_pixel_centre_origin_with_border_and_reverse() {
+    let (w, h) = (128_u32, 64_u32);
+    let origin = [64.5 / 128.0, 32.5 / 64.0];
+    for shape in SHAPES {
+        for reverse in [false, true] {
+            for (soft, border) in [(0.0, 0.0), (0.0, 0.125), (0.1, 0.05)] {
+                let start = WipeMask::new(shape, 0.0, w, h, origin, reverse, soft, border);
+                let end = WipeMask::new(shape, 1.0, w, h, origin, reverse, soft, border);
+                for y in 0..h {
+                    for x in 0..w {
+                        for (mask, want) in
+                            [(start, 0.0), (start.expanded(border), 0.0), (end, 1.0)]
+                        {
+                            assert_eq!(
+                                mask.coverage(x, y),
+                                want,
+                                "{shape:?} reverse={reverse} soft={soft} border={border} at ({x},{y})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Review MED-02: soft edge and border widths are fractions of the canvas
+/// height on every side of a box, on a non-square canvas, computed here from
+/// pixel counts (not from the mask formula).
+#[test]
+fn box_border_and_soft_edge_have_the_same_pixel_width_on_every_side() {
+    let (w, h) = (128_u32, 64_u32);
+    let mask = WipeMask::new(MaskShape::Box, 0.4, w, h, [0.5, 0.5], false, 0.0, 0.125);
+    let band = mask.expanded(0.125);
+    let in_band = |x: u32, y: u32| band.coverage(x, y) == 1.0 && mask.coverage(x, y) == 0.0;
+    let horizontal = (w / 2..w).filter(|&x| in_band(x, h / 2)).count();
+    let vertical = (h / 2..h).filter(|&y| in_band(w / 2, y)).count();
+    // 0.125 of a 64-pixel height is 8 pixels on each side.
+    assert!((7..=9).contains(&horizontal), "side band {horizontal} px");
+    assert!((7..=9).contains(&vertical), "top/bottom band {vertical} px");
+    let soft = WipeMask::new(MaskShape::Box, 0.4, w, h, [0.5, 0.5], false, 0.25, 0.0);
+    let ramp = |c: f32| c > 0.0 && c < 1.0;
+    let horizontal = (w / 2..w)
+        .filter(|&x| ramp(soft.coverage(x, h / 2)))
+        .count();
+    let vertical = (h / 2..h)
+        .filter(|&y| ramp(soft.coverage(w / 2, y)))
+        .count();
+    // 0.25 of 64 is a 16-pixel ramp on each side.
+    assert!((15..=17).contains(&horizontal), "side ramp {horizontal} px");
+    assert!(
+        (15..=17).contains(&vertical),
+        "top/bottom ramp {vertical} px"
+    );
+    // A portrait canvas too.
+    let (w, h) = (36_u32, 64_u32);
+    let mask = WipeMask::new(MaskShape::Box, 0.5, w, h, [0.5, 0.5], false, 0.0, 0.125);
+    let band = mask.expanded(0.125);
+    let in_band = |x: u32, y: u32| band.coverage(x, y) == 1.0 && mask.coverage(x, y) == 0.0;
+    let horizontal = (w / 2..w).filter(|&x| in_band(x, h / 2)).count();
+    let vertical = (h / 2..h).filter(|&y| in_band(w / 2, y)).count();
+    assert!(
+        (7..=9).contains(&horizontal),
+        "portrait side band {horizontal} px"
+    );
+    assert!(
+        (7..=9).contains(&vertical),
+        "portrait top/bottom band {vertical} px"
+    );
+    // And it starts empty with the band included.
+    let start = WipeMask::new(MaskShape::Box, 0.0, w, h, [0.5, 0.5], false, 0.0, 0.125);
+    assert!((0..h).all(|y| (0..w).all(|x| start.expanded(0.125).coverage(x, y) == 0.0)));
+}
