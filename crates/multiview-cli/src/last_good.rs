@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use multiview_config::MultiviewConfig;
 use multiview_control::boot_model::{
-    boot_fallback_marker_path, clear_boot_fallback_marker, load_desired_file,
+    boot_fallback_marker_path, clear_boot_fallback_marker, kept_copy_equals, load_desired_file,
     read_boot_fallback_marker, state_dir_for, write_atomic, AtomicWriteError, BootFallbackMarker,
     DesiredState,
 };
@@ -51,9 +51,11 @@ use multiview_control::boot_model::{
 /// The last-good copy's file name inside the state directory.
 pub const LAST_GOOD_FILE: &str = "last-good.json";
 /// The directory (inside the state directory) that keeps rejected states.
-pub const REJECTED_DIR: &str = "rejected";
+pub const REJECTED_DIR: &str = multiview_control::boot_model::REJECTED_DIR;
 /// How many rejected accepted states are kept (oldest pruned first).
 pub const MAX_REJECTED: usize = 5;
+/// How many names one millisecond's rejected copy may try (fails closed).
+const MAX_NAME_ATTEMPTS: u32 = 1000;
 
 /// The last-good copy for the boot config at `boot_path`.
 #[must_use]
@@ -147,9 +149,7 @@ pub type AtomicWriter<'a> = dyn Fn(&Path, &str) -> Result<(), AtomicWriteError> 
 fn write_checked(path: &Path, content: &str, writer: &AtomicWriter<'_>) -> Result<(), String> {
     match writer(path, content) {
         Ok(()) => Ok(()),
-        Err(AtomicWriteError::AfterRename(error))
-            if std::fs::read_to_string(path).is_ok_and(|now| now == content) =>
-        {
+        Err(AtomicWriteError::AfterRename(error)) if kept_copy_equals(path, content) => {
             tracing::warn!(path = %path.display(), %error, "written, but the directory sync failed");
             Ok(())
         }
@@ -189,9 +189,11 @@ pub fn keep_rejected_copy_with(
     writer: &AtomicWriter<'_>,
 ) -> Result<PathBuf, String> {
     let rejected_dir = state_dir_for(boot_path).join(REJECTED_DIR);
+    // Only a regular file of the same size is read, through a no-follow,
+    // non-blocking descriptor (never a symlink, FIFO or an oversized file).
     if let Some(existing) = rejected_files(&rejected_dir)
         .into_iter()
-        .find(|p| std::fs::read_to_string(p).is_ok_and(|kept| kept == rejected_text))
+        .find(|p| kept_copy_equals(p, rejected_text))
     {
         // The bound holds on a reuse too (files may have been dropped in by
         // hand or by an older build); the reused copy is never pruned.
@@ -200,12 +202,17 @@ pub fn keep_rejected_copy_with(
     }
     create_private_dir(&rejected_dir)?;
     // `desired-<13-digit ms>-<3-digit n>.json`: lexical order = time order.
-    let mut n = 0_u32;
-    let mut kept = rejected_dir.join(format!("desired-{now_ms:013}-{n:03}.json"));
-    while kept.exists() {
-        n = n.saturating_add(1);
-        kept = rejected_dir.join(format!("desired-{now_ms:013}-{n:03}.json"));
-    }
+    // A bounded search for a free name (`symlink_metadata` never follows a
+    // planted link or opens a FIFO); fails closed when none is free.
+    let kept = (0..MAX_NAME_ATTEMPTS)
+        .map(|n| rejected_dir.join(format!("desired-{now_ms:013}-{n:03}.json")))
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .ok_or_else(|| {
+            format!(
+                "no free name for a rejected-state copy in {}",
+                rejected_dir.display()
+            )
+        })?;
     write_checked(&kept, rejected_text, writer)
         .map_err(|e| format!("keeping a copy of the rejected state: {e}"))?;
     prune_rejected(&rejected_dir, &kept);
