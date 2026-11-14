@@ -330,4 +330,34 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     expect(body).toMatchObject({ action: 'auto', duration_frames: 30 });
     expect(body).not.toHaveProperty('transition');
   });
+
+  // MED-P3-2: the draft starts from the engine's confirmed selection, keeps unsaved
+  // local edits across a later engine change, and keeps the fields it does not expose.
+  it('loads the persisted selection into the draft and an edit keeps the other fields', async () => {
+    let selection: Record<string, unknown> = { kind: 'wipe', pattern: 'box', rate: 30, reverse: true, softness: 0.3, border_width: 0, position_xy: [0.2, 0.8], flip_flop: false };
+    const bodies: unknown[] = [];
+    server.use(
+      http.get('*/api/v1/switcher/me1', () => { polls += 1; return HttpResponse.json({ ...state, tick: state.tick + polls, transition: selection }); }),
+      http.post('*/api/v1/switcher/plan', () => HttpResponse.json({ can_take: true, class: 'class1', scene_version: 1 })),
+      http.post('*/api/v1/switcher/commands/set_transition', async ({ request }) => { bodies.push(await request.json()); commandCount += 1; return HttpResponse.json({ operation_id: 'op-t', kind: 'set_transition' }, { status: 202 }); }),
+    );
+    page();
+    const reverse = await screen.findByRole('checkbox', { name: 'Reverse' });
+    await waitFor(() => { expect(reverse).toBeChecked(); }, { timeout: 6000 });
+    expect(screen.getByRole('slider', { name: 'Wipe softness' })).toHaveValue('0.3');
+    expect(screen.getByRole('img', { name: 'Preview of Box wipe at 50%' })).toHaveAttribute('data-reverse', 'true');
+    // One local edit, then the engine changes another field: the edit survives.
+    await waitFor(() => { expect(reverse).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(reverse);
+    expect(reverse).not.toBeChecked();
+    selection = { ...selection, softness: 0.4 };
+    await waitFor(() => { expect(screen.getByRole('slider', { name: 'Wipe softness' })).toHaveValue('0.4'); }, { timeout: 6000 });
+    expect(reverse).not.toBeChecked();
+    const apply = screen.getByRole('button', { name: 'Apply to WIPE' });
+    await waitFor(() => { expect(apply).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(apply);
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(bodies[0]).toMatchObject({ action: 'set_transition', transition: { kind: 'wipe', pattern: 'box', rate: 30, reverse: false, softness: 0.4, border_width: 0, position_xy: [0.2, 0.8], flip_flop: false } });
+    expect(bodies[0]).not.toHaveProperty('transition.border_color');
+  });
 });

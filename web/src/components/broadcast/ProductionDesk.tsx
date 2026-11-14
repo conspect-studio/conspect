@@ -122,21 +122,65 @@ type TransitionKind = 'mix' | 'wipe' | 'dip';
 interface TransitionDraft { readonly pattern: WipePattern; readonly reverse: boolean; readonly softness: number; readonly borderWidth: number; readonly borderColor: string; readonly dipColor: string }
 const DEFAULT_DRAFT: TransitionDraft = { pattern: 'linear_edge', reverse: false, softness: 0, borderWidth: 0, borderColor: '#ffffff', dipColor: '#000000' };
 
-/** The descriptor `set_transition` sends; AUTO replaces `rate` with its own frames. */
-function transitionDescriptor(kind: TransitionKind, draft: TransitionDraft, rate: number): TransitionDescriptor {
+function isWipePattern(pattern: string): pattern is WipePattern {
+  return (WIPE_PATTERNS as readonly string[]).includes(pattern);
+}
+
+/** The draft the engine's confirmed selection implies (defaults for what it does not carry). */
+function draftFromSelection(transition: TransitionDescriptor | undefined): TransitionDraft {
+  if (transition?.kind === 'wipe') {
+    return {
+      ...DEFAULT_DRAFT,
+      ...(isWipePattern(transition.pattern) ? { pattern: transition.pattern } : {}),
+      reverse: transition.reverse ?? false,
+      softness: transition.softness ?? 0,
+      borderWidth: transition.border_width ?? 0,
+      ...(transition.border_color ? { borderColor: transition.border_color } : {}),
+    };
+  }
+  if (transition?.kind === 'dip' && transition.color) return { ...DEFAULT_DRAFT, dipColor: transition.color };
+  return DEFAULT_DRAFT;
+}
+
+const DRAFT_KEYS = ['pattern', 'reverse', 'softness', 'borderWidth', 'borderColor', 'dipColor'] as const satisfies readonly (keyof TransitionDraft)[];
+
+/**
+ * The unsaved local edits of `next` against the confirmed draft: only fields
+ * that differ. Reconciling with a new engine selection keeps every edit the
+ * engine does not now match (never overwritten) and drops the ones it does.
+ */
+function unsavedEdits(next: Partial<TransitionDraft>, confirmed: TransitionDraft): Partial<TransitionDraft> {
+  let edits: Partial<TransitionDraft> = {};
+  for (const key of DRAFT_KEYS) {
+    const value = next[key];
+    if (value !== undefined && value !== confirmed[key]) edits = { ...edits, [key]: value };
+  }
+  return edits;
+}
+
+/**
+ * The descriptor `set_transition` sends; AUTO replaces `rate` with its own frames.
+ * Fields of the confirmed selection the desk does not expose (`position_xy`,
+ * `switch_point`, …) are kept when the kind is unchanged.
+ */
+function transitionDescriptor(kind: TransitionKind, draft: TransitionDraft, rate: number, confirmed?: TransitionDescriptor): TransitionDescriptor {
   if (kind === 'mix') return { kind: 'mix', rate };
-  if (kind === 'dip') return { kind: 'dip', rate: Math.max(2, rate), color: draft.dipColor };
-  return { kind: 'wipe', pattern: draft.pattern, rate, reverse: draft.reverse, softness: draft.softness, border_width: draft.borderWidth, ...(draft.borderWidth > 0 ? { border_color: draft.borderColor } : {}) };
+  if (kind === 'dip') return { ...(confirmed?.kind === 'dip' ? confirmed : {}), kind: 'dip', rate: Math.max(2, rate), color: draft.dipColor };
+  const wipe: TransitionDescriptor = { ...(confirmed?.kind === 'wipe' ? confirmed : {}), kind: 'wipe', pattern: draft.pattern, rate, reverse: draft.reverse, softness: draft.softness, border_width: draft.borderWidth };
+  // No band: drop a confirmed border colour rather than send a stale one.
+  if (draft.borderWidth > 0) return { ...wipe, border_color: draft.borderColor };
+  delete wipe.border_color;
+  return wipe;
 }
 
 /** The engine's selected kind for the desk keys; a selected CUT makes AUTO a MIX. */
-function selectedKind(transition: { kind: string } | undefined): TransitionKind {
+function selectedKind(transition: TransitionDescriptor | undefined): TransitionKind {
   return transition?.kind === 'wipe' || transition?.kind === 'dip' ? transition.kind : 'mix';
 }
 
 /** The engine's selected wipe pattern, if the selection is a wipe. */
-function selectedPattern(transition: { kind: string } | undefined): string | undefined {
-  return transition?.kind === 'wipe' && 'pattern' in transition && typeof transition.pattern === 'string' ? transition.pattern : undefined;
+function selectedPattern(transition: TransitionDescriptor | undefined): string | undefined {
+  return transition?.kind === 'wipe' ? transition.pattern : undefined;
 }
 
 /** A ~50% progress thumbnail of a wipe pattern: incoming (light) revealed over outgoing (dark). */
@@ -191,7 +235,20 @@ function ProductionDeskBody(): JSX.Element {
   const [failure, setFailure] = useState<string>();
   const [confirm, setConfirm] = useState<{ action: SwitcherAction; source?: string }>();
   const [frames, setFrames] = useState('30');
-  const [draft, setDraft] = useState<TransitionDraft>(DEFAULT_DRAFT);
+  // The draft is the engine's confirmed selection overlaid with unsaved local edits.
+  const confirmedTransition = state.data?.transition;
+  const confirmedKey = JSON.stringify(confirmedTransition ?? null);
+  const confirmedDraft = draftFromSelection(confirmedTransition);
+  const [edits, setEdits] = useState<Partial<TransitionDraft>>({});
+  // Reconcile once per changed engine selection (by value: each poll is a fresh object),
+  // adjusting state during render rather than in an effect.
+  const [reconciledKey, setReconciledKey] = useState(confirmedKey);
+  if (reconciledKey !== confirmedKey) {
+    setReconciledKey(confirmedKey);
+    setEdits(unsavedEdits(edits, confirmedDraft));
+  }
+  const draft: TransitionDraft = { ...confirmedDraft, ...edits };
+  const setDraft = (next: TransitionDraft): void => { setEdits(unsavedEdits(next, confirmedDraft)); };
   const [help, setHelp] = useState(false);
   const [now, setNow] = useState(Date.now);
   // 'sending' from click until the tracker record is terminal; then the operation id.
@@ -244,7 +301,7 @@ function ProductionDeskBody(): JSX.Element {
   const kindLabel = kind === 'wipe' ? 'WIPE' : kind === 'dip' ? 'DIP' : 'MIX';
   const rate = framesValid ? Number(frames) : 30;
   // Selecting is not a take: no confirmation, but the same guard and plan → command path.
-  const select = (next: TransitionKind, nextDraft: TransitionDraft = draft): void => { send({ action: 'set_transition', transition: transitionDescriptor(next, nextDraft, rate) }); };
+  const select = (next: TransitionKind, nextDraft: TransitionDraft = draft): void => { send({ action: 'set_transition', transition: transitionDescriptor(next, nextDraft, rate, confirmedTransition) }); };
   const transitionReason = framesValid ? undefined : t`Enter 1–1000 frames`;
   const patternName = (pattern: WipePattern): string => pattern === 'linear_edge' ? t`Horizontal wipe` : pattern === 'vertical' ? t`Vertical wipe` : pattern === 'diagonal' ? t`Diagonal wipe` : pattern === 'box' ? t`Box wipe` : t`Circle wipe`;
   const name = (id: string | undefined): string | undefined => sources.data?.find((s) => s.id === id)?.name ?? id;

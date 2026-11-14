@@ -87,7 +87,11 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    before enqueue, and the engine re-checks every rule at the tick. The
    checks are shared, not copied: `TransitionDescriptor::is_valid` /
    `is_rendered`. `GET /api/v1/switcher/me1` reports the engine snapshot's
-   `transition`. The snapshot compares the descriptor every committed tick
+   `transition`. The OpenAPI document publishes the descriptor as a
+   `oneOf` tagged on `kind` (`TransitionDescriptorDoc`, a serde-equivalent
+   mirror in `multiview-control`, pinned to the core type by a round-trip
+   test); the route still parses the raw JSON so a malformed body is a typed
+   422, and the web client uses the generated type. The snapshot compares the descriptor every committed tick
    and clones it only on a changed tick. The selection is machine state, so
    it is persisted as `switcher.mix_effects[0].transition`. Config
    validation applies the same two rules. The persist relay writes the
@@ -97,7 +101,11 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    completed or interrupted AUTO persists the selection with its own rate.
    The first-slice
    launcher sets the persisted selection on the machine before the clock
-   starts. The desk enables MIX/WIPE/DIP (pressed state from GET). It has a
+   starts. The desk enables MIX/WIPE/DIP (pressed state from GET). Its
+   parameter draft starts from the confirmed selection in GET; a later
+   engine change updates every field without an unsaved local edit, and
+   applying keeps the selection's fields the desk does not expose
+   (`position_xy`, `switch_point`). It has a
    picker with the five patterns as SVG thumbnails, reverse, softness,
    border width/colour and a dip colour, a 50 % preview thumbnail, and an
    AUTO title naming the selected kind. AUTO still sends only its
