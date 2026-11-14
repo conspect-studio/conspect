@@ -490,6 +490,17 @@ pub trait OutputRouting: Send + Sync {
         let _ = principal;
         None
     }
+    /// The complete identity of the encoder a take of `feed` onto `output`
+    /// would open (#308 §12.8 rule 1): the engine's encoder-sharing key —
+    /// the feed at the output's format, the output's encoder settings and
+    /// its landed live reset's settings. Two set members with equal
+    /// identities share one new encoder; different identities are two.
+    /// `None` when unknown: the member counts as its own encoder, so the
+    /// set's delta is never under-counted.
+    fn encoder_identity(&self, output: &str, feed: &RoutedFeed) -> Option<String> {
+        let _ = (output, feed);
+        None
+    }
     /// A stored layout changed in the accepted library (ADR-0108 §10.1):
     /// `Some(body)` is its newly resolved body (outputs on it follow it live,
     /// at an IDR); `None` means it was deleted or no longer routes (outputs

@@ -51,7 +51,8 @@ use crate::patch_set::{SetMembers, SetReservation};
 use crate::state::AppState;
 
 /// The aggregate cost of a set (`POST /patch/plan`, #308): its NEW encoder
-/// delta, deduplicated per identical (feed, output format), against the
+/// delta, deduplicated per identical engine encoder identity (feed at the
+/// output's format, encoder settings, live reset settings), against the
 /// caller's per-principal cap and the global sessions.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -210,16 +211,18 @@ fn layout_for<'a>(video: &VideoFeed, layouts: &'a [LayoutRead]) -> Option<&'a La
     }
 }
 
-/// The dedupe key of a member's new encoder: identical (feed, output
-/// format) members share one encoder.
-fn encoder_key(feed: &RoutedFeed, output: &multiview_config::Output) -> (String, String) {
-    (
-        feed.bus_name(),
-        output
-            .format()
-            .and_then(|f| serde_json::to_string(f).ok())
-            .unwrap_or_default(),
-    )
+/// The dedupe key of a member's new encoder: the engine's complete
+/// encoder-sharing identity (feed at the output's format, the output's
+/// encoder settings and live reset settings, via
+/// `OutputRouting::encoder_identity`). Members with equal keys share one
+/// encoder; a member whose identity is unknown is its own (`member`, its
+/// config output id, which is unique in a set), never shared.
+fn encoder_key(state: &AppState, config_id: &str, feed: &RoutedFeed) -> String {
+    state
+        .output_routing
+        .as_ref()
+        .and_then(|c| c.routing.encoder_identity(config_id, feed))
+        .map_or_else(|| format!("member:{config_id}"), |id| format!("encoder:{id}"))
 }
 
 /// Whether a set's `delta` new encoders fit `principal`'s cap (when the
@@ -277,7 +280,7 @@ pub(crate) fn plan_set(
                 .zip(checked.plan.crosspoints),
         );
     }
-    let mut encoders: Vec<(String, String)> = Vec::new();
+    let mut encoders: Vec<String> = Vec::new();
     let mut global = None;
     for (sub, patch) in &shaped.outputs {
         let layout = layout_for(&patch.video, layouts);
@@ -291,7 +294,7 @@ pub(crate) fn plan_set(
                 let feed = RoutedFeed::of(&patch.video);
                 let output = output_of(state, &patch.output)?;
                 if let (Some(feed), Some(output)) = (feed, output) {
-                    let key = encoder_key(&feed, &output);
+                    let key = encoder_key(state, &output.id(), &feed);
                     if !encoders.contains(&key) {
                         encoders.push(key);
                     }
@@ -361,7 +364,7 @@ struct ReadyOutput {
     feed: RoutedFeed,
     layout: Option<LayoutBody>,
     audio_follow: bool,
-    new_encoder: Option<(String, String)>,
+    new_encoder: Option<String>,
 }
 
 /// Existence and the plan gate of one output member (§12.8): the output,
@@ -435,7 +438,9 @@ fn ready_output(
     *global = Some((cost.sessions_in_use, cost.sessions_max));
     Ok(Ok(ReadyOutput {
         api_id: patch.output.clone(),
-        new_encoder: cost.needs_encoder.then(|| encoder_key(&feed, &output)),
+        new_encoder: cost
+            .needs_encoder
+            .then(|| encoder_key(state, &config_id, &feed)),
         config_id,
         feed,
         layout,
@@ -535,9 +540,9 @@ pub(crate) fn take_set(
     {
         return Ok(Err(too_many(retry)));
     }
-    // The set's NEW encoder delta (identical (feed, format) pairs share
+    // The set's NEW encoder delta (members with one encoder identity share
     // one) against the principal's cap and the global sessions (rule 1).
-    let mut encoders: Vec<&(String, String)> = Vec::new();
+    let mut encoders: Vec<&String> = Vec::new();
     for key in outputs.iter().filter_map(|o| o.new_encoder.as_ref()) {
         if !encoders.contains(&key) {
             encoders.push(key);

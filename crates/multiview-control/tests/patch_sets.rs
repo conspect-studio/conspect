@@ -235,6 +235,13 @@ impl OutputRouting for Fake {
             .unwrap_or(0);
         Some(PrincipalSessions { held, max: 2 })
     }
+    /// The engine's encoder-sharing identity: the feed and the output's
+    /// encoder settings. Every output has the same format; output-2 alone
+    /// has its own encoder settings (a bit rate of its own).
+    fn encoder_identity(&self, output: &str, feed: &RoutedFeed) -> Option<String> {
+        let settings = if output == config_id(2) { "s1" } else { "s0" };
+        Some(format!("{}|{settings}", feed.bus_name()))
+    }
     fn snapshot(&self) -> Option<RoutingLive> {
         None
     }
@@ -1150,4 +1157,57 @@ async fn a_set_flood_is_429_and_never_starves_another_principal() {
         outputs <= 8 && principals <= 2,
         "limiter state bounded: {outputs}/{principals}"
     );
+}
+
+/// The set's encoder delta dedupes by the engine's COMPLETE sharing
+/// identity, not (feed, format) alone: two outputs on the same feed and
+/// format but different encoder settings need two encoders. A principal
+/// with one session left is told `fits: false` and the take is 409
+/// `capacity` with nothing enqueued and no key burned; the same feed on two
+/// outputs with equal settings shares one encoder and is admitted.
+#[tokio::test]
+async fn different_encoder_settings_never_share_one_new_encoder() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    rig.fake
+        .state
+        .lock()
+        .unwrap()
+        .held
+        .insert("operator-key".to_owned(), 1);
+    let body = set(vec![video(1, bars()), video(2, bars())]);
+    let resp = send(
+        &rig.router,
+        post("/api/v1/patch/plan", OPERATOR_TOKEN, None, &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let plan = body_json(resp).await;
+    assert_eq!(plan["set"]["new_encoders"], 2, "{plan}");
+    assert_eq!(plan["set"]["fits"], false, "{plan}");
+    assert_eq!(plan["can_take"], false, "{plan}");
+    let (status, problem) = take(&rig, OPERATOR_TOKEN, "settings", &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+    assert!(
+        problem["type"].as_str().unwrap().ends_with("capacity"),
+        "{problem}"
+    );
+    assert!(
+        rig.fake.state.lock().unwrap().offered.is_empty(),
+        "nothing enqueued"
+    );
+    assert_eq!(rig.state.patch_sets.records_len(), 0, "no key burned");
+    assert_eq!(rig.state.patch_sets.pending_len(), 0);
+    // Equal settings (output-0 and output-1): one shared encoder, fits.
+    let shared = set(vec![video(0, bars()), video(1, bars())]);
+    let resp = send(
+        &rig.router,
+        post("/api/v1/patch/plan", OPERATOR_TOKEN, None, &shared),
+    )
+    .await;
+    let plan = body_json(resp).await;
+    assert_eq!(plan["set"]["new_encoders"], 1, "{plan}");
+    assert_eq!(plan["set"]["fits"], true, "{plan}");
+    let (status, accepted) = take(&rig, OPERATOR_TOKEN, "shared", &shared).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
 }
