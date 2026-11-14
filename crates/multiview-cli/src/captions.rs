@@ -70,13 +70,20 @@ pub type DisplayCursors =
 /// `multiview-overlay`'s text [`Cue`](multiview_overlay::subtitle::Cue) models. A
 /// bitmap cue at `now` yields [`None`] here (the bitmap path stays on the existing
 /// per-source `sample_caption_bitmaps` sampling in the pipeline, unchanged).
-/// `active_at(now)` is the same lock-free [`CueStore::active_at`] read the baker
-/// already did, so routing through the layer adds no new hot-path cost and can
-/// neither pace nor stall the engine (invariants #1/#10).
+/// `active_at(now)` **borrows** the active cue from the lock-free store snapshot
+/// ([`CueStore::with_active_at_generation`]) and copies out only its bounded
+/// projection ([`bound_cue_lines`](multiview_output::hls::bound_cue_lines): at
+/// most 16 lines / 4 KiB inspected, at most 4 lines / 512 B kept), so the
+/// per-tick cost on the output clock thread is O(bounded) whatever the cue
+/// size a remote source sent (issue #430, invariants #1/#10). A cut cue is
+/// counted once per cue change in
+/// [`caption_burn_stats`](crate::overlays::caption_burn_stats).
 #[cfg(feature = "overlay")]
-#[derive(Clone)]
 pub struct CueStoreSource {
     store: Arc<CueStore>,
+    /// Start (ns) of the last truncated cue counted, so a cue held across
+    /// many ticks is counted once. `i64::MIN` = none yet.
+    last_truncated: std::sync::atomic::AtomicI64,
 }
 
 #[cfg(feature = "overlay")]
@@ -84,25 +91,51 @@ impl CueStoreSource {
     /// Wrap a per-source cue store as a routable text [`CueSource`](multiview_overlay::CueSource).
     #[must_use]
     pub fn new(store: Arc<CueStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            last_truncated: std::sync::atomic::AtomicI64::new(i64::MIN),
+        }
+    }
+}
+
+#[cfg(feature = "overlay")]
+impl Clone for CueStoreSource {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.store))
     }
 }
 
 #[cfg(feature = "overlay")]
 impl multiview_overlay::CueSource for CueStoreSource {
     fn active_at(&self, now: MediaTime) -> Option<multiview_overlay::subtitle::Cue> {
-        match self.store.active_at(now) {
-            Some(CaptionCue::Text { start, end, text }) if !text.lines.is_empty() => {
-                Some(multiview_overlay::subtitle::Cue {
-                    start,
-                    end,
-                    lines: text.lines,
-                })
-            }
-            // A bitmap cue (or an empty-line text cue) is not a text cue: the
-            // text-layer renders nothing for it (the bitmap path is separate).
-            _ => None,
+        use std::sync::atomic::Ordering;
+        let (start, end, bounded) = self
+            .store
+            .with_active_at_generation(now, self.store.generation(), |cue| match cue {
+                CaptionCue::Text { start, end, text } => Some((
+                    *start,
+                    *end,
+                    multiview_output::hls::bound_cue_lines(&text.lines),
+                )),
+                // A bitmap cue is not a text cue: the text-layer renders
+                // nothing for it (the bitmap path is separate).
+                _ => None,
+            })
+            .flatten()?;
+        if bounded.truncated()
+            && self
+                .last_truncated
+                .swap(start.as_nanos(), Ordering::Relaxed)
+                != start.as_nanos()
+        {
+            crate::overlays::caption_burn_stats().note_text_truncated();
         }
+        // An empty-line text cue renders nothing.
+        (!bounded.is_empty()).then(|| multiview_overlay::subtitle::Cue {
+            start,
+            end,
+            lines: bounded.into_lines(),
+        })
     }
 }
 
@@ -1844,6 +1877,56 @@ input_id = "cam_b"
                 plan.rendition_url
             );
         }
+    }
+
+    /// Issue #430: the clock-thread text projection the burn-in path samples
+    /// is bounded (inspection + output) and a cut cue is counted once per cue,
+    /// not once per tick.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn cue_store_source_projects_hostile_text_bounded_and_counts_once() {
+        use multiview_overlay::CueSource as _;
+        let store = Arc::new(CueStore::new());
+        let pad = "x".repeat(256 * 1024);
+        for (i, start) in [(0_i64, 0_i64), (1, 1_000)] {
+            let mut lines: Vec<String> = (0..40).map(|n| format!("c{i} l{n} {pad}")).collect();
+            lines.insert(0, String::new());
+            let cue = CaptionCue::try_text(
+                MediaTime::from_nanos(start),
+                MediaTime::from_nanos(start + 1_000),
+                lines,
+                None,
+            )
+            .unwrap();
+            store.publish(cue.start(), cue.end(), cue);
+        }
+        let source = CueStoreSource::new(Arc::clone(&store));
+        let before = crate::overlays::caption_burn_stats().text_truncated();
+        for t in 0..10 {
+            let cue = source.active_at(MediaTime::from_nanos(t * 50)).unwrap();
+            assert!(cue.lines.len() <= multiview_output::hls::subtitle::MAX_CUE_LINES);
+            let bytes = cue.lines.iter().map(|l| l.len() + 1).sum::<usize>() - 1;
+            assert!(bytes <= multiview_output::hls::subtitle::MAX_CUE_TEXT_BYTES);
+            assert!(cue.lines.iter().all(|l| l.capacity() <= 512));
+            assert!(cue.lines.first().unwrap().starts_with("c0 l0 "));
+        }
+        let after_first = crate::overlays::caption_burn_stats().text_truncated();
+        assert!(after_first > before, "the cut is counted");
+        assert!(source.active_at(MediaTime::from_nanos(1_500)).is_some());
+        assert!(
+            crate::overlays::caption_burn_stats().text_truncated() > after_first,
+            "the next cue counts again"
+        );
+        // A small cue passes through unchanged and is not counted.
+        let small = text_store(0, 1_000, "hello");
+        let small_source = CueStoreSource::new(small);
+        assert_eq!(
+            small_source
+                .active_at(MediaTime::from_nanos(10))
+                .unwrap()
+                .lines,
+            vec!["hello".to_owned()]
+        );
     }
 
     /// RT-10b: a per-source [`CueStore`] carrying one text cue, for the router

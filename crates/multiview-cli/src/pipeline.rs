@@ -6339,11 +6339,9 @@ impl BakeContext {
             return None;
         }
         let cue = self.subtitles.as_ref().and_then(|t| t.active_cue(pts))?;
-        if cue.lines.is_empty() {
-            None
-        } else {
-            Some(cue.lines.clone())
-        }
+        // Issue #430: copy only the bounded burn-in projection.
+        let bounded = multiview_output::hls::bound_cue_lines(&cue.lines);
+        (!bounded.is_empty()).then(|| bounded.into_lines())
     }
 }
 
@@ -9751,9 +9749,23 @@ fn sample_caption_bitmaps(
         let Some(selected) = times.get(id) else {
             continue;
         };
-        if let Some(multiview_ffmpeg::caption::CaptionCue::Bitmap { bitmap, .. }) =
-            store.active_at_generation(selected.pts, selected.generation)
-        {
+        // Issue #430: borrow the cue and copy its pixels only within the
+        // burn-in bounds (an oversize cue is refused and counted, never
+        // copied on the clock thread).
+        let bitmap = store
+            .with_active_at_generation(selected.pts, selected.generation, |cue| match cue {
+                multiview_ffmpeg::caption::CaptionCue::Bitmap { bitmap, .. } => {
+                    if crate::overlays::bitmap_within_burn_bounds(bitmap) {
+                        Some(bitmap.clone())
+                    } else {
+                        crate::overlays::caption_burn_stats().note_bitmap_refused();
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .flatten();
+        if let Some(bitmap) = bitmap {
             out.insert(id.clone(), bitmap);
         }
     }
@@ -26902,6 +26914,13 @@ mod chaos {
 /// The slots carry a source (`cc`) that is ingested but not shown in a cell,
 /// so the run measures the subtitle-slot path alone: burning such a cue into
 /// a displayed tile is the separate overlay path, which this does not cover.
+/// One real-time chaos pipeline at a time per test process: two concurrent
+/// wall-clock runs start each other late (observed: 63 of ~100 ticks for
+/// whichever starts second), so they would measure each other rather than
+/// the path under test.
+#[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
+static REALTIME_CHAOS_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
 mod subtitle_wedge_chaos {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -26992,6 +27011,7 @@ source = "cc"
     #[allow(clippy::too_many_lines)]
     // reason: one end-to-end chaos run checked across clock, sink and files.
     async fn a_wedged_subtitle_sink_with_hostile_captions_never_stalls_video() {
+        let _serial = super::REALTIME_CHAOS_SERIAL.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let playlist = dir.path().join("index.m3u8");
         let mut pipeline = Pipeline::build(&config(&playlist)).expect("pipeline builds");
@@ -27173,5 +27193,200 @@ mod media_url_for_log_tests {
             assert!(!logged.contains(secret), "{secret} leaked: {logged}");
         }
         assert_eq!(media_url_for_log("/media/clip.mp4"), "/media/clip.mp4");
+    }
+}
+
+/// Issue #430 chaos (R3, invariant #1): a captioned source DISPLAYED in a
+/// cell, fed hostile padded text cues (8 KiB and 64 KiB) changing every
+/// 100 ms, through the real pipeline (clock → hot-loop caption sampling →
+/// bake consumer burn-in → encode → HLS). The burn-in projection is bounded
+/// before any clone/shaping and the raster is cached per cue change, so the
+/// consumer keeps the cadence: no "fell behind the clock" fault (the run
+/// succeeds), shed ticks within the design bound, tick-exact video PTS, and
+/// the truncation counter records the cut.
+#[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
+mod caption_burnin_chaos {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    const FPS: u64 = 25;
+    const RUN_SECS: u64 = 4;
+    /// A new cue every 100 ms across the run (plus 2 s headroom).
+    const CUES: i64 = 60;
+
+    fn config(playlist: &std::path::Path) -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+"##,
+            playlist.display()
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    }
+
+    /// `pts` of every video packet of an MPEG-TS file.
+    fn video_pts(ts: &std::path::Path) -> Vec<i64> {
+        let out = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(ts)
+            .output()
+            .expect("ffprobe runs");
+        assert!(out.status.success(), "ffprobe: {out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+            .collect()
+    }
+
+    /// A visible-glyph cue line of about `bytes` bytes (worst case for
+    /// shaping and raster: every byte inks).
+    fn padded(i: i64, bytes: usize) -> String {
+        let mut line = format!("cue {i} ");
+        while line.len() < bytes {
+            line.push_str("Lorem ipsum dolor sit amet ");
+        }
+        line
+    }
+
+    #[allow(clippy::too_many_lines)]
+    // reason: one end-to-end chaos run checked across clock, consumer and files.
+    async fn run_with_cue_bytes(bytes: usize) {
+        let _serial = super::REALTIME_CHAOS_SERIAL.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let playlist = dir.path().join("index.m3u8");
+        let mut pipeline = Pipeline::build(&config(&playlist)).expect("pipeline builds");
+        let truncated_before = crate::overlays::caption_burn_stats().text_truncated();
+        // The DISPLAYED source carries the hostile cues: each 100 ms window
+        // holds a padded line, a blank line and a tail (three lines, the first
+        // `bytes` long), so the burn-in path must bound before it shapes.
+        let store = pipeline.attach_caption_store(
+            "in_a",
+            Arc::new(crate::captions::CueStore::with_capacity(128)),
+        );
+        for i in 0..CUES {
+            let (start, end) = (
+                MediaTime::from_nanos(i * 100_000_000),
+                MediaTime::from_nanos((i + 1) * 100_000_000),
+            );
+            let lines = vec![padded(i, bytes), String::new(), format!("tail {i}")];
+            let cue = multiview_ffmpeg::caption::CaptionCue::try_text(start, end, lines, None)
+                .expect("text cue");
+            store.publish(start, end, cue);
+        }
+        let stop = StopSignal::new();
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(RUN_SECS));
+                stop.stop();
+            })
+        };
+        let started = std::time::Instant::now();
+        // A consumer more than a queue's worth of ticks behind fails the run
+        // ("output fell N ticks behind the clock"): success proves it never did.
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(RUN_SECS + 60),
+            pipeline.run_until(&stop),
+        )
+        .await
+        .expect("the run ends")
+        .expect("the run succeeds: the consumer never fell behind the clock");
+        stopper.join().expect("stopper");
+        let elapsed = started.elapsed().as_secs_f64();
+        // Recorded on success too (the before/after numbers of #430).
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "caption_burnin_chaos {bytes} B: frames {} dropped {} over {elapsed:.2} s\n",
+                report.frames, report.dropped
+            ),
+        );
+
+        // The clock kept its cadence (CI-load tolerant: >= 90 %).
+        let expected = elapsed * f64::from(u32::try_from(FPS).unwrap());
+        let frames = f64::from(u32::try_from(report.frames).expect("small"));
+        assert!(
+            frames >= 0.9 * expected.min(f64::from(u32::try_from(RUN_SECS * FPS).unwrap())),
+            "clock ticks {frames} over {elapsed:.2} s (expected ~{expected:.0})"
+        );
+        // Design bound: per-tick burn-in cost is O(bounded) and the raster is
+        // cached per cue change, so the consumer sheds nothing from captions;
+        // <= 1 % absorbs a loaded CI runner's scheduling hiccups.
+        assert!(
+            report.dropped * 100 <= report.frames,
+            "consumer shed {} of {} ticks",
+            report.dropped,
+            report.frames
+        );
+        assert!(
+            crate::overlays::caption_burn_stats().text_truncated() > truncated_before,
+            "the hostile cues were cut by the burn-in projection"
+        );
+        // Video kept flowing with tick-derived stamps: consecutive packets of
+        // each written segment are exactly one tick apart (90 kHz / 25).
+        let segments: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("output dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+            .collect();
+        assert!(segments.len() >= 2, "video segments written: {segments:?}");
+        let tick_90k = i64::try_from(90_000 / FPS).unwrap();
+        for seg in &segments {
+            let mut pts = video_pts(seg);
+            pts.sort_unstable();
+            assert!(!pts.is_empty(), "{} carries video", seg.display());
+            assert!(
+                pts.windows(2)
+                    .all(|w| matches!(w, [a, b] if b - a == tick_90k)),
+                "{}: {pts:?}",
+                seg.display()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn displayed_8kib_captions_keep_the_cadence() {
+        run_with_cue_bytes(8 * 1024).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn displayed_64kib_captions_keep_the_cadence() {
+        run_with_cue_bytes(64 * 1024).await;
     }
 }
