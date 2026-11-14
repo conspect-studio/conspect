@@ -491,7 +491,9 @@ keyers.
   GPU failure falls back through the same persistent backend. The LUT cache checks a frame's transfer set
   in place (no per-frame list is built unless the set changed). The parallel CPU path still spawns
   its scoped band threads each frame, as it did before K1: a fixed, bounded cost, tracked in #416
-  (persistent band workers). ADR-0113 §9 already bounds this:
+  (persistent band workers). #395 (the bounded GPU readback, PR #424) merged after K1 was written; the
+  persistent fallback is now main's `cpu_fallback_backend`, and the WGSL key path is the next GPU
+  step (owed, tracked on #386). ADR-0113 §9 already bounds this:
   the default budget is 1 full-canvas DSK until the mda001 run passes.
 - Tests: `tests/keyers_cpu.rs` (20: goldens for linear self key with alpha used once, linear key
   source, luma clip/gain/invert, luma on a key source, mask with a flying key, unequal fill/key

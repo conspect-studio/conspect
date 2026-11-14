@@ -105,6 +105,7 @@ pub mod lateness;
 pub mod lifecycle;
 pub mod migration;
 pub mod output_lane;
+pub mod patch_set;
 pub mod placement;
 pub mod probe;
 pub mod program;
