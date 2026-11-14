@@ -949,8 +949,11 @@ impl LutCache {
     /// same transfers — dedup is first-seen and lookups are by transfer value, so
     /// the input order never matters — hence the composite output is unchanged.
     pub(crate) fn ensure(&mut self, canvas: CanvasColor, tiles: &[Tile<'_>]) -> &LutSet {
-        let want = present_transfers(canvas, tiles);
-        if !self.have || !same_transfer_set(&self.key, &want) {
+        // The steady-state check is allocation-free: the frame's transfer set is
+        // compared against the cached one in place, and only a changed set builds
+        // the deduped list (and the tables).
+        if !self.have || !matches_transfer_set(&self.key, canvas, tiles) {
+            let want = present_transfers(canvas, tiles);
             self.luts = LutSet::for_transfers(want.iter().copied());
             self.key = want;
             self.have = true;
@@ -979,9 +982,23 @@ fn push_unique(set: &mut Vec<TransferCharacteristic>, t: TransferCharacteristic)
     }
 }
 
-/// Order-independent set equality of two deduped transfer lists.
-fn same_transfer_set(a: &[TransferCharacteristic], b: &[TransferCharacteristic]) -> bool {
-    a.len() == b.len() && a.iter().all(|t| b.contains(t))
+/// Whether the deduped list `key` equals, as a set, the transfers present across
+/// `canvas` and `tiles` (the set [`present_transfers`] would build), without
+/// allocating: every present transfer is in `key`, and every `key` entry is
+/// present.
+fn matches_transfer_set(
+    key: &[TransferCharacteristic],
+    canvas: CanvasColor,
+    tiles: &[Tile<'_>],
+) -> bool {
+    let present = |t: &TransferCharacteristic| {
+        canvas.transfer == *t || tiles.iter().any(|tile| tile.image.color().transfer == *t)
+    };
+    key.contains(&canvas.transfer)
+        && tiles
+            .iter()
+            .all(|tile| key.contains(&tile.image.color().transfer))
+        && key.iter().all(present)
 }
 
 /// Composite a back-to-front stack of [`Tile`]s onto a `canvas_w x canvas_h`
@@ -2070,5 +2087,61 @@ fn write_chroma(uv_plane: &mut [u8], w: usize, px: u32, py: u32, cb: u8, cr: u8)
     }
     if let Some(slot) = uv_plane.get_mut(uv_index + 1) {
         *slot = cr;
+    }
+}
+
+#[cfg(test)]
+mod transfer_set_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::{matches_transfer_set, present_transfers, CanvasColor, Nv12Image, Tile};
+    use multiview_core::color::{
+        ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic as T,
+    };
+
+    fn img(transfer: T) -> Nv12Image {
+        let color = ColorInfo {
+            primaries: ColorPrimaries::Bt709,
+            transfer,
+            matrix: MatrixCoefficients::Bt709,
+            range: ColorRange::Limited,
+        };
+        Nv12Image::solid(2, 2, 128, 128, 128, color).unwrap()
+    }
+
+    /// The allocation-free check agrees with set equality against the list
+    /// `present_transfers` builds, for every key and frame drawn from a small
+    /// universe (review A-1 round 2).
+    #[test]
+    fn matches_transfer_set_equals_set_equality_with_present_transfers() {
+        let all = [T::Bt709, T::Pq, T::Hlg, T::Srgb];
+        let imgs: Vec<Nv12Image> = all.iter().map(|&t| img(t)).collect();
+        let canvas = CanvasColor::default();
+        // Every subset of tiles (as a frame) against every subset-derived key.
+        for frame_mask in 0_u32..16 {
+            let tiles: Vec<Tile<'_>> = (0..4)
+                .filter(|i| frame_mask & (1 << i) != 0)
+                .map(|i| Tile::placed(&imgs[i], 0, 0, 1.0))
+                .collect();
+            let want = present_transfers(canvas, &tiles);
+            for key_mask in 0_u32..16 {
+                let key_tiles: Vec<Tile<'_>> = (0..4)
+                    .filter(|i| key_mask & (1 << i) != 0)
+                    .map(|i| Tile::placed(&imgs[i], 0, 0, 1.0))
+                    .collect();
+                let mut key = present_transfers(canvas, &key_tiles);
+                key.reverse(); // order never matters
+                let expected = key.len() == want.len() && key.iter().all(|t| want.contains(t));
+                assert_eq!(
+                    matches_transfer_set(&key, canvas, &tiles),
+                    expected,
+                    "frame {frame_mask:04b} key {key_mask:04b}"
+                );
+            }
+        }
+        assert!(
+            !matches_transfer_set(&[], canvas, &[]),
+            "an empty key never matches"
+        );
     }
 }

@@ -488,7 +488,10 @@ keyers.
   any GPU work) to a **persistent** CPU reference owned by the GPU compositor, whose LUT cache and
   band/scene scratch survive across ticks (counted in `gpu_cpu_fallback_frames`; its pool is what
   `scratch_alloc_count` reports on a GPU backend). It is never drawn without its key. A genuine
-  GPU failure falls back through the same persistent backend. ADR-0113 §9 already bounds this:
+  GPU failure falls back through the same persistent backend. The LUT cache checks a frame's transfer set
+  in place (no per-frame list is built unless the set changed). The parallel CPU path still spawns
+  its scoped band threads each frame, as it did before K1: a fixed, bounded cost, tracked in #416
+  (persistent band workers). ADR-0113 §9 already bounds this:
   the default budget is 1 full-canvas DSK until the mda001 run passes.
 - Tests: `tests/keyers_cpu.rs` (20: goldens for linear self key with alpha used once, linear key
   source, luma clip/gain/invert, luma on a key source, mask with a flying key, unequal fill/key
