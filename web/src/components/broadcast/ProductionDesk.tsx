@@ -28,6 +28,7 @@ import { Dialog, DialogContent, DialogTitle } from '../ui/dialog';
 import { useOperationFeedback, useSubmitTrackedOperation } from './useOperationFeedback';
 import { OperationFeedback } from './OperationFeedback';
 import { useTakeLock } from './BroadcastShell';
+import { DeskCastButton } from '../../cast/DeskCastButton';
 import { tickConfirmed, useTickAdvancedAt } from './tickObservation';
 
 const STATE_KEY = ['switcher', 'me1'] as const;
@@ -47,7 +48,7 @@ function PreviewMonitor({ program, source, fresh }: { readonly program: boolean;
   return <figure className={`bd-monitor ${program ? 'bd-pgm' : 'bd-pvw'}`} data-tally={fresh && source ? (program ? 'program' : 'preview') : 'unknown'}>
     <div className="bd-picture">{program ? <PreviewSurface scope="program" whepEndpoint="/api/v1/preview/program/whep" jpegPath="/api/v1/preview/program.jpg" label={t`Program monitor`} capabilities={caps.data} className="bd-video" diagnosticsHost={diagHost} onTransportUnavailable={() => { setTransportUnavailable(true); }} /> : pvwLive && wallPreview.previewSource ? <WallCrop source={wallPreview.previewSource} label={t`Preview monitor`} className="bd-video" testId="preview-wall" /> : pvwUnavailable ? <span role="status" data-testid="preview-unavailable"><Trans>Preview unavailable — switcher backend not deployed</Trans></span> : pvw ? <div className="bd-jpeg"><img src={pvw} alt={t`Preview monitor`} />{pvwStill.state === 'stale' ? <em className="bd-stale" data-testid="preview-stale"><Trans>Stale</Trans></em> : null}</div> : <span><Trans>Waiting for a frame…</Trans></span>}</div>
     {program ? <div className="bd-diag-slot" ref={setDiagHost} data-testid="desk-fallback-slot" /> : null}
-    <figcaption><div className="bd-monitor-actions" data-monitor-actions={program ? 'program' : 'preview'} /><div className="bd-capline"><b>{program ? (fresh && source ? t`● ON AIR — PROGRAM` : t`○ PROGRAM — unconfirmed`) : (fresh && source ? t`▲ PREVIEW` : t`△ PREVIEW — unconfirmed`)}</b><span>{source ?? t`Unknown source`}</span></div><small>{fresh ? t`Engine-confirmed bus` : t`Unconfirmed / stale`}{pvwUnavailable ? null : still ? <> · {t`Still preview (~1 fps) — live video is unavailable for this preview`}</> : null}</small></figcaption>
+    <figcaption><div className="bd-monitor-actions" data-monitor-actions={program ? 'program' : 'preview'}><DeskCastButton bus={program ? 'program' : 'preview'} /></div><div className="bd-capline"><b>{program ? (fresh && source ? t`● ON AIR — PROGRAM` : t`○ PROGRAM — unconfirmed`) : (fresh && source ? t`▲ PREVIEW` : t`△ PREVIEW — unconfirmed`)}</b><span>{source ?? t`Unknown source`}</span></div><small>{fresh ? t`Engine-confirmed bus` : t`Unconfirmed / stale`}{pvwUnavailable ? null : still ? <> · {t`Still preview (~1 fps) — live video is unavailable for this preview`}</> : null}</small></figcaption>
     {program && <ProgramLevels />}
   </figure>;
 }

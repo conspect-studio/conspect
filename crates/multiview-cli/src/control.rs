@@ -394,6 +394,18 @@ where
             crate::output_routing_control::OutputRoutingAdapter::new(slot),
         ));
     }
+    // The custom Cast receiver app id (ADR-0111): `MULTIVIEW_CAST_APP_ID`
+    // wins over `[control] cast_app_id`; an invalid value is a warning and
+    // no custom receiver (the sender then uses the Default Media Receiver).
+    state = state.with_cast_app_id(cast_app_id(config));
+    // The running engine's cast outputs (ADR-0111): activation gates behind
+    // a lock-free slot, so the control plane never waits on the engine.
+    #[cfg(feature = "ffmpeg")]
+    if let Some(slot) = crate::cast_output::installed_cast_outputs() {
+        state = state.with_cast_engine(std::sync::Arc::new(crate::cast_output::CastEngineAdapter(
+            slot,
+        )));
+    }
     // The network front door's live counters (ADR-0107 slice 3,
     // `GET /api/v1/metrics/frontdoor`); absent when `[network]` is not
     // configured this run (404, not an error).
@@ -1483,6 +1495,31 @@ pub fn hls_mounts(config: &MultiviewConfig) -> Vec<HlsMount> {
         .collect()
 }
 
+/// The Cast receiver app id this run advertises (ADR-0111):
+/// `MULTIVIEW_CAST_APP_ID` (when set and non-empty) wins over
+/// `[control] cast_app_id`; either must be 8 hex characters (used
+/// upper-case), else a startup warning and `None`.
+fn cast_app_id(config: &MultiviewConfig) -> Option<String> {
+    let env = std::env::var("MULTIVIEW_CAST_APP_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let (raw, source) = match env {
+        Some(value) => (value, "MULTIVIEW_CAST_APP_ID"),
+        None => (
+            config.control.as_ref()?.cast_app_id.clone()?,
+            "control.cast_app_id",
+        ),
+    };
+    let normalized = multiview_config::normalize_cast_app_id(&raw);
+    if normalized.is_none() {
+        tracing::warn!(
+            source,
+            "the Cast receiver app id is not 8 hexadecimal characters; no custom receiver is advertised"
+        );
+    }
+    normalized
+}
+
 /// Build the Cast **delivery map** (DEV-D2, ADR-M011): the validated
 /// `control.cast_media_base` × the [`hls_mounts`] this listener serves, giving
 /// output id → the device-reachable playlist URL a Cast session `LOAD`s.
@@ -1514,7 +1551,7 @@ pub fn cast_delivery(
             return None;
         }
     };
-    let mut delivery = CastDelivery::new();
+    let mut delivery = CastDelivery::new().with_base(base.clone());
     for mount in hls_mounts(config) {
         let Some(playlist) = mount.playlist else {
             tracing::warn!(

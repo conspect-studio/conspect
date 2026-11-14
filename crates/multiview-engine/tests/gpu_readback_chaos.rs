@@ -76,7 +76,7 @@ fn run_chaos(fallback_cost: Duration) {
         .unwrap();
     let handle = rt.block_on(async {
         clock_thread::spawn("gpu-chaos", move || {
-            let (backend, gpu) = RunBackend::simulated_gpu(Duration::from_millis(1));
+            let (backend, gpu) = RunBackend::simulated_gpu(Duration::from_millis(1)).unwrap();
             gpu.set_cpu_fallback_cost(fallback_cost);
             let drive = CompositorDrive::new(
                 Arc::new(Layout {

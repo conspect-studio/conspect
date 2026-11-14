@@ -25,6 +25,10 @@ multiview-cloudflare = { path = "../multiview-cloudflare" }
 multiview-credentials = { path = "../multiview-credentials" }
 multiview-core = { workspace = true }
 multiview-engine = { workspace = true }
+# The HLS file-serving contract (`hls::http::serve_file`) the token-scoped
+# cast media route reuses. Default features only (pure Rust, no libav); the
+# crate is already in this graph through multiview-engine.
+multiview-output = { workspace = true }
 multiview-events = { workspace = true }
 multiview-config = { workspace = true }
 multiview-telemetry = { workspace = true }

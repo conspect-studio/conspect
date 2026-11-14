@@ -621,6 +621,10 @@ keyers.
   it. A tied keyer going off through a DIP draws weight 0 past the switch point, so its last
   committed draw is absent while it is still on air; the reject cancels the flight and the
   rejected frame shows it at rest. Pictures are the restored pair (`Arc` clones, no heap).
+  The settle bumps the off-clock scene epoch (#415) only when the settled draws differ from
+  the installed ones (keyer, rect, weight, key parameters or key presence; floats by bits), so
+  a deadline miss that changes nothing keeps the epoch and a CPU fallback slower than the
+  clock is still adopted. An unconditional bump froze Program (PR #443 review INV-MC-1).
   `reject_composed_tick` also refuses slot-held ops that moved this tick, and discards
   queued events. Applied keyer ops sit in `staged_success` and are refused with everything else.
   `Staged` is untouched. `repeat_tick` expires held keyer commands past their deadline.

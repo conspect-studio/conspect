@@ -42,9 +42,18 @@ use std::sync::Arc;
 
 use multiview_compositor::backend::{RunBackend, RunBackendKind};
 use multiview_compositor::blend::LinearRgba;
-use multiview_compositor::key::TileKey;
 use multiview_compositor::mask::{MaskShape, WipeMask};
-use multiview_compositor::pipeline::{CanvasColor, Nv12Image, Tile};
+use multiview_compositor::offclock::{FrameJob, JobMeta, SharedKey, SharedTile};
+
+/// The source metadata of one composite, carried with its job so an adopted
+/// late frame reports the sources it actually shows (issue #415).
+#[derive(Debug)]
+struct FrameMeta {
+    source_states: HashMap<String, SourceState>,
+    source_times: HashMap<String, multiview_framestore::tile::SourceFrameTime>,
+    mix: Option<MixOverlay>,
+}
+use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
 use multiview_core::layout::Layout;
 use multiview_core::switcher::Rgb8;
 use multiview_core::time::{MediaTime, Rational};
@@ -53,7 +62,7 @@ use multiview_framestore::TileStore;
 
 use crate::clock::Tick;
 use crate::error::{Error, Result};
-use crate::keyer::{KeyerDraw, KeyerParams, TieEnvelope, MAX_DSK};
+use crate::keyer::{KeyerDraw, KeyerFly, KeyerParams, TieEnvelope, MAX_DSK};
 use crate::slate::{failover_slate_image, FailoverSlate};
 
 /// Scratch slots reserved for keyer tiles on every compose (fill and key per
@@ -318,6 +327,12 @@ pub struct CompositorDrive<T> {
     /// in the same pass. All `None` without keyers (the steady state).
     /// Boxed once at construction (never per tick) to keep the drive small.
     keyers: Box<[Option<KeyerDraw>; MAX_DSK]>,
+    /// Bumped by every change to what a composite draws other than the
+    /// source frames' contents (layout, bindings, stores, slates, transition
+    /// step and style, downstream keyer draws). A GPU backend's CPU fallback hands a late result to a
+    /// later frame only under the same epoch (issue #415 review MC-1), so a
+    /// scene a hook staged and then rolled back never reaches the output.
+    scene_epoch: u64,
 }
 
 impl<T> CompositorDrive<T> {
@@ -357,6 +372,7 @@ impl<T> CompositorDrive<T> {
             transition_fill: None,
             transition_fill_builds: 0,
             keyers: Box::new([const { None }; MAX_DSK]),
+            scene_epoch: 0,
         })
     }
 
@@ -425,8 +441,23 @@ impl<T> CompositorDrive<T> {
     /// Install this tick's downstream keyer draws (ADR-0113 §3) by swapping
     /// them with `draws`; the previous draws come back in `draws`, so the
     /// caller drops their `Arc`s (refcount decrements, no allocation).
+    ///
+    /// A change of what the keyers draw (a keyer on or off, its weight,
+    /// rectangle or parameters, a key source gained or lost) bumps the scene
+    /// epoch (issue #415 review MC-1): a late off-clock result composed under
+    /// other keyer draws is never adopted. A new fill/key frame alone is
+    /// source content and keeps the epoch, as a cell's new frame does.
+    /// Allocation-free.
     pub fn set_keyer_draws(&mut self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
         std::mem::swap(&mut *self.keyers, draws);
+        let changed = self
+            .keyers
+            .iter()
+            .zip(draws.iter())
+            .any(|(new, old)| !same_keyer_scene(new.as_ref(), old.as_ref()));
+        if changed {
+            self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        }
     }
 
     /// The installed keyer draws.
@@ -435,10 +466,30 @@ impl<T> CompositorDrive<T> {
         &self.keyers
     }
 
-    /// The installed keyer draws, for the hook to settle them in place after
-    /// a rejected frame (weights only; no allocation).
-    pub fn keyer_draws_mut(&mut self) -> &mut [Option<KeyerDraw>; MAX_DSK] {
-        &mut self.keyers
+    /// Settle the installed keyer draws in place after a rejected frame
+    /// (`settle` changes weights or rebuilds resting draws; no allocation).
+    ///
+    /// Bumps the scene epoch (issue #415) only when the settled draws differ
+    /// from the installed ones: a late off-clock result of a scene the settle
+    /// changed is never adopted, while a deadline miss that changes nothing
+    /// (the steady state, or no keyers at all) keeps the epoch, so a slow
+    /// CPU-fallback job can still be adopted (#443 review INV-MC-1).
+    pub fn settle_keyer_draws_with(
+        &mut self,
+        settle: impl FnOnce(&mut [Option<KeyerDraw>; MAX_DSK]),
+    ) {
+        let before: [Option<KeyerSceneKey>; MAX_DSK] = self
+            .keyers
+            .each_ref()
+            .map(|d| d.as_ref().map(KeyerSceneKey::of));
+        settle(&mut self.keyers);
+        let changed = before
+            .iter()
+            .zip(self.keyers.iter())
+            .any(|(old, new)| *old != new.as_ref().map(KeyerSceneKey::of));
+        if changed {
+            self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        }
     }
 
     /// Whether the transition's incoming tile contributes to the frame
@@ -526,6 +577,7 @@ impl<T> CompositorDrive<T> {
     pub fn set_cell_slates(&mut self, mut slates: Vec<FailoverSlate>) {
         slates.truncate(self.layout.cells.len());
         self.cell_slates = slates;
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
     }
 
     /// The cumulative number of distinct failover-slate **images built** so far.
@@ -554,6 +606,14 @@ impl<T> CompositorDrive<T> {
     pub fn effective_cell_source(&self, cell_id: &str) -> Option<String> {
         let index = *self.cell_index.get(cell_id)?;
         self.layout.cells.get(index).and_then(|c| c.source.clone())
+    }
+
+    /// The scene epoch (issue #415): bumped by every change to what a
+    /// composite draws other than source frame contents. Test seam.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn scene_epoch(&self) -> u64 {
+        self.scene_epoch
     }
 
     /// Replace the compositor backend the per-tick composite dispatches through.
@@ -607,12 +667,14 @@ impl<T> CompositorDrive<T> {
             .set_frame_period(frame_period(layout.canvas.cadence()));
         self.layout = layout;
         self.layout_generation = self.layout_generation.wrapping_add(1);
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         Ok(())
     }
 
     /// Register or replace a source's frame store.
     pub fn insert_store(&mut self, source_id: impl Into<String>, store: Arc<TileStore<T>>) {
         self.stores.insert(source_id.into(), store);
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
     }
 
     /// The registered frame store for `source_id`, if any.
@@ -635,6 +697,7 @@ impl<T> CompositorDrive<T> {
     /// panic, never a stall (invariants #1/#2). O(1) map removal at the frame
     /// boundary; the producer teardown happens off the clock thread.
     pub fn remove_store(&mut self, source_id: &str) -> bool {
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         self.stores.remove(source_id).is_some()
     }
 
@@ -686,6 +749,7 @@ impl<T> CompositorDrive<T> {
         };
         cell.source = Some(source_id.to_owned());
         self.layout_generation = self.layout_generation.wrapping_add(1);
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         Ok(())
     }
 }
@@ -743,6 +807,7 @@ impl CompositorDrive<Nv12Image> {
             }
         }
         self.transition_style = style;
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         if let Some(mix) = self.mix_overlay.as_mut() {
             mix.style = style;
         }
@@ -771,17 +836,55 @@ impl CompositorDrive<Nv12Image> {
         self.compose_with(tick, &self.backend)
     }
 
-    /// As [`CompositorDrive::compose`], but on a fresh CPU reference backend
-    /// regardless of the configured one: the runtime's path for a GPU
-    /// deadline miss on the very first tick, when there is no last-good frame
-    /// to repeat (issue #395). Cold LUT caches: used at most once per run in
-    /// practice.
+    /// Whether the GPU backend lost its device (issue #415): every frame
+    /// since is composited on the CPU reference. `false` on the CPU backend.
+    #[must_use]
+    pub fn gpu_lost(&self) -> bool {
+        self.backend.gpu_lost()
+    }
+
+    /// A bounded stand-in frame for `tick`: black at canvas size and tag,
+    /// with the current source states. The runtime emits it when a GPU
+    /// backend has no frame ready for the very first tick (there is no
+    /// last-good to repeat yet, issue #415): building it is a memset, never a
+    /// composite, so the first tick is as bounded as every other.
     ///
     /// # Errors
     ///
-    /// [`Error::Canvas`] for a canvas the CPU compositor rejects.
-    pub fn compose_on_cpu(&self, tick: Tick) -> Result<CompositedFrame> {
-        self.compose_with(tick, &RunBackend::cpu())
+    /// [`Error::Canvas`] for a canvas the compositor rejects (odd / zero).
+    pub fn placeholder_frame(&self, tick: Tick) -> Result<CompositedFrame> {
+        let canvas = &self.layout.canvas;
+        let tag = self.canvas_color.output_tag();
+        let black_y = match tag.range {
+            multiview_core::color::ColorRange::Full => 0,
+            _ => 16,
+        };
+        let image = Nv12Image::solid(canvas.width, canvas.height, black_y, 128, 128, tag)
+            .map_err(|e| Error::Canvas(e.to_string()))?;
+        Ok(CompositedFrame {
+            tick,
+            canvas: Arc::new(image),
+            source_states: self.sample_states(tick.pts),
+            source_times: HashMap::new(),
+            repeat: true,
+            mix: None,
+        })
+    }
+
+    /// The identity of what the next composite draws apart from the source
+    /// frames' contents: the scene epoch plus the transition step (issue #415
+    /// review MC-1).
+    fn scene_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.scene_epoch.hash(&mut h);
+        if let Some(mix) = &self.mix_overlay {
+            mix.source.hash(&mut h);
+            mix.elapsed.hash(&mut h);
+            mix.duration.hash(&mut h);
+            mix.start.hash(&mut h);
+        }
+        h.finish()
     }
 
     fn compose_with(&self, tick: Tick, backend: &RunBackend) -> Result<CompositedFrame> {
@@ -851,55 +954,72 @@ impl CompositorDrive<Nv12Image> {
         // (ADR-0113 §3, render list 4).
         self.push_keyer_tiles(held, placements);
 
-        // Borrow the held images for the compositor's `Tile` slice. This slice is
-        // a per-tick local, NOT pooled: a `Tile<'_>` borrows into the pooled
-        // `held` vector, so its lifetime is the borrow — a `Vec<Tile<'_>>` cannot
-        // be a reused struct field in safe Rust (`unsafe` is forbidden here). It
-        // is small (one thin `&Nv12Image` + a rect + an opacity per cell), and the
-        // large per-tick churn — the `held` Arc vector, `placements`, and the
-        // z-order index vector — is what the pool eliminates. Each tile carries
-        // its DESTINATION cell rect so the compositor scales the source into the
-        // cell at composite time (scale-at-composite, RT-6 / ADR-0034 / inv #6): a
-        // source decoded at any geometry — including one just re-pointed in —
-        // composites correctly into the cell, never clipped or smeared. When the
-        // source already matches the cell size (the steady state:
-        // decode-at-display-resolution) the scale is a no-op and the result is
-        // byte-for-byte the prior 1:1 placement. The cell's per-tile opacity
-        // drives the compositor's premultiplied linear-light `over` blend.
-        let pictures: &[Arc<Nv12Image>] = held.as_slice();
-        let tiles: Vec<Tile<'_>> = placements
-            .iter()
-            .filter_map(|p| tile_of(p, pictures))
-            .collect();
+        // Hand the compositor the held images as owned `Arc`s plus each cell's
+        // DESTINATION rect (no pixel copy): a GPU backend composites the frame
+        // on its own worker thread while the clock waits for it at most a
+        // bounded time (issue #415), so the job must own what it reads. The
+        // compositor scales each source into its cell at composite time
+        // (scale-at-composite, RT-6 / ADR-0034 / inv #6): a source decoded at
+        // any geometry composites correctly into the cell; when it already
+        // matches the cell size (the steady state) the scale is a no-op and
+        // the result is byte-for-byte the prior 1:1 placement. The cell's
+        // per-tile opacity drives the premultiplied linear-light `over` blend.
+        let job = Arc::new(FrameJob {
+            canvas_w: canvas.width,
+            canvas_h: canvas.height,
+            canvas: self.canvas_color,
+            background: self.background,
+            tiles: placements
+                .iter()
+                .filter_map(|p| shared_tile(p, held))
+                .collect(),
+            scene: self.scene_key(),
+            // Only a GPU backend can hand back an earlier job's pixels (its
+            // CPU fallback adopts a late result): it needs that job's source
+            // metadata. The CPU backend composites this job inline.
+            meta: self.backend.is_offclock().then(|| {
+                JobMeta(Arc::new(FrameMeta {
+                    source_states: source_states.clone(),
+                    source_times: source_times.clone(),
+                    mix: self.mix_overlay.clone(),
+                }))
+            }),
+        });
 
         // Dispatch the composite through the selected backend (CPU reference by
-        // default; GPU-with-CPU-fallback when a run prefers the GPU). The call
-        // is synchronous and never blocks on an input or a client; on the GPU
-        // path a submit/readback failure surfaces as a typed error here, which
-        // becomes `Error::Canvas` — the drive returns rather than stalling the
-        // clock, and the caller holds last-good (safety rule §3, invariant #1).
-        // The GPU readback wait is bounded (issue #395): a miss is
-        // `Error::ComposeDeadline`, which the runtime turns into a counted
-        // last-good repeat of this tick.
-        let canvas_image = backend
-            .composite(
-                canvas.width,
-                canvas.height,
-                self.canvas_color,
-                self.background,
-                tiles.as_slice(),
-            )
-            .map_err(|e| match e {
-                multiview_compositor::Error::GpuDeadline(why) => Error::ComposeDeadline(why),
-                other => Error::Canvas(other.to_string()),
-            })?;
+        // default, inline; GPU off the clock thread with a CPU fallback). The
+        // call never blocks on an input or a client, and every GPU wait is
+        // bounded: a frame not ready in time is `Error::ComposeDeadline`,
+        // which the runtime turns into a counted last-good repeat of this
+        // tick (issues #395, #415). Any other failure becomes `Error::Canvas`.
+        let output = backend.composite_job(&job).map_err(|e| match e {
+            multiview_compositor::Error::GpuDeadline(why) => Error::ComposeDeadline(why),
+            other => Error::Canvas(other.to_string()),
+        })?;
+        // An adopted late result is the picture of an EARLIER job of the same
+        // scene: report that job's source states, times and transition step
+        // with it (issue #415 review MC-R2-1), never this tick's.
+        let mut mix = self.mix_overlay.clone();
+        if let Some(adopted) = output.adopted {
+            let meta = adopted
+                .as_ref()
+                .and_then(|m| m.0.downcast_ref::<FrameMeta>())
+                .ok_or_else(|| {
+                    Error::ComposeDeadline("adopted frame has no source metadata".to_owned())
+                })?;
+            source_states.clone_from(&meta.source_states);
+            source_times.clone_from(&meta.source_times);
+            mix.clone_from(&meta.mix);
+        }
+        let canvas_image = output.image;
 
         // Drop the borrowing tiles, then release the held `Arc`s now (rather than
         // pinning them until the next tick's `begin`), keeping the pooled
         // capacity. The next `begin` clears whatever remains, so correctness does
         // not depend on this; it shortens last-good frame retention to within the
-        // tick. `drop(tiles)` first releases its immutable borrow of `held`.
-        drop(tiles);
+        // tick. The job may still be referenced by a GPU worker that missed
+        // the clock's wait; it owns its own `Arc`s, so this is safe.
+        drop(job);
         held.clear();
         drop(scratch);
 
@@ -909,7 +1029,7 @@ impl CompositorDrive<Nv12Image> {
             source_states,
             source_times,
             repeat: false,
-            mix: self.mix_overlay.clone(),
+            mix,
         })
     }
 
@@ -1175,34 +1295,79 @@ struct Placement {
     key: Option<PlacedKey>,
 }
 
-/// The compositor tile for one placement, borrowing its pictures from `held`.
-/// A transition tile carries its wipe mask (ADR-0112 §3). A keyer tile carries its [`TileKey`], with its key picture when it has
-/// one; a key picture missing from `held` degrades to a self key, never a
-/// panic.
-fn tile_of<'a>(p: &Placement, held: &'a [Arc<Nv12Image>]) -> Option<Tile<'a>> {
-    let image = held.get(p.image_index)?;
-    let tile = Tile::scaled(
-        image.as_ref(),
-        p.dst_x,
-        p.dst_y,
-        p.dst_w,
-        p.dst_h,
-        p.opacity,
-    );
-    let tile = match p.mask {
-        Some(mask) => tile.with_mask(mask),
-        None => tile,
-    };
-    let Some(placed) = p.key else {
-        return Some(tile);
-    };
-    let key = TileKey {
+/// Whether two keyer draws draw the same scene (issue #415): the same keyer,
+/// rectangle, weight, parameters and key presence. The fill and key frames
+/// themselves are source content, as a cell's frame is.
+fn same_keyer_scene(a: Option<&KeyerDraw>, b: Option<&KeyerDraw>) -> bool {
+    a.map(KeyerSceneKey::of) == b.map(KeyerSceneKey::of)
+}
+
+/// What of a keyer draw changes the composed scene (issue #415 epoch): all
+/// but the fill and key frame contents, which are source content. `Copy`, so
+/// a before/after comparison allocates nothing.
+/// Floats compare by bits, so a NaN parameter never reads as a change on
+/// every tick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct KeyerSceneKey {
+    keyer: u8,
+    rect: KeyerFly,
+    weight_bits: u32,
+    /// `KeyKind` as (luma?, clip bits, gain bits).
+    kind: (bool, u32, u32),
+    invert: bool,
+    mask: Option<multiview_compositor::key::KeyMask>,
+    has_key: bool,
+}
+
+impl KeyerSceneKey {
+    fn of(d: &KeyerDraw) -> Self {
+        let kind = match d.params.kind {
+            multiview_compositor::key::KeyKind::Luma { clip, gain } => {
+                (true, clip.to_bits(), gain.to_bits())
+            }
+            _ => (false, 0, 0),
+        };
+        Self {
+            keyer: d.keyer,
+            rect: d.rect,
+            weight_bits: d.weight.to_bits(),
+            kind,
+            invert: d.params.invert,
+            mask: d.params.mask,
+            has_key: d.key.is_some(),
+        }
+    }
+}
+
+/// The owned compositor tile for one placement: `Arc` clones of its
+/// pictures in `held` (no pixel copy). A transition tile carries its wipe
+/// mask (ADR-0112 §3); a keyer tile carries its key block (ADR-0113 §3), so it
+/// keeps its key on the CPU and the off-clock GPU path alike.
+fn shared_tile(p: &Placement, held: &[Arc<Nv12Image>]) -> Option<SharedTile> {
+    held.get(p.image_index).map(|img| SharedTile {
+        image: Arc::clone(img),
+        dst_x: p.dst_x,
+        dst_y: p.dst_y,
+        dst_w: p.dst_w,
+        dst_h: p.dst_h,
+        opacity: p.opacity,
+        mask: p.mask,
+        key: p.key.map(|placed| shared_key(placed, held)),
+        group: multiview_compositor::key::TileGroup::Top,
+    })
+}
+
+/// The owned key block of a keyer placement (ADR-0113 §3) for its
+/// [`SharedTile`]: the key picture is an `Arc` clone of its entry in `held`
+/// (no pixel copy), so a keyed tile keeps its key on every backend path. A
+/// key picture missing from `held` degrades to a self key, never a panic.
+fn shared_key(placed: PlacedKey, held: &[Arc<Nv12Image>]) -> SharedKey {
+    SharedKey {
         kind: placed.params.kind,
-        source: placed.key_image.and_then(|i| held.get(i)).map(Arc::as_ref),
+        source: placed.key_image.and_then(|i| held.get(i)).map(Arc::clone),
         invert: placed.params.invert,
         mask: placed.params.mask,
-    };
-    Some(tile.with_key(key))
+    }
 }
 
 /// The per-tick resolve **scratch pool**: reusable buffers cleared-and-refilled
