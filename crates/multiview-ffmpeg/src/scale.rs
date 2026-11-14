@@ -811,10 +811,15 @@ mod run_into_tests {
                 libc::c_int::try_from(h + 1).unwrap(),
             );
         }
-        let stride = out.stride(0);
-        for r in 0..rows {
+        // Active bytes only: `out` is a plain `alloc_video` frame whose
+        // stride padding libav never wrote (review PB-18), so never a
+        // whole-plane slice. Every active byte came from the fully
+        // initialised source.
+        let got: Vec<&[u8]> = crate::frame::plane_rows(&out, 0, row).unwrap().collect();
+        assert_eq!(got.len(), rows);
+        for (r, line) in got.iter().enumerate() {
             assert_eq!(
-                &out.data(0)[r * stride..r * stride + row],
+                *line,
                 &expected[r * row..(r + 1) * row],
                 "row {r} differs from av_image_copy"
             );
