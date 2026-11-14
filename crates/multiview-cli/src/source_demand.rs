@@ -227,6 +227,29 @@ fn consumer_view(tag: &ConsumerTag) -> multiview_control::SourceConsumerView {
         .naming(tag.object.as_deref())
 }
 
+/// The last `yt-dlp` resolve failure of a `YouTube` source (issue #420), so the
+/// source status says why it shows no picture instead of only "starting".
+/// Already operator-safe (URLs redacted by `operator_message`).
+#[cfg(feature = "youtube")]
+fn youtube_reason(id: &str) -> Option<String> {
+    crate::youtube_status::last_error(id).map(|reason| format!("YouTube: {reason}"))
+}
+
+#[cfg(not(feature = "youtube"))]
+fn youtube_reason(_id: &str) -> Option<String> {
+    None
+}
+
+/// The status detail: a recorded `YouTube` resolve failure is the specific
+/// reason and leads; the generic demand detail (e.g. "no media yet; still
+/// retrying") follows it.
+fn with_youtube_reason(detail: Option<String>, youtube: Option<String>) -> Option<String> {
+    match (youtube, detail) {
+        (Some(youtube), Some(detail)) => Some(format!("{youtube} ({detail})")),
+        (youtube, detail) => youtube.or(detail),
+    }
+}
+
 /// Map an engine status onto the control-plane view.
 #[must_use]
 pub fn view_of(status: &multiview_engine::DemandStatus) -> multiview_control::SourceDemandView {
@@ -245,7 +268,7 @@ pub fn view_of(status: &multiview_engine::DemandStatus) -> multiview_control::So
         video_running: status.running.video,
         audio_running: status.running.audio,
         consumers: status.consumers.iter().map(consumer_view).collect(),
-        detail: status.detail.clone(),
+        detail: with_youtube_reason(status.detail.clone(), youtube_reason(&status.id)),
         starting_phase: status.starting.map(|phase| match phase {
             multiview_engine::StartingPhase::Queued => {
                 multiview_control::SourceStartingPhase::Queued
@@ -619,5 +642,37 @@ target = "slate""#
         let items = layout_items([(Some("a"), None), (None, None), (Some("a"), None)].into_iter());
         assert_eq!(items.len(), 2);
         assert_eq!(&*items[1].label, "cell-3");
+    }
+}
+
+#[cfg(all(test, feature = "youtube"))]
+mod youtube_detail_tests {
+    #[test]
+    fn a_youtube_resolve_failure_is_the_status_detail() {
+        let id = "demand-test-youtube-detail";
+        crate::youtube_status::record(id, Some("ERROR: No video formats found!"));
+        assert_eq!(
+            super::youtube_reason(id).as_deref(),
+            Some("YouTube: ERROR: No video formats found!")
+        );
+        crate::youtube_status::record(id, None);
+        assert_eq!(super::youtube_reason(id), None);
+    }
+
+    #[test]
+    fn the_youtube_reason_leads_a_generic_failed_detail() {
+        assert_eq!(
+            super::with_youtube_reason(
+                Some("no media yet; still retrying".to_owned()),
+                Some("YouTube: not a live stream (status: was_live)".to_owned()),
+            )
+            .as_deref(),
+            Some("YouTube: not a live stream (status: was_live) (no media yet; still retrying)")
+        );
+        assert_eq!(
+            super::with_youtube_reason(Some("generic".to_owned()), None).as_deref(),
+            Some("generic")
+        );
+        assert_eq!(super::with_youtube_reason(None, None), None);
     }
 }
