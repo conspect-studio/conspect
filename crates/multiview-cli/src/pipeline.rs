@@ -15643,14 +15643,14 @@ fn resolve_hls_audio_url_with(
     let playlist = match fetcher.fetch(master_url) {
         Ok(playlist) => playlist,
         Err(reason) => {
-            tracing::warn!(%master_url, %reason, "could not fetch HLS master for audio pin; opening URL as-is");
+            tracing::warn!(master_url = %multiview_core::redact::redact_resource_url(master_url), %reason, "could not fetch HLS master for audio pin; opening URL as-is");
             return None;
         }
     };
     let master = multiview_input::hls::MasterPlaylist::parse(&playlist.body).ok()?;
     let uri = master.pick_audio_uri()?;
     let audio_url = crate::captions::resolve_rendition_uri(&playlist.url, uri);
-    tracing::info!(%master_url, %audio_url, "pinned HLS audio decode to one media playlist");
+    tracing::info!(master_url = %multiview_core::redact::redact_resource_url(master_url), audio_url = %multiview_core::redact::redact_resource_url(&audio_url), "pinned HLS audio decode to one media playlist");
     Some(audio_url)
 }
 
@@ -15665,14 +15665,14 @@ fn resolve_hls_variant_url_with(
     let playlist = match fetcher.fetch(master_url) {
         Ok(playlist) => playlist,
         Err(reason) => {
-            tracing::warn!(%master_url, %reason, "could not fetch HLS master for variant pin; opening URL as-is");
+            tracing::warn!(master_url = %multiview_core::redact::redact_resource_url(master_url), %reason, "could not fetch HLS master for variant pin; opening URL as-is");
             return None;
         }
     };
     let master = match multiview_input::hls::MasterPlaylist::parse(&playlist.body) {
         Ok(master) => master,
         Err(err) => {
-            tracing::warn!(%master_url, error = %err, "HLS master parse failed for variant pin; opening URL as-is");
+            tracing::warn!(master_url = %multiview_core::redact::redact_resource_url(master_url), error = %err, "HLS master parse failed for variant pin; opening URL as-is");
             return None;
         }
     };
@@ -15685,10 +15685,12 @@ fn resolve_hls_variant_url_with(
     // Resolving against the requested origin yields a 404 that aborts the ingest.
     // For a non-redirecting fetch the effective URL equals the requested URL.
     let variant_url = crate::captions::resolve_rendition_uri(&playlist.url, &variant.uri);
+    // Query strings are dropped from the log: a signed CDN master (YouTube's
+    // googlevideo URLs, tokenised HLS) carries its credential there.
     tracing::info!(
-        %master_url,
-        effective_url = %playlist.url,
-        %variant_url,
+        master_url = %multiview_core::redact::redact_resource_url(master_url),
+        effective_url = %multiview_core::redact::redact_resource_url(&playlist.url),
+        variant_url = %multiview_core::redact::redact_resource_url(&variant_url),
         target_height = ?target_height,
         variant_height = ?variant.resolution_height,
         "pinned HLS main demuxer to a video variant (WebVTT rendition isolation)"

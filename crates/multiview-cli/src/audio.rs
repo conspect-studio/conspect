@@ -1451,6 +1451,31 @@ fn youtube_audio_master(
     None
 }
 
+/// The audio location as logged: query and fragment dropped, so a signed CDN
+/// master (a `YouTube` googlevideo URL, a tokenised HLS URL) never reaches the
+/// log with its signature.
+fn log_location(location: &str) -> String {
+    if location.contains("://") {
+        multiview_core::redact::redact_resource_url(location)
+    } else {
+        location.to_owned()
+    }
+}
+
+/// Whether the next `YouTube` audio connection must resolve afresh instead of
+/// reusing the master the video rail cached: this connection opened a master
+/// (not the video's shared fetch), the previous one did not already force a
+/// fresh resolve, and the decode died within 10 s (an expired master answers
+/// 403 at once). `decoded_for` times the decode only, never the shared-fetch
+/// wait before it.
+fn youtube_cached_master_failed(
+    opened_master: bool,
+    already_fresh: bool,
+    decoded_for: Duration,
+) -> bool {
+    opened_master && !already_fresh && decoded_for < Duration::from_secs(10)
+}
+
 /// How long [`await_shared_url`] waits for the video's fetcher.
 #[derive(Debug, Clone, Copy)]
 struct SharedUrlWait {
@@ -1648,12 +1673,15 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         };
         tracing::info!(
             source = %plan.id,
-            location = %pinned.as_deref().unwrap_or(&plan.location),
+            location = %log_location(pinned.as_deref().unwrap_or(&plan.location)),
             shared_fetch,
             request_headers_set = !open_headers.is_empty(),
             "live audio: opening"
         );
         let location = std::path::Path::new(pinned.as_deref().unwrap_or(&plan.location));
+        // Times THIS connection's decode only (not the shared-fetch wait), so
+        // an expired cached YouTube master that 403s at once is recognised.
+        let decode_started = Instant::now();
         if skip_connection {
             // No master for this `YouTube` connection: back off and retry below.
         } else
@@ -1709,8 +1737,11 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
             );
         }
         let ran_for = started.elapsed();
-        youtube_cache_failed =
-            youtube_master.is_some() && !youtube_cache_failed && ran_for < Duration::from_secs(10);
+        youtube_cache_failed = youtube_cached_master_failed(
+            youtube_master.is_some(),
+            youtube_cache_failed,
+            decode_started.elapsed(),
+        );
         if !plan.live || stop.load(Ordering::Acquire) {
             // A finite source has played its audio out (the store silence-fills
             // past EOF forever); a stop was requested. Either way, this ends.
@@ -2843,5 +2874,38 @@ mod shared_url_wait_tests {
         let started = std::time::Instant::now();
         assert_eq!(await_shared_url(|| None, || None, &stop, wait), None);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod youtube_audio_helper_tests {
+    use super::{log_location, youtube_cached_master_failed};
+    use std::time::Duration;
+
+    #[test]
+    fn a_signed_master_is_logged_without_its_signature() {
+        let logged = log_location(
+            "https://rr1.googlevideo.com/videoplayback/expire/1/index.m3u8?sig=SECRET&pot=TOKEN",
+        );
+        assert!(!logged.contains("SECRET"), "{logged}");
+        assert!(!logged.contains("TOKEN"), "{logged}");
+        assert!(logged.contains("googlevideo.com"), "{logged}");
+        assert_eq!(log_location("/media/clip.mp4"), "/media/clip.mp4");
+    }
+
+    #[test]
+    fn a_quickly_dead_master_forces_one_fresh_resolve() {
+        let quick = Duration::from_millis(50);
+        assert!(youtube_cached_master_failed(true, false, quick));
+        // The fresh resolve that follows does not chain another forced resolve.
+        assert!(!youtube_cached_master_failed(true, true, quick));
+        // A connection that ran a while was healthy.
+        assert!(!youtube_cached_master_failed(
+            true,
+            false,
+            Duration::from_secs(30)
+        ));
+        // The video rail's shared fetch is never "a master we opened".
+        assert!(!youtube_cached_master_failed(false, false, quick));
     }
 }
