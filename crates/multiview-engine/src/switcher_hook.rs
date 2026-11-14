@@ -5,8 +5,9 @@ use crate::drive::{CompositedFrame, CompositorDrive, MixOverlay, TransitionStyle
 use crate::keyer::{KeyerDraw, MAX_DSK};
 use crate::runtime::FrameControl;
 use crate::switcher_control::SwitcherTickDriver;
+use multiview_compositor::mask::MaskShape;
 use multiview_compositor::pipeline::Nv12Image;
-use multiview_core::switcher::{Rgb8, SourceRef, TransitionDescriptor};
+use multiview_core::switcher::{Rgb8, SourceRef, TransitionDescriptor, WipePattern};
 use multiview_framestore::{SwapCell, TileStore};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,6 +39,17 @@ pub struct SwitcherFrameHook<C> {
     /// by the driver, swapped into the drive, so the previous tick's `Arc`s
     /// come back here and drop on the next resolve. No per-tick allocation.
     keyer_buf: [Option<KeyerDraw>; MAX_DSK],
+}
+
+/// The compositor's mask shape for a switcher wipe pattern.
+fn mask_shape(pattern: WipePattern) -> MaskShape {
+    match pattern {
+        WipePattern::Vertical => MaskShape::Vertical,
+        WipePattern::Diagonal => MaskShape::Diagonal,
+        WipePattern::Box => MaskShape::Box,
+        WipePattern::Circle => MaskShape::Circle,
+        _ => MaskShape::Horizontal,
+    }
 }
 
 impl<C> SwitcherFrameHook<C> {
@@ -102,6 +114,22 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             } => TransitionStyle::Dip {
                 color: color.unwrap_or(Rgb8::BLACK),
                 switch_point: *switch_point,
+            },
+            TransitionDescriptor::Wipe {
+                pattern,
+                softness,
+                border_width,
+                border_color,
+                position_xy,
+                reverse,
+                ..
+            } => TransitionStyle::Wipe {
+                shape: mask_shape(*pattern),
+                origin: *position_xy,
+                reverse: *reverse,
+                softness: *softness,
+                border_width: *border_width,
+                border_color: *border_color,
             },
             _ => TransitionStyle::Mix,
         };

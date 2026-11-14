@@ -626,6 +626,9 @@ pub struct Tile<'a> {
     /// Scene group for an exact key-changing transition (ADR-0113 §2).
     /// [`TileGroup::Top`] (the default) is an ordinary layer.
     pub group: TileGroup,
+    /// An optional wipe mask (ADR-0112 §3): its per-canvas-pixel coverage
+    /// multiplies into the tile alpha at the one premultiply step.
+    pub mask: Option<crate::mask::WipeMask>,
 }
 
 impl<'a> Tile<'a> {
@@ -643,6 +646,7 @@ impl<'a> Tile<'a> {
             opacity,
             key: None,
             group: TileGroup::Top,
+            mask: None,
         }
     }
 
@@ -668,6 +672,7 @@ impl<'a> Tile<'a> {
             opacity,
             key: None,
             group: TileGroup::Top,
+            mask: None,
         }
     }
 
@@ -684,6 +689,28 @@ impl<'a> Tile<'a> {
     pub const fn in_group(mut self, group: TileGroup) -> Self {
         self.group = group;
         self
+    }
+
+    /// This tile, drawn through a wipe `mask` (ADR-0112 §3).
+    #[must_use]
+    pub const fn with_mask(mut self, mask: crate::mask::WipeMask) -> Self {
+        self.mask = Some(mask);
+        self
+    }
+
+    /// The mask coverage at canvas pixel `(px, py)`; `1` without a mask.
+    /// `WipeMask` has public fields: a malformed mask
+    /// ([`crate::mask::WipeMask::is_well_formed`]) covers nothing, and any
+    /// coverage is clamped to `[0, 1]` with NaN read as 0, so it can never
+    /// poison the layers beneath.
+    fn mask_coverage(&self, px: u32, py: u32) -> f32 {
+        self.mask.as_ref().map_or(1.0, |mask| {
+            if mask.is_well_formed() {
+                crate::key::unit(mask.coverage(px, py))
+            } else {
+                0.0
+            }
+        })
     }
 
     /// The destination width in pixels (the source is scaled to it). Falls back
@@ -1414,7 +1441,7 @@ fn composite_band_reference(
                     }
                 }
                 let src = match tile_dst_offset(tile, px, py) {
-                    Some((ddx, ddy)) => tile_pixel(tile, ddx, ddy, canvas, luts)?,
+                    Some((ddx, ddy)) => tile_pixel(tile, ddx, ddy, (px, py), canvas, luts)?,
                     None => None,
                 };
                 match tile.group {
@@ -1823,12 +1850,14 @@ fn merge_scenes(
 
 /// One tile's premultiplied-linear source value at destination-rect offset
 /// `(ddx, ddy)`: the fixed front half (#8 steps 1-4) and the coverage
-/// `opacity × fill_alpha × mask × matte` (ADR-0113 §3), premultiplied once.
+/// `opacity × fill_alpha × wipe_mask(canvas_px) × key_mask × matte`
+/// (ADR-0113 §3, ADR-0112 §3), premultiplied once.
 /// `None` when the source sample is out of bounds (defensive).
 fn tile_pixel(
     tile: &Tile<'_>,
     ddx: u32,
     ddy: u32,
+    canvas_px: (u32, u32),
     canvas: CanvasColor,
     luts: Option<&LutSet>,
 ) -> Result<Option<PremulRgba>> {
@@ -1844,7 +1873,10 @@ fn tile_pixel(
     };
     // `unit` maps a NaN opacity (a keyer's weight rides it) to 0, so a bad
     // weight never poisons the layers beneath; finite values clamp as before.
-    let mut a = crate::key::unit(tile.opacity) * tile_alpha(tile.image, sx, sy);
+    // The wipe mask (ADR-0112 §3) multiplies in at the same single premultiply.
+    let mut a = crate::key::unit(tile.opacity)
+        * tile_alpha(tile.image, sx, sy)
+        * tile.mask_coverage(canvas_px.0, canvas_px.1);
     if let Some(key) = &tile.key {
         // Post-range-expand fill Y (pipeline step 1) for a luma self key.
         let fill_y = range::expand_luma(y8, range::require_resolved(tile.image.color().range)?);
@@ -1925,7 +1957,12 @@ fn fold_tile_into_band(
                 gx += 1;
                 continue;
             };
-            if let Some(src) = tile_pixel(tile, ddx, ddy, canvas, luts)? {
+            // Canvas pixel for the wipe mask (bands split rows only).
+            let canvas_px = (
+                u32::try_from(gx).unwrap_or(0),
+                u32::try_from(gy).unwrap_or(0),
+            );
+            if let Some(src) = tile_pixel(tile, ddx, ddy, canvas_px, canvas, luts)? {
                 fold(row_base + col, src);
             }
             gx += 1;

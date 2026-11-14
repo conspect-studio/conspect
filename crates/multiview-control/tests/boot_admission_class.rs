@@ -237,11 +237,28 @@ fn assert_typed_switcher_refusal(what: &str, status: StatusCode, body: &Value) {
     );
 }
 
+/// #307: with a switcher the Program canvas is the M/E bus, so apply-layout
+/// (without `target`) is `switcher-owns-program` for every layout shape.
+fn assert_switcher_owns_program(what: &str, status: StatusCode, body: &Value) {
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{what}: {body}");
+    assert_eq!(
+        body["type"], "/problems/switcher-owns-program",
+        "{what}: {body}"
+    );
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("The switcher is on:"),
+        "{what}: {body}"
+    );
+}
+
 #[tokio::test]
 async fn apply_layout_table_switcher_on_and_off_single_and_multi_cell() {
     // (switcher, body, expect accepted)
     let cases = [
-        (true, one_cell_body("in_a"), true),
+        (true, one_cell_body("in_a"), false),
         (true, six_cell_body(), false),
         (true, one_cell_body("in_b"), false),
         (false, one_cell_body("in_a"), true),
@@ -261,13 +278,13 @@ async fn apply_layout_table_switcher_on_and_off_single_and_multi_cell() {
         if accepted {
             assert_eq!(status, StatusCode::ACCEPTED, "{what}: {problem}");
         } else {
-            assert_typed_switcher_refusal(&what, status, &problem);
+            assert_switcher_owns_program(&what, status, &problem);
         }
     }
 }
 
 /// Today's mda001 sequence (#317): switcher on, Layouts → Apply a 6-cell
-/// layout. It must be refused, desired.json unchanged byte for byte, nothing
+/// layout. It must be refused (#307: `switcher-owns-program`), desired.json unchanged byte for byte, nothing
 /// sent to the engine (it keeps running the 1-cell Program), and a "restart"
 /// from the persisted state must pass start-up admission.
 #[tokio::test]
@@ -279,11 +296,11 @@ async fn todays_sequence_six_cell_apply_with_switcher_is_refused_and_restart_boo
     let response = apply(&run, "NewsOne").await;
     let (status, body) =
         expect_accepted_or_refused_cleanly(&mut run, "NewsOne apply", &before, response).await;
-    assert_typed_switcher_refusal("NewsOne apply", status, &body);
+    assert_switcher_owns_program("NewsOne apply", status, &body);
     assert!(body["detail"]
         .as_str()
         .unwrap()
-        .starts_with("The switcher is on: a multi-cell layout cannot be the Program canvas."));
+        .contains("POST /api/v1/routing/output/take"));
     assert_eq!(run.desired_bytes(), before, "byte-for-byte unchanged");
     // Restart: rebuild the control plane from disk; the accepted canvas is
     // still the one full-canvas cell and admits.
@@ -321,7 +338,7 @@ async fn editor_save_and_apply_of_a_multi_cell_layout_is_refused_after_a_harmles
     let response = apply(&run, "edited").await;
     let (status, body) =
         expect_accepted_or_refused_cleanly(&mut run, "editor apply", &before, response).await;
-    assert_typed_switcher_refusal("editor apply", status, &body);
+    assert_switcher_owns_program("editor apply", status, &body);
 }
 
 /// The other persisting commands: sources, outputs, overlays (and their
@@ -398,7 +415,8 @@ async fn every_other_persisting_command_yields_a_bootable_state_or_a_clean_refus
 /// Review finding (Grok, PR #318): a boot-file edit that the admission refuses
 /// is latched like any invalid document — warned once, `desired.json`
 /// unchanged, and later polls of the same content do NOT re-enter the commit
-/// (no lock retake, no re-published warning every second).
+/// (no lock retake, no re-published warning every second). Since #307 the
+/// refused edit is an overlay on the Program canvas (a two-cell canvas starts).
 #[tokio::test]
 async fn watcher_refuses_an_inadmissible_boot_file_edit_once_and_latches_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -421,10 +439,10 @@ async fn watcher_refuses_an_inadmissible_boot_file_edit_once_and_latches_it() {
         multiview_control::config_watch::spawn(path.clone(), config, state.clone(), options);
     assert!(poll.poll_once().await && poll.poll_once().await);
 
-    // The operator edits the boot file to a two-cell canvas with the M/E on.
+    // The operator adds an overlay to the Program canvas with the M/E on.
     let edited = text.replace(
-        "[[cells]]\nid = \"pgm\"\nrect = { x = 0.0, y = 0.0, w = 1.0, h = 1.0 }\n[cells.source]\ninput_id = \"in_a\"\n",
-        "[[cells]]\nid = \"pgm\"\nrect = { x = 0.0, y = 0.0, w = 0.5, h = 1.0 }\n[cells.source]\ninput_id = \"in_a\"\n[[cells]]\nid = \"two\"\nrect = { x = 0.5, y = 0.0, w = 0.5, h = 1.0 }\n[cells.source]\ninput_id = \"in_b\"\n",
+        "[[outputs]]",
+        "[[overlays]]\nid = \"ov_clock\"\nkind = \"clock\"\ntarget = \"canvas\"\n[[outputs]]",
     );
     assert_ne!(edited, text, "fixture edit applies");
     std::fs::write(&path, &edited).unwrap();
@@ -458,4 +476,54 @@ async fn watcher_refuses_an_inadmissible_boot_file_edit_once_and_latches_it() {
         before,
         "desired.json unchanged"
     );
+}
+
+/// #307: a boot-file edit to a two-cell canvas with the M/E on is accepted:
+/// the persisted state boots (Program is the one-cell M/E bus) and the
+/// configured layout follows the file.
+#[tokio::test]
+async fn watcher_accepts_a_two_cell_boot_file_edit_with_the_switcher_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boot.toml");
+    let text = boot_text(true);
+    std::fs::write(&path, &text).unwrap();
+    let config = MultiviewConfig::load_from_toml(&text).unwrap();
+    let (state, _commands) = state_for(&path, &config);
+    let layouts = multiview_control::boot_model::layout_library(&state).unwrap();
+    multiview_control::boot_model::commit_desired(&state, config.clone(), layouts)
+        .await
+        .unwrap();
+    let (options, mut poll) = multiview_control::config_watch::WatchOptions::default()
+        .with_initial_observed(text.clone())
+        .with_manual_poll();
+    let _watch =
+        multiview_control::config_watch::spawn(path.clone(), config, state.clone(), options);
+    assert!(poll.poll_once().await && poll.poll_once().await);
+    let edited = text.replace(
+        "[[cells]]\nid = \"pgm\"\nrect = { x = 0.0, y = 0.0, w = 1.0, h = 1.0 }\n[cells.source]\ninput_id = \"in_a\"\n",
+        "[[cells]]\nid = \"pgm\"\nrect = { x = 0.0, y = 0.0, w = 0.5, h = 1.0 }\n[cells.source]\ninput_id = \"in_a\"\n[[cells]]\nid = \"two\"\nrect = { x = 0.5, y = 0.0, w = 0.5, h = 1.0 }\n[cells.source]\ninput_id = \"in_b\"\n",
+    );
+    assert_ne!(edited, text, "fixture edit applies");
+    std::fs::write(&path, &edited).unwrap();
+    for _ in 0..6 {
+        assert!(poll.poll_once().await);
+    }
+    let desired = load_desired(&path).unwrap().expect("accepted state");
+    assert_eq!(
+        desired.config.cells.len(),
+        2,
+        "the file's two cells persisted"
+    );
+    multiview_config::boot_admission(&desired.config).expect("the edited state boots");
+    let program = desired
+        .config
+        .program_canvas(desired.config.solve_layout().unwrap())
+        .unwrap();
+    assert!(program.synthesized);
+    assert_eq!(
+        program.layout.cells.len(),
+        1,
+        "Program is the one-cell M/E bus"
+    );
+    assert_eq!(program.layout.cells[0].source.as_deref(), Some("in_a"));
 }
