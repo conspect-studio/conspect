@@ -77,6 +77,21 @@ const MAX_PARAM_SET_BYTES: usize = 4096;
 /// 32 list modifications, weights and 128 MMCOs is under 2 KiB).
 const MAX_SLICE_HEADER_BYTES: usize = 4096;
 
+/// Largest previous access unit accepted (bytes), checked before any scan:
+/// the same 8 MiB bound as the passthrough tap's `MAX_AU_BYTES`, so the
+/// Annex-B start-code search is bounded for direct callers too (R2-A8).
+pub const MAX_PREV_AU_BYTES: usize = 8 * 1024 * 1024;
+
+/// The emulation-prevention zero counter: only "fewer than two" vs "two or
+/// more" matters, so it is capped at 2 and can never overflow.
+const fn bump_zeros(zeros: u8) -> u8 {
+    if zeros < 2 {
+        zeros + 1
+    } else {
+        2
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bit reading (RBSP, emulation prevention removed).
 // ---------------------------------------------------------------------------
@@ -84,14 +99,14 @@ const MAX_SLICE_HEADER_BYTES: usize = 4096;
 /// Remove emulation-prevention bytes (`00 00 03` -> `00 00`) from a NAL payload.
 fn unescape(nal: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(nal.len());
-    let mut zeros = 0_u32;
+    let mut zeros = 0_u8;
     for &b in nal {
         if zeros >= 2 && b == 0x03 {
             zeros = 0;
             continue;
         }
         if b == 0 {
-            zeros = zeros.saturating_add(1);
+            zeros = bump_zeros(zeros);
         } else {
             zeros = 0;
         }
@@ -241,7 +256,7 @@ impl BitWriter {
 /// Insert emulation-prevention bytes into an RBSP (§7.4.1).
 fn escape(rbsp: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rbsp.len() + rbsp.len() / 64 + 4);
-    let mut zeros = 0_u32;
+    let mut zeros = 0_u8;
     for &b in rbsp {
         if zeros >= 2 && b <= 0x03 {
             out.push(0x03);
@@ -249,7 +264,7 @@ fn escape(rbsp: &[u8]) -> Vec<u8> {
         }
         out.push(b);
         if b == 0 {
-            zeros = zeros.saturating_add(1);
+            zeros = bump_zeros(zeros);
         } else {
             zeros = 0;
         }
@@ -740,6 +755,9 @@ fn parse_slice_header(nal: &[u8], sps: &H264Sps, pps: &H264Pps) -> Option<PrevSl
 /// zero-length NAL in length-prefixed framing is malformed), and an Annex-B
 /// NAL is scanned for its end only within the prefix window.
 fn first_vcl_prefix(au: &[u8], framing: NalFraming) -> Option<&[u8]> {
+    if au.len() > MAX_PREV_AU_BYTES {
+        return None;
+    }
     let is_vcl = |b: &[u8]| b.first().is_some_and(|&h| matches!(h & 0x1F, 1 | 5));
     let window = MAX_SLICE_HEADER_BYTES + 1;
     match framing {
@@ -1962,10 +1980,35 @@ mod tests {
         assert!(b
             .repeat_after(&frame_nals(&nals, lp).unwrap(), lp)
             .is_none());
-        // The emulation counters saturate (no overflow on long zero runs).
+        // The emulation counters are capped at 2 (no overflow on any run).
+        assert_eq!(bump_zeros(0), 1);
+        assert_eq!(bump_zeros(1), 2);
+        assert_eq!(bump_zeros(2), 2);
         let zero_run = vec![0_u8; 70_000];
         assert_eq!(unescape(&zero_run).len(), 70_000);
         assert!(escape(&zero_run).len() > 70_000);
+    }
+
+    #[test]
+    fn an_oversize_previous_au_is_refused_before_any_scan() {
+        // R2-A8: a huge non-VCL prefix (or no start code at all) before the
+        // slice is refused by size, before the Annex-B start-code search.
+        let b = RepeatAuBuilder::new(BASE_SPS, BASE_PPS).unwrap();
+        let mut filler = vec![0x0C_u8]; // filler data NAL header
+        filler.resize(MAX_PREV_AU_BYTES, 0x55);
+        let au = annexb(&[&filler, BASE_P1]);
+        assert!(au.len() > MAX_PREV_AU_BYTES);
+        assert!(first_vcl_prefix(&au, NalFraming::AnnexB).is_none());
+        assert!(b.repeat_after(&au, NalFraming::AnnexB).is_none());
+        let no_start = vec![0x55_u8; MAX_PREV_AU_BYTES + 1];
+        assert!(first_vcl_prefix(&no_start, NalFraming::AnnexB).is_none());
+        let lp = NalFraming::LengthPrefixed { nal_length_size: 4 };
+        let lp_au = frame_nals(&[&filler, BASE_P1], lp).unwrap();
+        assert!(b.repeat_after(&lp_au, lp).is_none());
+        // Just under the bound the same shape still works.
+        filler.truncate(1024 * 1024);
+        let ok = annexb(&[&filler, BASE_P1]);
+        assert!(b.repeat_after(&ok, NalFraming::AnnexB).is_some());
     }
 
     #[test]
