@@ -431,6 +431,23 @@ export interface OutputStatus {
   readonly state: OutputRunState;
 }
 
+/** Data body of `patch.take` (ADR-0110 §12.8): the terminal outcome of an atomic patch set, for one destination. */
+export interface PatchTakeEvent {
+  /** Exactly one of `output` (an output API id) or `mixer` (+ `program`). */
+  readonly destination: {
+    readonly mixer?: string;
+    readonly output?: string;
+    readonly program?: string;
+  };
+  /** The set's operation id (the 202's `operation_id`). */
+  readonly operation_id: string;
+  readonly outcome: "applied" | "refused";
+  /** First cause when refused: capacity, feed-not-fresh, encoder-not-ready, slot-medium-mismatch, slot-format-unsupported, on-air-protected, unknown-slot, unknown-source, superseded, deadline, engine-busy, refused. */
+  readonly refusal?: string;
+  /** The tick the set was decided (the adoption tick when applied). */
+  readonly tick: number;
+}
+
 /** Data body of `$error`: a control-plane error. */
 export interface ProtocolError {
   /** Short stable machine-readable error code. */

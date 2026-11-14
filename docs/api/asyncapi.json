@@ -234,6 +234,9 @@
                   "$ref": "#/components/schemas/RouteOutputEvent"
                 },
                 {
+                  "$ref": "#/components/schemas/PatchTakeEvent"
+                },
+                {
                   "$ref": "#/components/schemas/Alert"
                 },
                 {
@@ -479,6 +482,16 @@
         },
         "summary": "An output sink changed run state (starting/running/migrating/error).",
         "title": "Output sink status update"
+      },
+      "PatchTakeEvent": {
+        "contentType": "application/json",
+        "description": "Published once per destination when every member of a set (`POST /patch/take` with two or more destinations, or a patch salvo) is terminal (ADR-0110 §12.8, #308). Topic `outputs` for an output (envelope `id` = output id), `switcher` for the mixer (envelope `id` = M/E id); `corr` = the set's operation id. Each delivery is scoped by its own destination, so a principal sees only the destinations it may read. Lossless.",
+        "name": "PatchTakeEvent",
+        "payload": {
+          "$ref": "#/components/schemas/PatchTakeEvent"
+        },
+        "summary": "An atomic multi-destination patch set settled (patch.take).",
+        "title": "Atomic patch set outcome"
       },
       "RouteOutputEvent": {
         "contentType": "application/json",
@@ -1749,6 +1762,53 @@
         },
         "required": [
           "state"
+        ],
+        "type": "object"
+      },
+      "PatchTakeEvent": {
+        "description": "Data body of `patch.take` (ADR-0110 §12.8): the terminal outcome of an atomic patch set, for one destination.",
+        "properties": {
+          "destination": {
+            "description": "Exactly one of `output` (an output API id) or `mixer` (+ `program`).",
+            "properties": {
+              "mixer": {
+                "type": "string"
+              },
+              "output": {
+                "type": "string"
+              },
+              "program": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "operation_id": {
+            "description": "The set's operation id (the 202's `operation_id`).",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "applied",
+              "refused"
+            ],
+            "type": "string"
+          },
+          "refusal": {
+            "description": "First cause when refused: capacity, feed-not-fresh, encoder-not-ready, slot-medium-mismatch, slot-format-unsupported, on-air-protected, unknown-slot, unknown-source, superseded, deadline, engine-busy, refused.",
+            "type": "string"
+          },
+          "tick": {
+            "description": "The tick the set was decided (the adoption tick when applied).",
+            "format": "uint64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation_id",
+          "tick",
+          "outcome",
+          "destination"
         ],
         "type": "object"
       },

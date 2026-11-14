@@ -7977,7 +7977,7 @@
         "tags": [
           "patch"
         ],
-        "summary": "Plan 1..64 mixer crosspoints (path, on-air flag, refusals) or the slots of\none output (§12.4 path P1/P2/P3 and cost); no change.",
+        "summary": "Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the\nslots of one output (§12.4 path P1/P2/P3 and cost), or an atomic set\nover many destinations (#308: every member planned, `can_take` only when\nall can and the set's new encoders fit the caller's caps); no change.",
         "operationId": "plan_patch",
         "requestBody": {
           "content": {
@@ -8031,7 +8031,7 @@
             }
           },
           "422": {
-            "description": "`slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, two outputs, or mixer + output: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout or bus on a mixer input; an unknown feed), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan.",
+            "description": "`slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, a destination named twice), `unknown-source` (a layout or bus on a mixer input; an unknown feed; more than 4 distinct layouts in one set), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8058,7 +8058,7 @@
         "tags": [
           "patch"
         ],
-        "summary": "Take 1..64 mixer crosspoints atomically at one engine tick, or one\noutput's video slot 0 (+ audio slot 0 follow) through the same machinery\nas `POST /routing/output/take` (the slot-0 alias; shared idempotency\nstore and limits; the outcome rides `route.output`).",
+        "summary": "Take 1..64 mixer crosspoints atomically at one engine tick, one output's\nvideo slot 0 (+ audio slot 0 follow) through the same machinery as\n`POST /routing/output/take` (the slot-0 alias; shared idempotency store\nand limits; the outcome rides `route.output`), or an atomic set over many\ndestinations (#308; outcome `patch.take`).",
         "operationId": "take_patch",
         "parameters": [
           {
@@ -8083,7 +8083,7 @@
         },
         "responses": {
           "202": {
-            "description": "",
+            "description": "Accepted. A set of two or more destinations (#308) settles on `patch.take` (one delivery per destination, scoped by it); mixer inputs alone on `switcher.operation`; one output on `route.output`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8093,7 +8093,7 @@
             }
           },
           "403": {
-            "description": "Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source; a replayed key is re-authorized.",
+            "description": "Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source (a layout: its id and whole source closure) of ANY member; nothing is enqueued and no key is burned; a replayed key is re-authorized.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8113,7 +8113,7 @@
             }
           },
           "409": {
-            "description": "`conflict` (an output take's Idempotency-Key first used for another output or feed; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or no source lease.",
+            "description": "`conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions), `aux-capacity` (no free layout canvas), or no source lease.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8133,7 +8133,7 @@
             }
           },
           "429": {
-            "description": "Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After.",
+            "description": "Over 2 takes/s per destination or 10/s per principal (one request = one take, whatever its crosspoint count; a set counts once per destination); see Retry-After.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8143,7 +8143,7 @@
             }
           },
           "503": {
-            "description": "`engine-busy` (the key and leases are released; or an output slot's `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity`.",
+            "description": "`engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity` (also: 256 sets already await their outcome).",
             "content": {
               "application/json": {
                 "schema": {
@@ -10118,7 +10118,7 @@
             }
           },
           "403": {
-            "description": "Not authorized to write.",
+            "description": "Not authorized to write, or (a patch salvo, #308) not authorized for a patch member's destination or source: every member's both ends are authorized at store time.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10138,7 +10138,17 @@
             }
           },
           "422": {
-            "description": "The salvo failed validation.",
+            "description": "The salvo failed validation (a patch salvo: more than 64 crosspoints, a destination twice, an unknown source, mixer input, output or layout, or an unsupported crosspoint shape).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`engine-busy`: a patch member's `{layout}` could not be read now; retry.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10401,6 +10411,98 @@
         }
       }
     },
+    "/api/v1/salvos/{id}/plan": {
+      "post": {
+        "tags": [
+          "salvos"
+        ],
+        "summary": "`POST /api/v1/salvos/{id}/plan` — plan a patch salvo's crosspoints\n(#308): the `POST /patch/plan` answer for the stored crosspoints and\n`on_air`, authorized like the take; no change. `arm` keeps its legacy\nmeaning.",
+        "operationId": "plan_salvo",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Salvo id to plan.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The patch plan of the salvo's crosspoints (as `POST /patch/plan`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PatchPlan"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the salvo or for a patch member's destination or source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No salvo with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "As `POST /patch/plan`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The salvo has no patch crosspoints, or as `POST /patch/plan`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`engine-busy`: a `{layout}` could not be read now.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/salvos/{id}/take": {
       "post": {
         "tags": [
@@ -10433,7 +10535,7 @@
         ],
         "responses": {
           "202": {
-            "description": "Take accepted; outcome on the realtime stream.",
+            "description": "Take accepted; outcome on the realtime stream. A salvo with only legacy recalls answers `AcceptedBody` (outcome `salvo.taken`). A patch salvo (#308) answers `{operation_id, status: \"accepted\", recall_operation_id?}`: its crosspoints are taken atomically through the `POST /patch/take` set path (outcome `patch.take`, or as that route for one destination) and a legacy recall, when present, is submitted too (`recall_operation_id`).",
             "content": {
               "application/json": {
                 "schema": {
@@ -10453,7 +10555,7 @@
             }
           },
           "403": {
-            "description": "Not authorized to take.",
+            "description": "Not authorized to take (a patch salvo: every member's both ends are re-authorized under the caller's current grants).",
             "content": {
               "application/json": {
                 "schema": {
@@ -10472,8 +10574,28 @@
               }
             }
           },
+          "409": {
+            "description": "A patch salvo: as `POST /patch/take` (`conflict`, `capacity`, `on-air-protected`, ...).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "422": {
             "description": "`switcher-owns-program`: a switcher M/E is declared and the salvo recalls a layout or cell sources (Program is the M/E bus; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Refused before the Idempotency-Key is reserved. A salvo of only tally/UMD recalls is unaffected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "A patch salvo: as `POST /patch/take`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -20516,7 +20638,7 @@
       },
       "PatchAccepted": {
         "type": "object",
-        "description": "`POST /patch/take` 202 answer; the outcome arrives as `switcher.operation`.",
+        "description": "`POST /patch/take` 202 answer. The outcome arrives as `switcher.operation`\n(mixer inputs), `route.output` (one output) or, for a set of two or more\ndestinations, `patch.take` (#308).",
         "required": [
           "operation_id",
           "status"
@@ -20525,6 +20647,13 @@
           "operation_id": {
             "type": "string",
             "description": "Correlates with `switcher.operation.operation_id`."
+          },
+          "recall_operation_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A patch salvo that also recalls layout/sources/tally/UMD: the\noperation id of that recall (its outcome rides `salvo.taken`)."
           },
           "status": {
             "type": "string",
@@ -22328,6 +22457,17 @@
             ],
             "description": "Recall a named layout (preset or head layout name)."
           },
+          "on_air": {
+            "$ref": "#/components/schemas/OnAir",
+            "description": "The patch crosspoints' on-air guard (default `protect`)."
+          },
+          "patch": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PatchCrosspoint"
+            },
+            "description": "Patch crosspoints taken atomically at one tick through the\n`POST /patch/take` set path (#308); the `/patch` crosspoint shape."
+          },
           "sources": {
             "type": "array",
             "items": {
@@ -22535,6 +22675,25 @@
         ],
         "description": "An IS-04 **Sender**: an egress flow (a Conspect program/preview output)."
       },
+      "SetCost": {
+        "type": "object",
+        "description": "The aggregate cost of a set (`POST /patch/plan`, #308): its NEW encoder\ndelta, deduplicated per identical (feed, output format), against the\ncaller's per-principal cap and the global sessions.",
+        "required": [
+          "new_encoders",
+          "fits"
+        ],
+        "properties": {
+          "fits": {
+            "type": "boolean",
+            "description": "Whether that delta fits the caller's cap and the global sessions now."
+          },
+          "new_encoders": {
+            "type": "integer",
+            "description": "New encoder sessions the whole set opens.",
+            "minimum": 0
+          }
+        }
+      },
       "SetModeAccepted": {
         "type": "object",
         "description": "The `202 Accepted` body for `set-mode`: the operation id, the **declared**\npre-apply impact class, and the human-readable impact statement (ADR-M009 —\nthe API surfaces the impact BEFORE applying).",
@@ -22609,6 +22768,27 @@
             "description": "The desired converged work mode (driver vocabulary, e.g. `encoder`)."
           }
         }
+      },
+      "SetPlan": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/PatchPlan",
+            "description": "The per-member plan (same fields as a single-destination plan)."
+          },
+          {
+            "type": "object",
+            "required": [
+              "set"
+            ],
+            "properties": {
+              "set": {
+                "$ref": "#/components/schemas/SetCost",
+                "description": "The whole set's encoder delta and fit (sets only)."
+              }
+            }
+          }
+        ],
+        "description": "The plan body of a set: the [`PatchPlan`] plus its aggregate cost."
       },
       "SetupCodeBody": {
         "type": "object",
