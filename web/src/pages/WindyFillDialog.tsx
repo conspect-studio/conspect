@@ -44,9 +44,9 @@ import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { CheckCircle2, Loader2, XCircle } from 'lucide-react';
 
-import type { MediaPlayer } from '../api/media-playersQueries';
+import type { ArtifactRef, LoadThen, MediaPlayer } from '../api/media-playersQueries';
 import { useLoadMediaPlayerArtifact, useMediaPlayerLoadOperation } from '../api/media-playersQueries';
-import { newIdempotencyKey } from '../api/operations';
+import { newIdempotencyKey, OperationApiError } from '../api/operations';
 import {
   useCancelCapture,
   useCaptureCapabilities,
@@ -287,6 +287,55 @@ interface CaptureAttempt {
 }
 
 /**
+ * One immutable artifact-load attempt: the `Idempotency-Key` minted for it
+ * and the EXACT body (`artifactRef` + `then`) sent with that key. "Retry
+ * load" must resend this snapshot verbatim — never rebuild `then` from the
+ * live draft, which stays editable after a succeeded capture. The server's
+ * load-key reuse check compares the stored `then` too
+ * (`crates/multiview-cli/src/player/provider.rs`: `old.then != then` ->
+ * "load key reused with different request"), so a Then changed after
+ * capture but before Retry load would otherwise be rejected.
+ */
+interface LoadAttempt {
+  readonly key: string;
+  readonly artifactRef: ArtifactRef;
+  readonly then: LoadThen | undefined;
+}
+
+/**
+ * True for a definite (non-network) rejection: the server answered with a
+ * structured 4xx and did NOT admit the job, so a retry of the identical
+ * body cannot succeed — only a corrected "Start new capture" can (finding
+ * 3). A network error (lost response) carries no such status: the prior
+ * POST's outcome is genuinely unknown, so "Retry same request" (same
+ * key+body) remains the safe default.
+ */
+function isDefiniteRejection(error: unknown): boolean {
+  return (
+    error instanceof OperationApiError
+    && error.status !== undefined
+    && error.status >= 400
+    && error.status < 500
+  );
+}
+
+/**
+ * Client-side mirror of the server's `View` bounds (schema.ts) so an
+ * obviously invalid value never round-trips to a 422 (finding 3): fps
+ * 1..30, frames 2..600 (realtime mode only — steps mode ignores `frames`),
+ * zoom 1..18, lat -85..85, lon -180..180 (matching the Latitude/Longitude
+ * inputs' own `min`/`max`).
+ */
+function isDraftValid(draft: FillDraft, isStepsMode: boolean): boolean {
+  if (!Number.isFinite(draft.fps) || draft.fps < 1 || draft.fps > 30) return false;
+  if (!isStepsMode && (!Number.isFinite(draft.frames) || draft.frames < 2 || draft.frames > 600)) return false;
+  if (!Number.isFinite(draft.zoom) || draft.zoom < 1 || draft.zoom > 18) return false;
+  if (!Number.isFinite(draft.lat) || draft.lat < -85 || draft.lat > 85) return false;
+  if (!Number.isFinite(draft.lon) || draft.lon < -180 || draft.lon > 180) return false;
+  return true;
+}
+
+/**
  * The "Fill from web…" dialog for one player: capture a bounded Windy view,
  * then load the finished artifact into that player.
  */
@@ -307,11 +356,14 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
   // The immutable {key, body} of the current capture attempt (finding 2):
   // kept across a lost-response retry, replaced only by a brand-new attempt.
   const [captureAttempt, setCaptureAttempt] = useState<CaptureAttempt | undefined>(undefined);
-  // The load key for THIS capture attempt's artifact (finding 1): minted once
-  // per jobId (i.e. once per new succeeded capture), reused only for a retry
-  // of that same load. A brand-new capture (Re-capture, or a changed-params
-  // submit) always gets a brand-new jobId and therefore a brand-new load key.
-  const [loadKey, setLoadKey] = useState<string | undefined>(undefined);
+  // The immutable {key, artifactRef, then} snapshot for THIS capture
+  // attempt's artifact load (finding 1): minted once per jobId (i.e. once
+  // per new succeeded capture) by snapshotting `draft.then` at that instant,
+  // then kept verbatim — "Retry load" resends this exact snapshot, never a
+  // `then` rebuilt from the live (still-editable) draft. A brand-new capture
+  // (Re-capture, or a changed-params submit) always gets a brand-new jobId
+  // and therefore a brand-new load attempt.
+  const [loadAttempt, setLoadAttempt] = useState<LoadAttempt | undefined>(undefined);
   const [loadOperation, setLoadOperation] = useState<number | undefined>(undefined);
   const [loadError, setLoadError] = useState<string | undefined>(undefined);
   const [loadStarted, setLoadStarted] = useState(false);
@@ -327,20 +379,22 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
     jobState === 'succeeded' || jobState === 'failed' || jobState === 'cancelled' || jobState === 'uncertain';
 
   /**
-   * POST the artifact load with an EXPLICIT key (finding 1): the caller
-   * decides fresh-vs-reuse, this function never mints one itself. Used both
-   * by the one-shot auto-trigger below and by a same-key load Retry.
+   * POST the artifact load for an EXPLICIT, already-snapshotted attempt
+   * (finding 1): the caller decides the key/artifactRef/then and this
+   * function never rebuilds any of them from the live draft. Used both by
+   * the one-shot auto-trigger below and by "Retry load" — both pass the
+   * SAME `LoadAttempt` object, so a retry resends the identical body.
    */
-  const submitLoad = (key: string, currentJobId: number, artifactId: string): void => {
+  const submitLoad = (attempt: LoadAttempt): void => {
     if (player === null) return;
     setLoadStarted(true);
     setLoadError(undefined);
     loadArtifact.mutate(
       {
         id: player.id,
-        artifactRef: { captureJobId: currentJobId, artifactId },
-        then: draft.then,
-        idempotencyKey: key,
+        artifactRef: attempt.artifactRef,
+        ...(attempt.then !== undefined ? { then: attempt.then } : {}),
+        idempotencyKey: attempt.key,
       },
       {
         onSuccess: (response): void => {
@@ -360,10 +414,14 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
   };
 
   // On a fresh success, submit the artifact load exactly once per attempt,
-  // minting a BRAND-NEW load key for this (job, artifact) pair — never the
-  // previous attempt's key, which was bound to a different artifactRef and
-  // would be refused by the server ("load key reused with different
-  // request", finding 1).
+  // snapshotting a BRAND-NEW {key, artifactRef, then} for this (job,
+  // artifact) pair — never the previous attempt's snapshot, which was bound
+  // to a different artifactRef and would be refused by the server ("load
+  // key reused with different request", finding 1). `draft.then` is read
+  // HERE, at the instant the capture succeeds, and frozen into the
+  // snapshot: later edits to the Then selector (still possible while the
+  // load is pending/failed) never change what a subsequent "Retry load"
+  // resends.
   useEffect(() => {
     if (
       jobState !== 'succeeded'
@@ -375,10 +433,14 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
       return;
     }
     loadTriggeredRef.current = true;
-    const key = newIdempotencyKey();
-    setLoadKey(key);
-    submitLoad(key, jobId, job.data.artifact_id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- loadTriggeredRef gates re-entry; draft/submitLoad are stable enough for this one-shot trigger.
+    const attempt: LoadAttempt = {
+      key: newIdempotencyKey(),
+      artifactRef: { captureJobId: jobId, artifactId: job.data.artifact_id },
+      then: draft.then,
+    };
+    setLoadAttempt(attempt);
+    submitLoad(attempt);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- loadTriggeredRef gates re-entry; draft.then is intentionally snapshotted once per succeeded job, not re-read on every draft change.
   }, [jobState, job.data, jobId]);
 
   if (player === null) {
@@ -416,6 +478,10 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
     ? nominalStepsFrames(draft.fps, draft.frameMs, draft.endHoldMs, draft.maxSteps)
     : draft.frames;
   const frameCapExceeded = isStepsMode && nominalFrames > MAX_NOMINAL_FRAMES;
+  // Finding 3: block submit on an obviously invalid field (fps/frames/
+  // zoom/lat/lon out of the server's documented range) before it ever
+  // round-trips to a 422.
+  const draftInvalid = !isDraftValid(draft, isStepsMode);
 
   /** Build the current draft's `CaptureBody` (never submits by itself). */
   const buildCaptureBody = (): CaptureBody => {
@@ -457,10 +523,11 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
       { body: attempt.body, idempotencyKey: attempt.key },
       {
         onSuccess: (accepted): void => {
-          // A NEW succeeded job always gets a NEW load key (finding 1): the
-          // artifact differs from any prior attempt's, so the previous load
-          // key — bound to a different artifactRef — must never be reused.
-          setLoadKey(undefined);
+          // A NEW succeeded job always gets a NEW load attempt (finding 1):
+          // the artifact differs from any prior attempt's, so the previous
+          // load snapshot — bound to a different artifactRef — must never
+          // be reused.
+          setLoadAttempt(undefined);
           setJobId(accepted.job_id);
         },
       },
@@ -469,7 +536,7 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
 
   /** A brand-new capture attempt: mint a fresh key+body pair and submit it. */
   const submit = (): void => {
-    if (!termsAccepted || !capsAvailable || frameCapExceeded) return;
+    if (!termsAccepted || !capsAvailable || frameCapExceeded || draftInvalid) return;
     saveDraft(playerId, draft);
     const attempt: CaptureAttempt = { key: newIdempotencyKey(), body: buildCaptureBody() };
     setCaptureAttempt(attempt);
@@ -490,11 +557,26 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
    * Retry the CURRENT attempt's POST with its IDENTICAL key+body (finding
    * 2): used only when the previous POST's outcome is unknown or failed —
    * never mints a new idempotency key, so an admitted-but-lost first attempt
-   * replays the same job rather than starting a second capture.
+   * replays the same job rather than starting a second capture. Gated on
+   * terms still being accepted RIGHT NOW (finding 2): the stored attempt
+   * body always carries `terms.accepted: true` from when it was built, so
+   * unchecking the box after an error and then hitting Retry must not
+   * silently resend that stale acceptance — it is a no-op instead.
    */
   const retrySubmit = (): void => {
-    if (captureAttempt === undefined) return;
+    if (captureAttempt === undefined || !termsAccepted) return;
     submitAttempt(captureAttempt);
+  };
+
+  /**
+   * "Start new capture" (finding 3): mints a brand-new key+body pair from
+   * the CURRENT (possibly just-corrected) draft, for use after a definite
+   * 4xx rejection where resending the same invalid body cannot succeed.
+   * Identical to `submit`, kept as a distinct named action so the two
+   * footer buttons read as separate operator intents.
+   */
+  const startNewCapture = (): void => {
+    submit();
   };
 
   const captureJobLabel = (state: string | undefined): string => {
@@ -1057,11 +1139,14 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                         size="sm"
                         disabled={loadArtifact.isPending}
                         onClick={(): void => {
-                          // Resend this SAME load key (never a fresh one):
-                          // the server replays the same operation rather
-                          // than starting a second commit (finding 1).
-                          if (loadKey !== undefined && job.data?.artifact_id) {
-                            submitLoad(loadKey, jobId, job.data.artifact_id);
+                          // Resend this SAME {key, artifactRef, then}
+                          // snapshot verbatim (never rebuilt from the live
+                          // draft): the server replays the same operation
+                          // rather than starting a second commit, and never
+                          // rejects it for a `then` that no longer matches
+                          // (finding 1).
+                          if (loadAttempt !== undefined) {
+                            submitLoad(loadAttempt);
                           }
                         }}
                       >
@@ -1105,17 +1190,48 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
             <Trans>Close</Trans>
           </Button>
           {jobId === undefined && createCapture.isError ? (
-            // The POST failed or its response was lost: offer the SAME
-            // attempt's key+body as a Retry (finding 2), never a fresh
-            // Capture that would mint a new key and risk a duplicate job.
-            <Button type="button" disabled={submitting} onClick={retrySubmit}>
-              {submitting ? <Loader2 className="mr-2 size-4 animate-spin" aria-hidden="true" /> : null}
-              <Trans>Retry</Trans>
-            </Button>
+            // The POST failed or its response was lost (finding 2 & 3): a
+            // definite 4xx (e.g. a 422 on an invalid field) means the
+            // server did NOT admit the job, so resending the identical
+            // body can only fail again — "Start new capture" with the
+            // corrected draft is the one that can succeed, and is offered
+            // first/emphasised for that case. "Retry same request" resends
+            // the IDENTICAL {key, body} pair (never a fresh key, which
+            // would risk a duplicate job for a lost-but-admitted POST) and
+            // is gated on terms still being accepted right now (finding 2:
+            // unchecking terms after the error must not let a stale
+            // `terms.accepted: true` go out via Retry).
+            <>
+              {!isDefiniteRejection(createCapture.error) ? (
+                <p className="text-xs text-muted-foreground">
+                  <Trans>
+                    The previous request's outcome may be unknown (a network
+                    error) — "Retry same request" resends it unchanged.
+                  </Trans>
+                </p>
+              ) : null}
+              <Button
+                type="button"
+                variant="outline"
+                disabled={submitting || !termsAccepted}
+                onClick={retrySubmit}
+              >
+                {submitting ? <Loader2 className="mr-2 size-4 animate-spin" aria-hidden="true" /> : null}
+                <Trans>Retry same request</Trans>
+              </Button>
+              <Button
+                type="button"
+                disabled={!termsAccepted || !capsAvailable || submitting || frameCapExceeded || draftInvalid}
+                onClick={startNewCapture}
+              >
+                {submitting ? <Loader2 className="mr-2 size-4 animate-spin" aria-hidden="true" /> : null}
+                <Trans>Start new capture</Trans>
+              </Button>
+            </>
           ) : jobId === undefined || (terminalCaptureState && jobState !== 'succeeded') ? (
             <Button
               type="button"
-              disabled={!termsAccepted || !capsAvailable || submitting || frameCapExceeded}
+              disabled={!termsAccepted || !capsAvailable || submitting || frameCapExceeded || draftInvalid}
               onClick={jobId === undefined ? submit : recapture}
             >
               {submitting ? <Loader2 className="mr-2 size-4 animate-spin" aria-hidden="true" /> : null}

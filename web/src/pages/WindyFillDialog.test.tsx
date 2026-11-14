@@ -557,7 +557,7 @@ describe('WindyFillDialog', () => {
     expect(screen.getByText(/Premium Windy capture is not configured/i)).toBeInTheDocument();
   });
 
-  it('a lost capture-create response (network error) offers Retry, which resends the SAME key+body', async () => {
+  it('a lost capture-create response (network error) offers "Retry same request", which resends the SAME key+body', async () => {
     let postCalls = 0;
     const keysSeen: (string | null)[] = [];
     const bodiesSeen: unknown[] = [];
@@ -585,7 +585,7 @@ describe('WindyFillDialog', () => {
     await userEvent.click(screen.getByLabelText(/accept the/i));
     await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
 
-    const retryButton = await screen.findByRole('button', { name: 'Retry' });
+    const retryButton = await screen.findByRole('button', { name: 'Retry same request' });
     await userEvent.click(retryButton);
 
     await waitFor(() => {
@@ -599,18 +599,49 @@ describe('WindyFillDialog', () => {
     expect(bodiesSeen[1]).toEqual(bodiesSeen[0]);
   });
 
-  it('a lost artifact-load response offers Retry load, which resends the SAME load key', async () => {
+  it('finding 2: unchecking terms after a failed POST disables "Retry same request" (no resend)', async () => {
+    let postCalls = 0;
+    server.use(
+      capabilitiesHandler(),
+      http.post('*/api/v1/media/captures', () => {
+        postCalls += 1;
+        return HttpResponse.error();
+      }),
+    );
+
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    const terms = screen.getByLabelText(/accept the/i);
+    await userEvent.click(terms);
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+
+    const retryButton = await screen.findByRole('button', { name: 'Retry same request' });
+    expect(postCalls).toBe(1);
+
+    // Uncheck terms: the Retry button must now be disabled, and clicking it
+    // (even if somehow still enabled) must send no further POST.
+    await userEvent.click(terms);
+    expect(retryButton).toBeDisabled();
+    await userEvent.click(retryButton).catch(() => undefined);
+    expect(postCalls).toBe(1);
+  });
+
+  it('a lost artifact-load response offers "Retry load", which resends the SAME load key AND body', async () => {
     let loadCalls = 0;
     const loadKeysSeen: (string | null)[] = [];
+    const loadBodiesSeen: unknown[] = [];
     server.use(
       capabilitiesHandler(),
       http.post('*/api/v1/media/captures', () =>
         HttpResponse.json({ job_id: 80, status_url: '/api/v1/media/captures/80' }, { status: 202 })),
       http.get('*/api/v1/media/captures/80', () =>
         HttpResponse.json({ job_id: 80, fill_id: 'vt-vt-1-windy', state: 'succeeded', artifact_id: 'art-80' })),
-      http.post('*/api/v1/media/players/vt-1/load', ({ request }) => {
+      http.post('*/api/v1/media/players/vt-1/load', async ({ request }) => {
         loadCalls += 1;
         loadKeysSeen.push(request.headers.get('idempotency-key'));
+        loadBodiesSeen.push(await request.json());
         if (loadCalls === 1) {
           return HttpResponse.error();
         }
@@ -635,9 +666,176 @@ describe('WindyFillDialog', () => {
     });
     expect(loadKeysSeen[1]).toBe(loadKeysSeen[0]);
     expect(loadKeysSeen[0]).toBeTruthy();
+    expect(loadBodiesSeen[1]).toEqual(loadBodiesSeen[0]);
 
     await waitFor(() => {
       expect(screen.getByText(/Completed/)).toBeInTheDocument();
     });
+  });
+
+  it('finding 1: Retry load resends the IDENTICAL body (artifactRef + then) even after Then is changed on the live draft', async () => {
+    let loadCalls = 0;
+    const loadKeysSeen: (string | null)[] = [];
+    const loadBodiesSeen: unknown[] = [];
+    server.use(
+      capabilitiesHandler(),
+      http.post('*/api/v1/media/captures', () =>
+        HttpResponse.json({ job_id: 90, status_url: '/api/v1/media/captures/90' }, { status: 202 })),
+      http.get('*/api/v1/media/captures/90', () =>
+        HttpResponse.json({ job_id: 90, fill_id: 'vt-vt-1-windy', state: 'succeeded', artifact_id: 'art-90' })),
+      http.post('*/api/v1/media/players/vt-1/load', async ({ request }) => {
+        loadCalls += 1;
+        loadKeysSeen.push(request.headers.get('idempotency-key'));
+        loadBodiesSeen.push(await request.json());
+        if (loadCalls === 1) {
+          return HttpResponse.error();
+        }
+        return HttpResponse.json({ operation: 300, state: 'pending' }, { status: 202 });
+      }),
+      http.get('*/api/v1/media/players/vt-1/load-operations/300', () =>
+        HttpResponse.json({ operation: 300, state: 'completed', native: null })),
+    );
+
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    // Default Then is "Play" (resume). Confirm before submitting.
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+
+    const retryLoadButton = await screen.findByRole('button', { name: 'Retry load' });
+
+    // Now change Then to "Cue" on the (still-editable) live draft, AFTER
+    // the capture succeeded and the first load attempt was snapshotted.
+    await userEvent.click(screen.getByRole('combobox', { name: /then/i }));
+    await userEvent.click(screen.getByRole('option', { name: 'Cue' }));
+
+    await userEvent.click(retryLoadButton);
+
+    await waitFor(() => {
+      expect(loadCalls).toBe(2);
+    });
+    // Same key, and the SAME body (including `then`) on the retry — never
+    // rebuilt from the live draft's now-changed Then selector.
+    expect(loadKeysSeen[1]).toBe(loadKeysSeen[0]);
+    expect(loadKeysSeen[0]).toBeTruthy();
+    expect(loadBodiesSeen[1]).toEqual(loadBodiesSeen[0]);
+    expect(loadBodiesSeen[0]).toMatchObject({
+      artifactRef: { captureJobId: 90, artifactId: 'art-90' },
+      then: 'resume',
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/Completed/)).toBeInTheDocument();
+    });
+  });
+
+  it('finding 3: a 422 validation rejection offers "Start new capture", which posts the corrected body with a NEW key', async () => {
+    const keysSeen: (string | null)[] = [];
+    const bodiesSeen: Record<string, unknown>[] = [];
+    let postCalls = 0;
+    server.use(
+      capabilitiesHandler(),
+      // Reject the FIRST submission unconditionally with a definite 422
+      // (standing in for any server-side validation/conflict rejection the
+      // client's own range checks do not catch, e.g. a combination the
+      // server rejects); accept the second.
+      http.post('*/api/v1/media/captures', async ({ request }) => {
+        postCalls += 1;
+        keysSeen.push(request.headers.get('idempotency-key'));
+        bodiesSeen.push((await request.json()) as Record<string, unknown>);
+        if (postCalls === 1) {
+          return HttpResponse.json(
+            { status: 422, title: 'Invalid view', detail: 'fps must be 1..30' },
+            { status: 422 },
+          );
+        }
+        return HttpResponse.json({ job_id: 95, status_url: '/api/v1/media/captures/95' }, { status: 202 });
+      }),
+      http.get('*/api/v1/media/captures/95', () =>
+        HttpResponse.json({ job_id: 95, fill_id: 'vt-vt-1-windy', state: 'queued' })),
+    );
+
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/fps must be 1\.\.30/i)).toBeInTheDocument();
+    });
+
+    // Both actions are offered; "Start new capture" is used here with a
+    // corrected fps (changed from the default 10 to a different valid
+    // value, so the resent body differs from the rejected one).
+    expect(screen.getByRole('button', { name: 'Retry same request' })).toBeInTheDocument();
+    const startNewButton = screen.getByRole('button', { name: 'Start new capture' });
+
+    const fps = screen.getByLabelText(/^fps$/i);
+    await userEvent.clear(fps);
+    await userEvent.type(fps, '20');
+
+    await userEvent.click(startNewButton);
+
+    await waitFor(() => {
+      expect(postCalls).toBe(2);
+    });
+    // A NEW key, and the corrected body (fps: 20, not the rejected value).
+    expect(keysSeen[1]).not.toBe(keysSeen[0]);
+    expect(keysSeen[1]).toBeTruthy();
+    expect((bodiesSeen[1]?.view as Record<string, unknown> | undefined)?.fps).toBe(20);
+    expect(bodiesSeen[1]).not.toEqual(bodiesSeen[0]);
+  });
+
+  it('finding 3: client-side validation blocks submit for out-of-range fps/zoom/lat/lon', async () => {
+    server.use(capabilitiesHandler());
+    renderDialog();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+
+    const captureButton = screen.getByRole('button', { name: 'Capture' });
+    expect(captureButton).toBeEnabled();
+
+    const fps = screen.getByLabelText(/^fps$/i);
+    await userEvent.clear(fps);
+    await userEvent.type(fps, '0');
+    expect(captureButton).toBeDisabled();
+
+    await userEvent.clear(fps);
+    await userEvent.type(fps, '31');
+    expect(captureButton).toBeDisabled();
+
+    await userEvent.clear(fps);
+    await userEvent.type(fps, '10');
+    expect(captureButton).toBeEnabled();
+
+    const zoom = screen.getByLabelText(/zoom/i);
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, '19');
+    expect(captureButton).toBeDisabled();
+
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, '10');
+    expect(captureButton).toBeEnabled();
+
+    const lat = screen.getByLabelText(/latitude/i);
+    await userEvent.clear(lat);
+    await userEvent.type(lat, '95');
+    expect(captureButton).toBeDisabled();
+
+    await userEvent.clear(lat);
+    await userEvent.type(lat, '-33.87');
+    expect(captureButton).toBeEnabled();
+
+    const lon = screen.getByLabelText(/longitude/i);
+    await userEvent.clear(lon);
+    await userEvent.type(lon, '-181');
+    expect(captureButton).toBeDisabled();
   });
 });
