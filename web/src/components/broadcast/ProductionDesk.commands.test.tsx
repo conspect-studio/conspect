@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../realtime/shared', () => ({ subscribeRealtime: () => () => undefined }));
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
@@ -359,5 +359,49 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     await waitFor(() => { expect(commandCount).toBe(1); });
     expect(bodies[0]).toMatchObject({ action: 'set_transition', transition: { kind: 'wipe', pattern: 'box', rate: 30, reverse: false, softness: 0.4, border_width: 0, position_xy: [0.2, 0.8], flip_flop: false } });
     expect(bodies[0]).not.toHaveProperty('transition.border_color');
+  });
+
+  // P3R2-A: a positive-width wipe without a border colour draws no border; editing
+  // only Reverse must not invent a white border colour for later AUTOs.
+  it('keeps border_color absent for a colourless positive-width wipe when only Reverse changes', async () => {
+    const selection: Record<string, unknown> = { kind: 'wipe', pattern: 'box', rate: 30, reverse: false, softness: 0, border_width: 0.05 };
+    const bodies: unknown[] = [];
+    server.use(
+      http.get('*/api/v1/switcher/me1', () => { polls += 1; return HttpResponse.json({ ...state, tick: state.tick + polls, transition: selection }); }),
+      http.post('*/api/v1/switcher/plan', () => HttpResponse.json({ can_take: true, class: 'class1', scene_version: 1 })),
+      http.post('*/api/v1/switcher/commands/set_transition', async ({ request }) => { bodies.push(await request.json()); commandCount += 1; return HttpResponse.json({ operation_id: 'op-t', kind: 'set_transition' }, { status: 202 }); }),
+    );
+    page();
+    await waitFor(() => { expect(screen.getByRole('slider', { name: 'Wipe border width' })).toHaveValue('0.05'); }, { timeout: 6000 });
+    const reverse = screen.getByRole('checkbox', { name: 'Reverse' });
+    await waitFor(() => { expect(reverse).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(reverse);
+    const apply = screen.getByRole('button', { name: 'Apply to WIPE' });
+    await waitFor(() => { expect(apply).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(apply);
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(bodies[0]).toMatchObject({ action: 'set_transition', transition: { kind: 'wipe', pattern: 'box', reverse: true, border_width: 0.05 } });
+    expect(bodies[0]).not.toHaveProperty('transition.border_color');
+  });
+
+  // P3R2-A: an explicit border colour edit is still sent.
+  it('sends border_color once the operator sets it on a colourless positive-width wipe', async () => {
+    const selection: Record<string, unknown> = { kind: 'wipe', pattern: 'box', rate: 30, reverse: false, softness: 0, border_width: 0.05 };
+    const bodies: unknown[] = [];
+    server.use(
+      http.get('*/api/v1/switcher/me1', () => { polls += 1; return HttpResponse.json({ ...state, tick: state.tick + polls, transition: selection }); }),
+      http.post('*/api/v1/switcher/plan', () => HttpResponse.json({ can_take: true, class: 'class1', scene_version: 1 })),
+      http.post('*/api/v1/switcher/commands/set_transition', async ({ request }) => { bodies.push(await request.json()); commandCount += 1; return HttpResponse.json({ operation_id: 'op-t', kind: 'set_transition' }, { status: 202 }); }),
+    );
+    page();
+    await waitFor(() => { expect(screen.getByRole('slider', { name: 'Wipe border width' })).toHaveValue('0.05'); }, { timeout: 6000 });
+    const colour = screen.getByLabelText('Wipe border colour');
+    await waitFor(() => { expect(colour).not.toBeDisabled(); }, { timeout: 6000 });
+    fireEvent.input(colour, { target: { value: '#ff0000' } });
+    const apply = screen.getByRole('button', { name: 'Apply to WIPE' });
+    await waitFor(() => { expect(apply).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(apply);
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(bodies[0]).toMatchObject({ action: 'set_transition', transition: { kind: 'wipe', border_width: 0.05, border_color: '#ff0000' } });
   });
 });

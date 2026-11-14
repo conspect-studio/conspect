@@ -119,8 +119,14 @@ function SourcePicture({ id, demand }: { readonly id: string; readonly demand: S
 
 type TransitionKind = 'mix' | 'wipe' | 'dip';
 /** Desk-side draft of the transition parameters; the engine's selection is the truth. */
-interface TransitionDraft { readonly pattern: WipePattern; readonly reverse: boolean; readonly softness: number; readonly borderWidth: number; readonly borderColor: string; readonly dipColor: string }
-const DEFAULT_DRAFT: TransitionDraft = { pattern: 'linear_edge', reverse: false, softness: 0, borderWidth: 0, borderColor: '#ffffff', dipColor: '#000000' };
+/**
+ * `borderColor` is absent while neither the selection nor the operator set one: a
+ * positive-width band without a colour draws nothing, and the desk must not invent one.
+ */
+interface TransitionDraft { readonly pattern: WipePattern; readonly reverse: boolean; readonly softness: number; readonly borderWidth: number; readonly borderColor?: string; readonly dipColor: string }
+const DEFAULT_DRAFT: TransitionDraft = { pattern: 'linear_edge', reverse: false, softness: 0, borderWidth: 0, dipColor: '#000000' };
+/** What the colour picker shows (and what a border-control edit adopts) when no colour is set. */
+const DEFAULT_BORDER_COLOR = '#ffffff';
 
 function isWipePattern(pattern: string): pattern is WipePattern {
   return (WIPE_PATTERNS as readonly string[]).includes(pattern);
@@ -167,8 +173,9 @@ function transitionDescriptor(kind: TransitionKind, draft: TransitionDraft, rate
   if (kind === 'mix') return { kind: 'mix', rate };
   if (kind === 'dip') return { ...(confirmed?.kind === 'dip' ? confirmed : {}), kind: 'dip', rate: Math.max(2, rate), color: draft.dipColor };
   const wipe: TransitionDescriptor = { ...(confirmed?.kind === 'wipe' ? confirmed : {}), kind: 'wipe', pattern: draft.pattern, rate, reverse: draft.reverse, softness: draft.softness, border_width: draft.borderWidth };
-  // No band: drop a confirmed border colour rather than send a stale one.
-  if (draft.borderWidth > 0) return { ...wipe, border_color: draft.borderColor };
+  // No band: drop a confirmed border colour rather than send a stale one. A band
+  // keeps the colour only when the selection or the operator set one (P3R2-A).
+  if (draft.borderWidth > 0 && draft.borderColor !== undefined) return { ...wipe, border_color: draft.borderColor };
   delete wipe.border_color;
   return wipe;
 }
@@ -322,8 +329,8 @@ function ProductionDeskBody(): JSX.Element {
             <div className="bd-wipe-preview" data-testid="transition-preview"><WipeThumbnail pattern={draft.pattern} reverse={draft.reverse} label={t`Preview of ${patternName(draft.pattern)} at 50%`} /></div>
             <label><input type="checkbox" checked={draft.reverse} onChange={(e) => { setDraft({ ...draft, reverse: e.target.checked }); }} /><Trans>Reverse</Trans></label>
             <label><Trans>Softness</Trans><input type="range" aria-label={t`Wipe softness`} min="0" max="0.5" step="0.01" value={draft.softness} onChange={(e) => { setDraft({ ...draft, softness: Number(e.target.value) }); }} /></label>
-            <label><Trans>Border width</Trans><input type="range" aria-label={t`Wipe border width`} min="0" max="0.2" step="0.005" value={draft.borderWidth} onChange={(e) => { setDraft({ ...draft, borderWidth: Number(e.target.value) }); }} /></label>
-            <label><Trans>Border colour</Trans><input type="color" aria-label={t`Wipe border colour`} value={draft.borderColor} onChange={(e) => { setDraft({ ...draft, borderColor: e.target.value }); }} /></label>
+            <label><Trans>Border width</Trans><input type="range" aria-label={t`Wipe border width`} min="0" max="0.2" step="0.005" value={draft.borderWidth} onChange={(e) => { setDraft({ ...draft, borderWidth: Number(e.target.value), borderColor: draft.borderColor ?? DEFAULT_BORDER_COLOR }); }} /></label>
+            <label><Trans>Border colour</Trans><input type="color" aria-label={t`Wipe border colour`} value={draft.borderColor ?? DEFAULT_BORDER_COLOR} onChange={(e) => { setDraft({ ...draft, borderColor: e.target.value }); }} /></label>
             <label><Trans>Dip colour</Trans><input type="color" aria-label={t`Dip colour`} value={draft.dipColor} onChange={(e) => { setDraft({ ...draft, dipColor: e.target.value }); }} /></label>
             <button type="button" className="bd-apply-transition" onClick={() => { select(kind); }}><Trans>Apply to {kindLabel}</Trans></button>
           </fieldset>
