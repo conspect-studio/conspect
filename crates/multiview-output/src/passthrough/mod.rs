@@ -21,4 +21,4 @@ pub use clock::{
     SlateLoop, SlotGate,
 };
 pub use match_rules::{evaluate, MatchMiss, SlotSpec, SourceTraits, StreamMeter};
-pub use tap::{CompressedTap, TapAu, TapReader, MAX_TAP_CONSUMERS, TAP_CAPACITY};
+pub use tap::{CompressedTap, TapAu, TapReader, MAX_AU_BYTES, MAX_TAP_CONSUMERS, TAP_CAPACITY};

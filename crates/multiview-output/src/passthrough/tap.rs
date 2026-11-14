@@ -15,10 +15,17 @@
 //! * The writer only ever `try_send`s. A full consumer channel drops the AU
 //!   **for that consumer only** and counts it ([`CompressedTap::dropped`]);
 //!   the writer never waits for a reader.
-//! * The clock side only ever `try_recv`s ([`TapReader::try_recv`]); it never
-//!   takes the sender-list mutex. That mutex is taken only by the writer
-//!   (`offer`) and by `subscribe` / reader drop (control-plane events), so a
-//!   clock thread can never contend on it.
+//! * The clock side only ever `try_recv`s ([`TapReader::try_recv`]) and never
+//!   takes the sender-list mutex, not even when its reader is dropped: `Drop`
+//!   only clears the reader's `alive` flag and decrements the consumer count;
+//!   the dead sender is pruned later by the writer (on `Disconnected`) or by
+//!   the next `subscribe`.
+//! * The writer only ever `try_lock`s the sender list. When `subscribe` (a
+//!   control-plane event, which builds its channel before locking) holds it,
+//!   the AU is dropped for every consumer and counted
+//!   ([`CompressedTap::contended`]); the ingest thread never waits.
+//! * An AU larger than [`MAX_AU_BYTES`] is dropped and counted
+//!   ([`CompressedTap::oversize`]); callers check the size before copying.
 //! * With no consumer, [`CompressedTap::has_consumers`] is a single atomic load
 //!   and [`CompressedTap::offer`] returns before touching anything, so the
 //!   ingest side can skip even building the [`TapAu`] (copying the bytes).
@@ -31,9 +38,9 @@
 //! harmless. The drop-**oldest** bound the design names is the clock's jitter
 //! buffer (8 ticks, [`super::clock`]), which is where real jitter is absorbed.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use multiview_core::time::Rational;
 
@@ -42,6 +49,11 @@ pub const TAP_CAPACITY: usize = 64;
 
 /// Maximum number of simultaneous consumers of one source's tap.
 pub const MAX_TAP_CONSUMERS: usize = 8;
+
+/// Largest access unit the tap carries (8 MiB). The ingest side checks a
+/// packet against it before copying; [`CompressedTap::offer`] drops (and
+/// counts) anything larger.
+pub const MAX_AU_BYTES: usize = 8 * 1024 * 1024;
 
 /// One coded access unit as the ingest side hands it to passthrough.
 ///
@@ -72,8 +84,9 @@ pub struct TapAu {
 
 /// One registered consumer: its id and the sending half of its channel.
 struct Consumer {
-    id: u64,
     tx: SyncSender<TapAu>,
+    /// Cleared by the reader's `Drop` (which never locks).
+    alive: Arc<AtomicBool>,
 }
 
 /// State shared between the tap and its readers.
@@ -82,10 +95,12 @@ struct TapShared {
     consumers: AtomicUsize,
     /// The per-consumer senders. Taken by the writer and (un)subscribe only.
     senders: Mutex<Vec<Consumer>>,
-    /// Monotonic id source for consumers.
-    next_id: AtomicU64,
     /// AUs dropped because a consumer's channel was full.
     dropped: AtomicU64,
+    /// AUs dropped because the sender list was locked by `subscribe`.
+    contended: AtomicU64,
+    /// AUs dropped because they exceeded [`MAX_AU_BYTES`].
+    oversize: AtomicU64,
 }
 
 impl TapShared {
@@ -126,8 +141,9 @@ impl CompressedTap {
             shared: Arc::new(TapShared {
                 consumers: AtomicUsize::new(0),
                 senders: Mutex::new(Vec::with_capacity(MAX_TAP_CONSUMERS)),
-                next_id: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
+                contended: AtomicU64::new(0),
+                oversize: AtomicU64::new(0),
             }),
         }
     }
@@ -151,45 +167,76 @@ impl CompressedTap {
         self.shared.dropped.load(Ordering::Relaxed)
     }
 
+    /// AUs dropped because the writer found the sender list locked.
+    #[must_use]
+    pub fn contended(&self) -> u64 {
+        self.shared.contended.load(Ordering::Relaxed)
+    }
+
+    /// AUs dropped because they exceeded [`MAX_AU_BYTES`].
+    #[must_use]
+    pub fn oversize(&self) -> u64 {
+        self.shared.oversize.load(Ordering::Relaxed)
+    }
+
     /// Offer one AU to every consumer. Never blocks: with no consumer it returns
-    /// at once; a full consumer channel drops this AU for that consumer and
-    /// counts it.
+    /// at once; an AU over [`MAX_AU_BYTES`] is dropped and counted; a locked
+    /// sender list (a concurrent `subscribe`) drops the AU and counts it; a
+    /// full consumer channel drops this AU for that consumer and counts it; a
+    /// disconnected consumer is pruned.
     pub fn offer(&self, au: TapAu) {
         if !self.has_consumers() {
             return;
         }
-        let senders = self.shared.lock();
-        let Some((last, rest)) = senders.split_last() else {
+        if au.data.len() > MAX_AU_BYTES {
+            self.shared.oversize.fetch_add(1, Ordering::Relaxed);
             return;
-        };
-        for consumer in rest {
-            self.send_one(&consumer.tx, au.clone());
         }
-        self.send_one(&last.tx, au);
-    }
-
-    fn send_one(&self, tx: &SyncSender<TapAu>, au: TapAu) {
-        // A disconnected reader is being dropped; its guard removes the sender.
-        if let Err(TrySendError::Full(_)) = tx.try_send(au) {
-            self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+        let mut senders = match self.shared.senders.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                self.shared.contended.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let mut disconnected = false;
+        for consumer in senders.iter() {
+            // An `Arc` clone of the bytes, never a copy.
+            match consumer.tx.try_send(au.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(TrySendError::Disconnected(_)) => disconnected = true,
+            }
+        }
+        if disconnected {
+            senders.retain(|c| c.alive.load(Ordering::Acquire));
         }
     }
 
     /// Register a new consumer. Returns `None` when [`MAX_TAP_CONSUMERS`]
-    /// readers already exist.
+    /// readers already exist. The channel is built before the lock is taken,
+    /// and dead senders are pruned under it.
     #[must_use]
     pub fn subscribe(&self) -> Option<TapReader> {
+        let (tx, rx) = mpsc::sync_channel(TAP_CAPACITY);
+        let alive = Arc::new(AtomicBool::new(true));
         let mut senders = self.shared.lock();
+        senders.retain(|c| c.alive.load(Ordering::Acquire));
         if senders.len() >= MAX_TAP_CONSUMERS {
             return None;
         }
-        let (tx, rx) = mpsc::sync_channel(TAP_CAPACITY);
-        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        senders.push(Consumer { id, tx });
+        senders.push(Consumer {
+            tx,
+            alive: Arc::clone(&alive),
+        });
         self.shared.consumers.fetch_add(1, Ordering::AcqRel);
+        drop(senders);
         Some(TapReader {
             rx,
-            id,
+            alive,
             shared: Arc::clone(&self.shared),
         })
     }
@@ -198,15 +245,13 @@ impl CompressedTap {
 /// One consumer's read handle. Dropping it unsubscribes.
 pub struct TapReader {
     rx: Receiver<TapAu>,
-    id: u64,
+    alive: Arc<AtomicBool>,
     shared: Arc<TapShared>,
 }
 
 impl std::fmt::Debug for TapReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TapReader")
-            .field("id", &self.id)
-            .finish_non_exhaustive()
+        f.debug_struct("TapReader").finish_non_exhaustive()
     }
 }
 
@@ -225,11 +270,9 @@ impl TapReader {
 }
 
 impl Drop for TapReader {
+    /// Never locks: the sender is pruned by the writer or the next subscribe.
     fn drop(&mut self) {
-        let mut senders = self.shared.lock();
-        let before = senders.len();
-        senders.retain(|c| c.id != self.id);
-        if senders.len() != before {
+        if self.alive.swap(false, Ordering::AcqRel) {
             self.shared.consumers.fetch_sub(1, Ordering::AcqRel);
         }
     }
@@ -331,5 +374,70 @@ mod tests {
         tap.offer(x);
         assert_eq!(Arc::as_ptr(&a.try_recv().unwrap().data), ptr);
         assert_eq!(Arc::as_ptr(&b.try_recv().unwrap().data), ptr);
+    }
+
+    #[test]
+    fn the_writer_never_waits_for_a_held_sender_lock() {
+        let tap = CompressedTap::new();
+        let reader = tap.subscribe().unwrap();
+        // Another thread holds the sender list (a stand-in for a slow subscribe).
+        let shared = Arc::clone(&tap.shared);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = shared.lock();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        for n in 0..100 {
+            tap.offer(au(n));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "offer never waits on the lock"
+        );
+        assert_eq!(tap.contended(), 100);
+        assert!(reader.try_recv().is_none());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        tap.offer(au(100));
+        assert_eq!(reader.try_recv().map(|a| a.dts), Some(100));
+    }
+
+    #[test]
+    fn reader_drop_never_takes_the_lock_and_the_writer_prunes() {
+        let tap = CompressedTap::new();
+        let keep = tap.subscribe().unwrap();
+        let gone = tap.subscribe().unwrap();
+        // Dropping a reader while the lock is held must not block.
+        let guard = tap.shared.lock();
+        drop(gone);
+        drop(guard);
+        assert_eq!(tap.consumer_count(), 1);
+        tap.offer(au(1));
+        assert_eq!(
+            tap.shared.lock().len(),
+            1,
+            "the writer pruned the dead sender"
+        );
+        assert_eq!(keep.try_recv().map(|a| a.dts), Some(1));
+        assert_eq!(tap.dropped(), 0);
+    }
+
+    #[test]
+    fn an_oversize_au_is_dropped_and_counted() {
+        let tap = CompressedTap::new();
+        let reader = tap.subscribe().unwrap();
+        let mut big = au(0);
+        big.data = Arc::from(vec![0_u8; MAX_AU_BYTES + 1]);
+        tap.offer(big);
+        assert_eq!(tap.oversize(), 1);
+        assert!(reader.try_recv().is_none());
+        let mut ok = au(1);
+        ok.data = Arc::from(vec![0_u8; MAX_AU_BYTES]);
+        tap.offer(ok);
+        assert!(reader.try_recv().is_some());
     }
 }
