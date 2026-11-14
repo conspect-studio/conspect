@@ -20751,7 +20751,7 @@
         }
       },
       "PatchPlanResponseDoc": {
-        "oneOf": [
+        "anyOf": [
           {
             "$ref": "#/components/schemas/PatchPlan"
           },

@@ -199,8 +199,13 @@ pub struct PatchPlanResponseDoc;
 #[cfg(feature = "openapi")]
 impl utoipa::PartialSchema for PatchPlanResponseDoc {
     fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
-        use utoipa::openapi::schema::{OneOfBuilder, Ref};
-        OneOfBuilder::new()
+        // `anyOf`, not `oneOf`: `SetPlan` flattens `PatchPlan` plus `set`, so
+        // every `SetPlan` instance also matches the `PatchPlan` schema (which
+        // has no `additionalProperties: false`). `oneOf` requires exactly one
+        // match and would reject every genuine `SetPlan` response (#308
+        // review A5).
+        use utoipa::openapi::schema::{AnyOfBuilder, Ref};
+        AnyOfBuilder::new()
             .item(Ref::from_schema_name("PatchPlan"))
             .item(Ref::from_schema_name("SetPlan"))
             .description(Some(
