@@ -1087,7 +1087,13 @@ the bounds and their tests); the wiring PR puts it on the front door.
   there is no prober until slice 9; `[network] alt_svc` is the manual gate. (5) The chaos test
   does not assert a lateness percentile (issue #321 retired that class): measured with 20
   parallel copies, the hammer's p99 rose up to 15 ms over idle while every tick was emitted on
-  time-stamped cadence with 0 repeats.
+  time-stamped cadence with 0 repeats. (6) Issue #403: `h3` 0.0.8 is no longer used unmodified;
+  it is vendored at `vendor/h3` with a fix for a peer-reachable panic (a DATA frame truncated by
+  FIN asserted on the trailers poll), and the server contains any remaining panic per request
+  task (`Counters::request_panics`) and per connection task (`Counters::connection_panics`)
+  without touching other connections (`crates/multiview-h3/tests/panic_isolation.rs`,
+  `crates/multiview-h3/PROVENANCE.md`). The h3 path runs on the front-door runtime, never on the
+  engine's output clock thread, so invariants #1/#10 are unaffected.
 * **Tests.** `multiview-moq` (claim cap/reuse/release, PEM loader checks); `multiview-control`
   `tests/h3_site.rs` (router over h3 with `ConnectInfo`, `/api/v1/ws` `4xx`, `503` after
   shutdown, `501` without a handler; `MoQ` over h3 with moq-tokio's own WebTransport client: an

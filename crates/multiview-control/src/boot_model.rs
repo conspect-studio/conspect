@@ -188,13 +188,16 @@ impl DesiredState {
 ///
 /// # Errors
 /// [`ControlError::NotAdmissibleWithSwitcher`] when the declared switcher M/E
-/// cannot drive the canvas; [`ControlError::Validation`] when it does not solve.
+/// cannot carry the document (overlays); [`ControlError::Validation`] when it
+/// does not solve. A multi-cell canvas with a switcher is admissible (#307):
+/// the Program canvas is the synthesized one-cell M/E bus.
 pub fn admit_for_boot(config: &MultiviewConfig) -> ControlResult<()> {
     let solved = config
         .solve_layout()
         .map_err(|e| ControlError::Validation(format!("desired configuration: {e}")))?;
     config
-        .switcher_canvas_admission(&solved)
+        .program_canvas(solved)
+        .map(|_| ())
         .map_err(ControlError::NotAdmissibleWithSwitcher)
     // `outputs_carry_program` is deliberately not checked here: start-up
     // builds the accepted document with the boot file's restart-only sections

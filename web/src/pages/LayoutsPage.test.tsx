@@ -1,7 +1,8 @@
-// #317: the Layouts page "Apply" with a switcher M/E declared. Where the page
-// can know in advance (switcher on, layout has more than one cell) Apply is
+// #317/#307: the Layouts page "Apply" with a switcher M/E declared. The page
+// knows in advance that the Program canvas is the M/E bus, so Apply is
 // disabled with the reason shown in text; when the server refuses with the
-// typed problem, the refusal and its reason are rendered, not a generic error.
+// typed problem anyway, the refusal and its reason are rendered, not a
+// generic error.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../realtime/shared', () => ({ subscribeRealtime: () => () => undefined }));
@@ -38,10 +39,10 @@ const server = setupServer(
   http.post('*/api/v1/commands/apply-layout', async ({ request }) => {
     applied.push(await request.json());
     return HttpResponse.json({
-      type: '/problems/layout-not-admissible-with-switcher',
-      title: 'Not admissible while the switcher is on',
+      type: '/problems/switcher-owns-program',
+      title: 'The switcher owns the Program canvas',
       status: 422,
-      detail: 'The switcher is on: the Program cell must be bound to the M/E program source "cam-1" (it is bound to "cam-2").',
+      detail: 'The switcher is on: the Program canvas is the M/E bus, so layout "single" cannot replace it.',
     }, { status: 422 });
   }),
 );
@@ -64,16 +65,21 @@ function applyButton(name: string): HTMLButtonElement {
   return screen.getByRole('button', { name: `Apply layout to engine: ${name}` });
 }
 
-describe('LayoutsPage Apply with the switcher on (#317)', () => {
-  it('disables Apply for a multi-cell layout and shows the reason in text', async () => {
+describe('LayoutsPage Apply with the switcher on (#307)', () => {
+  it('disables Apply for every layout and shows the reason in text', async () => {
     page();
     await screen.findByText('NewsOne');
     await waitFor(() => { expect(applyButton('NewsOne').disabled).toBe(true); });
     expect(applyButton('NewsOne').getAttribute('data-testid')).toBe('layout-apply-blocked-by-switcher');
-    const reason = screen.getByTestId('layout-apply-blocked-reason');
-    expect(reason.textContent).toContain('The switcher is on: a multi-cell layout cannot be the Program canvas.');
-    expect(applyButton('NewsOne').getAttribute('aria-describedby')).toBe(reason.id);
-    expect(applyButton('Single').disabled).toBe(false);
+    const reasons = screen.getAllByTestId('layout-apply-blocked-reason');
+    const reason = reasons.find((r) => r.id === applyButton('NewsOne').getAttribute('aria-describedby'));
+    expect(reason?.textContent).toContain('The switcher is on: Program is the M/E bus.');
+    // Layout-to-output takes live on the Outputs page (#307 review M2).
+    expect(reason?.textContent).toContain('Take this layout to an output from Outputs.');
+    expect(reason?.textContent).not.toContain('Routing');
+    const link = reason?.querySelector('a');
+    expect(link?.getAttribute('href')).toBe('/outputs');
+    expect(applyButton('Single').disabled).toBe(true);
   });
 
   it('keeps Apply enabled for a multi-cell layout when no switcher is declared', async () => {
@@ -85,13 +91,17 @@ describe('LayoutsPage Apply with the switcher on (#317)', () => {
   });
 
   it('renders the typed server refusal with its reason, not a generic failure', async () => {
+    // The switcher is turned on after the page loaded without it (stale page):
+    // the server is authoritative and its typed refusal is rendered.
+    switcherOn = false;
     page();
     await screen.findByText('Single');
+    await waitFor(() => { expect(applyButton('Single').disabled).toBe(false); });
     await userEvent.click(applyButton('Single'));
     await waitFor(() => { expect(applied).toEqual([{ layout: 'single' }]); });
     const title = await screen.findByText('Layout not applied: the switcher is on');
     const toast = title.closest('li') ?? document.body;
-    expect(within(toast).getByText(/must be bound to the M\/E program source/).textContent)
+    expect(within(toast).getByText(/Program canvas is the M\/E bus/).textContent)
       .toContain('Nothing was changed; the current layout keeps running.');
     expect(screen.queryByText('Could not apply layout')).toBeNull();
   });

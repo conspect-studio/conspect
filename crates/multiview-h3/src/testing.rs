@@ -423,4 +423,29 @@ mod tests {
         close.extend(crate::capsule::encode_close(9, "done"));
         capsule(&close);
     }
+
+    /// Issue #403: the CI fuzzer's `h3_request` crash input. A GET whose
+    /// HEADERS are followed by a DATA frame declaring 22 bytes and then FIN:
+    /// h3 0.0.8 returned "no more data" with the payload still owed, and the
+    /// trailers poll asserted (`frame.rs:57`). It must end the body with an
+    /// error, never panic.
+    #[test]
+    fn issue_403_truncated_data_frame_does_not_panic() {
+        // base64 `JAEI+/dQATjR9/EAFg==` (also fuzz/regressions/h3_request).
+        let repro: [u8; 13] = [
+            0x24, 0x01, 0x08, 0xfb, 0xf7, 0x50, 0x01, 0x38, 0xd1, 0xf7, 0xf1, 0x00, 0x16,
+        ];
+        h3_request(&repro);
+        // The resolved request's body yields no data (it errors).
+        assert_eq!(h3_request_body_len(&repro), Some(0));
+
+        // The same shape on a well-formed GET: a DATA frame cut short after
+        // some payload, and one with no payload at all, each then FIN.
+        for tail in [&[0x00, 0x05, b'a', b'b'][..], &[0x00, 0x16][..]] {
+            let mut get = vec![9u8, 0x01, 0x10, 0x00, 0x00, 0xd1, 0xd7, 0xc1, 0x50, 9];
+            get.extend_from_slice(b"localhost");
+            get.extend_from_slice(tail);
+            h3_request(&get);
+        }
+    }
 }

@@ -4,11 +4,14 @@ moq-tokio = { path = "vendor/moq-tokio" }
 moq-net = { path = "vendor/moq-net" }
 web-transport-moq = { path = "vendor/web-transport-moq" }
 rustls-platform-verifier = { path = "vendor/rustls-platform-verifier" }
+# hyperium h3 0.0.8 with the issue #403 fix (no panic on a truncated DATA
+# frame); see crates/multiview-h3/PROVENANCE.md.
+h3 = { path = "vendor/h3" }
 
 [workspace]
 resolver = "2"
 members = ["crates/*", "xtask"]
-exclude = ["vendor/moq-net", "vendor/web-transport-moq", "vendor/web-transport-trait", "vendor/moq-tokio", "crates/multiview-h3/fuzz"]
+exclude = ["vendor/moq-net", "vendor/web-transport-moq", "vendor/web-transport-trait", "vendor/moq-tokio", "crates/multiview-h3/fuzz", "vendor/h3"]
 
 [workspace.package]
 version = "0.1.0"

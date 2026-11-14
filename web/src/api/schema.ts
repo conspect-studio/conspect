@@ -481,6 +481,12 @@ export interface paths {
          *     releases the key. The submit mirrors [`cmd_swap`] (shed-on-full) and never
          *     blocks the engine (invariant #10); the outcome rides the realtime stream
          *     as a `job.progress` event (ADR-W008).
+         *
+         *     #307: with a switcher M/E declared the Program canvas is the M/E bus, so a
+         *     request without `target` answers `422 switcher-owns-program` BEFORE any
+         *     idempotency reservation (the key stays free). With `target: {output}` the
+         *     request is an output take of the layout (`take_output_as`, the same code
+         *     path as `POST /routing/output/take`).
          */
         post: operations["cmd_apply_layout"];
         delete?: never;
@@ -4013,6 +4019,12 @@ export interface components {
         ApplyLayoutRequest: {
             /** @description The layout id to make active on the running multiview. */
             layout: string;
+            target?: null | components["schemas"]["ApplyLayoutTarget"];
+        };
+        /** @description Where `apply-layout` sends the layout when `target` is present (#307). */
+        ApplyLayoutTarget: {
+            /** @description The output API id (the id `/api/v1/outputs/{id}` addresses). */
+            output: string;
         };
         /** @description Exact immutable completed capture selector; no path or owner override. */
         ArtifactRef: {
@@ -7392,6 +7404,17 @@ export interface components {
             bucket_edges_ms: number[];
             /** @description Cumulative per-bucket counts (edges, then overflow). */
             buckets_total: number[];
+            /**
+             * Format: int64
+             * @description Ticks whose GPU readback missed its deadline since the run started,
+             *     re-emitted as last-good (also counted in `frames_repeated_total`).
+             */
+            compose_deadline_misses_total: number;
+            /**
+             * Format: int64
+             * @description GPU readback deadline misses in the window.
+             */
+            compose_deadline_misses_window: number;
             /** @description Fresh-tick work: `before_compose` through `publish_state` (#311). */
             compose_duration: components["schemas"]["PhaseHistogram"];
             /** @description `compose_duration` split into its four parts. */
@@ -10876,8 +10899,35 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), the running canvas is unknown (no seeded snapshot — the gate fails closed), or a switcher M/E is declared and the layout is not one full-canvas cell bound to its program source (type `/problems/layout-not-admissible-with-switcher`; nothing is applied or persisted). */
+            /** @description With `target`: unknown output (as `POST /routing/output/take`). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description With `target`: the output take's 409s (`routing-unavailable`, `output-kind-unroutable`, `capacity`, `aux-capacity`, …). */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and a layout as a switcher source). With `target`: the output take's 422s. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description With `target`: over the output take rate limits; see Retry-After. */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -17692,6 +17742,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description `switcher-owns-program`: a video→cell take while a switcher M/E is declared (Program is the M/E bus and the take would not change the stored layout; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Refused before the Idempotency-Key is reserved. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Engine command bus at capacity; shed. */
             503: {
                 headers: {
@@ -17985,6 +18044,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description `switcher-owns-program`: a switcher M/E is declared and the salvo recalls a layout or cell sources (Program is the M/E bus; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Nothing is queued. A salvo of only tally/UMD recalls is unaffected. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Engine command bus at capacity; shed. */
             503: {
                 headers: {
@@ -18040,6 +18108,15 @@ export interface operations {
             };
             /** @description No salvo with that id. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `switcher-owns-program`: a switcher M/E is declared and the salvo recalls a layout or cell sources (Program is the M/E bus; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Refused before the Idempotency-Key is reserved. A salvo of only tally/UMD recalls is unaffected. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -18323,7 +18400,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file) on a full-engine run — `restart` otherwise (ndi/youtube/aes67, or a run without the decoder; ADR-W018). */
+            /** @description The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file, and youtube on a build with the `youtube` feature) on a full-engine run — `restart` otherwise (ndi/aes67, or a run without the decoder; ADR-W018). */
             201: {
                 headers: {
                     [name: string]: unknown;
@@ -18534,7 +18611,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description This run cannot start sources. */
+            /** @description This run cannot start sources, or the source is saved but applies on restart (the detail says which). */
             409: {
                 headers: {
                     [name: string]: unknown;

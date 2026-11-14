@@ -225,6 +225,7 @@ fn submit_for_existing_salvo(
     id: &str,
     head: Option<String>,
     idem: &IdempotencyKey,
+    recalls: bool,
     build: impl FnOnce(crate::command::OperationId, Option<String>) -> Command,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
@@ -236,8 +237,33 @@ fn submit_for_existing_salvo(
         crate::auth::authorize_output(principal, head)?;
     }
     // Fail fast on an unknown salvo before reserving an idempotency key.
-    let _ = crate::boot_model::accepted_salvo(state, id)?;
+    let salvo = crate::boot_model::accepted_salvo(state, id)?;
+    if recalls {
+        refuse_cell_recall_under_switcher(state, &salvo.salvo)?;
+    }
     submit_accepted(state, idem, |op| build(op, head))
+}
+
+/// #307 review M1: with a switcher M/E declared, a salvo that recalls a
+/// layout or cell sources would change neither Program (the M/E bus) nor the
+/// stored layout outputs show — refused (`switcher-owns-program`) instead of
+/// accepted as a silent no-op. A salvo of only tally/UMD recalls still fires.
+/// Called after authorization and existence, before any reservation.
+///
+/// # Errors
+/// [`ControlError::SwitcherOwnsCells`] for such a salvo under a switcher.
+pub(crate) fn refuse_cell_recall_under_switcher(
+    state: &AppState,
+    salvo: &Salvo,
+) -> ControlResult<()> {
+    if (salvo.layout.is_some() || !salvo.sources.is_empty())
+        && crate::routes::switcher_declared(state)?
+    {
+        return Err(crate::error::ControlError::SwitcherOwnsCells(
+            "a salvo that recalls a layout or cell sources",
+        ));
+    }
+    Ok(())
 }
 
 /// `POST /api/v1/salvos/{id}/arm` — arm (stage) the salvo (role: write; 202).
@@ -264,13 +290,19 @@ pub(crate) async fn arm_salvo(
     Path(id): Path<String>,
     Query(head): Query<HeadQuery>,
 ) -> ControlResult<Response> {
-    submit_for_existing_salvo(&state, &principal, &id, head.head, &idem, |op, head| {
-        Command::ArmSalvo {
+    submit_for_existing_salvo(
+        &state,
+        &principal,
+        &id,
+        head.head,
+        &idem,
+        false,
+        |op, head| Command::ArmSalvo {
             op,
             salvo: id.clone(),
             head,
-        }
-    })
+        },
+    )
 }
 
 /// `POST /api/v1/salvos/{id}/take` — take (apply) the salvo (role: write; 202).
@@ -286,6 +318,7 @@ pub(crate) async fn arm_salvo(
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to take.", body = crate::problem::Problem),
             (status = 404, description = "No salvo with that id.", body = crate::problem::Problem),
+            (status = 422, description = "`switcher-owns-program`: a switcher M/E is declared and the salvo recalls a layout or cell sources (Program is the M/E bus; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Refused before the Idempotency-Key is reserved. A salvo of only tally/UMD recalls is unaffected.", body = crate::problem::Problem),
             (status = 503, description = "Engine command bus at capacity; shed.", body = crate::problem::Problem),
         ),
     )
@@ -297,13 +330,19 @@ pub(crate) async fn take_salvo(
     Path(id): Path<String>,
     Query(head): Query<HeadQuery>,
 ) -> ControlResult<Response> {
-    submit_for_existing_salvo(&state, &principal, &id, head.head, &idem, |op, head| {
-        Command::TakeSalvo {
+    submit_for_existing_salvo(
+        &state,
+        &principal,
+        &id,
+        head.head,
+        &idem,
+        true,
+        |op, head| Command::TakeSalvo {
             op,
             salvo: Some(id.clone()),
             head,
-        }
-    })
+        },
+    )
 }
 
 /// `POST /api/v1/salvos/{id}/cancel` — cancel an armed salvo (role: write; 202).
@@ -330,11 +369,17 @@ pub(crate) async fn cancel_salvo(
     Path(id): Path<String>,
     Query(head): Query<HeadQuery>,
 ) -> ControlResult<Response> {
-    submit_for_existing_salvo(&state, &principal, &id, head.head, &idem, |op, head| {
-        Command::CancelSalvo {
+    submit_for_existing_salvo(
+        &state,
+        &principal,
+        &id,
+        head.head,
+        &idem,
+        false,
+        |op, head| Command::CancelSalvo {
             op,
             salvo: Some(id.clone()),
             head,
-        }
-    })
+        },
+    )
 }

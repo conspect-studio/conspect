@@ -313,6 +313,34 @@ impl TileParams {
         self
     }
 
+    /// Carry a wipe mask (ADR-0112 §3) in the spare `.z/.w` lanes, the same
+    /// no-growth precedent as the alpha layer: `opacity_transfer.z` = shape
+    /// id (`0` = none), `.w` = reverse; `range.w` = softness; `yuv2rgb0..2.w`
+    /// = origin x, origin y, extent; `prim0.w` = radius, `prim1.w` = expand.
+    /// The shader derives the aspect from the canvas size, as the CPU does.
+    #[must_use]
+    pub fn with_mask(mut self, mask: &crate::mask::WipeMask) -> Self {
+        // Exact endpoints (review MED-01): coverage 0 is zero opacity,
+        // coverage 1 is no mask at all; neither depends on float rounding.
+        match mask.pinned {
+            Some(c) if c <= 0.0 => {
+                self.opacity_transfer[0] = 0.0;
+                return self;
+            }
+            Some(_) => return self,
+            None => {}
+        }
+        self.opacity_transfer[2] = shape_lane(mask.shape.id());
+        self.opacity_transfer[3] = if mask.reverse { 1.0 } else { 0.0 };
+        self.range[3] = mask.softness;
+        self.yuv2rgb0[3] = mask.origin[0];
+        self.yuv2rgb1[3] = mask.origin[1];
+        self.yuv2rgb2[3] = mask.extent;
+        self.prim0[3] = mask.radius;
+        self.prim1[3] = mask.expand;
+        self
+    }
+
     /// The alpha-array layer this tile samples, or `None` for an opaque tile.
     #[must_use]
     pub const fn alpha_layer(&self) -> Option<u32> {
@@ -321,6 +349,18 @@ impl TileParams {
         } else {
             Some(self.dst_size[3])
         }
+    }
+}
+
+/// A small shape id as the `f32` lane the shader reads (exact for `0..=5`).
+fn shape_lane(id: u32) -> f32 {
+    match id {
+        1 => 1.0,
+        2 => 2.0,
+        3 => 3.0,
+        4 => 4.0,
+        5 => 5.0,
+        _ => 0.0,
     }
 }
 

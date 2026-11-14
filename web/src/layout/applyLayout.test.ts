@@ -93,19 +93,22 @@ describe('describeApplyError', () => {
   });
 });
 
-describe('switcher admission (#317)', () => {
+const OWNS_DETAIL = 'The switcher is on: the Program canvas is the M/E bus, so layout "news" cannot replace it. '
+  + 'To show the layout on an output, take it there with POST /api/v1/routing/output/take.';
+
+describe('switcher owns Program (#307)', () => {
   it('recognises the typed refusal and keeps its operator reason', async () => {
     server.use(
       http.post('*/api/v1/commands/apply-layout', () => HttpResponse.json({
-        type: '/problems/layout-not-admissible-with-switcher',
-        title: 'Not admissible while the switcher is on',
+        type: '/problems/switcher-owns-program',
+        title: 'The switcher owns the Program canvas',
         status: 422,
-        detail: 'The switcher is on: a multi-cell layout cannot be the Program canvas.',
+        detail: OWNS_DETAIL,
       }, { status: 422 })),
     );
     const error: unknown = await applyLayoutCommand('news').catch((e: unknown) => e);
     expect(isSwitcherRefusal(error)).toBe(true);
-    expect(describeApplyError(error)).toBe('The switcher is on: a multi-cell layout cannot be the Program canvas.');
+    expect(describeApplyError(error)).toBe(OWNS_DETAIL);
   });
 
   it('does not mistake another 422 for the switcher refusal', async () => {
@@ -119,9 +122,8 @@ describe('switcher admission (#317)', () => {
     expect(isSwitcherRefusal(error)).toBe(false);
   });
 
-  it('blocks only multi-cell layouts while the switcher is on', () => {
-    expect(blockedBySwitcher(true, 6)).toBe(true);
-    expect(blockedBySwitcher(true, 1)).toBe(false);
-    expect(blockedBySwitcher(false, 6)).toBe(false);
+  it('blocks every layout while the switcher is on, none without it', () => {
+    expect(blockedBySwitcher(true)).toBe(true);
+    expect(blockedBySwitcher(false)).toBe(false);
   });
 });

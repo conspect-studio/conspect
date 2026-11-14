@@ -370,3 +370,58 @@ fn normalize_context_address_rewrites_only_the_pointer() {
     ));
     assert_eq!(normalize_context_address(""), "");
 }
+
+/// Issue #420 review: libav names the segment it failed to open; a signed CDN
+/// URL (path or query signature) never survives into the emitted line.
+#[test]
+fn sanitize_line_reduces_urls_to_scheme_and_host() {
+    let line = "[hls @ 0x55] Error when loading first segment 'https://user:pw@rr1.googlevideo.com/videoplayback/signature/PATHSIG/seg.ts?sig=QSIG#F'\n";
+    let clean = sanitize_line(line);
+    assert_eq!(
+        clean,
+        "[hls @ 0x55] Error when loading first segment 'https://rr1.googlevideo.com/…'"
+    );
+    for secret in ["PATHSIG", "QSIG", "pw"] {
+        assert!(!clean.contains(secret), "{secret} leaked: {clean}");
+    }
+    assert_eq!(
+        sanitize_line("Opening 'http://[::1]:8080' for reading"),
+        "Opening 'http://[::1]:8080' for reading"
+    );
+    // IPv6 authorities: path, query and userinfo are still dropped.
+    assert_eq!(
+        sanitize_line("Opening 'https://[2001:db8::1]/segment?sig=SECRET' for reading"),
+        "Opening 'https://[2001:db8::1]/…' for reading"
+    );
+    assert_eq!(
+        sanitize_line("x https://u:PW@[2001:db8::1]:8443/s/SIG/a.ts y"),
+        "x https://[2001:db8::1]:8443/… y"
+    );
+    // Legal URI sub-delimiters never end the scan early (review ABUSE-04).
+    for (line, secret) in [
+        (
+            "Opening 'https://user:pa(ss@cdn.test/path?sig=SECRET'",
+            "SECRET",
+        ),
+        (
+            "Opening 'https://user:pa(ss@cdn.test/path?sig=SECRET'",
+            "pa(ss",
+        ),
+        ("x https://cdn.test/a(b)/signature/SECRET y", "SECRET"),
+        ("x https://cdn.test/a,b?sig=SECRET y", "SECRET"),
+        ("x https://cdn.test/it's/SECRET y", "SECRET"),
+        ("x https://[2001:db8::1/SECRET?sig=Q", "SECRET"),
+        ("x https://h.test/a]SECRET", "SECRET"),
+        ("two https://a.test/S1 and https://b.test/S2", "S1"),
+        ("two https://a.test/S1 and https://b.test/S2", "S2"),
+        ("x ://user:pw@h.test/SECRET", "SECRET"),
+    ] {
+        let clean = sanitize_line(line);
+        assert!(!clean.contains(secret), "{secret} leaked: {clean}");
+    }
+    assert_eq!(
+        sanitize_line("x https://cdn.test/a(b)/s y"),
+        "x https://cdn.test/… y"
+    );
+    assert_eq!(sanitize_line("x rtsp://cam/main y"), "x rtsp://cam/… y");
+}

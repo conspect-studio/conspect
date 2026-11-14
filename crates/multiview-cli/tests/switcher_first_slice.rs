@@ -247,6 +247,100 @@ async fn program_cell_id_differing_from_program_id_still_becomes_ready() {
     );
 }
 
+/// #307: a switcher over a TWO-cell document starts, the production command
+/// drain keys the drive by the synthesized Program cell (not the document's
+/// cells), the M/E binds it and becomes ready, and a Cut changes the received
+/// Program picture.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_cell_document_switcher_binds_the_synthesized_program_cell() {
+    let _serial = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(&dir.path().join("index.m3u8"));
+    cfg.layout = serde_json::from_value(serde_json::json!({
+        "kind": "grid", "columns": ["1fr", "1fr"], "rows": ["1fr"], "areas": ["a b"]
+    }))
+    .unwrap();
+    let mut second = cfg.cells[0].clone();
+    second.id = "wall_b".into();
+    second.area = Some("b".into());
+    second.source.input_id = Some("b".into());
+    cfg.cells.push(second);
+    cfg.validate().unwrap();
+    assert_eq!(cfg.solve_layout().unwrap().cells.len(), 2);
+    let mut pipeline = Pipeline::build(&cfg).unwrap();
+    assert_eq!(pipeline.switcher_program_layout().cells.len(), 1);
+    let preview = program_slot();
+    let pvw = program_slot();
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("a"),
+        SourceRef::new("b"),
+        vec![],
+    ));
+    driver.set_prime_stores(pipeline.preview_stores());
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: pipeline.switcher_program_layout(),
+            preview: pipeline.switcher_preview_layout("b"),
+        })
+        .unwrap();
+    pipeline
+        .attach_switcher(handle.clone(), driver, Arc::clone(&pvw))
+        .unwrap();
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+    let (_sender, commands) = multiview_control::command_bus(8);
+    let drain =
+        multiview_cli::control::command_drain(commands, cfg.clone(), Arc::clone(&publisher));
+    let stop = StopOnDrop::new();
+    let watchdog_stop = stop.signal();
+    let watchdog = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        watchdog_stop.stop();
+    });
+    let probe_stop = stop.signal();
+    let captured = Arc::clone(&preview);
+    let probe = tokio::spawn(async move {
+        for _ in 0..1500 {
+            if handle.is_ready() && captured.load().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let ready = handle.is_ready();
+        let before = captured.load().map(|p| p.sample(8, 8).unwrap().0);
+        let mut outcomes = handle.outcomes();
+        let _ = handle.try_send(SwitcherCommand {
+            operation_id: "cut-wall".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::Cut,
+        });
+        let completed = tokio::time::timeout(Duration::from_secs(4), outcomes.recv())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|done| done.event.completed);
+        let mut after = before;
+        for _ in 0..100 {
+            after = captured.load().map(|p| p.sample(8, 8).unwrap().0);
+            if after != before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        probe_stop.stop();
+        (ready, completed, before, after)
+    });
+    let run_stop = stop.signal();
+    Box::pin(pipeline.run_until_serving(&run_stop, &publisher, &preview, drain))
+        .await
+        .unwrap();
+    watchdog.abort();
+    let (ready, completed, before, after) = probe.await.unwrap();
+    assert!(ready, "the M/E binds the synthesized Program cell");
+    assert!(completed, "the Cut reaches an actual frame");
+    assert_ne!(before, after, "the received Program picture changes");
+}
+
 // ---------------------------------------------------------------------------
 // The real operator HTTP flow over the real launcher wiring
 // ---------------------------------------------------------------------------
@@ -659,12 +753,13 @@ area = "f"
 input_id = "c"
 "#;
 
-/// Opting into `[switcher]` on a canvas this slice cannot drive fails loudly
-/// instead of silently replacing the operator's multi-cell layout — and the very
-/// same multi-cell document still builds unchanged when the M/E block is absent,
-/// so an existing production multiview is never disturbed by the feature.
+/// #307: opting into `[switcher]` on a multi-cell canvas starts: Program is
+/// the one-cell M/E bus bound to `program_source` (the operator's wall stays a
+/// stored layout, routable to outputs) — and the very same multi-cell document
+/// still builds unchanged, as the multiview, when the M/E block is absent.
 #[test]
-fn opting_in_refuses_a_multi_cell_canvas_without_touching_the_legacy_path() {
+fn opting_in_on_a_multi_cell_canvas_starts_with_program_as_the_me_bus_and_the_legacy_path_untouched(
+) {
     let _serial = SERIAL.blocking_lock();
     let dir = tempfile::tempdir().unwrap();
     // Six cells (the live multi-tile shape) mapped three-to-two across three
@@ -710,14 +805,25 @@ segment_ms = 1000
     );
     let config = MultiviewConfig::load_from_toml(&switched).unwrap();
     config.validate().unwrap();
-    let Err(error) = Pipeline::build(&config) else {
-        panic!("a multi-cell canvas must not be replaced");
-    };
-    assert!(
-        error.to_string().contains("one full-canvas source cell"),
-        "typed refusal names the restriction: {error}"
+    let pipeline = Pipeline::build(&config).expect("a switcher with a multi-cell canvas starts");
+    let program = pipeline.switcher_program_layout();
+    assert_eq!(program.cells.len(), 1, "Program is the one-cell M/E bus");
+    let cell = &program.cells[0];
+    assert_eq!(cell.source.as_deref(), Some("a"), "bound to program_source");
+    assert_eq!(
+        (cell.x, cell.y, cell.w, cell.h),
+        (0.0, 0.0, 1.0, 1.0),
+        "full canvas"
     );
+    assert_eq!(cell.fit, multiview_core::layout::FitMode::Fill);
+    drop(pipeline);
     let legacy = MultiviewConfig::load_from_toml(&text).unwrap();
     legacy.validate().unwrap();
-    Pipeline::build(&legacy).expect("the same multi-cell document still builds without [switcher]");
+    let pipeline = Pipeline::build(&legacy)
+        .expect("the same multi-cell document still builds without [switcher]");
+    assert_eq!(
+        pipeline.switcher_program_layout().cells.len(),
+        6,
+        "the legacy multiview drives every document cell"
+    );
 }

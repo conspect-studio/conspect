@@ -69,6 +69,7 @@
 //! | WT datagrams | noq's receive buffer [`QuicLimits::datagram_receive_buffer_size`] (256 KiB), which drops the OLDEST datagram when full; nothing is queued above it |
 //! | CONNECT-stream capsules | one capsule body of at most 1028 bytes; unknown capsules are skipped by counting |
 //! | Request tasks | one per admitted request (bounded by the permits) plus the session task; all spawned on the runtime serving the connection (the session close too, from whichever runtime or thread `close`/drop happens) |
+//! | Panics | a panicking request task ends that request only (its stream and permit drop; `Counters::request_panics`); a panicking connection task ends that connection only (caps released by unwind; `Counters::connection_panics`); the accept loop and every other connection keep serving (#403) |
 //!
 //! Nothing here awaits the engine; the caller runs the endpoint on the
 //! front door's own runtime.

@@ -1134,6 +1134,13 @@ pub struct PlayerClipSpec {
     /// a constant DC level `amplitude` for the clip's duration (a constant is
     /// easy to recognise in the audio store, unlike a tone's phase).
     pub audio_level: Option<f32>,
+    /// Keyframe interval in frames. `1` (the default) makes every frame a
+    /// keyframe; a larger value (FFV1 only) writes real non-keyframe packets so
+    /// a container seek lands on a preceding keyframe.
+    pub gop: u32,
+    /// Presentation timestamp of frame 0, in frame periods (a nonzero source
+    /// PTS origin, as many containers have). Video-only clips.
+    pub pts_offset_frames: u32,
 }
 
 /// The luma increment between consecutive frames of a generated clip.
@@ -1151,6 +1158,8 @@ impl PlayerClipSpec {
             height: 48,
             luma_base,
             audio_level: None,
+            gop: 1,
+            pts_offset_frames: 0,
         }
     }
 
@@ -1203,7 +1212,7 @@ pub fn generate_player_clip(path: &Path, spec: &PlayerClipSpec) -> Result<()> {
         format,
         time_base: period,
         bit_rate: 0,
-        gop: 1,
+        gop: spec.gop.max(1),
         cuda_device: None,
     })?;
     let mut mux = Muxer::create_as(path, "mov")?;
@@ -1235,7 +1244,7 @@ pub fn generate_player_clip(path: &Path, spec: &PlayerClipSpec) -> Result<()> {
         // Chroma carries the clip's base so two clips differ in colour too.
         frame.data_mut(1).fill(spec.luma_base);
         frame.data_mut(2).fill(128);
-        frame.set_pts(Some(i64::from(i)));
+        frame.set_pts(Some(i64::from(i) + i64::from(spec.pts_offset_frames)));
         venc.send_frame(&frame)?;
         drain_player_video(&mut venc, &mut mux, vindex)?;
     }

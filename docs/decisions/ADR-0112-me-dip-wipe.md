@@ -40,14 +40,33 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    pipeline order unchanged (invariant #8). The incoming picture is drawn only
    from a fresh frame (ADR-0104 SW2-02); the terminal tick swaps the buses
    exactly as MIX does.
-3. **WIPE** (second PR) is one extra full-canvas draw of the incoming picture
-   with a per-pixel mask, in the same pass, on the CPU reference and the GPU
-   path. The tile carries an optional mask descriptor (pattern, progress,
-   softness, border); the coverage function is a closed-form SDF evaluated per
-   destination pixel, identical in Rust and WGSL, and multiplies into the tile
-   alpha at the one premultiply step. Patterns: horizontal, vertical, diagonal,
-   box (centre out) and circle (iris), each with `reverse`, a soft edge and an
-   optional solid border colour band.
+3. **WIPE** is one extra full-canvas draw of the incoming picture with a
+   per-pixel mask, in the same pass, on the CPU reference and the GPU path.
+   `Tile` carries an optional `mask::WipeMask` (shape, progress-derived edge
+   radius, softness, origin, reverse, canvas size); its coverage is a
+   closed-form distance field evaluated per canvas pixel, identical in Rust
+   (`WipeMask::coverage`) and WGSL (`wipe_coverage`), and multiplies into the
+   tile alpha at the one premultiply step (colour order unchanged, inv #8).
+   The GPU carries the mask in the spare `.z/.w` lanes of `TileParams` (no
+   struct growth, the ADR-0058 alpha-layer precedent). Patterns: horizontal
+   (`linear_edge`), `vertical`, `diagonal`, `box` (centre out) and `circle`
+   (iris, round on the canvas); `reverse` mirrors the field (other side, or
+   closing in from the outside); `softness` and `border_width` are fractions
+   of the canvas height in `[0, 1]`; `position_xy` in `[0, 1]` places the
+   box/circle origin. An optional `border_color` band is the same 2x2 colour
+   fill drawn through the edge grown by `border_width` times one minus the
+   edge's own coverage (smooth on both sides of a soft edge), drawn above the
+   incoming picture so it never depends on the incoming alpha: the band never
+   covers the revealed interior, and it is
+   drawn only while the incoming frame is fresh, so a stale or missing source
+   shows the outgoing picture, never a colour fill; the travel is lengthened by the soft half-width and the border so
+   progress 0 shows nothing of either and progress 1 shows only the incoming
+   picture, and both endpoints are pinned exactly (coverage 0 / 1 for the whole
+   canvas, whatever the origin or rounding). The signed distance to the edge is
+   measured in canvas-height units for every shape, the box's sides included,
+   so a soft edge or border band has the same pixel width on every side. `border_fill_source` and `flip_flop` are refused until rendered.
+   Edge pixels may differ between CPU and GPU by f32 rounding; the GPU test
+   bounds that to 1 % of luma samples by more than 3 code values.
 4. **Control API and desk** (third PR): `/api/v1/switcher/plan` and
    `/commands/set_transition` carry the descriptor, with the same BOLA,
    idempotency and 202-means-queued rules as `auto`; `GET /api/v1/switcher/me1`
@@ -56,8 +75,9 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
 
 ## Invariants
 
-- **#1:** a DIP adds at most one tile to a dissolve's tick (two full-canvas
-  tiles instead of one). The scratch pool is sized for both on the first
+- **#1:** a DIP or a bordered WIPE adds at most one tile to a dissolve's
+  tick (two full-canvas tiles instead of one); the mask is a handful of float
+  operations per pixel of the masked tile, no allocation. The scratch pool is sized for both on the first
   transition and never grows after; the colour fill is built once per colour
   change, never per tick (`transition_fill_builds`, pinned by
   `tests/switcher_dip.rs`). Nothing waits.

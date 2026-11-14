@@ -122,39 +122,30 @@ async fn mark_started(path: &Path) {
     task.await.unwrap();
 }
 
-/// Rewrite the accepted state into the 12-November shape (6 cells, one M/E).
-fn make_six_cell(path: &Path) {
-    make_six_cell_variant(path, "");
+/// Rewrite the accepted state into a shape start-up still refuses: one M/E
+/// plus overlays on the Program canvas (`SwitcherCanvasRefusal::Overlays`).
+/// (#307 admits the former fixture, six cells + one M/E: the M/E's Program
+/// canvas is synthesized and the wall is a stored layout.)
+fn make_me_with_overlays(path: &Path) {
+    make_me_with_overlays_variant(path, "");
 }
 
-/// [`make_six_cell`] with distinct bytes per `tag` (cell ids carry it).
-fn make_six_cell_variant(path: &Path, tag: &str) {
+/// [`make_me_with_overlays`] with distinct bytes per `tag` (overlay ids carry it).
+fn make_me_with_overlays_variant(path: &Path, tag: &str) {
     let file = desired(path);
     let mut document: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    let cells: Vec<_> = (0..6_u32)
-        .map(|i| {
-            serde_json::json!({
-                "id": format!("c{i}{tag}"),
-                "rect": {"x": f64::from(i % 3) / 3.0, "y": f64::from(i / 3) / 2.0, "w": 1.0 / 3.0, "h": 0.5},
-                "source": {"input_id": if i % 2 == 0 { "in_a" } else { "in_b" }}
-            })
-        })
-        .collect();
-    let cells: Vec<multiview_config::Cell> =
-        serde_json::from_value(serde_json::Value::Array(cells)).unwrap();
-    let cells = serde_json::to_value(cells).unwrap();
-    document["config"]["cells"] = cells.clone();
-    document["selected_body"]["cells"] = cells;
-    let selected = document["selected_layout_id"].clone();
-    let body = document["selected_body"].clone();
-    for layout in document["layouts"].as_array_mut().unwrap() {
-        if layout["id"] == selected {
-            layout["body"] = body.clone();
-        }
-    }
+    let overlays: Vec<multiview_config::Overlay> = serde_json::from_value(serde_json::json!([
+        {"id": format!("clock{tag}"), "kind": "clock", "target": "canvas"},
+        {"id": format!("label{tag}"), "kind": "label", "target": "canvas", "text": "x"}
+    ]))
+    .unwrap();
+    document["config"]["overlays"] = serde_json::to_value(overlays).unwrap();
     std::fs::write(&file, document.to_string()).unwrap();
 }
+
+/// The exact start-up refusal of [`make_me_with_overlays`]'s state.
+const OVERLAYS_REFUSAL: &str = "overlays cannot be added to the Program canvas";
 
 /// Three retries with no pause: the production attempt count, test speed.
 fn retry() -> RetryPolicy {
@@ -206,7 +197,7 @@ async fn non_bootable_saved_state_with_last_good_starts_from_last_good_and_keeps
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let rejected_bytes = std::fs::read(desired(&path)).unwrap();
 
     // Deciding writes nothing; the swap happens only after the build.
@@ -219,14 +210,12 @@ async fn non_bootable_saved_state_with_last_good_starts_from_last_good_and_keeps
     );
     assert_eq!(rejected_files(&path).len(), 0);
     let start = start_ok(boot, &path).expect("falls back, starts");
-    assert_eq!(start.running.cells.len(), 1, "started from last-good");
+    assert!(start.running.overlays.is_empty(), "started from last-good");
     assert!(marker_exists(&path), "#324: the fallback is persisted");
     multiview_config::boot_admission(&start.running).expect("the started state boots");
     let fallback = start.boot_fallback.clone().expect("fallback recorded");
     assert!(
-        fallback
-            .reason
-            .contains("multi-cell layouts are not replaced"),
+        fallback.reason.contains(OVERLAYS_REFUSAL),
         "the exact start-up reason: {}",
         fallback.reason
     );
@@ -257,9 +246,7 @@ async fn non_bootable_saved_state_with_last_good_starts_from_last_good_and_keeps
     };
     assert_eq!(warning.code, WarningCode::AcceptedStateRejected);
     assert!(warning.active);
-    assert!(warning
-        .message
-        .contains("multi-cell layouts are not replaced"));
+    assert!(warning.message.contains(OVERLAYS_REFUSAL));
     assert!(warning.message.contains(&kept_at.display().to_string()));
 }
 
@@ -267,17 +254,14 @@ async fn non_bootable_saved_state_with_last_good_starts_from_last_good_and_keeps
 async fn non_bootable_saved_state_without_last_good_fails_with_the_clear_error() {
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install(dir.path()).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let before = std::fs::read(desired(&path)).unwrap();
     let error = start_ok(boot, &path).expect_err("no fallback");
     assert!(
         error.contains("accepted desired state cannot be resumed"),
         "{error}"
     );
-    assert!(
-        error.contains("multi-cell layouts are not replaced"),
-        "{error}"
-    );
+    assert!(error.contains(OVERLAYS_REFUSAL), "{error}");
     assert_eq!(
         std::fs::read(desired(&path)).unwrap(),
         before,
@@ -349,7 +333,7 @@ async fn admission_fallback_whose_build_fails_moves_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let before = std::fs::read(desired(&path)).unwrap();
     let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
     let failed = build_with_fallback(start, &path, &retry(), |_| {
@@ -385,7 +369,7 @@ async fn kept_rejected_states_are_bounded() {
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
     for round in 0..(MAX_REJECTED + 3) {
-        make_six_cell_variant(&path, &format!("_{round}"));
+        make_me_with_overlays_variant(&path, &format!("_{round}"));
         start_ok(boot.clone(), &path).unwrap();
     }
     assert_eq!(rejected_files(&path).len(), MAX_REJECTED);
@@ -400,26 +384,23 @@ fn run_binary(path: &Path) -> std::process::Output {
         .expect("the multiview binary runs")
 }
 
-/// Today's restart, end to end through the real binary: the saved 6-cell state
+/// Today's restart, end to end through the real binary: the saved M/E-with-overlays state
 /// with one M/E and a last-good copy → the process starts and runs; without a
 /// last-good copy → it fails with the clear reason (and moves nothing).
 #[tokio::test]
 async fn the_real_binary_restarts_from_last_good_and_fails_clearly_without_it() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = install(dir.path()).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let failed = run_binary(&path);
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(!failed.status.success(), "no last-good: fails");
-    assert!(
-        stderr.contains("multi-cell layouts are not replaced"),
-        "{stderr}"
-    );
+    assert!(stderr.contains(OVERLAYS_REFUSAL), "{stderr}");
 
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
     let started = run_binary(&path);
     assert!(
@@ -517,7 +498,7 @@ fn validate(path: &Path) -> (i32, String) {
 async fn validate_distinguishes_fall_back_from_fail() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = install(dir.path()).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let (code, text) = validate(&path);
     assert_ne!(code, 0, "{text}");
     assert!(
@@ -528,7 +509,7 @@ async fn validate_distinguishes_fall_back_from_fail() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let (code, text) = validate(&path);
     assert_ne!(code, 0, "{text}");
     assert!(
@@ -536,10 +517,7 @@ async fn validate_distinguishes_fall_back_from_fail() {
         "{text}"
     );
     assert!(!text.contains("would refuse to start"), "{text}");
-    assert!(
-        text.contains("multi-cell layouts are not replaced"),
-        "{text}"
-    );
+    assert!(text.contains(OVERLAYS_REFUSAL), "{text}");
 }
 
 /// Review round 2 (lens 2): a last-good copy that itself cannot start is
@@ -548,7 +526,7 @@ async fn validate_distinguishes_fall_back_from_fail() {
 async fn validate_reports_an_unusable_last_good_as_a_failure() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = install(dir.path()).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     // The "last-good" copy is the same unstartable state.
     std::fs::copy(desired(&path), last_good_path_for(&path)).unwrap();
     let (code, text) = validate(&path);
@@ -565,7 +543,7 @@ async fn the_boot_model_names_the_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let start = start_ok(boot, &path).unwrap();
     let model = start.to_boot_model(&path);
     assert!(model
@@ -697,7 +675,7 @@ fn raised(events: &mut multiview_engine::EventSubscription<Event>) -> Option<Str
     None
 }
 
-/// #324 findings 1-2, the six-cell state: start from last-good, desired.json
+/// #324 findings 1-2, the M/E-with-overlays state: start from last-good, desired.json
 /// byte-identical, one kept copy, a persisted marker; the control plane serves
 /// last-good; the warning is raised on this start AND on a later clean-looking
 /// restart (crash-restart), until acknowledged.
@@ -707,7 +685,7 @@ async fn a_state_fault_keeps_the_saved_state_and_persists_the_warning_until_ackn
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
     let last_good = std::fs::read_to_string(last_good_path_for(&path)).unwrap();
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
     let start = start_ok(boot.clone(), &path).unwrap();
     assert_eq!(std::fs::read(desired(&path)).unwrap(), saved);
@@ -725,9 +703,7 @@ async fn a_state_fault_keeps_the_saved_state_and_persists_the_warning_until_ackn
     assert!(multiview_cli::last_good::announce(
         &path, &start, &publisher
     ));
-    assert!(raised(&mut events)
-        .unwrap()
-        .contains("multi-cell layouts are not replaced"));
+    assert!(raised(&mut events).unwrap().contains(OVERLAYS_REFUSAL));
     // A restart whose start does NOT itself fall back (simulated: a start
     // config without a fallback) still raises it from the marker.
     let plain = resolve_start_config(boot.clone(), BOOT.to_owned(), &path).unwrap();
@@ -739,9 +715,7 @@ async fn a_state_fault_keeps_the_saved_state_and_persists_the_warning_until_ackn
     assert!(multiview_cli::last_good::announce(
         &path, &plain, &publisher
     ));
-    assert!(raised(&mut events)
-        .unwrap()
-        .contains("multi-cell layouts are not replaced"));
+    assert!(raised(&mut events).unwrap().contains(OVERLAYS_REFUSAL));
     // Acknowledged (the CLI path): gone, and the saved state still untouched.
     let cleared = multiview_cli::last_good::acknowledge(&path).unwrap();
     assert!(cleared.is_some());
@@ -770,12 +744,12 @@ async fn enospc_while_recording_the_fallback_still_starts_from_last_good() {
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
     let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
     let (start, ()) = build_with_fallback(start, &path, &retry(), |_| Ok(())).unwrap();
     let start = commit_fallback_with(start, &path, &enospc).expect("starts anyway");
-    assert_eq!(start.running.cells.len(), 1, "from last-good");
+    assert!(start.running.overlays.is_empty(), "from last-good");
     let fallback = start.boot_fallback.clone().unwrap();
     assert!(fallback.kept_at.is_none());
     let error = fallback.persist_error.clone().expect("named");
@@ -801,7 +775,7 @@ async fn a_read_only_state_dir_still_starts_from_last_good() {
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
     let state = path.parent().unwrap().join(".multiview");
     let original = std::fs::metadata(&state).unwrap().permissions();
@@ -815,7 +789,7 @@ async fn a_read_only_state_dir_still_starts_from_last_good() {
     let result = start_ok(boot, &path);
     std::fs::set_permissions(&state, original).unwrap();
     let start = result.expect("starts from last-good anyway");
-    assert_eq!(start.running.cells.len(), 1);
+    assert!(start.running.overlays.is_empty(), "from last-good");
     let fallback = start.boot_fallback.unwrap();
     assert!(fallback.kept_at.is_none());
     assert!(fallback.persist_error.is_some());
@@ -830,7 +804,7 @@ async fn a_crash_between_the_kept_copy_and_the_marker_converges_on_restart() {
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let saved = std::fs::read_to_string(desired(&path)).unwrap();
     let kept = multiview_cli::last_good::keep_rejected_copy(&path, &saved, 1).unwrap();
     assert!(!marker_exists(&path));
@@ -849,7 +823,7 @@ async fn an_after_rename_failure_with_the_bytes_in_place_counts_as_kept() {
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
     let after_rename = |p: &Path, content: &str| {
         multiview_control::boot_model::write_atomic(p, content).unwrap();
@@ -993,7 +967,7 @@ async fn the_persisted_warning_is_listed_and_acknowledged_over_the_api() {
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install_text(dir.path(), &text).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
     // Run 1 (e.g. `--ticks`): decide, build, commit — no control plane.
     let first = resolve_start_config(boot.clone(), text.clone(), &path).unwrap();
@@ -1084,14 +1058,14 @@ async fn the_persisted_warning_is_listed_and_acknowledged_over_the_api() {
     let _ = server.await;
 }
 
-/// A fallback committed from the six-cell state, the way run 1 leaves it;
+/// A fallback committed from the M/E-with-overlays state, the way run 1 leaves it;
 /// returns the boot path, the boot config and the boot text with API keys.
 async fn fallen_back(dir: &Path) -> (PathBuf, MultiviewConfig, String) {
     set_key_secrets();
     let text = boot_with_keys();
     let (path, boot) = install_text(dir, &text).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let first = resolve_start_config(boot.clone(), text.clone(), &path).unwrap();
     let (first, ()) = build_with_fallback(first, &path, &retry(), |_| Ok(())).unwrap();
     commit_fallback(first, &path).unwrap();
@@ -1109,7 +1083,7 @@ async fn a_clean_start_from_the_accepted_state_clears_a_stale_marker() {
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
     let good = std::fs::read(desired(&path)).unwrap();
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     start_ok(boot.clone(), &path).unwrap();
     assert!(marker_exists(&path));
     // The operator fixes the saved state (here: back to one that admits).
@@ -1134,7 +1108,7 @@ async fn a_start_without_an_accepted_state_leaves_the_marker_alone() {
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     start_ok(boot.clone(), &path).unwrap();
     assert!(marker_exists(&path));
     std::fs::remove_file(desired(&path)).unwrap();
@@ -1221,7 +1195,7 @@ async fn the_rejected_bound_holds_when_a_kept_copy_is_reused() {
     let dir = tempfile::tempdir().unwrap();
     let (path, boot) = install(dir.path()).await;
     mark_started(&path).await;
-    make_six_cell(&path);
+    make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
     let rejected = path.parent().unwrap().join(".multiview").join(REJECTED_DIR);
     std::fs::create_dir_all(&rejected).unwrap();

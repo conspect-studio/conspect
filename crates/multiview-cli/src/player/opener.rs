@@ -115,6 +115,11 @@ pub struct StagedClip {
     /// The primed first frame at [`PlayoutGeometry::in_point`], decoded on the
     /// opener; retained for tests and future exact-frame resume.
     pub first_frame: DecodedVideoFrame,
+    /// Canonical-ns PTS of source frame 0 (the first decoded picture while
+    /// priming from the container start). Source frame indices after a seek are
+    /// `(pts - source_origin_ns) / frame_period`; a container may start at a
+    /// nonzero PTS.
+    pub source_origin_ns: i64,
     /// First image already tile-sized, tagged in the canvas colour space;
     /// conversion runs on the opener, never on ingest at commit.
     pub first_image: Arc<Nv12Image>,
@@ -501,11 +506,116 @@ fn publish(cell: &SwapCell<Arc<OpenerStatus>>, state: &OpenerStatus) {
 fn drain_retired(coordinator: &LoadCoordinator<StagedClip>) -> usize {
     let mut drained = 0;
     while let Some(clip) = coordinator.pop_retired() {
+        // Test-only stall point AFTER dequeue and BEFORE native destruction and
+        // its acknowledgement; compiled out of non-test builds.
+        #[cfg(test)]
+        retire_barrier::pause_after_dequeue(coordinator);
         drop(clip);
         coordinator.acknowledge_retired();
         drained += 1;
     }
     drained
+}
+
+/// Test-only deterministic stall of the REAL retirement path, keyed per
+/// coordinator address (never a process-global switch, so parallel tests cannot
+/// race). One arm stalls exactly one retirement: the opener parks after it
+/// dequeued a retired clip and before it destroys or acknowledges it.
+#[cfg(test)]
+pub(crate) mod retire_barrier {
+    #![allow(clippy::expect_used)] // Test-only barrier poisoning is a fixture failure.
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// One coordinator's barrier: (entered, released, passed).
+    #[derive(Default)]
+    pub(crate) struct Gate {
+        state: Mutex<(bool, bool, bool)>,
+        cv: Condvar,
+    }
+
+    impl Gate {
+        fn wait_flag(&self, pick: fn(&(bool, bool, bool)) -> bool, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut g = self
+                .state
+                .lock()
+                .expect("test barrier must not be poisoned");
+            while !pick(&g) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "hang deadline: {what}");
+                g = self
+                    .cv
+                    .wait_timeout(g, left)
+                    .expect("test barrier must not be poisoned")
+                    .0;
+            }
+        }
+        /// Block until the opener holds a dequeued, not yet destroyed clip.
+        pub(crate) fn wait_entered(&self) {
+            self.wait_flag(|s| s.0, "opener never reached the retirement barrier");
+        }
+        /// Whether the opener is parked holding the clip, not yet destroyed.
+        pub(crate) fn blocked(&self) -> bool {
+            let g = self
+                .state
+                .lock()
+                .expect("test barrier must not be poisoned");
+            g.0 && !g.1 && !g.2
+        }
+        /// Let destruction and acknowledgement proceed.
+        pub(crate) fn release(&self) {
+            self.state
+                .lock()
+                .expect("test barrier must not be poisoned")
+                .1 = true;
+            self.cv.notify_all();
+        }
+        /// Block until the opener resumed past the barrier.
+        pub(crate) fn wait_passed(&self) {
+            self.wait_flag(|s| s.2, "opener never resumed after release");
+        }
+    }
+
+    fn registry() -> &'static Mutex<HashMap<usize, Arc<Gate>>> {
+        static R: OnceLock<Mutex<HashMap<usize, Arc<Gate>>>> = OnceLock::new();
+        R.get_or_init(Mutex::default)
+    }
+
+    fn key<T>(coordinator: &super::LoadCoordinator<T>) -> usize {
+        std::ptr::from_ref(coordinator).addr()
+    }
+
+    /// Arm a one-shot stall for exactly this coordinator.
+    pub(crate) fn arm<T>(coordinator: &super::LoadCoordinator<T>) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        registry()
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .insert(key(coordinator), Arc::clone(&gate));
+        gate
+    }
+
+    /// Opener side: park after dequeue if this coordinator is armed.
+    pub(crate) fn pause_after_dequeue<T>(coordinator: &super::LoadCoordinator<T>) {
+        let gate = registry()
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .remove(&key(coordinator));
+        let Some(gate) = gate else { return };
+        gate.state
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .0 = true;
+        gate.cv.notify_all();
+        gate.wait_flag(|s| s.1, "retirement barrier never released");
+        gate.state
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .2 = true;
+        gate.cv.notify_all();
+    }
 }
 
 /// Drop the shutdown clip, if the ingest side handed one over. Returns the count.
@@ -583,7 +693,7 @@ fn open_one(
         stop,
     );
     demuxer.disarm_deadline();
-    let first_frame = primed?;
+    let (first_frame, source_origin_ns) = primed?;
     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
         return Err(OpenAbort::Abandoned);
     }
@@ -618,6 +728,7 @@ fn open_one(
         then: request.spec.then,
         probed,
         first_frame,
+        source_origin_ns,
         first_image,
         audio,
         audio_lease,
@@ -847,8 +958,9 @@ fn probe_facts(demuxer: &Demuxer) -> Result<VideoFacts, OpenAbort> {
 }
 
 /// Seek to the in-point (when it is not the first frame) and decode forward to
-/// it, returning the frame at the in-point. Checks the generation and `stop`
-/// between every packet.
+/// it, returning the frame at the in-point and the canonical-ns PTS of source
+/// frame 0 (the PTS origin). Checks the generation and `stop` between every
+/// packet.
 #[allow(clippy::too_many_arguments)] // Demux, decode, budget and cancellation owners must remain explicit.
 fn prime(
     demuxer: &mut Demuxer,
@@ -859,12 +971,13 @@ fn prime(
     generation: Generation,
     coordinator: &LoadCoordinator<StagedClip>,
     stop: &Arc<AtomicBool>,
-) -> Result<DecodedVideoFrame, OpenAbort> {
+) -> Result<(DecodedVideoFrame, i64), OpenAbort> {
     // Decode from the beginning for exact integer-frame positioning. Seeking to
     // a timestamp may land on a preceding keyframe, making a plain `in_point`
     // discard from that position silently choose the wrong frame. This bounded
     // prime rejects an in-point beyond the declared clip window at probe.
     let mut discarded: u64 = 0;
+    let mut origin_ns: Option<i64> = None;
     let phase_started = Instant::now();
     loop {
         check_prime_budget(phase_started.elapsed(), phase_timeout)?;
@@ -889,8 +1002,9 @@ fn prime(
                     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
                         return Err(OpenAbort::Abandoned);
                     }
+                    let origin = *origin_ns.get_or_insert(frame.meta.pts.as_nanos());
                     if discarded >= in_point {
-                        return Ok(frame);
+                        return Ok((frame, origin));
                     }
                     discarded += 1;
                 }

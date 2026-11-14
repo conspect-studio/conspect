@@ -96,14 +96,32 @@ pub enum ControlError {
     Repository(String),
 
     /// The prospective accepted state is one the engine would refuse to start
-    /// from (issue #317): the declared switcher M/E cannot drive its canvas.
-    /// Nothing was applied or persisted.
+    /// from (issue #317): the declared switcher M/E cannot carry it (today:
+    /// overlays on the Program canvas). Nothing was applied or persisted.
     #[error("{0}")]
     NotAdmissibleWithSwitcher(multiview_config::SwitcherCanvasRefusal),
+
+    /// `apply-layout` without a `target` while a switcher M/E is declared
+    /// (#307): the M/E owns the Program canvas. Nothing was reserved,
+    /// persisted or sent.
+    #[error("the switcher M/E owns the Program canvas; layout {0:?} was not applied")]
+    SwitcherOwnsProgram(String),
+
+    /// A cell edit — `SwapSource`, a video→cell route take, or a salvo that
+    /// recalls a layout or cell sources — while a switcher M/E is declared
+    /// (#307 review M1): it would change neither Program (the M/E bus) nor the
+    /// stored layout outputs show, so it is refused rather than accepted as a
+    /// silent no-op. The payload names the refused operation. Nothing was
+    /// reserved or sent.
+    #[error("the switcher M/E owns the Program canvas; {0} was not applied")]
+    SwitcherOwnsCells(&'static str),
 }
 
 /// The stable problem `type` slug for [`ControlError::NotAdmissibleWithSwitcher`].
 pub const LAYOUT_NOT_ADMISSIBLE_WITH_SWITCHER: &str = "layout-not-admissible-with-switcher";
+
+/// The stable problem `type` slug for [`ControlError::SwitcherOwnsProgram`].
+pub const SWITCHER_OWNS_PROGRAM: &str = "switcher-owns-program";
 
 impl ControlError {
     /// Map this error onto its RFC 9457 problem document.
@@ -173,6 +191,30 @@ impl ControlError {
                 "Not admissible while the switcher is on",
             )
             .with_detail(refusal.operator_message()),
+            Self::SwitcherOwnsProgram(layout) => Problem::new(
+                422,
+                SWITCHER_OWNS_PROGRAM,
+                "The switcher owns the Program canvas",
+            )
+            .with_detail(format!(
+                "The switcher is on: the Program canvas is the M/E bus, so layout {layout:?} \
+                 cannot replace it. To show the layout on an output, take it there with \
+                 POST /api/v1/routing/output/take (feed {{\"layout\":\"{layout}\"}}) or send \
+                 apply-layout with target {{\"output\":\"<id>\"}}. Nothing was changed."
+            )),
+            Self::SwitcherOwnsCells(operation) => Problem::new(
+                422,
+                SWITCHER_OWNS_PROGRAM,
+                "The switcher owns the Program canvas",
+            )
+            .with_detail(format!(
+                "The switcher is on: Program is the M/E bus, so {operation} would change \
+                 neither Program nor the stored layout outputs show. To change what a \
+                 layout's cells show, edit the stored layout with PUT /api/v1/layouts/{{id}} \
+                 (outputs showing it update live); to change Program, use a switcher select \
+                 (POST /api/v1/switcher/commands/select_preview or select_program). \
+                 Nothing was changed."
+            )),
         }
     }
 }

@@ -225,6 +225,7 @@ pub struct FiredBody {
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to fire.", body = crate::problem::Problem),
             (status = 404, description = "No salvo with that name.", body = crate::problem::Problem),
+            (status = 422, description = "`switcher-owns-program`: a switcher M/E is declared and the salvo recalls a layout or cell sources (Program is the M/E bus; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Nothing is queued. A salvo of only tally/UMD recalls is unaffected.", body = crate::problem::Problem),
             (status = 503, description = "Engine command bus at capacity; shed.", body = crate::problem::Problem),
         ),
     )
@@ -242,10 +243,14 @@ pub(crate) async fn fire_salvo(
         return err.into_response();
     }
     // The named salvo must exist — a clean 404 rather than an engine no-op.
-    if crate::boot_model::accepted_salvo(&state, &name).is_err() {
+    let Ok(salvo) = crate::boot_model::accepted_salvo(&state, &name) else {
         return Problem::new(404, "salvo_unknown", "Unknown salvo")
             .with_detail(format!("no salvo named {name:?} is defined"))
             .into_response();
+    };
+    // #307 review M1: a layout/cell recall under a switcher is refused.
+    if let Err(err) = super::salvos::refuse_cell_recall_under_switcher(&state, &salvo.salvo) {
+        return err.into_response();
     }
 
     // Queue the action so the strip + audit can correlate it. The action id is

@@ -133,13 +133,18 @@ pub fn map_av_level(av_level: i32) -> BridgeLevel {
 /// * strips trailing ASCII whitespace (the libav newline);
 /// * replaces interior control characters (other than ordinary space) with a
 ///   space so the record stays one clean printable line;
+/// * reduces every `scheme://…` URL to `scheme://host/…` (userinfo, path,
+///   query and fragment dropped): libav names the playlist or segment it
+///   failed to open, and a signed CDN URL (a `YouTube` googlevideo master
+///   carries `/signature/<sig>/` in its path) must never reach the log;
 /// * truncates to [`MAX_LINE_LEN`] at a UTF-8 character boundary.
 ///
-/// It allocates a single bounded `String` and is panic-free for any input
+/// It allocates a bounded `String` and is panic-free for any input
 /// (including empty, `%`-containing, NUL-containing, or oversized text).
 #[must_use]
 pub fn sanitize_line(raw: &str) -> String {
-    let trimmed = raw.trim_end();
+    let redacted = redact_line_urls(raw.trim_end());
+    let trimmed = redacted.as_str();
     let mut out = String::with_capacity(trimmed.len().min(MAX_LINE_LEN));
     for ch in trimmed.chars() {
         if out.len().saturating_add(ch.len_utf8()) > MAX_LINE_LEN {
@@ -154,6 +159,55 @@ pub fn sanitize_line(raw: &str) -> String {
             out.push(ch);
         }
     }
+    out
+}
+
+/// The byte length of the URL token that starts `text` (just past `://`).
+/// Conservative on purpose: a token ends only at whitespace, `"`, `<`, `>` or a
+/// backtick — characters a URL cannot contain unescaped. Sub-delimiters that a
+/// URL may legally carry (`'`, `(`, `)`, `,`, `[`, `]`, …) stay inside, so no
+/// userinfo, path or query after one of them escapes redaction.
+fn url_end(text: &str) -> usize {
+    text.find(|c: char| c.is_whitespace() || matches!(c, '"' | '<' | '>' | '`'))
+        .unwrap_or(text.len())
+}
+
+/// `line` with every `scheme://…` URL token reduced to `scheme://host/…`
+/// (see [`sanitize_line`] and [`url_end`]). A token that libav wrapped in
+/// single quotes keeps its closing quote outside the redaction.
+fn redact_line_urls(line: &str) -> String {
+    let mut out = String::with_capacity(line.len().min(MAX_LINE_LEN));
+    let mut rest = line;
+    while let Some(at) = rest.find("://") {
+        let (before, after) = rest.split_at(at);
+        let after = after.get(3..).unwrap_or_default();
+        let (mut url, mut tail) = after.split_at(url_end(after));
+        // `'https://h/p'` — libav's quoting, not part of the URL.
+        let quoted = before.rfind('\'').is_some_and(|q| {
+            before.get(q + 1..).is_some_and(|scheme| {
+                scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            })
+        });
+        if quoted && url.ends_with('\'') {
+            let cut = url.len() - 1;
+            tail = after.get(cut..).unwrap_or_default();
+            url = url.get(..cut).unwrap_or_default();
+        }
+        out.push_str(before);
+        out.push_str("://");
+        let authority = url.split(['/', '?', '#']).next().unwrap_or_default();
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        out.push_str(host);
+        if url.len() > host.len() {
+            out.push_str("/…");
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
     out
 }
 

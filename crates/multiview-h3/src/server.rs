@@ -416,7 +416,9 @@ pub async fn serve_connection(
     // session task, which holds the CONNECT stream's permit.
     let mut tasks = JoinSet::new();
     let result = loop {
-        while tasks.try_join_next().is_some() {}
+        while let Some(joined) = tasks.try_join_next() {
+            count_request_panic(&shared, joined);
+        }
         match h3conn.accept().await {
             Ok(Some(resolver)) => {
                 let shared = Arc::clone(&shared);
@@ -439,9 +441,23 @@ pub async fn serve_connection(
     };
     // Keep the h3 connection (its drop closes the QUIC connection) until
     // in-flight requests have finished; they end with the connection anyway.
-    while tasks.join_next().await.is_some() {}
+    while let Some(joined) = tasks.join_next().await {
+        count_request_panic(&shared, joined);
+    }
     drop(h3conn);
     result
+}
+
+/// A request task that panicked unwound only itself: its stream halves (and
+/// with them its request permit) were dropped, the connection keeps serving.
+/// Counted and logged so the bug is visible (issue #403).
+fn count_request_panic(shared: &Shared, joined: Result<(), tokio::task::JoinError>) {
+    if let Err(err) = joined {
+        if err.is_panic() {
+            Counters::inc(&shared.counters.request_panics);
+            tracing::error!(peer = %shared.peer, "h3 request task panicked; only that request was ended");
+        }
+    }
 }
 
 fn plain_response(status: http::StatusCode) -> http::Response<()> {

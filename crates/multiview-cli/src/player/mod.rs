@@ -77,6 +77,8 @@ pub use transport::{
 pub use handle::{publish_status, PlayerRuntime};
 #[cfg(feature = "ffmpeg")]
 pub use journal::BindingJournal;
+#[cfg(all(test, feature = "ffmpeg"))]
+pub(crate) use opener::retire_barrier;
 #[cfg(feature = "ffmpeg")]
 pub use opener::{
     LoadFailure, LoadFailureReason, OpenerConfig, OpenerStatus, PlayerOpener, RequestError,

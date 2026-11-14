@@ -2130,6 +2130,8 @@ pub struct ProgramMetricsHandles {
     pub phases: Arc<multiview_engine::lateness::TickPhases>,
     /// Cumulative last-good repeats.
     pub frames_repeated: Arc<std::sync::atomic::AtomicU64>,
+    /// Cumulative GPU readback deadline misses repeated as last-good (#395).
+    pub compose_deadline_misses: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Where a run publishes its [`ProgramMetricsHandles`].
@@ -2935,6 +2937,10 @@ impl Pipeline {
         config: &MultiviewConfig,
         player_state: Option<&Path>,
     ) -> Result<Self, PipelineError> {
+        // The run's explicit `yt-dlp` path, for live-added `YouTube` sources and
+        // their audio rails (issue #420).
+        #[cfg(feature = "youtube")]
+        crate::youtube_status::set_resolver_path(crate::youtube_resolver_path(config));
         // Fail-closed (#103): an AES67 PCM-audio source in a non-`aes67` build is a
         // config this binary cannot honour — reject it clearly up front, never wire
         // it dark (the same contract as a `display` source/output in a non-
@@ -2950,28 +2956,33 @@ impl Pipeline {
         // must not depend on tile-sizing at all). Fail-closed.
         #[cfg(feature = "aes67")]
         ensure_no_cell_binds_an_aes67_source(config)?;
-        let layout = Arc::new(config.solve_layout()?);
         let switcher_me = config
             .switcher
             .as_ref()
             .and_then(|s| s.mix_effects.first())
             .cloned();
-        // This slice admits a single real full-canvas source cell. A running
-        // legacy multiview with multiple cells remains untouched when the M/E
-        // block is absent; an opted-in unsupported layout fails loudly instead
-        // of replacing the operator's canvas with a guessed source.
-        // The SAME admission rules the control plane applies before it persists an
-        // accepted state (#317): `multiview_config::switcher_canvas_admission`,
-        // and (ADR-0108 slice 1, step 1) `outputs_carry_program`: an output fed
-        // directly by a source is validated and read back, but this engine does
-        // not carry it yet — fail loudly rather than put Program on it.
-        config
-            .switcher_canvas_admission(&layout)
+        // The Program canvas (#307, `docs/architecture/output-routing.md` §3):
+        // with an M/E declared it IS the M/E bus, one full-canvas cell bound to
+        // `program_source`. A document already of that shape is used unchanged
+        // (same cell id); any other document (a multi-cell wall) keeps its
+        // layout as a stored layout, routable to outputs, and Program is the
+        // synthesized one-cell bus. Without an M/E the legacy multiview is
+        // untouched. The SAME function the control plane applies before it
+        // persists an accepted state (#317); it still refuses overlays with an
+        // M/E. And (ADR-0108 slice 1, step 1) `outputs_carry_program`.
+        let program = config
+            .program_canvas(config.solve_layout()?)
             .map_err(|refusal| PipelineError::Engine(refusal.to_string()))?;
         ensure_outputs_carry_program(config)?;
-        let switcher_cell_id = switcher_me
-            .as_ref()
-            .and_then(|_| config.cells.first().map(|cell| cell.id.clone()));
+        if program.synthesized {
+            tracing::info!(
+                cells = config.cells.len(),
+                "switcher declared: Program is the one-cell M/E bus; the configured \
+                 layout stays a stored layout, routable to outputs"
+            );
+        }
+        let switcher_cell_id = switcher_me.as_ref().and(program.cell_id);
+        let layout = Arc::new(program.layout);
         let cadence = config.canvas.fps.rational();
         let canvas_color = CanvasColor::default();
         let tag = canvas_color.output_tag();
@@ -3967,7 +3978,7 @@ impl Pipeline {
         );
         let reformat_open =
             reformat_opener(self.encode_cfg.clone(), self.rendition_configs.clone());
-        let (router, handle) = crate::output_routing::OutputRouter::new_with_openers(
+        let (mut router, handle) = crate::output_routing::OutputRouter::new_with_openers(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -3996,6 +4007,11 @@ impl Pipeline {
             Some(reformat_open),
         )
         .map_err(spawn_err)?;
+        // Atomic sets (#308) pick their adoption tick after the clock's last
+        // composed tick: a wait-free atomic load, never a lock on the clock.
+        if let Some(control) = self.switcher_control.as_ref() {
+            router.set_switcher_clock(control.applied_tick_cell());
+        }
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
         let handle = Arc::new(handle.with_outputs(run_outputs).with_pictures(
             crate::output_routing::PlanPictures {
@@ -5535,6 +5551,7 @@ impl Pipeline {
                 lateness: program.lateness(),
                 phases: program.phases(),
                 frames_repeated: program.frames_repeated_counter(),
+                compose_deadline_misses: program.compose_deadline_misses_counter(),
             })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
         // the shared slot — a single lock-free store the off-hot-path
@@ -10908,6 +10925,8 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn source_removed(&self, id: &str) {
+        #[cfg(feature = "youtube")]
+        crate::youtube_status::forget(id);
         let retired_store = self.demand.as_ref().and_then(|(catalogue, manager)| {
             let store = catalogue
                 .load()
@@ -11127,8 +11146,58 @@ impl LiveIngestSpawner {
         {
             plan.decode_placement = self.decode_placement_for(&plan.id);
         }
-        spawn_ingest_producer(plan, registry)
-            .map(|(stop, handle)| crate::live_sources::SpawnedProducer { stop, handle })
+        // A live-added `YouTube` source resolves with the run's `yt-dlp` and
+        // keeps its master fresh exactly like a startup one (issue #420).
+        #[cfg(feature = "youtube")]
+        let youtube = match &plan.location {
+            SourceLocation::Youtube { watch_url } => {
+                plan.youtube_yt_dlp_path = crate::youtube_status::resolver_path();
+                plan.youtube_url_slot
+                    .clone()
+                    .map(|slot| (watch_url.clone(), slot, plan.youtube_yt_dlp_path.clone()))
+            }
+            _ => None,
+        };
+        let id = plan.id.clone();
+        let produced = spawn_ingest_producer(plan, registry)
+            .map(|(stop, handle)| crate::live_sources::SpawnedProducer { stop, handle });
+        #[cfg(feature = "youtube")]
+        if let (Some((watch_url, slot, path)), Some(producer)) = (youtube, produced.as_ref()) {
+            spawn_live_youtube_reresolve(&id, watch_url, slot, path, &producer.stop, registry);
+        }
+        #[cfg(not(feature = "youtube"))]
+        let _ = id;
+        produced
+    }
+}
+
+/// Spawn the proactive re-resolution loop of a live-added `YouTube` source
+/// (issue #420). It SHARES the video producer's stop flag and registers it
+/// under `{id}/youtube-reresolve`, so the hub's teardown of the source (which
+/// raises `{id}` and every `{id}/` companion, then waits for their exit) stops
+/// it with the producer. A failed spawn only loses the proactive refresh: the
+/// decode thread still resolves on every reconnect.
+#[cfg(feature = "youtube")]
+fn spawn_live_youtube_reresolve(
+    id: &str,
+    watch_url: String,
+    slot: Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>,
+    yt_dlp_path: Option<String>,
+    stop: &Arc<AtomicBool>,
+    registry: &crate::live_sources::StopRegistry,
+) {
+    let exited =
+        crate::live_sources::register_stop(registry, &format!("{id}/youtube-reresolve"), stop);
+    let exit_guard = crate::live_sources::ExitGuard::new(&exited);
+    let thread_stop = Arc::clone(stop);
+    if let Err(e) = std::thread::Builder::new()
+        .name(format!("multiview-yt-reresolve-{id}"))
+        .spawn(move || {
+            let _exit = exit_guard;
+            youtube_reresolve_thread(&watch_url, yt_dlp_path.as_deref(), &slot, &thread_stop);
+        })
+    {
+        tracing::error!(error = %e, source = %id, "could not spawn youtube re-resolution thread; falling back to resolve-on-reconnect");
     }
 }
 
@@ -14989,6 +15058,8 @@ fn build_media_player_boot_with_state(
                 #[cfg(test)]
                 panic_after_commit: Arc::new(AtomicBool::new(false)),
                 #[cfg(test)]
+                preroll_limits: None,
+                #[cfg(test)]
                 observer: None,
                 #[cfg(test)]
                 trace: None,
@@ -15080,6 +15151,19 @@ fn build_media_player_boot_with_state(
 /// The location mirrors the video [`ingest_plan_for`] mapping so a source's audio
 /// is decoded from the SAME media as its video (the audio peer opens its own
 /// libav context — the contexts are `!Send` and must not be shared).
+/// Whether `kind` is a `YouTube` source (always `false` without the feature).
+const fn is_youtube_kind(kind: &SourceKind) -> bool {
+    #[cfg(feature = "youtube")]
+    {
+        matches!(kind, SourceKind::Youtube { .. })
+    }
+    #[cfg(not(feature = "youtube"))]
+    {
+        let _ = kind;
+        false
+    }
+}
+
 fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPlan> {
     let (location, live) = match &source.kind {
         // Synthetic sources render video in-process and carry no audio.
@@ -15108,11 +15192,13 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
             Ok(lowered) => (lowered, true),
             Err(_) => return None,
         },
-        // YouTube/NDI audio is not wired through the libav file decoder here:
-        // YouTube needs the watch-URL resolve step (deferred to its own slice) and
-        // NDI audio is a host-memory receive. Both ride silence on the bus for now.
+        // `YouTube` (issue #420): the location is the WATCH url; the audio rail
+        // never opens it. It reads the video rail's fetched copy of the
+        // resolved master, else the master the video rail resolved, else
+        // resolves once itself (see `audio_ingest_loop`). NDI audio is a
+        // host-memory receive and rides silence on the bus for now.
         #[cfg(feature = "youtube")]
-        SourceKind::Youtube { .. } => return None,
+        SourceKind::Youtube { url } => (url.clone(), true),
         #[cfg(feature = "ndi")]
         SourceKind::Ndi { .. } => return None,
         // Any other (incl. NDI without the feature, future kinds): no audio path.
@@ -15126,6 +15212,7 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         anchor_floor: 0,
         audio_only: false,
         http_headers: http_headers_for(&source.kind).to_ffmpeg(),
+        youtube: is_youtube_kind(&source.kind),
     })
 }
 
@@ -15880,14 +15967,14 @@ fn resolve_hls_audio_url_with(
     let playlist = match fetcher.fetch(master_url) {
         Ok(playlist) => playlist,
         Err(reason) => {
-            tracing::warn!(%master_url, %reason, "could not fetch HLS master for audio pin; opening URL as-is");
+            tracing::warn!(master_url = %media_url_for_log(master_url), reason = %multiview_ffmpeg::sanitize_line(&reason), "could not fetch HLS master for audio pin; opening URL as-is");
             return None;
         }
     };
     let master = multiview_input::hls::MasterPlaylist::parse(&playlist.body).ok()?;
     let uri = master.pick_audio_uri()?;
     let audio_url = crate::captions::resolve_rendition_uri(&playlist.url, uri);
-    tracing::info!(%master_url, %audio_url, "pinned HLS audio decode to one media playlist");
+    tracing::info!(master_url = %media_url_for_log(master_url), audio_url = %media_url_for_log(&audio_url), "pinned HLS audio decode to one media playlist");
     Some(audio_url)
 }
 
@@ -15902,14 +15989,14 @@ fn resolve_hls_variant_url_with(
     let playlist = match fetcher.fetch(master_url) {
         Ok(playlist) => playlist,
         Err(reason) => {
-            tracing::warn!(%master_url, %reason, "could not fetch HLS master for variant pin; opening URL as-is");
+            tracing::warn!(master_url = %media_url_for_log(master_url), reason = %multiview_ffmpeg::sanitize_line(&reason), "could not fetch HLS master for variant pin; opening URL as-is");
             return None;
         }
     };
     let master = match multiview_input::hls::MasterPlaylist::parse(&playlist.body) {
         Ok(master) => master,
         Err(err) => {
-            tracing::warn!(%master_url, error = %err, "HLS master parse failed for variant pin; opening URL as-is");
+            tracing::warn!(master_url = %media_url_for_log(master_url), error = %err, "HLS master parse failed for variant pin; opening URL as-is");
             return None;
         }
     };
@@ -15922,10 +16009,12 @@ fn resolve_hls_variant_url_with(
     // Resolving against the requested origin yields a 404 that aborts the ingest.
     // For a non-redirecting fetch the effective URL equals the requested URL.
     let variant_url = crate::captions::resolve_rendition_uri(&playlist.url, &variant.uri);
+    // Only scheme and host are logged: a signed CDN master (a `YouTube`
+    // googlevideo URL) carries its signature in the path AND the query.
     tracing::info!(
-        %master_url,
-        effective_url = %playlist.url,
-        %variant_url,
+        master_url = %media_url_for_log(master_url),
+        effective_url = %media_url_for_log(&playlist.url),
+        variant_url = %media_url_for_log(&variant_url),
         target_height = ?target_height,
         variant_height = ?variant.resolution_height,
         "pinned HLS main demuxer to a video variant (WebVTT rendition isolation)"
@@ -15963,6 +16052,22 @@ fn main_demuxer_open_url(
         )
     };
     resolved.unwrap_or_else(|| url.to_owned())
+}
+
+/// A media URL as it may be logged: `scheme://host/…` only. A resolved
+/// `YouTube` googlevideo master carries its signature both in path segments
+/// (`/signature/<sig>/`) and in the query, and tokenised HLS CDNs do the same,
+/// so neither the path nor the query is logged. Userinfo is dropped. A string
+/// that is not a URL (a file path) is returned unchanged.
+pub(crate) fn media_url_for_log(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}/…")
 }
 
 /// Master-playlist fetcher for the variant pin that carries the source's
@@ -16156,6 +16261,165 @@ pub(crate) mod seek_barrier {
 #[cfg(feature = "ffmpeg")]
 const PRECOMMIT_MAX_ATTEMPTS: u32 = 3;
 
+/// Container seek position (`AV_TIME_BASE` microseconds) of source frame
+/// `frame`, offset by the clip's source PTS origin (a container may start its
+/// PTS at a nonzero value, and libav seeks on the absolute timeline).
+#[cfg(feature = "ffmpeg")]
+fn runtime_seek_micros(frame: u64, cadence: Rational, source_origin_ns: i64) -> i64 {
+    multiview_core::time::rescale(
+        i64::try_from(frame).unwrap_or(i64::MAX),
+        Rational::new(cadence.den, cadence.num),
+        Rational::new(1, 1_000_000),
+    )
+    .saturating_add(source_origin_ns.div_euclid(1_000))
+}
+
+/// Frame-accurate preroll after a runtime player seek / cue / lap wrap.
+///
+/// `Demuxer::seek` lands on the keyframe at-or-before the target, so after
+/// every seek the decoded pictures are offered here, labelled by their actual
+/// source index (`(pts - origin) / period`), and discarded until the target is
+/// reached. Runs only on the player's decode worker, never on the output clock.
+/// Bounded by a discarded-frame count and a wall-time budget. Exhausting either
+/// is a seek FAILURE ([`PrerollAdmit::Exhausted`]): the pre-target picture is
+/// never published; the caller holds last-good, pauses and reports the fault.
+#[cfg(feature = "ffmpeg")]
+#[derive(Debug)]
+struct SeekPreroll {
+    target: Option<u64>,
+    max_discard: u64,
+    time_budget: Duration,
+    discarded: u64,
+    started: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "ffmpeg")]
+impl Default for SeekPreroll {
+    fn default() -> Self {
+        Self {
+            target: None,
+            max_discard: 0,
+            time_budget: crate::player::OpenerConfig::READ_TIMEOUT,
+            discarded: 0,
+            started: None,
+        }
+    }
+}
+
+/// What to do with one decoded picture while a seek target may be pending.
+#[cfg(feature = "ffmpeg")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrerollAdmit {
+    /// Pre-target keyframe preroll: drop it (no stamp advance, no publish).
+    Discard,
+    /// Publish this picture as source frame `index`.
+    Publish(u64),
+    /// The preroll budget ran out before the target was reached. The picture
+    /// (source frame `landed`, before `target`) must NOT be published.
+    Exhausted {
+        /// The requested source frame.
+        target: u64,
+        /// The pre-target source frame decoded when the budget ran out.
+        landed: u64,
+        /// Pictures discarded for this seek, including `landed`.
+        discarded: u64,
+    },
+}
+
+#[cfg(feature = "ffmpeg")]
+impl SeekPreroll {
+    /// Arm a pending source-frame target after a successful seek + flush,
+    /// with its discard-count and wall-time budgets.
+    fn arm(&mut self, target: u64, (max_discard, time_budget): (u64, Duration)) {
+        self.target = Some(target);
+        self.max_discard = max_discard;
+        self.time_budget = time_budget;
+        self.discarded = 0;
+        self.started = None;
+    }
+
+    /// Drop any pending target (a fresh clip commit starts frame-exact).
+    fn clear(&mut self) {
+        self.target = None;
+        self.discarded = 0;
+        self.started = None;
+    }
+
+    /// [`Self::admit_at`] at the current instant.
+    fn admit(&mut self, index: u64, next: u64) -> PrerollAdmit {
+        self.admit_at(index, next, std::time::Instant::now())
+    }
+
+    /// Offer one decoded picture whose actual source index is `index`, at
+    /// `now` (injectable for deterministic budget tests). `next` is the
+    /// sequential index used when no seek is pending.
+    fn admit_at(&mut self, index: u64, next: u64, now: std::time::Instant) -> PrerollAdmit {
+        let Some(target) = self.target else {
+            return PrerollAdmit::Publish(next);
+        };
+        if index >= target {
+            self.clear();
+            return PrerollAdmit::Publish(index);
+        }
+        self.discarded = self.discarded.saturating_add(1);
+        let started = *self.started.get_or_insert(now);
+        if self.discarded <= self.max_discard
+            && now.saturating_duration_since(started) < self.time_budget
+        {
+            return PrerollAdmit::Discard;
+        }
+        let discarded = self.discarded;
+        self.clear();
+        PrerollAdmit::Exhausted {
+            target,
+            landed: index,
+            discarded,
+        }
+    }
+}
+
+/// Discard-count and wall-time budgets for one runtime seek preroll. Tests may
+/// inject tight limits per runtime; production uses clip length + 256 frames
+/// and the shared per-read budget.
+#[cfg(feature = "ffmpeg")]
+fn preroll_budget(runtime: &crate::player::PlayerRuntime, out_point: u64) -> (u64, Duration) {
+    #[cfg(test)]
+    if let Some(limits) = runtime.preroll_limits {
+        return limits;
+    }
+    let _ = runtime;
+    (
+        out_point.saturating_add(256),
+        crate::player::OpenerConfig::READ_TIMEOUT,
+    )
+}
+
+/// A seek preroll ran out of budget before its target: fail the seek exactly
+/// like a failed native seek. The pre-target picture is not published, the
+/// player pauses (the caller heartbeats last-good, never blocking the clock)
+/// and the redacted `SeekFailed` fault is published on the runtime status.
+#[cfg(feature = "ffmpeg")]
+fn fail_exhausted_preroll(
+    plan: &IngestPlan,
+    handle: &crate::player::PlayerHandle,
+    runtime: &crate::player::PlayerRuntime,
+    player: &mut crate::player::MediaPlayer,
+    (target, landed, discarded): (u64, u64, u64),
+) {
+    tracing::warn!(
+        player = %plan.id,
+        target,
+        landed,
+        discarded,
+        "player seek preroll budget exhausted before target; holding last-good"
+    );
+    player.pause();
+    let epoch = handle.control_bus.load().clip_epoch.0;
+    crate::player::publish_status(&runtime.status, |status| {
+        status.after_seek_failure(epoch, target)
+    });
+}
+
 #[cfg(feature = "ffmpeg")]
 #[allow(clippy::too_many_lines)]
 fn player_runtime_body(
@@ -16193,6 +16457,8 @@ fn player_runtime_body(
     };
     let mut last: Arc<Nv12Image> = Arc::clone(na);
     let mut frame_index = 0_u64;
+    // Pending frame-accurate seek target (decode-and-discard after a seek).
+    let mut preroll = SeekPreroll::default();
     let mut eof_draining = false;
     let mut eof_drained_frames = 0_u64;
     let mut first = true;
@@ -16334,11 +16600,7 @@ fn player_runtime_body(
                     if let Some(clip) = current.as_mut() {
                         #[cfg(test)]
                         seek_barrier::pause_before_seek(runtime);
-                        let micros = multiview_core::time::rescale(
-                            i64::try_from(target).unwrap_or(i64::MAX),
-                            Rational::new(cadence.den, cadence.num),
-                            Rational::new(1, 1_000_000),
-                        );
+                        let micros = runtime_seek_micros(target, cadence, clip.source_origin_ns);
                         let _seek_budget = clip
                             .demuxer
                             .phase_deadline(crate::player::OpenerConfig::READ_TIMEOUT);
@@ -16348,6 +16610,7 @@ fn player_runtime_body(
                             warmup_packets = 0;
                             warmup_started = None;
                             frame_index = target;
+                            preroll.arm(target, preroll_budget(runtime, clip.geometry.out_point()));
                         } else {
                             tracing::warn!(player = %plan.id, target, "player cue seek failed; held until next load");
                             player.pause();
@@ -16362,11 +16625,7 @@ fn player_runtime_body(
                     if let Some(clip) = current.as_mut() {
                         #[cfg(test)]
                         seek_barrier::pause_before_seek(runtime);
-                        let micros = multiview_core::time::rescale(
-                            i64::try_from(frame).unwrap_or(i64::MAX),
-                            Rational::new(cadence.den, cadence.num),
-                            Rational::new(1, 1_000_000),
-                        );
+                        let micros = runtime_seek_micros(frame, cadence, clip.source_origin_ns);
                         let _seek_budget = clip
                             .demuxer
                             .phase_deadline(crate::player::OpenerConfig::READ_TIMEOUT);
@@ -16376,6 +16635,7 @@ fn player_runtime_body(
                             warmup_packets = 0;
                             warmup_started = None;
                             frame_index = frame;
+                            preroll.arm(frame, preroll_budget(runtime, clip.geometry.out_point()));
                         } else {
                             tracing::warn!(player = %plan.id, frame, "player seek failed; held until next load");
                             player.pause();
@@ -16633,6 +16893,8 @@ fn player_runtime_body(
                         if let Some(clip) = current.as_ref() {
                             last = Arc::clone(&clip.first_image);
                             frame_index = clip.geometry.in_point();
+                            // The opener primed exactly the in-point frame.
+                            preroll.clear();
                             eof_draining = false;
                             eof_drained_frames = 0;
                             warmup_packets = 0;
@@ -16772,35 +17034,68 @@ fn player_runtime_body(
                                 Ok(Some(decoded)) => {
                                     warmup_packets = 0;
                                     warmup_started = None;
-                                    let index = frame_index;
-                                    frame_index = frame_index.saturating_add(1);
-                                    match player.on_decoded(index) {
-                                        PlayerAction::Publish { at } => {
-                                            if let Ok(image) = clip.scaler.convert(
-                                                &decoded.frame,
-                                                plan.canvas_color.output_tag(),
-                                            ) {
-                                                last = Arc::new(image);
-                                            }
-                                            PlayerAction::Publish { at }
-                                        }
-                                        PlayerAction::SeekFlushTo { frame } => {
-                                            // libav seek and flush are on the ingest thread only for
-                                            // the already-open current clip; never on the output clock.
-                                            let micros = multiview_core::time::rescale(
-                                                i64::try_from(frame).unwrap_or(i64::MAX),
-                                                Rational::new(cadence.den, cadence.num),
-                                                Rational::new(1, 1_000_000),
+                                    let actual = frame_index_of(
+                                        &decoded,
+                                        clip.source_origin_ns,
+                                        clip.geometry.frame_period_ns(),
+                                    );
+                                    // Pre-target keyframe preroll: discard, no
+                                    // stamp advance and no stale republish.
+                                    match preroll.admit(actual, frame_index) {
+                                        PrerollAdmit::Discard => continue,
+                                        PrerollAdmit::Exhausted {
+                                            target,
+                                            landed,
+                                            discarded,
+                                        } => {
+                                            frame_index = landed.saturating_add(1);
+                                            fail_exhausted_preroll(
+                                                plan,
+                                                handle,
+                                                runtime,
+                                                &mut player,
+                                                (target, landed, discarded),
                                             );
-                                            if clip.demuxer.seek(micros).is_ok() {
-                                                let _ = clip.decoder.flush();
-                                                frame_index = frame;
-                                            } else {
-                                                player.pause();
-                                            }
                                             player.on_heartbeat()
                                         }
-                                        _ => player.on_heartbeat(),
+                                        PrerollAdmit::Publish(index) => {
+                                            frame_index = index.saturating_add(1);
+                                            match player.on_decoded(index) {
+                                                PlayerAction::Publish { at } => {
+                                                    if let Ok(image) = clip.scaler.convert(
+                                                        &decoded.frame,
+                                                        plan.canvas_color.output_tag(),
+                                                    ) {
+                                                        last = Arc::new(image);
+                                                    }
+                                                    PlayerAction::Publish { at }
+                                                }
+                                                PlayerAction::SeekFlushTo { frame } => {
+                                                    // libav seek and flush are on the ingest thread only for
+                                                    // the already-open current clip; never on the output clock.
+                                                    let micros = runtime_seek_micros(
+                                                        frame,
+                                                        cadence,
+                                                        clip.source_origin_ns,
+                                                    );
+                                                    if clip.demuxer.seek(micros).is_ok() {
+                                                        let _ = clip.decoder.flush();
+                                                        frame_index = frame;
+                                                        preroll.arm(
+                                                            frame,
+                                                            preroll_budget(
+                                                                runtime,
+                                                                clip.geometry.out_point(),
+                                                            ),
+                                                        );
+                                                    } else {
+                                                        player.pause();
+                                                    }
+                                                    player.on_heartbeat()
+                                                }
+                                                _ => player.on_heartbeat(),
+                                            }
+                                        }
                                     }
                                 }
                                 // Decoder reorder warm-up is not a source frame.
@@ -16847,19 +17142,43 @@ fn player_runtime_body(
                         match clip.decoder.receive_frame() {
                             Ok(Some(decoded)) if player.is_playing_state() => {
                                 eof_drained_frames = eof_drained_frames.saturating_add(1);
-                                let index = frame_index;
-                                frame_index = frame_index.saturating_add(1);
-                                match player.on_decoded(index) {
-                                    PlayerAction::Publish { at } => {
-                                        if let Ok(image) = clip
-                                            .scaler
-                                            .convert(&decoded.frame, plan.canvas_color.output_tag())
-                                        {
-                                            last = Arc::new(image);
-                                        }
-                                        PlayerAction::Publish { at }
+                                let actual = frame_index_of(
+                                    &decoded,
+                                    clip.source_origin_ns,
+                                    clip.geometry.frame_period_ns(),
+                                );
+                                match preroll.admit(actual, frame_index) {
+                                    PrerollAdmit::Discard => continue,
+                                    PrerollAdmit::Exhausted {
+                                        target,
+                                        landed,
+                                        discarded,
+                                    } => {
+                                        frame_index = landed.saturating_add(1);
+                                        fail_exhausted_preroll(
+                                            plan,
+                                            handle,
+                                            runtime,
+                                            &mut player,
+                                            (target, landed, discarded),
+                                        );
+                                        player.on_heartbeat()
                                     }
-                                    _ => player.on_heartbeat(),
+                                    PrerollAdmit::Publish(index) => {
+                                        frame_index = index.saturating_add(1);
+                                        match player.on_decoded(index) {
+                                            PlayerAction::Publish { at } => {
+                                                if let Ok(image) = clip.scaler.convert(
+                                                    &decoded.frame,
+                                                    plan.canvas_color.output_tag(),
+                                                ) {
+                                                    last = Arc::new(image);
+                                                }
+                                                PlayerAction::Publish { at }
+                                            }
+                                            _ => player.on_heartbeat(),
+                                        }
+                                    }
                                 }
                             }
                             Ok(None) if player.is_playing_state() => {
@@ -16887,31 +17206,55 @@ fn player_runtime_body(
                                     let _lap_deadline = clip
                                         .demuxer
                                         .phase_deadline(crate::player::OpenerConfig::READ_TIMEOUT);
-                                    let micros = multiview_core::time::rescale(
-                                        i64::try_from(target).unwrap_or(i64::MAX),
-                                        Rational::new(cadence.den, cadence.num),
-                                        Rational::new(1, 1_000_000),
-                                    );
+                                    let micros =
+                                        runtime_seek_micros(target, cadence, clip.source_origin_ns);
                                     if clip.demuxer.seek(micros).is_ok()
                                         && clip.decoder.flush().is_ok()
                                     {
                                         frame_index = target;
+                                        let budget =
+                                            preroll_budget(runtime, clip.geometry.out_point());
+                                        preroll.arm(target, budget);
                                         // Re-prime one frame in this SAME output
                                         // tick. A seek-only heartbeat repeats the
                                         // last picture and loses a frame at every
                                         // lap seam. No open or teardown here.
                                         let mut primed = None;
+                                        let mut exhausted = None;
                                         // The aggregate phase deadline persists
                                         // through each per-read arm/disarm. A
                                         // malicious 64-packet stream cannot turn
                                         // 2 s reads into a 128 s tile stall.
-                                        for _ in 0..64 {
+                                        // Pre-target keyframe preroll is decoded
+                                        // and discarded here too (bounded by the
+                                        // preroll budget and the same deadline).
+                                        for _ in 0..64_u64.saturating_add(budget.0) {
                                             if stop.load(Ordering::Acquire) {
                                                 break;
                                             }
                                             match clip.decoder.receive_frame() {
                                                 Ok(Some(decoded)) => {
-                                                    primed = Some(decoded);
+                                                    let actual = frame_index_of(
+                                                        &decoded,
+                                                        clip.source_origin_ns,
+                                                        clip.geometry.frame_period_ns(),
+                                                    );
+                                                    match preroll.admit(actual, frame_index) {
+                                                        PrerollAdmit::Discard => continue,
+                                                        PrerollAdmit::Publish(index) => {
+                                                            frame_index = index;
+                                                            primed = Some(decoded);
+                                                        }
+                                                        PrerollAdmit::Exhausted {
+                                                            target,
+                                                            landed,
+                                                            discarded,
+                                                        } => {
+                                                            frame_index = landed.saturating_add(1);
+                                                            exhausted =
+                                                                Some((target, landed, discarded));
+                                                        }
+                                                    }
                                                     break;
                                                 }
                                                 Ok(None) => {}
@@ -16928,6 +17271,15 @@ fn player_runtime_body(
                                                         .is_ok() => {}
                                                 _ => break,
                                             }
+                                        }
+                                        if let Some(failure) = exhausted {
+                                            fail_exhausted_preroll(
+                                                plan,
+                                                handle,
+                                                runtime,
+                                                &mut player,
+                                                failure,
+                                            );
                                         }
                                         match primed {
                                             Some(decoded) => {
@@ -17121,7 +17473,7 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
         match open_and_stream(plan, tag, stop) {
             Ok(()) => {}
             Err(reason) => {
-                tracing::warn!(source = %plan.id, %reason, "ingest stream ended/errored");
+                tracing::warn!(source = %plan.id, reason = %multiview_ffmpeg::sanitize_line(&reason), "ingest stream ended/errored");
             }
         }
         // How long THIS connection streamed (before any backoff) — feeds the
@@ -18020,7 +18372,11 @@ fn youtube_resolver_config(yt_dlp_path: Option<&str>) -> multiview_input::youtub
 /// live) is returned as a `String` error — the caller's reconnect bracket backs
 /// off and retries while the tile degrades; it is never a panic.
 #[cfg(feature = "youtube")]
-fn resolve_youtube_master(watch_url: &str, yt_dlp_path: Option<&str>) -> Result<String, String> {
+pub(crate) fn resolve_youtube_master(
+    watch_url: &str,
+    yt_dlp_path: Option<&str>,
+    stop: Option<&AtomicBool>,
+) -> Result<String, String> {
     use multiview_input::youtube::reresolve::{ingest_url, ProcessResolver, Resolver};
 
     // A dedicated current-thread runtime for this one resolve. `yt-dlp`'s own hard
@@ -18033,9 +18389,29 @@ fn resolve_youtube_master(watch_url: &str, yt_dlp_path: Option<&str>) -> Result<
         .map_err(|e| format!("youtube resolver runtime: {e}"))?;
     let process = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
     let master = runtime
-        .block_on(process.resolve(watch_url))
+        .block_on(async {
+            // A stop abandons the resolve: dropping its future kills the
+            // `yt-dlp` child (`kill_on_drop`), so a removed source's thread
+            // leaves promptly instead of finishing up to three bounded runs.
+            tokio::select! {
+                resolved = process.resolve(watch_url) => Some(resolved),
+                () = wait_for_stop(stop) => None,
+            }
+        })
+        .ok_or_else(|| "stopped".to_owned())?
         .map_err(|e| e.operator_message())?;
     Ok(ingest_url(&master).to_owned())
+}
+
+/// Resolves once `stop` is raised (polled every 100 ms); never when `None`.
+#[cfg(feature = "youtube")]
+async fn wait_for_stop(stop: Option<&AtomicBool>) {
+    let Some(stop) = stop else {
+        return std::future::pending().await;
+    };
+    while !stop.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Pick the `*.googlevideo.com` HLS master URL to open for a `YouTube` source on a
@@ -18140,7 +18516,7 @@ fn youtube_reresolve_thread(
         // The loop never returns `Err` for an extraction failure (those degrade the
         // tile + back off inside it); a returned error is a fatal-config fault.
         // Log it — the tile rides the decode thread's inline resolve fallback.
-        tracing::warn!(%watch_url, error = %e, "youtube re-resolution loop ended with error");
+        tracing::warn!(%watch_url, error = %e.operator_message(), "youtube re-resolution loop ended with error");
     }
 }
 
@@ -18182,13 +18558,27 @@ fn open_and_stream(
     let resolved_youtube_url = match &plan.location {
         SourceLocation::Youtube { watch_url } => {
             let resolved = youtube_open_url(plan.youtube_url_slot.as_deref(), || {
-                resolve_youtube_master(watch_url, plan.youtube_yt_dlp_path.as_deref())
+                resolve_youtube_master(watch_url, plan.youtube_yt_dlp_path.as_deref(), Some(stop))
             });
             crate::youtube_status::record(&plan.id, resolved.as_ref().err().map(String::as_str));
-            Some(resolved?)
+            let resolved = resolved?;
+            // Publish the master this connection opens so the audio rail opens
+            // the SAME stream (issue #420), never a second `yt-dlp` run.
+            crate::youtube_status::record_master(&plan.id, watch_url, &resolved);
+            Some(resolved)
         }
         _ => None,
     };
+    // A resolved `YouTube` master opens through the SAME network-URL path as an
+    // `hls` source (variant pin, loopback segment fetcher shared with the audio
+    // rail, source-event bridge); `plan.location` stays the `YouTube` location so
+    // the HLS checks below treat it as HLS.
+    #[cfg(feature = "youtube")]
+    let youtube_open = resolved_youtube_url.map(SourceLocation::Url);
+    #[cfg(feature = "youtube")]
+    let open_location = youtube_open.as_ref().unwrap_or(&plan.location);
+    #[cfg(not(feature = "youtube"))]
+    let open_location = &plan.location;
 
     // Network sources open with an `rw_timeout` so a dead live source fails fast
     // instead of hanging this decode thread on open or a blocking read (#45).
@@ -18201,7 +18591,7 @@ fn open_and_stream(
     // before `input` so libav closes its duplicate first.
     #[cfg(feature = "srt-libsrt")]
     let mut _srt_reader: Option<crate::srt_ingest::SrtReader> = None;
-    let mut input = match &plan.location {
+    let mut input = match open_location {
         SourceLocation::Path(p) => {
             ffmpeg::format::input_with_dictionary(p, opts).map_err(|e| e.to_string())?
         }
@@ -18301,24 +18691,12 @@ fn open_and_stream(
             ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
                 .map_err(|e| e.to_string())?
         }
-        // A YouTube source opens the manifest URL resolved above (a network HLS
-        // master) exactly like any other URL — variant-pinned the same way so its
-        // master's WebVTT rendition (if any) is never folded into the main context.
+        // Unreachable: a `YouTube` source opens through the `Url` arm above with
+        // the master resolved before this match. Guarded so the match stays
+        // exhaustive.
         #[cfg(feature = "youtube")]
         SourceLocation::Youtube { .. } => {
-            // `resolved_youtube_url` is `Some` for this arm (set just above for the
-            // same `Youtube` location); a `let-else` keeps it panic-free.
-            let Some(url) = resolved_youtube_url.as_deref() else {
-                return Err("youtube source did not resolve a manifest url".to_owned());
-            };
-            let open_url = main_demuxer_open_url(
-                url,
-                &plan.location,
-                variant_height(plan),
-                &plan.http_headers,
-            );
-            ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
-                .map_err(|e| e.to_string())?
+            return Err("youtube source did not resolve a manifest url".to_owned());
         }
         // Unreachable: `ingest_loop` routes synthetic sources to the generator
         // before opening any media. Guarded so the match stays exhaustive.
@@ -28719,10 +29097,22 @@ loop_default = true
         worker: Option<std::thread::JoinHandle<Option<[Option<crate::player::StagedClip>; 3]>>>,
         audio_stop: Arc<AtomicBool>,
         audio_worker: Option<std::thread::JoinHandle<()>>,
+        /// The player's real audio store (consumed like the output clock does).
+        audio_store: Arc<multiview_audio::store::AudioStore>,
     }
 
     impl Rig {
         fn start(config: &MultiviewConfig, state: Option<&std::path::Path>) -> Option<Self> {
+            Self::start_observed(config, state, None, None)
+        }
+
+        /// As [`Rig::start`], wiring the worker's test-only publication observer.
+        fn start_observed(
+            config: &MultiviewConfig,
+            state: Option<&std::path::Path>,
+            observer: Option<std::sync::mpsc::SyncSender<(MediaTime, MediaTime, Arc<Nv12Image>)>>,
+            preroll_limits: Option<(u64, Duration)>,
+        ) -> Option<Self> {
             let layout = config.solve_layout().unwrap();
             let cadence = config.canvas.fps.rational();
             let boot = build_media_player_boot_with_state(
@@ -28732,7 +29122,14 @@ loop_default = true
                 CanvasColor::default(),
                 state,
             );
-            let plan = boot.plans.into_iter().next()?;
+            let mut plan = boot.plans.into_iter().next()?;
+            {
+                let runtime = plan.player.as_mut().unwrap().runtime.as_mut().unwrap();
+                runtime.preroll_limits = preroll_limits;
+                if let Some(observer) = observer {
+                    runtime.observer = Some(observer);
+                }
+            }
             let handle = plan.player.as_ref().unwrap().clone();
             let runtime = handle.runtime.as_ref().unwrap().clone();
             let clock = Arc::new(ManualTimeSource::new());
@@ -28746,6 +29143,7 @@ loop_default = true
             let store = Arc::clone(&boot.stores.first().expect("player fixture store").1);
             let audio_store =
                 Arc::clone(&boot.audio_stores.first().expect("audio fixture store").1);
+            let rig_audio_store = Arc::clone(&audio_store);
             let audio_plan = boot.audio_plans.into_iter().next().unwrap();
             let audio_stop = Arc::new(AtomicBool::new(false));
             let a_stop = Arc::clone(&audio_stop);
@@ -28768,6 +29166,7 @@ loop_default = true
                 worker: Some(worker),
                 audio_stop,
                 audio_worker: Some(audio_worker),
+                audio_store: rig_audio_store,
             })
         }
 
@@ -28909,6 +29308,481 @@ loop_default = true
             rig.shutdown().is_none(),
             "clean handoff after barrier release"
         );
+    }
+
+    /// An inter-frame (GOP > 1) FFV1 clip: frame `i` has centre luma
+    /// `spec.luma_of(i)`; only every `gop`-th packet is a keyframe. Frame 0 is
+    /// presented at `pts_offset` frame periods (a nonzero source PTS origin).
+    fn gop_clip(
+        dir: &std::path::Path,
+        name: &str,
+        gop: u32,
+        pts_offset: u32,
+    ) -> (PathBuf, PlayerClipSpec) {
+        let path = dir.join(name);
+        let mut spec = PlayerClipSpec::ffv1(Rational::new(25, 1), 40, 30);
+        spec.gop = gop;
+        spec.pts_offset_frames = pts_offset;
+        generate_player_clip(&path, &spec).unwrap();
+        // The fixture must really exercise the bug: non-keyframe packets exist
+        // and (when requested) the container PTS origin is nonzero.
+        let mut demux = multiview_ffmpeg::demux::Demuxer::open(&path).unwrap();
+        let mut keys = Vec::new();
+        let mut first_pts = None;
+        let mut i = 0_u32;
+        while let Some(packet) = demux.read_packet_for(0).unwrap() {
+            first_pts.get_or_insert(packet.packet.pts());
+            if packet.packet.is_key() {
+                keys.push(i);
+            }
+            i += 1;
+        }
+        assert_eq!(i, 40, "fixture frame count");
+        assert_eq!(
+            keys,
+            (0..40)
+                .step_by(usize::try_from(gop).unwrap())
+                .collect::<Vec<_>>()
+        );
+        let first_pts = first_pts.flatten().unwrap();
+        if pts_offset == 0 {
+            assert_eq!(first_pts, 0);
+        } else {
+            assert!(first_pts > 0, "nonzero source PTS origin: {first_pts}");
+        }
+        (path, spec)
+    }
+
+    type Observed = std::sync::mpsc::Receiver<(MediaTime, MediaTime, Arc<Nv12Image>)>;
+
+    fn centre_luma(image: &Nv12Image) -> u8 {
+        let (w, h) = (image.width(), image.height());
+        *image
+            .y_plane()
+            .get(usize::try_from(h / 2 * w + w / 2).unwrap())
+            .expect("tile centre pixel")
+    }
+
+    /// Advance the manual run clock one output tick at a time (the pacer
+    /// releases only `LEAD` ticks ahead of it) and collect the worker's
+    /// published tile pictures as a run-length-collapsed centre-luma list,
+    /// starting at the first picture whose luma is `from` (earlier NA heartbeat
+    /// publishes are skipped), until `want` distinct runs were observed.
+    fn published_lumas(rig: &Rig, rx: &Observed, from: u8, want: usize) -> Vec<u8> {
+        let period = MediaTime::from_tick(1, rig.cadence).as_nanos();
+        let mut now = 1_000_000_000_i64;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut out: Vec<u8> = Vec::new();
+        let mut last_at = None;
+        while out.len() < want {
+            assert!(Instant::now() < deadline, "hang deadline: got {out:?}");
+            now += period;
+            rig.clock.set(now);
+            while let Ok((at, _, image)) = rx.recv_timeout(Duration::from_millis(5)) {
+                if let Some(prev) = last_at {
+                    assert!(at > prev, "stamps strictly monotone");
+                }
+                last_at = Some(at);
+                let luma = centre_luma(&image);
+                if out.is_empty() && luma != from {
+                    continue;
+                }
+                if out.last() != Some(&luma) {
+                    out.push(luma);
+                }
+            }
+        }
+        out.truncate(want);
+        out
+    }
+
+    fn start_with_clip(spec: ClipSpec) -> (Rig, Observed) {
+        start_with_clip_limited(spec, None)
+    }
+
+    fn start_with_clip_limited(spec: ClipSpec, limits: Option<(u64, Duration)>) -> (Rig, Observed) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(16_384);
+        let rig = Rig::start_observed(&plain_config(), None, Some(tx), limits).unwrap();
+        rig.runtime.opener.request(spec).unwrap();
+        wait("clip committed", &|| {
+            rig.handle.control_bus.load().clip_epoch.0 >= 1 && rig.runtime.native.load().is_some()
+        });
+        (rig, rx)
+    }
+
+    /// Finding A: a runtime-path seek to a NON-keyframe (13; keyframes every
+    /// 10) must show exactly source frame 13, then 14, 15, ... — never the
+    /// preceding keyframe's pictures relabelled as the target.
+    #[test]
+    fn runtime_seek_to_non_keyframe_shows_exact_target_frame() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "gop.mov", 10, 0);
+        let (rig, rx) = start_with_clip(ClipSpec::new(&path, LoadThen::Cue));
+        rig.handle.mailbox.submit(TransportVerb::Seek { frame: 13 });
+        rig.handle.mailbox.submit(TransportVerb::Play);
+        let got = published_lumas(&rig, &rx, spec.luma_of(0), 6);
+        let want: Vec<u8> = [0_u32, 13, 14, 15, 16, 17]
+            .iter()
+            .map(|i| spec.luma_of(*i))
+            .collect();
+        assert_eq!(
+            got, want,
+            "primed frame 0, then exactly 13.. after the seek"
+        );
+        assert!(rig.runtime.status.load().fault.is_none());
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Finding A: a vamp lap whose in-point is a non-keyframe replays exactly
+    /// [13, 17) on every lap (in-band `SeekFlushTo` wrap).
+    #[test]
+    fn runtime_vamp_lap_with_non_keyframe_in_point_replays_exact_interval() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "gop.mov", 10, 0);
+        let mut clip = ClipSpec::new(&path, LoadThen::Cue);
+        clip.vamp_in = Some(13);
+        clip.vamp_out = Some(17);
+        let (rig, rx) = start_with_clip(clip);
+        rig.handle.mailbox.submit(TransportVerb::Vamp);
+        // frame 0 (primed), 1..=16 of the first pass, then three exact laps.
+        let got = published_lumas(&rig, &rx, spec.luma_of(0), 17 + 12);
+        let mut want: Vec<u8> = (0_u32..=16).map(|i| spec.luma_of(i)).collect();
+        for _ in 0..3 {
+            want.extend((13_u32..17).map(|i| spec.luma_of(i)));
+        }
+        assert_eq!(got, want, "every vamp lap is exactly source frames 13..17");
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Finding A: nonzero source PTS origin. Seek and the EOF lap (`vamp_out`
+    /// = clip end) both land on the exact non-keyframe source frame, measured
+    /// from the clip's first presentation time, not from PTS zero.
+    #[test]
+    fn runtime_seek_and_eof_lap_respect_nonzero_source_pts_origin() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "offset.mov", 10, 7);
+        let mut clip = ClipSpec::new(&path, LoadThen::Cue);
+        clip.vamp_in = Some(23);
+        let (rig, rx) = start_with_clip(clip);
+        rig.handle.mailbox.submit(TransportVerb::Seek { frame: 33 });
+        rig.handle.mailbox.submit(TransportVerb::Vamp);
+        // 0 (primed), 33..=39, EOF lap to 23..=39, then a second lap start.
+        let got = published_lumas(&rig, &rx, spec.luma_of(0), 1 + 7 + 17 + 3);
+        let mut want: Vec<u8> = vec![spec.luma_of(0)];
+        want.extend((33_u32..40).map(|i| spec.luma_of(i)));
+        want.extend((23_u32..40).map(|i| spec.luma_of(i)));
+        want.extend((23_u32..26).map(|i| spec.luma_of(i)));
+        assert_eq!(got, want, "origin-relative exact seek and EOF lap");
+        assert!(rig.runtime.status.load().fault.is_none());
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Finding C / R3 "retirement stalls preserve cadence": the REAL opener
+    /// retirement path is stalled AFTER it dequeued the old native clip A and
+    /// BEFORE A's destruction and acknowledgement. While held, the production
+    /// output clock + compositor emit exact tick-stamped valid frames of the
+    /// committed B, the audio store is consumed per tick, ownership stays
+    /// bounded (the stalled opener stages nothing; newer loads supersede, they
+    /// never queue more native owners), and no retirement ACK is observed.
+    /// Release then yields the ACK, and the latest load adopts.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn retirement_stall_after_dequeue_preserves_cadence_and_bounds_ownership() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let clip_a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let clip_b = clip(dir.path(), "b.mov", 140, Some(0.5));
+        let clip_c = clip(dir.path(), "c.mov", 80, None);
+        let clip_d = clip(dir.path(), "d.mov", 180, None);
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        let coordinator = Arc::clone(&rig.runtime.coordinator);
+        let ga = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&clip_a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed", &|| {
+            rig.handle.control_bus.load().clip_epoch == ga
+                && rig.runtime.audio_commit.ready_for_commit()
+        });
+
+        // Stall the next real retirement (A, displaced by B's commit).
+        let gate = crate::player::retire_barrier::arm(coordinator.as_ref());
+        let gb = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&clip_b, LoadThen::Cue))
+            .unwrap();
+        gate.wait_entered();
+        assert!(gate.blocked());
+        wait("B committed", &|| {
+            rig.handle.control_bus.load().clip_epoch == gb && rig.runtime.native.load().is_some()
+        });
+        let barrier = coordinator.retirement_barrier();
+        assert!(barrier >= 1, "A was issued for retirement");
+        assert!(
+            !coordinator.retirement_complete(barrier),
+            "A dequeued but neither destroyed nor acknowledged"
+        );
+
+        // Newer loads while the opener is stuck in destruction: latest-wins
+        // supersedes, nothing is staged, the retire queue does not grow.
+        let gc = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&clip_c, LoadThen::Cue))
+            .unwrap();
+        let gd = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&clip_d, LoadThen::Cue))
+            .unwrap();
+        assert!(coordinator.is_superseded(gc), "C superseded by D");
+        assert!(!coordinator.is_superseded(gd));
+
+        let first = rig.first_tick_after_anchor();
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let b_center = center(&rig.store, anchor);
+        let samples_per_tick = usize::try_from(48_000 / 25).unwrap();
+        let n: u64 = 150;
+        let mut emitted = 0_u64;
+        for chunk in 0..(n / 10) {
+            let frames = rig.drive(first + chunk * 10, 10);
+            for (i, (tick, luma)) in frames.iter().enumerate() {
+                let k = first + chunk * 10 + u64::try_from(i).unwrap();
+                assert_eq!(tick.index, k);
+                assert_eq!(
+                    tick.pts,
+                    MediaTime::from_tick(i64::try_from(k).unwrap(), rig.cadence),
+                    "tick-derived stamp"
+                );
+                assert_eq!(*luma, b_center, "tick {k} shows committed B");
+                let block = rig.audio_store.read(samples_per_tick);
+                assert_eq!(block.frame_count(), samples_per_tick, "audio every tick");
+                emitted += 1;
+            }
+            // Bounded ownership while stalled: the held A plus the queue never
+            // exceed the two retired native slots; no clip is staged.
+            assert!(gate.blocked(), "retirement still stalled");
+            assert!(
+                coordinator.retired_len() < crate::player::RETIRE_CAPACITY,
+                "held + queued retired owners bounded"
+            );
+            assert!(!coordinator.retirement_complete(barrier));
+            assert_eq!(rig.handle.control_bus.load().clip_epoch, gb, "B stays live");
+            assert!(rig.runtime.opener.status().finished < gc);
+        }
+        assert_eq!(emitted, n);
+        assert_eq!(coordinator.retired_len(), 0, "stall added no queued owners");
+
+        // Release: destruction completes, the ACK arrives, and the latest load
+        // (D) is then opened and adopted; superseded C never commits.
+        gate.release();
+        gate.wait_passed();
+        wait("retirement ack", &|| {
+            coordinator.retirement_complete(barrier)
+        });
+        wait("D adopted", &|| {
+            rig.handle.control_bus.load().clip_epoch == gd
+                && rig
+                    .runtime
+                    .native
+                    .load()
+                    .as_ref()
+                    .is_some_and(|ack| ack.generation == gd.0)
+        });
+        assert!(rig.runtime.opener.status().finished >= gd);
+        let after = rig.first_tick_after_anchor();
+        let d_anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let d_center = center(&rig.store, d_anchor);
+        assert_ne!(d_center, b_center, "D replaced B");
+        let frames = rig.drive(after, 5);
+        assert!(frames.iter().all(|(_, l)| *l == d_center));
+        wait("B retired too", &|| {
+            coordinator.retirement_complete(coordinator.retirement_barrier())
+        });
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Unit: count exhaustion is a distinct outcome, never a pre-target publish.
+    #[test]
+    fn seek_preroll_count_exhaustion_is_distinct_and_never_publishes_pre_target() {
+        let t0 = Instant::now();
+        let mut preroll = SeekPreroll::default();
+        assert_eq!(preroll.admit_at(5, 5, t0), PrerollAdmit::Publish(5), "idle");
+        preroll.arm(13, (2, Duration::from_secs(3600)));
+        assert_eq!(preroll.admit_at(10, 13, t0), PrerollAdmit::Discard);
+        assert_eq!(preroll.admit_at(11, 13, t0), PrerollAdmit::Discard);
+        assert_eq!(
+            preroll.admit_at(12, 13, t0),
+            PrerollAdmit::Exhausted {
+                target: 13,
+                landed: 12,
+                discarded: 3
+            }
+        );
+        // Disarmed after the failure; a fresh arm reaching the target publishes it.
+        preroll.arm(13, (2, Duration::from_secs(3600)));
+        assert_eq!(preroll.admit_at(12, 13, t0), PrerollAdmit::Discard);
+        assert_eq!(preroll.admit_at(13, 13, t0), PrerollAdmit::Publish(13));
+        assert_eq!(preroll.admit_at(14, 14, t0), PrerollAdmit::Publish(14));
+    }
+
+    /// Unit: wall-time exhaustion with an injected clock (no sleeping).
+    #[test]
+    fn seek_preroll_time_exhaustion_is_distinct_with_injected_clock() {
+        let t0 = Instant::now();
+        let budget = Duration::from_millis(100);
+        let mut preroll = SeekPreroll::default();
+        preroll.arm(30, (1_000, budget));
+        assert_eq!(preroll.admit_at(20, 30, t0), PrerollAdmit::Discard);
+        assert_eq!(
+            preroll.admit_at(21, 30, t0 + Duration::from_millis(99)),
+            PrerollAdmit::Discard
+        );
+        assert_eq!(
+            preroll.admit_at(22, 30, t0 + budget),
+            PrerollAdmit::Exhausted {
+                target: 30,
+                landed: 22,
+                discarded: 3
+            }
+        );
+        // The clock starts at the first discarded picture of each seek.
+        preroll.arm(30, (1_000, budget));
+        assert_eq!(
+            preroll.admit_at(20, 30, t0 + Duration::from_secs(10)),
+            PrerollAdmit::Discard
+        );
+        assert_eq!(
+            preroll.admit_at(30, 30, t0 + Duration::from_secs(10) + budget),
+            PrerollAdmit::Publish(30),
+            "reaching the target is never a failure"
+        );
+    }
+
+    /// Collect observed tile lumas for `ticks` output ticks after a fault.
+    fn lumas_for_ticks(rig: &Rig, rx: &Observed, ticks: u64) -> Vec<u8> {
+        let period = MediaTime::from_tick(1, rig.cadence).as_nanos();
+        let mut now = 1_000_000_000_i64 + 3_600 * 1_000_000_000;
+        let mut out = Vec::new();
+        for _ in 0..ticks {
+            now += period;
+            rig.clock.set(now);
+            while let Ok((_, _, image)) = rx.recv_timeout(Duration::from_millis(5)) {
+                out.push(centre_luma(&image));
+            }
+        }
+        out
+    }
+
+    fn assert_seek_failed(rig: &Rig, rx: &Observed, frame: u64) -> Vec<u8> {
+        // The worker only decodes when the run clock releases its next stamp:
+        // keep advancing it, one tick at a time, until the fault is published.
+        let period = MediaTime::from_tick(1, rig.cadence).as_nanos();
+        let mut now = 1_000_000_000_i64 + 1_800 * 1_000_000_000;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        while rig.runtime.status.load().fault.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "hang deadline: seek failure reported"
+            );
+            now += period;
+            rig.clock.set(now);
+            while let Ok((_, _, image)) = rx.recv_timeout(Duration::from_millis(5)) {
+                seen.push(centre_luma(&image));
+            }
+        }
+        assert_eq!(
+            rig.runtime.status.load().fault,
+            Some(crate::player::PlayerFault::SeekFailed {
+                generation: rig.handle.control_bus.load().clip_epoch.0,
+                frame,
+            })
+        );
+        wait("audio rail paused", &|| {
+            rig.handle.control_bus.load().state == crate::player::AudioTransport::Paused
+        });
+        seen
+    }
+
+    /// Runtime path, COUNT exhaustion on a user seek: seek 13 (keyframe 10)
+    /// with a 2-frame discard budget. Frames 10/11 are discarded, 12 exhausts:
+    /// it is never shown; last-good (primed frame 0) is held, the player
+    /// pauses and `SeekFailed{13}` is reported.
+    #[test]
+    fn runtime_seek_preroll_count_exhaustion_holds_last_good_and_reports() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "gop.mov", 10, 0);
+        let (rig, rx) = start_with_clip_limited(
+            ClipSpec::new(&path, LoadThen::Cue),
+            Some((2, Duration::from_secs(3600))),
+        );
+        rig.handle.mailbox.submit(TransportVerb::Seek { frame: 13 });
+        rig.handle.mailbox.submit(TransportVerb::Play);
+        let lumas = published_lumas(&rig, &rx, spec.luma_of(0), 1);
+        assert_eq!(lumas, vec![spec.luma_of(0)]);
+        let mut held = assert_seek_failed(&rig, &rx, 13);
+        held.extend(lumas_for_ticks(&rig, &rx, 40));
+        assert!(!held.is_empty(), "heartbeat keeps publishing");
+        assert!(
+            held.iter().all(|l| *l == spec.luma_of(0)),
+            "only last-good is shown, never a pre-target frame: {held:?}"
+        );
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Runtime path, TIME exhaustion (injected zero wall budget) on an in-band
+    /// vamp wrap to a non-keyframe `vamp_in`: material before `vamp_in` is
+    /// never played; the last lap picture is held and the failure reported.
+    #[test]
+    fn runtime_vamp_wrap_preroll_time_exhaustion_never_plays_before_vamp_in() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "gop.mov", 10, 0);
+        let mut clip = ClipSpec::new(&path, LoadThen::Cue);
+        clip.vamp_in = Some(13);
+        clip.vamp_out = Some(17);
+        let (rig, rx) = start_with_clip_limited(clip, Some((1_000, Duration::ZERO)));
+        rig.handle.mailbox.submit(TransportVerb::Vamp);
+        let got = published_lumas(&rig, &rx, spec.luma_of(0), 17);
+        let want: Vec<u8> = (0_u32..=16).map(|i| spec.luma_of(i)).collect();
+        assert_eq!(got, want, "first pass up to vamp_out");
+        let mut held = assert_seek_failed(&rig, &rx, 13);
+        held.extend(lumas_for_ticks(&rig, &rx, 40));
+        assert!(
+            held.iter().all(|l| *l == spec.luma_of(16)),
+            "last lap picture held; no pre-vamp_in frame: {held:?}"
+        );
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Runtime path, COUNT exhaustion in the EOF-lap re-prime (`vamp_in` 23,
+    /// keyframe 20, budget 1): 20 discarded, 21 exhausts and is never shown.
+    #[test]
+    fn runtime_eof_lap_preroll_count_exhaustion_holds_and_reports() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, spec) = gop_clip(dir.path(), "gop.mov", 10, 0);
+        let mut clip = ClipSpec::new(&path, LoadThen::Cue);
+        clip.vamp_in = Some(23);
+        let (rig, rx) = start_with_clip_limited(clip, Some((1, Duration::from_secs(3600))));
+        rig.handle.mailbox.submit(TransportVerb::Vamp);
+        let got = published_lumas(&rig, &rx, spec.luma_of(0), 40);
+        let want: Vec<u8> = (0_u32..40).map(|i| spec.luma_of(i)).collect();
+        assert_eq!(got, want, "first pass to clip end");
+        let mut held = assert_seek_failed(&rig, &rx, 23);
+        held.extend(lumas_for_ticks(&rig, &rx, 40));
+        assert!(
+            held.iter().all(|l| *l == spec.luma_of(39)),
+            "terminal picture held; no pre-vamp_in frame: {held:?}"
+        );
+        assert!(rig.shutdown().is_none());
     }
 
     /// 10k load requests against the actual opener + worker while the output
@@ -29450,5 +30324,89 @@ loop_default = true
         assert!(rig.runtime.coordinator.is_quiescent(retired));
         assert!(rig.runtime.audio_commit.retirement_complete(retired));
         drop(rig.shutdown());
+    }
+}
+
+/// Issue #420: a `YouTube` source carries an audio plan bound to its WATCH url,
+/// flagged so the audio rail never hands that url to libav.
+#[cfg(all(test, feature = "youtube"))]
+mod youtube_audio_plan_tests {
+    use super::audio_ingest_plan_for;
+    use multiview_config::Source;
+
+    #[test]
+    fn youtube_sources_get_a_live_audio_plan_on_the_watch_url() {
+        let yt: Source = serde_json::from_value(serde_json::json!({
+            "id": "yt", "kind": "youtube", "url": "https://www.youtube.com/watch?v=KHy_n-EMWY8",
+        }))
+        .expect("youtube");
+        let plan = audio_ingest_plan_for(&yt).expect("youtube audio plan");
+        assert!(plan.youtube);
+        assert!(plan.live);
+        assert_eq!(plan.location, "https://www.youtube.com/watch?v=KHy_n-EMWY8");
+        let hls: Source = serde_json::from_value(serde_json::json!({
+            "id": "h", "kind": "hls", "url": "https://o.test/m.m3u8",
+        }))
+        .expect("hls");
+        assert!(!audio_ingest_plan_for(&hls).expect("hls plan").youtube);
+    }
+}
+
+/// Issue #420: a live-added `YouTube` source's re-resolution loop shares the
+/// video producer's stop flag and is registered as an `{id}/` companion, so
+/// the hub's stop of the source ends it within the teardown grace.
+#[cfg(all(test, feature = "youtube"))]
+mod youtube_live_reresolve_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_live_reresolve_loop_is_an_id_companion_and_stops_with_the_producer() {
+        let registry = crate::live_sources::stop_registry();
+        let stop = Arc::new(AtomicBool::new(false));
+        let slot = Arc::new(multiview_framestore::SwapCell::empty());
+        super::spawn_live_youtube_reresolve(
+            "ytlive",
+            "https://youtu.be/x".to_owned(),
+            slot,
+            // A missing binary: every resolve fails fast and the loop backs off.
+            Some("/nonexistent/multiview-test-yt-dlp".to_owned()),
+            &stop,
+            &registry,
+        );
+        assert!(registry
+            .lock()
+            .expect("registry")
+            .contains_key("ytlive/youtube-reresolve"));
+        let started = Instant::now();
+        crate::live_sources::stop_rail(&registry, "ytlive", true, false, Vec::new());
+        assert!(
+            stop.load(Ordering::Acquire),
+            "the shared producer flag is raised"
+        );
+        assert!(registry.lock().expect("registry").is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the loop left within the teardown grace: {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod media_url_for_log_tests {
+    use super::media_url_for_log;
+
+    #[test]
+    fn path_query_fragment_and_userinfo_never_reach_the_log() {
+        let logged = media_url_for_log(
+            "https://user:pw@manifest.googlevideo.com/api/manifest/hls_variant/expire/1893456000/signature/PATHSIG/lsig/LSIG/index.m3u8?sig=QSIG#FRAG",
+        );
+        assert_eq!(logged, "https://manifest.googlevideo.com/…");
+        for secret in ["PATHSIG", "LSIG", "QSIG", "FRAG", "pw"] {
+            assert!(!logged.contains(secret), "{secret} leaked: {logged}");
+        }
+        assert_eq!(media_url_for_log("/media/clip.mp4"), "/media/clip.mp4");
     }
 }

@@ -1088,6 +1088,7 @@ impl<B: Buf> BidiStream<B> {
                 id,
                 writing: None,
                 abort: Arc::clone(&abort),
+                finished: false,
             },
             recv: RecvStream {
                 stream: None,
@@ -1437,9 +1438,15 @@ impl Drop for RecvStream {
         // noq stops an unfinished stream with code 0 on drop, which is not an
         // HTTP/3 code; abandon reading with H3_NO_ERROR instead (RFC 9114
         // section 4.1: a server may stop reading once it has responded).
+        // Dropped by a panic unwinding its task (#403): H3_INTERNAL_ERROR.
         if !self.fin {
             if let Some(stream) = self.stream.as_mut() {
-                let _ = stream.stop(to_varint(Code::H3_NO_ERROR.value()));
+                let code = if std::thread::panicking() {
+                    Code::H3_INTERNAL_ERROR
+                } else {
+                    Code::H3_NO_ERROR
+                };
+                let _ = stream.stop(to_varint(code.value()));
             }
         }
     }
@@ -1483,6 +1490,9 @@ pub struct SendStream<B: Buf> {
     id: StreamId,
     writing: Option<WriteBuf<B>>,
     abort: Arc<StreamShared>,
+    /// `poll_finish` succeeded: the drop-on-panic reset must not discard a
+    /// complete response.
+    finished: bool,
 }
 
 impl<B> SendStream<B>
@@ -1495,6 +1505,7 @@ where
             stream: Some(stream),
             writing: None,
             abort,
+            finished: false,
         }
     }
 
@@ -1521,6 +1532,22 @@ where
         self.stream
             .as_mut()
             .ok_or_else(|| StreamErrorIncoming::Unknown(Box::new(AdapterError::Detached)))
+    }
+}
+
+impl<B: Buf> Drop for SendStream<B> {
+    fn drop(&mut self) {
+        // Dropped by a panic unwinding its task (#403): noq would finish the
+        // stream gracefully, and a FIN without (complete) response headers
+        // makes the peer's h3 fail its WHOLE connection
+        // (H3_FRAME_UNEXPECTED). Reset only this stream instead. A stream
+        // already finished here is left alone (its response is complete);
+        // outside a panic nothing changes.
+        if std::thread::panicking() && !self.finished {
+            if let Some(stream) = self.stream.as_mut() {
+                let _ = stream.reset(to_varint(Code::H3_INTERNAL_ERROR.value()));
+            }
+        }
     }
 }
 
@@ -1553,10 +1580,12 @@ where
         &mut self,
         _cx: &mut task::Context<'_>,
     ) -> Poll<Result<(), StreamErrorIncoming>> {
-        Poll::Ready(self.stream_mut().and_then(|s| {
+        let res = self.stream_mut().and_then(|s| {
             s.finish()
                 .map_err(|e| StreamErrorIncoming::Unknown(Box::new(e)))
-        }))
+        });
+        self.finished |= res.is_ok();
+        Poll::Ready(res)
     }
 
     fn reset(&mut self, reset_code: u64) {

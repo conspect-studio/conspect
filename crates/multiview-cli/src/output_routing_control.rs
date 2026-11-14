@@ -14,13 +14,14 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_control::output_routing::{
     AudioPlanCost, LayoutBody, OutputLive, OutputOutcome, OutputReformatRequest, OutputRouting,
-    OutputTakeRequest, PlanCost, PlanPath, PlanRefusal, ReformatSubmitError, RoutedAudio,
-    RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
+    OutputTakeRequest, OutputTakeSet, PlanCost, PlanPath, PlanRefusal, ReformatSubmitError,
+    RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, TakeSubmitError,
 };
 
 use crate::output_routing::{
     FallbackReason, OutputRoutingHandle, OutputRoutingSlot, OutputTake, ReformatRefusal,
-    RefuseReason, TakeOutcome, TakeResult, DEFAULT_MAX_ENCODERS,
+    RefuseReason, TakeOutcome, TakeResult, TakeSet, DEFAULT_MAX_ENCODERS, MAX_SET_MEMBERS,
+    MAX_TAKE_ID_BYTES,
 };
 use crate::routing_audio::AudioChoice;
 use crate::routing_aux::PictureBus;
@@ -36,6 +37,7 @@ pub fn outcome_str(result: TakeResult) -> &'static str {
         TakeResult::Refused(RefuseReason::EncoderNotReady) => "refused:encoder-not-ready",
         TakeResult::Refused(RefuseReason::Unroutable) => "refused:unroutable",
         TakeResult::Refused(RefuseReason::FormatMismatch) => "refused:format-mismatch",
+        TakeResult::Refused(RefuseReason::OnAirProtected) => "refused:on-air-protected",
         TakeResult::Fallback(FallbackReason::AuxFailed) => "fallback:aux-failed",
         TakeResult::Fallback(FallbackReason::EncoderFailed) => "fallback:encoder-failed",
         TakeResult::ResetApplied => "reset:applied",
@@ -296,6 +298,48 @@ fn pump(rx: &Receiver<TakeOutcome>, ids: &[Option<String>], tx: &SyncSender<Outp
             return;
         }
     }
+}
+
+/// Map one authorized take onto the engine's [`OutputTake`] (the kind gate,
+/// the audio slot and the picture bus), or refuse it `Unroutable`.
+fn engine_take(
+    handle: &OutputRoutingHandle,
+    take: OutputTakeRequest,
+) -> Result<OutputTake, TakeSubmitError> {
+    let index = handle
+        .index_of(&take.output)
+        .ok_or(TakeSubmitError::Unroutable)?;
+    let run_output = handle
+        .outputs()
+        .get(index)
+        .ok_or(TakeSubmitError::Unroutable)?;
+    // Every take — video, combined or audio-only — honours the kind gate.
+    if !run_output.routable {
+        return Err(TakeSubmitError::Unroutable);
+    }
+    let program_audio = run_output.program_audio;
+    let audio = take_audio(take.audio.as_ref(), program_audio);
+    if audio.is_some() && !program_audio {
+        // The engine would refuse it `unroutable`; the control plane
+        // already answered `audio-unsupported` from the plan.
+        return Err(TakeSubmitError::Unroutable);
+    }
+    let bus = match take.video.as_ref() {
+        Some(feed) => {
+            Some(picture_bus(feed, take.layout.as_ref()).ok_or(TakeSubmitError::Unroutable)?)
+        }
+        None => None,
+    };
+    if bus.is_none() && audio.is_none() {
+        return Err(TakeSubmitError::Unroutable);
+    }
+    Ok(OutputTake {
+        operation_id: take.operation_id,
+        output_index: index,
+        bus,
+        audio,
+        principal: take.principal,
+    })
 }
 
 impl OutputRouting for OutputRoutingAdapter {
@@ -573,40 +617,35 @@ impl OutputRouting for OutputRoutingAdapter {
 
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
         let handle = self.handle().ok_or(TakeSubmitError::Busy)?;
-        let index = handle
-            .index_of(&take.output)
-            .ok_or(TakeSubmitError::Unroutable)?;
-        let run_output = handle
-            .outputs()
-            .get(index)
-            .ok_or(TakeSubmitError::Unroutable)?;
-        // Every take — video, combined or audio-only — honours the kind gate.
-        if !run_output.routable {
-            return Err(TakeSubmitError::Unroutable);
+        let take = engine_take(&handle, take)?;
+        handle.try_take(take).map_err(|_| TakeSubmitError::Busy)
+    }
+
+    fn try_take_set(&self, set: OutputTakeSet) -> Result<(), TakeSubmitError> {
+        // Bounds before anything is allocated or converted (review B-2),
+        // answered as the engine handle would (busy).
+        if set.members.is_empty()
+            || set.members.len() > MAX_SET_MEMBERS
+            || set.operation_id.len() > MAX_TAKE_ID_BYTES
+            || set.principal.len() > MAX_TAKE_ID_BYTES
+        {
+            return Err(TakeSubmitError::Busy);
         }
-        let program_audio = run_output.program_audio;
-        let audio = take_audio(take.audio.as_ref(), program_audio);
-        if audio.is_some() && !program_audio {
-            // The engine would refuse it `unroutable`; the control plane
-            // already answered `audio-unsupported` from the plan.
-            return Err(TakeSubmitError::Unroutable);
-        }
-        let bus = match take.video.as_ref() {
-            Some(feed) => {
-                Some(picture_bus(feed, take.layout.as_ref()).ok_or(TakeSubmitError::Unroutable)?)
+        let handle = self.handle().ok_or(TakeSubmitError::Busy)?;
+        let mut members = Vec::with_capacity(set.members.len());
+        for member in set.members {
+            // A set member always moves video (audio rides the video move).
+            if member.video.is_none() {
+                return Err(TakeSubmitError::Unroutable);
             }
-            None => None,
-        };
-        if bus.is_none() && audio.is_none() {
-            return Err(TakeSubmitError::Unroutable);
+            members.push(engine_take(&handle, member)?);
         }
         handle
-            .try_take(OutputTake {
-                operation_id: take.operation_id,
-                output_index: index,
-                bus,
-                audio,
-                principal: take.principal,
+            .try_take_set(TakeSet {
+                operation_id: set.operation_id,
+                principal: set.principal,
+                members,
+                arm: set.arm,
             })
             .map_err(|_| TakeSubmitError::Busy)
     }
@@ -733,6 +772,9 @@ impl multiview_control::program_metrics::ProgramMetricsSource for ProgramMetrics
             phases: handles.phases.snapshot(),
             frames_repeated: handles
                 .frames_repeated
+                .load(std::sync::atomic::Ordering::Acquire),
+            compose_deadline_misses: handles
+                .compose_deadline_misses
                 .load(std::sync::atomic::Ordering::Acquire),
         })
     }

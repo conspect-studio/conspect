@@ -138,25 +138,47 @@ async fn validate_passes_a_bootable_accepted_state() {
     assert!(text.contains("desired.json"), "{text}");
 }
 
+/// #307: the 12-November shape (six cells with one M/E declared) is now a
+/// state the engine starts from (Program is the one-cell M/E bus), so the
+/// preflight passes it.
+#[tokio::test]
+async fn validate_passes_a_six_cell_accepted_state_with_a_switcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = install(dir.path()).await;
+    make_six_cell(&path);
+    let (code, text) = validate(&path);
+    assert_eq!(
+        code, 0,
+        "a switcher with a multi-cell canvas starts: {text}"
+    );
+    assert!(text.contains("OK   start: accepted state"), "{text}");
+}
+
+/// The preflight still fails a non-bootable accepted state with the start-up
+/// reason: an overlay on the Program canvas while the M/E is declared.
 #[tokio::test]
 async fn validate_fails_a_non_bootable_accepted_state_with_the_start_up_reason() {
     let dir = tempfile::tempdir().unwrap();
     let path = install(dir.path()).await;
-    make_six_cell(&path);
+    let desired = path.parent().unwrap().join(".multiview/desired.json");
+    let mut document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&desired).unwrap()).unwrap();
+    document["config"]["overlays"] =
+        serde_json::json!([{"id": "ov_clock", "kind": "clock", "target": "canvas"}]);
+    std::fs::write(&desired, document.to_string()).unwrap();
     let (code, text) = validate(&path);
     assert_ne!(
         code, 0,
         "a state the engine refuses must fail the preflight: {text}"
     );
-    // The boot file itself is fine; that is exactly the trap of 12 November.
     assert!(text.starts_with("OK   "), "{text}");
     assert!(text.contains("FAIL start: accepted state"), "{text}");
     assert!(
-        text.contains("first-slice M/E requires one full-canvas source cell initially bound to program_source; multi-cell layouts are not replaced"),
+        text.contains("the switcher M/E owns the Program canvas"),
         "the same reason start-up gives: {text}"
     );
     assert!(
-        text.contains("The switcher is on: a multi-cell layout cannot be the Program canvas."),
+        text.contains("The switcher is on: overlays cannot be added to the Program canvas"),
         "{text}"
     );
 }
