@@ -86,6 +86,8 @@ use multiview_overlay::safearea::{SafeAreaKind, SafeAreaMarkers};
 
 use crate::wallclock::WallClockSource;
 
+pub use multiview_config::LayoutOverlays;
+
 /// Opaque white / amber / cyan / green linear overlay colours for the surface.
 const WHITE: OverlayColor = OverlayColor::opaque(0.92, 0.92, 0.92);
 const AMBER: OverlayColor = OverlayColor::opaque(0.95, 0.6, 0.05);
@@ -223,6 +225,35 @@ pub struct TileDynamics {
     /// separate axis from `state`. Anything but [`TileActivity::Ready`]
     /// replaces the signal text in the status chip.
     pub activity: TileActivity,
+    /// The tile's tally (on Program / on Preview). Drawn only when the
+    /// baker's [`LayoutOverlays::tally`] layer is on.
+    pub tally: TileTally,
+}
+
+/// A tile's tally: whether its source is on Program, on Preview, or neither.
+/// Drawn as a border inside the cell rect (red = Program, green = Preview);
+/// with the flags layer on, the state chip also names it (`PGM`/`PVW`) so the
+/// meaning is never colour alone. With flags off the border alone is shown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TileTally {
+    /// Neither on Program nor on Preview: no border.
+    #[default]
+    Off,
+    /// On Program: a red border, `PGM` in the chip.
+    Program,
+    /// On Preview: a green border, `PVW` in the chip.
+    Preview,
+}
+
+impl TileTally {
+    /// The tally's chip suffix and border colour, `None` for [`TileTally::Off`].
+    const fn mark(self) -> Option<(&'static str, OverlayColor)> {
+        match self {
+            Self::Off => None,
+            Self::Program => Some(("PGM", RED)),
+            Self::Preview => Some(("PVW", GREEN)),
+        }
+    }
 }
 
 /// A source's lifecycle as the tile status chip shows it
@@ -299,6 +330,11 @@ pub struct OverlayBaker {
     /// (invariant #1).
     wall_clock: WallClockSource,
     per_tile_safe_area: bool,
+    /// Which overlay layers this baker draws. Program's baker: every layer
+    /// except tally (Program has no tally border) with safe-area following
+    /// [`OverlayBaker::with_per_tile_safe_area`]; a routed layout's aux bake
+    /// uses the layout's own set ([`OverlayBaker::with_layers`]).
+    layers: LayoutOverlays,
     /// The Conspect tile-watermark seam (S3, ADR-0050 §5): when present and the
     /// published ladder level is at a watermark rung, the bake appends the corner
     /// watermark to the draw list. `None` (the default) never watermarks. The
@@ -404,8 +440,32 @@ impl OverlayBaker {
             analog_clocks: Vec::new(),
             wall_clock,
             per_tile_safe_area: false,
+            layers: LayoutOverlays {
+                tally: false,
+                safe_area: false,
+                ..LayoutOverlays::default()
+            },
             watermark: None,
         })
+    }
+
+    /// Draw exactly the given overlay `layers` (a routed layout's own set),
+    /// builder-style. `labels` gates the label chip; `meters` the meter lanes
+    /// and their scale text; `flags` the state chip and the content-fault
+    /// badge; `tally` the tally border (+ `PGM`/`PVW` in the chip); `clock`
+    /// the digital clock, its reference badge and every analog face;
+    /// `safe_area` the per-tile safe-area markers.
+    #[must_use]
+    pub fn with_layers(mut self, layers: LayoutOverlays) -> Self {
+        self.per_tile_safe_area = layers.safe_area;
+        self.layers = layers;
+        self
+    }
+
+    /// The overlay layers this baker draws.
+    #[must_use]
+    pub const fn layers(&self) -> LayoutOverlays {
+        self.layers
     }
 
     /// Attach the Conspect tile-watermark seam (S3, ADR-0050 §5): when `signal` is
@@ -437,6 +497,7 @@ impl OverlayBaker {
     #[must_use]
     pub fn with_per_tile_safe_area(mut self, on: bool) -> Self {
         self.per_tile_safe_area = on;
+        self.layers.safe_area = on;
         self
     }
 
@@ -538,6 +599,7 @@ impl OverlayBaker {
                 state: SourceState::NoSignal,
                 fault: TileFault::None,
                 activity: TileActivity::Ready,
+                tally: TileTally::Off,
             });
 
             // Advance this tile's meter from its own audio (conflated ~30 Hz).
@@ -590,6 +652,7 @@ impl OverlayBaker {
                     activity: dyn_.activity,
                 },
                 dyn_.fault,
+                dyn_.tally,
                 bars,
                 now_ns,
             )?;
@@ -616,7 +679,8 @@ impl OverlayBaker {
         // over a long run (anti-drift). The engine's output cadence is wholly
         // independent of this read (invariant #1): this is a pure display sample.
         let wall = self.wall_clock.now();
-        if let Some(clock) = self.clock {
+        let clock_layer = self.layers.clock;
+        if let Some(clock) = self.clock.filter(|_| clock_layer) {
             if let Some(text) = clock.render_digital(wall) {
                 // Translucent backing behind the readout so it stays legible over
                 // whatever sits beneath it — in particular the top-left tile's
@@ -665,7 +729,12 @@ impl OverlayBaker {
         // (ADR-W022 — no first-wins); the model owns the time→angle math (the
         // only float), this only maps those angles into the compositor's ring
         // + stroke primitives.
-        for analog in &self.analog_clocks {
+        let analog_faces: &[AnalogClockSpec] = if clock_layer {
+            &self.analog_clocks
+        } else {
+            &[]
+        };
+        for analog in analog_faces {
             if let Some(hands) = analog.model.render_analog(wall) {
                 let style = ClockFaceStyle::at(analog.cx, analog.cy, analog.radius);
                 // Each program-wide analog clock is a conventional 12-hour dial.
@@ -848,6 +917,7 @@ impl OverlayBaker {
         rect: PixelRect,
         state: ChipState,
         fault: TileFault,
+        tally: TileTally,
         bars: Option<(
             [MeterBar; MAX_METER_CHANNELS],
             usize,
@@ -856,8 +926,14 @@ impl OverlayBaker {
         now_ns: i64,
     ) -> Result<(), CompositorError> {
         let geom = TileGeometry::resolve(rect);
+        let layers = self.layers;
+        let tally_mark = tally.mark().filter(|_| layers.tally);
         if geom.width < MIN_TILE_PX || geom.height < MIN_TILE_PX {
             // Too small to host a legible surface; skip rather than draw mush.
+            // A tally border still reads on a tiny cell (no text needed).
+            if let Some((_, color)) = tally_mark {
+                push_box_outline(list, rect, tally_thickness(geom), color);
+            }
             return Ok(());
         }
 
@@ -879,7 +955,7 @@ impl OverlayBaker {
 
         // The per-input dB meter: a vertical peak-held bar down the tile's RIGHT
         // edge, fed by THAT input's own audio.
-        if let Some((bars, count, clips)) = bars {
+        if let Some((bars, count, clips)) = bars.filter(|_| layers.meters) {
             let track = geom.meter_track();
             let count = count.min(usize::try_from(track.width / 2).unwrap_or(0));
             if count > 0 && track.height > 0 {
@@ -1009,29 +1085,63 @@ impl OverlayBaker {
 
         // The state / fault flag: a top-left badge whose TEXT names the state, on
         // a translucent backing (meaning is the text, not the colour — A11y).
-        let (flag_text, flag_color) = state.chip();
-        let flag_h = geom.chip_height();
-        let flag_w = geom
-            .flag_width(self.text_ink_width(flag_text, FontFamily::Sans, geom.chip_text_px())?)
-            .min(geom.meter_left());
-        push_filled_rect(
-            list,
-            OverlayRect::new(geom.x, geom.y, flag_w, flag_h),
-            CHROME_BG,
-        );
-        self.push_text_clipped(
-            list,
-            flag_text,
-            TextRun {
-                family: FontFamily::Sans,
-                size_px: geom.chip_text_px(),
-                x: geom.x.saturating_add(geom.pad_i32()),
-                y: geom.y.saturating_add(geom.pad_i32() / 2),
-                color: flag_color,
-            },
-            OverlayRect::new(geom.x, geom.y, flag_w, flag_h),
-        )?;
+        // With the tally layer on, the chip also NAMES the tally ("LIVE · PGM")
+        // so its meaning is never the border colour alone.
+        if layers.flags {
+            let (base_text, flag_color) = state.chip();
+            let flag_text: std::borrow::Cow<'static, str> = match tally_mark {
+                Some((mark, _)) => std::borrow::Cow::Owned(format!("{base_text} \u{b7} {mark}")),
+                None => std::borrow::Cow::Borrowed(base_text),
+            };
+            let flag_h = geom.chip_height();
+            let flag_w = geom
+                .flag_width(self.text_ink_width(
+                    &flag_text,
+                    FontFamily::Sans,
+                    geom.chip_text_px(),
+                )?)
+                .min(geom.meter_left());
+            push_filled_rect(
+                list,
+                OverlayRect::new(geom.x, geom.y, flag_w, flag_h),
+                CHROME_BG,
+            );
+            self.push_text_clipped(
+                list,
+                &flag_text,
+                TextRun {
+                    family: FontFamily::Sans,
+                    size_px: geom.chip_text_px(),
+                    x: geom.x.saturating_add(geom.pad_i32()),
+                    y: geom.y.saturating_add(geom.pad_i32() / 2),
+                    color: flag_color,
+                },
+                OverlayRect::new(geom.x, geom.y, flag_w, flag_h),
+            )?;
+            self.draw_fault_badge(list, geom, fault, flag_w)?;
+        }
 
+        if layers.labels {
+            self.draw_label(list, geom, label)?;
+        }
+
+        // The tally border, drawn last so it stays visible over the chrome:
+        // inside the cell rect, never outside it.
+        if let Some((_, color)) = tally_mark {
+            push_box_outline(list, rect, tally_thickness(geom), color);
+        }
+
+        Ok(())
+    }
+
+    /// The per-tile content-fault badge (part of the flags layer).
+    fn draw_fault_badge(
+        &mut self,
+        list: &mut OverlayDrawList,
+        geom: TileGeometry,
+        fault: TileFault,
+        flag_w: u32,
+    ) -> Result<(), CompositorError> {
         // The per-tile content-fault badge: a TOP-RIGHT chip whose TEXT names the
         // fault (BLACK / FROZEN / NO AUDIO), drawn ONLY when a fault is present so
         // a healthy tile shows nothing. Positioned top-right (right-aligned, inset
@@ -1069,7 +1179,16 @@ impl OverlayBaker {
                 )?;
             }
         }
+        Ok(())
+    }
 
+    /// The input label (labels layer): bottom-left of the tile.
+    fn draw_label(
+        &mut self,
+        list: &mut OverlayDrawList,
+        geom: TileGeometry,
+        label: &str,
+    ) -> Result<(), CompositorError> {
         // The input label: bottom-left of the tile, on a translucent backing.
         let label_h = geom.chip_height();
         let label_w = geom
@@ -1736,6 +1855,63 @@ fn hand_angles(hands: AnalogHands) -> HandAngles {
     }
 }
 
+/// The tally border thickness for a cell: `max(2, min(w, h) / 90)`.
+fn tally_thickness(geom: TileGeometry) -> u32 {
+    (geom.width.min(geom.height) / 90).max(2)
+}
+
+/// Resolve source-bound cells into canvas-space tile chrome, in cell order,
+/// labelled from `labels` (the source id when absent). Program's bake, the
+/// live relayout drain and a routed layout's aux bake all use this one
+/// resolver, so a cell's chrome lands on the same pixels everywhere.
+#[must_use]
+pub fn tile_specs_for_layout(
+    layout: &multiview_core::layout::Layout,
+    labels: &HashMap<String, String>,
+) -> Vec<TileSpec> {
+    tile_specs_with(layout, |id| labels.get(id).cloned())
+}
+
+/// [`tile_specs_for_layout`] with a label lookup closure (`None` = the id).
+#[must_use]
+pub fn tile_specs_with(
+    layout: &multiview_core::layout::Layout,
+    label: impl Fn(&str) -> Option<String>,
+) -> Vec<TileSpec> {
+    let (cw, ch) = (layout.canvas.width, layout.canvas.height);
+    layout
+        .cells
+        .iter()
+        .filter_map(|cell| {
+            let id = cell.source.as_deref()?;
+            let text = label(id).unwrap_or_else(|| id.to_owned());
+            // Match the compositor's normalized endpoint quantization, not an
+            // independent truncation of width/height that can spill a pixel.
+            let x = norm_to_px_f32(cell.x, cw);
+            let y = norm_to_px_f32(cell.y, ch);
+            let right = norm_to_px_f32(cell.x + cell.w, cw);
+            let bottom = norm_to_px_f32(cell.y + cell.h, ch);
+            Some(TileSpec::new(
+                id,
+                text,
+                PixelRect {
+                    x,
+                    y,
+                    width: right - x,
+                    height: bottom - y,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// A normalized edge to canvas pixels as `f32`: the compositor's exact integer
+/// [`crate::display_size::frac_to_px`], widened losslessly (overlay sizes are
+/// well under 2^24).
+fn norm_to_px_f32(frac: f32, extent: u32) -> f32 {
+    f32_dim(crate::display_size::frac_to_px(frac, extent))
+}
+
 /// Round a non-negative `f32` pixel measure to `u32` (saturating), no `as`.
 fn round_dim(value: f32) -> u32 {
     if !value.is_finite() || value <= 0.0 {
@@ -2238,6 +2414,7 @@ mod tests {
                         state: *state,
                         fault: TileFault::None,
                         activity: TileActivity::Ready,
+                        tally: TileTally::Off,
                     },
                 )
             })
@@ -2263,6 +2440,7 @@ mod tests {
                         state: *state,
                         fault: *fault,
                         activity: TileActivity::Ready,
+                        tally: TileTally::Off,
                     },
                 )
             })
@@ -2377,6 +2555,7 @@ mod tests {
                 state: SourceState::Live,
                 fault: TileFault::Silent,
                 activity: TileActivity::Ready,
+                tally: TileTally::Off,
             },
         );
         dynamics.insert(
@@ -2387,6 +2566,7 @@ mod tests {
                 state: SourceState::Live,
                 fault: TileFault::None,
                 activity: TileActivity::Ready,
+                tally: TileTally::Off,
             },
         );
         let list = baker
@@ -2853,6 +3033,7 @@ mod tests {
                 state: SourceState::Live,
                 fault: TileFault::None,
                 activity: TileActivity::Ready,
+                tally: TileTally::Off,
             },
         )]);
         let first = baker
@@ -2949,6 +3130,7 @@ mod tests {
                 state: SourceState::Live,
                 fault: TileFault::None,
                 activity: TileActivity::Ready,
+                tally: TileTally::Off,
             },
         )]);
         let list = baker
@@ -2995,6 +3177,7 @@ mod tests {
                 state: SourceState::Live,
                 fault: TileFault::Silent,
                 activity: TileActivity::Ready,
+                tally: TileTally::Off,
             },
         )]);
         let list = baker
@@ -3109,6 +3292,7 @@ mod tests {
                     state: SourceState::Live,
                     fault: TileFault::Silent,
                     activity: TileActivity::Ready,
+                    tally: TileTally::Off,
                 },
             )]);
             let list = baker
@@ -3222,6 +3406,7 @@ mod tests {
                     state: SourceState::Live,
                     fault: TileFault::Silent,
                     activity: TileActivity::Ready,
+                    tally: TileTally::Off,
                 },
             )]);
             let list = baker
@@ -3761,5 +3946,218 @@ mod tests {
             }
             _ => false,
         })
+    }
+
+    /// One 640x360 LIVE tile at (320, 180) on a 1280x720 canvas, loud audio
+    /// and a fault, drawn with `layers` and `tally` for a few ticks.
+    fn layered(layers: LayoutOverlays, tally: TileTally) -> (OverlayDrawList, TileGeometry) {
+        let rect = PixelRect {
+            x: 320.0,
+            y: 180.0,
+            width: 640.0,
+            height: 360.0,
+        };
+        let mut baker =
+            OverlayBaker::new(vec![TileSpec::new("in_a", "CAMERA A", rect)], epoch_clock())
+                .unwrap()
+                .with_layers(layers);
+        let mut dynamics = HashMap::new();
+        dynamics.insert(
+            "in_a".to_owned(),
+            TileDynamics {
+                meter_db: -3.0,
+                channels: MeterChannels::from_db(&[-3.0, -6.0]),
+                state: SourceState::Live,
+                fault: TileFault::Frozen,
+                activity: TileActivity::Ready,
+                tally,
+            },
+        );
+        let mut list = OverlayDrawList::new();
+        for tick in 0..5 {
+            list = baker
+                .draw_list(
+                    MediaTime::from_nanos(tick * 40_000_000),
+                    &dynamics,
+                    &no_captions(),
+                    &no_bitmaps(),
+                )
+                .unwrap();
+        }
+        (list, TileGeometry::resolve(rect))
+    }
+
+    fn label_band(geom: TileGeometry) -> OverlayRect {
+        let h = geom.chip_height();
+        OverlayRect::new(
+            geom.x,
+            geom.y.saturating_add(i32_dim(geom.height - h)),
+            geom.meter_left(),
+            h,
+        )
+    }
+
+    fn chip_band(geom: TileGeometry) -> OverlayRect {
+        OverlayRect::new(geom.x, geom.y, geom.meter_left(), geom.chip_height())
+    }
+
+    fn tally_lines(list: &OverlayDrawList, color: OverlayColor) -> Vec<OverlayRect> {
+        list.primitives
+            .iter()
+            .filter_map(|p| match p {
+                OverlayPrimitive::Line { rect, color: c } if *c == color => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn program_baker_draws_every_layer_but_tally_by_default() {
+        let baker = OverlayBaker::new(quad_tiles(), epoch_clock()).unwrap();
+        let layers = baker.layers();
+        assert!(layers.labels && layers.meters && layers.flags && layers.clock);
+        assert!(!layers.tally, "Program has no tally border");
+        assert!(!layers.safe_area);
+        let baker = baker.with_per_tile_safe_area(true);
+        assert!(
+            baker.layers().safe_area,
+            "safe_area follows the Program switch"
+        );
+    }
+
+    #[test]
+    fn each_layer_switch_removes_exactly_its_primitives() {
+        let all = LayoutOverlays {
+            tally: false,
+            ..LayoutOverlays::default()
+        };
+        let (full, geom) = layered(all, TileTally::Off);
+        assert!(glyphs_in(&full, label_band(geom)) > 0, "label drawn");
+        assert!(glyphs_in(&full, chip_band(geom)) > 0, "chip + badge drawn");
+        assert!(!meter_fill_in(&full, geom).is_empty(), "meter drawn");
+        assert!(clock_band_glyphs(&full) > 0, "clock drawn");
+
+        let (no_labels, _) = layered(
+            LayoutOverlays {
+                labels: false,
+                ..all
+            },
+            TileTally::Off,
+        );
+        assert_eq!(
+            glyphs_in(&no_labels, label_band(geom)),
+            0,
+            "labels off: no label glyphs"
+        );
+        assert!(glyphs_in(&no_labels, chip_band(geom)) > 0);
+        assert!(!meter_fill_in(&no_labels, geom).is_empty());
+
+        let (no_meters, _) = layered(
+            LayoutOverlays {
+                meters: false,
+                ..all
+            },
+            TileTally::Off,
+        );
+        assert!(
+            meter_fill_in(&no_meters, geom).is_empty(),
+            "meters off: no meter fill"
+        );
+        assert!(glyphs_in(&no_meters, label_band(geom)) > 0);
+
+        let (no_flags, _) = layered(
+            LayoutOverlays {
+                flags: false,
+                ..all
+            },
+            TileTally::Off,
+        );
+        assert_eq!(
+            glyphs_in(&no_flags, chip_band(geom)),
+            0,
+            "flags off: no chip, no badge"
+        );
+        assert!(glyphs_in(&no_flags, label_band(geom)) > 0);
+        assert!(!meter_fill_in(&no_flags, geom).is_empty());
+
+        let (no_clock, _) = layered(
+            LayoutOverlays {
+                clock: false,
+                ..all
+            },
+            TileTally::Off,
+        );
+        assert_eq!(
+            clock_band_glyphs(&no_clock),
+            0,
+            "clock off: no clock band glyphs"
+        );
+        assert!(glyphs_in(&no_clock, label_band(geom)) > 0);
+
+        let (nothing, _) = layered(LayoutOverlays::none(), TileTally::Program);
+        assert!(
+            nothing.primitives.is_empty(),
+            "every layer off draws nothing"
+        );
+    }
+
+    #[test]
+    fn tally_draws_a_red_or_green_border_inside_the_cell_only() {
+        let layers = LayoutOverlays::default();
+        let (pgm, geom) = layered(layers, TileTally::Program);
+        let red = tally_lines(&pgm, RED);
+        assert_eq!(red.len(), 4, "a four-sided red border");
+        assert!(tally_lines(&pgm, GREEN).is_empty());
+        let thick = (geom.width.min(geom.height) / 90).max(2);
+        for rect in &red {
+            assert!(rect.width == thick || rect.height == thick);
+            assert!(
+                rect.x >= geom.x && rect.y >= geom.y,
+                "{rect:?} escapes the cell"
+            );
+            assert!(
+                i64::from(rect.x) + i64::from(rect.width)
+                    <= i64::from(geom.x) + i64::from(geom.width)
+                    && i64::from(rect.y) + i64::from(rect.height)
+                        <= i64::from(geom.y) + i64::from(geom.height),
+                "{rect:?} escapes the cell"
+            );
+        }
+        let (pvw, _) = layered(layers, TileTally::Preview);
+        assert_eq!(
+            tally_lines(&pvw, GREEN).len(),
+            4,
+            "a four-sided green border"
+        );
+        assert!(tally_lines(&pvw, RED).is_empty());
+        let (off, _) = layered(layers, TileTally::Off);
+        assert!(tally_lines(&off, RED).is_empty() && tally_lines(&off, GREEN).is_empty());
+        // The tally layer off draws no border even for a Program source.
+        let (masked, _) = layered(
+            LayoutOverlays {
+                tally: false,
+                ..layers
+            },
+            TileTally::Program,
+        );
+        assert!(tally_lines(&masked, RED).is_empty());
+    }
+
+    #[test]
+    fn tally_is_named_in_the_state_chip_never_colour_alone() {
+        let layers = LayoutOverlays::default();
+        let (plain, geom) = layered(layers, TileTally::Off);
+        let (pgm, _) = layered(layers, TileTally::Program);
+        let (pvw, _) = layered(layers, TileTally::Preview);
+        let band = chip_band(geom);
+        let plain_glyphs = glyphs_in(&plain, band);
+        assert!(
+            glyphs_in(&pgm, band) > plain_glyphs,
+            "chip reads LIVE · PGM"
+        );
+        assert!(
+            glyphs_in(&pvw, band) > plain_glyphs,
+            "chip reads LIVE · PVW"
+        );
     }
 }

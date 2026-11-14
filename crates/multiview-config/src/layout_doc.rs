@@ -432,7 +432,10 @@ mod tests {
         assert_eq!(doc.overlays, LayoutOverlays::default());
         assert!(doc.overlays.labels && doc.overlays.meters && doc.overlays.flags);
         assert!(doc.overlays.tally && doc.overlays.clock && !doc.overlays.safe_area);
-        assert!(serde_json::to_value(&doc).unwrap().get("overlays").is_none());
+        assert!(serde_json::to_value(&doc)
+            .unwrap()
+            .get("overlays")
+            .is_none());
     }
 
     #[test]

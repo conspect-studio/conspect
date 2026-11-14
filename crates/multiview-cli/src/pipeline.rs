@@ -6414,6 +6414,7 @@ impl StreamBaker {
                     state,
                     fault,
                     activity,
+                    tally: crate::overlays::TileTally::Off,
                 },
             );
             if !captions.contains_key(&spec.source_id) {
@@ -12164,51 +12165,10 @@ fn duration_from_nanos(nanos: i64) -> Duration {
     Duration::from_nanos(u64::try_from(nanos.max(0)).unwrap_or(u64::MAX))
 }
 
-/// Resolve source-bound cells into canvas-space tile chrome, in cell order.
+/// Resolve source-bound cells into canvas-space tile chrome, in cell order
+/// (moved to [`crate::overlays`] so a routed layout's aux bake shares it).
 #[cfg(feature = "overlay")]
-pub(crate) fn tile_specs_for_layout(
-    layout: &Layout,
-    labels: &std::collections::HashMap<String, String>,
-) -> Vec<crate::overlays::TileSpec> {
-    use multiview_overlay::geometry::PixelRect;
-    let (cw, ch) = (layout.canvas.width, layout.canvas.height);
-    layout
-        .cells
-        .iter()
-        .filter_map(|cell| {
-            let id = cell.source.as_deref()?;
-            let label = labels.get(id).cloned().unwrap_or_else(|| id.to_owned());
-            // Match the compositor's normalized endpoint quantization, not an
-            // independent truncation of width/height that can spill a pixel.
-            let x = norm_to_px_f32(cell.x, cw);
-            let y = norm_to_px_f32(cell.y, ch);
-            let right = norm_to_px_f32(cell.x + cell.w, cw);
-            let bottom = norm_to_px_f32(cell.y + cell.h, ch);
-            Some(crate::overlays::TileSpec::new(
-                id,
-                label,
-                PixelRect {
-                    x,
-                    y,
-                    width: right - x,
-                    height: bottom - y,
-                },
-            ))
-        })
-        .collect()
-}
-
-/// Convert a normalized fraction in `[0,1]` to a pixel coordinate `f32` against
-/// `extent`, `as`-cast-free, for placing the per-tile overlay surface. Reuses the
-/// exact integer [`crate::display_size::frac_to_px`] then widens losslessly (overlay sizes are well
-/// under 2^24).
-#[cfg(feature = "overlay")]
-fn norm_to_px_f32(frac: f32, extent: u32) -> f32 {
-    let px = crate::display_size::frac_to_px(frac, extent);
-    let high = u16::try_from(px >> 16).unwrap_or(u16::MAX);
-    let low = u16::try_from(px & 0xFFFF).unwrap_or(u16::MAX);
-    f32::from(high) * 65_536.0 + f32::from(low)
-}
+pub(crate) use crate::overlays::tile_specs_for_layout;
 
 /// Whole ticks in one second at `cadence` (`num/den`), rounded to nearest, used
 /// as the GOP / segment length. Exact integer arithmetic (never float fps).
@@ -12414,7 +12374,7 @@ pub fn analog_clocks_from_config(
 }
 
 /// Exact small-`u32` → `f32` widening (canvas sizes are well under `2^24`), no
-/// `as` cast — mirrors [`norm_to_px_f32`]'s widener.
+/// `as` cast — mirrors the overlay tile resolver's widener.
 #[cfg(feature = "overlay")]
 fn u32_to_f32(value: u32) -> f32 {
     let high = u16::try_from(value >> 16).unwrap_or(u16::MAX);
