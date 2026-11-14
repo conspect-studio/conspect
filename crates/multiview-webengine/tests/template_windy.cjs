@@ -30,7 +30,7 @@ test('CLEAN hides the hamburger menu icon, its bars and the mobile UI, children 
     assert.ok(t.CHROME_SELECTORS.includes(s), s);
   assert.match(t.CLEAN, /\.rhitem__hamburger \*/);
   assert.match(t.CLEAN, /\[class\*="hamburger"\] \*/);
-  assert.match(t.CLEAN, /\{visibility:hidden!important\}$/);
+  assert.match(t.CLEAN, /\{visibility:hidden!important;transition:none!important;animation:none!important\}$/);
 });
 
 test('guard reports visible chrome and ignores hidden, off-screen, empty or transparent chrome', () => {

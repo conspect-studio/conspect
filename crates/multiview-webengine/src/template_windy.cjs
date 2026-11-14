@@ -11,7 +11,9 @@ const CHROME_SELECTORS = ['#search', '#logo-wrapper', '#logo', '.rhpane', '#plug
   '#plugin-progress-bar', '#note-message', '.timecode', '.play-pause',
   '#plugin-search-input', '#plugin-startup-weather', '.rhitem__hamburger', '[class*="hamburger"]',
   '.mobile-ui', '.mobile-ui__icon', '.mobile-ui__hamburger-icon', '#mobile-avatar'];
-const CLEAN = `${CHROME_SELECTORS.join(',')},${CHROME_SELECTORS.map(x => x + ' *').join(',')}{visibility:hidden!important}`;
+// transition/animation off: Windy's hamburger bars carry `transition: 0.3s ease-in-out 0.5s`, so a
+// bare visibility:hidden only lands after the delay and the first step captured the icon (live, mda001).
+const CLEAN = `${CHROME_SELECTORS.join(',')},${CHROME_SELECTORS.map(x => x + ' *').join(',')}{visibility:hidden!important;transition:none!important;animation:none!important}`;
 const STYLE_ID = 'mv-clean-style';
 // Idempotent: (re)creates the style if Windy replaced head/style, and keeps it last.
 const ENSURE_CLEAN_EXPRESSION = `(()=>{let s=document.getElementById(${JSON.stringify(STYLE_ID)});
