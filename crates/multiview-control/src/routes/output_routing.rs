@@ -1128,19 +1128,32 @@ pub(crate) async fn take_output(
     idem: IdempotencyKey,
     Json(req): Json<OutputRouteRequest>,
 ) -> ControlResult<Response> {
+    take_output_as(&state, &principal, &idem, &req).await
+}
+
+/// The whole output take — authorization of both ends, the Idempotency-Key
+/// contract, limits, gates, reservation and enqueue — shared by
+/// `POST /routing/output/take` and its `apply-layout` alias
+/// (`target: {output}`, #307), so the alias can never authorize less.
+pub(crate) async fn take_output_as(
+    state: &AppState,
+    principal: &Principal,
+    idem: &IdempotencyKey,
+    req: &OutputRouteRequest,
+) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     // The request's ONE layout read (T-I1), after the output end and before
     // the closure answer (T-A1).
-    authorize_output_end(&principal, req.output())?;
-    let layout = read_feed_layout(&state, &principal, req.feed.as_ref()).await?;
-    authorize_ends(&principal, &req, layout.as_ref())?;
-    authorize_track_inputs(&state, &principal, &req)?;
+    authorize_output_end(principal, req.output())?;
+    let layout = read_feed_layout(state, principal, req.feed.as_ref()).await?;
+    authorize_ends(principal, req, layout.as_ref())?;
+    authorize_track_inputs(state, principal, req)?;
     let video = req.shape()?;
     let output = req.output().to_owned();
     let op = match take_output_slot0(
-        &state,
-        &principal,
-        &idem,
+        state,
+        principal,
+        idem,
         &output,
         video,
         req.audio.as_ref(),
@@ -1391,24 +1404,65 @@ fn slot0_key_of(idem: &IdempotencyKey) -> ControlResult<String> {
 }
 
 /// The take-store key of a slot-0 take: the scoped `Idempotency-Key` with
-/// its request path replaced by one shared namespace, so `/routing/output/take`
-/// and an output crosspoint of `/patch/take` replay each other (the alias,
-/// #342 B2). The principal and raw key stay in the scope; only the path is
-/// unified.
+/// its request path replaced by one shared namespace, so `/routing/output/take`,
+/// an output crosspoint of `/patch/take` (the alias, #342 B2) and
+/// `/commands/apply-layout` with `target: {output}` (the alias, #307) replay
+/// each other — and a different body under the same key is the take store's
+/// 409, whichever route reserved it. The principal and raw key stay in the
+/// scope; only the path is unified. (Only the `target` form of apply-layout
+/// reaches the take store; its no-target form uses the global store.)
 #[must_use]
 pub(crate) fn slot0_take_key(scoped: &str) -> String {
-    const ALIASES: [&str; 2] = ["/routing/output/take", "/patch/take"];
-    for path in ALIASES {
-        let needle = format!(":{}:{path}:", path.len());
-        if let Some(at) = scoped.find(&needle) {
-            let shared = "output-slot0-take";
-            return format!(
-                "{}:{}:{shared}:{}",
-                &scoped[..at],
-                shared.len(),
-                &scoped[at + needle.len()..]
-            );
-        }
+    const ALIASES: [&str; 3] = [
+        "/routing/output/take",
+        "/patch/take",
+        "/commands/apply-layout",
+    ];
+    // The scope is `{len}:{method}:{len}:{key_id}:{len}:{path}:{len}:{raw}`
+    // (`IdempotencyKey`). Walk the length prefixes to the REAL path field:
+    // a substring search could match a path spelled inside the client's raw
+    // token and split one key into two namespaces (#307 review A1 r2).
+    let Some((path_start, path_end)) = scope_path_span(scoped) else {
+        return scoped.to_owned();
+    };
+    let (Some(head), Some(path), Some(tail)) = (
+        scoped.get(..path_start),
+        scoped.get(path_start..path_end),
+        scoped.get(path_end..),
+    ) else {
+        return scoped.to_owned();
+    };
+    if !ALIASES.contains(&path) {
+        return scoped.to_owned();
     }
-    scoped.to_owned()
+    // `head` ends with `{path.len()}:`; replace that prefix and the path.
+    let Some(prefix) = head
+        .strip_suffix(':')
+        .and_then(|h| h.strip_suffix(path.len().to_string().as_str()))
+    else {
+        return scoped.to_owned();
+    };
+    let shared = "output-slot0-take";
+    format!("{prefix}{}:{shared}{tail}", shared.len())
+}
+
+/// The byte span of the path field (the third length-prefixed field) of an
+/// `IdempotencyKey` scope, or `None` when the scope is not well formed.
+fn scope_path_span(scoped: &str) -> Option<(usize, usize)> {
+    let mut at = 0_usize;
+    for field in 0..3 {
+        let rest = scoped.get(at..)?;
+        let colon = rest.find(':')?;
+        let len: usize = rest.get(..colon)?.parse().ok()?;
+        let start = at.checked_add(colon)?.checked_add(1)?;
+        let end = start.checked_add(len)?;
+        if scoped.get(end..end.checked_add(1)?)? != ":" {
+            return None;
+        }
+        if field == 2 {
+            return Some((start, end));
+        }
+        at = end + 1;
+    }
+    None
 }

@@ -1820,6 +1820,18 @@ fn apply_swap_source(config: &mut MultiviewConfig, tile: &str, source: &str) -> 
     true
 }
 
+/// With a switcher M/E declared, the Program drive's one cell (id and slate),
+/// from the same [`MultiviewConfig::program_canvas`] `Pipeline::build` uses
+/// (#307). `None` without an M/E, or when the document does not solve (the
+/// build would have refused it).
+fn switcher_program_cell(
+    config: &MultiviewConfig,
+) -> Option<(String, multiview_config::FailoverSlate)> {
+    config.switcher.as_ref()?.mix_effects.first()?;
+    let program = config.program_canvas(config.solve_layout().ok()?).ok()?;
+    Some((program.cell_id?, program.slate))
+}
+
 /// Re-solve the working `config` and hot-swap it onto `drive`, returning `true`
 /// on a successful apply.
 ///
@@ -2280,6 +2292,16 @@ pub struct CommandDrain {
     display_layout: Option<crate::display_size::DisplayLayoutSlot>,
     /// One-shot: the drive's cell-id → index map is established the first tick.
     cell_ids_set: bool,
+    /// With a switcher M/E declared (#307): the Program drive's one cell (id
+    /// and failover slate), from [`multiview_config::MultiviewConfig::program_canvas`].
+    /// The M/E owns that drive: a stored layout updates only the document
+    /// mirror in `config`, never the drive; cell edits are dropped (#307 M1).
+    switcher_program: Option<(String, multiview_config::FailoverSlate)>,
+    /// One-shot: a cell edit (`SwapSource`/`RouteVideo`/a cell-recalling
+    /// salvo) reaching the drain under a switcher has been warned about
+    /// (#307 review M1). The control plane refuses them; the backstop drops
+    /// them without touching the mirror and warns once, then at debug.
+    switcher_cell_edit_warned: bool,
     /// The demand seam (docs/architecture/demand-driven-sources.md): the drain
     /// republishes the layout consumers when bindings change. Wait-free.
     #[cfg(feature = "ffmpeg")]
@@ -2310,9 +2332,12 @@ impl CommandDrain {
             .iter()
             .map(|source| (source.id.clone(), source.clone()))
             .collect();
+        let switcher_program = switcher_program_cell(&config);
         Self {
             commands,
             config,
+            switcher_program,
+            switcher_cell_edit_warned: false,
             publisher,
             state: DrainState::default(),
             pending: std::collections::VecDeque::new(),
@@ -2500,6 +2525,15 @@ impl CommandDrain {
         // cells by id, and the per-cell `on_loss` failover-slate policy (ADR-0027
         // / ADR-0030) so a down tile composites the slate its config declares.
         // One-shot, off the hot composite.
+        if !self.cell_ids_set {
+            if let Some((id, slate)) = &self.switcher_program {
+                // #307: the drive is the M/E's one-cell Program bus, never the
+                // document's cells.
+                drive.set_cell_ids(vec![Some(id.clone())]);
+                drive.set_cell_slates(vec![*slate]);
+                self.cell_ids_set = true;
+            }
+        }
         if !self.cell_ids_set {
             let ids: Vec<Option<String>> = self
                 .config
@@ -2689,22 +2723,23 @@ impl CommandDrain {
             );
             return;
         }
-        // #317 backstop: the route refuses this with a typed 422 before persisting;
-        // the drain re-checks with the SAME start-up admission rule so no other
-        // submitter can put a canvas under the M/E that the engine could not boot.
-        // Pure comparisons over the solved cells; no allocation on the Ok path.
-        if let Err(refusal) = multiview_config::switcher_canvas_admission(
-            self.config.switcher.as_ref(),
-            &resolved.solved,
-            &resolved.document.cells,
-            &self.config.overlays,
-        ) {
-            tracing::warn!(
+        // #307: with a switcher M/E the Program drive is the M/E bus. A stored
+        // layout (the route refuses apply-layout first; the config watcher
+        // still forwards a boot-file layout edit) changes only the document
+        // mirror, the stored layout routable to outputs, never the drive, so it
+        // can neither replace the bus nor reset the M/E's Program binding.
+        if self.switcher_program.is_some() {
+            self.config.layout = resolved.document.layout;
+            self.config.cells = resolved.document.cells;
+            tracing::info!(
                 layout = %id,
-                reason = %refusal,
-                "apply_layout held: the switcher M/E cannot drive this canvas; not applied live"
+                "apply_layout: switcher declared; the document layout was updated, \
+                 Program stays the M/E bus"
             );
-            self.publish_apply_held(id, &refusal.operator_message());
+            self.publish_apply_held(
+                id,
+                "The switcher is on: the Program canvas is the M/E bus; the layout was stored, Program is unchanged",
+            );
             return;
         }
         let cells = resolved.solved.cells.len();
@@ -2763,6 +2798,16 @@ impl CommandDrain {
                 pct: 0,
                 message: Some(format!("layout {id} not applied: {reason}")),
             }));
+    }
+
+    /// The working config's solved layout name (`schema_v{N}`), the one
+    /// back-compat `ApplyLayout` id. A full solve: counted on the test spy.
+    fn working_layout_name(&self) -> Option<String> {
+        #[cfg(test)]
+        if let Some(spy) = &self.resolve_spy {
+            spy.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        self.config.solve_layout().ok().map(|l| l.name)
     }
 
     /// Re-solve the working config and hot-swap it onto `drive` (the geometry-
@@ -2835,8 +2880,16 @@ impl CommandDrain {
                     // id is a failure (no panic). A layout change CAN alter
                     // geometry, so this keeps the re-solve path (counted by the
                     // test spy).
-                    let working = self.config.solve_layout().ok().map(|l| l.name);
-                    if working.as_deref() == Some(layout.as_str()) {
+                    if self.switcher_program.is_some() {
+                        // #307: the M/E owns the Program drive; a re-solve of
+                        // the document must never land on it. Checked BEFORE
+                        // any solve: no clock-side work for an ignored command
+                        // (review I1).
+                        tracing::warn!(
+                            layout = %layout,
+                            "apply_layout: switcher declared; Program stays the M/E bus"
+                        );
+                    } else if self.working_layout_name().as_deref() == Some(layout.as_str()) {
                         let _ = self.resolve_and_apply(drive);
                     } else {
                         tracing::warn!(
@@ -2972,6 +3025,9 @@ impl CommandDrain {
     /// NOT a full layout re-solve. An unknown cell id is ignored (no enqueue) with a
     /// warn, exactly as before; the binding only takes effect if the cell exists.
     fn route_video_command(&mut self, command: &Command) {
+        if self.drop_switcher_cell_edit("route_video") {
+            return;
+        }
         match command.route_intent() {
             Some(RouteIntent::Video { cell, source }) => {
                 if self.config.cells.iter().any(|c| c.id == cell) {
@@ -2987,6 +3043,32 @@ impl CommandDrain {
                 tracing::warn!(?other, "route_video: unexpected desugar; held");
             }
         }
+    }
+
+    /// #307 review M1 backstop: with a switcher M/E declared, a cell edit
+    /// (`SwapSource`, `RouteVideo`, a salvo recalling a layout or cell
+    /// sources) changes neither Program (the M/E bus) nor the stored layout
+    /// outputs show, and the control plane refuses it (422
+    /// `switcher-owns-program`). One that still reaches the drain is DROPPED:
+    /// the working-config mirror is never mutated, so it never diverges from
+    /// the accepted state. Warns once per drain, then logs at debug. Returns
+    /// whether the command was dropped.
+    fn drop_switcher_cell_edit(&mut self, what: &'static str) -> bool {
+        if self.switcher_program.is_none() {
+            return false;
+        }
+        if self.switcher_cell_edit_warned {
+            tracing::debug!(command = what, "switcher declared; cell edit dropped");
+        } else {
+            self.switcher_cell_edit_warned = true;
+            tracing::warn!(
+                command = what,
+                "switcher declared: Program is the M/E bus; a cell edit reached the \
+                 drain and was dropped (edit the stored layout or use a switcher select); \
+                 further drops log at debug"
+            );
+        }
+        true
     }
 
     /// Take the named salvo (else the currently-armed one): enqueue every source
@@ -3007,6 +3089,11 @@ impl CommandDrain {
             tracing::warn!(salvo = %target, "take_salvo: no such salvo; ignored");
             return;
         };
+        if (recalled.layout.is_some() || !recalled.sources.is_empty())
+            && self.drop_switcher_cell_edit("take_salvo")
+        {
+            return;
+        }
         for recall in &recalled.sources {
             if self.config.cells.iter().any(|c| c.id == recall.cell) {
                 let cell = recall.cell.clone();
@@ -4402,6 +4489,254 @@ input_id = "in_b"
             }
         }
         assert!(saw_held, "the hold is observable on the realtime stream");
+    }
+
+    /// The two-cell test config with an M/E declared (program `in_a`).
+    fn switcher_config() -> MultiviewConfig {
+        let mut config = test_config();
+        config.switcher = Some(multiview_config::SwitcherConfig {
+            mix_effects: vec![multiview_config::MixEffectsConfig {
+                id: "me1".into(),
+                program: "main".into(),
+                program_source: "in_a".into(),
+                preview_source: "in_b".into(),
+                flip_flop: true,
+                inputs: vec![],
+                program_input: None,
+                preview_input: None,
+            }],
+            extra: serde_json::Map::new(),
+        });
+        config
+    }
+
+    /// The Program drive `Pipeline::build` makes for `config` (#307): the
+    /// M/E's one-cell bus, keyed by its reserved cell id.
+    fn switcher_drive(config: &MultiviewConfig) -> (CompositorDrive<Nv12Image>, String) {
+        let program = config
+            .program_canvas(config.solve_layout().expect("solve"))
+            .expect("program canvas");
+        let mut doc = config.clone();
+        doc.switcher = None;
+        let base = test_drive(&doc);
+        let id = program.cell_id.expect("program cell id");
+        let mut drive = base;
+        drive
+            .set_layout(Arc::new(program.layout))
+            .expect("program layout");
+        let drive = drive.with_cell_ids(vec![Some(id.clone())]);
+        (drive, id)
+    }
+
+    /// #307: with a switcher M/E declared, a stored multi-cell layout reaching
+    /// the drain (the route refuses apply-layout first; the config watcher
+    /// forwards a boot-file edit) changes only the document mirror and is
+    /// never put on the Program drive, which stays the one-cell M/E bus.
+    #[test]
+    fn apply_layout_multi_cell_under_a_switcher_never_reaches_the_program_drive() {
+        let config = switcher_config();
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, command_rx) = command_bus(8);
+        let spy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut drain = CommandDrain::new(command_rx, config.clone(), Arc::clone(&publisher))
+            .with_resolve_spy(&spy);
+        let (mut drive, cell_id) = switcher_drive(&config);
+        let before = drive.layout().clone();
+        assert_eq!(before.cells.len(), 1, "Program is the one-cell M/E bus");
+        let mut sub = publisher.subscribe();
+        let body = serde_json::json!({
+            "canvas": matching_canvas(),
+            "layout": { "kind": "absolute" },
+            "cells": [
+                { "id": "l", "rect": { "x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0 }, "source": { "input_id": "in_a" } },
+                { "id": "r", "rect": { "x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0 }, "source": { "input_id": "in_b" } }
+            ]
+        });
+        let document = multiview_config::LayoutDocument::from_body(&body).expect("body parses");
+        let solved = document.solve_named("NewsOne").expect("body solves");
+        sender
+            .try_submit(Command::ApplyLayout {
+                op: OperationId::new(),
+                layout: "NewsOne".to_owned(),
+                document: Some(Box::new(multiview_control::ResolvedLayout::new(
+                    solved, document,
+                ))),
+            })
+            .expect("submit apply-layout");
+        // The back-compat (no document) re-solve path must not land either.
+        let working = config.solve_layout().expect("solve").name;
+        sender
+            .try_submit(Command::ApplyLayout {
+                op: OperationId::new(),
+                layout: working,
+                document: None,
+            })
+            .expect("submit working apply-layout");
+        let _ = drain.apply(&mut drive);
+        assert_eq!(
+            spy.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "switcher ApplyLayout commands (stored and no-document) solve nothing \
+             on the output clock (review I1)"
+        );
+        assert_eq!(
+            drive.layout().cells,
+            before.cells,
+            "Program drive untouched"
+        );
+        assert_eq!(
+            drive.effective_cell_source(&cell_id),
+            Some("in_a".to_owned()),
+            "the M/E's Program cell binding is not reset"
+        );
+        assert_eq!(
+            drain
+                .config
+                .cells
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["l", "r"],
+            "the document (stored layout) follows the apply"
+        );
+        let mut saw_held = false;
+        while let Ok(seq) = sub.try_recv() {
+            if let Event::JobProgress(progress) = seq.event.as_ref() {
+                if progress.phase == "apply_layout_held" {
+                    let message = progress.message.as_deref().unwrap_or_default();
+                    assert!(message.contains("The switcher is on"), "{message:?}");
+                    saw_held = true;
+                }
+            }
+        }
+        assert!(saw_held, "the outcome is observable on the realtime stream");
+    }
+
+    /// #307 review M1: `SwapSource` / `RouteVideo` / a cell-recalling salvo
+    /// reaching the drain under a switcher (the control plane refuses them)
+    /// are dropped: never the M/E's Program cell, and never the working-config
+    /// mirror, which stays equal to the accepted state.
+    #[test]
+    fn cell_repoints_under_a_switcher_are_dropped_and_never_touch_the_mirror() {
+        let config = switcher_config();
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, command_rx) = command_bus(8);
+        let mut drain = CommandDrain::new(command_rx, config.clone(), Arc::clone(&publisher));
+        let (mut drive, cell_id) = switcher_drive(&config);
+        sender
+            .try_submit(Command::SwapSource {
+                op: OperationId::new(),
+                tile: "cell_a".to_owned(),
+                source: "in_b".to_owned(),
+            })
+            .expect("submit swap");
+        sender
+            .try_submit(Command::RouteVideo {
+                op: OperationId::new(),
+                cell: "cell_b".to_owned(),
+                source: multiview_config::routing::StreamRef::best(
+                    "in_a".to_owned(),
+                    multiview_core::stream::StreamKind::Video,
+                ),
+            })
+            .expect("submit route");
+        sender
+            .try_submit(Command::TakeSalvo {
+                op: OperationId::new(),
+                salvo: Some("salvo_one".to_owned()),
+                head: None,
+            })
+            .expect("submit salvo");
+        let applied = drain.apply(&mut drive);
+        assert_eq!(applied, 0, "no re-point reaches the Program drive");
+        assert_eq!(
+            drive.effective_cell_source(&cell_id),
+            Some("in_a".to_owned())
+        );
+        assert_eq!(drive.layout().cells.len(), 1);
+        assert_eq!(
+            drain.config.cells, config.cells,
+            "the mirror never diverges from the accepted state"
+        );
+    }
+
+    /// #307: tally and audio-follow-video read the Program source from the
+    /// composed frame's `source_states` (`StreamItem.switcher_audio` takes its
+    /// first key). With a multi-cell document under a switcher, the Program
+    /// canvas binds exactly one source, `program_source`, and after the M/E
+    /// rebinds its cell, exactly the new one; the wall's other source never
+    /// appears.
+    #[test]
+    fn tally_and_afv_see_only_the_program_source_with_a_multi_cell_document() {
+        use multiview_core::time::MediaTime;
+        let config = switcher_config();
+        let (mut drive, cell_id) = switcher_drive(&config);
+        let tick = |index: u64| multiview_engine::Tick {
+            index,
+            pts: MediaTime::from_nanos(0),
+        };
+        let frame = drive.compose(tick(0)).expect("compose");
+        assert_eq!(
+            frame.source_states.keys().collect::<Vec<_>>(),
+            ["in_a"],
+            "one bound source: the Program source"
+        );
+        drive.rebind_cell(&cell_id, "in_b").expect("M/E cut");
+        let frame = drive.compose(tick(1)).expect("compose after cut");
+        assert_eq!(frame.source_states.keys().collect::<Vec<_>>(), ["in_b"]);
+    }
+
+    /// #307 fail-closed retirement: removing the source on Program with the
+    /// synthesized canvas unregisters its store, and the M/E's Program cell
+    /// composites its failover slate from the next tick (never a stale frame,
+    /// never a panic).
+    #[test]
+    fn removing_the_program_source_under_a_switcher_fails_closed() {
+        use multiview_core::time::MediaTime;
+        let config = switcher_config();
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, command_rx) = command_bus(8);
+        let hub = crate::live_sources::LiveSourceHub::start(
+            crate::live_sources::stop_registry(),
+            crate::live_sources::shared_stores(std::collections::HashMap::new()),
+        );
+        let mut drain = CommandDrain::new(command_rx, config.clone(), Arc::clone(&publisher))
+            .with_live_sources(hub.handle());
+        let (mut drive, cell_id) = switcher_drive(&config);
+        let bright = Nv12Image::solid(64, 64, 200, 128, 128, CanvasColor::default().output_tag())
+            .expect("bright frame");
+        let store = Arc::new(multiview_framestore::TileStore::<Nv12Image>::with_defaults(
+            "in_a",
+        ));
+        store.publish(bright, MediaTime::from_nanos(0));
+        drive.insert_store("in_a", store);
+        let tick = |index: u64| multiview_engine::Tick {
+            index,
+            pts: MediaTime::from_nanos(0),
+        };
+        let _ = drain.apply(&mut drive);
+        let before = drive.compose(tick(0)).expect("compose before");
+        assert_eq!(
+            before.source_states.get("in_a"),
+            Some(&multiview_core::traits::SourceState::Live)
+        );
+        sender
+            .try_submit(Command::RemoveSource {
+                op: OperationId::new(),
+                id: "in_a".to_owned(),
+            })
+            .expect("submit remove");
+        let _ = drain.apply(&mut drive);
+        let after = drive.compose(tick(1)).expect("compose after");
+        assert_eq!(
+            after.source_states.get("in_a"),
+            Some(&multiview_core::traits::SourceState::NoSignal),
+            "the Program cell rides its slate"
+        );
+        let (y, _, _) = after.canvas.sample(32, 32).expect("sample");
+        assert!(y < 190, "the removed source's frame is gone (luma {y})");
+        assert!(drive.rebind_cell(&cell_id, "in_a").is_err());
+        hub.shutdown();
     }
 
     /// MINOR-3 (ADR-W019 review): the drain's pinned-canvas backstop compares
