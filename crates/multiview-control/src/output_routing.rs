@@ -314,6 +314,38 @@ pub struct SlotPlan {
     pub converts: u8,
 }
 
+/// The video bit rate of an output whose video slot 0 names none, kbit/s:
+/// the run's base encode default. The control plane compares a PUT's
+/// EFFECTIVE bitrate against it (review M-4); the engine encodes at it.
+pub const DEFAULT_VIDEO_KBPS: u32 = 4_000;
+
+/// A live format reset of one output (#342 B3), already authorized and
+/// rate-limited by the HTTP layer and submitted BEFORE the store commit
+/// (review X2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputReformatRequest {
+    /// The operation id minted for the reset (echoed in its outcome).
+    pub operation_id: String,
+    /// The output's config id.
+    pub output: String,
+    /// The output's NEW accepted config (its `format` and video slot 0
+    /// bitrate are what changed).
+    pub config: multiview_config::Output,
+    /// The authenticated key id the encoder is charged to.
+    pub principal: String,
+}
+
+/// Why a live format reset could not be started: the caller keeps the
+/// restart-pending answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReformatSubmitError {
+    /// The change needs a restart (the kind carries parameter sets out of
+    /// band, the codec changed, no running engine, …).
+    RestartRequired,
+    /// The engine mailbox is full or the run ended.
+    Busy,
+}
+
 /// One output's live routing readback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputLive {
@@ -429,6 +461,18 @@ pub trait OutputRouting: Send + Sync {
     fn snapshot(&self) -> Option<RoutingLive>;
     /// The outcome stream; `Some` exactly once.
     fn subscribe_outcomes(&self) -> Option<std::sync::mpsc::Receiver<OutputOutcome>>;
+    /// Reset `output` live to its new format / video bitrate (#342 B3):
+    /// non-blocking; the outcome rides `route.output` (`reset:applied` or
+    /// `reset:refused:<reason>`). The default answers `RestartRequired`
+    /// (an engine without a live reset path).
+    ///
+    /// # Errors
+    /// [`ReformatSubmitError`] when it cannot be started live.
+    fn try_reformat(&self, request: OutputReformatRequest) -> Result<(), ReformatSubmitError> {
+        let _ = request;
+        Err(ReformatSubmitError::RestartRequired)
+    }
+
     /// The §12.4 path the output's video slot 0 is carried on now (#342 B2:
     /// Program at the output's format is its base key, P1; a routed picture
     /// identity at the output's format P2; else P3). `None` when unknown.
@@ -771,6 +815,16 @@ impl WindowLimiter {
         }
     }
 
+    /// Undo the most recent [`Self::record`] of `key` at `at` (a request
+    /// that was admitted but never reached the engine, review X2).
+    fn refund(&mut self, key: &str, at: Instant) {
+        if let Some((_, events)) = self.keys.get_mut(key) {
+            if let Some(i) = events.iter().rposition(|t| *t == at) {
+                events.remove(i);
+            }
+        }
+    }
+
     fn len(&self) -> usize {
         self.keys.len()
     }
@@ -813,6 +867,16 @@ impl TakeLimiter {
         outputs.record(output, now);
         principals.record(principal, now);
         Ok(())
+    }
+
+    /// Give back a slot [`Self::admit`] charged at `at` for a request that
+    /// never reached the engine (a busy mailbox or a restart-required
+    /// reset, review X2): only a submitted take or reset is charged.
+    pub fn refund(&self, output: &str, principal: &str, at: Instant) {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (outputs, principals) = &mut *guard;
+        outputs.refund(output, at);
+        principals.refund(principal, at);
     }
 
     /// Admit one request of `principal` touching every destination in

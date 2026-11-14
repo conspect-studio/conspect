@@ -1,11 +1,11 @@
 //! Owned frame hook for a first-slice one-cell Program scene. No shared mutex
 //! crosses between the frame boundary and completion callbacks.
 use crate::clock::Tick;
-use crate::drive::{CompositedFrame, CompositorDrive};
+use crate::drive::{CompositedFrame, CompositorDrive, TransitionStyle};
 use crate::runtime::FrameControl;
 use crate::switcher_control::SwitcherTickDriver;
 use multiview_compositor::pipeline::Nv12Image;
-use multiview_core::switcher::SourceRef;
+use multiview_core::switcher::{Rgb8, SourceRef, TransitionDescriptor};
 use multiview_framestore::{SwapCell, TileStore};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,6 +86,24 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
                 start,
             )
         });
+        // The style follows the machine's (frozen in-flight) descriptor; a
+        // change re-codes the DIP colour once, never per tick.
+        let style = match self.driver.transition() {
+            TransitionDescriptor::Dip {
+                color,
+                switch_point,
+                ..
+            } => TransitionStyle::Dip {
+                color: color.unwrap_or(Rgb8::BLACK),
+                switch_point: *switch_point,
+            },
+            _ => TransitionStyle::Mix,
+        };
+        if mix.is_some() && drive.transition_style() != style {
+            if let Err(error) = drive.set_transition_style(style) {
+                failure = Some(error.to_string());
+            }
+        }
         let result = match mix {
             Some((elapsed, duration, start)) => {
                 drive.set_mix_overlay(Some((preview.as_str(), elapsed, duration, start)))

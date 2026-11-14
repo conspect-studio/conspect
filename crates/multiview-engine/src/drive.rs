@@ -44,7 +44,8 @@ use multiview_compositor::backend::{RunBackend, RunBackendKind};
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image, Tile};
 use multiview_core::layout::Layout;
-use multiview_core::time::MediaTime;
+use multiview_core::switcher::Rgb8;
+use multiview_core::time::{MediaTime, Rational};
 use multiview_core::traits::SourceState;
 use multiview_framestore::TileStore;
 
@@ -87,7 +88,28 @@ pub struct CompositedFrame {
     pub mix: Option<MixOverlay>,
 }
 
-/// One AUTO dissolve step: `source` drawn full-canvas at `elapsed / duration`.
+/// How the incoming picture of an AUTO is drawn over the outgoing one
+/// (ADR-0104 §3, ADR-0112). `Copy` and allocation-free: it is re-derived from
+/// the machine's transition descriptor on every tick of a flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TransitionStyle {
+    /// A dissolve: the incoming picture at `elapsed / duration`.
+    #[default]
+    Mix,
+    /// Dip through a solid colour: the colour fades up over the outgoing
+    /// picture until `switch_point`, then the incoming picture fades up over
+    /// the colour (ADR-0112 §2).
+    Dip {
+        /// The colour dipped through.
+        color: Rgb8,
+        /// Where the outgoing/incoming swap happens, in `(0, 1)`.
+        switch_point: Rational,
+    },
+}
+
+/// One AUTO transition step: `source` drawn full-canvas at `elapsed /
+/// duration`, in the given [`TransitionStyle`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixOverlay {
     /// The incoming (Preview) source.
@@ -99,6 +121,8 @@ pub struct MixOverlay {
     /// The tick the AUTO started on: identifies one flight, so two
     /// consecutive AUTOs between the same sources are distinct (SW2-04).
     pub start: i128,
+    /// How the step is drawn (dissolve, dip, ...).
+    pub style: TransitionStyle,
 }
 
 impl MixOverlay {
@@ -205,6 +229,14 @@ pub struct CompositorDrive<T> {
     /// drawn as one extra full-canvas tile above every layout cell in the SAME
     /// composite pass. `None` outside a dissolve (the steady state).
     mix_overlay: Option<MixOverlay>,
+    /// The style the next/active overlay is drawn in (ADR-0112).
+    transition_style: TransitionStyle,
+    /// The DIP colour as a 2x2 canvas-coded solid image, scaled to the full
+    /// canvas at composite time. Built once per distinct colour (never per
+    /// tick) by [`CompositorDrive::set_transition_style`].
+    transition_fill: Option<(Rgb8, Arc<Nv12Image>)>,
+    /// Odometer of `transition_fill` builds (the no-per-tick-allocation gate).
+    transition_fill_builds: u64,
 }
 
 impl<T> CompositorDrive<T> {
@@ -240,6 +272,9 @@ impl<T> CompositorDrive<T> {
             backend: RunBackend::cpu(),
             scratch: RefCell::new(ComposeScratch::default()),
             mix_overlay: None,
+            transition_style: TransitionStyle::Mix,
+            transition_fill: None,
+            transition_fill_builds: 0,
         })
     }
 
@@ -265,11 +300,13 @@ impl<T> CompositorDrive<T> {
             )));
         }
         let duration = duration.max(1);
+        let style = self.transition_style;
         match &mut self.mix_overlay {
             Some(mix) if mix.source == source => {
                 mix.elapsed = elapsed;
                 mix.duration = duration;
                 mix.start = start;
+                mix.style = style;
             }
             slot => {
                 *slot = Some(MixOverlay {
@@ -277,10 +314,24 @@ impl<T> CompositorDrive<T> {
                     elapsed,
                     duration,
                     start,
+                    style,
                 });
             }
         }
         Ok(())
+    }
+
+    /// How many times a DIP colour fill was built: once per distinct colour
+    /// change, never per tick (invariant #1 allocation gate).
+    #[must_use]
+    pub fn transition_fill_builds(&self) -> u64 {
+        self.transition_fill_builds
+    }
+
+    /// The active transition style (ADR-0112).
+    #[must_use]
+    pub fn transition_style(&self) -> TransitionStyle {
+        self.transition_style
     }
 
     /// The active mix overlay, if any.
@@ -549,6 +600,30 @@ impl<T> CompositorDrive<T> {
 }
 
 impl CompositorDrive<Nv12Image> {
+    /// Select how the AUTO overlay is drawn (ADR-0112). A DIP colour is coded
+    /// into the canvas colour space once, as a 2x2 solid the compositor scales
+    /// to the full canvas, and reused for every tick of every dip through that
+    /// colour: a tick allocates nothing here, only a colour change does.
+    ///
+    /// # Errors
+    /// [`Error::Canvas`] if the colour cannot be coded for this canvas; the
+    /// style is then left unchanged.
+    pub fn set_transition_style(&mut self, style: TransitionStyle) -> Result<()> {
+        if let TransitionStyle::Dip { color, .. } = style {
+            if self.transition_fill.as_ref().map(|(c, _)| *c) != Some(color) {
+                let fill = Nv12Image::solid_rgb(2, 2, color.r, color.g, color.b, self.canvas_color)
+                    .map_err(|e| Error::Canvas(e.to_string()))?;
+                self.transition_fill = Some((color, Arc::new(fill)));
+                self.transition_fill_builds = self.transition_fill_builds.saturating_add(1);
+            }
+        }
+        self.transition_style = style;
+        if let Some(mix) = self.mix_overlay.as_mut() {
+            mix.style = style;
+        }
+        Ok(())
+    }
+
     /// Produce exactly one composited frame for `tick` (invariant #1).
     ///
     /// Samples each cell's source store at `tick.pts` (last-good / `NoSignal`
@@ -595,7 +670,9 @@ impl CompositorDrive<Nv12Image> {
         // never stalls the clock (invariant #1).
         let mut scratch = self.scratch.borrow_mut();
         let cell_count = self.layout.cells.len();
-        scratch.begin(cell_count + usize::from(self.mix_overlay.is_some()));
+        // A transition adds at most two full-canvas tiles (the DIP colour and
+        // the incoming picture), so the pool is sized once for both.
+        scratch.begin(cell_count + 2 * usize::from(self.mix_overlay.is_some()));
         let ComposeScratch {
             held,
             placements,
@@ -638,22 +715,7 @@ impl CompositorDrive<Nv12Image> {
         // this same pass. A missing frame is skipped (the outgoing picture shows
         // through), never a slate blended into Program.
         if let Some(mix) = &self.mix_overlay {
-            if let Some(store) = self.stores.get(&mix.source) {
-                // Only a fresh incoming frame is blended (SW2-02): a held
-                // stale frame or a slate never fades into Program.
-                let read = store.read_at(now);
-                if let (true, Some(frame)) = (read.state().is_live(), read.frame()) {
-                    held.push(Arc::clone(frame));
-                    placements.push(Placement {
-                        image_index: held.len().saturating_sub(1),
-                        dst_x: 0,
-                        dst_y: 0,
-                        dst_w: canvas.width,
-                        dst_h: canvas.height,
-                        opacity: mix.opacity(),
-                    });
-                }
-            }
+            self.push_transition_tiles(mix, now, canvas.width, canvas.height, held, placements);
         }
 
         // Borrow the held images for the compositor's `Tile` slice. This slice is
@@ -719,6 +781,65 @@ impl CompositorDrive<Nv12Image> {
             repeat: false,
             mix: self.mix_overlay.clone(),
         })
+    }
+
+    /// Push the AUTO transition's full-canvas tiles above the layout cells, in
+    /// this same composite pass (ADR-0104 §3, ADR-0112): the DIP colour at its
+    /// weight, then the incoming picture at its weight. A missing incoming
+    /// frame is skipped (the outgoing picture shows through), never a slate.
+    fn push_transition_tiles(
+        &self,
+        mix: &MixOverlay,
+        now: MediaTime,
+        width: u32,
+        height: u32,
+        held: &mut Vec<Arc<Nv12Image>>,
+        placements: &mut Vec<Placement>,
+    ) {
+        let mut full_canvas = |image: Arc<Nv12Image>, opacity: f32| {
+            held.push(image);
+            placements.push(Placement {
+                image_index: held.len().saturating_sub(1),
+                dst_x: 0,
+                dst_y: 0,
+                dst_w: width,
+                dst_h: height,
+                opacity,
+            });
+        };
+        let incoming = match mix.style {
+            TransitionStyle::Mix => mix.opacity(),
+            TransitionStyle::Dip {
+                color,
+                switch_point,
+            } => {
+                let (dip, incoming) = multiview_core::switcher::kernel::dip_weights(
+                    mix.elapsed,
+                    mix.duration,
+                    switch_point,
+                );
+                // The colour is drawn over the outgoing picture; at the
+                // switch point it is opaque and the incoming one rises.
+                if dip > 0.0 {
+                    if let Some((_, fill)) =
+                        self.transition_fill.as_ref().filter(|(c, _)| *c == color)
+                    {
+                        full_canvas(Arc::clone(fill), dip);
+                    }
+                }
+                incoming
+            }
+        };
+        if incoming > 0.0 {
+            if let Some(store) = self.stores.get(&mix.source) {
+                // Only a fresh incoming frame is blended (SW2-02): a held
+                // stale frame or a slate never fades into Program.
+                let read = store.read_at(now);
+                if let (true, Some(frame)) = (read.state().is_live(), read.frame()) {
+                    full_canvas(Arc::clone(frame), incoming);
+                }
+            }
+        }
     }
 
     /// Sample one cell's image and state without blocking: the bound source's

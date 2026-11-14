@@ -1271,6 +1271,15 @@ impl<D: WindowDelivery> WindowDelivery for OutputWindowTap<D> {
         self.registry.mark_discontinuity(output_index, reason);
         self.delivery.mark_discontinuity(output_index, reason);
     }
+    fn mark_config_change(
+        &mut self,
+        output_index: usize,
+        params: Option<multiview_ffmpeg::StreamCodecParameters>,
+    ) {
+        self.registry
+            .mark_discontinuity(output_index, OfferError::DecoderConfigChanged);
+        self.delivery.mark_config_change(output_index, params);
+    }
     fn take_discontinuity(
         &mut self,
         output_index: usize,
