@@ -664,3 +664,19 @@ fn carried_audio_resolves_slots_tracks_and_auto_against_the_declared_tracks() {
         toml::from_str("kind = \"cast\"\nid = \"c\"\naudio = { mode = \"auto\" }\n").unwrap();
     assert_eq!(auto.carried_audio(&declared), (true, declared.to_vec()));
 }
+
+/// #343 × ADR-0111: a cast output has no per-output clock yet, so a format
+/// rate other than Program's is refused (at Program's rate it is accepted).
+#[test]
+fn a_cast_output_at_another_rate_is_refused() {
+    let at = |fps: &str| {
+        format!(
+            "\n[[outputs]]\nkind = \"hls\"\nid = \"prog\"\npath = \"/srv/p/index.m3u8\"\ncodec = \"h264\"\n\
+             {CAST}[outputs.format]\nwidth = 1280\nheight = 720\nfps = \"{fps}\"\n"
+        )
+    };
+    let err = load_hd(&at("25/1")).unwrap_err();
+    assert!(err.contains("slot-format-unsupported"), "{err}");
+    assert!(err.contains("per-output clock"), "{err}");
+    load_hd(&at("30000/1001")).expect("Program's rate stays accepted");
+}
