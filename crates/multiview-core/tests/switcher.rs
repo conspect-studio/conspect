@@ -574,3 +574,57 @@ fn dip_weights_split_exactly_at_the_switch_point() {
     assert_eq!(dip_weights(3, 10, Rational::new(1, 1)), (0.0, 1.0));
     assert_eq!(dip_weights(3, 10, Rational::new(0, 1)), (0.0, 1.0));
 }
+
+fn stinger_of(pre_roll: u32, clip: u32, trigger: u32, mix: u32) -> TransitionDescriptor {
+    serde_json::from_value(json!({
+        "kind": "stinger", "player": "mp1", "pre_roll": pre_roll,
+        "clip_duration": clip, "trigger_point": trigger, "mix_rate": mix
+    }))
+    .unwrap()
+}
+
+/// ADR-0112 §5: a stinger is rendered exactly when it is valid: its mix
+/// window inside the clip and every count at most `MAX_STINGER_FRAMES`.
+#[test]
+fn a_stinger_is_rendered_only_when_valid_and_bounded() {
+    use multiview_core::switcher::MAX_STINGER_FRAMES;
+    let ok = stinger_of(5, 40, 10, 20);
+    assert!(ok.is_valid() && ok.is_rendered());
+    assert_eq!(ok.source_ref().map(SourceRef::as_str), Some("mp1"));
+    let edge = stinger_of(1, 30, 20, 10);
+    assert!(edge.is_rendered(), "trigger + mix == clip");
+    for bad in [
+        stinger_of(1, 30, 21, 10),
+        stinger_of(MAX_STINGER_FRAMES + 1, 30, 5, 10),
+        stinger_of(1, MAX_STINGER_FRAMES + 1, 5, 10),
+        stinger_of(1, 30, u32::MAX, 10),
+    ] {
+        assert!(!bad.is_valid() && !bad.is_rendered(), "{bad:?}");
+        assert!(bad.stinger_timing().is_none());
+    }
+    let max = stinger_of(MAX_STINGER_FRAMES, MAX_STINGER_FRAMES, 1, 1);
+    assert!(max.is_rendered());
+}
+
+/// ADR-0112 §5: the timing in output frames from the AUTO's tick.
+#[test]
+fn stinger_timing_places_the_clip_the_mix_and_the_swap() {
+    let timing = stinger_of(2, 10, 3, 4).stinger_timing().unwrap();
+    assert_eq!(timing.total(), 12);
+    assert_eq!(timing.mix_start(), 5);
+    assert_eq!(timing.swap_at(), 9);
+    assert!(!timing.clip_visible(1));
+    assert!(timing.clip_visible(2) && timing.clip_visible(11));
+    assert!(!timing.clip_visible(12));
+    assert_eq!(timing.mix_frame(4), None);
+    assert_eq!(timing.mix_frame(5), Some(0));
+    assert_eq!(timing.mix_frame(8), Some(3));
+    assert_eq!(timing.mix_frame(9), None);
+    // A one-frame mix is a cut on the trigger point; a mix that ends with
+    // the clip swaps on the clip's end.
+    let cut = stinger_of(1, 6, 2, 1).stinger_timing().unwrap();
+    assert_eq!((cut.mix_frame(3), cut.swap_at()), (Some(0), 4));
+    let late = stinger_of(1, 6, 2, 4).stinger_timing().unwrap();
+    assert_eq!(late.swap_at(), late.total());
+    assert!(TransitionDescriptor::Cut.stinger_timing().is_none());
+}
