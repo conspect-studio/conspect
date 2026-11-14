@@ -1752,11 +1752,6 @@ mod tests {
         const TICK: u64 = 33_366_667; // ns, rounded
         multiview_ffmpeg::ensure_initialized().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        if let Ok(keep) = std::env::var("P0_E2E_KEEP") {
-            let _ = std::fs::remove_dir_all(&keep);
-            std::fs::create_dir_all(&keep).unwrap();
-            eprintln!("keeping {keep}");
-        }
         let src = dir.path().join("src.ts");
         let status = std::process::Command::new("ffmpeg")
             .args([
@@ -1991,8 +1986,8 @@ mod tests {
             "every emitted packet (slate and source) decodes"
         );
         // Mux to live TS HLS and probe the segments.
-        let hls = std::env::var("P0_E2E_KEEP")
-            .map_or_else(|_| dir.path().join("hls"), std::path::PathBuf::from);
+        // Only ever inside the test's own fresh temp dir.
+        let hls = dir.path().join("hls");
         std::fs::create_dir_all(&hls).unwrap();
         let sink = multiview_output::sink::PacketMuxSink::segment_live(
             &hls,
