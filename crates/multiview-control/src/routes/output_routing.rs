@@ -1253,10 +1253,9 @@ pub(crate) enum SlotTake {
 /// # Errors
 /// Repository errors, `NotFound` for an unknown output, a missing key, a key
 /// reused for another take (409), or `idempotency-capacity`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 // reason: the slot-0 take's inputs are the request's parts plus its ONE
-// pre-read layout (T-I1); a struct would only rename them. One linear
-// validate-then-apply sequence (#440 and #409 merged it to 101 lines).
+// pre-read layout (T-I1); a struct would only rename them.
 pub(crate) fn take_output_slot0(
     state: &AppState,
     principal: &Principal,
