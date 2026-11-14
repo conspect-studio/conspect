@@ -1,5 +1,6 @@
 'use strict';
-// Pure step-loop planning for radar "steps" capture. No I/O, no browser: the
+// Pure step-loop planning for radar "steps" capture. No I/O, no browser (the
+// deadline race below uses only a timer): the
 // host feeds it timestamps and screenshot hashes; tests run it under node --test.
 // All duration -> frame-count arithmetic is integer (never float fps).
 const LIMITS = Object.freeze({
@@ -76,4 +77,48 @@ function planFrames({timestamps, timing, frameMs, endHoldMs, fps}) {
   return {durations: ms, counts, holdFrames, total};
 }
 
-module.exports = {LIMITS, validateOptions, selectSteps, dedupe, durations, planFrames, framesAt};
+// ---- Per-step readiness and deadlines (pure apart from one timer) ----
+const STEP_TIMEOUT = 'radar step did not settle';
+// Absolute deadline of one step: the step budget, never past the phase cutoff.
+function stepDeadline(now, phaseDeadline, stepMs) {
+  const d = Math.min(now + stepMs, phaseDeadline);
+  if (!(d > now)) throw new Error(STEP_TIMEOUT);
+  return d;
+}
+function checkDeadline(now, deadline) {
+  if (!(now < deadline)) throw new Error(STEP_TIMEOUT);
+}
+// Race one awaited call against the absolute deadline; expiry rejects with the
+// step error. The losing promise is still observed so it never goes unhandled.
+function withinDeadline(promise, deadline, now = Date.now()) {
+  const p = Promise.resolve(promise);
+  const left = deadline - now;
+  if (!(left > 0)) { p.catch(() => {}); return Promise.reject(new Error(STEP_TIMEOUT)); }
+  let timer;
+  const expiry = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(STEP_TIMEOUT)), left); });
+  return Promise.race([p, expiry]).finally(() => clearTimeout(timer));
+}
+// The page is quiescent for step `t`: timestamp applied, no pending tile, no
+// "No data", the expected overlay, and no tracked tile request in flight.
+function stepQuiet(state, t, overlay, inflight) {
+  return !!state && state.timestamp === t && state.tilesPending === 0 && !state.noData
+    && (overlay === null || state.overlay === overlay) && inflight === 0;
+}
+// Quiescence must hold CONTINUOUSLY for settleMs. A non-quiet observation or any
+// network activity after the window opened restarts it. The host resets network
+// tracking at the timestamp set, so an earlier step's activity never counts.
+function settleTracker(settleMs) {
+  let since = null;
+  return {
+    reset() { since = null; },
+    observe(now, quiet, lastActivity) {
+      if (!quiet) { since = null; return false; }
+      if (since === null) since = now;
+      if (lastActivity > since) since = lastActivity;
+      return now - since >= settleMs;
+    },
+  };
+}
+
+module.exports = {LIMITS, validateOptions, selectSteps, dedupe, durations, planFrames, framesAt,
+  STEP_TIMEOUT, stepDeadline, checkDeadline, withinDeadline, stepQuiet, settleTracker};

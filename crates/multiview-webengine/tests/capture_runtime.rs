@@ -277,3 +277,90 @@ fn steps_capture_with_a_single_distinct_frame_fails_clearly() {
     )
     .is_err());
 }
+
+/// Fake radar page whose step tiles arrive asynchronously: the timestamp updates
+/// at once and paints white (the pre-tile frame), 150 ms later a pending
+/// `img.leaflet-tile` appears, and only when it completes (~500 ms) does the
+/// step colour paint. Captured frames must show the final colour, never white.
+fn fake_radar_async_tiles() -> Capture {
+    let document = "<body style='margin:0'><canvas id='c' width='320' height='180'></canvas><script>\
+        const colors={1000:'red',2000:'blue',3000:'green',4000:'red'};let ts=null;\
+        const paint=f=>{const x=c.getContext('2d');x.fillStyle=f;x.fillRect(0,0,320,180);};\
+        const png='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';\
+        window.W={store:{get:k=>k==='radarCalendar'?{timestamps:[1000,2000,3000,4000]}:k==='timestamp'?ts:null,\
+        set:(k,v)=>{if(k!=='timestamp')return;ts=v;paint('white');\
+        setTimeout(()=>{const i=document.createElement('img');i.className='leaflet-tile';i.style.display='none';\
+        document.body.appendChild(i);setTimeout(()=>{i.onload=()=>{if(ts===v)paint(colors[v]);};i.src=png;},350);},150);}}};</script>"
+        .to_owned();
+    Capture {
+        document,
+        ..fake_radar_steps()
+    }
+}
+
+#[test]
+fn steps_capture_waits_for_tiles_that_start_after_the_timestamp_update() {
+    let Some(tools) = tools() else { return };
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = ArtifactStore::open(
+        directory.path(),
+        Limits {
+            bytes: 10_000_000,
+            count: 20,
+        },
+    )
+    .unwrap();
+    let output = run_capture(
+        &mut store,
+        provenance(1),
+        2_000_000,
+        &tools,
+        &fake_radar_async_tiles(),
+        Control {
+            cancelled: &AtomicBool::new(false),
+            deadline: Instant::now() + Duration::from_secs(60),
+        },
+        |_| true,
+    )
+    .unwrap();
+    let mut bytes = Vec::new();
+    store
+        .pin(&output.id, "owner", |_| true)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    let mov = directory.path().join("async.mov");
+    std::fs::write(&mov, &bytes).unwrap();
+    let out = std::process::Command::new(&tools.ffmpeg)
+        .args(["-nostdin", "-loglevel", "error", "-i"])
+        .arg(&mov)
+        .args([
+            "-vf",
+            "scale=1:1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let frames: String = out
+        .stdout
+        .chunks(3)
+        .map(|p| {
+            if p.iter().all(|v| *v > 200) {
+                'w'
+            } else {
+                match p.iter().enumerate().max_by_key(|(_, v)| **v).unwrap().0 {
+                    0 => 'r',
+                    1 => 'g',
+                    _ => 'b',
+                }
+            }
+        })
+        .collect();
+    // red, blue, green, red at 2 frames each plus the 3-frame hold; no white frame.
+    assert_eq!(frames, "rrbbggrrrrr");
+}

@@ -78,3 +78,56 @@ test('a plan over the 600-frame cap is refused', () => {
   assert.throws(() => sp.planFrames({timestamps: ts, timing: 'equal', frameMs: 5000, endHoldMs: 0, fps: 30}),
     /exceeds frame cap/);
 });
+
+test('step deadline is the step budget capped by the phase cutoff', () => {
+  assert.strictEqual(sp.stepDeadline(1000, 100000, 15000), 16000);
+  assert.strictEqual(sp.stepDeadline(1000, 5000, 15000), 5000);
+  assert.throws(() => sp.stepDeadline(5000, 5000, 15000), /radar step did not settle/);
+  assert.throws(() => sp.stepDeadline(6000, 5000, 15000), /radar step did not settle/);
+  assert.doesNotThrow(() => sp.checkDeadline(10, 11));
+  assert.throws(() => sp.checkDeadline(11, 11), /radar step did not settle/);
+});
+
+test('a stalled awaited call fails with the step error within the bound', async () => {
+  // A never-resolving status/timestamp call (a stalled page).
+  const start = Date.now();
+  await assert.rejects(sp.withinDeadline(new Promise(() => {}), start + 80), /radar step did not settle/);
+  const took = Date.now() - start;
+  assert.ok(took >= 70 && took < 1000, String(took));
+  // Already expired: rejects at once, and a late rejection of the loser is observed.
+  await assert.rejects(sp.withinDeadline(Promise.reject(new Error('late')), Date.now() - 1), /did not settle/);
+  // Fast calls pass through, including their own failures.
+  assert.strictEqual(await sp.withinDeadline(Promise.resolve(7), Date.now() + 1000), 7);
+  await assert.rejects(sp.withinDeadline(Promise.reject(new Error('boom')), Date.now() + 1000), /boom/);
+});
+
+test('quiescence requires timestamp, tiles, data, overlay and no inflight request', () => {
+  const ok = {timestamp: 5, tilesPending: 0, noData: false, overlay: 'radar'};
+  assert.ok(sp.stepQuiet(ok, 5, 'radar', 0));
+  assert.ok(sp.stepQuiet({...ok, overlay: 'x'}, 5, null, 0));
+  assert.ok(!sp.stepQuiet(null, 5, 'radar', 0));
+  assert.ok(!sp.stepQuiet({...ok, timestamp: 4}, 5, 'radar', 0));
+  assert.ok(!sp.stepQuiet({...ok, tilesPending: 1}, 5, 'radar', 0));
+  assert.ok(!sp.stepQuiet({...ok, noData: true}, 5, 'radar', 0));
+  assert.ok(!sp.stepQuiet({...ok, overlay: 'wind'}, 5, 'radar', 0));
+  assert.ok(!sp.stepQuiet(ok, 5, 'radar', 1));
+});
+
+test('settling needs continuous quiescence and restarts on activity', () => {
+  const tr = sp.settleTracker(300);
+  // Old network activity (before the window) never satisfies settling immediately.
+  assert.ok(!tr.observe(1000, true, 0));
+  assert.ok(!tr.observe(1200, true, 0));
+  // A tile starting mid-window breaks quiescence and restarts the window.
+  assert.ok(!tr.observe(1250, false, 0));
+  assert.ok(!tr.observe(1300, true, 0));
+  assert.ok(!tr.observe(1550, true, 0));
+  assert.ok(tr.observe(1600, true, 0));
+  // Network activity inside the window pushes it forward.
+  const tn = sp.settleTracker(300);
+  assert.ok(!tn.observe(0, true, 0));
+  assert.ok(!tn.observe(300, true, 200));
+  assert.ok(tn.observe(500, true, 200));
+  tn.reset();
+  assert.ok(!tn.observe(600, true, 200));
+});

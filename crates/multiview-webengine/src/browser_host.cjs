@@ -257,23 +257,45 @@ async function main() {
     }
     const timeline = stepPlan.selectSteps(await evalJson(windyTemplate.CALENDAR_EXPRESSION), req.max_steps);
     const shots = [];
+    const phaseDeadline = HOST_START + HOST_DEADLINE_MS - 10000;
+    const statusExpr = windyTemplate.statusExpression(expectedOverlay ?? 'radar');
     for (const t of timeline) {
-      const remaining = HOST_START + HOST_DEADLINE_MS - 10000 - Date.now();
-      if (remaining <= 0) throw new Error('radar step did not settle');
-      const stepDeadline = Date.now() + Math.min(STEP_DEADLINE_MS, remaining);
-      await send('Runtime.evaluate', {expression: windyTemplate.setTimestampExpression(t)});
-      let state;
-      for (;;) {
-        state = await evalJson(windyTemplate.statusExpression(expectedOverlay ?? 'radar'));
+      // Every awaited call of this step races min(step budget, phase cutoff), so a
+      // stalled page fails the job instead of overrunning on per-command timeouts.
+      const deadline = stepPlan.stepDeadline(Date.now(), phaseDeadline, STEP_DEADLINE_MS);
+      const bounded = p => stepPlan.withinDeadline(p, deadline);
+      const quietNow = async () => {
+        const state = await bounded(evalJson(statusExpr));
         if (state && state.canvases === 0) throw new Error('radar layer did not render (GL unavailable?)');
-        if (state && state.timestamp === t && state.tilesPending === 0 && !state.noData
-            && (expectedOverlay === null || state.overlay === expectedOverlay)
-            && inflight.size === 0 && Date.now() - networkChanged >= STEP_SETTLE_MS) break;
-        if (Date.now() >= stepDeadline) throw new Error('radar step did not settle');
-        await sleep(100);
+        return stepPlan.stepQuiet(state, t, expectedOverlay, inflight.size);
+      };
+      // The settling window starts at the set: a previous step's network activity
+      // never counts towards this one.
+      const tracker = stepPlan.settleTracker(STEP_SETTLE_MS);
+      networkChanged = Date.now();
+      await bounded(send('Runtime.evaluate', {expression: windyTemplate.setTimestampExpression(t)}));
+      networkChanged = Date.now();
+      let png;
+      for (;;) {
+        const quiet = await quietNow();
+        stepPlan.checkDeadline(Date.now(), deadline);
+        if (tracker.observe(Date.now(), quiet, networkChanged)) {
+          // Revalidate immediately before and right after the screenshot; any
+          // change (new tiles, timestamp moved, network activity) restarts settling.
+          const mark = networkChanged;
+          if (await quietNow() && networkChanged === mark) {
+            stepPlan.checkDeadline(Date.now(), deadline);
+            const shot = await bounded(screenshot());
+            if (await quietNow() && networkChanged === mark) {
+              stepPlan.checkDeadline(Date.now(), deadline);
+              png = shot;
+              break;
+            }
+          }
+          tracker.reset();
+        }
+        await bounded(sleep(50));
       }
-      await sleep(STEP_SETTLE_MS);
-      const png = await screenshot();
       shots.push({t, png, hash: crypto.createHash('sha256').update(png).digest('hex')});
     }
     const {kept, dropped} = stepPlan.dedupe(shots);
