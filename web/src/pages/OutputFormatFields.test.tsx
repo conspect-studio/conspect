@@ -7,6 +7,7 @@ import { useState } from 'react';
 import type { JSX } from 'react';
 import { describe, expect, it } from 'vitest';
 import { fireEvent, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '../test/render';
 import { emptyOutputForm, outputFormToBody } from '../resources/forms';
 import type { OutputFormState } from '../resources/forms';
@@ -284,6 +285,88 @@ describe('OutputFormatFields', () => {
       );
       const select = within(screen.getByTestId('subtitle-slot-0')).getByTestId('subtitle-slot-0-source');
       expect(select.textContent).toContain('Camera 1');
+    });
+
+    // UI-2 (review): every keystroke used to rewrite the controlled name
+    // through trim(), so typing a space-separated name lost every space the
+    // instant it was typed.
+    it('types a multiword name keeping spaces (UI-2 fix)', async () => {
+      let latest = base({
+        kind: 'hls',
+        extra: { slots: { subtitle: [{ format: 'webvtt' }] } },
+      });
+      renderWithProviders(
+        <Harness
+          initial={latest}
+          editing
+          onChange={(next): void => {
+            latest = next;
+          }}
+        />,
+      );
+      const input = within(screen.getByTestId('subtitle-slot-0')).getByLabelText('Name');
+      await userEvent.type(input, 'English captions');
+      expect(input).toHaveValue('English captions');
+      expect(outputFormToBody(latest).slots).toEqual({
+        subtitle: [{ format: 'webvtt', name: 'English captions' }],
+      });
+    });
+
+    // UI-2 (review): a save-time trim must not silently discard an
+    // existing, server-valid name/language that legitimately carries
+    // whitespace (the server never trims either).
+    it('preserves a stored name/language with interior/edge whitespace on an unrelated edit', () => {
+      const firstRow: SubtitleSlotRow = { format: 'webvtt', language: 'en', name: '  spaced name  ', source: undefined };
+      const withRow = withSubtitleSlots(base(), [firstRow]);
+      // Editing (adding) a second row must not retroactively mangle the first.
+      const withSecondRow = withSubtitleSlots(withRow, [
+        firstRow,
+        { format: 'webvtt', language: 'es', name: '', source: undefined },
+      ]);
+      expect(outputFormToBody(withSecondRow).slots).toEqual({
+        subtitle: [
+          { format: 'webvtt', language: 'en', name: '  spaced name  ' },
+          { format: 'webvtt', language: 'es' },
+        ],
+      });
+    });
+
+    // UI-3 (review): JS string length counts UTF-16 code units, so 33
+    // supplementary-plane characters (e.g. an emoji) looked like 66 and
+    // were wrongly rejected as over the 64-character limit, despite being
+    // 33 valid Rust `chars()`.
+    it('counts Unicode scalar values, not UTF-16 units, for the name length (UI-3 fix)', () => {
+      const name33 = '\u{1F600}'.repeat(33);
+      // eslint-disable-next-line @typescript-eslint/no-misused-spread -- counting scalar values by design.
+      expect([...name33]).toHaveLength(33);
+      expect(name33.length).toBe(66); // UTF-16: 2 units per emoji.
+      expect(
+        subtitleSlotError('hls', [{ format: 'webvtt', language: '', name: name33, source: undefined }], 0),
+      ).toBeUndefined();
+      const name65 = '\u{1F600}'.repeat(65);
+      expect(
+        subtitleSlotError('hls', [{ format: 'webvtt', language: '', name: name65, source: undefined }], 0),
+      ).toBe('name');
+    });
+
+    // UI-3 (review): the control check must reject the complete control
+    // range Rust's `char::is_control()` rejects, including C1 (U+0080–
+    // U+009F) — a naive `\u0000-\u001f` regex missed C1 entirely.
+    it('rejects C1 control characters (U+0080–U+009F) like Rust char::is_control (UI-3 fix)', () => {
+      expect(
+        subtitleSlotError('hls', [{ format: 'webvtt', language: '', name: 'a\u0085b', source: undefined }], 0),
+      ).toBe('name');
+      expect(
+        subtitleSlotError('hls', [{ format: 'webvtt', language: '', name: 'a\u009fb', source: undefined }], 0),
+      ).toBe('name');
+      // DEL (U+007F) and the already-covered C0 range still reject.
+      expect(
+        subtitleSlotError('hls', [{ format: 'webvtt', language: '', name: 'a\u007fb', source: undefined }], 0),
+      ).toBe('name');
+      // A plain ASCII name stays valid.
+      expect(
+        subtitleSlotError('hls', [{ format: 'webvtt', language: '', name: 'plain name', source: undefined }], 0),
+      ).toBeUndefined();
     });
   });
 });

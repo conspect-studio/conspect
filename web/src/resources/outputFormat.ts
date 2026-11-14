@@ -206,10 +206,16 @@ export function withSubtitleSlots(
   if (rows.length === 0) {
     delete slots.subtitle;
   } else {
+    // Keep the raw authored value: trimming here on every keystroke (via
+    // updateRow → withSubtitleSlots → this) would eat a space the instant
+    // it was typed (review UI-2) and would silently strip a server-valid
+    // name/language that legitimately carries leading/trailing or interior
+    // whitespace. Submission-time normalization, if ever wanted, belongs at
+    // the save boundary (`outputFormToBody`), not in every edit.
     slots.subtitle = rows.map((row) => {
       const slot: Record<string, unknown> = { format: row.format };
-      if (row.language.trim() !== '') slot.language = row.language.trim();
-      if (row.name.trim() !== '') slot.name = row.name.trim();
+      if (row.language !== '') slot.language = row.language;
+      if (row.name !== '') slot.name = row.name;
       if (row.source !== undefined) slot.source = row.source;
       return slot;
     });
@@ -221,11 +227,29 @@ export function withSubtitleSlots(
     : { ...form, extra: { ...rest, slots } };
 }
 
-/** A subtitle slot row's effective menu label (name, else language, else the default). */
+/**
+ * A subtitle slot row's effective menu label (name, else language, else the
+ * default). Mirrors the server's `SubtitleSlot::effective_name`
+ * byte-for-byte: it never trims (`crates/multiview-config/src/
+ * output_format.rs`), so this does not either — a stored name/language
+ * that legitimately carries leading/trailing whitespace must compare equal
+ * to what the server computes.
+ */
 export function subtitleEffectiveName(row: SubtitleSlotRow, index: number): string {
-  if (row.name.trim() !== '') return row.name.trim();
-  if (row.language.trim() !== '') return row.language.trim();
+  if (row.name !== '') return row.name;
+  if (row.language !== '') return row.language;
   return `Subtitles ${String(index + 1)}`;
+}
+
+/**
+ * Whether a Unicode scalar value is a Rust `char::is_control()` control
+ * character: C0 (U+0000–U+001F), DEL (U+007F) and C1 (U+0080–U+009F).
+ * `crates/multiview-config/src/output_format.rs:833–834` rejects a name
+ * containing one of these (plus `"`), so the editor must refuse the exact
+ * same set — not just C0 as a naive `\u0000-\u001f` regex would.
+ */
+function isControlScalar(codePoint: number): boolean {
+  return (codePoint >= 0x00 && codePoint <= 0x1f) || codePoint === 0x7f || (codePoint >= 0x80 && codePoint <= 0x9f);
 }
 
 /**
@@ -234,7 +258,8 @@ export function subtitleEffectiveName(row: SubtitleSlotRow, index: number): stri
  * `MAX_SUBTITLE_NAME_LEN`): `'language'`, `'name'`, `'format'` (the medium
  * cannot carry it at all, or carries but does not build it yet) or
  * `'duplicate-name'` (another slot's effective name repeats). `undefined` ⇒
- * valid.
+ * valid. Never trims: the server validates (and stores) the raw authored
+ * value.
  */
 export function subtitleSlotError(
   kind: OutputKind,
@@ -247,20 +272,26 @@ export function subtitleSlotError(
   if (!cap.mediumFormats.includes(row.format) || !cap.builtFormats.includes(row.format)) {
     return 'format';
   }
-  if (row.language.trim() !== '') {
-    const language = row.language.trim();
+  if (row.language !== '') {
+    const language = row.language;
     const ok =
       language.length >= 1 &&
       language.length <= MAX_SUBTITLE_LANGUAGE_LEN &&
       /^[A-Za-z0-9-]+$/.test(language);
     if (!ok) return 'language';
   }
-  if (row.name.trim() !== '') {
-    const name = row.name.trim();
-    const hasControlOrQuote = Array.from(name).some(
-      (c) => c === '"' || c.codePointAt(0) === undefined || (c.codePointAt(0) ?? 0) < 0x20 || c === '\u007f',
-    );
-    const ok = name.length <= MAX_SUBTITLE_NAME_LEN && !hasControlOrQuote;
+  if (row.name !== '') {
+    const name = row.name;
+    // Count Unicode scalar values (code points), not UTF-16 units: a
+    // spread/Array.from over a string iterates by code point, so a
+    // supplementary-plane character (e.g. an emoji outside the BMP) counts
+    // as 1, matching Rust's `chars().count()`.
+    const scalars = Array.from(name);
+    const hasControlOrQuote = scalars.some((c) => {
+      const codePoint = c.codePointAt(0);
+      return c === '"' || codePoint === undefined || isControlScalar(codePoint);
+    });
+    const ok = scalars.length <= MAX_SUBTITLE_NAME_LEN && !hasControlOrQuote;
     if (!ok) return 'name';
   }
   const effective = subtitleEffectiveName(row, index);

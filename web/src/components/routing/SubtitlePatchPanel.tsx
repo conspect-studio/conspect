@@ -24,7 +24,7 @@ import {
 import type { PatchOutputView, PatchSubtitleSlot } from '../../api/patch';
 import { OperationApiError } from '../../api/operations';
 import { subscribeRealtime } from '../../realtime/shared';
-import { useSources } from '../../resources/queries';
+import { useOutputs, useSources } from '../../resources/queries';
 import {
   Table,
   TableBody,
@@ -53,7 +53,13 @@ function columnsOf(outputs: readonly PatchOutputView[], names: ReadonlyMap<strin
     .map((o) => ({ output: o.output, name: names.get(o.output) ?? o.output, slots: o.subtitle }));
 }
 
-/** Per-cell pending/outcome state, keyed by `${output}:${slot}`. */
+/**
+ * Per-destination (output + slot) pending/outcome state, keyed by
+ * `${output}:${slot}`. One state per destination, not per source row: the
+ * destination is what a take applies to, so its status is shown once per
+ * column (review UI-5), covering both the captioned-source rows and the
+ * None (unpatch) row.
+ */
 interface CellState {
   readonly operationId: string;
   readonly outcome?: string;
@@ -65,24 +71,39 @@ function cellKey(output: string, slot: number): string {
   return `${output}:${String(slot)}`;
 }
 
+/** Bounded ring of the most recent realtime outcomes, keyed by operation id. */
+const RECENT_OUTCOMES = 32;
+
 /** The Routing page's Subtitle patch view (ADR-0110 §12.8, #345 part F3). */
 export function SubtitlePatchPanel(): JSX.Element | null {
   const { t } = useLingui();
   const sources = useSources();
+  const outputs = useOutputs();
   const patch = useQuery({
     queryKey: ['patch', 'subtitle'],
     queryFn: () => getPatch(),
     refetchInterval: 4000,
   });
   const [cells, setCells] = useState<Readonly<Record<string, CellState>>>({});
-  const cellsRef = useRef(cells);
-  useEffect(() => {
-    cellsRef.current = cells;
-  }, [cells]);
 
+  // Outcomes are buffered by operation id from mount (not from the 202 on):
+  // the realtime `route.output` event can arrive before `takePatch`'s HTTP
+  // response resolves (e.g. the engine answers on the wire before this
+  // client's own fetch promise settles), in which case a naive "only match
+  // a cell already carrying this operation id" listener drops it forever —
+  // a refused take would then show no refusal at all (review UI-1). Buffer
+  // every subtitle outcome here (bounded, oldest evicted first) and
+  // reconcile once the operation id is known, from either direction.
+  const recentOutcomes = useRef(new Map<string, string>());
+
+  // Destination labels must come from the OUTPUT resource list, never from
+  // sources: an output and a source can share an id, and resolving the
+  // name from sources would then label the destination as that unrelated
+  // source — an operator could patch the wrong output under a plausible-
+  // looking label (review UI-4).
   const outputNames = useMemo(
-    () => new Map((sources.data ?? []).map((s) => [s.id, s.name] as const)),
-    [sources.data],
+    () => new Map((outputs.data ?? []).map((o) => [o.id, o.name] as const)),
+    [outputs.data],
   );
   const columns = useMemo(() => columnsOf(patch.data?.outputs ?? [], outputNames), [patch.data, outputNames]);
   const captionSources = useMemo(
@@ -90,8 +111,8 @@ export function SubtitlePatchPanel(): JSX.Element | null {
     [sources.data],
   );
 
-  // One subscription for the panel's lifetime: an outcome may arrive before
-  // the take's 202 response (or before a per-cell effect runs).
+  // One subscription for the panel's lifetime, independent of any take in
+  // flight.
   useEffect(
     () =>
       subscribeRealtime('outputs', (envelope) => {
@@ -103,6 +124,12 @@ export function SubtitlePatchPanel(): JSX.Element | null {
         const operationId = data.operation_id;
         const outcome = data.outcome;
         if (!outcome.startsWith('subtitle:')) return;
+        recentOutcomes.current.set(operationId, outcome);
+        while (recentOutcomes.current.size > RECENT_OUTCOMES) {
+          const oldest = recentOutcomes.current.keys().next().value;
+          if (oldest === undefined) break;
+          recentOutcomes.current.delete(oldest);
+        }
         setCells((current) => {
           let changed: Record<string, CellState> | undefined;
           for (const [key, state] of Object.entries(current)) {
@@ -136,11 +163,15 @@ export function SubtitlePatchPanel(): JSX.Element | null {
       }
       const accepted = await takePatch({ crosspoints: [crosspoint] });
       const note = planned?.note;
+      // The outcome may already have arrived (buffered above) while this
+      // take's own HTTP response was still in flight.
+      const already = recentOutcomes.current.get(accepted.operation_id);
       setCells((current) => ({
         ...current,
-        [key]: note !== undefined && note !== null
-          ? { operationId: accepted.operation_id, note }
-          : { operationId: accepted.operation_id },
+        [key]:
+          note !== undefined && note !== null
+            ? { operationId: accepted.operation_id, note, ...(already !== undefined ? { outcome: already } : {}) }
+            : { operationId: accepted.operation_id, ...(already !== undefined ? { outcome: already } : {}) },
       }));
     } catch (error) {
       setCells((current) => ({
@@ -152,6 +183,40 @@ export function SubtitlePatchPanel(): JSX.Element | null {
       }));
     }
   };
+
+  /**
+   * Destination-level status/error text for one column slot, if any:
+   * an error (plan refusal or a thrown take) wins over everything else;
+   * then a settled outcome; then the `source-has-no-captions` plan note;
+   * then "pending" while a take is accepted but not yet settled (a
+   * non-empty operation id with no outcome). `undefined` ⇒ no status to
+   * show (never attempted, or an in-flight plan/take with no operation id
+   * yet and no error).
+   */
+  function statusOf(cellState: CellState | undefined): JSX.Element | undefined {
+    if (cellState === undefined) return undefined;
+    if (cellState.error !== undefined) {
+      return <span className="text-destructive">{cellState.error}</span>;
+    }
+    if (cellState.outcome !== undefined) {
+      return <span>{cellState.outcome}</span>;
+    }
+    if (cellState.note === 'source-has-no-captions') {
+      return (
+        <span>
+          <Trans>source-has-no-captions</Trans>
+        </span>
+      );
+    }
+    if (cellState.operationId !== '') {
+      return (
+        <span>
+          <Trans>pending</Trans>
+        </span>
+      );
+    }
+    return undefined;
+  }
 
   return (
     <section className="grid gap-2" data-testid="subtitle-patch-panel" aria-label={t`Subtitle patch`}>
@@ -194,7 +259,6 @@ export function SubtitlePatchPanel(): JSX.Element | null {
                     const current = subtitleSlotSource(slot);
                     const redacted = subtitleSlotRedacted(slot);
                     const cellId = `subtitle-cell-${source.id}-${key}`;
-                    const cellState = cells[key];
                     const patched = current === source.id;
                     return (
                       <TableCell key={key} data-testid={cellId}>
@@ -215,21 +279,8 @@ export function SubtitlePatchPanel(): JSX.Element | null {
                             {patched ? <Trans>patched</Trans> : <Trans>patch</Trans>}
                           </button>
                         )}
-                        <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
-                          <span>{slot.live ? <Trans>live</Trans> : <Trans>config</Trans>}</span>
-                          {cellState?.note === 'source-has-no-captions' ? (
-                            <span data-testid={`${cellId}-note`}>
-                              <Trans>source-has-no-captions</Trans>
-                            </span>
-                          ) : null}
-                          {cellState?.error !== undefined ? (
-                            <span role="alert" data-testid={`${cellId}-error`} className="text-destructive">
-                              {cellState.error}
-                            </span>
-                          ) : null}
-                          {cellState?.outcome !== undefined ? (
-                            <span data-testid={`${cellId}-outcome`}>{cellState.outcome}</span>
-                          ) : null}
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {slot.live ? <Trans>live</Trans> : <Trans>config</Trans>}
                         </div>
                       </TableCell>
                     );
@@ -263,6 +314,33 @@ export function SubtitlePatchPanel(): JSX.Element | null {
                         <Trans>none</Trans>
                       </button>
                     )}
+                  </TableCell>
+                );
+              }),
+            )}
+          </TableRow>
+          {/*
+            Destination-level status, rendered once per column (never
+            duplicated per source row) and always present — including when
+            zero sources declare captions, so an unpatch failure (no
+            captioned row to carry it) is never silently dropped (review
+            UI-5). `aria-live="polite"` + `role="status"` announce a change
+            to assistive tech without the cell needing focus.
+          */}
+          <TableRow data-testid="subtitle-status-row">
+            <TableCell>
+              <Trans>Status</Trans>
+            </TableCell>
+            {columns.flatMap((column) =>
+              column.slots.map((slot) => {
+                const key = cellKey(column.output, slot.slot);
+                const cellState = cells[key];
+                const content = statusOf(cellState);
+                return (
+                  <TableCell key={key} data-testid={`subtitle-status-${key}`}>
+                    <span role="status" aria-live="polite" className="text-xs">
+                      {content ?? <span className="sr-only">{t`No pending change`}</span>}
+                    </span>
                   </TableCell>
                 );
               }),
