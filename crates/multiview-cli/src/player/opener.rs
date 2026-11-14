@@ -506,11 +506,116 @@ fn publish(cell: &SwapCell<Arc<OpenerStatus>>, state: &OpenerStatus) {
 fn drain_retired(coordinator: &LoadCoordinator<StagedClip>) -> usize {
     let mut drained = 0;
     while let Some(clip) = coordinator.pop_retired() {
+        // Test-only stall point AFTER dequeue and BEFORE native destruction and
+        // its acknowledgement; compiled out of non-test builds.
+        #[cfg(test)]
+        retire_barrier::pause_after_dequeue(coordinator);
         drop(clip);
         coordinator.acknowledge_retired();
         drained += 1;
     }
     drained
+}
+
+/// Test-only deterministic stall of the REAL retirement path, keyed per
+/// coordinator address (never a process-global switch, so parallel tests cannot
+/// race). One arm stalls exactly one retirement: the opener parks after it
+/// dequeued a retired clip and before it destroys or acknowledges it.
+#[cfg(test)]
+pub(crate) mod retire_barrier {
+    #![allow(clippy::expect_used)] // Test-only barrier poisoning is a fixture failure.
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// One coordinator's barrier: (entered, released, passed).
+    #[derive(Default)]
+    pub(crate) struct Gate {
+        state: Mutex<(bool, bool, bool)>,
+        cv: Condvar,
+    }
+
+    impl Gate {
+        fn wait_flag(&self, pick: fn(&(bool, bool, bool)) -> bool, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut g = self
+                .state
+                .lock()
+                .expect("test barrier must not be poisoned");
+            while !pick(&g) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "hang deadline: {what}");
+                g = self
+                    .cv
+                    .wait_timeout(g, left)
+                    .expect("test barrier must not be poisoned")
+                    .0;
+            }
+        }
+        /// Block until the opener holds a dequeued, not yet destroyed clip.
+        pub(crate) fn wait_entered(&self) {
+            self.wait_flag(|s| s.0, "opener never reached the retirement barrier");
+        }
+        /// Whether the opener is parked holding the clip, not yet destroyed.
+        pub(crate) fn blocked(&self) -> bool {
+            let g = self
+                .state
+                .lock()
+                .expect("test barrier must not be poisoned");
+            g.0 && !g.1 && !g.2
+        }
+        /// Let destruction and acknowledgement proceed.
+        pub(crate) fn release(&self) {
+            self.state
+                .lock()
+                .expect("test barrier must not be poisoned")
+                .1 = true;
+            self.cv.notify_all();
+        }
+        /// Block until the opener resumed past the barrier.
+        pub(crate) fn wait_passed(&self) {
+            self.wait_flag(|s| s.2, "opener never resumed after release");
+        }
+    }
+
+    fn registry() -> &'static Mutex<HashMap<usize, Arc<Gate>>> {
+        static R: OnceLock<Mutex<HashMap<usize, Arc<Gate>>>> = OnceLock::new();
+        R.get_or_init(Mutex::default)
+    }
+
+    fn key<T>(coordinator: &super::LoadCoordinator<T>) -> usize {
+        std::ptr::from_ref(coordinator).addr()
+    }
+
+    /// Arm a one-shot stall for exactly this coordinator.
+    pub(crate) fn arm<T>(coordinator: &super::LoadCoordinator<T>) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        registry()
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .insert(key(coordinator), Arc::clone(&gate));
+        gate
+    }
+
+    /// Opener side: park after dequeue if this coordinator is armed.
+    pub(crate) fn pause_after_dequeue<T>(coordinator: &super::LoadCoordinator<T>) {
+        let gate = registry()
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .remove(&key(coordinator));
+        let Some(gate) = gate else { return };
+        gate.state
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .0 = true;
+        gate.cv.notify_all();
+        gate.wait_flag(|s| s.1, "retirement barrier never released");
+        gate.state
+            .lock()
+            .expect("test barrier must not be poisoned")
+            .2 = true;
+        gate.cv.notify_all();
+    }
 }
 
 /// Drop the shutdown clip, if the ingest side handed one over. Returns the count.

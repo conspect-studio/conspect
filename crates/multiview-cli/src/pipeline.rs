@@ -28826,6 +28826,8 @@ loop_default = true
         worker: Option<std::thread::JoinHandle<Option<[Option<crate::player::StagedClip>; 3]>>>,
         audio_stop: Arc<AtomicBool>,
         audio_worker: Option<std::thread::JoinHandle<()>>,
+        /// The player's real audio store (consumed like the output clock does).
+        audio_store: Arc<multiview_audio::store::AudioStore>,
     }
 
     impl Rig {
@@ -28871,6 +28873,7 @@ loop_default = true
             let store = Arc::clone(&boot.stores.first().expect("player fixture store").1);
             let audio_store =
                 Arc::clone(&boot.audio_stores.first().expect("audio fixture store").1);
+            let rig_audio_store = Arc::clone(&audio_store);
             let audio_plan = boot.audio_plans.into_iter().next().unwrap();
             let audio_stop = Arc::new(AtomicBool::new(false));
             let a_stop = Arc::clone(&audio_stop);
@@ -28893,6 +28896,7 @@ loop_default = true
                 worker: Some(worker),
                 audio_stop,
                 audio_worker: Some(audio_worker),
+                audio_store: rig_audio_store,
             })
         }
 
@@ -29199,6 +29203,133 @@ loop_default = true
         want.extend((23_u32..26).map(|i| spec.luma_of(i)));
         assert_eq!(got, want, "origin-relative exact seek and EOF lap");
         assert!(rig.runtime.status.load().fault.is_none());
+        assert!(rig.shutdown().is_none());
+    }
+
+    /// Finding C / R3 "retirement stalls preserve cadence": the REAL opener
+    /// retirement path is stalled AFTER it dequeued the old native clip A and
+    /// BEFORE A's destruction and acknowledgement. While held, the production
+    /// output clock + compositor emit exact tick-stamped valid frames of the
+    /// committed B, the audio store is consumed per tick, ownership stays
+    /// bounded (the stalled opener stages nothing; newer loads supersede, they
+    /// never queue more native owners), and no retirement ACK is observed.
+    /// Release then yields the ACK, and the latest load adopts.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn retirement_stall_after_dequeue_preserves_cadence_and_bounds_ownership() {
+        let _budget = crate::player::budget_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let clip_a = clip(dir.path(), "a.mov", 30, Some(0.25));
+        let clip_b = clip(dir.path(), "b.mov", 140, Some(0.5));
+        let clip_c = clip(dir.path(), "c.mov", 80, None);
+        let clip_d = clip(dir.path(), "d.mov", 180, None);
+        let rig = Rig::start(&plain_config(), None).unwrap();
+        let coordinator = Arc::clone(&rig.runtime.coordinator);
+        let ga = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&clip_a, LoadThen::Cue))
+            .unwrap();
+        wait("A committed", &|| {
+            rig.handle.control_bus.load().clip_epoch == ga
+                && rig.runtime.audio_commit.ready_for_commit()
+        });
+
+        // Stall the next real retirement (A, displaced by B's commit).
+        let gate = crate::player::retire_barrier::arm(coordinator.as_ref());
+        let gb = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&clip_b, LoadThen::Cue))
+            .unwrap();
+        gate.wait_entered();
+        assert!(gate.blocked());
+        wait("B committed", &|| {
+            rig.handle.control_bus.load().clip_epoch == gb && rig.runtime.native.load().is_some()
+        });
+        let barrier = coordinator.retirement_barrier();
+        assert!(barrier >= 1, "A was issued for retirement");
+        assert!(
+            !coordinator.retirement_complete(barrier),
+            "A dequeued but neither destroyed nor acknowledged"
+        );
+
+        // Newer loads while the opener is stuck in destruction: latest-wins
+        // supersedes, nothing is staged, the retire queue does not grow.
+        let gc = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&clip_c, LoadThen::Cue))
+            .unwrap();
+        let gd = rig
+            .runtime
+            .opener
+            .request(ClipSpec::new(&clip_d, LoadThen::Cue))
+            .unwrap();
+        assert!(coordinator.is_superseded(gc), "C superseded by D");
+        assert!(!coordinator.is_superseded(gd));
+
+        let first = rig.first_tick_after_anchor();
+        let anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let b_center = center(&rig.store, anchor);
+        let samples_per_tick = usize::try_from(48_000 / 25).unwrap();
+        let n: u64 = 150;
+        let mut emitted = 0_u64;
+        for chunk in 0..(n / 10) {
+            let frames = rig.drive(first + chunk * 10, 10);
+            for (i, (tick, luma)) in frames.iter().enumerate() {
+                let k = first + chunk * 10 + u64::try_from(i).unwrap();
+                assert_eq!(tick.index, k);
+                assert_eq!(
+                    tick.pts,
+                    MediaTime::from_tick(i64::try_from(k).unwrap(), rig.cadence),
+                    "tick-derived stamp"
+                );
+                assert_eq!(*luma, b_center, "tick {k} shows committed B");
+                let block = rig.audio_store.read(samples_per_tick);
+                assert_eq!(block.frame_count(), samples_per_tick, "audio every tick");
+                emitted += 1;
+            }
+            // Bounded ownership while stalled: the held A plus the queue never
+            // exceed the two retired native slots; no clip is staged.
+            assert!(gate.blocked(), "retirement still stalled");
+            assert!(
+                coordinator.retired_len() < crate::player::RETIRE_CAPACITY,
+                "held + queued retired owners bounded"
+            );
+            assert!(!coordinator.retirement_complete(barrier));
+            assert_eq!(rig.handle.control_bus.load().clip_epoch, gb, "B stays live");
+            assert!(rig.runtime.opener.status().finished < gc);
+        }
+        assert_eq!(emitted, n);
+        assert_eq!(coordinator.retired_len(), 0, "stall added no queued owners");
+
+        // Release: destruction completes, the ACK arrives, and the latest load
+        // (D) is then opened and adopted; superseded C never commits.
+        gate.release();
+        gate.wait_passed();
+        wait("retirement ack", &|| {
+            coordinator.retirement_complete(barrier)
+        });
+        wait("D adopted", &|| {
+            rig.handle.control_bus.load().clip_epoch == gd
+                && rig
+                    .runtime
+                    .native
+                    .load()
+                    .as_ref()
+                    .is_some_and(|ack| ack.generation == gd.0)
+        });
+        assert!(rig.runtime.opener.status().finished >= gd);
+        let after = rig.first_tick_after_anchor();
+        let d_anchor = rig.handle.control_bus.load().start_anchor.unwrap();
+        let d_center = center(&rig.store, d_anchor);
+        assert_ne!(d_center, b_center, "D replaced B");
+        let frames = rig.drive(after, 5);
+        assert!(frames.iter().all(|(_, l)| *l == d_center));
+        wait("B retired too", &|| {
+            coordinator.retirement_complete(coordinator.retirement_barrier())
+        });
         assert!(rig.shutdown().is_none());
     }
 
