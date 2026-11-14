@@ -93,6 +93,14 @@ pub enum Error {
     #[error("GPU readback deadline: {0}")]
     GpuDeadline(String),
 
+    /// The GPU device is lost or faulted (issue #415): wgpu's device-lost
+    /// callback fired, an uncaptured device error was reported, or a device
+    /// call panicked (wgpu 30 `Device::poll` on a lost device). Permanent: the
+    /// run backend composites every later frame on the CPU reference. Not
+    /// feature-gated (the simulated chaos backend uses it).
+    #[error("GPU device lost: {0}")]
+    GpuLost(String),
+
     /// The composite request exceeded a fixed GPU resource limit (e.g. more
     /// tiles than the bound tile-array / storage buffer was sized for).
     #[cfg(feature = "wgpu")]

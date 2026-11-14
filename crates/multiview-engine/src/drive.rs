@@ -43,7 +43,8 @@ use std::sync::Arc;
 use multiview_compositor::backend::{RunBackend, RunBackendKind};
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::mask::{MaskShape, WipeMask};
-use multiview_compositor::pipeline::{CanvasColor, Nv12Image, Tile};
+use multiview_compositor::offclock::{FrameJob, SharedTile};
+use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
 use multiview_core::layout::Layout;
 use multiview_core::switcher::Rgb8;
 use multiview_core::time::{MediaTime, Rational};
@@ -741,63 +742,55 @@ impl CompositorDrive<Nv12Image> {
             self.push_transition_tiles(mix, now, canvas.width, canvas.height, held, placements);
         }
 
-        // Borrow the held images for the compositor's `Tile` slice. This slice is
-        // a per-tick local, NOT pooled: a `Tile<'_>` borrows into the pooled
-        // `held` vector, so its lifetime is the borrow — a `Vec<Tile<'_>>` cannot
-        // be a reused struct field in safe Rust (`unsafe` is forbidden here). It
-        // is small (one thin `&Nv12Image` + a rect + an opacity per cell), and the
-        // large per-tick churn — the `held` Arc vector, `placements`, and the
-        // z-order index vector — is what the pool eliminates. Each tile carries
-        // its DESTINATION cell rect so the compositor scales the source into the
-        // cell at composite time (scale-at-composite, RT-6 / ADR-0034 / inv #6): a
-        // source decoded at any geometry — including one just re-pointed in —
-        // composites correctly into the cell, never clipped or smeared. When the
-        // source already matches the cell size (the steady state:
-        // decode-at-display-resolution) the scale is a no-op and the result is
-        // byte-for-byte the prior 1:1 placement. The cell's per-tile opacity
-        // drives the compositor's premultiplied linear-light `over` blend.
-        let tiles: Vec<Tile<'_>> = placements
-            .iter()
-            .filter_map(|p| {
-                held.get(p.image_index).map(|img| {
-                    let tile =
-                        Tile::scaled(img.as_ref(), p.dst_x, p.dst_y, p.dst_w, p.dst_h, p.opacity);
-                    match p.mask {
-                        Some(mask) => tile.with_mask(mask),
-                        None => tile,
-                    }
+        // Hand the compositor the held images as owned `Arc`s plus each cell's
+        // DESTINATION rect (no pixel copy): a GPU backend composites the frame
+        // on its own worker thread while the clock waits for it at most a
+        // bounded time (issue #415), so the job must own what it reads. The
+        // compositor scales each source into its cell at composite time
+        // (scale-at-composite, RT-6 / ADR-0034 / inv #6): a source decoded at
+        // any geometry composites correctly into the cell; when it already
+        // matches the cell size (the steady state) the scale is a no-op and
+        // the result is byte-for-byte the prior 1:1 placement. The cell's
+        // per-tile opacity drives the premultiplied linear-light `over` blend.
+        let job = Arc::new(FrameJob {
+            canvas_w: canvas.width,
+            canvas_h: canvas.height,
+            canvas: self.canvas_color,
+            background: self.background,
+            tiles: placements
+                .iter()
+                .filter_map(|p| {
+                    held.get(p.image_index).map(|img| SharedTile {
+                        image: Arc::clone(img),
+                        dst_x: p.dst_x,
+                        dst_y: p.dst_y,
+                        dst_w: p.dst_w,
+                        dst_h: p.dst_h,
+                        opacity: p.opacity,
+                        mask: p.mask,
+                    })
                 })
-            })
-            .collect();
+                .collect(),
+        });
 
         // Dispatch the composite through the selected backend (CPU reference by
-        // default; GPU-with-CPU-fallback when a run prefers the GPU). The call
-        // is synchronous and never blocks on an input or a client; on the GPU
-        // path a submit/readback failure surfaces as a typed error here, which
-        // becomes `Error::Canvas` — the drive returns rather than stalling the
-        // clock, and the caller holds last-good (safety rule §3, invariant #1).
-        // The GPU readback wait is bounded (issue #395): a miss is
-        // `Error::ComposeDeadline`, which the runtime turns into a counted
-        // last-good repeat of this tick.
-        let canvas_image = backend
-            .composite(
-                canvas.width,
-                canvas.height,
-                self.canvas_color,
-                self.background,
-                tiles.as_slice(),
-            )
-            .map_err(|e| match e {
-                multiview_compositor::Error::GpuDeadline(why) => Error::ComposeDeadline(why),
-                other => Error::Canvas(other.to_string()),
-            })?;
+        // default, inline; GPU off the clock thread with a CPU fallback). The
+        // call never blocks on an input or a client, and every GPU wait is
+        // bounded: a frame not ready in time is `Error::ComposeDeadline`,
+        // which the runtime turns into a counted last-good repeat of this
+        // tick (issues #395, #415). Any other failure becomes `Error::Canvas`.
+        let canvas_image = backend.composite_job(&job).map_err(|e| match e {
+            multiview_compositor::Error::GpuDeadline(why) => Error::ComposeDeadline(why),
+            other => Error::Canvas(other.to_string()),
+        })?;
 
         // Drop the borrowing tiles, then release the held `Arc`s now (rather than
         // pinning them until the next tick's `begin`), keeping the pooled
         // capacity. The next `begin` clears whatever remains, so correctness does
         // not depend on this; it shortens last-good frame retention to within the
-        // tick. `drop(tiles)` first releases its immutable borrow of `held`.
-        drop(tiles);
+        // tick. The job may still be referenced by a GPU worker that missed
+        // the clock's wait; it owns its own `Arc`s, so this is safe.
+        drop(job);
         held.clear();
         drop(scratch);
 

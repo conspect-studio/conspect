@@ -53,6 +53,7 @@ pub mod gpu;
 pub mod mask;
 pub mod matrix;
 pub mod native;
+pub mod offclock;
 #[cfg(feature = "overlay")]
 pub mod overlay;
 pub mod pipeline;

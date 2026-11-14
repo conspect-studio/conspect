@@ -85,12 +85,6 @@ pub struct GpuCompositor {
     /// ticks). Present only with the `overlay` feature.
     #[cfg(feature = "overlay")]
     overlay: std::sync::Mutex<OverlayResources>,
-    /// Frames the run backend re-composited on the CPU after a genuine GPU
-    /// failure (observability; see `RunBackend::gpu_cpu_fallback_frames`).
-    cpu_fallback_frames: std::sync::atomic::AtomicU64,
-    /// The persistent CPU reference a GPU-failure frame is composited on (its
-    /// LUTs and band scratch survive across fallback frames, #395 INV-1).
-    cpu_fallback: crate::backend::CpuBackend,
     /// The bounded-readback state machine (issue #395): the per-frame deadline,
     /// the held stalled readback, and the miss counter. Never waits longer than
     /// the deadline; never waits at all while a readback is stalled.
@@ -174,6 +168,12 @@ impl PendingReadback for WgpuReadback {
             return ReadbackPoll::Ready;
         }
         if self.planes.iter().any(|p| p.state == MapState::Failed) {
+            // A map fails at once on a lost device, and the bounded `Wait`
+            // above returns early (a submission index the lost device never
+            // accepted), so the device-lost callback would never run. One
+            // non-blocking `Poll` lets wgpu run its maintenance and report the
+            // loss (issue #415). Its result is not needed: the frame failed.
+            let _ = self.device.poll(wgpu::PollType::Poll);
             return ReadbackPoll::Failed("readback buffer map failed".to_owned());
         }
         match polled {
@@ -357,8 +357,6 @@ impl GpuCompositor {
             pool: std::sync::Mutex::new(SurfacePool::default()),
             #[cfg(feature = "overlay")]
             overlay,
-            cpu_fallback_frames: std::sync::atomic::AtomicU64::new(0),
-            cpu_fallback: crate::backend::CpuBackend::default(),
             readback: ReadbackGate::default(),
         })
     }
@@ -367,6 +365,36 @@ impl GpuCompositor {
     /// `min(10 ms, period / 2)` ([`crate::readback::readback_deadline`]).
     pub fn set_frame_period(&self, period: Duration) {
         self.readback.set_frame_period(period);
+    }
+
+    /// **Test seam**: destroy the wgpu device, which loses it exactly as a
+    /// driver reset would (wgpu fires the device-lost callback once the queue
+    /// drains). Production never calls this.
+    #[doc(hidden)]
+    pub fn destroy_device_for_test(&self) {
+        self.ctx.device().destroy();
+    }
+
+    /// Whether the device-lost / uncaptured-error callbacks reported the
+    /// device as lost (issue #415).
+    #[must_use]
+    pub fn is_device_lost(&self) -> bool {
+        self.ctx.health().is_lost()
+    }
+
+    /// Refuse GPU work on a lost / faulted device (issue #415): returns
+    /// [`Error::GpuLost`] once the device-lost or uncaptured-error callback
+    /// fired, so no call reaches a device that wgpu would panic on.
+    fn admit_device(&self) -> Result<()> {
+        if self.ctx.health().is_lost() {
+            return Err(Error::GpuLost(
+                self.ctx
+                    .health()
+                    .reason()
+                    .unwrap_or_else(|| "device lost".to_owned()),
+            ));
+        }
+        Ok(())
     }
 
     /// The current per-frame readback deadline.
@@ -382,24 +410,10 @@ impl GpuCompositor {
         self.readback.misses()
     }
 
-    /// Count one frame the run backend re-composited on the CPU after a GPU
-    /// failure; returns the new total (always `>= 1`).
-    pub(crate) fn record_cpu_fallback(&self) -> u64 {
-        self.cpu_fallback_frames
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(1)
-    }
-
-    /// The persistent CPU backend GPU-failure frames are composited on.
-    pub(crate) fn cpu_fallback_backend(&self) -> &crate::backend::CpuBackend {
-        &self.cpu_fallback
-    }
-
     /// Frames re-composited on the CPU after a genuine GPU failure.
     #[must_use]
     pub fn cpu_fallback_frames(&self) -> u64 {
-        self.cpu_fallback_frames
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.ctx.health().cpu_fallback_frames()
     }
 
     /// The number of GPU buffer/texture allocations the surface pool has made
@@ -463,6 +477,7 @@ impl GpuCompositor {
         // Admission is checked UNDER the pool lock, so a concurrent composite
         // can never pass admission and then reuse buffers another call left
         // mid-map (#395 review MC-1).
+        self.admit_device()?;
         self.readback.admit()?;
         let device = self.ctx.device();
         let mut encoder =
@@ -540,6 +555,7 @@ impl GpuCompositor {
         // Admission is checked UNDER the pool lock, so a concurrent composite
         // can never pass admission and then reuse buffers another call left
         // mid-map (#395 review MC-1).
+        self.admit_device()?;
         self.readback.admit()?;
         let device = self.ctx.device();
         let mut encoder =
@@ -1401,6 +1417,39 @@ fn copy_plane(
     }
     drop(data);
     Ok(out)
+}
+
+impl crate::offclock::FrameComposer for GpuCompositor {
+    fn compose_tiles(
+        &self,
+        canvas_w: u32,
+        canvas_h: u32,
+        canvas: CanvasColor,
+        background: LinearRgba,
+        tiles: &[Tile<'_>],
+    ) -> Result<Nv12Image> {
+        let out = self.composite(canvas_w, canvas_h, canvas, background, tiles);
+        // An uncaptured error reported during this frame means its pixels
+        // cannot be trusted: never hand them out (issue #415).
+        if out.is_ok() {
+            self.admit_device()?;
+        }
+        out
+    }
+}
+
+impl crate::offclock::GpuComposer for GpuCompositor {
+    fn set_frame_period(&self, period: Duration) {
+        self.readback.set_frame_period(period);
+    }
+
+    fn gate_misses(&self) -> u64 {
+        self.readback.misses()
+    }
+
+    fn health(&self) -> std::sync::Arc<crate::readback::GpuHealth> {
+        std::sync::Arc::clone(self.ctx.health())
+    }
 }
 
 impl Compositor for GpuCompositor {
