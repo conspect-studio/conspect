@@ -343,9 +343,7 @@ impl WindowDelivery for BindingDelivery {
             binding.queue.report_loss(reason);
             binding.rejected_batches = binding.rejected_batches.saturating_add(1);
             binding.last_rejection = Some(RejectionReason::from_offer(reason));
-            if let BindingPolicy::DropCounted(counter) = &binding.policy {
-                counter.fetch_add(1, Ordering::AcqRel);
-            }
+            sync_drop_counted_flushed(binding);
         }
     }
 
@@ -390,6 +388,7 @@ impl WindowDelivery for BindingDelivery {
             binding.staged.clear();
             binding.queue.report_loss(OfferError::ProducerLoss);
             binding.queue.close();
+            sync_drop_counted_flushed(binding);
             binding.failed = true;
             binding.last_rejection = Some(RejectionReason::NeedsRecoveryPoint);
         }
@@ -425,6 +424,27 @@ struct Binding {
     rejected_bytes: u64,
     last_rejection: Option<RejectionReason>,
     failed: bool,
+    /// Last value of `queue.flushed_packets_total()` already folded into this
+    /// binding's `DropCounted` counter (INV-1, review-lens3): a monotonic
+    /// high-water mark so every queue-flushed packet is added exactly once,
+    /// independent of how many separate loss events produced it.
+    drop_counted_flushed_seen: u64,
+}
+
+/// For a `DropCounted` binding, add every packet the carrier's monotonic
+/// `flushed_packets_total()` has newly flushed from the queued backlog since
+/// the last call (admission `OldestAge`/`Occupied`, a stale `pop_at`,
+/// `report_loss`, or `close`) to the external counter, exactly once. A no-op
+/// for `Bounded`/`Push` bindings, whose paths are unchanged.
+fn sync_drop_counted_flushed(binding: &mut Binding) {
+    if let BindingPolicy::DropCounted(counter) = &binding.policy {
+        let total = binding.queue.flushed_packets_total();
+        let delta = total.saturating_sub(binding.drop_counted_flushed_seen);
+        if delta > 0 {
+            counter.fetch_add(delta, Ordering::AcqRel);
+        }
+        binding.drop_counted_flushed_seen = total;
+    }
 }
 
 /// Atomic delivery for every binding of one program.
@@ -512,6 +532,7 @@ impl BindingDelivery {
                 rejected_bytes: 0,
                 last_rejection: None,
                 failed: false,
+                drop_counted_flushed_seen: 0,
             });
             receivers.push(packet_rx);
         }
@@ -681,13 +702,21 @@ impl BindingDelivery {
                         }
                     }
                     BindingPolicy::DropCounted(counter) => {
+                        // The rejected incoming window's own packets never
+                        // entered the queue, so `flushed_packets_total` does
+                        // not (and must not) include them: count them here.
                         counter.fetch_add(
                             u64::try_from(packets).unwrap_or(u64::MAX),
                             Ordering::AcqRel,
                         );
+                        // This same `offer_emitted` call may ALSO have
+                        // invalidated (flushed) an already-admitted queued
+                        // backlog (OldestAge/Occupied): add that delta too,
+                        // exactly once (INV-1, review-lens3).
                     }
                     BindingPolicy::Bounded => {}
                 }
+                sync_drop_counted_flushed(binding);
                 // A wedged pump means this binding is over: report it and stop
                 // offering (its queue keeps draining until the lease expires).
                 if binding.wedged.load(Ordering::Acquire) {
@@ -723,6 +752,7 @@ impl BindingDelivery {
     fn pump_binding(binding: &mut Binding, now: Instant) {
         if binding.failed {
             while binding.queue.pop_at(now).ok().flatten().is_some() {}
+            sync_drop_counted_flushed(binding);
             return;
         }
         if let Some(lease) = binding.pending.take() {
@@ -754,11 +784,12 @@ impl BindingDelivery {
                 Ok(None) => return,
                 Err(error) => {
                     // A stale queued window invalidated the backlog: media
-                    // this binding had admitted is lost.
+                    // this binding had admitted is lost. `pop_at`'s
+                    // `invalidate` call already flushed the exact packet
+                    // count into `flushed_packets_total`; fold the delta in
+                    // (INV-1, review-lens3), not a fixed per-event count of 1.
                     binding.last_rejection = Some(RejectionReason::from_offer(error));
-                    if let BindingPolicy::DropCounted(counter) = &binding.policy {
-                        counter.fetch_add(1, Ordering::AcqRel);
-                    }
+                    sync_drop_counted_flushed(binding);
                     return;
                 }
             }
@@ -804,10 +835,21 @@ impl BindingDelivery {
         // have been owned and released. A residue means real media was lost at
         // close, which must be reported rather than swallowed.
         for (index, binding) in self.bindings.iter_mut().enumerate() {
+            // Any last queue-internal flush (e.g. age expiry observed only
+            // inside the drain loop above) must still be folded in exactly
+            // once before this binding's teardown truth is read.
+            sync_drop_counted_flushed(binding);
             if !binding.queue.is_drained() {
                 let (packets, bytes) = binding.queue.reserved();
                 binding.rejected_batches = binding.rejected_batches.saturating_add(1);
                 binding.last_rejection = Some(RejectionReason::Occupied);
+                // These reserved packets (still-queued windows, or an
+                // in-flight lease never acknowledged by the sink) were never
+                // delivered: a `DropCounted` binding must count them so its
+                // public total still equals every packet the sink never got.
+                if let BindingPolicy::DropCounted(counter) = &binding.policy {
+                    counter.fetch_add(u64::try_from(packets).unwrap_or(u64::MAX), Ordering::AcqRel);
+                }
                 tracing::warn!(
                     binding = index,
                     packets,
@@ -941,13 +983,16 @@ fn send_bounded_packet(tx: &SyncSender<LeasedPacket>, packet: LeasedPacket) -> b
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::{
-        tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, RejectionReason, HANDOFF_LEASES,
-        PUMP_WEDGE_GRACE,
+        tick_span, BindingDelivery, BindingPolicy, DeliveryLimits, DeliveryWindow, RejectionReason,
+        WindowDelivery, HANDOFF_LEASES, PUMP_WEDGE_GRACE,
     };
     use multiview_core::time::Rational;
     use multiview_ffmpeg::{CodecKind, EncodedPacket, NalFraming};
-    use multiview_output::batch::RecoveryGate;
+    use multiview_output::batch::{OfferError, RecoveryGate};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::Receiver;
+    use std::sync::Arc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     fn packet(size: usize) -> EncodedPacket {
@@ -1058,16 +1103,27 @@ mod tests {
             !status.failed && status.reserved_packets <= CAP,
             "{status:?}"
         );
-        // Nothing is unaccounted for: every offered packet was received,
-        // counted as dropped, or is still retained (bounded).
+        // Drain whatever remains while `finish` hands off the rest of the
+        // backlog, then STRENGTHENED (review-lens3 INV-1; was a `+ CAP`
+        // allowance that could hide a real missing packet inside the cap):
+        // every offered packet is received, counted as dropped, or both
+        // never happens — received + dropped must equal offered exactly.
+        let collector = thread::spawn(move || {
+            let mut tail = 0_u64;
+            while rx.recv().is_ok() {
+                tail += 1;
+            }
+            tail
+        });
+        delivery.finish();
+        received += collector.join().expect("collector");
         let lost = dropped.load(Ordering::Acquire);
-        assert!(
-            received + lost + u64::try_from(CAP).unwrap() >= offered,
-            "received {received} + dropped {lost} of {offered}"
+        assert_eq!(
+            received + lost,
+            offered,
+            "received {received} + dropped {lost} must equal offered {offered} exactly"
         );
         assert!(received < offered);
-        drop(rx);
-        delivery.finish();
     }
 
     #[test]
@@ -1355,5 +1411,175 @@ mod tests {
         assert_eq!(status.admitted_batches, 1);
         delivery.finish();
         assert_eq!(collector.join().expect("collector").len(), 1);
+    }
+
+    /// Offer multi-packet windows to a `DropCounted` binding whose sink never
+    /// drains, long enough for a real queued backlog to exist (the pump's
+    /// in-flight pipeline — one held lease plus the bounded lease/packet
+    /// handoffs — fills up and further admitted windows pile up in the
+    /// queue itself), then return however many packets were offered.
+    fn offer_until_backlog_builds(
+        delivery: &mut BindingDelivery,
+        deadline: Instant,
+        packets_per_window: usize,
+    ) -> u64 {
+        let span = Duration::from_millis(5);
+        let mut offered = 0_u64;
+        let mut index = 0_u64;
+        while Instant::now() < deadline {
+            let mut packets: Vec<EncodedPacket> = Vec::with_capacity(packets_per_window);
+            for slot in 0..packets_per_window {
+                // An IDR opens every window so a strict-RAP gate (armed by a
+                // prior loss) never blocks the next admission.
+                packets.push(if slot == 0 { h264_packet(5) } else { packet(2) });
+            }
+            let now = Instant::now();
+            let _ = delivery.try_offer(
+                DeliveryWindow {
+                    output_index: 0,
+                    packets,
+                    media_span: span,
+                },
+                now,
+            );
+            offered += u64::try_from(packets_per_window).unwrap_or(u64::MAX);
+            index += 1;
+            if index % 8 == 0 {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        offered
+    }
+
+    /// INV-1 (review-lens3): offer multi-packet windows to a `DropCounted`
+    /// binding with a tiny packet cap and a sink that never drains, so a
+    /// real backlog of already-admitted queued windows piles up and later
+    /// `Occupied` admission failures flush it. Drain the sink and `finish`,
+    /// then assert EXACT conservation: every offered packet was received by
+    /// the sink, counted as dropped, or both never happens.
+    #[test]
+    fn drop_counted_occupied_with_backlog_conserves_every_packet_exactly() {
+        const CAP: usize = 6;
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            limits(CAP),
+            vec![Some(gate())],
+        );
+        let rx = receivers.pop().unwrap();
+        let offered = offer_until_backlog_builds(
+            &mut delivery,
+            Instant::now() + Duration::from_millis(600),
+            3,
+        );
+        assert!(
+            delivery.statuses()[0].queued_windows > 0
+                || dropped.load(Ordering::Acquire) > 0
+                || delivery.statuses()[0].reserved_packets > 0,
+            "the never-draining sink must have produced backlog, drops, or both"
+        );
+        let collector = thread::spawn(move || {
+            let mut received = 0_u64;
+            while rx.recv().is_ok() {
+                received += 1;
+            }
+            received
+        });
+        delivery.finish();
+        let received = collector.join().expect("collector");
+        let lost = dropped.load(Ordering::Acquire);
+        assert_eq!(
+            received + lost,
+            offered,
+            "received {received} + dropped {lost} must equal offered {offered} exactly"
+        );
+    }
+
+    /// INV-1 (review-lens3): a tiny `max_age` with a never-draining sink ages
+    /// out queued backlog windows (both when the next offer discovers the
+    /// stale entry, and when `finish`'s own drain loop calls `pop_at` at a
+    /// later `now` with no new offer in between). Drain and `finish`, then
+    /// assert EXACT conservation.
+    #[test]
+    fn drop_counted_oldest_age_with_backlog_conserves_every_packet_exactly() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            DeliveryLimits {
+                max_packets: 64,
+                max_bytes: 1024 * 1024,
+                max_age: Duration::from_millis(15),
+            },
+            vec![Some(gate())],
+        );
+        let rx = receivers.pop().unwrap();
+        let offered = offer_until_backlog_builds(
+            &mut delivery,
+            Instant::now() + Duration::from_millis(600),
+            2,
+        );
+        let collector = thread::spawn(move || {
+            let mut received = 0_u64;
+            while rx.recv().is_ok() {
+                received += 1;
+            }
+            received
+        });
+        delivery.finish();
+        let received = collector.join().expect("collector");
+        let lost = dropped.load(Ordering::Acquire);
+        assert_eq!(
+            received + lost,
+            offered,
+            "received {received} + dropped {lost} must equal offered {offered} exactly"
+        );
+    }
+
+    /// INV-1 (review-lens3): build a real queued backlog on a `DropCounted`
+    /// binding with a never-draining sink, then declare an explicit
+    /// `report_loss` (the assembler's "I discarded real media before
+    /// admission" path), which must flush and count that backlog. Drain and
+    /// `finish`, then assert EXACT conservation.
+    #[test]
+    fn drop_counted_report_loss_with_backlog_conserves_every_packet_exactly() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&dropped))],
+            limits(64),
+            vec![Some(gate())],
+        );
+        let rx = receivers.pop().unwrap();
+        let mut offered = offer_until_backlog_builds(
+            &mut delivery,
+            Instant::now() + Duration::from_millis(400),
+            2,
+        );
+        // The assembler now discards a real emission before admission: it
+        // must declare the loss explicitly. This flushes and must count the
+        // entire queued backlog that existed at that moment, exactly.
+        WindowDelivery::report_loss(&mut delivery, 0, OfferError::ProducerLoss);
+        // Keep offering a little more (now past the loss, requiring a fresh
+        // RAP, which `offer_until_backlog_builds` always supplies) so the
+        // conservation check also covers packets offered after the loss.
+        offered += offer_until_backlog_builds(
+            &mut delivery,
+            Instant::now() + Duration::from_millis(200),
+            2,
+        );
+        let collector = thread::spawn(move || {
+            let mut received = 0_u64;
+            while rx.recv().is_ok() {
+                received += 1;
+            }
+            received
+        });
+        delivery.finish();
+        let received = collector.join().expect("collector");
+        let lost = dropped.load(Ordering::Acquire);
+        assert_eq!(
+            received + lost,
+            offered,
+            "received {received} + dropped {lost} must equal offered {offered} exactly"
+        );
     }
 }
