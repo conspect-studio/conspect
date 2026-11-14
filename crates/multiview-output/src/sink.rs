@@ -5754,9 +5754,12 @@ mod tests {
             let carried = first_video_pts_90k(&ts).expect("a video PES PTS");
             let vtt =
                 std::fs::read_to_string(dir.path().join(format!("subs0-{index}.vtt"))).unwrap();
+            // One shared WebVTT timeline per rendition (LOCAL zero = its first
+            // segment start), so each map names the segment's own LOCAL.
+            let local = format!("00:00:00.{:03}", 100 * i);
             assert!(
                 vtt.starts_with(&format!(
-                    "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{carried},LOCAL:00:00:00.000\n"
+                    "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{carried},LOCAL:{local}\n"
                 )),
                 "the map names the PTS the TS carries: {vtt}"
             );
@@ -5766,7 +5769,7 @@ mod tests {
                 std::fs::read_to_string(dir.path().join(format!("subs1-{index}.vtt"))).unwrap();
             assert_eq!(
                 empty,
-                format!("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{carried},LOCAL:00:00:00.000\n"),
+                format!("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{carried},LOCAL:{local}\n"),
                 "an empty slot still gets a valid header-only segment"
             );
         }
@@ -5784,18 +5787,17 @@ mod tests {
                 .to_owned();
             std::fs::read_to_string(dir.path().join(format!("subs0-{index}.vtt"))).unwrap()
         };
+        // RFC 8216 §3.5: the spanning cue carries its total interval, with
+        // the same timestamps in both segments.
+        for i in [0, 1] {
+            assert!(
+                vtt(i).contains("00:00:00.050 --> 00:00:00.150\nFish &amp; &lt;chips&gt;\n"),
+                "{}",
+                vtt(i)
+            );
+        }
         assert!(
-            vtt(0).contains("00:00:00.050 --> 00:00:00.100\nFish &amp; &lt;chips&gt;\n"),
-            "{}",
-            vtt(0)
-        );
-        assert!(
-            vtt(1).contains("00:00:00.000 --> 00:00:00.050\nFish &amp; &lt;chips&gt;\n"),
-            "{}",
-            vtt(1)
-        );
-        assert!(
-            vtt(2).contains("00:00:00.050 --> 00:00:00.080\nthird\n"),
+            vtt(2).contains("00:00:00.250 --> 00:00:00.280\nthird\n"),
             "{}",
             vtt(2)
         );

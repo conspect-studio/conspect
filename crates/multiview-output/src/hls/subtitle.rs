@@ -601,16 +601,23 @@ mod tests {
     }
 
     #[test]
-    fn vtt_clips_cues_to_the_segment() {
+    fn vtt_cues_carry_their_total_interval_on_the_shared_timeline() {
+        // RFC 8216 §3.5: a cue overlapping the segment carries its TOTAL
+        // display interval (never clipped), on the rendition's timeline
+        // (LOCAL zero = the rendition's first segment start, here 0).
         let before = cue(0, 1_000, 2_500, &["spans in"]);
         let after = cue(0, 3_500, 9_000, &["spans out"]);
-        let text = render_vtt(&[&before, &after], ms(2_000), ms(4_000), ms(2_000), 0);
+        let text = render_vtt(&[&before, &after], ms(2_000), ms(4_000), ms(0), 180_000);
         assert!(
-            text.contains("00:00:00.000 --> 00:00:00.500\nspans in\n"),
+            text.starts_with("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:180000,LOCAL:00:00:02.000\n"),
             "{text}"
         );
         assert!(
-            text.contains("00:00:01.500 --> 00:00:02.000\nspans out\n"),
+            text.contains("00:00:01.000 --> 00:00:02.500\nspans in\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("00:00:03.500 --> 00:00:09.000\nspans out\n"),
             "{text}"
         );
         // Hours render too.
@@ -650,7 +657,8 @@ mod tests {
         open.end = SubtitleCue::OPEN_END;
         let mut held = SlotCues::default();
         held.push(open.clone(), &stats);
-        // Segment [0, 1000) closes with the cue still open: clipped to it.
+        // Segment [0, 1000) closes with the cue still open (end unknown): it
+        // is ended at the segment end ...
         let text = render_vtt(
             &held.overlapping(ms(0), ms(1_000)),
             ms(0),
@@ -664,18 +672,31 @@ mod tests {
         );
         held.retire_before(ms(1_000));
         assert_eq!(held.len(), 1, "an open cue is kept");
-        // Its close arrives: the closed cue replaces the open one.
+        // ... and re-emitted with the same start, extended, while still open.
+        let text = render_vtt(
+            &held.overlapping(ms(1_000), ms(2_000)),
+            ms(1_000),
+            ms(2_000),
+            ms(0),
+            90_000,
+        );
+        assert!(
+            text.contains("00:00:00.500 --> 00:00:02.000\nlong\n"),
+            "{text}"
+        );
+        // Its close arrives: the closed cue replaces the open one and carries
+        // its total interval (same start as in every earlier segment).
         held.push(cue(0, 500, 1_200, &["long"]), &stats);
         assert_eq!(held.len(), 1);
         let text = render_vtt(
             &held.overlapping(ms(1_000), ms(2_000)),
             ms(1_000),
             ms(2_000),
-            ms(1_000),
-            0,
+            ms(0),
+            90_000,
         );
         assert!(
-            text.contains("00:00:00.000 --> 00:00:00.200\nlong\n"),
+            text.contains("00:00:00.500 --> 00:00:01.200\nlong\n"),
             "{text}"
         );
         // A lost close: the next cue closes the open one at its start.
