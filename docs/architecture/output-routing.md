@@ -2254,8 +2254,24 @@ once that muxer writes its rule.)
 - *The tap.* `CompressedTap` gives each consumer (8 at most) its own bounded
   `sync_channel` of 64 AUs. The writer only `try_send`s and the clock only `try_recv`s. A full
   channel drops the **newest** AU for that consumer only, and the drop is counted. That happens
-  only when the consumer's clock is dead or wedged, because a live clock drains every tick. The
-  drop-oldest bound is the clock's jitter buffer (8 AUs), and that is where jitter is absorbed.
+  when the consumer's clock is dead or wedged, and also for a live clock when a demux burst puts
+  more than 64 unread AUs in its channel between two of its ticks (a clock takes at most 16 per
+  tick). The drop-oldest bound is the clock's jitter buffer (8 AUs), where ordinary jitter is
+  absorbed. Any AU loss is a DTS gap for that clock: a stall at the missing AU's tick, so the slot
+  bridges and returns after 30 on-time ticks; it never emits a picture that references a lost one.
+  The writer never blocks: it `try_lock`s its sender list (held only by `subscribe`, which builds
+  its channel first) and drops the AU, counted as `contended`, when it is held; a reader's `Drop`
+  never locks (the writer prunes disconnected senders). An AU over `MAX_AU_BYTES` (8 MiB) is
+  dropped and counted, at the tap and in the clock.
+- *Timestamps.* Conversion to ticks is relative to a per-stream epoch (the first AU's DTS,
+  re-anchored after a malformed AU, a time-base change or a DTS off the epoch's grid), so an
+  absolute source DTS need not be a whole number of frame periods. All offset arithmetic is
+  checked; an overflow, or a converted magnitude above 2^62 ticks, is `malformed`.
+- *Presentation delay.* After a run with B-frames the bridge carries one constant presentation
+  delay (`pts = tick + d`, `d = max(0, max emitted PTS + 1 - t)`), so a bridge picture never
+  presents at or before a picture already emitted; a new run adds the smallest constant delay that
+  puts its IDR after everything emitted (at most 8 ticks, else the slot stays bridged with
+  `presentation-delay` until the output signals a discontinuity and the timeline is reset).
 - *Start of a run.* The first IDR of a run gets `dts' = max(tick, arrival tick + 3)`, so it waits
   `TARGET_DEPTH` ticks in the buffer (the bridge fills those ticks) and the run starts with
   3 ticks of depth.
@@ -2265,10 +2281,12 @@ once that muxer writes its rule.)
   everything after it shift back by the size of the drop set. This is applied only if every AU
   kept before the IDR presents before the IDR's new PTS; otherwise it waits for the next IDR.
 - *Repeat AU.* H.264 only. HEVC has no repeat AU yet, so an HEVC underrun stalls and bridges.
-  The H.264 repeat sets `num_ref_idx_l0_active` to 1, so it copies the most recent reference
-  picture whatever the PPS default. It returns `None` (and the clock does not correct) for POC
-  type 1, MBAFF, FMO, separate colour planes, a previous MMCO 5, intra-only profiles, and a
-  repeat after a non-reference picture under POC type 2.
+  The H.264 repeat sets `num_ref_idx_l0_active` to 1, so it copies `RefPicList0[0]`. That is the
+  previous picture only when the previous picture is a short-term reference marked by the sliding
+  window, so it returns `None` (and the clock does not correct) after a non-reference picture,
+  adaptive reference marking (any MMCO), or a long-term IDR, and also for POC type 1, MBAFF, FMO,
+  separate colour planes and intra-only profiles. Its parsing is bounded (parameter sets up to
+  4 KiB, a 4 KiB slice-header prefix, at most 1024 NALs).
 - *Return after a stall that hid a parameter change.* An IDR whose parameter generation differs
   from the previous run's always needs the 300-tick parameter-change wait.
 
