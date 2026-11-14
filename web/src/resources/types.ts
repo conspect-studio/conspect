@@ -123,6 +123,14 @@ export interface SourceView {
    * `'not_supported'` for every other kind (there is no cue surface to watch).
    */
   readonly eventObservation: 'observing' | 'disabled' | 'not_supported';
+  /**
+   * Whether this source declares `captions` (absent or `off` ⇒ `false`): the
+   * same test the server applies for a subtitle slot's `source-has-no-
+   * captions` plan note (ADR-0110 §12.8, #345 part F2). Optional so existing
+   * literals built without it (tests, fixtures) still type-check; absent ⇒
+   * `false`.
+   */
+  readonly hasCaptions?: boolean;
 }
 
 /**
