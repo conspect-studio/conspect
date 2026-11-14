@@ -22,7 +22,9 @@
 //! of `POST /routing/output/take` (that route is the slot-0 alias): the take
 //! store's replay, the per-output and per-principal limits, the bounded
 //! `try_send`, the `route.output` outcome and persistence on `applied`.
-//! Atomic multi-destination sets arrive with patch salvos (#308).
+//! Two or more destinations (outputs, or mixer + output) are an atomic set
+//! (#308, `super::patch_set`); subtitle crosspoints (#345) go through
+//! `super::patch_subtitle` and are never part of a set.
 
 use std::time::Instant;
 
@@ -68,7 +70,8 @@ pub struct PatchDestination {
     /// Output API id (an output slot destination, with `slot`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
-    /// Output slot index: video and audio slot 0 in this release.
+    /// Output slot index: video and audio slot 0 in this release; a
+    /// subtitle slot below the output's declared `slots.subtitle` count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<u32>,
 }
@@ -78,13 +81,14 @@ pub struct PatchDestination {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct PatchCrosspoint {
-    /// `video` (this slice), `audio` or `subtitle`.
+    /// `video`, `audio` or `subtitle` (output subtitle slots, #345).
     pub plane: String,
     /// Where the source is patched.
     pub destination: PatchDestination,
     /// A mixer input: `{"source": id}` or `"none"`. An output video slot 0:
     /// `{"source": id}`, `{"layout": id}` (a stored layout; Read on it AND on
-    /// every source its cells bind) or `{"bus": ..}`; audio slot 0: `"follow"`.
+    /// every source its cells bind) or `{"bus": ..}`; audio slot 0: `"follow"`;
+    /// an output subtitle slot: `{"source": id}` or `"none"`.
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     pub source: Value,
 }
@@ -150,7 +154,8 @@ pub struct PlannedCrosspoint {
     /// The destination as requested.
     pub destination: PatchDestination,
     /// The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`
-    /// (§12.4), or `follow` (an audio slot riding the video take).
+    /// (§12.4), `follow` (an audio slot riding the video take) or
+    /// `subtitle` (a subtitle slot's route-table re-point).
     pub path: &'static str,
     /// Whether the destination input is on Program now (mixer inputs).
     pub on_air: bool,
@@ -159,6 +164,11 @@ pub struct PlannedCrosspoint {
     pub cost: Option<SlotCost>,
     /// `null` when the crosspoint can be taken.
     pub refusal: Option<PatchRefusal>,
+    /// A non-refusing remark: `source-has-no-captions` (a subtitle slot
+    /// patched to a source that declares no `captions` carries an empty
+    /// track). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
 }
 
 /// `POST /patch/plan` answer.
@@ -496,6 +506,7 @@ pub(crate) fn check(
             on_air: on_program,
             cost: None,
             refusal,
+            note: None,
         });
     }
     Ok(Ok(Checked {
@@ -521,7 +532,7 @@ pub(crate) fn validate_count(req: &PatchRequest) -> ControlResult<()> {
 /// The live patch (mixer plane), built from the engine's readback.
 #[cfg_attr(feature = "openapi", utoipa::path(get, path = "/api/v1/patch", tag = "patch",
     responses(
-        (status = 200, description = "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ] } ] }`. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.", body = Object),
+        (status = 200, description = "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.", body = Object),
         (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
         (status = 403, description = "Role lacks Read.", body = crate::problem::Problem),
         (status = 503, description = "engine-busy: every layout-read slot is in use (a layout on air on a visible output); retry", body = crate::problem::Problem),
@@ -585,7 +596,7 @@ pub(crate) async fn get_patch(
         (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object + output axis) or a source.", body = crate::problem::Problem),
         (status = 404, description = "Unknown output.", body = crate::problem::Problem),
         (status = 409, description = "`switcher-unavailable` or `routing-unavailable`.", body = crate::problem::Problem),
-        (status = 422, description = "`slot-medium-mismatch` (an audio slot other than slot 0 follow, a subtitle slot), `unknown-slot` (video slot >= 1, a destination named twice), `unknown-source` (a layout or bus on a mixer input; an unknown feed; more than 4 distinct layouts in one set), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan.", body = crate::problem::Problem),
+        (status = 422, description = "`slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; subtitle crosspoints mixed with video/audio ones or naming two outputs), `unknown-source` (a layout or bus on a mixer input; an unknown feed; more than 4 distinct layouts in one set), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A subtitle slot (`{\"source\": id}` or `\"none\"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track).", body = crate::problem::Problem),
         (status = 503, description = "`engine-busy`: an output slot's `{layout}` could not be read now (every layout-read slot is in use); retry.", body = crate::problem::Problem),
     )))]
 pub(crate) async fn plan_patch(
@@ -606,6 +617,21 @@ pub(crate) async fn plan_request(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     validate_count(req)?;
+    if super::patch_subtitle::has_subtitle(req) {
+        // Both ends of every crosspoint are authorized BEFORE shape and any
+        // existence answer (T-A1 ordering); a subtitle request reads no
+        // layout (a `{layout}` source is refused by shape) and is never a
+        // set (shape refuses subtitle crosspoints beside others).
+        authorize(principal, req, &[])?;
+        let patch = match super::patch_subtitle::shape(req) {
+            Ok(patch) => patch,
+            Err(response) => return Ok(*response),
+        };
+        return Ok(match super::patch_subtitle::plan(state, req, &patch)? {
+            Ok(plan) => (StatusCode::OK, Json(plan)).into_response(),
+            Err(response) => response,
+        });
+    }
     let layouts = match read_patch_layouts(state, principal, req).await? {
         Ok(layouts) => layouts,
         Err(response) => return Ok(response),
@@ -649,7 +675,7 @@ pub(crate) async fn plan_request(
         (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source (a layout: its id and whole source closure) of ANY member; nothing is enqueued and no key is burned; a replayed key is re-authorized.", body = crate::problem::Problem),
         (status = 404, description = "Unknown output.", body = crate::problem::Problem),
         (status = 409, description = "`conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions), `aux-capacity` (no free layout canvas), or no source lease.", body = crate::problem::Problem),
-        (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints.", body = crate::problem::Problem),
+        (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run` (see the subtitle design note).", body = crate::problem::Problem),
         (status = 429, description = "Over 2 takes/s per destination or 10/s per principal (one request = one take, whatever its crosspoint count; a set counts once per destination); see Retry-After.", body = crate::problem::Problem),
         (status = 503, description = "`engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity` (also: 256 sets already await their outcome).", body = crate::problem::Problem),
     )))]
@@ -664,6 +690,20 @@ pub(crate) async fn take_patch(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     validate_count(&req)?;
+    if super::patch_subtitle::has_subtitle(&req) {
+        // As the plan: authorize every end first (a replay re-authorizes).
+        authorize(&principal, &req, &[])?;
+        let patch = match super::patch_subtitle::shape(&req) {
+            Ok(patch) => patch,
+            Err(response) => return Ok(*response),
+        };
+        return Ok(
+            match super::patch_subtitle::take(&state, &principal, &idem, &patch)? {
+                Ok(op) => accepted(op),
+                Err(response) => response,
+            },
+        );
+    }
     let layouts = match read_patch_layouts(&state, &principal, &req).await? {
         Ok(layouts) => layouts,
         Err(response) => return Ok(response),

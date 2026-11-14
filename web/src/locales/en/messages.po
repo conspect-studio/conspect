@@ -302,6 +302,10 @@ msgstr "{option} (custom — preserved)"
 msgid "{seconds} s ago"
 msgstr "{seconds} s ago"
 
+#: src/cast/castLabels.ts:38
+msgid "{seconds} s behind live"
+msgstr "{seconds} s behind live"
+
 #: src/events/SourceEventsButton.tsx:51
 msgid "{seconds} seconds"
 msgstr "{seconds} seconds"
@@ -471,23 +475,23 @@ msgstr "<0>YouTube restream:</0> the inbound ingest and the outbound destination
 msgid "⊘ Not available"
 msgstr "⊘ Not available"
 
-#: src/components/broadcast/ProductionDesk.tsx:50
+#: src/components/broadcast/ProductionDesk.tsx:51
 msgid "▲ PREVIEW"
 msgstr "▲ PREVIEW"
 
-#: src/components/broadcast/ProductionDesk.tsx:50
+#: src/components/broadcast/ProductionDesk.tsx:51
 msgid "△ PREVIEW — unconfirmed"
 msgstr "△ PREVIEW — unconfirmed"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "○ Dark — neither bus"
 msgstr "○ Dark — neither bus"
 
-#: src/components/broadcast/ProductionDesk.tsx:50
+#: src/components/broadcast/ProductionDesk.tsx:51
 msgid "○ PROGRAM — unconfirmed"
 msgstr "○ PROGRAM — unconfirmed"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "● Amber — PREVIEW"
 msgstr "● Amber — PREVIEW"
 
@@ -495,7 +499,7 @@ msgstr "● Amber — PREVIEW"
 msgid "● AMBER — preview"
 msgstr "● AMBER — preview"
 
-#: src/components/broadcast/ProductionDesk.tsx:50
+#: src/components/broadcast/ProductionDesk.tsx:51
 msgid "● ON AIR — PROGRAM"
 msgstr "● ON AIR — PROGRAM"
 
@@ -511,7 +515,7 @@ msgstr "● on PGM"
 msgid "● RED — on air"
 msgstr "● RED — on air"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "● Red — PROGRAM"
 msgstr "● Red — PROGRAM"
 
@@ -587,7 +591,7 @@ msgstr "A context pack carries diagnostics, logs, and a redacted config — neve
 msgid "A CSS-grid layout with <0>columns</0> and <1>rows</1> track lists (<2>fr</2> / <3>px</3> / <4>%</4>), a <5>gap</5>, and an <6>areas</6> map that names where each cell sits."
 msgstr "A CSS-grid layout with <0>columns</0> and <1>rows</1> track lists (<2>fr</2> / <3>px</3> / <4>%</4>), a <5>gap</5>, and an <6>areas</6> map that names where each cell sits."
 
-#: src/pages/CastPage.tsx:134
+#: src/pages/CastPage.tsx:185
 msgid "A device id is required"
 msgstr "A device id is required"
 
@@ -679,7 +683,7 @@ msgstr "A per-cell <0>qos</0> block sets a degradation <1>priority</1> and strat
 msgid "A probe watches one cell for a fail state and raises an alarm after its dwell window."
 msgstr "A probe watches one cell for a fail state and raises an alarm after its dwell window."
 
-#: src/pages/CastPage.tsx:101
+#: src/pages/CastPage.tsx:150
 msgid "A receiver address is required"
 msgstr "A receiver address is required"
 
@@ -907,7 +911,7 @@ msgstr "Action/graphics safe-area guide lines."
 
 #: src/pages/AlarmsPage.tsx:221
 #: src/pages/approved/SourcesSurface.tsx:370
-#: src/pages/CastPage.tsx:320
+#: src/pages/CastPage.tsx:393
 #: src/pages/DevicesPage.tsx:634
 #: src/pages/graphics/DataView.tsx:365
 #: src/pages/LayoutsPage.tsx:132
@@ -951,11 +955,11 @@ msgstr "Active NVENC sessions out of the discovered ceiling"
 msgid "Active only"
 msgstr "Active only"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Active system alarm summary"
 msgstr "Active system alarm summary"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Active system alarms only"
 msgstr "Active system alarms only"
 
@@ -983,7 +987,7 @@ msgstr "Add {0} sources"
 msgid "Add {title} as source"
 msgstr "Add {title} as source"
 
-#: src/components/broadcast/ProductionDesk.tsx:208
+#: src/components/broadcast/ProductionDesk.tsx:209
 msgid "Add a source — opens the New source dialog"
 msgstr "Add a source — opens the New source dialog"
 
@@ -1040,7 +1044,7 @@ msgstr "Add selected ({0})"
 msgid "Add selected streams as sources"
 msgstr "Add selected streams as sources"
 
-#: src/components/broadcast/ProductionDesk.tsx:208
+#: src/components/broadcast/ProductionDesk.tsx:209
 msgid "Add source"
 msgstr "Add source"
 
@@ -1060,7 +1064,7 @@ msgstr "Add to rundown"
 msgid "Added"
 msgstr "Added"
 
-#: src/pages/CastPage.tsx:256
+#: src/pages/CastPage.tsx:321
 msgid "Address"
 msgstr "Address"
 
@@ -1167,7 +1171,7 @@ msgstr "Alarm acknowledged"
 msgid "Alarm policy (dwell, severity, latching)"
 msgstr "Alarm policy (dwell, severity, latching)"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Alarm summary unavailable"
 msgstr "Alarm summary unavailable"
 
@@ -1176,8 +1180,8 @@ msgid "Alarm when offline"
 msgstr "Alarm when offline"
 
 #: src/app/navigation.tsx:70
-#: src/components/broadcast/BroadcastShell.tsx:47
-#: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/BroadcastShell.tsx:48
+#: src/components/broadcast/ProductionDesk.tsx:204
 #: src/docs/registry.ts:262
 #: src/pages/AlarmsPage.tsx:152
 #: src/pages/docs/FeaturesPage.tsx:164
@@ -1185,15 +1189,15 @@ msgid "Alarms"
 msgstr "Alarms"
 
 #. placeholder {0}: alarms.data.length
-#: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/ProductionDesk.tsx:204
 msgid "Alarms — {0} active system"
 msgstr "Alarms — {0} active system"
 
-#: src/components/broadcast/BroadcastShell.tsx:47
+#: src/components/broadcast/BroadcastShell.tsx:48
 msgid "Alarms — {alarmCount} active system"
 msgstr "Alarms — {alarmCount} active system"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Alarms & engine health"
 msgstr "Alarms & engine health"
 
@@ -1243,7 +1247,7 @@ msgstr "All endpoints live under <0>/api/v1</0>."
 msgid "All kinds"
 msgstr "All kinds"
 
-#: src/components/broadcast/BroadcastShell.tsx:48
+#: src/components/broadcast/BroadcastShell.tsx:49
 msgid "All screens"
 msgstr "All screens"
 
@@ -1581,7 +1585,7 @@ msgstr "Attached automatically"
 #: src/app/navigation.tsx:58
 #: src/components/broadcast/BroadcastShell.tsx:34
 #: src/components/broadcast/library/Chips.tsx:139
-#: src/pages/approved/PatchMatrix.tsx:892
+#: src/pages/approved/PatchMatrix.tsx:895
 #: src/pages/OutputAudioRow.tsx:307
 #: src/pages/OutputFeedRow.tsx:434
 #: src/pages/OutputsPage.tsx:897
@@ -1604,8 +1608,8 @@ msgstr "Audio feed for {outputName}"
 msgid "Audio feeds"
 msgstr "Audio feeds"
 
-#: src/pages/approved/PatchMatrix.tsx:708
-#: src/pages/approved/PatchMatrix.tsx:720
+#: src/pages/approved/PatchMatrix.tsx:711
+#: src/pages/approved/PatchMatrix.tsx:723
 msgid "Audio Follow rides its output's video take: also arm that output's video"
 msgstr "Audio Follow rides its output's video take: also arm that output's video"
 
@@ -1637,7 +1641,7 @@ msgstr "Audio languages"
 msgid "Audio meters"
 msgstr "Audio meters"
 
-#: src/components/broadcast/ProductionDesk.tsx:59
+#: src/components/broadcast/ProductionDesk.tsx:60
 msgid "Audio meters unavailable — no measured level telemetry"
 msgstr "Audio meters unavailable — no measured level telemetry"
 
@@ -1728,16 +1732,16 @@ msgstr "Auto (drop leading zero units)"
 msgid "Auto (first usable track)"
 msgstr "Auto (first usable track)"
 
-#: src/components/broadcast/ProductionDesk.tsx:212
+#: src/components/broadcast/ProductionDesk.tsx:213
 #: src/pages/SwitcherPage.tsx:148
 msgid "Auto frames"
 msgstr "Auto frames"
 
-#: src/components/broadcast/ProductionDesk.tsx:212
+#: src/components/broadcast/ProductionDesk.tsx:213
 msgid "AUTO frames"
 msgstr "AUTO frames"
 
-#: src/components/broadcast/ProductionDesk.tsx:211
+#: src/components/broadcast/ProductionDesk.tsx:212
 msgid "AUTO mix over {frames} frames"
 msgstr "AUTO mix over {frames} frames"
 
@@ -2020,6 +2024,15 @@ msgstr "Browser-direct; TURN for hard NATs"
 msgid "Buffered log records, oldest first."
 msgstr "Buffered log records, oldest first."
 
+#. placeholder {0}: cast.deviceName ?? t`this device`
+#: src/cast/CastButton.tsx:54
+msgid "Buffering on {0}"
+msgstr "Buffering on {0}"
+
+#: src/cast/castLabels.ts:18
+msgid "Buffering…"
+msgstr "Buffering…"
+
 #: src/pages/docs/concepts/TransportsPage.tsx:299
 msgid "Buffers and lags under loss"
 msgstr "Buffers and lags under loss"
@@ -2044,6 +2057,7 @@ msgstr "Bus"
 msgid "Bus setup"
 msgstr "Bus setup"
 
+#: src/cast/CastFeedPicker.tsx:66
 #: src/pages/approved/PatchMatrix.test.tsx:739
 #: src/pages/approved/PatchMatrix.tsx:191
 #: src/pages/OutputFeedRow.tsx:322
@@ -2066,13 +2080,13 @@ msgstr "cadence unknown"
 msgid "Camera 1"
 msgstr "Camera 1"
 
-#: src/pages/approved/PatchMatrix.tsx:698
-#: src/pages/approved/PatchMatrix.tsx:856
+#: src/pages/approved/PatchMatrix.tsx:701
+#: src/pages/approved/PatchMatrix.tsx:859
 msgid "Can take."
 msgstr "Can take."
 
-#: src/components/broadcast/BroadcastShell.tsx:45
-#: src/components/broadcast/ProductionDesk.tsx:216
+#: src/components/broadcast/BroadcastShell.tsx:46
+#: src/components/broadcast/ProductionDesk.tsx:217
 #: src/components/switcher/MixerInputBank.tsx:75
 #: src/events/AutomationPanel.tsx:135
 #: src/iptv/AddSourceDialog.tsx:79
@@ -2081,12 +2095,12 @@ msgstr "Can take."
 #: src/iptv/SourceLinks.tsx:420
 #: src/layout/components/GridLayoutEditor.tsx:882
 #: src/layout/components/LayoutEditor.tsx:426
-#: src/pages/approved/PatchMatrix.tsx:1075
-#: src/pages/approved/PatchMatrix.tsx:1104
-#: src/pages/CastPage.tsx:459
-#: src/pages/CastPage.tsx:520
-#: src/pages/CastPage.tsx:569
-#: src/pages/CastPage.tsx:603
+#: src/pages/approved/PatchMatrix.tsx:1078
+#: src/pages/approved/PatchMatrix.tsx:1107
+#: src/pages/CastPage.tsx:545
+#: src/pages/CastPage.tsx:606
+#: src/pages/CastPage.tsx:655
+#: src/pages/CastPage.tsx:689
 #: src/pages/DeviceDetailPage.tsx:902
 #: src/pages/DeviceDetailPage.tsx:970
 #: src/pages/DeviceDetailPage.tsx:1092
@@ -2162,12 +2176,12 @@ msgid "Cannot rename: area(s) {0} would no longer be a rectangle."
 msgstr "Cannot rename: area(s) {0} would no longer be a rectangle."
 
 #. placeholder {0}: refusal.detail
-#: src/pages/approved/PatchMatrix.tsx:698
-#: src/pages/approved/PatchMatrix.tsx:700
+#: src/pages/approved/PatchMatrix.tsx:701
+#: src/pages/approved/PatchMatrix.tsx:703
 msgid "Cannot take: {0}"
 msgstr "Cannot take: {0}"
 
-#: src/pages/approved/PatchMatrix.tsx:856
+#: src/pages/approved/PatchMatrix.tsx:859
 msgid "Cannot take."
 msgstr "Cannot take."
 
@@ -2245,16 +2259,22 @@ msgid "Carry the file to an online portal to obtain a signed lease."
 msgstr "Carry the file to an online portal to obtain a signed lease."
 
 #: src/app/navigation.tsx:61
-#: src/pages/CastPage.tsx:215
-#: src/pages/CastPage.tsx:257
+#: src/cast/CastButton.tsx:110
+#: src/cast/CastButton.tsx:111
+#: src/cast/CastButton.tsx:127
+#: src/cast/CastButton.tsx:131
+#: src/components/broadcast/BroadcastShell.tsx:35
+#: src/pages/CastPage.tsx:266
+#: src/pages/CastPage.tsx:322
 msgid "Cast"
 msgstr "Cast"
 
-#: src/pages/CastPage.tsx:217
-msgid "Cast a running output to a Chromecast / Google Cast receiver as an ephemeral session, then optionally save it as a permanent device. The session list refreshes on its own."
-msgstr "Cast a running output to a Chromecast / Google Cast receiver as an ephemeral session, then optionally save it as a permanent device. The session list refreshes on its own."
+#. placeholder {0}: target.name
+#: src/cast/CastButton.tsx:119
+msgid "Cast {0} to a TV (Google Cast)"
+msgstr "Cast {0} to a TV (Google Cast)"
 
-#: src/pages/CastPage.tsx:408
+#: src/pages/CastPage.tsx:486
 msgid "Cast a running output's rendition to a Cast receiver. Leave the output blank to use the first declared rendition."
 msgstr "Cast a running output's rendition to a Cast receiver. Leave the output blank to use the first declared rendition."
 
@@ -2270,15 +2290,44 @@ msgstr "Cast devices are never offered: they cannot join a synchronized canvas (
 msgid "Cast devices never join a synchronized canvas (their latency is multiple seconds and uncontrolled). Use a display node or a vendor decoder for synchronized walls."
 msgstr "Cast devices never join a synchronized canvas (their latency is multiple seconds and uncontrolled). Use a display node or a vendor decoder for synchronized walls."
 
-#: src/pages/CastPage.tsx:252
+#: src/cast/castLabels.ts:24
+msgid "Cast failed"
+msgstr "Cast failed"
+
+#: src/pages/CastPage.tsx:280
+msgid "Cast from the engine (same network)"
+msgstr "Cast from the engine (same network)"
+
+#: src/cast/BrowserCastSection.tsx:36
+msgid "Cast from this browser"
+msgstr "Cast from this browser"
+
+#: src/cast/CastButton.tsx:42
+msgid "Cast needs Chrome or Edge"
+msgstr "Cast needs Chrome or Edge"
+
+#: src/cast/CastButton.tsx:38
+#: src/cast/CastButton.tsx:39
+msgid "Cast needs Chrome or Edge on a computer or Android"
+msgstr "Cast needs Chrome or Edge on a computer or Android"
+
+#: src/cast/BrowserCastSection.tsx:49
+msgid "Cast needs Chrome or Edge on a computer or Android."
+msgstr "Cast needs Chrome or Edge on a computer or Android."
+
+#: src/pages/CastPage.tsx:316
 msgid "Cast receivers seen on the network (untrusted hints)."
 msgstr "Cast receivers seen on the network (untrusted hints)."
 
-#: src/pages/CastPage.tsx:114
+#: src/cast/castLoad.ts:125
+msgid "Cast session error."
+msgstr "Cast session error."
+
+#: src/pages/CastPage.tsx:165
 msgid "Cast session started"
 msgstr "Cast session started"
 
-#: src/pages/CastPage.tsx:199
+#: src/pages/CastPage.tsx:250
 msgid "Cast session stopped"
 msgstr "Cast session stopped"
 
@@ -2286,13 +2335,26 @@ msgstr "Cast session stopped"
 msgid "Cast targets"
 msgstr "Cast targets"
 
-#: src/pages/CastPage.tsx:277
+#: src/pages/CastPage.tsx:349
 msgid "Cast to"
 msgstr "Cast to"
 
-#: src/pages/CastPage.tsx:283
+#: src/pages/CastPage.tsx:355
 msgid "Cast to this"
 msgstr "Cast to this"
+
+#: src/cast/ActiveCastCard.tsx:48
+msgid "Casting from this browser"
+msgstr "Casting from this browser"
+
+#: src/api/castStreams.ts:176
+msgid "Casting is not available right now: the engine has no usable cast output."
+msgstr "Casting is not available right now: the engine has no usable cast output."
+
+#. placeholder {0}: cast.deviceName ?? t`this device`
+#: src/cast/CastButton.tsx:52
+msgid "Casting to {0}"
+msgstr "Casting to {0}"
 
 #: src/iptv/IptvOrgPage.tsx:977
 msgid "Categories"
@@ -2376,8 +2438,8 @@ msgstr "Change mode…"
 msgid "Changes"
 msgstr "Changes"
 
-#: src/pages/approved/PatchMatrix.tsx:692
-#: src/pages/approved/PatchMatrix.tsx:857
+#: src/pages/approved/PatchMatrix.tsx:695
+#: src/pages/approved/PatchMatrix.tsx:860
 msgid "Changes Program: needs confirmation."
 msgstr "Changes Program: needs confirmation."
 
@@ -2434,7 +2496,7 @@ msgstr "Check all token pages"
 msgid "Checked from this server."
 msgstr "Checked from this server."
 
-#: src/pages/approved/PatchMatrix.tsx:482
+#: src/pages/approved/PatchMatrix.tsx:485
 msgid "Checking permission…"
 msgstr "Checking permission…"
 
@@ -2458,12 +2520,12 @@ msgstr "Choose a feed and plan it first"
 msgid "Choose a feed…"
 msgstr "Choose a feed…"
 
-#: src/pages/approved/PatchMatrix.tsx:761
-#: src/pages/approved/PatchMatrix.tsx:1038
+#: src/pages/approved/PatchMatrix.tsx:764
+#: src/pages/approved/PatchMatrix.tsx:1041
 msgid "Choose a salvo first"
 msgstr "Choose a salvo first"
 
-#: src/pages/approved/PatchMatrix.tsx:1026
+#: src/pages/approved/PatchMatrix.tsx:1029
 msgid "Choose a salvo…"
 msgstr "Choose a salvo…"
 
@@ -2494,6 +2556,10 @@ msgstr "Choose an output or source…"
 #: src/pages/SettingsPage.tsx:158
 msgid "Choose light, dark, or follow the system."
 msgstr "Choose light, dark, or follow the system."
+
+#: src/cast/ActiveCastCard.tsx:52
+msgid "Choosing a device…"
+msgstr "Choosing a device…"
 
 #: src/docs/registry.ts:451
 #: src/pages/docs/concepts/LatencyPage.tsx:143
@@ -2551,7 +2617,7 @@ msgstr "Class"
 #. placeholder {1}: String(set.new_encoders)
 #. placeholder {2}: set.new_encoders === 1 ? '' : 's'
 #. placeholder {3}: set.fits ? t`fits` : t`does not fit`
-#: src/pages/approved/PatchMatrix.tsx:699
+#: src/pages/approved/PatchMatrix.tsx:702
 msgid "class {0} · +{1} encoder{2} · {3}"
 msgstr "class {0} · +{1} encoder{2} · {3}"
 
@@ -2563,19 +2629,19 @@ msgstr "Class-1 — hot, seamless at a frame boundary"
 msgid "Class-2 — make-before-break migration (asynchronous)"
 msgstr "Class-2 — make-before-break migration (asynchronous)"
 
-#: src/pages/approved/PatchMatrix.tsx:1041
+#: src/pages/approved/PatchMatrix.tsx:1044
 msgid "Classify salvo"
 msgstr "Classify salvo"
 
-#: src/pages/approved/PatchMatrix.tsx:966
+#: src/pages/approved/PatchMatrix.tsx:969
 msgid "Classify selection"
 msgstr "Classify selection"
 
-#: src/pages/approved/PatchMatrix.tsx:765
+#: src/pages/approved/PatchMatrix.tsx:768
 msgid "Classify the salvo first"
 msgstr "Classify the salvo first"
 
-#: src/pages/approved/PatchMatrix.tsx:712
+#: src/pages/approved/PatchMatrix.tsx:715
 msgid "Classify the selection first"
 msgstr "Classify the selection first"
 
@@ -2583,7 +2649,7 @@ msgstr "Classify the selection first"
 msgid "Clauses"
 msgstr "Clauses"
 
-#: src/pages/approved/PatchMatrix.tsx:519
+#: src/pages/approved/PatchMatrix.tsx:522
 #: src/pages/LayoutsPage.tsx:120
 msgid "Clean"
 msgstr "Clean"
@@ -2596,6 +2662,7 @@ msgstr "CLEAN"
 msgid "Clean (no overlays)"
 msgstr "Clean (no overlays)"
 
+#: src/cast/CastFeedPicker.tsx:37
 #: src/pages/OutputFeedRow.tsx:179
 msgid "Clean (Program without labels and tally)"
 msgstr "Clean (Program without labels and tally)"
@@ -2626,7 +2693,7 @@ msgid "Clear place"
 msgstr "Clear place"
 
 #: src/components/broadcast/library/LibraryBrowser.tsx:333
-#: src/pages/approved/PatchMatrix.tsx:993
+#: src/pages/approved/PatchMatrix.tsx:996
 msgid "Clear selection"
 msgstr "Clear selection"
 
@@ -2855,6 +2922,10 @@ msgstr "Configuration exported"
 msgid "Configuration file"
 msgstr "Configuration file"
 
+#: src/cast/BrowserCastSection.tsx:67
+msgid "Configuration snippet"
+msgstr "Configuration snippet"
+
 #: src/pages/OutputsPage.tsx:1442
 msgid "Configure output servers and renditions."
 msgstr "Configure output servers and renditions."
@@ -2906,7 +2977,7 @@ msgstr "configured: {label} (not on air)"
 msgid "Confirm"
 msgstr "Confirm"
 
-#: src/pages/approved/PatchMatrix.tsx:1087
+#: src/pages/approved/PatchMatrix.tsx:1090
 #: src/pages/RoutingPage.tsx:644
 msgid "Confirm a program-affecting take?"
 msgstr "Confirm a program-affecting take?"
@@ -2919,12 +2990,12 @@ msgstr "Confirm a take on a Program output?"
 msgid "Confirm on-air re-patch"
 msgstr "Confirm on-air re-patch"
 
-#: src/components/broadcast/ProductionDesk.tsx:216
+#: src/components/broadcast/ProductionDesk.tsx:217
 msgid "Confirm program change"
 msgstr "Confirm program change"
 
-#: src/components/broadcast/ProductionDesk.tsx:216
-#: src/pages/approved/PatchMatrix.tsx:1115
+#: src/components/broadcast/ProductionDesk.tsx:217
+#: src/pages/approved/PatchMatrix.tsx:1118
 #: src/pages/OutputFeedRow.tsx:466
 #: src/pages/RoutingPage.tsx:665
 msgid "Confirm take"
@@ -2955,6 +3026,10 @@ msgstr "Connected ({0})"
 msgid "Connecting"
 msgstr "Connecting"
 
+#: src/cast/castLabels.ts:14
+msgid "Connecting to the TV…"
+msgstr "Connecting to the TV…"
+
 #: src/auth/RequireAuth.tsx:39
 msgid "Connecting…"
 msgstr "Connecting…"
@@ -2979,7 +3054,7 @@ msgstr "Conspect"
 msgid "Conspect composites the canvas <0>once</0> per tick, encodes it <1>once per rendition</1>, and fans the same encoded packets out to every output that wants that rendition. Writing the wall to HLS while pushing it to an RTMP and an SRT destination at the same codec, resolution, and bitrate costs one encode — not three. A second encode is created only when an output genuinely needs a different codec, resolution, or bitrate."
 msgstr "Conspect composites the canvas <0>once</0> per tick, encodes it <1>once per rendition</1>, and fans the same encoded packets out to every output that wants that rendition. Writing the wall to HLS while pushing it to an RTMP and an SRT destination at the same codec, resolution, and bitrate costs one encode — not three. A second encode is created only when an output genuinely needs a different codec, resolution, or bitrate."
 
-#: src/components/broadcast/BroadcastShell.tsx:39
+#: src/components/broadcast/BroadcastShell.tsx:40
 msgid "CONSPECT Control — Desk"
 msgstr "CONSPECT Control — Desk"
 
@@ -3051,11 +3126,11 @@ msgstr "Continue past the target"
 msgid "Continuous output and fault isolation are design objectives, not warranties of uninterrupted operation. Inputs are sampled, never trusted to pace the output. A single fixed-cadence clock emits exactly one frame per tick. When a source drops, its tile holds its last good frame and shows a clear state while the engine reconnects in the background — the rest of the wall keeps running."
 msgstr "Continuous output and fault isolation are design objectives, not warranties of uninterrupted operation. Inputs are sampled, never trusted to pace the output. A single fixed-cadence clock emits exactly one frame per tick. When a source drops, its tile holds its last good frame and shows a clear state while the engine reconnects in the background — the rest of the wall keeps running."
 
-#: src/components/broadcast/BroadcastShell.tsx:39
+#: src/components/broadcast/BroadcastShell.tsx:40
 msgid "Control"
 msgstr "Control"
 
-#: src/components/broadcast/ProductionDesk.tsx:204
+#: src/components/broadcast/ProductionDesk.tsx:205
 msgid "Controls disabled"
 msgstr "Controls disabled"
 
@@ -3137,7 +3212,7 @@ msgstr "Copy failed"
 msgid "Copy unavailable"
 msgstr "Copy unavailable"
 
-#: src/components/broadcast/BroadcastShell.tsx:40
+#: src/components/broadcast/BroadcastShell.tsx:41
 msgid "Core screens"
 msgstr "Core screens"
 
@@ -3182,6 +3257,11 @@ msgstr "Could not bind the source"
 #: src/pages/SystemActionsPage.tsx:91
 msgid "Could not cancel the action"
 msgstr "Could not cancel the action"
+
+#: src/cast/castLoad.ts:135
+#: src/cast/castLoad.ts:138
+msgid "Could not cast to this device."
+msgstr "Could not cast to this device."
 
 #: src/pages/DeviceDetailPage.tsx:982
 msgid "Could not change the mode"
@@ -3263,7 +3343,7 @@ msgstr "Could not load alarms:"
 msgid "Could not load capabilities."
 msgstr "Could not load capabilities."
 
-#: src/pages/CastPage.tsx:303
+#: src/pages/CastPage.tsx:376
 msgid "Could not load cast sessions:"
 msgstr "Could not load cast sessions:"
 
@@ -3275,7 +3355,7 @@ msgstr "Could not load device:"
 msgid "Could not load devices:"
 msgstr "Could not load devices:"
 
-#: src/pages/CastPage.tsx:241
+#: src/pages/CastPage.tsx:305
 msgid "Could not load discovery:"
 msgstr "Could not load discovery:"
 
@@ -3350,6 +3430,10 @@ msgstr "Could not load the audio routing:"
 msgid "Could not load the audit log:"
 msgstr "Could not load the audit log:"
 
+#: src/cast/BrowserCastSection.tsx:57
+msgid "Could not load the cast settings:"
+msgstr "Could not load the cast settings:"
+
 #: src/iptv/IptvOrgPage.tsx:396
 msgid "Could not load the catalogue:"
 msgstr "Could not load the catalogue:"
@@ -3412,6 +3496,10 @@ msgstr "Could not measure"
 msgid "Could not plan the take"
 msgstr "Could not plan the take"
 
+#: src/api/castStreams.ts:213
+msgid "Could not prepare the cast stream."
+msgstr "Could not prepare the cast stream."
+
 #: src/pages/DeviceDetailPage.tsx:310
 msgid "Could not probe"
 msgstr "Could not probe"
@@ -3434,7 +3522,7 @@ msgstr "Could not reboot"
 msgid "Could not save"
 msgstr "Could not save"
 
-#: src/pages/CastPage.tsx:153
+#: src/pages/CastPage.tsx:204
 msgid "Could not save as a device"
 msgstr "Could not save as a device"
 
@@ -3475,7 +3563,7 @@ msgstr "Could not save the rundown"
 msgid "Could not send the reply"
 msgstr "Could not send the reply"
 
-#: src/pages/CastPage.tsx:183
+#: src/pages/CastPage.tsx:234
 msgid "Could not set the volume"
 msgstr "Could not set the volume"
 
@@ -3483,7 +3571,7 @@ msgstr "Could not set the volume"
 msgid "Could not show the test pattern"
 msgstr "Could not show the test pattern"
 
-#: src/pages/CastPage.tsx:119
+#: src/pages/CastPage.tsx:170
 msgid "Could not start the cast session"
 msgstr "Could not start the cast session"
 
@@ -3491,7 +3579,7 @@ msgstr "Could not start the cast session"
 msgid "Could not start the scan"
 msgstr "Could not start the scan"
 
-#: src/pages/CastPage.tsx:203
+#: src/pages/CastPage.tsx:254
 msgid "Could not stop the cast session"
 msgstr "Could not stop the cast session"
 
@@ -3724,7 +3812,7 @@ msgstr "Cut"
 msgid "CUT"
 msgstr "CUT"
 
-#: src/components/broadcast/ProductionDesk.tsx:211
+#: src/components/broadcast/ProductionDesk.tsx:212
 msgid "CUT — Preview and Program carry the same source"
 msgstr "CUT — Preview and Program carry the same source"
 
@@ -3732,11 +3820,11 @@ msgstr "CUT — Preview and Program carry the same source"
 msgid "Cut Program"
 msgstr "Cut Program"
 
-#: src/components/broadcast/BroadcastShell.tsx:45
+#: src/components/broadcast/BroadcastShell.tsx:46
 msgid "CUT will execute without another confirmation. AUTO remains unavailable. Direct program selection remains guarded."
 msgstr "CUT will execute without another confirmation. AUTO remains unavailable. Direct program selection remains guarded."
 
-#: src/components/broadcast/ProductionDesk.tsx:211
+#: src/components/broadcast/ProductionDesk.tsx:212
 msgid "Cuts to"
 msgstr "Cuts to"
 
@@ -4084,12 +4172,13 @@ msgstr "Detect per-cell fail states — black, freeze, silence, and loudness vio
 msgid "Detected: {0}"
 msgstr "Detected: {0}"
 
+#: src/cast/ActiveCastCard.tsx:51
 #: src/devices/FromDevice.tsx:85
 #: src/pages/CapabilitiesPage.tsx:140
 msgid "Device"
 msgstr "Device"
 
-#: src/pages/CastPage.tsx:493
+#: src/pages/CastPage.tsx:579
 msgid "Device id"
 msgstr "Device id"
 
@@ -4179,11 +4268,11 @@ msgstr "Discard the source wall-clock"
 
 #: src/app/AppLayout.tsx:17
 #: src/components/ConnectionStatus.tsx:47
-#: src/pages/approved/PatchMatrix.tsx:847
+#: src/pages/approved/PatchMatrix.tsx:850
 msgid "Disconnected"
 msgstr "Disconnected"
 
-#: src/pages/approved/PatchMatrix.tsx:484
+#: src/pages/approved/PatchMatrix.tsx:487
 msgid "Disconnected: takes are disabled until the connection is back"
 msgstr "Disconnected: takes are disabled until the connection is back"
 
@@ -4199,7 +4288,7 @@ msgstr "DISCOVERED"
 msgid "Discovered peers (untrusted, read-only)."
 msgstr "Discovered peers (untrusted, read-only)."
 
-#: src/pages/CastPage.tsx:233
+#: src/pages/CastPage.tsx:297
 msgid "Discovered receivers"
 msgstr "Discovered receivers"
 
@@ -4243,7 +4332,7 @@ msgstr "Display format"
 msgid "Display name"
 msgstr "Display name"
 
-#: src/pages/CastPage.tsx:506
+#: src/pages/CastPage.tsx:592
 msgid "Display name (optional)"
 msgstr "Display name (optional)"
 
@@ -4287,7 +4376,7 @@ msgstr "Document shape"
 msgid "Documentation"
 msgstr "Documentation"
 
-#: src/pages/approved/PatchMatrix.tsx:699
+#: src/pages/approved/PatchMatrix.tsx:702
 msgid "does not fit"
 msgstr "does not fit"
 
@@ -4449,7 +4538,7 @@ msgstr "e.g. cam-north"
 msgid "e.g. cam1-clean"
 msgstr "e.g. cam1-clean"
 
-#: src/pages/CastPage.tsx:498
+#: src/pages/CastPage.tsx:584
 msgid "e.g. cast-lobby"
 msgstr "e.g. cast-lobby"
 
@@ -4473,7 +4562,7 @@ msgstr "e.g. dev-foyer"
 msgid "e.g. eng"
 msgstr "e.g. eng"
 
-#: src/pages/CastPage.tsx:436
+#: src/pages/CastPage.tsx:514
 msgid "e.g. Lobby TV"
 msgstr "e.g. Lobby TV"
 
@@ -4734,19 +4823,19 @@ msgstr "Engine default (mixed program bus)"
 msgid "Engine default (reclock to house)"
 msgstr "Engine default (reclock to house)"
 
-#: src/pages/approved/PatchMatrix.tsx:845
+#: src/pages/approved/PatchMatrix.tsx:848
 msgid "Engine not confirming (stale)"
 msgstr "Engine not confirming (stale)"
 
-#: src/pages/approved/PatchMatrix.tsx:868
+#: src/pages/approved/PatchMatrix.tsx:871
 msgid "Engine not confirming: the tick has not advanced for over 2 s. Crosspoints show as unknown; takes stay enabled."
 msgstr "Engine not confirming: the tick has not advanced for over 2 s. Crosspoints show as unknown; takes stay enabled."
 
-#: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/ProductionDesk.tsx:204
 msgid "ENGINE TICK"
 msgstr "ENGINE TICK"
 
-#: src/components/broadcast/ProductionDesk.tsx:50
+#: src/components/broadcast/ProductionDesk.tsx:51
 msgid "Engine-confirmed bus"
 msgstr "Engine-confirmed bus"
 
@@ -4755,7 +4844,7 @@ msgstr "Engine-confirmed bus"
 msgid "Enrollment"
 msgstr "Enrollment"
 
-#: src/components/broadcast/ProductionDesk.tsx:183
+#: src/components/broadcast/ProductionDesk.tsx:184
 msgid "Enter 1–1000 frames"
 msgstr "Enter 1–1000 frames"
 
@@ -4870,6 +4959,10 @@ msgstr "Events: {name}"
 #: src/pages/SystemActionsPage.tsx:183
 msgid "Every account-side action — claim, transfer, lease, consent, enforcement change, and more. Immutable and append-only."
 msgstr "Every account-side action — claim, transfer, lease, consent, enforcement change, and more. Immutable and append-only."
+
+#: src/api/castStreams.ts:178
+msgid "Every cast output is in use, or you have too many casts. Stop a cast and try again."
+msgstr "Every cast output is in use, or you have too many casts. Stop a cast and try again."
 
 #: src/layout/components/validationMessages.tsx:29
 msgid "Every cell needs a non-empty identifier."
@@ -5106,7 +5199,7 @@ msgstr "Find a public live channel by name, topic or place, check that it plays 
 msgid "Find devices with a network scan, then adopt them with an explicit confirmation — discovery alone never changes anything."
 msgstr "Find devices with a network scan, then adopt them with an explicit confirmation — discovery alone never changes anything."
 
-#: src/pages/CastPage.tsx:449
+#: src/pages/CastPage.tsx:535
 msgid "first declared rendition"
 msgstr "first declared rendition"
 
@@ -5116,7 +5209,7 @@ msgstr "first declared rendition"
 msgid "Fit"
 msgstr "Fit"
 
-#: src/pages/approved/PatchMatrix.tsx:699
+#: src/pages/approved/PatchMatrix.tsx:702
 msgid "fits"
 msgstr "fits"
 
@@ -5150,7 +5243,7 @@ msgstr "Focus player transport"
 msgid "Focus transport"
 msgstr "Focus transport"
 
-#: src/pages/approved/PatchMatrix.tsx:520
+#: src/pages/approved/PatchMatrix.tsx:523
 #: src/pages/OutputAudioRow.tsx:193
 #: src/pages/OutputAudioRow.tsx:201
 #: src/pages/OutputAudioRow.tsx:296
@@ -5364,6 +5457,10 @@ msgstr "Good on LAN; not for WAN"
 msgid "Good; degrades over poor links"
 msgstr "Good; degrades over poor links"
 
+#: src/cast/BrowserCastSection.tsx:105
+msgid "Google Cast and Chromecast are trademarks of Google LLC. This project is independent and not affiliated with or endorsed by Google."
+msgstr "Google Cast and Chromecast are trademarks of Google LLC. This project is independent and not affiliated with or endorsed by Google."
+
 #: src/docs/registry.ts:653
 #: src/pages/docs/concepts/GlossaryPage.tsx:86
 msgid "GOP (Group of Pictures)"
@@ -5573,9 +5670,9 @@ msgstr "Height (%)"
 msgid "Height (px)"
 msgstr "Height (px)"
 
-#: src/components/broadcast/ProductionDesk.tsx:203
-#: src/components/broadcast/ProductionDesk.tsx:203
-#: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/ProductionDesk.tsx:204
+#: src/components/broadcast/ProductionDesk.tsx:204
+#: src/components/broadcast/ProductionDesk.tsx:204
 #: src/pages/approved/MediaSurface.tsx:135
 #: src/pages/approved/RoutingSurface.tsx:94
 #: src/pages/approved/ShowPage.tsx:41
@@ -5785,7 +5882,7 @@ msgstr "Identify requested"
 msgid "Idle"
 msgstr "Idle"
 
-#: src/components/broadcast/ProductionDesk.tsx:115
+#: src/components/broadcast/ProductionDesk.tsx:116
 msgid "Idle — not in use"
 msgstr "Idle — not in use"
 
@@ -5882,7 +5979,7 @@ msgstr "In sync"
 msgid "In the layout, place a media player (looping clip) cell and the weather cell over the same area, with the weather cell on a higher z. Set the weather cell’s opacity (for example 0.9) to taste. Transparent graphics composite on the CPU path; opaque ones also run on the GPU."
 msgstr "In the layout, place a media player (looping clip) cell and the weather cell over the same area, with the weather cell on a higher z. Set the weather cell’s opacity (for example 0.9) to taste. Transparent graphics composite on the CPU path; opaque ones also run on the GPU."
 
-#: src/pages/approved/PatchMatrix.tsx:909
+#: src/pages/approved/PatchMatrix.tsx:912
 msgid "In this release only an output's audio slot 0 can be patched, and only to Follow, which rides that output's video take: arm both. Other audio feeds are fixed by the output's configuration."
 msgstr "In this release only an output's audio slot 0 can be patched, and only to Follow, which rides that output's video take: arm both. Other audio feeds are fixed by the output's configuration."
 
@@ -6321,7 +6418,8 @@ msgid "layout: {id}"
 msgstr "layout: {id}"
 
 #: src/app/navigation.tsx:53
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/cast/CastFeedPicker.tsx:67
+#: src/components/broadcast/ProductionDesk.tsx:215
 #: src/docs/registry.ts:227
 #: src/pages/approved/PatchMatrix.tsx:192
 #: src/pages/DashboardPage.tsx:58
@@ -6473,11 +6571,11 @@ msgstr "LISTEN"
 msgid "Listening, no caller attached"
 msgstr "Listening, no caller attached"
 
-#: src/components/broadcast/ProductionDesk.tsx:66
+#: src/components/broadcast/ProductionDesk.tsx:67
 #: src/components/SystemFooter.tsx:27
 #: src/components/TileStateBadge.tsx:29
 #: src/iptv/Badges.tsx:96
-#: src/pages/approved/PatchMatrix.tsx:844
+#: src/pages/approved/PatchMatrix.tsx:847
 msgid "Live"
 msgstr "Live"
 
@@ -6498,7 +6596,7 @@ msgstr "Live API playground"
 msgid "Live engine status at a glance."
 msgstr "Live engine status at a glance."
 
-#: src/pages/CastPage.tsx:313
+#: src/pages/CastPage.tsx:386
 msgid "Live ephemeral cast sessions."
 msgstr "Live ephemeral cast sessions."
 
@@ -6535,7 +6633,7 @@ msgstr "Live program output"
 msgid "Live program output and per-input previews, with each tile's lifecycle state from the engine stream."
 msgstr "Live program output and per-input previews, with each tile's lifecycle state from the engine stream."
 
-#: src/pages/CastPage.tsx:295
+#: src/pages/CastPage.tsx:368
 msgid "Live sessions"
 msgstr "Live sessions"
 
@@ -6602,12 +6700,12 @@ msgstr "Load older records"
 msgid "Loaded"
 msgstr "Loaded"
 
-#: src/pages/approved/PatchMatrix.tsx:843
+#: src/pages/approved/PatchMatrix.tsx:846
 #: src/pages/MediaPlayersPage.tsx:635
 msgid "Loading"
 msgstr "Loading"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Loading alarm summary"
 msgstr "Loading alarm summary"
 
@@ -6636,7 +6734,7 @@ msgstr "Loading canvas…"
 msgid "Loading capabilities…"
 msgstr "Loading capabilities…"
 
-#: src/pages/CastPage.tsx:299
+#: src/pages/CastPage.tsx:372
 msgid "Loading cast sessions…"
 msgstr "Loading cast sessions…"
 
@@ -6679,6 +6777,10 @@ msgstr "Loading logs…"
 #: src/pages/MediaPlayersPage.tsx:801
 msgid "Loading media players…"
 msgstr "Loading media players…"
+
+#: src/cast/castLabels.ts:16
+msgid "Loading on the TV…"
+msgstr "Loading on the TV…"
 
 #: src/pages/OutputsPage.tsx:1469
 msgid "Loading outputs…"
@@ -6736,6 +6838,10 @@ msgstr "Loading sync groups…"
 #: src/pages/TallyPage.tsx:303
 msgid "Loading tally state…"
 msgstr "Loading tally state…"
+
+#: src/cast/BrowserCastSection.tsx:53
+msgid "Loading the cast settings…"
+msgstr "Loading the cast settings…"
 
 #: src/iptv/IptvOrgPage.tsx:392
 msgid "Loading the catalogue…"
@@ -6801,7 +6907,7 @@ msgstr "Location"
 msgid "Location id"
 msgstr "Location id"
 
-#: src/components/broadcast/BroadcastShell.tsx:44
+#: src/components/broadcast/BroadcastShell.tsx:45
 msgid "Locked"
 msgstr "Locked"
 
@@ -6827,7 +6933,7 @@ msgstr "Long-running actions are accepted with an operation id and their outcome
 msgid "Long-running ops"
 msgstr "Long-running ops"
 
-#: src/pages/CastPage.tsx:237
+#: src/pages/CastPage.tsx:301
 msgid "Looking for Cast receivers…"
 msgstr "Looking for Cast receivers…"
 
@@ -6864,7 +6970,7 @@ msgstr "Low–medium (window-tuned)"
 msgid "Luma threshold (0–255)"
 msgstr "Luma threshold (0–255)"
 
-#: src/components/broadcast/ProductionDesk.tsx:209
+#: src/components/broadcast/ProductionDesk.tsx:210
 msgid "M/E 1 — Switcher"
 msgstr "M/E 1 — Switcher"
 
@@ -6919,7 +7025,7 @@ msgstr "Managed devices."
 msgid "Managed facility LAN"
 msgstr "Managed facility LAN"
 
-#: src/components/broadcast/BroadcastShell.tsx:48
+#: src/components/broadcast/BroadcastShell.tsx:49
 #: src/components/broadcast/ProducerStatus.tsx:122
 msgid "Management"
 msgstr "Management"
@@ -7156,7 +7262,7 @@ msgstr "MIX"
 msgid "Mix bank"
 msgstr "Mix bank"
 
-#: src/components/broadcast/ProductionDesk.tsx:211
+#: src/components/broadcast/ProductionDesk.tsx:212
 msgid "MIX is the only supported transition"
 msgstr "MIX is the only supported transition"
 
@@ -7189,6 +7295,10 @@ msgstr "mode {0} — {1}"
 #: src/pages/DeviceDetailPage.tsx:978
 msgid "Mode change accepted"
 msgstr "Mode change accepted"
+
+#: src/pages/CastPage.tsx:320
+msgid "Model"
+msgstr "Model"
 
 #: src/pages/docs/concepts/CodecsPage.tsx:96
 msgid "Modern GPUs and SoCs contain dedicated video engines — separate silicon for decode and encode that runs at a fraction of the power of a CPU doing the same work. Conspect uses them through each platform's standard interface: NVDEC/NVENC on NVIDIA, VAAPI on Intel and AMD (including Quick Sync), and VideoToolbox on Apple Silicon. With acceleration, decoding a wall of sources and encoding the canvas leaves the CPU almost idle; without it, a handful of HD decodes can saturate a machine."
@@ -7301,7 +7411,7 @@ msgstr "Multicast"
 msgid "Multicast Listener Discovery version 2 — the IPv6 protocol a receiver uses to tell the network which multicast groups (and, with source-specific multicast, which senders) it wants. It is the IPv6 successor to IPv4's IGMP and the primary group-join mechanism in Conspect's IPv6-first multicast support."
 msgstr "Multicast Listener Discovery version 2 — the IPv6 protocol a receiver uses to tell the network which multicast groups (and, with source-specific multicast, which senders) it wants. It is the IPv6 successor to IPv4's IGMP and the primary group-join mechanism in Conspect's IPv6-first multicast support."
 
-#: src/components/broadcast/ProductionDesk.tsx:208
+#: src/components/broadcast/ProductionDesk.tsx:209
 msgid "Multiview wall"
 msgstr "Multiview wall"
 
@@ -7322,6 +7432,11 @@ msgstr "MUTE"
 msgid "Mute {label}"
 msgstr "Mute {label}"
 
+#: src/cast/ActiveCastCard.tsx:80
+#: src/cast/ActiveCastCard.tsx:81
+msgid "Mute the TV"
+msgstr "Mute the TV"
+
 #: src/pages/AudioPage.tsx:520
 #: src/pages/AudioPage.tsx:820
 msgid "MUTED"
@@ -7330,8 +7445,8 @@ msgstr "MUTED"
 #: src/components/broadcast/library/MetadataInspector.tsx:248
 #: src/events/JournalPanel.tsx:125
 #: src/pages/approved/MediaSurface.tsx:102
-#: src/pages/CastPage.tsx:255
-#: src/pages/CastPage.tsx:316
+#: src/pages/CastPage.tsx:319
+#: src/pages/CastPage.tsx:389
 #: src/pages/DeviceDetailPage.tsx:1043
 #: src/pages/DeviceDetailPage.tsx:1146
 #: src/pages/DevicesPage.tsx:125
@@ -7353,7 +7468,7 @@ msgstr "MUTED"
 msgid "Name"
 msgstr "Name"
 
-#: src/pages/CastPage.tsx:431
+#: src/pages/CastPage.tsx:509
 msgid "Name (optional)"
 msgstr "Name (optional)"
 
@@ -7549,7 +7664,7 @@ msgstr "No {0} address"
 msgid "No active stream."
 msgstr "No active stream."
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "No active system alarms reported"
 msgstr "No active system alarms reported"
 
@@ -7598,11 +7713,19 @@ msgstr "No capture job API exists yet."
 msgid "No capture scheduling API exists yet."
 msgstr "No capture scheduling API exists yet."
 
-#: src/pages/CastPage.tsx:245
+#: src/cast/BrowserCastSection.tsx:62
+msgid "No cast output is configured. Browser casting plays from a cast output: add one to the engine configuration and restart the engine."
+msgstr "No cast output is configured. Browser casting plays from a cast output: add one to the engine configuration and restart the engine."
+
+#: src/cast/castLoad.ts:129
+msgid "No Cast receiver is available on this network."
+msgstr "No Cast receiver is available on this network."
+
+#: src/pages/CastPage.tsx:309
 msgid "No Cast receivers discovered. You can still start a session by entering a receiver address directly."
 msgstr "No Cast receivers discovered. You can still start a session by entering a receiver address directly."
 
-#: src/pages/CastPage.tsx:308
+#: src/pages/CastPage.tsx:381
 msgid "No cast sessions are running."
 msgstr "No cast sessions are running."
 
@@ -7614,7 +7737,7 @@ msgstr "No cells yet. Add one to start composing the multiview."
 msgid "No compiled-in driver recognises this service."
 msgstr "No compiled-in driver recognises this service."
 
-#: src/components/broadcast/ProductionDesk.tsx:116
+#: src/components/broadcast/ProductionDesk.tsx:117
 msgid "No confirmed frame"
 msgstr "No confirmed frame"
 
@@ -7649,6 +7772,10 @@ msgstr "No extra encoder"
 #: src/pages/DashboardPage.tsx:123
 msgid "No frame-rate sample."
 msgstr "No frame-rate sample."
+
+#: src/api/castStreams.ts:180
+msgid "No free encoder is left for this cast. Stop another output or cast what a cast output already shows."
+msgstr "No free encoder is left for this cast. Stop another output or cast what a cast output already shows."
 
 #: src/pages/docs/concepts/ResiliencePage.tsx:42
 msgid "No fresh frame has arrived for a short hold window. The tile keeps showing its last good frame — visually nothing changes yet, but the engine has noticed."
@@ -7824,7 +7951,7 @@ msgstr "No production rundown API exists, so there is no cue list to take, hold 
 msgid "No published source has an upstream EPG."
 msgstr "No published source has an upstream EPG."
 
-#: src/pages/approved/PatchMatrix.tsx:873
+#: src/pages/approved/PatchMatrix.tsx:876
 msgid "No readback tick is visible to your role, so the engine cannot be confirmed live. Crosspoints show as unknown; takes stay enabled."
 msgstr "No readback tick is visible to your role, so the engine cannot be confirmed live. Crosspoints show as unknown; takes stay enabled."
 
@@ -7865,12 +7992,12 @@ msgstr "No salvos are defined yet."
 msgid "No services discovered yet. Run a scan to browse the network."
 msgstr "No services discovered yet. Run a scan to browse the network."
 
-#: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/ProductionDesk.tsx:204
 msgid "No show clock in the engine API"
 msgstr "No show clock in the engine API"
 
-#: src/components/broadcast/ProductionDesk.tsx:66
-#: src/components/broadcast/ProductionDesk.tsx:110
+#: src/components/broadcast/ProductionDesk.tsx:67
+#: src/components/broadcast/ProductionDesk.tsx:111
 #: src/components/TileStateBadge.tsx:47
 msgid "No signal"
 msgstr "No signal"
@@ -7884,7 +8011,7 @@ msgstr "NO SIGNAL"
 msgid "No source"
 msgstr "No source"
 
-#: src/components/broadcast/ProductionDesk.tsx:208
+#: src/components/broadcast/ProductionDesk.tsx:209
 msgid "No source catalog available"
 msgstr "No source catalog available"
 
@@ -7892,7 +8019,7 @@ msgstr "No source catalog available"
 msgid "No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile."
 msgstr "No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile."
 
-#: src/components/broadcast/ProductionDesk.tsx:210
+#: src/components/broadcast/ProductionDesk.tsx:211
 msgid "No sources available"
 msgstr "No sources available"
 
@@ -7917,7 +8044,7 @@ msgstr "No streams match. Loosen a filter or choose another place."
 msgid "No subtitle columns or caption sources yet: the Subtitle tab fills in once outputs declare subtitle slots."
 msgstr "No subtitle columns or caption sources yet: the Subtitle tab fills in once outputs declare subtitle slots."
 
-#: src/pages/approved/PatchMatrix.tsx:929
+#: src/pages/approved/PatchMatrix.tsx:932
 msgid "No subtitle slots yet: this build has not declared any output's subtitle renditions (#345 fills this tab)."
 msgstr "No subtitle slots yet: this build has not declared any output's subtitle renditions (#345 fills this tab)."
 
@@ -7945,7 +8072,7 @@ msgstr "No temperature reported."
 msgid "No tickets yet."
 msgstr "No tickets yet."
 
-#: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/ProductionDesk.tsx:204
 msgid "No timecode source in the engine API"
 msgstr "No timecode source in the engine API"
 
@@ -8026,6 +8153,10 @@ msgstr "Not available"
 #: src/components/YoutubeVtClipHint.tsx:45
 msgid "Not available on this server yet — tracked as issue #423. There is no server endpoint to import a URL into the media library."
 msgstr "Not available on this server yet — tracked as issue #423. There is no server endpoint to import a URL into the media library."
+
+#: src/cast/castLabels.ts:10
+msgid "Not casting"
+msgstr "Not casting"
 
 #: src/iptv/BulkAddDialog.tsx:105
 msgid "Not created"
@@ -8114,8 +8245,8 @@ msgstr "Nothing enumerated yet — streams appear once the device's driver has p
 msgid "Nothing enumerated yet — the list fills in once the device's driver has probed it."
 msgstr "Nothing enumerated yet — the list fills in once the device's driver has probed it."
 
-#: src/pages/approved/PatchMatrix.tsx:710
-#: src/pages/approved/PatchMatrix.tsx:722
+#: src/pages/approved/PatchMatrix.tsx:713
+#: src/pages/approved/PatchMatrix.tsx:725
 msgid "Nothing in this selection can be taken in this release"
 msgstr "Nothing in this selection can be taken in this release"
 
@@ -8206,7 +8337,7 @@ msgstr "Observed"
 msgid "Observed {0} at {1}: {2} (feels like {3}), humidity {4}, wind {5} {6}, pressure {7}."
 msgstr "Observed {0} at {1}: {2} (feels like {3}), humidity {4}, wind {5} {6}, pressure {7}."
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Observed tiles"
 msgstr "Observed tiles"
 
@@ -8350,7 +8481,7 @@ msgstr "open"
 msgid "Open a ticket to read and reply to its thread."
 msgstr "Open a ticket to read and reply to its thread."
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Open alarms"
 msgstr "Open alarms"
 
@@ -8367,11 +8498,11 @@ msgstr "Open HLS playlist"
 msgid "Open in VLC"
 msgstr "Open in VLC"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Open live monitoring"
 msgstr "Open live monitoring"
 
-#: src/components/broadcast/BroadcastShell.tsx:48
+#: src/components/broadcast/BroadcastShell.tsx:49
 msgid "Open navigation"
 msgstr "Open navigation"
 
@@ -8409,7 +8540,7 @@ msgid "Operation {0} · expected generation {1} · observed generation {2}"
 msgstr "Operation {0} · expected generation {1} · observed generation {2}"
 
 #. placeholder {0}: accepted.operation_id
-#: src/pages/CastPage.tsx:177
+#: src/pages/CastPage.tsx:228
 msgid "Operation {0}; the level arrives on the realtime stream."
 msgstr "Operation {0}; the level arrives on the realtime stream."
 
@@ -8497,7 +8628,7 @@ msgstr "Out of spec"
 msgid "Outbound publishing is a separate path (Routing)"
 msgstr "Outbound publishing is a separate path (Routing)"
 
-#: src/components/broadcast/ProductionDesk.tsx:204
+#: src/components/broadcast/ProductionDesk.tsx:205
 msgid "Outcome unknown; controls remain blocked until a correlated terminal event"
 msgstr "Outcome unknown; controls remain blocked until a correlated terminal event"
 
@@ -8509,7 +8640,7 @@ msgstr "outcome unknown; do not repeat"
 msgid "Outcome unknown; refresh the engine state before taking again"
 msgstr "Outcome unknown; refresh the engine state before taking again"
 
-#: src/pages/CastPage.tsx:318
+#: src/pages/CastPage.tsx:391
 #: src/pages/IptvPage.tsx:232
 msgid "Output"
 msgstr "Output"
@@ -8536,7 +8667,7 @@ msgstr "Output cadence as a <0>\"num/den\"</0> rational string, for example <1>\
 msgid "Output cards — program still images (JPEG, ~1 fps)"
 msgstr "Output cards — program still images (JPEG, ~1 fps)"
 
-#: src/pages/CastPage.tsx:444
+#: src/pages/CastPage.tsx:530
 msgid "Output id (optional)"
 msgstr "Output id (optional)"
 
@@ -8672,7 +8803,7 @@ msgstr "Patch a source to a destination. Plan classifies the take without applyi
 msgid "Patch source for input {0}"
 msgstr "Patch source for input {0}"
 
-#: src/pages/approved/PatchMatrix.tsx:1000
+#: src/pages/approved/PatchMatrix.tsx:1003
 msgid "Patch take"
 msgstr "Patch take"
 
@@ -8728,7 +8859,7 @@ msgstr "Per-cell audio level meters."
 msgid "Per-family result for {0}"
 msgstr "Per-family result for {0}"
 
-#: src/pages/approved/PatchMatrix.tsx:481
+#: src/pages/approved/PatchMatrix.tsx:484
 msgid "Permission unavailable (retrying)"
 msgstr "Permission unavailable (retrying)"
 
@@ -8740,7 +8871,7 @@ msgstr "Permission unavailable (retrying)"
 msgid "PGM"
 msgstr "PGM"
 
-#: src/components/broadcast/ProductionDesk.tsx:210
+#: src/components/broadcast/ProductionDesk.tsx:211
 msgid "PGM bus — direct taps always confirm"
 msgstr "PGM bus — direct taps always confirm"
 
@@ -8813,7 +8944,7 @@ msgstr "Pixels at or below this 8-bit luma count as black (16 = broadcast black)
 msgid "Plain UDP has no recovery at all: a lost packet is a glitch on screen. That is acceptable on a managed facility LAN and wrong for the internet (use SRT there, which wraps the same transport stream in a recovering envelope). Multicast group management is IPv6-first: receivers join groups via MLDv2, with IPv4/IGMP as the legacy path."
 msgstr "Plain UDP has no recovery at all: a lost packet is a glitch on screen. That is acceptable on a managed facility LAN and wrong for the internet (use SRT there, which wraps the same transport stream in a recovering envelope). Multicast group management is IPv6-first: receivers join groups via MLDv2, with IPv4/IGMP as the legacy path."
 
-#: src/pages/approved/PatchMatrix.tsx:955
+#: src/pages/approved/PatchMatrix.tsx:958
 #: src/pages/approved/RoutingSurface.tsx:360
 msgid "Plan — nothing selected"
 msgstr "Plan — nothing selected"
@@ -8827,8 +8958,8 @@ msgstr "Plan (dry run)"
 msgid "Plan a source → {0}"
 msgstr "Plan a source → {0}"
 
-#: src/pages/approved/PatchMatrix.tsx:640
-#: src/pages/approved/PatchMatrix.tsx:797
+#: src/pages/approved/PatchMatrix.tsx:643
+#: src/pages/approved/PatchMatrix.tsx:800
 #: src/pages/OutputAudioRow.tsx:260
 #: src/pages/OutputFeedRow.tsx:217
 msgid "Plan failed"
@@ -8853,7 +8984,7 @@ msgid "Plan: {0} → {1}"
 msgstr "Plan: {0} → {1}"
 
 #. placeholder {0}: String(selections.length)
-#: src/pages/approved/PatchMatrix.tsx:955
+#: src/pages/approved/PatchMatrix.tsx:958
 msgid "Plan: {0} crosspoint(s)"
 msgstr "Plan: {0} crosspoint(s)"
 
@@ -8918,6 +9049,7 @@ msgstr "Player"
 msgid "Players"
 msgstr "Players"
 
+#: src/cast/castLabels.ts:20
 #: src/pages/MediaPlayersPage.tsx:639
 msgid "Playing"
 msgstr "Playing"
@@ -8966,6 +9098,10 @@ msgstr "Pre-roll"
 msgid "Précis"
 msgstr "Précis"
 
+#: src/cast/castLabels.ts:12
+msgid "Preparing the stream…"
+msgstr "Preparing the stream…"
+
 #: src/pages/docs/DevicesHelpPage.tsx:57
 msgid "Present only in the untrusted discovery inventory — not a device yet. Adoption is always an explicit operator action."
 msgstr "Present only in the untrusted discovery inventory — not a device yet. Adoption is always an explicit operator action."
@@ -8978,8 +9114,10 @@ msgstr "Presentation timing is unavailable or stale. Timing is uncertain."
 msgid "preview"
 msgstr "preview"
 
+#: src/cast/CastFeedPicker.tsx:36
+#: src/cast/DeskCastButton.tsx:12
 #: src/layout/components/GridLayoutEditor.tsx:552
-#: src/pages/approved/PatchMatrix.tsx:518
+#: src/pages/approved/PatchMatrix.tsx:521
 #: src/pages/OutputFeedRow.tsx:178
 #: src/preview/SourcePreviewButton.tsx:16
 msgid "Preview"
@@ -8991,11 +9129,15 @@ msgid "Preview — input {0}"
 msgstr "Preview — input {0}"
 
 #. placeholder {0}: source.name
-#: src/components/broadcast/ProductionDesk.tsx:208
+#: src/components/broadcast/ProductionDesk.tsx:209
 msgid "Preview {0}"
 msgstr "Preview {0}"
 
-#: src/components/broadcast/ProductionDesk.tsx:183
+#: src/api/castStreams.ts:182
+msgid "Preview and Clean need a switcher in this run. Cast Program or a source instead."
+msgstr "Preview and Clean need a switcher in this run. Cast Program or a source instead."
+
+#: src/components/broadcast/ProductionDesk.tsx:184
 msgid "Preview and Program carry the same source"
 msgstr "Preview and Program carry the same source"
 
@@ -9003,8 +9145,8 @@ msgstr "Preview and Program carry the same source"
 msgid "Preview diagnostics"
 msgstr "Preview diagnostics"
 
-#: src/components/broadcast/ProductionDesk.tsx:48
-#: src/components/broadcast/ProductionDesk.tsx:48
+#: src/components/broadcast/ProductionDesk.tsx:49
+#: src/components/broadcast/ProductionDesk.tsx:49
 msgid "Preview monitor"
 msgstr "Preview monitor"
 
@@ -9017,7 +9159,7 @@ msgstr "Preview negotiation failed."
 msgid "Preview of input {0}"
 msgstr "Preview of input {0}"
 
-#: src/components/broadcast/ProductionDesk.tsx:48
+#: src/components/broadcast/ProductionDesk.tsx:49
 msgid "Preview unavailable — switcher backend not deployed"
 msgstr "Preview unavailable — switcher backend not deployed"
 
@@ -9109,8 +9251,8 @@ msgid "Product telemetry"
 msgstr "Product telemetry"
 
 #: src/app/navigation.tsx:51
-#: src/components/broadcast/ProductionDesk.tsx:202
 #: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/ProductionDesk.tsx:204
 msgid "Production desk"
 msgstr "Production desk"
 
@@ -9130,8 +9272,10 @@ msgstr "Profiles"
 msgid "PROG"
 msgstr "PROG"
 
+#: src/cast/CastFeedPicker.tsx:34
+#: src/cast/DeskCastButton.tsx:12
 #: src/pages/approved/PatchMatrix.test.tsx:742
-#: src/pages/approved/PatchMatrix.tsx:517
+#: src/pages/approved/PatchMatrix.tsx:520
 #: src/pages/MonitoringPage.tsx:210
 msgid "Program"
 msgstr "Program"
@@ -9190,7 +9334,7 @@ msgstr "PROGRAM master gain — unavailable"
 msgid "Program meters"
 msgstr "Program meters"
 
-#: src/pages/approved/PatchMatrix.tsx:521
+#: src/pages/approved/PatchMatrix.tsx:524
 #: src/pages/AudioPage.tsx:1226
 #: src/pages/OutputAudioRow.tsx:207
 #: src/pages/OutputAudioRow.tsx:297
@@ -9201,7 +9345,7 @@ msgstr "Program mix"
 msgid "Program mix gain, mute, and source membership apply on the next audio tick with a short fade. New, removed, or renamed discrete tracks can remain pending while the program mix applies live. A changed output sample rate or unknown mixed source requires a config export and restart. X-Multiview-Apply reports live, partial, or restart."
 msgstr "Program mix gain, mute, and source membership apply on the next audio tick with a short fade. New, removed, or renamed discrete tracks can remain pending while the program mix applies live. A changed output sample rate or unknown mixed source requires a config export and restart. X-Multiview-Apply reports live, partial, or restart."
 
-#: src/components/broadcast/ProductionDesk.tsx:48
+#: src/components/broadcast/ProductionDesk.tsx:49
 msgid "Program monitor"
 msgstr "Program monitor"
 
@@ -9231,7 +9375,7 @@ msgstr "Program still image for output {0}"
 msgid "Program tally is not confirmed right now (switcher state missing or stale), so it is not guessed."
 msgstr "Program tally is not confirmed right now (switcher state missing or stale), so it is not guessed."
 
-#: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/ProductionDesk.tsx:204
 msgid "Program timecode"
 msgstr "Program timecode"
 
@@ -9239,7 +9383,7 @@ msgstr "Program timecode"
 msgid "Program-output timing is designed to remain independent of this device: if it fails, bound sources ride the tile ladder and outputs ride their failover policy. Continuity is a design objective, not an uptime warranty."
 msgstr "Program-output timing is designed to remain independent of this device: if it fails, bound sources ride the tile ladder and outputs ride their failover policy. Continuity is a design objective, not an uptime warranty."
 
-#: src/pages/CastPage.tsx:483
+#: src/pages/CastPage.tsx:569
 msgid "Promote this ephemeral session to a permanent managed Cast device."
 msgstr "Promote this ephemeral session to a permanent managed Cast device."
 
@@ -9315,7 +9459,7 @@ msgstr "Push to/from streaming platforms"
 msgid "PVW"
 msgstr "PVW"
 
-#: src/components/broadcast/ProductionDesk.tsx:210
+#: src/components/broadcast/ProductionDesk.tsx:211
 msgid "PVW bus"
 msgstr "PVW bus"
 
@@ -9399,7 +9543,7 @@ msgstr "Reachable. DEGRADED means the device itself reports a fault — a stalle
 msgid "Read the in-app documentation"
 msgstr "Read the in-app documentation"
 
-#: src/pages/approved/PatchMatrix.tsx:848
+#: src/pages/approved/PatchMatrix.tsx:851
 msgid "Read-only"
 msgstr "Read-only"
 
@@ -9407,11 +9551,11 @@ msgstr "Read-only"
 msgid "Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Lifecycle timers use the source presentation clock. Marker times are predictions from the clock each one names, and their countdowns run against this browser's clock."
 msgstr "Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Lifecycle timers use the source presentation clock. Marker times are predictions from the clock each one names, and their countdowns run against this browser's clock."
 
-#: src/pages/approved/PatchMatrix.tsx:478
+#: src/pages/approved/PatchMatrix.tsx:481
 msgid "Read-only: your role lacks Write"
 msgstr "Read-only: your role lacks Write"
 
-#: src/pages/approved/PatchMatrix.tsx:849
+#: src/pages/approved/PatchMatrix.tsx:852
 msgid "Readback unavailable"
 msgstr "Readback unavailable"
 
@@ -9449,7 +9593,7 @@ msgstr "Reboot this device?"
 msgid "Reboot…"
 msgstr "Reboot…"
 
-#: src/pages/approved/PatchMatrix.tsx:1012
+#: src/pages/approved/PatchMatrix.tsx:1015
 msgid "Recall a stored salvo"
 msgstr "Recall a stored salvo"
 
@@ -9458,11 +9602,11 @@ msgstr "Recall a stored salvo"
 msgid "Recalled layout"
 msgstr "Recalled layout"
 
-#: src/pages/CastPage.tsx:317
+#: src/pages/CastPage.tsx:390
 msgid "Receiver"
 msgstr "Receiver"
 
-#: src/pages/CastPage.tsx:418
+#: src/pages/CastPage.tsx:496
 msgid "Receiver address"
 msgstr "Receiver address"
 
@@ -9542,11 +9686,11 @@ msgstr "Refresh (exact rational)"
 msgid "Refresh relay status"
 msgstr "Refresh relay status"
 
-#: src/pages/approved/PatchMatrix.tsx:1005
+#: src/pages/approved/PatchMatrix.tsx:1008
 msgid "Refused by the engine"
 msgstr "Refused by the engine"
 
-#: src/pages/approved/PatchMatrix.tsx:1004
+#: src/pages/approved/PatchMatrix.tsx:1007
 msgid "Refused by the engine: {reason}"
 msgstr "Refused by the engine: {reason}"
 
@@ -9730,6 +9874,14 @@ msgstr "Replacement"
 msgid "Replacement is another source id, or \"bars\" / \"bars_tone\". Bars uses your first configured Bars source; \"bars_tone\" also routes its 1 kHz line-up tone onto this source's program audio. Add a Bars source on the Sources page first if you have none."
 msgstr "Replacement is another source id, or \"bars\" / \"bars_tone\". Bars uses your first configured Bars source; \"bars_tone\" also routes its 1 kHz line-up tone onto this source's program audio. Add a Bars source on the Sources page first if you have none."
 
+#: src/cast/CastButton.tsx:110
+msgid "replaces the current browser cast"
+msgstr "replaces the current browser cast"
+
+#: src/cast/CastButton.tsx:119
+msgid "Replaces the current browser cast"
+msgstr "Replaces the current browser cast"
+
 #: src/pages/SupportPage.tsx:254
 msgid "Reply"
 msgstr "Reply"
@@ -9873,6 +10025,7 @@ msgstr "Results"
 msgid "Results stream in below as they are found. {0}"
 msgstr "Results stream in below as they are found. {0}"
 
+#: src/cast/CastButton.tsx:103
 #: src/pages/approved/SourcesSurface.tsx:95
 msgid "Retry"
 msgstr "Retry"
@@ -9880,6 +10033,11 @@ msgstr "Retry"
 #: src/pages/approved/SourcesSurface.tsx:81
 msgid "Retry {name}"
 msgstr "Retry {name}"
+
+#: src/cast/CastButton.tsx:98
+#: src/cast/CastButton.tsx:99
+msgid "Retry cast"
+msgstr "Retry cast"
 
 #: src/components/broadcast/library/VTReferenceSummary.tsx:231
 msgid "Retry detach (same operation)"
@@ -9975,7 +10133,7 @@ msgstr "Route {0}"
 msgid "Route {row}"
 msgstr "Route {row}"
 
-#: src/components/broadcast/ProductionDesk.tsx:208
+#: src/components/broadcast/ProductionDesk.tsx:209
 msgid "Route / patch"
 msgstr "Route / patch"
 
@@ -9995,6 +10153,10 @@ msgstr "Routing"
 #: src/pages/approved/RoutingSurface.tsx:78
 msgid "Routing & outputs"
 msgstr "Routing & outputs"
+
+#: src/api/castStreams.ts:188
+msgid "Routing is not available in this run, so the cast output cannot change what it shows."
+msgstr "Routing is not available in this run, so the cast output cannot change what it shows."
 
 #. placeholder {0}: String(rowIndex + 1)
 #. placeholder {1}: String(colIndex + 1)
@@ -10098,13 +10260,13 @@ msgid "Salted digests and a signed lease request — never raw serials, MAC addr
 msgstr "Salted digests and a signed lease request — never raw serials, MAC addresses, or media. The exhaustive list:"
 
 #: src/docs/registry.ts:733
-#: src/pages/approved/PatchMatrix.tsx:1015
+#: src/pages/approved/PatchMatrix.tsx:1018
 #: src/pages/docs/concepts/GlossaryPage.tsx:279
 msgid "Salvo"
 msgstr "Salvo"
 
 #. placeholder {0}: String(selections.length)
-#: src/pages/approved/PatchMatrix.tsx:864
+#: src/pages/approved/PatchMatrix.tsx:867
 msgid "Salvo arming ({0} selected)"
 msgstr "Salvo arming ({0} selected)"
 
@@ -10116,7 +10278,7 @@ msgstr "Salvo created"
 msgid "Salvo deleted"
 msgstr "Salvo deleted"
 
-#: src/pages/approved/PatchMatrix.tsx:1070
+#: src/pages/approved/PatchMatrix.tsx:1073
 msgid "Salvo id"
 msgstr "Salvo id"
 
@@ -10124,7 +10286,7 @@ msgstr "Salvo id"
 msgid "Salvo saved"
 msgstr "Salvo saved"
 
-#: src/pages/approved/PatchMatrix.tsx:1000
+#: src/pages/approved/PatchMatrix.tsx:1003
 msgid "Salvo take"
 msgstr "Salvo take"
 
@@ -10149,7 +10311,7 @@ msgid "Sample rate (Hz)"
 msgstr "Sample rate (Hz)"
 
 #: src/components/broadcast/library/VTReferenceSummary.tsx:246
-#: src/pages/CastPage.tsx:523
+#: src/pages/CastPage.tsx:609
 #: src/pages/IptvPage.tsx:125
 #: src/pages/LayoutsPage.tsx:502
 #: src/pages/OutputsPage.tsx:1611
@@ -10168,12 +10330,12 @@ msgstr "Save & apply to engine"
 msgid "Save & unload"
 msgstr "Save & unload"
 
-#: src/pages/CastPage.tsx:480
+#: src/pages/CastPage.tsx:566
 msgid "Save as a device"
 msgstr "Save as a device"
 
-#: src/pages/CastPage.tsx:360
-#: src/pages/CastPage.tsx:370
+#: src/pages/CastPage.tsx:438
+#: src/pages/CastPage.tsx:448
 msgid "Save as device"
 msgstr "Save as device"
 
@@ -10230,7 +10392,7 @@ msgstr "Saved and applied live: the program mix is now following the new routing
 msgid "Saved as {0}. Restart Conspect with this file to apply stored changes."
 msgstr "Saved as {0}. Restart Conspect with this file to apply stored changes."
 
-#: src/pages/CastPage.tsx:148
+#: src/pages/CastPage.tsx:199
 msgid "Saved as device"
 msgstr "Saved as device"
 
@@ -10313,6 +10475,14 @@ msgstr "Search docs…"
 msgid "Search documentation"
 msgstr "Search documentation"
 
+#: src/cast/CastFeedPicker.tsx:76
+msgid "Search feeds"
+msgstr "Search feeds"
+
+#: src/cast/CastFeedPicker.tsx:77
+msgid "Search feeds…"
+msgstr "Search feeds…"
+
 #: src/components/broadcast/library/LibraryBrowser.tsx:195
 #: src/components/broadcast/library/LibraryBrowser.tsx:196
 msgid "Search library assets"
@@ -10377,7 +10547,7 @@ msgstr "Select {0} to {1}"
 msgid "Select {name} for bulk add"
 msgstr "Select {name} for bulk add"
 
-#: src/components/broadcast/ProductionDesk.tsx:208
+#: src/components/broadcast/ProductionDesk.tsx:209
 msgid "Select a source to Preview"
 msgstr "Select a source to Preview"
 
@@ -10399,8 +10569,8 @@ msgstr "Select and copy the value manually."
 msgid "Select cell"
 msgstr "Select cell"
 
-#: src/pages/approved/PatchMatrix.tsx:706
-#: src/pages/approved/PatchMatrix.tsx:718
+#: src/pages/approved/PatchMatrix.tsx:709
+#: src/pages/approved/PatchMatrix.tsx:721
 msgid "Select crosspoints first"
 msgstr "Select crosspoints first"
 
@@ -10500,12 +10670,12 @@ msgstr "Set at end"
 msgid "Set at start"
 msgstr "Set at start"
 
-#: src/pages/CastPage.tsx:541
+#: src/pages/CastPage.tsx:627
 msgid "Set the receiver volume"
 msgstr "Set the receiver volume"
 
-#: src/pages/CastPage.tsx:349
-#: src/pages/CastPage.tsx:572
+#: src/pages/CastPage.tsx:427
+#: src/pages/CastPage.tsx:658
 msgid "Set volume"
 msgstr "Set volume"
 
@@ -10558,6 +10728,10 @@ msgstr "Show all channels"
 msgid "Show fewer"
 msgstr "Show fewer"
 
+#: src/pages/CastPage.tsx:268
+msgid "Show Program, Preview, a layout or a source on a Chromecast or Google Cast TV: from this browser, or from the engine when it shares the TV's network."
+msgstr "Show Program, Preview, a layout or a source on a Chromecast or Google Cast TV: from this browser, or from the engine when it shares the TV's network."
+
 #: src/pages/approved/ShowPage.tsx:36
 msgid "Show rundown"
 msgstr "Show rundown"
@@ -10565,6 +10739,10 @@ msgstr "Show rundown"
 #: src/pages/AudioPage.tsx:1453
 msgid "Show selected channel"
 msgstr "Show selected channel"
+
+#: src/cast/ActiveCastCard.tsx:120
+msgid "Show something else"
+msgstr "Show something else"
 
 #: src/iptv/IptvOrgPage.tsx:834
 msgid "Show streams of {name}"
@@ -10586,6 +10764,10 @@ msgstr "Show the UTC offset badge"
 msgid "Shown past the target. Blank uses the default “+”."
 msgstr "Shown past the target. Blank uses the default “+”."
 
+#: src/cast/ActiveCastCard.tsx:53
+msgid "Shows"
+msgstr "Shows"
+
 #: src/pages/SourcesPage.tsx:830
 msgid "Sidecar file path"
 msgstr "Sidecar file path"
@@ -10600,7 +10782,7 @@ msgstr "Sign in"
 msgid "Signal"
 msgstr "Signal"
 
-#: src/components/broadcast/ProductionDesk.tsx:65
+#: src/components/broadcast/ProductionDesk.tsx:66
 msgid "Signal unconfirmed"
 msgstr "Signal unconfirmed"
 
@@ -10608,7 +10790,7 @@ msgstr "Signal unconfirmed"
 msgid "Signal unknown"
 msgstr "Signal unknown"
 
-#: src/pages/approved/PatchMatrix.tsx:522
+#: src/pages/approved/PatchMatrix.tsx:525
 #: src/pages/OutputAudioRow.tsx:208
 #: src/pages/OutputAudioRow.tsx:298
 msgid "Silence"
@@ -10681,7 +10863,7 @@ msgstr "Source ↓ / Dest →"
 msgid "Source bound"
 msgstr "Source bound"
 
-#: src/components/broadcast/ProductionDesk.tsx:208
+#: src/components/broadcast/ProductionDesk.tsx:209
 msgid "Source catalog unavailable"
 msgstr "Source catalog unavailable"
 
@@ -10717,7 +10899,7 @@ msgstr "Source input id"
 msgid "Source list unavailable — type the source input id below."
 msgstr "Source list unavailable — type the source input id below."
 
-#: src/components/broadcast/ProductionDesk.tsx:108
+#: src/components/broadcast/ProductionDesk.tsx:109
 msgid "Source live preview"
 msgstr "Source live preview"
 
@@ -10729,12 +10911,12 @@ msgstr "Source names"
 msgid "Source preview"
 msgstr "Source preview"
 
-#: src/components/broadcast/ProductionDesk.tsx:112
-#: src/components/broadcast/ProductionDesk.tsx:114
+#: src/components/broadcast/ProductionDesk.tsx:113
+#: src/components/broadcast/ProductionDesk.tsx:115
 msgid "Source still preview"
 msgstr "Source still preview"
 
-#: src/components/broadcast/ProductionDesk.tsx:211
+#: src/components/broadcast/ProductionDesk.tsx:212
 msgid "source unknown"
 msgstr "source unknown"
 
@@ -10751,6 +10933,7 @@ msgid "Source: {0} ({1})"
 msgstr "Source: {0} ({1})"
 
 #: src/app/navigation.tsx:54
+#: src/cast/CastFeedPicker.tsx:68
 #: src/components/broadcast/BroadcastShell.tsx:33
 #: src/docs/registry.ts:138
 #: src/docs/registry.ts:232
@@ -10826,8 +11009,8 @@ msgstr "Stacking order"
 msgid "Stage"
 msgstr "Stage"
 
-#: src/components/broadcast/ProductionDesk.tsx:48
-#: src/components/broadcast/ProductionDesk.tsx:66
+#: src/components/broadcast/ProductionDesk.tsx:49
+#: src/components/broadcast/ProductionDesk.tsx:67
 #: src/components/TileStateBadge.tsx:35
 msgid "Stale"
 msgstr "Stale"
@@ -10840,12 +11023,12 @@ msgstr "STALE"
 msgid "Stale — last successful poll; the status poll is failing."
 msgstr "Stale — last successful poll; the status poll is failing."
 
-#: src/components/broadcast/ProductionDesk.tsx:114
+#: src/components/broadcast/ProductionDesk.tsx:115
 msgid "Stale frame"
 msgstr "Stale frame"
 
 #: src/components/SourceLifecycleActions.tsx:53
-#: src/pages/CastPage.tsx:462
+#: src/pages/CastPage.tsx:548
 #: src/pages/SourcesPage.tsx:923
 msgid "Start"
 msgstr "Start"
@@ -10854,7 +11037,7 @@ msgstr "Start"
 msgid "Start {name}"
 msgstr "Start {name}"
 
-#: src/pages/CastPage.tsx:405
+#: src/pages/CastPage.tsx:483
 msgid "Start a cast session"
 msgstr "Start a cast session"
 
@@ -10862,7 +11045,7 @@ msgstr "Start a cast session"
 msgid "Start a transfer"
 msgstr "Start a transfer"
 
-#: src/pages/CastPage.tsx:226
+#: src/pages/CastPage.tsx:284
 msgid "Start cast"
 msgstr "Start cast"
 
@@ -10885,9 +11068,9 @@ msgstr "Start, stop, and swap actions accept an <0>Idempotency-Key</0> so a retr
 msgid "started by an operator"
 msgstr "started by an operator"
 
-#: src/components/broadcast/ProductionDesk.tsx:66
-#: src/components/broadcast/ProductionDesk.tsx:112
+#: src/components/broadcast/ProductionDesk.tsx:67
 #: src/components/broadcast/ProductionDesk.tsx:113
+#: src/components/broadcast/ProductionDesk.tsx:114
 #: src/components/SourceDemandBadge.tsx:89
 #: src/pages/approved/SourcesSurface.tsx:350
 msgid "Starting"
@@ -10901,8 +11084,9 @@ msgstr "Starting the source… it was idle because nothing was using it."
 msgid "Starting: {startingPhase}"
 msgstr "Starting: {startingPhase}"
 
+#: src/cast/ActiveCastCard.tsx:55
 #: src/pages/AlarmsPage.tsx:183
-#: src/pages/CastPage.tsx:319
+#: src/pages/CastPage.tsx:392
 #: src/pages/DevicesPage.tsx:552
 msgid "State"
 msgstr "State"
@@ -10963,7 +11147,7 @@ msgstr "Stereo"
 msgid "Still preview (~1 fps)"
 msgstr "Still preview (~1 fps)"
 
-#: src/components/broadcast/ProductionDesk.tsx:50
+#: src/components/broadcast/ProductionDesk.tsx:51
 msgid "Still preview (~1 fps) — live video is unavailable for this preview"
 msgstr "Still preview (~1 fps) — live video is unavailable for this preview"
 
@@ -10971,10 +11155,11 @@ msgstr "Still preview (~1 fps) — live video is unavailable for this preview"
 msgid "Still preview (~1 fps) — live video is unavailable for this preview."
 msgstr "Still preview (~1 fps) — live video is unavailable for this preview."
 
+#: src/cast/CastButton.tsx:65
 #: src/components/broadcast/library/AssetAuditionControls.tsx:174
 #: src/components/SourceLifecycleActions.tsx:67
-#: src/pages/CastPage.tsx:382
-#: src/pages/CastPage.tsx:606
+#: src/pages/CastPage.tsx:460
+#: src/pages/CastPage.tsx:692
 #: src/pages/MediaPlayersPage.tsx:440
 msgid "Stop"
 msgstr "Stop"
@@ -10988,6 +11173,12 @@ msgstr "Stop {0}"
 msgid "Stop {name}"
 msgstr "Stop {name}"
 
+#: src/cast/ActiveCastCard.tsx:112
+#: src/cast/CastButton.tsx:60
+#: src/cast/CastButton.tsx:61
+msgid "Stop casting"
+msgstr "Stop casting"
+
 #: src/pages/approved/ShowPage.tsx:71
 msgid "Stop live item"
 msgstr "Stop live item"
@@ -10996,11 +11187,11 @@ msgstr "Stop live item"
 msgid "Stop player"
 msgstr "Stop player"
 
-#: src/pages/CastPage.tsx:376
+#: src/pages/CastPage.tsx:454
 msgid "Stop session"
 msgstr "Stop session"
 
-#: src/pages/CastPage.tsx:590
+#: src/pages/CastPage.tsx:676
 msgid "Stop this cast session?"
 msgstr "Stop this cast session?"
 
@@ -11009,7 +11200,11 @@ msgstr "Stop this cast session?"
 msgid "Stopped"
 msgstr "Stopped"
 
-#: src/pages/approved/PatchMatrix.tsx:984
+#: src/cast/castLabels.ts:22
+msgid "Stopping…"
+msgstr "Stopping…"
+
+#: src/pages/approved/PatchMatrix.tsx:987
 msgid "Store as salvo…"
 msgstr "Store as salvo…"
 
@@ -11017,11 +11212,11 @@ msgstr "Store as salvo…"
 msgid "Store credential securely"
 msgstr "Store credential securely"
 
-#: src/pages/approved/PatchMatrix.tsx:1078
+#: src/pages/approved/PatchMatrix.tsx:1081
 msgid "Store salvo"
 msgstr "Store salvo"
 
-#: src/pages/approved/PatchMatrix.tsx:1061
+#: src/pages/approved/PatchMatrix.tsx:1064
 msgid "Store this selection as a salvo"
 msgstr "Store this selection as a salvo"
 
@@ -11127,7 +11322,7 @@ msgstr "Subject"
 msgid "Subsystem:"
 msgstr "Subsystem:"
 
-#: src/pages/approved/PatchMatrix.tsx:893
+#: src/pages/approved/PatchMatrix.tsx:896
 msgid "Subtitle"
 msgstr "Subtitle"
 
@@ -11139,7 +11334,7 @@ msgstr "Subtitle layers"
 msgid "subtitle patching is not available in this release (#345)"
 msgstr "subtitle patching is not available in this release (#345)"
 
-#: src/pages/approved/PatchMatrix.tsx:937
+#: src/pages/approved/PatchMatrix.tsx:940
 msgid "Subtitle patching is not available in this release (#345): this tab shows what is on air only."
 msgstr "Subtitle patching is not available in this release (#345): this tab shows what is on air only."
 
@@ -11214,12 +11409,12 @@ msgid "Switched to the alternative"
 msgstr "Switched to the alternative"
 
 #: src/app/navigation.tsx:63
-#: src/components/broadcast/ProductionDesk.tsx:204
+#: src/components/broadcast/ProductionDesk.tsx:205
 #: src/pages/SwitcherPage.tsx:119
 msgid "Switcher"
 msgstr "Switcher"
 
-#: src/components/broadcast/ProductionDesk.tsx:204
+#: src/components/broadcast/ProductionDesk.tsx:205
 #: src/pages/SwitcherPage.tsx:121
 msgid "Switcher operation rejected"
 msgstr "Switcher operation rejected"
@@ -11289,7 +11484,7 @@ msgstr "Take"
 msgid "TAKE"
 msgstr "TAKE"
 
-#: src/pages/approved/PatchMatrix.tsx:974
+#: src/pages/approved/PatchMatrix.tsx:977
 msgid "Take all"
 msgstr "Take all"
 
@@ -11305,8 +11500,8 @@ msgstr "Take audio to {outputName}"
 msgid "Take exit"
 msgstr "Take exit"
 
-#: src/pages/approved/PatchMatrix.tsx:664
-#: src/pages/approved/PatchMatrix.tsx:827
+#: src/pages/approved/PatchMatrix.tsx:667
+#: src/pages/approved/PatchMatrix.tsx:830
 #: src/pages/OutputAudioRow.tsx:279
 #: src/pages/OutputFeedRow.tsx:239
 msgid "Take failed"
@@ -11328,12 +11523,12 @@ msgstr "Take next"
 msgid "take pending"
 msgstr "take pending"
 
-#: src/pages/approved/PatchMatrix.tsx:1049
+#: src/pages/approved/PatchMatrix.tsx:1052
 #: src/pages/SalvosPage.tsx:263
 msgid "Take salvo"
 msgstr "Take salvo"
 
-#: src/pages/approved/PatchMatrix.tsx:974
+#: src/pages/approved/PatchMatrix.tsx:977
 msgid "Take this crosspoint"
 msgstr "Take this crosspoint"
 
@@ -11354,11 +11549,11 @@ msgstr "Takes are locked and {outputName} currently carries Program. Confirm to 
 msgid "Takes are locked and this one changes what is on program (the current PGM source or the audio program bus). Confirm to apply it."
 msgstr "Takes are locked and this one changes what is on program (the current PGM source or the audio program bus). Confirm to apply it."
 
-#: src/pages/approved/PatchMatrix.tsx:1090
+#: src/pages/approved/PatchMatrix.tsx:1093
 msgid "Takes are locked and this salvo changes a crosspoint that currently carries Program. Confirm to take it."
 msgstr "Takes are locked and this salvo changes a crosspoint that currently carries Program. Confirm to take it."
 
-#: src/pages/approved/PatchMatrix.tsx:1095
+#: src/pages/approved/PatchMatrix.tsx:1098
 msgid "Takes are locked and this set changes a crosspoint that currently carries Program. Confirm to apply it."
 msgstr "Takes are locked and this set changes a crosspoint that currently carries Program. Confirm to apply it."
 
@@ -11367,17 +11562,17 @@ msgstr "Takes are locked and this set changes a crosspoint that currently carrie
 msgid "Takes effect at the next frame boundary."
 msgstr "Takes effect at the next frame boundary."
 
-#: src/components/broadcast/BroadcastShell.tsx:44
-#: src/components/broadcast/BroadcastShell.tsx:44
+#: src/components/broadcast/BroadcastShell.tsx:45
+#: src/components/broadcast/BroadcastShell.tsx:45
 msgid "Takes locked"
 msgstr "Takes locked"
 
-#: src/components/broadcast/BroadcastShell.tsx:46
-#: src/components/broadcast/BroadcastShell.tsx:46
+#: src/components/broadcast/BroadcastShell.tsx:47
+#: src/components/broadcast/BroadcastShell.tsx:47
 msgid "Takes unlocked"
 msgstr "Takes unlocked"
 
-#: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/ProductionDesk.tsx:204
 msgid "Takes: when locked, CUT confirms once, naming both sources. PGM bus taps always confirm."
 msgstr "Takes: when locked, CUT confirms once, naming both sources. PGM bus taps always confirm."
 
@@ -11392,7 +11587,7 @@ msgstr "Takes: when locked, CUT confirms once, naming both sources. PGM bus taps
 msgid "Tally"
 msgstr "Tally"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Tally & engine status"
 msgstr "Tally & engine status"
 
@@ -11404,15 +11599,15 @@ msgstr "Tally binding (optional)"
 msgid "Tally borders"
 msgstr "Tally borders"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Tally follows the engine bus IDs; source presence does not prove signal."
 msgstr "Tally follows the engine bus IDs; source presence does not prove signal."
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Tally is separate from signal and output transmission."
 msgstr "Tally is separate from signal and output transmission."
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "Tally legend"
 msgstr "Tally legend"
 
@@ -11428,7 +11623,7 @@ msgstr "Tally shows which sources are on-air. A tally profile maps the bits of a
 msgid "Tally unknown"
 msgstr "Tally unknown"
 
-#: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/ProductionDesk.tsx:204
 msgid "Tally vs signal: the wall border and lamp are tally (red = on program, amber = cue); the chip is signal state. A source can be live and red, or live and dark — never one merged state."
 msgstr "Tally vs signal: the wall border and lamp are tally (red = on program, amber = cue); the chip is signal state. A source can be live and red, or live and dark — never one merged state."
 
@@ -11560,9 +11755,17 @@ msgstr "Testing, placeholders, layout work"
 msgid "Text selection only — alignment, asset grid, interval order or transcript revision is unavailable."
 msgstr "Text selection only — alignment, asset grid, interval order or transcript revision is unavailable."
 
+#: src/api/castStreams.ts:190
+msgid "That feed does not exist (any more). Choose another one."
+msgstr "That feed does not exist (any more). Choose another one."
+
 #: src/auth/LoginPage.tsx:50
 msgid "That key was not accepted. Check it and try again."
 msgstr "That key was not accepted. Check it and try again."
+
+#: src/api/castStreams.ts:192
+msgid "That layout cannot be cast right now."
+msgstr "That layout cannot be cast right now."
 
 #: src/pages/LayoutEditorPage.tsx:161
 msgid "That layout no longer exists."
@@ -11607,6 +11810,26 @@ msgstr "The browser could not play the preview media."
 #: src/pages/docs/FeaturesPage.tsx:18
 msgid "The building blocks of a Conspect deployment, and what each one does."
 msgstr "The building blocks of a Conspect deployment, and what each one does."
+
+#: src/cast/castLoad.ts:131
+msgid "The Cast receiver could not load the media."
+msgstr "The Cast receiver could not load the media."
+
+#: src/cast/castLoad.ts:133
+msgid "The Cast receiver could not play this stream. Check that the address uses HTTPS with a valid certificate."
+msgstr "The Cast receiver could not play this stream. Check that the address uses HTTPS with a valid certificate."
+
+#: src/cast/castLoad.ts:127
+msgid "The Cast request timed out."
+msgstr "The Cast request timed out."
+
+#: src/cast/castController.ts:229
+msgid "The cast settings are still loading. Try again in a moment."
+msgstr "The cast settings are still loading. Try again in a moment."
+
+#: src/cast/castController.ts:379
+msgid "The cast stream ended on the server (expired or stopped elsewhere)."
+msgstr "The cast stream ended on the server (expired or stopped elsewhere)."
 
 #: src/layout/components/validationMessages.tsx:33
 msgid "The cell extends outside the canvas."
@@ -11721,9 +11944,27 @@ msgstr "The driver probes on its own cadence; the latest status shows here as it
 msgid "The effective build-profile licence of this artifact (its codec-linking licence), distinct from the project’s source-available licence."
 msgstr "The effective build-profile licence of this artifact (its codec-linking licence), distinct from the project’s source-available licence."
 
-#: src/components/broadcast/ProductionDesk.tsx:177
+#: src/pages/CastPage.tsx:288
+msgid "The engine dials the TV itself, so this only works when the engine and the TV share a network. A session can be saved as a permanent device. The session list refreshes on its own."
+msgstr "The engine dials the TV itself, so this only works when the engine and the TV share a network. A session can be saved as a permanent device. The session list refreshes on its own."
+
+#: src/cast/castLoad.ts:119
+msgid "The engine did not have the cast stream ready within 15 seconds. Try again; if it keeps failing, check the cast output on the Outputs page."
+msgstr "The engine did not have the cast stream ready within 15 seconds. Try again; if it keeps failing, check the cast output on the Outputs page."
+
+#: src/api/castStreams.ts:194
+#: src/api/castStreams.ts:208
+msgid "The engine is busy and did not switch the cast output in time. Try again."
+msgstr "The engine is busy and did not switch the cast output in time. Try again."
+
+#: src/components/broadcast/ProductionDesk.tsx:178
 msgid "The engine refused this plan"
 msgstr "The engine refused this plan"
+
+#. placeholder {0}: reason.slice(8)
+#: src/api/castStreams.ts:199
+msgid "The engine refused to switch the cast output ({0})."
+msgstr "The engine refused to switch the cast output ({0})."
 
 #: src/pages/docs/ComposePage.tsx:46
 msgid "The engine. It ingests that feed plus three built-in test patterns into a 2x2 canvas, encodes once, and writes HLS to a named volume."
@@ -11899,11 +12140,15 @@ msgstr "The output clock"
 msgid "The output clock, genlock, PTP, and wall-clock time — how frames are paced and aligned."
 msgstr "The output clock, genlock, PTP, and wall-clock time — how frames are paced and aligned."
 
+#: src/pages/CastPage.tsx:521
+msgid "The output's own rendition"
+msgstr "The output's own rendition"
+
 #: src/pages/SwitcherPage.tsx:96
 msgid "The patch cannot be taken"
 msgstr "The patch cannot be taken"
 
-#: src/pages/approved/PatchMatrix.tsx:878
+#: src/pages/approved/PatchMatrix.tsx:881
 msgid "The patch readback could not be read."
 msgstr "The patch readback could not be read."
 
@@ -11911,11 +12156,11 @@ msgstr "The patch readback could not be read."
 msgid "the plan is a dry run that classifies the take. Only Take applies it; a Class-2 migration is accepted asynchronously (HTTP 202 is not applied) and its outcome arrives on the realtime stream."
 msgstr "the plan is a dry run that classifies the take. Only Take applies it; a Class-2 migration is accepted asynchronously (HTTP 202 is not applied) and its outcome arrives on the realtime stream."
 
-#: src/pages/approved/PatchMatrix.tsx:769
+#: src/pages/approved/PatchMatrix.tsx:772
 msgid "The plan refuses this salvo"
 msgstr "The plan refuses this salvo"
 
-#: src/pages/approved/PatchMatrix.tsx:714
+#: src/pages/approved/PatchMatrix.tsx:717
 msgid "The plan refuses this take"
 msgstr "The plan refuses this take"
 
@@ -11931,7 +12176,7 @@ msgstr "The procedure WebRTC peers use to find a working network path between th
 msgid "The production rundown is unavailable: no show-control contract exists. No video switch occurs here; the Desk PROGRAM monitor is the only truth for what viewers see."
 msgstr "The production rundown is unavailable: no show-control contract exists. No video switch occurs here; the Desk PROGRAM monitor is the only truth for what viewers see."
 
-#: src/components/broadcast/ProductionDesk.tsx:216
+#: src/components/broadcast/ProductionDesk.tsx:217
 msgid "The program bus changes what viewers see. Acceptance is not completion."
 msgstr "The program bus changes what viewers see. Acceptance is not completion."
 
@@ -11947,7 +12192,7 @@ msgstr "The quick-start file at <0>deploy/compose.yaml</0> brings up three servi
 msgid "The Real Time Streaming Protocol — the standard way IP cameras and encoders serve a live stream by URL (for example <0>rtsp://camera.local:8554/main</0>). The control channel negotiates the session and the media flows as RTP, over UDP or interleaved in TCP, with latency well under a second."
 msgstr "The Real Time Streaming Protocol — the standard way IP cameras and encoders serve a live stream by URL (for example <0>rtsp://camera.local:8554/main</0>). The control channel negotiates the session and the media flows as RTP, over UDP or interleaved in TCP, with latency well under a second."
 
-#: src/pages/CastPage.tsx:593
+#: src/pages/CastPage.tsx:679
 msgid "The receiver stops playing the cast output."
 msgstr "The receiver stops playing the cast output."
 
@@ -11983,16 +12228,16 @@ msgstr "The rundown is empty. Add items from the library below."
 msgid "The running order as cue cards."
 msgstr "The running order as cue cards."
 
-#: src/pages/approved/PatchMatrix.tsx:819
+#: src/pages/approved/PatchMatrix.tsx:822
 msgid "The salvo changed since it was classified: classify it again."
 msgstr "The salvo changed since it was classified: classify it again."
 
-#: src/pages/approved/PatchMatrix.tsx:788
+#: src/pages/approved/PatchMatrix.tsx:791
 msgid "The salvo changed while it was being classified: classify it again."
 msgstr "The salvo changed while it was being classified: classify it again."
 
 #. placeholder {0}: String(crosspoints.length)
-#: src/pages/approved/PatchMatrix.tsx:1063
+#: src/pages/approved/PatchMatrix.tsx:1066
 msgid "The salvo stores the {0} armed crosspoint(s) with on-air protection by default."
 msgstr "The salvo stores the {0} armed crosspoint(s) with on-air protection by default."
 
@@ -12075,6 +12320,14 @@ msgstr "The tracks overflow the canvas (fixed sizes or percentages exceed it) �
 msgid "The transport the active lease arrived over, and when the next licensing contact is due."
 msgstr "The transport the active lease arrived over, and when the next licensing contact is due."
 
+#: src/cast/castReport.ts:84
+msgid "The TV could not play the stream."
+msgstr "The TV could not play the stream."
+
+#: src/cast/ActiveCastCard.tsx:69
+msgid "The TV has not reached this server. Check that the TV can open https://{host} (certificate, DNS, firewall)."
+msgstr "The TV has not reached this server. Check that the TV can open https://{host} (certificate, DNS, firewall)."
+
 #: src/pages/docs/ApiPage.tsx:98
 msgid "The UI subscribes to engine events for tile states, operation results, alarms, and telemetry. These streams are strictly best-effort: they can drop or conflate events under load and are physically incapable of slowing the engine, so a client must tolerate gaps and reconcile against the REST state."
 msgstr "The UI subscribes to engine events for tile states, operation results, alarms, and telemetry. These streams are strictly best-effort: they can drop or conflate events under load and are physically incapable of slowing the engine, so a client must tolerate gaps and reconcile against the REST state."
@@ -12096,7 +12349,7 @@ msgstr "The vendor does not document this mount, so the URL is operator-supplied
 msgid "The vendor's stable handle (UUID / PCI bus id), never the index."
 msgstr "The vendor's stable handle (UUID / PCI bus id), never the index."
 
-#: src/pages/CastPage.tsx:544
+#: src/pages/CastPage.tsx:630
 msgid "The volume change is accepted asynchronously; the applied level arrives on the realtime stream."
 msgstr "The volume change is accepted asynchronously; the applied level arrives on the realtime stream."
 
@@ -12148,6 +12401,14 @@ msgstr "This area has no cell yet."
 msgid "This area has no cell, so nothing will render in it."
 msgstr "This area has no cell, so nothing will render in it."
 
+#: src/cast/BrowserCastSection.tsx:39
+msgid "This browser is the Cast sender; the TV fetches the stream straight from this server over HTTPS. Works wherever the engine runs, as long as the TV can reach this address."
+msgstr "This browser is the Cast sender; the TV fetches the stream straight from this server over HTTPS. Works wherever the engine runs, as long as the TV can reach this address."
+
+#: src/api/castStreams.ts:186
+msgid "This cast output cannot be routed to another feed."
+msgstr "This cast output cannot be routed to another feed."
+
 #: src/layout/components/validationMessages.tsx:86
 msgid "This cell declares both an area and a rect — keep exactly one (the engine rejects the pair)."
 msgstr "This cell declares both an area and a rect — keep exactly one (the engine rejects the pair)."
@@ -12167,6 +12428,11 @@ msgstr "This Conspect control plane requires an API key. Paste your admin or ope
 #: src/resources/FormControls.tsx:658
 msgid "This control plane does not serve config export yet. Update the server to use it."
 msgstr "This control plane does not serve config export yet. Update the server to use it."
+
+#: src/cast/CastButton.tsx:52
+#: src/cast/CastButton.tsx:54
+msgid "this device"
+msgstr "this device"
 
 #: src/resources/FormControls.tsx:120
 msgid "This device is already a member of the group."
@@ -12249,6 +12515,10 @@ msgstr "This output already carries this feed"
 msgid "This overlay kind has no configurable parameters in this build. Parameters authored in a config file are preserved unchanged."
 msgstr "This overlay kind has no configurable parameters in this build. Parameters authored in a config file are preserved unchanged."
 
+#: src/cast/BrowserCastSection.tsx:75
+msgid "This page is not served over HTTPS. A TV only plays an HTTPS address with a valid certificate."
+msgstr "This page is not served over HTTPS. A TV only plays an HTTPS address with a valid certificate."
+
 #: src/pages/LayoutsPage.tsx:751
 msgid "This permanently removes the layout. Running outputs are not affected until a new layout is applied."
 msgstr "This permanently removes the layout. Running outputs are not affected until a new layout is applied."
@@ -12274,11 +12544,11 @@ msgstr "This playlist declares no guide URL."
 msgid "This requires licence-server connectivity (not yet wired in this build)."
 msgstr "This requires licence-server connectivity (not yet wired in this build)."
 
-#: src/pages/approved/PatchMatrix.tsx:763
+#: src/pages/approved/PatchMatrix.tsx:766
 msgid "This salvo has crosspoints this page cannot read"
 msgstr "This salvo has crosspoints this page cannot read"
 
-#: src/pages/approved/PatchMatrix.tsx:767
+#: src/pages/approved/PatchMatrix.tsx:770
 msgid "This salvo protects on-air crosspoints (stored on-air: protect); a recall cannot override it"
 msgstr "This salvo protects on-air crosspoints (stored on-air: protect); a recall cannot override it"
 
@@ -12423,6 +12693,10 @@ msgstr "Timezone offset (minutes from UTC)"
 msgid "Timing & sync"
 msgstr "Timing & sync"
 
+#: src/cast/BrowserCastSection.tsx:45
+msgid "Tip: the Program and Preview monitors on the desk have their own Cast buttons."
+msgstr "Tip: the Program and Preview monitors on the desk have their own Cast buttons."
+
 #: src/events/JournalPanel.tsx:94
 msgid "To"
 msgstr "To"
@@ -12442,6 +12716,14 @@ msgstr "Token inventory incomplete; creation disabled"
 #: src/pages/RelayConfigurationControls.tsx:41
 msgid "Token revoked. Existing connected sessions are not terminated."
 msgstr "Token revoked. Existing connected sessions are not terminated."
+
+#: src/api/castStreams.ts:205
+msgid "Too many cast requests. Wait a moment and try again."
+msgstr "Too many cast requests. Wait a moment and try again."
+
+#: src/api/castStreams.ts:184
+msgid "Too many layouts are on air at once. Cast something else or free a layout output."
+msgstr "Too many layouts are on air at once. Cast something else or free a layout output."
 
 #: src/components/broadcast/useOperationFeedback.ts:51
 msgid "Too many unresolved commands. Wait for an outcome or resolve an unknown command before retrying."
@@ -12532,7 +12814,7 @@ msgstr "Transition"
 msgid "Transition running"
 msgstr "Transition running"
 
-#: src/components/broadcast/ProductionDesk.tsx:211
+#: src/components/broadcast/ProductionDesk.tsx:212
 msgid "Transition type"
 msgstr "Transition type"
 
@@ -12588,6 +12870,10 @@ msgstr "TURN credentials are server-side configuration: they live in the config 
 msgid "Turning it on"
 msgstr "Turning it on"
 
+#: src/cast/ActiveCastCard.tsx:89
+msgid "TV volume"
+msgstr "TV volume"
+
 #: src/pages/IptvPage.tsx:253
 #: src/pages/SourcesPage.tsx:1007
 msgid "tvg-id"
@@ -12610,12 +12896,12 @@ msgstr "UMD (Under-Monitor Display)"
 msgid "Unacknowledged"
 msgstr "Unacknowledged"
 
-#: src/components/broadcast/ProductionDesk.tsx:203
-#: src/components/broadcast/ProductionDesk.tsx:203
+#: src/components/broadcast/ProductionDesk.tsx:204
+#: src/components/broadcast/ProductionDesk.tsx:204
 msgid "unavailable"
 msgstr "unavailable"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 #: src/pages/approved/MediaSurface.tsx:30
 msgid "Unavailable"
 msgstr "Unavailable"
@@ -12644,7 +12930,7 @@ msgstr "Uncertain"
 msgid "Unclaimed"
 msgstr "Unclaimed"
 
-#: src/components/broadcast/ProductionDesk.tsx:50
+#: src/components/broadcast/ProductionDesk.tsx:51
 msgid "Unconfirmed / stale"
 msgstr "Unconfirmed / stale"
 
@@ -12675,8 +12961,8 @@ msgstr "unknown"
 
 #: src/components/broadcast/library/MetadataInspector.tsx:201
 #: src/components/broadcast/ProducerStatus.tsx:72
-#: src/components/broadcast/ProductionDesk.tsx:216
-#: src/components/broadcast/ProductionDesk.tsx:216
+#: src/components/broadcast/ProductionDesk.tsx:217
+#: src/components/broadcast/ProductionDesk.tsx:217
 #: src/pages/approved/RoutingSurface.tsx:44
 #: src/pages/approved/SourcesSurface.tsx:354
 #: src/pages/MediaPlayersPage.tsx:355
@@ -12695,11 +12981,15 @@ msgstr "Unknown — no measured readback"
 msgid "Unknown error"
 msgstr "Unknown error"
 
-#: src/components/broadcast/ProductionDesk.tsx:211
+#: src/cast/ActiveCastCard.tsx:29
+msgid "Unknown feed"
+msgstr "Unknown feed"
+
+#: src/components/broadcast/ProductionDesk.tsx:212
 msgid "unknown source"
 msgstr "unknown source"
 
-#: src/components/broadcast/ProductionDesk.tsx:50
+#: src/components/broadcast/ProductionDesk.tsx:51
 msgid "Unknown source"
 msgstr "Unknown source"
 
@@ -12711,7 +13001,7 @@ msgstr "Unknown values mean the browser did not provide evidence. Network blocki
 msgid "Unknown: no current loudness telemetry"
 msgstr "Unknown: no current loudness telemetry"
 
-#: src/pages/approved/PatchMatrix.tsx:846
+#: src/pages/approved/PatchMatrix.tsx:849
 msgid "Unknown: no readback tick"
 msgstr "Unknown: no readback tick"
 
@@ -12748,21 +13038,26 @@ msgstr "Unlinked from IPTV-ORG"
 msgid "Unload"
 msgstr "Unload"
 
-#: src/components/broadcast/BroadcastShell.tsx:45
+#: src/components/broadcast/BroadcastShell.tsx:46
 msgid "Unlock takes"
 msgstr "Unlock takes"
 
-#: src/components/broadcast/BroadcastShell.tsx:45
+#: src/components/broadcast/BroadcastShell.tsx:46
 msgid "Unlock time-critical takes?"
 msgstr "Unlock time-critical takes?"
 
-#: src/components/broadcast/BroadcastShell.tsx:46
+#: src/components/broadcast/BroadcastShell.tsx:47
 msgid "Unlocked"
 msgstr "Unlocked"
 
 #: src/preview/WhepPlayer.tsx:382
 msgid "Unmute {label}"
 msgstr "Unmute {label}"
+
+#: src/cast/ActiveCastCard.tsx:80
+#: src/cast/ActiveCastCard.tsx:81
+msgid "Unmute the TV"
+msgstr "Unmute the TV"
 
 #: src/components/switcher/MixerInputBank.tsx:35
 msgid "Unpatched"
@@ -12886,6 +13181,10 @@ msgstr "User-Agent"
 msgid "User-Agent header (optional)"
 msgstr "User-Agent header (optional)"
 
+#: src/cast/BrowserCastSection.tsx:82
+msgid "Using Google's default receiver. Register the Conspect receiver for diagnostics and the branded screen."
+msgstr "Using Google's default receiver. Register the Conspect receiver for diagnostics and the branded screen."
+
 #: src/pages/LicencePage.tsx:400
 msgid "valid to"
 msgstr "valid to"
@@ -12929,7 +13228,7 @@ msgid "Very low (~1 frame)"
 msgstr "Very low (~1 frame)"
 
 #: src/components/broadcast/library/Chips.tsx:139
-#: src/pages/approved/PatchMatrix.tsx:891
+#: src/pages/approved/PatchMatrix.tsx:894
 #: src/pages/OutputFeedRow.tsx:333
 msgid "Video"
 msgstr "Video"
@@ -12991,19 +13290,19 @@ msgstr "Visibility"
 msgid "Visible"
 msgstr "Visible"
 
-#: src/pages/CastPage.tsx:355
+#: src/pages/CastPage.tsx:433
 msgid "Volume"
 msgstr "Volume"
 
-#: src/pages/CastPage.tsx:553
+#: src/pages/CastPage.tsx:639
 msgid "Volume (0–100)"
 msgstr "Volume (0–100)"
 
-#: src/pages/CastPage.tsx:176
+#: src/pages/CastPage.tsx:227
 msgid "Volume change accepted"
 msgstr "Volume change accepted"
 
-#: src/pages/CastPage.tsx:168
+#: src/pages/CastPage.tsx:219
 msgid "Volume must be between 0 and 100"
 msgstr "Volume must be between 0 and 100"
 
@@ -13036,7 +13335,7 @@ msgstr "VT transport"
 msgid "VT transport, graphics, capture and the clip library."
 msgstr "VT transport, graphics, capture and the clip library."
 
-#: src/components/broadcast/ProductionDesk.tsx:48
+#: src/components/broadcast/ProductionDesk.tsx:49
 #: src/pages/MonitoringPage.tsx:87
 #: src/preview/PreviewSurface.tsx:47
 msgid "Waiting for a frame…"
@@ -13078,15 +13377,15 @@ msgstr "Waiting for meter telemetry…"
 msgid "Waiting for the first metrics sample…"
 msgstr "Waiting for the first metrics sample…"
 
-#: src/components/broadcast/ProductionDesk.tsx:126
+#: src/components/broadcast/ProductionDesk.tsx:127
 msgid "Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still."
 msgstr "Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still."
 
-#: src/components/broadcast/ProductionDesk.tsx:126
+#: src/components/broadcast/ProductionDesk.tsx:127
 msgid "Wall tiles are live video from one shared WebRTC session; a tile without a live cell shows its still."
 msgstr "Wall tiles are live video from one shared WebRTC session; a tile without a live cell shows its still."
 
-#: src/components/broadcast/ProductionDesk.tsx:127
+#: src/components/broadcast/ProductionDesk.tsx:128
 msgid "Wall tiles are still previews refreshed every ~2 s — not live video."
 msgstr "Wall tiles are still previews refreshed every ~2 s — not live video."
 
@@ -13237,6 +13536,14 @@ msgstr "What this build can do: available backends, the compositor tier, and the
 msgid "What this machine sends, and to whom. Two separate pipes: the mandatory licensing heartbeat and the opt-in product telemetry."
 msgstr "What this machine sends, and to whom. Two separate pipes: the mandatory licensing heartbeat and the opt-in product telemetry."
 
+#: src/cast/BrowserCastSection.tsx:93
+msgid "What to cast"
+msgstr "What to cast"
+
+#: src/pages/CastPage.tsx:523
+msgid "What to show"
+msgstr "What to show"
+
 #: src/pages/docs/concepts/CodecsPage.tsx:18
 msgid "What transcoding actually is, the common video codecs, hardware acceleration, and how Conspect encodes its output."
 msgstr "What transcoding actually is, the common video codecs, hardware acceleration, and how Conspect encodes its output."
@@ -13362,12 +13669,12 @@ msgstr "Width and height must both be even numbers from 16 to 8192, at most 3840
 msgid "Window"
 msgstr "Window"
 
-#: src/components/broadcast/ProductionDesk.tsx:211
-#: src/components/broadcast/ProductionDesk.tsx:211
+#: src/components/broadcast/ProductionDesk.tsx:212
+#: src/components/broadcast/ProductionDesk.tsx:212
 msgid "WIPE and DIP have no supported control contract"
 msgstr "WIPE and DIP have no supported control contract"
 
-#: src/components/broadcast/ProductionDesk.tsx:214
+#: src/components/broadcast/ProductionDesk.tsx:215
 msgid "WIPE, DIP, USK, DSK and AUX have no supported control contract."
 msgstr "WIPE, DIP, USK, DSK and AUX have no supported control contract."
 
@@ -13394,6 +13701,10 @@ msgstr "XMLTV guide URL"
 #: src/pages/MeshPage.tsx:260
 msgid "Yes"
 msgstr "Yes"
+
+#: src/api/castStreams.ts:202
+msgid "You are not allowed to cast this feed or use this cast output."
+msgstr "You are not allowed to cast this feed or use this cast output."
 
 #: src/pages/docs/OverviewPage.tsx:103
 msgid "You can also run the binary directly against a config file with <0>multiview run path/to/multiview.toml</0>. See the sections below for the container, compose, config, and API details."

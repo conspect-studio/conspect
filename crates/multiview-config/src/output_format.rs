@@ -435,7 +435,8 @@ impl Output {
             | Output::Webrtc { format, .. }
             | Output::WhipPush { format, .. }
             | Output::Aes67 { format, .. }
-            | Output::Display { format, .. } => format.as_ref(),
+            | Output::Display { format, .. }
+            | Output::Cast { format, .. } => format.as_ref(),
         }
     }
 
@@ -452,7 +453,8 @@ impl Output {
             | Output::Webrtc { format, .. }
             | Output::WhipPush { format, .. }
             | Output::Aes67 { format, .. }
-            | Output::Display { format, .. } => format,
+            | Output::Display { format, .. }
+            | Output::Cast { format, .. } => format,
         }
     }
 
@@ -470,7 +472,8 @@ impl Output {
             | Output::Webrtc { slots, .. }
             | Output::WhipPush { slots, .. }
             | Output::Aes67 { slots, .. }
-            | Output::Display { slots, .. } => slots.as_ref(),
+            | Output::Display { slots, .. }
+            | Output::Cast { slots, .. } => slots.as_ref(),
         }
     }
 
@@ -487,7 +490,8 @@ impl Output {
             | Output::Webrtc { slots, .. }
             | Output::WhipPush { slots, .. }
             | Output::Aes67 { slots, .. }
-            | Output::Display { slots, .. } => slots,
+            | Output::Display { slots, .. }
+            | Output::Cast { slots, .. } => slots,
         }
     }
 
@@ -561,6 +565,20 @@ impl Output {
                 video_codecs: H264_ONLY,
                 raw_video: false,
                 format_convertible: false,
+                subtitle_max: 0,
+                subtitle_medium_formats: NO_SUBTITLES,
+                subtitle_formats: NO_SUBTITLES,
+            },
+            // A cast stream is one H.264 video rendition and one audio
+            // rendition (CMAF). It is a packet sink like HLS, so the Program
+            // is converted to its format. The cast packager carries no
+            // subtitles (ADR-0111).
+            Output::Cast { .. } => SlotCapability {
+                video_max: 1,
+                audio_max: Some(1),
+                video_codecs: H264_ONLY,
+                raw_video: false,
+                format_convertible: true,
                 subtitle_max: 0,
                 subtitle_medium_formats: NO_SUBTITLES,
                 subtitle_formats: NO_SUBTITLES,
