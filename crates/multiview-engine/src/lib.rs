@@ -103,10 +103,12 @@ pub mod isolation;
 pub mod lateness;
 pub mod lifecycle;
 pub mod migration;
+pub mod output_lane;
 pub mod patch_set;
 pub mod placement;
 pub mod probe;
 pub mod program;
+pub mod program_latch;
 pub mod programset;
 pub mod ptp;
 pub mod registry;
@@ -165,6 +167,10 @@ pub use migration::{
     drain_stop, validate_migration, KeepaliveSink, LoadSnapshot, MigrationOutcome,
     OutputCrosspoint, PlacementCoordinator, RollbackReason,
 };
+pub use output_lane::{
+    spawn_output_lane, LaneJoinError, LanePacing, OutputLaneClock, OutputLaneHandle,
+    OutputLaneStats, LATCH_DELAY, MAX_CATCHUP_TICKS,
+};
 pub use placement::{
     MigrationPlan, PlacementController, PlacementControllerConfig, PlacementProposal, ShedReason,
 };
@@ -173,6 +179,7 @@ pub use probe::{
     FormatProbe, FreezeConfig, FreezeProbe, LumaView, LumaViewError, ProbeObservation,
 };
 pub use program::{MultiviewProgram, ProgramId, ProgramKind};
+pub use program_latch::{Latched, ProgramLatch, PROGRAM_LATCH_CAPACITY};
 pub use programset::{Program, ProgramSet};
 pub use ptp::{PtpSample, PtpServo, ServoConfig};
 pub use registry::{

@@ -85,16 +85,26 @@ pub fn on_clock_thread() -> bool {
 /// capped at [`STOP_POLL`]; the source is re-read after every wakeup, so an
 /// early or late wakeup never accumulates into drift.
 pub fn sleep_until(deadline_nanos: i64, source: &dyn TimeSource, stop: &StopSignal) {
+    sleep_until_or(deadline_nanos, source, &|| stop.is_stopped());
+}
+
+/// [`sleep_until`] with an arbitrary stop predicate, checked before every
+/// step (each at most [`STOP_POLL`] of real time, including the portable
+/// fallback's final spin), so a caller with more than one stop — a per-output
+/// clock observes both the run's stop and its own — returns within one
+/// [`STOP_POLL`] of either being raised, even on a time source that never
+/// reaches the deadline.
+pub fn sleep_until_or(deadline_nanos: i64, source: &dyn TimeSource, stopped: &dyn Fn() -> bool) {
     let poll = i64::try_from(STOP_POLL.as_nanos()).unwrap_or(i64::MAX);
     loop {
-        if stop.is_stopped() {
+        if stopped() {
             return;
         }
         let remaining = deadline_nanos.saturating_sub(source.now_nanos());
         if remaining <= 0 {
             return;
         }
-        if !platform_step(remaining, poll, deadline_nanos, source) {
+        if !platform_step(remaining, poll, deadline_nanos, source, stopped) {
             return;
         }
     }
@@ -103,7 +113,13 @@ pub fn sleep_until(deadline_nanos: i64, source: &dyn TimeSource, stop: &StopSign
 /// Linux: one absolute `clock_nanosleep` step of at most `poll`. Returns
 /// `true` to re-check (the caller re-reads the source after every wake).
 #[cfg(target_os = "linux")]
-fn platform_step(remaining: i64, poll: i64, _deadline: i64, _source: &dyn TimeSource) -> bool {
+fn platform_step(
+    remaining: i64,
+    poll: i64,
+    _deadline: i64,
+    _source: &dyn TimeSource,
+    _stopped: &dyn Fn() -> bool,
+) -> bool {
     use rustix::thread::{clock_nanosleep_absolute, ClockId};
     use rustix::time::{clock_gettime, Timespec};
     // Convert "deadline in `nanos`" to an ABSOLUTE CLOCK_MONOTONIC instant and
@@ -142,14 +158,27 @@ fn platform_step(remaining: i64, poll: i64, _deadline: i64, _source: &dyn TimeSo
 /// thread's priority for a scheduler quantum. Returns `false` once the
 /// deadline is reached.
 #[cfg(not(target_os = "linux"))]
-fn platform_step(remaining: i64, poll: i64, deadline: i64, source: &dyn TimeSource) -> bool {
+fn platform_step(
+    remaining: i64,
+    poll: i64,
+    deadline: i64,
+    source: &dyn TimeSource,
+    stopped: &dyn Fn() -> bool,
+) -> bool {
     let margin = i64::try_from(SPIN_MARGIN.as_nanos()).unwrap_or(0);
     if remaining > margin {
         let half = (remaining / 2).min(poll);
         std::thread::sleep(Duration::from_nanos(u64::try_from(half).unwrap_or(0)));
         return true;
     }
+    // The spin is bounded in REAL time by STOP_POLL and checks the stop, so a
+    // source that never reaches the deadline (a frozen test clock) cannot
+    // hold the thread here; on a real source it ends within SPIN_MARGIN.
+    let spin_started = std::time::Instant::now();
     while source.now_nanos() < deadline {
+        if stopped() || spin_started.elapsed() >= STOP_POLL {
+            return true;
+        }
         std::hint::spin_loop();
     }
     false
@@ -225,7 +254,9 @@ impl<T> ClockThread<T> {
         }
     }
 
-    /// Whether the body has returned (or panicked). Wait-free.
+    /// Whether the body has returned (or panicked). Wait-free. Once `true`,
+    /// the result has already been delivered: [`Self::join`] resolves
+    /// without waiting.
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
@@ -276,8 +307,10 @@ where
             if let Err(panic) = &outcome {
                 tracing::error!(clock_thread = %label, %panic, "output clock thread panicked");
             }
-            done.store(true, Ordering::Release);
+            // The result is delivered BEFORE `finished` is raised, so a caller
+            // that saw `is_finished()` gets it from `join` without waiting.
             let _ = tx.send(outcome);
+            done.store(true, Ordering::Release);
         })?;
     Ok(ClockThread {
         result: rx,
@@ -468,6 +501,42 @@ mod tests {
             line.contains("EEVDF slice 300 µs") || line.contains("kernel has no custom slice"),
             "{line}"
         );
+    }
+
+    /// #343 review P1-A2: once `is_finished()` is true the result is already
+    /// delivered, so `join` is ready on its FIRST poll (a bounded join after
+    /// `is_finished` can never park).
+    #[test]
+    fn join_is_ready_on_the_first_poll_once_finished() {
+        for _ in 0..200 {
+            let handle = spawn("clock-ready", || 5_u8).unwrap();
+            while !handle.is_finished() {
+                std::hint::spin_loop();
+            }
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            let mut join = std::pin::pin!(handle.join());
+            assert_eq!(join.as_mut().poll(&mut cx), Poll::Ready(Ok(5)));
+        }
+    }
+
+    /// #343 review P1-I1: `sleep_until_or` observes an external stop within
+    /// one `STOP_POLL` on a source that never reaches the deadline.
+    #[test]
+    fn sleep_until_or_observes_a_predicate_on_a_frozen_source() {
+        let source = ManualTimeSource::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        let raiser = Arc::clone(&flag);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            raiser.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        sleep_until_or(1_000, &source, &|| flag.load(Ordering::Acquire));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The deadline 1 µs away on a frozen source: on the portable path this
+        // is the spin phase, which must be bounded and stop-aware too.
+        t.join().ok();
     }
 
     #[test]
