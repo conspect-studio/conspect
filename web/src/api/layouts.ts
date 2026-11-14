@@ -123,6 +123,35 @@ export async function fetchLayoutEtag(
   return response.headers.get('ETag') ?? undefined;
 }
 
+/** A single layout read together with its current `ETag`, as ONE response. */
+export interface LayoutWithEtag {
+  /** The layout exactly as the control plane returned it just now. */
+  readonly layout: Layout;
+  /** The `ETag` from that same response, when present. */
+  readonly etag: string | undefined;
+}
+
+/**
+ * Read a single layout AND its `ETag` from the same `GET /api/v1/layouts/{id}`
+ * response. A save that edits only part of a layout (e.g. the Layers dialog)
+ * must base its edit on this fresh read — never on a list-derived snapshot,
+ * whose body/ETag can already be stale relative to a concurrent editor save —
+ * and must send exactly this `ETag` as `If-Match` so a lost-update is a
+ * `412`, not a silent overwrite.
+ */
+export async function fetchLayoutWithEtag(
+  client: MultiviewApiClient,
+  id: string,
+): Promise<LayoutWithEtag> {
+  const { data, error, response } = await client.GET('/api/v1/layouts/{id}', {
+    params: { path: { id } },
+  });
+  if (error !== undefined) {
+    throw new LayoutApiError(error.title, error.status, error.detail ?? undefined);
+  }
+  return { layout: data, etag: response.headers.get('ETag') ?? undefined };
+}
+
 /**
  * Delete a layout via `DELETE /api/v1/layouts/{id}`. Sends `If-Match` when an
  * ETag is provided. A 404 response is treated as idempotent success (the
