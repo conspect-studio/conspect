@@ -73,8 +73,8 @@ pub struct WipeMask {
     /// The soft-edge width in canvas-height units (`0` is a hard edge).
     pub softness: f32,
     /// The border band's width in canvas-height units: `> 0` makes this the
-    /// band's draw, covering the edge grown by this much except where the
-    /// edge itself fully covers: never the revealed interior (review MED-03); `0`
+    /// band's draw: the edge grown by this much, attenuated by the edge's own
+    /// coverage, so never the revealed interior (review MED-03); `0`
     /// is the incoming picture's own mask.
     pub expand: f32,
     /// An exact coverage for the whole canvas at an endpoint: `Some(0.0)` at
@@ -140,8 +140,8 @@ impl WipeMask {
     }
 
     /// The border band of this edge, `expand` wide (canvas-height units):
-    /// coverage of the edge grown by `expand`, cut to zero wherever the edge
-    /// itself fully covers. The band never covers the revealed interior, so a missing,
+    /// coverage of the edge grown by `expand` times one minus the edge's own
+    /// coverage. The band never covers the revealed interior, so a missing,
     /// stale or transparent incoming picture shows the outgoing one there,
     /// never the border colour (review MED-03). At either endpoint the band
     /// covers nothing.
@@ -170,14 +170,10 @@ impl WipeMask {
         };
         let d = sign * inside(self.shape, self.aspect, self.origin, radius, u, v);
         if self.expand > 0.0 {
-            // Zero wherever the incoming picture is fully revealed; the grown
-            // edge's coverage elsewhere (so with an opaque incoming picture the
-            // frame is exactly the grown-edge band under it).
-            if edge(d, self.softness) >= 1.0 {
-                0.0
-            } else {
-                edge(d + self.expand, self.softness)
-            }
+            // The grown edge attenuated by the edge itself: smooth on both
+            // sides of a soft band, zero wherever the incoming picture is
+            // fully revealed (review MED-03).
+            edge(d + self.expand, self.softness) * (1.0 - edge(d, self.softness))
         } else {
             edge(d, self.softness)
         }

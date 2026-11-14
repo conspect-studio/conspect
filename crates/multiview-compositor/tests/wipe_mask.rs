@@ -312,6 +312,12 @@ fn border_band_never_covers_the_revealed_interior() {
                             let c = mask.coverage(x, y);
                             let b = band.coverage(x, y);
                             assert!((0.0..=1.0).contains(&b));
+                            // Under the soft ramp the band fades out as the
+                            // incoming picture fades in (no hard inner edge).
+                            assert!(
+                                b <= 1.0 - c + 1e-6,
+                                "{shape:?} rev={reverse} soft={soft} p={progress} ({x},{y}): band {b} incoming {c}"
+                            );
                             if c >= 1.0 {
                                 interior += 1;
                                 assert_eq!(
@@ -336,4 +342,37 @@ fn border_band_never_covers_the_revealed_interior() {
             }
         }
     }
+}
+
+/// Review MED-03: a soft border narrower than the soft edge has no hard inner
+/// cut-off. Along a horizontal wipe's travel axis the band's coverage changes
+/// by at most a bounded step per pixel (the ramp slope), and its peak is
+/// strictly inside (0, 1) where it overlaps the incoming ramp.
+#[test]
+fn a_soft_narrow_band_is_continuous_across_the_ramp() {
+    let (w, h) = (256_u32, 64_u32);
+    let (soft, border) = (0.2_f32, 0.02_f32);
+    let mask = WipeMask::new(
+        MaskShape::Horizontal,
+        0.5,
+        w,
+        h,
+        [0.5, 0.5],
+        false,
+        soft,
+        border,
+    );
+    let band = mask.expanded(border);
+    let row: Vec<f32> = (0..w).map(|x| band.coverage(x, h / 2)).collect();
+    // One pixel is 1/64 of the height; the band is a product of two ramps of
+    // slope 1/softness, so a step is at most about 2/(softness*h).
+    let max_step = 2.0 / (soft * h as f32) + 1e-3;
+    for pair in row.windows(2) {
+        assert!(
+            (pair[1] - pair[0]).abs() <= max_step,
+            "jump {pair:?} > {max_step}"
+        );
+    }
+    let peak = row.iter().copied().fold(0.0_f32, f32::max);
+    assert!(peak > 0.0 && peak < 1.0, "peak {peak}");
 }

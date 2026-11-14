@@ -65,10 +65,10 @@ fn gpu_wipe_masks_match_the_cpu_reference() {
             for (soft, bw, reverse) in [(0.0, 0.0, false), (0.08, 0.03, true)] {
                 let mask = WipeMask::new(shape, progress, W, H, [0.4, 0.6], reverse, soft, bw);
                 let mut tiles = vec![Tile::scaled(&out, 0, 0, W, H, 1.0)];
+                tiles.push(Tile::scaled(&inc, 0, 0, W, H, 1.0).with_mask(mask));
                 if bw > 0.0 {
                     tiles.push(Tile::scaled(&border, 0, 0, W, H, 1.0).with_mask(mask.expanded(bw)));
                 }
-                tiles.push(Tile::scaled(&inc, 0, 0, W, H, 1.0).with_mask(mask));
                 let cpu = composite(
                     W,
                     H,

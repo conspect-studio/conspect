@@ -105,11 +105,11 @@ fn wipe_coverage(t: TileParams, px: u32, py: u32, cw: u32, ch: u32) -> f32 {
     let d = sign * inside;
     let softness = t.range.w;
     let expand = t.prim1.w;
-    // A border band (expand > 0) is the grown edge cut to zero wherever the
-    // edge itself fully covers: never the revealed interior (mirrors
-    // `mask::coverage`).
+    // A border band (expand > 0) is the grown edge attenuated by the edge's
+    // own coverage: smooth on both sides, never the revealed interior
+    // (mirrors `mask::coverage`).
     if expand > 0.0 {
-        return select(wipe_edge(d + expand, softness), 0.0, wipe_edge(d, softness) >= 1.0);
+        return wipe_edge(d + expand, softness) * (1.0 - wipe_edge(d, softness));
     }
     return wipe_edge(d, softness);
 }

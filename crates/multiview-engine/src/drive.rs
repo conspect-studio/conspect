@@ -802,7 +802,17 @@ impl CompositorDrive<Nv12Image> {
                 mask,
             });
         };
+        // Only a fresh incoming frame is blended (SW2-02): a held stale frame
+        // or a slate never fades into Program.
+        let fresh = self.stores.get(&mix.source).and_then(|store| {
+            let read = store.read_at(now);
+            match (read.state().is_live(), read.frame()) {
+                (true, Some(frame)) => Some(Arc::clone(frame)),
+                _ => None,
+            }
+        });
         let mut mask = None;
+        let mut band = None;
         let incoming = match mix.style {
             TransitionStyle::Mix => mix.opacity(),
             TransitionStyle::Dip {
@@ -847,30 +857,33 @@ impl CompositorDrive<Nv12Image> {
                         0.0
                     },
                 );
-                // The border band: the colour drawn through the same edge
-                // grown by the border width, under the incoming picture. Its
-                // mask excludes the revealed interior, so a stale or missing
-                // incoming frame never turns the wipe into a colour fill.
-                if let (Some(color), true) = (border_color, border_width > 0.0) {
-                    if let Some((_, fill)) =
-                        self.transition_fill.as_ref().filter(|(c, _)| *c == color)
-                    {
-                        full_canvas(Arc::clone(fill), 1.0, Some(edge.expanded(border_width)));
-                    }
+                // The border band (review MED-03): the colour drawn ABOVE the
+                // incoming picture through its own intrinsic mask (the edge
+                // grown by the border width, attenuated by the edge's own
+                // coverage), so it never depends on the incoming alpha and is
+                // soft on both sides. It is drawn only with a fresh incoming
+                // frame: without one the wipe shows the outgoing picture,
+                // never a colour fill.
+                if let (Some(color), true, true) =
+                    (border_color, border_width > 0.0, fresh.is_some())
+                {
+                    band = self
+                        .transition_fill
+                        .as_ref()
+                        .filter(|(c, _)| *c == color)
+                        .map(|(_, fill)| (Arc::clone(fill), edge.expanded(border_width)));
                 }
                 mask = Some(edge);
                 1.0
             }
         };
         if incoming > 0.0 {
-            if let Some(store) = self.stores.get(&mix.source) {
-                // Only a fresh incoming frame is blended (SW2-02): a held
-                // stale frame or a slate never fades into Program.
-                let read = store.read_at(now);
-                if let (true, Some(frame)) = (read.state().is_live(), read.frame()) {
-                    full_canvas(Arc::clone(frame), incoming, mask);
-                }
+            if let Some(frame) = fresh {
+                full_canvas(frame, incoming, mask);
             }
+        }
+        if let Some((fill, band_mask)) = band {
+            full_canvas(fill, 1.0, Some(band_mask));
         }
     }
 

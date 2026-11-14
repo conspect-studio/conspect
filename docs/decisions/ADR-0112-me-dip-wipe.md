@@ -54,10 +54,12 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    closing in from the outside); `softness` and `border_width` are fractions
    of the canvas height in `[0, 1]`; `position_xy` in `[0, 1]` places the
    box/circle origin. An optional `border_color` band is the same 2x2 colour
-   fill drawn through the edge grown by `border_width`, cut to zero wherever
-   the edge itself fully covers, under the incoming picture: the band never
-   covers the revealed interior, so a stale, missing or transparent incoming
-   picture shows the outgoing one there, never the border colour; the travel is lengthened by the soft half-width and the border so
+   fill drawn through the edge grown by `border_width` times one minus the
+   edge's own coverage (smooth on both sides of a soft edge), drawn above the
+   incoming picture so it never depends on the incoming alpha: the band never
+   covers the revealed interior, and it is
+   drawn only while the incoming frame is fresh, so a stale or missing source
+   shows the outgoing picture, never a colour fill; the travel is lengthened by the soft half-width and the border so
    progress 0 shows nothing of either and progress 1 shows only the incoming
    picture, and both endpoints are pinned exactly (coverage 0 / 1 for the whole
    canvas, whatever the origin or rounding). The signed distance to the edge is

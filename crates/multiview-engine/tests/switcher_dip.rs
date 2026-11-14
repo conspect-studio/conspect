@@ -856,8 +856,8 @@ fn wipe(rate: u32, pattern: &str, extra: &serde_json::Value) -> TransitionDescri
     serde_json::from_value(value).unwrap()
 }
 
-/// The CPU reference of one wipe frame: outgoing, optional border band,
-/// incoming through the mask.
+/// The CPU reference of one wipe frame: outgoing, incoming through the mask,
+/// then the optional border band above it (review MED-03).
 fn wipe_reference(
     mask: multiview_compositor::mask::WipeMask,
     border: Option<(Rgb8, f32)>,
@@ -869,10 +869,10 @@ fn wipe_reference(
     if let Some((c, _)) = border {
         fill = Some(Nv12Image::solid_rgb(2, 2, c.r, c.g, c.b, CanvasColor::default()).unwrap());
     }
+    tiles.push(Tile::scaled(&b, 0, 0, W, W, 1.0).with_mask(mask));
     if let (Some(f), Some((_, width))) = (fill.as_ref(), border) {
         tiles.push(Tile::scaled(f, 0, 0, W, W, 1.0).with_mask(mask.expanded(width)));
     }
-    tiles.push(Tile::scaled(&b, 0, 0, W, W, 1.0).with_mask(mask));
     pipeline::composite(
         W,
         W,
@@ -1078,19 +1078,17 @@ fn repeated_bordered_wipes_build_the_border_once_and_never_grow_the_scratch_pool
 }
 
 /// Review MED-03: when the incoming source stops being fresh during a
-/// bordered wipe, Program shows the outgoing picture plus the border band
-/// only; the border colour never fills the revealed interior.
+/// bordered soft wipe, Program shows the outgoing picture alone: neither the
+/// border colour nor a hard strip across the soft ramp appears.
 #[test]
-fn a_bordered_wipe_with_a_stale_incoming_source_shows_only_the_band() {
-    use multiview_compositor::mask::{MaskShape, WipeMask};
+fn a_bordered_wipe_with_a_stale_incoming_source_shows_the_outgoing_picture() {
     let mut rig = rig();
-    let border = Rgb8::new(0, 255, 0);
     rig.send(
         "set",
         SwitcherVerb::SetTransition(wipe(
             40,
             "box",
-            &serde_json::json!({"border_width": 0.1, "border_color": "#00ff00"}),
+            &serde_json::json!({"softness": 0.1, "border_width": 0.02, "border_color": "#00ff00"}),
         )),
     );
     rig.step(0);
@@ -1111,31 +1109,44 @@ fn a_bordered_wipe_with_a_stale_incoming_source_shows_only_the_band() {
         rig.hook.after_compose(&frame);
         last = Some(Arc::clone(&frame.canvas));
     }
-    let got = last.unwrap();
     assert!(
         rig.handle.snapshot().unwrap().in_flight,
         "the wipe is still running"
     );
-    let mask = WipeMask::new(MaskShape::Box, 0.5, W, W, [0.5, 0.5], false, 0.0, 0.1);
-    let a = solid(A_Y);
-    let fill =
-        Nv12Image::solid_rgb(2, 2, border.r, border.g, border.b, CanvasColor::default()).unwrap();
-    let want = pipeline::composite(
-        W,
-        W,
-        CanvasColor::default(),
-        LinearRgba::TRANSPARENT,
-        &[
-            Tile::scaled(&a, 0, 0, W, W, 1.0),
-            Tile::scaled(&fill, 0, 0, W, W, 1.0).with_mask(mask.expanded(0.1)),
-        ],
-    )
-    .unwrap();
-    assert_frame(&got, &want, "stale incoming at elapsed 20");
-    // The centre (revealed interior) is the outgoing picture, not the border.
-    assert_eq!(
-        got.sample(W / 2, W / 2).unwrap().0,
-        A_Y,
-        "interior shows the outgoing picture"
+    assert_frame(
+        &last.unwrap(),
+        &solid_canvas(A_Y),
+        "stale incoming at elapsed 20",
     );
+}
+
+/// Review MED-03: a soft wipe whose border is much narrower than the soft
+/// edge, with an opaque incoming picture, equals the CPU reference (incoming
+/// through the mask, band above it) at several points of the flight.
+#[test]
+fn a_soft_wipe_with_a_narrow_border_matches_the_reference() {
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    let border = Rgb8::new(0, 255, 0);
+    let (_, frames) = run_dip(wipe(
+        10,
+        "circle",
+        &serde_json::json!({"softness": 0.2, "border_width": 0.02, "border_color": "#00ff00"}),
+    ));
+    for (index, elapsed) in [(4_usize, 2_u32), (7, 5), (10, 8)] {
+        let mask = WipeMask::new(
+            MaskShape::Circle,
+            elapsed as f32 / 10.0,
+            W,
+            W,
+            [0.5, 0.5],
+            false,
+            0.2,
+            0.02,
+        );
+        assert_frame(
+            &frames[index],
+            &wipe_reference(mask, Some((border, 0.02))),
+            &format!("soft narrow border elapsed {elapsed}"),
+        );
+    }
 }
