@@ -154,12 +154,17 @@ tile. No switcher or drive code changes.
   walks `buf[]`/`extended_buf` in place, allocation-free.
   No public path builds a Rust slice over a caller-supplied `Video`, whose
   geometry the safe `Video::set_width`/`set_height`/`set_format` could widen
-  over unwritten padding inside its allocation (review PB-14): the identity
-  `run_into` copies in libav (`av_frame_copy`), `plane_rows` is
+  over unwritten padding inside its allocation (review PB-14), nor over a
+  libav copy of one (review PB-15): `Scaler::run_into` takes its *source*
+  as a `ScratchFrame` too, so a `ScratchFrame`'s bytes come only from the
+  zero fill, checked `plane_mut` writes and `run_into` from another
+  `ScratchFrame` (its documented provenance invariant); `Scaler::run`
+  still takes any `&Video` but returns a plain `Video`, which no safe API
+  turns into a `ScratchFrame` or `AlphaSource`; `plane_rows` is
   crate-private and only sees frames with trusted metadata, and
   `alpha::AlphaSource` has private fields — it is built only by the decoder
-  in this crate (its untouched output frame) or from a zero-initialised
-  `ScratchFrame` (`AlphaSource::from_checked`), and hands out only `&Video`.
+  in this crate (its untouched output frame) or from a `ScratchFrame`
+  (`AlphaSource::from_checked`), and hands out only `&Video`.
   Decoded alpha is read through `frame::plane_rows`, which validates the plane,
   its signed linesize, its subsampled height and that every row lies in
   one of the frame's own buffers before yielding single-row slices, so a
@@ -175,13 +180,17 @@ tile. No switcher or drive code changes.
   `multiview-ffmpeg` `frame::tests`, `alpha::tests` (negative linesize,
   mismatched layout), `scale::run_into_tests` (an undersized or shared
   destination is an error, an undersized or unbuffered source is an error
-  in the conversion and identity paths of `run` and `run_into`, a source
-  or destination without the 16-byte swscale padding — exact-end or
-  15-byte tail, top-down or bottom-up — is refused before `sws_scale`
-  while a padded or normally allocated one converts, a
-  bottom-up source still converts, a null frame allocation never becomes a
-  `ScratchFrame`) and `tests/scale_resample.rs` (bottom-up identity
-  `run_into`). Player path
+  in the conversion and identity paths of `run`, a source or destination
+  without the 16-byte swscale padding — exact-end or 15-byte tail,
+  top-down or bottom-up — is refused before `sws_scale` while a padded or
+  normally allocated one converts, a bottom-up source still converts, a
+  null frame allocation never becomes a `ScratchFrame`, a widened decoder
+  frame through `run` stays a plain `Video`), `compile_fail` doctests on
+  `Scaler::run_into` / `Scaler::run` (a `Video` source, undersized,
+  unbuffered or widened, does not compile in `run_into`; `run`'s output
+  cannot become an `AlphaSource` or `ScratchFrame`) and
+  `tests/scale_resample.rs` (`ScratchFrame`-sourced `run_into` reuse,
+  bottom-up identity copy). Player path
   (ffmpeg): `pipeline::media_alpha::tests` (yuva → NV12+A, rgba/argb/bgra
   → NV12+A, odd-size scaling, steady-state reuse, an unallocatable scratch
   frame as an error, the no-alpha-decoder warning) and

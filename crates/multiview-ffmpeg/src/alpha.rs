@@ -146,8 +146,10 @@ impl AlphaSource {
 
     /// An alpha source over a [`ScratchFrame`]: allocated by the checked
     /// `alloc_video` (every owned byte zero-initialised, review PB-12) and
-    /// never exposed mutably, so its geometry is still the allocation's and
-    /// every row the copy can view is initialised. `layout` is checked
+    /// never exposed mutably, so its geometry is still the allocation's, and
+    /// written only by `plane_mut` or a `Scaler::run_into` from another
+    /// `ScratchFrame` (review PB-15), so every row the copy can view is
+    /// initialised (the [`ScratchFrame`] provenance invariant). `layout` is checked
     /// against the frame's format by [`Self::copy_to`].
     #[must_use]
     pub fn from_checked(frame: ScratchFrame, layout: AlphaLayout) -> Self {

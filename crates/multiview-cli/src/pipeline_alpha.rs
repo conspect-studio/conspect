@@ -99,9 +99,7 @@ impl MediaAlpha {
             .as_mut()
             .ok_or_else(|| "alpha scaler unexpectedly absent".to_owned())?;
         let out = reuse(&mut self.scaled, tile_w, tile_h)?;
-        scaler
-            .run_into(decoded.frame(), out)
-            .map_err(|e| e.to_string())?;
+        scaler.run_into(decoded, out).map_err(|e| e.to_string())?;
         let (resized, resized_stride) = out.plane(0).map_err(|e| e.to_string())?;
         let tile_rows = usize::try_from(tile_h).map_err(|_| "height overflow".to_owned())?;
         self.pool

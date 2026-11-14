@@ -22,11 +22,15 @@
 //!   over a decoder frame's unwritten stride padding or padded extra rows,
 //!   so only frames with trusted metadata may reach it.
 //! * Public paths never build a Rust slice over a caller-supplied
-//!   [`Video`]: [`crate::Scaler`] hands such frames to libav (`sws_scale`,
-//!   `av_frame_copy`) after the bounds checks below, and the public
-//!   slice views ([`ScratchFrame::plane`]/[`ScratchFrame::plane_mut`],
+//!   [`Video`], nor over a copy of one: [`crate::Scaler::run`] hands such a
+//!   frame to libav (`sws_scale`, `av_frame_copy`) after the bounds checks
+//!   below and returns a plain, untrusted `Video`; the public slice views
+//!   ([`ScratchFrame::plane`]/[`ScratchFrame::plane_mut`],
 //!   [`crate::alpha::AlphaSource::copy_to`]) exist only over frames whose
-//!   geometry no caller can change.
+//!   geometry no caller can change and whose bytes are all initialised —
+//!   which is why [`crate::Scaler::run_into`] takes its source as a
+//!   [`ScratchFrame`] too (review PB-15, the [`ScratchFrame`] provenance
+//!   invariant).
 //! * [`check_swscale_source`] / [`check_swscale_destination`] add the
 //!   libswscale contract on top: `libavutil/frame.h` documents that
 //!   "swscale can read up to 16 bytes beyond the planes", so
@@ -226,6 +230,28 @@ fn new_frame() -> Video {
 /// re-validates the span against the frame's own buffers
 /// ([`ScratchFrame::plane`], [`ScratchFrame::plane_mut`]); writes also
 /// require the buffers to be writable (`av_frame_is_writable`).
+///
+/// # Provenance invariant (reviews PB-12/PB-14/PB-15)
+/// Every byte a `ScratchFrame` holds is initialised, and its format, width
+/// and height are the ones it was allocated with. Its contents can only
+/// come from:
+///
+/// 1. the zero fill of [`alloc_video`] (every owned buffer byte, row
+///    padding and tail included, at allocation);
+/// 2. checked Rust writes through [`ScratchFrame::plane_mut`] (a `&mut [u8]`
+///    can only store initialised bytes);
+/// 3. [`crate::Scaler::run_into`], whose **source is another
+///    `ScratchFrame`** (never an arbitrary [`Video`]), so libav
+///    (`av_frame_copy`/`sws_scale`) only moves bytes that already satisfy
+///    this invariant.
+///
+/// No public safe API turns a [`Video`] into a `ScratchFrame` (there is no
+/// `From<Video>`, constructor over a `Video`, or `&mut Video` accessor; the
+/// raw-frame accessors `into_video`/`video_mut` are crate-private and used
+/// only by [`crate::alpha::AlphaSource::from_checked`] and `run_into`), so
+/// a caller frame widened with `Video::set_width` over unwritten padding
+/// can never become one. [`ScratchFrame::plane`] and
+/// [`crate::alpha::AlphaSource::from_checked`] rely on this.
 pub struct ScratchFrame {
     frame: Video,
 }

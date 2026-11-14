@@ -119,13 +119,13 @@ fn run_into_reuses_the_output_frame_for_scale_and_identity() {
     .unwrap();
     // Mismatched on purpose: the first run_into reallocates it.
     let mut out = ScratchFrame::alloc(Pixel::GRAY8, 1, 1).unwrap();
-    scaler.run_into(src.frame(), &mut out).unwrap();
+    scaler.run_into(&src, &mut out).unwrap();
     assert_eq!(
         (out.format(), out.width(), out.height()),
         (Pixel::GRAY8, 14, 10)
     );
     let buffer = out.frame().data(0).as_ptr();
-    scaler.run_into(src.frame(), &mut out).unwrap();
+    scaler.run_into(&src, &mut out).unwrap();
     assert_eq!(
         out.frame().data(0).as_ptr(),
         buffer,
@@ -142,7 +142,7 @@ fn run_into_reuses_the_output_frame_for_scale_and_identity() {
     .unwrap();
     // Mismatched on purpose: the first run_into reallocates it.
     let mut same = ScratchFrame::alloc(Pixel::GRAY8, 1, 1).unwrap();
-    identity.run_into(src.frame(), &mut same).unwrap();
+    identity.run_into(&src, &mut same).unwrap();
     let ((s_plane, s), (d_plane, d)) = (src.plane(0).unwrap(), same.plane(0).unwrap());
     for y in 0..5 {
         assert_eq!(&d_plane[y * d..y * d + 7], &s_plane[y * s..y * s + 7]);
