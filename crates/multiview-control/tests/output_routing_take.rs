@@ -822,6 +822,13 @@ async fn readback_carries_live_state_and_redacts_unreadable_pending_feeds() {
         sessions_in_use: 1,
         sessions_max: 6,
         dropped_ticks: 0,
+        passthrough: multiview_control::output_routing::PassthroughTotals {
+            keys: 1,
+            aus: 500,
+            slate_ticks: 7,
+            bridges: 1,
+            ..Default::default()
+        },
     });
     let whole = body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await;
     let row = whole["outputs"]
@@ -839,11 +846,17 @@ async fn readback_carries_live_state_and_redacts_unreadable_pending_feeds() {
     );
     assert_eq!(row["pending"]["held_ticks"], 12);
     assert_eq!(whole["buses"]["encoder_sessions"], "1 of 6 in use");
+    // #344 D2b: passthrough totals, whole-system principals only.
+    assert_eq!(whole["buses"]["passthrough"]["keys"], 1);
+    assert_eq!(whole["buses"]["passthrough"]["aus"], 500);
+    assert_eq!(whole["buses"]["passthrough"]["slate_ticks"], 7);
+    assert_eq!(whole["buses"]["passthrough"]["bridges"], 1);
     let scoped =
         body_json(send(&rig.router, get("/api/v1/routing", SCOPED_ROUTER_TOKEN)).await).await;
     let text = scoped.to_string();
     assert!(!text.contains("secret-cam"), "{text}");
     assert!(scoped["buses"].get("encoder_sessions").is_none(), "{text}");
+    assert!(scoped["buses"].get("passthrough").is_none(), "{text}");
     let rows = scoped["outputs"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "only the readable output: {text}");
     assert_eq!(
@@ -1274,6 +1287,7 @@ async fn readback_reports_the_live_bus_and_the_configured_feed_separately() {
         sessions_in_use: 0,
         sessions_max: 6,
         dropped_ticks: 0,
+        passthrough: multiview_control::output_routing::PassthroughTotals::default(),
     });
     let r = row(&body_json(send(&rig.router, get("/api/v1/routing", OPERATOR_TOKEN)).await).await);
     assert_eq!(r["state"], "on_air");
@@ -1613,6 +1627,7 @@ async fn readback_redacts_live_and_configured_video_independently() {
         sessions_in_use: 0,
         sessions_max: 6,
         dropped_ticks: 0,
+        passthrough: multiview_control::output_routing::PassthroughTotals::default(),
     });
     let state = body_json(send(&rig.router, get("/api/v1/routing", BUS_ROUTER_TOKEN)).await).await;
     assert!(!state.to_string().contains("secret-cam"), "{state}");
@@ -2064,6 +2079,7 @@ async fn layout_audio_and_live_edits_of_a_routed_layout() {
             sessions_in_use: 1,
             sessions_max: 6,
             dropped_ticks: 0,
+            passthrough: multiview_control::output_routing::PassthroughTotals::default(),
         });
     }
     // An editor without Write on output-1: 403 routed-layout, unchanged.

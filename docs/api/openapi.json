@@ -20522,6 +20522,69 @@
           }
         }
       },
+      "PassthroughTotals": {
+        "type": "object",
+        "description": "Passthrough (P0) counters of the run (#344 D2b): keys open (no encoder\nsession each) and cumulative AU / repeat / drift-drop / stall / slate /\nbridge counts.",
+        "required": [
+          "keys",
+          "aus",
+          "repeats",
+          "drift_drops",
+          "stalls",
+          "slate_ticks",
+          "bridges",
+          "bridges_refused"
+        ],
+        "properties": {
+          "aus": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Source access units passed through.",
+            "minimum": 0
+          },
+          "bridges": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Moves onto an on-demand picture bridge.",
+            "minimum": 0
+          },
+          "bridges_refused": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bridges that found no encoder session (stayed on the slate).",
+            "minimum": 0
+          },
+          "drift_drops": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Access units dropped by drift corrections.",
+            "minimum": 0
+          },
+          "keys": {
+            "type": "integer",
+            "description": "Passthrough keys open.",
+            "minimum": 0
+          },
+          "repeats": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Repeat (skip) access units emitted by drift corrections.",
+            "minimum": 0
+          },
+          "slate_ticks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks emitted from a format slate.",
+            "minimum": 0
+          },
+          "stalls": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Runs ended by a stall.",
+            "minimum": 0
+          }
+        }
+      },
       "PatchAccepted": {
         "type": "object",
         "description": "`POST /patch/take` 202 answer; the outcome arrives as `switcher.operation`.",
@@ -22245,6 +22308,17 @@
             "type": "integer",
             "description": "Video encoders running.",
             "minimum": 0
+          },
+          "passthrough": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PassthroughTotals",
+                "description": "Passthrough (P0) counters (#344 D2b) — whole-system principals only."
+              }
+            ]
           }
         }
       },

@@ -151,8 +151,11 @@ struct FakeState {
     live: Option<RoutingLive>,
     /// Per output: its passthrough miss in the plan and its live state
     /// (#344 D2b).
-    passthrough: HashMap<String, (Option<String>, Option<(String, Option<String>)>)>,
+    passthrough: HashMap<String, FakePassthrough>,
 }
+
+/// A fake output's passthrough: its plan miss and its live (state, reason).
+type FakePassthrough = (Option<String>, Option<(String, Option<String>)>);
 
 struct Fake {
     state: Mutex<FakeState>,

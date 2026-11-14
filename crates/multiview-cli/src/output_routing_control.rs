@@ -753,6 +753,19 @@ impl OutputRouting for OutputRoutingAdapter {
                 .saturating_add(snapshot.opens_in_flight),
             sessions_max: self.max_encoders,
             dropped_ticks: snapshot.dropped_aux_ticks,
+            passthrough: {
+                let p = snapshot.passthrough;
+                multiview_control::output_routing::PassthroughTotals {
+                    keys: p.keys_live,
+                    aus: p.aus,
+                    repeats: p.repeats,
+                    drift_drops: p.drift_drops,
+                    stalls: p.stalls,
+                    slate_ticks: p.slate_ticks,
+                    bridges: p.bridges,
+                    bridges_refused: p.bridges_refused,
+                }
+            },
         })
     }
 

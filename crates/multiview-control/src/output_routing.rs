@@ -419,6 +419,32 @@ pub struct RoutingLive {
     pub sessions_max: usize,
     /// Clock ticks the routed-picture thread could not take.
     pub dropped_ticks: u64,
+    /// Passthrough (P0) totals (#344 D2b).
+    pub passthrough: PassthroughTotals,
+}
+
+/// Passthrough (P0) counters of the run (#344 D2b): keys open (no encoder
+/// session each) and cumulative AU / repeat / drift-drop / stall / slate /
+/// bridge counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PassthroughTotals {
+    /// Passthrough keys open.
+    pub keys: usize,
+    /// Source access units passed through.
+    pub aus: u64,
+    /// Repeat (skip) access units emitted by drift corrections.
+    pub repeats: u64,
+    /// Access units dropped by drift corrections.
+    pub drift_drops: u64,
+    /// Runs ended by a stall.
+    pub stalls: u64,
+    /// Ticks emitted from a format slate.
+    pub slate_ticks: u64,
+    /// Moves onto an on-demand picture bridge.
+    pub bridges: u64,
+    /// Bridges that found no encoder session (stayed on the slate).
+    pub bridges_refused: u64,
 }
 
 /// One terminal take outcome from the engine.
