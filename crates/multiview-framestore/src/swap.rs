@@ -565,6 +565,17 @@ impl<P: SwapPointer> SwapCell<P> {
         }
     }
 
+    /// The current value, cloned, in exactly ONE attempt: read `head`, then
+    /// the slot it names; `None` if a publisher moved `head` (or is writing
+    /// that slot) meanwhile. Bounded work for a caller that must not retry
+    /// an unbounded number of times (the output clock, #307 review I1): it
+    /// keeps what it has and tries again on a later tick.
+    #[must_use]
+    pub fn try_load(&self) -> Option<P> {
+        let head = self.head.load(Ordering::Acquire);
+        self.read_tagged(head)
+    }
+
     /// Atomically replace the current value with `value` and return exactly
     /// the value it replaced. Retries (never waits) if another publisher got
     /// in first.
@@ -650,6 +661,17 @@ impl<T> SwapCell<Arc<T>> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 impl<P> SwapCell<P> {
+    /// Test seam: hold the head slot's WRITE lock, as a publisher recycling
+    /// that slot would, so a single read attempt of it must fail.
+    fn hold_writer_for_test(&self) -> impl Drop + '_ {
+        let head = self.head.load(Ordering::Acquire);
+        self.slot(idx_of(head))
+            .expect("the head slot exists")
+            .entry
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Test seam: take and hold a reader's critical section on the value
     /// readers currently load, exactly as a reader that the OS deschedules
     /// in the middle of `load` would hold it.
@@ -1047,5 +1069,75 @@ mod chaos {
         release.wait();
         a.join().expect("publisher A panicked");
         assert_eq!(*cell.load(), (2, 1000));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod try_load {
+    //! #307 review I1: [`SwapCell::try_load`] is one bounded attempt.
+    use super::SwapCell;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_quiet_cell_loads_on_the_first_attempt() {
+        let cell = SwapCell::new(Arc::new(1_u64));
+        assert_eq!(*cell.try_load().unwrap(), 1);
+        cell.store(Arc::new(2));
+        assert_eq!(*cell.try_load().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_lost_race_returns_none_without_waiting() {
+        let cell = SwapCell::new(Arc::new(7_u64));
+        {
+            // A publisher holds the head slot: the one attempt fails at once
+            // (`load` would spin here until the writer let go).
+            let _writer = cell.hold_writer_for_test();
+            let started = Instant::now();
+            assert!(cell.try_load().is_none());
+            assert!(started.elapsed() < Duration::from_secs(1), "never blocks");
+        }
+        assert_eq!(*cell.try_load().unwrap(), 7, "Some once the writer is gone");
+    }
+
+    #[test]
+    fn concurrent_publishers_never_block_it_and_it_succeeds_once_they_stop() {
+        let cell = Arc::new(SwapCell::new(Arc::new(0_u64)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let published = Arc::new(AtomicU64::new(0));
+        let publishers: Vec<_> = (0..3)
+            .map(|_| {
+                let (cell, stop, published) =
+                    (Arc::clone(&cell), Arc::clone(&stop), Arc::clone(&published));
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let n = published.fetch_add(1, Ordering::Relaxed) + 1;
+                        cell.store(Arc::new(n));
+                    }
+                })
+            })
+            .collect();
+        let (mut some, mut none) = (0_u64, 0_u64);
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            match cell.try_load() {
+                Some(_) => some += 1,
+                None => none += 1,
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for publisher in publishers {
+            publisher.join().unwrap();
+        }
+        assert!(published.load(Ordering::Relaxed) > 0, "publishers ran");
+        assert!(some + none > 0);
+        // Quiet again: one attempt is enough, and it is the newest value.
+        let last = published.load(Ordering::Relaxed);
+        let loaded = *cell.try_load().expect("Some once publishers stopped");
+        assert!(loaded <= last && loaded > 0);
     }
 }

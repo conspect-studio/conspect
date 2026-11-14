@@ -7,7 +7,8 @@
 //! it. The Program frame hook polls [`LayoutSources::generation`] once per
 //! fresh tick (one Acquire load) and adopts the set only when the generation
 //! moved, at the frame boundary, so the steady state does no work and never
-//! allocates. The off-clock `routing-aux` thread composes each layout into its
+//! allocates. Acquisition is one bounded attempt ([`LayoutSources::try_load`]):
+//! a lost race defers adoption (and its acknowledgement) to the next tick. The off-clock `routing-aux` thread composes each layout into its
 //! store; the clock only ever reads stores.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,6 +51,9 @@ pub struct LayoutSources {
     /// adoption, never in the steady state).
     adopted: AtomicU64,
     set: SwapCell<Arc<LayoutSourceSet>>,
+    /// Test seam: the next N [`Self::try_load`] attempts lose their race.
+    #[cfg(test)]
+    forced_misses: std::sync::atomic::AtomicU32,
 }
 
 impl Default for LayoutSources {
@@ -66,6 +70,8 @@ impl LayoutSources {
             generation: AtomicU64::new(0),
             adopted: AtomicU64::new(0),
             set: SwapCell::new(Arc::new(LayoutSourceSet::default())),
+            #[cfg(test)]
+            forced_misses: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -103,10 +109,37 @@ impl LayoutSources {
         self.adopted.load(Ordering::Acquire)
     }
 
-    /// The current set (a pointer clone, wait-free).
+    /// The current set (a pointer clone). Lock-free, NOT bounded: it retries
+    /// while publishers keep moving the cell. Off-clock callers only; the
+    /// output clock uses [`Self::try_load`].
     #[must_use]
     pub fn load(&self) -> Arc<LayoutSourceSet> {
         self.set.load()
+    }
+
+    /// The current set in exactly one attempt (#307 review I1); `None` when
+    /// a publish raced it. The frame hook then keeps its previous set, does
+    /// not acknowledge, and tries again on the next tick: bounded work per
+    /// tick however hard the control plane churns the registry.
+    #[must_use]
+    pub fn try_load(&self) -> Option<Arc<LayoutSourceSet>> {
+        #[cfg(test)]
+        {
+            // Single-threaded test seam: the hook is the only caller.
+            let misses = self.forced_misses.load(Ordering::Acquire);
+            if misses > 0 {
+                self.forced_misses.store(misses - 1, Ordering::Release);
+                return None;
+            }
+        }
+        self.set.try_load()
+    }
+
+    /// Test seam: make the next `n` [`Self::try_load`] attempts fail as if a
+    /// publish raced each of them.
+    #[cfg(test)]
+    pub(crate) fn force_misses(&self, n: u32) {
+        self.forced_misses.store(n, Ordering::Release);
     }
 }
 

@@ -33,9 +33,13 @@ pub struct SwitcherFrameHook<C> {
     pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
     last_preview: Option<Arc<str>>,
     /// Stored layouts registered as M/E sources (#307): adopted at the frame
-    /// boundary when the registry generation moves. `None` = not wired.
+    /// boundary when the registry generation moves (one bounded acquisition
+    /// attempt per tick; a lost race retries next tick). `None` = not wired.
     pub layout_sources: Option<Arc<LayoutSources>>,
     seen_generation: u64,
+    /// The last adopted set (the deferred-removal path reads it; never a
+    /// reload on the clock).
+    adopted_set: Option<Arc<crate::switcher_layouts::LayoutSourceSet>>,
     /// Keys currently adopted into the drive/driver/preview maps (≤ 4).
     adopted: Vec<Arc<str>>,
     /// A removal was deferred because the M/E still referenced the key.
@@ -64,6 +68,7 @@ impl<C> SwitcherFrameHook<C> {
             last_preview: None,
             layout_sources: None,
             seen_generation: 0,
+            adopted_set: None,
             adopted: Vec::new(),
             deferred: false,
             fps_num: 0,
@@ -88,8 +93,13 @@ impl<C> SwitcherFrameHook<C> {
         };
         let generation = sources.generation();
         if generation != self.seen_generation {
+            // One bounded attempt (#307 review I1). A publish raced it: keep
+            // the previous set, do not record or acknowledge this generation,
+            // and try again on the next tick.
+            let Some(set) = sources.try_load() else {
+                return;
+            };
             self.seen_generation = generation;
-            let set = sources.load();
             for (key, store, revision) in &set.entries {
                 let current = drive.store(key);
                 if current.is_some_and(|existing| Arc::ptr_eq(existing, store))
@@ -111,11 +121,15 @@ impl<C> SwitcherFrameHook<C> {
             // Ack: every key of this generation is in the maps now, so a
             // command naming one, drained after this, finds its store.
             sources.mark_adopted(generation);
+            self.adopted_set = Some(set);
         }
         if !self.deferred {
             return;
         }
-        let set = sources.load();
+        // The cached set (a refcount bump, no allocation, no reload).
+        let Some(set) = self.adopted_set.clone() else {
+            return;
+        };
         let mut index = 0;
         let mut still_deferred = false;
         while let Some(key) = self.adopted.get(index) {
@@ -433,6 +447,55 @@ mod tests {
             assert_eq!(drive, preview, "drive and preview maps agree");
             drive
         }
+    }
+
+    /// #307 review I1: a lost acquisition race costs one bounded attempt;
+    /// the hook keeps its previous set, does not record or acknowledge the
+    /// generation, and adopts on a later tick. The deferred-removal path
+    /// uses the cached set (no reload): it keeps working while every
+    /// acquisition attempt fails.
+    #[test]
+    fn a_lost_acquisition_race_defers_adoption_and_its_ack() {
+        let mut rig = rig(false);
+        rig.step(true);
+        rig.sources.force_misses(3);
+        rig.register();
+        for _ in 0..3 {
+            rig.step(true);
+            assert!(!rig.present(), "not adopted while acquisition loses");
+            assert_eq!(rig.sources.adopted_generation(), 0, "no ack");
+        }
+        rig.step(true);
+        assert!(rig.present());
+        assert_eq!(rig.sources.adopted_generation(), rig.sources.generation());
+        // Put it on Program, then unregister: the removal is deferred.
+        rig.send(SwitcherVerb::SelectProgram(SourceRef::new(KEY)));
+        rig.step(true);
+        rig.unregister();
+        rig.step(true);
+        assert!(rig.present(), "deferred while on Program");
+        let acked = rig.sources.adopted_generation();
+        // Release Program while every acquisition attempt fails (no new
+        // generation is pending, so none is made): the deferred removal
+        // completes from the cached set.
+        rig.sources.force_misses(u32::MAX);
+        rig.send(SwitcherVerb::SelectProgram(SourceRef::new("a")));
+        rig.step(true);
+        rig.step(true);
+        assert!(!rig.present(), "removed from the cached set");
+        assert_eq!(rig.sources.adopted_generation(), acked);
+        // A new generation while acquisition keeps failing: never adopted,
+        // never acknowledged, and the clock keeps ticking.
+        rig.register();
+        for _ in 0..10 {
+            rig.step(true);
+        }
+        assert!(!rig.present());
+        assert_eq!(rig.sources.adopted_generation(), acked);
+        rig.sources.force_misses(0);
+        rig.step(true);
+        assert!(rig.present());
+        assert_eq!(rig.sources.adopted_generation(), rig.sources.generation());
     }
 
     #[test]
