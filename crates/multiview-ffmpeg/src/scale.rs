@@ -396,6 +396,7 @@ mod run_into_tests {
     /// caller-supplied frame, for [`Scaler::run`] (which still takes one).
     fn gray(w: u32, h: u32) -> Video {
         let mut frame = alloc_video(Pixel::GRAY8, w, h).unwrap();
+        crate::frame::fill_owned_buffers(&mut frame, 0);
         let stride = frame.stride(0);
         for (i, b) in frame.data_mut(0).iter_mut().enumerate() {
             *b = u8::try_from((i % stride) * 30 % 256).unwrap();
@@ -420,6 +421,7 @@ mod run_into_tests {
     /// output before `run_into` took a `ScratchFrame`.
     fn undersized(w: u32, small_h: u32, claimed_h: u32) -> ScratchFrame {
         let mut frame = alloc_video(Pixel::GRAY8, w, small_h).unwrap();
+        crate::frame::fill_owned_buffers(&mut frame, 0);
         frame.set_height(claimed_h);
         ScratchFrame::from_video_unchecked(frame)
     }
@@ -745,6 +747,9 @@ mod run_into_tests {
     /// unwritten padding.
     fn widened_rgba(w: u32, h: u32, dw: u32, dh: u32) -> Video {
         let mut frame = alloc_video(Pixel::RGBA, w, h).unwrap();
+        // Every owned byte initialised first: the widened geometry reads
+        // past the written rows into the buffer tail (PB-16).
+        crate::frame::fill_owned_buffers(&mut frame, 0);
         for (i, b) in frame.data_mut(0).iter_mut().enumerate() {
             *b = u8::try_from(i % 251).unwrap();
         }
@@ -818,6 +823,7 @@ mod run_into_tests {
         // An expansion past the allocation is still refused before libav
         // reads: the bounds checks are unchanged.
         let mut tall = alloc_video(Pixel::RGBA, w, h).unwrap();
+        crate::frame::fill_owned_buffers(&mut tall, 0);
         tall.set_height(4096);
         let spec = ScaleSpec::new(Pixel::RGBA, w, 4096);
         let mut identity = Scaler::new(spec, spec).unwrap();

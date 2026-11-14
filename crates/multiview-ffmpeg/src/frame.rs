@@ -184,7 +184,7 @@ std::thread_local! {
 /// Set every byte of every buffer `frame` owns to `value`, padding included
 /// (review PB-12: `av_frame_get_buffer` storage is not initialised). Called
 /// once per allocation, before any Rust slice can expose the bytes.
-fn fill_owned_buffers(frame: &mut Video, value: u8) {
+pub(crate) fn fill_owned_buffers(frame: &mut Video, value: u8) {
     #[cfg(test)]
     FILLS.with(|n| n.set(n.get() + 1));
     for_each_owned_buffer(frame, |data, size| {
@@ -981,6 +981,9 @@ mod tests {
     #[test]
     fn plane_rows_walks_a_subsampled_plane_and_refuses_bad_requests() {
         let mut frame = alloc_video(Pixel::YUV420P, 6, 5).unwrap();
+        // Every plane initialised before any row slice exists (plain
+        // `alloc_video` storage is not filled since PB-16).
+        fill_owned_buffers(&mut frame, 0);
         let stride = frame.stride(1);
         for (i, b) in frame.data_mut(1).iter_mut().enumerate() {
             *b = u8::try_from(i / stride).unwrap();
@@ -1022,6 +1025,9 @@ mod tests {
     #[test]
     fn plane_rows_trusts_the_frame_metadata() {
         let mut frame = alloc_video(Pixel::RGBA, 5, 2).unwrap();
+        // Initialise every byte before any row slice exists (review: plain
+        // `alloc_video` storage is not filled since PB-16).
+        fill_owned_buffers(&mut frame, 0);
         assert!(frame.stride(0) >= 32);
         assert!(plane_rows(&frame, 0, 24).is_err(), "20 active bytes");
         frame.set_width(6);
