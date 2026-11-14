@@ -1,5 +1,7 @@
 //! Bounded management-only admission and native ACK reconciliation.
-use super::{ClipSpec, Generation, PlayerRuntime};
+#[cfg(target_os = "linux")]
+use super::ClipSpec;
+use super::{Generation, PlayerRuntime};
 use multiview_control::{
     auth::Principal,
     error::{ControlError, ControlResult},
@@ -258,7 +260,7 @@ impl PlayerLoadProvider for RuntimeProvider {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = lease;
-            return Err(ControlError::EngineBusy);
+            Err(ControlError::EngineBusy)
         }
         #[cfg(target_os = "linux")]
         {
