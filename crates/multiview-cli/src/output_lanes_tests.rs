@@ -829,19 +829,32 @@ fn a_rate_output_carries_the_program_audio_packets_with_a_bounded_av_offset() {
     );
 }
 
-/// Chaos (R3, invariants #1/#10): the lane clock wedges 1.5 s (blocking, in
-/// its tick body) mid-run. Program keeps exactly one frame per tick with
-/// consecutive PTS and never repeats; its Program-rate sibling is untouched;
-/// the lane skips the ticks it missed (catch-up bound 8 ticks) and its worker
-/// gap-fills them, so the rate output's PTS stay consecutive. 1.5 s of wall
-/// time is at most 1.5 s of output time on the gated clock (37 ticks), inside
-/// the 2 s gap a lane fills (beyond it the output would fail alone).
+/// Chaos (R3, invariants #1/#10): the lane clock wedges (blocking, in its
+/// tick body) mid-run and is held wedged by a handshake until Program has
+/// visibly progressed: while it is held, the test clock no longer waits on
+/// Program beyond [`LOOSE_PATIENCE`] (#343 review I3), and Program plus its
+/// Program-rate sibling must emit at least 20 new frames within a generous
+/// wall bound — a Program that waited on the lane would stall here and fail.
+/// After the release: Program keeps exactly one frame per tick with
+/// consecutive PTS and never repeats; the sibling is untouched; the lane
+/// skips the ticks it missed (catch-up bound 8 ticks) and its worker
+/// gap-fills them, so the rate output's PTS stay consecutive. 20 Program
+/// frames are ~0.7 s of output time (~17 lane ticks): past the catch-up bound
+/// and inside the 2 s gap a lane fills.
 #[test]
+#[allow(clippy::too_many_lines)] // One scenario: the handshake, then the counts.
 fn a_wedged_lane_clock_never_moves_program_or_its_sibling() {
     const TICKS: u64 = 300;
     const WEDGE_AT: u64 = 60;
+    const PROGRESS: u64 = 20;
+    const BOUND: Duration = Duration::from_secs(15);
     let wedged = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&wedged);
+    let (wedged_tx, wedged_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let hook_io = Mutex::new((wedged_tx, release_rx));
+    let progress = Arc::new(Mutex::new(None::<(u64, usize)>));
+    let record = Arc::clone(&progress);
     let doc = Doc {
         sibling: true,
         ..Doc::default()
@@ -849,12 +862,48 @@ fn a_wedged_lane_clock_never_moves_program_or_its_sibling() {
     let hooks = Hooks {
         on_tick: Some(Arc::new(move |tick| {
             if tick >= WEDGE_AT && !flag.swap(true, Ordering::AcqRel) {
-                std::thread::sleep(Duration::from_millis(1_500));
+                let io = hook_io.lock().unwrap();
+                let _ = io.0.send(());
+                // Held until the test observed Program progress (bounded).
+                let _ = io.1.recv_timeout(Duration::from_secs(30));
             }
         })),
         ..Hooks::default()
     };
-    let run = drive("lanes_wedge", doc, TICKS, hooks, |_| {});
+    let run = drive("lanes_wedge", doc, TICKS, hooks, move |ctl| {
+        wedged_rx
+            .recv_timeout(BOUND)
+            .expect("the lane clock reached the wedge");
+        ctl.loose.store(true, Ordering::Release);
+        let program_at = ctl.observer.load(Ordering::Acquire);
+        let sibling_at = ctl.program[1].lock().unwrap().video.len();
+        let start = Instant::now();
+        let progressed = loop {
+            let program = ctl.observer.load(Ordering::Acquire) - program_at;
+            let sibling = ctl.program[1].lock().unwrap().video.len() - sibling_at;
+            if (program >= PROGRESS && u64::try_from(sibling).unwrap() >= PROGRESS)
+                || start.elapsed() >= BOUND
+            {
+                break (program, sibling);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        *record.lock().unwrap() = Some(progressed);
+        ctl.loose.store(false, Ordering::Release);
+        let _ = release_tx.send(());
+    });
+    let (program_progress, sibling_progress) = progress
+        .lock()
+        .unwrap()
+        .expect("the controller observed the wedge");
+    assert!(
+        program_progress >= PROGRESS,
+        "Program emitted {program_progress} frames while the lane clock was wedged"
+    );
+    assert!(
+        u64::try_from(sibling_progress).unwrap() >= PROGRESS,
+        "the sibling got {sibling_progress} frames while the lane clock was wedged"
+    );
     assert!(wedged.load(Ordering::Acquire), "the lane clock wedged");
     assert_program(&run, TICKS);
     assert_eq!(run.program.len(), 2);
