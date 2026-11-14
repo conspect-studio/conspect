@@ -616,7 +616,7 @@ keyers.
 - **CLI boot.** `attach_first_slice` resolves `KeyerDef`s from `pipeline.preview_stores()`; a
   missing store is a boot error. It then calls `keyer::admit` against the document's budget and
   `driver.set_keyers`.
-- **Deviation: Clean is refused while a DSK is defined (until K2b).**
+- **Deviation: Clean is refused while a DSK is defined (until K2b, #435).**
   - **Boot.** Validation refuses an output whose feed is Clean when a DSK is defined
     (`clean-unavailable-with-dsk`).
   - **Takes.** The output router's handle carries `dsk_defined`. The plan answers
