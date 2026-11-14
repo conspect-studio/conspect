@@ -27,6 +27,7 @@ multiview-clocksys = { workspace = true }
 multiview-control = { workspace = true }
 multiview-weather = { workspace = true }
 multiview-graphics = { workspace = true }
+multiview-webengine = { path = "../multiview-webengine" }
 multiview-config = { workspace = true }
 multiview-events = { workspace = true }
 # The local entitlement plane (Conspect, ADR-0050): the cli reads the published
@@ -543,6 +544,7 @@ ptp = ["multiview-engine/ptp"]
 # needs the native leaf, and without it such a URL fails closed with a clear
 # "requires srt-libsrt" error (never libsrt's opaque "Bad parameters").
 ffmpeg = [
+    "dep:rustix",
     "dep:ffmpeg-next",
     # #309: the exit watchdog's SIGKILL backstop (safe `rustix::process::kill_process`).
     "dep:rustix",
