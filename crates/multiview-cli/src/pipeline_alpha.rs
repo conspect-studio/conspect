@@ -26,9 +26,9 @@
 use std::sync::Arc;
 
 use ffmpeg_next::format::Pixel;
-use ffmpeg_next::util::frame::Video;
 use multiview_compositor::pipeline::{AlphaPlanePool, Nv12Image};
 use multiview_ffmpeg::alpha::{extract_alpha, AlphaDepth, AlphaLayout, AlphaSource};
+use multiview_ffmpeg::frame::ScratchFrame;
 use multiview_ffmpeg::{ScaleSpec, Scaler};
 
 /// Per-player alpha attacher: the bounded plane pool plus the reused scratch
@@ -37,9 +37,11 @@ use multiview_ffmpeg::{ScaleSpec, Scaler};
 pub(super) struct MediaAlpha {
     pool: Arc<AlphaPlanePool>,
     /// The decoded-size `GRAY8` copy of the alpha (only when scaling).
-    decoded: Option<Video>,
-    /// The tile-size `GRAY8` scaler output (only when scaling).
-    scaled: Option<Video>,
+    decoded: Option<ScratchFrame>,
+    /// The tile-size `GRAY8` scaler output (only when scaling). A checked
+    /// [`ScratchFrame`] from the first use on, never an unchecked
+    /// `Video::empty()` (whose `av_frame_alloc` result is not null-checked).
+    scaled: Option<ScratchFrame>,
     scaler: Option<Scaler>,
 }
 
@@ -78,10 +80,9 @@ impl MediaAlpha {
         // Different size: decoded alpha -> GRAY8 at decoded size, then the
         // luma's scaler geometry to the tile size.
         let decoded = reuse(&mut self.decoded, in_w, in_h)?;
-        let stride = decoded.stride(0);
-        source
-            .copy_to(decoded.data_mut(0), stride)
-            .map_err(|e| e.to_string())?;
+        let (plane, stride) = decoded.plane_mut(0).map_err(|e| e.to_string())?;
+        source.copy_to(plane, stride).map_err(|e| e.to_string())?;
+        let decoded: &ScratchFrame = decoded;
         let from = ScaleSpec::new(Pixel::GRAY8, in_w, in_h);
         let to = ScaleSpec::new(Pixel::GRAY8, tile_w, tile_h);
         if self
@@ -97,16 +98,18 @@ impl MediaAlpha {
             .scaler
             .as_mut()
             .ok_or_else(|| "alpha scaler unexpectedly absent".to_owned())?;
-        let out = self.scaled.get_or_insert_with(Video::empty);
-        scaler.run_into(decoded, out).map_err(|e| e.to_string())?;
-        let resized: &Video = out;
+        let out = reuse(&mut self.scaled, tile_w, tile_h)?;
+        scaler
+            .run_into(decoded.frame(), out)
+            .map_err(|e| e.to_string())?;
+        let (resized, resized_stride) = out.plane(0).map_err(|e| e.to_string())?;
         let tile_rows = usize::try_from(tile_h).map_err(|_| "height overflow".to_owned())?;
         self.pool
             .attach_with(image, |plane| {
                 extract_alpha(
                     GRAY_U8,
-                    resized.data(0),
-                    resized.stride(0),
+                    resized,
+                    resized_stride,
                     tile_cols,
                     tile_rows,
                     plane,
@@ -226,20 +229,18 @@ fn geometry(e: impl std::fmt::Display) -> multiview_compositor::error::Error {
 
 /// The reused `GRAY8` frame in `slot`, reallocated only on a size change.
 ///
-/// The allocation is checked ([`multiview_ffmpeg::frame::alloc_video`]): a
-/// failed or oversized allocation is an error here, before `stride(0)` or
-/// `data_mut(0)` could touch a frame without planes.
-fn reuse(slot: &mut Option<Video>, w: u32, h: u32) -> Result<&mut Video, String> {
+/// The allocation is checked ([`ScratchFrame::alloc`]): a null `AVFrame`, a
+/// failed or oversized allocation is an error here, before any plane or
+/// accessor could touch a frame without planes.
+fn reuse(slot: &mut Option<ScratchFrame>, w: u32, h: u32) -> Result<&mut ScratchFrame, String> {
     if slot
         .as_ref()
-        .is_some_and(|f| f.width() != w || f.height() != h)
+        .is_some_and(|f| !f.matches(Pixel::GRAY8, w, h))
     {
         *slot = None;
     }
     if slot.is_none() {
-        *slot = Some(
-            multiview_ffmpeg::frame::alloc_video(Pixel::GRAY8, w, h).map_err(|e| e.to_string())?,
-        );
+        *slot = Some(ScratchFrame::alloc(Pixel::GRAY8, w, h).map_err(|e| e.to_string())?);
     }
     slot.as_mut()
         .ok_or_else(|| "alpha scratch frame unexpectedly absent".to_owned())
@@ -256,6 +257,7 @@ mod tests {
     )]
 
     use super::*;
+    use ffmpeg_next::util::frame::Video;
     use multiview_compositor::pipeline::CanvasColor;
     use multiview_ffmpeg::alpha::alpha_layout;
 
@@ -512,7 +514,26 @@ mod tests {
         assert!(slot.is_none());
         assert!(reuse(&mut slot, 0, 4).is_err());
         let frame = reuse(&mut slot, 7, 5).unwrap();
-        assert_eq!((frame.width(), frame.height(), frame.planes()), (7, 5, 1));
+        assert_eq!(
+            (frame.width(), frame.height(), frame.frame().planes()),
+            (7, 5, 1)
+        );
+    }
+
+    /// R3 round 2 #2: the tile-size scaler output is never an unchecked
+    /// `Video::empty()` (no null check on `av_frame_alloc`) handed to
+    /// `run_into`: before the first scaled frame no scratch exists, and after
+    /// it the scratch is a checked `ScratchFrame` at exactly the tile size.
+    #[test]
+    fn the_scaled_scratch_is_a_checked_tile_size_frame() {
+        let mut alpha = MediaAlpha::default();
+        assert!(alpha.scaled.is_none() && alpha.decoded.is_none());
+        let mut to_tile = super::super::TileScaler::new(4, 4);
+        let image = player_path(&yuva420p(8, 6), (4, 4), &mut alpha, &mut to_tile);
+        let scaled = alpha.scaled.as_ref().unwrap();
+        assert!(scaled.matches(Pixel::GRAY8, 4, 4));
+        assert!(scaled.plane(0).is_ok());
+        assert_eq!(image.alpha_plane().unwrap().len(), 16);
     }
 
     #[test]
@@ -523,14 +544,20 @@ mod tests {
         let first = player_path(&frame, (4, 4), &mut alpha, &mut to_tile);
         let plane = first.alpha_plane().unwrap().as_ptr();
         drop(first);
-        let decoded = alpha.decoded.as_ref().unwrap().data(0).as_ptr();
-        let scaled = alpha.scaled.as_ref().unwrap().data(0).as_ptr();
+        let decoded = alpha.decoded.as_ref().unwrap().frame().data(0).as_ptr();
+        let scaled = alpha.scaled.as_ref().unwrap().frame().data(0).as_ptr();
         assert_eq!(alpha.pool().retained(), 1);
         for _ in 0..16 {
             let image = player_path(&frame, (4, 4), &mut alpha, &mut to_tile);
             assert_eq!(image.alpha_plane().unwrap().as_ptr(), plane);
-            assert_eq!(alpha.decoded.as_ref().unwrap().data(0).as_ptr(), decoded);
-            assert_eq!(alpha.scaled.as_ref().unwrap().data(0).as_ptr(), scaled);
+            assert_eq!(
+                alpha.decoded.as_ref().unwrap().frame().data(0).as_ptr(),
+                decoded
+            );
+            assert_eq!(
+                alpha.scaled.as_ref().unwrap().frame().data(0).as_ptr(),
+                scaled
+            );
             drop(image);
             assert_eq!(alpha.pool().retained(), 1);
         }
