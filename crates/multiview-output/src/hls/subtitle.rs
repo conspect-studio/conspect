@@ -16,8 +16,9 @@
 //!   exact-size allocations), applied by the sampler before it retains,
 //!   compares or enqueues text and again (defensively) at the feed boundary.
 //! - [`render_vtt`] — one `.vtt` segment: the `X-TIMESTAMP-MAP` header and the
-//!   cues overlapping the segment on the rendition's shared `WebVTT` timeline
-//!   (RFC 8216 §3.5: a cue carries its total display interval).
+//!   cues [`SlotCues::publish`] chose, on the rendition's shared `WebVTT`
+//!   timeline (RFC 8216 §3.5: a known cue carries its total display interval;
+//!   a cue published while open becomes immutable, non-overlapping pieces).
 //! - [`unique_rendition_names`] — distinct `NAME`s for the `subs` group.
 //! - [`first_video_pts_90k`] — the 90 kHz PTS the first video PES of a written
 //!   MPEG-TS segment actually carries (the `MPEGTS` side of the map).
@@ -217,10 +218,9 @@ pub fn unique_rendition_names(renditions: &[SubtitleRendition]) -> Vec<String> {
 /// The engine sends a cue twice: **open** when it starts (`end` =
 /// [`SubtitleCue::OPEN_END`]) and **closed** when it changes (the real end).
 /// The sink merges the two by `(slot, start)`, so a cue that spans a segment
-/// boundary is written into every segment it covers with its total display
-/// interval (an open cue, whose end is not known yet, is ended at the
-/// closing segment's end and re-emitted with the same start, extended, in
-/// the next segment).
+/// boundary is written into every segment it covers: with its total display
+/// interval when its end was known at its first publication, else as one
+/// contiguous piece per segment (see [`SlotCues::publish`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleCue {
     /// The subtitle slot (index into the sink's renditions).
@@ -394,28 +394,44 @@ pub fn subtitle_feed_with_capacity(capacity: usize) -> (SubtitleFeed, SubtitleFe
     )
 }
 
+/// One held cue plus whether a piece of it was already published while it
+/// was still open (its end unknown).
+#[derive(Debug)]
+struct Held {
+    cue: SubtitleCue,
+    /// A segment carried a piece of this cue while it was open: from then on
+    /// it is published as contiguous, non-overlapping per-segment pieces,
+    /// never as one total interval (MED2-1).
+    rolling: bool,
+}
+
 /// The cues one slot holds between segment closes, bounded.
 #[derive(Debug, Default)]
 pub struct SlotCues {
-    cues: VecDeque<SubtitleCue>,
+    cues: VecDeque<Held>,
 }
 
 impl SlotCues {
     /// Hold `cue` (its text bounded); beyond [`MAX_HELD_CUES_PER_SLOT`] the
     /// cue that ends first is dropped and counted. A cue with the start of a
-    /// held open cue replaces it (its close); any other held open cue is
-    /// closed at this cue's start (a lost close never shows a cue forever
-    /// past its successor).
+    /// held open cue replaces it (its close; it inherits whether pieces of it
+    /// were already published); any other held open cue is closed at this
+    /// cue's start (a lost close never shows a cue forever past its
+    /// successor).
     pub fn push(&mut self, mut cue: SubtitleCue, stats: &SubtitleStats) {
+        let mut rolling = false;
+        self.cues.retain(|h| {
+            let replaced = h.cue.is_open() && h.cue.start == cue.start;
+            rolling |= replaced && h.rolling;
+            !replaced
+        });
         if cue.end <= cue.start {
             // An empty close still retires its open cue.
-            self.cues.retain(|c| !(c.is_open() && c.start == cue.start));
             return;
         }
-        self.cues.retain(|c| !(c.is_open() && c.start == cue.start));
         for held in &mut self.cues {
-            if held.is_open() && held.start < cue.start {
-                held.end = cue.start;
+            if held.cue.is_open() && held.cue.start < cue.start {
+                held.cue.end = cue.start;
             }
         }
         if !is_compact(&cue.lines, cue.lines.capacity()) {
@@ -428,13 +444,13 @@ impl SlotCues {
         if cue.lines.is_empty() {
             return;
         }
-        self.cues.push_back(cue);
+        self.cues.push_back(Held { cue, rolling });
         while self.cues.len() > MAX_HELD_CUES_PER_SLOT {
             let oldest = self
                 .cues
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, c)| c.end)
+                .min_by_key(|(_, h)| h.cue.end)
                 .map(|(i, _)| i);
             if let Some(i) = oldest {
                 self.cues.remove(i);
@@ -443,21 +459,62 @@ impl SlotCues {
         }
     }
 
-    /// The cues overlapping `[start, end)`, in start order.
+    /// The cues overlapping `[start, end)`, in start order (as held).
     #[must_use]
     pub fn overlapping(&self, start: MediaTime, end: MediaTime) -> Vec<&SubtitleCue> {
         let mut out: Vec<&SubtitleCue> = self
             .cues
             .iter()
+            .map(|h| &h.cue)
             .filter(|c| c.start < end && c.end > start)
             .collect();
         out.sort_by_key(|c| (c.start, c.end));
         out
     }
 
+    /// The cue intervals segment `[start, end)` publishes, in start order.
+    /// Published segments are immutable and clients merge the cues of all
+    /// loaded segments (hls.js de-duplicates only identical start/end/text),
+    /// so every published interval must stay true forever and copies may
+    /// never overlap:
+    ///
+    /// - a cue whose end is known and that was never published open carries
+    ///   its **total** interval in every segment it overlaps (RFC 8216 §3.5;
+    ///   identical copies, de-duplicated by the client);
+    /// - a cue still open (end unknown) carries the piece
+    ///   `[max(cue start, start), end)` and is marked rolling; from then on
+    ///   every segment carries its piece `[max(cue start, start),
+    ///   min(cue end, end))` — contiguous, non-overlapping pieces whose union
+    ///   is the cue's display time, through its close.
+    pub fn publish(&mut self, start: MediaTime, end: MediaTime) -> Vec<SubtitleCue> {
+        let mut out = Vec::new();
+        for held in &mut self.cues {
+            let cue = &held.cue;
+            if !(cue.start < end && cue.end > start) {
+                continue;
+            }
+            if cue.is_open() {
+                held.rolling = true;
+            }
+            let piece = if held.rolling {
+                SubtitleCue {
+                    slot: cue.slot,
+                    start: cue.start.max(start),
+                    end: cue.end.min(end),
+                    lines: cue.lines.clone(),
+                }
+            } else {
+                cue.clone()
+            };
+            out.push(piece);
+        }
+        out.sort_by_key(|c| (c.start, c.end));
+        out
+    }
+
     /// Forget every cue that ended at or before `edge` (already written).
     pub fn retire_before(&mut self, edge: MediaTime) {
-        self.cues.retain(|c| c.end > edge);
+        self.cues.retain(|h| h.cue.end > edge);
     }
 
     /// Number of cues held.
@@ -522,13 +579,13 @@ pub fn pts_90k_of(at: MediaTime) -> u64 {
 /// modulo 2^33 — so the pair is exact and a 33-bit PTS wrap between segments
 /// stays consistent (players resolve `MPEGTS` modulo 2^33).
 ///
-/// Every cue overlapping the segment follows with its **total** display
-/// interval on that timeline (RFC 8216 §3.5), never clipped to the segment.
-/// The one exception is a cue still open (end unknown): it is ended at the
-/// segment end and re-emitted with the same start, extended, in the next
-/// segment (and with its real end once its close arrives). A cue that started
-/// before `base` (before this rendition's first segment) starts at LOCAL zero.
-/// No cue ⇒ a header-only (valid) file.
+/// Every cue given follows with the interval it carries, on that timeline
+/// ([`SlotCues::publish`] decides it: a cue's total interval, RFC 8216 §3.5,
+/// or a contiguous per-segment piece of a cue published while open). A cue
+/// still marked open is written as the segment's piece `[max(start,
+/// seg_start), seg_end)`. A cue that started before `base` (before this
+/// rendition's first segment) starts at LOCAL zero. No cue ⇒ a header-only
+/// (valid) file.
 #[must_use]
 pub fn render_vtt(
     cues: &[&SubtitleCue],
@@ -556,11 +613,12 @@ pub fn render_vtt(
         vtt_time(seg_local - remainder_ns)
     );
     for cue in cues {
-        let start = local(cue.start);
-        let end = if cue.is_open() {
-            local(seg_end)
+        // An open cue (end unknown) is only ever the segment's piece: it never
+        // claims time before the segment (see `SlotCues::publish`).
+        let (start, end) = if cue.is_open() {
+            (local(cue.start.max(seg_start)), local(seg_end))
         } else {
-            local(cue.end)
+            (local(cue.start), local(cue.end))
         };
         if end <= start || cue.lines.is_empty() {
             continue;
@@ -983,6 +1041,95 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len());
+    }
+
+    /// Parse the cues of one rendered segment (on the shared timeline: every
+    /// segment of a rendition maps the same origin), as a client does.
+    fn client_cues(text: &str) -> Vec<(i64, i64, String)> {
+        let time = |t: &str| -> i64 {
+            let p: Vec<i64> = t.split([':', '.']).map(|x| x.parse().unwrap()).collect();
+            ((p[0] * 60 + p[1]) * 60 + p[2]) * 1000 + p[3]
+        };
+        let mut out = Vec::new();
+        let mut it = text.lines();
+        while let Some(line) = it.next() {
+            if let Some((a, b)) = line.split_once(" --> ") {
+                out.push((time(a), time(b), it.next().unwrap().to_owned()));
+            }
+        }
+        out
+    }
+
+    /// Run `events` (cue pushes keyed by the segment index before whose
+    /// publication they arrive) through 1-second segments, load every
+    /// segment's cues together de-duplicated by (start, end, text) as hls.js
+    /// does, and return how many copies are active at each 10 ms instant.
+    fn client_active_counts(events: &[(usize, SubtitleCue)], segments: usize) -> Vec<usize> {
+        let stats = SubtitleStats::default();
+        let mut held = SlotCues::default();
+        let mut loaded: Vec<(i64, i64, String)> = Vec::new();
+        for seg in 0..segments {
+            for (_, cue) in events.iter().filter(|(at, _)| *at == seg) {
+                held.push(cue.clone(), &stats);
+            }
+            let (start, end) = (
+                ms(i64::try_from(seg).unwrap() * 1_000),
+                ms(i64::try_from(seg + 1).unwrap() * 1_000),
+            );
+            let pieces = held.publish(start, end);
+            let text = render_vtt(&pieces.iter().collect::<Vec<_>>(), start, end, ms(0), 0);
+            for c in client_cues(&text) {
+                if !loaded.contains(&c) {
+                    loaded.push(c);
+                }
+            }
+            held.retire_before(end);
+        }
+        (0..i64::try_from(segments).unwrap() * 100)
+            .map(|t| {
+                let at = t * 10;
+                loaded
+                    .iter()
+                    .filter(|(a, b, _)| *a <= at && at < *b)
+                    .count()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_client_loading_every_segment_sees_one_copy_of_a_rolling_cue() {
+        // Open at 0.5 s (known at segment 0), still open through segments 0
+        // and 1, closed at 2.4 s before segment 2 is published.
+        let mut open = cue(0, 500, 0, &["rolling"]);
+        open.end = SubtitleCue::OPEN_END;
+        let events = [(0, open), (2, cue(0, 500, 2_400, &["rolling"]))];
+        let counts = client_active_counts(&events, 4);
+        for (i, n) in counts.iter().enumerate() {
+            let at = i64::try_from(i).unwrap() * 10;
+            let expected = usize::from((500..2_400).contains(&at));
+            assert_eq!(*n, expected, "at {at} ms: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn a_client_loading_every_segment_sees_one_copy_of_a_known_cue() {
+        // Its end is known before its first publication: the total interval
+        // in every segment it overlaps, identical copies de-duplicated.
+        let events = [(0, cue(0, 500, 2_400, &["known"]))];
+        let counts = client_active_counts(&events, 4);
+        for (i, n) in counts.iter().enumerate() {
+            let at = i64::try_from(i).unwrap() * 10;
+            let expected = usize::from((500..2_400).contains(&at));
+            assert_eq!(*n, expected, "at {at} ms: {counts:?}");
+        }
+        let stats = SubtitleStats::default();
+        let mut held = SlotCues::default();
+        held.push(cue(0, 500, 2_400, &["known"]), &stats);
+        assert_eq!(
+            held.publish(ms(1_000), ms(2_000))[0].start,
+            ms(500),
+            "total"
+        );
     }
 
     #[test]

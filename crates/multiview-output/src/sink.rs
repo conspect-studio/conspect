@@ -3448,8 +3448,9 @@ impl<'a> SegmentState<'a> {
             .unwrap_or_else(|| crate::hls::subtitle::pts_90k_of(start));
         for sub in &mut renditions.subtitles {
             let base = *sub.base.get_or_insert(start);
+            let pieces = sub.held.publish(start, end);
             let text = crate::hls::subtitle::render_vtt(
-                &sub.held.overlapping(start, end),
+                &pieces.iter().collect::<Vec<_>>(),
                 start,
                 end,
                 base,

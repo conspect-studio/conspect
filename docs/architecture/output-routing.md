@@ -2081,16 +2081,21 @@ restart".
   **as written** (read back from the video rendition's `.ts`, so the muxer's own offset is
   included; a test checks it against the real TS), moved back by the sub-millisecond remainder
   modulo 2^33 so the pair is exact and a 33-bit PTS wrap between segments stays on one timeline.
-  Then every cue overlapping the segment with its **total** display interval on that timeline
-  (RFC 8216 §3.5; never clipped), so a cue spanning segments has identical timestamps in each,
-  with `&`, `<`, `>` escaped. A cue whose end is not known yet (still open at the segment close)
-  is ended at the segment end and re-emitted with the same start, extended, in the next segment
-  (with its real end once the close arrives). An empty segment gets a header-only file. Old
-  `.vtt` files retire with the TS grace (`prune_prior_*`) only when named exactly
-  `subs<slot>-<index>.vtt` (all-digit fields, so e.g. `subs+1-1.vtt` is never touched); rendition
-  cleanup removes only
-  manifests matching the exact generated grammar `subs<slot>-g<generation>.m3u8` (parsed
-  numbers), so e.g. `subtitles.m3u8` or `subscriptions.m3u8` are never touched.
+  Then the cues overlapping the segment (`SlotCues::publish`), with `&`, `<`, `>` escaped.
+  Published segments are immutable and clients merge the cues of every loaded segment (hls.js
+  de-duplicates only identical start/end/text), so no published interval may later turn false
+  or overlap another copy. A cue whose end is known before its first publication carries its
+  **total** display interval in every segment it overlaps (RFC 8216 §3.5; identical copies), so it
+  has identical timestamps in each. A cue still open (end unknown) when a segment is published
+  becomes *rolling*: that segment carries the piece `[max(start, segment start), segment end)`,
+  each later segment the next contiguous piece, and the segment containing the close
+  `[segment start, end)`. The pieces never overlap and their union is the display time, so a
+  client sees exactly one copy at every instant (a test loads every segment together and counts
+  copies). An empty segment gets a header-only file. Old `.vtt` files retire with the TS grace
+  (`prune_prior_*`) only when named exactly `subs<slot>-<index>.vtt` (all-digit fields); rendition
+  cleanup removes only manifests matching the exact generated grammar
+  `subs<slot>-g<generation>.m3u8` (all-digit fields), so e.g. `subtitles.m3u8`,
+  `subscriptions.m3u8` or `subs+1-1.vtt` are never touched.
 - **Bounds.** Cue text is bounded to 4 lines and 512 bytes (`bound_cue_lines`: UTF-8 boundary
   safe, blank lines dropped, a fresh exact-size allocation, never the source's capacity). Its
   work is bounded too: it examines at most 16 source lines (blank ones included) and 4 KiB of
