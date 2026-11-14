@@ -2630,6 +2630,12 @@ struct IngestPlan {
     live_anchor: LiveAnchorSlot,
     /// Authoritative source lifecycle shared by video, audio and captions.
     lifecycle: u64,
+    /// The source's compressed passthrough tap (output-routing §12.5, #344
+    /// D2a), registered in [`crate::passthrough_tap`]'s wait-free lookup. The
+    /// demux reader offers each video packet to it only while a passthrough
+    /// consumer exists (one atomic load otherwise). `None` for producers with
+    /// no compressed stream (players, synthetic, tests).
+    tap: Option<Arc<crate::passthrough_tap::SourceTap>>,
     /// Whether this is a live (continuous, never-EOF) source. Live sources are
     /// reopened on EOF/error (a transient HLS/RTSP drop reconnects); a finite
     /// file/VOD source plays once and then holds its last frame.
@@ -10756,6 +10762,7 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
             store.filter(|_| self.clear_on_remove)
         });
         let lifecycle = remove_live_lifecycle(id);
+        crate::passthrough_tap::forget(id);
         if let Some(store) = retired_store {
             store.clear();
         }
@@ -14511,6 +14518,7 @@ fn ingest_plan_for(
         output_origin: crate::timing_status::anchor_slot(),
         live_anchor: live_anchor_slot(&source.id),
         lifecycle: 0,
+        tap: Some(crate::passthrough_tap::source_tap(&source.id)),
         live,
         #[cfg(feature = "overlay")]
         incontainer_sub: None,
@@ -14721,6 +14729,7 @@ fn build_media_player_boot(
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             // A media player is a finite asset played under transport control;
             // it is not a live (reconnect-forever) source — the player loop owns
             // its own loop/hold lifecycle.
@@ -17204,6 +17213,10 @@ fn open_and_stream(
     // error (docs/architecture/local-capture-devices.md).
     let is_device = matches!(plan.location, SourceLocation::Device { .. });
     let mut last_device_frame = Instant::now();
+    // The compressed passthrough tap (output-routing §12.5, #344 D2a): one
+    // writer per connection, fed on the demux thread. Without a consumer it
+    // costs one atomic load per video packet; it never blocks this thread.
+    let mut tap_writer = tap_writer_for(plan, &input, stream_index, declared_fps);
     let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
         let mut packet = ffmpeg::codec::packet::Packet::empty();
         match packet.read(&mut input) {
@@ -17225,6 +17238,9 @@ fn open_and_stream(
                 last_device_frame = Instant::now();
                 if packet.stream() == stream_index {
                     video_fence = video_fence.saturating_add(1);
+                    if let (Some(writer), Some(bytes)) = (tap_writer.as_mut(), packet.data()) {
+                        writer.on_packet(bytes, packet.dts(), packet.pts(), packet.is_key());
+                    }
                 }
                 Some(ReadItem::Packet((video_fence, packet)))
             }
@@ -18212,6 +18228,53 @@ fn heartbeat_player_hold(
             }),
         );
     }
+}
+
+/// The passthrough tap writer for this connection of `plan` (#344 D2a), or
+/// `None` when the plan has no tap or the stream's codec/framing is not one
+/// the strict-IDR classifier models. Bumps the tap's connection generation
+/// and publishes the stream's match-rule traits. Arrival times are read from
+/// the run's monotonic time source (wait-free); before a run seeds the writer
+/// skips packets (counted), so a passthrough clock never sees a mixed base.
+fn tap_writer_for(
+    plan: &IngestPlan,
+    input: &ffmpeg::format::context::Input,
+    stream_index: usize,
+    declared_fps: Rational,
+) -> Option<crate::passthrough_tap::TapWriter> {
+    let tap = plan.tap.as_ref()?;
+    let stream = input.stream(stream_index)?;
+    let params = stream.parameters();
+    let (codec, framing) = multiview_ffmpeg::stream_framing(&params)?;
+    let facts = multiview_ffmpeg::video_stream_facts(&params);
+    let open = crate::passthrough_tap::OpenFacts {
+        codec,
+        framing,
+        time_base: multiview_ffmpeg::from_ff_rational(stream.time_base()),
+        frame_rate: declared_fps,
+        profile: facts.profile,
+        level: facts.level,
+        width: facts.width,
+        height: facts.height,
+        color_primaries: facts.color_primaries,
+        color_trc: facts.color_trc,
+        color_space: facts.color_space,
+        color_range: facts.color_range,
+        field_order: facts.field_order,
+        bits_per_raw_sample: facts.bits_per_raw_sample,
+        extradata: facts.extradata,
+    };
+    let origin = Arc::clone(&plan.output_origin);
+    let now_ns = Box::new(move || {
+        origin
+            .load()
+            .and_then(|run| u64::try_from(run.time().now_nanos()).ok())
+    });
+    Some(crate::passthrough_tap::TapWriter::connect(
+        Arc::clone(tap),
+        open,
+        now_ns,
+    ))
 }
 
 /// Resolve the best video stream's `(index, codec parameters, time-base,
@@ -23026,6 +23089,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -23198,6 +23262,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -23314,6 +23379,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,

@@ -253,6 +253,39 @@ pub fn mpeg2_sequence_header(au: &[u8]) -> Option<&[u8]> {
     au.get(start..end)
 }
 
+/// Whether an H.264 access unit is a **reference** picture: its first coded
+/// slice NAL (types 1..=5) has `nal_ref_idc != 0`. `None` when the access unit
+/// carries no slice NAL (or the framing cannot carry one). Other codecs: the
+/// caller treats every picture as a reference (fail safe for passthrough).
+#[must_use]
+pub fn h264_is_reference(au: &[u8], framing: NalFraming) -> Option<bool> {
+    let mut found = None;
+    for_each_nal(au, framing, |nal| match nal.first() {
+        Some(&b) if (1..=5).contains(&(b & 0x1F)) => {
+            found = Some(b & 0x60 != 0);
+            true
+        }
+        _ => false,
+    });
+    found
+}
+
+/// The first parameter-set NAL of H.264 type `nal_type` (7 = SPS, 8 = PPS)
+/// in `au` (header byte included), or `None`.
+#[must_use]
+pub fn h264_nal_of_type(au: &[u8], framing: NalFraming, nal_type: u8) -> Option<&[u8]> {
+    let mut found = None;
+    for_each_nal(au, framing, |nal| {
+        if nal.first().is_some_and(|&b| b & 0x1F == nal_type) {
+            found = Some(nal);
+            true
+        } else {
+            false
+        }
+    });
+    found
+}
+
 /// Every NAL unit of `au` under `framing` (empty NALs skipped).
 fn collect_nals<'a>(au: &'a [u8], framing: NalFraming, out: &mut Vec<&'a [u8]>) {
     for_each_nal(au, framing, |nal| {
@@ -469,8 +502,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        is_idr, is_self_contained_idr, mpeg2_sequence_header, parameter_sets, read_leb128,
-        CodecKind, NalFraming,
+        h264_is_reference, h264_nal_of_type, is_idr, is_self_contained_idr, mpeg2_sequence_header,
+        parameter_sets, read_leb128, CodecKind, NalFraming,
     };
 
     #[test]
@@ -711,5 +744,35 @@ mod tests {
             CodecKind::Other,
             NalFraming::AnnexB
         ));
+    }
+
+    #[test]
+    fn h264_reference_reads_the_first_slice_nal_ref_idc() {
+        // 3-byte start codes: a 4-byte one leaves its leading zero on the NAL before.
+        let sc = [0u8, 0, 1];
+        let au = |hdrs: &[u8]| -> Vec<u8> {
+            hdrs.iter()
+                .flat_map(|&h| sc.iter().copied().chain([h, 0xAA]))
+                .collect()
+        };
+        // SPS (ref 3) then a non-reference P slice (nal_ref_idc 0, type 1).
+        assert_eq!(
+            h264_is_reference(&au(&[0x67, 0x01]), NalFraming::AnnexB),
+            Some(false)
+        );
+        assert_eq!(
+            h264_is_reference(&au(&[0x09, 0x41]), NalFraming::AnnexB),
+            Some(true)
+        );
+        assert_eq!(
+            h264_is_reference(&au(&[0x67, 0x68]), NalFraming::AnnexB),
+            None
+        );
+        let a = au(&[0x67, 0x68, 0x65]);
+        assert_eq!(
+            h264_nal_of_type(&a, NalFraming::AnnexB, 8),
+            Some(&[0x68, 0xAA][..])
+        );
+        assert_eq!(h264_nal_of_type(&a, NalFraming::AnnexB, 6), None);
     }
 }

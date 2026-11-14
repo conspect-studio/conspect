@@ -679,21 +679,7 @@ impl Demuxer {
     /// random-access structure this classifier does not model.
     #[must_use]
     pub fn stream_idr_framing(&self, index: usize) -> Option<(CodecKind, NalFraming)> {
-        let params = self.input.stream(index)?.parameters();
-        let codec = match params.id() {
-            ffmpeg::codec::Id::H264 => CodecKind::H264,
-            ffmpeg::codec::Id::HEVC => CodecKind::Hevc,
-            ffmpeg::codec::Id::AV1 => CodecKind::Av1,
-            _ => return None,
-        };
-        let framing = match codec {
-            // AV1 is carried as the low-overhead OBU stream.
-            CodecKind::Av1 => NalFraming::Obu,
-            // H.264 / HEVC: avcC/hvcC extradata ⇒ length-prefixed; else Annex-B.
-            CodecKind::H264 | CodecKind::Hevc => nal_framing_from_extradata(&params)?,
-            CodecKind::Other => return None,
-        };
-        Some((codec, framing))
+        stream_framing(&self.input.stream(index)?.parameters())
     }
 
     /// Read the next coded packet from any stream, or [`None`] at end-of-stream.
@@ -1205,6 +1191,94 @@ mod ffi_open {
 }
 
 use ffi_open::{ensure_devices_registered, open_input_with_format, open_input_with_interrupt};
+
+/// The `(codec, framing)` pair of a demuxed stream's codec parameters (see
+/// [`Demuxer::stream_idr_framing`]), for callers that hold the parameters of
+/// an `Input` they opened themselves. `None` for a codec the IDR classifier
+/// does not model or a malformed avcC/hvcC record.
+#[must_use]
+pub fn stream_framing(params: &Parameters) -> Option<(CodecKind, NalFraming)> {
+    let codec = match params.id() {
+        ffmpeg::codec::Id::H264 => CodecKind::H264,
+        ffmpeg::codec::Id::HEVC => CodecKind::Hevc,
+        ffmpeg::codec::Id::AV1 => CodecKind::Av1,
+        _ => return None,
+    };
+    let framing = match codec {
+        // AV1 is carried as the low-overhead OBU stream.
+        CodecKind::Av1 => NalFraming::Obu,
+        // H.264 / HEVC: avcC/hvcC extradata ⇒ length-prefixed; else Annex-B.
+        CodecKind::H264 | CodecKind::Hevc => nal_framing_from_extradata(params)?,
+        CodecKind::Other => return None,
+    };
+    Some((codec, framing))
+}
+
+/// The raw video facts of a demuxed stream's codec parameters that the
+/// passthrough match rules need (output-routing §12.5): plain libav scalars
+/// (ISO/IEC 23091-2 code points for the colour fields, which libav's enums
+/// equal) plus a copy of the extradata. Read once per (re)connect, never per
+/// packet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VideoStreamFacts {
+    /// `profile` (libav; `-99` unknown).
+    pub profile: i32,
+    /// `level` (libav; `-99` unknown).
+    pub level: i32,
+    /// Width in pixels (`0` unknown).
+    pub width: u32,
+    /// Height in pixels (`0` unknown).
+    pub height: u32,
+    /// `color_primaries` code point (2 = unspecified).
+    pub color_primaries: i32,
+    /// `color_trc` code point (2 = unspecified).
+    pub color_trc: i32,
+    /// `color_space` (matrix coefficients) code point (2 = unspecified).
+    pub color_space: i32,
+    /// `color_range` (libav: 0 unspecified, 1 MPEG/limited, 2 JPEG/full).
+    pub color_range: i32,
+    /// `field_order` (libav: 0 unknown, 1 progressive, 2..=5 interlaced).
+    pub field_order: i32,
+    /// `bits_per_raw_sample` (`0` unknown).
+    pub bits_per_raw_sample: i32,
+    /// The codec extradata (avcC/hvcC or Annex-B sets; empty when none).
+    pub extradata: Vec<u8>,
+}
+
+/// Read [`VideoStreamFacts`] from `params`.
+#[must_use]
+#[allow(unsafe_code)]
+// reason(allow as_conversions): the colour / field-order fields are bindgen
+// `#[repr(u32)]` C enums; `as u32` is the only discriminant read (no From).
+#[allow(clippy::as_conversions)]
+pub fn video_stream_facts(params: &Parameters) -> VideoStreamFacts {
+    // SAFETY: `params.as_ptr()` is a valid `AVCodecParameters` for the borrow
+    // of `params`. Every field read here is a plain scalar (or the extradata
+    // pointer + size, copied into an owned Vec within the borrow). Nothing is
+    // written and no pointer escapes.
+    unsafe {
+        let raw = params.as_ptr();
+        let len = usize::try_from((*raw).extradata_size).unwrap_or(0);
+        let extradata = if (*raw).extradata.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts((*raw).extradata, len).to_vec()
+        };
+        VideoStreamFacts {
+            profile: (*raw).profile,
+            level: (*raw).level,
+            width: u32::try_from((*raw).width).unwrap_or(0),
+            height: u32::try_from((*raw).height).unwrap_or(0),
+            color_primaries: i32::try_from((*raw).color_primaries as u32).unwrap_or(2),
+            color_trc: i32::try_from((*raw).color_trc as u32).unwrap_or(2),
+            color_space: i32::try_from((*raw).color_space as u32).unwrap_or(2),
+            color_range: i32::try_from((*raw).color_range as u32).unwrap_or(0),
+            field_order: i32::try_from((*raw).field_order as u32).unwrap_or(0),
+            bits_per_raw_sample: (*raw).bits_per_raw_sample,
+            extradata,
+        }
+    }
+}
 
 /// Read the NAL framing of an H.264 / HEVC stream from its codec extradata.
 ///
