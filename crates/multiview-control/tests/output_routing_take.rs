@@ -2239,9 +2239,13 @@ async fn apply_layout_with_a_switcher_is_switcher_owns_program_and_reserves_no_k
         detail.contains("POST /api/v1/routing/output/take"),
         "{detail}"
     );
-    // Review M3: a layout is not yet a switcher source (the next PR of #307),
-    // so the refusal never advertises selecting one.
-    assert!(!detail.contains("select_preview"), "{detail}");
+    // #307 PR 2: a stored layout IS a switcher source now, so the refusal
+    // names that operation (it advertised nothing while it did not exist).
+    assert!(
+        detail.contains("/api/v1/switcher/commands/select_preview")
+            && detail.contains("{\"layout\":\"schema_v1\"}"),
+        "{detail}"
+    );
     assert!(detail.contains("target"), "{detail}");
     assert_eq!(
         rig.state.idempotency.usage().0,
