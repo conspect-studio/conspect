@@ -218,6 +218,24 @@ pub struct OutputTakeRequest {
     pub principal: String,
 }
 
+/// An atomic multi-crosspoint set of output takes (ADR-0110 decision 8,
+/// output-routing.md §12.8, #308), already authorized and validated by the
+/// HTTP layer. Every member lands at one adoption tick or none does; each
+/// member reports one [`OutputOutcome`] carrying the set's `operation_id`.
+#[derive(Debug, Clone)]
+pub struct OutputTakeSet {
+    /// The set's operation id (echoed in every member's outcome).
+    pub operation_id: String,
+    /// The authenticated key id the set is charged to (never client input).
+    pub principal: String,
+    /// One take per distinct output, each with a video feed. The members'
+    /// own `operation_id`/`principal` are ignored (the set's apply).
+    pub members: Vec<OutputTakeRequest>,
+    /// The mixer half's handshake, shared with the `SwitcherVerb::PatchArmed`
+    /// the caller sends to the switcher (`None`: no mixer member).
+    pub arm: Option<Arc<multiview_engine::patch_set::SetArm>>,
+}
+
 /// Why a take could not be enqueued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TakeSubmitError {
@@ -443,6 +461,15 @@ pub trait OutputRouting: Send + Sync {
     /// # Errors
     /// [`TakeSubmitError`] when it cannot be enqueued.
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError>;
+    /// Enqueue an authorized atomic set without waiting (#308). The default
+    /// refuses: an engine without set support never half-applies one.
+    ///
+    /// # Errors
+    /// [`TakeSubmitError`] when it cannot be enqueued.
+    fn try_take_set(&self, set: OutputTakeSet) -> Result<(), TakeSubmitError> {
+        let _ = set;
+        Err(TakeSubmitError::Unroutable)
+    }
     /// A stored layout changed in the accepted library (ADR-0108 §10.1):
     /// `Some(body)` is its newly resolved body (outputs on it follow it live,
     /// at an IDR); `None` means it was deleted or no longer routes (outputs
@@ -1255,6 +1282,49 @@ pub async fn persist_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine without set support (the trait default) refuses a set
+    /// whole instead of half-applying it (#308).
+    #[test]
+    fn the_default_set_seam_refuses_unroutable() {
+        struct NoSets;
+        impl OutputRouting for NoSets {
+            fn plan(&self, _: &str, _: &RoutedFeed) -> Result<PlanCost, PlanRefusal> {
+                Err(PlanRefusal::OutputKindUnroutable)
+            }
+            fn plan_audio(
+                &self,
+                _: &str,
+                _: Option<&RoutedFeed>,
+                _: Option<&RoutedAudio>,
+            ) -> Result<AudioPlanCost, PlanRefusal> {
+                Err(PlanRefusal::OutputKindUnroutable)
+            }
+            fn try_take(&self, _: OutputTakeRequest) -> Result<(), TakeSubmitError> {
+                Ok(())
+            }
+            fn snapshot(&self) -> Option<RoutingLive> {
+                None
+            }
+            fn subscribe_outcomes(&self) -> Option<std::sync::mpsc::Receiver<OutputOutcome>> {
+                None
+            }
+        }
+        let set = OutputTakeSet {
+            operation_id: "op".into(),
+            principal: "p".into(),
+            members: vec![OutputTakeRequest {
+                operation_id: String::new(),
+                output: "out".into(),
+                video: Some(RoutedFeed::Program),
+                audio: None,
+                layout: None,
+                principal: String::new(),
+            }],
+            arm: Some(Arc::new(multiview_engine::patch_set::SetArm::new())),
+        };
+        assert_eq!(NoSets.try_take_set(set), Err(TakeSubmitError::Unroutable));
+    }
 
     #[test]
     fn per_principal_state_is_bounded_by_the_lru_cap() {
