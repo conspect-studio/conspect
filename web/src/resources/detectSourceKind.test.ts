@@ -122,6 +122,17 @@ describe('detectSourceKind — file paths', () => {
     expect(d?.suggestedName).toBe('clip.mp4');
   });
 
+  it('percent-decodes a file:// URL path (spaces, Unicode, literal percent)', () => {
+    expect(detectSourceKind('file:///media/My%20Clip.mp4')?.locator).toBe('/media/My Clip.mp4');
+    expect(detectSourceKind('file:///media/caf%C3%A9.mp4')?.locator).toBe('/media/café.mp4');
+    expect(detectSourceKind('file:///media/100%25.mp4')?.locator).toBe('/media/100%.mp4');
+    expect(detectSourceKind('file:///media/My%20Clip.mp4')?.suggestedName).toBe('My Clip.mp4');
+  });
+
+  it('keeps a malformed escape in a file:// URL without throwing', () => {
+    expect(detectSourceKind('file:///media/bad%ZZ.mp4')?.locator).toBe('/media/bad%ZZ.mp4');
+  });
+
   it('detects a file:// URL', () => {
     const d = detectSourceKind('file:///media/clip.mp4');
     expect(d?.kind).toBe('file');

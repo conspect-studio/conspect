@@ -101,6 +101,15 @@ function parseYoutubeLocator(
   return undefined;
 }
 
+/** Percent-decode a `file:` URL pathname; a malformed escape returns it unchanged. */
+function decodeFilePath(pathname: string): string {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
+}
+
 /** Whether `path` (ignoring query/fragment, already stripped by `URL`) ends in `.m3u8`. */
 function isM3u8Path(pathname: string): boolean {
   return /\.m3u8$/i.test(pathname);
@@ -145,7 +154,9 @@ export function detectSourceKind(
   const scheme = url.protocol.endsWith(':') ? url.protocol.slice(0, -1).toLowerCase() : url.protocol.toLowerCase();
 
   if (scheme === 'file') {
-    const path = url.pathname;
+    // `URL` keeps percent-encoding; the engine opens the literal path, so
+    // decode it (a malformed escape keeps the encoded form, never throws).
+    const path = decodeFilePath(url.pathname);
     const base = path.split('/').filter((p) => p !== '').pop() ?? 'file';
     const id = dedupeId(slugify(base), existingIds);
     return {
