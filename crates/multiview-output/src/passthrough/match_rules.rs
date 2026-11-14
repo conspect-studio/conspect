@@ -325,7 +325,13 @@ impl StreamMeter {
             .ring
             .iter()
             .zip(self.ring.iter().skip(1))
-            .all(|(a, b)| (i128::from(b.dts) - i128::from(a.dts)) * k == rhs);
+            // Checked: an overflowing product (hostile timestamps / time base)
+            // is never a frame period, so it is not CFR.
+            .all(|(a, b)| {
+                (i128::from(b.dts) - i128::from(a.dts))
+                    .checked_mul(k)
+                    .is_some_and(|lhs| lhs == rhs)
+            });
         Some(ok)
     }
 
@@ -366,7 +372,7 @@ impl StreamMeter {
             .map(|s| i128::try_from(s.size).unwrap_or(i128::MAX / 16))
             .sum();
         // bits / (span * tb.num / tb.den)
-        let denom = span * i128::from(tb.num);
+        let denom = span.checked_mul(i128::from(tb.num))?;
         if denom <= 0 {
             return None;
         }
@@ -403,7 +409,8 @@ fn valid_tb(r: Rational) -> bool {
 fn covers(tb: Rational, from: i64, to: i64) -> bool {
     // (to - from) * tb.num / tb.den >= WINDOW
     let span = i128::from(to) - i128::from(from);
-    span * i128::from(tb.num) >= i128::from(METER_WINDOW_SECS) * i128::from(tb.den)
+    // Saturating: an overflow can only mean "longer than the window".
+    span.saturating_mul(i128::from(tb.num)) >= i128::from(METER_WINDOW_SECS) * i128::from(tb.den)
 }
 
 /// Evaluate the match rules; `Ok(())` when the source can be passed through.
@@ -766,5 +773,22 @@ mod tests {
             MatchMiss::NotEnoughHistory.to_string(),
             "not-enough-history"
         );
+    }
+
+    #[test]
+    fn overflowing_cfr_products_are_not_cfr_and_never_panic() {
+        // R1-A3: (i64::MAX - 0) * tb.num * rate.num overflowed i128.
+        let huge = Rational::new(i64::MAX, 1);
+        let mut m = StreamMeter::new();
+        m.push(0, 0, 10, true, huge);
+        m.push(i64::MAX, i64::MAX, 10, true, huge);
+        assert!(m.window_full());
+        assert_eq!(m.is_cfr(Rational::new(i64::MAX, 1)), Some(false));
+        let _ = m.bitrate_bps();
+        let mut m = StreamMeter::new();
+        m.push(i64::MIN, i64::MIN, 10, true, huge);
+        m.push(i64::MAX, i64::MAX, 10, true, huge);
+        assert_eq!(m.is_cfr(Rational::new(i64::MAX, 1)), Some(false));
+        let _ = m.bitrate_bps();
     }
 }
