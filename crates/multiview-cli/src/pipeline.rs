@@ -3939,7 +3939,7 @@ impl Pipeline {
         };
         #[cfg(not(feature = "overlay"))]
         let resolve: crate::subtitle_slots::CueResolver = {
-            let _ = stores;
+            drop(stores);
             Box::new(|_: &str, _: MediaTime| None)
         };
         crate::subtitle_slots::SubtitleRun::new(outputs, resolve, self.cadence)
