@@ -669,6 +669,48 @@ async fn cut_auto_and_tie_are_202_with_an_outcome_on_the_engine_tick() {
     );
 }
 
+/// Review H2: a retry of a `keyer_auto` whose ramp has started answers the
+/// original 202 and `operation_id` (the idempotency record is resolved before
+/// the state-dependent `keyer-ramping` admission), and enqueues nothing; a
+/// fresh key for the same request is still refused 409 `keyer-ramping`.
+#[tokio::test]
+async fn a_keyer_auto_retry_during_its_ramp_replays_the_first_202() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = rig(&path);
+    let mut outcomes = rig.handle.outcomes();
+    let auto = body(
+        "keyer_auto",
+        json!({"keyer":"dsk1","on":true,"duration_frames":10}),
+    );
+    let response = command(&rig, FULL, "ramp-1", &auto).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let op = body_json(response).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tick(&mut rig.driver, 1);
+    assert!(rig.handle.snapshot().unwrap().keyers[0]
+        .unwrap()
+        .ramp
+        .is_some());
+    let replay = command(&rig, FULL, "ramp-1", &auto).await;
+    assert_eq!(replay.status(), StatusCode::ACCEPTED, "the retry replays");
+    let replay = body_json(replay).await;
+    assert_eq!(replay["operation_id"], op.as_str());
+    assert_eq!(replay["kind"], "keyer_auto");
+    // A different key is a new request: the ramp refuses it.
+    let (status, kind) = kind_of(command(&rig, FULL, "ramp-2", &auto).await).await;
+    assert_eq!(
+        (status, kind.as_str()),
+        (StatusCode::CONFLICT, "keyer-ramping")
+    );
+    tick(&mut rig.driver, 2);
+    // Only the ramp's own start outcome so far: the replay enqueued nothing.
+    while let Ok(item) = outcomes.try_recv() {
+        assert_eq!(item.event.operation_id, op, "nothing else was enqueued");
+    }
+}
+
 #[tokio::test]
 async fn a_full_mailbox_is_503_and_releases_the_key_and_the_leases() {
     let (_dir, path) = temp_boot(DOC);

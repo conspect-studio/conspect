@@ -9,10 +9,11 @@
 //! `Program` scope, `Control` on the keyer object id `<program>/<keyer>`,
 //! `Read` on every named source) — **before** any existence answer and before
 //! the `Idempotency-Key` is looked at. A scoped principal therefore cannot
-//! probe which keyers or sources exist. Then shape (`in:<n>` refused 422),
-//! existence against the engine's committed definitions, the on-air guard,
-//! admission (`capacity`, the Clean rule), and only for a command the key (a
-//! replay answers its first 202), the reservation, the leases and the bounded
+//! probe which keyers or sources exist. Then shape (`in:<n>` refused 422);
+//! for a command the key lookup (a replay answers its first 202 before any
+//! state-dependent check, review H2); existence against the engine's
+//! committed definitions, the on-air guard, admission (`capacity`, the Clean
+//! rule), and for a command the reservation, the leases and the bounded
 //! `try_send` (full → 503, key and leases released).
 //!
 //! The control plane has one object axis, so `Control` and `Read` on an id
@@ -249,6 +250,24 @@ fn shape(kind: &str, fields: &KeyerFields, other_refs: bool) -> Result<String, B
     }
 }
 
+/// The request-shape checks of a keyer verb (no engine or repository state):
+/// `duration_frames` only on `keyer_auto`, the verb's own fields, `in:<n>`
+/// refused, a keyer id. Returns the keyer id.
+fn request_shape(req: &super::switcher::SwitcherRequest) -> Result<String, Box<Response>> {
+    let kind = req.action.as_str();
+    if req.duration_frames.is_some() && kind != "keyer_auto" {
+        return Err(Box::new(typed(
+            422,
+            "validation",
+            "duration_frames applies to keyer_auto only",
+        )));
+    }
+    if kind == "keyer_auto" {
+        auto_rate(req.duration_frames)?;
+    }
+    shape(kind, &req.keyer, other_refs(req))
+}
+
 /// A keyer verb validated against the engine, ready to enqueue.
 pub struct Checked {
     /// The engine verb.
@@ -334,14 +353,7 @@ pub fn check(
 ) -> ControlResult<Result<Checked, Response>> {
     let kind = req.action.as_str();
     let fields = &req.keyer;
-    if req.duration_frames.is_some() && kind != "keyer_auto" {
-        return Ok(Err(typed(
-            422,
-            "validation",
-            "duration_frames applies to keyer_auto only",
-        )));
-    }
-    let keyer = match shape(kind, fields, other_refs(req)) {
+    let keyer = match request_shape(req) {
         Ok(keyer) => keyer,
         Err(response) => return Ok(Err(*response)),
     };
@@ -1007,6 +1019,23 @@ pub fn submit(
     scene_version: u64,
 ) -> ControlResult<Response> {
     use crate::concurrency::Reservation;
+    // Authorization ran in the caller; the request shape is stateless.
+    if let Err(response) = request_shape(req) {
+        return Ok(*response);
+    }
+    let Some(key) = idem.0.as_deref().filter(|key| !key.trim().is_empty()) else {
+        return Err(ControlError::Validation(
+            "Idempotency-Key is required".into(),
+        ));
+    };
+    // A retry answers its first 202 before any state-dependent admission
+    // (review H2): the ramp a first `keyer_auto` started, or the DSK a first
+    // `keyer_set` defined, must not turn its own retry into a 409. The key
+    // is scoped per principal and path (`IdempotencyKey`), so this never
+    // answers another principal's operation.
+    if let Some(op) = state.idempotency.peek(key) {
+        return Ok(accepted(op.to_string(), &req.action));
+    }
     let checked = match check(state, principal, handle, req)? {
         Ok(checked) => checked,
         Err(response) => return Ok(response),
@@ -1014,11 +1043,6 @@ pub fn submit(
     if let Some(refused) = &checked.plan.refusal {
         return Ok(typed(409, &refused.kind, refused.detail.clone()));
     }
-    let Some(key) = idem.0.as_deref().filter(|key| !key.trim().is_empty()) else {
-        return Err(ControlError::Validation(
-            "Idempotency-Key is required".into(),
-        ));
-    };
     let op = match state.idempotency.reserve(Some(key)) {
         Reservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         Reservation::Replay(op) => return Ok(accepted(op.to_string(), &req.action)),

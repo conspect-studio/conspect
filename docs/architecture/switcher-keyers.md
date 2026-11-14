@@ -730,7 +730,11 @@ keyers.
   `on_at_start` and `on_air`. `keyer_auto` takes its optional rate override in the existing
   `duration_frames` (1..=300). The handlers dispatch keyer verbs to `routes::switcher_keyers`
   right after BOLA. The background verbs are unchanged and refuse keyer fields.
-  - Commands use the same `Idempotency-Key` store (a replay answers the first 202), the same
+  - Commands use the same `Idempotency-Key` store (a replay answers the first 202), resolved
+    right after authorization and the stateless request shape and **before** any
+    state-dependent admission (review round 1 H2): a retry of a `keyer_auto` whose ramp has
+    started, or of a `keyer_set` that already applied, replays its 202 instead of answering
+    409. A fresh request that then fails admission reserves nothing. They also use the same
     202 `SwitcherAccepted {operation_id, kind}` and the same 64-slot `try_send` (503
     `engine-busy`, key and leases released). Outcomes ride `switcher.operation` unchanged.
   - The engine verbs are K2a's `KeyerCut`/`KeyerAuto`/`KeyerTie`. The control plane maps
@@ -856,6 +860,8 @@ keyers.
     - a Viewer and a ReadOnly key holding every grant are 403 on `/plan` for all four verbs
       (H1);
     - 202 plus outcome, replay and ramp refusal;
+    - a `keyer_auto` retry during its own ramp replays the first 202, enqueuing nothing, while
+      a new key is 409 `keyer-ramping` (H2);
     - 503 on a full mailbox, releasing the key and the leases;
     - `in:<n>` refused with 422;
     - `capacity` generic for scoped callers, totals for unscoped, a repeated refusal leaving
