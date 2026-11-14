@@ -2161,7 +2161,9 @@ A formatted output falls back to its own base key (Program at its format).
 ### 12.5 Passthrough and invariant #1
 
 **Match rules** (all required; any miss means P1-P3): a constant frame rate (every source DTS
-delta exactly one frame period over the last 10 s); codec equal; profile and level within the
+delta exactly one frame period over the last 10 s); codec equal; profile on the codec's explicit
+decoder-compatibility ladder at or below the slot's (Extended, scalable, multiview and other
+profiles off the ladder never match; plain Baseline only into a Baseline slot) and level within the
 slot's settings; coded size equal to the slot's; frame rate exactly equal (as a rational) to the
 output's; scan equal; all four colour tags equal (primaries, transfer, matrix, range; untagged is
 not equal); bit depth and chroma equal; the source's measured GOP not longer than the medium allows
@@ -2283,6 +2285,48 @@ continuous PCR from those timestamps. The rule then depends only on the paramete
 
 (ADR-0108's slice-1 behaviour of refusing parameter-set changes on non-TS outputs ends, per medium,
 once that muxer writes its rule.)
+
+**As built in slice D, part D1 (#344).** The core is pure Rust and always compiled:
+`crates/multiview-output/src/passthrough/` (`tap.rs`, `match_rules.rs`, `clock.rs`) and
+`crates/multiview-ffmpeg/src/h264_repeat.rs`. Differences from the text above:
+- *The tap.* `CompressedTap` gives each consumer (8 at most) its own bounded
+  `sync_channel` of 64 AUs. The writer only `try_send`s and the clock only `try_recv`s. A full
+  channel drops the **newest** AU for that consumer only, and the drop is counted. That happens
+  when the consumer's clock is dead or wedged, and also for a live clock when a demux burst puts
+  more than 64 unread AUs in its channel between two of its ticks (a clock takes at most 16 per
+  tick). The drop-oldest bound is the clock's jitter buffer (8 AUs), where ordinary jitter is
+  absorbed. Any AU loss is a DTS gap for that clock: a stall at the missing AU's tick, so the slot
+  bridges and returns after 30 on-time ticks; it never emits a picture that references a lost one.
+  The writer never blocks: it `try_lock`s its sender list (held only by `subscribe`, which builds
+  its channel first) and drops the AU, counted as `contended`, when it is held; a reader's `Drop`
+  never locks (the writer prunes disconnected senders). An AU over `MAX_AU_BYTES` (8 MiB) is
+  dropped and counted, at the tap and in the clock.
+- *Timestamps.* Conversion to ticks is relative to a per-stream epoch (the first AU's DTS,
+  re-anchored after a malformed AU, a time-base change or a DTS off the epoch's grid), so an
+  absolute source DTS need not be a whole number of frame periods. All offset arithmetic is
+  checked; an overflow, or a converted magnitude above 2^62 ticks, is `malformed`.
+- *Presentation delay.* After a run with B-frames the bridge carries one constant presentation
+  delay (`pts = tick + d`, `d = max(0, max emitted PTS + 1 - t)`), so a bridge picture never
+  presents at or before a picture already emitted; a new run adds the smallest constant delay that
+  puts its IDR after everything emitted (at most 8 ticks, else the slot stays bridged with
+  `presentation-delay` until the output signals a discontinuity and the timeline is reset).
+- *Start of a run.* The first IDR of a run gets `dts' = max(tick, arrival tick + 3)`, so it waits
+  `TARGET_DEPTH` ticks in the buffer (the bridge fills those ticks) and the run starts with
+  3 ticks of depth.
+- *Too deep with B-frames.* The drop set is the decode-order suffix before the IDR. It starts at
+  the queued AU with the highest PTS among the AUs after the previous IDR. For IBBP that is the
+  last P and the B after it. For a P-only source it is the AU before the IDR. The IDR and
+  everything after it shift back by the size of the drop set. This is applied only if every AU
+  kept before the IDR presents before the IDR's new PTS; otherwise it waits for the next IDR.
+- *Repeat AU.* H.264 only. HEVC has no repeat AU yet, so an HEVC underrun stalls and bridges.
+  The H.264 repeat sets `num_ref_idx_l0_active` to 1, so it copies `RefPicList0[0]`. That is the
+  previous picture only when the previous picture is a short-term reference marked by the sliding
+  window, so it returns `None` (and the clock does not correct) after a non-reference picture,
+  adaptive reference marking (any MMCO), or a long-term IDR, and also for POC type 1, MBAFF, FMO,
+  separate colour planes and intra-only profiles. Its parsing is bounded (parameter sets up to
+  4 KiB, a 4 KiB slice-header prefix, at most 1024 NALs).
+- *Return after a stall that hid a parameter change.* An IDR whose parameter generation differs
+  from the previous run's always needs the 300-tick parameter-change wait.
 
 **Audio with passthrough video.** Audio is always decoded and re-encoded on the global AAC grid
 (ADR-0108 §5.2). For lip sync, the audio of a passthrough slot is read at the source time of the
