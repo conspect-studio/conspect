@@ -179,6 +179,8 @@ struct FakeRouting {
     takes: Mutex<Vec<OutputTakeRequest>>,
     refuse: Mutex<Option<String>>,
     no_encoder: Mutex<bool>,
+    /// The plan answers this refusal (a DSK defined refuses Clean, K2a).
+    plan_refusal: Mutex<Option<PlanRefusal>>,
     tx: SyncSender<OutputOutcome>,
     rx: Mutex<Option<Receiver<OutputOutcome>>>,
 }
@@ -206,6 +208,7 @@ impl FakeRouting {
             takes: Mutex::new(Vec::new()),
             refuse: Mutex::new(None),
             no_encoder: Mutex::new(false),
+            plan_refusal: Mutex::new(None),
             tx,
             rx: Mutex::new(Some(rx)),
         })
@@ -220,6 +223,9 @@ impl FakeRouting {
 
 impl OutputRouting for FakeRouting {
     fn plan(&self, _output: &str, _feed: &RoutedFeed) -> Result<PlanCost, PlanRefusal> {
+        if let Some(refusal) = *self.plan_refusal.lock().unwrap() {
+            return Err(refusal);
+        }
         Ok(PlanCost {
             needs_encoder: *self.no_encoder.lock().unwrap(),
             sessions_in_use: 4,
@@ -722,6 +728,33 @@ async fn refusals_pass_through_and_release_the_stream() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(doc["detail"], "the cast directory is not writable");
+}
+
+/// ADR-0113 K2a: a cast of Clean while a downstream keyer is defined is
+/// refused exactly as a take is (409 `clean-unavailable-with-dsk`), and no
+/// stream or take is left behind.
+#[tokio::test]
+async fn a_cast_of_clean_with_a_dsk_defined_is_refused() {
+    let rig = rig();
+    *rig.routing.plan_refusal.lock().unwrap() = Some(PlanRefusal::CleanUnavailableWithDsk);
+    let (status, doc) = create(
+        &rig,
+        OPERATOR_TOKEN,
+        serde_json::json!({"feed": {"bus": "clean"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{doc}");
+    assert_eq!(doc["type"], "/problems/clean-unavailable-with-dsk");
+    assert!(rig.routing.takes().is_empty(), "no take was submitted");
+    let list = body_json(
+        send(
+            &rig.router,
+            support::get("/api/v1/cast/streams", OPERATOR_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(list.as_array().unwrap().len(), 0, "no stream was created");
 }
 
 #[tokio::test]

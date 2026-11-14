@@ -115,6 +115,9 @@ pub enum ConsumerClass {
     AlwaysOn,
     /// An operator pressed Start.
     Manual,
+    /// A defined downstream or upstream keyer keeps its fill and key warm
+    /// (ADR-0113 §4); labelled with the keyer object id (`main/dsk1`).
+    Keyer,
 }
 
 impl ConsumerClass {
@@ -130,6 +133,7 @@ impl ConsumerClass {
             Self::EventAutomation => "event_automation",
             Self::AlwaysOn => "always_on",
             Self::Manual => "manual",
+            Self::Keyer => "keyer",
         }
     }
 }
