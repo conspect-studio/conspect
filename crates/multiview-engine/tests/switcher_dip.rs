@@ -388,7 +388,10 @@ fn the_snapshot_carries_the_selected_transition_after_its_command_tick() {
     let done = rig.handle.snapshot().unwrap();
     assert!(!done.in_flight);
     assert_eq!(done.completion_count, flight.completion_count + 1);
-    assert_eq!(done.transition, selected, "completion restores nothing: it never changed");
+    assert_eq!(
+        done.transition, selected,
+        "completion restores nothing: it never changed"
+    );
 }
 
 /// Invariant #1 allocation gate: the colour is coded once per distinct colour,

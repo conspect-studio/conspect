@@ -629,7 +629,10 @@ async fn an_applied_selection_is_persisted_after_the_tick_and_survives_a_reload(
     );
     // An AUTO interrupted by a CUT leaves it too.
     for (id, verb) in [
-        ("auto-2", SwitcherVerb::Auto(FrameCount::try_from(3).unwrap())),
+        (
+            "auto-2",
+            SwitcherVerb::Auto(FrameCount::try_from(3).unwrap()),
+        ),
         ("cut", SwitcherVerb::Cut),
     ] {
         handle
@@ -673,7 +676,10 @@ fn the_documented_transition_schema_is_a_tagged_union_matching_the_core_type() {
         request.to_string().contains("TransitionDescriptorDoc"),
         "{request}"
     );
-    assert!(state.to_string().contains("TransitionDescriptorDoc"), "{state}");
+    assert!(
+        state.to_string().contains("TransitionDescriptorDoc"),
+        "{state}"
+    );
     let union = &schemas["TransitionDescriptorDoc"];
     let variants = union["oneOf"].as_array().expect("oneOf");
     let mut kinds: Vec<&str> = variants
@@ -683,7 +689,15 @@ fn the_documented_transition_schema_is_a_tagged_union_matching_the_core_type() {
     kinds.sort_unstable();
     assert_eq!(
         kinds,
-        ["cut", "dip", "dve_push", "dve_squeeze", "mix", "stinger", "wipe"]
+        [
+            "cut",
+            "dip",
+            "dve_push",
+            "dve_squeeze",
+            "mix",
+            "stinger",
+            "wipe"
+        ]
     );
     for case in [
         json!({"kind": "cut"}),

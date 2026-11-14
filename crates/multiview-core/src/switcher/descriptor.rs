@@ -235,10 +235,7 @@ pub enum TransitionDescriptor {
         color: Option<Rgb8>,
         /// Where the outgoing/incoming swap happens under the dip: an exact
         /// rational in `(0, 1)`, defaulting to `1/2`.
-        #[serde(
-            default = "default_switch_point",
-            deserialize_with = "strict_rational"
-        )]
+        #[serde(default = "default_switch_point", deserialize_with = "strict_rational")]
         switch_point: Rational,
     },
     /// Per-tile SDF mask transition (wave 2).
@@ -396,7 +393,9 @@ fn no_fields<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D:
 
 /// A `{num, den}` that refuses unknown fields. [`Rational`] itself stays
 /// lenient: it is shared by every cadence/timebase document in the repo.
-fn strict_rational<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Rational, D::Error> {
+fn strict_rational<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Rational, D::Error> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Strict {
