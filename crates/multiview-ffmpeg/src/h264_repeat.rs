@@ -24,7 +24,14 @@
 //!   is not reconstructible from one slice header). Type 2 also refuses a
 //!   repeat after a non-reference picture (two consecutive non-reference
 //!   pictures are not allowed with POC type 2, §8.2.1.3).
-//! * A previous picture that used MMCO 5 is refused.
+//! * The previous picture must be what the default `RefPicList0[0]` holds: a
+//!   short-term reference marked by the sliding window. A non-reference
+//!   previous picture, adaptive reference marking (any MMCO, including 3, 5
+//!   and 6) or an IDR with `long_term_reference_flag` is refused.
+//! * Bounded work: SPS / PPS over 4 KiB are refused before unescaping; only
+//!   the first 4 KiB of the previous picture's first VCL NAL is unescaped
+//!   and parsed; at most 1024 NALs are examined and a zero-length NAL in
+//!   length-prefixed framing is malformed.
 //! * Scaling matrices in the SPS are parsed (§7.3.2.1.1.1), never guessed.
 //!
 //! ## The repeat picture
@@ -58,8 +65,17 @@ const MAX_PIC_SIZE_IN_MBS: u64 = 139_264;
 /// previous slice header (a real header has at most a few dozen).
 const MAX_SYNTAX_LOOP: usize = 128;
 
-/// Upper bound on the NAL units scanned in one previous access unit.
+/// Upper bound on the NAL units scanned in one previous access unit
+/// (zero-length NALs count).
 const MAX_NALS_PER_AU: usize = 1024;
+
+/// Largest SPS / PPS NAL accepted (bytes, before unescaping).
+const MAX_PARAM_SET_BYTES: usize = 4096;
+
+/// Bytes of the previous picture's first VCL NAL that are unescaped and
+/// parsed: a slice header fits well inside (the largest legal header with
+/// 32 list modifications, weights and 128 MMCOs is under 2 KiB).
+const MAX_SLICE_HEADER_BYTES: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Bit reading (RBSP, emulation prevention removed).
@@ -75,7 +91,7 @@ fn unescape(nal: &[u8]) -> Vec<u8> {
             continue;
         }
         if b == 0 {
-            zeros += 1;
+            zeros = zeros.saturating_add(1);
         } else {
             zeros = 0;
         }
@@ -233,7 +249,7 @@ fn escape(rbsp: &[u8]) -> Vec<u8> {
         }
         out.push(b);
         if b == 0 {
-            zeros += 1;
+            zeros = zeros.saturating_add(1);
         } else {
             zeros = 0;
         }
@@ -298,17 +314,17 @@ impl H264Sps {
         }
     }
 
-    /// `FrameHeightInMbs`.
+    /// `FrameHeightInMbs` (checked: `None` on overflow).
     #[must_use]
-    pub fn frame_height_in_mbs(&self) -> u64 {
+    pub fn frame_height_in_mbs(&self) -> Option<u64> {
         let factor = if self.frame_mbs_only { 1 } else { 2 };
-        u64::from(self.pic_height_in_map_units) * factor
+        u64::from(self.pic_height_in_map_units).checked_mul(factor)
     }
 
-    /// `PicSizeInMbs` of a frame.
+    /// `PicSizeInMbs` of a frame (checked: `None` on overflow).
     #[must_use]
-    pub fn frame_size_in_mbs(&self) -> u64 {
-        u64::from(self.pic_width_in_mbs) * self.frame_height_in_mbs()
+    pub fn frame_size_in_mbs(&self) -> Option<u64> {
+        u64::from(self.pic_width_in_mbs).checked_mul(self.frame_height_in_mbs()?)
     }
 }
 
@@ -378,6 +394,9 @@ fn skip_scaling_list(r: &mut BitReader<'_>, size: usize) -> Option<()> {
 #[must_use]
 pub fn parse_sps(nal: &[u8]) -> Option<H264Sps> {
     let nal = strip_start_code(nal);
+    if nal.len() > MAX_PARAM_SET_BYTES {
+        return None;
+    }
     let (&header, payload) = nal.split_first()?;
     if header & 0x80 != 0 || header & 0x1F != 7 {
         return None;
@@ -433,8 +452,10 @@ pub fn parse_sps(nal: &[u8]) -> Option<H264Sps> {
     }
     let max_num_ref_frames = r.ue_max(16)?;
     let _gaps_in_frame_num_value_allowed = r.flag()?;
-    let pic_width_in_mbs = r.ue_max(u32::MAX - 1)?.checked_add(1)?;
-    let pic_height_in_map_units = r.ue_max(u32::MAX - 1)?.checked_add(1)?;
+    // Each dimension alone is refused above Level 6.2 MaxFS before any product.
+    let max_dim = u32::try_from(MAX_PIC_SIZE_IN_MBS).ok()?;
+    let pic_width_in_mbs = r.ue_max(max_dim - 1)?.checked_add(1)?;
+    let pic_height_in_map_units = r.ue_max(max_dim - 1)?.checked_add(1)?;
     let frame_mbs_only = r.flag()?;
     let mb_adaptive_frame_field = if frame_mbs_only { false } else { r.flag()? };
     // direct_8x8_inference_flag must be readable: the fields above are only
@@ -460,7 +481,7 @@ pub fn parse_sps(nal: &[u8]) -> Option<H264Sps> {
         frame_mbs_only,
         mb_adaptive_frame_field,
     };
-    if sps.frame_size_in_mbs() > MAX_PIC_SIZE_IN_MBS {
+    if sps.frame_size_in_mbs()? > MAX_PIC_SIZE_IN_MBS {
         return None;
     }
     Some(sps)
@@ -473,6 +494,9 @@ pub fn parse_sps(nal: &[u8]) -> Option<H264Sps> {
 #[must_use]
 pub fn parse_pps(nal: &[u8]) -> Option<H264Pps> {
     let nal = strip_start_code(nal);
+    if nal.len() > MAX_PARAM_SET_BYTES {
+        return None;
+    }
     let (&header, payload) = nal.split_first()?;
     if header & 0x80 != 0 || header & 0x1F != 8 {
         return None;
@@ -492,7 +516,7 @@ pub fn parse_pps(nal: &[u8]) -> Option<H264Pps> {
     let num_ref_idx_l1_default_active = r.ue_max(31)? + 1;
     let weighted_pred = r.flag()?;
     let weighted_bipred_idc = r.bits(2)?;
-    let pic_init_qp = 26 + r.se()?;
+    let pic_init_qp = 26_i32.checked_add(r.se()?)?;
     let _pic_init_qs = r.se()?;
     let _chroma_qp_index_offset = r.se()?;
     let deblocking_filter_control_present = r.flag()?;
@@ -539,6 +563,10 @@ pub struct PrevSlice {
     pub pps_id: u32,
     /// Whether a `memory_management_control_operation` 5 was signalled.
     pub mmco5: bool,
+    /// Whether `adaptive_ref_pic_marking_mode_flag` was set (any MMCO).
+    pub adaptive_marking: bool,
+    /// An IDR's `long_term_reference_flag`.
+    pub long_term: bool,
 }
 
 /// Skip a `pred_weight_table()` (§7.3.3.2).
@@ -595,7 +623,8 @@ fn parse_slice_header(nal: &[u8], sps: &H264Sps, pps: &H264Pps) -> Option<PrevSl
     if header & 0x80 != 0 || !(nal_type == 1 || nal_type == 5) {
         return None;
     }
-    let rbsp = unescape(payload);
+    // Only a bounded prefix is unescaped (the header is at its start).
+    let rbsp = unescape(payload.get(..payload.len().min(MAX_SLICE_HEADER_BYTES))?);
     let mut r = BitReader::new(&rbsp);
     let _first_mb = r.ue()?;
     let slice_type = r.ue_max(9)? % 5;
@@ -661,11 +690,14 @@ fn parse_slice_header(nal: &[u8], sps: &H264Sps, pps: &H264Pps) -> Option<PrevSl
         skip_pred_weight_table(&mut r, sps.chroma_array_type(), l0, is_b.then_some(l1))?;
     }
     let mut mmco5 = false;
+    let mut adaptive_marking = false;
+    let mut long_term = false;
     if nal_ref_idc != 0 {
         if idr {
             let _no_output_of_prior_pics = r.flag()?;
-            let _long_term_reference = r.flag()?;
+            long_term = r.flag()?;
         } else if r.flag()? {
+            adaptive_marking = true;
             let mut done = false;
             for _ in 0..MAX_SYNTAX_LOOP {
                 match r.ue_max(6)? {
@@ -696,7 +728,79 @@ fn parse_slice_header(nal: &[u8], sps: &H264Sps, pps: &H264Pps) -> Option<PrevSl
         field_pic,
         pps_id,
         mmco5,
+        adaptive_marking,
+        long_term,
     })
+}
+
+/// The first VCL NAL (types 1 / 5) of an access unit, cut to at most
+/// [`MAX_SLICE_HEADER_BYTES`] + 1 bytes (header byte included). Bounded: at
+/// most [`MAX_NALS_PER_AU`] NALs are examined (zero-length ones count, and a
+/// zero-length NAL in length-prefixed framing is malformed), and an Annex-B
+/// NAL is scanned for its end only within the prefix window.
+fn first_vcl_prefix(au: &[u8], framing: NalFraming) -> Option<&[u8]> {
+    let is_vcl = |b: &[u8]| b.first().is_some_and(|&h| matches!(h & 0x1F, 1 | 5));
+    let window = MAX_SLICE_HEADER_BYTES + 1;
+    match framing {
+        NalFraming::AnnexB => {
+            let mut i = 0_usize;
+            let mut seen = 0_usize;
+            loop {
+                // Next start code at or after i.
+                let s = au
+                    .get(i..)?
+                    .windows(3)
+                    .position(|w| w == [0, 0, 1])
+                    .and_then(|p| i.checked_add(p)?.checked_add(3))?;
+                seen += 1;
+                if seen > MAX_NALS_PER_AU {
+                    return None;
+                }
+                let limit = au.len().min(s.saturating_add(window));
+                let region = au.get(s..limit)?;
+                let end = region
+                    .windows(3)
+                    .position(|w| w == [0, 0, 1])
+                    .map_or(region.len(), |p| p);
+                let mut body = region.get(..end)?;
+                while let Some(rest) = body.strip_suffix(&[0]) {
+                    body = rest;
+                }
+                if is_vcl(body) {
+                    return Some(body);
+                }
+                i = s;
+            }
+        }
+        NalFraming::LengthPrefixed { nal_length_size } => {
+            let size = usize::from(nal_length_size);
+            if !(1..=4).contains(&size) {
+                return None;
+            }
+            let mut off = 0_usize;
+            for _ in 0..MAX_NALS_PER_AU {
+                if off >= au.len() {
+                    return None;
+                }
+                let len = au
+                    .get(off..off.checked_add(size)?)?
+                    .iter()
+                    .fold(0_usize, |a, &b| (a << 8) | usize::from(b));
+                if len == 0 {
+                    return None;
+                }
+                let start = off + size;
+                let end = start.checked_add(len)?;
+                let body = au.get(start..end)?;
+                if is_vcl(body) {
+                    return body.get(..body.len().min(window));
+                }
+                off = end;
+            }
+            None
+        }
+        NalFraming::Obu => None,
+    }
 }
 
 /// Split an access unit into NAL bodies under `framing` (bounded).
@@ -743,9 +847,11 @@ fn split_nals(au: &[u8], framing: NalFraming) -> Option<Vec<&[u8]>> {
                 let start = off + size;
                 let end = start.checked_add(len)?;
                 let body = au.get(start..end)?;
-                if !body.is_empty() {
-                    out.push(body);
+                // A zero-length NAL is malformed framing.
+                if body.is_empty() {
+                    return None;
                 }
+                out.push(body);
                 if out.len() > MAX_NALS_PER_AU {
                     return None;
                 }
@@ -1022,7 +1128,7 @@ impl RepeatAuBuilder {
         {
             return None;
         }
-        let mbs = sps.frame_size_in_mbs();
+        let mbs = sps.frame_size_in_mbs()?;
         if mbs == 0 || mbs > MAX_PIC_SIZE_IN_MBS {
             return None;
         }
@@ -1051,11 +1157,19 @@ impl RepeatAuBuilder {
     /// Parse the previous access unit's first slice header.
     #[must_use]
     pub fn prev_slice(&self, prev_au: &[u8], framing: NalFraming) -> Option<PrevSlice> {
-        let nals = split_nals(prev_au, framing)?;
-        let vcl = nals
-            .into_iter()
-            .find(|n| n.first().is_some_and(|&h| matches!(h & 0x1F, 1 | 5)))?;
+        let vcl = first_vcl_prefix(prev_au, framing)?;
         parse_slice_header(vcl, &self.sps, &self.pps)
+    }
+
+    /// Whether the picture after `prev` may be a repeat of it: with a
+    /// default reference list (one active entry, no modification) the repeat
+    /// copies `RefPicList0[0]`, the short-term reference with the highest
+    /// `PicNum`. That is `prev` only when `prev` is a short-term reference
+    /// marked by the sliding window: refused after a non-reference picture,
+    /// adaptive marking (any MMCO, including 3 and 6) or an IDR marked long
+    /// term (R1-M3).
+    fn repeat_allowed(prev: &PrevSlice) -> bool {
+        prev.nal_ref_idc != 0 && !prev.adaptive_marking && !prev.mmco5 && !prev.long_term
     }
 
     /// The repeat AU to place right after `prev_au` (the previously emitted
@@ -1063,6 +1177,9 @@ impl RepeatAuBuilder {
     #[must_use]
     pub fn repeat_after(&self, prev_au: &[u8], framing: NalFraming) -> Option<Vec<u8>> {
         let prev = self.prev_slice(prev_au, framing)?;
+        if !Self::repeat_allowed(&prev) {
+            return None;
+        }
         let slice = self.slice_rbsp(&prev)?;
         // AUD: primary_pic_type 1 (I, P), then rbsp_trailing_bits.
         let aud: [u8; 2] = [0x09, 0x30];
@@ -1142,7 +1259,7 @@ impl RepeatAuBuilder {
             }
             w.bytes(data);
         } else {
-            let mbs = u32::try_from(sps.frame_size_in_mbs()).ok()?;
+            let mbs = u32::try_from(sps.frame_size_in_mbs()?).ok()?;
             w.ue(mbs); // mb_skip_run
             w.trailing_bits();
         }
@@ -1655,5 +1772,248 @@ mod tests {
         assert!(b
             .repeat_after(&annexb(&[&nal]), NalFraming::AnnexB)
             .is_none());
+    }
+
+    /// A CAVLC baseline P slice header (frame_num 3) with the given
+    /// `nal_ref_idc` and marking: `None` = sliding window, `Some(ops)` =
+    /// adaptive marking with `(mmco, args)` then 0.
+    fn p_slice(nal_ref_idc: u8, marking: Option<&[(u32, &[u32])]>) -> Vec<u8> {
+        let mut w = BitWriter::default();
+        w.ue(0);
+        w.ue(5);
+        w.ue(0);
+        w.bits(3, 4);
+        w.bit(0); // num_ref_idx_active_override_flag
+        w.bit(0); // ref_pic_list_modification_flag_l0
+        if nal_ref_idc != 0 {
+            match marking {
+                None => w.bit(0),
+                Some(ops) => {
+                    w.bit(1);
+                    for (op, args) in ops {
+                        w.ue(*op);
+                        for a in *args {
+                            w.ue(*a);
+                        }
+                    }
+                    w.ue(0);
+                }
+            }
+        }
+        w.se(0);
+        w.ue(1);
+        w.ue(300);
+        w.trailing_bits();
+        let mut nal = vec![(nal_ref_idc << 5) | 1];
+        nal.extend(escape(&w.into_bytes()));
+        nal
+    }
+
+    #[test]
+    fn repeat_refused_unless_prev_is_the_sliding_window_short_term_ref() {
+        // R1-M3: RefPicList0[0] is the previous picture only for a short-term
+        // reference marked by the sliding window.
+        let b = RepeatAuBuilder::new(BASE_SPS, BASE_PPS).unwrap();
+        let ok = p_slice(2, None);
+        assert!(b
+            .repeat_after(&annexb(&[&ok]), NalFraming::AnnexB)
+            .is_some());
+        let nonref = p_slice(0, None);
+        assert!(b
+            .repeat_after(&annexb(&[&nonref]), NalFraming::AnnexB)
+            .is_none());
+        for ops in [
+            &[(1_u32, &[0_u32][..])][..],
+            &[(3, &[0, 0][..])][..],
+            &[(6, &[0][..])][..],
+            &[(2, &[0][..]), (4, &[1][..])][..],
+        ] {
+            let nal = p_slice(2, Some(ops));
+            let prev = b.prev_slice(&annexb(&[&nal]), NalFraming::AnnexB).unwrap();
+            assert!(prev.adaptive_marking);
+            assert!(
+                b.repeat_after(&annexb(&[&nal]), NalFraming::AnnexB)
+                    .is_none(),
+                "adaptive marking {ops:?}"
+            );
+        }
+        // An IDR marked long-term.
+        let mut w = BitWriter::default();
+        w.ue(0);
+        w.ue(7);
+        w.ue(0);
+        w.bits(0, 4);
+        w.ue(0); // idr_pic_id
+        w.bit(0); // no_output_of_prior_pics
+        w.bit(1); // long_term_reference_flag
+        w.se(0);
+        w.ue(1);
+        w.trailing_bits();
+        let mut idr = vec![0x65];
+        idr.extend(escape(&w.into_bytes()));
+        let prev = b.prev_slice(&annexb(&[&idr]), NalFraming::AnnexB).unwrap();
+        assert!(prev.idr && prev.long_term);
+        assert!(b
+            .repeat_after(&annexb(&[&idr]), NalFraming::AnnexB)
+            .is_none());
+        // The real x264 IDR (short-term) still repeats.
+        assert!(b
+            .repeat_after(&annexb(&[BASE_IDR]), NalFraming::AnnexB)
+            .is_some());
+    }
+
+    #[test]
+    fn pic_init_qp_overflow_is_refused() {
+        // R1-A1: se() of ue 4294967293 is +2147483647; 26 + that overflowed.
+        let mut w = BitWriter::default();
+        w.ue(0);
+        w.ue(0);
+        w.bits(0, 2);
+        w.ue(0);
+        w.ue(0);
+        w.ue(0);
+        w.bits(0, 3);
+        w.ue(4_294_967_293); // pic_init_qp_minus26 = +2^31 - 1
+        w.se(0);
+        w.se(0);
+        w.bits(0b100, 3);
+        w.trailing_bits();
+        let mut nal = vec![0x68];
+        nal.extend(w.into_bytes());
+        assert!(parse_pps(&nal).is_none());
+    }
+
+    #[test]
+    fn huge_dimensions_are_refused_without_overflow() {
+        // R1-A2: width/height near u32::MAX must never multiply unchecked.
+        for (wm1, hm1, fmo) in [
+            (u32::MAX - 2, u32::MAX - 2, false),
+            (u32::MAX - 2, 0, true),
+            (0, u32::MAX - 2, false),
+            (70_000, 70_000, true),
+        ] {
+            let mut w = BitWriter::default();
+            w.ue(0);
+            w.ue(0);
+            w.ue(2);
+            w.ue(1);
+            w.bit(0);
+            w.ue(wm1);
+            w.ue(hm1);
+            w.bit(u32::from(fmo));
+            if !fmo {
+                w.bit(0);
+            }
+            w.bit(1);
+            w.trailing_bits();
+            let mut nal = vec![0x67, 0x42, 0xc0, 0x0d];
+            nal.extend(w.into_bytes());
+            assert!(parse_sps(&nal).is_none(), "{wm1}x{hm1}");
+        }
+        let sps = H264Sps {
+            pic_width_in_mbs: u32::MAX,
+            pic_height_in_map_units: u32::MAX,
+            frame_mbs_only: false,
+            ..parse_sps(BASE_SPS).unwrap()
+        };
+        assert_eq!(
+            sps.frame_size_in_mbs(),
+            u64::from(u32::MAX).checked_mul(2 * u64::from(u32::MAX))
+        );
+        let sps = H264Sps {
+            pic_width_in_mbs: u32::MAX,
+            ..sps
+        };
+        assert!(sps.frame_height_in_mbs().is_some());
+    }
+
+    #[test]
+    fn work_is_bounded() {
+        // R1-A6: oversize parameter sets are refused before unescaping.
+        let mut big_sps = BASE_SPS.to_vec();
+        big_sps.resize(MAX_PARAM_SET_BYTES + 1, 0);
+        assert!(parse_sps(&big_sps).is_none());
+        let mut big_pps = BASE_PPS.to_vec();
+        big_pps.resize(MAX_PARAM_SET_BYTES + 1, 0);
+        assert!(parse_pps(&big_pps).is_none());
+        // A huge previous slice: only the prefix is parsed; still correct.
+        let b = RepeatAuBuilder::new(BASE_SPS, BASE_PPS).unwrap();
+        let mut big = BASE_P1.to_vec();
+        big.resize(4 * 1024 * 1024, 0x55);
+        let lp = NalFraming::LengthPrefixed { nal_length_size: 4 };
+        let prev = frame_nals(&[&big], lp).unwrap();
+        assert!(b.repeat_after(&prev, lp).is_some());
+        assert!(b
+            .repeat_after(&annexb(&[&big]), NalFraming::AnnexB)
+            .is_some());
+        assert!(first_vcl_prefix(&prev, lp).unwrap().len() <= MAX_SLICE_HEADER_BYTES + 1);
+        // Zero-length NALs in length-prefixed framing are malformed and are
+        // never an unbounded loop.
+        let zeros = vec![0_u8; 1 << 20];
+        assert!(b.repeat_after(&zeros, lp).is_none());
+        assert!(split_nals(&zeros, lp).is_none());
+        // Many non-VCL NALs before the VCL: capped.
+        let aud: &[u8] = &[0x09, 0x30];
+        let mut nals: Vec<&[u8]> = vec![aud; MAX_NALS_PER_AU + 1];
+        nals.push(BASE_P1);
+        assert!(b.repeat_after(&annexb(&nals), NalFraming::AnnexB).is_none());
+        assert!(b
+            .repeat_after(&frame_nals(&nals, lp).unwrap(), lp)
+            .is_none());
+        // The emulation counters saturate (no overflow on long zero runs).
+        assert_eq!(unescape(&[0; 70_000]).len(), 70_000);
+        assert!(escape(&[0; 70_000]).len() > 70_000);
+    }
+
+    #[test]
+    fn truncated_parameter_sets_and_slices_return_none() {
+        // T1: every truncation below the first complete parse is None, and
+        // parsing is monotone in the prefix length.
+        for full in [BASE_SPS, HIGH_SPS, HB_SPS] {
+            let first = (0..=full.len())
+                .find(|&n| parse_sps(&full[..n]).is_some())
+                .unwrap();
+            assert!(first > 5, "a usable SPS needs its fields");
+            for n in 0..first {
+                assert!(parse_sps(&full[..n]).is_none(), "SPS prefix {n}");
+            }
+            for n in first..=full.len() {
+                assert_eq!(parse_sps(&full[..n]), parse_sps(full), "SPS prefix {n}");
+            }
+        }
+        for full in [BASE_PPS, HIGH_PPS, HB_PPS] {
+            let first = (0..=full.len())
+                .find(|&n| parse_pps(&full[..n]).is_some())
+                .unwrap();
+            for n in 0..first {
+                assert!(parse_pps(&full[..n]).is_none(), "PPS prefix {n}");
+            }
+        }
+        let b = RepeatAuBuilder::new(HIGH_SPS, HIGH_PPS).unwrap();
+        let first = (1..=HIGH_P3.len())
+            .find(|&n| {
+                b.repeat_after(&annexb(&[&HIGH_P3[..n]]), NalFraming::AnnexB)
+                    .is_some()
+            })
+            .unwrap();
+        assert!(first > 3);
+        for n in 1..first {
+            assert!(
+                b.repeat_after(&annexb(&[&HIGH_P3[..n]]), NalFraming::AnnexB)
+                    .is_none(),
+                "slice prefix {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn cabac_tables_match_spec_literals() {
+        // T1: independent spot values from ITU-T H.264 Tables 9-44 / 9-45.
+        assert_eq!(RANGE_TAB_LPS[0], [128, 176, 208, 240]);
+        assert_eq!(RANGE_TAB_LPS[12], [77, 94, 111, 128]);
+        assert_eq!(RANGE_TAB_LPS[63], [2, 2, 2, 2]);
+        assert_eq!(TRANS_IDX_LPS[..5], [0, 0, 1, 2, 2]);
+        assert_eq!(TRANS_IDX_LPS[62], 38);
+        assert_eq!(TRANS_IDX_LPS[63], 63);
     }
 }
