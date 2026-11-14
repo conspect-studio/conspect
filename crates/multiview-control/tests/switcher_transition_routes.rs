@@ -805,3 +805,56 @@ async fn unrepresentable_transition_numbers_are_typed_invalid_transition_422s() 
     tick(&mut driver, 1);
     assert!(outcomes.try_recv().is_err(), "a refusal queues nothing");
 }
+
+/// P3R2-C: a retry of an accepted `set_transition` with its original
+/// Idempotency-Key during a later AUTO replays the original 202 and operation
+/// id; it is not refused by the transient active-take check, and queues nothing.
+#[tokio::test]
+async fn a_replay_during_an_auto_returns_the_original_operation() {
+    let (h, handle, mut driver) = rig();
+    let mut outcomes = handle.outcomes();
+    let dip = json!({"kind": "dip", "rate": 10});
+    let first = send(
+        &h.router,
+        command(&set(dip.clone()), OPERATOR_TOKEN, "orig"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let op = body_json(first).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tick(&mut driver, 1);
+    assert_eq!(outcomes.try_recv().unwrap().event.operation_id, op);
+    handle
+        .try_send(SwitcherCommand {
+            operation_id: "auto".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::Auto(FrameCount::try_from(10).unwrap()),
+        })
+        .unwrap();
+    tick(&mut driver, 2);
+    assert!(handle.snapshot().unwrap().in_flight);
+    while outcomes.try_recv().is_ok() {}
+    let replay = send(
+        &h.router,
+        command(&set(dip.clone()), OPERATOR_TOKEN, "orig"),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replayed = body_json(replay).await;
+    assert_eq!(replayed["operation_id"], op.as_str());
+    assert_eq!(replayed["kind"], "set_transition");
+    // A fresh key is still refused by the active-take check.
+    let fresh = send(&h.router, command(&set(dip), OPERATOR_TOKEN, "fresh")).await;
+    assert_eq!(fresh.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    tick(&mut driver, 3);
+    let mut ids = Vec::new();
+    while let Ok(item) = outcomes.try_recv() {
+        ids.push(item.event.operation_id.clone());
+    }
+    assert!(
+        !ids.iter().any(|id| id == &op),
+        "the replay queued nothing: {ids:?}"
+    );
+}

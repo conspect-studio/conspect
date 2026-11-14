@@ -83,8 +83,13 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    `invalid-transition` for a shape or number the machine refuses, an
    unknown field or a field of another kind (the descriptor and its switch
    point deny unknown fields, in the API and in a persisted config alike), or
-   a rate above 1000 frames. A selection while a take is in flight is refused
-   before enqueue, and the engine re-checks every rule at the tick. The
+   a rate above 1000 frames, including a number JSON cannot carry (`1e400`,
+   `NaN`) inside `transition`; other malformed bodies keep the body
+   extractor's rejection. A selection while a take is in flight is refused
+   before enqueue, and the engine re-checks every rule at the tick. A retry
+   with an already-reserved Idempotency-Key is answered with its original
+   202 after authorization and static validation, before the transient
+   bus/active-take/scene checks; a fresh key passes every check first. The
    checks are shared, not copied: `TransitionDescriptor::is_valid` /
    `is_rendered`. `GET /api/v1/switcher/me1` reports the engine snapshot's
    `transition`. The OpenAPI document publishes the descriptor as a
@@ -105,7 +110,8 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    parameter draft starts from the confirmed selection in GET; a later
    engine change updates every field without an unsaved local edit, and
    applying keeps the selection's fields the desk does not expose
-   (`position_xy`, `switch_point`). It has a
+   (`position_xy`, `switch_point`). A band without a `border_color` stays
+   colourless until the operator sets the border colour or width. It has a
    picker with the five patterns as SVG thumbnails, reverse, softness,
    border width/colour and a dip colour, a 50 % preview thumbnail, and an
    AUTO title naming the selected kind. AUTO still sends only its

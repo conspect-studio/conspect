@@ -557,11 +557,24 @@ pub(crate) async fn submit_switcher(
         Err(response) => return Ok(*response),
     };
     authorize_target(&principal, target.as_ref())?;
+    let verb = verb(&req, &kind, target.as_ref(), transition)?;
+    // P3R2-C: authorization and static validation are done; an EXISTING
+    // reservation is a replay and answers its original 202 before the
+    // transient admission checks (buses, an active take, the scene), which
+    // describe the engine now rather than the request. `peek` never reserves;
+    // a fresh key still passes every check below before `reserve`.
+    if let Some(op) = idem
+        .0
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .and_then(|key| state.idempotency.peek(key))
+    {
+        return Ok(accepted(&op, kind));
+    }
     validate_buses(handle, &req, target.as_ref())?;
     let scene_version = handle
         .scene_version()
         .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;
-    let verb = verb(&req, &kind, target.as_ref(), transition)?;
     // The request's lease is acquired only on the Fresh reservation arm below;
     // a replay never changes PVW demand. Keep the old lease through admission.
     let demand = state.source_demand.clone();
