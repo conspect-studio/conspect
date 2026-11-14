@@ -340,7 +340,8 @@ fn a_transition_change_during_a_take_is_refused_and_the_flight_keeps_its_dip() {
 
 /// ADR-0112 §4: the published snapshot reports the selection from the tick
 /// the command was applied on, never before, and a refused selection leaves
-/// it unchanged. An AUTO freezes its own rate into the flight's descriptor.
+/// it unchanged. An AUTO's own rate is the flight's, never the selection's:
+/// the snapshot keeps reporting the operator's selection during and after it.
 #[test]
 fn the_snapshot_carries_the_selected_transition_after_its_command_tick() {
     let mut rig = rig();
@@ -375,19 +376,19 @@ fn the_snapshot_carries_the_selected_transition_after_its_command_tick() {
     let before = rig.handle.snapshot().unwrap();
     rig.step(3);
     assert!(Arc::ptr_eq(&before, &rig.handle.snapshot().unwrap()));
-    // The AUTO's rate is the flight's rate; the kind stays the selection.
+    // The AUTO's rate is the flight's rate; the snapshot keeps the selection.
     rig.send("auto", SwitcherVerb::Auto(FrameCount::try_from(5).unwrap()));
     rig.step(4);
     let flight = rig.handle.snapshot().unwrap();
     assert!(flight.in_flight);
-    assert_eq!(
-        flight.transition.rate(),
-        Some(FrameCount::try_from(5).unwrap())
-    );
-    assert!(matches!(
-        flight.transition,
-        TransitionDescriptor::Wipe { .. }
-    ));
+    assert_eq!(flight.transition, selected, "the selection, not the flight");
+    for index in 5..=9 {
+        rig.step(index);
+    }
+    let done = rig.handle.snapshot().unwrap();
+    assert!(!done.in_flight);
+    assert_eq!(done.completion_count, flight.completion_count + 1);
+    assert_eq!(done.transition, selected, "completion restores nothing: it never changed");
 }
 
 /// Invariant #1 allocation gate: the colour is coded once per distinct colour,
