@@ -716,3 +716,149 @@ keyers.
     `EventStream` cost), never per tick.
   - **Upload weight.** `u` is uncalibrated.
   - **Extra reads.** Each keyer on air adds 1–2 lock-free `read_at` per tick.
+
+### K4 (#389): keyer control API
+
+- **Routes.** No new route. `keyer_cut`, `keyer_auto`, `keyer_tie` and `keyer_set` are actions on
+  `POST /api/v1/switcher/plan` and `POST /api/v1/switcher/commands/{kind}`. `SwitcherRequest`
+  flattens `KeyerFields`: `keyer`, `on`, `tie`, and the `keyer_set` fields `fill`, `key`, `type`,
+  `clip`, `gain`, `invert`, `mask`, `fly`, `max_source`, `rate`, `loss`, `loss_trigger`, `z`,
+  `on_at_start` and `on_air`. `keyer_auto` takes its optional rate override in the existing
+  `duration_frames` (1..=300). The handlers dispatch keyer verbs to `routes::switcher_keyers`
+  right after BOLA. The background verbs are unchanged and refuse keyer fields.
+  - Commands use the same `Idempotency-Key` store (a replay answers the first 202), the same
+    202 `SwitcherAccepted {operation_id, kind}` and the same 64-slot `try_send` (503
+    `engine-busy`, key and leases released). Outcomes ride `switcher.operation` unchanged.
+  - The engine verbs are K2a's `KeyerCut`/`KeyerAuto`/`KeyerTie`. The control plane maps
+    `keyer` ids to indices through the committed definitions. K4 adds
+    `SwitcherVerb::KeyerSet {keyer, def, allow_on_air}`.
+- **BOLA (plan and command, before any existence answer or key).** The checks run in
+  `authorize_refs` after the role gate (`Read` for plan, `Write` for command):
+  `authorize_object(me)`, `Program(program)`, `authorize_object("<program>/<keyer>")` and
+  `authorize_object` on every named `fill`/`key`. The control plane has one object axis, so
+  `Control` and `Read` on an id are both that grant, and the role separates them (as for
+  every other switcher verb). An unknown keyer that the caller may not see is a 403, never a
+  404. A readable unknown keyer is 404 `unknown-keyer`. A denied request burns no key.
+- **Shape.** `in:<n>` as fill or key is 422 `keyer-source-not-a-source`. Each verb accepts only
+  its own fields. `duration_frames` outside 1..=300 is 422 `keyer-rate`.
+- **`keyer_set` (class 1, one tick).**
+  - **Merge.** The request is merged onto the committed definition. A free slot defines a new
+    DSK: `fill` is required, z defaults to max + 1, and the other fields take the config
+    defaults.
+  - **Validation.** The merged entry is checked with the config's own per-definition rules
+    (`DownstreamKeyerConfig::validate_definition`, the same checks boot validation runs: source
+    exists, `chroma`/`premultiplied` refused by name, geometry, `max_source`, mask). The
+    cross-keyer rules are then checked against the live set: unique z, at most 2 DSKs (409
+    `capacity`), and the budget.
+  - **Resolve.** The definition is resolved off the clock (`SwitcherControl::resolve_keyer`,
+    against the stores and canvas published once at attach) into an `Arc<KeyerDef>`. The tick
+    only moves that `Arc` in.
+  - **At the tick.** `KeyerRuntime::define` rechecks the summed cost (`REFUSE_KEYER_CAPACITY`),
+    a unique id and z, and that a slot keeps its id for life (`keyer-definition`). It also
+    rechecks the on-air guard (`REFUSE_KEYER_ON_AIR_PROTECTED`). A fill or key change of a keyer
+    on air or ramping (`allow`) needs the new sources fresh now, else it is refused and never
+    held. The tick bumps `def_version` and releases a last-good pair that belonged to the old
+    sources. It queues a `switcher.keyer` event with `reason = "definition"` and never changes
+    on-air state.
+  - **Rejected frames.** A rejected frame restores the previous definitions, the reserved cost,
+    the draw order and the version (`DefUndo`, `Arc` refcounts only).
+  - **Publication.** Definitions are published in a `LatestState<KeyerDefinitions>` at attach
+    and then only on a committed `keyer_set` tick, before that tick's keyer events.
+- **Admission (§7).** The plan reports `KeyerCost {delta, fits}` for every caller.
+  `reserved`, `budget` and `holders` (keyer object ids) go to unscoped principals only
+  (`Principal::is_global`, ADR-0108 decision 8). A scoped caller's 409 `capacity` detail is
+  generic. A refused command takes no lease and keeps no key. Raising `max_source` is
+  admitted like any other cost increase (tested).
+- **On-air guard.** Changing `fill` or `key` of a keyer that is on air, ramping or holding a
+  command needs `on_air = "allow"`, else 409 `on-air-protected` (plan refusal and command).
+  Parameter changes that keep the sources are not protected. They take effect on the applying
+  tick.
+- **Make-before-break.** A `keyer_set` takes leases on its fill and key (label
+  `keyer:<program>/<keyer>`) before the enqueue. A settle task subscribed before the enqueue
+  waits for the outcome (deadline 10 s) and then decides from the committed definitions, not
+  the event, so a lagged ring cannot mislead it.
+  - **Applied.** It republishes the run's `keyer` demand set (`ConsumerSet::publish`, which
+    leases the new set before it releases the old one), persists the definitions, and only
+    then drops the request's leases.
+  - **Refused or busy.** The leases drop at once.
+- **Clean rule.** One `AtomicBool` "DSK defined" cell is shared by three holders: the switcher
+  (`SwitcherControl::dsk_defined_cell`, set at attach), the routing handle (plan and take
+  refusal) and the router (refusal at the drain, new).
+  - A `keyer_set` that defines the first DSK is refused while any output carries Clean or has
+    a take to it pending: a plan refusal, or 409 `clean-unavailable-with-dsk`.
+  - Otherwise it sets the cell before the enqueue and rechecks the routing snapshot.
+  - **Either order.** A Clean take planned before the cell was set is refused `unroutable` at
+    the router drain, so the two orders cannot both win.
+  - A refused or busy `keyer_set` recomputes the cell from the committed definitions.
+- **GET.** `GET /api/v1/switcher/{me}` adds:
+  - `keyers[]` (design note §8 shape: `id`, `family = "dsk"`, `fill`, `key`, `type`, `fly`,
+    `mask`, `on_air`, `tie`, `ramp {start_tick, rate, to_on}`, `rate`, `loss`, `stale`,
+    `pending`), filtered by the keyer object id, with an unreadable fill or key replaced by
+    `"redacted"`;
+  - `tally {program, preview}`: the engine roles resolved to source ids off the clock. An
+    unreadable id is dropped, and so is a keyer role whose keyer row is unreadable.
+
+  The snapshot carries ramp descriptors, so it changes only on state changes.
+- **`switcher.keyer` event.** A new `Event::SwitcherKeyer {me, program, keyer, tick, on_air,
+  stale, reason, fill, key}` on topic `switcher`, with envelope `id` = the keyer object id.
+  - **Scope.** It has its own `AuthzScope::Keyer {me, program, keyer}`: the M/E object, the
+    `program:` grant and the keyer object, the same rule GET filters rows by. This is a new
+    variant of the exhaustive enum, and `scope_permits` handles it.
+  - **Redaction.** The per-client projection (`redact_embedded_objects`) replaces an
+    unreadable fill or key with `"redacted"`, as GET does.
+  - **Relay.** `switcher_keyers::forward_keyer_events` turns committed `KeyerEvent`s into this
+    event off the clock. The CLI spawns it next to the outcome relay.
+  - **AsyncAPI.** The message and schema are added.
+- **Persistence.** After `applied`, the committed definitions are written as
+  `switcher.downstream_keyers` of the accepted state, under the config-mutation lock, after a
+  full `validate()`. Nothing is written before the engine applied the change (tested).
+  On-air, tie, ramp and pending state are never written. A restart therefore comes up with
+  every keyer off, except `on_at_start` DSKs, which return as the op-less boot intent. The
+  test round-trips the persisted document through TOML, `validate()` and `keyer::admit`.
+- **CLI wiring.**
+  - `attach_first_slice` now always installs a keyer runtime when an M/E exists (an empty
+    runtime is a no-op per tick), so the first DSK can be defined at run time.
+  - The pipeline creates the `keyer` consumer set for every M/E run (seeded only with declared
+    DSKs) and hands it to the switcher (`set_keyer_demand`).
+  - The routing handle and the router get the switcher's cell.
+- **Deviations and choices.**
+  - **`arm` is not built.** It needs USKs (K3, #388). USK `keyer_set` fields arrive with K3.
+  - **z is fixed after definition.** The design is silent on re-ordering. Changing z would
+    re-order draws mid-flight, so a `keyer_set` with a different z on an existing keyer is 422.
+  - **No delete.** The design defines no verb that removes a keyer. A DSK is removed by
+    editing the config.
+  - **Fill/key change on an engaged keyer.** With `allow`, the new sources must be fresh at the
+    applying tick, else the change is refused (`keyer source has no fresh frame…`), never
+    held. The design is silent here. Refusing keeps the slot's one pending entry for operator
+    CUT/AUTO.
+  - **New-source leases.** These are video-only preview leases
+    (`SourceDemandProvider::preview_lease`), held until settle. The durable lease is the
+    `keyer` consumer set, as at boot.
+  - **The +1 decode charge** for a fill or key that is not running (ADR-0110 §10) is not
+    computed separately. The lease is refused if the demand manager cannot take it (409
+    `capacity`).
+  - **No per-principal fairness** on the switcher routes and the shared idempotency store. It
+    is still tracked in #394.
+- **Tests.**
+  - `multiview-engine` `tests/keyers_set.rs` (5): define at one tick and publish on change,
+    refusal over budget, on-air guard with protect and allow, a rejected frame restoring the
+    definition, and id/z clashes.
+  - `multiview-control` `tests/switcher_keyers.rs` (9):
+    - the BOLA matrix for each verb on plan and command, for the M/E, program, keyer and
+      source grants and a viewer, with no key burned;
+    - 202 plus outcome, replay and ramp refusal;
+    - 503 on a full mailbox, releasing the key and the leases;
+    - `in:<n>` refused with 422;
+    - `capacity` generic for scoped callers, totals for unscoped, a repeated refusal leaving
+      nothing behind, and `max_source` raise admission;
+    - `on-air-protected` and make-before-break leases;
+    - the Clean rule;
+    - GET/events parity and redaction for scoped principals;
+    - persistence and a restart.
+  - Lib unit tests: tally resolution, row filtering and redaction, and the `Keyer` scope.
+  - `multiview-events` `authz_scope` (switcher.keyer).
+  - `multiview-cli` `output_routing` (a Clean take refused at the drain once the shared cell is
+    set).
+- **Concern.** The GET/events parity test drives the driver without the frame hook, so its
+  `tally` is the background roles only. Keyer tally resolution is covered by the lib unit
+  test on a constructed snapshot.
