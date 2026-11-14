@@ -541,55 +541,103 @@ mod tests {
         spawn_output_lane(cfg, Arc::clone(time), StopSignal::new(), on_tick).unwrap()
     }
 
-    /// Chaos (R3): a lane whose callback wedges for 1 s skips the ticks it
-    /// missed instead of bursting them; an independent lane on the same time
-    /// source keeps its full count. Bounds are loose enough for a loaded
-    /// macOS runner (counts, not percentiles).
+    /// Two lanes at 25 fps on one shared manual source with stepped pacing:
+    /// the test moves time tick by tick and waits until `lane` has emitted
+    /// `want` ticks — synchronized progression, no wall-clock assumptions.
+    fn manual_pair_cfg(name: &str) -> OutputLaneClock {
+        let mut cfg = manual_cfg(Rational::FPS_25, 0);
+        cfg.name = name.to_owned();
+        cfg.latch_delay = Duration::ZERO;
+        cfg
+    }
+
+    fn step_to(manual: &ManualTimeSource, k: u64) {
+        let reference = OutputClock::new(Rational::FPS_25).unwrap();
+        manual.set(reference.deadline_nanos(k, 0));
+    }
+
+    /// Chaos (R3): a lane whose callback wedges while 25 ticks of time pass
+    /// skips the ticks it missed (exactly) instead of bursting them; an
+    /// independent lane on the same time source emits every tick on time
+    /// throughout. Deterministic: manual time, synchronized steps.
     #[test]
     fn a_wedged_lane_skips_and_never_affects_an_independent_lane() {
-        let time: Arc<dyn TimeSource> = Arc::new(MonotonicTimeSource::new());
-        let seed = time.now_nanos();
-        let mut wedged_once = false;
-        let wedged = real_lane("wedged", &time, seed, move |tick| {
-            if tick.index == 2 && !wedged_once {
-                wedged_once = true;
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        });
-        let healthy = real_lane("healthy", &time, seed, |_| {});
-        std::thread::sleep(Duration::from_millis(1_600));
+        let manual = Arc::new(ManualTimeSource::new());
+        let time: Arc<dyn TimeSource> = manual.clone();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let wedged = spawn_output_lane(
+            manual_pair_cfg("wedged"),
+            Arc::clone(&time),
+            StopSignal::new(),
+            move |tick| {
+                if tick.index == 2 {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                }
+            },
+        )
+        .unwrap();
+        let healthy =
+            spawn_output_lane(manual_pair_cfg("healthy"), time, StopSignal::new(), |_| {}).unwrap();
         let (w, h) = (wedged.stats(), healthy.stats());
-        let elapsed_ticks = u64::try_from((time.now_nanos() - seed) / 40_000_000).unwrap();
-        // The healthy lane emitted (about) one tick per period throughout.
-        assert!(
-            h.ticks() + 4 >= elapsed_ticks.min(40),
-            "healthy {} of {elapsed_ticks}",
-            h.ticks()
-        );
-        assert!(h.ticks() <= elapsed_ticks + 1);
-        assert_eq!(h.skipped_ticks(), 0);
-        // The wedged lane skipped the ~25 ticks it slept through.
-        assert!(w.skipped_ticks() >= 15, "skipped {}", w.skipped_ticks());
-        assert!(w.ticks() + w.skipped_ticks() <= elapsed_ticks + 1);
-        assert!(w.ticks() < h.ticks());
+        for k in 0..=2_u64 {
+            step_to(&manual, k);
+            assert!(
+                wait_for(|| h.ticks() == k + 1 && w.ticks() == k + 1),
+                "tick {k}"
+            );
+        }
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // 25 ticks pass while the wedged lane is blocked in its callback: the
+        // healthy lane emits each of them as time reaches it.
+        for k in 3..=27_u64 {
+            step_to(&manual, k);
+            assert!(wait_for(|| h.ticks() == k + 1), "healthy tick {k}");
+        }
+        assert_eq!(w.ticks(), 3, "the wedged lane is still inside tick 2");
+        assert_eq!(h.skipped_ticks(), 0, "the healthy lane never skipped");
+        // Release: the wedged lane wakes 25 periods late (> 8) and skips to
+        // the tick due now (27): indices 3..=26 are skipped, 27 is emitted.
+        drop(release_tx);
+        assert!(wait_for(|| w.ticks() == 4), "wedged lane resumed");
+        assert_eq!(w.skipped_ticks(), 24);
+        assert_eq!(h.ticks(), 28, "healthy unaffected by the release");
         assert_eq!(wedged.join_within(Duration::from_secs(2)), Ok(()));
         assert_eq!(healthy.join_within(Duration::from_secs(2)), Ok(()));
     }
 
     #[test]
     fn a_panicking_callback_ends_only_its_lane() {
-        let time: Arc<dyn TimeSource> = Arc::new(MonotonicTimeSource::new());
-        let seed = time.now_nanos();
-        let doomed = real_lane("doomed", &time, seed, |tick| {
-            assert!(tick.index < 3, "lane callback failure");
-        });
-        let healthy = real_lane("survivor", &time, seed, |_| {});
+        let manual = Arc::new(ManualTimeSource::new());
+        let time: Arc<dyn TimeSource> = manual.clone();
+        let mut calls = 0_u32;
+        let doomed = spawn_output_lane(
+            manual_pair_cfg("doomed"),
+            Arc::clone(&time),
+            StopSignal::new(),
+            move |_| {
+                calls += 1;
+                assert!(calls < 3, "lane callback failure");
+            },
+        )
+        .unwrap();
+        let healthy =
+            spawn_output_lane(manual_pair_cfg("survivor"), time, StopSignal::new(), |_| {})
+                .unwrap();
+        let h = healthy.stats();
+        for k in 0..=2_u64 {
+            step_to(&manual, k);
+            assert!(wait_for(|| h.ticks() == k + 1), "tick {k}");
+        }
+        // The third callback panicked: that lane alone ended.
         assert!(wait_for(|| doomed.is_finished()));
-        let at_panic = healthy.stats().ticks();
-        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(doomed.stats().ticks(), 3);
+        for k in 3..=6_u64 {
+            step_to(&manual, k);
+            assert!(wait_for(|| h.ticks() == k + 1), "survivor tick {k}");
+        }
         assert!(!healthy.is_finished());
-        assert!(healthy.stats().ticks() >= at_panic + 3, "survivor stalled");
-        assert_eq!(doomed.stats().ticks(), 4);
         match doomed.join_within(Duration::from_secs(1)) {
             Err(LaneJoinError::Panicked(message)) => {
                 assert!(message.contains("lane callback failure"), "{message}");
@@ -669,12 +717,15 @@ mod tests {
         let reads = Arc::new(AtomicU64::new(0));
         let counting: Arc<dyn TimeSource> = Arc::new(Counting(manual, Arc::clone(&reads)));
         let lane = spawn_output_lane(cfg, counting, StopSignal::new(), |_| {}).unwrap();
+        // Count only inside the measured window (baseline after spawn).
+        std::thread::sleep(Duration::from_millis(10));
+        let baseline = reads.load(Ordering::Relaxed);
         let started = Instant::now();
         std::thread::sleep(Duration::from_millis(100));
         // Bound the reads by the MEASURED elapsed time: a >= 1 ms step reads
         // the source about twice per elapsed millisecond (a stall of the test
         // thread only raises the allowance); a busy loop reads millions.
-        let n = reads.load(Ordering::Relaxed);
+        let n = reads.load(Ordering::Relaxed).saturating_sub(baseline);
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let allowed = elapsed_ms.saturating_add(10).saturating_mul(4);
         assert!(n <= allowed, "{n} time reads in {elapsed_ms} ms: spinning");
