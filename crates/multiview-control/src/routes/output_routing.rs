@@ -299,6 +299,12 @@ pub(crate) fn routing_unavailable() -> Response {
         .into_response()
 }
 
+/// Refusal kind: Clean while a downstream keyer is defined (ADR-0113, K2a).
+pub(crate) const CLEAN_UNAVAILABLE_WITH_DSK: &str = "clean-unavailable-with-dsk";
+/// Operator text for [`CLEAN_UNAVAILABLE_WITH_DSK`].
+pub(crate) const CLEAN_WITH_DSK_TEXT: &str =
+    "Clean is unavailable while a downstream keyer is defined; pre-DSK Clean is not built yet";
+
 pub(crate) fn refusal_problem(status: u16, kind: &str, detail: String) -> Response {
     Problem::new(status, kind, "Take refused")
         .with_detail(detail)
@@ -1020,6 +1026,10 @@ fn plan_video(
             kind: "switcher-required".to_owned(),
             detail: "Preview and Clean need a switcher (M/E) in this run".to_owned(),
         }),
+        Err(PlanRefusal::CleanUnavailableWithDsk) => refusals.push(OutputPlanRefusal {
+            kind: CLEAN_UNAVAILABLE_WITH_DSK.to_owned(),
+            detail: CLEAN_WITH_DSK_TEXT.to_owned(),
+        }),
         Err(PlanRefusal::OutputKindUnroutable) => refusals.push(OutputPlanRefusal {
             kind: "output-kind-unroutable".to_owned(),
             detail: "This output's kind cannot switch feeds live in this release".to_owned(),
@@ -1107,8 +1117,28 @@ pub(crate) fn audio_gate(
         Err(PlanRefusal::AudioUnsupported) => Some(audio_unsupported()),
         Err(PlanRefusal::OutputKindUnroutable) => Some(unroutable_kind()),
         // The video plan answers the video refusals.
-        Err(PlanRefusal::SwitcherRequired | PlanRefusal::AuxCapacity { .. }) | Ok(_) => None,
+        Err(
+            PlanRefusal::SwitcherRequired
+            | PlanRefusal::AuxCapacity { .. }
+            | PlanRefusal::CleanUnavailableWithDsk,
+        )
+        | Ok(_) => None,
     }
+}
+
+/// The slot-0 take's admission gates, video plan first then audio (`Some` =
+/// refused): the same order and answers as checking each in turn.
+fn take_gates(
+    control: &crate::output_routing::OutputRoutingControl,
+    principal: &Principal,
+    config_id: &str,
+    feed: Option<&RoutedFeed>,
+    audio: Option<&RoutedAudio>,
+) -> Option<Response> {
+    if let Some(refused) = feed.and_then(|feed| plan_gate(control, principal, config_id, feed)) {
+        return Some(refused);
+    }
+    audio.and_then(|audio| audio_gate(control, config_id, feed, audio))
 }
 
 /// The take-time admission gate from the engine's plan (`Some` = refused).
@@ -1123,6 +1153,11 @@ fn plan_gate(
             409,
             "switcher-required",
             "Preview and Clean need a switcher (M/E) in this run".to_owned(),
+        )),
+        Err(PlanRefusal::CleanUnavailableWithDsk) => Some(refusal_problem(
+            409,
+            CLEAN_UNAVAILABLE_WITH_DSK,
+            CLEAN_WITH_DSK_TEXT.to_owned(),
         )),
         Err(PlanRefusal::OutputKindUnroutable) => Some(unroutable_kind()),
         Err(PlanRefusal::AudioUnsupported) => Some(audio_unsupported()),
@@ -1296,15 +1331,14 @@ pub(crate) fn take_output_slot0(
             Err((response, _)) => return Ok(SlotTake::Refused(response)),
         },
     };
-    if let Some(feed) = &feed {
-        if let Some(refused) = plan_gate(&control, principal, &config_id, feed) {
-            return Ok(SlotTake::Refused(refused));
-        }
-    }
-    if let Some(audio) = &audio {
-        if let Some(refused) = audio_gate(&control, &config_id, feed.as_ref(), audio) {
-            return Ok(SlotTake::Refused(refused));
-        }
+    if let Some(refused) = take_gates(
+        &control,
+        principal,
+        &config_id,
+        feed.as_ref(),
+        audio.as_ref(),
+    ) {
+        return Ok(SlotTake::Refused(refused));
     }
     // The record exists before the enqueue, so an outcome never beats it.
     let pending = PendingTake {

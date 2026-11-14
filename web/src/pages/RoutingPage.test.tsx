@@ -24,6 +24,8 @@ const server = setupServer(
   http.get('*/api/v1/outputs', () => HttpResponse.json([])),
   http.get('*/api/v1/layouts', () => HttpResponse.json([])),
   http.get('*/api/v1/audio-routing', () => HttpResponse.json({ state: { selectable_tracks: [] } })),
+  // The Subtitle patch panel (#345 part F3) reads the live patch.
+  http.get('*/api/v1/patch', () => HttpResponse.json({ mixer: [], outputs: [] })),
   http.post('http://localhost:3000/api/v1/routing/plan', async ({ request }) => {
     lastPlanBody = await request.json();
     return HttpResponse.json({ class: 'class2', coerced: false });
