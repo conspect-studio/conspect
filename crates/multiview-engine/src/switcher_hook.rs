@@ -105,6 +105,9 @@ impl<C> SwitcherFrameHook<C> {
                 }
             }
             self.deferred = self.adopted.iter().any(|key| set.get(key).is_none());
+            // Ack: every key of this generation is in the maps now, so a
+            // command naming one, drained after this, finds its store.
+            sources.mark_adopted(generation);
         }
         if !self.deferred {
             return;
@@ -441,6 +444,7 @@ mod tests {
         rig.register();
         rig.step(true);
         assert!(rig.present());
+        assert_eq!(rig.sources.adopted_generation(), rig.sources.generation());
         assert!(rig.hook.driver.references_source("a"));
         assert_eq!(rig.hook.adopted_layout_sources().len(), 1);
         // The driver knows the store: a select of the layout is admitted.
@@ -493,7 +497,7 @@ mod tests {
         rig.step(true);
         assert!(!rig.present(), "removed at the boundary after the release");
         assert!(!rig.hook.deferred);
-        assert!(rig.hook.adopted_layout_sources().is_empty());
+        assert_eq!(rig.hook.adopted_layout_sources(), []);
         assert!(!rig.hook.driver.references_source(KEY));
     }
 

@@ -44,6 +44,9 @@ impl LayoutSourceSet {
 #[derive(Debug)]
 pub struct LayoutSources {
     generation: AtomicU64,
+    /// The generation the frame hook last adopted (its ack; written once per
+    /// adoption, never in the steady state).
+    adopted: AtomicU64,
     set: SwapCell<Arc<LayoutSourceSet>>,
 }
 
@@ -59,6 +62,7 @@ impl LayoutSources {
     pub fn new() -> Self {
         Self {
             generation: AtomicU64::new(0),
+            adopted: AtomicU64::new(0),
             set: SwapCell::new(Arc::new(LayoutSourceSet::default())),
         }
     }
@@ -74,6 +78,27 @@ impl LayoutSources {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// Publish and return the new generation (the writer waits, off the
+    /// clock, for [`Self::adopted_generation`] to reach it).
+    pub fn publish_generation(&self, set: LayoutSourceSet) -> u64 {
+        self.set.store(Arc::new(set));
+        self.generation.fetch_add(1, Ordering::Release) + 1
+    }
+
+    /// The frame hook acknowledges that it adopted `generation` (Release).
+    pub fn mark_adopted(&self, generation: u64) {
+        self.adopted.store(generation, Ordering::Release);
+    }
+
+    /// The generation the frame hook last adopted (Acquire). A command that
+    /// names a newly registered key is sent only once this reached the
+    /// registration's generation, so the drain that sees the command already
+    /// has the store (the hook adopts before it drains).
+    #[must_use]
+    pub fn adopted_generation(&self) -> u64 {
+        self.adopted.load(Ordering::Acquire)
     }
 
     /// The current set (a pointer clone, wait-free).
@@ -98,6 +123,14 @@ mod tests {
             entries: vec![(Arc::from("layout:a"), Arc::clone(&store))],
         });
         assert_eq!(sources.generation(), 1);
+        assert_eq!(sources.adopted_generation(), 0);
+        sources.mark_adopted(1);
+        assert_eq!(sources.adopted_generation(), 1);
+        assert_eq!(sources.publish_generation(LayoutSourceSet::default()), 2);
+        assert!(sources.load().entries.is_empty());
+        sources.publish(LayoutSourceSet {
+            entries: vec![(Arc::from("layout:a"), Arc::clone(&store))],
+        });
         let set = sources.load();
         assert!(Arc::ptr_eq(set.get("layout:a").unwrap(), &store));
         assert!(set.get("layout:b").is_none());

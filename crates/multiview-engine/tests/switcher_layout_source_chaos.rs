@@ -10,7 +10,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::type_complexity
 )]
 // reason: a chaos test asserts many counts over one run; splitting it hides
 // the single-run relationship between the flood and the clock.
@@ -211,7 +212,7 @@ fn cmd(op: String, verb: SwitcherVerb) -> SwitcherCommand {
     }
 }
 
-/// A flood of select_preview layout / cut / auto / select_program plus
+/// A flood of `select_preview` layout / cut / auto / `select_program` plus
 /// registry add/remove republishes while the layout source is fed every
 /// tick: exactly one fresh frame per tick at the tick-derived PTS, the
 /// Program cell rebinds to the layout after a take, and while the layout is
@@ -248,12 +249,11 @@ async fn a_layout_source_flood_keeps_one_frame_per_tick() {
                 let op = format!("op-{n}");
                 let verb = match n % 8 {
                     0 | 4 => SwitcherVerb::SelectPreview(SourceRef::new(KEY)),
-                    1 => SwitcherVerb::Cut,
+                    1 | 7 => SwitcherVerb::Cut,
                     2 => SwitcherVerb::SelectPreview(SourceRef::new("b")),
                     3 => SwitcherVerb::SelectProgram(SourceRef::new("a")),
                     5 => SwitcherVerb::Auto(FrameCount::from_ms(200, Rational::new(25, 1))),
-                    6 => SwitcherVerb::SelectProgram(SourceRef::new(KEY)),
-                    _ => SwitcherVerb::Cut,
+                    _ => SwitcherVerb::SelectProgram(SourceRef::new(KEY)),
                 };
                 if handle.try_send(cmd(op, verb)).is_err() {
                     std::thread::yield_now();
@@ -349,7 +349,7 @@ async fn a_layout_source_flood_keeps_one_frame_per_tick() {
 
 /// The layout is CUT to Program, then its aux publisher dies. Program keeps
 /// emitting exactly one frame per tick; the layout source ages LIVE → STALE
-/// → NO_SIGNAL (slate), in that order, and the clock is unaffected.
+/// → `NO_SIGNAL` (slate), in that order, and the clock is unaffected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dead_layout_publisher_ages_to_slate_without_moving_the_clock() {
     const TICKS: u64 = 600;
