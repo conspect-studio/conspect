@@ -171,7 +171,7 @@ pub fn caption_burn_stats() -> &'static CaptionBurnStats {
     &STATS
 }
 
-/// Most recent cut-cue identities a [`TruncationTally`] remembers.
+/// Distinct cut-cue identities a [`TruncationTally`] remembers.
 pub const TRUNCATION_TALLY_RING: usize = 64;
 
 /// Counts a truncated caption cue **once per cue identity** (issue #430).
@@ -179,26 +179,34 @@ pub const TRUNCATION_TALLY_RING: usize = 64;
 /// A reader samples the active cue on every tick, and with overlapping cues
 /// the active one can alternate (A, then a newer B, then A again once B
 /// ends) or an older cue can first surface after a newer one ends. The tally
-/// therefore remembers the identities of the last [`TRUNCATION_TALLY_RING`]
-/// distinct cut cues (FIFO ring), not only the last one: a cue is counted the
-/// first time it is seen cut and never again while it stays in the ring.
-/// Bound: a cue is recounted only if more than [`TRUNCATION_TALLY_RING`]
-/// other cut cues were counted between two of its appearances — for a
-/// native store that needs more than 64 retained overlapping cues (the
-/// default store retains 16), for a sidecar more than 64 cut cues shown
-/// while one long cue stays active. Work per sample is a
-/// scan of ≤ 64 `u64`s, lock-free (relaxed atomics; one sampler per tally).
+/// therefore remembers up to [`TRUNCATION_TALLY_RING`] distinct cut-cue
+/// identities with least-recently-observed replacement: every cut
+/// observation of a remembered identity refreshes it to most recent, and a
+/// new identity replaces the one observed longest ago. A cue is counted the
+/// first time it is observed cut.
+///
+/// Exact bound: an identity is counted again only when it reappears after
+/// **64 or more other distinct cut identities** were observed since its own
+/// last cut observation; with 63 or fewer it is not recounted, however often
+/// any of them repeat. For a native store that needs 64 other cut cues
+/// selected while a cue is retained (the default store retains 16); for a
+/// sidecar, 64 other cut cues shown while one long cue is hidden behind them.
+/// Uncut observations neither count nor refresh. Work per sample is a scan
+/// of 64 slots, lock-free and allocation-free (relaxed atomics; one sampler
+/// per tally).
 ///
 /// The identity is supplied by the caller — the cue store's per-cue publish
 /// sequence, or a sidecar track index — and must change whenever the cue does
 /// (replacement, generation change).
 #[derive(Debug)]
 pub struct TruncationTally {
-    /// `1 +` the identities of the most recently counted cut cues (`0` = an
-    /// empty slot). Boxed so embedding a tally keeps its owner small.
-    seen: Box<[std::sync::atomic::AtomicU64; TRUNCATION_TALLY_RING]>,
-    /// The ring slot the next new identity overwrites.
-    next: std::sync::atomic::AtomicUsize,
+    /// Per slot: `1 +` the identity (`0` = empty) and the observation stamp
+    /// of its last cut observation. Boxed so embedding a tally keeps its
+    /// owner small.
+    slots:
+        Box<[(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); TRUNCATION_TALLY_RING]>,
+    /// Monotonic observation stamp (cut observations only).
+    clock: std::sync::atomic::AtomicU64,
     stats: &'static CaptionBurnStats,
 }
 
@@ -212,31 +220,51 @@ impl TruncationTally {
     /// A tally counting into `stats` (tests use a private sink).
     #[must_use]
     pub fn with_stats(stats: &'static CaptionBurnStats) -> Self {
+        use std::sync::atomic::AtomicU64;
         Self {
-            seen: Box::new(std::array::from_fn(|_| {
-                std::sync::atomic::AtomicU64::new(0)
+            slots: Box::new(std::array::from_fn(|_| {
+                (AtomicU64::new(0), AtomicU64::new(0))
             })),
-            next: std::sync::atomic::AtomicUsize::new(0),
+            clock: AtomicU64::new(0),
             stats,
         }
     }
 
-    /// Record one sample of cue `identity`; counts it when it was `truncated`
-    /// and is not among the last [`TRUNCATION_TALLY_RING`] cut cues counted.
+    /// Record one sample of cue `identity`. When `truncated`, counts it
+    /// unless it is remembered (see the type's exact bound), and marks it as
+    /// the most recently observed identity either way.
     pub fn observe(&self, identity: u64, truncated: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         if !truncated {
             return;
         }
         let key = identity.wrapping_add(1).max(1);
-        if self.seen.iter().any(|slot| slot.load(Relaxed) == key) {
-            return;
+        let now = self.clock.load(Relaxed).wrapping_add(1);
+        self.clock.store(now, Relaxed);
+        // One pass: a hit, else the empty or least-recently-observed slot.
+        let mut victim: Option<(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64)> =
+            None;
+        let mut oldest = u64::MAX;
+        for (slot_key, slot_stamp) in &*self.slots {
+            let held = slot_key.load(Relaxed);
+            if held == key {
+                slot_stamp.store(now, Relaxed);
+                return;
+            }
+            let stamp = if held == 0 {
+                0
+            } else {
+                slot_stamp.load(Relaxed)
+            };
+            if stamp < oldest {
+                oldest = stamp;
+                victim = Some((slot_key, slot_stamp));
+            }
         }
-        let at = self.next.load(Relaxed) % TRUNCATION_TALLY_RING;
-        if let Some(slot) = self.seen.get(at) {
-            slot.store(key, Relaxed);
+        if let Some((slot_key, slot_stamp)) = victim {
+            slot_key.store(key, Relaxed);
+            slot_stamp.store(now, Relaxed);
         }
-        self.next.store((at + 1) % TRUNCATION_TALLY_RING, Relaxed);
         self.stats.note_text_truncated();
     }
 }
@@ -3080,35 +3108,71 @@ mod tests {
         );
     }
 
-    /// Issue #430 (MED2-1): the tally dedupes every recent cut cue, not only
-    /// the last; the documented bound is where an old cue is recounted.
+    /// Issue #430 (MED2-1/MED3-1): the tally dedupes every remembered cut
+    /// cue, refreshing on each observation, with the exact documented bound.
     #[test]
-    fn truncation_tally_dedupes_resurfacing_cues_within_its_ring() {
-        let stats: &'static CaptionBurnStats = Box::leak(Box::default());
-        let tally = TruncationTally::with_stats(stats);
+    fn truncation_tally_dedupes_resurfacing_cues_with_exact_bound() {
+        let ring = u64::try_from(TRUNCATION_TALLY_RING).unwrap();
+        let fresh = || {
+            let stats: &'static CaptionBurnStats = Box::leak(Box::default());
+            (TruncationTally::with_stats(stats), stats)
+        };
+        // Alternation and uncut samples.
+        let (tally, stats) = fresh();
         for id in [7, 9, 7, 9, 7] {
             tally.observe(id, true);
         }
-        assert_eq!(stats.text_truncated(), 2, "A, B, A, B, A is two cues");
         tally.observe(11, false);
-        assert_eq!(stats.text_truncated(), 2, "an uncut cue is not counted");
-        // Fill the ring with other cut cues: 7 is then forgotten (the bound).
-        let ring = u64::try_from(TRUNCATION_TALLY_RING).unwrap();
-        for id in 100..100 + ring - 1 {
+        assert_eq!(stats.text_truncated(), 2, "A, B, A, B, A is two cues");
+        // Boundary: 63 other distinct cut cues since A's last observation
+        // keep A remembered...
+        let (tally, stats) = fresh();
+        tally.observe(0, true);
+        for id in 1..ring {
             tally.observe(id, true);
         }
-        tally.observe(9, true);
+        tally.observe(0, true);
         assert_eq!(
             stats.text_truncated(),
-            2 + ring - 1,
-            "9 is still remembered"
+            ring,
+            "63 intervening: A not recounted"
         );
-        tally.observe(1_000, true);
-        tally.observe(7, true);
+        // ...64 make it count again.
+        let (tally, stats) = fresh();
+        tally.observe(0, true);
+        for id in 1..=ring {
+            tally.observe(id, true);
+        }
+        tally.observe(0, true);
         assert_eq!(
             stats.text_truncated(),
-            2 + ring + 1,
-            "beyond the ring, 7 recounts"
+            ring + 2,
+            "64 intervening: A recounted"
+        );
+        // The reviewer's trace: A, 63 distinct, A, B, A — A counts once
+        // (its middle observation refreshed it, so B evicts another cue).
+        let (tally, stats) = fresh();
+        tally.observe(0, true);
+        for id in 1..ring {
+            tally.observe(id, true);
+        }
+        tally.observe(0, true);
+        tally.observe(1_000, true);
+        tally.observe(0, true);
+        assert_eq!(stats.text_truncated(), ring + 1, "A, 63, A, B, A: A once");
+        // Repeats of remembered cues do not advance the bound.
+        let (tally, stats) = fresh();
+        tally.observe(0, true);
+        for _ in 0..10 {
+            for id in 1..ring {
+                tally.observe(id, true);
+            }
+        }
+        tally.observe(0, true);
+        assert_eq!(
+            stats.text_truncated(),
+            ring,
+            "repeats of 63 others never evict A"
         );
     }
 

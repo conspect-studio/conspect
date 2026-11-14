@@ -22720,6 +22720,77 @@ mod live_overlay_bake_tests {
         assert_eq!(count, 2, "B then the exposed A, each once");
     }
 
+    /// Issue #430 (MED3-1), caller level: a long cut sidecar cue A hidden
+    /// behind short cut cues is recounted exactly when 64 other distinct cut
+    /// cues were shown since its last appearance — not at 63, and not when
+    /// its own middle appearance refreshed it (A, 63 shorts, A, B, A).
+    #[test]
+    fn sidecar_long_cue_recount_follows_the_exact_tally_bound() {
+        let pad = "w".repeat(8 * 1024);
+        let ts = |ms: u64| {
+            format!(
+                "{:02}:{:02}:{:02},{:03}",
+                ms / 3_600_000,
+                ms / 60_000 % 60,
+                ms / 1_000 % 60,
+                ms % 1_000
+            )
+        };
+        // A = [0, 1000) s; short k = [10 + 2k, 11 + 2k) s, k = 0..64.
+        let mut srt = format!("1\n{} --> {}\nA {pad}\n\n", ts(0), ts(1_000_000));
+        for k in 0..64_u64 {
+            let start = 10_000 + 2_000 * k;
+            std::fmt::Write::write_fmt(
+                &mut srt,
+                format_args!(
+                    "{}\n{} --> {}\nS{k} {pad}\n\n",
+                    k + 2,
+                    ts(start),
+                    ts(start + 1_000)
+                ),
+            )
+            .unwrap();
+        }
+        let track = multiview_overlay::subtitle::CueTrack::parse_srt(&srt).unwrap();
+        let run = |samples: &[i64]| {
+            let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+            let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+            let mut ctx = bake_context(&slot);
+            ctx.subtitles = Some(track.clone());
+            ctx.sidecar_target = Some("in_a".to_owned());
+            ctx.sidecar_truncated = crate::overlays::TruncationTally::with_stats(stats);
+            for &ms in samples {
+                let at = multiview_core::time::MediaTime::from_nanos(ms * 1_000_000);
+                assert!(
+                    ctx.sidecar_caption_lines("in_a", at).is_some(),
+                    "at {ms} ms"
+                );
+            }
+            stats.text_truncated()
+        };
+        // Inside short k, and in the gap after it (A shows again).
+        let short = |k: i64| 10_500 + 2_000 * k;
+        let gap_after = |k: i64| 11_500 + 2_000 * k;
+        // A, 63 shorts, A: A not recounted.
+        let below: Vec<i64> = std::iter::once(1_000)
+            .chain((0..63).map(short))
+            .chain([gap_after(62)])
+            .collect();
+        assert_eq!(run(&below), 64, "63 intervening: A once");
+        // A, 64 shorts, A: A recounted.
+        let at_bound: Vec<i64> = std::iter::once(1_000)
+            .chain((0..64).map(short))
+            .chain([gap_after(63)])
+            .collect();
+        assert_eq!(run(&at_bound), 66, "64 intervening: A twice");
+        // A, 63 shorts, A, B (the 64th short), A: A once.
+        let refreshed: Vec<i64> = std::iter::once(1_000)
+            .chain((0..63).map(short))
+            .chain([gap_after(62), short(63), gap_after(63)])
+            .collect();
+        assert_eq!(run(&refreshed), 65, "A, 63, A, B, A: A once");
+    }
+
     /// One streamed tick over a uniform dark canvas.
     fn item(tick_index: u64) -> StreamItem {
         let tag = CanvasColor::default().output_tag();
