@@ -79,7 +79,7 @@ pub const REFUSE_NOT_AN_INPUT: &str =
     "not-on-an-input: this M/E selects numbered inputs; select an input, not a source";
 /// Typed refusal: the transition kind or one of its options is not rendered.
 pub const REFUSE_UNSUPPORTED_TRANSITION: &str =
-    "unsupported-transition: this engine renders cut, mix, dip to a colour and wipe";
+    "unsupported-transition: this engine renders cut, mix, dip to a colour, wipe and stinger";
 
 /// Is `descriptor` a transition the Program drive renders (ADR-0112)?
 #[must_use]
@@ -256,6 +256,7 @@ impl SwitcherControl {
             inputs_version: 0,
             published_inputs_version: 0,
             inputs_readback: handle.inputs.clone(),
+            player_roll: None,
         };
         (handle, driver)
     }
@@ -385,6 +386,8 @@ pub struct SwitcherTickDriver {
     inputs_version: u64,
     published_inputs_version: u64,
     inputs_readback: LatestState<InputsReadback>,
+    /// Off-clock media-player roll for a stinger AUTO (ADR-0112 §5).
+    player_roll: Option<crate::player_roll::PlayerRollSender>,
 }
 
 /// Everything a rejected tick must restore (review SW2-03): the machine and
@@ -565,6 +568,14 @@ impl SwitcherTickDriver {
         self.primed_stores = Some(stores);
     }
 
+    /// Install the off-clock media-player roll a stinger AUTO uses to cue and
+    /// play its player (ADR-0112 §5), before the clock starts. Without one a
+    /// stinger still takes on schedule; its clip is drawn only if the player
+    /// happens to be publishing fresh frames.
+    pub fn set_player_roll(&mut self, roll: crate::player_roll::PlayerRollSender) {
+        self.player_roll = Some(roll);
+    }
+
     /// Advertise AUTO. Called only by the frame hook that renders the
     /// dissolve inside the Program drive (ADR-0104 §3).
     pub fn advertise_auto(&self) {
@@ -647,13 +658,24 @@ impl SwitcherTickDriver {
                 }
                 // The flight renders its own descriptor (the selection at the
                 // AUTO's rate); the selection itself is unchanged (ADR-0112 §4).
-                validate_mix(&pair.program, &pair.preview)
+                let projection = validate_mix(&pair.program, &pair.preview)
                     .map_err(|e| e.to_string())
                     .and_then(|()| {
                         self.machine
                             .auto_with(descriptor, tick)
                             .map_err(|e| e.to_string())
-                    })
+                    })?;
+                // A stinger rolls its player now, through a bounded queue to
+                // an off-clock worker: this tick never waits for the player,
+                // and the take's timing never depends on it (ADR-0112 §5).
+                if projection.started {
+                    if let (Some(roll), Some((_, _, player, _))) =
+                        (&self.player_roll, self.machine.stinger_flight())
+                    {
+                        roll.roll(player);
+                    }
+                }
+                Ok(projection)
             }
             SwitcherVerb::SelectPreview(_)
             | SwitcherVerb::Patch(_)
@@ -747,6 +769,20 @@ impl SwitcherTickDriver {
         self.machine.auto_window()
     }
 
+    /// The active stinger AUTO (ADR-0112 §5): anchor tick, timing, player
+    /// and whether its take already swapped the buses.
+    #[must_use]
+    pub fn stinger_flight(
+        &self,
+    ) -> Option<(
+        i128,
+        multiview_core::switcher::StingerTiming,
+        &SourceRef,
+        bool,
+    )> {
+        self.machine.stinger_flight()
+    }
+
     /// The descriptor the Program drive renders: the in-flight AUTO's own
     /// descriptor during a take, else the selection.
     #[must_use]
@@ -796,8 +832,9 @@ impl SwitcherTickDriver {
             self.stage();
         }
         // SW2-02: never complete an AUTO onto a source without a fresh frame.
-        if let Some((start, rate)) = self.machine.auto_window() {
-            let terminal = i128::from(tick.index) - start >= i128::from(rate.get());
+        // A stinger's take completes at the end of its mix window (§5).
+        if let Some((start, frames)) = self.machine.take_window() {
+            let terminal = i128::from(tick.index) - start >= i128::from(frames);
             let (_, preview) = self.resolved_selections();
             if terminal && self.fresh_at(preview.as_str(), tick) == Some(false) {
                 self.machine.abort();

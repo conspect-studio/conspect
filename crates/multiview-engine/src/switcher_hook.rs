@@ -90,14 +90,33 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // AUTO dissolve: the outgoing source stays in the Program cell, the
         // incoming one is drawn above it at elapsed/duration in this same pass.
         // At the terminal tick the machine has swapped and the window is gone.
-        let mix = self.driver.auto_window().map(|(start, rate)| {
-            let elapsed = (i128::from(tick.index) - start).clamp(0, i128::from(rate.get()));
-            (
-                u32::try_from(elapsed).unwrap_or(rate.get()),
-                rate.get(),
-                start,
-            )
-        });
+        // A stinger (ADR-0112 §5) is a MIX over `mix_rate` frames from its
+        // trigger point (mix frame k at (k + 1) / mix_rate, so a one-frame
+        // mix is a cut), plus its clip on top while the clip window is open.
+        let mut clip = None;
+        let mix = match self.driver.stinger_flight() {
+            Some((start, timing, player, _)) => {
+                let elapsed =
+                    u32::try_from((i128::from(tick.index) - start).max(0)).unwrap_or(u32::MAX);
+                if timing.clip_visible(elapsed) {
+                    clip = Some(player.as_str());
+                }
+                timing
+                    .mix_frame(elapsed)
+                    .map(|k| (k.saturating_add(1), timing.mix_rate, start))
+            }
+            None => self.driver.auto_window().map(|(start, rate)| {
+                let elapsed = (i128::from(tick.index) - start).clamp(0, i128::from(rate.get()));
+                (
+                    u32::try_from(elapsed).unwrap_or(rate.get()),
+                    rate.get(),
+                    start,
+                )
+            }),
+        };
+        if drive.stinger_clip() != clip {
+            drive.set_stinger_clip(clip);
+        }
         // The style follows the machine's (frozen in-flight) descriptor; a
         // change re-codes the DIP colour once, never per tick.
         let style = match self.driver.transition() {
@@ -150,6 +169,7 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             self.failed_tick = Some(tick.index);
             self.driver.reject_composed_tick(tick, &error);
             let _ = drive.set_mix_overlay(None);
+            drive.set_stinger_clip(None);
             // Keep the drive coherent with the restored machine (SW2-03): if
             // this tick re-pointed the cell before failing, point it back.
             let (restored, _) = self.driver.resolved_selections();

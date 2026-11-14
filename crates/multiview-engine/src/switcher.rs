@@ -3,7 +3,9 @@
 //! The caller drains intents at the tick boundary, passes the *same* output
 //! [`Tick`] used for composition, and applies the returned projection. No time
 //! source, I/O, shared lock or asynchronous work is involved here.
-use multiview_core::switcher::{ArmedSet, FrameCount, Progress, SourceRef, TransitionDescriptor};
+use multiview_core::switcher::{
+    ArmedSet, FrameCount, Progress, SourceRef, StingerTiming, TransitionDescriptor,
+};
 use thiserror::Error;
 
 use crate::clock::Tick;
@@ -53,6 +55,9 @@ enum Flight {
         start: i128,
         rate: FrameCount,
         min_progress: Option<Progress>,
+        /// A stinger's take already swapped the buses; the flight is in its
+        /// clip tail (ADR-0112 §5). Always `false` for every other kind.
+        swapped: bool,
     },
     Manual {
         position: u16,
@@ -155,6 +160,41 @@ impl SwitcherState {
             _ => None,
         }
     }
+    /// The window until the active AUTO's take swaps the buses: its anchor
+    /// tick and frame count. For a stinger that is the end of the mix window
+    /// (ADR-0112 §5), and `None` once the take has swapped (the clip tail).
+    #[must_use]
+    pub fn take_window(&self) -> Option<(i128, u32)> {
+        match self.flight {
+            Some(Flight::Auto {
+                start,
+                rate,
+                swapped,
+                ..
+            }) => match self.active_transition().stinger_timing() {
+                Some(_) if swapped => None,
+                Some(timing) => Some((start, timing.swap_at())),
+                None => Some((start, rate.get())),
+            },
+            _ => None,
+        }
+    }
+
+    /// The active stinger AUTO (ADR-0112 §5): its anchor tick, timing, player
+    /// and whether the take has already swapped the buses. Allocation-free.
+    #[must_use]
+    pub fn stinger_flight(&self) -> Option<(i128, StingerTiming, &SourceRef, bool)> {
+        let Some(Flight::Auto { start, swapped, .. }) = self.flight else {
+            return None;
+        };
+        match self.active_transition() {
+            descriptor @ TransitionDescriptor::Stinger { player, .. } => descriptor
+                .stinger_timing()
+                .map(|timing| (start, timing, player, swapped)),
+            _ => None,
+        }
+    }
+
     /// Total completed takes, useful to correlate completion edges.
     #[must_use]
     pub fn completion_count(&self) -> u64 {
@@ -255,6 +295,7 @@ impl SwitcherState {
                         u32::from(position),
                         FrameCount::try_from(u32::from(u16::MAX)).unwrap_or(FrameCount::ONE),
                     )),
+                    swapped: false,
                 });
                 return Ok(self.sample(tick));
             }
@@ -268,6 +309,7 @@ impl SwitcherState {
             start: i128::from(tick.index),
             rate,
             min_progress: None,
+            swapped: false,
         });
         Ok(SwitcherProjection {
             progress: Progress::ZERO,
@@ -313,6 +355,7 @@ impl SwitcherState {
     /// Returns [`SwitcherError::NothingArmed`] if no elements are armed.
     pub fn tbar(&mut self, position: u16, tick: Tick) -> Result<SwitcherProjection, SwitcherError> {
         self.require_armed()?;
+        self.end_stinger_tail();
         // ADR-0055 §5: the absolute setter is idempotent; a re-sent identical
         // value never changes state (panels re-send at ~30 Hz). A nonzero
         // write during AUTO is not a duplicate of the manual state: it takes
@@ -365,6 +408,9 @@ impl SwitcherState {
     /// Returns [`SwitcherError::NothingArmed`] if no elements are armed.
     pub fn cut(&mut self) -> Result<SwitcherProjection, SwitcherError> {
         self.require_armed()?;
+        // A stinger whose take already swapped is only drawing its clip: a
+        // CUT is then a new take, not a second completion of the old one.
+        self.end_stinger_tail();
         let started = self.flight.is_none();
         let mut projection = self.finish();
         projection.started = started;
@@ -409,8 +455,12 @@ impl SwitcherState {
                 start,
                 rate,
                 min_progress,
+                swapped,
             }) => {
                 let elapsed = (i128::from(tick.index) - start).max(0);
+                if let Some(timing) = self.active_transition().stinger_timing() {
+                    return self.sample_stinger(start, rate, swapped, timing, elapsed);
+                }
                 if elapsed >= i128::from(rate.get()) {
                     self.finish()
                 } else {
@@ -423,6 +473,7 @@ impl SwitcherState {
                                 start,
                                 rate,
                                 min_progress: None,
+                                swapped,
                             });
                             progress
                         }
@@ -438,6 +489,67 @@ impl SwitcherState {
         }
     }
 
+    /// A stinger flight at `elapsed` (ADR-0112 §5): the take swaps the buses
+    /// at the end of the mix window (`completed` once), the flight then runs
+    /// on through the clip tail and ends at `pre_roll + clip_duration`. A
+    /// skipped tick past both swaps and ends in one projection.
+    fn sample_stinger(
+        &mut self,
+        start: i128,
+        rate: FrameCount,
+        swapped: bool,
+        timing: StingerTiming,
+        elapsed: i128,
+    ) -> SwitcherProjection {
+        let total = i128::from(timing.total());
+        if !swapped && elapsed >= i128::from(timing.swap_at()) {
+            if elapsed >= total {
+                return self.finish();
+            }
+            self.swap_buses();
+            self.flight = Some(Flight::Auto {
+                start,
+                rate,
+                min_progress: None,
+                swapped: true,
+            });
+            return SwitcherProjection {
+                progress: Progress::COMPLETE,
+                started: false,
+                completed: true,
+            };
+        }
+        if swapped && elapsed >= total {
+            // The clip tail ended: the take completed at the swap already.
+            self.flight = None;
+            self.flight_transition = None;
+            self.lever_out_of_sync = self.last_manual_position != 0;
+            return SwitcherProjection::idle();
+        }
+        let progress = if swapped {
+            Progress::COMPLETE
+        } else {
+            Progress::new(
+                u32::try_from(elapsed).unwrap_or(timing.swap_at()),
+                FrameCount::try_from(timing.swap_at()).unwrap_or(FrameCount::ONE),
+            )
+        };
+        SwitcherProjection {
+            progress,
+            started: false,
+            completed: false,
+        }
+    }
+
+    /// End a stinger flight that is in its clip tail (the take already
+    /// swapped the buses, ADR-0112 §5), leaving the buses as they are.
+    fn end_stinger_tail(&mut self) {
+        if matches!(self.flight, Some(Flight::Auto { swapped: true, .. })) {
+            self.flight = None;
+            self.flight_transition = None;
+        }
+    }
+
     fn require_armed(&self) -> Result<(), SwitcherError> {
         if self.armed.is_empty() {
             Err(SwitcherError::NothingArmed)
@@ -448,8 +560,9 @@ impl SwitcherState {
 
     /// The selected descriptor with its duration replaced by `rate`: an AUTO
     /// carries its own rate and keeps the selected kind (ADR-0112 §3). A
-    /// CUT selection becomes a MIX, as an AUTO always has a duration. Kinds
-    /// without a single rate (stinger) are returned unchanged.
+    /// CUT selection becomes a MIX, as an AUTO always has a duration. A
+    /// stinger keeps its own timing (pre-roll plus clip, ADR-0112 §5) and is
+    /// returned unchanged.
     #[must_use]
     pub fn transition_with_rate(&self, rate: FrameCount) -> TransitionDescriptor {
         let mut next = self.transition.clone();
@@ -472,7 +585,10 @@ impl SwitcherState {
             | TransitionDescriptor::Wipe { rate, .. }
             | TransitionDescriptor::DvePush { rate, .. }
             | TransitionDescriptor::DveSqueeze { rate, .. } => *rate,
-            TransitionDescriptor::Stinger { clip_duration, .. } => *clip_duration,
+            descriptor @ TransitionDescriptor::Stinger { .. } => descriptor
+                .stinger_timing()
+                .and_then(|timing| FrameCount::try_from(timing.total()).ok())
+                .unwrap_or(FrameCount::ONE),
             _ => FrameCount::ONE,
         }
     }
@@ -481,6 +597,16 @@ impl SwitcherState {
         self.flight = None;
         self.flight_transition = None;
         self.lever_out_of_sync = self.last_manual_position != 0;
+        self.swap_buses();
+        SwitcherProjection {
+            progress: Progress::COMPLETE,
+            started: false,
+            completed: true,
+        }
+    }
+
+    /// Complete the take: swap the armed background and toggle armed keys.
+    fn swap_buses(&mut self) {
         if self.armed.background {
             if self.flip_flop {
                 std::mem::swap(&mut self.program, &mut self.preview);
@@ -497,10 +623,5 @@ impl SwitcherState {
             }
         }
         self.completion_count = self.completion_count.saturating_add(1);
-        SwitcherProjection {
-            progress: Progress::COMPLETE,
-            started: false,
-            completed: true,
-        }
     }
 }

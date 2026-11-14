@@ -105,6 +105,7 @@ pub mod lifecycle;
 pub mod migration;
 pub mod output_lane;
 pub mod placement;
+pub mod player_roll;
 pub mod probe;
 pub mod program;
 pub mod program_latch;

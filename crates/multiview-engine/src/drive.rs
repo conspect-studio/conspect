@@ -254,6 +254,10 @@ pub struct CompositorDrive<T> {
     transition_fill: Option<(Rgb8, Arc<Nv12Image>)>,
     /// Odometer of `transition_fill` builds (the no-per-tick-allocation gate).
     transition_fill_builds: u64,
+    /// ADR-0112 §5: the stinger clip's media player, drawn as one more
+    /// full-canvas tile above every other tile (its own alpha, else opaque)
+    /// while its clip window is open. `None` outside a stinger clip.
+    stinger_clip: Option<String>,
 }
 
 impl<T> CompositorDrive<T> {
@@ -292,7 +296,27 @@ impl<T> CompositorDrive<T> {
             transition_style: TransitionStyle::Mix,
             transition_fill: None,
             transition_fill_builds: 0,
+            stinger_clip: None,
         })
+    }
+
+    /// Draw the stinger clip from `player`'s store on top of the next
+    /// composites (ADR-0112 §5), or stop with `None`. Pure state: the id is
+    /// allocated once per clip, never per tick. Only a fresh frame is drawn;
+    /// a stale, missing or unregistered player store draws nothing (never a
+    /// slate on Program), so this never fails.
+    pub fn set_stinger_clip(&mut self, player: Option<&str>) {
+        match (player, &mut self.stinger_clip) {
+            (None, slot) => *slot = None,
+            (Some(player), Some(current)) if current == player => {}
+            (Some(player), slot) => *slot = Some(player.to_owned()),
+        }
+    }
+
+    /// The stinger clip's player, while a clip is drawn.
+    #[must_use]
+    pub fn stinger_clip(&self) -> Option<&str> {
+        self.stinger_clip.as_deref()
     }
 
     /// Draw `source` as one full-canvas tile at `elapsed / duration` above
@@ -664,8 +688,13 @@ impl CompositorDrive<Nv12Image> {
         let mut scratch = self.scratch.borrow_mut();
         let cell_count = self.layout.cells.len();
         // A transition adds at most two full-canvas tiles (the DIP colour and
-        // the incoming picture), so the pool is sized once for both.
-        scratch.begin(cell_count + 2 * usize::from(self.mix_overlay.is_some()));
+        // the incoming picture) and a stinger one more (its clip), so the
+        // pool is sized once for all three.
+        scratch.begin(
+            cell_count
+                + 2 * usize::from(self.mix_overlay.is_some())
+                + usize::from(self.stinger_clip.is_some()),
+        );
         let ComposeScratch {
             held,
             placements,
@@ -710,6 +739,26 @@ impl CompositorDrive<Nv12Image> {
         // through), never a slate blended into Program.
         if let Some(mix) = &self.mix_overlay {
             self.push_transition_tiles(mix, now, canvas.width, canvas.height, held, placements);
+        }
+        // The stinger clip (ADR-0112 §5): its fresh frame on top of the take,
+        // through its own alpha plane when it carries one (the compositor's
+        // per-pixel tile alpha), else opaque. A stale or missing frame is
+        // skipped: Program shows the take beneath, never a slate.
+        if let Some(frame) = self
+            .stinger_clip
+            .as_deref()
+            .and_then(|player| self.fresh_frame(player, now))
+        {
+            held.push(frame);
+            placements.push(Placement {
+                image_index: held.len().saturating_sub(1),
+                dst_x: 0,
+                dst_y: 0,
+                dst_w: canvas.width,
+                dst_h: canvas.height,
+                opacity: 1.0,
+                mask: None,
+            });
         }
 
         // Borrow the held images for the compositor's `Tile` slice. This slice is
@@ -804,13 +853,7 @@ impl CompositorDrive<Nv12Image> {
         };
         // Only a fresh incoming frame is blended (SW2-02): a held stale frame
         // or a slate never fades into Program.
-        let fresh = self.stores.get(&mix.source).and_then(|store| {
-            let read = store.read_at(now);
-            match (read.state().is_live(), read.frame()) {
-                (true, Some(frame)) => Some(Arc::clone(frame)),
-                _ => None,
-            }
-        });
+        let fresh = self.fresh_frame(&mix.source, now);
         let mut mask = None;
         let mut band = None;
         let incoming = match mix.style {
@@ -885,6 +928,18 @@ impl CompositorDrive<Nv12Image> {
         if let Some((fill, band_mask)) = band {
             full_canvas(fill, 1.0, Some(band_mask));
         }
+    }
+
+    /// `source`'s frame at `now` if it is fresh (live), else `None`: never a
+    /// held stale frame or a slate. Wait-free store read.
+    fn fresh_frame(&self, source: &str, now: MediaTime) -> Option<Arc<Nv12Image>> {
+        self.stores.get(source).and_then(|store| {
+            let read = store.read_at(now);
+            match (read.state().is_live(), read.frame()) {
+                (true, Some(frame)) => Some(Arc::clone(frame)),
+                _ => None,
+            }
+        })
     }
 
     /// Sample one cell's image and state without blocking: the bound source's
