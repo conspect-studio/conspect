@@ -30,8 +30,32 @@ const layouts = [
 ];
 let switcherOn = true;
 let applied: unknown[] = [];
+let putBodies: Record<string, unknown>[] = [];
+let putStatus = 200;
 const server = setupServer(
   http.get('*/api/v1/layouts', () => HttpResponse.json(layouts)),
+  http.get('*/api/v1/layouts/:id', ({ params }) => {
+    const found = layouts.find((l) => l.id === params.id);
+    if (found === undefined) {
+      return new HttpResponse(null, { status: 404 });
+    }
+    return HttpResponse.json(found, { headers: { ETag: 'v1' } });
+  }),
+  http.put('*/api/v1/layouts/:id', async ({ request, params }) => {
+    const body = (await request.json()) as Record<string, unknown>;
+    putBodies.push(body);
+    if (putStatus !== 200) {
+      return HttpResponse.json(
+        { type: '/problems/forbidden', title: 'Access denied', status: putStatus, detail: 'routed-layout: this layout is on air on an output; changing it needs Write on every output it feeds and Read on every source it shows' },
+        { status: putStatus },
+      );
+    }
+    const found = layouts.find((l) => l.id === params.id);
+    return HttpResponse.json(
+      { id: params.id, name: body.name, version: (found?.version ?? 1) + 1, body: body.body },
+      { headers: { ETag: 'v2' } },
+    );
+  }),
   http.get('*/api/v1/switcher/me1', () => (switcherOn
     ? HttpResponse.json({ program_source: 'cam-1', preview_source: 'cam-2', tick: 7, in_flight: false })
     : HttpResponse.json({ type: '/problems/conflict', title: 'Conflict', status: 409 }, { status: 409 }))),
@@ -46,7 +70,7 @@ const server = setupServer(
   }),
 );
 beforeAll(() => { server.listen(); });
-afterEach(() => { server.resetHandlers(); switcherOn = true; applied = []; });
+afterEach(() => { server.resetHandlers(); switcherOn = true; applied = []; putBodies = []; putStatus = 200; });
 afterAll(() => { server.close(); });
 
 function page() {
@@ -94,5 +118,124 @@ describe('LayoutsPage Apply with the switcher on (#317)', () => {
     expect(within(toast).getByText(/must be bound to the M\/E program source/).textContent)
       .toContain('Nothing was changed; the current layout keeps running.');
     expect(screen.queryByText('Could not apply layout')).toBeNull();
+  });
+});
+
+// PR-B: the "Layers" column + dialog editing the engine `overlays` sub-doc.
+function layersButton(name: string): HTMLButtonElement {
+  return screen.getByRole('button', { name: `Layers: ${name}` });
+}
+
+describe('LayoutsPage Layers column + dialog', () => {
+  it('shows "All" for a layout with no overlays key (every layer at its default)', async () => {
+    page();
+    await screen.findByText('Single');
+    const row = screen.getByText('Single').closest('tr');
+    expect(row).not.toBeNull();
+    // The engine default is 5-of-6 (safe_area off), not "All" — labels/
+    // meters/flags/tally/clock on, safe_area off.
+    expect(within(row as HTMLElement).getByText('5 of 6')).toBeInTheDocument();
+  });
+
+  it('opens the Layers dialog with the accessible title/description and six controls', async () => {
+    page();
+    await screen.findByText('Single');
+    await userEvent.click(layersButton('Single'));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('Layers')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Source names')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Audio meters')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('State & fault flags')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Tally borders')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Clock')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Safe-area markers')).toBeInTheDocument();
+    const metersCheckbox = within(dialog).getByLabelText('Audio meters');
+    expect(metersCheckbox).toHaveProperty('checked', true);
+    const safeAreaCheckbox = within(dialog).getByLabelText('Safe-area markers');
+    expect(safeAreaCheckbox).toHaveProperty('checked', false);
+  });
+
+  it('toggling meters off and saving sends overlays {..., meters:false} with every other key unchanged', async () => {
+    page();
+    await screen.findByText('Single');
+    await userEvent.click(layersButton('Single'));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByLabelText('Audio meters'));
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => { expect(putBodies).toHaveLength(1); });
+    const sent = putBodies[0];
+    expect(sent?.name).toBe('Single');
+    const body = sent?.body as Record<string, unknown>;
+    expect(body.overlays).toEqual({
+      labels: true,
+      meters: false,
+      flags: true,
+      tally: true,
+      clock: true,
+      safe_area: false,
+    });
+    expect(body.canvas).toEqual(canvas);
+    expect(body.layout).toEqual({ kind: 'absolute' });
+    expect(body.cells).toEqual(layouts[0]?.body.cells);
+  });
+
+  it('"Clean (no overlays)" sets every layer off and saves all-false', async () => {
+    page();
+    await screen.findByText('Single');
+    await userEvent.click(layersButton('Single'));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Clean (no overlays)' }));
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => { expect(putBodies).toHaveLength(1); });
+    const body = putBodies[0]?.body as Record<string, unknown>;
+    expect(body.overlays).toEqual({
+      labels: false,
+      meters: false,
+      flags: false,
+      tally: false,
+      clock: false,
+      safe_area: false,
+    });
+  });
+
+  it('"Reset to defaults" after toggling clears the overlays key entirely (byte-stable default)', async () => {
+    page();
+    await screen.findByText('Single');
+    await userEvent.click(layersButton('Single'));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByLabelText('Audio meters'));
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Reset to defaults' }));
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => { expect(putBodies).toHaveLength(1); });
+    const body = putBodies[0]?.body as Record<string, unknown>;
+    expect('overlays' in body).toBe(false);
+  });
+
+  it('a 403 routed-layout failure on save shows a readable message, not a generic error', async () => {
+    putStatus = 403;
+    page();
+    await screen.findByText('Single');
+    await userEvent.click(layersButton('Single'));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByLabelText('Audio meters'));
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    const title = await screen.findByText('Could not save layers: this layout is routed');
+    const toast = title.closest('li') ?? document.body;
+    expect(within(toast).getByText(/routed-layout:/).textContent).toContain(
+      'needs Write on every output it feeds',
+    );
+  });
+
+  it('is disabled while saving', async () => {
+    page();
+    await screen.findByText('Single');
+    await userEvent.click(layersButton('Single'));
+    const dialog = await screen.findByRole('dialog');
+    const saveBtn = within(dialog).getByRole('button', { name: 'Save' });
+    await userEvent.click(saveBtn);
+    // Immediately after the click the mutation is pending; the Save button
+    // (and the checkboxes) must already be disabled.
+    expect(saveBtn.hasAttribute('disabled')).toBe(true);
+    await waitFor(() => { expect(putBodies).toHaveLength(1); });
   });
 });
