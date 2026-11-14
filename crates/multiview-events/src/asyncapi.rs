@@ -1239,7 +1239,7 @@ fn warning_code_schema() -> Value {
             "`#[non_exhaustive]`: the catalog grows over time, so a client must ",
             "treat an unknown code as a forward-compatible warning, not an error.",
         ),
-        "enum": ["gpu-present-no-vulkan-adapter", "config-file-invalid", "config-file-requires-restart", "config-file-apply-incomplete", "container-no-host-networking", "catalogue-link-attention", "accepted-state-rejected", "tls-certificate"]
+        "enum": ["gpu-present-no-vulkan-adapter", "config-file-invalid", "config-file-requires-restart", "config-file-apply-incomplete", "container-no-host-networking", "catalogue-link-attention", "accepted-state-rejected", "tls-certificate", "config-file-removed-accepted"]
     })
 }
 

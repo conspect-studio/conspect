@@ -1,7 +1,9 @@
 # ADR-W020: Config-file watch — hot-reload the impacted parts through the one apply machinery
 
 - **Status:** Accepted — §1's stat-only fingerprint superseded by [ADR-W027](ADR-W027.md)
-  (2026-07-11; the watch fingerprint now folds a content hash). The rest of this ADR stands.
+  (2026-07-11; the watch fingerprint now folds a content hash). §3a/§3b added 2026-11-13
+  (#367: a file edit carries only what the file changed; no commit during shutdown). The rest
+  of this ADR stands.
 - **Area:** Web/API stack · config-as-code ↔ engine (invariant #11 live-apply classification)
 - **Date:** 2026-06-10
 - **Source:** [management-capability-matrix](../research/management-capability-matrix.md);
@@ -97,6 +99,92 @@ next)` — exhaustive over every `MultiviewConfig` section: sources (by id:
 added/changed/removed), canvas (pinned signal vs cosmetic axes), layout+cells, outputs,
 overlays, probes, audio, control, placement, salvos, tally_profiles, walls, devices,
 sync_groups, routing, schema_version.
+
+### 3a. A file edit carries only what the FILE changed (#367, 2026-11-13)
+
+**Rule: a boot-file edit applies only the sections the file edit changed. Untouched sections
+keep the accepted state's value.** The boot file is not the accepted state: the operator builds
+the accepted state (`.multiview/desired.json`, ADR-W032) through the API and the UI, and the
+boot file is usually the small original document. Committing the whole file over the accepted
+state — what §3's "the new file becomes the baseline" did once the accepted envelope existed —
+replaced 12 sources, 2 outputs, the switcher and 5 audio routes with the file's 1 source and 1
+output when one `[control] ui_dir` key changed (#367).
+
+* The watcher keeps the **previous file document** next to its running baseline. A settled
+  change is the edit `previous file → new file`, computed by the pure
+  `multiview_config::merge_file_edit(previous_file, new_file, accepted)`: a section the file
+  did not change keeps the accepted value; id-keyed lists (sources, outputs, overlays, probes,
+  programs, tally profiles, salvos, walls, devices, sync groups, media players and fills,
+  weather locations, graphics data sources/items/channels, IPTV entries, audio routes, routing
+  crosspoints, cells, M/Es and their mixer inputs) merge per item — an item the file added or
+  changed takes the file's change, an item the file removed is removed, every other accepted
+  item stays (hash-indexed, linear in the list sizes) — and a changed item merges **field by
+  field at every depth** (a recursive three-way merge of its serialized form; nested arrays of
+  `id`- or `number`-keyed objects per item), so an API write of one field — a catalogue URL
+  follow, an armed automation rule, a Program cell rebind, a propagated output track, a mixer
+  patch, a channel rundown — survives a file edit of another field of the same item. An enum
+  variant switch (the string value of one of the schema's tag keys — `kind`, `target`, `mode`, `by`,
+  `slate`, `provider` — changed; a same-named non-string field such as a display output's
+  `mode` object is ordinary data) is merged per key too: a file switch lands the tag and the fields the
+  file changed while shared fields it did not touch keep the accepted value; when only the
+  accepted state switched, the file's edits land on the fields the accepted variant can carry
+  (decided by deserializing the result; if the accepted variant rejects an edited key, keys
+  the accepted object lacks are skipped as old-variant-only); when both switched to different
+  variants, the file's wins. A merged item that does not
+  deserialize falls back to the file's whole item. Deliberate whole units: the canvas's pinned signal (width, height, cadence),
+  and a layout change, which takes the file's cells (cells name the layout's areas). A
+  singleton block the file adds (e.g. `[audio]` absent before) states its scalar values
+  (the sample rate), so they win; its keyed lists still merge onto the accepted ones. When
+  the accepted list still equals the previous file's list, the new list is taken whole (a
+  reorder lands). The function destructures `MultiviewConfig` exhaustively, so a new section
+  is a compile error until the merge decides how an edit carries it.
+* A file whose document did not change (a touch, a reformat, the unchanged boot file at start)
+  is no edit at all, even where the accepted state differs from the file.
+* The merged document is validated as a whole and admitted for boot (ADR-W032). An edit that
+  does not combine with the accepted state (e.g. the file drops a source the accepted
+  switcher uses) is refused whole and latched like an invalid document; nothing is written.
+* The live apply (§4) diffs the merged document against the running baseline, as before.
+* Before a file commit **removes sources, outputs, the switcher (or an M/E), audio routes or
+  IPTV entries that exist in the accepted state**, the watcher keeps a byte copy of the accepted envelope as
+  `.multiview/rejected/replaced-<unix-ms>-<n>.json` (owner-only, atomic, deduplicated by
+  reading only a same-size regular file through an `O_NOFOLLOW | O_NONBLOCK` descriptor; at
+  most 1000 name attempts, failing closed; newest 5 kept; the #324 `desired-*.json` copies
+  use the same rules) and raises the latched critical warning **`config-file-removed-accepted`**
+  naming every removed item and the copy's path. No copy, no commit (the edit is retried).
+
+### 3b. No accepted-state commit after the exit decision (#367)
+
+Once the run decides to exit, nothing writes the accepted state any more. On #367 the old
+process's watcher committed the file while its engine was already gone (`command bus receiver
+is closed`).
+
+* Every exit decision **freezes the accepted state** (`AppState::freeze_accepted_state`) and
+  stops the watcher: the stop-signal task, the exit-durable thread (#309, any armed exit on
+  the pipeline path), and the return of either drive loop (stop, fatal fault or error, on both
+  the pipeline and the software path), before tenant teardown and the final persist. The
+  software path, which has no exit-durable thread, runs a small control-plane task that
+  freezes as soon as the stop signal is raised or any exit is armed.
+* The durable write (`write_desired`, which every accepted-state commit goes through: the
+  watcher, the REST mutations and revert-to-start) prepares and fsyncs its temp file outside
+  the write serial, then checks the freeze and renames **under a commit gate**
+  (`AppState::commit_unless_frozen`). The commit's decision point is that check: a commit
+  whose check ran after the freeze fails; one whose check ran before it was decided before
+  the exit and may finish its rename. The freeze itself is wait-free (one atomic store), so a
+  stalled filesystem cannot hang the stop-signal task before the exit watchdog is armed. The
+  exit then waits for the gate, **bounded (500 ms) and off the async workers** — on the
+  exit-durable thread (after the watchdog is armed) and on the blocking pool when a drive
+  loop returns — so no `desired.json` rename is in flight when the teardown and the final
+  persist run. The wait never covers an fsync. The exit-time `active.toml` persist shares the
+  write serial, so it waits for an in-flight rename (before #367 it waited for the whole
+  temp write, fsync and rename). A filesystem that stalls a rename in `.multiview/` also
+  stalls the `active.toml` write in the same directory; the exit watchdog (#309) is what
+  bounds that case, not this settle.
+* The watcher also checks "stopped, frozen, or command bus closed" under the config-mutation
+  lock before every commit path. A closed bus (the receiver already dropped) is only a
+  backstop: it becomes true after the exit decision, never in a normal run.
+
+A file edit seen during shutdown is applied by the next process from its own boot state; a
+dying process never writes the accepted state.
 
 ### 4. Apply each diff item through the SAME machinery the API uses
 
@@ -204,7 +292,8 @@ bounded `--ticks` smoke runs are not watched.
 * `bind_and_serve` additionally returns the `AppState` so the watcher shares the router's
   stores; `cmd_apply_layout`'s resolve+solve+gate moved into the shared
   `resolve_layout_document` used by both triggers.
-* The baseline-becomes-file rule means a file edit that only touches restart-only sections
+* The baseline-becomes-file rule (as amended by §3a: the baseline becomes the file edit merged
+  onto the accepted state) means a file edit that only touches restart-only sections
   still advances the baseline: the diff is consumed, the warning latches, and the file remains
   the durable truth (`GET /config/export` still overlays the live stores onto the boot base
   document; the watcher does not rewrite the base document).

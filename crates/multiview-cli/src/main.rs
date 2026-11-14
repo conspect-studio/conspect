@@ -37,6 +37,68 @@ use multiview_telemetry::tracing_init::SubscriberBuilder;
 /// `active.toml` write per window (~2 s), coalescing a burst of live changes.
 const RUNNING_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// What an exit decision freezes (#367): the config-file watcher stops, and
+/// the accepted state (`desired.json`) takes no further commit from any path
+/// (the watcher, a REST mutation, a revert). Cloneable into the signal task and
+/// the exit-durable thread; [`Self::freeze`] is wait-free and idempotent.
+#[derive(Clone)]
+struct ExitFreeze {
+    watch: Option<multiview_cli::config_watch::ConfigWatchHandle>,
+    state: Option<multiview_control::AppState>,
+}
+
+impl ExitFreeze {
+    fn new(
+        watch: Option<&multiview_cli::config_watch::ConfigWatchHandle>,
+        state: Option<&multiview_control::AppState>,
+    ) -> Self {
+        Self {
+            watch: watch.cloned(),
+            state: state.cloned(),
+        }
+    }
+
+    fn freeze(&self) {
+        if let Some(state) = &self.state {
+            state.freeze_accepted_state();
+        }
+        if let Some(watch) = &self.watch {
+            watch.stop();
+        }
+    }
+
+    /// Freeze, then wait (blocking, at most [`ACCEPTED_COMMIT_SETTLE`]) for a
+    /// `desired.json` rename whose freeze check ran before the freeze. Call
+    /// only off the async workers and after the exit watchdog is armed.
+    fn freeze_and_settle(&self) {
+        self.freeze();
+        if let Some(state) = &self.state {
+            if !state.await_accepted_commits(ACCEPTED_COMMIT_SETTLE) {
+                tracing::warn!(
+                    "a desired.json rename decided before the exit is still in flight; exiting without waiting further"
+                );
+            }
+        }
+    }
+
+    /// [`Self::freeze_and_settle`] from async code: the freeze runs at once
+    /// (wait-free), the bounded wait on the blocking pool.
+    async fn freeze_and_settle_async(&self) {
+        self.freeze();
+        let this = self.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || this.freeze_and_settle()).await {
+            tracing::warn!(error = %error, "the exit-time accepted-state settle task failed");
+        }
+    }
+}
+
+/// How long an exit waits for a `desired.json` rename already past its
+/// freeze check (#367). A rename is a metadata operation; the bound only
+/// matters on a stalled filesystem, where the later `active.toml` persist
+/// (same directory, same write serial) stalls as it did before #367 and the
+/// exit watchdog (#309) bounds the exit.
+const ACCEPTED_COMMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The run's handle on the debounced ADR-W024 Running persister: the spawned
 /// task plus the served [`multiview_control::AppState`] it persists from.
 struct RunningPersist {
@@ -1257,10 +1319,18 @@ async fn run_pipeline_until_ctrl_c(
     }
 
     let stop_for_signal = stop.clone();
+    // #367: the config-file watcher stops committing the moment an exit is
+    // decided, not at the late tenant teardown: a boot-file edit seen during
+    // shutdown must never be written over the accepted state.
+    let freeze_for_signal = ExitFreeze::new(
+        config_watch.as_ref(),
+        running_persist.as_ref().map(|p| &p.state),
+    );
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
         // #309: decide first, log second.
         stop_for_signal.stop();
+        freeze_for_signal.freeze();
         multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
@@ -1274,6 +1344,10 @@ async fn run_pipeline_until_ctrl_c(
     // (the persist writes the same Running state again; idempotent).
     let early_persist_state = running_persist.as_ref().map(|p| p.state.clone());
     let decided_drain = std::sync::Arc::clone(&early_drain);
+    let decided_freeze = ExitFreeze::new(
+        config_watch.as_ref(),
+        running_persist.as_ref().map(|p| &p.state),
+    );
     // A dedicated OS thread with its own small runtime: the main runtime's
     // workers can be busy with the synchronous pipeline teardown (a task parked
     // behind it would miss the bound), and this work must not depend on them.
@@ -1288,6 +1362,10 @@ async fn run_pipeline_until_ctrl_c(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            // #367: no config-file commit after an exit is decided (a fatal
+            // output fault as well as a stop signal). This OS thread runs
+            // after the watchdog is armed, so the bounded settle is safe here.
+            decided_freeze.freeze_and_settle();
             // Begin the control plane's graceful drain now (the deadline cuts it).
             decided_drain.notify_one();
             // Journal counters first (bounded wait for the worker to apply it):
@@ -1431,9 +1509,18 @@ async fn run_pipeline_until_ctrl_c(
     // MP-1 (ADR-0030 §2.2): build the engine `ProgramSet` and drive this single
     // program (id "main") through it — behaviour-identical to today (one program,
     // the same drive/stop/publisher/preview/drain). See `drive_main_program_in_set`.
+    let exit_freeze = ExitFreeze::new(
+        config_watch.as_ref(),
+        running_persist.as_ref().map(|p| &p.state),
+    );
     let report =
-        drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain)
-            .await?;
+        drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain).await;
+    // #367: the drive loop returned (a stop, a fatal fault, or an error): the
+    // run is exiting, so no config-file commit may write the accepted state
+    // from here on, whatever made it return. The settle (bounded) lets a
+    // rename decided before the freeze finish before the teardown.
+    exit_freeze.freeze_and_settle_async().await;
+    let report = report?;
     let tenants_start = std::time::Instant::now();
 
     // The run is over: release this generation's preview demand explicitly
@@ -1756,10 +1843,18 @@ async fn run_software_until_ctrl_c(
     };
 
     let stop_for_signal = stop.clone();
+    // #367: the config-file watcher stops committing the moment an exit is
+    // decided, not at the late tenant teardown: a boot-file edit seen during
+    // shutdown must never be written over the accepted state.
+    let freeze_for_signal = ExitFreeze::new(
+        config_watch.as_ref(),
+        running_persist.as_ref().map(|p| &p.state),
+    );
     let signal = tokio::spawn(async move {
         let which = await_shutdown_signal().await;
         // #309: decide first, log second.
         stop_for_signal.stop();
+        freeze_for_signal.freeze();
         multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Stop);
         tracing::info!(
             signal = which,
@@ -1808,13 +1903,40 @@ async fn run_software_until_ctrl_c(
         stop.clone(),
     );
 
+    // #367: the software run has no exit-durable thread; freeze the accepted
+    // state the moment ANY exit is decided (a stop, or a fatal arm anywhere),
+    // not only once the engine loop has returned and its teardown finished.
+    // Off the clock: a 5 ms poll of two atomics on a control-plane task.
+    let decided = {
+        let freeze = ExitFreeze::new(
+            config_watch.as_ref(),
+            running_persist.as_ref().map(|p| &p.state),
+        );
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            while !stop.is_stopped() && multiview_cli::exit_watchdog::armed().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            freeze.freeze();
+        })
+    };
     let report = engine
         .run_until_stopped_with_control(&stop, publisher.as_ref(), drain)
         .await;
+    decided.abort();
+    // #367: the engine loop returned (a stop or an error): the run is exiting,
+    // so no config-file commit may write the accepted state from here on.
     if report.is_err() {
-        // #309: an engine error is an exit decision.
+        // #309: an engine error is an exit decision. Armed before the settle
+        // below, so the watchdog bounds the whole exit.
         multiview_cli::exit_watchdog::arm(multiview_cli::exit_watchdog::ExitCause::Fatal);
     }
+    ExitFreeze::new(
+        config_watch.as_ref(),
+        running_persist.as_ref().map(|p| &p.state),
+    )
+    .freeze_and_settle_async()
+    .await;
     let report = report.context("headless run until Ctrl-C")?;
 
     // The engine loop returned; tear down every run tenant in one call.
