@@ -230,10 +230,14 @@ impl Drop for Nv12Image {
 }
 
 /// Bounded reusable alpha storage for media/graphics fills. Opaque frames do
-/// not acquire a buffer. This pool retains at most one returned plane.
+/// not acquire a buffer. This pool retains at most one returned plane. The
+/// return path (frame drop) only ever `try_lock`s: under contention the plane
+/// is freed rather than pooled, so dropping a frame never waits on a producer.
 #[derive(Debug, Default)]
 pub struct AlphaPlanePool {
     spare: std::sync::Mutex<Option<Vec<u8>>>,
+    /// Returned planes freed instead of pooled because the lock was busy.
+    contended: AtomicU64,
 }
 
 impl AlphaPlanePool {
@@ -272,6 +276,9 @@ impl AlphaPlanePool {
         F: FnOnce(&mut [u8]) -> Result<()>,
     {
         let expected = image.y_plane.len();
+        // The lock guards only the `Option::take`; it is released before the
+        // resize and `fill` (copy/scale/extract), so a concurrent return is
+        // never turned away by work done here.
         let mut spare = self
             .spare
             .lock()
@@ -300,13 +307,35 @@ impl AlphaPlanePool {
         usize::from(spare.is_some())
     }
 
+    /// Returned planes this pool freed instead of retaining because its lock
+    /// was momentarily held when the last holder dropped the frame (the
+    /// return path never waits; see [`Nv12Image`]'s `Drop`).
+    #[must_use]
+    pub fn contended_drops(&self) -> u64 {
+        self.contended.load(Ordering::Relaxed)
+    }
+
+    /// Offer a returned plane back for reuse. Runs from [`Nv12Image`]'s
+    /// `Drop`, which can be the output clock thread letting go of the last
+    /// reference, so it never waits (invariants #1/#10, data-plane safety
+    /// §4): when the lock is busy (a producer is leasing) the plane is freed
+    /// instead of pooled. Retention stays bounded at one plane either way.
     fn give_back(&self, plane: Vec<u8>) {
-        let mut spare = self
-            .spare
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut spare = match self.spare.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.contended.fetch_add(1, Ordering::Relaxed);
+                drop(plane);
+                return;
+            }
+        };
         if spare.is_none() {
             *spare = Some(plane);
+        } else {
+            // Drop the surplus plane outside the lock.
+            drop(spare);
+            drop(plane);
         }
     }
 }
@@ -1918,5 +1947,68 @@ fn write_chroma(uv_plane: &mut [u8], w: usize, px: u32, py: u32, cb: u8, cr: u8)
     }
     if let Some(slot) = uv_plane.get_mut(uv_index + 1) {
         *slot = cr;
+    }
+}
+
+#[cfg(test)]
+mod alpha_pool_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    fn image() -> Nv12Image {
+        Nv12Image::solid(4, 2, 16, 128, 128, ColorInfo::default()).unwrap()
+    }
+
+    /// PB-4: the clock thread can drop the last reference to a frame with
+    /// alpha while the player holds the pool lock. The return path must not
+    /// wait on that lock (invariants #1/#10): it drops the plane instead.
+    #[test]
+    fn dropping_an_alpha_image_never_waits_on_a_held_pool_lock() {
+        let pool = Arc::new(AlphaPlanePool::default());
+        let leased = pool.attach(image(), &[7; 8]).unwrap();
+        // The "player" holds the pool lock for the whole drop.
+        let guard = pool.spare.lock().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let clock = std::thread::spawn(move || {
+            drop(leased);
+            done_tx.send(()).unwrap();
+        });
+        // Generous bound: a blocking return would never finish while the
+        // guard is held, a non-blocking one finishes in microseconds.
+        let finished = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        drop(guard);
+        clock.join().unwrap();
+        assert!(finished, "Nv12Image::drop blocked on the held pool lock");
+        // The contended plane was freed, not pooled: the pool stays bounded.
+        assert_eq!(pool.retained(), 0);
+        assert_eq!(pool.contended_drops(), 1);
+        // An uncontended return still pools it.
+        drop(pool.attach(image(), &[1; 8]).unwrap());
+        assert_eq!(pool.retained(), 1);
+        assert_eq!(pool.contended_drops(), 1);
+    }
+
+    /// PB-4: `attach_with` never holds the pool lock while `fill` runs, so a
+    /// frame returned during a (long) copy/scale/extract is pooled.
+    #[test]
+    fn attach_with_does_not_hold_the_lock_across_fill() {
+        let pool = Arc::new(AlphaPlanePool::default());
+        let first = pool.attach(image(), &[3; 8]).unwrap();
+        let mut slot = Some(first);
+        let second = pool
+            .attach_with(image(), |plane| {
+                // Returned mid-fill (another holder lets go of a frame).
+                drop(slot.take());
+                plane.fill(9);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(pool.contended_drops(), 0, "fill ran under the pool lock");
+        assert_eq!(pool.retained(), 1);
+        assert_eq!(second.alpha_plane(), Some(&[9; 8][..]));
     }
 }
