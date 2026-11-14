@@ -134,10 +134,18 @@ M/E are still refused (`SwitcherCanvasRefusal::Overlays`). `boot_admission` adds
   nothing reserved, applied or persisted; `target: {output}` makes it an output
   take of the layout;
 - the engine drain (`CommandDrain::switcher_program`): with an M/E the drive is
-  keyed by the Program cell alone; a stored layout, SwapSource, RouteVideo or
-  salvo recall changes only the document mirror (the stored layout), never the
-  Program drive, and never resets the M/E's Program binding (an
-  `apply_layout_held` outcome says so);
+  keyed by the Program cell alone; a stored layout from the config watcher
+  updates only the document mirror, never the Program drive, and never resets
+  the M/E's Program binding (an `apply_layout_held` outcome says so). A no-document
+  `ApplyLayout` is ignored before any solve (no clock-side work);
+- the cell-edit routes (#307 review M1): with an M/E declared,
+  `POST /commands/swap`, a video→cell `POST /routing/video/take` and a salvo
+  take/fire that recalls a layout or cell sources answer `422`
+  `/problems/switcher-owns-program` after authorization and before the
+  idempotency reservation. They would change neither Program (the M/E bus) nor
+  the stored layout outputs show; the detail names `PUT /api/v1/layouts/{id}`
+  (routed outputs update live) and a switcher select. One that still reaches the
+  drain is dropped (warned once) without mutating the working-config mirror;
 - `multiview validate <config>`, which now also checks what `multiview run` will
   start from (`.multiview/desired.json` when it exists) and exits non-zero with
   start-up's reason. Run it as the deploy preflight. It also warns while an

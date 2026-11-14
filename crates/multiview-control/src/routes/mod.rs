@@ -147,11 +147,29 @@ pub struct ApplyLayoutTarget {
 }
 
 /// Whether the accepted configuration declares a switcher M/E: then the
-/// Program canvas is the M/E bus and `apply-layout` cannot replace it (#307).
-fn switcher_declared(state: &AppState) -> ControlResult<bool> {
-    let document = crate::boot_model::current_desired_config(state)?;
-    Ok(document
-        .get("switcher")
+/// Program canvas is the M/E bus, `apply-layout` cannot replace it, and cell
+/// edits are refused (#307). Reads the accepted envelope (else the adopted
+/// config) under a boot model, else the loaded base document — the section
+/// the composed document carries verbatim — without composing or validating
+/// the whole document, so a store-only run with no working layout still
+/// answers.
+pub(crate) fn switcher_declared(state: &AppState) -> ControlResult<bool> {
+    if let Some(model) = &state.boot_model {
+        let declared = |config: &multiview_config::MultiviewConfig| {
+            config
+                .switcher
+                .as_ref()
+                .is_some_and(|switcher| !switcher.mix_effects.is_empty())
+        };
+        return Ok(match model.accepted().map_err(ControlError::Repository)? {
+            Some(desired) => declared(&desired.config),
+            None => declared(&model.adopted_config()),
+        });
+    }
+    Ok(state
+        .base_document
+        .as_deref()
+        .and_then(|document| document.get("switcher"))
         .and_then(|switcher| switcher.get("mix_effects"))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|mix_effects| !mix_effects.is_empty()))
@@ -750,6 +768,13 @@ async fn cmd_swap(
     // input onto the tile, so a scoped operator may swap in only sources within
     // its object allowlist (a missing/out-of-scope id fails closed).
     crate::auth::authorize_object(&principal, &req.source)?;
+    // #307 review M1: with a switcher M/E the document's cells are neither
+    // Program (the M/E bus) nor the stored layout outputs show, so a swap
+    // would be a silent no-op. Refused after authorization (no existence
+    // leak) and before the idempotency reservation (the key stays usable).
+    if switcher_declared(&state)? {
+        return Err(ControlError::SwitcherOwnsCells("a tile swap"));
+    }
     let tile = req.tile.clone();
     let source = req.source.clone();
     let response = submit_accepted(&state, &idem, |op| Command::SwapSource {

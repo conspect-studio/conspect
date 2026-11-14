@@ -106,6 +106,15 @@ pub enum ControlError {
     /// persisted or sent.
     #[error("the switcher M/E owns the Program canvas; layout {0:?} was not applied")]
     SwitcherOwnsProgram(String),
+
+    /// A cell edit — `SwapSource`, a video→cell route take, or a salvo that
+    /// recalls a layout or cell sources — while a switcher M/E is declared
+    /// (#307 review M1): it would change neither Program (the M/E bus) nor the
+    /// stored layout outputs show, so it is refused rather than accepted as a
+    /// silent no-op. The payload names the refused operation. Nothing was
+    /// reserved or sent.
+    #[error("the switcher M/E owns the Program canvas; {0} was not applied")]
+    SwitcherOwnsCells(&'static str),
 }
 
 /// The stable problem `type` slug for [`ControlError::NotAdmissibleWithSwitcher`].
@@ -194,6 +203,19 @@ impl ControlError {
                  apply-layout with target {{\"output\":\"<id>\"}}; to cut it to Program, \
                  select it as a switcher source with \
                  POST /api/v1/switcher/commands/select_preview (layout:{layout}). \
+                 Nothing was changed."
+            )),
+            Self::SwitcherOwnsCells(operation) => Problem::new(
+                422,
+                SWITCHER_OWNS_PROGRAM,
+                "The switcher owns the Program canvas",
+            )
+            .with_detail(format!(
+                "The switcher is on: Program is the M/E bus, so {operation} would change \
+                 neither Program nor the stored layout outputs show. To change what a \
+                 layout's cells show, edit the stored layout with PUT /api/v1/layouts/{{id}} \
+                 (outputs showing it update live); to change Program, use a switcher select \
+                 (POST /api/v1/switcher/commands/select_preview or select_program). \
                  Nothing was changed."
             )),
         }
