@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use multiview_compositor::backend::{RunBackend, RunBackendKind};
 use multiview_compositor::blend::LinearRgba;
+use multiview_compositor::key::TileKey;
 use multiview_compositor::mask::{MaskShape, WipeMask};
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image, Tile};
 use multiview_core::layout::Layout;
@@ -52,7 +53,12 @@ use multiview_framestore::TileStore;
 
 use crate::clock::Tick;
 use crate::error::{Error, Result};
+use crate::keyer::{KeyerDraw, KeyerParams, TieEnvelope, MAX_DSK};
 use crate::slate::{failover_slate_image, FailoverSlate};
+
+/// Scratch slots reserved for keyer tiles on every compose (fill and key per
+/// downstream keyer), so `scratch_reservations` never depends on keyer state.
+const KEYER_TILES: usize = 2 * MAX_DSK;
 
 /// A frame composited for one output tick: the tagged canvas image, its
 /// presentation timestamp, and the per-source states sampled this tick.
@@ -155,6 +161,59 @@ impl MixOverlay {
             duration,
         ))
     }
+
+    /// The weight of the incoming (Preview) picture on this step: the MIX
+    /// opacity, the DIP incoming contribution `i` (0 before the switch
+    /// point), or the WIPE edge position (0 covers nothing). Zero means the
+    /// incoming source does not contribute to the frame (tally, review F4).
+    #[must_use]
+    pub fn incoming_weight(&self) -> f32 {
+        match self.style {
+            TransitionStyle::Mix | TransitionStyle::Wipe { .. } => self.opacity(),
+            TransitionStyle::Dip { switch_point, .. } => {
+                multiview_core::switcher::kernel::dip_weights(
+                    self.elapsed,
+                    self.duration,
+                    switch_point,
+                )
+                .1
+            }
+        }
+    }
+
+    /// The weights a tied downstream keyer draws on this step (ADR-0113 §4):
+    /// MIX `p` going on and `1 − p` going off, with `p` the same opacity the
+    /// incoming tile uses; DIP the incoming contribution `i` going on and
+    /// `1 − d` going off, with the same `dip_weights` the transition tiles use;
+    /// WIPE (until K3) `0` going on and `1` going off, a CUT at the terminal
+    /// tick.
+    #[must_use]
+    pub fn tie_envelope(&self) -> TieEnvelope {
+        match self.style {
+            TransitionStyle::Mix => TieEnvelope::mix(self.opacity()),
+            TransitionStyle::Dip { switch_point, .. } => {
+                let (dip, incoming) = multiview_core::switcher::kernel::dip_weights(
+                    self.elapsed,
+                    self.duration,
+                    switch_point,
+                );
+                TieEnvelope {
+                    going_on: incoming,
+                    going_off: 1.0 - dip,
+                }
+            }
+            // K2a deviation (design note §14, K3): the per-pixel WIPE
+            // envelope (`m(x, y)` on, `1 − m(x, y)` off) needs a complement
+            // mask the compositor does not have yet. Until K3 a tied keyer
+            // on a WIPE behaves like a CUT at the transition end: it keeps
+            // its current state through the flight and flips on the
+            // terminal tick.
+            TransitionStyle::Wipe { .. } => TieEnvelope {
+                going_on: 0.0,
+                going_off: 1.0,
+            },
+        }
+    }
 }
 
 impl CompositedFrame {
@@ -254,6 +313,11 @@ pub struct CompositorDrive<T> {
     transition_fill: Option<(Rgb8, Arc<Nv12Image>)>,
     /// Odometer of `transition_fill` builds (the no-per-tick-allocation gate).
     transition_fill_builds: u64,
+    /// ADR-0113: this tick's downstream keyer draws (ascending z), set by the
+    /// switcher frame hook. Drawn above the layout and the transition tiles
+    /// in the same pass. All `None` without keyers (the steady state).
+    /// Boxed once at construction (never per tick) to keep the drive small.
+    keyers: Box<[Option<KeyerDraw>; MAX_DSK]>,
 }
 
 impl<T> CompositorDrive<T> {
@@ -292,6 +356,7 @@ impl<T> CompositorDrive<T> {
             transition_style: TransitionStyle::Mix,
             transition_fill: None,
             transition_fill_builds: 0,
+            keyers: Box::new([const { None }; MAX_DSK]),
         })
     }
 
@@ -355,6 +420,44 @@ impl<T> CompositorDrive<T> {
     #[must_use]
     pub fn mix_overlay(&self) -> Option<&MixOverlay> {
         self.mix_overlay.as_ref()
+    }
+
+    /// Install this tick's downstream keyer draws (ADR-0113 §3) by swapping
+    /// them with `draws`; the previous draws come back in `draws`, so the
+    /// caller drops their `Arc`s (refcount decrements, no allocation).
+    pub fn set_keyer_draws(&mut self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
+        std::mem::swap(&mut *self.keyers, draws);
+    }
+
+    /// The installed keyer draws.
+    #[must_use]
+    pub fn keyer_draws(&self) -> &[Option<KeyerDraw>; MAX_DSK] {
+        &self.keyers
+    }
+
+    /// The installed keyer draws, for the hook to settle them in place after
+    /// a rejected frame (weights only; no allocation).
+    pub fn keyer_draws_mut(&mut self) -> &mut [Option<KeyerDraw>; MAX_DSK] {
+        &mut self.keyers
+    }
+
+    /// Whether the transition's incoming tile contributes to the frame
+    /// composed at `now`: an overlay with incoming weight > 0 whose source
+    /// reads live (the same test `push_transition_tiles` applies). One
+    /// wait-free `read_at`; `false` without an overlay.
+    #[must_use]
+    pub fn transition_incoming_drawn(&self, now: MediaTime) -> bool {
+        let Some(mix) = self.mix_overlay.as_ref() else {
+            return false;
+        };
+        let weight = mix.incoming_weight();
+        if weight.is_nan() || weight <= 0.0 {
+            return false;
+        }
+        self.stores.get(&mix.source).is_some_and(|store| {
+            let read = store.read_at(now);
+            read.state().is_live() && read.frame().is_some()
+        })
     }
 
     /// The cumulative number of times the per-tick resolve **scratch pool** has
@@ -693,8 +796,11 @@ impl CompositorDrive<Nv12Image> {
         let mut scratch = self.scratch.borrow_mut();
         let cell_count = self.layout.cells.len();
         // A transition adds at most two full-canvas tiles (the DIP colour and
-        // the incoming picture), so the pool is sized once for both.
-        scratch.begin(cell_count + 2 * usize::from(self.mix_overlay.is_some()));
+        // the incoming picture, or the WIPE incoming picture and its border
+        // band), so the pool is sized once for both. The
+        // keyer slots are always reserved (ADR-0113), so the pool never grows
+        // when a keyer goes on air.
+        scratch.begin(cell_count + 2 * usize::from(self.mix_overlay.is_some()) + KEYER_TILES);
         let ComposeScratch {
             held,
             placements,
@@ -732,6 +838,7 @@ impl CompositorDrive<Nv12Image> {
                 dst_h,
                 opacity: cell.opacity,
                 mask: None,
+                key: None,
             });
         }
         // The AUTO dissolve's incoming picture: one full-canvas tile on top, in
@@ -740,6 +847,9 @@ impl CompositorDrive<Nv12Image> {
         if let Some(mix) = &self.mix_overlay {
             self.push_transition_tiles(mix, now, canvas.width, canvas.height, held, placements);
         }
+        // Downstream keyers above everything, the transition included
+        // (ADR-0113 §3, render list 4).
+        self.push_keyer_tiles(held, placements);
 
         // Borrow the held images for the compositor's `Tile` slice. This slice is
         // a per-tick local, NOT pooled: a `Tile<'_>` borrows into the pooled
@@ -756,18 +866,10 @@ impl CompositorDrive<Nv12Image> {
         // decode-at-display-resolution) the scale is a no-op and the result is
         // byte-for-byte the prior 1:1 placement. The cell's per-tile opacity
         // drives the compositor's premultiplied linear-light `over` blend.
+        let pictures: &[Arc<Nv12Image>] = held.as_slice();
         let tiles: Vec<Tile<'_>> = placements
             .iter()
-            .filter_map(|p| {
-                held.get(p.image_index).map(|img| {
-                    let tile =
-                        Tile::scaled(img.as_ref(), p.dst_x, p.dst_y, p.dst_w, p.dst_h, p.opacity);
-                    match p.mask {
-                        Some(mask) => tile.with_mask(mask),
-                        None => tile,
-                    }
-                })
-            })
+            .filter_map(|p| tile_of(p, pictures))
             .collect();
 
         // Dispatch the composite through the selected backend (CPU reference by
@@ -834,6 +936,7 @@ impl CompositorDrive<Nv12Image> {
                 dst_h: height,
                 opacity,
                 mask,
+                key: None,
             });
         };
         // Only a fresh incoming frame is blended (SW2-02): a held stale frame
@@ -918,6 +1021,37 @@ impl CompositorDrive<Nv12Image> {
         }
         if let Some((fill, band_mask)) = band {
             full_canvas(fill, 1.0, Some(band_mask));
+        }
+    }
+
+    /// Append the keyer tiles (fill, then its key) to the pooled scratch, in
+    /// the ascending-z order the hook resolved. Refcount increments only; the
+    /// capacity was reserved by `begin` (`KEYER_TILES`), so this never grows
+    /// the pool. A zero or NaN weight contributes nothing.
+    fn push_keyer_tiles(&self, held: &mut Vec<Arc<Nv12Image>>, placements: &mut Vec<Placement>) {
+        for draw in self.keyers.iter().flatten() {
+            if draw.weight.is_nan() || draw.weight <= 0.0 {
+                continue;
+            }
+            held.push(Arc::clone(&draw.fill));
+            let image_index = held.len().saturating_sub(1);
+            let key_image = draw.key.as_ref().map(|key| {
+                held.push(Arc::clone(key));
+                held.len().saturating_sub(1)
+            });
+            placements.push(Placement {
+                image_index,
+                dst_x: draw.rect.x,
+                dst_y: draw.rect.y,
+                dst_w: draw.rect.w,
+                dst_h: draw.rect.h,
+                opacity: draw.weight,
+                mask: None,
+                key: Some(PlacedKey {
+                    params: draw.params,
+                    key_image,
+                }),
+            });
         }
     }
 
@@ -1014,7 +1148,16 @@ struct SlateCache {
     builds: u64,
 }
 
+/// Internal: a keyer placement's key block, referencing the key picture in
+/// the `held` vec.
+#[derive(Clone, Copy)]
+struct PlacedKey {
+    params: KeyerParams,
+    key_image: Option<usize>,
+}
+
 /// Internal: a resolved tile placement referencing an entry in the `held` vec.
+#[derive(Clone, Copy)]
 struct Placement {
     image_index: usize,
     dst_x: u32,
@@ -1028,6 +1171,38 @@ struct Placement {
     opacity: f32,
     /// A wipe mask for a transition tile (ADR-0112 §3); `None` for a cell.
     mask: Option<WipeMask>,
+    /// A keyer's key block (ADR-0113 §3); `None` for an ordinary tile.
+    key: Option<PlacedKey>,
+}
+
+/// The compositor tile for one placement, borrowing its pictures from `held`.
+/// A transition tile carries its wipe mask (ADR-0112 §3). A keyer tile carries its [`TileKey`], with its key picture when it has
+/// one; a key picture missing from `held` degrades to a self key, never a
+/// panic.
+fn tile_of<'a>(p: &Placement, held: &'a [Arc<Nv12Image>]) -> Option<Tile<'a>> {
+    let image = held.get(p.image_index)?;
+    let tile = Tile::scaled(
+        image.as_ref(),
+        p.dst_x,
+        p.dst_y,
+        p.dst_w,
+        p.dst_h,
+        p.opacity,
+    );
+    let tile = match p.mask {
+        Some(mask) => tile.with_mask(mask),
+        None => tile,
+    };
+    let Some(placed) = p.key else {
+        return Some(tile);
+    };
+    let key = TileKey {
+        kind: placed.params.kind,
+        source: placed.key_image.and_then(|i| held.get(i)).map(Arc::as_ref),
+        invert: placed.params.invert,
+        mask: placed.params.mask,
+    };
+    Some(tile.with_key(key))
 }
 
 /// The per-tick resolve **scratch pool**: reusable buffers cleared-and-refilled
@@ -1072,18 +1247,22 @@ impl ComposeScratch {
         // One bounded reservation per new high-water cell count. `capacity()` only
         // grows, so once it covers the layout this is a no-op for every later tick
         // — the steady-state per-tick allocation is zero.
+        // The vectors were just cleared (`len() == 0`), and `reserve(n)`
+        // guarantees `capacity() >= len() + n`, so `reserve(cell_count)` is
+        // the exact request. (Reserving `cell_count - capacity()` is a no-op
+        // on a cleared non-empty-capacity vector and re-counted a growth on
+        // every tick above the high-water mark.)
         let mut grew = false;
         if self.held.capacity() < cell_count {
-            self.held.reserve(cell_count - self.held.capacity());
+            self.held.reserve(cell_count);
             grew = true;
         }
         if self.placements.capacity() < cell_count {
-            self.placements
-                .reserve(cell_count - self.placements.capacity());
+            self.placements.reserve(cell_count);
             grew = true;
         }
         if self.order.capacity() < cell_count {
-            self.order.reserve(cell_count - self.order.capacity());
+            self.order.reserve(cell_count);
             grew = true;
         }
         if grew {

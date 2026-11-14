@@ -509,3 +509,210 @@ keyers.
   the target host; median ms at 1080p): 0 keyers 30.0, 1 full-canvas alpha DSK 41.1, 2 full-canvas
   keyers 54.5, 2 flying 576x324 31.2, 1080p source in a 128x72 fly 27.6, key-changing MIX + DSK
   58.9. The calibration of `u` and `fold` on the RTX 4060 is owed with the GPU key path.
+
+### K2a (#387): DSK runtime in the Program drive
+
+- **Config.** `[[switcher.downstream_keyers]]` and `switcher.keyer_budget` are typed fields of
+  `SwitcherConfig` (named fields win over `flatten`, so they leave `extra`; other future keys still
+  round-trip there). `DownstreamKeyerConfig` is `deny_unknown_fields`. `type = "chroma"` and
+  `premultiplied = true` parse only so validation can refuse them by name. `validate_keyers` runs
+  from the document validation, where the canvas is known. It checks: at most 2 DSKs; unique ids
+  and z; a declared program; fill and key are declared sources, `in:` refused; rate in 1..=300;
+  clip in [0, 1]; gain finite and >= 0; fly even, >= 16 and inside the canvas; `max_source` even
+  and <= 8192; mask inside `max_source`; summed cost within the budget. A DSK also needs a
+  `[[switcher.mix_effects]]` on its program (`dsk-requires-mix-effects`, review F3): keyers run
+  on the M/E's Program drive, and without one boot would install nothing while `on_at_start`,
+  the demand leases and the Clean refusal still applied.
+- **Cost and budget.** `keyer_cost` is `fold·dst/canvas + u·(fill + key)/canvas` on the
+  `max_source` areas, shared by config and engine (`KeyerDef::cost`). `KEYER_UPLOAD_WEIGHT` (`u`) is
+  1.0. That value is an uncalibrated placeholder until the RTX 4060 figure lands with the GPU key
+  path. `DEFAULT_KEYER_BUDGET` is 3.0: one full-canvas DSK with a canvas-size fill **and** key. It
+  admits exactly one DSK of any key type and refuses a second full-canvas one.
+- **Runtime (`multiview_engine::keyer`).** `KeyerRuntime` lives in `SwitcherTickDriver` and is
+  installed before the clock starts with `set_keyers(keyer::admit(defs, w, h, budget)?)`.
+  - **Fixed state.** `[Option<KeyerSlot>; 2]`. Each slot holds `Copy` `KeyerFlags` (on air, tie,
+    ramp, pending, stale), a last-good `(fill, key)` pair, and pending and ramp op ids. The op ids
+    are moved in from the command and never cloned per tick.
+  - **Events.** Up to 8 per tick, queued in a fixed array; overflow is counted.
+  - **Tally.** Two 14-entry role sets.
+  - **Stores.** `KeyerDef` holds the fill and key `Arc<TileStore>`s resolved at attach, so a tick
+    never looks a source up by id.
+- **Verbs.** `SwitcherVerb::{KeyerCut, KeyerAuto, KeyerTie}` take a keyer index and are
+  engine-internal (K4 maps ids to indices and adds REST).
+  - They use the existing 64-slot `try_send` mailbox. The drain dispatches them **before** the
+    scene-version, held-take and take branches, so a held background take never blocks a DSK.
+  - The ramp payload is a `FrameCount`.
+  - **Typed refusals:**
+    - `REFUSE_KEYER_NO_FRESH_FRAME` (at exactly tick + 50);
+    - `keyer-pending` (a second command while one is held);
+    - `unknown-keyer`;
+    - `keyer-ramping` (AUTO during AUTO);
+    - an AUTO interrupted by a keyer CUT;
+    - `source-lost`;
+    - `keyer-rate` (`REFUSE_KEYER_RATE`, review F5): a `KeyerAuto` rate override above
+      `MAX_KEYER_RATE` (300, the config bound), refused before any state change. A
+      `FrameCount` is already >= 1.
+  - An AUTO toward the current state is an applied no-op.
+- **Gate, pair, loss.**
+  - **Going on.** Fill and key must be fresh (`read_at(pts)` Fresh) and inside `max_source`.
+    Going off is never gated.
+  - **Reads.** Each keyer that is on, ramping or taking part in a tied background AUTO (weight
+    0 included) does one `read_at` per source
+    per tick. State and picture come from that same read. A keyer that is off reads nothing.
+  - **Pair.** A tick where both reads are live replaces the pair. Otherwise the stored pair is
+    drawn, frozen together. With no pair the keyer draws nothing, and a slate is never keyed (a
+    `NoSignal` read has no frame).
+  - **Oversize.** A fresh frame larger than the envelope is a non-live read and counts
+    `keyer_oversize_frames`.
+  - **Loss.** A local `rank()` orders states, because `SourceState` is `non_exhaustive` and has no
+    `Ord`. At the trigger on either source:
+    - `drop_to_off_air` clears on-air, the ramp and the pair, refuses the ramp's op and emits
+      `SourceLost`. The keyer stays off.
+    - `hold_last_good` sets `stale` once, and recovery clears it (`SourceRecovered`).
+- **Tie.**
+  - **Participation (review F1).** `KeyerFlags::flight: Option<bool>` records a tied keyer's
+    part in the background AUTO and its direction (`true` going on), fixed on the tick the AUTO
+    starts (`begin_tied_transition`) and never re-derived from `on_air`. Only participants
+    draw the envelope and flip on the terminal tick (`complete_tied`); a keyer tied during the
+    flight waits for the next take. A participant is engaged for the whole flight, so its loss
+    policy applies on every tick, including a DIP's weight-0 ticks before the switch point.
+  - **Loss cancels participation.** `drop_to_off_air` during the flight clears `flight` with
+    `on_air`: the keyer stays off through the recovery and the terminal tick, until an
+    operator puts it on (the design is silent here; this is the conservative choice, off stays
+    off). An operator keyer CUT, AUTO (the no-op included) or a held command that lands also
+    takes the keyer out of the flight, and an untie mid-flight leaves it in its current state.
+  - **CUT.** A tied keyer flips on the CUT tick (`stage_take`).
+  - **MIX.** It draws `p` going on and `1 − p` going off. `p` is the same `MixOverlay::opacity`
+    the dissolve tile uses. It flips on the terminal tick (`projection.completed` after `sample`).
+  - **DIP (ADR-0112).** The same flip, with the DIP envelope: `i` going on (0 until the switch
+    point) and `1 − d` going off, from the same `kernel::dip_weights` the transition tiles use.
+    `MixOverlay::tie_envelope()` returns a `Copy` `TieEnvelope { going_on, going_off }` for the
+    overlay's `TransitionStyle`, so the hook passes one value whatever the transition is.
+  - **Deviation: WIPE (ADR-0112, rendered since the merge of main into K1).** §3.2 asks for the
+    per-pixel envelope `m(x, y)` going on and `1 − m(x, y)` going off. A keyer tile carries a
+    single `WipeMask` slot and the compositor has no complement mask, so in K2a a tied keyer on a
+    WIPE behaves like a CUT at the transition end: `tie_envelope()` returns `{going_on: 0,
+    going_off: 1}`, the keyer keeps its state through the flight and flips on the terminal tick
+    (`keyers_dsk::a_tied_dsk_on_a_wipe_cuts_at_the_terminal_tick`). The exact WIPE envelope is K3
+    (#388).
+  - **Gate.** A CUT or AUTO is also gated on the fill and key of every tied keyer it would put on
+    (`take_fresh`). For a new take that is every tied keyer that is off and not in its own AUTO.
+    A CUT during a background AUTO completes that flight, so it waits only for the surviving
+    going-on participants (`flight == Some(true)`, review round 2 G2): a keyer whose
+    participation a loss cancelled is never waited for, the CUT completes at once, and a
+    recovery after the terminal tick neither swaps the background again nor keys the DSK.
+  - **Preview tally.** During the flight the same rule names the keyers coming on: a loss
+    that cancels participation removes the keyer's fill and key from `preview` on that tick.
+  - **Abort.** An AUTO aborted by SW2-02, interrupted by a punch or rolled back by a rejected
+    frame cancels participation (`cancel_tied`), and tied keyers keep their
+    state.
+  - **Boot.** `on_at_start` is seeded as an op-less pending going-on. It lands at the first fresh
+    tick with an `OnAtStart` event and no outcome. An operator command supersedes it.
+- **Reject atomicity (review F2).** A rejected tick leaves the composed output and every
+  keyer's last-good pair exactly as committed. `begin_tick` stages the flags, the last-good
+  pairs (refcount increments only) and the tally; `reject` restores all three, so a staged off
+  that released the pair gets it back. The hook never resolves keyers on a rejected frame and
+  no longer clears the drive's draws: the last committed draws stay installed (an on-air DSK
+  stays in the frame, with stale sources too). `on_compose_failed` swaps the committed draws
+  back from `keyer_buf`. In both paths `settle_keyer_draws` rebuilds the installed draws as the
+  committed resting state, in ascending z, in the same fixed array (review round 2 G1): a
+  keyer still in its own AUTO keeps its committed draw; every other keyer draws its restored
+  last-good pair at weight 1 on air and nothing off, whether or not the committed tick drew
+  it. A tied keyer going off through a DIP draws weight 0 past the switch point, so its last
+  committed draw is absent while it is still on air; the reject cancels the flight and the
+  rejected frame shows it at rest. Pictures are the restored pair (`Arc` clones, no heap).
+  `reject_composed_tick` also refuses slot-held ops that moved this tick, and discards
+  queued events. Applied keyer ops sit in `staged_success` and are refused with everything else.
+  `Staged` is untouched. `repeat_tick` expires held keyer commands past their deadline.
+- **Compose.** The hook resolves keyers only on a frame that will commit, after the mix block. It
+  calls `driver.resolve_keyers(tick, envelope, incoming_drawn, &mut keyer_buf)` and then `drive.set_keyer_draws`, a
+  `mem::swap` of a fixed `[Option<KeyerDraw>; 2]`. `KeyerDraw` is two `Arc`s plus `Copy` parameters.
+  - `compose` reserves a constant `KEYER_TILES = 4` in `begin`, on top of the two transition tiles
+    (DIP colour and incoming, or WIPE incoming and border band), so `scratch_reservations` does not depend on keyer state.
+  - **Fix: `ComposeScratch::begin`.** It reserved `cell_count - capacity()` on a cleared vector.
+    `Vec::reserve` is relative to `len()` (0 after `clear`), so the request was too small whenever
+    the target exceeded twice the old capacity, and the odometer then counted a growth on every
+    tick. It now reserves `cell_count`. A frame with keyers reaches this, because it adds 4 tiles to
+    a one-cell layout.
+  - `push_keyer_tiles` appends the fill (and key) to the pooled `held` vector, with one `Placement`
+    per keyer: fly rect, opacity = weight, and a `PlacedKey`. They go in ascending z, above the
+    transition tiles.
+  - `tile_of(p, held)` builds every `Tile`, adding `with_key(TileKey { kind, source, invert, mask })`
+    for keyer tiles. `CompositedFrame` is unchanged.
+- **Snapshot and events.**
+  - `SwitcherSnapshot` gains `keyers: [Option<KeyerSnapshot>; 2]` and `tally: KeyerTally`. Both
+    are `Copy` and `Eq`, and they are part of the change test. A ramp is published as
+    `{start_tick, rate, to_on}`, so the snapshot changes on state changes, never per ramp tick.
+  - `SwitcherControl::keyer_events()` is a drop-oldest `EventStream<KeyerEvent>` (capacity 256),
+    published only in `commit_composed_tick`.
+  - Op outcomes reuse `SwitcherOutcome`, and therefore the `switcher.operation` relay. The
+    `switcher.keyer` wire event and its redaction are K4.
+- **Demand.** `ConsumerClass::Keyer` has the wire token `"keyer"`. The pipeline seeds one
+  `consumer_set(Keyer, Rails::VIDEO)` with a `SetItem` per fill and key, labelled `main/dsk1`. It
+  keeps the handle (`Pipeline::keyer_demand`) so K4 can `publish` on a definition change.
+- **Run-future size (review F6).** `KeyerRuntime` in `SwitcherTickDriver` and the
+  `[Option<KeyerDraw>; 2]` buffers in `CompositorDrive` and `SwitcherFrameHook` are boxed once
+  at construction; nothing is boxed per tick. The `discrete_audio_tracks` run futures went from
+  18 352 B (over clippy's 16 KiB `large_futures` threshold) to 13 536 B. Boxing the `Pipeline`
+  keyer fields saved only 32 B and was not kept.
+- **CLI boot.** `attach_first_slice` resolves `KeyerDef`s from `pipeline.preview_stores()`; a
+  missing store is a boot error. It then calls `keyer::admit` against the document's budget and
+  `driver.set_keyers`.
+- **Deviation: Clean is refused while a DSK is defined (until K2b, #435).**
+  - **Boot.** Validation refuses an output whose feed is Clean when a DSK is defined
+    (`clean-unavailable-with-dsk`).
+  - **Takes.** The output router's handle carries `dsk_defined`. The plan answers
+    `PlanRefusal::CleanUnavailableWithDsk`: a 409 `clean-unavailable-with-dsk` on take, and a plan
+    and patch refusal of the same kind. `try_take` refuses as `unroutable` if a caller skips the plan.
+  - **Why.** Clean can never show DSK pixels, and the no-DSK Clean alias is unchanged. The hand-off
+    ring, the aux GPU compositor and `clean-needs-gpu` are K2b.
+- **Deviation: tally as roles.** The tally is `TallyRole::{Program, Preview, Fill(k), Key(k)}`
+  rather than store indices: PGM and PVW have no stable store index in the drive. The control
+  plane resolves roles to source ids off the clock (K4).
+  - `program` holds the background, the PVW role only on a frame where the transition's
+    incoming tile contributes (`CompositorDrive::transition_incoming_drawn`: incoming weight
+    > 0 and a live frame, the test `push_transition_tiles` applies; never at MIX `p = 0` or a
+    DIP's colour-only ticks, review F4), and the fill and key of
+    every keyer tile drawn with weight > 0.
+  - `preview` holds PVW plus the fill and key of tied keyers going on.
+- **Deviation: GPU before #395.** A keyed tile makes `GpuCompositor` return `GpuLimit`, and
+  `RunBackend` composes that frame on the CPU (`gpu_cpu_fallback_frames`). It is never drawn without
+  its key. The ADR §7 rule "CPU fallback only if the reserved cost fits the CPU budget, else
+  keyer-less frames and `gpu-fallback` after 3" is **not** built in K2a. It needs a per-frame
+  fallback signal from `RunBackend` into the drive, and that is a follow-up with K2b / after #395.
+  The default budget (1 DSK) bounds the CPU cost meanwhile.
+- **Tests.**
+  - `multiview-config` unit tests (8 keyer cases) and `tests/switcher_keyers.rs` (a DSK
+    without an M/E is refused).
+  - `multiview-engine` `keyer` unit tests.
+  - `multiview-control` `tests/output_routing_take.rs`: Clean is refused in the plan and as a 409
+    `clean-unavailable-with-dsk` on take while a DSK is defined.
+  - `tests/keyers_dsk.rs`: CUT, AUTO k/N, tie on CUT, MIX, DIP and WIPE (the CUT-at-end deviation), abort, reject, held background take,
+    PVW tally at MIX `p = 0` and before a DIP switch point, the AUTO rate bound (300, 301,
+    `u32::MAX`),
+    `on_at_start`, unknown index, z order and tally.
+  - `tests/keyers_gate_loss.rs`: refusal at exactly +50 with 0 lost ticks, `keyer-pending`,
+    tied loss and recovery during a MIX and a DIP in both directions (stays off), a rejected
+    take with an on-air DSK, with stale sources and with a staged off, and a failed compose,
+    both reject paths after a committed zero-weight tick of a tied DIP going off (pixels on
+    the rejection tick, weight, pair identity, z order under a second DSK), a CUT during an
+    AUTO after a tied loss (completes at once, one swap, stays off), the Preview tally
+    dropping a lost participant,
+    fill-only and key-only death mid-ramp (`Arc::ptr_eq` frozen pair, drop at the trigger, stays
+    off), `hold_last_good`, slate never keyed, oversize, going off never gated.
+  - `tests/keyers_chaos.rs`:
+    - 10 000 commands from 8 tokio tasks, with contiguous ticks and PTS, a counted 503 total, one
+      outcome per op and bounded work per tick;
+    - stalled outcome, event and snapshot readers while sources die. The flood here never sends
+      "off", so keyers stay engaged until their sources reach the loss trigger. A reader's
+      retention is checked as the drain bound (at most the ring of 256, the rest a counted lag),
+      because tokio's `Receiver::len` also counts overwritten messages;
+    - `scratch_reservations` and `slate_builds` constant over 10 000 ramping ticks, with tally
+      roles equal to the composed keyer tiles on every tick.
+- **Concerns.**
+  - **No counting allocator.** The workspace forbids `unsafe_code` on every target, and a
+    `GlobalAlloc` needs `unsafe`. So the no-per-tick-allocation gate is the pooled odometers plus
+    the runtime's fixed arrays. `keyer_events` publishes one `Arc` per state change (the existing
+    `EventStream` cost), never per tick.
+  - **Upload weight.** `u` is uncalibrated.
+  - **Extra reads.** Each keyer on air adds 1–2 lock-free `read_at` per tick.

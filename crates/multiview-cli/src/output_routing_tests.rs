@@ -6760,6 +6760,82 @@ fn the_control_adapter_maps_a_set_onto_its_members_and_refuses_it_whole() {
     );
 }
 
+/// ADR-0113 / K2a: with a DSK defined, Clean carries the keyer's pixels, so
+/// the control adapter refuses a Clean take `Unroutable` on both submit paths
+/// — a single take and any member of a take set (the whole set, before
+/// anything is queued) — even for a caller that skipped the plan gate.
+#[test]
+fn the_control_adapter_refuses_clean_with_a_dsk_on_single_takes_and_every_set_member() {
+    use multiview_control::output_routing::{
+        OutputRouting, OutputTakeRequest, OutputTakeSet, RoutedFeed, TakeSubmitError,
+    };
+    let run_output = |id: &str| RunOutput {
+        id: Some(id.into()),
+        codec_name: String::new(),
+        settings: 0,
+        feed_format: None,
+        base_format: None,
+        routable: true,
+        program_audio: false,
+    };
+    let member = |output: &str, video: RoutedFeed| OutputTakeRequest {
+        operation_id: "ignored".into(),
+        output: output.into(),
+        video: Some(video),
+        audio: None,
+        layout: None,
+        principal: "ignored".into(),
+    };
+    let set = |members| OutputTakeSet {
+        operation_id: "salvo".into(),
+        principal: "p".into(),
+        members,
+        arm: None,
+    };
+    let adapter_with = |dsk: bool| {
+        let (r, h, aux) = router(3, 6, Box::new(|_| Err("never".to_owned())));
+        let h = h
+            .with_outputs(vec![run_output("a"), run_output("b")])
+            .with_dsk_defined(dsk);
+        let slot = output_routing_slot();
+        slot.store(Some(Arc::new(h)));
+        let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+        (adapter, r, aux)
+    };
+    let (adapter, _r, _aux) = adapter_with(true);
+    assert_eq!(
+        adapter.try_take(member("a", RoutedFeed::Clean)),
+        Err(TakeSubmitError::Unroutable),
+        "a single Clean take with a DSK is unroutable"
+    );
+    for members in [
+        vec![
+            member("a", RoutedFeed::Program),
+            member("b", RoutedFeed::Clean),
+        ],
+        vec![
+            member("a", RoutedFeed::Clean),
+            member("b", RoutedFeed::Program),
+        ],
+    ] {
+        assert_eq!(
+            adapter.try_take_set(set(members)),
+            Err(TakeSubmitError::Unroutable),
+            "a set with any Clean member is refused whole while a DSK is defined"
+        );
+    }
+    // The same Clean member is admitted when no DSK is defined: the refusal
+    // is the DSK rule, not a generic Clean refusal.
+    let (adapter, _r, _aux) = adapter_with(false);
+    assert_eq!(
+        adapter.try_take_set(set(vec![
+            member("a", RoutedFeed::Program),
+            member("b", RoutedFeed::Clean),
+        ])),
+        Ok(())
+    );
+}
+
 // ---- Review r1 regressions (#308) ----
 
 /// Drive a two-member set with a mixer half until the router proposed `T`.

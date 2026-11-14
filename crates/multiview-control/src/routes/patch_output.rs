@@ -246,6 +246,12 @@ pub(crate) fn plan(
                     "Preview and Clean need a switcher (M/E) in this run",
                 ));
             }
+            Err(PlanRefusal::CleanUnavailableWithDsk) => {
+                refused = Some(refusal(
+                    super::output_routing::CLEAN_UNAVAILABLE_WITH_DSK,
+                    super::output_routing::CLEAN_WITH_DSK_TEXT,
+                ));
+            }
             Err(PlanRefusal::OutputKindUnroutable) => {
                 refused = Some(refusal(
                     "output-kind-unroutable",

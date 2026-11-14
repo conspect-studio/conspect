@@ -100,6 +100,7 @@ pub mod error;
 pub mod ha;
 pub mod heads;
 pub mod isolation;
+pub mod keyer;
 pub mod lateness;
 pub mod lifecycle;
 pub mod migration;

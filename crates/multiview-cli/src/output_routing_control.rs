@@ -324,6 +324,12 @@ fn engine_take(
         // already answered `audio-unsupported` from the plan.
         return Err(TakeSubmitError::Unroutable);
     }
+    // ADR-0113 / K2a: never route DSK pixels as Clean (the plan gate
+    // already refused; this covers a caller that skipped it). Here, so a
+    // single take and every member of a take set pass the same rule.
+    if take.video == Some(RoutedFeed::Clean) && handle.dsk_defined() {
+        return Err(TakeSubmitError::Unroutable);
+    }
     let bus = match take.video.as_ref() {
         Some(feed) => {
             Some(picture_bus(feed, take.layout.as_ref()).ok_or(TakeSubmitError::Unroutable)?)
@@ -358,6 +364,9 @@ impl OutputRouting for OutputRoutingAdapter {
         }
         if matches!(feed, RoutedFeed::Preview | RoutedFeed::Clean) && !handle.has_preview() {
             return Err(PlanRefusal::SwitcherRequired);
+        }
+        if *feed == RoutedFeed::Clean && handle.dsk_defined() {
+            return Err(PlanRefusal::CleanUnavailableWithDsk);
         }
         let snapshot = handle.snapshot();
         let bus = feed.bus_name();
