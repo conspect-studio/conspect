@@ -205,6 +205,22 @@ mod tests {
         assert_eq!(dst, [20, 21, 22, 23, 10, 11, 12, 13, 0, 1, 2, 3]);
     }
 
+    /// PB-13: on a bottom-up plane too, rows wider than the active bytes
+    /// (into the stride padding) are refused and the active width walks every
+    /// row.
+    #[test]
+    fn a_bottom_up_plane_never_yields_its_padding() {
+        let (w, h) = (5_u32, 3_u32);
+        let mut frame = rgba(w, h);
+        flip_bottom_up(&mut frame);
+        let active = usize::try_from(w).unwrap() * 4;
+        assert!(crate::frame::plane_rows(&frame, 0, active + 1).is_err());
+        assert_eq!(
+            crate::frame::plane_rows(&frame, 0, active).unwrap().count(),
+            usize::try_from(h).unwrap()
+        );
+    }
+
     /// PB-1: a layout that does not describe the frame's format is refused
     /// before any plane is read.
     #[test]

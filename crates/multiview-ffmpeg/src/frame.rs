@@ -578,7 +578,9 @@ impl<'a> Iterator for PlaneRows<'a> {
         // SAFETY: `plane_rows` proved that for every `row < rows` the span
         // `[first + row * linesize, + row_bytes)` lies inside a single
         // `AVBufferRef` owned by the frame, so the offset stays in that
-        // allocation and the bytes are initialized, readable libav memory.
+        // allocation, and that `row_bytes` is at most the plane's active row
+        // width, which a decoder (or `alloc_video`'s one-time fill) has
+        // initialised; the stride padding is never part of a row.
         // `PhantomData<&'a Video>` keeps the frame (and its buffers) borrowed,
         // immutably, for as long as the slice lives.
         unsafe {
@@ -750,6 +752,14 @@ fn padded_plane_rows(
     if rows == 0 || row_bytes == 0 {
         return Ok(no_rows());
     }
+    // Only the active bytes of a row are known to be initialised: a decoder
+    // writes `av_image_get_linesize` bytes per row, never the stride padding
+    // (review PB-13). A wider request is refused before any slice exists.
+    if row_bytes > self::row_bytes(frame, plane)? {
+        return Err(FfmpegError::FrameLayout(
+            "requested row is wider than the plane's active bytes",
+        ));
+    }
     if data.is_null() {
         return Err(FfmpegError::FrameLayout("plane has no data"));
     }
@@ -871,6 +881,22 @@ mod tests {
         assert!(plane_rows(&frame, 3, 1).is_err(), "no plane 3 in yuv420p");
         assert!(plane_rows(&frame, 9, 1).is_err());
         assert!(plane_rows(&frame, 0, stride.max(64) + 1).is_err());
+        // Review PB-13: a row wider than the active bytes (into the stride
+        // padding a decoder never writes) is refused; the active width and
+        // any prefix of it are accepted.
+        let active = row_bytes(&frame, 0).unwrap();
+        assert!(
+            plane_rows(&frame, 0, active + 1).is_err(),
+            "padding is not a row"
+        );
+        assert_eq!(
+            plane_rows(&frame, 0, active).unwrap().count(),
+            usize::try_from(frame.height()).unwrap()
+        );
+        assert!(
+            plane_rows(&frame, 0, 1).is_ok(),
+            "a prefix of a row is fine"
+        );
         // An unallocated frame has no rows to give.
         let empty = Video::empty();
         assert!(plane_rows(&empty, 0, 1).is_err());

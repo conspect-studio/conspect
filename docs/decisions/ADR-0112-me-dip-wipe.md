@@ -128,7 +128,9 @@ tile. No switcher or drive code changes.
   can stall the output clock.
 - **FFI safety.** Every frame `alloc_video` returns has all its owned buffer
   bytes (rows, row padding, tail) initialised once at allocation, since
-  `av_frame_get_buffer` storage is not zeroed (review PB-12). Scratch frames are `multiview_ffmpeg::frame::ScratchFrame`s,
+  `av_frame_get_buffer` storage is not zeroed (review PB-12). `plane_rows` never yields
+  more than a row's active bytes (`av_image_get_linesize`), so a decoder
+  frame's unwritten stride padding is never a Rust slice (review PB-13). Scratch frames are `multiview_ffmpeg::frame::ScratchFrame`s,
   which only the checked `alloc_video` (null `AVFrame`, dimension cap, CPU
   format, `av_frame_get_buffer` result) creates — never the unchecked
   `Video::new`/`Video::empty`. `Scaler::run_into` reuses only a
