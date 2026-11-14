@@ -500,4 +500,26 @@ number = 3
         )
         .is_err());
     }
+
+    /// MED-P3-4: a persisted selection with an unknown field, a field of
+    /// another variant or an unknown nested field is refused at load.
+    #[test]
+    fn a_persisted_transition_with_an_unknown_field_is_refused_at_load() {
+        let head = "id = \"me1\"\nprogram = \"main\"\nprogram_source = \"a\"\npreview_source = \"b\"\n[transition]\n";
+        for body in [
+            "kind = \"mix\"\nrate = 10\nreverse = true\n",
+            "kind = \"cut\"\nrate = 10\n",
+            "kind = \"dip\"\nrate = 10\npattern = \"box\"\n",
+            "kind = \"wipe\"\npattern = \"box\"\nrate = 10\ncolor = \"#ffffff\"\n",
+            "kind = \"dip\"\nrate = 10\nswitch_point = { num = 1, den = 2, x = 0 }\n",
+        ] {
+            let error = toml::from_str::<MixEffectsConfig>(&format!("{head}{body}"));
+            assert!(error.is_err(), "{body}");
+        }
+        // The known shapes still load.
+        assert!(toml::from_str::<MixEffectsConfig>(&format!(
+            "{head}kind = \"dip\"\nrate = 10\nswitch_point = {{ num = 1, den = 3 }}\n"
+        ))
+        .is_ok());
+    }
 }

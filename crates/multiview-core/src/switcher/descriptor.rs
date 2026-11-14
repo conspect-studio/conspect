@@ -203,14 +203,18 @@ pub enum DveDirection {
 /// An armed M/E transition with its exact parameters (ADR-0055 §3).
 ///
 /// Serde is internally tagged on `kind` and the enum is `#[non_exhaustive]`.
+/// Unknown fields, and fields of another variant, are refused (the tag field
+/// itself is allowed), as is an unknown field of the nested switch point.
 /// Every duration is a [`FrameCount`]; an API `rate_ms` converts exactly once at
 /// the boundary and is never stored (ADR-T015 §2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum TransitionDescriptor {
     /// Atomic frame-boundary swap — the degenerate one-frame case of every timed
-    /// transition below.
+    /// transition below. Carries no field: a field beside the tag is refused
+    /// (serde ignores fields of an internally tagged unit variant otherwise).
+    #[serde(deserialize_with = "no_fields")]
     Cut,
     /// Dissolve weighted by exact rational progress.
     Mix {
@@ -231,7 +235,10 @@ pub enum TransitionDescriptor {
         color: Option<Rgb8>,
         /// Where the outgoing/incoming swap happens under the dip: an exact
         /// rational in `(0, 1)`, defaulting to `1/2`.
-        #[serde(default = "default_switch_point")]
+        #[serde(
+            default = "default_switch_point",
+            deserialize_with = "strict_rational"
+        )]
         switch_point: Rational,
     },
     /// Per-tile SDF mask transition (wave 2).
@@ -377,6 +384,27 @@ impl TransitionDescriptor {
             _ => None,
         }
     }
+}
+
+/// The `cut` payload: nothing beside the `kind` tag.
+fn no_fields<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+    Empty::deserialize(deserializer).map(|Empty {}| ())
+}
+
+/// A `{num, den}` that refuses unknown fields. [`Rational`] itself stays
+/// lenient: it is shared by every cadence/timebase document in the repo.
+fn strict_rational<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Rational, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Strict {
+        num: i64,
+        den: i64,
+    }
+    let Strict { num, den } = Strict::deserialize(deserializer)?;
+    Ok(Rational::new(num, den))
 }
 
 /// The default dip split point: half the window (ADR-0055 §3).

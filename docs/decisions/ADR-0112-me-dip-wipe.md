@@ -80,8 +80,10 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    before the body is parsed. The route answers with typed 422s:
    `unsupported-transition` for what the drive does not render (stinger,
    DVE, a dip through a source, `flip_flop`, `border_fill_source`), and
-   `invalid-transition` for a shape or number the machine refuses or a rate
-   above 1000 frames. A selection while a take is in flight is refused
+   `invalid-transition` for a shape or number the machine refuses, an
+   unknown field or a field of another kind (the descriptor and its switch
+   point deny unknown fields, in the API and in a persisted config alike), or
+   a rate above 1000 frames. A selection while a take is in flight is refused
    before enqueue, and the engine re-checks every rule at the tick. The
    checks are shared, not copied: `TransitionDescriptor::is_valid` /
    `is_rendered`. `GET /api/v1/switcher/me1` reports the engine snapshot's

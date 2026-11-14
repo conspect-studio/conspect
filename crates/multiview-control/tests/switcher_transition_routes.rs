@@ -350,6 +350,50 @@ async fn invalid_shapes_and_numbers_are_typed_invalid_transition_422s() {
     assert!(outcomes.try_recv().is_err(), "a refusal queues nothing");
 }
 
+/// MED-P3-4: an unknown field, or a field of another variant, is a typed
+/// `invalid-transition` 422 on both routes and queues nothing.
+#[tokio::test]
+async fn unknown_or_foreign_descriptor_fields_are_typed_invalid_transition_422s() {
+    let (h, handle, mut driver) = rig();
+    let mut outcomes = handle.outcomes();
+    for (n, transition) in [
+        json!({"kind": "mix", "rate": 10, "reverse": true}),
+        json!({"kind": "mix", "rate": 10, "colour": "#ffffff"}),
+        json!({"kind": "cut", "rate": 10}),
+        json!({"kind": "dip", "rate": 10, "pattern": "box"}),
+        json!({"kind": "dip", "rate": 10, "switch_point": {"num": 1, "den": 2, "x": 0}}),
+        json!({"kind": "wipe", "pattern": "box", "rate": 10, "color": "#ffffff"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let plan = send(
+            &h.router,
+            post_json(
+                "/api/v1/switcher/plan",
+                OPERATOR_TOKEN,
+                &set(transition.clone()),
+            ),
+        )
+        .await;
+        assert!(
+            problem_type(plan).await.ends_with("invalid-transition"),
+            "{transition}"
+        );
+        let take = send(
+            &h.router,
+            command(&set(transition.clone()), OPERATOR_TOKEN, &format!("u{n}")),
+        )
+        .await;
+        assert!(
+            problem_type(take).await.ends_with("invalid-transition"),
+            "{transition}"
+        );
+    }
+    tick(&mut driver, 1);
+    assert!(outcomes.try_recv().is_err(), "a refusal queues nothing");
+}
+
 #[tokio::test]
 async fn every_other_action_carrying_a_transition_is_refused() {
     let (h, handle, mut driver) = rig();
