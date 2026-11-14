@@ -10674,7 +10674,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description No such stream, it expired, or it is another principal's. */
+            /** @description No such stream, it expired, or it is another principal's; `cast-stream-revoked` (owner or Admin only) when the server revoked its token because its output was taken to a feed the owner may not read, or the owner can no longer be resolved (`detail` says which). */
             404: {
                 headers: {
                     [name: string]: unknown;
