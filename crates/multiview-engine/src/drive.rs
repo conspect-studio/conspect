@@ -329,7 +329,7 @@ pub struct CompositorDrive<T> {
     keyers: Box<[Option<KeyerDraw>; MAX_DSK]>,
     /// Bumped by every change to what a composite draws other than the
     /// source frames' contents (layout, bindings, stores, slates, transition
-    /// step and style). A GPU backend's CPU fallback hands a late result to a
+    /// step and style, downstream keyer draws). A GPU backend's CPU fallback hands a late result to a
     /// later frame only under the same epoch (issue #415 review MC-1), so a
     /// scene a hook staged and then rolled back never reaches the output.
     scene_epoch: u64,
@@ -441,8 +441,23 @@ impl<T> CompositorDrive<T> {
     /// Install this tick's downstream keyer draws (ADR-0113 §3) by swapping
     /// them with `draws`; the previous draws come back in `draws`, so the
     /// caller drops their `Arc`s (refcount decrements, no allocation).
+    ///
+    /// A change of what the keyers draw (a keyer on or off, its weight,
+    /// rectangle or parameters, a key source gained or lost) bumps the scene
+    /// epoch (issue #415 review MC-1): a late off-clock result composed under
+    /// other keyer draws is never adopted. A new fill/key frame alone is
+    /// source content and keeps the epoch, as a cell's new frame does.
+    /// Allocation-free.
     pub fn set_keyer_draws(&mut self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
         std::mem::swap(&mut *self.keyers, draws);
+        let changed = self
+            .keyers
+            .iter()
+            .zip(draws.iter())
+            .any(|(new, old)| !same_keyer_scene(new.as_ref(), old.as_ref()));
+        if changed {
+            self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        }
     }
 
     /// The installed keyer draws.
@@ -453,7 +468,11 @@ impl<T> CompositorDrive<T> {
 
     /// The installed keyer draws, for the hook to settle them in place after
     /// a rejected frame (weights only; no allocation).
+    ///
+    /// Bumps the scene epoch (issue #415): the caller may change any draw,
+    /// so a late off-clock result of the unsettled draws is never adopted.
     pub fn keyer_draws_mut(&mut self) -> &mut [Option<KeyerDraw>; MAX_DSK] {
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         &mut self.keyers
     }
 
@@ -1250,6 +1269,23 @@ struct Placement {
     mask: Option<WipeMask>,
     /// A keyer's key block (ADR-0113 §3); `None` for an ordinary tile.
     key: Option<PlacedKey>,
+}
+
+/// Whether two keyer draws draw the same scene (issue #415): the same keyer,
+/// rectangle, weight, parameters and key presence. The fill and key frames
+/// themselves are source content, as a cell's frame is.
+fn same_keyer_scene(a: Option<&KeyerDraw>, b: Option<&KeyerDraw>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.keyer == b.keyer
+                && a.rect == b.rect
+                && a.weight.to_bits() == b.weight.to_bits()
+                && a.params == b.params
+                && a.key.is_some() == b.key.is_some()
+        }
+        _ => false,
+    }
 }
 
 /// The owned compositor tile for one placement: `Arc` clones of its
