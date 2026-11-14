@@ -155,29 +155,38 @@ impl WipeMask {
     }
 
     /// Whether this mask may be drawn on a `canvas_w x canvas_h` canvas: it is
-    /// one [`WipeMask::new`] builds for that canvas (the same width, height
-    /// and aspect bit for bit), every float field is finite, and `pinned` (if
-    /// set) is exactly `0` or `1` (the only endpoints `new` pins; the GPU maps
+    /// one [`WipeMask::new`] builds for that canvas (the same width, height,
+    /// aspect and extent bit for bit; origin, softness and expand in `[0, 1]`;
+    /// a finite radius within the travel `new` gives), and `pinned` (if set)
+    /// is exactly `0` or `1` (the only endpoints `new` pins; the GPU maps
     /// them exactly). `WipeMask` has public fields; a mask that fails this
     /// draws nothing on the CPU reference and on the GPU alike, so the two
     /// paths never disagree and the layers beneath are never poisoned.
     #[must_use]
     pub fn is_valid_for(&self, canvas_w: u32, canvas_h: u32) -> bool {
-        self.width == canvas_w
-            && self.height == canvas_h
-            && canvas_w > 0
-            && canvas_h > 0
-            && self.aspect.to_bits() == aspect(canvas_w, canvas_h).to_bits()
-            && [
-                self.origin[0],
-                self.origin[1],
-                self.extent,
-                self.radius,
-                self.softness,
-                self.expand,
-            ]
-            .iter()
-            .all(|v| v.is_finite())
+        if self.width != canvas_w || self.height != canvas_h || canvas_w == 0 || canvas_h == 0 {
+            return false;
+        }
+        let aspect = aspect(canvas_w, canvas_h);
+        if self.aspect.to_bits() != aspect.to_bits() {
+            return false;
+        }
+        // A bounded geometry domain (merge review R-6): finite fields alone can
+        // still overflow (`extent - radius`, a circle's distance), so every
+        // field must lie where `new`/`expanded` put it. Within it every
+        // intermediate of `coverage` and the shader is finite.
+        let unit = |v: f32| (0.0..=1.0).contains(&v);
+        let scale = 1.0_f32.max(1.0 / aspect);
+        // `new`'s radius spans `[-margin, extent + softness/2·scale + margin]`
+        // with `margin <= 1.5·scale`; 2·scale + 1 is a strict superset.
+        let reach = self.extent + 2.0 * scale + 1.0;
+        unit(self.origin[0])
+            && unit(self.origin[1])
+            && self.extent.to_bits() == extent(self.shape, aspect, self.origin).to_bits()
+            && unit(self.softness)
+            && unit(self.expand)
+            && self.radius.is_finite()
+            && self.radius.abs() <= reach
             && self.pinned.is_none_or(|c| {
                 c.to_bits() == 0.0_f32.to_bits() || c.to_bits() == 1.0_f32.to_bits()
             })

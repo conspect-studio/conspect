@@ -99,6 +99,70 @@ fn gpu_wipe_masks_match_the_cpu_reference() {
     }
 }
 
+/// Masks a caller could build from public fields that `WipeMask::new` for a
+/// `W x H` canvas never produces (PR #406 merge reviews R-1..R-6).
+fn malformed(good: WipeMask) -> Vec<WipeMask> {
+    vec![
+        WipeMask {
+            pinned: Some(f32::NAN),
+            ..good
+        },
+        WipeMask {
+            pinned: Some(2.0),
+            ..good
+        },
+        WipeMask {
+            radius: f32::NAN,
+            ..good
+        },
+        WipeMask {
+            softness: f32::INFINITY,
+            ..good
+        },
+        WipeMask {
+            pinned: Some(0.5),
+            ..good
+        },
+        WipeMask { width: 0, ..good },
+        WipeMask { height: 0, ..good },
+        // R-6: finite fields whose intermediates overflow (`extent - radius`).
+        WipeMask {
+            shape: MaskShape::Circle,
+            origin: [f32::MAX, 0.0],
+            extent: f32::MAX,
+            radius: -f32::MAX,
+            reverse: true,
+            softness: 1.0,
+            ..good
+        },
+        WipeMask {
+            radius: 1.0e30,
+            ..good
+        },
+        WipeMask {
+            softness: 2.0,
+            ..good
+        },
+        WipeMask {
+            aspect: 0.0,
+            ..good
+        },
+        WipeMask {
+            aspect: -1.0,
+            ..good
+        },
+        WipeMask {
+            aspect: 2.0,
+            ..good
+        },
+        WipeMask {
+            width: W * 2,
+            height: H * 2,
+            ..good
+        },
+    ]
+}
+
 /// Merge review R-1 (PR #406): a malformed public mask draws nothing on the
 /// GPU, as on the CPU reference, and never poisons the layer beneath.
 #[test]
@@ -125,47 +189,7 @@ fn gpu_malformed_wipe_mask_draws_nothing_like_the_cpu_reference() {
         &only_out,
     )
     .unwrap();
-    for mask in [
-        WipeMask {
-            pinned: Some(f32::NAN),
-            ..good
-        },
-        WipeMask {
-            pinned: Some(2.0),
-            ..good
-        },
-        WipeMask {
-            radius: f32::NAN,
-            ..good
-        },
-        WipeMask {
-            softness: f32::INFINITY,
-            ..good
-        },
-        WipeMask {
-            pinned: Some(0.5),
-            ..good
-        },
-        WipeMask { width: 0, ..good },
-        WipeMask { height: 0, ..good },
-        WipeMask {
-            aspect: 0.0,
-            ..good
-        },
-        WipeMask {
-            aspect: -1.0,
-            ..good
-        },
-        WipeMask {
-            aspect: 2.0,
-            ..good
-        },
-        WipeMask {
-            width: W * 2,
-            height: H * 2,
-            ..good
-        },
-    ] {
+    for mask in malformed(good) {
         let tiles = [
             Tile::scaled(&out, 0, 0, W, H, 1.0),
             Tile::scaled(&inc, 0, 0, W, H, 1.0).with_mask(mask),

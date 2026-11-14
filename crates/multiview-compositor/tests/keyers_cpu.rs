@@ -607,7 +607,7 @@ fn a_nan_weight_reads_as_zero_and_never_poisons_the_layers_beneath() {
 fn malformed_masks(
     good: multiview_compositor::mask::WipeMask,
 ) -> Vec<multiview_compositor::mask::WipeMask> {
-    use multiview_compositor::mask::WipeMask;
+    use multiview_compositor::mask::{MaskShape, WipeMask};
     vec![
         WipeMask {
             pinned: Some(f32::NAN),
@@ -639,6 +639,24 @@ fn malformed_masks(
         },
         WipeMask { width: 0, ..good },
         WipeMask { height: 0, ..good },
+        // R-6: finite fields whose intermediates overflow (`extent - radius`).
+        WipeMask {
+            shape: MaskShape::Circle,
+            origin: [f32::MAX, 0.0],
+            extent: f32::MAX,
+            radius: -f32::MAX,
+            reverse: true,
+            softness: 1.0,
+            ..good
+        },
+        WipeMask {
+            radius: 1.0e30,
+            ..good
+        },
+        WipeMask {
+            softness: 2.0,
+            ..good
+        },
         WipeMask {
             aspect: 0.0,
             ..good
@@ -885,5 +903,35 @@ fn keys_and_groups_across_band_boundaries_match_the_oracle_on_every_thread_count
             warm,
             "no growth after warmup"
         );
+    }
+}
+
+proptest! {
+    /// Every mask the engine can build (`WipeMask::new`, and `expanded` for
+    /// the border band) is valid for its own canvas, so the R-1..R-6 checks
+    /// never suppress a real wipe.
+    #[test]
+    fn every_constructed_wipe_mask_is_valid_for_its_canvas(
+        shape in 0_usize..5,
+        progress in -0.5_f32..1.5,
+        w in 1_u32..4096,
+        h in 1_u32..4096,
+        ox in -0.5_f32..1.5,
+        oy in -0.5_f32..1.5,
+        reverse in any::<bool>(),
+        softness in -0.5_f32..1.5,
+        border in -0.5_f32..1.5,
+    ) {
+        use multiview_compositor::mask::{MaskShape, WipeMask};
+        let shape = [
+            MaskShape::Horizontal,
+            MaskShape::Vertical,
+            MaskShape::Diagonal,
+            MaskShape::Box,
+            MaskShape::Circle,
+        ][shape];
+        let mask = WipeMask::new(shape, progress, w, h, [ox, oy], reverse, softness, border);
+        prop_assert!(mask.is_valid_for(w, h), "{:?}", mask);
+        prop_assert!(mask.expanded(border).is_valid_for(w, h));
     }
 }
