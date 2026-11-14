@@ -2037,10 +2037,10 @@ refused `slot-medium-mismatch`). Audio rows follow `Output::audio_capability`
 
 | Output kind | video slots | audio slots | subtitle slots | video codecs | notes |
 | --- | --- | --- | --- | --- | --- |
-| `hls` | 1 (a ladder later) | N, select-one renditions (`SelectOne`) | N WebVTT renditions (slice F) | H.264, HEVC | the production segmenter writes **MPEG-TS** segments (`MediaPlaylist::new(SegmentType::MpegTs)`, `crates/multiview-output/src/sink.rs:1458`); `SegmentType::Fmp4` exists in the playlist writer but is not selectable on the output yet. Passthrough needs an IDR within every `segment_ms` |
-| `ll_hls` | 1 | N, select-one (`SelectOne`, as HLS) | N WebVTT | H.264, HEVC | fMP4/CMAF parts with `EXT-X-MAP` |
-| `srt`, `rist` | 1 in v1 (N PIDs later) | N simultaneous PIDs | N (DVB; A53 in the video) | H.264, HEVC, MPEG-2 | MPEG-TS |
-| `rtmp` | 1 | 1; N when `multitrack = true` (Enhanced RTMP v2) | A53 in the video only | H.264 (HEVC with Enhanced RTMP) | FLV |
+| `hls` | 1 (a ladder later) | N, select-one renditions (`SelectOne`) | N (≤ 8) WebVTT renditions (slice F, built) | H.264, HEVC | the production segmenter writes **MPEG-TS** segments (`MediaPlaylist::new(SegmentType::MpegTs)`, `crates/multiview-output/src/sink.rs:1458`); `SegmentType::Fmp4` exists in the playlist writer but is not selectable on the output yet. Passthrough needs an IDR within every `segment_ms` |
+| `ll_hls` | 1 | N, select-one (`SelectOne`, as HLS) | N WebVTT (refused until fMP4 WebVTT parts land, follow-up) | H.264, HEVC | fMP4/CMAF parts with `EXT-X-MAP` |
+| `srt`, `rist` | 1 in v1 (N PIDs later) | N simultaneous PIDs | N (DVB; A53 in the video), refused until built (follow-up) | H.264, HEVC, MPEG-2 | MPEG-TS |
+| `rtmp` | 1 | 1; N when `multitrack = true` (Enhanced RTMP v2) | A53 in the video only, refused until built (follow-up) | H.264 (HEVC with Enhanced RTMP) | FLV |
 | `rtsp_server` | 1 | N simultaneous | 0 | H.264, HEVC | |
 | `webrtc` (WHEP), `whip_push`, MoQ preview | 1 | 1 (`AtMost(1)`, Opus) | 0 | H.264 | B-frames forbidden: a B-frame source never passes through |
 | `ndi` | 1 (raw) | 1 PCM channel-map feed (no discrete tracks) | 0 | raw | no encoder; never passthrough |
@@ -2148,6 +2148,109 @@ What stays restart-pending, with today's `x-multiview-apply: restart` and why:
 The Outputs page shows the format and slots editor with the matching warning: "Applying resets
 this output (about 1 s); Program and other outputs are not affected" or "Applies on the next
 restart".
+
+**As built in slice F (#345, part F1): subtitle slots, static patch.**
+- **Config.** Slots are `[[outputs.slots.subtitle]]` (same reason as B1): `format` (`webvtt`
+  default, `cea608`, `dvb`), `language` (1..=35 of `[A-Za-z0-9-]`), `name` (menu label, at most 64
+  characters, no control character, no `"`) and `source` (the slot's patch: a declared source id;
+  absent = unpatched, the rendition stays empty). At most 8 per output (`MAX_SUBTITLE_SLOTS`).
+  `SlotCapability` carries `subtitle_max`, the formats the medium carries
+  (`subtitle_medium_formats`) and the formats built for it (`subtitle_formats`):
+  - `hls`: up to 8 `webvtt` slots, built.
+  - `ll_hls`: `slot-format-unsupported` (fMP4/CMAF WebVTT parts are a follow-up).
+  - `srt`, `rist`, `rtmp`: `cea608` / `dvb` are `slot-format-unsupported` "not built yet" (A53
+    SEI injection and DVB-sub encoding are follow-ups); `webvtt` there is `slot-medium-mismatch`.
+  - every other kind: any subtitle slot is `slot-medium-mismatch`.
+  - An unknown `source` is refused at document validation (`subtitle slot i names unknown
+    source`). An output without subtitle slots serializes exactly as before.
+  - The effective menu labels (`SubtitleSlot::effective_name`: the name, else the language, else
+    "Subtitles i+1") must be distinct within an output (RFC 8216 §4.3.4.1.1: every member of a
+    group has a different `NAME`): two slots with `language = "en"` and no name, two equal names,
+    or a name equal to another slot's fallback are `slot-format-unsupported` (`subtitle slot i
+    name "…" repeats slot j's`).
+- **Sink** (`multiview-output::hls::subtitle`, `PacketMuxSink::with_subtitles`). A subtitle slot
+  forces the master/rendition layout like an audio rendition does. Slot `i` is a media playlist
+  `subs<i>-g<gen>.m3u8` in the master's `GROUP-ID="subs"` (`DEFAULT=NO,AUTOSELECT=YES`,
+  `NAME` = the slot's effective name; the sink also disambiguates any duplicate that reaches it
+  unvalidated, deterministically, with a ` (i+1)` suffix); every `EXT-X-STREAM-INF`
+  names `SUBTITLES="subs"`, and the master is published only once every subtitle playlist exists.
+  At every video segment close each slot writes `subs<i>-<index>.vtt` (tmp + rename; the TS
+  segment's index) and pushes it with the video segment's duration and start PTS, so the media
+  sequence, discontinuities and PDT match the video playlist. Each rendition has one shared,
+  non-negative `WebVTT` timeline: LOCAL zero is its first segment's start. Each file starts
+  `WEBVTT` / `X-TIMESTAMP-MAP=MPEGTS:<n>,LOCAL:<l>`, where `l` is the segment start on that
+  timeline (to the millisecond) and `n` is the 90 kHz PTS the segment's first video PES carries
+  **as written** (read back from the video rendition's `.ts`, so the muxer's own offset is
+  included; a test checks it against the real TS), moved back by the sub-millisecond remainder
+  modulo 2^33 so the pair is exact and a 33-bit PTS wrap between segments stays on one timeline.
+  Then the cues overlapping the segment (`SlotCues::publish`), with `&`, `<`, `>` escaped.
+  Published segments are immutable and clients merge the cues of every loaded segment (hls.js
+  de-duplicates only identical start/end/text), so no published interval may later turn false
+  or overlap another copy. A cue whose end is known before its first publication carries its
+  **total** display interval in every segment it overlaps (RFC 8216 §3.5; identical copies), so it
+  has identical timestamps in each. A cue still open (end unknown) when a segment is published
+  becomes *rolling*: that segment carries the piece `[max(start, segment start), segment end)`,
+  each later segment the next contiguous piece, and the segment containing the close
+  `[segment start, end)`. The pieces never overlap and their union is the display time, so a
+  client sees exactly one copy at every instant (a test loads every segment together and counts
+  copies). A piece never asserts display beyond **confirmed** cue state: the sampler publishes a
+  lock-free per-output *accepted-through watermark* (`SubtitleFeed::mark_accepted_through`: the
+  latest tick T such that every slot change observed at ticks ≤ T was accepted into the feed; it
+  does not advance while any slot still holds a refused change), paired with the feed's accepted
+  count. The sink's `drain_confirmed` confirms T only once it has received that many cues, and an
+  open cue's piece then runs to `min(segment end, T)`; the rest is carried forward and the next
+  piece starts at the uncovered point (subtitle publication may lag; video never waits). So a
+  close or successor delayed by a full feed can never contradict an already-published piece.
+  Staleness **fails closed**: display is never inferred from a timeout. If the watermark stays
+  behind the segment start (or absent) for more than `MAX_WATERMARK_LAG_SEGMENTS` (2) consecutive
+  closes, every close that withholds an open cue counts `SubtitleStats::watermark_stale`, but
+  nothing of the cue is published past the confirmed point. A permanently dead sampler therefore
+  shows the cue only up to its last confirmed instant: subtitles stop, video is unaffected. The
+  only reconciliation state is each held cue's last published end, bounded by the 64 held cues
+  per slot. When the watermark advances again, or the real close or successor arrives, the cue
+  resumes with a piece starting at that end. The client's union therefore stays one copy,
+  contiguous or gapped, never overlapping and never past the true close.
+  A known cue whose close arrives after its time was already published is carried once by the
+  next segment rather than lost. An empty segment gets a header-only file. Old `.vtt` files retire with the TS grace
+  (`prune_prior_*`) only when named exactly `subs<slot>-<index>.vtt` (all-digit fields); rendition
+  cleanup removes only manifests matching the exact generated grammar
+  `subs<slot>-g<generation>.m3u8` (all-digit fields), so e.g. `subtitles.m3u8`,
+  `subscriptions.m3u8` or `subs+1-1.vtt` are never touched.
+- **Bounds.** Cue text is bounded to 4 lines and 512 bytes (`bound_cue_lines`: UTF-8 boundary
+  safe, blank lines dropped, a fresh exact-size allocation, never the source's capacity). Its
+  work is bounded too: it examines at most 16 source lines (blank ones included) and 4 KiB of
+  source bytes (whitespace included), checking that budget before each next line and classifying
+  whitespace only within the inspected prefix, so a hostile cue (256 KiB of padding, 100k blank
+  lines) costs a fixed amount of work per tick (`BoundedLines::inspected_*`). The bound applies
+  **before** the engine retains, compares or enqueues it: the resolver projects the active cue
+  while borrowing it from the cue-store snapshot (`CaptionCueStore::with_active_at_generation`,
+  `subtitle_slots::text_cue_lines`), so a bitmap cue is skipped without copying its pixels and
+  a 256 KiB text cue costs a 512-byte copy. `SubtitleFeed::try_offer`/`offer` re-project any
+  payload that is not already compact (defence at the public boundary), and `SlotCues::push`
+  does too. The sink drains at most the feed's capacity per segment close (`drain` is capped:
+  concurrent offers refill the channel while it drains, so an uncapped drain could collect without
+  bound); the rest waits in the channel. The engine-to-sink `SubtitleFeed` is a 256-cue channel
+  the sampler only `try_send`s
+  into (never blocks). A change the full feed refuses is kept in a per-slot pending queue (at
+  most 4) and retried non-blockingly on every later tick until accepted, so a close is never
+  lost to a transient sink stall, even when silence follows; on overflow an unsent open cue
+  superseded by its close goes first, then the oldest unsent closed cue (counted as a feed
+  drop), never the close of a cue the sink holds open. The sink holds at most 64 cues per slot
+  (drops the first-ending one). `SubtitleStats` counts feed drops, held drops, truncations and
+  written segments (`PacketMuxSink::subtitle_stats`).
+- **Engine** (`multiview-cli::subtitle_slots`). Each HLS output with subtitle slots gets a route
+  table `Arc<SwapCell<Arc<[Option<String>]>>>` (slot → source, from config `source`; F2
+  re-points it live). Once per item the **bake consumer** (never the output clock; the hot-loop
+  projection gains no work) reads the table, asks the source's caption store for the text cue at
+  the picture the compositor latches for that tick (`TileStore::peek_at_with_source_time`: the same
+  selection as `read_at`, without moving the prune watermark) and the bounded text projection of
+  `CueStore::with_active_at_generation(pts, generation, ..)`. `SubtitleSlotSampler` turns the samples
+  into cue changes on the output timeline (`MediaTime::from_tick`): an open cue when text
+  appears, the closed cue when it changes. A cue spanning segment boundaries is written into each
+  segment it covers. A re-point lands on one tick: the old source's cue ends at tick T and the new
+  source's cue may start at T. A source without a caption store yields no cues.
+- **Follow-ups:** LL-HLS WebVTT (fMP4 parts), CEA-608 in A53 SEI for TS/RTMP, DVB subtitles;
+  the patch API plane, live re-patch and persistence (F2); the Outputs editor and matrix tab (F3).
 
 ### 12.4 The cheapest path per crosspoint
 

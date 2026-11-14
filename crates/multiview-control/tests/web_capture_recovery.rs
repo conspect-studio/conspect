@@ -27,7 +27,7 @@ fn recovery_case(prune: bool) {
     let root = tempfile::tempdir().unwrap();
     let tool = root.path().join("node");
     let marker = root.path().join("runs");
-    std::fs::write(&tool,format!("#!/bin/sh\ncat >/dev/null\nprintf x >> '{}'\nprintf media\nprintf '%s\\n' '{{\"event\":\"capture_complete\",\"frames\":2}}' >&2\n",marker.display())).unwrap();
+    std::fs::write(&tool,format!("#!/bin/sh\ncat >/dev/null\nprintf x >> '{}'\nprintf media\nprintf '%s\\n' '{{\"event\":\"capture_complete\",\"frames\":2,\"steps_kept\":2}}' >&2\n",marker.display())).unwrap();
     std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
     let store_dir = root.path().join("store");
     std::fs::create_dir(&store_dir).unwrap();
@@ -37,6 +37,7 @@ fn recovery_case(prune: bool) {
                 node: tool,
                 browser: "/bin/sh".into(),
                 ffmpeg: "/bin/sh".into(),
+                gl: multiview_webengine::capture::BrowserGl::Default,
             },
             ArtifactStore::open(
                 &store_dir,
@@ -103,6 +104,7 @@ fn recovery_case(prune: bool) {
                         require_premium: false,
                         credentials: None,
                     }),
+                    capture: multiview_webengine::capture::CaptureOptions::default(),
                 },
                 maximum_bytes: 64 * 1024 * 1024,
                 timeout: Duration::from_secs(120),
@@ -139,6 +141,7 @@ fn recovery_case(prune: bool) {
                     document: "trusted fixture".into(),
                     background: Background::Opaque,
                     windy: None,
+                    capture: multiview_webengine::capture::CaptureOptions::default(),
                 },
                 maximum_bytes: 1024,
                 timeout: Duration::from_secs(120),
