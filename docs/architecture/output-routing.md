@@ -2345,13 +2345,26 @@ once that muxer writes its rule.)
     `MAX_AU_BYTES` is counted as oversize at once; a malformed prefix is
     counted separately. `to_annex_b` then writes into a single `Arc<[u8]>` of
     the exact size (review R1-A-2).
-  - For an H.264 source, the writer caches the connection's SPS/PPS: from the
-    avcC or Annex-B extradata first, then replaced by in-band sets as they
-    pass. Each set is bounded to 4 KiB. When an IDR carries neither set, the
-    writer adds the current ones (after a leading AUD) before classifying it.
-    An MP4/avc1 source, whose sets live only in extradata, therefore yields
-    strict IDRs and can pass through. A reconnect starts from its own
-    extradata (review R1-M-1).
+  - For an H.264 source, the writer caches the connection's SPS/PPS by id,
+    at most 32 of each. The cache is filled from every set in the avcC or
+    Annex-B extradata, then from every in-band SPS/PPS of every AU, IDR or not
+    (review R2-M-3).
+    - A set whose id is reused with different bytes bumps `params_gen` before
+      that AU is offered.
+    - A set whose id cannot be read invalidates the whole cache, so a stale
+      set is never inserted.
+    - An IDR that carries neither set gets exactly the PPS its first slice
+      names, plus that PPS's SPS, inserted after a leading AUD and before
+      classification (review R2-M-4).
+    - When that PPS or its SPS is unknown, the IDR stays incomplete: it is not
+      strict, so no run starts on it. It is counted as `unresolved_sets`.
+    - An MP4/avc1 source, whose sets live only in extradata, therefore yields
+      strict IDRs. A reconnect starts from its own extradata (review R1-M-1).
+  - The 1024-NAL budget also holds for Annex-B packets (`annex_b_nal_count`:
+    no allocation, early exit), and it counts the two NALs an insertion adds.
+    `scan_parameter_sets` streams the NALs and returns `Rejected` past the
+    budget, so the demux thread never collects an unbounded list
+    (review R2-A-3).
   - Extradata over 64 KiB (`multiview_ffmpeg::MAX_FACTS_EXTRADATA`, checked on
     the length) is never copied. That connection gets no writer, so
     passthrough is off for it, and the refusal is counted as
