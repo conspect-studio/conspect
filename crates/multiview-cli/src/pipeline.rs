@@ -4613,18 +4613,20 @@ impl Pipeline {
             binding_ids,
         };
         let preview = crate::preview::program_slot();
-        let out = self
-            .drive_streaming(
-                time,
-                RealtimePacer,
-                &stop,
-                Some(max_ticks),
-                plan,
-                publisher,
-                &preview,
-                |_: &mut CompositorDrive<Nv12Image>| {},
-            )
-            .await?;
+        // Boxed: the streaming drive's state machine is large (clippy
+        // `large_futures` on the ffmpeg-linked targets); one heap allocation
+        // per bounded run, never per tick.
+        let out = Box::pin(self.drive_streaming(
+            time,
+            RealtimePacer,
+            &stop,
+            Some(max_ticks),
+            plan,
+            publisher,
+            &preview,
+            |_: &mut CompositorDrive<Nv12Image>| {},
+        ))
+        .await?;
         Ok(out.report)
     }
 
