@@ -565,6 +565,57 @@ impl SwitcherTickDriver {
         self.primed_stores = Some(stores);
     }
 
+    /// Register (or replace) one primed store at a frame boundary: a stored
+    /// layout adopted as an M/E source (#307). Without an installed store map
+    /// (no prime provider) this is a no-op, so it never fabricates one.
+    /// Allocates only for the insert itself (on a registry change, never in
+    /// the steady state).
+    pub fn insert_prime_store(&mut self, id: &str, store: Arc<TileStore<Nv12Image>>) {
+        if let Some(stores) = self.primed_stores.as_mut() {
+            if let Some(existing) = stores.get_mut(id) {
+                *existing = store;
+            } else {
+                stores.insert(id.to_owned(), store);
+            }
+        }
+    }
+
+    /// Unregister one primed store; `true` if it was registered. The caller
+    /// checks [`Self::references_source`] first.
+    pub fn remove_prime_store(&mut self, id: &str) -> bool {
+        self.primed_stores
+            .as_mut()
+            .is_some_and(|stores| stores.remove(id).is_some())
+    }
+
+    /// Whether the M/E references `id` now: the resolved PGM or PVW source,
+    /// any numbered input patched to it, or the held take naming it (a
+    /// select target or a patch member). Allocation-free.
+    #[must_use]
+    pub fn references_source(&self, id: &str) -> bool {
+        let (program, preview) = self.resolved_selections();
+        if program.as_str() == id || preview.as_str() == id {
+            return true;
+        }
+        if self
+            .inputs
+            .as_ref()
+            .is_some_and(|table| table.input_for_source(id).is_some())
+        {
+            return true;
+        }
+        match self.pending_take.as_ref().map(|(command, _)| &command.verb) {
+            Some(SwitcherVerb::SelectProgram(target) | SwitcherVerb::SelectPreview(target)) => {
+                self.resolve(target).as_str() == id
+            }
+            Some(SwitcherVerb::Patch(set)) => set
+                .members
+                .iter()
+                .any(|(_, source)| source.as_ref().is_some_and(|s| s.as_str() == id)),
+            _ => false,
+        }
+    }
+
     /// Advertise AUTO. Called only by the frame hook that renders the
     /// dissolve inside the Program drive (ADR-0104 §3).
     pub fn advertise_auto(&self) {
