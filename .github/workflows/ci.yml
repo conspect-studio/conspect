@@ -190,6 +190,47 @@ jobs:
           cargo test --locked -p multiview-control --features capture-browser-integration --test web_capture_tcp actual_browser_http_post_commits_decodable_artifact -- --exact 2>&1 | tee capture-browser-proof.log
           grep -F 'test result: ok. 1 passed; 0 failed;' capture-browser-proof.log
 
+  # #382: a real headless Chrome opens WebTransport sessions against the HTTP/3
+  # front door and plays MoQ through the app's own client (connectMoq +
+  # @moq/watch via `startMoqPlaybackWithRefresh`) for 15 s, past the 10 s header
+  # deadline that used to reset every CONNECT stream. Both tests are opt-in
+  # features (node, web/ deps, Chrome, ffmpeg/libvpx); the positive-count grep
+  # makes a silently skipped test a failure.
+  h3-browser-webtransport:
+    name: required real-browser WebTransport over h3 (Chrome)
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: provision Chrome, ffmpeg and the web dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          npm --prefix web ci
+          (cd web && npx playwright install --with-deps chromium)
+          echo "CONSPECT_WEB_FFMPEG=$(command -v ffmpeg)" >> "$GITHUB_ENV"
+      - name: Chrome WebTransport subprotocol negotiation (multiview-h3)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p multiview-h3 --features browser-integration --test chrome_webtransport -- --nocapture 2>&1 | tee h3-chrome-wt.log
+          grep -F 'test result: ok. 1 passed; 0 failed;' h3-chrome-wt.log
+      - name: Chrome plays MoQ from the h3 front door (multiview-control)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p multiview-control --features moq-browser-integration --test h3_chrome_moq -- --nocapture 2>&1 | tee h3-chrome-moq.log
+          grep -F 'test result: ok. 1 passed; 0 failed;' h3-chrome-moq.log
+
   test:
     name: check + test (${{ matrix.os }})
     # The long pole of CI: macOS check+test runs ~15min warm (the slowest leg);

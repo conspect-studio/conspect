@@ -80,3 +80,164 @@ async fn uni_stream_with_incomplete_type_is_stopped_at_the_deadline() {
     let (resp, _) = fetch(&mut client.send, request(http::Method::GET, "/after")).await;
     assert_eq!(resp.status(), 200);
 }
+
+/// #382: the header deadline covers only the request HEADERS. A
+/// WebTransport CONNECT stream (and its session) must outlive it: before
+/// the fix the guard re-armed the deadline on the next pending read, so
+/// every session was reset with `H3_REQUEST_REJECTED` `header_deadline`
+/// after accept (10 s in production: `MoQ` played 10 s, then fell back).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webtransport_session_outlives_the_header_deadline() {
+    let (tx, mut sessions) = tokio::sync::mpsc::unbounded_channel();
+    let server = start(
+        TestSite::new(),
+        Some(std::sync::Arc::new(Holder(tx))),
+        short_deadline(),
+        None,
+    )
+    .await;
+    let mut client = h3_client(&server).await;
+    let mut connect = client
+        .send
+        .send_request(connect_request("/moq/x", Some(r#""moqt-16""#)))
+        .await
+        .unwrap();
+    let resp = tokio::time::timeout(TIMEOUT, connect.recv_response())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let session = tokio::time::timeout(TIMEOUT, sessions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // Three header deadlines with an idle CONNECT stream.
+    let ended = tokio::time::timeout(Duration::from_millis(2400), {
+        let session = session.clone();
+        async move { web_transport_trait::Session::closed(&session).await }
+    })
+    .await;
+    assert!(ended.is_err(), "the session ended: {ended:?}");
+    // The session still carries streams both ways.
+    let mut uni = web_transport_trait::Session::open_uni(&session)
+        .await
+        .unwrap();
+    web_transport_trait::SendStream::write(&mut uni, b"alive")
+        .await
+        .unwrap();
+    web_transport_trait::SendStream::finish(&mut uni).unwrap();
+    let (_, mut recv, prefix) = tokio::time::timeout(TIMEOUT, client.uni.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut got = prefix.map(|p| p.to_vec()).unwrap_or_default();
+    got.extend(recv.read_to_end(64).await.unwrap());
+    assert_eq!(got, b"alive");
+    assert_eq!(
+        multiview_h3::Counters::get(&server.endpoint.counters().header_deadline_rejections),
+        0
+    );
+}
+
+/// #382: a request body may take longer than the header deadline once the
+/// HEADERS frame is complete (an upload on a slow link).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_body_may_outlast_the_header_deadline() {
+    let server = start(TestSite::new(), None, short_deadline(), None).await;
+    let mut client = h3_client(&server).await;
+    let fut = async {
+        let mut stream = client
+            .send
+            .send_request(request(http::Method::POST, "/upload"))
+            .await
+            .unwrap();
+        for piece in [&b"slow "[..], b"body ", b"sent"] {
+            stream
+                .send_data(bytes::Bytes::from_static(piece))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+        stream.finish().await.unwrap();
+        let resp = stream.recv_response().await.unwrap();
+        let body = read_body(&mut stream).await;
+        (resp, body)
+    };
+    let (resp, body) = tokio::time::timeout(TIMEOUT, fut).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body, b"slow body sent");
+}
+
+struct Holder(tokio::sync::mpsc::UnboundedSender<multiview_h3::WtSession>);
+
+impl multiview_h3::WtHandler for Holder {
+    fn admit(
+        &self,
+        _req: &http::request::Parts,
+        _peer: std::net::SocketAddr,
+    ) -> Result<multiview_h3::AdmitToken, http::StatusCode> {
+        Ok(Box::new(()))
+    }
+
+    fn accept(
+        &self,
+        session: multiview_h3::WtSession,
+        _token: multiview_h3::AdmitToken,
+        _req: http::request::Parts,
+        _peer: std::net::SocketAddr,
+    ) -> multiview_h3::BoxFuture<'static, ()> {
+        let _ = self.0.send(session.clone());
+        Box::pin(async move {
+            let _ = web_transport_trait::Session::closed(&session).await;
+        })
+    }
+
+    fn protocols(&self) -> &[&'static str] {
+        &["moqt-16"]
+    }
+}
+
+/// #382 review: a zero-length grease frame (which h3 ignores) before the
+/// HEADERS does not lift the header deadline: a stream that then stays
+/// silent, or sends only part of its HEADERS, is still reset at the
+/// deadline, and the connection keeps serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grease_before_headers_does_not_lift_the_deadline() {
+    let server = start(TestSite::new(), None, short_deadline(), None).await;
+    let mut client = h3_client(&server).await;
+    let mut streams = Vec::new();
+    for partial_headers in [false, true] {
+        let (mut send, recv) = client.conn.open_bi().await.unwrap();
+        let mut bytes = Vec::new();
+        multiview_h3::varint::encode(0x21, &mut bytes);
+        multiview_h3::varint::encode(0, &mut bytes);
+        if partial_headers {
+            multiview_h3::varint::encode(0x01, &mut bytes);
+            multiview_h3::varint::encode(64, &mut bytes);
+            bytes.extend([0u8; 8]);
+        }
+        send.write_all(&bytes).await.unwrap();
+        streams.push((send, recv));
+    }
+    let started = Instant::now();
+    let (resp, _) = fetch(&mut client.send, request(http::Method::GET, "/next")).await;
+    assert_eq!(resp.status(), 200);
+    for (send, _recv) in &streams {
+        let stopped = tokio::time::timeout(TIMEOUT, send.stopped())
+            .await
+            .expect("a greased stream escaped the header deadline")
+            .unwrap();
+        assert_eq!(stopped.map(noq::VarInt::into_inner), Some(0x10b));
+    }
+    assert!(
+        started.elapsed() >= Duration::from_millis(600),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        multiview_h3::Counters::get(&server.endpoint.counters().header_deadline_rejections),
+        2
+    );
+    let (resp, _) = fetch(&mut client.send, request(http::Method::GET, "/after")).await;
+    assert_eq!(resp.status(), 200);
+}

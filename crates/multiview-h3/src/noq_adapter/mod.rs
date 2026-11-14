@@ -1198,8 +1198,13 @@ where
 struct RecvGuard {
     guard: HeaderGuard,
     /// The header deadline as a fixed instant, measured from stream accept
-    /// (set at construction, never recomputed).
-    deadline_at: Instant,
+    /// (set at construction, never recomputed). `None` once the first frame
+    /// (the request HEADERS) is complete: from then on no deadline applies
+    /// to the stream (a request body, a WebTransport CONNECT stream that
+    /// lives as long as its session). #382: clearing only the `Sleep` let
+    /// the next pending read re-create it from this past instant, which
+    /// reset every CONNECT stream `header_deadline` after accept.
+    deadline_at: Option<Instant>,
     /// The `Sleep` backing `deadline_at`, created lazily on the first
     /// `poll_data_max` call rather than at construction: while the stream
     /// sits in `pending_bi`/awaiting the request semaphore, nothing polls
@@ -1216,7 +1221,7 @@ impl RecvGuard {
     fn new(config: &GuardConfig) -> Self {
         Self {
             guard: HeaderGuard::new(config.max_field_section_size),
-            deadline_at: Instant::now() + config.header_deadline,
+            deadline_at: Some(Instant::now() + config.header_deadline),
             deadline: None,
             counters: Arc::clone(&config.counters),
         }
@@ -1225,11 +1230,19 @@ impl RecvGuard {
     /// Polls the deadline, creating its `Sleep` on first use. `deadline_at`
     /// in the past (as in a unit test) fires on this first poll.
     fn poll_deadline(&mut self, cx: &mut task::Context<'_>) -> bool {
-        let at = self.deadline_at;
+        let Some(at) = self.deadline_at else {
+            return false;
+        };
         let sleep = self
             .deadline
             .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
         sleep.as_mut().poll(cx).is_ready()
+    }
+
+    /// The request HEADERS are complete: no deadline applies any more.
+    fn clear_deadline(&mut self) {
+        self.deadline_at = None;
+        self.deadline = None;
     }
 }
 
@@ -1376,8 +1389,8 @@ impl RecvStream {
         if let (Some(guard), Some(data)) = (self.guard.as_mut(), chunk.as_ref()) {
             match guard.guard.feed(data) {
                 Verdict::Continue => {
-                    if guard.guard.first_frame_complete() {
-                        guard.deadline = None;
+                    if guard.guard.headers_complete() {
+                        guard.clear_deadline();
                     }
                 }
                 Verdict::WebTransport => self.guard = None,
@@ -1689,9 +1702,23 @@ mod tests {
         assert!(guard.deadline.is_none());
         // Move the deadline into the past, as if accept happened well
         // before `header_deadline` ago.
-        guard.deadline_at = Instant::now() - Duration::from_secs(10);
+        guard.deadline_at = Some(Instant::now() - Duration::from_secs(10));
         let fired = std::future::poll_fn(|cx| task::Poll::Ready(guard.poll_deadline(cx))).await;
         assert!(fired, "a past deadline must fire on the first poll");
+    }
+
+    #[tokio::test]
+    async fn a_cleared_deadline_never_fires_again() {
+        // #382: once the HEADERS frame is complete the deadline is gone for
+        // good, even if its instant has passed and a later read is pending.
+        let mut guard = RecvGuard::new(&guard_config());
+        guard.deadline_at = Some(Instant::now() - Duration::from_secs(10));
+        guard.clear_deadline();
+        for _ in 0..3 {
+            let fired = std::future::poll_fn(|cx| task::Poll::Ready(guard.poll_deadline(cx))).await;
+            assert!(!fired, "a cleared deadline fired");
+            assert!(guard.deadline.is_none(), "a cleared deadline re-armed");
+        }
     }
 
     #[test]
