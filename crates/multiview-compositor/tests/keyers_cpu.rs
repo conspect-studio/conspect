@@ -603,6 +603,97 @@ fn a_nan_weight_reads_as_zero_and_never_poisons_the_layers_beneath() {
 }
 
 #[test]
+fn a_malformed_wipe_mask_covers_nothing_and_never_poisons_the_layers_beneath() {
+    // Merge review R-1: `WipeMask` has public fields, so a NaN or out-of-range
+    // field must not reach the premultiply. A malformed mask covers nothing,
+    // on a plain tile and on a keyed one, on both kernels.
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    let c = bt709(ColorRange::Limited);
+    let bg = solid(8, 8, 140, 100, 160, c);
+    let k = solid(8, 8, 220, 128, 128, c);
+    let base = comp(8, 8, &[Tile::placed(&bg, 0, 0, 1.0)]);
+    let good = WipeMask::new(
+        MaskShape::Horizontal,
+        0.5,
+        8,
+        8,
+        [0.0, 0.0],
+        false,
+        0.1,
+        0.0,
+    );
+    assert!(good.is_well_formed());
+    let malformed = [
+        WipeMask {
+            pinned: Some(f32::NAN),
+            ..good
+        },
+        WipeMask {
+            pinned: Some(2.0),
+            ..good
+        },
+        WipeMask {
+            pinned: Some(-1.0),
+            ..good
+        },
+        WipeMask {
+            radius: f32::NAN,
+            ..good
+        },
+        WipeMask {
+            softness: f32::INFINITY,
+            ..good
+        },
+        WipeMask {
+            origin: [f32::NAN, 0.0],
+            ..good
+        },
+    ];
+    for mask in malformed {
+        assert!(!mask.is_well_formed(), "{mask:?}");
+        for keyed in [false, true] {
+            let tile = Tile::placed(&k, 0, 0, 1.0).with_mask(mask);
+            let tile = if keyed {
+                tile.with_key(TileKey::linear())
+            } else {
+                tile
+            };
+            let tiles = [Tile::placed(&bg, 0, 0, 1.0), tile];
+            let out = comp(8, 8, &tiles);
+            assert_eq!(
+                out, base,
+                "malformed mask {mask:?} (keyed {keyed}) covers nothing"
+            );
+            let reference = composite_reference(8, 8, canvas(), BLACK, &tiles, true).unwrap();
+            assert_eq!(reference, base, "reference kernel agrees for {mask:?}");
+        }
+    }
+    // A well-formed keyed + masked tile is drawn through its mask: the left
+    // half shows the keyer, the right half the background.
+    let tiles = [
+        Tile::placed(&bg, 0, 0, 1.0),
+        Tile::placed(&k, 0, 0, 1.0)
+            .with_key(TileKey::linear())
+            .with_mask(WipeMask::new(
+                MaskShape::Horizontal,
+                0.5,
+                8,
+                8,
+                [0.0, 0.0],
+                false,
+                0.0,
+                0.0,
+            )),
+    ];
+    let out = comp(8, 8, &tiles);
+    assert_eq!(
+        luma(&out, 0, 0),
+        luma(&comp(8, 8, &[Tile::placed(&k, 0, 0, 1.0)]), 0, 0)
+    );
+    assert_eq!(luma(&out, 7, 0), luma(&base, 7, 0));
+}
+
+#[test]
 fn only_background_changing_with_an_opaque_b_equals_the_incoming_tile_at_p() {
     // ADR-0113 §2: the merge reduces to today's incoming-tile-at-weight render.
     let c = bt709(ColorRange::Limited);

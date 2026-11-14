@@ -322,6 +322,12 @@ impl TileParams {
     pub fn with_mask(mut self, mask: &crate::mask::WipeMask) -> Self {
         // Exact endpoints (review MED-01): coverage 0 is zero opacity,
         // coverage 1 is no mask at all; neither depends on float rounding.
+        // A malformed public mask draws nothing, exactly as on the CPU
+        // reference (`WipeMask::is_well_formed`).
+        if !mask.is_well_formed() {
+            self.opacity_transfer[0] = 0.0;
+            return self;
+        }
         match mask.pinned {
             Some(c) if c <= 0.0 => {
                 self.opacity_transfer[0] = 0.0;

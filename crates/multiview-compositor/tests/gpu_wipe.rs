@@ -98,3 +98,65 @@ fn gpu_wipe_masks_match_the_cpu_reference() {
         }
     }
 }
+
+/// Merge review R-1 (PR #406): a malformed public mask draws nothing on the
+/// GPU, as on the CPU reference, and never poisons the layer beneath.
+#[test]
+fn gpu_malformed_wipe_mask_draws_nothing_like_the_cpu_reference() {
+    let Some(gpu) = try_gpu() else { return };
+    let out = solid(40, 110, 140);
+    let inc = solid(200, 150, 100);
+    let good = WipeMask::new(
+        MaskShape::Horizontal,
+        0.5,
+        W,
+        H,
+        [0.0, 0.0],
+        false,
+        0.1,
+        0.0,
+    );
+    let only_out = [Tile::scaled(&out, 0, 0, W, H, 1.0)];
+    let base = composite(
+        W,
+        H,
+        CanvasColor::default(),
+        LinearRgba::TRANSPARENT,
+        &only_out,
+    )
+    .unwrap();
+    for mask in [
+        WipeMask {
+            pinned: Some(f32::NAN),
+            ..good
+        },
+        WipeMask {
+            pinned: Some(2.0),
+            ..good
+        },
+        WipeMask {
+            radius: f32::NAN,
+            ..good
+        },
+        WipeMask {
+            softness: f32::INFINITY,
+            ..good
+        },
+    ] {
+        let tiles = [
+            Tile::scaled(&out, 0, 0, W, H, 1.0),
+            Tile::scaled(&inc, 0, 0, W, H, 1.0).with_mask(mask),
+        ];
+        let got = gpu
+            .composite(
+                W,
+                H,
+                CanvasColor::default(),
+                LinearRgba::TRANSPARENT,
+                &tiles,
+            )
+            .unwrap();
+        let m = mismatch(base.y_plane(), got.y_plane(), 3);
+        assert!(m == 0.0, "{mask:?}: {m}");
+    }
+}

@@ -699,8 +699,18 @@ impl<'a> Tile<'a> {
     }
 
     /// The mask coverage at canvas pixel `(px, py)`; `1` without a mask.
+    /// `WipeMask` has public fields: a malformed mask
+    /// ([`crate::mask::WipeMask::is_well_formed`]) covers nothing, and any
+    /// coverage is clamped to `[0, 1]` with NaN read as 0, so it can never
+    /// poison the layers beneath.
     fn mask_coverage(&self, px: u32, py: u32) -> f32 {
-        self.mask.as_ref().map_or(1.0, |mask| mask.coverage(px, py))
+        self.mask.as_ref().map_or(1.0, |mask| {
+            if mask.is_well_formed() {
+                crate::key::unit(mask.coverage(px, py))
+            } else {
+                0.0
+            }
+        })
     }
 
     /// The destination width in pixels (the source is scaled to it). Falls back
