@@ -87,6 +87,19 @@ pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
     descriptor.is_rendered()
 }
 
+/// Typed refusal: the selection changed between the AUTO's admission (where
+/// its references were authorized) and the tick (review SA-2).
+pub const REFUSE_SELECTION_CHANGED: &str =
+    "selection-changed: the transition selection changed after this AUTO was authorized; re-plan the operation";
+
+impl SwitcherVerb {
+    /// Is this an AUTO, bound to a selection or not?
+    #[must_use]
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto(_) | Self::AutoExpecting { .. })
+    }
+}
+
 /// Typed refusal: a select names an undeclared or unpatched input.
 pub const REFUSE_UNKNOWN_INPUT: &str = "unknown-slot: the input is not declared or not patched";
 
@@ -114,6 +127,18 @@ pub enum SwitcherVerb {
     /// Begin an exact-duration automatic take on the next frame boundary,
     /// in the selected transition kind (ADR-0112 §3).
     Auto(FrameCount),
+    /// [`Self::Auto`] bound to the selection the control plane authorized
+    /// (review SA-2): the engine refuses it with
+    /// [`REFUSE_SELECTION_CHANGED`] when its selection is no longer exactly
+    /// `selection` at the tick, so a concurrent `SetTransition` can never
+    /// swap an unauthorized stinger player (or dip/border source) into the
+    /// caller's flight. The comparison is a borrow, never a clone.
+    AutoExpecting {
+        /// The AUTO's rate, as [`Self::Auto`].
+        rate: FrameCount,
+        /// The selection the caller was authorized for.
+        selection: TransitionDescriptor,
+    },
     /// Select the transition the next AUTO uses (ADR-0112 §3). Refused
     /// during a take and for a kind this engine does not render.
     SetTransition(TransitionDescriptor),
@@ -645,9 +670,14 @@ impl SwitcherTickDriver {
         match verb {
             SwitcherVerb::SelectProgram(source) => Ok(self.machine.punch(source.clone())),
             SwitcherVerb::Cut => self.machine.cut().map_err(|e| e.to_string()),
-            SwitcherVerb::Auto(rate) => {
+            SwitcherVerb::Auto(rate) | SwitcherVerb::AutoExpecting { rate, .. } => {
                 if self.machine.is_in_flight() {
                     return Err("cannot start a second AUTO during an active take".into());
+                }
+                if let SwitcherVerb::AutoExpecting { selection, .. } = verb {
+                    if selection != self.machine.transition() {
+                        return Err(REFUSE_SELECTION_CHANGED.into());
+                    }
                 }
                 let Some(pair) = scenes else {
                     return Err("no active PGM/PVW scene provider".into());
@@ -693,7 +723,7 @@ impl SwitcherTickDriver {
         scenes: Option<Arc<ScenePair>>,
         tick: Tick,
     ) {
-        if matches!(verb, SwitcherVerb::Auto(_)) && !next.completed {
+        if verb.is_auto() && !next.completed {
             self.active_auto_scenes = scenes;
             self.active_auto = Some(operation_id);
             return;
@@ -904,10 +934,11 @@ impl SwitcherTickDriver {
             };
             let scenes = self.scenes.latest();
             self.stage();
-            let take = matches!(
-                command.verb,
-                SwitcherVerb::SelectProgram(_) | SwitcherVerb::Cut | SwitcherVerb::Auto(_)
-            );
+            let take = command.verb.is_auto()
+                || matches!(
+                    command.verb,
+                    SwitcherVerb::SelectProgram(_) | SwitcherVerb::Cut
+                );
             let result: Result<Option<SwitcherProjection>, String> = if scenes
                 .as_ref()
                 .is_some_and(|pair| pair.version != command.scene_version)
@@ -952,7 +983,7 @@ impl SwitcherTickDriver {
                         .map(|()| Some(self.machine.sample(tick)))
                         .map_err(|e| e.to_string())
                 }
-            } else if matches!(command.verb, SwitcherVerb::Auto(_)) && self.machine.is_in_flight() {
+            } else if command.verb.is_auto() && self.machine.is_in_flight() {
                 Err("cannot start a second AUTO during an active take".into())
             } else if let SwitcherVerb::SelectProgram(source) = &command.verb {
                 if source == self.machine.program()

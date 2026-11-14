@@ -1000,3 +1000,166 @@ async fn a_stinger_player_is_authorized_before_it_is_looked_up() {
     ));
     authorize_refs(&principal(&["me1", "vt1"]), &req).unwrap();
 }
+
+/// A rig whose router also knows `me-only`: an operator for me1/program:main
+/// and sources a, b, but denied the stinger player `vt1` (review SA-2). The
+/// driver rolls through a probe so a test can prove no roll happened.
+fn scoped_rig() -> (
+    Harness,
+    SwitcherControl,
+    SwitcherTickDriver,
+    multiview_engine::player_roll::PlayerRollReceiver,
+) {
+    let (handle, mut driver) = runtime();
+    driver.advertise_auto();
+    let (roll, rolls) = multiview_engine::player_roll::PlayerRollSender::channel(["vt1".into()]);
+    driver.set_player_roll(roll);
+    let h = harness_with(|state| {
+        let mut state = state
+            .with_sources_store(configured_sources(&["a", "b"]))
+            .with_media_player_store(configured_players(&["vt1"]))
+            .with_switcher(handle.clone());
+        Arc::get_mut(&mut state.api_keys)
+            .expect("the harness key store is uniquely owned before the router is built")
+            .register(
+                "me-only",
+                "me-only-secret-s2",
+                Principal {
+                    key_id: "me-only".into(),
+                    role: Role::Operator,
+                    scoped_object_ids: Some(
+                        ["me1", "a", "b"].into_iter().map(str::to_owned).collect(),
+                    ),
+                    scoped_output_ids: Some(vec!["program:main".to_owned()]),
+                    scoped_discovery_domains: None,
+                },
+            );
+        state
+    });
+    (h, handle, driver, rolls)
+}
+
+const ME_ONLY_TOKEN: &str = "me-only.me-only-secret-s2";
+
+fn auto_request(path: &str, token: &str, key: &str) -> Request<Body> {
+    let mut request = post_json(
+        path,
+        token,
+        &json!({ "me": "me1", "program": "main", "action": "auto", "duration_frames": 10 }),
+    );
+    request
+        .headers_mut()
+        .insert("Idempotency-Key", key.parse().unwrap());
+    request
+}
+
+/// SA-2 BOLA: principal A selects a stinger through player vt1; principal B,
+/// authorized for me1/program but denied vt1, cannot AUTO it: 403 on plan
+/// and command, nothing queued, no flight and no roll. A may still AUTO it.
+#[tokio::test]
+async fn an_auto_is_forbidden_when_the_selected_stinger_player_is_denied() {
+    let (h, handle, mut driver, mut rolls) = scoped_rig();
+    let mut outcomes = handle.outcomes();
+    let response = send(
+        &h.router,
+        command(&set(stinger("vt1")), OPERATOR_TOKEN, "sel"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tick(&mut driver, 1);
+    while outcomes.try_recv().is_ok() {}
+    for path in ["/api/v1/switcher/plan", "/api/v1/switcher/commands/auto"] {
+        let response = send(&h.router, auto_request(path, ME_ONLY_TOKEN, "b-auto")).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    tick(&mut driver, 2);
+    tick(&mut driver, 3);
+    assert!(outcomes.try_recv().is_err(), "nothing was queued");
+    let snapshot = handle.snapshot().unwrap();
+    assert!(!snapshot.in_flight);
+    assert_eq!(snapshot.completion_count, 0);
+    assert_eq!(rolls.try_recv(), None, "the denied player was not rolled");
+    // The same principal may AUTO a selection naming nothing it is denied.
+    let response = send(
+        &h.router,
+        command(
+            &set(json!({"kind": "mix", "rate": 5})),
+            OPERATOR_TOKEN,
+            "mix",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tick(&mut driver, 4);
+    let response = send(
+        &h.router,
+        auto_request("/api/v1/switcher/commands/auto", ME_ONLY_TOKEN, "b-mix"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+/// SA-2 race: A's stinger selection (player vt1) is already queued but not
+/// yet applied when B's AUTO is checked, so B passes against the published
+/// MIX selection and its AUTO queues behind A's selection. At the tick the
+/// selection changes first; the engine then refuses B's AUTO with the typed
+/// selection-changed outcome: no flight, no completion, no roll.
+#[tokio::test]
+async fn an_auto_whose_selection_changed_after_its_check_is_refused_by_the_engine() {
+    let (h, handle, mut driver, mut rolls) = scoped_rig();
+    let mut outcomes = handle.outcomes();
+    let response = send(
+        &h.router,
+        command(
+            &set(json!({"kind": "mix", "rate": 5})),
+            OPERATOR_TOKEN,
+            "mix",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tick(&mut driver, 1);
+    while outcomes.try_recv().is_ok() {}
+    handle
+        .try_send(SwitcherCommand {
+            operation_id: "a-sel".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::SetTransition(serde_json::from_value(stinger("vt1")).unwrap()),
+        })
+        .unwrap();
+    let response = send(
+        &h.router,
+        auto_request("/api/v1/switcher/commands/auto", ME_ONLY_TOKEN, "b-auto"),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "checked against MIX"
+    );
+    let b_op = body_json(response).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tick(&mut driver, 2);
+    let mut done = HashMap::new();
+    while let Ok(item) = outcomes.try_recv() {
+        done.insert(item.event.operation_id.clone(), item.event.clone());
+    }
+    assert!(done["a-sel"].error.is_none(), "{done:?}");
+    let refused = &done[&b_op];
+    assert!(!refused.completed);
+    assert_eq!(
+        refused.error.as_deref(),
+        Some(multiview_engine::switcher_control::REFUSE_SELECTION_CHANGED)
+    );
+    tick(&mut driver, 3);
+    let snapshot = handle.snapshot().unwrap();
+    assert!(!snapshot.in_flight);
+    assert_eq!(snapshot.completion_count, 0);
+    assert_eq!(
+        rolls.try_recv(),
+        None,
+        "the unauthorized player was not rolled"
+    );
+}

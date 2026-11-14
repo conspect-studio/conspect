@@ -834,3 +834,47 @@ async fn a_stinger_command_flood_never_moves_the_output_clock() {
         "{selection:?}"
     );
 }
+
+/// SA-2: an AUTO bound to the selection its caller was authorized for is
+/// refused with a typed outcome when the selection changed before its tick
+/// (no flight, no roll), and runs when the selection still matches.
+#[test]
+fn an_auto_bound_to_a_stale_selection_is_refused_and_never_rolls() {
+    let (roll, mut rx) = PlayerRollSender::channel(["p".to_owned()]);
+    let mut rig = rig(Some(roll));
+    let mut outcomes = rig.handle.outcomes();
+    let mix = TransitionDescriptor::Mix {
+        rate: FrameCount::try_from(4).unwrap(),
+    };
+    rig.send("mix", SwitcherVerb::SetTransition(mix.clone()));
+    rig.step(0, Some(Clip::Alpha));
+    rig.send("sting", SwitcherVerb::SetTransition(stinger(2, 10, 3, 4)));
+    rig.send(
+        "auto-stale",
+        SwitcherVerb::AutoExpecting {
+            rate: FrameCount::try_from(5).unwrap(),
+            selection: mix,
+        },
+    );
+    rig.step(1, Some(Clip::Alpha));
+    let mut done = HashMap::new();
+    while let Ok(item) = outcomes.try_recv() {
+        done.insert(item.event.operation_id.clone(), item.event.clone());
+    }
+    assert_eq!(
+        done["auto-stale"].error.as_deref(),
+        Some(multiview_engine::switcher_control::REFUSE_SELECTION_CHANGED)
+    );
+    assert!(!rig.handle.snapshot().unwrap().in_flight);
+    assert_eq!(rx.try_recv(), None, "a refused AUTO never rolls");
+    rig.send(
+        "auto-bound",
+        SwitcherVerb::AutoExpecting {
+            rate: FrameCount::try_from(5).unwrap(),
+            selection: stinger(2, 10, 3, 4),
+        },
+    );
+    rig.step(2, Some(Clip::Alpha));
+    assert!(rig.handle.snapshot().unwrap().in_flight);
+    assert_eq!(rx.try_recv(), Some(0));
+}

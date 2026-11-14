@@ -175,7 +175,15 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
      descriptor references (BOLA, before parsing), then refuses a player
      that is not a configured media player with a typed 422
      `unknown-media-player` on plan and command; an out-of-range stinger is
-     `invalid-transition`. Config validation refuses a persisted stinger
+     `invalid-transition`. AUTO renders the engine's selection, not the
+     request, so `plan` and `commands/auto` authorize the reference inside
+     the current selection (`snapshot.transition`: the stinger player, a dip
+     or border fill source) with the same per-object check, answering 403
+     before admission (review SA-2). The AUTO command then carries that
+     selection (`SwitcherVerb::AutoExpecting`) and the engine refuses it
+     with the typed `selection-changed` outcome when its selection differs
+     at the tick, so a concurrent selection change cannot swap an
+     unauthorized player into the flight. Config validation refuses a persisted stinger
      whose player is not in `media_players`. `dip_source`,
      `border_fill_source`, `flip_flop` and DVE stay refused.
    - **Desk.** A STING key beside MIX/WIPE/DIP; the "Transition parameters"

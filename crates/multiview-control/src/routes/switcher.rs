@@ -164,6 +164,30 @@ pub fn authorize_refs(principal: &Principal, req: &SwitcherRequest) -> ControlRe
     Ok(())
 }
 
+/// AUTO renders the engine's current selection, not anything in the
+/// request, so the references inside that selection (a stinger's player, a
+/// dip or border fill source) are authorized for the caller exactly like a
+/// request reference (review SA-2). Returns the selection the caller was
+/// authorized for; the AUTO carries it and the engine refuses the AUTO if
+/// its selection differs at the tick, so a concurrent selection change can
+/// never swap in an unauthorized reference.
+///
+/// # Errors
+/// 403 when the principal is denied a selection reference; 409 before the
+/// engine has published its first snapshot.
+fn authorize_selection(
+    principal: &Principal,
+    handle: &SwitcherControl,
+) -> ControlResult<TransitionDescriptor> {
+    let snapshot = handle.snapshot().ok_or_else(|| {
+        ControlError::Conflict("switcher has not published its transition selection yet".into())
+    })?;
+    if let Some(source) = snapshot.transition.source_ref() {
+        authorize_object(principal, source.as_str())?;
+    }
+    Ok(snapshot.transition.clone())
+}
+
 /// Parse and check `set_transition`'s descriptor against the engine's own
 /// rules (ADR-0112): typed 422 `invalid-transition` for a shape or number
 /// the machine refuses, `unsupported-transition` for a kind or option the
@@ -272,6 +296,7 @@ fn verb(
     kind: &str,
     target: Option<&Target>,
     transition: Option<TransitionDescriptor>,
+    selection: Option<TransitionDescriptor>,
 ) -> ControlResult<SwitcherVerb> {
     let target = || {
         target
@@ -285,13 +310,16 @@ fn verb(
         "set_transition" => transition
             .map(SwitcherVerb::SetTransition)
             .ok_or_else(|| ControlError::Validation("transition required".into())),
-        "auto" => Ok(SwitcherVerb::Auto(
-            FrameCount::try_from(
+        "auto" => Ok(SwitcherVerb::AutoExpecting {
+            rate: FrameCount::try_from(
                 req.duration_frames
                     .ok_or_else(|| ControlError::Validation("duration_frames required".into()))?,
             )
             .map_err(|e| ControlError::Validation(e.to_string()))?,
-        )),
+            selection: selection.ok_or_else(|| {
+                ControlError::Conflict("AUTO has no authorized transition selection".into())
+            })?,
+        }),
         _ => Err(ControlError::NotFound {
             kind: "switcher-verb",
             id: kind.into(),
@@ -528,6 +556,9 @@ pub(crate) async fn plan_switcher(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
         ));
     }
+    if req.action == "auto" {
+        authorize_selection(&principal, handle)?;
+    }
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
@@ -579,12 +610,19 @@ pub(crate) async fn submit_switcher(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
         ));
     }
+    // SA-2: the selection AUTO will render is authorized, and bound into the
+    // command, before anything (even a replay) is answered.
+    let selection = if req.action == "auto" {
+        Some(authorize_selection(&principal, handle)?)
+    } else {
+        None
+    };
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
     };
     authorize_target(&principal, target.as_ref())?;
-    let verb = verb(&req, &kind, target.as_ref(), transition)?;
+    let verb = verb(&req, &kind, target.as_ref(), transition, selection)?;
     // P3R2-C: authorization and static validation are done; an EXISTING
     // reservation is a replay and answers its original 202 before the
     // transient admission checks (buses, an active take, the scene), which
