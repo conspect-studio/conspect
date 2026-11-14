@@ -831,6 +831,12 @@ impl multiview_control::program_metrics::ProgramMetricsSource for ProgramMetrics
                     },
                 )
                 .collect(),
+            full_canvas_decodes: u64::try_from(
+                handles
+                    .full_canvas_decodes
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+            .unwrap_or(u64::MAX),
         })
     }
 }

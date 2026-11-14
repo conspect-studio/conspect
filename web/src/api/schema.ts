@@ -7736,6 +7736,12 @@ export interface components {
              */
             frames_repeated_window: number;
             /**
+             * Format: int64
+             * @description Source decodes producing at least the full canvas now (#469): the
+             *     GPU-cost bound of sizing routed, PGM and PVW sources at the canvas.
+             */
+            full_canvas_decodes?: number;
+            /**
              * Format: double
              * @description Largest lateness since the run started, ms.
              */

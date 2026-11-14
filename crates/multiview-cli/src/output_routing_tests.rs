@@ -166,6 +166,7 @@ fn router(
         preview_selection: None,
         halved: Arc::new(AtomicBool::new(false)),
         sizing: None,
+        source_sizing: None,
     };
     let aux = wiring();
     let mirror = AuxWiring {
@@ -178,6 +179,7 @@ fn router(
         preview_selection: None,
         halved: Arc::new(AtomicBool::new(false)),
         sizing: None,
+        source_sizing: None,
     };
     let (r, h) = OutputRouter::new(
         RouterConfig {
@@ -444,6 +446,7 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             preview_selection: None,
             halved: Arc::new(AtomicBool::new(false)),
             sizing: None,
+            source_sizing: None,
         },
         open,
     )
@@ -2137,6 +2140,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             preview_selection: None,
             halved: Arc::new(AtomicBool::new(false)),
             sizing: None,
+            source_sizing: None,
         },
         open,
     )
@@ -4510,6 +4514,7 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
             preview_selection: None,
             halved: Arc::clone(&halved),
             sizing: None,
+            source_sizing: None,
         },
         Box::new(move |_, bus| {
             take_log.lock().unwrap().push((bus.clone(), None));
@@ -8143,4 +8148,46 @@ fn a_rejected_set_never_switches_a_staying_members_private_bus_audio() {
             "no bars sample ever reached the bus on air (block at {start})"
         );
     }
+}
+
+/// #469 (a): a source routed to an output as a bare feed is published for
+/// the decoders (at the canvas: no output format) from the take until its
+/// feed closes after the linger, and the Program-only router publishes none.
+#[test]
+fn a_direct_source_route_publishes_source_sizing_until_it_closes() {
+    let mut x = harness(2, 6, None);
+    let sizing = crate::display_size::source_sizing_slot();
+    x.r.aux.source_sizing = Some(Arc::clone(&sizing));
+    for t in 0..3 {
+        x.tick(t);
+    }
+    assert!(sizing.load().is_empty(), "nothing routed");
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let mut now = 3;
+    let mut applied = false;
+    while !applied {
+        x.tick(now);
+        applied = x
+            .outcomes
+            .try_iter()
+            .any(|o| o.outcome == TakeResult::Applied);
+        now += 1;
+        assert!(now < 3 + OPEN_DEADLINE_TICKS, "applied within the deadline");
+    }
+    assert_eq!(
+        *sizing.load(),
+        vec![(Arc::<str>::from("cam"), (u32::MAX, u32::MAX))],
+        "the routed source sizes at the canvas"
+    );
+    let published = sizing.load();
+    x.tick(now);
+    assert!(
+        Arc::ptr_eq(&published, &sizing.load()),
+        "no republish without a feed change"
+    );
+    x.h.try_take(take("b", 1, PictureBus::Program)).unwrap();
+    for t in now + 1..now + 40 + LINGER_TICKS + 2 {
+        x.tick(t);
+    }
+    assert!(sizing.load().is_empty(), "un-routed: no sizing left");
 }

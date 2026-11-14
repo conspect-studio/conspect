@@ -67,6 +67,112 @@ pub type DisplayLayoutSlot = Arc<SwapCell<Arc<Layout>>>;
 /// these, so a routed layout's cells are drawn at their own size.
 pub type AuxSizingSlot = Arc<SwapCell<Arc<Vec<Cell>>>>;
 
+/// Direct source routes (#469): every source an output is routed to as a
+/// bare `src:<id>` feed, with the pixel size it is composed at (the output's
+/// format, or the canvas). Written by the output router when its feed set
+/// changes, read by the decode threads. Capped at the canvas on read.
+pub type SourceSizingSlot = Arc<SwapCell<SourceRoutes>>;
+
+/// The direct source routes at one instant: (source id, composed size).
+pub type SourceRoutes = Arc<Vec<(Arc<str>, (u32, u32))>>;
+
+/// An empty [`SourceSizingSlot`].
+#[must_use]
+pub fn source_sizing_slot() -> SourceSizingSlot {
+    Arc::new(SwapCell::from_pointee(Vec::new()))
+}
+
+/// [`cell_pixel_size`] widened by the direct routes in `routes` that name
+/// `source_id`: the per-axis supremum, each route capped at the canvas and
+/// even (NV12), at least 2x2.
+#[must_use]
+pub fn routed_pixel_size(
+    layout: &Layout,
+    routes: &[(Arc<str>, (u32, u32))],
+    source_id: &str,
+) -> Option<(u32, u32)> {
+    let (cw, ch) = (layout.canvas.width, layout.canvas.height);
+    routes
+        .iter()
+        .filter(|(id, _)| &**id == source_id)
+        .map(|(_, (w, h))| ((w.min(&cw) & !1).max(2), (h.min(&ch) & !1).max(2)))
+        .chain(cell_pixel_size(layout, source_id))
+        .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)))
+}
+
+/// [`display_size`] widened by the direct routes in `routes`.
+#[must_use]
+pub fn routed_display_size(
+    layout: &Layout,
+    routes: &[(Arc<str>, (u32, u32))],
+    source_id: &str,
+) -> (u32, u32) {
+    routed_pixel_size(layout, routes, source_id).unwrap_or_else(|| display_size(layout, source_id))
+}
+
+/// One M/E bus selection (a source id), written by the switcher frame hook
+/// only when it changes, read by the decode threads.
+pub type SelectionSlot = Arc<SwapCell<Option<Arc<str>>>>;
+
+/// M/E bus sizing (#469): the sources on the PGM and PVW buses. PGM is also
+/// Clean (the pre-bake Program); PVW is also the incoming source of a
+/// transition in flight. Each is drawn full-canvas, so a selected source
+/// decodes at the canvas whether or not a cell of the live layout binds it.
+#[derive(Clone)]
+pub struct BusSizing {
+    /// The PGM (and Clean) source.
+    pub program: SelectionSlot,
+    /// The PVW source (the incoming source of a transition).
+    pub preview: SelectionSlot,
+}
+
+impl BusSizing {
+    /// Two empty selections.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            program: Arc::new(SwapCell::new(None)),
+            preview: Arc::new(SwapCell::new(None)),
+        }
+    }
+
+    fn load(&self) -> Buses {
+        [self.program.load(), self.preview.load()]
+    }
+}
+
+impl Default for BusSizing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The selected bus sources at one instant.
+type Buses = [Option<Arc<str>>; 2];
+
+/// Whether two bus readings name the same sources.
+fn same_buses(a: &Buses, b: &Buses) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| x.as_deref() == y.as_deref())
+}
+
+/// The full-canvas cell a bus selection is drawn in.
+fn bus_cell(source: &str) -> Cell {
+    Cell {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+        source: Some(source.to_owned()),
+        ..Cell::default()
+    }
+}
+
+/// Decodes producing at least the full canvas now (#469 GPU-cost bound,
+/// reported as `full_canvas_decodes`). Shared by every decode of a pipeline.
+pub type FullCanvasGauge = Arc<AtomicUsize>;
+
 /// An empty [`AuxSizingSlot`].
 #[must_use]
 pub fn aux_sizing_slot() -> AuxSizingSlot {
@@ -77,11 +183,21 @@ pub fn aux_sizing_slot() -> AuxSizingSlot {
 /// `layout` itself when there are none (no allocation).
 #[must_use]
 pub fn sizing_layout(layout: &Arc<Layout>, extra: &[Cell]) -> Arc<Layout> {
-    if extra.is_empty() {
+    sizing_layout_with(layout, extra, &[None, None])
+}
+
+/// [`sizing_layout`] plus one full-canvas cell per selected M/E bus source
+/// (#469). `layout` itself when there is nothing to add (no allocation).
+#[must_use]
+fn sizing_layout_with(layout: &Arc<Layout>, extra: &[Cell], buses: &Buses) -> Arc<Layout> {
+    if extra.is_empty() && buses.iter().all(Option::is_none) {
         return Arc::clone(layout);
     }
     let mut sizing = Layout::clone(layout);
     sizing.cells.extend_from_slice(extra);
+    sizing
+        .cells
+        .extend(buses.iter().flatten().map(|source| bus_cell(source)));
     Arc::new(sizing)
 }
 
@@ -168,6 +284,9 @@ pub fn frac_to_px(frac: f32, extent: u32) -> u32 {
 pub struct DisplayFollow {
     layout: DisplayLayoutSlot,
     aux: Option<AuxSizingSlot>,
+    routes: Option<SourceSizingSlot>,
+    buses: Option<BusSizing>,
+    full_canvas: Option<FullCanvasGauge>,
     registry: Option<Arc<SourceRegistry<Nv12Image>>>,
     #[cfg(test)]
     rehearsal: Option<Arc<Rehearsal>>,
@@ -193,6 +312,9 @@ impl DisplayFollow {
         Self {
             layout,
             aux: None,
+            routes: None,
+            buses: None,
+            full_canvas: None,
             registry,
             #[cfg(test)]
             rehearsal: None,
@@ -206,6 +328,41 @@ impl DisplayFollow {
         self
     }
 
+    /// Also size for the direct source routes in `routes` (#469).
+    #[must_use]
+    pub fn with_source_sizing(mut self, routes: SourceSizingSlot) -> Self {
+        self.routes = Some(routes);
+        self
+    }
+
+    /// The direct source routes now (empty without source sizing).
+    fn routes(&self) -> SourceRoutes {
+        static NONE: std::sync::OnceLock<SourceRoutes> = std::sync::OnceLock::new();
+        self.routes.as_ref().map_or_else(
+            || Arc::clone(NONE.get_or_init(|| Arc::new(Vec::new()))),
+            |slot| slot.load(),
+        )
+    }
+
+    /// Also size for the M/E bus selections in `buses` (#469).
+    #[must_use]
+    pub fn with_bus_sizing(mut self, buses: BusSizing) -> Self {
+        self.buses = Some(buses);
+        self
+    }
+
+    /// Count this pipeline's full-canvas decodes in `gauge` (#469).
+    #[must_use]
+    pub fn with_full_canvas_gauge(mut self, gauge: FullCanvasGauge) -> Self {
+        self.full_canvas = Some(gauge);
+        self
+    }
+
+    /// The selected bus sources now (none without bus sizing).
+    fn buses(&self) -> Buses {
+        self.buses.as_ref().map_or([None, None], BusSizing::load)
+    }
+
     /// The routed cells now (empty without aux sizing).
     fn aux_cells(&self) -> Arc<Vec<Cell>> {
         static NONE: std::sync::OnceLock<Arc<Vec<Cell>>> = std::sync::OnceLock::new();
@@ -216,9 +373,9 @@ impl DisplayFollow {
     }
 
     /// The layout every size decision uses: the live layout plus the routed
-    /// cells.
+    /// cells plus a full-canvas cell per selected M/E bus source.
     fn sizing(&self) -> Arc<Layout> {
-        sizing_layout(&self.layout.load(), &self.aux_cells())
+        sizing_layout_with(&self.layout.load(), &self.aux_cells(), &self.buses())
     }
 
     /// Treat this decode as NVDEC, with software replacements, counting into
@@ -263,13 +420,15 @@ impl DisplayFollow {
     /// The size `source_id` wants under the live layout.
     #[must_use]
     pub fn size_for(&self, source_id: &str) -> (u32, u32) {
-        display_size(&self.sizing(), source_id)
+        routed_display_size(&self.sizing(), &self.routes(), source_id)
     }
 
     /// [`fixed_size`] under the live layout.
     #[must_use]
     pub fn fixed_size_for(&self, source_id: &str) -> (u32, u32) {
-        fixed_size(&self.sizing(), source_id)
+        let layout = self.sizing();
+        routed_pixel_size(&layout, &self.routes(), source_id)
+            .unwrap_or_else(|| fixed_size(&layout, source_id))
     }
 
     /// The height to pick an HLS variant for. An unbound source keeps the canvas
@@ -279,7 +438,8 @@ impl DisplayFollow {
     #[must_use]
     pub fn variant_height(&self, source_id: &str) -> u32 {
         let layout = self.sizing();
-        cell_pixel_size(&layout, source_id).map_or(layout.canvas.height, |(_, h)| h)
+        routed_pixel_size(&layout, &self.routes(), source_id)
+            .map_or(layout.canvas.height, |(_, h)| h)
     }
 
     /// Record the size `source_id` now decodes at. Decode thread only.
@@ -398,8 +558,12 @@ pub struct DisplayFollower {
     id: String,
     seen: Arc<Layout>,
     seen_aux: Arc<Vec<Cell>>,
+    seen_routes: SourceRoutes,
+    seen_buses: Buses,
     desired: (u32, u32),
     gate: SettleGate,
+    /// Whether this decode is counted in the full-canvas gauge now.
+    full: bool,
 }
 
 impl DisplayFollower {
@@ -408,14 +572,42 @@ impl DisplayFollower {
     pub fn new(follow: DisplayFollow, id: &str, applied: (u32, u32)) -> Self {
         let seen = follow.layout.load();
         let seen_aux = follow.aux_cells();
-        let desired = display_size(&sizing_layout(&seen, &seen_aux), id);
-        Self {
+        let seen_routes = follow.routes();
+        let seen_buses = follow.buses();
+        let desired = routed_display_size(
+            &sizing_layout_with(&seen, &seen_aux, &seen_buses),
+            &seen_routes,
+            id,
+        );
+        let mut follower = Self {
             follow,
             id: id.to_owned(),
             seen,
             seen_aux,
+            seen_routes,
+            seen_buses,
             desired,
             gate: SettleGate::new(applied),
+            full: false,
+        };
+        follower.count(applied);
+        follower
+    }
+
+    /// Keep the full-canvas gauge true for a decode now producing `size`.
+    fn count(&mut self, size: (u32, u32)) {
+        let Some(gauge) = &self.follow.full_canvas else {
+            return;
+        };
+        let canvas = &self.seen.canvas;
+        let full = size.0 >= canvas.width && size.1 >= canvas.height;
+        if full != self.full {
+            if full {
+                gauge.fetch_add(1, Ordering::AcqRel);
+            } else {
+                gauge.fetch_sub(1, Ordering::AcqRel);
+            }
+            self.full = full;
         }
     }
 
@@ -424,10 +616,22 @@ impl DisplayFollower {
     pub fn due(&mut self, now: Instant) -> Option<(u32, u32)> {
         let live = self.follow.layout.load();
         let live_aux = self.follow.aux_cells();
-        if !Arc::ptr_eq(&live, &self.seen) || !Arc::ptr_eq(&live_aux, &self.seen_aux) {
-            self.desired = display_size(&sizing_layout(&live, &live_aux), &self.id);
+        let live_routes = self.follow.routes();
+        let live_buses = self.follow.buses();
+        if !Arc::ptr_eq(&live, &self.seen)
+            || !Arc::ptr_eq(&live_aux, &self.seen_aux)
+            || !Arc::ptr_eq(&live_routes, &self.seen_routes)
+            || !same_buses(&live_buses, &self.seen_buses)
+        {
+            self.desired = routed_display_size(
+                &sizing_layout_with(&live, &live_aux, &live_buses),
+                &live_routes,
+                &self.id,
+            );
             self.seen = live;
             self.seen_aux = live_aux;
+            self.seen_routes = live_routes;
+            self.seen_buses = live_buses;
         }
         self.gate.observe(self.desired, now)
     }
@@ -436,6 +640,18 @@ impl DisplayFollower {
     pub fn adopted(&mut self, size: (u32, u32), now: Instant) {
         self.gate.adopted(size, now);
         self.follow.record(&self.id, size);
+        self.count(size);
+    }
+}
+
+impl Drop for DisplayFollower {
+    fn drop(&mut self) {
+        // An ended decode no longer costs a full-canvas decode.
+        if self.full {
+            if let Some(gauge) = &self.follow.full_canvas {
+                gauge.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
     }
 }
 
@@ -1521,5 +1737,100 @@ mod tests {
             Arc::ptr_eq(&sizing_layout(&base, &[]), &base),
             "no copy without routed cells"
         );
+    }
+
+    /// #469 (a): a source routed to an output as a bare feed decodes at the
+    /// output's size although no cell binds it; un-routed it returns to the
+    /// unbound size after the settle.
+    #[test]
+    fn a_direct_source_route_sizes_the_decode_at_the_output_format() {
+        let program = layout(1920, 1080, vec![cell(Some("wall"), 0.5, 0.5)]);
+        let slot: DisplayLayoutSlot = Arc::new(SwapCell::new(Arc::new(program)));
+        let routes = source_sizing_slot();
+        let follow =
+            DisplayFollow::new(Arc::clone(&slot), None).with_source_sizing(Arc::clone(&routes));
+        let mut follower = DisplayFollower::new(follow.clone(), "cam", UNBOUND_DISPLAY_SIZE);
+        let t0 = Instant::now();
+        assert_eq!(follower.due(t0), None, "unrouted: the unbound size");
+        // Routed at the canvas (no output format): capped to the canvas.
+        routes.store(Arc::new(vec![(Arc::from("cam"), (u32::MAX, u32::MAX))]));
+        assert_eq!(follow.size_for("cam"), (1920, 1080));
+        assert_eq!(follow.variant_height("cam"), 1080);
+        assert_eq!(follower.due(t0), None, "debounced");
+        assert_eq!(follower.due(t0 + DISPLAY_SETTLE), Some((1920, 1080)));
+        follower.adopted((1920, 1080), t0 + DISPLAY_SETTLE);
+        // A 1280x720 output format: the supremum with a bigger cell wins
+        // per axis; an odd format is made even.
+        routes.store(Arc::new(vec![
+            (Arc::from("cam"), (1281, 721)),
+            (Arc::from("wall"), (640, 1080)),
+        ]));
+        assert_eq!(follow.size_for("cam"), (1280, 720));
+        assert_eq!(follow.size_for("wall"), (960, 1080));
+        // Un-routed: back to the unbound size once settled and spaced.
+        routes.store(Arc::new(Vec::new()));
+        let later = t0 + DISPLAY_SETTLE + DISPLAY_MIN_INTERVAL;
+        assert_eq!(follower.due(later), None);
+        assert_eq!(
+            follower.due(later + DISPLAY_SETTLE),
+            Some(UNBOUND_DISPLAY_SIZE)
+        );
+    }
+
+    /// #469 (b): the PGM and PVW selections (PVW = a transition's incoming
+    /// source) decode at the full canvas; a source leaving both buses goes
+    /// back to its cell / unbound size.
+    #[test]
+    fn a_selected_bus_source_decodes_at_the_full_canvas() {
+        let program = layout(1920, 1080, vec![cell(Some("pip"), 0.25, 0.25)]);
+        let slot: DisplayLayoutSlot = Arc::new(SwapCell::new(Arc::new(program)));
+        let buses = BusSizing::new();
+        let follow = DisplayFollow::new(Arc::clone(&slot), None).with_bus_sizing(buses.clone());
+        assert_eq!(follow.size_for("pip"), (480, 270));
+        assert_eq!(follow.size_for("cam"), UNBOUND_DISPLAY_SIZE);
+        buses.program.store(Some(Arc::from("cam")));
+        buses.preview.store(Some(Arc::from("pip")));
+        assert_eq!(follow.size_for("cam"), (1920, 1080), "PGM is full canvas");
+        assert_eq!(follow.size_for("pip"), (1920, 1080), "PVW is full canvas");
+        assert_eq!(follow.size_for("other"), UNBOUND_DISPLAY_SIZE);
+        // A cut swaps the buses: both still full canvas, nothing to do.
+        let mut follower = DisplayFollower::new(follow.clone(), "cam", (1920, 1080));
+        let t0 = Instant::now();
+        buses.program.store(Some(Arc::from("pip")));
+        buses.preview.store(Some(Arc::from("cam")));
+        assert_eq!(follower.due(t0 + DISPLAY_SETTLE), None);
+        // cam leaves both buses: unbound after the settle.
+        buses.preview.store(Some(Arc::from("other")));
+        assert_eq!(follower.due(t0), None);
+        assert_eq!(
+            follower.due(t0 + DISPLAY_SETTLE),
+            Some(UNBOUND_DISPLAY_SIZE)
+        );
+    }
+
+    /// #469 cost bound: the gauge counts exactly the decodes producing the
+    /// full canvas, follows every adoption both ways, and an ended decode
+    /// leaves it.
+    #[test]
+    fn the_full_canvas_gauge_counts_full_canvas_decodes() {
+        let program = layout(1920, 1080, vec![cell(Some("a"), 0.5, 0.5)]);
+        let slot: DisplayLayoutSlot = Arc::new(SwapCell::new(Arc::new(program)));
+        let gauge: FullCanvasGauge = Arc::new(AtomicUsize::new(0));
+        let follow =
+            DisplayFollow::new(Arc::clone(&slot), None).with_full_canvas_gauge(Arc::clone(&gauge));
+        let mut a = DisplayFollower::new(follow.clone(), "a", (960, 540));
+        let b = DisplayFollower::new(follow.clone(), "b", (1920, 1080));
+        assert_eq!(gauge.load(Ordering::Acquire), 1);
+        let t0 = Instant::now();
+        a.adopted((1920, 1080), t0);
+        assert_eq!(gauge.load(Ordering::Acquire), 2);
+        a.adopted((1920, 1080), t0);
+        assert_eq!(gauge.load(Ordering::Acquire), 2, "counted once");
+        a.adopted((960, 540), t0);
+        assert_eq!(gauge.load(Ordering::Acquire), 1);
+        drop(b);
+        assert_eq!(gauge.load(Ordering::Acquire), 0, "an ended decode leaves");
+        drop(a);
+        assert_eq!(gauge.load(Ordering::Acquire), 0);
     }
 }

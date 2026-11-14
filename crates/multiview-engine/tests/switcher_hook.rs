@@ -298,3 +298,201 @@ fn repatching_the_program_input_rebinds_the_program_cell_on_the_same_tick() {
     assert_eq!(snapshot.program_input, Some(1));
     assert_eq!(snapshot.completion_count, 0, "a patch is not a faked take");
 }
+
+type Hook = SwitcherFrameHook<fn(&mut CompositorDrive<Nv12Image>)>;
+
+/// A two-source M/E (PGM `a`, PVW `b`) whose hook publishes bus sizing.
+struct SizingRig {
+    drive: CompositorDrive<Nv12Image>,
+    handle: SwitcherControl,
+    hook: Hook,
+    program: multiview_engine::switcher_hook::BusSizingSlot,
+    preview: multiview_engine::switcher_hook::BusSizingSlot,
+}
+
+/// The rig's no-op legacy control hook.
+fn legacy(_: &mut CompositorDrive<Nv12Image>) {}
+
+fn sizing_rig() -> SizingRig {
+    use multiview_framestore::SwapCell;
+    let color = ColorInfo::default().resolve_defaults(64, 64);
+    let a = Arc::new(TileStore::<Nv12Image>::with_defaults("a"));
+    let b = Arc::new(TileStore::<Nv12Image>::with_defaults("b"));
+    for store in [&a, &b] {
+        store.publish(
+            Nv12Image::solid(64, 64, 100, 128, 128, color).unwrap(),
+            multiview_core::time::MediaTime::ZERO,
+        );
+    }
+    let stores = HashMap::from([("a".into(), a), ("b".into(), b)]);
+    let drive = CompositorDrive::new(
+        layout("a"),
+        stores.clone(),
+        Nv12Image::solid(64, 64, 16, 128, 128, color).unwrap(),
+        CanvasColor::default(),
+        LinearRgba::TRANSPARENT,
+    )
+    .unwrap()
+    .with_cell_ids(vec![Some("pgm".into())]);
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("a"),
+        SourceRef::new("b"),
+        vec![],
+    ));
+    driver.set_prime_stores(stores);
+    handle
+        .set_scenes(ScenePair {
+            version: 1,
+            program: layout("a"),
+            preview: layout("b"),
+        })
+        .unwrap();
+    let mut hook: Hook = SwitcherFrameHook::new(driver, "pgm".into(), legacy);
+    let program = Arc::new(SwapCell::new(None));
+    let preview = Arc::new(SwapCell::new(None));
+    hook.bus_sizing = Some([Arc::clone(&program), Arc::clone(&preview)]);
+    SizingRig {
+        drive,
+        handle,
+        hook,
+        program,
+        preview,
+    }
+}
+
+/// #469 (b): the hook publishes the PGM/PVW sources for decode sizing on the
+/// tick a CUT applies, before the frame is composed, and stores nothing on a
+/// tick where the selections did not change (no per-tick allocation).
+#[test]
+fn the_hook_publishes_bus_sizing_only_when_a_selection_changes() {
+    use multiview_engine::runtime::FrameControl;
+    use multiview_framestore::SwapCell;
+    let SizingRig {
+        mut drive,
+        handle,
+        mut hook,
+        program,
+        preview,
+    } = sizing_rig();
+    let read = |slot: &SwapCell<Option<Arc<str>>>| slot.load().map(|s| s.to_string());
+    let tick = |index| multiview_engine::clock::Tick {
+        index,
+        pts: multiview_core::time::MediaTime::ZERO,
+    };
+    hook.before_compose(&mut drive, tick(0));
+    assert_eq!(read(&program).as_deref(), Some("a"));
+    assert_eq!(read(&preview).as_deref(), Some("b"));
+    let frame = drive.compose(tick(0)).unwrap();
+    hook.after_compose(&frame);
+    let held = program.load().unwrap();
+    hook.before_compose(&mut drive, tick(1));
+    assert!(
+        Arc::ptr_eq(&held, &program.load().unwrap()),
+        "an unchanged selection is not republished"
+    );
+    let frame = drive.compose(tick(1)).unwrap();
+    hook.after_compose(&frame);
+    handle
+        .try_send(SwitcherCommand {
+            operation_id: "cut".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::Cut,
+        })
+        .unwrap();
+    hook.before_compose(&mut drive, tick(2));
+    assert_eq!(
+        read(&program).as_deref(),
+        Some("b"),
+        "the new PGM source is published before its first frame composes"
+    );
+    assert_eq!(read(&preview).as_deref(), Some("a"));
+}
+
+/// #469 chaos (inv #1/#10): a CUT on every tick while a decode-side reader
+/// hammers the bus sizing slots. The clock emits exactly one frame per tick,
+/// the reader never blocks it, and the slots end on the final selection.
+#[tokio::test]
+async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    const TICKS: u64 = 300;
+    let SizingRig {
+        drive,
+        handle,
+        hook,
+        program,
+        preview,
+    } = sizing_rig();
+    let stop = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicU64::new(0));
+    let reader = {
+        let (program, preview, stop, reads) = (
+            Arc::clone(&program),
+            Arc::clone(&preview),
+            Arc::clone(&stop),
+            Arc::clone(&reads),
+        );
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                let _p = program.load();
+                let _v = preview.load();
+                reads.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+    let clock = Arc::new(ManualTimeSource::new());
+    let ts: Arc<dyn TimeSource> = clock.clone();
+    let mut runtime = EngineRuntime::new(
+        OutputClock::new(Rational::new(25, 1)).unwrap(),
+        drive,
+        ts,
+        CooperativePacer,
+    );
+    let publisher = EnginePublisher::<u8, ()>::new(16);
+    let mut frames = Vec::new();
+    let pace = Arc::clone(&clock);
+    let flood = handle.clone();
+    let mut sent = 0_u64;
+    runtime
+        .run_for_with_frame_control(
+            &publisher,
+            &StopSignal::new(),
+            TICKS,
+            |frame| {
+                frames.push(frame.tick.index);
+                // One CUT per tick from the control side; a full mailbox
+                // drops, it never waits.
+                if flood
+                    .try_send(SwitcherCommand {
+                        operation_id: format!("cut{sent}"),
+                        scene_version: 1,
+                        verb: SwitcherVerb::Cut,
+                    })
+                    .is_ok()
+                {
+                    sent += 1;
+                }
+                pace.advance(std::time::Duration::from_millis(40));
+                0
+            },
+            |_| None,
+            hook,
+        )
+        .await
+        .unwrap();
+    stop.store(true, Ordering::Release);
+    reader.join().unwrap();
+    assert_eq!(
+        frames,
+        (0..TICKS).collect::<Vec<_>>(),
+        "exactly one frame per tick"
+    );
+    assert!(reads.load(Ordering::Relaxed) > 0, "the reader ran");
+    assert!(sent > TICKS / 2, "the flood reached the mailbox: {sent}");
+    let snapshot = handle.snapshot().unwrap();
+    assert_eq!(
+        program.load().as_deref(),
+        Some(snapshot.program.as_str()),
+        "PGM sizing ends on the final selection"
+    );
+    assert_eq!(preview.load().as_deref(), Some(snapshot.preview.as_str()));
+}

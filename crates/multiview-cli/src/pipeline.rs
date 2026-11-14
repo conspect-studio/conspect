@@ -2166,6 +2166,8 @@ pub struct ProgramMetricsHandles {
     pub compose_deadline_misses: Arc<std::sync::atomic::AtomicU64>,
     /// The run's per-output clocks (#343; empty without a rate output).
     pub output_clocks: Vec<OutputClockMetrics>,
+    /// Decodes producing the full canvas now (#469 GPU-cost bound).
+    pub full_canvas_decodes: crate::display_size::FullCanvasGauge,
 }
 
 /// One per-output clock's wait-free counters (#343, output-routing §12.6).
@@ -2221,6 +2223,12 @@ pub struct Pipeline {
     /// Aux sizing (ADR-0108 §2.4): the routed layouts' cells, written by the
     /// output router, merged into every decode's size decision.
     aux_sizing: crate::display_size::AuxSizingSlot,
+    /// Direct source routes (#469), written by the output router.
+    source_sizing: crate::display_size::SourceSizingSlot,
+    /// The M/E PGM/PVW selections (#469), written by the switcher hook.
+    bus_sizing: crate::display_size::BusSizing,
+    /// Decodes producing the full canvas now (#469 cost bound).
+    full_canvas_decodes: crate::display_size::FullCanvasGauge,
     /// The fixed output cadence (exact rational).
     cadence: Rational,
     /// The single program this pipeline runs (ADR-0030 MP-0). The legacy
@@ -3169,6 +3177,10 @@ impl Pipeline {
         let display_layout: DisplayLayoutSlot =
             Arc::new(multiview_framestore::SwapCell::new(Arc::clone(&layout)));
         let aux_sizing = crate::display_size::aux_sizing_slot();
+        let source_sizing = crate::display_size::source_sizing_slot();
+        let bus_sizing = crate::display_size::BusSizing::new();
+        let full_canvas_decodes: crate::display_size::FullCanvasGauge =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut source_handles: Vec<SourceHandle<Nv12Image>> =
             Vec::with_capacity(config.sources.len());
 
@@ -3260,6 +3272,9 @@ impl Pipeline {
                     Some(Arc::clone(&source_registry)),
                 )
                 .with_aux_sizing(Arc::clone(&aux_sizing))
+                .with_source_sizing(Arc::clone(&source_sizing))
+                .with_bus_sizing(bus_sizing.clone())
+                .with_full_canvas_gauge(Arc::clone(&full_canvas_decodes))
             });
             // Reserve the authoritative epoch before either startup rail starts.
             // Old detached publishers from a previous run retain their old token.
@@ -3698,6 +3713,9 @@ impl Pipeline {
             layout,
             display_layout,
             aux_sizing,
+            source_sizing,
+            bus_sizing,
+            full_canvas_decodes,
             cadence,
             program_spec,
             switcher_me,
@@ -4186,6 +4204,7 @@ impl Pipeline {
                 preview_selection: preview_selection.clone(),
                 halved: Arc::clone(&aux.halved),
                 sizing: Some(Arc::clone(&self.aux_sizing)),
+                source_sizing: Some(Arc::clone(&self.source_sizing)),
             },
             open,
             Some(reformat_open),
@@ -4481,7 +4500,10 @@ impl Pipeline {
                 Arc::clone(&self.display_layout),
                 Some(Arc::clone(&self.source_registry)),
             )
-            .with_aux_sizing(Arc::clone(&self.aux_sizing)),
+            .with_aux_sizing(Arc::clone(&self.aux_sizing))
+            .with_source_sizing(Arc::clone(&self.source_sizing))
+            .with_bus_sizing(self.bus_sizing.clone())
+            .with_full_canvas_gauge(Arc::clone(&self.full_canvas_decodes)),
             canvas_color: self.canvas_color,
             cadence: self.cadence,
             output_origin: Arc::clone(&self.epoch_anchor),
@@ -6074,6 +6096,7 @@ impl Pipeline {
                 output_clocks: running_lanes
                     .as_deref()
                     .map_or_else(Vec::new, output_lanes::RunningLanes::metrics),
+                full_canvas_decodes: Arc::clone(&self.full_canvas_decodes),
             })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
         // the shared slot — a single lock-free store the off-hot-path
@@ -6423,6 +6446,11 @@ impl Pipeline {
                     hook.preview_slot = Some(preview_slot);
                     hook.preview_stores = Some(self.catalogue_stores());
                     hook.preview_selection = preview_selection;
+                    // #469: the decoders size the PGM/PVW sources full-canvas.
+                    hook.bus_sizing = Some([
+                        Arc::clone(&self.bus_sizing.program),
+                        Arc::clone(&self.bus_sizing.preview),
+                    ]);
                     // The only clock-side routing duty: one non-blocking `try_send`
                     // after a fresh compose, and only while a routed feed is active.
                     // The engine run future is boxed (one allocation per run, never

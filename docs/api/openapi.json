@@ -22318,6 +22318,12 @@
             "description": "Last-good repeats in the window.",
             "minimum": 0
           },
+          "full_canvas_decodes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Source decodes producing at least the full canvas now (#469): the\nGPU-cost bound of sizing routed, PGM and PVW sources at the canvas.",
+            "minimum": 0
+          },
           "lateness_max_ms": {
             "type": "number",
             "format": "double",
