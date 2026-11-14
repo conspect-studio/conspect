@@ -288,6 +288,19 @@ pub struct SalvoDoc {
     /// UMD label changes.
     #[serde(default)]
     pub umd: Vec<UmdRecallDoc>,
+    /// Patch crosspoints taken atomically at one tick through the
+    /// `POST /patch/take` set path (#308); the `/patch` crosspoint shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patch: Vec<crate::routes::patch::PatchCrosspoint>,
+    /// The patch crosspoints' on-air guard (default `protect`).
+    #[serde(default, skip_serializing_if = "is_protect")]
+    pub on_air: crate::routes::patch::OnAir,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+// reason: serde's `skip_serializing_if` passes a reference.
+fn is_protect(on_air: &crate::routes::patch::OnAir) -> bool {
+    *on_air == crate::routes::patch::OnAir::Protect
 }
 
 /// `OpenAPI` mirror of [`multiview_config::BitColor`].

@@ -972,6 +972,46 @@ pub struct RouteOutputEvent {
     pub outcome: String,
 }
 
+/// The destination one `patch.take` delivery is about (ADR-0110 §12.8,
+/// #308): an output (its API id) or the mixer (M/E id + its program). Exactly
+/// one of `output` / `mixer` is set; a later plane (subtitle slots, #345)
+/// reuses the same shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchTakeDestination {
+    /// The output API id, for an output member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// The M/E id, for the mixer half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer: Option<String>,
+    /// The program the M/E belongs to (scopes the mixer delivery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+}
+
+/// The terminal outcome of one atomic multi-destination patch set
+/// (`POST /patch/take` with two or more destinations, or a patch salvo;
+/// ADR-0110 decision 8, output-routing §12.8, #308). Published once per
+/// destination when every member of the set is terminal, each delivery
+/// scoped by its own destination, so a principal only ever learns about the
+/// destinations it may read. Lossless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchTakeEvent {
+    /// The set's operation id (the 202's `operation_id`).
+    pub operation_id: String,
+    /// The tick the set was decided (the adoption tick when applied).
+    pub tick: u64,
+    /// `applied` (every member at the same tick) or `refused`.
+    pub outcome: String,
+    /// The first cause when refused: `capacity`, `feed-not-fresh`,
+    /// `encoder-not-ready`, `slot-medium-mismatch`, `slot-format-unsupported`,
+    /// `on-air-protected`, `superseded`, `deadline`, ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// The destination this delivery is about.
+    pub destination: PatchTakeDestination,
+}
+
 /// A graphics (CG) playout channel's PVW/PGM state changed (topic
 /// [`crate::topic::Topic::Switcher`]): emitted on cue / take / clear / next.
 /// Lossless lifecycle event, scoped by the channel id.
@@ -1839,6 +1879,11 @@ pub enum Event {
     /// ADR-0108 §6.2). Lossless.
     #[serde(rename = "route.output")]
     RouteOutput(RouteOutputEvent),
+    /// An atomic multi-destination patch set settled (ADR-0110 §12.8, #308):
+    /// one delivery per destination, scoped by it (topic `outputs` for an
+    /// output, `switcher` for the mixer; envelope `id` = the destination).
+    #[serde(rename = "patch.take")]
+    PatchTake(PatchTakeEvent),
     /// A RIST link-health telemetry sample (topic `outputs`): retransmits / RTT /
     /// link-quality / bandwidth / lost / recovered for a RIST source or output
     /// link, obtained via the direct-librist FFI stats callback `FFmpeg`'s
@@ -2000,6 +2045,7 @@ impl Event {
             Self::SystemMetrics(_) => "system.metrics",
             Self::OutputStatus(_) => "output.status",
             Self::RouteOutput(_) => "route.output",
+            Self::PatchTake(_) => "patch.take",
             Self::RistLinkStats(_) => "rist.link.stats",
             Self::AlertRaised(_) => "alert.raised",
             Self::AlertCleared(_) => "alert.cleared",
@@ -2083,6 +2129,24 @@ impl Event {
             Self::SwitcherOperation(e) => AuthzScope::ObjectAndProgram {
                 object: &e.me,
                 program: &e.program,
+            },
+            // A set outcome is delivered per destination with that
+            // destination's scope (#308): an output on both of its axes, the
+            // mixer as `switcher.operation`. A delivery naming neither (never
+            // published) is denied to every scoped principal.
+            Self::PatchTake(e) => match (&e.destination.output, &e.destination.mixer) {
+                (Some(output), _) => AuthzScope::ObjectAndOutput {
+                    object: output,
+                    output,
+                },
+                (None, Some(me)) => AuthzScope::ObjectAndProgram {
+                    object: me,
+                    program: e.destination.program.as_deref().unwrap_or("main"),
+                },
+                (None, None) => AuthzScope::ObjectAndOutput {
+                    object: "",
+                    output: "",
+                },
             },
             Self::MediaPlayerState(e) => AuthzScope::Object(&e.player),
             Self::GraphicsChannelState(e) => AuthzScope::Object(&e.channel),

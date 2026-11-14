@@ -339,14 +339,15 @@ async fn authorization_runs_before_existence_and_burns_no_key() {
 async fn unsupported_shapes_are_typed_422s() {
     let (_dir, path) = temp_boot();
     let rig = rig(&path);
-    // #342 B2: an output slot is now patchable on its own; beside a mixer
-    // crosspoint it is a multi-destination set (#308), still refused.
-    let output = json!({ "plane": "video", "destination": {"output": "hls-1", "slot": 0}, "source": {"source": "bars"} });
+    // #342 B2: an output slot is patchable on its own; beside a mixer
+    // crosspoint it is an atomic set (#308, tests/patch_sets.rs). One
+    // destination naming both a mixer input and an output slot is refused.
+    let output = json!({ "plane": "video", "destination": {"mixer": "me1", "input": 5, "output": "hls-1", "slot": 0}, "source": {"source": "bars"} });
     let audio = json!({ "plane": "audio", "destination": {"mixer": "me1", "input": 4}, "source": {"source": "bars"} });
     let layout = json!({ "plane": "video", "destination": {"mixer": "me1", "input": 4}, "source": {"layout": "x"} });
     let too_many: Vec<Value> = (0..65).map(|_| xp(4, "bars")).collect();
     let cases = [
-        (vec![xp(4, "bars"), output], "unknown-slot", "#308"),
+        (vec![xp(4, "bars"), output], "unknown-slot", "not both"),
         (vec![audio], "slot-medium-mismatch", "video"),
         (vec![xp(4, "bars"), xp(4, "vt1")], "unknown-slot", "twice"),
         (vec![xp(9, "bars")], "unknown-slot", "not declared"),

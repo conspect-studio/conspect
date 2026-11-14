@@ -147,7 +147,10 @@ pub use routing::{
     RoutingTable, StreamRef, StreamSelector, SubtitleCrosspoint, VideoCrosspoint, VideoFeed,
     MAIN_PROGRAM,
 };
-pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
+pub use salvo::{
+    PatchCrosspoint, PatchDestinationSpec, PatchOnAir, PatchSourceSpec, Salvo, SourceRecall,
+    TallyRecall, UmdRecall, MAX_PATCH_CROSSPOINTS,
+};
 pub use schema::{
     lower_rist_url, Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig,
     ColorOverride, DeviceBackend, DisplayModeSpec, EpgMode, EpgSource, EventsConfig, Fps, Layout,
@@ -2017,6 +2020,45 @@ impl MultiviewConfig {
                         salvo.id, recall.cell
                     )));
                 }
+            }
+            self.validate_salvo_patch(salvo, &sources)?;
+        }
+        Ok(())
+    }
+
+    /// A patch salvo's document references (#308): every `{source}` is a
+    /// declared source and every mixer destination a declared input of a
+    /// declared M/E. Output API ids and stored layouts are not part of this
+    /// document (the control plane assigns output ids; layouts live in the
+    /// layouts library): `PUT /salvos/{id}` checks them against the accepted
+    /// state, and a take re-checks everything.
+    fn validate_salvo_patch(
+        &self,
+        salvo: &Salvo,
+        sources: &HashSet<&str>,
+    ) -> Result<(), ConfigError> {
+        for xp in &salvo.patch {
+            if let PatchSourceSpec::Source { id, .. } = &xp.source {
+                if !sources.contains(id.as_str()) {
+                    return Err(ConfigError::Validation(format!(
+                        "salvo {:?} patches unknown source {id:?}",
+                        salvo.id
+                    )));
+                }
+            }
+            let (Some(me), Some(input)) = (&xp.destination.mixer, xp.destination.input) else {
+                continue;
+            };
+            let declared = self
+                .switcher
+                .as_ref()
+                .and_then(|s| s.mix_effects.iter().find(|m| m.id == *me))
+                .is_some_and(|m| m.inputs.iter().any(|i| i.number == input));
+            if !declared {
+                return Err(ConfigError::Validation(format!(
+                    "salvo {:?} patches undeclared mixer input {me}.in{input}",
+                    salvo.id
+                )));
             }
         }
         Ok(())

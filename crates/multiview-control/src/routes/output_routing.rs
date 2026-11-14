@@ -282,14 +282,17 @@ pub(crate) fn routing_unavailable() -> Response {
         .into_response()
 }
 
-fn refusal_problem(status: u16, kind: &str, detail: String) -> Response {
+pub(crate) fn refusal_problem(status: u16, kind: &str, detail: String) -> Response {
     Problem::new(status, kind, "Take refused")
         .with_detail(detail)
         .into_response()
 }
 
 /// The accepted output body behind an API id (`None` = unknown).
-fn output_of(state: &AppState, api_id: &str) -> ControlResult<Option<multiview_config::Output>> {
+pub(crate) fn output_of(
+    state: &AppState,
+    api_id: &str,
+) -> ControlResult<Option<multiview_config::Output>> {
     let resources = crate::boot_model::accepted_resources(state, "outputs")?
         .map_or_else(|| state.outputs.list(), Ok)?;
     for versioned in resources {
@@ -1038,7 +1041,7 @@ fn too_many(retry: std::time::Duration) -> Response {
     response
 }
 
-fn unroutable_kind() -> Response {
+pub(crate) fn unroutable_kind() -> Response {
     refusal_problem(
         409,
         "output-kind-unroutable",
@@ -1052,7 +1055,7 @@ fn audio_unsupported() -> Response {
 
 /// The take-time audio gate (`Some` = refused): an explicit audio choice on
 /// an output without a program-audio slot is `audio-unsupported`.
-fn audio_gate(
+pub(crate) fn audio_gate(
     control: &crate::output_routing::OutputRoutingControl,
     config_id: &str,
     video: Option<&RoutedFeed>,
@@ -1353,7 +1356,7 @@ fn replay_slot0(
 }
 
 /// The refusal of a take key first used for another take (409 `conflict`).
-fn key_reused() -> ControlError {
+pub(crate) fn key_reused() -> ControlError {
     ControlError::Conflict("Idempotency-Key reused with a different request".into())
 }
 

@@ -563,18 +563,15 @@ async fn unsupported_output_slots_are_typed_422s() {
         // A layout on video slot 0 is routable since #368 (see
         // `a_layout_patches_onto_output_video_slot_0`); an unknown one is an
         // unknown feed.
-        (
-            vec![video("output-0", bars()), video("output-1", bars())],
-            "unknown-slot",
-            "#308",
-        ),
+        // Two outputs, or an output beside a mixer input, are an atomic set
+        // since #308 (tests/patch_sets.rs); one destination naming both is
+        // still refused.
         (
             vec![
-                video("output-0", bars()),
-                json!({ "plane": "video", "destination": {"mixer": "me1", "input": 4}, "source": bars() }),
+                json!({ "plane": "video", "destination": {"output": "output-0", "slot": 0, "mixer": "me1", "input": 4}, "source": bars() }),
             ],
             "unknown-slot",
-            "#308",
+            "not both",
         ),
     ];
     for (crosspoints, kind, detail) in cases {

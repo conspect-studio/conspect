@@ -18,6 +18,17 @@
 //! * `POST /api/v1/salvos/{id}/cancel` — cancel a previously-armed salvo (role:
 //!   write; `Idempotency-Key`; `202`).
 //!
+//! * `POST /api/v1/salvos/{id}/plan` — plan a patch salvo's crosspoints
+//!   (role: write; the `POST /patch/plan` answer; no change).
+//!
+//! A salvo may carry **patch** crosspoints (ADR-0110 decision 8, #308):
+//! `PUT` authorizes every member's both ends at store time (a principal can
+//! never store a salvo it could not take), and `take` runs them through the
+//! atomic set path of `POST /patch/take` (its own `salvo-take:<id>` key
+//! namespace; outcome `patch.take`) and then submits the legacy recall
+//! exactly as before when the salvo has one. A salvo with only legacy
+//! fields keeps its path byte-for-byte.
+//!
 //! The arm/take/cancel actions submit to the engine command bus and return `202`
 //! immediately; their outcome arrives on the realtime stream as a
 //! `salvo.armed` / `salvo.taken` / `salvo.cancelled` event (ADR-W008). The bus
@@ -120,9 +131,10 @@ pub(crate) async fn get_salvo(
             (status = 200, description = "The replaced salvo.", body = crate::openapi_schemas::SalvoDoc),
             (status = 201, description = "The created salvo.", body = crate::openapi_schemas::SalvoDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 403, description = "Not authorized to write.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to write, or (a patch salvo, #308) not authorized for a patch member's destination or source: every member's both ends are authorized at store time.", body = crate::problem::Problem),
             (status = 412, description = "If-Match precondition failed.", body = crate::problem::Problem),
-            (status = 422, description = "The salvo failed validation.", body = crate::problem::Problem),
+            (status = 422, description = "The salvo failed validation (a patch salvo: more than 64 crosspoints, a destination twice, an unknown source, mixer input, output or layout, or an unsupported crosspoint shape).", body = crate::problem::Problem),
+            (status = 503, description = "`engine-busy`: a patch member's `{layout}` could not be read now; retry.", body = crate::problem::Problem),
         ),
     )
 )]
@@ -140,6 +152,20 @@ pub(crate) async fn put_salvo(
     salvo
         .validate()
         .map_err(|e| crate::error::ControlError::Validation(e.to_string()))?;
+    // #308: every patch member's both ends, before anything is stored, so a
+    // principal cannot store a salvo it could not take; then the shape and
+    // the outputs/layouts it names (the document validation checks sources
+    // and mixer inputs).
+    if !salvo.patch.is_empty() {
+        let req = crate::routes::patch_set::salvo_request(&salvo);
+        let layouts =
+            match crate::routes::patch::read_patch_layouts(&state, &principal, &req).await? {
+                Ok(layouts) => layouts,
+                Err(response) => return Ok(response),
+            };
+        crate::routes::patch::authorize(&principal, &req, &layouts)?;
+        crate::routes::patch_set::validate_stored(&state, &req, &layouts)?;
+    }
 
     // Review H1: serialize with every other durable config mutation and
     // commit the desired envelope before the store projection changes.
@@ -305,6 +331,29 @@ pub(crate) async fn arm_salvo(
     )
 }
 
+/// `OpenAPI` shape of a `POST /salvos/{id}/take` `202`: `AcceptedBody` for
+/// a salvo with only legacy recalls, `PatchAccepted` for a patch salvo
+/// (#308). Two distinct Rust types; only the document is a `oneOf`.
+#[cfg(feature = "openapi")]
+pub struct SalvoTakeAcceptedDoc;
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for SalvoTakeAcceptedDoc {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{OneOfBuilder, Ref};
+        OneOfBuilder::new()
+            .item(Ref::from_schema_name("AcceptedBody"))
+            .item(Ref::from_schema_name("PatchAccepted"))
+            .description(Some(
+                "`AcceptedBody` for a salvo with only legacy recalls; `PatchAccepted` for a patch salvo (#308).",
+            ))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for SalvoTakeAcceptedDoc {}
+
 /// `POST /api/v1/salvos/{id}/take` — take (apply) the salvo (role: write; 202).
 #[cfg_attr(
     feature = "openapi",
@@ -314,10 +363,12 @@ pub(crate) async fn arm_salvo(
         tag = "salvos",
         params(("id" = String, Path, description = "Salvo id to take."), HeadQuery),
         responses(
-            (status = 202, description = "Take accepted; outcome on the realtime stream.", body = crate::routes::AcceptedBody),
+            (status = 202, description = "Take accepted; outcome on the realtime stream. A salvo with only legacy recalls answers `AcceptedBody` (outcome `salvo.taken`). A patch salvo (#308) answers `{operation_id, status: \"accepted\", recall_operation_id?}`: its crosspoints are taken atomically through the `POST /patch/take` set path (outcome `patch.take`, for one destination too) and a legacy recall, when present, is submitted too (`recall_operation_id`).", body = SalvoTakeAcceptedDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
-            (status = 403, description = "Not authorized to take.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to take (a patch salvo: every member's both ends are re-authorized under the caller's current grants).", body = crate::problem::Problem),
             (status = 404, description = "No salvo with that id.", body = crate::problem::Problem),
+            (status = 409, description = "A patch salvo: as `POST /patch/take` (`conflict`, `capacity`, `on-air-protected`, ...).", body = crate::problem::Problem),
+            (status = 429, description = "A patch salvo: as `POST /patch/take`.", body = crate::problem::Problem),
             (status = 422, description = "`switcher-owns-program`: a switcher M/E is declared and the salvo recalls a layout or cell sources (Program is the M/E bus; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Refused before the Idempotency-Key is reserved. A salvo of only tally/UMD recalls is unaffected.", body = crate::problem::Problem),
             (status = 503, description = "Engine command bus at capacity; shed.", body = crate::problem::Problem),
         ),
@@ -330,19 +381,128 @@ pub(crate) async fn take_salvo(
     Path(id): Path<String>,
     Query(head): Query<HeadQuery>,
 ) -> ControlResult<Response> {
-    submit_for_existing_salvo(
-        &state,
-        &principal,
-        &id,
-        head.head,
-        &idem,
-        true,
-        |op, head| Command::TakeSalvo {
-            op,
-            salvo: Some(id.clone()),
-            head,
-        },
+    principal.role.require(Action::Write)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    if let Some(head) = head.head.as_deref() {
+        crate::auth::authorize_output(&principal, head)?;
+    }
+    let salvo = crate::boot_model::accepted_salvo(&state, &id)?.salvo;
+    if salvo.patch.is_empty() {
+        // A salvo with only legacy recalls: today's path, byte-for-byte.
+        return submit_for_existing_salvo(
+            &state,
+            &principal,
+            &id,
+            head.head,
+            &idem,
+            true,
+            |op, head| Command::TakeSalvo {
+                op,
+                salvo: Some(id.clone()),
+                head,
+            },
+        );
+    }
+    take_patch_salvo(&state, &principal, &idem, &id, head.head, &salvo).await
+}
+
+/// Whether a salvo recalls anything besides its patch.
+fn has_recall(salvo: &Salvo) -> bool {
+    salvo.layout.is_some()
+        || !salvo.sources.is_empty()
+        || !salvo.tally.is_empty()
+        || !salvo.umd.is_empty()
+}
+
+/// Take a patch salvo (#308): the stored crosspoints through the atomic set
+/// path of `POST /patch/take` (every member re-authorized under the caller's
+/// CURRENT grants, the key in its own `salvo-take:<id>` namespace), then the
+/// legacy recall exactly as today when the salvo has one. A retry with the
+/// same key replays the set and re-submits only what did not land.
+async fn take_patch_salvo(
+    state: &AppState,
+    principal: &Principal,
+    idem: &IdempotencyKey,
+    id: &str,
+    head: Option<String>,
+    salvo: &Salvo,
+) -> ControlResult<Response> {
+    let recall = has_recall(salvo);
+    if recall {
+        refuse_cell_recall_under_switcher(state, salvo)?;
+    }
+    let req = crate::routes::patch_set::salvo_request(salvo);
+    crate::routes::patch::validate_count(&req)?;
+    let layouts = match crate::routes::patch::read_patch_layouts(state, principal, &req).await? {
+        Ok(layouts) => layouts,
+        Err(response) => return Ok(response),
+    };
+    crate::routes::patch::authorize(principal, &req, &layouts)?;
+    let key = crate::routes::patch_set::set_key(idem, &format!("salvo-take:{id}"))?;
+    let op = match crate::routes::patch_set::take_set(state, principal, &key, &req, &layouts)? {
+        Ok(op) => op,
+        Err(response) => return Ok(response),
+    };
+    let recall_operation_id = if recall {
+        let body = crate::routes::submit_accepted_body(state, idem, |op| {
+            Ok(Command::TakeSalvo {
+                op,
+                salvo: Some(id.to_owned()),
+                head,
+            })
+        })?;
+        Some(body.operation_id)
+    } else {
+        None
+    };
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(crate::routes::patch::PatchAccepted {
+            operation_id: op,
+            status: "accepted",
+            recall_operation_id,
+        }),
     )
+        .into_response())
+}
+
+/// `POST /api/v1/salvos/{id}/plan` — plan a patch salvo's crosspoints
+/// (#308): the `POST /patch/plan` answer for the stored crosspoints and
+/// `on_air`, authorized like the take; no change. `arm` keeps its legacy
+/// meaning.
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        post,
+        path = "/api/v1/salvos/{id}/plan",
+        tag = "salvos",
+        params(("id" = String, Path, description = "Salvo id to plan.")),
+        responses(
+            (status = 200, description = "The patch plan of the salvo's crosspoints (as `POST /patch/plan`): a `PatchPlan`, or a `SetPlan` with `set: {new_encoders, fits}` for two or more destinations.", body = crate::routes::patch::PatchPlanResponseDoc),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized for the salvo or for a patch member's destination or source.", body = crate::problem::Problem),
+            (status = 404, description = "No salvo with that id.", body = crate::problem::Problem),
+            (status = 409, description = "As `POST /patch/plan`.", body = crate::problem::Problem),
+            (status = 422, description = "The salvo has no patch crosspoints, or as `POST /patch/plan`.", body = crate::problem::Problem),
+            (status = 503, description = "`engine-busy`: a `{layout}` could not be read now.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn plan_salvo(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Write)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let salvo = crate::boot_model::accepted_salvo(&state, &id)?.salvo;
+    if salvo.patch.is_empty() {
+        return Err(crate::error::ControlError::Validation(
+            "this salvo has no patch crosspoints to plan".into(),
+        ));
+    }
+    let req = crate::routes::patch_set::salvo_request(&salvo);
+    crate::routes::patch::plan_request(&state, &principal, &req).await
 }
 
 /// `POST /api/v1/salvos/{id}/cancel` — cancel an armed salvo (role: write; 202).

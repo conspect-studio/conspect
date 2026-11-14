@@ -201,7 +201,7 @@ pub struct SubtitleCrosspoint {
 }
 
 /// Output rendition tap; a configured preview output must never carry PGM.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputBus {
     /// Post-switcher on-air canvas.

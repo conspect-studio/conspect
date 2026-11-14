@@ -177,6 +177,58 @@ impl OutputRouter {
         })
     }
 
+    /// The published per-principal holdings: the cached list, rebuilt
+    /// (one bounded scan) only when [`OutputRouter::holdings_dirty`] says a
+    /// holding changed. An unchanged tick is one `Arc` clone: no scan, no
+    /// allocation on the bake consumer (invariant #1). Test builds verify
+    /// the cache against a fresh scan on every call.
+    pub(super) fn held_by_principal(&mut self) -> Arc<Vec<(String, usize)>> {
+        if self.holdings_dirty {
+            let next = self.principals_held();
+            if *self.principals_held != next {
+                self.principals_held = Arc::new(next);
+            }
+            self.holdings_dirty = false;
+            #[cfg(test)]
+            {
+                self.holdings_rebuilds += 1;
+            }
+        }
+        #[cfg(test)]
+        assert_eq!(
+            *self.principals_held,
+            self.principals_held(),
+            "a holdings change did not mark holdings_dirty"
+        );
+        Arc::clone(&self.principals_held)
+    }
+
+    /// Every principal holding encoders, with [`Self::principal_held`]
+    /// (sorted; bounded by the keys, opens and sets the router holds).
+    pub(super) fn principals_held(&self) -> Vec<(String, usize)> {
+        let mut principals: Vec<&str> = self
+            .dynamic
+            .iter()
+            .map(|d| d.principal.as_str())
+            .chain(self.opens.values().map(|o| o.principal.as_str()))
+            .chain(
+                self.sets
+                    .active
+                    .iter()
+                    .filter(|s| s.reserved > 0)
+                    .map(|s| s.principal.as_str()),
+            )
+            .filter(|p| !p.is_empty())
+            .collect();
+        principals.sort_unstable();
+        principals.dedup();
+        principals
+            .into_iter()
+            .map(|p| (p.to_owned(), self.principal_held(p)))
+            .filter(|(_, held)| *held > 0)
+            .collect()
+    }
+
     /// Encoders charged to `principal`: live keys, opens in flight and its
     /// sets' unissued reservations.
     fn principal_held(&self, principal: &str) -> usize {
@@ -482,6 +534,7 @@ impl OutputRouter {
             }
             members.push(index);
         }
+        self.holdings_dirty = true;
         self.sets.active.push(ActiveSet {
             id,
             operation_id: set.operation_id,
@@ -551,12 +604,10 @@ impl OutputRouter {
                 self.refuse_pending(index, tick, RefuseReason::Capacity, dispatcher);
                 return;
             }
-            if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
-                if unheld && principal != BOOT_PRINCIPAL && !d.reformat {
-                    principal.clone_into(&mut d.principal);
-                }
-                d.linger_deadline = None;
-            }
+            self.adopt_key(
+                key,
+                (unheld && principal != BOOT_PRINCIPAL).then_some(principal),
+            );
             self.member_ready(index, key);
             return;
         }
@@ -585,7 +636,7 @@ impl OutputRouter {
                 if let Some(s) = self.sets.active.iter_mut().find(|s| s.id == group) {
                     s.reserved = s.reserved.saturating_sub(1);
                 }
-                self.opens.insert(
+                self.insert_open(
                     id,
                     PendingOpen {
                         bus: bus.clone(),
@@ -636,6 +687,7 @@ impl OutputRouter {
         // `try_supersede_set` first), so a lost refusal below is a genuine
         // fault after the commit (an encoder died), never a supersede.
         let set = self.sets.active.swap_remove(pos);
+        self.holdings_dirty = true;
         let mut result = result;
         let refused = set
             .arm
@@ -755,6 +807,7 @@ impl OutputRouter {
                 // the no-op members land with them.
                 if let Some(pos) = self.sets.active.iter().position(|s| s.id == id) {
                     self.sets.active.swap_remove(pos);
+                    self.holdings_dirty = true;
                 }
                 for (index, _) in pending {
                     self.finish_noop_member(index, at, tick, dispatcher);
