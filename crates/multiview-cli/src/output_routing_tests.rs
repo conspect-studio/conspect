@@ -6282,10 +6282,11 @@ fn a_subtitle_take_repoints_the_route_table_for_the_next_sampler_tick() {
     run.tick(10);
     run.tick(11);
     assert_eq!(tick.load(Ordering::Acquire), 11);
-    // The take: slot 0 → cam_b; it lands by the next tick (12).
+    // The take: slot 0 → cam_b; the answer is the last finished tick (11),
+    // and the next sampled tick (12 here) uses the new table.
     assert_eq!(
         adapter.try_take_subtitles(request("hls-1", vec![(0, Some("cam_b".to_owned()))])),
-        Ok(12)
+        Ok(11)
     );
     assert_eq!(
         adapter.subtitle_routes("hls-1"),
