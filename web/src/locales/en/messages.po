@@ -1978,7 +1978,7 @@ msgid "Buffered log records, oldest first."
 msgstr "Buffered log records, oldest first."
 
 #. placeholder {0}: cast.deviceName ?? t`this device`
-#: src/cast/CastButton.tsx:52
+#: src/cast/CastButton.tsx:54
 msgid "Buffering on {0}"
 msgstr "Buffering on {0}"
 
@@ -2184,14 +2184,20 @@ msgid "Carry the file to an online portal to obtain a signed lease."
 msgstr "Carry the file to an online portal to obtain a signed lease."
 
 #: src/app/navigation.tsx:61
-#: src/cast/CastButton.tsx:108
-#: src/cast/CastButton.tsx:109
-#: src/cast/CastButton.tsx:121
+#: src/cast/CastButton.tsx:110
+#: src/cast/CastButton.tsx:111
+#: src/cast/CastButton.tsx:127
+#: src/cast/CastButton.tsx:131
 #: src/components/broadcast/BroadcastShell.tsx:35
 #: src/pages/CastPage.tsx:266
 #: src/pages/CastPage.tsx:322
 msgid "Cast"
 msgstr "Cast"
+
+#. placeholder {0}: target.name
+#: src/cast/CastButton.tsx:119
+msgid "Cast {0} to a TV (Google Cast)"
+msgstr "Cast {0} to a TV (Google Cast)"
 
 #: src/pages/CastPage.tsx:486
 msgid "Cast a running output's rendition to a Cast receiver. Leave the output blank to use the first declared rendition."
@@ -2221,16 +2227,16 @@ msgstr "Cast from the engine (same network)"
 msgid "Cast from this browser"
 msgstr "Cast from this browser"
 
-#: src/cast/CastButton.tsx:40
+#: src/cast/CastButton.tsx:42
 msgid "Cast needs Chrome or Edge"
 msgstr "Cast needs Chrome or Edge"
 
-#: src/cast/CastButton.tsx:36
-#: src/cast/CastButton.tsx:37
+#: src/cast/CastButton.tsx:38
+#: src/cast/CastButton.tsx:39
 msgid "Cast needs Chrome or Edge on a computer or Android"
 msgstr "Cast needs Chrome or Edge on a computer or Android"
 
-#: src/cast/BrowserCastSection.tsx:46
+#: src/cast/BrowserCastSection.tsx:49
 msgid "Cast needs Chrome or Edge on a computer or Android."
 msgstr "Cast needs Chrome or Edge on a computer or Android."
 
@@ -2271,7 +2277,7 @@ msgid "Casting is not available right now: the engine has no usable cast output.
 msgstr "Casting is not available right now: the engine has no usable cast output."
 
 #. placeholder {0}: cast.deviceName ?? t`this device`
-#: src/cast/CastButton.tsx:50
+#: src/cast/CastButton.tsx:52
 msgid "Casting to {0}"
 msgstr "Casting to {0}"
 
@@ -2779,7 +2785,7 @@ msgstr "Configuration exported"
 msgid "Configuration file"
 msgstr "Configuration file"
 
-#: src/cast/BrowserCastSection.tsx:64
+#: src/cast/BrowserCastSection.tsx:67
 msgid "Configuration snippet"
 msgstr "Configuration snippet"
 
@@ -3285,7 +3291,7 @@ msgstr "Could not load the audio routing:"
 msgid "Could not load the audit log:"
 msgstr "Could not load the audit log:"
 
-#: src/cast/BrowserCastSection.tsx:54
+#: src/cast/BrowserCastSection.tsx:57
 msgid "Could not load the cast settings:"
 msgstr "Could not load the cast settings:"
 
@@ -5256,7 +5262,7 @@ msgstr "Good on LAN; not for WAN"
 msgid "Good; degrades over poor links"
 msgstr "Good; degrades over poor links"
 
-#: src/cast/BrowserCastSection.tsx:102
+#: src/cast/BrowserCastSection.tsx:105
 msgid "Google Cast and Chromecast are trademarks of Google LLC. This project is independent and not affiliated with or endorsed by Google."
 msgstr "Google Cast and Chromecast are trademarks of Google LLC. This project is independent and not affiliated with or endorsed by Google."
 
@@ -6608,7 +6614,7 @@ msgstr "Loading sync groups…"
 msgid "Loading tally state…"
 msgstr "Loading tally state…"
 
-#: src/cast/BrowserCastSection.tsx:50
+#: src/cast/BrowserCastSection.tsx:53
 msgid "Loading the cast settings…"
 msgstr "Loading the cast settings…"
 
@@ -7473,7 +7479,7 @@ msgstr "No capture job API exists yet."
 msgid "No capture scheduling API exists yet."
 msgstr "No capture scheduling API exists yet."
 
-#: src/cast/BrowserCastSection.tsx:59
+#: src/cast/BrowserCastSection.tsx:62
 msgid "No cast output is configured. Browser casting plays from a cast output: add one to the engine configuration and restart the engine."
 msgstr "No cast output is configured. Browser casting plays from a cast output: add one to the engine configuration and restart the engine."
 
@@ -9510,11 +9516,11 @@ msgstr "Replacement"
 msgid "Replacement is another source id, or \"bars\" / \"bars_tone\". Bars uses your first configured Bars source; \"bars_tone\" also routes its 1 kHz line-up tone onto this source's program audio. Add a Bars source on the Sources page first if you have none."
 msgstr "Replacement is another source id, or \"bars\" / \"bars_tone\". Bars uses your first configured Bars source; \"bars_tone\" also routes its 1 kHz line-up tone onto this source's program audio. Add a Bars source on the Sources page first if you have none."
 
-#: src/cast/CastButton.tsx:108
+#: src/cast/CastButton.tsx:110
 msgid "replaces the current browser cast"
 msgstr "replaces the current browser cast"
 
-#: src/cast/CastButton.tsx:117
+#: src/cast/CastButton.tsx:119
 msgid "Replaces the current browser cast"
 msgstr "Replaces the current browser cast"
 
@@ -9657,7 +9663,7 @@ msgstr "Results"
 msgid "Results stream in below as they are found. {0}"
 msgstr "Results stream in below as they are found. {0}"
 
-#: src/cast/CastButton.tsx:101
+#: src/cast/CastButton.tsx:103
 #: src/pages/approved/SourcesSurface.tsx:81
 msgid "Retry"
 msgstr "Retry"
@@ -9666,8 +9672,8 @@ msgstr "Retry"
 msgid "Retry {name}"
 msgstr "Retry {name}"
 
-#: src/cast/CastButton.tsx:96
-#: src/cast/CastButton.tsx:97
+#: src/cast/CastButton.tsx:98
+#: src/cast/CastButton.tsx:99
 msgid "Retry cast"
 msgstr "Retry cast"
 
@@ -10735,7 +10741,7 @@ msgstr "Still preview (~1 fps) — live video is unavailable for this preview"
 msgid "Still preview (~1 fps) — live video is unavailable for this preview."
 msgstr "Still preview (~1 fps) — live video is unavailable for this preview."
 
-#: src/cast/CastButton.tsx:63
+#: src/cast/CastButton.tsx:65
 #: src/components/broadcast/library/AssetAuditionControls.tsx:174
 #: src/components/SourceLifecycleActions.tsx:67
 #: src/pages/CastPage.tsx:460
@@ -10754,8 +10760,8 @@ msgid "Stop {name}"
 msgstr "Stop {name}"
 
 #: src/cast/ActiveCastCard.tsx:112
-#: src/cast/CastButton.tsx:58
-#: src/cast/CastButton.tsx:59
+#: src/cast/CastButton.tsx:60
+#: src/cast/CastButton.tsx:61
 msgid "Stop casting"
 msgstr "Stop casting"
 
@@ -11929,8 +11935,8 @@ msgstr "This Conspect control plane requires an API key. Paste your admin or ope
 msgid "This control plane does not serve config export yet. Update the server to use it."
 msgstr "This control plane does not serve config export yet. Update the server to use it."
 
-#: src/cast/CastButton.tsx:50
 #: src/cast/CastButton.tsx:52
+#: src/cast/CastButton.tsx:54
 msgid "this device"
 msgstr "this device"
 
@@ -12011,7 +12017,7 @@ msgstr "This output already carries this feed"
 msgid "This overlay kind has no configurable parameters in this build. Parameters authored in a config file are preserved unchanged."
 msgstr "This overlay kind has no configurable parameters in this build. Parameters authored in a config file are preserved unchanged."
 
-#: src/cast/BrowserCastSection.tsx:72
+#: src/cast/BrowserCastSection.tsx:75
 msgid "This page is not served over HTTPS. A TV only plays an HTTPS address with a valid certificate."
 msgstr "This page is not served over HTTPS. A TV only plays an HTTPS address with a valid certificate."
 
@@ -12176,6 +12182,10 @@ msgstr "Timezone offset (minutes from UTC)"
 #: src/pages/docs/concepts/TimingSyncPage.tsx:17
 msgid "Timing & sync"
 msgstr "Timing & sync"
+
+#: src/cast/BrowserCastSection.tsx:45
+msgid "Tip: the Program and Preview monitors on the desk have their own Cast buttons."
+msgstr "Tip: the Program and Preview monitors on the desk have their own Cast buttons."
 
 #: src/events/JournalPanel.tsx:94
 msgid "To"
@@ -12649,7 +12659,7 @@ msgstr "User-Agent"
 msgid "User-Agent header (optional)"
 msgstr "User-Agent header (optional)"
 
-#: src/cast/BrowserCastSection.tsx:79
+#: src/cast/BrowserCastSection.tsx:82
 msgid "Using Google's default receiver. Register the Conspect receiver for diagnostics and the branded screen."
 msgstr "Using Google's default receiver. Register the Conspect receiver for diagnostics and the branded screen."
 
@@ -12999,7 +13009,7 @@ msgstr "What this build can do: available backends, the compositor tier, and the
 msgid "What this machine sends, and to whom. Two separate pipes: the mandatory licensing heartbeat and the opt-in product telemetry."
 msgstr "What this machine sends, and to whom. Two separate pipes: the mandatory licensing heartbeat and the opt-in product telemetry."
 
-#: src/cast/BrowserCastSection.tsx:90
+#: src/cast/BrowserCastSection.tsx:93
 msgid "What to cast"
 msgstr "What to cast"
 

@@ -15,11 +15,13 @@ export interface CastButtonProps {
   readonly target: CastTarget;
   /** Icon-only footprint for dense places (monitor captions, table cells). */
   readonly compact?: boolean;
+  /** With `compact`: show the word "Cast" next to the icon on wide screens (the desk monitors). */
+  readonly labelOnWide?: boolean;
   readonly className?: string;
 }
 
 /** A Cast (browser sender) button + state for one target. */
-export function CastButton({ target, compact = false, className }: CastButtonProps): JSX.Element {
+export function CastButton({ target, compact = false, labelOnWide = false, className }: CastButtonProps): JSX.Element {
   const { t } = useLingui();
   const cast = useCast(target);
   const busyWithOther = useCastBusyWithOther(target);
@@ -114,11 +116,20 @@ export function CastButton({ target, compact = false, className }: CastButtonPro
       className={cn(className)}
       disabled={!receiver.ready}
       aria-label={label}
-      title={busyWithOther ? t`Replaces the current browser cast` : label}
+      title={busyWithOther ? t`Replaces the current browser cast` : t`Cast ${target.name} to a TV (Google Cast)`}
       onClick={cast.start}
+      {...(compact && labelOnWide ? { 'data-label-on-wide': '' } : {})}
     >
       <Cast aria-hidden="true" />
-      {compact ? null : <Trans>Cast</Trans>}
+      {compact ? (
+        labelOnWide ? (
+          <span aria-hidden="true" className="hidden md:inline">
+            <Trans>Cast</Trans>
+          </span>
+        ) : null
+      ) : (
+        <Trans>Cast</Trans>
+      )}
     </Button>
   );
 }

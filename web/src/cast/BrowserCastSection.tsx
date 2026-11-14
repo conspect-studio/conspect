@@ -41,6 +41,9 @@ export function BrowserCastSection(): JSX.Element {
           wherever the engine runs, as long as the TV can reach this address.
         </Trans>
       </p>
+      <p className="text-sm text-muted-foreground" data-testid="cast-desk-hint">
+        <Trans>Tip: the Program and Preview monitors on the desk have their own Cast buttons.</Trans>
+      </p>
       {!receiver.supported ? (
         <p role="status" className="text-sm">
           <Trans>Cast needs Chrome or Edge on a computer or Android.</Trans>

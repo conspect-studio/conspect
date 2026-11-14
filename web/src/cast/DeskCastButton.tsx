@@ -10,5 +10,5 @@ export function DeskCastButton({ bus }: { readonly bus: 'program' | 'preview' })
   const { t } = useLingui();
   if (!useHasCastProvider()) return null;
   const name = bus === 'program' ? t`Program` : t`Preview`;
-  return <CastButton compact target={{ key: `feed:bus:${bus}`, name, feed: { bus } }} />;
+  return <CastButton compact labelOnWide className="md:w-auto md:px-2 md:gap-1" target={{ key: `feed:bus:${bus}`, name, feed: { bus } }} />;
 }

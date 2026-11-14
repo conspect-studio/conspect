@@ -68,6 +68,10 @@ describe('ProductionDesk Cast buttons', () => {
     await waitFor(() => {
       expect(pgm).toBeEnabled();
     });
+    // Findable: a visible "Cast" word beside the icon on wide screens, and a tooltip that says what it does.
+    expect(pgm).toHaveTextContent('Cast');
+    expect(pgm.querySelector('.md\\:inline')).not.toBeNull();
+    expect(pgm).toHaveAttribute('title', 'Cast Program to a TV (Google Cast)');
     await user.click(pvw);
     await waitFor(() => {
       expect(created).toEqual([{ feed: { bus: 'preview' } }]);
