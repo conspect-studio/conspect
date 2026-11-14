@@ -37,11 +37,14 @@ export type { Layout, LayoutInput } from './layouts';
 export class ApiError extends Error {
   /** The HTTP status code, when the failure carried an RFC 9457 problem body. */
   readonly status: number | undefined;
+  /** The RFC 9457 problem `detail`, when the server returned one. */
+  readonly detail: string | undefined;
 
-  constructor(message: string, status?: number) {
+  constructor(message: string, status?: number, detail?: string) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.detail = detail;
   }
 }
 
@@ -87,7 +90,7 @@ export interface MutationContext {
 
 function toApiError(error: unknown): ApiError {
   if (error instanceof LayoutApiError) {
-    return new ApiError(error.message, error.status);
+    return new ApiError(error.message, error.status, error.detail);
   }
   if (error instanceof Error) {
     return new ApiError(error.message);
