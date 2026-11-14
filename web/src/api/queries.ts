@@ -176,7 +176,7 @@ export function useSaveLayout(
         // means create.
         // A caller that asked for a conditional write must never get an
         // unconditional one: an empty explicit tag is refused, not dropped.
-        if (explicitIfMatch !== undefined && explicitIfMatch.trim() === '') {
+        if (explicitIfMatch?.trim() === '') {
           throw new ApiError('Missing ETag for a conditional save', 428);
         }
         let ifMatch = explicitIfMatch ?? etags[id];
