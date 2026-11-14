@@ -935,3 +935,49 @@ proptest! {
         prop_assert!(mask.expanded(border).is_valid_for(w, h));
     }
 }
+
+/// Merge review R-7: a valid mask with a tiny positive softness never overflows
+/// the edge (`d / softness`); it draws as the hard edge of the same wipe.
+#[test]
+fn a_tiny_softness_wipe_draws_as_a_hard_edge() {
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    let c = bt709(ColorRange::Limited);
+    let bg = solid(16, 2, 140, 100, 160, c);
+    let k = solid(16, 2, 220, 128, 128, c);
+    let tiny = WipeMask::new(
+        MaskShape::Horizontal,
+        0.75,
+        16,
+        2,
+        [0.0, 0.0],
+        false,
+        f32::MIN_POSITIVE,
+        0.0,
+    );
+    assert!(tiny.is_valid_for(16, 2));
+    let hard = WipeMask::new(
+        MaskShape::Horizontal,
+        0.75,
+        16,
+        2,
+        [0.0, 0.0],
+        false,
+        0.0,
+        0.0,
+    );
+    for x in 0..16 {
+        assert!(tiny.coverage(x, 0).is_finite());
+        assert_eq!(tiny.coverage(x, 0), hard.coverage(x, 0), "x={x}");
+    }
+    let draw = |m| {
+        comp(
+            16,
+            2,
+            &[
+                Tile::placed(&bg, 0, 0, 1.0),
+                Tile::placed(&k, 0, 0, 1.0).with_mask(m),
+            ],
+        )
+    };
+    assert_eq!(draw(tiny), draw(hard));
+}

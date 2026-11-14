@@ -217,3 +217,46 @@ fn gpu_malformed_wipe_mask_draws_nothing_like_the_cpu_reference() {
         assert_eq!(cpu, base, "CPU {mask:?}");
     }
 }
+
+/// Merge review R-7: a tiny positive softness draws the same on the GPU as
+/// on the CPU reference (no overflow in the edge).
+#[test]
+fn gpu_tiny_softness_wipe_matches_the_cpu_reference() {
+    let Some(gpu) = try_gpu() else { return };
+    let out = solid(40, 110, 140);
+    let inc = solid(200, 150, 100);
+    let mask = WipeMask::new(
+        MaskShape::Horizontal,
+        0.6,
+        W,
+        H,
+        [0.0, 0.0],
+        false,
+        f32::MIN_POSITIVE,
+        0.0,
+    );
+    assert!(mask.is_valid_for(W, H));
+    let tiles = [
+        Tile::scaled(&out, 0, 0, W, H, 1.0),
+        Tile::scaled(&inc, 0, 0, W, H, 1.0).with_mask(mask),
+    ];
+    let cpu = composite(
+        W,
+        H,
+        CanvasColor::default(),
+        LinearRgba::TRANSPARENT,
+        &tiles,
+    )
+    .unwrap();
+    let got = gpu
+        .composite(
+            W,
+            H,
+            CanvasColor::default(),
+            LinearRgba::TRANSPARENT,
+            &tiles,
+        )
+        .unwrap();
+    let m = mismatch(cpu.y_plane(), got.y_plane(), 3);
+    assert!(m <= 0.01, "{m}");
+}

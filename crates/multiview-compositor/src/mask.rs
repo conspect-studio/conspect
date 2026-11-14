@@ -222,7 +222,17 @@ impl WipeMask {
 /// width `softness` (`0` is hard). Mirrors `wipe_edge` in `composite.wgsl`.
 fn edge(d: f32, softness: f32) -> f32 {
     if softness > 0.0 {
-        (d / softness + 0.5).clamp(0.0, 1.0)
+        // Saturate outside the band before dividing (merge review R-7): a tiny
+        // softness would overflow `d / softness`. Inside it `|d| <= softness/2`,
+        // so the ratio is bounded by 0.5 and the value is the same as before.
+        let half = softness * 0.5;
+        if d >= half {
+            1.0
+        } else if d <= -half {
+            0.0
+        } else {
+            (d / softness + 0.5).clamp(0.0, 1.0)
+        }
     } else if d >= 0.0 {
         1.0
     } else {

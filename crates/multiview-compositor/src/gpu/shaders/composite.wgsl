@@ -118,6 +118,15 @@ fn wipe_coverage(t: TileParams, px: u32, py: u32, cw: u32, ch: u32) -> f32 {
 // Mirrors `mask::edge`.
 fn wipe_edge(d: f32, softness: f32) -> f32 {
     if softness > 0.0 {
+        // Saturate before dividing (mirrors `mask::edge`): a tiny softness
+        // would overflow `d / softness`; inside the band the ratio is <= 0.5.
+        let half = softness * 0.5;
+        if d >= half {
+            return 1.0;
+        }
+        if d <= -half {
+            return 0.0;
+        }
         return clamp(d / softness + 0.5, 0.0, 1.0);
     }
     return select(0.0, 1.0, d >= 0.0);
