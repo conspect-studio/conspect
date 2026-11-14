@@ -2919,6 +2919,10 @@ impl Pipeline {
     #[allow(clippy::too_many_lines)]
     // reason: see `build`.
     fn build_inner(config: &MultiviewConfig) -> Result<Self, PipelineError> {
+        // The run's explicit `yt-dlp` path, for live-added `YouTube` sources and
+        // their audio rails (issue #420).
+        #[cfg(feature = "youtube")]
+        crate::youtube_status::set_resolver_path(crate::youtube_resolver_path(config));
         // Fail-closed (#103): an AES67 PCM-audio source in a non-`aes67` build is a
         // config this binary cannot honour — reject it clearly up front, never wire
         // it dark (the same contract as a `display` source/output in a non-
@@ -10739,6 +10743,8 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn source_removed(&self, id: &str) {
+        #[cfg(feature = "youtube")]
+        crate::youtube_status::forget(id);
         let retired_store = self.demand.as_ref().and_then(|(catalogue, manager)| {
             let store = catalogue
                 .load()
@@ -10958,8 +10964,58 @@ impl LiveIngestSpawner {
         {
             plan.decode_placement = self.decode_placement_for(&plan.id);
         }
-        spawn_ingest_producer(plan, registry)
-            .map(|(stop, handle)| crate::live_sources::SpawnedProducer { stop, handle })
+        // A live-added `YouTube` source resolves with the run's `yt-dlp` and
+        // keeps its master fresh exactly like a startup one (issue #420).
+        #[cfg(feature = "youtube")]
+        let youtube = match &plan.location {
+            SourceLocation::Youtube { watch_url } => {
+                plan.youtube_yt_dlp_path = crate::youtube_status::resolver_path();
+                plan.youtube_url_slot
+                    .clone()
+                    .map(|slot| (watch_url.clone(), slot, plan.youtube_yt_dlp_path.clone()))
+            }
+            _ => None,
+        };
+        let id = plan.id.clone();
+        let produced = spawn_ingest_producer(plan, registry)
+            .map(|(stop, handle)| crate::live_sources::SpawnedProducer { stop, handle });
+        #[cfg(feature = "youtube")]
+        if let (Some((watch_url, slot, path)), Some(producer)) = (youtube, produced.as_ref()) {
+            spawn_live_youtube_reresolve(&id, watch_url, slot, path, &producer.stop, registry);
+        }
+        #[cfg(not(feature = "youtube"))]
+        let _ = id;
+        produced
+    }
+}
+
+/// Spawn the proactive re-resolution loop of a live-added `YouTube` source
+/// (issue #420). It SHARES the video producer's stop flag and registers it
+/// under `{id}/youtube-reresolve`, so the hub's teardown of the source (which
+/// raises `{id}` and every `{id}/` companion, then waits for their exit) stops
+/// it with the producer. A failed spawn only loses the proactive refresh: the
+/// decode thread still resolves on every reconnect.
+#[cfg(feature = "youtube")]
+fn spawn_live_youtube_reresolve(
+    id: &str,
+    watch_url: String,
+    slot: Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>,
+    yt_dlp_path: Option<String>,
+    stop: &Arc<AtomicBool>,
+    registry: &crate::live_sources::StopRegistry,
+) {
+    let exited =
+        crate::live_sources::register_stop(registry, &format!("{id}/youtube-reresolve"), stop);
+    let exit_guard = crate::live_sources::ExitGuard::new(&exited);
+    let thread_stop = Arc::clone(stop);
+    if let Err(e) = std::thread::Builder::new()
+        .name(format!("multiview-yt-reresolve-{id}"))
+        .spawn(move || {
+            let _exit = exit_guard;
+            youtube_reresolve_thread(&watch_url, yt_dlp_path.as_deref(), &slot, &thread_stop);
+        })
+    {
+        tracing::error!(error = %e, source = %id, "could not spawn youtube re-resolution thread; falling back to resolve-on-reconnect");
     }
 }
 
@@ -14766,6 +14822,19 @@ fn build_media_player_boot(
 /// The location mirrors the video [`ingest_plan_for`] mapping so a source's audio
 /// is decoded from the SAME media as its video (the audio peer opens its own
 /// libav context — the contexts are `!Send` and must not be shared).
+/// Whether `kind` is a `YouTube` source (always `false` without the feature).
+const fn is_youtube_kind(kind: &SourceKind) -> bool {
+    #[cfg(feature = "youtube")]
+    {
+        matches!(kind, SourceKind::Youtube { .. })
+    }
+    #[cfg(not(feature = "youtube"))]
+    {
+        let _ = kind;
+        false
+    }
+}
+
 fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPlan> {
     let (location, live) = match &source.kind {
         // Synthetic sources render video in-process and carry no audio.
@@ -14794,11 +14863,13 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
             Ok(lowered) => (lowered, true),
             Err(_) => return None,
         },
-        // YouTube/NDI audio is not wired through the libav file decoder here:
-        // YouTube needs the watch-URL resolve step (deferred to its own slice) and
-        // NDI audio is a host-memory receive. Both ride silence on the bus for now.
+        // `YouTube` (issue #420): the location is the WATCH url; the audio rail
+        // never opens it. It reads the video rail's fetched copy of the
+        // resolved master, else the master the video rail resolved, else
+        // resolves once itself (see `audio_ingest_loop`). NDI audio is a
+        // host-memory receive and rides silence on the bus for now.
         #[cfg(feature = "youtube")]
-        SourceKind::Youtube { .. } => return None,
+        SourceKind::Youtube { url } => (url.clone(), true),
         #[cfg(feature = "ndi")]
         SourceKind::Ndi { .. } => return None,
         // Any other (incl. NDI without the feature, future kinds): no audio path.
@@ -14812,6 +14883,7 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         anchor_floor: 0,
         audio_only: false,
         http_headers: http_headers_for(&source.kind).to_ffmpeg(),
+        youtube: is_youtube_kind(&source.kind),
     })
 }
 
@@ -16666,7 +16738,11 @@ fn youtube_resolver_config(yt_dlp_path: Option<&str>) -> multiview_input::youtub
 /// live) is returned as a `String` error — the caller's reconnect bracket backs
 /// off and retries while the tile degrades; it is never a panic.
 #[cfg(feature = "youtube")]
-fn resolve_youtube_master(watch_url: &str, yt_dlp_path: Option<&str>) -> Result<String, String> {
+pub(crate) fn resolve_youtube_master(
+    watch_url: &str,
+    yt_dlp_path: Option<&str>,
+    stop: Option<&AtomicBool>,
+) -> Result<String, String> {
     use multiview_input::youtube::reresolve::{ingest_url, ProcessResolver, Resolver};
 
     // A dedicated current-thread runtime for this one resolve. `yt-dlp`'s own hard
@@ -16679,9 +16755,29 @@ fn resolve_youtube_master(watch_url: &str, yt_dlp_path: Option<&str>) -> Result<
         .map_err(|e| format!("youtube resolver runtime: {e}"))?;
     let process = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
     let master = runtime
-        .block_on(process.resolve(watch_url))
+        .block_on(async {
+            // A stop abandons the resolve: dropping its future kills the
+            // `yt-dlp` child (`kill_on_drop`), so a removed source's thread
+            // leaves promptly instead of finishing up to three bounded runs.
+            tokio::select! {
+                resolved = process.resolve(watch_url) => Some(resolved),
+                () = wait_for_stop(stop) => None,
+            }
+        })
+        .ok_or_else(|| "stopped".to_owned())?
         .map_err(|e| e.operator_message())?;
     Ok(ingest_url(&master).to_owned())
+}
+
+/// Resolves once `stop` is raised (polled every 100 ms); never when `None`.
+#[cfg(feature = "youtube")]
+async fn wait_for_stop(stop: Option<&AtomicBool>) {
+    let Some(stop) = stop else {
+        return std::future::pending().await;
+    };
+    while !stop.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Pick the `*.googlevideo.com` HLS master URL to open for a `YouTube` source on a
@@ -16828,13 +16924,27 @@ fn open_and_stream(
     let resolved_youtube_url = match &plan.location {
         SourceLocation::Youtube { watch_url } => {
             let resolved = youtube_open_url(plan.youtube_url_slot.as_deref(), || {
-                resolve_youtube_master(watch_url, plan.youtube_yt_dlp_path.as_deref())
+                resolve_youtube_master(watch_url, plan.youtube_yt_dlp_path.as_deref(), Some(stop))
             });
             crate::youtube_status::record(&plan.id, resolved.as_ref().err().map(String::as_str));
-            Some(resolved?)
+            let resolved = resolved?;
+            // Publish the master this connection opens so the audio rail opens
+            // the SAME stream (issue #420), never a second `yt-dlp` run.
+            crate::youtube_status::record_master(&plan.id, watch_url, &resolved);
+            Some(resolved)
         }
         _ => None,
     };
+    // A resolved `YouTube` master opens through the SAME network-URL path as an
+    // `hls` source (variant pin, loopback segment fetcher shared with the audio
+    // rail, source-event bridge); `plan.location` stays the `YouTube` location so
+    // the HLS checks below treat it as HLS.
+    #[cfg(feature = "youtube")]
+    let youtube_open = resolved_youtube_url.map(SourceLocation::Url);
+    #[cfg(feature = "youtube")]
+    let open_location = youtube_open.as_ref().unwrap_or(&plan.location);
+    #[cfg(not(feature = "youtube"))]
+    let open_location = &plan.location;
 
     // Network sources open with an `rw_timeout` so a dead live source fails fast
     // instead of hanging this decode thread on open or a blocking read (#45).
@@ -16847,7 +16957,7 @@ fn open_and_stream(
     // before `input` so libav closes its duplicate first.
     #[cfg(feature = "srt-libsrt")]
     let mut _srt_reader: Option<crate::srt_ingest::SrtReader> = None;
-    let mut input = match &plan.location {
+    let mut input = match open_location {
         SourceLocation::Path(p) => {
             ffmpeg::format::input_with_dictionary(p, opts).map_err(|e| e.to_string())?
         }
@@ -16947,24 +17057,12 @@ fn open_and_stream(
             ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
                 .map_err(|e| e.to_string())?
         }
-        // A YouTube source opens the manifest URL resolved above (a network HLS
-        // master) exactly like any other URL — variant-pinned the same way so its
-        // master's WebVTT rendition (if any) is never folded into the main context.
+        // Unreachable: a `YouTube` source opens through the `Url` arm above with
+        // the master resolved before this match. Guarded so the match stays
+        // exhaustive.
         #[cfg(feature = "youtube")]
         SourceLocation::Youtube { .. } => {
-            // `resolved_youtube_url` is `Some` for this arm (set just above for the
-            // same `Youtube` location); a `let-else` keeps it panic-free.
-            let Some(url) = resolved_youtube_url.as_deref() else {
-                return Err("youtube source did not resolve a manifest url".to_owned());
-            };
-            let open_url = main_demuxer_open_url(
-                url,
-                &plan.location,
-                variant_height(plan),
-                &plan.http_headers,
-            );
-            ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
-                .map_err(|e| e.to_string())?
+            return Err("youtube source did not resolve a manifest url".to_owned());
         }
         // Unreachable: `ingest_loop` routes synthetic sources to the generator
         // before opening any media. Guarded so the match stays exhaustive.
@@ -26628,5 +26726,72 @@ mod chaos {
                 }
             }
         }
+    }
+}
+
+/// Issue #420: a `YouTube` source carries an audio plan bound to its WATCH url,
+/// flagged so the audio rail never hands that url to libav.
+#[cfg(all(test, feature = "youtube"))]
+mod youtube_audio_plan_tests {
+    use super::audio_ingest_plan_for;
+    use multiview_config::Source;
+
+    #[test]
+    fn youtube_sources_get_a_live_audio_plan_on_the_watch_url() {
+        let yt: Source = serde_json::from_value(serde_json::json!({
+            "id": "yt", "kind": "youtube", "url": "https://www.youtube.com/watch?v=KHy_n-EMWY8",
+        }))
+        .expect("youtube");
+        let plan = audio_ingest_plan_for(&yt).expect("youtube audio plan");
+        assert!(plan.youtube);
+        assert!(plan.live);
+        assert_eq!(plan.location, "https://www.youtube.com/watch?v=KHy_n-EMWY8");
+        let hls: Source = serde_json::from_value(serde_json::json!({
+            "id": "h", "kind": "hls", "url": "https://o.test/m.m3u8",
+        }))
+        .expect("hls");
+        assert!(!audio_ingest_plan_for(&hls).expect("hls plan").youtube);
+    }
+}
+
+/// Issue #420: a live-added `YouTube` source's re-resolution loop shares the
+/// video producer's stop flag and is registered as an `{id}/` companion, so
+/// the hub's stop of the source ends it within the teardown grace.
+#[cfg(all(test, feature = "youtube"))]
+mod youtube_live_reresolve_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_live_reresolve_loop_is_an_id_companion_and_stops_with_the_producer() {
+        let registry = crate::live_sources::stop_registry();
+        let stop = Arc::new(AtomicBool::new(false));
+        let slot = Arc::new(multiview_framestore::SwapCell::empty());
+        super::spawn_live_youtube_reresolve(
+            "ytlive",
+            "https://youtu.be/x".to_owned(),
+            slot,
+            // A missing binary: every resolve fails fast and the loop backs off.
+            Some("/nonexistent/multiview-test-yt-dlp".to_owned()),
+            &stop,
+            &registry,
+        );
+        assert!(registry
+            .lock()
+            .expect("registry")
+            .contains_key("ytlive/youtube-reresolve"));
+        let started = Instant::now();
+        crate::live_sources::stop_rail(&registry, "ytlive", true, false, Vec::new());
+        assert!(
+            stop.load(Ordering::Acquire),
+            "the shared producer flag is raised"
+        );
+        assert!(registry.lock().expect("registry").is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the loop left within the teardown grace: {:?}",
+            started.elapsed()
+        );
     }
 }

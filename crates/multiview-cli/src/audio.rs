@@ -1409,6 +1409,46 @@ pub(crate) struct AudioIngestPlan {
     /// makes (master fetch for the audio pin and libav's own opens). Empty for
     /// every other source kind.
     pub(crate) http_headers: multiview_ffmpeg::HttpHeaders,
+    /// `location` is a `YouTube` WATCH url (issue #420): never opened by libav.
+    /// Each connection opens the video rail's fetched copy of the resolved
+    /// master, else the master the video rail resolved, else one resolve of
+    /// its own; with none of them this connection is skipped (backoff).
+    pub(crate) youtube: bool,
+}
+
+/// The HLS master the audio rail of a `YouTube` source opens when the video
+/// rail's fetched copy is not available: the master the video rail last
+/// resolved from this watch URL, else one resolve on this (audio) thread,
+/// bounded by the resolver's hard timeouts. `None` on failure (the reason is
+/// already recorded by the video rail; this connection backs off).
+#[cfg(feature = "youtube")]
+fn youtube_audio_master(
+    plan: &AudioIngestPlan,
+    stop: &AtomicBool,
+    use_cached: bool,
+) -> Option<String> {
+    if let Some(master) =
+        crate::youtube_status::master(&plan.id, &plan.location).filter(|_| use_cached)
+    {
+        return Some(master);
+    }
+    let path = crate::youtube_status::resolver_path();
+    match crate::pipeline::resolve_youtube_master(&plan.location, path.as_deref(), Some(stop)) {
+        Ok(master) => Some(master),
+        Err(reason) => {
+            tracing::info!(source = %plan.id, %reason, "youtube audio: resolve failed; retrying after backoff");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "youtube"))]
+fn youtube_audio_master(
+    _plan: &AudioIngestPlan,
+    _stop: &AtomicBool,
+    _use_cached: bool,
+) -> Option<String> {
+    None
 }
 
 /// How long [`await_shared_url`] waits for the video's fetcher.
@@ -1518,6 +1558,10 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         multiview_ffmpeg::ResourceGuard::enter(multiview_ffmpeg::ResourceContext::source(&plan.id));
     let mut attempt: u32 = 0;
     let mut jitter = JitterRng::seeded(&plan.id);
+    // A `YouTube` connection on the video rail's cached master that died at once
+    // (an expired master answers 403) resolves afresh next time, so a stopped
+    // video rail can never pin the audio rail to a dead URL.
+    let mut youtube_cache_failed = false;
     loop {
         if stop.load(Ordering::Acquire)
             || (plan.lifecycle != 0 && crate::pipeline::live_lifecycle(&plan.id) != plan.lifecycle)
@@ -1531,11 +1575,12 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // ("Invalid data found"), leaving the source silent. Re-resolved on every
         // connection (variant URIs can be session-bound). Best-effort: `None`
         // keeps the original URL.
-        let is_hls = plan
-            .location
-            .split(['?', '#'])
-            .next()
-            .is_some_and(|b| b.to_ascii_lowercase().ends_with(".m3u8"));
+        let is_hls = plan.youtube
+            || plan
+                .location
+                .split(['?', '#'])
+                .next()
+                .is_some_and(|b| b.to_ascii_lowercase().ends_with(".m3u8"));
         // Prefer the video's fetched copy (one fetch per source: audio and video
         // read the same segments). Fall back to opening the origin when video is
         // not on the fetcher.
@@ -1566,10 +1611,19 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
             None
         };
         let shared_fetch = shared.is_some();
+        // A `YouTube` rail opens a resolved master, never its watch URL.
+        let youtube_master = if plan.youtube && shared.is_none() {
+            youtube_audio_master(plan, stop, !youtube_cache_failed)
+        } else {
+            None
+        };
+        let skip_connection = plan.youtube && shared.is_none() && youtube_master.is_none();
+        let origin = youtube_master.as_deref().unwrap_or(&plan.location);
         let pinned = if shared.is_some() {
             shared
-        } else if plan.live && is_hls {
-            crate::pipeline::resolve_hls_audio_url_with_headers(&plan.location, &plan.http_headers)
+        } else if plan.live && is_hls && !skip_connection {
+            crate::pipeline::resolve_hls_audio_url_with_headers(origin, &plan.http_headers)
+                .or_else(|| youtube_master.clone())
         } else {
             None
         };
@@ -1600,6 +1654,9 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
             "live audio: opening"
         );
         let location = std::path::Path::new(pinned.as_deref().unwrap_or(&plan.location));
+        if skip_connection {
+            // No master for this `YouTube` connection: back off and retry below.
+        } else
         // One connection's worth of decode. `audio_decode_loop` opens the decoder
         // on THIS thread (libav contexts are not `Send`), publishes every decoded
         // block, and returns on stop / EOF / open-or-decode error — logging the
@@ -1652,6 +1709,8 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
             );
         }
         let ran_for = started.elapsed();
+        youtube_cache_failed =
+            youtube_master.is_some() && !youtube_cache_failed && ran_for < Duration::from_secs(10);
         if !plan.live || stop.load(Ordering::Acquire) {
             // A finite source has played its audio out (the store silence-fills
             // past EOF forever); a stop was requested. Either way, this ends.

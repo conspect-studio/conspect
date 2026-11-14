@@ -19,8 +19,9 @@
 //!   fixture- and property-tested.
 //! * [`process`] — the thin subprocess shell: discover and spawn `yt-dlp` with an
 //!   argument vector (no shell), a hard timeout (a hung process is killed, not
-//!   awaited — invariant #10), captured stderr, and the `web_safari` player
-//!   client pinned.
+//!   awaited — invariant #10), captured stderr, `yt-dlp`'s default player
+//!   clients first with one explicit-client fallback, and `node` as the JS
+//!   runtime when present (issue #420).
 //!
 //! ## Isolation (invariants #1 / #2 / #10)
 //!
@@ -43,7 +44,10 @@ pub mod process;
 pub mod reresolve;
 pub mod resolve;
 
-pub use process::{probe_version, resolve as resolve_url, ResolverConfig};
+pub use process::{
+    find_node, find_on_path, probe_version, resolve as resolve_url, resolve_args, ResolverConfig,
+    FALLBACK_PLAYER_CLIENTS,
+};
 pub use reresolve::{
     ingest_url, run_reresolve_loop, ManualClock, ProcessResolver, ReresolveConfig,
     ReresolveOutcome, ReresolveSchedule, Resolver, SystemUnixClock, UnixClock,
@@ -102,16 +106,43 @@ impl YoutubeError {
     /// - [`Self::Unavailable`] ⇒ `"yt-dlp not found on the server"` (the
     ///   capability gate's message, never a raw spawn-error dump).
     /// - every other variant ⇒ the resolver's own [`std::fmt::Display`] text
-    ///   (JSON parse failure, no HLS master, or a yt-dlp extraction failure),
-    ///   which is already a plain-English sentence.
+    ///   (JSON parse failure, no HLS master, or a yt-dlp extraction failure,
+    ///   which carries yt-dlp's own error line), with every `http(s)://` URL
+    ///   replaced by `<url>` so a signed media URL never reaches the status API.
     #[must_use]
     pub fn operator_message(&self) -> String {
         match self {
             Self::NotLive(status) => {
                 format!("not a live stream (status: {})", status.wire_label())
             }
+            Self::Unavailable(reason) if reason.contains("timed out") => {
+                "yt-dlp timed out".to_owned()
+            }
             Self::Unavailable(_) => "yt-dlp not found on the server".to_owned(),
-            other => other.to_string(),
+            other => redact_urls(&other.to_string()),
         }
+    }
+}
+
+/// Replace every `http://` / `https://` URL in `text` with `<url>`.
+fn redact_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = ["https://", "http://"]
+            .iter()
+            .filter_map(|scheme| rest.find(scheme))
+            .min();
+        let Some(start) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(rest.get(..start).unwrap_or_default());
+        out.push_str("<url>");
+        let tail = rest.get(start..).unwrap_or_default();
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | ','))
+            .unwrap_or(tail.len());
+        rest = tail.get(end..).unwrap_or_default();
     }
 }

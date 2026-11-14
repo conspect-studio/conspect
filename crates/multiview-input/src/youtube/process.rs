@@ -5,9 +5,16 @@
 //!
 //! Hardening (ADR-0015 §6): spawned with an **argument vector** (no shell, no
 //! interpolation); a **hard timeout** kills a hung process rather than awaiting
-//! it (invariant #10); stderr is captured into `tracing` for diagnosis. The
-//! `web_safari` player client is pinned (PO-token-free live HLS); `ios` is
-//! avoided.
+//! it (invariant #10); stderr is captured for diagnosis.
+//!
+//! Player clients (issue #420): no client is pinned. The first attempt uses
+//! `yt-dlp`'s own current default clients (they track what `YouTube` serves);
+//! only when that attempt fails does one fallback attempt try the explicit
+//! [`FALLBACK_PLAYER_CLIENTS`] list. A pinned client went stale on 14 Nov 2026
+//! (`web_safari` answered "No video formats found!"), which is why the default
+//! comes first. When a `node` binary is found, `--js-runtimes node:<path>` is
+//! passed so the `n`-signature can be solved (`yt-dlp` enables only Deno by
+//! default); an older `yt-dlp` that rejects the flag is retried without it.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -17,9 +24,15 @@ use tokio::time::timeout;
 
 use super::{resolve::parse_info_dict, ResolvedHls, YoutubeError};
 
-/// The pinned player client: a current default that yields PO-token-free live
-/// HLS (ADR-0015 §5). `ios` is deliberately avoided.
-const PLAYER_CLIENT_ARG: &str = "youtube:player_client=web_safari";
+/// The explicit player clients the single fallback attempt asks for when the
+/// default-client attempt fails (issue #420). `ios` is deliberately absent: it
+/// needs a PO token for live HLS (ADR-0015 §5).
+pub const FALLBACK_PLAYER_CLIENTS: &str = "default,web_safari,tv";
+
+/// Upper bound on the bytes kept from one `yt-dlp -J` stdout. A live
+/// info-dict is well under 2 MiB; anything larger is refused rather than
+/// buffered without bound.
+const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Default hard deadline for one `yt-dlp` invocation. A slower/hung process is
 /// killed, never awaited (invariant #10).
@@ -32,8 +45,14 @@ pub struct ResolverConfig {
     /// The `yt-dlp` binary to run — an explicit path, or just `"yt-dlp"` to
     /// resolve it on `PATH`.
     pub yt_dlp_path: String,
-    /// Hard per-invocation deadline; on expiry the child is killed.
+    /// Hard per-invocation deadline; on expiry the child is killed. A resolve
+    /// may run up to three invocations (default clients, js-runtime retry,
+    /// fallback clients), each under this deadline.
     pub timeout: Duration,
+    /// The JavaScript runtime handed to `yt-dlp` as `--js-runtimes node:<path>`
+    /// (an absolute path). `None` passes no runtime flag. [`Self::default`] and
+    /// [`Self::new`] fill it from [`find_node`].
+    pub js_runtime: Option<String>,
 }
 
 impl Default for ResolverConfig {
@@ -41,6 +60,7 @@ impl Default for ResolverConfig {
         Self {
             yt_dlp_path: "yt-dlp".to_owned(),
             timeout: DEFAULT_TIMEOUT,
+            js_runtime: find_node(),
         }
     }
 }
@@ -55,8 +75,75 @@ impl ResolverConfig {
         Self {
             yt_dlp_path: yt_dlp_path.into(),
             timeout,
+            js_runtime: find_node(),
         }
     }
+
+    /// Replace the JavaScript runtime path (`None` disables the flag).
+    #[must_use]
+    pub fn with_js_runtime(mut self, js_runtime: Option<String>) -> Self {
+        self.js_runtime = js_runtime;
+        self
+    }
+}
+
+/// Find an executable `node` on `PATH`, returning its absolute path. Pure
+/// filesystem lookup (no subprocess). `None` when absent.
+#[must_use]
+pub fn find_node() -> Option<String> {
+    find_on_path("node", std::env::var_os("PATH").as_deref())
+}
+
+/// Find `name` as an executable regular file in the `PATH`-style `path` list.
+#[must_use]
+pub fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<String> {
+    let path = path?;
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+        .and_then(|found| found.to_str().map(str::to_owned))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// The argument vector of one `yt-dlp -J` attempt (without the program name):
+/// `-J --no-warnings [--js-runtimes node:<path>] [--extractor-args
+/// youtube:player_client=<clients>] -- <url>`. `url` is always after `--`, so
+/// a URL starting with `-` can never be read as an option.
+#[must_use]
+pub fn resolve_args(
+    js_runtime: Option<&str>,
+    player_clients: Option<&str>,
+    url: &str,
+) -> Vec<String> {
+    let mut args = vec!["-J".to_owned(), "--no-warnings".to_owned()];
+    if let Some(node) = js_runtime {
+        args.push("--js-runtimes".to_owned());
+        args.push(format!("node:{node}"));
+    }
+    if let Some(clients) = player_clients {
+        args.push("--extractor-args".to_owned());
+        args.push(format!("youtube:player_client={clients}"));
+    }
+    args.push("--".to_owned());
+    args.push(url.to_owned());
+    args
+}
+
+/// Whether a failed `yt-dlp` run rejected the `--js-runtimes` option itself
+/// (an older `yt-dlp`), so the attempt is worth repeating without it.
+fn rejected_js_runtimes(stderr: &str) -> bool {
+    stderr.contains("no such option") && stderr.contains("js-runtimes")
 }
 
 /// Truncate captured stderr to a bounded length for logging, so a misbehaving
@@ -64,8 +151,12 @@ impl ResolverConfig {
 /// command line — cookies are secret-ref only, ADR-M006 — so there is nothing to
 /// redact from our own argv; this only bounds size.)
 fn bounded_stderr(stderr: &[u8]) -> String {
+    bounded_text(&String::from_utf8_lossy(stderr))
+}
+
+/// [`bounded_stderr`] over text already decoded.
+fn bounded_text(text: &str) -> String {
     const MAX: usize = 2048;
-    let text = String::from_utf8_lossy(stderr);
     let trimmed = text.trim();
     match trimmed.char_indices().nth(MAX) {
         Some((byte_idx, _)) => match trimmed.get(..byte_idx) {
@@ -119,30 +210,12 @@ pub async fn probe_version(config: &ResolverConfig) -> Result<String, YoutubeErr
     Ok(version)
 }
 
-/// Resolve a `YouTube` watch/live URL to a live HLS master by spawning
-/// `yt-dlp -J` and parsing its info-dict.
-///
-/// The invocation pins the `web_safari` player client, disables warnings, and is
-/// bounded by [`ResolverConfig::timeout`]; a hung process is killed. `--live-from-start`
-/// is deliberately **not** passed (we tail the live edge). `url` is passed as a
-/// single argument with no shell interpolation.
-///
-/// # Errors
-///
-/// - [`YoutubeError::Unavailable`] if `yt-dlp` cannot be spawned or times out.
-/// - [`YoutubeError::Resolve`] if it exits non-zero (extraction failure).
-/// - the [`parse_info_dict`] errors ([`YoutubeError::Json`] /
-///   [`YoutubeError::NotLive`] / [`YoutubeError::NoHlsMaster`]) on its output.
-pub async fn resolve(config: &ResolverConfig, url: &str) -> Result<ResolvedHls, YoutubeError> {
+/// One `yt-dlp -J` run: `Ok(stdout)` on success, else the classified error
+/// ([`YoutubeError::Unavailable`] for spawn failure/timeout,
+/// [`YoutubeError::Resolve`] carrying bounded stderr for a non-zero exit).
+async fn run_once(config: &ResolverConfig, args: &[String]) -> Result<String, YoutubeError> {
     let spawn = Command::new(&config.yt_dlp_path)
-        .args([
-            "-J",
-            "--no-warnings",
-            "--extractor-args",
-            PLAYER_CLIENT_ARG,
-            "--",
-        ])
-        .arg(url)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -158,7 +231,67 @@ pub async fn resolve(config: &ResolverConfig, url: &str) -> Result<ResolvedHls, 
     if !output.status.success() {
         return Err(YoutubeError::Resolve(bounded_stderr(&output.stderr)));
     }
+    if output.stdout.len() > MAX_STDOUT_BYTES {
+        return Err(YoutubeError::Resolve(format!(
+            "yt-dlp -J output exceeded {MAX_STDOUT_BYTES} bytes"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
-    let json = String::from_utf8_lossy(&output.stdout);
+/// One attempt with a given client list, retrying once without
+/// `--js-runtimes` when this `yt-dlp` does not know that option.
+async fn attempt(
+    config: &ResolverConfig,
+    clients: Option<&str>,
+    url: &str,
+) -> Result<ResolvedHls, YoutubeError> {
+    let js = config.js_runtime.as_deref();
+    let first = run_once(config, &resolve_args(js, clients, url)).await;
+    let json = match first {
+        Err(YoutubeError::Resolve(stderr)) if js.is_some() && rejected_js_runtimes(&stderr) => {
+            run_once(config, &resolve_args(None, clients, url)).await?
+        }
+        other => other?,
+    };
     parse_info_dict(&json)
+}
+
+/// Resolve a `YouTube` watch/live URL to a live HLS master by spawning
+/// `yt-dlp -J` and parsing its info-dict.
+///
+/// Attempt 1 uses `yt-dlp`'s default player clients. When it fails with an
+/// extraction error or no HLS master, attempt 2 asks for
+/// [`FALLBACK_PLAYER_CLIENTS`]. A spawn failure/timeout (binary missing or
+/// hung) and a "not live" classification are final: another client cannot
+/// fix either. Each invocation is bounded by [`ResolverConfig::timeout`]; a
+/// hung process is killed. `--live-from-start` is deliberately **not** passed
+/// (we tail the live edge). `url` is a single argument after `--` with no
+/// shell interpolation. When both attempts fail the error names both reasons.
+///
+/// # Errors
+///
+/// - [`YoutubeError::Unavailable`] if `yt-dlp` cannot be spawned or times out.
+/// - [`YoutubeError::Resolve`] if every attempt exits non-zero.
+/// - the [`parse_info_dict`] errors ([`YoutubeError::Json`] /
+///   [`YoutubeError::NotLive`] / [`YoutubeError::NoHlsMaster`]) on its output.
+pub async fn resolve(config: &ResolverConfig, url: &str) -> Result<ResolvedHls, YoutubeError> {
+    let first = match attempt(config, None, url).await {
+        Ok(resolved) => return Ok(resolved),
+        Err(e @ (YoutubeError::Unavailable(_) | YoutubeError::NotLive(_))) => return Err(e),
+        Err(e) => e,
+    };
+    match attempt(config, Some(FALLBACK_PLAYER_CLIENTS), url).await {
+        Ok(resolved) => Ok(resolved),
+        Err(YoutubeError::Resolve(second)) => {
+            let first = match first {
+                YoutubeError::Resolve(text) => text,
+                other => other.to_string(),
+            };
+            Err(YoutubeError::Resolve(bounded_text(&format!(
+                "{first} | fallback clients ({FALLBACK_PLAYER_CLIENTS}): {second}"
+            ))))
+        }
+        Err(other) => Err(other),
+    }
 }
