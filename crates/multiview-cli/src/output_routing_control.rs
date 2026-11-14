@@ -315,6 +315,9 @@ impl OutputRouting for OutputRoutingAdapter {
         if matches!(feed, RoutedFeed::Preview | RoutedFeed::Clean) && !handle.has_preview() {
             return Err(PlanRefusal::SwitcherRequired);
         }
+        if *feed == RoutedFeed::Clean && handle.dsk_defined() {
+            return Err(PlanRefusal::CleanUnavailableWithDsk);
+        }
         let snapshot = handle.snapshot();
         let bus = feed.bus_name();
         // §7 rule 1: a layout not composing for another output needs a free
@@ -589,6 +592,11 @@ impl OutputRouting for OutputRoutingAdapter {
         if audio.is_some() && !program_audio {
             // The engine would refuse it `unroutable`; the control plane
             // already answered `audio-unsupported` from the plan.
+            return Err(TakeSubmitError::Unroutable);
+        }
+        // ADR-0113 / K2a: never route DSK pixels as Clean (the plan gate
+        // already refused; this covers a caller that skipped it).
+        if take.video == Some(RoutedFeed::Clean) && handle.dsk_defined() {
             return Err(TakeSubmitError::Unroutable);
         }
         let bus = match take.video.as_ref() {

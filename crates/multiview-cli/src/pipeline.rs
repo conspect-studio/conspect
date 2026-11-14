@@ -2181,6 +2181,13 @@ pub struct Pipeline {
     /// Optional first-slice M/E on this one program; absent preserves legacy
     /// source/layout/encode behaviour byte-for-byte.
     switcher_me: Option<multiview_config::MixEffectsConfig>,
+    /// Declared downstream keyers (ADR-0113, K2a) and the keyer budget they
+    /// were admitted against at validation; empty without a `[switcher]`.
+    switcher_keyers: Vec<multiview_config::DownstreamKeyerConfig>,
+    keyer_budget: f32,
+    /// The `keyer` demand consumer set (ADR-0113 §4), kept so a definition
+    /// change (K4 `keyer_set`) can `publish` the new fill/key leases.
+    keyer_demand: Option<multiview_engine::ConsumerSet<Nv12Image>>,
     /// The id of the one config cell the first-slice M/E drives (#245). The
     /// live drain addresses cells by their config ids, so the switcher hook and
     /// the drive's id map must use this id, never the program id.
@@ -2940,6 +2947,16 @@ impl Pipeline {
             .as_ref()
             .and_then(|s| s.mix_effects.first())
             .cloned();
+        let switcher_keyers = config
+            .switcher
+            .as_ref()
+            .map(|s| s.downstream_keyers.clone())
+            .unwrap_or_default();
+        let keyer_budget = config
+            .switcher
+            .as_ref()
+            .and_then(|s| s.keyer_budget)
+            .unwrap_or(multiview_config::DEFAULT_KEYER_BUDGET);
         // This slice admits a single real full-canvas source cell. A running
         // legacy multiview with multiple cells remains untouched when the M/E
         // block is absent; an opted-in unsupported layout fails loudly instead
@@ -3557,6 +3574,9 @@ impl Pipeline {
             cadence,
             program_spec,
             switcher_me,
+            switcher_keyers,
+            keyer_budget,
+            keyer_demand: None,
             switcher_cell_id,
             switcher_control: None,
             switcher_driver: None,
@@ -3975,13 +3995,17 @@ impl Pipeline {
         )
         .map_err(spawn_err)?;
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
-        let handle = Arc::new(handle.with_outputs(run_outputs).with_pictures(
-            crate::output_routing::PlanPictures {
-                stores: plan_stores,
-                canvas: aux_canvas,
-                preview_selection: preview_selection.clone(),
-            },
-        ));
+        let handle = Arc::new(
+            handle
+                .with_outputs(run_outputs)
+                .with_pictures(crate::output_routing::PlanPictures {
+                    stores: plan_stores,
+                    canvas: aux_canvas,
+                    preview_selection: preview_selection.clone(),
+                })
+                // ADR-0113 / K2a: Clean is refused while a DSK is defined.
+                .with_dsk_defined(!self.switcher_keyers.is_empty()),
+        );
         enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
         self.output_routing.store(Some(handle));
         Ok(RunRouting {
@@ -4138,6 +4162,15 @@ impl Pipeline {
                 ]);
                 self.switcher_audio_warm = Some(warm);
             }
+        }
+        // ADR-0113 §4: a defined keyer keeps its fill and key warm, leased to
+        // the keyer object id (listed in `GET /api/v1/sources/status`).
+        if !self.switcher_keyers.is_empty() {
+            let keyers = manager.consumer_set(multiview_engine::ConsumerClass::Keyer, Rails::VIDEO);
+            keyers.seed(crate::switcher_runtime::keyer_demand_items(
+                &self.switcher_keyers,
+            ));
+            self.keyer_demand = Some(keyers);
         }
         self.demand_sets = Some((layout, audio));
         self.demand = Some(manager.clone());
@@ -4618,6 +4651,30 @@ impl Pipeline {
     #[must_use]
     pub fn switcher_me(&self) -> Option<&multiview_config::MixEffectsConfig> {
         self.switcher_me.as_ref()
+    }
+
+    /// Declared downstream keyers (ADR-0113), in config order.
+    #[must_use]
+    pub fn switcher_keyers(&self) -> &[multiview_config::DownstreamKeyerConfig] {
+        &self.switcher_keyers
+    }
+
+    /// The keyer budget the declared keyers are admitted against.
+    #[must_use]
+    pub const fn keyer_budget(&self) -> f32 {
+        self.keyer_budget
+    }
+
+    /// The `keyer` demand consumer set, once the demand manager exists.
+    #[must_use]
+    pub fn keyer_demand(&self) -> Option<&multiview_engine::ConsumerSet<Nv12Image>> {
+        self.keyer_demand.as_ref()
+    }
+
+    /// The program canvas size `(width, height)` in pixels.
+    #[must_use]
+    pub fn canvas_size(&self) -> (u32, u32) {
+        (self.layout.canvas.width, self.layout.canvas.height)
     }
 
     /// Installed, real M/E handle for the management API.

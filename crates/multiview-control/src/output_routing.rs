@@ -246,6 +246,9 @@ pub enum PlanRefusal {
     /// The output has no program-audio slot for a routed audio feed (NDI,
     /// AES67, display, or a run without program audio).
     AudioUnsupported,
+    /// Clean while a downstream keyer is defined (ADR-0113, slice K2a):
+    /// Program carries DSK pixels and pre-DSK Clean is not built yet.
+    CleanUnavailableWithDsk,
 }
 
 /// The predicted audio cost of a take (§5.2, §7).

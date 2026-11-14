@@ -496,6 +496,9 @@ pub struct OutputRoutingHandle {
     outcomes: Arc<Mutex<Option<Receiver<TakeOutcome>>>>,
     outputs: Arc<[RunOutput]>,
     has_preview: bool,
+    /// A downstream keyer is defined (ADR-0113, K2a): Program carries DSK
+    /// pixels, so Clean is refused until pre-DSK Clean lands (K2b).
+    dsk_defined: bool,
     /// What the plan needs to tell an identity picture (P2) from a convert
     /// (P3), #342 B2: the run's store lookup and its canvas. `None` until
     /// [`OutputRoutingHandle::with_pictures`].
@@ -638,6 +641,20 @@ impl OutputRoutingHandle {
     pub fn with_pictures(mut self, pictures: PlanPictures) -> Self {
         self.pictures = Some(pictures);
         self
+    }
+
+    /// Mark the run as defining a downstream keyer (ADR-0113, K2a): a take
+    /// to Clean is then refused (`clean-unavailable-with-dsk`).
+    #[must_use]
+    pub fn with_dsk_defined(mut self, defined: bool) -> Self {
+        self.dsk_defined = defined;
+        self
+    }
+
+    /// Whether the run defines a downstream keyer (Clean is unavailable).
+    #[must_use]
+    pub const fn dsk_defined(&self) -> bool {
+        self.dsk_defined
     }
 
     /// The run's store lookup and canvas, when attached.
@@ -1231,6 +1248,7 @@ impl OutputRouter {
             outcomes: Arc::new(Mutex::new(Some(outcome_rx))),
             outputs: Arc::from(Vec::new()),
             has_preview: cfg.has_preview,
+            dsk_defined: false,
             pictures: None,
             max_aux_canvases: cfg.max_aux_canvases,
         };
