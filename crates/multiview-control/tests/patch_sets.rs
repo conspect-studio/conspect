@@ -1339,3 +1339,98 @@ async fn different_encoder_settings_never_share_one_new_encoder() {
     let (status, accepted) = take(&rig, OPERATOR_TOKEN, "shared", &shared).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
 }
+
+/// #308 review A7: a set's limiter charge is refunded on EVERY unsuccessful
+/// exit after admission — 409 `capacity` (the encoder delta does not fit),
+/// 503 `engine-busy` (the router's own mailbox refuses the enqueue after
+/// every control-plane gate passed) — and a replay of an earlier 202 never
+/// charges the limiter at all (it answers before `TakeLimiter::admit_across`
+/// runs). None of them narrow output-0's or the principal's per-second
+/// budget: two 409s and one 503, all touching output-0, still leave BOTH of
+/// output-0's `TAKES_PER_OUTPUT_PER_SEC = 2` slots free for two fresh
+/// single-output takes in the same second.
+#[tokio::test]
+async fn refused_and_replayed_sets_refund_their_limiter_charge() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+
+    // The principal already holds its encoder cap (2 of 2): a set needing
+    // ANY new encoder is refused 409 `capacity` AFTER `admit_across` has
+    // already charged output-0 and output-1 (and the principal window).
+    rig.fake
+        .state
+        .lock()
+        .unwrap()
+        .held
+        .insert("operator-key".to_owned(), 2);
+    let capacity_body = set(vec![video(0, bars()), video(1, json!({"source": "vt1"}))]);
+    for i in 0..2 {
+        let (status, problem) = take(
+            &rig,
+            OPERATOR_TOKEN,
+            &format!("refund-cap-{i}"),
+            &capacity_body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+        assert!(
+            problem["type"].as_str().unwrap().ends_with("capacity"),
+            "{problem}"
+        );
+    }
+    assert!(
+        rig.fake.state.lock().unwrap().offered.is_empty(),
+        "a 409 capacity set never reaches the engine"
+    );
+
+    // Clear the cap, then make the router's OWN mailbox refuse: a set that
+    // passes every control-plane gate (including the encoder delta) but
+    // whose `try_take_set` the router refuses (503 `engine-busy`) must ALSO
+    // refund — it reached the engine's door but never landed.
+    rig.fake.state.lock().unwrap().held.remove("operator-key");
+    rig.fake.state.lock().unwrap().busy = true;
+    let busy_body = set(vec![video(0, bars()), video(5, bars())]);
+    let (status, problem) = take(&rig, OPERATOR_TOKEN, "refund-busy", &busy_body).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{problem}");
+    rig.fake.state.lock().unwrap().busy = false;
+    assert_eq!(
+        rig.state.patch_sets.records_len(),
+        0,
+        "the busy set's key was released, nothing left charged"
+    );
+
+    // An admitted set on DIFFERENT outputs (not output-0), then a replay of
+    // its own key: the replay answers from the store before `admit_across`
+    // runs at all, so it never re-charges any limiter either.
+    let admitted_body = set(vec![video(7, bars()), video(8, bars())]);
+    let (status, first) = take(&rig, OPERATOR_TOKEN, "refund-replay", &admitted_body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    let (status, replay) = take(&rig, OPERATOR_TOKEN, "refund-replay", &admitted_body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+    assert_eq!(replay["operation_id"], first["operation_id"], "a replay");
+
+    // Despite two 409s and one 503 all touching output-0 (three charges
+    // that would have exhausted and overrun its 2/s window had any of them
+    // leaked), output-0 still admits two FRESH single-output takes in the
+    // same second — proving every one of those charges was given back.
+    for i in 0..2 {
+        let (status, body) = take(
+            &rig,
+            OPERATOR_TOKEN,
+            &format!("refund-single-{i}"),
+            &set(vec![video(0, bars())]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "single take {i}: {body}");
+    }
+    // Both of output-0's slots are now genuinely spent (not still open from
+    // an under-counted refund): a third touch in the same second is 429.
+    let (status, body) = take(
+        &rig,
+        OPERATOR_TOKEN,
+        "refund-single-overflow",
+        &set(vec![video(0, bars())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+}

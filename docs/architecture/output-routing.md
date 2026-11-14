@@ -2783,11 +2783,31 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   crosspoints never multiply either budget — and alternating single-output takes with
   multi-destination sets on the SAME output cannot double that output's 2/s budget by routing one
   path through `patch_limiter` and the other through `control.limiter`. The principal is charged
-  once per limiter the set's destinations touch (`TakeLimiter::check_set`/`record_set`): a
-  mixer-only set charges only `patch_limiter`'s principal window, an output-only set charges only
-  `control.limiter`'s, and a mixed set charges both, so it cannot escape either principal budget by
-  hiding part of its destinations behind the other limiter. Both limiters are checked (never
-  recorded) before either records, so a refusal on either consumes nothing on the other. The set's
+  once per limiter the set's destinations touch: a mixer-only set charges only `patch_limiter`'s
+  principal window, an output-only set charges only `control.limiter`'s, and a mixed set charges
+  both, so it cannot escape either principal budget by hiding part of its destinations behind the
+  other limiter. Admission is ONE atomic operation across every limiter the set spans
+  (`TakeLimiter::admit_across`, #308 review A6, fixed in slice E2 round 2): it locks every
+  participating limiter's mutex at once, in one consistent order (by pointer address, so two
+  concurrent set admissions naming the same limiters never deadlock each other), checks every
+  destination and principal window under those locks, and only once every limiter has passed does
+  it record on any of them. The earlier shape (`check_set` on every limiter, then `record_set` on
+  every limiter, two separate lock acquisitions) left a window where a concurrent admission — a
+  single-output `admit` on `control.limiter`, or another set's own two-step admission — could pass
+  its own check before either of this set's `record_set` calls ran, so two concurrent takers of an
+  output's last slot could both be admitted; `admit_across`'s single locked critical section closes
+  it, and single-output `admit` stays mutually exclusive with it because both lock the same mutex.
+  A refusal on any participating limiter charges nothing anywhere (every lock is released first).
+  The charge itself is tracked as a `SetCharge` (which limiter, which destinations, the one
+  principal, the instant) and is refunded — on every destination and the principal window, on
+  every limiter, exactly once each — on every unsuccessful exit AFTER admission: the set's own
+  encoder-delta capacity check, an idempotency-store capacity or conflict, a lease failure, and a
+  failed `try_take_set`/`PatchArmed` enqueue (#308 review A7, fixed in slice E2 round 2); a replay
+  of an earlier 202 answers from the idempotency store before `admit_across` ever runs, so it never
+  charges anything to refund. `take_set` wraps the charge in a drop-refunds-unless-committed guard,
+  so an admission path with several early-return exits cannot forget one; only a set that actually
+  reaches the engine (armed and/or enqueued) keeps its charge, exactly as a single take's own
+  `TakeLimiter::refund` already does for `POST /routing/output/take`. The set's
   NEW encoder delta counts members whose plan needs an encoder, deduplicated per identical
   engine encoder identity: the router's sharing key (feed at the output's format, the output's
   encoder settings and its landed live reset's settings), read through the defaulted seam

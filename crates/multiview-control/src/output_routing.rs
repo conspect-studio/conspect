@@ -974,57 +974,112 @@ impl TakeLimiter {
         Ok(())
     }
 
-    /// Check (never record) the per-destination window for every entry in
-    /// `destinations`, and the per-principal window for `charge_principal`
-    /// when given. The counterpart to [`Self::record_set`]: a multi-member
-    /// take that spans two [`TakeLimiter`] instances (the mixer's
-    /// `patch_limiter` and an output's `control.limiter`, review B3) must
-    /// check both before recording into either, so a refusal on the second
-    /// limiter never leaves the first charged.
-    ///
-    /// # Errors
-    /// The longest delay until every needed slot frees.
-    pub fn check_set(
-        &self,
-        destinations: &[String],
-        charge_principal: Option<&str>,
-        now: Instant,
-    ) -> Result<(), Duration> {
+    /// Refund every destination in `destinations` and the one principal
+    /// charge made for them in one lock (undoes [`Self::admit_across`]'s
+    /// per-limiter charge, #308 review A7): the counterpart to
+    /// [`WindowLimiter::refund`] for a whole set's destinations on this one
+    /// limiter.
+    fn refund_many(&self, destinations: &[String], principal: &str, at: Instant) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let (outputs, principals) = &mut *guard;
-        let mut wait: Option<Duration> = None;
         for destination in destinations {
-            if let Err(delay) = outputs.check(destination, now) {
-                wait = Some(wait.map_or(delay, |w| w.max(delay)));
+            outputs.refund(destination, at);
+        }
+        principals.refund(principal, at);
+    }
+
+    /// Admit one multi-destination take as ONE atomic operation across
+    /// every [`TakeLimiter`] it spans (#308 reviews A6/B3: a mixed set
+    /// charges the mixer's `patch_limiter` for its mixer destinations and an
+    /// output's `control.limiter` for its output destinations, the SAME
+    /// limiter a single-output take's [`Self::admit`] uses). Locking two
+    /// `check_set`-then-`record_set` calls separately (the slice-E2-round-1
+    /// shape) left a window where a concurrent admission could pass both
+    /// checks before either recorded, so two concurrent requests could both
+    /// take the output's last slot. This method closes that window: it
+    /// locks EVERY participating limiter's mutex at once, in one
+    /// consistent order (by pointer address, so two concurrent admissions
+    /// naming the same limiters never deadlock), checks every destination
+    /// and that limiter's principal window, and only once every limiter has
+    /// passed does it record on any of them — all still under the locks.
+    /// The same limiter named twice (defensive) is deduped: its
+    /// destinations are merged and its principal window charged once.
+    /// Single-destination [`Self::admit`] keeps locking only its own
+    /// mutex, so it stays mutually exclusive with a set admission that also
+    /// touches that limiter.
+    ///
+    /// Only limiters with at least one destination in `parts` are charged
+    /// (an empty slice names a limiter the set does not touch, so it is
+    /// skipped, matching a single-limiter set charging only its own
+    /// principal window).
+    ///
+    /// # Errors
+    /// The longest delay until every needed slot frees; nothing is charged.
+    pub fn admit_across<'a>(
+        parts: &[(&'a TakeLimiter, &[String])],
+        principal: &str,
+        now: Instant,
+    ) -> Result<SetCharge<'a>, Duration> {
+        // Dedupe by limiter identity (pointer), merging each limiter's
+        // distinct destinations; only a limiter the set actually touches
+        // participates (and is charged).
+        let mut grouped: Vec<(*const TakeLimiter, &'a TakeLimiter, Vec<String>)> = Vec::new();
+        for (limiter, destinations) in parts {
+            let ptr: *const TakeLimiter = *limiter;
+            if let Some(entry) = grouped.iter_mut().find(|(p, _, _)| *p == ptr) {
+                for destination in *destinations {
+                    if !entry.2.contains(destination) {
+                        entry.2.push(destination.clone());
+                    }
+                }
+            } else {
+                grouped.push((ptr, *limiter, destinations.to_vec()));
             }
         }
-        if let Some(principal) = charge_principal {
+        grouped.retain(|(_, _, destinations)| !destinations.is_empty());
+        // A consistent global lock order (by pointer address): two
+        // concurrent set admissions spanning the same limiters always
+        // acquire them in the same order, so neither can deadlock the
+        // other.
+        grouped.sort_by_key(|(ptr, _, _)| *ptr);
+        let mut guards: Vec<std::sync::MutexGuard<'_, (WindowLimiter, WindowLimiter)>> =
+            Vec::with_capacity(grouped.len());
+        for (_, limiter, _) in &grouped {
+            guards.push(limiter.inner.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+        let mut wait: Option<Duration> = None;
+        for ((_, _, destinations), guard) in grouped.iter().zip(guards.iter_mut()) {
+            let (outputs, principals) = &mut **guard;
+            for destination in destinations {
+                if let Err(delay) = outputs.check(destination, now) {
+                    wait = Some(wait.map_or(delay, |w| w.max(delay)));
+                }
+            }
             if let Err(delay) = principals.check(principal, now) {
                 wait = Some(wait.map_or(delay, |w| w.max(delay)));
             }
         }
-        wait.map_or(Ok(()), Err)
-    }
-
-    /// Record one take per entry in `destinations`, and one take for
-    /// `charge_principal` when given. Call only after every limiter this
-    /// multi-member take spans has passed [`Self::check_set`] (review B3):
-    /// this method itself never checks, so a caller that records on a
-    /// limiter it has not just checked can over-admit.
-    pub fn record_set(
-        &self,
-        destinations: &[String],
-        charge_principal: Option<&str>,
-        now: Instant,
-    ) {
-        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let (outputs, principals) = &mut *guard;
-        for destination in destinations {
-            outputs.record(destination, now);
+        if let Some(wait) = wait {
+            // Every lock is dropped here (guards goes out of scope) without
+            // a single record having happened: a refusal charges nothing.
+            return Err(wait);
         }
-        if let Some(principal) = charge_principal {
+        for ((_, _, destinations), guard) in grouped.iter().zip(guards.iter_mut()) {
+            let (outputs, principals) = &mut **guard;
+            for destination in destinations {
+                outputs.record(destination, now);
+            }
             principals.record(principal, now);
         }
+        drop(guards);
+        Ok(SetCharge {
+            parts: grouped
+                .into_iter()
+                .map(|(_, limiter, destinations)| (limiter, destinations))
+                .collect(),
+            principal: principal.to_owned(),
+            at: now,
+        })
     }
 
     /// Tracked (outputs, principals) — the bound is the cap.
@@ -1032,6 +1087,71 @@ impl TakeLimiter {
     pub fn tracked(&self) -> (usize, usize) {
         let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         (guard.0.len(), guard.1.len())
+    }
+}
+
+/// Exactly what [`TakeLimiter::admit_across`] charged: which limiter, which
+/// destinations on it, the one principal, and the instant (#308 review A6).
+/// Kept until the take reaches the engine; [`Self::refund`] undoes the
+/// charge on every unsuccessful exit after admission (review A7), so only a
+/// set that actually reached the engine stays charged, exactly as a single
+/// take's [`TakeLimiter::refund`] already does. Dropping a `SetCharge`
+/// without calling `refund` leaves the charge in place (the set DID admit);
+/// callers that must refund on every exit unless committed use
+/// [`SetChargeGuard`].
+#[derive(Debug)]
+pub struct SetCharge<'a> {
+    parts: Vec<(&'a TakeLimiter, Vec<String>)>,
+    principal: String,
+    at: Instant,
+}
+
+impl SetCharge<'_> {
+    /// Give back every destination and principal slot this charge recorded,
+    /// on every participating limiter, exactly once each (#308 review A7):
+    /// a set refused after admission (encoder capacity, idempotency
+    /// capacity/conflict/replay, a lease failure, a failed enqueue) must
+    /// not consume the budget a set that never reached the engine would
+    /// otherwise have burned. Each limiter is locked once for its own
+    /// refund; no two `SetCharge`s alias the same limiter's destinations
+    /// without each owning its own charge, so a double-refund of one
+    /// take-slot cannot happen through this type.
+    pub fn refund(self) {
+        for (limiter, destinations) in &self.parts {
+            limiter.refund_many(destinations, &self.principal, self.at);
+        }
+    }
+}
+
+/// An RAII guard around a [`SetCharge`]: refunds it on drop unless
+/// [`Self::commit`] already consumed it (#308 review A7). Use this instead
+/// of calling [`SetCharge::refund`] by hand on every early-return branch of
+/// an admission path with several exits: a branch added later that forgets
+/// an explicit refund call still refunds correctly when the guard drops.
+pub struct SetChargeGuard<'a> {
+    charge: Option<SetCharge<'a>>,
+}
+
+impl<'a> SetChargeGuard<'a> {
+    /// Wrap `charge` for RAII refund-on-drop.
+    #[must_use]
+    pub fn new(charge: SetCharge<'a>) -> Self {
+        Self {
+            charge: Some(charge),
+        }
+    }
+
+    /// The take reached the engine: keep the charge (no refund on drop).
+    pub fn commit(mut self) {
+        self.charge.take();
+    }
+}
+
+impl Drop for SetChargeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(charge) = self.charge.take() {
+            charge.refund();
+        }
     }
 }
 
@@ -1420,6 +1540,116 @@ mod tests {
             assert!(limiter.admit(&format!("x{i}"), "q", t1).is_ok());
         }
         assert!(limiter.admit("y", "q", t1).is_err());
+    }
+
+    /// #308 review A6: `admit_across` locks every participating limiter and
+    /// checks-then-records atomically, so a single-output `admit` racing a
+    /// `admit_across` set naming the SAME limiter and output can never both
+    /// pass the output's last slot. One output's limit is 2; it is already
+    /// at 1 use (one prior single take), so exactly one slot remains. Two
+    /// threads race for it at the same instant with a `Barrier`: one is a
+    /// plain `admit` (as a single-output take), the other an
+    /// `admit_across` touching the same destination (as a set). Exactly one
+    /// must succeed, and the output's recorded use count must never exceed
+    /// the limit — repeated for many rounds (fresh limiter and instant each
+    /// round) to make a races-both-through window visible if the locking
+    /// were not atomic.
+    #[test]
+    fn set_and_single_take_admission_on_one_output_is_mutually_exclusive() {
+        for round in 0..200_u64 {
+            let limiter = Arc::new(TakeLimiter::new(8, 8));
+            let now = Instant::now() + Duration::from_secs(round * 10);
+            // Pre-charge the output to 1 of its 2 slots (as a prior single
+            // take would), leaving exactly one slot for the race.
+            assert!(limiter.admit("out-0", "pre", now).is_ok());
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let single_limiter = Arc::clone(&limiter);
+            let single_barrier = Arc::clone(&barrier);
+            let single = std::thread::spawn(move || {
+                single_barrier.wait();
+                single_limiter.admit("out-0", "single-principal", now)
+            });
+
+            let set_limiter = Arc::clone(&limiter);
+            let set_barrier = Arc::clone(&barrier);
+            let set = std::thread::spawn(move || {
+                let destinations = vec!["out-0".to_owned()];
+                let parts = [(&*set_limiter, destinations.as_slice())];
+                set_barrier.wait();
+                // A `SetCharge` with no `.refund()` call leaves its charge
+                // in place (as a set that reached the engine would): this
+                // test asserts mutual exclusion, not refund behaviour.
+                TakeLimiter::admit_across(&parts, "set-principal", now).map(|_charge| ())
+            });
+
+            let single_ok = single.join().unwrap().is_ok();
+            let set_ok = set.join().unwrap().is_ok();
+            assert!(
+                single_ok ^ set_ok,
+                "round {round}: exactly one of the single take and the set \
+                 must win the output's last slot (single={single_ok}, set={set_ok})"
+            );
+            // The output's window never exceeds its limit (2): the
+            // pre-charge plus exactly one winner.
+            let (outputs, _) = limiter.tracked();
+            assert_eq!(outputs, 1, "round {round}: still one tracked output");
+            // A fresh request at the same instant is now refused on both
+            // paths (the window is full): confirms the count really is 2,
+            // never 3.
+            assert!(
+                limiter.admit("out-0", "overflow-check", now).is_err(),
+                "round {round}: the output window must be exactly at its \
+                 limit after the race, never over it"
+            );
+        }
+    }
+
+    /// #308 review A6: `admit_across` spanning TWO distinct limiters (as a
+    /// mixed set touching `patch_limiter` and an output's `control.limiter`)
+    /// locks both before checking either, so a concurrent `admit_across` set
+    /// and a concurrent single-output `admit` on the shared output limiter
+    /// still observe exactly one winner for the output's last slot, the
+    /// same guarantee as the single-limiter case above, repeated for many
+    /// rounds.
+    #[test]
+    fn two_limiter_set_admission_is_still_mutually_exclusive_with_a_single_take() {
+        for round in 0..100_u64 {
+            let mixer_limiter = TakeLimiter::new(8, 8);
+            let output_limiter = Arc::new(TakeLimiter::new(8, 8));
+            let now = Instant::now() + Duration::from_secs(round * 10);
+            assert!(output_limiter.admit("out-0", "pre", now).is_ok());
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let single_limiter = Arc::clone(&output_limiter);
+            let single_barrier = Arc::clone(&barrier);
+            let single = std::thread::spawn(move || {
+                single_barrier.wait();
+                single_limiter.admit("out-0", "single-principal", now)
+            });
+
+            let set_barrier = Arc::clone(&barrier);
+            let mixer_destinations = vec!["me1.in4".to_owned()];
+            let output_destinations = vec!["out-0".to_owned()];
+            let parts = [
+                (&mixer_limiter, mixer_destinations.as_slice()),
+                (&*output_limiter, output_destinations.as_slice()),
+            ];
+            set_barrier.wait();
+            let set_ok = TakeLimiter::admit_across(&parts, "set-principal", now).is_ok();
+
+            let single_ok = single.join().unwrap().is_ok();
+            assert!(
+                single_ok ^ set_ok,
+                "round {round}: exactly one winner (single={single_ok}, set={set_ok})"
+            );
+            assert!(
+                output_limiter
+                    .admit("out-0", "overflow-check", now)
+                    .is_err(),
+                "round {round}: the output window must be at its limit, never over it"
+            );
+        }
     }
 
     #[test]

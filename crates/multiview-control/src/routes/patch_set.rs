@@ -527,16 +527,20 @@ pub(crate) fn take_set(
     }
     // One take for the principal, one per destination (§12.8 rule 3).
     //
-    // B3: a set's output members are charged against the SAME limiter a
+    // A6/B3: a set's output members are charged against the SAME limiter a
     // single-output take uses (`control.limiter`, `take_output_slot0`'s
     // `output_routing.rs`), not the mixer's `patch_limiter`: alternating
     // single-output takes with two-output sets on one output must not
     // double that output's or the principal's per-second budget. Mixer
     // members keep `patch_limiter`, exactly as a plain mixer patch
-    // (`take_patch`). The two limiters are checked together before either
-    // records (`check_set` on both, then `record_set` on both): a refusal
-    // on either consumes nothing on the other (docs/architecture/
-    // output-routing.md §12.8).
+    // (`take_patch`). Both limiters are admitted in ONE call to
+    // `TakeLimiter::admit_across` (#308 review A6, fixed in slice E2 round
+    // 2): it locks every participating limiter's mutex at once, checks
+    // every destination and principal window under those locks, and only
+    // then records on any of them — so a concurrent single-output `admit`
+    // or another set's `admit_across` on the same limiter can never
+    // interleave between a check and a record the way the previous
+    // check-then-record-separately shape allowed.
     let mixer_destinations: Vec<String> = mixer
         .as_ref()
         .map(|m| {
@@ -547,51 +551,33 @@ pub(crate) fn take_set(
         })
         .unwrap_or_default();
     let output_destinations: Vec<String> = outputs.iter().map(|o| o.api_id.clone()).collect();
-    // The principal is charged once per set, but on every limiter whose
-    // destinations it touches: a mixed set must not escape either the
-    // mixer-patch principal budget or the output-take principal budget by
-    // routing only part of its destinations through each limiter.
-    let charge_mixer_principal = mixer.is_some();
-    let charge_output_principal = !outputs.is_empty();
     let now = Instant::now();
     let control_limiter = state.output_routing.as_ref().map(|c| &c.limiter);
-    if let Err(retry) = state.patch_limiter.check_set(
-        &mixer_destinations,
-        charge_mixer_principal.then_some(principal.key_id.as_str()),
-        now,
-    ) {
-        return Ok(Err(too_many(retry)));
+    if !output_destinations.is_empty() && control_limiter.is_none() {
+        return Ok(Err(routing_unavailable()));
     }
-    if !output_destinations.is_empty() {
-        let Some(limiter) = control_limiter else {
-            return Ok(Err(routing_unavailable()));
-        };
-        if let Err(retry) = limiter.check_set(
-            &output_destinations,
-            charge_output_principal.then_some(principal.key_id.as_str()),
-            now,
-        ) {
-            return Ok(Err(too_many(retry)));
+    let mut parts: Vec<(&crate::output_routing::TakeLimiter, &[String])> = Vec::new();
+    if !mixer_destinations.is_empty() {
+        parts.push((&state.patch_limiter, mixer_destinations.as_slice()));
+    }
+    if let Some(limiter) = control_limiter {
+        if !output_destinations.is_empty() {
+            parts.push((limiter, output_destinations.as_slice()));
         }
     }
-    // Both limiters passed their check; record on both now (never partially:
-    // a check failure above returned before either limiter recorded).
-    state.patch_limiter.record_set(
-        &mixer_destinations,
-        charge_mixer_principal.then_some(principal.key_id.as_str()),
-        now,
-    );
-    if !output_destinations.is_empty() {
-        // Existence of `control_limiter` was already proven above when
-        // `output_destinations` is non-empty.
-        if let Some(limiter) = control_limiter {
-            limiter.record_set(
-                &output_destinations,
-                charge_output_principal.then_some(principal.key_id.as_str()),
-                now,
-            );
+    // A7: the charge is refunded on every unsuccessful exit from here on
+    // (encoder capacity, idempotency capacity/conflict, a replay of an
+    // earlier 202, a lease failure, or a failed enqueue) unless `commit()`
+    // is called after the set actually reaches the engine — an RAII guard
+    // so a future added exit path cannot forget it.
+    let charge_guard = if parts.is_empty() {
+        None
+    } else {
+        match crate::output_routing::TakeLimiter::admit_across(&parts, &principal.key_id, now) {
+            Ok(charge) => Some(crate::output_routing::SetChargeGuard::new(charge)),
+            Err(retry) => return Ok(Err(too_many(retry))),
         }
-    }
+    };
     // The set's NEW encoder delta (members with one encoder identity share
     // one) against the principal's cap and the global sessions (rule 1).
     let mut encoders: Vec<&String> = Vec::new();
@@ -604,6 +590,8 @@ pub(crate) fn take_set(
         global = live_sessions(state);
     }
     if !delta_fits(state, principal, encoders.len(), global) {
+        // The charge guard drops here and refunds: this set never reaches
+        // the engine.
         let (in_use, max) = global.unwrap_or((0, 0));
         return Ok(Err(refusal_problem(
             409,
@@ -632,6 +620,10 @@ pub(crate) fn take_set(
         },
         Instant::now(),
     ) {
+        // The charge guard drops and refunds on every one of these: a
+        // capacity/conflict failure or a replay of an EARLIER 202 must not
+        // consume this request's charge, since nothing of this request
+        // reaches the engine.
         SetReservation::Capacity => return Err(ControlError::IdempotencyCapacity),
         SetReservation::Conflict => return Err(super::output_routing::key_reused()),
         SetReservation::Replay(op) => return Ok(Ok(op.to_string())),
@@ -712,7 +704,8 @@ pub(crate) fn take_set(
         if let Err(error) = control.routing.try_take_set(set) {
             // The switcher's armed half is dropped by the refusal (it
             // publishes its own refused outcome, which releases its leases);
-            // nothing of the set changes.
+            // nothing of the set changes. The charge guard drops here too:
+            // a set whose enqueue failed (503) must not stay charged.
             if let Some(arm) = &arm {
                 let _ = arm.refuse(SetRefusal::Busy);
             }
@@ -722,6 +715,10 @@ pub(crate) fn take_set(
                 TakeSubmitError::Unroutable => unroutable_kind(),
             }));
         }
+    }
+    // The set reached the engine (armed and/or enqueued): keep the charge.
+    if let Some(guard) = charge_guard {
+        guard.commit();
     }
     state.audit(
         &principal.key_id,
