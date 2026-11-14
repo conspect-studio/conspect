@@ -592,6 +592,16 @@ fn a_silent_tap_never_blocks_the_router_or_reaches_p0() {
     // (the router never waits on the key's tap).
     p.assert_one_packet_per_tick(0);
     p.assert_one_packet_per_tick(1);
+    // Review R2-A-6: the router's tick is bounded. The bound is generous
+    // (robust on a loaded CI runner): the slowest of 300+ router ticks
+    // stays under half the harness tick period (200 ms at 5 fps); a router
+    // waiting on the never-sending tap would block indefinitely.
+    let period = std::time::Duration::from_nanos(u64::try_from(TICK_NS).unwrap());
+    assert!(
+        p.x.max_router < period / 2,
+        "slowest router tick {:?} vs period {period:?}",
+        p.x.max_router
+    );
     let program: Vec<i64> = p.packets(0).iter().map(|x| x.0).collect();
     assert!(
         program.windows(2).all(|w| w[1] == w[0] + 1),
@@ -750,6 +760,16 @@ fn a_set_take_off_p0_retires_the_candidate() {
     assert!(p.view(0).passthrough.is_none(), "candidate retired");
     assert_eq!(p.x.h.snapshot().passthrough.keys_live, 0);
     p.assert_one_packet_per_tick(0);
+    // Review R2 (I-1): the old key's tap reader is gone (reaped off-clock).
+    let mut gone = false;
+    for _ in 0..200 {
+        if p.src.tap.consumer_count() == 0 {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(gone, "the tap is unsubscribed");
 }
 
 fn take_by(op: &str, output: usize, principal: &str) -> OutputTake {
