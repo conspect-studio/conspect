@@ -618,6 +618,9 @@ pub struct Tile<'a> {
     pub dst_h: u32,
     /// Uniform tile opacity in `[0, 1]` (straight alpha).
     pub opacity: f32,
+    /// An optional wipe mask (ADR-0112 §3): its per-canvas-pixel coverage
+    /// multiplies into the tile alpha at the one premultiply step.
+    pub mask: Option<crate::mask::WipeMask>,
 }
 
 impl<'a> Tile<'a> {
@@ -633,6 +636,7 @@ impl<'a> Tile<'a> {
             dst_w: image.width,
             dst_h: image.height,
             opacity,
+            mask: None,
         }
     }
 
@@ -656,7 +660,20 @@ impl<'a> Tile<'a> {
             dst_w,
             dst_h,
             opacity,
+            mask: None,
         }
+    }
+
+    /// This tile, drawn through a wipe `mask` (ADR-0112 §3).
+    #[must_use]
+    pub const fn with_mask(mut self, mask: crate::mask::WipeMask) -> Self {
+        self.mask = Some(mask);
+        self
+    }
+
+    /// The mask coverage at canvas pixel `(px, py)`; `1` without a mask.
+    fn mask_coverage(&self, px: u32, py: u32) -> f32 {
+        self.mask.as_ref().map_or(1.0, |mask| mask.coverage(px, py))
     }
 
     /// The destination width in pixels (the source is scaled to it). Falls back
@@ -1398,7 +1415,9 @@ fn composite_band_reference(
                     r: lin[0],
                     g: lin[1],
                     b: lin[2],
-                    a: tile.opacity.clamp(0.0, 1.0) * tile_alpha(tile.image, sx, sy),
+                    a: tile.opacity.clamp(0.0, 1.0)
+                        * tile_alpha(tile.image, sx, sy)
+                        * tile.mask_coverage(px, py),
                 }
                 .premultiplied();
                 acc = over(src, acc);
@@ -1673,11 +1692,18 @@ fn fold_tile_into_band(
                     }
                     None => tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?,
                 };
+                // Canvas pixel for the wipe mask (bands split rows only).
+                let canvas_px = (
+                    u32::try_from(gx).unwrap_or(0),
+                    u32::try_from(gy).unwrap_or(0),
+                );
                 let src = LinearRgba {
                     r: lin[0],
                     g: lin[1],
                     b: lin[2],
-                    a: opacity * tile_alpha(tile.image, src_x, src_y),
+                    a: opacity
+                        * tile_alpha(tile.image, src_x, src_y)
+                        * tile.mask_coverage(canvas_px.0, canvas_px.1),
                 }
                 .premultiplied();
                 // The accumulator destination: the resident value if this pixel
