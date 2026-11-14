@@ -871,12 +871,20 @@ mod tests {
                 sent
             })
         };
+        // Drain until the producer has really refilled the queue several times
+        // over. A fixed iteration count raced on a loaded CI runner: all drains
+        // could finish before the producer thread was ever scheduled (total 0).
+        // The deadline only bounds a broken producer; it is not a timing claim.
         let mut total = 0_usize;
         let mut max = 0_usize;
-        for _ in 0..20_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while total <= 4 * CAP && std::time::Instant::now() < deadline {
             let n = rx.try_drain().len();
             max = max.max(n);
             total += n;
+            if n == 0 {
+                std::thread::yield_now();
+            }
         }
         done.store(true, std::sync::atomic::Ordering::Release);
         let sent = producer.join().unwrap();
