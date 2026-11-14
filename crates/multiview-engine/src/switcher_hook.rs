@@ -4,8 +4,9 @@ use crate::clock::Tick;
 use crate::drive::{CompositedFrame, CompositorDrive, TransitionStyle};
 use crate::runtime::FrameControl;
 use crate::switcher_control::SwitcherTickDriver;
+use multiview_compositor::mask::MaskShape;
 use multiview_compositor::pipeline::Nv12Image;
-use multiview_core::switcher::{Rgb8, SourceRef, TransitionDescriptor};
+use multiview_core::switcher::{Rgb8, SourceRef, TransitionDescriptor, WipePattern};
 use multiview_framestore::{SwapCell, TileStore};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +34,17 @@ pub struct SwitcherFrameHook<C> {
     last_preview: Option<Arc<str>>,
     fps_num: i64,
     fps_den: i64,
+}
+
+/// The compositor's mask shape for a switcher wipe pattern.
+fn mask_shape(pattern: WipePattern) -> MaskShape {
+    match pattern {
+        WipePattern::Vertical => MaskShape::Vertical,
+        WipePattern::Diagonal => MaskShape::Diagonal,
+        WipePattern::Box => MaskShape::Box,
+        WipePattern::Circle => MaskShape::Circle,
+        _ => MaskShape::Horizontal,
+    }
 }
 
 impl<C> SwitcherFrameHook<C> {
@@ -96,6 +108,22 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             } => TransitionStyle::Dip {
                 color: color.unwrap_or(Rgb8::BLACK),
                 switch_point: *switch_point,
+            },
+            TransitionDescriptor::Wipe {
+                pattern,
+                softness,
+                border_width,
+                border_color,
+                position_xy,
+                reverse,
+                ..
+            } => TransitionStyle::Wipe {
+                shape: mask_shape(*pattern),
+                origin: *position_xy,
+                reverse: *reverse,
+                softness: *softness,
+                border_width: *border_width,
+                border_color: *border_color,
             },
             _ => TransitionStyle::Mix,
         };
