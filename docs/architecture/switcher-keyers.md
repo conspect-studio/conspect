@@ -519,7 +519,10 @@ keyers.
   from the document validation, where the canvas is known. It checks: at most 2 DSKs; unique ids
   and z; a declared program; fill and key are declared sources, `in:` refused; rate in 1..=300;
   clip in [0, 1]; gain finite and >= 0; fly even, >= 16 and inside the canvas; `max_source` even
-  and <= 8192; mask inside `max_source`; summed cost within the budget.
+  and <= 8192; mask inside `max_source`; summed cost within the budget. A DSK also needs a
+  `[[switcher.mix_effects]]` on its program (`dsk-requires-mix-effects`, review F3): keyers run
+  on the M/E's Program drive, and without one boot would install nothing while `on_at_start`,
+  the demand leases and the Clean refusal still applied.
 - **Cost and budget.** `keyer_cost` is `fold·dst/canvas + u·(fill + key)/canvas` on the
   `max_source` areas, shared by config and engine (`KeyerDef::cost`). `KEYER_UPLOAD_WEIGHT` (`u`) is
   1.0. That value is an uncalibrated placeholder until the RTX 4060 figure lands with the GPU key
@@ -545,12 +548,16 @@ keyers.
     - `unknown-keyer`;
     - `keyer-ramping` (AUTO during AUTO);
     - an AUTO interrupted by a keyer CUT;
-    - `source-lost`.
+    - `source-lost`;
+    - `keyer-rate` (`REFUSE_KEYER_RATE`, review F5): a `KeyerAuto` rate override above
+      `MAX_KEYER_RATE` (300, the config bound), refused before any state change. A
+      `FrameCount` is already >= 1.
   - An AUTO toward the current state is an applied no-op.
 - **Gate, pair, loss.**
   - **Going on.** Fill and key must be fresh (`read_at(pts)` Fresh) and inside `max_source`.
     Going off is never gated.
-  - **Reads.** Each keyer that is on, ramping or riding a tied MIX does one `read_at` per source
+  - **Reads.** Each keyer that is on, ramping or taking part in a tied background AUTO (weight
+    0 included) does one `read_at` per source
     per tick. State and picture come from that same read. A keyer that is off reads nothing.
   - **Pair.** A tick where both reads are live replaces the pair. Otherwise the stored pair is
     drawn, frozen together. With no pair the keyer draws nothing, and a slate is never keyed (a
@@ -563,6 +570,17 @@ keyers.
       `SourceLost`. The keyer stays off.
     - `hold_last_good` sets `stale` once, and recovery clears it (`SourceRecovered`).
 - **Tie.**
+  - **Participation (review F1).** `KeyerFlags::flight: Option<bool>` records a tied keyer's
+    part in the background AUTO and its direction (`true` going on), fixed on the tick the AUTO
+    starts (`begin_tied_transition`) and never re-derived from `on_air`. Only participants
+    draw the envelope and flip on the terminal tick (`complete_tied`); a keyer tied during the
+    flight waits for the next take. A participant is engaged for the whole flight, so its loss
+    policy applies on every tick, including a DIP's weight-0 ticks before the switch point.
+  - **Loss cancels participation.** `drop_to_off_air` during the flight clears `flight` with
+    `on_air`: the keyer stays off through the recovery and the terminal tick, until an
+    operator puts it on (the design is silent here; this is the conservative choice, off stays
+    off). An operator keyer CUT, AUTO (the no-op included) or a held command that lands also
+    takes the keyer out of the flight, and an untie mid-flight leaves it in its current state.
   - **CUT.** A tied keyer flips on the CUT tick (`stage_take`).
   - **MIX.** It draws `p` going on and `1 − p` going off. `p` is the same `MixOverlay::opacity`
     the dissolve tile uses. It flips on the terminal tick (`projection.completed` after `sample`).
@@ -579,16 +597,25 @@ keyers.
     (#388).
   - **Gate.** A CUT or AUTO is also gated on the fill and key of every tied keyer it would put on
     (`take_fresh`).
-  - **Abort.** An AUTO aborted by SW2-02 never reaches the terminal tick, so tied keyers keep their
+  - **Abort.** An AUTO aborted by SW2-02, interrupted by a punch or rolled back by a rejected
+    frame cancels participation (`cancel_tied`), and tied keyers keep their
     state.
   - **Boot.** `on_at_start` is seeded as an op-less pending going-on. It lands at the first fresh
     tick with an `OnAtStart` event and no outcome. An operator command supersedes it.
-- **Reject atomicity.** `drain_at_tick` copies the `[KeyerFlags; 2]` (Copy, no heap).
-  `reject_composed_tick` restores them, refuses slot-held ops that moved this tick, and discards
+- **Reject atomicity (review F2).** A rejected tick leaves the composed output and every
+  keyer's last-good pair exactly as committed. `begin_tick` stages the flags, the last-good
+  pairs (refcount increments only) and the tally; `reject` restores all three, so a staged off
+  that released the pair gets it back. The hook never resolves keyers on a rejected frame and
+  no longer clears the drive's draws: the last committed draws stay installed (an on-air DSK
+  stays in the frame, with stale sources too). `on_compose_failed` swaps the committed draws
+  back from `keyer_buf`. In both paths `settle_keyer_draws` sets a keyer whose tied
+  transition the reject cancelled to its resting weight (1 on air, nothing off), pictures
+  untouched.
+  `reject_composed_tick` also refuses slot-held ops that moved this tick, and discards
   queued events. Applied keyer ops sit in `staged_success` and are refused with everything else.
   `Staged` is untouched. `repeat_tick` expires held keyer commands past their deadline.
 - **Compose.** The hook resolves keyers only on a frame that will commit, after the mix block. It
-  calls `driver.resolve_keyers(tick, envelope, &mut keyer_buf)` and then `drive.set_keyer_draws`, a
+  calls `driver.resolve_keyers(tick, envelope, incoming_drawn, &mut keyer_buf)` and then `drive.set_keyer_draws`, a
   `mem::swap` of a fixed `[Option<KeyerDraw>; 2]`. `KeyerDraw` is two `Arc`s plus `Copy` parameters.
   - `compose` reserves a constant `KEYER_TILES = 4` in `begin`, on top of the two transition tiles
     (DIP colour and incoming, or WIPE incoming and border band), so `scratch_reservations` does not depend on keyer state.
@@ -613,6 +640,11 @@ keyers.
 - **Demand.** `ConsumerClass::Keyer` has the wire token `"keyer"`. The pipeline seeds one
   `consumer_set(Keyer, Rails::VIDEO)` with a `SetItem` per fill and key, labelled `main/dsk1`. It
   keeps the handle (`Pipeline::keyer_demand`) so K4 can `publish` on a definition change.
+- **Run-future size (review F6).** `KeyerRuntime` in `SwitcherTickDriver` and the
+  `[Option<KeyerDraw>; 2]` buffers in `CompositorDrive` and `SwitcherFrameHook` are boxed once
+  at construction; nothing is boxed per tick. The `discrete_audio_tracks` run futures went from
+  18 352 B (over clippy's 16 KiB `large_futures` threshold) to 13 536 B. Boxing the `Pipeline`
+  keyer fields saved only 32 B and was not kept.
 - **CLI boot.** `attach_first_slice` resolves `KeyerDef`s from `pipeline.preview_stores()`; a
   missing store is a boot error. It then calls `keyer::admit` against the document's budget and
   `driver.set_keyers`.
@@ -627,7 +659,10 @@ keyers.
 - **Deviation: tally as roles.** The tally is `TallyRole::{Program, Preview, Fill(k), Key(k)}`
   rather than store indices: PGM and PVW have no stable store index in the drive. The control
   plane resolves roles to source ids off the clock (K4).
-  - `program` holds the background, the PVW role while a MIX draws it, and the fill and key of
+  - `program` holds the background, the PVW role only on a frame where the transition's
+    incoming tile contributes (`CompositorDrive::transition_incoming_drawn`: incoming weight
+    > 0 and a live frame, the test `push_transition_tiles` applies; never at MIX `p = 0` or a
+    DIP's colour-only ticks, review F4), and the fill and key of
     every keyer tile drawn with weight > 0.
   - `preview` holds PVW plus the fill and key of tied keyers going on.
 - **Deviation: GPU before #395.** A keyed tile makes `GpuCompositor` return `GpuLimit`, and
@@ -637,13 +672,18 @@ keyers.
   fallback signal from `RunBackend` into the drive, and that is a follow-up with K2b / after #395.
   The default budget (1 DSK) bounds the CPU cost meanwhile.
 - **Tests.**
-  - `multiview-config` unit tests (8 keyer cases) and `tests/switcher_keyers.rs`.
+  - `multiview-config` unit tests (8 keyer cases) and `tests/switcher_keyers.rs` (a DSK
+    without an M/E is refused).
   - `multiview-engine` `keyer` unit tests.
   - `multiview-control` `tests/output_routing_take.rs`: Clean is refused in the plan and as a 409
     `clean-unavailable-with-dsk` on take while a DSK is defined.
   - `tests/keyers_dsk.rs`: CUT, AUTO k/N, tie on CUT, MIX, DIP and WIPE (the CUT-at-end deviation), abort, reject, held background take,
+    PVW tally at MIX `p = 0` and before a DIP switch point, the AUTO rate bound (300, 301,
+    `u32::MAX`),
     `on_at_start`, unknown index, z order and tally.
   - `tests/keyers_gate_loss.rs`: refusal at exactly +50 with 0 lost ticks, `keyer-pending`,
+    tied loss and recovery during a MIX and a DIP in both directions (stays off), a rejected
+    take with an on-air DSK, with stale sources and with a staged off, and a failed compose,
     fill-only and key-only death mid-ramp (`Arc::ptr_eq` frozen pair, drop at the trigger, stays
     off), `hold_last_good`, slate never keyed, oversize, going off never gated.
   - `tests/keyers_chaos.rs`:
