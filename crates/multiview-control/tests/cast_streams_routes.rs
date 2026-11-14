@@ -818,7 +818,8 @@ async fn media_types_cache_cors_range_head_and_scope() {
     assert_eq!(r.status(), StatusCode::OK);
     let h = r.headers();
     assert_eq!(h[header::CONTENT_TYPE], "application/vnd.apple.mpegurl");
-    assert_eq!(h[header::CACHE_CONTROL], "max-age=1, must-revalidate");
+    // ABUSE-2: the token surface overrides the public-HLS cache tiers.
+    assert_eq!(h[header::CACHE_CONTROL], "no-store");
     assert_eq!(
         h[header::ACCESS_CONTROL_ALLOW_ORIGIN],
         "https://cast.example"
@@ -830,10 +831,7 @@ async fn media_types_cache_cors_range_head_and_scope() {
     );
     let r = send(&rig.router, get(format!("/cast/{ta}/seg-v-1-0.m4s"), true)).await;
     assert_eq!(r.headers()[header::CONTENT_TYPE], "video/iso.segment");
-    assert_eq!(
-        r.headers()[header::CACHE_CONTROL],
-        "public, max-age=31536000, immutable"
-    );
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
     let r = send(
         &rig.router,
         get(format!("/cast/{ta}/init-v-1-0.mp4"), false),
