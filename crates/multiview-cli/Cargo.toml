@@ -727,6 +727,11 @@ nvidia = [
     # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096): the
     # shipped deploy image runs the supervised heartbeat loop (when configured).
     "heartbeat",
+    # Server-side Cast (ADR-M011, ADR-0111): mDNS device discovery and the live
+    # CASTV2 driver, so the Cast page can start a TV on the LAN. Pure Rust,
+    # LGPL-clean (mdns-sd, prost, rustls), GPU-free.
+    "discovery",
+    "devices-net",
 ]
 
 # Apple Silicon / Intel macOS: VideoToolbox codecs + Metal compositor + FFmpeg.
@@ -770,6 +775,11 @@ apple = [
     "mesh-mdns",
     # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096).
     "heartbeat",
+    # Server-side Cast (ADR-M011, ADR-0111): mDNS device discovery and the live
+    # CASTV2 driver, so the Cast page can start a TV on the LAN. Pure Rust,
+    # LGPL-clean (mdns-sd, prost, rustls), GPU-free.
+    "discovery",
+    "devices-net",
 ]
 
 # Linux VAAPI/QSV: VAAPI + QuickSync codecs + wgpu compositor + FFmpeg.
@@ -817,6 +827,11 @@ linux-vaapi = [
     "mesh-mdns",
     # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096).
     "heartbeat",
+    # Server-side Cast (ADR-M011, ADR-0111): mDNS device discovery and the live
+    # CASTV2 driver, so the Cast page can start a TV on the LAN. Pure Rust,
+    # LGPL-clean (mdns-sd, prost, rustls), GPU-free.
+    "discovery",
+    "devices-net",
 ]
 
 # Everything non-GPL: all codec backends, every compositor backend, FFmpeg,

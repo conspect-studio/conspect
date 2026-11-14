@@ -1,6 +1,6 @@
 # ADR-M011: Google Cast output driver: protocol stance, sessions, legacy-IPv4 interop
 
-- **Status:** Proposed
+- **Status:** Proposed; amended by [ADR-0111](ADR-0111-cast-output.md) (with a cast output the session launches the configured Conspect receiver and loads a scoped `/cast/<token>/` CMAF stream; the `/hls/` path stays for a run without one)
 - **Area:** Management
 - **Date:** 2026-06-10
 - **Source brief:** [managed-devices.md](../research/managed-devices.md)

@@ -2027,6 +2027,26 @@ enum RunnableOutput {
         /// with the consumer's never-block fan-out and the status snapshot.
         link: Arc<multiview_output::push_link::PushLinkStatus>,
     },
+    /// A cast output (ADR-0111): HLS + CMAF fMP4 written by the pure-Rust
+    /// [`CastPackager`](multiview_output::hls::cast::CastPackager) on this
+    /// output's sink thread, only while its [`CastGate`](crate::cast_output::CastGate)
+    /// is active. Inactive, it writes nothing and keeps a bounded in-memory
+    /// pre-roll. Its delivery drops (and counts) instead of waiting, so a
+    /// stalled disk never paces the bake consumer (invariants #1/#10).
+    Cast {
+        /// The output's stable config id.
+        id: String,
+        /// The activation gate shared with the control plane.
+        gate: Arc<crate::cast_output::CastGate>,
+        /// The directory the stream is written to. For an output with no
+        /// configured `dir` this is the default under the state directory
+        /// (re-resolved by [`Pipeline::set_state_dir`]).
+        dir: PathBuf,
+        /// Whether `dir` is the default (no `dir` in the config).
+        default_dir: bool,
+        /// The pipeline's outbound epoch (`EXT-X-PROGRAM-DATE-TIME`).
+        epoch: multiview_output::SharedEpoch,
+    },
     /// A WebRTC program output (`webrtc` WHEP-serve / `whip_push`): a **mux-free**
     /// sink that re-stamps each coded [`EncodedPacket`] into an
     /// [`EgressSample`](multiview_webrtc::egress::EgressSample) and pushes it onto
@@ -2110,7 +2130,10 @@ impl RunnableOutput {
     /// lines) name the output.
     fn id(&self) -> &str {
         match self {
-            Self::File { id, .. } | Self::Hls { id, .. } | Self::Push { id, .. } => id,
+            Self::File { id, .. }
+            | Self::Hls { id, .. }
+            | Self::Push { id, .. }
+            | Self::Cast { id, .. } => id,
             #[cfg(feature = "webrtc-native")]
             Self::WebRtc { id, .. } => id,
             #[cfg(feature = "ndi-bindings")]
@@ -2259,6 +2282,9 @@ pub struct Pipeline {
     /// [`Pipeline::build_sink_runners`] and projected into the engine-state
     /// snapshot under `outputs.<id>.link` (read lock-free on the hot loop).
     push_links: PushLinkRegistry,
+    /// The current run's cast outputs (ADR-0111), published by
+    /// [`Pipeline::build_sink_runners`] and emptied when the run ends.
+    cast_outputs: crate::cast_output::CastOutputsSlot,
     /// Source-kind audio applicability, refreshed at frame-boundary live edits.
     /// Missing PCM from a decoded source is unknown, not proof of no audio.
     #[cfg(feature = "overlay")]
@@ -2439,6 +2465,9 @@ pub struct Pipeline {
     declared_audio_outputs: Vec<(String, Vec<usize>)>,
     /// The runnable outputs declared in the config.
     outputs: Vec<RunnableOutput>,
+    /// The HLS outputs' subtitle slots (slice F #345): route tables + cue
+    /// feeds, sampled by the bake consumer.
+    subtitle_outputs: Vec<SubtitleOutputPlan>,
     /// The bake-consumer push handles for the configured AES67 outputs (#103),
     /// paired with the serve-side `Aes67Sender` inside each `RunnableOutput::Aes67`.
     /// `drive_streaming` hands these to the bake consumer, which pushes every
@@ -2534,6 +2563,12 @@ pub struct Pipeline {
     /// source a cell actually binds. Derived once from the configuration —
     /// never invented — and cloned per binding with that binding's own output id.
     window_dependencies: Arc<Vec<crate::output_window_registry::Dependency>>,
+    /// Test seam (never in a non-test build): stall the shared bake consumer
+    /// ONCE, at the first hot item at or after this tick, for this long. Taken
+    /// by the next run. Lets an isolation test prove its assertions detect a
+    /// stall in the path every output shares (negative control).
+    #[cfg(test)]
+    consumer_stall_for_test: Option<(u64, Duration)>,
 }
 
 type HashMapStores = std::collections::HashMap<String, Arc<TileStore<Nv12Image>>>;
@@ -2636,6 +2671,12 @@ struct IngestPlan {
     live_anchor: LiveAnchorSlot,
     /// Authoritative source lifecycle shared by video, audio and captions.
     lifecycle: u64,
+    /// The source's compressed passthrough tap (output-routing §12.5, #344
+    /// D2a), registered in [`crate::passthrough_tap`]'s wait-free lookup. The
+    /// demux reader offers each video packet to it only while a passthrough
+    /// consumer exists (one atomic load otherwise). `None` for producers with
+    /// no compressed stream (players, synthetic, tests).
+    tap: Option<Arc<crate::passthrough_tap::SourceTap>>,
     /// Whether this is a live (continuous, never-EOF) source. Live sources are
     /// reopened on EOF/error (a transient HLS/RTSP drop reconnects); a finite
     /// file/VOD source plays once and then holds its last frame.
@@ -3339,6 +3380,7 @@ impl Pipeline {
         #[cfg(not(feature = "display-kms"))]
         let has_display = false;
         let mut outputs = built.packet;
+        let subtitle_outputs = built.subtitles;
         if outputs.is_empty() && !has_display {
             return Err(PipelineError::NoOutput("file/HLS"));
         }
@@ -3426,6 +3468,8 @@ impl Pipeline {
                 .find(|item| item.id() == output.id())
                 .is_some_and(|item| matches!(item, multiview_config::Output::LlHls { .. }));
             output_inband_sets.push(!ll_hls && inband_parameter_changes_ok(output));
+            // A cast stream carries the program audio only (track 0).
+            let cast_audio = multiview_output::AudioSelection::default();
             // Only a TS-segment HLS sink rebuilds its muxer at a flagged
             // change (#342 B3 review M-1).
             output_live_reset.push(!ll_hls && matches!(output, RunnableOutput::Hls { .. }));
@@ -3433,6 +3477,7 @@ impl Pipeline {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
                 | RunnableOutput::Push { sink, .. } => Some(sink.audio_selection()),
+                RunnableOutput::Cast { .. } => Some(&cast_audio),
                 #[cfg(feature = "webrtc-native")]
                 RunnableOutput::WebRtc { .. } => None,
                 #[cfg(feature = "ndi-bindings")]
@@ -3635,6 +3680,7 @@ impl Pipeline {
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
+            subtitle_outputs,
             #[cfg(feature = "display-kms")]
             display_plans: built.display,
             #[cfg(feature = "ndi-bindings")]
@@ -3654,6 +3700,7 @@ impl Pipeline {
             #[cfg(feature = "overlay")]
             tile_spec_apply,
             push_links: Arc::new(multiview_framestore::SwapCell::new(Arc::new(Vec::new()))),
+            cast_outputs: crate::cast_output::cast_outputs_slot(),
             #[cfg(feature = "overlay")]
             audio_free_sources,
             #[cfg(feature = "overlay")]
@@ -3676,6 +3723,8 @@ impl Pipeline {
             program_metrics: Arc::new(multiview_framestore::SwapCell::empty()),
             optional_preview: None,
             window_dependencies: Arc::new(window_dependency_axes(config)),
+            #[cfg(test)]
+            consumer_stall_for_test: None,
         })
     }
 
@@ -3902,6 +3951,55 @@ impl Pipeline {
             .collect()
     }
 
+    /// The run's subtitle-slot sampler (slice F #345). The resolver reads, per
+    /// slot source and tick, the source's caption store at the picture the
+    /// compositor latches for that tick (`peek_at_with_source_time`: the
+    /// same selection, without moving the store's prune watermark) and the
+    /// cue store's text cue for that picture's generation, projected to
+    /// bounded text without cloning the cue. Lock-free reads only; it runs on the bake consumer, never the output clock. A source
+    /// with no caption store (or a build without captions) yields no cues.
+    fn subtitle_run(
+        &self,
+        stores: crate::routing_aux::StoreLookup,
+    ) -> crate::subtitle_slots::SubtitleRun {
+        if self.subtitle_outputs.is_empty() {
+            return crate::subtitle_slots::SubtitleRun::none(self.cadence);
+        }
+        let outputs = self
+            .subtitle_outputs
+            .iter()
+            .map(|plan| {
+                tracing::info!(
+                    output = %plan.output_id,
+                    slots = plan.slots,
+                    "subtitle slots: WebVTT renditions sampled off the output clock"
+                );
+                crate::subtitle_slots::SubtitleOutputSampler::new(
+                    Arc::clone(&plan.routes),
+                    plan.feed.clone(),
+                    plan.slots,
+                )
+            })
+            .collect();
+        #[cfg(feature = "overlay")]
+        let resolve: crate::subtitle_slots::CueResolver = {
+            let captions = Arc::clone(&self.live_caption_stores);
+            Box::new(move |id: &str, now: MediaTime| {
+                let store = captions.load().get(id).cloned()?;
+                let picture = stores(id)?.peek_at_with_source_time(now)?;
+                // Borrow-and-project (ABU-1/INV-1): bounded text only, a
+                // bitmap cue is skipped without copying its pixels.
+                crate::subtitle_slots::text_cue_lines(&store, picture.pts, picture.generation)
+            })
+        };
+        #[cfg(not(feature = "overlay"))]
+        let resolve: crate::subtitle_slots::CueResolver = {
+            drop(stores);
+            Box::new(|_: &str, _: MediaTime| None)
+        };
+        crate::subtitle_slots::SubtitleRun::new(outputs, resolve, self.cadence)
+    }
+
     /// Build one run's output routing (ADR-0108 slice 1): the clock's aux tick
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
@@ -3946,6 +4044,7 @@ impl Pipeline {
             Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new()));
         let aux_canvas = self.aux_canvas();
         let plan_stores = Arc::clone(&stores);
+        let subtitle_stores = Arc::clone(&stores);
         // Filled once this run's Program exists (§7 back-off input).
         let program_lateness: crate::routing_aux::ProgramLateness =
             Arc::new(multiview_framestore::SwapCell::empty());
@@ -4029,6 +4128,7 @@ impl Pipeline {
                 inband_sets: self.output_inband_sets.clone(),
                 base_formats: self.rendition_formats.clone(),
                 convert_hook: self.convert_hook.clone(),
+                subtitles: Box::new(self.subtitle_run(subtitle_stores)),
             },
             aux_tx,
             preview_selection,
@@ -4860,6 +4960,10 @@ impl Pipeline {
             .position(|output| matches!(output, RunnableOutput::Hls { .. }));
         let hls_key = hls_index.and_then(|index| self.output_video_keys.get(index).copied());
         let hls_audio = hls_index.and_then(|index| self.output_audio_tracks.get(index).cloned());
+        // Publish this run's cast outputs (off the clock, before any sink
+        // thread exists): the control plane activates them through the slot.
+        let cast = self.cast_entries(&configured, &self.output_video_keys);
+        self.cast_outputs.store(Arc::new(cast));
         let outputs = maybe_prepend_program_ts(configured, live);
         if !live {
             if let Some(hls_key) = hls_key {
@@ -4892,6 +4996,13 @@ impl Pipeline {
                         links.push((id.clone(), Arc::clone(link)));
                         SinkSendPolicy::DropWhenFull(Arc::clone(link))
                     }
+                    // A cast sink writes to disk only while a cast is
+                    // active and must never pace or fail anything else: its
+                    // delivery drops (counted in the gate) instead of
+                    // waiting, and survives a stalled disk.
+                    RunnableOutput::Cast { gate, .. } => {
+                        SinkSendPolicy::DropCounted(gate.dropped_counter())
+                    }
                     _ => SinkSendPolicy::Bounded,
                 };
                 let runner: SinkRunner = Box::new(move |rx, params, time_base, audio, tracks| {
@@ -4904,6 +5015,71 @@ impl Pipeline {
         // by the per-tick snapshot projection; replaced wholesale per run).
         self.push_links.store(Arc::new(links));
         (runners, binding_ids)
+    }
+
+    /// Where each run publishes its cast outputs (ADR-0111) for the control
+    /// plane: empty before the first run and after each run.
+    #[must_use]
+    pub fn cast_outputs(&self) -> crate::cast_output::CastOutputsSlot {
+        Arc::clone(&self.cast_outputs)
+    }
+
+    /// Test seam: the next run's shared bake consumer sleeps ONCE for `stall`
+    /// at the first hot item at or after tick `at` (a stall in the path every
+    /// output shares, unlike a stall inside one sink). Used only by the cast
+    /// pipeline tests, which need a real encoder (`gpl-codecs`).
+    #[cfg(all(test, feature = "gpl-codecs"))]
+    pub(crate) fn stall_consumer_once_for_test(&mut self, at: u64, stall: Duration) {
+        self.consumer_stall_for_test = Some((at, stall));
+    }
+
+    /// Tell the pipeline the engine's state directory: a cast output with no
+    /// configured `dir` writes to `<state dir>/cast/<id>`. Call before the
+    /// run starts (nothing is created here).
+    pub fn set_state_dir(&mut self, state_dir: &Path) {
+        for output in &mut self.outputs {
+            if let RunnableOutput::Cast {
+                id,
+                dir,
+                default_dir: true,
+                ..
+            } = output
+            {
+                *dir = crate::cast_output::default_cast_dir(state_dir, id);
+            }
+        }
+    }
+
+    /// This run's cast outputs: check each directory (an unusable one
+    /// disables that output only) and describe each for the control plane.
+    /// `keys` is the video key per configured output, in the same order.
+    fn cast_entries(
+        &self,
+        configured: &[RunnableOutput],
+        keys: &[usize],
+    ) -> Vec<crate::cast_output::CastOutputEntry> {
+        configured
+            .iter()
+            .enumerate()
+            .filter_map(|(index, output)| {
+                let RunnableOutput::Cast { id, gate, dir, .. } = output else {
+                    return None;
+                };
+                crate::cast_output::prepare_cast_dir(dir, id, gate);
+                let encode = keys
+                    .get(index)
+                    .and_then(|&key| self.rendition_configs.get(key));
+                Some(crate::cast_output::CastOutputEntry {
+                    id: id.clone(),
+                    dir: dir.clone(),
+                    gate: Arc::clone(gate),
+                    width: encode.map_or(0, |cfg| cfg.width),
+                    height: encode.map_or(0, |cfg| cfg.height),
+                    fps: self.cadence,
+                    codec: encode.map_or_else(String::new, |cfg| cfg.codec_name.clone()),
+                })
+            })
+            .collect()
     }
 
     /// Test seam: shorten the boot-take retry policy (wall-clock bound tests).
@@ -5027,6 +5203,99 @@ impl Pipeline {
         })
     }
 
+    /// **Test seam** (ADR-0111): as [`Self::drive_streaming_for_test`], but
+    /// every cast output keeps its REAL sink (packager, gate, directory) and
+    /// its real delivery policy; `params.runners` replace the other outputs,
+    /// in configured order. Bindings keep their config ids, so a routing
+    /// take addresses an output by the id it has in the document.
+    ///
+    /// # Errors
+    /// See [`Self::drive_streaming_for_test`].
+    #[cfg(all(test, feature = "gpl-codecs"))]
+    pub(crate) async fn drive_streaming_with_cast_for_test<P: Pacer + Send>(
+        &mut self,
+        params: StreamTestParams<P>,
+        stop: &StopSignal,
+    ) -> Result<StreamTestResult, PipelineError> {
+        let StreamTestParams {
+            time,
+            pacer,
+            max_ticks,
+            policy,
+            runners: fakes,
+            consumer_fault_after_ticks,
+            shed_at_tick,
+            hot_tick_observer,
+        } = params;
+        let is_cast: Vec<bool> = self
+            .outputs
+            .iter()
+            .map(|output| matches!(output, RunnableOutput::Cast { .. }))
+            .collect();
+        // Live: no `program.ts` anchor, so runner index == configured index.
+        let (real, binding_ids) = self.build_sink_runners(true);
+        let mut fakes = fakes.into_iter();
+        let runners = real
+            .into_iter()
+            .zip(is_cast)
+            .map(|(real, cast)| {
+                if cast {
+                    return real;
+                }
+                let Some(fake) = fakes.next() else {
+                    return real;
+                };
+                let runner: SinkRunner = Box::new(move |rx, _params, _tb, _audio, _tracks| {
+                    let (tx, plain_rx) = std::sync::mpsc::sync_channel(1);
+                    let bridge = std::thread::spawn(move || {
+                        while let Ok(leased) = rx.recv() {
+                            if tx.send(leased.packet).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    let outcome = fake(plain_rx);
+                    let _ = bridge.join();
+                    Ok(SinkRunOutcome {
+                        line: format!("test sink: {} packet(s)", outcome.frames),
+                        playlist: None,
+                        frames: outcome.frames,
+                    })
+                });
+                (runner, SinkSendPolicy::Bounded)
+            })
+            .collect();
+        let capacity = policy.queue_cap();
+        let plan = StreamPlan {
+            policy,
+            runners,
+            consumer_fault_after_ticks,
+            shed_at_tick,
+            hot_tick_observer,
+            binding_ids,
+        };
+        let publisher = EnginePublisher::<EngineStateSnapshot, Event>::new(EVENT_CAPACITY);
+        let preview = crate::preview::program_slot();
+        let out = self
+            .drive_streaming(
+                time,
+                pacer,
+                stop,
+                max_ticks,
+                plan,
+                &publisher,
+                &preview,
+                |_: &mut CompositorDrive<Nv12Image>| {},
+            )
+            .await?;
+        Ok(StreamTestResult {
+            report: out.report,
+            peak_occupancy: out.peak_occupancy,
+            capacity,
+            sink_frames: out.sink_frames,
+        })
+    }
+
     /// The streaming core shared by `run_for`/`run_until`/the test seam: spawn the
     /// per-sink fan-out threads + the single bake consumer, drive the engine's
     /// protected output core (one composited canvas per tick), stream each tick
@@ -5062,6 +5331,8 @@ impl Pipeline {
         // never go on air silently receiving/emitting silence.
         #[cfg(feature = "aes67")]
         self.ensure_aes67_has_program_audio()?;
+        // The run's cast outputs are published until this function returns.
+        let _cast_run = crate::cast_output::CastRunGuard(Arc::clone(&self.cast_outputs));
         let StreamPlan {
             policy,
             runners,
@@ -5525,8 +5796,12 @@ impl Pipeline {
         // The consumer owns a Send `BakeContext` and builds its own (non-Send)
         // overlay baker from it, plus the single `ProgramEncoder`; the bake +
         // encode math moved off the hot loop, never onto it.
-        #[cfg_attr(not(feature = "overlay"), allow(unused_mut))]
+        #[cfg_attr(not(any(test, feature = "overlay")), allow(unused_mut))]
         let mut bake_ctx = self.bake_context();
+        #[cfg(test)]
+        {
+            bake_ctx.consumer_stall = self.consumer_stall_for_test.take();
+        }
         #[cfg(feature = "overlay")]
         let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
         // Output routing (ADR-0108 slice 1): the clock's aux tick sender (inert
@@ -6207,6 +6482,8 @@ impl Pipeline {
                 .demand
                 .as_ref()
                 .map(|manager| (manager.activity_reader(), Arc::clone(&self.catalogue))),
+            #[cfg(test)]
+            consumer_stall: None,
             aux_signals: None,
         }
     }
@@ -6216,7 +6493,10 @@ impl Pipeline {
     #[cfg(not(feature = "overlay"))]
     #[allow(clippy::unused_self)]
     fn bake_context(&self) -> BakeContext {
-        BakeContext {}
+        BakeContext {
+            #[cfg(test)]
+            consumer_stall: None,
+        }
     }
 }
 
@@ -6275,6 +6555,11 @@ struct BakeContext {
         multiview_engine::ActivityReader,
         crate::source_rails::Catalogue,
     )>,
+    /// Test seam: `(tick, stall)` — the consumer sleeps once for `stall` at
+    /// the first hot item at or after `tick` (see
+    /// [`Pipeline::stall_consumer_once_for_test`]).
+    #[cfg(test)]
+    consumer_stall: Option<(u64, Duration)>,
     /// Routed layouts' overlay signals: published at most once per baked
     /// frame, only while a routed layout wants them (one relaxed load
     /// otherwise). `None` before routing is wired and in tests.
@@ -6988,6 +7273,9 @@ impl StreamEgress {
             .iter()
             .map(|(_, send_policy)| match send_policy {
                 SinkSendPolicy::DropWhenFull(link) => BindingPolicy::Push(Arc::clone(link)),
+                SinkSendPolicy::DropCounted(counter) => {
+                    BindingPolicy::DropCounted(Arc::clone(counter))
+                }
                 SinkSendPolicy::Bounded => BindingPolicy::Bounded,
             })
             .collect();
@@ -7859,6 +8147,9 @@ struct ConsumerRouting {
     /// Chaos/test hook run on every convert thread before each convert
     /// (#342 review I3); `None` in production.
     convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// The subtitle-slot cue sampler (slice F #345), ticked once per item.
+    /// Boxed for `clippy::large_futures`, like the router.
+    subtitles: Box<crate::subtitle_slots::SubtitleRun>,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
@@ -8407,11 +8698,18 @@ fn consumer_main<D: WindowDelivery>(
         inband_sets,
         base_formats,
         convert_hook,
+        mut subtitles,
     } = routing;
     // #342 review I1/I2: one `format-convert` thread per distinct non-canvas
     // base format, fed non-blocking right after the bake. Empty (no thread,
     // no work) for a run whose base keys are all at the canvas format.
     let mut convert_stages = crate::format_convert::ConvertStages::default();
+    #[cfg(test)]
+    let (ctx, mut test_stall) = {
+        let mut ctx = ctx;
+        let stall = ctx.consumer_stall.take();
+        (ctx, stall)
+    };
     let mut baker = StreamBaker::new(ctx)?;
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(256);
     if video_encoders.is_empty() {
@@ -8655,6 +8953,13 @@ fn consumer_main<D: WindowDelivery>(
         in_flight.fetch_sub(1, Ordering::AcqRel);
         #[cfg(feature = "_chaos-test-seams")]
         chaos_stall.maybe_stall(item.tick_index);
+        #[cfg(test)]
+        if let Some((at, stall)) = test_stall {
+            if item.tick_index >= at {
+                test_stall = None;
+                std::thread::sleep(stall);
+            }
+        }
         // Live-opened encoders' windows first: a live window T must be staged
         // before base window T closes, or a move onto it is refused.
         router
@@ -8755,6 +9060,9 @@ fn consumer_main<D: WindowDelivery>(
         };
         let overlaid = baker.bake(&item)?;
         router.publish_program(item.tick_index, &overlaid);
+        // Slice F (#345): sample every HLS subtitle slot at this tick, off the
+        // clock (one empty check when no output declares a subtitle slot).
+        subtitles.tick(item.tick_index);
         // NO-FALTER: fill any ticks this consumer missed (a transient stall
         // shed them from the hot queue) with frame substitution — the last
         // good baked canvas restamped at each missing tick's index. The
@@ -9182,6 +9490,9 @@ enum SinkSendPolicy {
     /// Never wait ([`send_or_drop`]): a resilient live push drops + counts on
     /// a full queue (its link status records the drop).
     DropWhenFull(Arc<multiview_output::push_link::PushLinkStatus>),
+    /// Never wait and never abandon: a sink that stalls and comes back (the
+    /// cast packager's disk writes) loses packets, each added to the counter.
+    DropCounted(Arc<AtomicU64>),
 }
 // scatter the dispatch without reducing complexity.
 #[allow(clippy::too_many_lines)] // Each sink variant seeds its independent mux and transport state.
@@ -9302,6 +9613,15 @@ fn run_one_output(
             rx,
             multiview_output::MuxStream::new(params, time_base),
             (audio, &track_mux),
+        )),
+        RunnableOutput::Cast {
+            id,
+            gate,
+            dir,
+            default_dir: _,
+            epoch,
+        } => Ok(run_cast_output(
+            &id, gate, &dir, epoch, &rx, params, time_base, audio,
         )),
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { id: _, sink, label } => {
@@ -9642,6 +9962,79 @@ where
         line: format!("{label}: {sent} canvas frame(s) sent to NDI"),
         playlist: None,
         frames: sent,
+    }
+}
+
+/// Run a cast output's sink (ADR-0111) over its fan-out channel.
+/// **Infallible**: a cast output can never fail the run.
+///
+/// The packager's video rendition is described by the encoder that feeds
+/// this output (its real size, bit rate and parameter sets), never by the
+/// canvas: an output with its own format is encoded at that format.
+#[allow(clippy::too_many_arguments)] // Each argument is one distinct input of the sink thread.
+fn run_cast_output(
+    id: &str,
+    gate: Arc<crate::cast_output::CastGate>,
+    dir: &Path,
+    epoch: multiview_output::SharedEpoch,
+    rx: &Receiver<LeasedPacket>,
+    params: &StreamCodecParameters,
+    time_base: Rational,
+    audio: Option<&(StreamCodecParameters, Rational)>,
+) -> SinkRunOutcome {
+    use multiview_output::hls::cast::{CastAudioConfig, CastVideoConfig};
+    let (width, height) = params.video_dimensions().unwrap_or((0, 0));
+    let video = CastVideoConfig {
+        time_base,
+        width,
+        height,
+        bit_rate: params.opened_bit_rate().or_else(|| params.bit_rate()),
+        extradata: params.codec_config_bytes(),
+    };
+    let audio = audio.and_then(|(audio_params, audio_tb)| {
+        // The audio time base is `1/sample_rate` (the AAC encoder's).
+        let sample_rate = (audio_tb.num == 1)
+            .then(|| u32::try_from(audio_tb.den).ok())
+            .flatten()?;
+        let asc = audio_params.codec_config_bytes();
+        // AudioSpecificConfig: 5 bits object type, 4 bits rate index, 4 bits
+        // channel configuration. Stereo (the program bus) when absent.
+        let channels = asc
+            .as_deref()
+            .and_then(|bytes| bytes.get(1))
+            .map(|byte| u16::from((byte >> 3) & 0x0F))
+            .filter(|channels| *channels > 0)
+            .unwrap_or(multiview_config::output_format::SLOT_AUDIO_CHANNELS);
+        Some(CastAudioConfig {
+            time_base: *audio_tb,
+            sample_rate,
+            channels,
+            bit_rate: audio_params
+                .opened_bit_rate()
+                .or_else(|| audio_params.bit_rate()),
+            audio_specific_config: asc,
+        })
+    });
+    let setup = crate::cast_output::CastSetup {
+        id: id.to_owned(),
+        dir: dir.to_path_buf(),
+        gate,
+        epoch,
+        video,
+        audio,
+    };
+    let report =
+        crate::cast_output::run_cast_sink(setup, rx, &|packet| params.is_decoder_ready_rap(packet));
+    SinkRunOutcome {
+        line: format!(
+            "cast {id} ({}): {} packet(s), {} restart(s){}",
+            dir.display(),
+            report.packets,
+            report.restarts,
+            if report.panicked { " (disabled)" } else { "" }
+        ),
+        playlist: None,
+        frames: report.packets,
     }
 }
 
@@ -10808,6 +11201,7 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
             store.filter(|_| self.clear_on_remove)
         });
         let lifecycle = remove_live_lifecycle(id);
+        crate::passthrough_tap::forget(id);
         if let Some(store) = retired_store {
             store.clear();
         }
@@ -12550,7 +12944,9 @@ fn output_codec(output: &Output) -> Option<&str> {
         // codec they name (default h264). A webrtc-only config therefore selects
         // h264, not the mpeg2video fallback the SRTP packetizer cannot carry.
         | Output::Webrtc { codec, .. }
-        | Output::WhipPush { codec, .. } => Some(codec.as_str()),
+        | Output::WhipPush { codec, .. }
+        // A cast output consumes an H.264 rendition like an HLS output.
+        | Output::Cast { codec, .. } => Some(codec.as_str()),
         // NDI carries no codec token; a future output kind names none here until
         // explicitly wired (`Output` is `#[non_exhaustive]`).
         Output::Ndi { .. } | _ => None,
@@ -12567,6 +12963,8 @@ struct BuiltOutputs {
     /// shares the existing per-sink thread + end-of-program lifecycle — but it
     /// consumes the canvas tap below, never the packets.
     packet: Vec<RunnableOutput>,
+    /// The HLS outputs' subtitle slots (slice F #345).
+    subtitles: Vec<SubtitleOutputPlan>,
     /// DRM/KMS display heads, started as raw-frame sinks at stream start.
     #[cfg(feature = "display-kms")]
     display: Vec<DisplayOutputPlan>,
@@ -13178,7 +13576,7 @@ fn build_hls_output(
     output: &Output,
     path: &str,
     epoch: &multiview_output::SharedEpoch,
-) -> Result<RunnableOutput, PipelineError> {
+) -> Result<(RunnableOutput, Option<SubtitleOutputPlan>), PipelineError> {
     let (dir, prefix, playlist_path) = hls_paths(Path::new(path));
     // #324: classified by kind — permissions, a read-only or full volume is a
     // host fault (retried, never a reason to fall back from the operator's
@@ -13188,18 +13586,63 @@ fn build_hls_output(
         PipelineError::io(format!("output hls: creating {}", dir.display()), source)
     })?;
     let (meta, matrix) = output_mux_meta(output);
-    Ok(RunnableOutput::Hls {
-        id: output.id(),
-        sink: PacketMuxSink::segment_live(
-            dir,
-            prefix,
-            playlist_path.clone(),
-            HLS_LIVE_WINDOW,
-            epoch.clone(),
-        )
-        .with_output_metadata(meta, matrix),
-        playlist_path,
-    })
+    let mut sink = PacketMuxSink::segment_live(
+        dir,
+        prefix,
+        playlist_path.clone(),
+        HLS_LIVE_WINDOW,
+        epoch.clone(),
+    )
+    .with_output_metadata(meta, matrix);
+    // Slice F (#345): WebVTT subtitle renditions for a TS-segment HLS output
+    // (config refuses them on LL-HLS), fed by the bake consumer's sampler.
+    let mut plan = None;
+    if let (Output::Hls { .. }, Some(slots)) = (output, output.slots()) {
+        if !slots.subtitle.is_empty() {
+            let renditions = slots
+                .subtitle
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| multiview_output::hls::SubtitleRendition {
+                    name: slot.effective_name(i),
+                    language: slot.language.clone(),
+                })
+                .collect();
+            let (feed, rx) = multiview_output::hls::subtitle_feed();
+            sink = sink.with_subtitles(renditions, rx);
+            plan = Some(SubtitleOutputPlan {
+                output_id: output.id(),
+                routes: crate::subtitle_slots::subtitle_routes(
+                    slots
+                        .subtitle
+                        .iter()
+                        .map(|slot| slot.source.clone())
+                        .collect(),
+                ),
+                feed,
+                slots: slots.subtitle.len(),
+            });
+        }
+    }
+    Ok((
+        RunnableOutput::Hls {
+            id: output.id(),
+            sink,
+            playlist_path,
+        },
+        plan,
+    ))
+}
+
+/// One HLS output's subtitle slots for the run (slice F #345): its route
+/// table (slot → source, re-pointed live by the patch API), the engine side
+/// of its sink's cue feed and its slot count.
+#[derive(Clone)]
+pub(crate) struct SubtitleOutputPlan {
+    output_id: String,
+    routes: crate::subtitle_slots::SubtitleRoutes,
+    feed: multiview_output::hls::SubtitleFeed,
+    slots: usize,
 }
 
 /// A fresh link-status record for a push sink: listener mode is read from the
@@ -13302,6 +13745,7 @@ fn build_outputs(
     #[cfg(feature = "aes67")]
     ensure_no_aes67_ssrc_collision(outputs)?;
     let mut runnable = Vec::new();
+    let mut subtitles = Vec::new();
     #[cfg(feature = "display-kms")]
     let mut display_plans = Vec::new();
     #[cfg(feature = "ndi-bindings")]
@@ -13320,7 +13764,25 @@ fn build_outputs(
                 }
             }
             Output::Hls { path, .. } | Output::LlHls { path, .. } => {
-                runnable.push(build_hls_output(output, path, epoch)?);
+                let (built, plan) = build_hls_output(output, path, epoch)?;
+                runnable.push(built);
+                subtitles.extend(plan);
+            }
+            // A cast output (ADR-0111): nothing touches the disk here. Its
+            // directory is claimed when the run starts and written only
+            // while a cast stream is active.
+            Output::Cast { id, dir, .. } => {
+                let default_state = multiview_control::boot_model::state_dir_for(Path::new(""));
+                runnable.push(RunnableOutput::Cast {
+                    id: id.clone(),
+                    gate: Arc::new(crate::cast_output::CastGate::new()),
+                    dir: dir.as_ref().map_or_else(
+                        || crate::cast_output::default_cast_dir(&default_state, id),
+                        PathBuf::from,
+                    ),
+                    default_dir: dir.is_none(),
+                    epoch: epoch.clone(),
+                });
             }
             Output::Rtmp { url, .. } => {
                 runnable.push(build_push_output(output, PushProtocol::Rtmp, url, "rtmp"));
@@ -13446,6 +13908,7 @@ fn build_outputs(
     // the anchor is prepended at run time by `maybe_prepend_program_ts`, not here.
     Ok(BuiltOutputs {
         packet: runnable,
+        subtitles,
         #[cfg(feature = "display-kms")]
         display: display_plans,
         #[cfg(feature = "ndi-bindings")]
@@ -13837,7 +14300,11 @@ fn handle_ndi_output(
 /// sequence header, SDP, `moov`); raw-frame sinks carry no packets.
 fn inband_parameter_changes_ok(output: &RunnableOutput) -> bool {
     match output {
-        RunnableOutput::Hls { .. } => true,
+        // The cast packager is not a libav muxer with one fixed init: it
+        // reads the parameter sets of every IDR, and on a change it writes a
+        // new init segment and declares `EXT-X-DISCONTINUITY`, so a switch
+        // onto changed sets (always a self-contained RAP) is a clean splice.
+        RunnableOutput::Hls { .. } | RunnableOutput::Cast { .. } => true,
         // `srt` / `rist` mux MPEG-TS; `rtmp` muxes FLV (sequence header).
         RunnableOutput::Push { label, .. } => matches!(*label, "srt" | "rist"),
         RunnableOutput::File { path, .. } => path
@@ -13863,7 +14330,9 @@ fn maybe_prepend_program_ts(mut runnable: Vec<RunnableOutput>, live: bool) -> Ve
         }
         // A push / WebRTC output has no on-disk directory to derive a program
         // file from; only an HLS output anchors the self-contained `program.ts`.
-        RunnableOutput::File { .. } | RunnableOutput::Push { .. } => None,
+        RunnableOutput::File { .. } | RunnableOutput::Push { .. } | RunnableOutput::Cast { .. } => {
+            None
+        }
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { .. } => None,
         // The NDI sink is a raw-canvas consumer, not a packet/disk muxer — it
@@ -14001,6 +14470,8 @@ fn apply_output_audio_selections(
             RunnableOutput::File { id, sink, .. }
             | RunnableOutput::Hls { id, sink, .. }
             | RunnableOutput::Push { id, sink, .. } => (id.as_str(), sink),
+            // Program audio only: nothing to select.
+            RunnableOutput::Cast { .. } => continue,
             #[cfg(feature = "webrtc-native")]
             RunnableOutput::WebRtc { .. } => continue,
             #[cfg(feature = "ndi-bindings")]
@@ -14572,6 +15043,7 @@ fn ingest_plan_for(
         output_origin: crate::timing_status::anchor_slot(),
         live_anchor: live_anchor_slot(&source.id),
         lifecycle: 0,
+        tap: Some(crate::passthrough_tap::source_tap(&source.id)),
         live,
         #[cfg(feature = "overlay")]
         incontainer_sub: None,
@@ -14782,6 +15254,7 @@ fn build_media_player_boot(
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             // A media player is a finite asset played under transport control;
             // it is not a live (reconnect-forever) source — the player loop owns
             // its own loop/hold lifecycle.
@@ -17325,6 +17798,10 @@ fn open_and_stream(
     // error (docs/architecture/local-capture-devices.md).
     let is_device = matches!(plan.location, SourceLocation::Device { .. });
     let mut last_device_frame = Instant::now();
+    // The compressed passthrough tap (output-routing §12.5, #344 D2a): one
+    // writer per connection, fed on the demux thread. Without a consumer it
+    // costs one atomic load per video packet; it never blocks this thread.
+    let mut tap_writer = tap_writer_for(plan, &input, stream_index, declared_fps);
     let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
         let mut packet = ffmpeg::codec::packet::Packet::empty();
         match packet.read(&mut input) {
@@ -17346,6 +17823,9 @@ fn open_and_stream(
                 last_device_frame = Instant::now();
                 if packet.stream() == stream_index {
                     video_fence = video_fence.saturating_add(1);
+                    if let (Some(writer), Some(bytes)) = (tap_writer.as_mut(), packet.data()) {
+                        writer.on_packet(bytes, packet.dts(), packet.pts(), packet.is_key());
+                    }
                 }
                 Some(ReadItem::Packet((video_fence, packet)))
             }
@@ -18333,6 +18813,50 @@ fn heartbeat_player_hold(
             }),
         );
     }
+}
+
+/// The passthrough tap writer for this connection of `plan` (#344 D2a), or
+/// `None` when the plan has no tap or the stream's codec/framing is not one
+/// the strict-IDR classifier models. Bumps the tap's connection generation
+/// and publishes the stream's match-rule traits. Arrival times are read from
+/// the run's monotonic time source (wait-free); before a run seeds the writer
+/// skips packets (counted), so a passthrough clock never sees a mixed base.
+fn tap_writer_for(
+    plan: &IngestPlan,
+    input: &ffmpeg::format::context::Input,
+    stream_index: usize,
+    declared_fps: Rational,
+) -> Option<crate::passthrough_tap::TapWriter> {
+    let tap = plan.tap.as_ref()?;
+    let stream = input.stream(stream_index)?;
+    let params = stream.parameters();
+    let (codec, framing) = multiview_ffmpeg::stream_framing(&params)?;
+    let facts = multiview_ffmpeg::video_stream_facts(&params);
+    let open = crate::passthrough_tap::OpenFacts {
+        codec,
+        framing,
+        time_base: multiview_ffmpeg::from_ff_rational(stream.time_base()),
+        frame_rate: declared_fps,
+        profile: facts.profile,
+        level: facts.level,
+        width: facts.width,
+        height: facts.height,
+        color_primaries: facts.color_primaries,
+        color_trc: facts.color_trc,
+        color_space: facts.color_space,
+        color_range: facts.color_range,
+        field_order: facts.field_order,
+        bits_per_raw_sample: facts.bits_per_raw_sample,
+        extradata: facts.extradata,
+        extradata_oversize: facts.extradata_oversize,
+    };
+    let origin = Arc::clone(&plan.output_origin);
+    let now_ns = Box::new(move || {
+        origin
+            .load()
+            .and_then(|run| u64::try_from(run.time().now_nanos()).ok())
+    });
+    crate::passthrough_tap::TapWriter::try_connect(Arc::clone(tap), open, now_ns)
 }
 
 /// Resolve the best video stream's `(index, codec parameters, time-base,
@@ -22455,6 +22979,7 @@ mod live_overlay_bake_tests {
             canvas_height: 180,
             overlay_apply: Some(Arc::clone(slot)),
             activity: None,
+            consumer_stall: None,
             aux_signals: None,
         }
     }
@@ -23189,6 +23714,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -23361,6 +23887,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -23477,6 +24004,7 @@ mod media_player_loop_tests {
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             lifecycle: 0,
+            tap: None,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -26795,6 +27323,208 @@ mod chaos {
                     std::thread::sleep(d);
                 }
             }
+        }
+    }
+}
+
+/// INV3-1 (#345): the wedged-subtitle-sink chaos run at the integrated level.
+/// The REAL pipeline (output clock, bake consumer, encoder, HLS sink) runs live
+/// with three subtitle slots whose cue feed is never drained (a wedged
+/// subtitle consumer) while the patched source's caption store carries
+/// hostile, changing cues (text padded with 256 KiB of whitespace). Invariants
+/// #1/#10: the clock keeps its cadence, the bake consumer keeps up (sampling
+/// stays bounded and never waits on the feed), video segments keep their
+/// tick-derived stamps, and the feed never holds more than its capacity.
+///
+/// The slots carry a source (`cc`) that is ingested but not shown in a cell,
+/// so the run measures the subtitle-slot path alone: burning such a cue into
+/// a displayed tile is the separate overlay path, which this does not cover.
+#[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
+mod subtitle_wedge_chaos {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    const FPS: u64 = 25;
+    /// Hostile caption cues published before the run.
+    const CUES: i64 = 80;
+    const RUN_SECS: u64 = 4;
+    const WEDGE_CAPACITY: usize = 8;
+
+    fn config(playlist: &std::path::Path) -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[sources]]
+id = "cc"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs.slots.subtitle]]
+name = "one"
+source = "cc"
+[[outputs.slots.subtitle]]
+name = "two"
+source = "cc"
+[[outputs.slots.subtitle]]
+name = "three"
+source = "cc"
+"##,
+            playlist.display()
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    }
+
+    /// `(pts, duration)` of every video packet of an MPEG-TS file.
+    fn video_packets(ts: &std::path::Path) -> Vec<(i64, i64)> {
+        let out = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts,duration",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(ts)
+            .output()
+            .expect("ffprobe runs");
+        assert!(out.status.success(), "ffprobe: {out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split(',');
+                Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)]
+    // reason: one end-to-end chaos run checked across clock, sink and files.
+    async fn a_wedged_subtitle_sink_with_hostile_captions_never_stalls_video() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let playlist = dir.path().join("index.m3u8");
+        let mut pipeline = Pipeline::build(&config(&playlist)).expect("pipeline builds");
+        assert_eq!(pipeline.subtitle_outputs.len(), 1);
+        assert_eq!(pipeline.subtitle_outputs[0].slots, 3);
+        // Wedge: the sampler feeds a small channel nobody ever drains.
+        let (wedged, wedged_rx) =
+            multiview_output::hls::subtitle::subtitle_feed_with_capacity(WEDGE_CAPACITY);
+        let wedge_stats = wedged.stats();
+        pipeline.subtitle_outputs[0].feed = wedged;
+        // Hostile, changing captions: a new 100 ms cue every 100 ms over the
+        // run's source timeline, each a short text padded with 256 KiB of
+        // whitespace plus a blank line. (The store deep-clones its window on
+        // every publish, so the count stays modest.)
+        let store = pipeline.attach_caption_store(
+            "cc",
+            Arc::new(crate::captions::CueStore::with_capacity(128)),
+        );
+        let pad = " ".repeat(256 * 1024);
+        for i in 0..CUES {
+            let (start, end) = (
+                MediaTime::from_nanos(i * 100_000_000),
+                MediaTime::from_nanos((i + 1) * 100_000_000),
+            );
+            let lines = vec![format!("cue {i}{pad}"), String::new(), format!("tail {i}")];
+            let cue = multiview_ffmpeg::caption::CaptionCue::try_text(start, end, lines, None)
+                .expect("text cue");
+            store.publish(start, end, cue);
+        }
+        let stop = StopSignal::new();
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(RUN_SECS));
+                stop.stop();
+            })
+        };
+        let started = std::time::Instant::now();
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(RUN_SECS + 60),
+            pipeline.run_until(&stop),
+        )
+        .await
+        .expect("the run ends: nothing blocks on the wedged subtitle feed")
+        .expect("the run succeeds");
+        stopper.join().expect("stopper");
+        let elapsed = started.elapsed().as_secs_f64();
+
+        // The clock kept its cadence (CI-load tolerant: >= 90 %).
+        let expected = elapsed * f64::from(u32::try_from(FPS).unwrap());
+        let frames = f64::from(u32::try_from(report.frames).expect("small"));
+        assert!(
+            frames >= 0.9 * expected.min(f64::from(u32::try_from(RUN_SECS * FPS).unwrap())),
+            "clock ticks {frames} over {elapsed:.2} s (expected ~{expected:.0})"
+        );
+        // The bake consumer kept up: at most 10 % of ticks shed.
+        assert!(
+            report.dropped * 10 <= report.frames,
+            "consumer shed {} of {} ticks",
+            report.dropped,
+            report.frames
+        );
+        // The hostile cues were sampled (truncated) and the wedge dropped
+        // (counted) instead of growing: the feed holds at most its capacity.
+        assert!(
+            wedge_stats.truncated() > 0,
+            "hostile cues reached the sampler"
+        );
+        assert!(wedge_stats.feed_dropped() > 0, "the wedge drops and counts");
+        let queued = wedged_rx.drain();
+        assert!(queued.len() <= WEDGE_CAPACITY, "{}", queued.len());
+        assert!(queued
+            .iter()
+            .all(|c| c.lines.len() <= 4 && c.lines.iter().map(String::len).sum::<usize>() <= 512));
+        // Video kept flowing with tick-derived stamps: consecutive packets of
+        // each written segment are exactly one tick apart (90 kHz / 25).
+        let segments: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("output dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "ts")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("video-"))
+            })
+            .collect();
+        assert!(segments.len() >= 2, "video segments written: {segments:?}");
+        let tick_90k = i64::try_from(90_000 / FPS).unwrap();
+        for seg in &segments {
+            let mut pts: Vec<i64> = video_packets(seg).into_iter().map(|(p, _)| p).collect();
+            pts.sort_unstable();
+            assert!(!pts.is_empty(), "{seg:?} carries video");
+            assert!(
+                pts.windows(2).all(|w| w[1] - w[0] == tick_90k),
+                "{seg:?}: {pts:?}"
+            );
         }
     }
 }

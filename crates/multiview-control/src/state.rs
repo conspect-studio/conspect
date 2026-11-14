@@ -780,6 +780,12 @@ pub struct AppState {
     /// Stored layouts registered as M/E sources (#307); `None` until the
     /// binary installs the engine side (a layout select then answers 409).
     pub me_layouts: Option<Arc<crate::me_layouts::MeLayoutRegistry>>,
+    /// The running engine's cast outputs (ADR-0111); `None` until the binary
+    /// installs the engine seam (no cast output can be used).
+    pub cast_engine: Option<crate::cast_engine::SharedCastEngine>,
+    /// The cast stream tokens (ADR-0111, design §3): bounded, shared by
+    /// every router clone of this state.
+    pub cast_streams: Arc<crate::cast_streams::CastStreams>,
     /// Program tick lateness / repeats (ADR-0108 §10); `None` = 404.
     pub program_metrics: Option<Arc<crate::program_metrics::ProgramMetrics>>,
     /// The network front door's live counters (ADR-0107 slice 3); `None` =
@@ -1064,6 +1070,7 @@ impl AppState {
     // field count, not branching logic.
     #[allow(clippy::too_many_lines)]
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one flat field-per-line struct literal
     pub fn new(
         engine: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
         commands: CommandSender,
@@ -1128,6 +1135,8 @@ impl AppState {
             switcher: None,
             output_routing: None,
             me_layouts: None,
+            cast_engine: None,
+            cast_streams: Arc::new(crate::cast_streams::CastStreams::new()),
             program_metrics: None,
             frontdoor_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
@@ -1588,6 +1597,27 @@ impl AppState {
     #[must_use]
     pub fn with_me_layouts(mut self, sources: crate::me_layouts::SharedMeLayoutSources) -> Self {
         self.me_layouts = Some(Arc::new(crate::me_layouts::MeLayoutRegistry::new(sources)));
+        self
+    }
+
+    /// Replace the cast stream registry (tests inject a clock).
+    #[must_use]
+    pub fn with_cast_streams(mut self, streams: Arc<crate::cast_streams::CastStreams>) -> Self {
+        self.cast_streams = streams;
+        self
+    }
+
+    /// Set the registered custom Cast receiver app id (already validated).
+    #[must_use]
+    pub fn with_cast_app_id(self, app_id: Option<String>) -> Self {
+        self.cast_streams.set_receiver_app_id(app_id);
+        self
+    }
+
+    /// Install the engine seam of the cast outputs (ADR-0111).
+    #[must_use]
+    pub fn with_cast_engine(mut self, engine: crate::cast_engine::SharedCastEngine) -> Self {
+        self.cast_engine = Some(engine);
         self
     }
 

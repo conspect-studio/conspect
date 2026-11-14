@@ -268,6 +268,13 @@ pub struct BoundedBatchQueue {
     max_age: Duration,
     recovery_gate: Option<RecoveryGate>,
     closed: bool,
+    /// Monotonic count of packets ever flushed by [`Self::invalidate`]
+    /// (admission failure `OldestAge`/`Occupied`, a stale `pop_at`, `close`,
+    /// or an explicit [`Self::report_loss`]). Never reset and independent of
+    /// `pending_discontinuity`: a caller that wants the packets flushed since
+    /// it last checked reads this value, subtracts its own last-seen total,
+    /// and adds the delta to its own counter.
+    flushed_packets_total: u64,
     /// A `mark_discontinuity(DecoderConfigChanged)` whose generation has not
     /// admitted its first window yet: that window's lease reports it.
     config_change_pending: bool,
@@ -303,6 +310,7 @@ impl BoundedBatchQueue {
             max_age: max_age.min(MAX_QUEUE_AGE),
             recovery_gate: None,
             closed: false,
+            flushed_packets_total: 0,
             config_change_pending: false,
             config_params_pending: None,
         }
@@ -477,6 +485,18 @@ impl BoundedBatchQueue {
         self.entries.len()
     }
 
+    /// Monotonic total of packets this queue has ever flushed from its queued
+    /// backlog via [`Self::invalidate`] (admission failure, a stale `pop_at`,
+    /// `close`, or an explicit [`Self::report_loss`]). Never decreases and
+    /// never resets; it does not include packets rejected before admission
+    /// (those never entered the queue) or packets handed out via `pop`/`pop_at`
+    /// and later dropped by a lease. A caller tracks the delta since its own
+    /// last read to attribute newly flushed packets exactly once.
+    #[must_use]
+    pub fn flushed_packets_total(&self) -> u64 {
+        self.flushed_packets_total
+    }
+
     /// Declare a real encoded-media loss before continuing delivery.
     ///
     /// The producer calls this after a nonempty batch fails construction, or
@@ -628,6 +648,9 @@ impl BoundedBatchQueue {
                 event.flushed_packets += entry.batch.packet_count();
                 event.flushed_bytes += entry.batch.payload_bytes();
             }
+            self.flushed_packets_total = self
+                .flushed_packets_total
+                .saturating_add(u64::try_from(entry.batch.packet_count()).unwrap_or(u64::MAX));
             self.reservations
                 .packets
                 .fetch_sub(entry.batch.packet_count(), Ordering::AcqRel);
@@ -853,6 +876,61 @@ mod tests {
             q.try_offer(key(), now + MAX_QUEUE_AGE + Duration::from_nanos(1)),
             Err(OfferError::NeedsRecoveryPoint)
         );
+    }
+
+    #[test]
+    fn flushed_packets_total_is_monotonic_across_separate_invalidations() {
+        // INV-1 (review-lens3): the carrier's monotonic flush counter must
+        // reflect every packet actually ejected from the queued backlog by
+        // `invalidate`, accumulating across unrelated loss events and never
+        // reset or affected by `pending_discontinuity` being consumed.
+        let now = Instant::now();
+        let q = BoundedBatchQueue::new();
+        assert_eq!(q.flushed_packets_total(), 0);
+
+        // First loss: two queued one-packet windows flushed by `Occupied`.
+        let mut tight = BoundedBatchQueue::with_limits(2, 1024, MAX_QUEUE_AGE).with_recovery_gate(
+            RecoveryGate::StrictRap {
+                codec: CodecKind::H264,
+                framing: NalFraming::AnnexB,
+            },
+        );
+        tight.try_offer(h264_au(0x65, false), now).unwrap();
+        tight.try_offer(h264_au(0x41, false), now).unwrap();
+        assert_eq!(tight.flushed_packets_total(), 0);
+        assert_eq!(
+            tight.try_offer(h264_au(0x41, false), now),
+            Err(OfferError::Occupied)
+        );
+        assert_eq!(tight.flushed_packets_total(), 2);
+        // Consuming the discontinuity event must not reset the total.
+        assert_eq!(
+            tight.take_discontinuity().unwrap().flushed_packets,
+            2,
+            "per-event count matches the monotonic delta for this loss"
+        );
+        assert_eq!(tight.flushed_packets_total(), 2);
+
+        // Second, unrelated loss on the same queue: age expiry of one more
+        // queued window. The total accumulates rather than restarting.
+        // `Occupied` armed the recovery gate, so the next window must open
+        // at a strict RAP before it is re-admitted into the backlog.
+        tight.try_offer(h264_au(0x65, false), now).unwrap();
+        assert_eq!(
+            tight.try_offer(
+                h264_au(0x65, false),
+                now + MAX_QUEUE_AGE + Duration::from_nanos(1)
+            ),
+            Err(OfferError::OldestAge)
+        );
+        assert_eq!(tight.flushed_packets_total(), 3);
+
+        // A `report_loss` call with no queued backlog adds nothing further.
+        tight.report_loss(OfferError::ProducerLoss);
+        assert_eq!(tight.flushed_packets_total(), 3);
+
+        // The unrelated first queue is untouched by `tight`'s losses.
+        assert_eq!(q.flushed_packets_total(), 0);
     }
 
     #[test]

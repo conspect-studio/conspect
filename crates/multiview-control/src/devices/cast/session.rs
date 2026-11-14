@@ -65,7 +65,7 @@ use tokio::time::Instant;
 
 use super::media::CastMediaTarget;
 use super::protocol::{
-    self, CastFrame, InboundMessage, MediaStatusEntry, PlayerState, DEFAULT_MEDIA_RECEIVER_APP_ID,
+    self, CastAppId, CastFrame, InboundMessage, MediaStatusEntry, PlayerState, DEFAULT_LOAD_TITLE,
     PLATFORM_RECEIVER_ID,
 };
 use crate::devices::broadcaster::DeviceBroadcaster;
@@ -148,6 +148,16 @@ impl<C: CastConnector> CastConnector for Arc<C> {
 /// `Mutex`-guarded map write — pure control plane, invariant #10).
 pub type LoadAcceptedHook = Arc<dyn Fn() + Send + Sync>;
 
+/// Observes every published player state: `(mode, idle_reason)` where `mode`
+/// is the conflated status token (`connecting`, `loading`, `playing`,
+/// `buffering`, `paused`, `idle`, `load-failed`, `no-media`, `preempted`, …)
+/// and `idle_reason` the receiver's last `idleReason` / LOAD error reason
+/// while not playing. Runs on the actor task: cheap and non-blocking.
+pub type PlayerStateHook = Arc<dyn Fn(&str, Option<&str>) + Send + Sync>;
+
+/// Longest receiver-supplied reason kept (characters).
+const MAX_REASON_CHARS: usize = 64;
+
 /// Session-actor timing (the ADR-M011 numbers as defaults).
 ///
 /// A plain record (not `#[non_exhaustive]`) so tests can build it directly,
@@ -168,6 +178,10 @@ pub struct CastSessionConfig {
     /// How long the establishment waits for the LAUNCH (and a reconnect for
     /// its `GET_STATUS` answer) before the attempt is declared unreachable.
     pub launch_timeout: Duration,
+    /// The receiver app the session launches and recognises in
+    /// `RECEIVER_STATUS` (Google's Default Media Receiver `CC1AD845` unless
+    /// a registered custom receiver is configured).
+    pub app_id: CastAppId,
 }
 
 impl Default for CastSessionConfig {
@@ -178,6 +192,7 @@ impl Default for CastSessionConfig {
             reconnect_delay: Duration::from_secs(5),
             reload_delay: Duration::from_secs(5),
             launch_timeout: Duration::from_secs(10),
+            app_id: CastAppId::DEFAULT_MEDIA_RECEIVER,
         }
     }
 }
@@ -197,6 +212,7 @@ impl CastSessionConfig {
             reconnect_delay: Duration::from_millis(5),
             reload_delay: Duration::from_millis(5),
             launch_timeout: Duration::from_millis(10),
+            app_id: CastAppId::DEFAULT_MEDIA_RECEIVER,
         }
     }
 }
@@ -280,6 +296,12 @@ pub struct CastSessionActor<C: CastConnector> {
     /// Fired when the receiver accepts our LOAD (the started-at stamp's
     /// trigger); [`None`] when nothing consumes the moment.
     load_accepted: Option<LoadAcceptedHook>,
+    /// Fired on every published status with the player state.
+    player_state: Option<PlayerStateHook>,
+    /// The receiver's last idle / LOAD-error reason (bounded).
+    idle_reason: Option<String>,
+    /// The LOAD's `customData.title`.
+    title: String,
 }
 
 impl<C: CastConnector + 'static> CastSessionActor<C> {
@@ -311,7 +333,33 @@ impl<C: CastConnector + 'static> CastSessionActor<C> {
             preempted: false,
             mode: "connecting",
             load_accepted: None,
+            player_state: None,
+            idle_reason: None,
+            title: DEFAULT_LOAD_TITLE.to_owned(),
         }
+    }
+
+    /// Attach the [`PlayerStateHook`] fired on every published status.
+    #[must_use]
+    pub fn with_player_state_hook(mut self, hook: PlayerStateHook) -> Self {
+        self.player_state = Some(hook);
+        self
+    }
+
+    /// Set the LOAD's `customData.title` (the operator-facing name).
+    #[must_use]
+    pub fn with_title(mut self, title: &str) -> Self {
+        title
+            .chars()
+            .take(120)
+            .collect::<String>()
+            .clone_into(&mut self.title);
+        self
+    }
+
+    /// Remember a receiver-supplied reason (bounded; `None` clears it).
+    fn note_reason(&mut self, reason: Option<&str>) {
+        self.idle_reason = reason.map(|r| r.chars().take(MAX_REASON_CHARS).collect());
     }
 
     /// Attach the [`LoadAcceptedHook`] fired when the receiver accepts this
@@ -363,6 +411,9 @@ impl<C: CastConnector + 'static> CastSessionActor<C> {
         status.mode = Some(self.mode.to_owned());
         status.capabilities = Some(CAST_CAPABILITIES);
         let _seq = self.broadcaster.publish_status(status);
+        if let Some(hook) = self.player_state.as_ref() {
+            hook(self.mode, self.idle_reason.as_deref());
+        }
     }
 
     /// Tear the channel down and ride the lifecycle to UNREACHABLE (the
@@ -451,7 +502,7 @@ impl<C: CastConnector + 'static> CastSessionActor<C> {
         if let Err(err) = channel
             .send(protocol::launch_frame(
                 launch_id,
-                DEFAULT_MEDIA_RECEIVER_APP_ID,
+                self.config.app_id.as_str(),
             ))
             .await
         {
@@ -476,10 +527,11 @@ impl<C: CastConnector + 'static> CastSessionActor<C> {
         }
         let load_id = self.next_request_id();
         if channel
-            .send(protocol::load_frame(
+            .send(protocol::load_frame_titled(
                 load_id,
                 &app.transport_id,
                 &self.media,
+                &self.title,
             ))
             .await
             .is_err()
@@ -529,7 +581,7 @@ impl<C: CastConnector + 'static> CastSessionActor<C> {
                     if let Some(app) = status
                         .applications
                         .iter()
-                        .find(|a| a.app_id == DEFAULT_MEDIA_RECEIVER_APP_ID)
+                        .find(|a| a.app_id == self.config.app_id.as_str())
                     {
                         return Ok(LaunchedApp {
                             session_id: app.session_id.clone(),
@@ -749,6 +801,8 @@ impl<C: CastConnector + 'static> CastSessionActor<C> {
                     );
                     self.media_session_id = None;
                     self.mode = "load-failed";
+                    let reason = reason.as_deref().unwrap_or(kind.as_str()).to_owned();
+                    self.note_reason(Some(&reason));
                     if self.reload_due.is_none() {
                         self.reload_due = Some(Instant::now() + self.config.reload_delay);
                     }
@@ -838,12 +892,14 @@ impl<C: CastConnector + 'static> CastSessionActor<C> {
         self.mode = state.mode_token();
         match state {
             PlayerState::Playing | PlayerState::Buffering | PlayerState::Paused => {
+                self.note_reason(None);
                 // Healthy playback cancels any pending IDLE re-LOAD (the
                 // media recovered on its own).
                 self.reload_due = None;
                 self.drive(LifecycleEvent::Recover)
             }
             PlayerState::Idle => {
+                self.note_reason(idle_reason);
                 if !self.preempted && self.reload_due.is_none() {
                     tracing::info!(
                         device = %self.device_id,
@@ -872,7 +928,8 @@ impl<C: CastConnector + 'static> CastSessionActor<C> {
         // from its first active MEDIA_STATUS.
         self.media_session_id = None;
         let load_id = self.next_request_id();
-        let frame = protocol::load_frame(load_id, &app.transport_id, &self.media);
+        let frame =
+            protocol::load_frame_titled(load_id, &app.transport_id, &self.media, &self.title);
         if let Some(channel) = self.channel.as_mut() {
             if channel.send(frame).await.is_err() {
                 let _ = self.channel_died();

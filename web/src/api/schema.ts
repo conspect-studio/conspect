@@ -154,6 +154,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/cast/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/cast/config` — the receiver app id, namespace and the cast
+         *     outputs this principal may use (role: read; filtered per output on both
+         *     axes).
+         */
+        get: operations["get_cast_config"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/cast/sessions": {
         parameters: {
             query?: never;
@@ -166,10 +187,21 @@ export interface paths {
         put?: never;
         /**
          * `POST /api/v1/cast/sessions` — start an ad-hoc cast session (role: write).
-         * @description Resolves the rendition, spawns the supervised session actor through the
-         *     shared poller registry, and records the ephemeral session. The actor
-         *     CONNECTs → `LAUNCH`es the Default Media Receiver (`CC1AD845`) → `LOAD`s the
-         *     device-reachable HLS URL, then supervises the session (ADR-M011).
+         * @description When the engine runs a cast output (ADR-0111) the session creates its own
+         *     cast stream (`feed` / `output` as `POST /cast/streams` takes them, same
+         *     authorization, owner = the caller), launches the configured receiver app
+         *     (the registered custom receiver, else the Default Media Receiver
+         *     `CC1AD845`) and LOADs `{control.cast_media_base}/cast/<token>/master.m3u8`
+         *     (fMP4, LIVE). The session owns the stream: stopping the session revokes
+         *     it, and a revoked or expired stream ends the session. Only the receiver's
+         *     playlist fetches keep the token alive. The token is never served,
+         *     audited, published or logged (`media_url` is redacted).
+         *
+         *     Without a cast output: resolves the HLS rendition, spawns the supervised
+         *     session actor through the shared poller registry, and records the
+         *     ephemeral session. The actor CONNECTs → `LAUNCH`es the Default Media
+         *     Receiver (`CC1AD845`) → `LOAD`s the device-reachable HLS URL, then
+         *     supervises the session (ADR-M011).
          */
         post: operations["start_cast_session"];
         delete?: never;
@@ -246,6 +278,57 @@ export interface paths {
          */
         post: operations["set_cast_volume"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/cast/streams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/cast/streams` — the caller's own streams (Admin: all);
+         *     never carries `path`.
+         */
+        get: operations["list_cast_streams"];
+        put?: never;
+        /**
+         * `POST /api/v1/cast/streams` — mint a cast stream token (role: write; no
+         *     `Idempotency-Key`). `output` uses that cast output as it is (the caller
+         *     must be authorized for the output on both axes AND for the feed it
+         *     shows); `feed` picks an output already showing it, else takes a free one
+         *     to it (operation `cast:<uuid>`, never persisted); neither = Program.
+         */
+        post: operations["create_cast_stream"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/cast/streams/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/cast/streams/{id}` — one stream with its readiness and the
+         *     receiver's last report; `path` only for the owner.
+         */
+        get: operations["get_cast_stream"];
+        put?: never;
+        post?: never;
+        /**
+         * `DELETE /api/v1/cast/streams/{id}` — revoke the token at once (owner or
+         *     Admin; role: write).
+         */
+        delete: operations["delete_cast_stream"];
         options?: never;
         head?: never;
         patch?: never;
@@ -4489,6 +4572,61 @@ export interface components {
          * @enum {string}
          */
         CaptureMode: "steps" | "realtime";
+        /** @description `GET /api/v1/cast/config`. */
+        CastConfigDoc: {
+            /** @description The custom message namespace. */
+            namespace: string;
+            /** @description The cast outputs this principal may use. */
+            outputs: components["schemas"]["CastOutputDoc"][];
+            /**
+             * @description The registered custom receiver app id (8 upper-case hex characters);
+             *     `null` = none registered (use Google's Default Media Receiver).
+             */
+            receiver_app_id?: string | null;
+            receiver_last_fetch?: null | components["schemas"]["ReceiverFetch"];
+            /** @description Where the receiver app is served (`/cast/receiver/`). */
+            receiver_path: string;
+        };
+        /** @description What fetched the media of a stream (no token, no IP). */
+        CastFetches: {
+            /** @description The last fetcher was a Cast device (`User-Agent` contains `CrKey`). */
+            cast_device: boolean;
+            /**
+             * Format: int64
+             * @description The last fetch (Unix ms), if any.
+             */
+            last_unix_ms?: number | null;
+            /**
+             * Format: int64
+             * @description Successful playlist fetches.
+             */
+            playlists: number;
+            /**
+             * Format: int64
+             * @description Successful segment / init fetches.
+             */
+            segments: number;
+            /** @description The last fetcher's `User-Agent` (at most 160 characters). */
+            user_agent?: string | null;
+        };
+        /** @description A cast output as `GET /cast/config` lists it. */
+        CastOutputDoc: {
+            /** @description A cast stream is active on it. */
+            active: boolean;
+            /**
+             * @description What it shows now: `{"bus":"program"}`, `{"source":"cam1"}`,
+             *     `{"layout":"NewsOne"}`; absent when the engine has not said.
+             */
+            feed?: Record<string, never> | null;
+            /** @description The output's API id. */
+            id: string;
+            /** @description Why it cannot be used, when it cannot. */
+            last_error?: string | null;
+            /** @description A receiver can start now (master + 5 video segments). */
+            ready: boolean;
+            /** @description Cast streams on it. */
+            streams: number;
+        };
         /**
          * @description One ephemeral cast session as the API serves it: the descriptive record
          *     plus the live lifecycle state.
@@ -4498,12 +4636,28 @@ export interface components {
             address: string;
             /** @description The runtime session id (`cast-session-…`, UUID-fresh per start). */
             id: string;
-            /** @description The resolved device-reachable media URL the session LOADs. */
+            /**
+             * @description Why the receiver is idle or refused the LOAD (its `idleReason` /
+             *     error reason, e.g. `ERROR`, `FINISHED`), while not playing.
+             */
+            idle_reason?: string | null;
+            last_report?: null | components["schemas"]["ReceiverReport"];
+            /**
+             * @description The device-reachable media URL the session LOADs. For a session
+             *     that plays a cast stream the token is redacted:
+             *     `https://…/cast/<redacted>/master.m3u8`.
+             */
             media_url: string;
             /** @description The operator-facing name, if given. */
             name?: string | null;
             /** @description The output id whose rendition the session casts. */
             output: string;
+            /**
+             * @description The receiver's player state as last reported: `connecting`,
+             *     `loading`, `playing`, `buffering`, `paused`, `idle`, `load-failed`,
+             *     `no-media`, `preempted`, `relaunching`.
+             */
+            player_state?: string | null;
             /**
              * Format: int64
              * @description When the receiver **accepted** the session's `LOAD` (the first
@@ -4519,6 +4673,47 @@ export interface components {
              *     registry.
              */
             state: string;
+            /**
+             * @description The cast stream the session owns (stopping the session revokes it;
+             *     revoking or expiring it ends the session).
+             */
+            stream_id?: string | null;
+        };
+        /** @description One cast stream. */
+        CastStreamDoc: {
+            /** @description `application/vnd.apple.mpegurl`. */
+            content_type: string;
+            /**
+             * Format: int64
+             * @description When the token expires unless a playlist is fetched (Unix ms).
+             */
+            expires_unix_ms: number;
+            /** @description The feed the stream was created for. */
+            feed: Record<string, never>;
+            /** @description Media fetch counters (no token, no IP). */
+            fetches: components["schemas"]["CastFetches"];
+            /** @description `fmp4`. */
+            hls_segment_format: string;
+            /** @description `fmp4`. */
+            hls_video_segment_format: string;
+            /** @description The stream id (not a secret). */
+            id: string;
+            last_report?: null | components["schemas"]["ReceiverReport"];
+            /** @description The cast output's API id. */
+            output: string;
+            /**
+             * @description `/cast/<token>/master.m3u8`, relative to this origin. Only in the
+             *     create answer and the owner's `GET`; never in a list.
+             */
+            path?: string | null;
+            /** @description A receiver can start now. */
+            ready: boolean;
+            /**
+             * Format: int64
+             * @description Video segments published (Google's Default Media Receiver starts
+             *     slowly on a young playlist: wait for 8).
+             */
+            segments: number;
         };
         /** @description The `POST /api/v1/cast/sessions/{id}/volume` request body. */
         CastVolumeRequest: {
@@ -4745,6 +4940,17 @@ export interface components {
         ConsentSetRequest: {
             /** @description Whether to consent to the outbound daily telemetry pipe. */
             enabled: boolean;
+        };
+        /** @description `POST /api/v1/cast/streams` body. */
+        CreateCastStream: {
+            /**
+             * @description What to show, as `POST /routing/output/take` takes it:
+             *     `{"bus":"program"|"preview"|"clean"}`, `{"source":"<id>"}` or
+             *     `{"layout":"<id>"}`. Absent (and no `output`) = Program.
+             */
+            feed?: Record<string, never> | null;
+            /** @description A cast output's API id, used as it is (what it shows now). */
+            output?: string | null;
         };
         /** @description `POST /api/v1/tls/credential` body (loopback admin listener only). */
         CredentialRequest: {
@@ -6572,6 +6778,24 @@ export interface components {
              * @description Optional PTP domain (`0..=127`).
              */
             ptp_domain?: number | null;
+        } | {
+            audio?: null | components["schemas"]["OutputAudioDoc"];
+            /** @description The rendition to consume; `h264` (the default) is the only value. */
+            codec?: string | null;
+            /**
+             * @description Directory the stream is written to while active; absent means
+             *     `<state dir>/cast/<id>`.
+             */
+            dir?: string | null;
+            gpu_pin?: null | components["schemas"]["DevicePinDoc"];
+            /**
+             * @description Stable operator id (required): 1 to 64 characters of
+             *     `[A-Za-z0-9_-]`.
+             */
+            id: string;
+            /** @enum {string} */
+            kind: "cast";
+            metadata?: null | components["schemas"]["OutputMetadataDoc"];
         };
         /**
          * @description `OpenAPI` mirror of `multiview_config::OutputFlip` (ADR-0089 §2.2). A flip is
@@ -7466,6 +7690,28 @@ export interface components {
             subscribed_sender?: string | null;
             /** @description The transport URN. */
             transport: string;
+        };
+        /** @description The last fetch of the receiver app (no IP). */
+        ReceiverFetch: {
+            /** @description The fetcher was a Cast device (`User-Agent` contains `CrKey`). */
+            cast_device: boolean;
+            /**
+             * Format: int64
+             * @description When (Unix ms).
+             */
+            unix_ms: number;
+            /** @description The fetcher's `User-Agent` (at most 160 characters). */
+            user_agent?: string | null;
+        };
+        /** @description The last receiver report of a stream, as received. */
+        ReceiverReport: {
+            /**
+             * Format: int64
+             * @description When it arrived (Unix ms).
+             */
+            received_unix_ms: number;
+            /** @description The report object the receiver posted (at most 2 KiB of JSON). */
+            report: Record<string, never>;
         };
         /**
          * @description `OpenAPI` mirror of the `[devices.reconnect]` block: supervised-reconnect
@@ -8510,6 +8756,17 @@ export interface components {
              *     advertised one).
              */
             address: string;
+            /**
+             * @description What to show, as `POST /cast/streams` takes it
+             *     (`{"bus":"program"|"preview"|"clean"}`, `{"source":"<id>"}`,
+             *     `{"layout":"<id>"}`). When the engine runs a cast output the session
+             *     creates its own cast stream (same authorization as `POST
+             *     /cast/streams`, owner = the caller) and LOADs
+             *     `{control.cast_media_base}/cast/<token>/master.m3u8`; `output` may
+             *     then name a cast output. Without a cast output a `feed` is refused
+             *     (`409 cast-unavailable`) and `output` names an HLS rendition as before.
+             */
+            feed?: Record<string, never> | null;
             /** @description An operator-facing name for the session (e.g. the room/TV name). */
             name?: string | null;
             /**
@@ -9958,6 +10215,35 @@ export interface operations {
             };
         };
     };
+    get_cast_config: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The cast configuration. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CastConfigDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     list_cast_sessions: {
         parameters: {
             query?: never;
@@ -10027,7 +10313,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized to start a session. */
+            /** @description Not authorized to start a session; with a cast output: the caller may not read the output (object and output axis) or the feed, exactly as for `POST /cast/streams`. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -10036,7 +10322,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description No castable rendition (control.cast_media_base unset / no HLS output) or no live cast driver in this build. */
+            /** @description No live cast driver in this build; with a cast output: `cast-no-public-base` (control.cast_media_base is not an absolute https:// origin) or any refusal of `POST /cast/streams` (`cast-unavailable`, `cast-capacity`, `cast-no-encoder`, routing refusals); without one: no castable rendition (control.cast_media_base unset / no HLS output) or `cast-unavailable` for a `feed`. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -10045,8 +10331,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The address is not a valid host[:port], or the named output is not a served HLS rendition. */
+            /** @description The address is not a valid host[:port], the named output is not a served HLS rendition, or `unknown-feed`. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The `POST /cast/streams` creation limit (burst 4, then 1/s per principal). */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy`: the take onto the cast output did not settle within 3 s. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -10280,6 +10584,211 @@ export interface operations {
             };
             /** @description level_percent is out of range (0–100). */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_cast_streams: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The caller's cast streams (an Admin sees all), without tokens. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CastStreamDoc"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    create_cast_stream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateCastStream"];
+            };
+        };
+        responses: {
+            /** @description Created; `path` carries the token (shown only here and in the owner's GET). */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CastStreamDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The role cannot write, or the caller may not read the output (object AND output axis) or the feed (a layout: its whole source closure), or a feed the output was taken to while the stream was being created. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown output. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `cast-unavailable` (no usable cast output, the engine is not running, or the output's own error), `cast-capacity` (every cast output in use, or 32 streams / 8 for this caller), `cast-no-encoder` (no free encoder session for the take), `cast-feed-changed` (the output's feed kept changing while the stream was being created: retry), or a routing refusal of the take passed through (`switcher-required`, `aux-capacity`, `output-kind-unroutable`, `routing-unavailable`, `refused:*`). */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `unknown-feed` / `layout-not-admissible`, or a malformed body. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Over 4 creations in a burst, then 1/s, per principal; see Retry-After. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy`: the take could not be enqueued or did not settle within 3 s. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_cast_stream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cast stream id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stream (`path` only for its owner). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CastStreamDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such stream, it expired, or it is another principal's; `cast-stream-revoked` (owner or Admin only) when the server revoked its token because its output was taken to a feed the owner may not read, or the owner can no longer be resolved (`detail` says which). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_cast_stream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cast stream id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revoked: the next media request with its token is 404. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The role cannot write. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such stream, it expired, or it is another principal's. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

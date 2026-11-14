@@ -92,6 +92,14 @@ pub struct Segment {
     /// derived from the outbound presentation epoch as
     /// `epoch.wall_at(segment first PTS)`). `None` ⇒ no PDT tag.
     pub program_date_time_ns: Option<i64>,
+    /// The `EXT-X-MAP` init-segment URI in force **from** this segment
+    /// (fMP4 only). It is rendered (after the segment's
+    /// `EXT-X-DISCONTINUITY`, before its `EXTINF`) when it differs from the
+    /// map already in force or when the segment is discontinuous, and stays
+    /// in force for the following segments. `None` ⇒ the segment uses
+    /// whichever map is already in force (the playlist-level one for the
+    /// first segment).
+    pub map_uri: Option<String>,
     /// LL-HLS parts that make up this segment, in order.
     pub parts: Vec<Part>,
 }
@@ -106,8 +114,18 @@ impl Segment {
             duration,
             discontinuity: false,
             program_date_time_ns: None,
+            map_uri: None,
             parts: Vec::new(),
         }
+    }
+
+    /// Switch the `EXT-X-MAP` init segment at this segment (see
+    /// [`Segment::map_uri`]). Used with a discontinuity when the decoder
+    /// configuration changes mid-stream.
+    #[must_use]
+    pub fn with_map_uri(mut self, uri: impl Into<String>) -> Self {
+        self.map_uri = Some(uri.into());
+        self
     }
 
     /// Attach the wall-clock instant of this segment's first sample (integer
@@ -149,6 +167,7 @@ pub struct MediaPlaylist {
     preload_hint: Option<String>,
     segments: Vec<Segment>,
     rendition_reports: Vec<RenditionReport>,
+    extinf_decimals: usize,
 }
 
 impl MediaPlaylist {
@@ -168,7 +187,17 @@ impl MediaPlaylist {
             preload_hint: None,
             segments: Vec::new(),
             rendition_reports: Vec::new(),
+            extinf_decimals: 3,
         }
+    }
+
+    /// Set the number of decimal places `EXTINF` durations are rendered with
+    /// (default 3, clamped to `3..=9`). A CMAF packager whose segment
+    /// durations are exact sample-count ratios (e.g. `94 * 1024 / 48000`)
+    /// raises this so the text does not round away sub-millisecond precision.
+    /// LL-HLS part durations and server-control values keep three decimals.
+    pub fn set_extinf_decimals(&mut self, decimals: usize) {
+        self.extinf_decimals = decimals.clamp(3, 9);
     }
 
     /// Set `EXT-X-TARGETDURATION` (integer seconds) explicitly.
@@ -293,6 +322,11 @@ impl MediaPlaylist {
                 if evicted.discontinuity {
                     self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
                 }
+                // A map switched at the evicted segment stays in force for the
+                // segments after it, so it becomes the playlist-level map.
+                if let Some(map) = &evicted.map_uri {
+                    self.map_uri.clone_from(map);
+                }
             }
             // Drop the front segment and advance the media sequence by one.
             self.segments.remove(0);
@@ -342,14 +376,33 @@ impl MediaPlaylist {
                 self.discontinuity_sequence
             );
         }
-        if self.segment_type == SegmentType::Fmp4 {
-            let _ = writeln!(out, "#EXT-X-MAP:URI=\"{}\"", self.map_uri);
+        let fmp4 = self.segment_type == SegmentType::Fmp4;
+        // The map in force while walking the segments. A map switched at the
+        // very first listed segment is the playlist-level map (no stale init
+        // is advertised ahead of it).
+        let mut active_map: &str = self
+            .segments
+            .first()
+            .and_then(|seg| seg.map_uri.as_deref())
+            .unwrap_or(&self.map_uri);
+        if fmp4 {
+            let _ = writeln!(out, "#EXT-X-MAP:URI=\"{active_map}\"");
         }
 
         // Segments (and their parts) in order.
-        for seg in &self.segments {
+        for (index, seg) in self.segments.iter().enumerate() {
             if seg.discontinuity {
                 let _ = writeln!(out, "#EXT-X-DISCONTINUITY");
+            }
+            if let Some(map) = seg.map_uri.as_deref() {
+                // A changed map is announced where it takes effect; after a
+                // discontinuity the map in force is announced again (the
+                // decoder is re-initialised there).
+                let restated = seg.discontinuity && index > 0;
+                if fmp4 && (map != active_map || restated) {
+                    let _ = writeln!(out, "#EXT-X-MAP:URI=\"{map}\"");
+                }
+                active_map = map;
             }
             if let Some(pdt_ns) = seg.program_date_time_ns {
                 // The PDT applies to the first sample of the segment (RFC 8216
@@ -372,7 +425,7 @@ impl MediaPlaylist {
                 }
                 let _ = writeln!(out);
             }
-            let _ = writeln!(out, "#EXTINF:{},", fmt_seconds(seg.duration));
+            let _ = writeln!(out, "#EXTINF:{:.*},", self.extinf_decimals, seg.duration);
             let _ = writeln!(out, "{}", seg.uri);
         }
 

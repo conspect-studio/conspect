@@ -562,6 +562,37 @@
         }
       }
     },
+    "/api/v1/cast/config": {
+      "get": {
+        "tags": [
+          "cast"
+        ],
+        "summary": "`GET /api/v1/cast/config` — the receiver app id, namespace and the cast\noutputs this principal may use (role: read; filtered per output on both\naxes).",
+        "operationId": "get_cast_config",
+        "responses": {
+          "200": {
+            "description": "The cast configuration.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CastConfigDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/cast/sessions": {
       "get": {
         "tags": [
@@ -610,7 +641,7 @@
           "cast"
         ],
         "summary": "`POST /api/v1/cast/sessions` — start an ad-hoc cast session (role: write).",
-        "description": "Resolves the rendition, spawns the supervised session actor through the\nshared poller registry, and records the ephemeral session. The actor\nCONNECTs → `LAUNCH`es the Default Media Receiver (`CC1AD845`) → `LOAD`s the\ndevice-reachable HLS URL, then supervises the session (ADR-M011).",
+        "description": "When the engine runs a cast output (ADR-0111) the session creates its own\ncast stream (`feed` / `output` as `POST /cast/streams` takes them, same\nauthorization, owner = the caller), launches the configured receiver app\n(the registered custom receiver, else the Default Media Receiver\n`CC1AD845`) and LOADs `{control.cast_media_base}/cast/<token>/master.m3u8`\n(fMP4, LIVE). The session owns the stream: stopping the session revokes\nit, and a revoked or expired stream ends the session. Only the receiver's\nplaylist fetches keep the token alive. The token is never served,\naudited, published or logged (`media_url` is redacted).\n\nWithout a cast output: resolves the HLS rendition, spawns the supervised\nsession actor through the shared poller registry, and records the\nephemeral session. The actor CONNECTs → `LAUNCH`es the Default Media\nReceiver (`CC1AD845`) → `LOAD`s the device-reachable HLS URL, then\nsupervises the session (ADR-M011).",
         "operationId": "start_cast_session",
         "requestBody": {
           "content": {
@@ -644,7 +675,7 @@
             }
           },
           "403": {
-            "description": "Not authorized to start a session.",
+            "description": "Not authorized to start a session; with a cast output: the caller may not read the output (object and output axis) or the feed, exactly as for `POST /cast/streams`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -654,7 +685,7 @@
             }
           },
           "409": {
-            "description": "No castable rendition (control.cast_media_base unset / no HLS output) or no live cast driver in this build.",
+            "description": "No live cast driver in this build; with a cast output: `cast-no-public-base` (control.cast_media_base is not an absolute https:// origin) or any refusal of `POST /cast/streams` (`cast-unavailable`, `cast-capacity`, `cast-no-encoder`, routing refusals); without one: no castable rendition (control.cast_media_base unset / no HLS output) or `cast-unavailable` for a `feed`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -664,7 +695,27 @@
             }
           },
           "422": {
-            "description": "The address is not a valid host[:port], or the named output is not a served HLS rendition.",
+            "description": "The address is not a valid host[:port], the named output is not a served HLS rendition, or `unknown-feed`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The `POST /cast/streams` creation limit (burst 4, then 1/s per principal).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`engine-busy`: the take onto the cast output did not settle within 3 s.",
             "content": {
               "application/json": {
                 "schema": {
@@ -957,6 +1008,244 @@
           },
           "422": {
             "description": "level_percent is out of range (0–100).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cast/streams": {
+      "get": {
+        "tags": [
+          "cast"
+        ],
+        "summary": "`GET /api/v1/cast/streams` — the caller's own streams (Admin: all);\nnever carries `path`.",
+        "operationId": "list_cast_streams",
+        "responses": {
+          "200": {
+            "description": "The caller's cast streams (an Admin sees all), without tokens.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CastStreamDoc"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "cast"
+        ],
+        "summary": "`POST /api/v1/cast/streams` — mint a cast stream token (role: write; no\n`Idempotency-Key`). `output` uses that cast output as it is (the caller\nmust be authorized for the output on both axes AND for the feed it\nshows); `feed` picks an output already showing it, else takes a free one\nto it (operation `cast:<uuid>`, never persisted); neither = Program.",
+        "operationId": "create_cast_stream",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCastStream"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created; `path` carries the token (shown only here and in the owner's GET).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CastStreamDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The role cannot write, or the caller may not read the output (object AND output axis) or the feed (a layout: its whole source closure), or a feed the output was taken to while the stream was being created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown output.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`cast-unavailable` (no usable cast output, the engine is not running, or the output's own error), `cast-capacity` (every cast output in use, or 32 streams / 8 for this caller), `cast-no-encoder` (no free encoder session for the take), `cast-feed-changed` (the output's feed kept changing while the stream was being created: retry), or a routing refusal of the take passed through (`switcher-required`, `aux-capacity`, `output-kind-unroutable`, `routing-unavailable`, `refused:*`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`unknown-feed` / `layout-not-admissible`, or a malformed body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Over 4 creations in a burst, then 1/s, per principal; see Retry-After.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`engine-busy`: the take could not be enqueued or did not settle within 3 s.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cast/streams/{id}": {
+      "get": {
+        "tags": [
+          "cast"
+        ],
+        "summary": "`GET /api/v1/cast/streams/{id}` — one stream with its readiness and the\nreceiver's last report; `path` only for the owner.",
+        "operationId": "get_cast_stream",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cast stream id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stream (`path` only for its owner).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CastStreamDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such stream, it expired, or it is another principal's; `cast-stream-revoked` (owner or Admin only) when the server revoked its token because its output was taken to a feed the owner may not read, or the owner can no longer be resolved (`detail` says which).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "cast"
+        ],
+        "summary": "`DELETE /api/v1/cast/streams/{id}` — revoke the token at once (owner or\nAdmin; role: write).",
+        "operationId": "delete_cast_stream",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Cast stream id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked: the next media request with its token is 404."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The role cannot write.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such stream, it expired, or it is another principal's.",
             "content": {
               "application/json": {
                 "schema": {
@@ -15543,6 +15832,136 @@
           "realtime"
         ]
       },
+      "CastConfigDoc": {
+        "type": "object",
+        "description": "`GET /api/v1/cast/config`.",
+        "required": [
+          "receiver_path",
+          "namespace",
+          "outputs"
+        ],
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "description": "The custom message namespace."
+          },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CastOutputDoc"
+            },
+            "description": "The cast outputs this principal may use."
+          },
+          "receiver_app_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The registered custom receiver app id (8 upper-case hex characters);\n`null` = none registered (use Google's Default Media Receiver)."
+          },
+          "receiver_last_fetch": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReceiverFetch",
+                "description": "The last fetch of the receiver app (no IP), `null` = never."
+              }
+            ]
+          },
+          "receiver_path": {
+            "type": "string",
+            "description": "Where the receiver app is served (`/cast/receiver/`)."
+          }
+        }
+      },
+      "CastFetches": {
+        "type": "object",
+        "description": "What fetched the media of a stream (no token, no IP).",
+        "required": [
+          "playlists",
+          "segments",
+          "cast_device"
+        ],
+        "properties": {
+          "cast_device": {
+            "type": "boolean",
+            "description": "The last fetcher was a Cast device (`User-Agent` contains `CrKey`)."
+          },
+          "last_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The last fetch (Unix ms), if any.",
+            "minimum": 0
+          },
+          "playlists": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Successful playlist fetches.",
+            "minimum": 0
+          },
+          "segments": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Successful segment / init fetches.",
+            "minimum": 0
+          },
+          "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last fetcher's `User-Agent` (at most 160 characters)."
+          }
+        }
+      },
+      "CastOutputDoc": {
+        "type": "object",
+        "description": "A cast output as `GET /cast/config` lists it.",
+        "required": [
+          "id",
+          "active",
+          "ready",
+          "streams"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "A cast stream is active on it."
+          },
+          "feed": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "What it shows now: `{\"bus\":\"program\"}`, `{\"source\":\"cam1\"}`,\n`{\"layout\":\"NewsOne\"}`; absent when the engine has not said."
+          },
+          "id": {
+            "type": "string",
+            "description": "The output's API id."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it cannot be used, when it cannot."
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "A receiver can start now (master + 5 video segments)."
+          },
+          "streams": {
+            "type": "integer",
+            "description": "Cast streams on it.",
+            "minimum": 0
+          }
+        }
+      },
       "CastSessionDoc": {
         "type": "object",
         "description": "One ephemeral cast session as the API serves it: the descriptive record\nplus the live lifecycle state.",
@@ -15562,9 +15981,27 @@
             "type": "string",
             "description": "The runtime session id (`cast-session-…`, UUID-fresh per start)."
           },
+          "idle_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the receiver is idle or refused the LOAD (its `idleReason` /\nerror reason, e.g. `ERROR`, `FINISHED`), while not playing."
+          },
+          "last_report": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReceiverReport",
+                "description": "The cast stream's last receiver report (custom receiver only)."
+              }
+            ]
+          },
           "media_url": {
             "type": "string",
-            "description": "The resolved device-reachable media URL the session LOADs."
+            "description": "The device-reachable media URL the session LOADs. For a session\nthat plays a cast stream the token is redacted:\n`https://…/cast/<redacted>/master.m3u8`."
           },
           "name": {
             "type": [
@@ -15577,6 +16014,13 @@
             "type": "string",
             "description": "The output id whose rendition the session casts."
           },
+          "player_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The receiver's player state as last reported: `connecting`,\n`loading`, `playing`, `buffering`, `paused`, `idle`, `load-failed`,\n`no-media`, `preempted`, `relaunching`."
+          },
           "started_unix_ns": {
             "type": [
               "integer",
@@ -15588,6 +16032,93 @@
           "state": {
             "type": "string",
             "description": "The session's live lifecycle state (the DEV-A3 wire vocabulary, e.g.\n`ADOPTING`/`ONLINE`/`DEGRADED`), read from the latest-wins status\nregistry."
+          },
+          "stream_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cast stream the session owns (stopping the session revokes it;\nrevoking or expiring it ends the session)."
+          }
+        }
+      },
+      "CastStreamDoc": {
+        "type": "object",
+        "description": "One cast stream.",
+        "required": [
+          "id",
+          "output",
+          "feed",
+          "content_type",
+          "hls_segment_format",
+          "hls_video_segment_format",
+          "ready",
+          "segments",
+          "expires_unix_ms",
+          "fetches"
+        ],
+        "properties": {
+          "content_type": {
+            "type": "string",
+            "description": "`application/vnd.apple.mpegurl`."
+          },
+          "expires_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the token expires unless a playlist is fetched (Unix ms).",
+            "minimum": 0
+          },
+          "feed": {
+            "type": "object",
+            "description": "The feed the stream was created for."
+          },
+          "fetches": {
+            "$ref": "#/components/schemas/CastFetches",
+            "description": "Media fetch counters (no token, no IP)."
+          },
+          "hls_segment_format": {
+            "type": "string",
+            "description": "`fmp4`."
+          },
+          "hls_video_segment_format": {
+            "type": "string",
+            "description": "`fmp4`."
+          },
+          "id": {
+            "type": "string",
+            "description": "The stream id (not a secret)."
+          },
+          "last_report": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReceiverReport",
+                "description": "The receiver's last report, if any."
+              }
+            ]
+          },
+          "output": {
+            "type": "string",
+            "description": "The cast output's API id."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`/cast/<token>/master.m3u8`, relative to this origin. Only in the\ncreate answer and the owner's `GET`; never in a list."
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "A receiver can start now."
+          },
+          "segments": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Video segments published (Google's Default Media Receiver starts\nslowly on a young playlist: wait for 8).",
+            "minimum": 0
           }
         }
       },
@@ -16134,6 +16665,27 @@
           "enabled": {
             "type": "boolean",
             "description": "Whether to consent to the outbound daily telemetry pipe."
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreateCastStream": {
+        "type": "object",
+        "description": "`POST /api/v1/cast/streams` body.",
+        "properties": {
+          "feed": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "What to show, as `POST /routing/output/take` takes it:\n`{\"bus\":\"program\"|\"preview\"|\"clean\"}`, `{\"source\":\"<id>\"}` or\n`{\"layout\":\"<id>\"}`. Absent (and no `output`) = Program."
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A cast output's API id, used as it is (what it shows now)."
           }
         },
         "additionalProperties": false
@@ -19907,6 +20459,73 @@
                 "minimum": 0
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "Cast output (ADR-0111): an HLS + CMAF fMP4 stream for a Google Cast\nreceiver, written only while a cast stream is active. It carries an\nH.264 picture of at most 1920x1080 at 30 fps (its `format`, else the\ncanvas), shares another H.264 output's encode when its format, codec\nand bit rate are the same, and has no public playback URL.",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "audio": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/OutputAudioDoc",
+                    "description": "Per-output audio selection (program audio only; discrete tracks\nare rejected)."
+                  }
+                ]
+              },
+              "codec": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The rendition to consume; `h264` (the default) is the only value."
+              },
+              "dir": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Directory the stream is written to while active; absent means\n`<state dir>/cast/<id>`."
+              },
+              "gpu_pin": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/DevicePinDoc",
+                    "description": "Encode-stage GPU pin of the consumed rendition."
+                  }
+                ]
+              },
+              "id": {
+                "type": "string",
+                "description": "Stable operator id (required): 1 to 64 characters of\n`[A-Za-z0-9_-]`."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "cast"
+                ]
+              },
+              "metadata": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/OutputMetadataDoc",
+                    "description": "Per-output declarative metadata intent (ADR-0088); a cast stream\ncarries none of it."
+                  }
+                ]
+              }
+            }
           }
         ],
         "description": "`OpenAPI` mirror of `multiview_config::Output` (tagged by `kind`) — the body\naccepted by `POST`/`PUT /api/v1/outputs/{id}`."
@@ -21578,6 +22197,53 @@
           }
         ],
         "description": "An IS-04 **Receiver**: an ingress flow (a Conspect input)."
+      },
+      "ReceiverFetch": {
+        "type": "object",
+        "description": "The last fetch of the receiver app (no IP).",
+        "required": [
+          "unix_ms",
+          "cast_device"
+        ],
+        "properties": {
+          "cast_device": {
+            "type": "boolean",
+            "description": "The fetcher was a Cast device (`User-Agent` contains `CrKey`)."
+          },
+          "unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When (Unix ms).",
+            "minimum": 0
+          },
+          "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The fetcher's `User-Agent` (at most 160 characters)."
+          }
+        }
+      },
+      "ReceiverReport": {
+        "type": "object",
+        "description": "The last receiver report of a stream, as received.",
+        "required": [
+          "received_unix_ms",
+          "report"
+        ],
+        "properties": {
+          "received_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it arrived (Unix ms).",
+            "minimum": 0
+          },
+          "report": {
+            "type": "object",
+            "description": "The report object the receiver posted (at most 2 KiB of JSON)."
+          }
+        }
       },
       "ReconnectPolicyDoc": {
         "type": "object",
@@ -24019,6 +24685,13 @@
             "type": "string",
             "description": "The device authority to dial: `host[:port]`, IPv6 bracketed\n(`[2001:db8::20]:8009`); the CASTV2 port 8009 is the default when\nomitted (Cast **groups** advertise non-default ports — give the\nadvertised one)."
           },
+          "feed": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "What to show, as `POST /cast/streams` takes it\n(`{\"bus\":\"program\"|\"preview\"|\"clean\"}`, `{\"source\":\"<id>\"}`,\n`{\"layout\":\"<id>\"}`). When the engine runs a cast output the session\ncreates its own cast stream (same authorization as `POST\n/cast/streams`, owner = the caller) and LOADs\n`{control.cast_media_base}/cast/<token>/master.m3u8`; `output` may\nthen name a cast output. Without a cast output a `feed` is refused\n(`409 cast-unavailable`) and `output` names an HLS rendition as before."
+          },
           "name": {
             "type": [
               "string",
@@ -26178,7 +26851,7 @@
     },
     {
       "name": "cast",
-      "description": "Ephemeral Google Cast sessions of a served HLS rendition + save-as-device promotion (ADR-M011). Google Cast and Chromecast are trademarks of Google LLC."
+      "description": "Ephemeral Google Cast sessions of a served HLS rendition + save-as-device promotion (ADR-M011), and cast stream tokens for the browser sender: one cast output's HLS files at /cast/<token>/ (ADR-0111). Google Cast and Chromecast are trademarks of Google LLC."
     },
     {
       "name": "discovery",
