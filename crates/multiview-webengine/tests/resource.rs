@@ -148,6 +148,7 @@ fn real_producer_descendant_cpu_reaches_observer() {
         node,
         browser: stub.clone(),
         ffmpeg: stub,
+        gl: multiview_webengine::capture::BrowserGl::Default,
     };
     let capture = Capture {
         width: 320,
@@ -157,6 +158,7 @@ fn real_producer_descendant_cpu_reaches_observer() {
         windy: None,
         background: Background::Opaque,
         document: "x".into(),
+        capture: multiview_webengine::capture::CaptureOptions::default(),
     };
     let cancel = AtomicBool::new(false);
     let mut best: Option<multiview_webengine::resource::ResourceSample> = None;
@@ -224,6 +226,7 @@ fn service_status_exposes_descendant_sample_while_running() {
         node,
         browser: stub.clone(),
         ffmpeg: stub,
+        gl: multiview_webengine::capture::BrowserGl::Default,
     };
     let service = Service::start(
         tools,
@@ -247,6 +250,7 @@ fn service_status_exposes_descendant_sample_while_running() {
                 windy: None,
                 background: Background::Opaque,
                 document: "x".into(),
+                capture: multiview_webengine::capture::CaptureOptions::default(),
             },
             maximum_bytes: 1000,
             timeout: Duration::from_secs(60),

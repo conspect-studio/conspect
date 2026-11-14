@@ -893,6 +893,16 @@ impl GpuCompositor {
                 "{tile_count} tiles exceeds MAX_TILES ({MAX_TILES})"
             )));
         }
+        // Keyer coverage and scene groups (ADR-0113, K1) are built on the CPU
+        // oracle first; the WGSL key path lands after #395 (a deadline on the
+        // GPU readback). Until then a keyed or grouped tile is a typed limit,
+        // so `RunBackend` composes that frame on the CPU reference (counted)
+        // instead of drawing it without its key.
+        if crate::key::needs_cpu_keyer_path(tiles) {
+            return Err(Error::GpuLimit(
+                "keyer tiles are composed on the CPU until the GPU key path lands".to_owned(),
+            ));
+        }
 
         let device = self.ctx.device();
         let queue = self.ctx.queue();
@@ -920,7 +930,7 @@ impl GpuCompositor {
                 canvas,
             )?;
             let params = match &tile.mask {
-                Some(mask) => params.with_mask(mask),
+                Some(mask) => params.with_mask(mask, canvas_w, canvas_h),
                 None => params,
             };
             let params = match img.alpha_plane() {

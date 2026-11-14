@@ -32,11 +32,18 @@ export type Problem = components['schemas']['Problem'];
 export class LayoutApiError extends Error {
   /** The HTTP status code, when one was returned. */
   readonly status: number | undefined;
+  /**
+   * The RFC 9457 problem `detail`, when the server returned one — the
+   * specific reason behind a generic `title` (e.g. the `routed-layout` 403's
+   * explanation of which outputs/sources are missing authorization).
+   */
+  readonly detail: string | undefined;
 
-  constructor(message: string, status?: number) {
+  constructor(message: string, status?: number, detail?: string) {
     super(message);
     this.name = 'LayoutApiError';
     this.status = status;
+    this.detail = detail;
   }
 }
 
@@ -62,7 +69,7 @@ export async function createLayout(
     body: input,
   });
   if (error !== undefined) {
-    throw new LayoutApiError(error.title, error.status);
+    throw new LayoutApiError(error.title, error.status, error.detail ?? undefined);
   }
   const etag = response.headers.get('ETag');
   return { layout: data, etag: etag ?? undefined };
@@ -88,7 +95,7 @@ export async function updateLayout(
     headers: extraHeaders,
   });
   if (error !== undefined) {
-    throw new LayoutApiError(error.title, error.status);
+    throw new LayoutApiError(error.title, error.status, error.detail ?? undefined);
   }
   const etag = response.headers.get('ETag');
   return { layout: data, etag: etag ?? undefined };
@@ -111,9 +118,38 @@ export async function fetchLayoutEtag(
     return undefined;
   }
   if (error !== undefined) {
-    throw new LayoutApiError(error.title, error.status);
+    throw new LayoutApiError(error.title, error.status, error.detail ?? undefined);
   }
   return response.headers.get('ETag') ?? undefined;
+}
+
+/** A single layout read together with its current `ETag`, as ONE response. */
+export interface LayoutWithEtag {
+  /** The layout exactly as the control plane returned it just now. */
+  readonly layout: Layout;
+  /** The `ETag` from that same response, when present. */
+  readonly etag: string | undefined;
+}
+
+/**
+ * Read a single layout AND its `ETag` from the same `GET /api/v1/layouts/{id}`
+ * response. A save that edits only part of a layout (e.g. the Layers dialog)
+ * must base its edit on this fresh read — never on a list-derived snapshot,
+ * whose body/ETag can already be stale relative to a concurrent editor save —
+ * and must send exactly this `ETag` as `If-Match` so a lost-update is a
+ * `412`, not a silent overwrite.
+ */
+export async function fetchLayoutWithEtag(
+  client: MultiviewApiClient,
+  id: string,
+): Promise<LayoutWithEtag> {
+  const { data, error, response } = await client.GET('/api/v1/layouts/{id}', {
+    params: { path: { id } },
+  });
+  if (error !== undefined) {
+    throw new LayoutApiError(error.title, error.status, error.detail ?? undefined);
+  }
+  return { layout: data, etag: response.headers.get('ETag') ?? undefined };
 }
 
 /**
@@ -139,6 +175,6 @@ export async function deleteLayoutById(
     return;
   }
   if (error !== undefined) {
-    throw new LayoutApiError(error.title, error.status);
+    throw new LayoutApiError(error.title, error.status, error.detail ?? undefined);
   }
 }

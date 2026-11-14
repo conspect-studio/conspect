@@ -828,6 +828,8 @@ impl CompositorDrive<Nv12Image> {
                         dst_h: p.dst_h,
                         opacity: p.opacity,
                         mask: p.mask,
+                        key: None,
+                        group: multiview_compositor::key::TileGroup::Top,
                     })
                 })
                 .collect(),

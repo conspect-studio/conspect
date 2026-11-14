@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use crate::blend::LinearRgba;
 use crate::error::{Error, Result};
+use crate::key::{KeyKind, KeyMask, TileGroup, TileKey};
 use crate::mask::WipeMask;
 use crate::pipeline::{CanvasColor, Nv12Image, Tile};
 use crate::readback::{GpuHealth, STALL_HOLD, UNCLOCKED_READBACK_DEADLINE};
@@ -74,6 +75,46 @@ pub struct SharedTile {
     pub opacity: f32,
     /// Optional wipe mask.
     pub mask: Option<WipeMask>,
+    /// Optional key block (ADR-0113 §3), its key source owned.
+    pub key: Option<SharedKey>,
+    /// The tile's scene group (ADR-0113 §2).
+    pub group: TileGroup,
+}
+
+/// The owned twin of a [`TileKey`] (its key source as an `Arc`).
+#[derive(Debug, Clone)]
+pub struct SharedKey {
+    /// Matte derivation.
+    pub kind: KeyKind,
+    /// Separate key signal, or `None` for a self key.
+    pub source: Option<Arc<Nv12Image>>,
+    /// Invert the matte.
+    pub invert: bool,
+    /// Optional source-space mask.
+    pub mask: Option<KeyMask>,
+}
+
+impl SharedKey {
+    /// Own `key` (copies a key source image: off-clock callers only; the
+    /// drive builds it from its held `Arc`s).
+    #[must_use]
+    pub fn from_key(key: &TileKey<'_>) -> Self {
+        Self {
+            kind: key.kind,
+            source: key.source.map(|s| Arc::new(s.clone())),
+            invert: key.invert,
+            mask: key.mask,
+        }
+    }
+
+    fn borrowed(&self) -> TileKey<'_> {
+        TileKey {
+            kind: self.kind,
+            source: self.source.as_deref(),
+            invert: self.invert,
+            mask: self.mask,
+        }
+    }
 }
 
 /// One frame to composite off the clock thread (owned, `Send`).
@@ -125,6 +166,8 @@ impl FrameJob {
                     dst_h: t.dst_h,
                     opacity: t.opacity,
                     mask: t.mask,
+                    key: t.key.as_ref().map(SharedKey::from_key),
+                    group: t.group,
                 })
                 .collect(),
             scene: 0,
@@ -138,13 +181,28 @@ impl FrameJob {
         self.tiles
             .iter()
             .map(|t| {
-                let tile = Tile::scaled(&t.image, t.dst_x, t.dst_y, t.dst_w, t.dst_h, t.opacity);
+                let tile = Tile::scaled(&t.image, t.dst_x, t.dst_y, t.dst_w, t.dst_h, t.opacity)
+                    .in_group(t.group);
+                let tile = match &t.key {
+                    Some(key) => tile.with_key(key.borrowed()),
+                    None => tile,
+                };
                 match t.mask {
                     Some(mask) => tile.with_mask(mask),
                     None => tile,
                 }
             })
             .collect()
+    }
+
+    /// Whether this frame needs the CPU keyer path (ADR-0113 K1: keyed or
+    /// scene-grouped tiles are composited on the CPU reference until the GPU
+    /// key path lands).
+    #[must_use]
+    pub fn needs_cpu_keyer_path(&self) -> bool {
+        self.tiles
+            .iter()
+            .any(|t| t.key.is_some() || t.group != TileGroup::Top)
     }
 
     /// Composite this job through `composer`.
@@ -895,6 +953,22 @@ impl<G: GpuComposer> OffClockGpu<G> {
         self.with_gpu(GpuComposer::gate_misses).unwrap_or(0)
     }
 
+    /// Transfer-LUT builds of the persistent CPU fallback.
+    #[must_use]
+    pub fn cpu_fallback_lut_builds(&self) -> u64 {
+        self.cpu
+            .with_composer(|c| c.cpu.lut_build_count())
+            .unwrap_or(0)
+    }
+
+    /// Band-scratch allocations of the persistent CPU fallback.
+    #[must_use]
+    pub fn cpu_fallback_scratch_allocs(&self) -> u64 {
+        self.cpu
+            .with_composer(|c| c.cpu.scratch_alloc_count())
+            .unwrap_or(0)
+    }
+
     /// Frames dispatched to the CPU fallback.
     #[must_use]
     pub fn cpu_fallback_frames(&self) -> u64 {
@@ -941,6 +1015,14 @@ impl<G: GpuComposer> OffClockGpu<G> {
         let budget = frame_budget(period);
         if self.health.is_lost() {
             return self.cpu_frame(job, start, budget, "GPU device lost");
+        }
+        if job.needs_cpu_keyer_path() {
+            return self.cpu_frame(
+                job,
+                start,
+                budget,
+                "keyed frame (CPU key path, ADR-0113 K1)",
+            );
         }
         let wait = if period.is_zero() {
             budget
@@ -1075,6 +1157,9 @@ impl<G: GpuComposer> OffClockGpu<G> {
         };
         if self.health.is_lost() {
             return on_cpu("GPU device lost");
+        }
+        if job.needs_cpu_keyer_path() {
+            return on_cpu("keyed frame (CPU key path, ADR-0113 K1)");
         }
         match self.gpu.run(job, UNCLOCKED_FRAME_BUDGET) {
             Outcome::Done(Ok(image)) => {

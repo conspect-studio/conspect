@@ -236,7 +236,7 @@ impl CpuBackend {
 
     /// Composite one CPU frame with memoized transfer LUTs + reused band scratch,
     /// fanning across [`auto_thread_count`] worker threads (the production path).
-    fn composite(
+    pub(crate) fn composite(
         &self,
         canvas_w: u32,
         canvas_h: u32,
@@ -260,7 +260,7 @@ impl CpuBackend {
     /// byte-identical for any `n_threads` (the band split only partitions work;
     /// [`crate::pipeline::composite_with_threads`] documents the invariant), so
     /// this changes only *which* code path runs, never the pixels.
-    fn composite_with_thread_count(
+    pub(crate) fn composite_with_thread_count(
         &self,
         canvas_w: u32,
         canvas_h: u32,
@@ -297,18 +297,18 @@ impl CpuBackend {
     }
 
     /// Number of transfer-LUT set builds since this backend was constructed.
-    fn lut_build_count(&self) -> u64 {
+    pub(crate) fn lut_build_count(&self) -> u64 {
         self.lock_scratch().luts.build_count()
     }
 
     /// Number of per-band scratch allocations since this backend was constructed.
-    fn scratch_alloc_count(&self) -> u64 {
+    pub(crate) fn scratch_alloc_count(&self) -> u64 {
         self.lock_scratch().pool.alloc_count()
     }
 
     /// Number of per-band scratch slots the reused pool holds (grow-only): `1`
     /// after a serial composite, the clamped worker count after a parallel one.
-    fn band_count(&self) -> usize {
+    pub(crate) fn band_count(&self) -> usize {
         self.lock_scratch().pool.band_count()
     }
 }
@@ -550,8 +550,9 @@ impl RunBackend {
 
     /// The number of transfer-LUT set builds the persistent CPU backend has
     /// performed since construction. A stable transfer set builds once across
-    /// any number of ticks (efficiency finding #5). Returns `0` for the GPU
-    /// backend, whose shader transfer functions do not use CPU LUTs.
+    /// any number of ticks (efficiency finding #5). For the GPU backend this is
+    /// its persistent per-frame CPU fallback's count (the shader itself uses no
+    /// CPU LUTs).
     ///
     /// This counter is an observability/test seam, not part of the composite
     /// algorithm; reading it does not mutate or rebuild the cache.
@@ -561,22 +562,24 @@ impl RunBackend {
         match self {
             Self::Cpu(cpu) => cpu.lut_build_count(),
             #[cfg(feature = "wgpu")]
-            Self::Gpu(_) => 0,
+            Self::Gpu(gpu) => gpu.cpu_fallback_lut_builds(),
             Self::SimulatedGpu(_) => 0,
         }
     }
 
     /// The number of reusable CPU band-scratch allocations since construction.
     /// The count may grow during warmup/resizes but stays constant across steady-
-    /// state ticks (efficiency finding #6). Returns `0` for the GPU backend,
-    /// which exposes its own surface-pool counter.
+    /// state ticks (efficiency finding #6). For the GPU backend this is its
+    /// persistent per-frame CPU fallback's count (keyed frames until the GPU
+    /// key path lands, ADR-0113 K1); the GPU exposes its own surface-pool
+    /// counter.
     #[doc(hidden)]
     #[must_use]
     pub fn scratch_alloc_count(&self) -> u64 {
         match self {
             Self::Cpu(cpu) => cpu.scratch_alloc_count(),
             #[cfg(feature = "wgpu")]
-            Self::Gpu(_) => 0,
+            Self::Gpu(gpu) => gpu.cpu_fallback_scratch_allocs(),
             Self::SimulatedGpu(_) => 0,
         }
     }

@@ -22,6 +22,8 @@
 //!
 //! ## Module map
 //!
+//! - [`key`] — keyer coverage (luma/linear matte, key source, mask) and the
+//!   scene groups of an exact key-changing transition (ADR-0113).
 //! - [`range`] — limited<->full quantization range expand/compress (8-bit).
 //! - [`matrix`] — YUV'<->R'G'B' matrices (BT.601/709/2020-NCL).
 //! - [`transfer`] — EOTF/OETF (sRGB, BT.709/BT.1886, PQ ST 2084, HLG B67).
@@ -50,6 +52,7 @@ pub mod blend;
 pub mod error;
 #[cfg(feature = "wgpu")]
 pub mod gpu;
+pub mod key;
 pub mod mask;
 pub mod matrix;
 pub mod native;
@@ -65,6 +68,7 @@ pub mod transfer_lut;
 
 pub use backend::{normalize_pci_bus_id, AdapterMatchInfo, GpuTarget, RunBackend, RunBackendKind};
 pub use error::{Error, Result};
+pub use key::{KeyKind, KeyMask, SceneMember, SceneMerge, TileGroup, TileKey};
 pub use native::{
     admit_native_composite, CompositeBackend, NativeAdmission, NativeRejection, TileFormats,
 };
