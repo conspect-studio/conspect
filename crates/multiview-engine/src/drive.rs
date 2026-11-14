@@ -446,11 +446,11 @@ impl<T> CompositorDrive<T> {
     /// reference (invariant #1 — a missing/failed GPU never stalls or crashes the
     /// run). The default backend is the CPU reference, so callers that never call
     /// this keep the prior behaviour exactly.
-    #[must_use]
     ///
     /// The backend's GPU readback deadline is bounded by the canvas cadence
     /// here (and again on every [`CompositorDrive::set_layout`]): `min(10 ms,
     /// period / 2)` (issue #395).
+    #[must_use]
     pub fn with_backend(mut self, backend: RunBackend) -> Self {
         self.backend = backend;
         self.backend

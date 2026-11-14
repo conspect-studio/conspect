@@ -351,13 +351,17 @@ last-good repeat.
   both are mapped or the deadline passes. No `wait_indefinitely` and no blocking
   `recv()` remain in the compositor.
 * **Deadline** `readback_deadline(period) = min(10 ms, period / 2)`
-  (`MAX_READBACK_DEADLINE` = 10 ms, the default before a period is known): 10 ms
+  (`MAX_READBACK_DEADLINE` = 10 ms; also used for a degenerate zero period): 10 ms
   at 25/29.97/30/50 fps, 8.33 ms at 60, 4.17 ms at 120. The 1080p GPU round trip
   on the test server is ~4 ms (§8), so 10 ms is 2.5× healthy headroom; half a
   period leaves the other half for wake + hook + project, so a miss never makes
   the tick itself late by more than half a period and never cascades into
   ADR-T018 catch-up. `CompositorDrive::with_backend` / `set_layout` set it from
-  the canvas cadence (`RunBackend::set_frame_period`).
+  the canvas cadence (`RunBackend::set_frame_period`), so Program always runs
+  under it. A compositor whose period was never set (an off-clock caller: a
+  test, a one-shot render) uses `UNCLOCKED_READBACK_DEADLINE` = 2 s instead,
+  still bounded but not held to the clock budget (a cold pipeline on a software
+  rasteriser takes longer than 10 ms).
 * **Miss ⇒ `Error::GpuDeadline` ⇒ repeat last-good.** The run backend does not
   re-composite a deadline miss on the CPU (the budget is spent). The drive maps
   it to the engine's `Error::ComposeDeadline`; the runtime emits last-good under

@@ -198,6 +198,11 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         tick: Tick,
         reason: &str,
     ) {
+        // `before_compose` already rejected and rolled back this tick: never
+        // publish a second terminal outcome for it.
+        if self.failed_tick.take() == Some(tick.index) {
+            return;
+        }
         self.driver.reject_composed_tick(tick, reason);
         let _ = drive.set_mix_overlay(None);
         let (restored, _) = self.driver.resolved_selections();

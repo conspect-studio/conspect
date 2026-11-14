@@ -385,7 +385,8 @@ pub trait FrameControl {
     fn on_repeat(&mut self, _drive: &mut CompositorDrive<Nv12Image>, _tick: Tick) {}
     /// The fresh compose of `tick` (staged by [`FrameControl::before_compose`])
     /// failed — a GPU readback deadline miss (issue #395) — and the runtime
-    /// re-emitted last-good under `tick` instead. A hook that staged a take
+    /// re-emitted last-good under `tick` instead (not called for the very
+    /// first tick, which is composed on the CPU reference and committed). A hook that staged a take
     /// must roll it back: the staged scene never reached the output.
     /// `after_compose` is not called for this tick.
     fn on_compose_failed(
@@ -1118,8 +1119,10 @@ impl<P: Pacer> EngineRuntime<P> {
                     // The GPU missed this tick's readback deadline: never end
                     // the run and never slip — the tick is still emitted.
                     self.compose_deadline_misses.fetch_add(1, Ordering::AcqRel);
-                    control.on_compose_failed(&mut self.drive, tick, &reason);
                     if let Some(last) = last_good.as_mut() {
+                        // The staged scene never reaches the output: let the
+                        // hook roll a staged take back.
+                        control.on_compose_failed(&mut self.drive, tick, &reason);
                         // Re-emit last-good under THIS tick, exactly like the
                         // cadence-hold repeat path (fresh pts, counted).
                         last.tick = tick;
@@ -1135,7 +1138,9 @@ impl<P: Pacer> EngineRuntime<P> {
                         continue;
                     }
                     // The very first tick has nothing to repeat: compose it on
-                    // the CPU reference so the first frame always exists.
+                    // the CPU reference so the first frame always exists. The
+                    // staged scene IS composed here, so `after_compose`
+                    // commits it as for any fresh frame.
                     self.drive.compose_on_cpu(tick)?
                 }
                 Err(other) => return Err(other),

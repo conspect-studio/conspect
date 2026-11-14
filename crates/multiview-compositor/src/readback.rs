@@ -41,6 +41,14 @@ use crate::pipeline::{CanvasColor, Nv12Image, Tile};
 /// ([`readback_deadline`]).
 pub const MAX_READBACK_DEADLINE: Duration = Duration::from_millis(10);
 
+/// The readback deadline of a compositor whose output frame period was never
+/// set (2 s): an off-clock caller (a test, a one-shot render) still never waits
+/// forever, but a cold pipeline or a software rasteriser is not held to the
+/// output-clock budget. The engine always sets the period
+/// ([`ReadbackGate::set_frame_period`]) before the clock composes, so Program
+/// runs under [`readback_deadline`], never this.
+pub const UNCLOCKED_READBACK_DEADLINE: Duration = Duration::from_secs(2);
+
 /// How long a stalled readback makes frames fail fast (repeat last-good)
 /// before the run backend starts compositing them on the CPU reference
 /// (500 ms: long enough to ride out a transient driver hiccup without paying
@@ -105,7 +113,7 @@ pub struct ReadbackGate<P> {
 
 impl<P> Default for ReadbackGate<P> {
     fn default() -> Self {
-        Self::new(MAX_READBACK_DEADLINE, STALL_HOLD)
+        Self::new(UNCLOCKED_READBACK_DEADLINE, STALL_HOLD)
     }
 }
 
@@ -498,7 +506,7 @@ mod tests {
         assert_eq!(readback_deadline(ns(8_333_333)), ns(4_166_666));
         assert_eq!(readback_deadline(Duration::ZERO), MAX_READBACK_DEADLINE);
         let gate: ReadbackGate<SimPending> = ReadbackGate::default();
-        assert_eq!(gate.deadline(), MAX_READBACK_DEADLINE);
+        assert_eq!(gate.deadline(), UNCLOCKED_READBACK_DEADLINE);
         gate.set_frame_period(ns(16_666_667));
         assert_eq!(gate.deadline(), ns(8_333_333));
     }
