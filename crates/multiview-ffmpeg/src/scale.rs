@@ -149,4 +149,49 @@ impl Scaler {
         output.set_pts(input.pts());
         Ok(output)
     }
+
+    /// Convert `input` into the caller-owned `output`, reusing its buffers.
+    ///
+    /// `output` is (re)allocated only when it is empty or does not match the
+    /// destination spec, so a steady per-frame caller converts with no heap
+    /// allocation after the first frame (the media player's alpha scale,
+    /// #391). An identity spec copies the planes into `output` in place.
+    ///
+    /// # Errors
+    /// As [`Self::run`].
+    pub fn run_into(&mut self, input: &Video, output: &mut Video) -> Result<()> {
+        if input.format() != self.src.format
+            || input.width() != self.src.width
+            || input.height() != self.src.height
+        {
+            return Err(FfmpegError::FrameMismatch(
+                "input geometry/format differs from the scaler's source spec",
+            ));
+        }
+        if output.format() != self.dst.format
+            || output.width() != self.dst.width
+            || output.height() != self.dst.height
+        {
+            *output = Video::new(self.dst.format, self.dst.width, self.dst.height);
+        }
+        if self.src == self.dst {
+            // Never the libswscale no-op path (Defect A, see `run`).
+            for plane in 0..input.planes().min(output.planes()) {
+                let rows = usize::try_from(input.plane_height(plane)).unwrap_or(0);
+                let (s_stride, d_stride) = (input.stride(plane), output.stride(plane));
+                let row = s_stride.min(d_stride);
+                for r in 0..rows {
+                    let src = input.data(plane).get(r * s_stride..r * s_stride + row);
+                    let dst = output
+                        .data_mut(plane)
+                        .get_mut(r * d_stride..r * d_stride + row);
+                    if let (Some(src), Some(dst)) = (src, dst) {
+                        dst.copy_from_slice(src);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        self.sws.run(input, output).map_err(FfmpegError::Convert)
+    }
 }

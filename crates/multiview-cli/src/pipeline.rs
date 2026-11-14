@@ -14074,6 +14074,7 @@ pub(crate) fn nv12_to_decoded(image: &Nv12Image) -> Result<DecodedVideoFrame, Pi
         meta,
         raw_pts: None,
         a53_cc: None,
+        alpha: None,
     })
 }
 

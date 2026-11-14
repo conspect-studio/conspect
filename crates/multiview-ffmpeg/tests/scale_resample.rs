@@ -93,6 +93,53 @@ fn scaler_rejects_a_mismatched_input_frame() {
     }
 }
 
+#[test]
+fn run_into_reuses_the_output_frame_for_scale_and_identity() {
+    // GRAY8 7x5 -> 14x10: the media player's alpha scale shape (#391).
+    let mut src = Video::new(Pixel::GRAY8, 7, 5);
+    let stride = src.stride(0);
+    for y in 0..5 {
+        for x in 0..7 {
+            src.data_mut(0)[y * stride + x] = if x >= 4 { 255 } else { 0 };
+        }
+    }
+    let mut scaler = Scaler::new(
+        ScaleSpec::new(Pixel::GRAY8, 7, 5),
+        ScaleSpec::new(Pixel::GRAY8, 14, 10),
+    )
+    .unwrap();
+    let mut out = Video::empty();
+    scaler.run_into(&src, &mut out).unwrap();
+    assert_eq!(
+        (out.format(), out.width(), out.height()),
+        (Pixel::GRAY8, 14, 10)
+    );
+    let buffer = out.data(0).as_ptr();
+    scaler.run_into(&src, &mut out).unwrap();
+    assert_eq!(
+        out.data(0).as_ptr(),
+        buffer,
+        "steady state must reuse the frame"
+    );
+    assert!(out.data(0)[0] <= 8 && out.data(0)[13] >= 247);
+
+    // Identity copies the active samples in place (never the sws no-op).
+    let mut identity = Scaler::new(
+        ScaleSpec::new(Pixel::GRAY8, 7, 5),
+        ScaleSpec::new(Pixel::GRAY8, 7, 5),
+    )
+    .unwrap();
+    let mut same = Video::empty();
+    identity.run_into(&src, &mut same).unwrap();
+    for y in 0..5 {
+        let (s, d) = (src.stride(0), same.stride(0));
+        assert_eq!(
+            &same.data(0)[y * d..y * d + 7],
+            &src.data(0)[y * s..y * s + 7]
+        );
+    }
+}
+
 /// Build a packed-S16 stereo audio frame of `samples` frames at `rate`.
 fn s16_stereo(samples: usize, rate: u32, pts: i64) -> Audio {
     let mut frame = Audio::new(
