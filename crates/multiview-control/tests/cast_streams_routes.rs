@@ -27,7 +27,8 @@ use multiview_control::cast_engine::{CastEngine, CastEngineError, CastOutputStat
 use multiview_control::cast_streams::CastStreams;
 use multiview_control::output_routing::{
     AudioPlanCost, OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost,
-    PlanRefusal, RoutedAudio, RoutedFeed, RoutingLive, TakeSubmitError,
+    PlanRefusal, RoutedAudio, RoutedFeed, RoutingLive, SubtitleTakeError, SubtitleTakeRequest,
+    TakeSubmitError,
 };
 use multiview_control::{
     boot_model::BootModel, command_bus, AppState, EngineStateSnapshot, InMemoryRepository,
@@ -181,7 +182,13 @@ struct FakeRouting {
     no_encoder: Mutex<bool>,
     tx: SyncSender<OutputOutcome>,
     rx: Mutex<Option<Receiver<OutputOutcome>>>,
+    /// The live subtitle route table per output (#418).
+    subtitles: Mutex<HashMap<String, Vec<Option<String>>>>,
+    /// Run inside a subtitle take, before the table is swapped.
+    on_subtitle_take: SubtitleHook,
 }
+
+type SubtitleHook = Mutex<Option<Box<dyn Fn() + Send + Sync>>>;
 
 impl FakeRouting {
     fn new() -> Arc<Self> {
@@ -208,6 +215,8 @@ impl FakeRouting {
             no_encoder: Mutex::new(false),
             tx,
             rx: Mutex::new(Some(rx)),
+            subtitles: Mutex::new(HashMap::new()),
+            on_subtitle_take: Mutex::new(None),
         })
     }
     fn takes(&self) -> Vec<OutputTakeRequest> {
@@ -265,6 +274,22 @@ impl OutputRouting for FakeRouting {
     }
     fn snapshot(&self) -> Option<RoutingLive> {
         Some(self.live.lock().unwrap().clone())
+    }
+    fn try_take_subtitles(&self, take: SubtitleTakeRequest) -> Result<u64, SubtitleTakeError> {
+        if let Some(hook) = self.on_subtitle_take.lock().unwrap().as_ref() {
+            hook();
+        }
+        let mut tables = self.subtitles.lock().unwrap();
+        let Some(table) = tables.get_mut(&take.output) else {
+            return Err(SubtitleTakeError::NotInRun);
+        };
+        for (slot, source) in take.slots {
+            table[slot] = source;
+        }
+        Ok(1)
+    }
+    fn subtitle_routes(&self, output: &str) -> Option<Vec<Option<String>>> {
+        self.subtitles.lock().unwrap().get(output).cloned()
     }
     fn subscribe_outcomes(&self) -> Option<Receiver<OutputOutcome>> {
         self.rx.lock().unwrap().take()
@@ -2027,8 +2052,8 @@ async fn an_authorized_request_in_flight_across_a_take_is_served() {
 }
 
 // ---------------------------------------------------------------------------
-// #418 review ABUSE-2: a cast stream carries its output's discrete audio
-// tracks, so its token needs Read on them too.
+// #418 review ABUSE-1 / ABUSE-2: a cast stream carries its output's subtitle
+// slots and discrete audio tracks, so its token needs Read on them too.
 // ---------------------------------------------------------------------------
 
 /// [`DOC`] with cast-1 (output-0) carrying `slots` (TOML appended to its
@@ -2042,6 +2067,16 @@ fn doc_with(slots: &str, extra: &str) -> String {
     )
 }
 
+/// cast-1 with one subtitle slot patched to `source`.
+fn subtitle_doc(source: &str) -> String {
+    doc_with(
+        &format!(
+            "[[outputs.slots.subtitle]]\nformat = \"webvtt\"\nlanguage = \"en\"\nsource = \"{source}\"\n"
+        ),
+        "",
+    )
+}
+
 /// A discrete track `secret-trk` routed from `secret-cam`.
 const SECRET_TRACK: &str = r#"
 [audio]
@@ -2051,6 +2086,261 @@ input_id = "secret-cam"
 channels = { kind = "stereo" }
 target_track = "secret-trk"
 "#;
+
+fn subtitle_take(token: &str, key: &str, source: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/patch/take")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("Idempotency-Key", key)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"crosspoints": [{
+                "plane": "subtitle",
+                "destination": {"output": "output-0", "slot": 0},
+                "source": source,
+            }]}))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+/// ABUSE-1: an owner who may not read the subtitle slot's source gets no
+/// token — from the accepted config, and from the engine's live route table
+/// when it differs (the readback wins).
+#[tokio::test]
+async fn create_is_refused_when_the_owner_may_not_read_a_subtitle_source() {
+    let rig = rig_doc(&subtitle_doc("secret-cam"), |s| s);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{doc}");
+    assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+    // An owner who may read it is served.
+    let (status, doc) = create(
+        &rig,
+        OPERATOR_2,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+
+    // Config says `a` (readable), the run's live table says `secret-cam`.
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{doc}");
+}
+
+/// ABUSE-1: a subtitle re-patch through `/patch/take` to a source the
+/// owner may not read revokes the token BEFORE the engine swaps the route
+/// table (no cue of it can be published to it); the owner's GET says why.
+#[tokio::test]
+async fn a_subtitle_repatch_to_an_unreadable_source_revokes_before_the_swap() {
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("a".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    let id = doc["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (state, observed) = (rig.state.clone(), Arc::clone(&seen));
+    *rig.routing.on_subtitle_take.lock().unwrap() = Some(Box::new(move || {
+        observed
+            .lock()
+            .unwrap()
+            .push(state.cast_streams.servable_on("cast-1"));
+    }));
+    let r = send(
+        &rig.router,
+        subtitle_take(
+            OPERATOR_TOKEN,
+            "abuse-1-subs",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert_eq!(*seen.lock().unwrap(), vec![0], "servable at the swap");
+    assert_eq!(
+        rig.routing.subtitles.lock().unwrap()["cast-1"],
+        vec![Some("secret-cam".to_owned())]
+    );
+    for file in ["master.m3u8", "seg-v-1-0.m4s"] {
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/{file}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{file}");
+        assert_eq!(body, b"not found\n", "{file}");
+    }
+    let own = body_json(
+        send(
+            &rig.router,
+            support::get(&format!("/api/v1/cast/streams/{id}"), SCOPED),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(own["type"], "/problems/cast-stream-revoked", "{own}");
+}
+
+/// ABUSE-1, the positive case: an owner who may read the new subtitle
+/// source keeps playing across the re-patch, while a co-viewer who may not
+/// loses its token.
+#[tokio::test]
+async fn a_subtitle_repatch_keeps_tokens_whose_owner_may_read_the_new_source() {
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("a".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        OPERATOR_2,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let keeps = token_of(&doc);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let loses = token_of(&doc);
+    let generation = rig.state.cast_streams.generation("cast-1").unwrap();
+    let r = send(
+        &rig.router,
+        subtitle_take(
+            OPERATOR_TOKEN,
+            "abuse-1-subs-ok",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert!(rig.state.cast_streams.generation("cast-1").unwrap() > generation);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{keeps}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{loses}/master.m3u8")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    // Unpatching (`none`) needs nothing: the remaining token keeps playing.
+    let r = send(
+        &rig.router,
+        subtitle_take(
+            OPERATOR_TOKEN,
+            "abuse-1-subs-none",
+            serde_json::json!("none"),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{keeps}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+}
+
+/// ABUSE-1: a subtitle route the engine swapped without a commit (seen
+/// only on its readback) is re-authorized by the media barrier before
+/// anything is served, even though the picture did not change.
+#[tokio::test]
+async fn the_media_barrier_rechecks_a_subtitle_route_seen_on_the_readback() {
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("a".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+    let (status, body) = fetch(&rig, &format!("/cast/{token}/sub0-1-0.vtt")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found\n");
+    assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+}
+
+/// ABUSE-1: a media request in flight (authorized, paused before opening
+/// its file) across a revoking subtitle re-patch never serves its bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_in_flight_across_a_revoking_subtitle_repatch_is_not_served() {
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("a".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    let (paused, resume) = pause_media(&rig);
+    let router = rig.router.clone();
+    let path = format!("/cast/{token}/master.m3u8");
+    let call = tokio::spawn(async move {
+        let response = send(&router, public("GET", &path).body(Body::empty()).unwrap()).await;
+        (response.status(), body_bytes(response).await)
+    });
+    paused.await.unwrap();
+    let r = send(
+        &rig.router,
+        subtitle_take(
+            OPERATOR_TOKEN,
+            "abuse-1-subs-flight",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    resume.send(()).unwrap();
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found\n");
+}
 
 /// ABUSE-2: a discrete track the stream packages (an explicit audio slot,
 /// or `auto`) needs Read on the track and its route input; the routed audio

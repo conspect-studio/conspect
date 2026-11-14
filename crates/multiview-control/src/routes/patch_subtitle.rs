@@ -322,6 +322,18 @@ pub(crate) fn take(
     // order and a full queue refuses before any route changes (review
     // COR-1, AUZ-1/2, INV-3/4).
     control.ensure_subtitle_worker(state);
+    // #418 review ABUSE-1: a cast output publishes its subtitle slots' cue
+    // text to its stream tokens. Commit the re-patch through the cast
+    // authorization gate BEFORE the engine swaps the route table, so a
+    // token whose owner may not read a new source is revoked before any cue
+    // of it can be published (a refused take below only over-revokes:
+    // fail closed, as for a video take).
+    crate::cast_streams::reauth::before_subtitle_change(
+        state,
+        &checked.config_id,
+        &patch.slots,
+        &principal.key_id,
+    );
     let outcome = match control.take_subtitles(request, &patch.output) {
         SubtitleAdmission::Queued(outcome) => outcome,
         SubtitleAdmission::Busy => {

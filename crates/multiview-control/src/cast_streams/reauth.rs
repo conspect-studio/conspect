@@ -16,7 +16,11 @@
 //! every discrete audio track the stream packages as a rendition (#418
 //! review ABUSE-2: `slots.audio` / the output's `audio` selection resolved
 //! by [`multiview_config::Output::carried_audio`], the engine's own rule;
-//! Read on the track name and its route input).
+//! Read on the track name and its route input) and the source of every
+//! subtitle slot (#418 review ABUSE-1: Read on the source whose captions the
+//! slot carries, from the engine's live route table, else the accepted
+//! config). A subtitle re-patch commits through [`before_subtitle_change`]
+//! before the engine swaps its route table.
 //! A token whose owner fails, or whose owner can no longer be resolved, is
 //! revoked at once: its next request is the same `404` as any dead token,
 //! the reason stays readable by its owner (`GET /cast/streams/{id}`), the
@@ -130,7 +134,37 @@ pub(crate) fn before_change(
     let change = Change {
         op: op.map(str::to_owned),
         bus: video.map(RoutedFeed::bus_name),
-        needs: closure(state, config_id, video, layout, audio),
+        needs: closure(state, config_id, video, layout, audio, None),
+    };
+    let revoked = state.cast_streams.commit(config_id, change, &check(state));
+    report(state, revoked, actor)
+}
+
+/// Commit a subtitle re-patch of cast output `config_id` (slot → new
+/// source, `None` = unpatched; #418 review ABUSE-1), BEFORE the engine
+/// swaps its route table: the same fail-closed generation step as a video
+/// take ([`before_change`]), with the picture unchanged and the output's
+/// complete next closure — every subtitle slot at its NEW source. A token
+/// whose owner may not read a new source is revoked before any cue of it
+/// can be published. Returns the revoked ids.
+pub(crate) fn before_subtitle_change(
+    state: &AppState,
+    config_id: &str,
+    slots: &[(usize, Option<String>)],
+    actor: &str,
+) -> Vec<String> {
+    if state
+        .cast_streams
+        .slots()
+        .iter()
+        .all(|s| s.config_id != config_id)
+    {
+        return Vec::new();
+    }
+    let change = Change {
+        op: None,
+        bus: None,
+        needs: closure(state, config_id, None, None, None, Some(slots)),
     };
     let revoked = state.cast_streams.commit(config_id, change, &check(state));
     report(state, revoked, actor)
@@ -157,6 +191,7 @@ pub(crate) fn on_outcome(state: &AppState, outcome: &OutputOutcome) -> Vec<Strin
         Some(feed),
         None,
         outcome.audio.as_ref(),
+        None,
     );
     let op = (!outcome.operation_id.is_empty()).then_some(outcome.operation_id.as_str());
     let revoked = state.cast_streams.observe(
@@ -172,15 +207,25 @@ pub(crate) fn on_outcome(state: &AppState, outcome: &OutputOutcome) -> Vec<Strin
 
 /// The media path's barrier, run before each `/cast/<token>/…` lookup: when
 /// the engine readback shows output `config_id` on a picture bus the gate
-/// does not clear (a fallback whose outcome is not relayed yet), its tokens
-/// are re-authorized for it NOW, at a new generation, before anything is
-/// served. Cheap when nothing changed (one readback load, one short lock).
+/// does not clear (a fallback whose outcome is not relayed yet), or a
+/// subtitle source the gate does not clear (#418 review ABUSE-1: a route
+/// swapped without a commit), its tokens are re-authorized for it NOW, at a
+/// new generation, before anything is served. Cheap when nothing changed
+/// (two readback loads, two short locks).
 pub(crate) fn on_media(state: &AppState, config_id: &str) {
     let Some(bus) = live_bus(state, config_id) else {
         return;
     };
     if state.cast_streams.clears(config_id, &bus) {
-        return;
+        let subtitles: Vec<Need> = live_subtitles(state, config_id)
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .map(Need::Object)
+            .collect();
+        if subtitles.is_empty() || state.cast_streams.covers(config_id, &subtitles) {
+            return;
+        }
     }
     let (_, needs) = live_needs(state, config_id);
     let revoked = state.cast_streams.observe(
@@ -264,10 +309,10 @@ pub(crate) fn recheck_all(state: &AppState, actor: &str) -> Vec<String> {
 /// (with the output's configured audio choice; `None` grants: unknown).
 fn live_needs(state: &AppState, config_id: &str) -> (Option<String>, Option<Vec<Need>>) {
     let Some(bus) = live_bus(state, config_id) else {
-        return (None, closure(state, config_id, None, None, None));
+        return (None, closure(state, config_id, None, None, None, None));
     };
     let needs = RoutedFeed::from_bus_name(&bus)
-        .and_then(|feed| closure(state, config_id, Some(&feed), None, None));
+        .and_then(|feed| closure(state, config_id, Some(&feed), None, None, None));
     (Some(bus), needs)
 }
 
@@ -306,14 +351,16 @@ fn permits(owner: &Principal, output: &str, needs: &[Need]) -> bool {
 }
 
 /// The grants the output's next feed requires (`None`: undeterminable, so
-/// every token fails closed): the picture, the audio choice and every
-/// discrete track the stream packages.
+/// every token fails closed): the picture, the audio choice, every discrete
+/// track the stream packages and every subtitle slot's source (`subtitles`:
+/// a re-patch about to apply, slot → new source, over the current ones).
 fn closure(
     state: &AppState,
     config_id: &str,
     video: Option<&RoutedFeed>,
     layout: Option<&RoutedLayout>,
     audio: Option<&RoutedAudio>,
+    subtitles: Option<&[(usize, Option<String>)]>,
 ) -> Option<Vec<Need>> {
     let live;
     let video = if let Some(video) = video {
@@ -326,6 +373,7 @@ fn closure(
     let mut needs = video_needs(state, video, layout)?;
     needs.extend(audio_needs(&config, config_id, audio)?);
     needs.extend(carried_track_needs(&config, config_id)?);
+    needs.extend(subtitle_needs(state, &config, config_id, subtitles)?);
     Some(needs)
 }
 
@@ -367,6 +415,47 @@ fn carried_track_needs(
             needs.push(Need::Object(input));
         }
         needs.push(Need::Object(track.to_owned()));
+    }
+    Some(needs)
+}
+
+/// The engine's live subtitle route table of `config_id` (slot → source;
+/// `None`: no run samples it).
+fn live_subtitles(state: &AppState, config_id: &str) -> Option<Vec<Option<String>>> {
+    state
+        .output_routing
+        .as_ref()?
+        .routing
+        .subtitle_routes(config_id)
+}
+
+/// ABUSE-1 (#418): Read on the source of every subtitle slot: `patch`'s
+/// new source for a re-patched slot, else the engine's live route table,
+/// else the accepted config's slot source (F2 persists re-patches there).
+fn subtitle_needs(
+    state: &AppState,
+    config: &multiview_config::MultiviewConfig,
+    config_id: &str,
+    patch: Option<&[(usize, Option<String>)]>,
+) -> Option<Vec<Need>> {
+    let output = output_of(config, config_id)?;
+    let Some(slots) = output.slots().map(|s| s.subtitle.as_slice()) else {
+        return Some(Vec::new());
+    };
+    let live = live_subtitles(state, config_id);
+    let mut needs = Vec::new();
+    for (i, slot) in slots.iter().enumerate() {
+        let patched = patch.and_then(|p| p.iter().find(|(s, _)| *s == i));
+        let source = match (patched, live.as_ref().and_then(|t| t.get(i))) {
+            (Some((_, source)), _) | (None, Some(source)) => source.clone(),
+            (None, None) => slot.source.clone(),
+        };
+        if let Some(source) = source {
+            let need = Need::Object(source);
+            if !needs.contains(&need) {
+                needs.push(need);
+            }
+        }
     }
     Some(needs)
 }

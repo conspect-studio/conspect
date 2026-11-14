@@ -462,6 +462,17 @@ impl CastStreams {
         revoked
     }
 
+    /// Whether every armed token on `config_id` is authorized for all of
+    /// `needs` (the media path's check of the subtitle readback, #418).
+    #[must_use]
+    pub(crate) fn covers(&self, config_id: &str, needs: &[Need]) -> bool {
+        self.lock()
+            .gates
+            .get(config_id)
+            .and_then(super::registry::Gate::cleared_needs)
+            .is_some_and(|cleared| needs.iter().all(|n| cleared.contains(n)))
+    }
+
     /// Whether every armed token on `config_id` is authorized for the
     /// picture bus `bus` (the media path's check of the readback).
     #[must_use]
