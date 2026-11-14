@@ -233,18 +233,8 @@ impl ControlError {
                  (POST /api/v1/switcher/commands/select_preview or select_program). \
                  Nothing was changed."
             )),
-            Self::LayoutOnAir(layout) => {
-                Problem::new(409, "layout-on-air", "Layout is on the M/E").with_detail(format!(
-                    "layout {layout:?}: {}",
-                    crate::me_layouts::ME_LAYOUT_ON_AIR_DETAIL
-                ))
-            }
-            Self::LayoutChanged(layout) => {
-                Problem::new(409, "layout-changed", "Layout changed").with_detail(format!(
-                    "layout {layout:?}: {}",
-                    crate::me_layouts::MeLayoutError::Changed.detail()
-                ))
-            }
+            Self::LayoutOnAir(layout) => me_layout_conflict(&layout, MeLayoutError::OnAir),
+            Self::LayoutChanged(layout) => me_layout_conflict(&layout, MeLayoutError::Changed),
             Self::LayoutNotAdmissible(detail) => Problem::new(
                 422,
                 "layout-not-admissible",
@@ -254,6 +244,18 @@ impl ControlError {
         }
     }
 }
+
+/// A 409 M/E layout-source refusal of stored layout `layout` (#307).
+fn me_layout_conflict(layout: &str, error: crate::me_layouts::MeLayoutError) -> Problem {
+    let title = match error {
+        MeLayoutError::OnAir => "Layout is on the M/E",
+        _ => "Layout changed",
+    };
+    Problem::new(409, error.kind(), title)
+        .with_detail(format!("layout {layout:?}: {}", error.detail()))
+}
+
+use crate::me_layouts::MeLayoutError;
 
 impl axum::response::IntoResponse for ControlError {
     fn into_response(self) -> axum::response::Response {

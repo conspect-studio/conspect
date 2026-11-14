@@ -303,6 +303,10 @@ impl SwitcherControl {
     ///
     /// # Errors
     /// Returns the command unchanged if the bounded mailbox is full or closed.
+    #[allow(clippy::result_large_err)]
+    // reason: the refusal hands the caller its unsent command back (the
+    // mpsc `TrySendError` contract); boxing it would allocate per command
+    // and change every construction site for a cold error path.
     pub fn try_send(&self, command: SwitcherCommand) -> Result<(), SwitcherCommand> {
         self.tx
             .try_send(command)
@@ -1380,20 +1384,20 @@ mod tests {
         }
     }
 
-    fn preview_guard(source: &str, layout_revision: Option<u64>) -> Option<SelectionGuard> {
-        Some(SelectionGuard {
+    fn preview_guard(source: &str, layout_revision: Option<u64>) -> SelectionGuard {
+        SelectionGuard {
             preview: Some(SourceRef::new(source)),
             target: None,
             layout_revision,
-        })
+        }
     }
 
-    fn target_guard(source: &str, layout_revision: Option<u64>) -> Option<SelectionGuard> {
-        Some(SelectionGuard {
+    fn target_guard(source: &str, layout_revision: Option<u64>) -> SelectionGuard {
+        SelectionGuard {
             preview: None,
             target: Some(SourceRef::new(source)),
             layout_revision,
-        })
+        }
     }
 
     #[test]
@@ -1406,7 +1410,7 @@ mod tests {
             SwitcherVerb::SelectPreview(SourceRef::new("secret")),
             None,
         );
-        rig.send("cut", SwitcherVerb::Cut, preview_guard("b", None));
+        rig.send("cut", SwitcherVerb::Cut, Some(preview_guard("b", None)));
         rig.tick();
         assert_eq!(rig.outcome("pv").error, None);
         assert_eq!(
@@ -1415,7 +1419,11 @@ mod tests {
         );
         assert_eq!(rig.program(), "a", "Program unchanged");
         // A CUT authorized for the current Preview takes it.
-        rig.send("cut2", SwitcherVerb::Cut, preview_guard("secret", None));
+        rig.send(
+            "cut2",
+            SwitcherVerb::Cut,
+            Some(preview_guard("secret", None)),
+        );
         rig.tick();
         assert_eq!(rig.outcome("cut2").error, None);
         assert_eq!(rig.program(), "secret");
@@ -1433,7 +1441,7 @@ mod tests {
         rig.send(
             "auto",
             SwitcherVerb::Auto(FrameCount::try_from(3).unwrap()),
-            preview_guard("b", None),
+            Some(preview_guard("b", None)),
         );
         rig.tick();
         assert_eq!(
@@ -1459,7 +1467,7 @@ mod tests {
         rig.send(
             "pgm",
             SwitcherVerb::SelectProgram(SourceRef::input(2)),
-            target_guard("b", None),
+            Some(target_guard("b", None)),
         );
         rig.tick();
         assert_eq!(rig.outcome("patch").error, None);
@@ -1472,7 +1480,7 @@ mod tests {
         rig.send(
             "pv",
             SwitcherVerb::SelectPreview(SourceRef::input(3)),
-            target_guard("b", None),
+            Some(target_guard("b", None)),
         );
         rig.tick();
         assert_eq!(
@@ -1490,7 +1498,7 @@ mod tests {
         rig.send(
             "pv",
             SwitcherVerb::SelectPreview(SourceRef::new("layout:wall")),
-            target_guard("layout:wall", Some(7)),
+            Some(target_guard("layout:wall", Some(7))),
         );
         rig.tick();
         assert_eq!(
@@ -1500,7 +1508,7 @@ mod tests {
         rig.send(
             "pv2",
             SwitcherVerb::SelectPreview(SourceRef::new("layout:wall")),
-            target_guard("layout:wall", Some(8)),
+            Some(target_guard("layout:wall", Some(8))),
         );
         rig.tick();
         assert_eq!(rig.outcome("pv2").error, None);
@@ -1510,7 +1518,7 @@ mod tests {
         rig.send(
             "cut",
             SwitcherVerb::Cut,
-            preview_guard("layout:wall", Some(8)),
+            Some(preview_guard("layout:wall", Some(8))),
         );
         rig.tick();
         assert_eq!(
@@ -1521,7 +1529,7 @@ mod tests {
         rig.send(
             "cut2",
             SwitcherVerb::Cut,
-            preview_guard("layout:wall", Some(9)),
+            Some(preview_guard("layout:wall", Some(9))),
         );
         rig.tick();
         assert_eq!(rig.outcome("cut2").error, None);
@@ -1538,7 +1546,7 @@ mod tests {
         rig.send(
             "pgm",
             SwitcherVerb::SelectProgram(SourceRef::new("layout:wall")),
-            target_guard("layout:wall", Some(7)),
+            Some(target_guard("layout:wall", Some(7))),
         );
         rig.tick();
         assert!(rig.outcomes.try_recv().is_err(), "held, no outcome yet");

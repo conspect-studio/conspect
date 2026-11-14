@@ -877,7 +877,7 @@ fn removal_cannot_unregister_a_fresh_registration(sweep: bool) {
     // The removal is now parked inside the adapter's unregister.
     sources.entered.wait();
     let ensured = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ensurer = {
+    let second = {
         let registry = Arc::clone(&registry);
         let demand = Arc::clone(&demand);
         let ensured = Arc::clone(&ensured);
@@ -895,7 +895,7 @@ fn removal_cannot_unregister_a_fresh_registration(sweep: bool) {
     );
     sources.release.wait();
     remover.join().unwrap();
-    ensurer.join().unwrap();
+    second.join().unwrap();
     assert_eq!(registry.ids(), vec!["x".to_owned()]);
     assert_eq!(sources.registered(), vec!["x".to_owned()]);
     assert_eq!(sources.inner.bodies.lock().unwrap()["x"].0.revision, 20);
@@ -903,7 +903,7 @@ fn removal_cannot_unregister_a_fresh_registration(sweep: bool) {
     assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(registry.remove("x"));
     assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert!(sources.registered().is_empty());
+    assert_eq!(sources.registered(), Vec::<String>::new());
 }
 
 #[test]
@@ -1004,7 +1004,7 @@ async fn an_old_read_is_refused_after_a_delete() {
         registry.ensure(old, None, Instant::now()),
         Err(multiview_control::me_layouts::MeLayoutError::Changed)
     );
-    assert!(rig.sources.registered().is_empty());
+    assert_eq!(rig.sources.registered(), Vec::<String>::new());
     // Through HTTP the layout is simply gone now.
     let response = submit(&rig, OPERATOR_TOKEN, "gone", select("select_preview", "w1")).await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);

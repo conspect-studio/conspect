@@ -1199,7 +1199,7 @@ mod tests {
         .unwrap();
         let cam_frame = gradient(1920, 1080, canvas().color);
         let cam_luma = cam_frame.y_plane().to_vec();
-        let mut published = |i: u64| {
+        let published = |i: u64| {
             cam.publish(cam_frame.clone(), tick(i).pts);
             tx.offer(tick(i));
             assert!(wait_for(

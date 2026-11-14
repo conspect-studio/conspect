@@ -65,7 +65,7 @@ impl Drop for StopOnDrop {
 /// An independent supervisor of one run: the sink records progress; after
 /// `limit` the watchdog raises `expired`, stops the producers and the
 /// runtime. If the runtime then still does not return (a clock wedged
-/// inside the engine ignores its StopSignal), it reports and exits the test
+/// inside the engine ignores its `StopSignal`), it reports and exits the test
 /// process with a failure rather than hang.
 struct Watchdog {
     expired: Arc<AtomicBool>,
@@ -104,7 +104,9 @@ impl Watchdog {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                eprintln!(
+                // The only way to fail a test whose runtime cannot return.
+                #[allow(clippy::print_stderr)]
+                let () = eprintln!(
                     "watchdog: the run did not return within {limit:?} + 10 s (last tick {}); \
                      the output clock is wedged",
                     progress.load(Ordering::Acquire)

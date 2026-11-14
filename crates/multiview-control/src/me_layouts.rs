@@ -518,8 +518,8 @@ mod tests {
     fn fences_evict_the_smallest_and_raise_the_floor() {
         let mut fences = Fences::default();
         assert_eq!(fences.get("never"), 0);
-        for i in 0..MAX_LAYOUT_FENCES {
-            fences.set(&format!("l{i}"), 100 + i as u64);
+        for (i, value) in (0..MAX_LAYOUT_FENCES).zip(100_u64..) {
+            fences.set(&format!("l{i}"), value);
         }
         assert_eq!(fences.by_id.len(), MAX_LAYOUT_FENCES);
         assert_eq!(fences.floor, 0);
