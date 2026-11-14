@@ -648,6 +648,12 @@ fn a_malformed_wipe_mask_covers_nothing_and_never_poisons_the_layers_beneath() {
             origin: [f32::NAN, 0.0],
             ..good
         },
+        WipeMask {
+            pinned: Some(0.5),
+            ..good
+        },
+        WipeMask { width: 0, ..good },
+        WipeMask { height: 0, ..good },
     ];
     for mask in malformed {
         assert!(!mask.is_well_formed(), "{mask:?}");

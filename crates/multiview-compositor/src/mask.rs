@@ -154,8 +154,9 @@ impl WipeMask {
         self
     }
 
-    /// Whether every float field is finite and `pinned` (if set) is in
-    /// `[0, 1]`. `WipeMask` has public fields; [`WipeMask::new`] always builds a
+    /// Whether the mask is one [`WipeMask::new`] can build: a non-zero
+    /// geometry, every float field finite, and `pinned` (if set) exactly `0`
+    /// or `1` (the only endpoints `new` pins; the GPU maps them exactly). `WipeMask` has public fields; [`WipeMask::new`] always builds a
     /// well-formed one. A malformed mask draws nothing on the CPU reference and
     /// on the GPU alike, so it can never poison the layers beneath.
     #[must_use]
@@ -171,7 +172,11 @@ impl WipeMask {
         ]
         .iter()
         .all(|v| v.is_finite())
-            && self.pinned.is_none_or(|c| (0.0..=1.0).contains(&c))
+            && self.width > 0
+            && self.height > 0
+            && self.pinned.is_none_or(|c| {
+                c.to_bits() == 0.0_f32.to_bits() || c.to_bits() == 1.0_f32.to_bits()
+            })
     }
 
     /// Coverage in `[0, 1]` at canvas pixel `(px, py)`. Must stay identical

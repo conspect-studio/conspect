@@ -142,6 +142,12 @@ fn gpu_malformed_wipe_mask_draws_nothing_like_the_cpu_reference() {
             softness: f32::INFINITY,
             ..good
         },
+        WipeMask {
+            pinned: Some(0.5),
+            ..good
+        },
+        WipeMask { width: 0, ..good },
+        WipeMask { height: 0, ..good },
     ] {
         let tiles = [
             Tile::scaled(&out, 0, 0, W, H, 1.0),
