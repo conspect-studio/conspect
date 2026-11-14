@@ -529,8 +529,9 @@ waited 5.0 s on the clock thread.
   backend's CPU-fallback count, so every fresh frame is exactly a GPU or a
   CPU composite (a repeat never counts one), and liveness is a goal in
   ticks (≥ 20 fresh CPU frames after the loss, ≥ 20 fresh GPU frames after
-  a stall) that the run keeps ticking for, up to 1800 ticks, instead of a
-  share of a fixed 150-tick window. Unit tests also cover
+  a stall, ≥ 10 of them after tick 150 so a path that recovers and then
+  stops delivering fails) that the run keeps ticking for, up to 3600 ticks,
+  instead of a share of a fixed 150-tick window. Unit tests also cover
   same-scene adoption between frames, refusal of other-scene results, never
   adopting a CPU result older than a delivered GPU frame, an adopted frame
   carrying its own job's metadata, a late panic marking the device lost,

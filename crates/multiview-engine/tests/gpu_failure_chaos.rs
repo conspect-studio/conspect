@@ -49,10 +49,33 @@ use multiview_engine::{
 
 const TICKS: u64 = 150;
 /// The liveness cap: a run that has not met its fresh-frame goal after this
-/// many ticks (60 s at 30 fps) fails. A healthy host stops at `TICKS`.
-const MAX_TICKS: u64 = 1800;
+/// many ticks (120 s at 30 fps) fails. A healthy host stops at `TICKS` + a
+/// few; a single core starved by 3 busy loops at nice 15 needed up to 1206.
+const MAX_TICKS: u64 = 3600;
 /// Fresh frames a recovered (or CPU-fallback) path must deliver.
 const FRESH_GOAL: usize = 20;
+/// Fresh frames of the same provenance that must ALSO arrive after the
+/// minimum `TICKS` window (review R1): a path that recovers and then stops
+/// delivering for good never meets this and fails at `MAX_TICKS`.
+const CONTINUING_GOAL: usize = 10;
+
+/// The liveness goal: `FRESH_GOAL` fresh `which` frames from `from` on, and
+/// `CONTINUING_GOAL` of them after the minimum `TICKS` window.
+fn goal_met(seen: &[Seen], from: u64, which: fn(&Seen, &Seen) -> bool) -> bool {
+    count_fresh(seen, from, which) >= FRESH_GOAL
+        && count_fresh(seen, TICKS, which) >= CONTINUING_GOAL
+}
+
+/// `goal_met`, asserted with the counts in the message.
+fn assert_goal(seen: &[Seen], from: u64, which: fn(&Seen, &Seen) -> bool, what: &str) {
+    let total = count_fresh(seen, from, which);
+    let continuing = count_fresh(seen, TICKS, which);
+    assert!(
+        total >= FRESH_GOAL && continuing >= CONTINUING_GOAL,
+        "{what}: {total} fresh from tick {from} (need {FRESH_GOAL}), \
+         {continuing} after tick {TICKS} (need {CONTINUING_GOAL})"
+    );
+}
 const FAULT_AT: u64 = 30;
 /// The longest gap between two emitted frames the design allows, with slack
 /// for a loaded runner: the clock waits at most `period / 2` for the GPU job,
@@ -288,7 +311,7 @@ fn device_loss_never_panics_the_clock_and_falls_back_to_cpu_for_good() {
                 gpu.lose_device();
             }
         },
-        |seen| count_fresh(seen, FAULT_AT, Seen::is_cpu) >= FRESH_GOAL,
+        |seen| goal_met(seen, FAULT_AT, Seen::is_cpu),
         |_| {},
     );
     assert_cadence(&r);
@@ -328,7 +351,12 @@ fn device_loss_never_panics_the_clock_and_falls_back_to_cpu_for_good() {
         r.gpu_frames <= gpu_at_loss + 1,
         "at most the one in-flight job"
     );
-    assert!(cpu_after >= FRESH_GOAL, "fresh CPU frames after the loss");
+    assert_goal(
+        &r.seen,
+        FAULT_AT,
+        Seen::is_cpu,
+        "fresh CPU frames after the loss",
+    );
 }
 
 /// "Submit" blocks for at least 1.5 s (a driver-side `queue.submit` that
@@ -345,7 +373,7 @@ fn blocked_submit_never_holds_the_clock() {
                 release_after_cpu_phase(gpu);
             }
         },
-        |seen| count_fresh(seen, FAULT_AT, Seen::is_gpu) >= FRESH_GOAL,
+        |seen| goal_met(seen, FAULT_AT, Seen::is_gpu),
         |_| {},
     );
     assert_cadence(&r);
@@ -361,9 +389,11 @@ fn blocked_submit_never_holds_the_clock() {
         "a GPU stuck past the stall hold composites on the CPU"
     );
     assert!(!r.lost, "a slow submit is not a device loss");
-    assert!(
-        gpu_after >= FRESH_GOAL,
-        "the GPU path recovers by itself ({gpu_after} GPU frames after the stall)"
+    assert_goal(
+        &r.seen,
+        FAULT_AT,
+        Seen::is_gpu,
+        "the GPU path recovers by itself",
     );
 }
 
@@ -431,7 +461,7 @@ fn a_gpu_stuck_from_tick_zero_with_a_slow_cpu_still_emits_every_tick() {
                 release_after_cpu_phase(gpu);
             }
         },
-        |seen| count_fresh(seen, 0, Seen::is_gpu) >= FRESH_GOAL,
+        |seen| goal_met(seen, 0, Seen::is_gpu),
         |_| {},
     );
     assert_cadence(&r);
@@ -448,5 +478,5 @@ fn a_gpu_stuck_from_tick_zero_with_a_slow_cpu_still_emits_every_tick() {
         cpu >= usize::try_from(CPU_BEFORE_RELEASE).unwrap(),
         "the slow CPU fallback still delivers"
     );
-    assert!(gpu >= FRESH_GOAL, "fresh frames after recovery");
+    assert_goal(&r.seen, 0, Seen::is_gpu, "fresh GPU frames after recovery");
 }
