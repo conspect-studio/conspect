@@ -290,6 +290,9 @@ impl<P: PendingReadback> ReadbackGate<P> {
 struct SimDevice {
     latency_nanos: AtomicU64,
     hung: AtomicBool,
+    /// Polls that were allowed to block (a non-zero wait): the deterministic
+    /// proof that a fail-fast frame never waited (no wall-clock assertion).
+    blocking_polls: AtomicU64,
 }
 
 /// A simulated in-flight readback: ready `latency` after submit unless the
@@ -311,6 +314,7 @@ impl PendingReadback for SimPending {
         if wait.is_zero() {
             return ReadbackPoll::Pending;
         }
+        self.device.blocking_polls.fetch_add(1, Ordering::Relaxed);
         // A blocked device wait: up to `wait`, or until the latency elapses.
         let sleep = if self.device.hung.load(Ordering::Acquire) {
             wait
@@ -553,7 +557,11 @@ mod tests {
 
     #[test]
     fn slow_readback_misses_within_the_deadline_then_recovers() {
-        let (gate, device) = sim(Duration::from_millis(60), STALL_HOLD);
+        // A hung device stands in for "slower than the deadline": the miss is
+        // then deterministic (a sleep overshoot on a loaded runner cannot turn
+        // it into an on-time readback, as a fixed 60 ms latency could).
+        let (gate, device) = sim(Duration::from_millis(1), STALL_HOLD);
+        device.hung.store(true, Ordering::Release);
         let t = Instant::now();
         let err = submit(&gate, &device).unwrap_err();
         let took = t.elapsed();
@@ -565,19 +573,18 @@ mod tests {
         assert!(took < Duration::from_millis(10) + SLACK, "{took:?}");
         assert!(gate.is_stalled());
         assert_eq!(gate.misses(), 1);
-        // Outstanding: the next frame fails fast, without waiting.
-        let t = Instant::now();
+        // Outstanding: the next frame fails fast, with no blocking poll.
+        let blocking = device.blocking_polls.load(Ordering::Relaxed);
         let err = submit(&gate, &device).unwrap_err();
         assert!(matches!(err, Error::GpuDeadline(_)), "{err:?}");
-        assert!(
-            t.elapsed() < Duration::from_millis(10),
-            "fail-fast waited {:?}",
-            t.elapsed()
+        assert_eq!(
+            device.blocking_polls.load(Ordering::Relaxed),
+            blocking,
+            "a fail-fast frame must never wait on the device"
         );
         assert_eq!(gate.misses(), 2);
-        // Once the slow readback lands, the next frame recovers by itself.
-        device.latency_nanos.store(1_000_000, Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(70));
+        // Once the readback lands, the next frame recovers by itself.
+        device.hung.store(false, Ordering::Release);
         submit(&gate, &device).unwrap();
         assert!(!gate.is_stalled());
         assert_eq!(gate.misses(), 2);
@@ -591,13 +598,13 @@ mod tests {
         assert!(matches!(submit(&gate, &device), Err(Error::GpuDeadline(_))));
         assert!(matches!(submit(&gate, &device), Err(Error::GpuDeadline(_))));
         std::thread::sleep(hold);
-        let t = Instant::now();
+        let blocking = device.blocking_polls.load(Ordering::Relaxed);
         let err = submit(&gate, &device).unwrap_err();
         assert!(matches!(err, Error::GpuRuntime(_)), "{err:?}");
-        assert!(
-            t.elapsed() < Duration::from_millis(10),
-            "stall hold waited {:?}",
-            t.elapsed()
+        assert_eq!(
+            device.blocking_polls.load(Ordering::Relaxed),
+            blocking,
+            "the stall hold must not wait on the device"
         );
         assert_eq!(
             gate.misses(),
