@@ -94,16 +94,24 @@ fn scaler_rejects_a_mismatched_input_frame() {
     }
 }
 
+/// A `GRAY8` `w x h` [`ScratchFrame`] filled through `plane_mut` with
+/// `pixel(x, y)` (initialised Rust bytes): the only kind of source
+/// `Scaler::run_into` accepts (review PB-15).
+fn gray_scratch(w: u32, h: u32, pixel: impl Fn(usize, usize) -> u8) -> ScratchFrame {
+    let mut src = ScratchFrame::alloc(Pixel::GRAY8, w, h).unwrap();
+    let (plane, stride) = src.plane_mut(0).unwrap();
+    for y in 0..usize::try_from(h).unwrap() {
+        for x in 0..usize::try_from(w).unwrap() {
+            plane[y * stride + x] = pixel(x, y);
+        }
+    }
+    src
+}
+
 #[test]
 fn run_into_reuses_the_output_frame_for_scale_and_identity() {
     // GRAY8 7x5 -> 14x10: the media player's alpha scale shape (#391).
-    let mut src = Video::new(Pixel::GRAY8, 7, 5);
-    let stride = src.stride(0);
-    for y in 0..5 {
-        for x in 0..7 {
-            src.data_mut(0)[y * stride + x] = if x >= 4 { 255 } else { 0 };
-        }
-    }
+    let src = gray_scratch(7, 5, |x, _| if x >= 4 { 255 } else { 0 });
     let mut scaler = Scaler::new(
         ScaleSpec::new(Pixel::GRAY8, 7, 5),
         ScaleSpec::new(Pixel::GRAY8, 14, 10),
@@ -111,19 +119,20 @@ fn run_into_reuses_the_output_frame_for_scale_and_identity() {
     .unwrap();
     // Mismatched on purpose: the first run_into reallocates it.
     let mut out = ScratchFrame::alloc(Pixel::GRAY8, 1, 1).unwrap();
-    scaler.run_into(&src, &mut out).unwrap();
+    scaler.run_into(src.frame(), &mut out).unwrap();
     assert_eq!(
         (out.format(), out.width(), out.height()),
         (Pixel::GRAY8, 14, 10)
     );
     let buffer = out.frame().data(0).as_ptr();
-    scaler.run_into(&src, &mut out).unwrap();
+    scaler.run_into(src.frame(), &mut out).unwrap();
     assert_eq!(
         out.frame().data(0).as_ptr(),
         buffer,
         "steady state must reuse the frame"
     );
-    assert!(out.frame().data(0)[0] <= 8 && out.frame().data(0)[13] >= 247);
+    let (resized, _) = out.plane(0).unwrap();
+    assert!(resized[0] <= 8 && resized[13] >= 247);
 
     // Identity copies the active samples in place (never the sws no-op).
     let mut identity = Scaler::new(
@@ -133,22 +142,21 @@ fn run_into_reuses_the_output_frame_for_scale_and_identity() {
     .unwrap();
     // Mismatched on purpose: the first run_into reallocates it.
     let mut same = ScratchFrame::alloc(Pixel::GRAY8, 1, 1).unwrap();
-    identity.run_into(&src, &mut same).unwrap();
+    identity.run_into(src.frame(), &mut same).unwrap();
+    let ((s_plane, s), (d_plane, d)) = (src.plane(0).unwrap(), same.plane(0).unwrap());
     for y in 0..5 {
-        let (s, d) = (src.stride(0), same.frame().stride(0));
-        assert_eq!(
-            &same.frame().data(0)[y * d..y * d + 7],
-            &src.data(0)[y * s..y * s + 7]
-        );
+        assert_eq!(&d_plane[y * d..y * d + 7], &s_plane[y * s..y * s + 7]);
     }
 }
 
-/// PB-1/PB-2: the identity `run_into` copy (libav `av_frame_copy`, PB-14)
-/// walks a bottom-up (negative linesize) input row by row in display order,
-/// never as one `linesize * height` slice, and its output allocation is
-/// checked.
+/// PB-1/PB-2: the identity copy (libav `av_frame_copy`, PB-14) walks a
+/// bottom-up (negative linesize) input row by row in display order, never
+/// as one `linesize * height` slice, and its output allocation is checked.
+/// Through `Scaler::run`: `run_into` takes only a `ScratchFrame` source
+/// (review PB-15), which is always top-down, so a bottom-up frame cannot
+/// reach it; `run` shares the identity `av_frame_copy`.
 #[test]
-fn run_into_identity_copies_a_bottom_up_frame_in_display_order() {
+fn identity_copies_a_bottom_up_frame_in_display_order() {
     let (w, h) = (6_u32, 4_u32);
     let (cols, rows) = (6_usize, 4_usize);
     let mut src = Video::new(Pixel::GRAY8, w, h);
@@ -173,19 +181,13 @@ fn run_into_identity_copies_a_bottom_up_frame_in_display_order() {
         ScaleSpec::new(Pixel::GRAY8, w, h),
     )
     .unwrap();
-    // Mismatched on purpose: the first run_into reallocates it.
-    let mut out = ScratchFrame::alloc(Pixel::GRAY8, 1, 1).unwrap();
-    identity.run_into(&src, &mut out).unwrap();
-    let d = out.frame().stride(0);
+    let out = identity.run(&src).unwrap();
+    let d = out.stride(0);
     for y in 0..rows {
         let expected: Vec<u8> = (0..cols)
             .map(|x| u8::try_from(10 * (3 - y) + x).unwrap())
             .collect();
-        assert_eq!(
-            &out.frame().data(0)[y * d..y * d + cols],
-            &expected[..],
-            "row {y}"
-        );
+        assert_eq!(&out.data(0)[y * d..y * d + cols], &expected[..], "row {y}");
     }
 }
 

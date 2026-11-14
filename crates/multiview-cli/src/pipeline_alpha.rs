@@ -289,16 +289,25 @@ mod tests {
     /// The decoder's alpha frame as an [`AlphaSource`]. Outside
     /// `multiview-ffmpeg` an `AlphaSource` can only wrap a checked
     /// [`ScratchFrame`] (review PB-14: an arbitrary `Video`'s geometry may
-    /// have been widened over unwritten bytes), so copy the test frame into
-    /// one with libav (`Scaler` identity, `av_frame_copy`): the same pixels
-    /// at the same format and size a decoder would hand over.
+    /// have been widened over unwritten bytes), and a `ScratchFrame` is
+    /// filled only through `plane_mut` (review PB-15: `Scaler::run_into`
+    /// no longer takes a `Video` source). So copy every plane's active rows
+    /// of the test frame (built here, all rows written) into one: the same
+    /// pixels at the same format and size a decoder would hand over.
     fn checked_source(frame: &Video, layout: AlphaLayout) -> AlphaSource {
-        let spec = ScaleSpec::new(frame.format(), frame.width(), frame.height());
-        let mut scratch = ScratchFrame::alloc(spec.format, spec.width, spec.height).unwrap();
-        Scaler::new(spec, spec)
-            .unwrap()
-            .run_into(frame, &mut scratch)
-            .unwrap();
+        let mut scratch =
+            ScratchFrame::alloc(frame.format(), frame.width(), frame.height()).unwrap();
+        for p in 0..frame.planes() {
+            let rows = frame.plane_height(p) as usize;
+            let src_stride = frame.stride(p);
+            let (dst, dst_stride) = scratch.plane_mut(p).unwrap();
+            // `plane_mut` spans `stride * (rows - 1) + active row bytes`.
+            let active = dst.len() - dst_stride * (rows - 1);
+            for y in 0..rows {
+                dst[y * dst_stride..y * dst_stride + active]
+                    .copy_from_slice(&frame.data(p)[y * src_stride..y * src_stride + active]);
+            }
+        }
         AlphaSource::from_checked(scratch, layout)
     }
 
