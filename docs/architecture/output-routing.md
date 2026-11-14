@@ -2497,6 +2497,119 @@ once that muxer writes its rule.)
 - *Return after a stall that hid a parameter change.* An IDR whose parameter generation differs
   from the previous run's always needs the 300-tick parameter-change wait.
 
+**As built in slice D, part D2a (#344).** The engine-side pieces under
+`crates/multiview-cli/src/` (all behind `ffmpeg`), with no router decision yet:
+- *Tap at ingest* (`passthrough_tap.rs`). Every config source's `IngestPlan`
+  carries one `SourceTap`. It is registered in a process-wide wait-free registry:
+  a `SwapCell` holding an immutable map, so `lookup` is one load, and it is
+  forgotten on source removal. The demux reader closure in `open_and_stream`
+  hands each video packet to a per-connection `TapWriter`:
+  - With no consumer, that costs one atomic load per packet: no copy, no
+    clock read and no classification (test).
+  - With a consumer, the bytes are copied once into an `Arc<[u8]>`. A
+    length-prefixed packet is re-framed as Annex B in that same copy, so every
+    `TapAu` is Annex B and a reconnect cannot change framing under a reader.
+    `idr::annex_b_size` computes the re-framed size before anything is
+    allocated, with checked arithmetic and a 1024-NAL budget. A result over
+    `MAX_AU_BYTES` is counted as oversize at once; a malformed prefix is
+    counted separately. `to_annex_b` then writes into a single `Arc<[u8]>` of
+    the exact size (review R1-A-2).
+  - For an H.264 source, the writer caches the connection's SPS/PPS by id,
+    at most 32 of each. The cache is filled from every set in the avcC or
+    Annex-B extradata, then from every in-band SPS/PPS of every AU, IDR or not
+    (review R2-M-3).
+    - A set whose id is reused with different bytes bumps `params_gen` before
+      that AU is offered.
+    - A set whose id cannot be read invalidates the whole cache, so a stale
+      set is never inserted.
+    - An IDR that carries neither set gets exactly the PPS its first slice
+      names, plus that PPS's SPS, inserted after a leading AUD and before
+      classification (review R2-M-4).
+    - When that PPS or its SPS is unknown, the IDR stays incomplete: it is not
+      strict, so no run starts on it. It is counted as `unresolved_sets`.
+    - An MP4/avc1 source, whose sets live only in extradata, therefore yields
+      strict IDRs. A reconnect starts from its own extradata (review R1-M-1).
+  - The 1024-NAL budget also holds for Annex-B packets (`annex_b_nal_count`:
+    no allocation, early exit), and it counts the two NALs an insertion adds.
+    `scan_parameter_sets` streams the NALs and returns `Rejected` past the
+    budget, so the demux thread never collects an unbounded list
+    (review R2-A-3).
+  - Extradata over 64 KiB (`multiview_ffmpeg::MAX_FACTS_EXTRADATA`, checked on
+    the length) is never copied. That connection gets no writer, so
+    passthrough is off for it, and the refusal is counted as
+    `refused_extradata`. A configuration is never truncated (review R1-A-1).
+  - Each `TapAu` is classified: `strict_idr` through `idr::is_self_contained_idr`
+    and `reference` through `idr::h264_is_reference` (`nal_ref_idc`).
+    `arrival_ns` comes from the run's monotonic `TimeSource`.
+  - It is then `offer`ed (D1: never blocks).
+  - `params_gen` is per source and bumps on every (re)connect (a reconnect is
+    a parameter change) and on any keyframe whose sets differ from the last
+    ones (a rejected scan also counts as a change).
+  - `SourceTraits` are published per connection with a connection generation.
+    The codec comes from libav. Profile, `constraint_flags` (the SPS byte after
+    `profile_idc`), level, depth, chroma and scan come from the SPS (avcC or
+    Annex-B extradata). When there is no extradata SPS, they are refreshed from
+    the first in-band SPS. The size, the four colour tags (unspecified =
+    untagged) and the declared rate come from the stream parameters, read
+    through a new safe `multiview_ffmpeg::video_stream_facts`.
+  - Packets are skipped (and counted) before a run seeds or when they carry
+    no timestamp.
+- *`PassthroughLive`* (`passthrough_live.rs`) is a `LiveEncoder`. Each `encode`
+  ignores the canvas and returns exactly one packet for the tick, stamped
+  `dts = tick`. That packet is one of:
+  - the source AU: its bytes unchanged, `pts = tick + source reorder + the
+    clock's bounded delay`;
+  - an H.264 repeat AU. There is one `RepeatAuBuilder` per `params_gen`,
+    primed from that generation's strict-IDR SPS/PPS as the key drains the
+    AUs, because the AU a repeat follows is usually a P without sets. A new
+    generation drops the builder (review R1-M-2);
+  - the **format slate**: one closed black GOP, baked once by `bake_slate`
+    with `VideoRenditionEncoder` at the slot's `EncodeConfig`. The encoder is
+    dropped right after, so no session is held. The slate is always entered at
+    its IDR.
+
+  The other `LiveEncoder` contracts:
+  - `move_gate` passes only a run-start strict IDR or a slate IDR. The worker
+    records their DTS in a lock-free ring before the packet leaves it.
+  - A mid-run source IDR keeps `AV_PKT_FLAG_KEY`, so HLS can cut a segment
+    there, but it is not a move point.
+  - `parameter_sets` scans every keyframe.
+  - Status is an `Arc<PassthroughStatus>` of atomics: state, reason code,
+    delay in ticks, AU / repeat / slate / run / stall / parameter-change /
+    drift-drop counters.
+- *Exact watermark.* `VideoEncodeWorker::reorder_bound` gains
+  `ReorderBound::DtsIsTick`. The worker publishes `floor_ns(max emitted DTS + 1)`,
+  derived from DTS and never from PTS. That bound is exact because every packet's
+  DTS is its tick and ticks strictly increase. So a passthrough key closes its
+  windows even with B-frames, and the bound is never too high (test against
+  every later packet).
+- *Dispatcher (behaviour change).* The steady-state loop that tracks the
+  current key's sets now signals exactly one `mark_config_change` on an
+  `inband_ok` output when a keyframe of the current key carries sets that differ
+  from the ones the output carries. A rejected scan leaves the output's sets
+  unknown, so both it and the next keyframe with sets count as changes. Before,
+  such a keyframe was only recorded. Ordinary encoders' sets never change, so they
+  never trigger it (test). Out-of-band outputs still only record.
+
+Deviations from the D2 spec:
+- `PassthroughLive::new` takes a baked `FormatSlate` rather than baking itself.
+  `bake_slate` is the routing-open-thread step the D2b opener calls, which keeps
+  the key testable without an encoder.
+- Tap AUs are Annex B (re-framed at the copy). The spec did not say. This makes
+  the bytes directly muxable to TS and keeps the framing stable across
+  reconnects.
+- The slot gate's `matches` is "every generation" until D2b supplies the router's
+  match verdict (`set_matching`). `matched_slate_ready` is always true because
+  the format slate exists from open.
+- `PassthroughStatus::delay_ticks` is the clock's emission depth (an
+  approximation of source-time delay). D2b's audio may refine it.
+
+Deferred to D2b: the router's P0 decision and eligibility, the passthrough opener
+(`MAX_PASSTHROUGH_KEYS`, no encoder-cap charge), fault handling with the
+on-demand picture bridge, return-to-P0 moves, the readback and plan `path`/`passthrough`
+fields, audio by source time, `/metrics` counters, and the `ffmpeg`
+end-to-end test.
+
 **Audio with passthrough video.** Audio is always decoded and re-encoded on the global AAC grid
 (ADR-0108 §5.2). For lip sync, the audio of a passthrough slot is read at the source time of the
 video AU emitted on the tick (the tap carries each AU's source PTS on the ingest timeline,
