@@ -817,6 +817,16 @@ impl PassthroughClock {
     ) -> Emission {
         self.pending_fault = None;
         self.tick_probe(t);
+        // A bridge entered without `end_run` (`disarm` mid-run) has not fixed
+        // its presentation delay for this tick: raise it (never lower it) so
+        // this bridge presents after everything already emitted (R2-M1).
+        if let Some(need) = self
+            .max_emitted_pts
+            .and_then(|m| m.checked_add(1))
+            .and_then(|m| m.checked_sub(t))
+        {
+            self.bridge_delay = self.bridge_delay.max(need);
+        }
         let State::Bridge {
             reason,
             required,
@@ -1566,6 +1576,31 @@ mod tests {
                 out.iter()
                     .any(|e| matches!(e, Emission::Bridge { dts, pts, .. } if pts > dts)),
                 "a delayed bridge was exercised"
+            );
+            assert_monotone(&out);
+        }
+    }
+
+    #[test]
+    fn disarm_mid_b_frame_run_never_reuses_an_emitted_pts() {
+        // R2-M1: `disarm` switches Run -> Bridge without `end_run`; the next
+        // bridge must still present after the run's future-PTS P picture.
+        for disarm_at in 6_u64..18 {
+            let mut c = PassthroughClock::new(Rational::FPS_29_97);
+            c.arm();
+            let mut out = Vec::new();
+            for tick in 0..40_u64 {
+                if tick == disarm_at {
+                    c.disarm();
+                }
+                let (d, p, idr) = ibbp(i64::try_from(tick).unwrap());
+                let mut a = au(d, idr);
+                a.pts = p * 3003;
+                out.push(c.on_tick(tick, 0, std::iter::once(a), &Open, &mut NoRepeat));
+            }
+            assert!(
+                out.iter().any(|e| matches!(e, Emission::Au { .. })),
+                "a run before the disarm at {disarm_at}"
             );
             assert_monotone(&out);
         }

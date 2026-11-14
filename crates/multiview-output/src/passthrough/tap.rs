@@ -33,10 +33,12 @@
 //! ## Drop policy (recorded deviation from "drop-oldest")
 //!
 //! A per-consumer channel drops the **newest** AU when its 64 slots are unread.
-//! A live clock drains its reader every tick (up to the same bound), so 64
-//! unread AUs means that clock is dead or wedged; dropping the newest there is
-//! harmless. The drop-**oldest** bound the design names is the clock's jitter
-//! buffer (8 ticks, [`super::clock`]), which is where real jitter is absorbed.
+//! A live clock drains at most 16 AUs per tick, so a demux burst of more than
+//! 64 unread AUs between ticks drops AUs even for a live clock (and a dead or
+//! wedged clock fills the channel). A dropped AU is a dts gap: the clock sees
+//! a stall and bridges. The drop-**oldest** bound the design names is the
+//! clock's jitter buffer (8 ticks, [`super::clock`]), where ordinary jitter is
+//! absorbed.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
