@@ -831,6 +831,16 @@ keyers.
     reservation is held. Reservations are RAII guards that release exactly their own count,
     so a request that fails can never release another's. The operations are lock-free and
     allocation-free.
+  - **Bounded on the clock (review round 2 J2).** A lock-free CAS loop is not wait-free:
+    concurrent control-plane reservations could keep invalidating the clock's CAS. The clock
+    therefore admits only through `tick_reserve_dsk` / `tick_reserve_clean`, which make at
+    most `MAX_TICK_ATTEMPTS` (4) CAS attempts and then refuse as `TickRefusal::Contended`,
+    counted on the gate (`contended()`). The switcher answers that refusal
+    `clean-gate-contended` (`REFUSE_KEYER_GATE_CONTENDED`; nothing changes, the caller
+    re-issues); the router refuses the Clean take `Unroutable`, as when excluded. Off-clock
+    callers keep the retrying CAS. Every release is one non-retrying `fetch_sub` on its own
+    count field (the field holds at least the guard's own count, so it never borrows into the
+    neighbour), and `set_defined` is one `fetch_or`.
   - **Control plane.** A `keyer_set` that defines a new keyer (not only the first one) takes
     a DSK reservation before its leases and enqueue. A refusal is 409
     `clean-unavailable-with-dsk`. It holds the reservation in its settle task until a
@@ -842,8 +852,8 @@ keyers.
     `reconcile_clean` releases the reservation of every output that neither carries Clean
     nor has a take to it pending (O(outputs); the slots are sized at construction).
   - **Engine backstop.** At the tick, a `keyer_set` for a free slot takes its own DSK
-    reservation. If Clean is held it is refused `clean-unavailable-with-dsk`
-    (`REFUSE_KEYER_CLEAN`) and nothing changes. The reservation is held across the compose.
+    reservation (bounded, J2). If Clean is held it is refused `clean-unavailable-with-dsk`
+    (`REFUSE_KEYER_CLEAN`), if contended `clean-gate-contended`, and nothing changes. The reservation is held across the compose.
     The commit sets the "defined" bit before the tick's outcomes, then drops it. A rejected
     frame drops it without setting the bit. Attach sets the bit for declared DSKs. Nothing
     clears it (no keyer removal verb).
@@ -946,6 +956,11 @@ keyers.
     admission point. Engine (`keyers_set`): the tick refuses a new keyer while Clean is held
     and a rejected definition releases the tick's reservation. Lib `clean_gate`: counting,
     and 2 000 barrier-synchronised races of both orders, never both winning.
+  - J2 lib `clean_gate`: a concurrent reservation landing between every load and CAS of a
+    clock admission (attempt seam, deterministic) is refused `Contended` within
+    `MAX_TICK_ATTEMPTS` and counted (it spun 1 001 attempts before the fix); the bounded
+    entry points keep the exclusion, and releases leave the other field and the defined bit
+    intact.
 - **Concern.** The GET/events parity test drives the driver without the frame hook, so its
   `tally` is the background roles only. Keyer tally resolution is covered by the lib unit
   test on a constructed snapshot.

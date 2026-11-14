@@ -14,13 +14,13 @@ use multiview_framestore::TileStore;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-use crate::clean_gate::{CleanDskGate, DskReservation};
+use crate::clean_gate::{CleanDskGate, DskReservation, TickRefusal};
 use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::keyer::{
     KeyerAction, KeyerCounters, KeyerDef, KeyerDefinition, KeyerDefinitions, KeyerDraw, KeyerEvent,
     KeyerReadback, KeyerRuntime, KeyerSnapshot, KeyerTally, OpSink, TieEnvelope, MAX_DSK,
-    REFUSE_KEYER_CLEAN, REFUSE_KEYER_SET_DEADLINE,
+    REFUSE_KEYER_CLEAN, REFUSE_KEYER_GATE_CONTENDED, REFUSE_KEYER_SET_DEADLINE,
 };
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
 use crate::switcher::{SwitcherProjection, SwitcherState};
@@ -1249,19 +1249,27 @@ impl SwitcherTickDriver {
                 // Backstop (review H3): a new keyer is defined only under a
                 // DSK reservation taken here, at the tick, so it cannot land
                 // while an output carries Clean or has a take to it pending,
-                // whatever the caller did. One CAS; no allocation.
+                // whatever the caller did. At most `MAX_TICK_ATTEMPTS` CAS
+                // attempts, then refused as contention (review J2: never
+                // spins on the clock); no allocation.
                 let new_keyer = self.keyers.def(usize::from(keyer)).is_none();
                 let reservation = if new_keyer {
-                    let Some(reservation) = self.clean_gate.try_reserve_dsk() else {
-                        self.publish_outcome(
-                            command.operation_id,
-                            tick.index,
-                            false,
-                            Some(REFUSE_KEYER_CLEAN.into()),
-                        );
-                        continue;
-                    };
-                    Some(reservation)
+                    match self.clean_gate.tick_reserve_dsk() {
+                        Ok(reservation) => Some(reservation),
+                        Err(refusal) => {
+                            let reason = match refusal {
+                                TickRefusal::Excluded => REFUSE_KEYER_CLEAN,
+                                TickRefusal::Contended => REFUSE_KEYER_GATE_CONTENDED,
+                            };
+                            self.publish_outcome(
+                                command.operation_id,
+                                tick.index,
+                                false,
+                                Some(reason.into()),
+                            );
+                            continue;
+                        }
+                    }
                 } else {
                     None
                 };

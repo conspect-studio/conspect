@@ -2320,7 +2320,10 @@ impl OutputRouter {
 
     /// Hold a Clean reservation for output `index` (kept if it already holds
     /// one): `false` when a downstream keyer is defined or being defined
-    /// (review H3). One CAS; an `Arc` refcount, never an allocation.
+    /// (review H3), or when concurrent reservations contended the gate for
+    /// its bounded attempts (review J2: the clock refuses, never spins; the
+    /// take is refused like an excluded one and counted on the gate). An
+    /// `Arc` refcount, never an allocation.
     pub(super) fn hold_clean(&mut self, index: usize) -> bool {
         if index >= self.outputs.len() {
             return false;
@@ -2329,7 +2332,7 @@ impl OutputRouter {
             return false;
         };
         if slot.is_none() {
-            *slot = self.clean_gate.try_reserve_clean();
+            *slot = self.clean_gate.tick_reserve_clean().ok();
         }
         slot.is_some()
     }

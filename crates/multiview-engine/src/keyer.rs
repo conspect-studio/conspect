@@ -87,6 +87,13 @@ pub const REFUSE_KEYER_STALE: &str =
 pub const REFUSE_KEYER_CLEAN: &str =
     "clean-unavailable-with-dsk: an output carries Clean; defining a downstream keyer would put \
      DSK pixels on it";
+/// Typed refusal: a `keyer_set` defining a new keyer whose tick-side Clean /
+/// DSK admission lost [`crate::clean_gate::MAX_TICK_ATTEMPTS`] CAS attempts
+/// to concurrent reservations (review J2: the clock refuses rather than
+/// spin). Nothing changes; the caller re-issues it.
+pub const REFUSE_KEYER_GATE_CONTENDED: &str =
+    "clean-gate-contended: the Clean / DSK admission was contended at the tick; re-issue the \
+     keyer_set";
 /// Typed refusal: a `keyer_set` drained at or after its deadline tick
 /// (review H4): it never applies; the caller re-plans.
 pub const REFUSE_KEYER_SET_DEADLINE: &str =
