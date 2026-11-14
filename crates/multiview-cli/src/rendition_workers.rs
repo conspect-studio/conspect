@@ -79,6 +79,14 @@ pub enum ReorderBound {
     /// The opened encoder has no reorder buffer and no lookahead: it cannot
     /// emit a packet for an earlier input after the call for a later input.
     NoReorder,
+    /// Every packet `encode(item)` returns carries `DTS == item.tick` or an
+    /// earlier filled tick (time base `1/cadence`), and ticks strictly
+    /// increase across calls: so after a call whose highest emitted DTS is
+    /// `T`, every future packet has `DTS >= T + 1` whatever its PTS (a
+    /// passthrough key re-stamps DTS from the tick and passes the source's
+    /// reorder through PTS, #344 D2a). The worker publishes exactly
+    /// `floor_ns(T + 1)`, never a bound derived from PTS.
+    DtsIsTick,
     /// No demonstrated bound. The worker never publishes a watermark.
     Unknown,
 }
@@ -322,6 +330,16 @@ impl RenditionWorker {
                             watermarks.advance(
                                 highest_emitted
                                     .and_then(|emitted| next_tick_lower_bound_ns(emitted, cadence)),
+                            )
+                        }
+                        ReorderBound::DtsIsTick => {
+                            let highest_dts = packets
+                                .iter()
+                                .filter_map(EncodedPacket::dts)
+                                .max()
+                                .and_then(|dts| u64::try_from(dts).ok());
+                            watermarks.advance(
+                                highest_dts.and_then(|dts| next_tick_lower_bound_ns(dts, cadence)),
                             )
                         }
                         ReorderBound::Unknown => None,
@@ -1000,6 +1018,74 @@ mod tests {
             events.last().expect("terminal"),
             DispatchEvent::FinishVideo { packets, .. } if packets.len() == 1
         ));
+    }
+
+    /// A tick-stamped encoder whose PTS runs ahead of DTS (a passthrough key
+    /// carrying B-frame reorder): one packet per tick, `dts = tick`,
+    /// `pts = tick + 2`.
+    struct TickStamped;
+
+    impl VideoEncodeWorker for TickStamped {
+        fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
+            let tick = i64::try_from(item.tick).unwrap_or(i64::MAX);
+            let mut raw = ffmpeg_next::codec::packet::Packet::new(16);
+            raw.set_dts(Some(tick));
+            raw.set_pts(Some(tick + 2));
+            Ok(vec![EncodedPacket::from_packet(raw)])
+        }
+
+        fn reorder_bound(&self) -> ReorderBound {
+            ReorderBound::DtsIsTick
+        }
+
+        fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// #344 D2a: a `DtsIsTick` worker's watermark is derived from the emitted
+    /// DTS, never the PTS: after the call for tick T it is exactly
+    /// `floor_ns(T + 1)`, so it is never above a later packet's DTS even
+    /// though every PTS is two ticks ahead.
+    #[test]
+    fn a_dts_is_tick_worker_publishes_the_exact_dts_bound_not_the_pts_one() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let worker =
+            RenditionWorker::spawn(0, CADENCE, TIMEBASE, Box::new(TickStamped), move |e| {
+                sink.lock().expect("lock").push(e);
+                Ok(())
+            })
+            .expect("worker");
+        let canvas = canvas();
+        for tick in 0..4 {
+            worker
+                .offer(BakedTick {
+                    tick,
+                    canvas: Arc::clone(&canvas),
+                })
+                .expect("offer");
+        }
+        worker.join().expect("join");
+        let events = events.lock().expect("lock");
+        let marks: Vec<(u64, i128)> = events
+            .iter()
+            .filter_map(|event| match event {
+                DispatchEvent::Video {
+                    tick,
+                    watermark: Some(mark),
+                    ..
+                } => Some((*tick, mark.complete_before_ns)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marks.len(), 4);
+        for (tick, mark) in marks {
+            let exact = next_tick_lower_bound_ns(tick, CADENCE).expect("bound");
+            // floor_ns(DTS of tick + 1): the next packet's DTS exactly, never
+            // the (two ticks higher) PTS bound.
+            assert_eq!(mark, exact.complete_before_ns, "tick {tick}");
+        }
     }
 
     #[test]

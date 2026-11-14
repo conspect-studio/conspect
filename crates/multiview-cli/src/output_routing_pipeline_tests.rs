@@ -1729,6 +1729,59 @@ codec = "mpeg2video"
 segment_ms = 1000
 "##;
 
+/// The decoded limited-range (BT.709, 8-bit) luma of [`LAYOUT_CONFIG`]'s two
+/// solid sources: `@_a` = `#202020` (left on Program) and `@_b` = `#e0e0e0`
+/// (right). `Y = 16 + 219 * v / 255` for a grey `v`.
+///
+/// #426: the routed-layout picture tests compare output 1 against these, not
+/// against output 0's decoded picture. In an `overlay` build Program carries
+/// its baked program-wide chrome (the wall-clock readout and its reference
+/// badge, on by default); on the 64x64 test canvas that chrome covers most of
+/// the luma sample windows, so Program's pixels are not the sources' pixels.
+const LAYOUT_LUMA: (i64, i64) = (16 + 219 * 0x20 / 255, 16 + 219 * 0xe0 / 255);
+
+/// The mean luma of rows `rows` of the 16 px column window inset 8 px into
+/// the 32 px half of a 64x64 plane that starts at column `x0` (clear of the
+/// cell edge).
+fn window_mean(plane: &[u8], x0: usize, rows: std::ops::Range<usize>) -> i64 {
+    let mut sum = 0i64;
+    let mut n = 0i64;
+    for row in rows {
+        for x in x0 + 8..x0 + 24 {
+            sum += i64::from(plane[row * 64 + x]);
+            n += 1;
+        }
+    }
+    sum / n
+}
+
+/// The mean luma of the 16x48 window (rows 8..56) of the half at `x0`.
+fn half_mean(plane: &[u8], x0: usize) -> i64 {
+    window_mean(plane, x0, 8..56)
+}
+
+/// Program's picture is the sources' luma: asserted on the full window in a
+/// build without `overlay`, and in an `overlay` build on rows 56..64, below
+/// the program-wide clock chrome (its readout at y 6, the reference badge at
+/// y 36, its backing ending before row 55 on this canvas). Cells this small (32 px) draw
+/// no per-tile chrome (`MIN_TILE_PX`).
+fn assert_program_is_the_sources(t: i64, plane: &[u8]) {
+    let rows = if cfg!(feature = "overlay") {
+        56..64
+    } else {
+        8..56
+    };
+    let halves = (
+        window_mean(plane, 0, rows.clone()),
+        window_mean(plane, 32, rows),
+    );
+    let (a, b) = LAYOUT_LUMA;
+    assert!(
+        (halves.0 - a).abs() <= 6 && (halves.1 - b).abs() <= 6,
+        "tick {t}: Program's halves {halves:?} are the sources' luma ({a}, {b})"
+    );
+}
+
 /// A routed layout for the 64x64 test canvas: the Program grid with its two
 /// cells swapped (`b` left, `a` right).
 fn swapped_layout(prefix: &str) -> PictureBus {
@@ -1879,20 +1932,11 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
         .filter(|t| routed.contains_key(t) && program.contains_key(t))
         .collect();
     assert!(compared.len() >= 15, "decoded {} pictures", compared.len());
-    let mean = |plane: &[u8], x0: usize| -> i64 {
-        let mut sum = 0i64;
-        let mut n = 0i64;
-        for row in 8..56 {
-            for x in x0 + 8..x0 + 24 {
-                sum += i64::from(plane[row * 64 + x]);
-                n += 1;
-            }
-        }
-        sum / n
-    };
     for t in &compared {
         let (p, r) = (&program[t], &routed[t]);
-        let (pl, pr, rl, rr) = (mean(p, 0), mean(p, 32), mean(r, 0), mean(r, 32));
+        assert_program_is_the_sources(*t, p);
+        let (pl, pr) = LAYOUT_LUMA;
+        let (rl, rr) = (half_mean(r, 0), half_mean(r, 32));
         assert!(
             pr - pl > 100,
             "tick {t}: the halves really differ ({pl}, {pr})"
@@ -1980,17 +2024,6 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
     // Before the edit the halves are swapped; after it they match Program.
     let program = decode_luma(&run.video[0]);
     let routed = decode_luma(&run.video[1]);
-    let mean = |plane: &[u8], x0: usize| -> i64 {
-        let mut sum = 0i64;
-        let mut n = 0i64;
-        for row in 8..56 {
-            for x in x0 + 8..x0 + 24 {
-                sum += i64::from(plane[row * 64 + x]);
-                n += 1;
-            }
-        }
-        sum / n
-    };
     let at = i64::try_from(applied.tick).unwrap();
     let fell_tick = i64::try_from(fell.tick).unwrap();
     let mut swapped_seen = 0;
@@ -2000,7 +2033,9 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         let (Some(p), Some(r)) = (program.get(&t), routed.get(&t)) else {
             continue;
         };
-        let (pl, pr, rl, rr) = (mean(p, 0), mean(p, 32), mean(r, 0), mean(r, 32));
+        assert_program_is_the_sources(t, p);
+        let (pl, pr) = LAYOUT_LUMA;
+        let (rl, rr) = (half_mean(r, 0), half_mean(r, 32));
         if (rl - pr).abs() <= 6 && (rr - pl).abs() <= 6 {
             assert!(
                 unswapped_seen == 0,
