@@ -1451,15 +1451,11 @@ fn youtube_audio_master(
     None
 }
 
-/// The audio location as logged: query and fragment dropped, so a signed CDN
-/// master (a `YouTube` googlevideo URL, a tokenised HLS URL) never reaches the
-/// log with its signature.
+/// The audio location as logged: scheme and host only (see
+/// [`crate::pipeline::media_url_for_log`]), so a signed CDN master never
+/// reaches the log with its signature.
 fn log_location(location: &str) -> String {
-    if location.contains("://") {
-        multiview_core::redact::redact_resource_url(location)
-    } else {
-        location.to_owned()
-    }
+    crate::pipeline::media_url_for_log(location)
 }
 
 /// Whether the next `YouTube` audio connection must resolve afresh instead of
@@ -2885,8 +2881,9 @@ mod youtube_audio_helper_tests {
     #[test]
     fn a_signed_master_is_logged_without_its_signature() {
         let logged = log_location(
-            "https://rr1.googlevideo.com/videoplayback/expire/1/index.m3u8?sig=SECRET&pot=TOKEN",
+            "https://rr1.googlevideo.com/videoplayback/signature/PATHSIG/index.m3u8?sig=SECRET&pot=TOKEN",
         );
+        assert!(!logged.contains("PATHSIG"), "{logged}");
         assert!(!logged.contains("SECRET"), "{logged}");
         assert!(!logged.contains("TOKEN"), "{logged}");
         assert!(logged.contains("googlevideo.com"), "{logged}");
