@@ -162,6 +162,9 @@ node "$here/stream-health.mjs" "$S$media" > "$out/stream-health-before.json" 2>/
 # (a) the validator on the engine's cast directory
 { "$validator" "$run_dir/cast"; rc=$?; echo "RESULT {\"test\":\"validator\",\"pass\":$([ $rc = 0 ] && echo true || echo false),\"failed\":[$([ $rc = 0 ] || echo "\"cast_validate exit $rc\"")],\"parts\":[]}"; echo "exit=$rc"; } > "$out/validator.log" 2>&1
 specs+=("a-validator=$out/validator.log")
+# (a') receiver.js helpers that need no browser (report size in UTF-8 bytes)
+run test-receiver-unit 60 node "$here/test-receiver-unit.mjs"
+specs+=("a2-receiver-unit=$out/test-receiver-unit.log")
 # (b) Shaka 4.15.56, SDK default config, and (c) the real receiver SDK + the engine-served receiver: side by side
 if [ "$serial" = 1 ]; then
   run test-shaka $((seconds * 2 + 180)) node "$here/test-shaka.mjs" "$S$path" --seconds "$seconds" --sequential 1

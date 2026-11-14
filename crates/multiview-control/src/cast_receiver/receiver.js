@@ -477,6 +477,18 @@
     } catch (e) { info('custom message not sent:', redact(e && e.message ? e.message : e)); }
   }
 
+  /** The UTF-8 byte length of a string (lone surrogates count 3, as they are sent replaced). */
+  function utf8Length(text) {
+    var n = 0;
+    for (var i = 0; i < text.length; i++) {
+      var c = text.charCodeAt(i);
+      if (c < 0x80) { n += 1; } else if (c < 0x800) { n += 2; }
+      else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < text.length && (text.charCodeAt(i + 1) & 0xFC00) === 0xDC00) { n += 4; i++; }
+      else { n += 3; }
+    }
+    return n;
+  }
+
   /** POST the report to <token base>report: at most one per second, dropped (not queued) when too soon. */
   function post(report) {
     if (!current || terminal) { return; }
@@ -485,10 +497,11 @@
     if (t - lastPostAt < POST_MIN_GAP_MS) { return; }
     lastPostAt = t;
     var body = JSON.stringify(report);
-    // Over the engine's limit: the tracks go first (the sender has them in MEDIA_STATUS), then the device string.
-    if (body.length > MAX_REPORT_BODY && report.tracks) { report.tracks = null; body = JSON.stringify(report); }
-    if (body.length > MAX_REPORT_BODY) { report.device = report.device.slice(0, 60); body = JSON.stringify(report); }
-    if (body.length > MAX_REPORT_BODY) { return; }
+    // Over the engine's limit (in UTF-8 bytes, as the engine counts): the tracks go first (the sender has them in
+    // MEDIA_STATUS), then the device string.
+    if (utf8Length(body) > MAX_REPORT_BODY && report.tracks) { report.tracks = null; body = JSON.stringify(report); }
+    if (utf8Length(body) > MAX_REPORT_BODY) { report.device = report.device.slice(0, 60); body = JSON.stringify(report); }
+    if (utf8Length(body) > MAX_REPORT_BODY) { return; }
     try {
       var xhr = new XMLHttpRequest();
       xhr.open('POST', current.base + 'report', true);
