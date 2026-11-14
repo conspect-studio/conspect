@@ -82,6 +82,7 @@ pub mod nmos;
 pub mod notify;
 pub mod output_routing;
 pub mod patch;
+pub mod patch_set;
 pub mod pending_actions;
 pub mod preview;
 pub mod problem;
@@ -302,6 +303,7 @@ pub fn router_with(state: AppState, surface: Surface) -> Router {
             output_routing::spawn_outcome_relay(&state, control);
         }
         patch::spawn_persist_relay(&state);
+        patch_set::spawn_aggregator(&state);
         if let Some(metrics) = state.program_metrics.as_ref() {
             program_metrics::spawn_sampler(metrics);
         }
