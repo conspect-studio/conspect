@@ -5204,6 +5204,15 @@ fn layout_canvases_are_admitted_shared_and_fall_back_when_aux_fails() {
     );
     assert_eq!(x.d.video_key_count(), keys, "+0 encoders");
     assert_eq!(x.h.snapshot().aux_canvases, vec!["aux:L1".to_owned()]);
+    // Both outputs read ONE aux feed (one slot, so one compose and one
+    // overlay bake per tick, shared by every subscriber).
+    let feeds = x.r.aux.feeds.load();
+    let on_l1: Vec<_> = feeds.iter().filter(|f| f.bus == l1).collect();
+    assert_eq!(on_l1.len(), 1, "one feed for the shared layout");
+    assert!(
+        on_l1[0].format.is_none(),
+        "composed at the canvas, no per-output format"
+    );
     // Output 1 moving from L1 to L2 is still refused: output 2 holds L1.
     x.h.try_take(take("swap", 1, l2.clone())).unwrap();
     t += 1;

@@ -218,6 +218,42 @@ fn drive_prepared<F>(
 where
     F: FnOnce(OutputRoutingSlot) + Send + 'static,
 {
+    drive_outputs(template, audio, switcher, prefix, ticks, 2, prep, control)
+}
+
+/// As [`drive_config`] (no audio, no M/E) with `outputs` test sinks.
+#[cfg(feature = "overlay")]
+fn drive_runners<F>(template: &str, prefix: &str, ticks: u64, outputs: usize, control: F) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
+    drive_outputs(
+        template,
+        false,
+        false,
+        prefix,
+        ticks,
+        outputs,
+        |_| {},
+        control,
+    )
+}
+
+/// As [`drive_prepared`] with `outputs` test sinks (one per config output).
+#[allow(clippy::too_many_arguments)]
+fn drive_outputs<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    outputs: usize,
+    prep: impl FnOnce(&mut Pipeline),
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
     let config =
         multiview_config::MultiviewConfig::load_from_toml(&template.replace('@', prefix)).unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
@@ -235,9 +271,15 @@ where
     }
     let rendition_configs = pipeline.rendition_config_count();
     let slot = pipeline.output_routing();
-    let seen: Vec<Seen> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
-    let seen_audio: Vec<SeenAudio> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
-    let seen_video: Vec<SeenVideo> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+    let seen: Vec<Seen> = (0..outputs)
+        .map(|_| Arc::new(Mutex::new(Vec::new())))
+        .collect();
+    let seen_audio: Vec<SeenAudio> = (0..outputs)
+        .map(|_| Arc::new(Mutex::new(Vec::new())))
+        .collect();
+    let seen_video: Vec<SeenVideo> = (0..outputs)
+        .map(|_| Arc::new(Mutex::new(Vec::new())))
+        .collect();
     let runners: Vec<TestSinkRunner> = seen
         .iter()
         .zip(&seen_audio)
@@ -2193,4 +2235,113 @@ fn a_live_reformat_resets_one_output_and_leaves_the_other_untouched() {
     assert_eq!(decode_size(&run.video[1][..at_index]), Some((64, 64)));
     assert_eq!(decode_size(&run.video[1][at_index..]), Some((32, 64)));
     assert_eq!(decode_size(&run.video[0]), Some((64, 64)));
+}
+
+/// [`LAYOUT_CONFIG`] at 128x96 so a routed layout's overlay chrome fits
+/// (64x96 cells; cells under 48 px draw none) while an unoptimised test
+/// build still bakes at cadence and three outputs: output 0 stays on Program.
+#[cfg(feature = "overlay")]
+fn overlay_layout_config() -> String {
+    let three = LAYOUT_CONFIG
+        .replace("width = 64\nheight = 64", "width = 128\nheight = 96")
+        .replace("# keep-video\n", "");
+    format!(
+        "{three}[[outputs]]\nid = \"out2\"\nkind = \"hls\"\npath = \"/tmp/multiview-routing-e2e/@/c/index.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n"
+    )
+}
+
+/// A 128x96 routed layout `id` with overlays on: both sources side by side.
+#[cfg(feature = "overlay")]
+fn overlay_layout(prefix: &str, id: &str) -> PictureBus {
+    use multiview_core::layout::{Canvas, Cell, Layout};
+    let cell = |x: f32, source: &str| Cell {
+        x,
+        w: 0.5,
+        h: 1.0,
+        source: Some(format!("{prefix}_{source}")),
+        ..Cell::default()
+    };
+    PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::new(
+        crate::aux_layout::RoutedLayout {
+            id: id.to_owned(),
+            slates: vec![multiview_config::FailoverSlate::Black; 2],
+            audio: multiview_config::LayoutAudio::default(),
+            overlays: multiview_config::LayoutOverlays::default(),
+            revision: crate::output_routing::next_layout_revision(),
+            layout: Layout {
+                name: id.to_owned(),
+                canvas: Canvas {
+                    width: 128,
+                    height: 96,
+                    fps_num: 25,
+                    fps_den: 1,
+                },
+                cells: vec![cell(0.0, "b"), cell(0.5, "a")],
+            },
+        },
+    )))
+}
+
+/// Program protection (R3, invariants #1/#10) through the real pipeline: two
+/// routed layouts with every default overlay layer on, each on its own
+/// output, while output 0 stays on Program. Output 0 gets every window with a
+/// one-tick PTS step; both routed outputs receive frames; the aux thread
+/// never fails. Count-based only (no timing assertions).
+#[cfg(feature = "overlay")]
+#[test]
+fn two_routed_layouts_with_overlays_never_cost_program_a_window() {
+    const TICKS: u64 = 250;
+    let config = overlay_layout_config();
+    let run = drive_runners(&config, "route_overlays", TICKS, 3, move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+            slot.load()
+        });
+        let outcomes = handle.outcomes().expect("one outcome reader");
+        wait_for("the first routing tick", Duration::from_secs(10), || {
+            (handle.snapshot().video_keys > 0).then_some(())
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        for (op, output, id) in [("l1", 1, "news-a"), ("l2", 2, "news-b")] {
+            handle
+                .try_take(take(op, output, overlay_layout("route_overlays", id)))
+                .unwrap();
+            let o = wait_for("layout outcome", Duration::from_secs(10), || {
+                outcomes.try_recv().ok()
+            });
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+        }
+        let s = wait_for("both layouts routed", Duration::from_secs(2), || {
+            let s = handle.snapshot();
+            (s.outputs[1].bus == "aux:news-a" && s.outputs[2].bus == "aux:news-b").then_some(s)
+        });
+        assert_eq!(s.aux_canvases.len(), 2, "{:?}", s.aux_canvases);
+    });
+    assert_eq!(run.frames, TICKS);
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(
+        pts_of(&run.outputs[0]),
+        all,
+        "output 0 (Program) gets every window, one tick apart"
+    );
+    for output in [1, 2] {
+        let pts = pts_of(&run.outputs[output]);
+        // One packet per tick with a one-tick PTS step across the move onto
+        // the layout; the routed encoder's last frames may still be in
+        // flight when the bounded run ends (count-based, no timing).
+        assert_eq!(pts.first(), Some(&0), "routed output {output}");
+        assert!(
+            pts.windows(2).all(|w| w[1] == w[0] + 1),
+            "routed output {output}: a one-tick PTS step"
+        );
+        assert!(
+            pts.len() + 4 >= all.len(),
+            "routed output {output} received frames to the end: {}",
+            pts.len()
+        );
+    }
+    // An aux failure moves every routed output back to Program (§4.4): both
+    // still on their layouts at the end proves `failed` never rose.
+    let end = &run.final_snapshot.outputs;
+    assert_eq!(end[1].bus, "aux:news-a", "aux never failed");
+    assert_eq!(end[2].bus, "aux:news-b", "aux never failed");
 }

@@ -1279,4 +1279,146 @@ codec = "h264"
         assert!(!off.observe(t0 + Duration::from_secs(11), lateness.snapshot()));
     }
 
+    /// Chaos (overlay builds): a routed layout with overlays on whose source
+    /// dies mid-run. Its store stops publishing and ages to NO SIGNAL; the
+    /// aux thread keeps publishing one baked frame per tick, the dead cell
+    /// reads NO SIGNAL (from the store state compose saw), `failed` stays
+    /// false; `wanted` is raised while the layout bakes. A missing store is
+    /// NO SIGNAL too.
+    #[cfg(feature = "overlay")]
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)] // One chaos scenario.
+    fn a_layout_with_overlays_keeps_publishing_while_a_source_dies() {
+        const TICKS: u64 = 300;
+        use multiview_core::layout::{Canvas, Cell, Layout};
+        use multiview_core::traits::SourceState;
+        let (w, h) = (640u32, 360u32);
+        let color = CanvasColor::default();
+        let live = Arc::new(TileStore::<Nv12Image>::with_defaults("live"));
+        let dying = Arc::new(TileStore::<Nv12Image>::with_defaults("dying"));
+        let (l, d) = (Arc::clone(&live), Arc::clone(&dying));
+        let stores: StoreLookup = Arc::new(move |id: &str| match id {
+            "live" => Some(Arc::clone(&l)),
+            "dying" => Some(Arc::clone(&d)),
+            _ => None,
+        });
+        let cell = |x: f32, source: &str| Cell {
+            x,
+            w: 1.0 / 3.0,
+            h: 1.0,
+            source: Some(source.to_owned()),
+            ..Cell::default()
+        };
+        let body = Arc::new(crate::aux_layout::RoutedLayout {
+            id: "news".to_owned(),
+            layout: Layout {
+                name: "news".to_owned(),
+                canvas: Canvas {
+                    width: w,
+                    height: h,
+                    fps_num: 25,
+                    fps_den: 1,
+                },
+                cells: vec![
+                    cell(0.0, "live"),
+                    cell(1.0 / 3.0, "dying"),
+                    cell(2.0 / 3.0, "gone"),
+                ],
+            },
+            slates: vec![multiview_config::FailoverSlate::Black; 3],
+            audio: multiview_config::LayoutAudio::default(),
+            overlays: multiview_config::LayoutOverlays::default(),
+            revision: 0,
+        });
+        let feed = AuxFeed::new(PictureBus::Layout(LayoutRef::new(Arc::clone(&body))));
+        let slot = Arc::clone(&feed.slot);
+        let wanted = Arc::new(AtomicBool::new(false));
+        let signals = crate::aux_overlays::signals_slot();
+        let mut published = crate::aux_overlays::AuxOverlaySignals::default();
+        published.program.insert("live".to_owned());
+        signals.store(Arc::new(published));
+        let (tx, rx) = aux_tick_channel();
+        tx.active_flag().store(true, Ordering::Release);
+        let handle = spawn_routing_aux(AuxInputs {
+            rx,
+            feeds: Arc::new(SwapCell::from_pointee(vec![feed])),
+            stores,
+            preview_selection: None,
+            canvas: AuxCanvas {
+                width: w,
+                height: h,
+                color: color.output_tag(),
+            },
+            layout_canvas: crate::aux_layout::LayoutCanvasSpec {
+                width: w,
+                height: h,
+                color,
+                background: [16, 128, 128],
+            },
+            program_lateness: None,
+            tick_ns: 0,
+            overlays: Some(crate::aux_overlays::AuxOverlayInputs {
+                signals,
+                wanted: Arc::clone(&wanted),
+                labels: Arc::new(|id: &str| Some(id.to_uppercase())),
+                watermark: None,
+                wall_clock: crate::wallclock::WallClockSource::system(),
+                canvas_color: color,
+            }),
+        })
+        .unwrap();
+        let frame = |luma: u8| {
+            Nv12Image::solid((w / 3) & !1, h, luma, 128, 128, color.output_tag()).unwrap()
+        };
+        // 25 fps ticks: 40 ms apart. The dying source stops at tick 10; the
+        // store's no-signal threshold is 10 s = 250 ticks after that.
+        let tick25 = |i: u64| AuxTick {
+            index: i,
+            pts: MediaTime::from_nanos(i64::try_from(i).unwrap() * 40_000_000),
+        };
+        for i in 0..TICKS {
+            live.publish(frame(200), tick25(i).pts);
+            if i < 10 {
+                dying.publish(frame(60), tick25(i).pts);
+            }
+            tx.offer(tick25(i));
+            // Deliver every tick (count-based: no frame may be skipped).
+            assert!(
+                wait_for(|| slot.composed.load(Ordering::Relaxed) == i + 1),
+                "tick {i} published"
+            );
+        }
+        assert!(
+            wanted.load(Ordering::Relaxed),
+            "a baking layout wants signals"
+        );
+        assert!(!handle.failed.load(Ordering::Acquire));
+        let last = slot.latest.load().unwrap();
+        assert_eq!(last.tick, TICKS - 1);
+        // The dead cell (middle third) shows its black slate under the chip;
+        // the live cell keeps its picture. Sample below the top chip band and
+        // above the bottom label band, left of the meter column.
+        let (wu, x_mid, x_live) = (
+            usize::try_from(w).unwrap(),
+            usize::try_from(w / 2).unwrap(),
+            40,
+        );
+        let row = usize::try_from(h / 2).unwrap();
+        let y = last.frame.y_plane();
+        assert!(y[row * wu + x_live] > 150, "live cell keeps its picture");
+        assert!(y[row * wu + x_mid] < 40, "dead cell shows its black slate");
+
+        // The cell states the bake read, by store state (re-derived the same
+        // way the aux compose reads them).
+        assert_eq!(
+            dying.read_at(tick25(TICKS - 1).pts).state(),
+            SourceState::NoSignal
+        );
+        assert_eq!(
+            live.read_at(tick25(TICKS - 1).pts).state(),
+            SourceState::Live
+        );
+        drop(tx);
+        assert!(wait_for(|| handle.failed.load(Ordering::Acquire)));
+    }
 }
