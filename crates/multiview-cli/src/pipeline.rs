@@ -2433,6 +2433,9 @@ pub struct Pipeline {
     declared_audio_outputs: Vec<(String, Vec<usize>)>,
     /// The runnable outputs declared in the config.
     outputs: Vec<RunnableOutput>,
+    /// The HLS outputs' subtitle slots (slice F #345): route tables + cue
+    /// feeds, sampled by the bake consumer.
+    subtitle_outputs: Vec<SubtitleOutputPlan>,
     /// The bake-consumer push handles for the configured AES67 outputs (#103),
     /// paired with the serve-side `Aes67Sender` inside each `RunnableOutput::Aes67`.
     /// `drive_streaming` hands these to the bake consumer, which pushes every
@@ -3324,6 +3327,7 @@ impl Pipeline {
         #[cfg(not(feature = "display-kms"))]
         let has_display = false;
         let mut outputs = built.packet;
+        let subtitle_outputs = built.subtitles;
         if outputs.is_empty() && !has_display {
             return Err(PipelineError::NoOutput("file/HLS"));
         }
@@ -3619,6 +3623,7 @@ impl Pipeline {
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
+            subtitle_outputs,
             #[cfg(feature = "display-kms")]
             display_plans: built.display,
             #[cfg(feature = "ndi-bindings")]
@@ -3886,6 +3891,60 @@ impl Pipeline {
             .collect()
     }
 
+    /// The run's subtitle-slot sampler (slice F #345). The resolver reads, per
+    /// slot source and tick, the source's caption store at the picture the
+    /// compositor latches for that tick (`peek_at_with_source_time`: the
+    /// same selection, without moving the store's prune watermark) and the
+    /// cue store's text cue for that picture's generation. Lock-free reads
+    /// only; it runs on the bake consumer, never the output clock. A source
+    /// with no caption store (or a build without captions) yields no cues.
+    fn subtitle_run(
+        &self,
+        stores: crate::routing_aux::StoreLookup,
+    ) -> crate::subtitle_slots::SubtitleRun {
+        if self.subtitle_outputs.is_empty() {
+            return crate::subtitle_slots::SubtitleRun::none(self.cadence);
+        }
+        let outputs = self
+            .subtitle_outputs
+            .iter()
+            .map(|plan| {
+                tracing::info!(
+                    output = %plan.output_id,
+                    slots = plan.slots,
+                    "subtitle slots: WebVTT renditions sampled off the output clock"
+                );
+                crate::subtitle_slots::SubtitleOutputSampler::new(
+                    Arc::clone(&plan.routes),
+                    plan.feed.clone(),
+                    plan.slots,
+                )
+            })
+            .collect();
+        #[cfg(feature = "overlay")]
+        let resolve: crate::subtitle_slots::CueResolver = {
+            let captions = Arc::clone(&self.live_caption_stores);
+            Box::new(move |id: &str, now: MediaTime| {
+                let store = captions.load().get(id).cloned()?;
+                let picture = stores(id)?.peek_at_with_source_time(now)?;
+                match store.active_at_generation(picture.pts, picture.generation)? {
+                    multiview_ffmpeg::caption::CaptionCue::Text { text, .. }
+                        if !text.lines.is_empty() =>
+                    {
+                        Some(text.lines)
+                    }
+                    _ => None,
+                }
+            })
+        };
+        #[cfg(not(feature = "overlay"))]
+        let resolve: crate::subtitle_slots::CueResolver = {
+            let _ = stores;
+            Box::new(|_: &str, _: MediaTime| None)
+        };
+        crate::subtitle_slots::SubtitleRun::new(outputs, resolve, self.cadence)
+    }
+
     /// Build one run's output routing (ADR-0108 slice 1): the clock's aux tick
     /// sender, the `routing-aux` thread, and the consumer's router with its
     /// base forced-IDR cells. Publishes the take handle into
@@ -3920,6 +3979,7 @@ impl Pipeline {
             Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new()));
         let aux_canvas = self.aux_canvas();
         let plan_stores = Arc::clone(&stores);
+        let subtitle_stores = Arc::clone(&stores);
         // Filled once this run's Program exists (§7 back-off input).
         let program_lateness: crate::routing_aux::ProgramLateness =
             Arc::new(multiview_framestore::SwapCell::empty());
@@ -3991,6 +4051,7 @@ impl Pipeline {
                 inband_sets: self.output_inband_sets.clone(),
                 base_formats: self.rendition_formats.clone(),
                 convert_hook: self.convert_hook.clone(),
+                subtitles: Box::new(self.subtitle_run(subtitle_stores)),
             },
             aux_tx,
             preview_selection,
@@ -7705,6 +7766,9 @@ struct ConsumerRouting {
     /// Chaos/test hook run on every convert thread before each convert
     /// (#342 review I3); `None` in production.
     convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// The subtitle-slot cue sampler (slice F #345), ticked once per item.
+    /// Boxed for `clippy::large_futures`, like the router.
+    subtitles: Box<crate::subtitle_slots::SubtitleRun>,
 }
 
 /// End-of-run bound for the routing reaper to finish closed live encoders.
@@ -8253,6 +8317,7 @@ fn consumer_main<D: WindowDelivery>(
         inband_sets,
         base_formats,
         convert_hook,
+        mut subtitles,
     } = routing;
     // #342 review I1/I2: one `format-convert` thread per distinct non-canvas
     // base format, fed non-blocking right after the bake. Empty (no thread,
@@ -8601,6 +8666,9 @@ fn consumer_main<D: WindowDelivery>(
         };
         let overlaid = baker.bake(&item)?;
         router.publish_program(item.tick_index, &overlaid);
+        // Slice F (#345): sample every HLS subtitle slot at this tick, off the
+        // clock (one empty check when no output declares a subtitle slot).
+        subtitles.tick(item.tick_index);
         // NO-FALTER: fill any ticks this consumer missed (a transient stall
         // shed them from the hot queue) with frame substitution — the last
         // good baked canvas restamped at each missing tick's index. The
@@ -12501,6 +12569,8 @@ struct BuiltOutputs {
     /// shares the existing per-sink thread + end-of-program lifecycle — but it
     /// consumes the canvas tap below, never the packets.
     packet: Vec<RunnableOutput>,
+    /// The HLS outputs' subtitle slots (slice F #345).
+    subtitles: Vec<SubtitleOutputPlan>,
     /// DRM/KMS display heads, started as raw-frame sinks at stream start.
     #[cfg(feature = "display-kms")]
     display: Vec<DisplayOutputPlan>,
@@ -13112,7 +13182,7 @@ fn build_hls_output(
     output: &Output,
     path: &str,
     epoch: &multiview_output::SharedEpoch,
-) -> Result<RunnableOutput, PipelineError> {
+) -> Result<(RunnableOutput, Option<SubtitleOutputPlan>), PipelineError> {
     let (dir, prefix, playlist_path) = hls_paths(Path::new(path));
     // #324: classified by kind — permissions, a read-only or full volume is a
     // host fault (retried, never a reason to fall back from the operator's
@@ -13122,18 +13192,67 @@ fn build_hls_output(
         PipelineError::io(format!("output hls: creating {}", dir.display()), source)
     })?;
     let (meta, matrix) = output_mux_meta(output);
-    Ok(RunnableOutput::Hls {
-        id: output.id(),
-        sink: PacketMuxSink::segment_live(
-            dir,
-            prefix,
-            playlist_path.clone(),
-            HLS_LIVE_WINDOW,
-            epoch.clone(),
-        )
-        .with_output_metadata(meta, matrix),
-        playlist_path,
-    })
+    let mut sink = PacketMuxSink::segment_live(
+        dir,
+        prefix,
+        playlist_path.clone(),
+        HLS_LIVE_WINDOW,
+        epoch.clone(),
+    )
+    .with_output_metadata(meta, matrix);
+    // Slice F (#345): WebVTT subtitle renditions for a TS-segment HLS output
+    // (config refuses them on LL-HLS), fed by the bake consumer's sampler.
+    let mut plan = None;
+    if let (Output::Hls { .. }, Some(slots)) = (output, output.slots()) {
+        if !slots.subtitle.is_empty() {
+            let renditions = slots
+                .subtitle
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| multiview_output::hls::SubtitleRendition {
+                    name: slot
+                        .name
+                        .clone()
+                        .or_else(|| slot.language.clone())
+                        .unwrap_or_else(|| format!("Subtitles {}", i + 1)),
+                    language: slot.language.clone(),
+                })
+                .collect();
+            let (feed, rx) = multiview_output::hls::subtitle_feed();
+            sink = sink.with_subtitles(renditions, rx);
+            plan = Some(SubtitleOutputPlan {
+                output_id: output.id(),
+                routes: crate::subtitle_slots::subtitle_routes(
+                    slots
+                        .subtitle
+                        .iter()
+                        .map(|slot| slot.source.clone())
+                        .collect(),
+                ),
+                feed,
+                slots: slots.subtitle.len(),
+            });
+        }
+    }
+    Ok((
+        RunnableOutput::Hls {
+            id: output.id(),
+            sink,
+            playlist_path,
+        },
+        plan,
+    ))
+}
+
+/// One HLS output's subtitle slots for the run (slice F #345): its route
+/// table (slot → source, re-pointed live by the patch API), the engine side
+/// of its sink's cue feed and its slot count.
+#[derive(Clone)]
+pub(crate) struct SubtitleOutputPlan {
+    output_id: String,
+    routes: crate::subtitle_slots::SubtitleRoutes,
+    feed: multiview_output::hls::SubtitleFeed,
+    slots: usize,
 }
 
 /// A fresh link-status record for a push sink: listener mode is read from the
@@ -13236,6 +13355,7 @@ fn build_outputs(
     #[cfg(feature = "aes67")]
     ensure_no_aes67_ssrc_collision(outputs)?;
     let mut runnable = Vec::new();
+    let mut subtitles = Vec::new();
     #[cfg(feature = "display-kms")]
     let mut display_plans = Vec::new();
     #[cfg(feature = "ndi-bindings")]
@@ -13254,7 +13374,9 @@ fn build_outputs(
                 }
             }
             Output::Hls { path, .. } | Output::LlHls { path, .. } => {
-                runnable.push(build_hls_output(output, path, epoch)?);
+                let (built, plan) = build_hls_output(output, path, epoch)?;
+                runnable.push(built);
+                subtitles.extend(plan);
             }
             Output::Rtmp { url, .. } => {
                 runnable.push(build_push_output(output, PushProtocol::Rtmp, url, "rtmp"));
@@ -13380,6 +13502,7 @@ fn build_outputs(
     // the anchor is prepended at run time by `maybe_prepend_program_ts`, not here.
     Ok(BuiltOutputs {
         packet: runnable,
+        subtitles,
         #[cfg(feature = "display-kms")]
         display: display_plans,
         #[cfg(feature = "ndi-bindings")]
