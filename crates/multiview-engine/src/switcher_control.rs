@@ -337,7 +337,7 @@ impl SwitcherControl {
             inputs_version: 0,
             published_inputs_version: 0,
             inputs_readback: handle.inputs.clone(),
-            keyers: KeyerRuntime::default(),
+            keyers: Box::default(),
             keyer_events: handle.keyer_events.clone(),
             keyer_counters: Arc::clone(&handle.keyer_counters),
         };
@@ -494,7 +494,9 @@ pub struct SwitcherTickDriver {
     published_inputs_version: u64,
     inputs_readback: LatestState<InputsReadback>,
     /// Downstream keyers (ADR-0113); empty unless [`Self::set_keyers`].
-    keyers: KeyerRuntime,
+    /// Boxed: built once at attach, it keeps the fixed keyer state out of
+    /// the driver (and so out of the output loop's future).
+    keyers: Box<KeyerRuntime>,
     keyer_events: EventStream<KeyerEvent>,
     keyer_counters: Arc<KeyerCounters>,
 }
@@ -516,7 +518,7 @@ impl SwitcherTickDriver {
     /// [`Self::set_inputs`]). Build them with [`crate::keyer::admit`].
     pub fn set_keyers(&mut self, mut keyers: KeyerRuntime) {
         keyers.set_counters(Arc::clone(&self.keyer_counters));
-        self.keyers = keyers;
+        *self.keyers = keyers;
     }
 
     /// The keyer runtime (read-only: flags, last-good pair, tally).

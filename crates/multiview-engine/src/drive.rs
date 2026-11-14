@@ -316,7 +316,8 @@ pub struct CompositorDrive<T> {
     /// ADR-0113: this tick's downstream keyer draws (ascending z), set by the
     /// switcher frame hook. Drawn above the layout and the transition tiles
     /// in the same pass. All `None` without keyers (the steady state).
-    keyers: [Option<KeyerDraw>; MAX_DSK],
+    /// Boxed once at construction (never per tick) to keep the drive small.
+    keyers: Box<[Option<KeyerDraw>; MAX_DSK]>,
 }
 
 impl<T> CompositorDrive<T> {
@@ -355,7 +356,7 @@ impl<T> CompositorDrive<T> {
             transition_style: TransitionStyle::Mix,
             transition_fill: None,
             transition_fill_builds: 0,
-            keyers: [const { None }; MAX_DSK],
+            keyers: Box::new([const { None }; MAX_DSK]),
         })
     }
 
@@ -425,7 +426,7 @@ impl<T> CompositorDrive<T> {
     /// them with `draws`; the previous draws come back in `draws`, so the
     /// caller drops their `Arc`s (refcount decrements, no allocation).
     pub fn set_keyer_draws(&mut self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
-        std::mem::swap(&mut self.keyers, draws);
+        std::mem::swap(&mut *self.keyers, draws);
     }
 
     /// The installed keyer draws.

@@ -37,8 +37,9 @@ pub struct SwitcherFrameHook<C> {
     fps_den: i64,
     /// Fixed exchange buffer for this tick's keyer draws (ADR-0113): filled
     /// by the driver, swapped into the drive, so the previous tick's `Arc`s
-    /// come back here and drop on the next resolve. No per-tick allocation.
-    keyer_buf: [Option<KeyerDraw>; MAX_DSK],
+    /// come back here and drop on the next resolve. No per-tick allocation:
+    /// boxed once at construction to keep the hook small.
+    keyer_buf: Box<[Option<KeyerDraw>; MAX_DSK]>,
 }
 
 /// The compositor's mask shape for a switcher wipe pattern.
@@ -72,7 +73,7 @@ impl<C> SwitcherFrameHook<C> {
             last_preview: None,
             fps_num: 0,
             fps_den: 0,
-            keyer_buf: [const { None }; MAX_DSK],
+            keyer_buf: Box::new([const { None }; MAX_DSK]),
         }
     }
 }
