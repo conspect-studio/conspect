@@ -22,7 +22,7 @@ fuzz workspace's), because of a peer-reachable panic (issue #403); see below.
 
 The published archive, copied unchanged except for these edits, each marked
 `conspect patch (issue #403)` in the source (`.cargo-ok` dropped; `LICENSE`
-unchanged). Upstream `master` still carries the panic as of 2026-11-14.
+unchanged; patch record `vendor/h3/CONSPECT-PATCH.md`). Upstream `master` still carries the panic as of 2026-11-14; reported as https://github.com/hyperium/h3/issues/386.
 
 1. `src/frame.rs` `FrameStream::poll_data`: when the stream ends while a
    DATA frame still owes payload bytes, return
