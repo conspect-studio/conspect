@@ -62,22 +62,23 @@ export async function applyLayoutCommand(
 
 /**
  * The stable problem type the server answers when a switcher M/E is declared
- * and the layout cannot be its Program canvas (#317). Nothing was applied or
- * persisted; the running layout is kept.
+ * (#307): the Program canvas is the M/E bus, so apply-layout cannot replace it.
+ * The refusal happens before anything is reserved, persisted or sent; the
+ * detail names the operations that do what the operator means (take the
+ * layout to an output, or use it as a switcher source).
  */
-export const LAYOUT_NOT_ADMISSIBLE_WITH_SWITCHER = '/problems/layout-not-admissible-with-switcher';
+export const SWITCHER_OWNS_PROGRAM = '/problems/switcher-owns-program';
 
 /** Whether `error` is the typed switcher refusal (not a generic failure). */
 export function isSwitcherRefusal(error: unknown): error is OperationApiError {
-  return error instanceof OperationApiError && error.problemType === LAYOUT_NOT_ADMISSIBLE_WITH_SWITCHER;
+  return error instanceof OperationApiError && error.problemType === SWITCHER_OWNS_PROGRAM;
 }
 
 /**
- * What the page can know before it asks: with the switcher on, a layout with
- * more than one cell cannot be the Program canvas. Returns `true` when Apply
- * must be disabled. The server stays authoritative for every other case (a
- * one-cell layout bound to another source is still refused by the server).
+ * What the page can know before it asks: with the switcher on, the Program
+ * canvas is the M/E bus and no layout replaces it (#307). Returns `true` when
+ * Apply must be disabled; the layout can still be taken to an output.
  */
-export function blockedBySwitcher(switcherOn: boolean, cellCount: number): boolean {
-  return switcherOn && cellCount > 1;
+export function blockedBySwitcher(switcherOn: boolean): boolean {
+  return switcherOn;
 }

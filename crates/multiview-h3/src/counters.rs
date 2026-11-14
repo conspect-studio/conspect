@@ -31,6 +31,15 @@ pub struct Counters {
     /// (oversized control frame, SETTINGS late, partial frame too old,
     /// QPACK stream over its byte cap).
     pub control_stream_rejections: AtomicU64,
+    /// Request tasks that panicked (a bug in the site, the WebTransport
+    /// handler or the h3 request path; issue #403). The panic ends that
+    /// request's stream only; the connection and the endpoint keep serving.
+    pub request_panics: AtomicU64,
+    /// Connection tasks that panicked (handshake, the h3 connection driver
+    /// or the peers hook). The panic ends that connection only; its caps
+    /// and permits are released by unwinding and the endpoint keeps
+    /// accepting.
+    pub connection_panics: AtomicU64,
     /// Requests whose site did not return the response head within
     /// `H3Limits::response_head_timeout`.
     pub response_timeouts: AtomicU64,
