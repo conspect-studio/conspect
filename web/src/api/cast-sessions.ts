@@ -25,23 +25,13 @@ import type { OutputVideoFeed } from './outputRouting';
 import type { components } from './types';
 
 /**
- * One live cast session as the control plane returns it. The optional fields
- * past the generated doc are the receiver-state additions of the cast2 lane
- * (`stream_id`, `player_state`, `idle_reason`, `last_report`, as
- * `routes/cast_sessions.rs` serializes them; drop them here once
- * `docs/api/openapi.json` carries them). `media_url` is redacted
- * (`…/cast/<redacted>/master.m3u8`) for a token stream; tolerate its absence.
+ * One live cast session, exactly as the control plane returns it (`media_url`
+ * is redacted, `…/cast/<redacted>/master.m3u8`, for a token stream).
  */
-export type CastSession = Omit<components['schemas']['CastSessionDoc'], 'media_url'> & {
-  readonly media_url?: string | null;
-  readonly stream_id?: string | null;
-  readonly player_state?: string | null;
-  readonly idle_reason?: string | null;
-  readonly last_report?: { readonly received_unix_ms: number; readonly report: unknown } | null;
-};
+export type CastSession = components['schemas']['CastSessionDoc'];
 
 /** The body of a start-cast-session request (`feed`: what to show, as a cast stream takes it). */
-export type StartCastSessionRequest = components['schemas']['StartCastSessionRequest'] & {
+export type StartCastSessionRequest = Omit<components['schemas']['StartCastSessionRequest'], 'feed'> & {
   readonly feed?: OutputVideoFeed;
 };
 
@@ -66,6 +56,7 @@ function isCastSession(value: unknown): value is CastSession {
     isRecord(value) &&
     typeof value.address === 'string' &&
     typeof value.id === 'string' &&
+    typeof value.media_url === 'string' &&
     typeof value.output === 'string' &&
     typeof value.state === 'string'
   );

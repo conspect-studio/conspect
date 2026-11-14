@@ -187,10 +187,21 @@ export interface paths {
         put?: never;
         /**
          * `POST /api/v1/cast/sessions` — start an ad-hoc cast session (role: write).
-         * @description Resolves the rendition, spawns the supervised session actor through the
-         *     shared poller registry, and records the ephemeral session. The actor
-         *     CONNECTs → `LAUNCH`es the Default Media Receiver (`CC1AD845`) → `LOAD`s the
-         *     device-reachable HLS URL, then supervises the session (ADR-M011).
+         * @description When the engine runs a cast output (ADR-0111) the session creates its own
+         *     cast stream (`feed` / `output` as `POST /cast/streams` takes them, same
+         *     authorization, owner = the caller), LAUNCHes the configured receiver app
+         *     (the registered custom receiver, else the Default Media Receiver
+         *     `CC1AD845`) and LOADs `{control.cast_media_base}/cast/<token>/master.m3u8`
+         *     (fMP4, LIVE). The session owns the stream: stopping the session revokes
+         *     it, and a revoked or expired stream ends the session. Only the receiver's
+         *     playlist fetches keep the token alive. The token is never served,
+         *     audited, published or logged (`media_url` is redacted).
+         *
+         *     Without a cast output: resolves the HLS rendition, spawns the supervised
+         *     session actor through the shared poller registry, and records the
+         *     ephemeral session. The actor CONNECTs → `LAUNCH`es the Default Media
+         *     Receiver (`CC1AD845`) → `LOAD`s the device-reachable HLS URL, then
+         *     supervises the session (ADR-M011).
          */
         post: operations["start_cast_session"];
         delete?: never;
@@ -4608,12 +4619,28 @@ export interface components {
             address: string;
             /** @description The runtime session id (`cast-session-…`, UUID-fresh per start). */
             id: string;
-            /** @description The resolved device-reachable media URL the session LOADs. */
+            /**
+             * @description Why the receiver is idle or refused the LOAD (its `idleReason` /
+             *     error reason, e.g. `ERROR`, `FINISHED`), while not playing.
+             */
+            idle_reason?: string | null;
+            last_report?: null | components["schemas"]["ReceiverReport"];
+            /**
+             * @description The device-reachable media URL the session LOADs. For a session
+             *     that plays a cast stream the token is redacted:
+             *     `https://…/cast/<redacted>/master.m3u8`.
+             */
             media_url: string;
             /** @description The operator-facing name, if given. */
             name?: string | null;
             /** @description The output id whose rendition the session casts. */
             output: string;
+            /**
+             * @description The receiver's player state as last reported: `connecting`,
+             *     `loading`, `playing`, `buffering`, `paused`, `idle`, `load-failed`,
+             *     `no-media`, `preempted`, `relaunching`.
+             */
+            player_state?: string | null;
             /**
              * Format: int64
              * @description When the receiver **accepted** the session's `LOAD` (the first
@@ -4629,6 +4656,11 @@ export interface components {
              *     registry.
              */
             state: string;
+            /**
+             * @description The cast stream the session owns (stopping the session revokes it;
+             *     revoking or expiring it ends the session).
+             */
+            stream_id?: string | null;
         };
         /** @description One cast stream. */
         CastStreamDoc: {
@@ -8693,6 +8725,17 @@ export interface components {
              *     advertised one).
              */
             address: string;
+            /**
+             * @description What to show, as `POST /cast/streams` takes it
+             *     (`{"bus":"program"|"preview"|"clean"}`, `{"source":"<id>"}`,
+             *     `{"layout":"<id>"}`). When the engine runs a cast output the session
+             *     creates its own cast stream (same authorization as `POST
+             *     /cast/streams`, owner = the caller) and LOADs
+             *     `{control.cast_media_base}/cast/<token>/master.m3u8`; `output` may
+             *     then name a cast output. Without a cast output a `feed` is refused
+             *     (`409 cast-unavailable`) and `output` names an HLS rendition as before.
+             */
+            feed?: Record<string, never> | null;
             /** @description An operator-facing name for the session (e.g. the room/TV name). */
             name?: string | null;
             /**
@@ -10205,7 +10248,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized to start a session. */
+            /** @description Not authorized to start a session; with a cast output: the caller may not read the output (object and output axis) or the feed, exactly as for `POST /cast/streams`. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -10214,7 +10257,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description No castable rendition (control.cast_media_base unset / no HLS output) or no live cast driver in this build. */
+            /** @description No live cast driver in this build; with a cast output: `cast-no-public-base` (control.cast_media_base is not an absolute https:// origin) or any refusal of `POST /cast/streams` (`cast-unavailable`, `cast-capacity`, `cast-no-encoder`, routing refusals); without one: no castable rendition (control.cast_media_base unset / no HLS output) or `cast-unavailable` for a `feed`. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -10223,8 +10266,26 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The address is not a valid host[:port], or the named output is not a served HLS rendition. */
+            /** @description The address is not a valid host[:port], the named output is not a served HLS rendition, or `unknown-feed`. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The `POST /cast/streams` creation limit (burst 4, then 1/s per principal). */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `engine-busy`: the take onto the cast output did not settle within 3 s. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
