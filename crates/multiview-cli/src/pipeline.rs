@@ -1483,6 +1483,9 @@ segment_ms = 1000
                 None,
             ),
             clear_on_remove: false,
+            live_bus_stores: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::new(),
+            )),
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
@@ -1598,6 +1601,9 @@ segment_ms = 1000
                 None,
             ),
             clear_on_remove: false,
+            live_bus_stores: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::new(),
+            )),
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
@@ -2222,6 +2228,9 @@ pub struct Pipeline {
     switcher_driver: Option<multiview_engine::switcher_control::SwitcherTickDriver>,
     /// Separate PVW JPEG tap: never silently copy the PGM canvas here.
     switcher_preview: Option<crate::preview::ProgramSlot>,
+    /// Stores of sources added while a switcher run is live (issue #464):
+    /// the hub RCUs them in, the switcher driver/hook load them wait-free.
+    live_bus_stores: multiview_engine::switcher_control::LiveStoreMap,
     /// Per-source native caption cue stores, keyed by source id. Each store is
     /// written by an isolated caption reader thread (HLS `WebVTT` rendition demux)
     /// and **sampled** at each output tick by the overlay baker, which burns the
@@ -3663,6 +3672,9 @@ impl Pipeline {
             switcher_control: None,
             switcher_driver: None,
             switcher_preview: None,
+            live_bus_stores: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::new(),
+            )),
             stores,
             source_registry,
             source_handles,
@@ -4410,6 +4422,12 @@ impl Pipeline {
         })
     }
 
+    /// The switcher run's live-added source stores (issue #464).
+    #[must_use]
+    pub fn live_bus_stores(&self) -> multiview_engine::switcher_control::LiveStoreMap {
+        Arc::clone(&self.live_bus_stores)
+    }
+
     /// The configured-source catalogue.
     #[must_use]
     pub fn catalogue(&self) -> crate::source_rails::Catalogue {
@@ -4424,6 +4442,7 @@ impl Pipeline {
                 .map(|manager| (Arc::clone(&self.catalogue), manager)),
             source_events: Arc::clone(&self.source_events),
             clear_on_remove: self.switcher_me.is_some(),
+            live_bus_stores: Arc::clone(&self.live_bus_stores),
             layout: Arc::clone(&self.layout),
             display: DisplayFollow::new(
                 Arc::clone(&self.display_layout),
@@ -6313,6 +6332,7 @@ impl Pipeline {
             async {
                 if let Some(mut switcher_driver) = self.switcher_driver.take() {
                     switcher_driver.set_prime_stores(self.catalogue_stores());
+                    switcher_driver.set_live_stores(Arc::clone(&self.live_bus_stores));
                     let Some(preview_slot) = self.switcher_preview.clone() else {
                         return Err(PipelineError::Engine("switcher preview tap missing".into()));
                     };
@@ -6328,6 +6348,7 @@ impl Pipeline {
                     );
                     hook.preview_slot = Some(preview_slot);
                     hook.preview_stores = Some(self.catalogue_stores());
+                    hook.live_stores = Some(Arc::clone(&self.live_bus_stores));
                     hook.preview_selection = preview_selection;
                     // The only clock-side routing duty: one non-blocking `try_send`
                     // after a fresh compose, and only while a routed feed is active.
@@ -11283,10 +11304,15 @@ struct LiveIngestSpawner {
         crate::source_rails::Catalogue,
         multiview_engine::DemandManager<Nv12Image>,
     )>,
-    /// First-slice switcher runs fail closed on a live media edit and retire a
-    /// removed or edited source's store pixels, so the M/E can never resolve
-    /// stale media (PR 224). Policy-only edits still apply live.
+    /// First-slice switcher runs retire a removed or media-edited source's
+    /// store pixels before the new definition is catalogued, so the M/E can
+    /// never resolve stale media (PR 224, issue #464). An edit of a source on
+    /// a bus is refused by the control plane before it reaches the engine;
+    /// policy-only edits apply live without a restart.
     clear_on_remove: bool,
+    /// The switcher run's live-added source stores (issue #464), so a source
+    /// added after the clock started can be primed, taken and monitored.
+    live_bus_stores: multiview_engine::switcher_control::LiveStoreMap,
     source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved startup layout: the pinned canvas, which a live layout swap
     /// cannot change. Tile sizes come from `display`. Read by the GPU
@@ -11356,6 +11382,11 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
             return false;
         };
         crate::source_rails::catalogue_upsert_with(catalogue, &spawn.source, &spawn.store);
+        if self.clear_on_remove {
+            // The M/E primes, takes and monitors only stores it can see: a
+            // source added after the clock started joins the live map.
+            self.publish_bus_store(&spawn.source.id, Some(&spawn.store));
+        }
         manager.set_pins(
             &spawn.source.id,
             crate::source_demand::standing_pins(&spawn.source),
@@ -11365,14 +11396,26 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn invalidate_live_edit(&self, id: &str) -> bool {
-        if !self.clear_on_remove || self.demand.is_none() {
+        if !self.clear_on_remove {
             return false;
         }
-        // Invalidate before reconciliation can resolve a stale configured rail.
-        // Fencing also excludes any detached old producer's late publications.
-        self.source_removed(id);
-        tracing::warn!(source = %id, "switcher source edit requires restart; stale demand catalogue entry invalidated");
-        true
+        let Some((catalogue, _)) = &self.demand else {
+            return false;
+        };
+        // Issue #464: a NEW id has no previous definition and no stale
+        // pixels, so it is never refused — the caller catalogues it live.
+        let Some(entry) = catalogue.load().get(id).cloned() else {
+            return false;
+        };
+        // A media edit (the control plane refused it already if the source
+        // was on a bus). The hub's teardown has stopped and awaited the old
+        // producer; fence any detached writer with a fresh lifecycle, then
+        // retire the old pixels BEFORE the new definition is catalogued, so
+        // the M/E can never prime or take the previous media (PR 224).
+        let _fence = begin_live_lifecycle(id);
+        entry.store().clear();
+        tracing::info!(source = %id, "switcher source edit: old media retired; the new definition starts live");
+        false
     }
 
     fn update_policy(&self, spawn: &crate::live_sources::SourceSpawn) -> bool {
@@ -11461,6 +11504,9 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         if let Some(store) = retired_store {
             store.clear();
         }
+        if self.clear_on_remove {
+            self.publish_bus_store(id, None);
+        }
         if let Some(lease) = self.source_events.activate(id, lifecycle) {
             lease.retire();
         }
@@ -11522,6 +11568,33 @@ fn spawn_live_audio(
 }
 
 impl LiveIngestSpawner {
+    /// RCU `id`'s store into (or, with `None`, out of) the switcher's live
+    /// store map. Hub worker only; the clock only loads the map.
+    fn publish_bus_store(&self, id: &str, store: Option<&Arc<TileStore<Nv12Image>>>) {
+        let unchanged = {
+            let current = self.live_bus_stores.load();
+            match store {
+                Some(store) => current.get(id).is_some_and(|known| Arc::ptr_eq(known, store)),
+                None => !current.contains_key(id),
+            }
+        };
+        if unchanged {
+            return;
+        }
+        self.live_bus_stores.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            match store {
+                Some(store) => {
+                    next.insert(id.to_owned(), Arc::clone(store));
+                }
+                None => {
+                    next.remove(id);
+                }
+            }
+            next
+        });
+    }
+
     /// The video half of [`crate::live_sources::IngestSpawner::spawn`].
     #[allow(clippy::too_many_lines)]
     // reason: live caption setup shares source planning but runs only on the hub worker.
@@ -26564,6 +26637,10 @@ segment_ms = 1000
         assert_eq!(size("news"), Some(req((320, 180))));
     }
 
+    /// Issue #464 (supersedes the PR 224 restart-only fence): on a switcher
+    /// run a media edit retires the old pixels and fences the old producer,
+    /// then lets the new definition be catalogued live into the same store; a
+    /// removal still retires the store and drops the catalogue entry.
     #[test]
     fn switcher_live_edits_and_removal_cannot_resolve_stale_media() {
         use crate::live_sources::IngestSpawner;
@@ -26589,14 +26666,65 @@ segment_ms = 1000
             }),
         );
         let retained = rails.store("cam1").expect("boot store exists");
-        assert!(guarded.invalidate_live_edit("cam1"));
-        assert!(retained.read_at(MediaTime::from_nanos(0)).frame().is_none());
-        assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
-        assert!(rails.store("cam1").is_none());
-        crate::source_rails::catalogue_upsert(&pipeline.catalogue(), &config.sources[0]);
+        retained.publish(
+            Nv12Image::solid(16, 16, 200, 128, 128, multiview_core::color::ColorInfo::default().resolve_defaults(16, 16))
+                .expect("frame"),
+            MediaTime::from_nanos(0),
+        );
+        assert!(retained.read_at(MediaTime::from_nanos(0)).frame().is_some());
+        let before = live_lifecycle("cam1");
+        // The edit is never refused: the hub goes on to catalogue it live.
+        assert!(!guarded.invalidate_live_edit("cam1"));
+        assert!(
+            retained.read_at(MediaTime::from_nanos(0)).frame().is_none(),
+            "the old media is retired before the new definition is catalogued"
+        );
+        assert_ne!(live_lifecycle("cam1"), before, "a detached old writer is fenced");
+        // The catalogue keeps the entry; the hub's upsert replaces it.
+        assert!(rails.store("cam1").is_some());
         guarded.source_removed("cam1");
         assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
         assert!(rails.store("cam1").is_none());
+    }
+
+    /// Issue #464: a NEW id on a switcher run is catalogued live (never
+    /// refused, never clearing anything) and joins the M/E's live store map;
+    /// removing it leaves the map.
+    #[test]
+    fn live_source_switcher_new_id_is_catalogued_and_visible_to_the_me() {
+        use crate::live_sources::IngestSpawner;
+
+        let config = two_cells_one_source_config();
+        let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
+        let _manager = pipeline.demand();
+        let mut guarded = pipeline.live_spawner();
+        guarded.clear_on_remove = true;
+        assert!(!guarded.invalidate_live_edit("fresh"), "a new id is never refused");
+        let source: Source = serde_json::from_value(
+            serde_json::json!({"id": "fresh", "kind": "hls", "url": "http://[::1]:9/f.m3u8"}),
+        )
+        .expect("source");
+        let store = Arc::new(TileStore::<Nv12Image>::with_defaults("fresh"));
+        assert!(guarded.catalogue(&crate::live_sources::SourceSpawn {
+            source,
+            store: Arc::clone(&store),
+        }));
+        let catalogued = pipeline.catalogue().load().get("fresh").cloned();
+        assert!(
+            catalogued.is_some_and(|entry| Arc::ptr_eq(entry.store(), &store)),
+            "the drain's store is catalogued"
+        );
+        assert!(
+            pipeline
+                .live_bus_stores()
+                .load()
+                .get("fresh")
+                .is_some_and(|known| Arc::ptr_eq(known, &store)),
+            "the M/E can prime and take the live-added store"
+        );
+        guarded.source_removed("fresh");
+        assert!(!pipeline.live_bus_stores().load().contains_key("fresh"));
+        assert!(pipeline.catalogue().load().get("fresh").is_none());
     }
 
     #[test]

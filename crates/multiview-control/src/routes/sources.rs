@@ -350,6 +350,83 @@ fn live_apply_upsert(
     ApplyMode::Restart
 }
 
+/// Issue #464: on a switcher run, a media edit of a source on a bus would let
+/// the M/E air the old definition (or a slate) mid-show. Refuse it before the
+/// durable commit with a `409` naming every switcher consumer; nothing is
+/// stored or enqueued. Policy/guide-only edits and restart-only kinds pass.
+fn refuse_on_bus_media_edit(
+    state: &AppState,
+    id: &str,
+    previous: Option<&multiview_config::Source>,
+    next_body: &serde_json::Value,
+) -> ControlResult<()> {
+    let Some(next) = parse_stored_source(next_body) else {
+        return Ok(());
+    };
+    if previous.is_some_and(|previous| previous.same_media(&next))
+        || !state.live_sources.is_live(&next.kind)
+    {
+        return Ok(());
+    }
+    let consumers = switcher_bus_consumers(state, id);
+    if consumers.is_empty() {
+        return Ok(());
+    }
+    Err(crate::error::ControlError::Conflict(format!(
+        "source {id:?} is on a switcher bus ({}); a media edit would change what is on air. \
+         Take it off the bus first, then edit (policy-only edits apply live)",
+        consumers.join(", ")
+    )))
+}
+
+/// The switcher consumers of `id`: the M/E's current Program and Preview
+/// (engine snapshot, input-resolved), and every declared downstream keyer's
+/// fill and key. Empty on a run with no switcher.
+pub(crate) fn switcher_bus_consumers(state: &AppState, id: &str) -> Vec<String> {
+    let mut consumers = Vec::new();
+    if let Some(snapshot) = state.switcher.as_ref().and_then(|s| s.snapshot()) {
+        if snapshot.program.as_str() == id {
+            consumers.push("program bus".to_owned());
+        }
+        if snapshot.preview.as_str() == id {
+            consumers.push("preview bus".to_owned());
+        }
+    }
+    for keyer in declared_keyers(state) {
+        let object = format!("{}/{}", keyer.program, keyer.id);
+        if keyer.fill == id {
+            consumers.push(format!("keyer {object} fill"));
+        }
+        if keyer.key.as_deref() == Some(id) {
+            consumers.push(format!("keyer {object} key"));
+        }
+    }
+    consumers
+}
+
+/// The downstream keyers the running engine admitted (the adopted config).
+fn declared_keyers(state: &AppState) -> Vec<multiview_config::DownstreamKeyerConfig> {
+    if let Some(model) = &state.boot_model {
+        return model
+            .adopted_config()
+            .switcher
+            .map(|switcher| switcher.downstream_keyers)
+            .unwrap_or_default();
+    }
+    state
+        .base_document
+        .as_deref()
+        .and_then(|document| document.get("switcher"))
+        .and_then(|switcher| switcher.get("downstream_keyers"))
+        .and_then(|keyers| serde_json::from_value(keyers.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// How long `Start` waits for a source the engine adopted live to reach the
+/// demand catalogue (the hub applies it at the next frame boundary, off the
+/// clock). Bounded; polled on the control task, never on the engine.
+const START_CATALOGUE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Enqueue a live removal of `id` for the running engine, returning the apply
 /// semantics the DELETE response must declare (`live` iff enqueued).
 fn live_apply_remove(state: &AppState, id: &str) -> ApplyMode {
@@ -712,6 +789,7 @@ pub(crate) async fn apply_source_update(
         body: validated_body(TypedCollection::Sources, id, &input.body)?,
     };
     let previous = parse_stored_source(&current.resource.body);
+    refuse_on_bus_media_edit(state, id, previous.as_ref(), &input.body)?;
     crate::boot_model::commit_resource(
         state,
         "sources",
@@ -941,7 +1019,22 @@ pub(crate) async fn start_source(
             "this run cannot start sources on request".to_owned(),
         ));
     };
-    if !demand.start_source(&id) {
+    let mut started = demand.start_source(&id);
+    // Issue #464: a source the engine adopted live (its upsert landed) is
+    // catalogued by the hub at the next frame boundary. Wait for it, bounded,
+    // so Start agrees with the engine instead of racing the hub.
+    let adopted = state
+        .boot_model
+        .as_ref()
+        .is_some_and(|model| model.adopted_sources().iter().any(|s| s.id == id));
+    if !started && adopted {
+        let deadline = tokio::time::Instant::now() + START_CATALOGUE_WAIT;
+        while !started && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            started = demand.start_source(&id);
+        }
+    }
+    if !started {
         // The source is stored but the running engine does not know it: it
         // was saved as a restart-only change (issue #420). Say so plainly.
         return Err(crate::error::ControlError::Conflict(format!(

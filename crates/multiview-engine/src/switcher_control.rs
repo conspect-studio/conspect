@@ -246,6 +246,11 @@ pub struct SwitcherOutcome {
     pub error: Option<String>,
 }
 
+/// The run's live-added source stores (issue #464): written off the clock by
+/// the live-source hub (RCU), read on the clock with one wait-free load.
+pub type LiveStoreMap =
+    Arc<multiview_framestore::SwapCell<Arc<HashMap<String, Arc<TileStore<Nv12Image>>>>>>;
+
 /// A cloneable control-plane handle; it cannot mutate the machine directly.
 #[derive(Debug, Clone)]
 pub struct SwitcherControl {
@@ -327,6 +332,7 @@ impl SwitcherControl {
             active_auto: None,
             active_auto_scenes: None,
             primed_stores: None,
+            live_stores: None,
             pending_take: None,
             armed: None,
             last_tick: 0,
@@ -481,6 +487,9 @@ pub struct SwitcherTickDriver {
     composed_count: Arc<std::sync::atomic::AtomicU64>,
     auto_capable: Arc<std::sync::atomic::AtomicBool>,
     primed_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    /// Stores of sources added while the run is live (issue #464), consulted
+    /// after the fixed boot map. One wait-free load per lookup.
+    live_stores: Option<LiveStoreMap>,
     pending_take: Option<(SwitcherCommand, u64)>,
     /// The armed mixer half of an atomic set (#308), if any.
     armed: Option<ArmedSet>,
@@ -635,10 +644,7 @@ impl SwitcherTickDriver {
             let on_bus = on_program || preview_input == Some(*number);
             match source {
                 Some(source) => {
-                    let known = self
-                        .primed_stores
-                        .as_ref()
-                        .is_some_and(|stores| stores.contains_key(source.as_str()));
+                    let known = self.store_for(source.as_str()).is_some();
                     if !known {
                         return Err(format!(
                             "unknown-source: {:?} has no frame store in this run",
@@ -719,6 +725,29 @@ impl SwitcherTickDriver {
         self.primed_stores = Some(stores);
     }
 
+    /// Install the run's live-added source stores (issue #464): a source
+    /// added after the clock started is primed, patched and taken from this
+    /// map. Consulted before the boot map; the hub worker RCUs it, the
+    /// clock only loads it (wait-free, no allocation).
+    pub fn set_live_stores(&mut self, live: LiveStoreMap) {
+        self.live_stores = Some(live);
+    }
+
+    /// The store for `source`: the live map first (a source removed and
+    /// re-added live has a NEW store there; the boot map keeps the retired
+    /// one), then the boot map.
+    fn store_for(&self, source: &str) -> Option<Arc<TileStore<Nv12Image>>> {
+        let stores = self.primed_stores.as_ref()?;
+        if let Some(store) = self
+            .live_stores
+            .as_ref()
+            .and_then(|live| live.load().get(source).cloned())
+        {
+            return Some(store);
+        }
+        stores.get(source).cloned()
+    }
+
     /// Advertise AUTO. Called only by the frame hook that renders the
     /// dissolve inside the Program drive (ADR-0104 §3).
     pub fn advertise_auto(&self) {
@@ -730,10 +759,9 @@ impl SwitcherTickDriver {
     /// latch-and-classify rule (ADR-0104 §2). `None` when no store map is
     /// installed. Wait-free: atomic loads and a ring snapshot, no allocation.
     fn fresh_at(&self, source: &str, tick: Tick) -> Option<bool> {
-        let stores = self.primed_stores.as_ref()?;
+        self.primed_stores.as_ref()?;
         Some(
-            stores
-                .get(source)
+            self.store_for(source)
                 .is_some_and(|store| store.state_at(tick.pts).is_live()),
         )
     }

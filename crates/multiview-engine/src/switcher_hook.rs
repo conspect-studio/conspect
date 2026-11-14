@@ -29,6 +29,9 @@ pub struct SwitcherFrameHook<C> {
     pub preview_slot: Option<Arc<SwapCell<Option<Arc<Nv12Image>>>>>,
     /// Shared store map, reused rather than decoding the preview source twice.
     pub preview_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    /// Stores of sources added while the run is live (issue #464), consulted
+    /// before `preview_stores` with one wait-free load.
+    pub live_stores: Option<crate::switcher_control::LiveStoreMap>,
     /// Wait-free PVW selection for the routed Preview feed (ADR-0108 §2.5):
     /// written only when the PVW source changes, so it allocates only then.
     pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
@@ -69,6 +72,7 @@ impl<C> SwitcherFrameHook<C> {
             last_error: None,
             preview_slot: None,
             preview_stores: None,
+            live_stores: None,
             preview_selection: None,
             last_preview: None,
             fps_num: 0,
@@ -199,8 +203,14 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // admitted compositor/rendition — this tap never composes or encodes.
         if let (Some(slot), Some(stores)) = (&self.preview_slot, &self.preview_stores) {
             let (_, preview) = self.driver.resolved_selections();
-            let picture = stores
-                .get(preview.as_str())
+            // The live map first: a source re-added live has a new store.
+            let live = self
+                .live_stores
+                .as_ref()
+                .and_then(|live| live.load().get(preview.as_str()).cloned());
+            let picture = live
+                .as_ref()
+                .or_else(|| stores.get(preview.as_str()))
                 .and_then(|store| store.read_at(frame.tick.pts).frame().cloned());
             // A missing PVW frame stays an honest "unavailable" monitor; it is
             // never replaced with the Program canvas.
