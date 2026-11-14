@@ -7927,7 +7927,9 @@ fn drive_selected_audio_for_item(
         if item.switcher_audio_enabled {
             match &item.switcher_mix {
                 Some(mix) => {
-                    let remaining = u64::from(mix.duration.saturating_sub(mix.elapsed));
+                    // The take's exact audio window from this tick (SA-3):
+                    // never derived from the video weight's `elapsed`.
+                    let remaining = u64::from(mix.audio_remaining);
                     handle.crossfade_program_source(
                         bus,
                         item.switcher_audio.as_deref(),
@@ -8196,6 +8198,86 @@ mod switcher_shed_audio_tests {
             (0..7).collect::<Vec<_>>(),
             "the dispatch callback receives each job's own tick"
         );
+    }
+
+    /// SA-3: a stinger's 4-frame mix (video weight (k + 1) / 4, so its
+    /// first item carries `elapsed` 1) crossfades Program audio over exactly
+    /// 4 ticks of samples from its first mix tick, and the incoming source
+    /// reaches full gain exactly at the swap boundary, not a tick early.
+    /// Modelled on `auto_crossfade_ramps_over_the_exact_tick_budget_and_starts_once`.
+    #[test]
+    fn a_stinger_mix_crossfades_audio_over_its_exact_mix_window() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let a = Arc::new(AudioStore::timeline(format, 24_000));
+        let b = Arc::new(AudioStore::timeline(format, 24_000));
+        let mut bus = ProgramBus::new(format, Rational::new(25, 1));
+        let pa = bus.add_source("a", Arc::clone(&a), 1.0);
+        let pb = bus.add_source("b", Arc::clone(&b), 1.0);
+        let handle = crate::audio::AudioControlHandle::from_sources(
+            [("a".into(), a), ("b".into(), b)].into_iter().collect(),
+            [("a".into(), pa), ("b".into(), pb)].into_iter().collect(),
+        );
+        let mut last = None;
+        let block =
+            drive_selected_audio_for_item(&mut bus, Some(&handle), &item(0, "a"), &mut last)
+                .expect("audio");
+        assert_eq!(block.frame_count(), 1920);
+        // The stinger's mix frames k = 0..4 on ticks 1..=4, swap on 5.
+        let mixing = |tick: u64, k: u32| {
+            let mut item = item(tick, "a");
+            item.switcher_mix = Some(multiview_engine::MixOverlay {
+                source: "b".into(),
+                elapsed: k + 1,
+                duration: 4,
+                start: -4,
+                style: multiview_engine::TransitionStyle::Mix,
+                audio_remaining: 4 - k,
+            });
+            item
+        };
+        let budget = 4 * 1920;
+        for (k, tick) in (1..4).enumerate() {
+            let k = u32::try_from(k).unwrap();
+            let block =
+                drive_selected_audio_for_item(&mut bus, Some(&handle), &mixing(tick, k), &mut last)
+                    .expect("audio");
+            assert_eq!(block.frame_count(), 1920, "one tick of samples");
+            let ramp = bus
+                .program_gain_ramp(pb)
+                .expect("still ramping before the last mix tick");
+            assert_eq!(ramp.frames_total, budget, "the whole 4-tick mix window");
+            assert_eq!(
+                bus.program_gain_ramp(pa)
+                    .expect("outgoing ramps")
+                    .frames_total,
+                budget
+            );
+            assert_eq!(
+                ramp.frames_done,
+                1920 * (usize::try_from(k).unwrap() + 1),
+                "started once, on the first mix tick"
+            );
+        }
+        // The last mix tick (k = 3) consumes the last 1920 samples: the ramp
+        // completes exactly at its end and retires, b at full gain, a silent.
+        let block =
+            drive_selected_audio_for_item(&mut bus, Some(&handle), &mixing(4, 3), &mut last)
+                .expect("audio");
+        assert_eq!(block.frame_count(), 1920);
+        assert!(
+            bus.program_gain_ramp(pb).is_none(),
+            "completed on the boundary"
+        );
+        assert!(bus.program_gain_ramp(pa).is_none());
+        assert_eq!(bus.program_gain(pa), Some(0.0));
+        assert_eq!(bus.program_gain(pb), Some(1.0));
+        // The swap tick: Program is b, an immediate set.
+        let block =
+            drive_selected_audio_for_item(&mut bus, Some(&handle), &item(5, "b"), &mut last)
+                .expect("audio");
+        assert_eq!(block.frame_count(), 1920);
+        assert_eq!(bus.program_gain(pa), Some(0.0));
+        assert_eq!(bus.program_gain(pb), Some(1.0));
     }
 
     fn assert_pcm(block: &multiview_audio::format::AudioBlock, expected: &[f32], start: usize) {

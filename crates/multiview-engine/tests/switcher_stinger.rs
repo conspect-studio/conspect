@@ -878,3 +878,65 @@ fn an_auto_bound_to_a_stale_selection_is_refused_and_never_rolls() {
     assert!(rig.handle.snapshot().unwrap().in_flight);
     assert_eq!(rx.try_recv(), Some(0));
 }
+
+/// SA-3: a stinger's mix frame k carries the video weight `(k + 1) / mix_rate`
+/// and the audio budget of the mix window left (`mix_rate - k` ticks, to the
+/// swap), so a 4-frame mix gets a 4-frame audio ramp. A plain MIX keeps
+/// duration - elapsed, as before.
+#[test]
+fn a_stinger_mix_carries_its_exact_audio_window() {
+    let mut rig = rig(None);
+    rig.send("set", SwitcherVerb::SetTransition(stinger(2, 10, 3, 4)));
+    rig.step(0, Some(Clip::Alpha));
+    rig.send("auto", SwitcherVerb::Auto(FrameCount::try_from(5).unwrap()));
+    let mut steps = vec![];
+    for index in 1..14 {
+        rig.step(index, Some(Clip::Alpha));
+        steps.push(
+            rig.drive
+                .mix_overlay()
+                .map(|m| (m.elapsed, m.duration, m.audio_remaining)),
+        );
+    }
+    // AUTO on tick 1: the mix is e 5..9 (ticks 6..=9), the swap on tick 10.
+    assert_eq!(
+        &steps[4..10],
+        &[
+            None,
+            Some((1, 4, 4)),
+            Some((2, 4, 3)),
+            Some((3, 4, 2)),
+            Some((4, 4, 1)),
+            None,
+        ]
+    );
+    // A plain MIX of 4: elapsed 0..4, audio 4..1 (unchanged behaviour).
+    let mut rig = self::rig(None);
+    rig.send(
+        "set",
+        SwitcherVerb::SetTransition(TransitionDescriptor::Mix {
+            rate: FrameCount::try_from(4).unwrap(),
+        }),
+    );
+    rig.step(0, Some(Clip::Alpha));
+    rig.send("auto", SwitcherVerb::Auto(FrameCount::try_from(4).unwrap()));
+    let mut steps = vec![];
+    for index in 1..6 {
+        rig.step(index, Some(Clip::Alpha));
+        steps.push(
+            rig.drive
+                .mix_overlay()
+                .map(|m| (m.elapsed, m.duration, m.audio_remaining)),
+        );
+    }
+    assert_eq!(
+        steps,
+        vec![
+            Some((0, 4, 4)),
+            Some((1, 4, 3)),
+            Some((2, 4, 2)),
+            Some((3, 4, 1)),
+            None
+        ]
+    );
+}

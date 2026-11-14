@@ -71,6 +71,47 @@ impl<C> SwitcherFrameHook<C> {
     }
 }
 
+impl<C> SwitcherFrameHook<C> {
+    /// This tick's mix step `(elapsed, duration, start, audio_remaining)`
+    /// and stinger clip player, if any (ADR-0104 §3, ADR-0112 §5).
+    #[allow(clippy::type_complexity)]
+    // reason: one private tuple consumed once by `before_compose`.
+    fn mix_step(&self, tick: Tick) -> (Option<(u32, u32, i128, u32)>, Option<&str>) {
+        let mut clip = None;
+        let mix = match self.driver.stinger_flight() {
+            Some((start, timing, player, _)) => {
+                let elapsed =
+                    u32::try_from((i128::from(tick.index) - start).max(0)).unwrap_or(u32::MAX);
+                if timing.clip_visible(elapsed) {
+                    clip = Some(player.as_str());
+                }
+                // Video weight (k + 1) / mix_rate; audio ramps over exactly
+                // the mix window's remaining frames, to its exclusive end
+                // `swap_at` (review SA-3), never one frame short.
+                timing.mix_frame(elapsed).map(|k| {
+                    (
+                        k.saturating_add(1),
+                        timing.mix_rate,
+                        start,
+                        timing.swap_at().saturating_sub(elapsed),
+                    )
+                })
+            }
+            None => self.driver.auto_window().map(|(start, rate)| {
+                let elapsed = (i128::from(tick.index) - start).clamp(0, i128::from(rate.get()));
+                let elapsed = u32::try_from(elapsed).unwrap_or(rate.get());
+                (
+                    elapsed,
+                    rate.get(),
+                    start,
+                    rate.get().saturating_sub(elapsed),
+                )
+            }),
+        };
+        (mix, clip)
+    }
+}
+
 impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHook<C> {
     fn before_compose(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
         self.fps_num = drive.layout().canvas.fps_num;
@@ -93,27 +134,7 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // A stinger (ADR-0112 §5) is a MIX over `mix_rate` frames from its
         // trigger point (mix frame k at (k + 1) / mix_rate, so a one-frame
         // mix is a cut), plus its clip on top while the clip window is open.
-        let mut clip = None;
-        let mix = match self.driver.stinger_flight() {
-            Some((start, timing, player, _)) => {
-                let elapsed =
-                    u32::try_from((i128::from(tick.index) - start).max(0)).unwrap_or(u32::MAX);
-                if timing.clip_visible(elapsed) {
-                    clip = Some(player.as_str());
-                }
-                timing
-                    .mix_frame(elapsed)
-                    .map(|k| (k.saturating_add(1), timing.mix_rate, start))
-            }
-            None => self.driver.auto_window().map(|(start, rate)| {
-                let elapsed = (i128::from(tick.index) - start).clamp(0, i128::from(rate.get()));
-                (
-                    u32::try_from(elapsed).unwrap_or(rate.get()),
-                    rate.get(),
-                    start,
-                )
-            }),
-        };
+        let (mix, clip) = self.mix_step(tick);
         if drive.stinger_clip() != clip {
             drive.set_stinger_clip(clip);
         }
@@ -152,9 +173,10 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             }
         }
         let result = match mix {
-            Some((elapsed, duration, start)) => {
-                drive.set_mix_overlay(Some((preview.as_str(), elapsed, duration, start)))
-            }
+            Some((elapsed, duration, start, audio)) => drive.set_mix_overlay_with_audio(
+                Some((preview.as_str(), elapsed, duration, start)),
+                audio,
+            ),
             None if drive.mix_overlay().is_some() => drive.set_mix_overlay(None),
             None => Ok(()),
         };

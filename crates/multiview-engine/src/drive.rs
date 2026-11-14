@@ -140,6 +140,12 @@ pub struct MixOverlay {
     pub start: i128,
     /// How the step is drawn (dissolve, dip, ...).
     pub style: TransitionStyle,
+    /// Output ticks of Program audio crossfade left from this frame (this
+    /// one included) to the end of the take's window: `duration - elapsed`
+    /// for a MIX/DIP/WIPE, and the mix window's exclusive end minus this
+    /// frame for a stinger, whose `elapsed` is `k + 1` for its video weight
+    /// (review SA-3). The audio consumer ramps over exactly this budget.
+    pub audio_remaining: u32,
 }
 
 impl MixOverlay {
@@ -330,6 +336,22 @@ impl<T> CompositorDrive<T> {
     /// [`Error::Rebind`] if `source` has no registered store; the overlay is
     /// then cleared, never drawn from a guessed store.
     pub fn set_mix_overlay(&mut self, overlay: Option<(&str, u32, u32, i128)>) -> Result<()> {
+        let audio = overlay.map(|(_, elapsed, duration, _)| duration.saturating_sub(elapsed));
+        self.set_mix_overlay_with_audio(overlay, audio.unwrap_or(0))
+    }
+
+    /// [`Self::set_mix_overlay`] with the Program audio crossfade's remaining
+    /// tick budget given explicitly ([`MixOverlay::audio_remaining`]), for a
+    /// step whose video weight is not `elapsed / duration` of its audio
+    /// window (a stinger's mix, ADR-0112 §5).
+    ///
+    /// # Errors
+    /// As [`Self::set_mix_overlay`].
+    pub fn set_mix_overlay_with_audio(
+        &mut self,
+        overlay: Option<(&str, u32, u32, i128)>,
+        audio_remaining: u32,
+    ) -> Result<()> {
         let Some((source, elapsed, duration, start)) = overlay else {
             self.mix_overlay = None;
             return Ok(());
@@ -348,6 +370,7 @@ impl<T> CompositorDrive<T> {
                 mix.duration = duration;
                 mix.start = start;
                 mix.style = style;
+                mix.audio_remaining = audio_remaining;
             }
             slot => {
                 *slot = Some(MixOverlay {
@@ -356,6 +379,7 @@ impl<T> CompositorDrive<T> {
                     duration,
                     start,
                     style,
+                    audio_remaining,
                 });
             }
         }

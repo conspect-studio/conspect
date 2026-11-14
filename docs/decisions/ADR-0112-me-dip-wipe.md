@@ -196,7 +196,12 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
      and covers Program for its window.
    - **Audio.** Program audio follows the take's mix (the existing AUTO
      crossfade over the mix window); the clip's own audio is not mixed in by
-     this PR.
+     this PR. The mix overlay carries the audio budget separately from the
+     video weight (`MixOverlay::audio_remaining`, review SA-3): mix frame `k`
+     draws at `(k + 1) / mix_rate` but ramps audio over `swap_at - e` =
+     `mix_rate - k` ticks, so the crossfade starts on the first mix tick,
+     lasts exactly `mix_rate` ticks of samples and completes on the swap
+     boundary. MIX/DIP/WIPE keep `duration - elapsed`.
 
 ## Invariants
 
