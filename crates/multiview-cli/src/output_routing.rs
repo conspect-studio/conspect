@@ -430,6 +430,10 @@ pub struct OutputRouteView {
     /// Whether the output runs a private encoded audio bus now (a take that
     /// changes its audio then costs no new audio encode).
     pub private_audio: bool,
+    /// The encoder settings of the output's landed live reset (#342 B3):
+    /// part of the encoder-sharing identity a later take opens at (#308
+    /// §12.8 rule 1). `None` (no reset) costs nothing to publish.
+    pub reset: Option<ReformatSettings>,
 }
 
 /// Wait-free routing state, written by the consumer only on change.
@@ -492,7 +496,9 @@ pub struct RoutingSnapshot {
     /// Encoder sessions charged per principal (live keys, opens in flight
     /// and set reservations), sorted by principal; principals holding none
     /// are absent. Read by the control plane's set admission (§12.8 rule 1).
-    pub principals_held: Vec<(String, usize)>,
+    /// Shared with the router's cache: republished without a copy while
+    /// holdings are unchanged.
+    pub principals_held: Arc<Vec<(String, usize)>>,
     /// `routing.max_encoders_per_principal`.
     pub max_per_principal: usize,
 }
@@ -1179,6 +1185,18 @@ pub struct OutputRouter {
     /// Items handed to the reaper this run (0 = nothing to wait for at the end).
     reaped: u64,
     dirty: bool,
+    /// The per-principal encoder holdings (live keys, opens in flight, set
+    /// reservations) changed since [`Self::principals_held`] was last
+    /// rebuilt: set wherever a key is created, adopted or retired, an open
+    /// starts or ends, or a set's reservation changes. Snapshot publication
+    /// (on the bake consumer) rebuilds only then (invariant #1: an
+    /// unchanged tick allocates nothing for it).
+    holdings_dirty: bool,
+    /// The last rebuilt holdings, shared with the published snapshot.
+    principals_held: Arc<Vec<(String, usize)>>,
+    /// Holdings rebuilds (test observation).
+    #[cfg(test)]
+    holdings_rebuilds: u64,
     reaper: Option<std::thread::JoinHandle<()>>,
     /// Routed outputs' audio (`audio = follow`); `None` for a run without
     /// program audio.
@@ -1342,6 +1360,10 @@ impl OutputRouter {
             video_keys: 0,
             reaped: 0,
             dirty: true,
+            holdings_dirty: true,
+            principals_held: Arc::new(Vec::new()),
+            #[cfg(test)]
+            holdings_rebuilds: 0,
             reaper: Some(reaper),
             audio: None,
             #[cfg(test)]
@@ -2290,7 +2312,9 @@ impl OutputRouter {
 
     fn drain_opens(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
         while let Ok(result) = self.open_rx.try_recv() {
-            let Some(open) = self.opens.remove(&result.id) else {
+            let removed = self.opens.remove(&result.id);
+            self.holdings_dirty |= removed.is_some();
+            let Some(open) = removed else {
                 // Late (deadline passed): never used.
                 if let Ok(encoder) = result.encoder {
                     self.reap(Reap::Encoder(encoder));
@@ -2363,6 +2387,7 @@ impl OutputRouter {
                 continue;
             };
             self.last_forced.insert(key, tick);
+            self.holdings_dirty = true;
             self.dynamic.push(DynamicKey {
                 bus: open.bus,
                 format: open.format,
@@ -2408,6 +2433,7 @@ impl OutputRouter {
             .retain(|_, o| o.waiter.is_some() || tick < o.deadline);
         if self.opens.len() != before {
             self.dirty = true;
+            self.holdings_dirty = true;
         }
     }
 
@@ -2842,6 +2868,7 @@ impl OutputRouter {
                     if late {
                         // The result, if it ever comes, goes to the reaper.
                         self.opens.remove(&id);
+                        self.holdings_dirty = true;
                         self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
                     }
                 }
@@ -3040,6 +3067,7 @@ impl OutputRouter {
                     // A reformat key stays charged to its principal (X1).
                     if !held_by_other && !d.reformat {
                         principal.clone_into(&mut d.principal);
+                        self.holdings_dirty = true;
                     }
                     d.linger_deadline = None;
                 }
@@ -3067,6 +3095,7 @@ impl OutputRouter {
             reformat: reset.clone(),
         }) {
             Ok(()) => {
+                self.holdings_dirty = true;
                 self.opens.insert(
                     id,
                     PendingOpen {
@@ -3279,6 +3308,7 @@ impl OutputRouter {
         let _ = dispatcher.retire_video_key(key);
         if let Some(pos) = self.dynamic.iter().position(|d| d.key == key) {
             let mut d = self.dynamic.swap_remove(pos);
+            self.holdings_dirty = true;
             if let Some(worker) = d.worker.take() {
                 self.reap(Reap::Worker(worker.close_input()));
             }
@@ -3437,6 +3467,7 @@ impl OutputRouter {
                     .as_ref()
                     .map_or_else(|| "follow".to_owned(), |a| a.choice(i).label()),
                 private_audio: self.audio.as_ref().is_some_and(|a| a.has_private_bus(i)),
+                reset: o.reset.clone(),
             })
             .collect();
         let next = RoutingSnapshot {
@@ -3468,7 +3499,7 @@ impl OutputRouter {
             aux_halved: self.aux.halved.load(Ordering::Relaxed),
             sets_pending: self.sets.active.len(),
             set_partial: self.sets.partial,
-            principals_held: self.principals_held(),
+            principals_held: self.held_by_principal(),
             max_per_principal: self.cfg.max_per_principal,
         };
         if *self.snapshot.load() != next {

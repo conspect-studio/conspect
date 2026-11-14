@@ -101,6 +101,7 @@ impl OutputRouter {
                 reformat: Some(req.settings.clone()),
             }) {
                 Ok(()) => {
+                    self.holdings_dirty = true;
                     self.opens.insert(
                         id,
                         PendingOpen {
@@ -217,6 +218,7 @@ impl OutputRouter {
             return true;
         };
         self.last_forced.insert(key, tick);
+        self.holdings_dirty = true;
         self.dynamic.push(DynamicKey {
             bus: open.bus.clone(),
             format: open.format,
@@ -427,6 +429,7 @@ impl OutputRouter {
             ReformatPhase::Opening(id) => {
                 // The open's result goes to the reaper (`drain_opens`).
                 self.opens.remove(&id);
+                self.holdings_dirty = true;
             }
             ReformatPhase::Warming(key) => self.close(key, dispatcher),
             ReformatPhase::Moving(key) => {

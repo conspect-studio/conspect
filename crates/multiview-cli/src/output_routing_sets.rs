@@ -177,6 +177,32 @@ impl OutputRouter {
         })
     }
 
+    /// The published per-principal holdings: the cached list, rebuilt
+    /// (one bounded scan) only when [`OutputRouter::holdings_dirty`] says a
+    /// holding changed. An unchanged tick is one `Arc` clone: no scan, no
+    /// allocation on the bake consumer (invariant #1). Test builds verify
+    /// the cache against a fresh scan on every call.
+    pub(super) fn held_by_principal(&mut self) -> Arc<Vec<(String, usize)>> {
+        if self.holdings_dirty {
+            let next = self.principals_held();
+            if *self.principals_held != next {
+                self.principals_held = Arc::new(next);
+            }
+            self.holdings_dirty = false;
+            #[cfg(test)]
+            {
+                self.holdings_rebuilds += 1;
+            }
+        }
+        #[cfg(test)]
+        assert_eq!(
+            *self.principals_held,
+            self.principals_held(),
+            "a holdings change did not mark holdings_dirty"
+        );
+        Arc::clone(&self.principals_held)
+    }
+
     /// Every principal holding encoders, with [`Self::principal_held`]
     /// (sorted; bounded by the keys, opens and sets the router holds).
     pub(super) fn principals_held(&self) -> Vec<(String, usize)> {
@@ -508,6 +534,7 @@ impl OutputRouter {
             }
             members.push(index);
         }
+        self.holdings_dirty = true;
         self.sets.active.push(ActiveSet {
             id,
             operation_id: set.operation_id,
@@ -580,6 +607,7 @@ impl OutputRouter {
             if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
                 if unheld && principal != BOOT_PRINCIPAL && !d.reformat {
                     principal.clone_into(&mut d.principal);
+                    self.holdings_dirty = true;
                 }
                 d.linger_deadline = None;
             }
@@ -611,6 +639,7 @@ impl OutputRouter {
                 if let Some(s) = self.sets.active.iter_mut().find(|s| s.id == group) {
                     s.reserved = s.reserved.saturating_sub(1);
                 }
+                self.holdings_dirty = true;
                 self.opens.insert(
                     id,
                     PendingOpen {
@@ -662,6 +691,7 @@ impl OutputRouter {
         // `try_supersede_set` first), so a lost refusal below is a genuine
         // fault after the commit (an encoder died), never a supersede.
         let set = self.sets.active.swap_remove(pos);
+        self.holdings_dirty = true;
         let mut result = result;
         let refused = set
             .arm
@@ -781,6 +811,7 @@ impl OutputRouter {
                 // the no-op members land with them.
                 if let Some(pos) = self.sets.active.iter().position(|s| s.id == id) {
                     self.sets.active.swap_remove(pos);
+                    self.holdings_dirty = true;
                 }
                 for (index, _) in pending {
                     self.finish_noop_member(index, at, tick, dispatcher);
