@@ -97,7 +97,7 @@ msgid "{0} accepted — awaiting durable operation outcome."
 msgstr "{0} accepted — awaiting durable operation outcome."
 
 #. placeholder {0}: op.label
-#: src/pages/MediaPlayersPage.tsx:501
+#: src/pages/MediaPlayersPage.tsx:515
 msgid "{0} accepted."
 msgstr "{0} accepted."
 
@@ -845,6 +845,10 @@ msgstr "Accent colour (#RRGGBB, optional)"
 msgid "Accept the publisher's audio (Opus)"
 msgstr "Accept the publisher's audio (Opus)"
 
+#: src/pages/WindyFillDialog.tsx:1129
+msgid "Accepted"
+msgstr "Accepted"
+
 #: src/pages/LayoutsPage.tsx:733
 msgid "Accessible editing path: Cells form + Inspector in the editor"
 msgstr "Accessible editing path: Cells form + Inspector in the editor"
@@ -1221,7 +1225,7 @@ msgstr "All cells showing this source"
 msgid "All configured layouts."
 msgstr "All configured layouts."
 
-#: src/pages/MediaPlayersPage.tsx:819
+#: src/pages/MediaPlayersPage.tsx:839
 msgid "All configured media players."
 msgstr "All configured media players."
 
@@ -1289,11 +1293,11 @@ msgstr "Amber"
 msgid "AMD"
 msgstr "AMD"
 
-#: src/pages/MediaPlayersPage.tsx:882
+#: src/pages/MediaPlayersPage.tsx:902
 msgid "An asset id is required"
 msgstr "An asset id is required"
 
-#: src/pages/MediaPlayersPage.tsx:202
+#: src/pages/MediaPlayersPage.tsx:206
 msgid "An exit is already armed."
 msgstr "An exit is already armed."
 
@@ -1502,7 +1506,7 @@ msgstr "Arm automation? Confirmed ad breaks on this source will switch program o
 msgid "Arm cue"
 msgstr "Arm cue"
 
-#: src/pages/MediaPlayersPage.tsx:290
+#: src/pages/MediaPlayersPage.tsx:294
 msgid "Arm exit"
 msgstr "Arm exit"
 
@@ -1510,12 +1514,12 @@ msgstr "Arm exit"
 msgid "Arm salvo"
 msgstr "Arm salvo"
 
-#: src/pages/MediaPlayersPage.tsx:284
+#: src/pages/MediaPlayersPage.tsx:288
 msgid "Arm vamp exit"
 msgstr "Arm vamp exit"
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:667
+#: src/pages/MediaPlayersPage.tsx:682
 msgid "Arm vamp exit on {0}"
 msgstr "Arm vamp exit on {0}"
 
@@ -1543,7 +1547,7 @@ msgstr "Assessment"
 msgid "Asset"
 msgstr "Asset"
 
-#: src/pages/MediaPlayersPage.tsx:856
+#: src/pages/MediaPlayersPage.tsx:876
 msgid "Asset id"
 msgstr "Asset id"
 
@@ -1636,6 +1640,10 @@ msgstr "Audio meters unavailable — no measured level telemetry"
 #: src/pages/approved/AudioSurface.tsx:91
 msgid "Audio mixer"
 msgstr "Audio mixer"
+
+#: src/pages/WindyFillDialog.tsx:1167
+msgid "audio present"
+msgstr "audio present"
 
 #: src/pages/approved/RoutingSurface.tsx:193
 msgid "Audio program / tracks"
@@ -2084,7 +2092,7 @@ msgstr "Camera 1"
 #: src/pages/graphics/LibraryView.tsx:155
 #: src/pages/LayoutsPage.tsx:499
 #: src/pages/LayoutsPage.tsx:771
-#: src/pages/MediaPlayersPage.tsx:894
+#: src/pages/MediaPlayersPage.tsx:914
 #: src/pages/OutputFeedRow.tsx:458
 #: src/pages/OutputsPage.tsx:1609
 #: src/pages/OutputsPage.tsx:1658
@@ -2095,12 +2103,13 @@ msgstr "Camera 1"
 #: src/pages/SalvosPage.tsx:433
 #: src/pages/SystemActionsPage.tsx:151
 #: src/pages/TallyPage.tsx:432
+#: src/pages/WindyFillDialog.tsx:1186
 #: src/resources/CrudPage.tsx:380
 #: src/resources/CrudPage.tsx:425
 msgid "Cancel"
 msgstr "Cancel"
 
-#: src/pages/MediaPlayersPage.tsx:316
+#: src/pages/MediaPlayersPage.tsx:320
 msgid "Cancel exit"
 msgstr "Cancel exit"
 
@@ -2112,16 +2121,17 @@ msgstr "Cancel salvo"
 msgid "Cancel token revocation"
 msgstr "Cancel token revocation"
 
-#: src/pages/MediaPlayersPage.tsx:310
+#: src/pages/MediaPlayersPage.tsx:314
 msgid "Cancel vamp exit"
 msgstr "Cancel vamp exit"
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:671
+#: src/pages/MediaPlayersPage.tsx:686
 msgid "Cancel vamp exit on {0}"
 msgstr "Cancel vamp exit on {0}"
 
 #: src/events/SourceEventsButton.tsx:18
+#: src/pages/WindyFillDialog.tsx:593
 msgid "Cancelled"
 msgstr "Cancelled"
 
@@ -2199,12 +2209,25 @@ msgstr "Captions"
 
 #: src/pages/approved/MediaSurface.tsx:29
 #: src/pages/approved/MediaSurface.tsx:118
+#: src/pages/WindyFillDialog.tsx:1238
 msgid "Capture"
 msgstr "Capture"
+
+#: src/pages/WindyFillDialog.tsx:646
+msgid "Capture a bounded Windy weather view and load it into this player."
+msgstr "Capture a bounded Windy weather view and load it into this player."
 
 #: src/pages/approved/MediaSurface.tsx:146
 msgid "Capture and the clip library listing are unavailable until their backend contracts ship."
 msgstr "Capture and the clip library listing are unavailable until their backend contracts ship."
+
+#: src/pages/WindyFillDialog.tsx:1102
+msgid "Capture job"
+msgstr "Capture job"
+
+#: src/pages/WindyFillDialog.tsx:887
+msgid "Capture mode"
+msgstr "Capture mode"
 
 #: src/pages/approved/MediaSurface.tsx:33
 msgid "Capture-to-slot is not available: this control plane exposes no capture endpoint. Nothing is captured, scheduled or stored from this page."
@@ -2448,6 +2471,10 @@ msgstr "Check all token pages"
 msgid "Checked from this server."
 msgstr "Checked from this server."
 
+#: src/pages/WindyFillDialog.tsx:660
+msgid "Checking capture capabilities…"
+msgstr "Checking capture capabilities…"
+
 #: src/pages/SwitcherPage.tsx:115
 msgid "Checking switcher engine…"
 msgstr "Checking switcher engine…"
@@ -2658,6 +2685,7 @@ msgstr "Clock source: receive time"
 #: src/iptv/BulkAddDialog.tsx:192
 #: src/iptv/SourceLinks.tsx:403
 #: src/iptv/SourceLinks.tsx:445
+#: src/pages/WindyFillDialog.tsx:1190
 msgid "Close"
 msgstr "Close"
 
@@ -2760,6 +2788,10 @@ msgstr "Command failed"
 msgid "Commands"
 msgstr "Commands"
 
+#: src/pages/WindyFillDialog.tsx:612
+msgid "Committing"
+msgstr "Committing"
+
 #: src/pages/SupportPage.tsx:344
 msgid "Community support"
 msgstr "Community support"
@@ -2772,6 +2804,10 @@ msgstr "Compiled features"
 #: src/pages/RelayManagementPage.tsx:60
 msgid "Complete token count: {0}"
 msgstr "Complete token count: {0}"
+
+#: src/pages/WindyFillDialog.tsx:614
+msgid "Completed"
+msgstr "Completed"
 
 #: src/pages/ProbesPage.tsx:303
 msgid "Compliance standard"
@@ -2851,7 +2887,7 @@ msgstr "Configure output servers and renditions."
 msgid "Configured ≠ on-air:"
 msgstr "Configured ≠ on-air:"
 
-#: src/pages/MediaPlayersPage.tsx:322
+#: src/pages/MediaPlayersPage.tsx:326
 msgid "Configured default"
 msgstr "Configured default"
 
@@ -3141,7 +3177,7 @@ msgstr "Corner radius must be a whole number of pixels (0 or more)."
 
 #: src/components/broadcast/OperationFeedback.tsx:157
 #: src/events/SourceEventsButton.tsx:49
-#: src/pages/MediaPlayersPage.tsx:511
+#: src/pages/MediaPlayersPage.tsx:525
 msgid "Correlation"
 msgstr "Correlation"
 
@@ -3288,7 +3324,7 @@ msgstr "Could not load graphics channels."
 msgid "Could not load layouts:"
 msgstr "Could not load layouts:"
 
-#: src/pages/MediaPlayersPage.tsx:805
+#: src/pages/MediaPlayersPage.tsx:825
 msgid "Could not load media players:"
 msgstr "Could not load media players:"
 
@@ -3672,12 +3708,13 @@ msgstr "Crosspoints"
 msgid "CUDA-enabled image (NVDEC / NVENC plus a wgpu compositor) for NVIDIA GPUs."
 msgstr "CUDA-enabled image (NVDEC / NVENC plus a wgpu compositor) for NVIDIA GPUs."
 
-#: src/pages/MediaPlayersPage.tsx:399
+#: src/pages/MediaPlayersPage.tsx:403
+#: src/pages/WindyFillDialog.tsx:1039
 msgid "Cue"
 msgstr "Cue"
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:657
+#: src/pages/MediaPlayersPage.tsx:672
 msgid "Cue {0}"
 msgstr "Cue {0}"
 
@@ -3685,11 +3722,11 @@ msgstr "Cue {0}"
 msgid "Cue card — next"
 msgstr "Cue card — next"
 
-#: src/pages/MediaPlayersPage.tsx:393
+#: src/pages/MediaPlayersPage.tsx:397
 msgid "Cue player to in-point"
 msgstr "Cue player to in-point"
 
-#: src/pages/MediaPlayersPage.tsx:637
+#: src/pages/MediaPlayersPage.tsx:652
 msgid "Cued"
 msgstr "Cued"
 
@@ -3701,6 +3738,10 @@ msgstr "Cued:"
 #: src/pages/graphics/DataView.tsx:139
 msgid "Current"
 msgstr "Current"
+
+#: src/pages/WindyFillDialog.tsx:1045
+msgid "Current end-of-clip behaviour for this player: "
+msgstr "Current end-of-clip behaviour for this player: "
 
 #: src/pages/DeviceDetailPage.tsx:959
 msgid "Current mode: {currentMode}"
@@ -4064,7 +4105,7 @@ msgstr "Detail"
 #: src/iptv/IptvOrgPage.tsx:841
 #: src/pages/approved/SourcesSurface.tsx:297
 #: src/pages/approved/SourcesSurface.tsx:300
-#: src/pages/MediaPlayersPage.tsx:548
+#: src/pages/MediaPlayersPage.tsx:562
 msgid "Details"
 msgstr "Details"
 
@@ -4397,6 +4438,7 @@ msgstr "Dual (analogue face + digital readout)"
 
 #: src/components/broadcast/library/MetadataInspector.tsx:347
 #: src/events/SourceEventsButton.tsx:66
+#: src/pages/WindyFillDialog.tsx:1164
 msgid "Duration"
 msgstr "Duration"
 
@@ -4557,7 +4599,7 @@ msgstr "each sink shows requested (config) against effective (measured). Where t
 msgid "Each stream becomes an ordinary source linked to its IPTV-ORG entry. Nothing is probed or applied beyond creating the sources."
 msgstr "Each stream becomes an ordinary source linked to its IPTV-ORG entry. Nothing is probed or applied beyond creating the sources."
 
-#: src/pages/MediaPlayersPage.tsx:458
+#: src/pages/MediaPlayersPage.tsx:472
 msgid "Earlier unresolved commands"
 msgstr "Earlier unresolved commands"
 
@@ -4701,7 +4743,11 @@ msgstr "Encoder utilisation (device total)"
 msgid "Encoder utilisation: ours over device total"
 msgstr "Encoder utilisation: ours over device total"
 
-#: src/pages/MediaPlayersPage.tsx:647
+#: src/pages/WindyFillDialog.tsx:971
+msgid "End hold (ms)"
+msgstr "End hold (ms)"
+
+#: src/pages/MediaPlayersPage.tsx:662
 msgid "End of file"
 msgstr "End of file"
 
@@ -4820,6 +4866,10 @@ msgstr "EPG: {0}"
 msgid "Epoch"
 msgstr "Epoch"
 
+#: src/pages/WindyFillDialog.tsx:944
+msgid "Equal"
+msgstr "Equal"
+
 #: src/pages/docs/ApiPage.tsx:86
 msgid "Errors"
 msgstr "Errors"
@@ -4866,6 +4916,10 @@ msgstr "Every document starts with a <0>schema_version</0> and then declares the
 msgid "Every input on the program mix is muted. Unmute at least one, or take them all off the mix."
 msgstr "Every input on the program mix is muted. Unmute at least one, or take them all off the mix."
 
+#: src/pages/WindyFillDialog.tsx:875
+msgid "Every N minutes (coming soon — no scheduler yet)"
+msgstr "Every N minutes (coming soon — no scheduler yet)"
+
 #: src/layout/components/validationMessages.tsx:69
 msgid "Every named area must form a contiguous rectangle."
 msgstr "Every named area must form a contiguous rectangle."
@@ -4902,15 +4956,15 @@ msgstr "Exceptions (failed / starting) sort first"
 msgid "Existing relay ID"
 msgstr "Existing relay ID"
 
-#: src/pages/MediaPlayersPage.tsx:238
+#: src/pages/MediaPlayersPage.tsx:242
 msgid "exit armed"
 msgstr "exit armed"
 
-#: src/pages/MediaPlayersPage.tsx:220
+#: src/pages/MediaPlayersPage.tsx:224
 msgid "Exit keys available"
 msgstr "Exit keys available"
 
-#: src/pages/MediaPlayersPage.tsx:223
+#: src/pages/MediaPlayersPage.tsx:227
 msgid "Exit keys unavailable"
 msgstr "Exit keys unavailable"
 
@@ -4976,6 +5030,8 @@ msgstr "Face"
 
 #: src/components/broadcast/ProducerStatus.tsx:60
 #: src/pages/approved/SourcesSurface.tsx:352
+#: src/pages/WindyFillDialog.tsx:591
+#: src/pages/WindyFillDialog.tsx:616
 msgid "Failed"
 msgstr "Failed"
 
@@ -5065,6 +5121,12 @@ msgstr "Fill (stretch)"
 msgid "Fill colour"
 msgstr "Fill colour"
 
+#: src/pages/MediaPlayersPage.tsx:461
+#: src/pages/MediaPlayersPage.tsx:467
+#: src/pages/WindyFillDialog.tsx:643
+msgid "Fill from web…"
+msgstr "Fill from web…"
+
 #: src/pages/SystemActionsPage.tsx:193
 msgid "Filter by kind"
 msgstr "Filter by kind"
@@ -5117,11 +5179,11 @@ msgstr "Fix these problems before saving:"
 msgid "Flags"
 msgstr "Flags"
 
-#: src/pages/MediaPlayersPage.tsx:377
+#: src/pages/MediaPlayersPage.tsx:381
 msgid "Focus player transport"
 msgstr "Focus player transport"
 
-#: src/pages/MediaPlayersPage.tsx:380
+#: src/pages/MediaPlayersPage.tsx:384
 msgid "Focus transport"
 msgstr "Focus transport"
 
@@ -5185,9 +5247,17 @@ msgstr "Format presets"
 msgid "Forward"
 msgstr "Forward"
 
+#: src/pages/WindyFillDialog.tsx:796
+msgid "FPS"
+msgstr "FPS"
+
 #: src/pages/ProbesPage.tsx:209
 msgid "Fractions of the tile, so a static logo or lower-third cannot mask a black or frozen background."
 msgstr "Fractions of the tile, so a static logo or lower-third cannot mask a black or frozen background."
+
+#: src/pages/WindyFillDialog.tsx:953
+msgid "Frame duration (ms)"
+msgstr "Frame duration (ms)"
 
 #: src/layout/components/FrameRateField.tsx:35
 #: src/pages/DashboardPage.tsx:119
@@ -5214,10 +5284,15 @@ msgstr "Frame-accurate with sub-millisecond flip deltas — all heads are driven
 msgid "Frame-accurate: every node presents the same frame index, with at most a fraction of one refresh of phase residual. This is the tier for video walls."
 msgstr "Frame-accurate: every node presents the same frame index, with at most a fraction of one refresh of phase residual. This is the tier for video walls."
 
-#: src/pages/MediaPlayersPage.tsx:259
-#: src/pages/MediaPlayersPage.tsx:355
+#: src/pages/MediaPlayersPage.tsx:263
+#: src/pages/MediaPlayersPage.tsx:359
+#: src/pages/WindyFillDialog.tsx:1165
 msgid "frames"
 msgstr "frames"
+
+#: src/pages/WindyFillDialog.tsx:815
+msgid "Frames"
+msgstr "Frames"
 
 #: src/pages/docs/concepts/ResiliencePage.tsx:36
 msgid "Fresh frames are arriving; the tile shows the newest one. This is the normal state."
@@ -5719,6 +5794,10 @@ msgstr "HTTP only"
 #: src/pages/DevicesPage.tsx:157
 msgid "HTTP(S) management endpoint. Wrap IPv6 literals in brackets."
 msgstr "HTTP(S) management endpoint. Wrap IPv6 literals in brackets."
+
+#: src/pages/WindyFillDialog.tsx:1068
+msgid "I accept the <0>Windy terms of use</0> ({WINDY_TERMS_VERSION})"
+msgstr "I accept the <0>Windy terms of use</0> ({WINDY_TERMS_VERSION})"
 
 #: src/docs/registry.ts:663
 #: src/pages/docs/concepts/GlossaryPage.tsx:110
@@ -6237,6 +6316,10 @@ msgstr "Latency profile (optional)"
 msgid "Latency, robustness, and scale pull against each other. Buffering is what absorbs network jitter and gives retransmission time to repair loss — so cutting the buffer cuts your protection with it. A 120 ms SRT window is snappy but fragile on a lossy link; a 2 s window rides out trouble at the cost of 2 s. Plain HTTP segments are the most robust and scalable delivery there is, and also the slowest."
 msgstr "Latency, robustness, and scale pull against each other. Buffering is what absorbs network jitter and gives retransmission time to repair loss — so cutting the buffer cuts your protection with it. A 120 ms SRT window is snappy but fragile on a lossy link; a 2 s window rides out trouble at the cost of 2 s. Plain HTTP segments are the most robust and scalable delivery there is, and also the slowest."
 
+#: src/pages/WindyFillDialog.tsx:718
+msgid "Latitude"
+msgstr "Latitude"
+
 #: src/pages/graphics/DataView.tsx:483
 msgid "Layering over a looped video background"
 msgstr "Layering over a looped video background"
@@ -6549,25 +6632,26 @@ msgstr "Live-media production, routing, and monitoring. Start by licensing this 
 msgid "LL-HLS (Low-Latency HLS)"
 msgstr "LL-HLS (Low-Latency HLS)"
 
-#: src/pages/MediaPlayersPage.tsx:453
-#: src/pages/MediaPlayersPage.tsx:903
+#: src/pages/MediaPlayersPage.tsx:457
+#: src/pages/MediaPlayersPage.tsx:923
+#: src/pages/WindyFillDialog.tsx:1126
 msgid "Load"
 msgstr "Load"
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:655
+#: src/pages/MediaPlayersPage.tsx:670
 msgid "Load {0}"
 msgstr "Load {0}"
 
-#: src/pages/MediaPlayersPage.tsx:843
+#: src/pages/MediaPlayersPage.tsx:863
 msgid "Load a media-library asset into this player. It cues to the asset's in-point, ready to take."
 msgstr "Load a media-library asset into this player. It cues to the asset's in-point, ready to take."
 
-#: src/pages/MediaPlayersPage.tsx:840
+#: src/pages/MediaPlayersPage.tsx:860
 msgid "Load asset"
 msgstr "Load asset"
 
-#: src/pages/MediaPlayersPage.tsx:447
+#: src/pages/MediaPlayersPage.tsx:451
 msgid "Load asset into player"
 msgstr "Load asset into player"
 
@@ -6583,11 +6667,11 @@ msgstr "Load from library…"
 msgid "Load older records"
 msgstr "Load older records"
 
-#: src/pages/MediaPlayersPage.tsx:246
+#: src/pages/MediaPlayersPage.tsx:250
 msgid "Loaded"
 msgstr "Loaded"
 
-#: src/pages/MediaPlayersPage.tsx:635
+#: src/pages/MediaPlayersPage.tsx:650
 msgid "Loading"
 msgstr "Loading"
 
@@ -6660,7 +6744,7 @@ msgstr "Loading licensing contact…"
 msgid "Loading logs…"
 msgstr "Loading logs…"
 
-#: src/pages/MediaPlayersPage.tsx:801
+#: src/pages/MediaPlayersPage.tsx:821
 msgid "Loading media players…"
 msgstr "Loading media players…"
 
@@ -6786,6 +6870,7 @@ msgstr "Locale"
 
 #: src/iptv/Controls.tsx:275
 #: src/pages/graphics/DataView.tsx:350
+#: src/pages/WindyFillDialog.tsx:698
 msgid "Location"
 msgstr "Location"
 
@@ -6819,12 +6904,20 @@ msgstr "Long-running actions are accepted with an operation id and their outcome
 msgid "Long-running ops"
 msgstr "Long-running ops"
 
+#: src/pages/WindyFillDialog.tsx:734
+msgid "Longitude"
+msgstr "Longitude"
+
 #: src/pages/CastPage.tsx:301
 msgid "Looking for Cast receivers…"
 msgstr "Looking for Cast receivers…"
 
-#: src/pages/MediaPlayersPage.tsx:334
-#: src/pages/MediaPlayersPage.tsx:370
+#: src/pages/WindyFillDialog.tsx:882
+msgid "Loop"
+msgstr "Loop"
+
+#: src/pages/MediaPlayersPage.tsx:338
+#: src/pages/MediaPlayersPage.tsx:374
 msgid "Loop default"
 msgstr "Loop default"
 
@@ -6987,6 +7080,10 @@ msgstr "Max"
 msgid "Max resolution"
 msgstr "Max resolution"
 
+#: src/pages/WindyFillDialog.tsx:989
+msgid "Max steps"
+msgstr "Max steps"
+
 #: src/pages/ProbesPage.tsx:328
 msgid "Max true-peak (dBTP)"
 msgstr "Max true-peak (dBTP)"
@@ -7062,7 +7159,7 @@ msgstr "Media tasks"
 msgid "Media time"
 msgstr "Media time"
 
-#: src/pages/MediaPlayersPage.tsx:861
+#: src/pages/MediaPlayersPage.tsx:881
 msgid "Media-library asset id"
 msgstr "Media-library asset id"
 
@@ -7571,7 +7668,7 @@ msgstr "No alternatives are available."
 msgid "No analysis for this mode — no analysis service supplied it."
 msgstr "No analysis for this mode — no analysis service supplied it."
 
-#: src/pages/MediaPlayersPage.tsx:874
+#: src/pages/MediaPlayersPage.tsx:894
 msgid "No asset browser is available here yet: this control plane has no library listing to pick from, so the asset id must be typed exactly as the media library defines it."
 msgstr "No asset browser is available here yet: this control plane has no library listing to pick from, so the asset id must be typed exactly as the media library defines it."
 
@@ -7652,7 +7749,7 @@ msgstr "No devices adopted."
 msgid "No drop target."
 msgstr "No drop target."
 
-#: src/pages/MediaPlayersPage.tsx:204
+#: src/pages/MediaPlayersPage.tsx:208
 msgid "No exit is armed."
 msgstr "No exit is armed."
 
@@ -7750,11 +7847,11 @@ msgstr "No live item: timing and overrun are unknown."
 msgid "No live signal data"
 msgstr "No live signal data"
 
-#: src/pages/MediaPlayersPage.tsx:242
+#: src/pages/MediaPlayersPage.tsx:246
 msgid "No live state"
 msgstr "No live state"
 
-#: src/pages/MediaPlayersPage.tsx:198
+#: src/pages/MediaPlayersPage.tsx:202
 msgid "No live state yet — the player's vamp status is unknown."
 msgstr "No live state yet — the player's vamp status is unknown."
 
@@ -7782,7 +7879,7 @@ msgstr "No matching place."
 msgid "No media"
 msgstr "No media"
 
-#: src/pages/MediaPlayersPage.tsx:810
+#: src/pages/MediaPlayersPage.tsx:830
 msgid "No media players are configured. Declare them under<0>media_players</0> in the config."
 msgstr "No media players are configured. Declare them under<0>media_players</0> in the config."
 
@@ -7987,11 +8084,15 @@ msgstr "No watermark"
 msgid "Nodes enrol with a keypair identity: the node proves itself with its key, not with a network address, so a node keeps its identity across DHCP changes and re-images. That is why the management address is optional for the <0>displaynode</0> driver — an enrolled node finds the controller and authenticates itself. After a network loss the node reconnects with its enrolled identity, re-pulls its stream, and re-converges its sync offset before un-muting its output."
 msgstr "Nodes enrol with a keypair identity: the node proves itself with its key, not with a network address, so a node keeps its identity across DHCP changes and re-images. That is why the management address is optional for the <0>displaynode</0> driver — an enrolled node finds the controller and authenticates itself. After a network loss the node reconnects with its enrolled identity, re-pulls its stream, and re-converges its sync offset before un-muting its output."
 
+#: src/pages/WindyFillDialog.tsx:1017
+msgid "Nominal total frames: {nominalFrames} (cap {MAX_NOMINAL_FRAMES})."
+msgstr "Nominal total frames: {nominalFrames} (cap {MAX_NOMINAL_FRAMES})."
+
 #: src/components/routing/SubtitlePatchPanel.tsx:304
 msgid "none"
 msgstr "none"
 
-#: src/pages/MediaPlayersPage.tsx:328
+#: src/pages/MediaPlayersPage.tsx:332
 #: src/pages/SalvosPage.tsx:240
 msgid "None"
 msgstr "None"
@@ -8071,7 +8172,7 @@ msgstr "Not in use: this source is not running and costs nothing."
 msgid "Not linked to IPTV-ORG"
 msgstr "Not linked to IPTV-ORG"
 
-#: src/pages/MediaPlayersPage.tsx:253
+#: src/pages/MediaPlayersPage.tsx:257
 msgid "Not loaded"
 msgstr "Not loaded"
 
@@ -8326,6 +8427,10 @@ msgstr "On signal loss"
 msgid "on the Licence screen."
 msgstr "on the Licence screen."
 
+#: src/pages/WindyFillDialog.tsx:863
+msgid "Once"
+msgstr "Once"
+
 #: src/pages/approved/MediaSurface.tsx:39
 msgid "One-shot capture"
 msgstr "One-shot capture"
@@ -8342,7 +8447,7 @@ msgstr "ONLINE / DEGRADED"
 msgid "Only CEA-608 fields cc1, cc2, cc3 and cc4 decode. CEA-708 services are not supported."
 msgstr "Only CEA-608 fields cc1, cc2, cc3 and cc4 decode. CEA-708 services are not supported."
 
-#: src/pages/MediaPlayersPage.tsx:200
+#: src/pages/MediaPlayersPage.tsx:204
 msgid "Only while the player is vamping."
 msgstr "Only while the player is vamping."
 
@@ -8513,7 +8618,7 @@ msgstr "Outbound publishing is a separate path (Routing)"
 msgid "Outcome unknown; controls remain blocked until a correlated terminal event"
 msgstr "Outcome unknown; controls remain blocked until a correlated terminal event"
 
-#: src/pages/MediaPlayersPage.tsx:462
+#: src/pages/MediaPlayersPage.tsx:476
 msgid "outcome unknown; do not repeat"
 msgstr "outcome unknown; do not repeat"
 
@@ -8595,6 +8700,10 @@ msgstr "Over ceiling"
 #: src/layout/components/SourcePalette.tsx:185
 msgid "Over the layout drop zone."
 msgstr "Over the layout drop zone."
+
+#: src/pages/WindyFillDialog.tsx:678
+msgid "Overlay"
+msgstr "Overlay"
 
 #: src/app/navigation.tsx:57
 #: src/docs/registry.ts:148
@@ -8700,20 +8809,20 @@ msgid "patched"
 msgstr "patched"
 
 #: src/components/broadcast/library/AssetAuditionControls.tsx:165
-#: src/pages/MediaPlayersPage.tsx:426
+#: src/pages/MediaPlayersPage.tsx:430
 msgid "Pause"
 msgstr "Pause"
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:661
+#: src/pages/MediaPlayersPage.tsx:676
 msgid "Pause {0}"
 msgstr "Pause {0}"
 
-#: src/pages/MediaPlayersPage.tsx:420
+#: src/pages/MediaPlayersPage.tsx:424
 msgid "Pause player"
 msgstr "Pause player"
 
-#: src/pages/MediaPlayersPage.tsx:641
+#: src/pages/MediaPlayersPage.tsx:656
 msgid "Paused"
 msgstr "Paused"
 
@@ -8877,16 +8986,17 @@ msgid "Planning…"
 msgstr "Planning…"
 
 #: src/components/broadcast/library/AssetAuditionControls.tsx:165
-#: src/pages/MediaPlayersPage.tsx:413
+#: src/pages/MediaPlayersPage.tsx:417
+#: src/pages/WindyFillDialog.tsx:1038
 msgid "Play"
 msgstr "Play"
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:659
+#: src/pages/MediaPlayersPage.tsx:674
 msgid "Play {0}"
 msgstr "Play {0}"
 
-#: src/pages/MediaPlayersPage.tsx:407
+#: src/pages/MediaPlayersPage.tsx:411
 msgid "Play player"
 msgstr "Play player"
 
@@ -8907,7 +9017,8 @@ msgstr "Playback URL"
 msgid "Playback URLs are unavailable: this server does not provide them yet (backend not deployed)."
 msgstr "Playback URLs are unavailable: this server does not provide them yet (backend not deployed)."
 
-#: src/pages/MediaPlayersPage.tsx:852
+#: src/pages/MediaPlayersPage.tsx:872
+#: src/pages/WindyFillDialog.tsx:655
 msgid "Player"
 msgstr "Player"
 
@@ -8916,7 +9027,7 @@ msgid "Players"
 msgstr "Players"
 
 #: src/cast/castLabels.ts:20
-#: src/pages/MediaPlayersPage.tsx:639
+#: src/pages/MediaPlayersPage.tsx:654
 msgid "Playing"
 msgstr "Playing"
 
@@ -8934,7 +9045,7 @@ msgstr "Playout"
 msgid "Playout command failed"
 msgstr "Playout command failed"
 
-#: src/pages/MediaPlayersPage.tsx:258
+#: src/pages/MediaPlayersPage.tsx:262
 msgid "Position"
 msgstr "Position"
 
@@ -8963,6 +9074,14 @@ msgstr "Pre-roll"
 #: src/pages/graphics/DataView.tsx:554
 msgid "Précis"
 msgstr "Précis"
+
+#: src/pages/WindyFillDialog.tsx:844
+msgid "Premium (authenticated) capture"
+msgstr "Premium (authenticated) capture"
+
+#: src/pages/WindyFillDialog.tsx:849
+msgid "Premium Windy capture is not configured on this server; the public (unauthenticated) view is used."
+msgstr "Premium Windy capture is not configured on this server; the public (unauthenticated) view is used."
 
 #: src/cast/castLabels.ts:12
 msgid "Preparing the stream…"
@@ -9249,6 +9368,10 @@ msgstr "Program-output timing is designed to remain independent of this device: 
 msgid "Promote this ephemeral session to a permanent managed Cast device."
 msgstr "Promote this ephemeral session to a permanent managed Cast device."
 
+#: src/pages/WindyFillDialog.tsx:945
+msgid "Proportional to radar time"
+msgstr "Proportional to radar time"
+
 #: src/iptv/IptvOrgPage.tsx:470
 msgid "Protocol"
 msgstr "Protocol"
@@ -9333,9 +9456,21 @@ msgstr "Quality"
 msgid "Question"
 msgstr "Question"
 
+#: src/pages/WindyFillDialog.tsx:585
+msgid "Queued"
+msgstr "Queued"
+
 #: src/pages/SystemActionsPage.tsx:299
 msgid "Queued remote actions you can cancel locally, and the immutable account audit trail."
 msgstr "Queued remote actions you can cancel locally, and the immutable account audit trail."
+
+#: src/pages/WindyFillDialog.tsx:690
+msgid "Radar / storm"
+msgstr "Radar / storm"
+
+#: src/pages/WindyFillDialog.tsx:902
+msgid "Radar steps"
+msgstr "Radar steps"
 
 #: src/iptv/IptvOrgPage.tsx:404
 msgid "Radius"
@@ -9389,6 +9524,10 @@ msgstr "Raw"
 msgid "Re-arm to the next occurrence (recurring daily)"
 msgstr "Re-arm to the next occurrence (recurring daily)"
 
+#: src/pages/WindyFillDialog.tsx:1242
+msgid "Re-capture"
+msgstr "Re-capture"
+
 #: src/components/switcher/MixerInputBank.tsx:67
 msgid "Re-patch…"
 msgstr "Re-patch…"
@@ -9417,6 +9556,10 @@ msgstr "Reading…"
 #: src/pages/approved/SourcesSurface.tsx:349
 msgid "Ready"
 msgstr "Ready"
+
+#: src/pages/WindyFillDialog.tsx:918
+msgid "Realtime"
+msgstr "Realtime"
 
 #: src/docs/registry.ts:208
 #: src/pages/docs/ApiPage.tsx:96
@@ -9525,6 +9668,7 @@ msgid "Referer header (optional)"
 msgstr "Referer header (optional)"
 
 #: src/events/JournalPanel.tsx:97
+#: src/pages/WindyFillDialog.tsx:858
 msgid "Refresh"
 msgstr "Refresh"
 
@@ -9892,6 +10036,14 @@ msgstr "Retry detach (same operation)"
 msgid "Retry live preview"
 msgstr "Retry live preview"
 
+#: src/pages/WindyFillDialog.tsx:1153
+msgid "Retry load"
+msgstr "Retry load"
+
+#: src/pages/WindyFillDialog.tsx:1220
+msgid "Retry same request"
+msgstr "Retry same request"
+
 #: src/resources/FormControls.tsx:288
 msgid "Reveal {label}"
 msgstr "Reveal {label}"
@@ -10084,6 +10236,10 @@ msgstr "Rundown unavailable"
 #: src/pages/OutputsPage.tsx:128
 msgid "Runnable"
 msgstr "Runnable"
+
+#: src/pages/WindyFillDialog.tsx:587
+msgid "Running"
+msgstr "Running"
 
 #: src/docs/registry.ts:49
 #: src/pages/docs/ContainerPage.tsx:23
@@ -10284,7 +10440,7 @@ msgstr "Scoped API token"
 msgid "Scroll sideways for more destinations →"
 msgstr "Scroll sideways for more destinations →"
 
-#: src/pages/MediaPlayersPage.tsx:360
+#: src/pages/MediaPlayersPage.tsx:364
 msgid "Scrub position: unknown"
 msgstr "Scrub position: unknown"
 
@@ -10351,7 +10507,7 @@ msgid "Seeding from a preset replaces every cell in this draft. Nothing is saved
 msgstr "Seeding from a preset replaces every cell in this draft. Nothing is saved until you save the layout."
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:665
+#: src/pages/MediaPlayersPage.tsx:680
 msgid "Seek {0}"
 msgstr "Seek {0}"
 
@@ -10457,7 +10613,7 @@ msgid "Send reply"
 msgstr "Send reply"
 
 #. placeholder {0}: op.label
-#: src/pages/MediaPlayersPage.tsx:475
+#: src/pages/MediaPlayersPage.tsx:489
 msgid "Sending {0}…"
 msgstr "Sending {0}…"
 
@@ -10502,6 +10658,10 @@ msgstr "Set at start"
 #: src/pages/CastPage.tsx:627
 msgid "Set the receiver volume"
 msgstr "Set the receiver volume"
+
+#: src/pages/WindyFillDialog.tsx:1050
+msgid "Set this player to loop at end of clip in its configuration for a continuously-refreshed fill to play seamlessly."
+msgstr "Set this player to loop at end of clip in its configuration for a continuously-refreshed fill to play seamlessly."
 
 #: src/pages/CastPage.tsx:427
 #: src/pages/CastPage.tsx:658
@@ -10628,11 +10788,16 @@ msgstr "Silence"
 msgid "Silence level (dBFS)"
 msgstr "Silence level (dBFS)"
 
+#: src/pages/WindyFillDialog.tsx:1167
+msgid "silent"
+msgstr "silent"
+
 #: src/pages/LoudnessMeter.tsx:56
 msgid "Silent (gated)"
 msgstr "Silent (gated)"
 
 #: src/components/broadcast/library/MetadataInspector.tsx:368
+#: src/pages/WindyFillDialog.tsx:770
 msgid "Size"
 msgstr "Size"
 
@@ -10885,6 +11050,10 @@ msgstr "Start a transfer"
 msgid "Start cast"
 msgstr "Start cast"
 
+#: src/pages/WindyFillDialog.tsx:1228
+msgid "Start new capture"
+msgstr "Start new capture"
+
 #. placeholder {0}: String(count)
 #. placeholder {0}: String(selected.size)
 #: src/iptv/ActivationChoice.tsx:44
@@ -10997,12 +11166,12 @@ msgstr "Still preview (~1 fps) — live video is unavailable for this preview."
 #: src/components/SourceLifecycleActions.tsx:67
 #: src/pages/CastPage.tsx:460
 #: src/pages/CastPage.tsx:692
-#: src/pages/MediaPlayersPage.tsx:440
+#: src/pages/MediaPlayersPage.tsx:444
 msgid "Stop"
 msgstr "Stop"
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:663
+#: src/pages/MediaPlayersPage.tsx:678
 msgid "Stop {0}"
 msgstr "Stop {0}"
 
@@ -11020,7 +11189,7 @@ msgstr "Stop casting"
 msgid "Stop live item"
 msgstr "Stop live item"
 
-#: src/pages/MediaPlayersPage.tsx:434
+#: src/pages/MediaPlayersPage.tsx:438
 msgid "Stop player"
 msgstr "Stop player"
 
@@ -11033,7 +11202,7 @@ msgid "Stop this cast session?"
 msgstr "Stop this cast session?"
 
 #: src/components/broadcast/ProducerStatus.tsx:66
-#: src/pages/MediaPlayersPage.tsx:643
+#: src/pages/MediaPlayersPage.tsx:658
 msgid "Stopped"
 msgstr "Stopped"
 
@@ -11168,6 +11337,10 @@ msgstr "Subtitle slots"
 msgid "Subtitle track (id / language)"
 msgstr "Subtitle track (id / language)"
 
+#: src/pages/WindyFillDialog.tsx:589
+msgid "Succeeded"
+msgstr "Succeeded"
+
 #: src/pages/ProbesPage.tsx:272
 msgid "Successive frames differing by less than this per-mille of full-scale luma count as frozen."
 msgstr "Successive frames differing by less than this per-mille of full-scale luma count as frozen."
@@ -11177,6 +11350,7 @@ msgid "Summary"
 msgstr "Summary"
 
 #: src/events/SourceEventsButton.tsx:19
+#: src/pages/WindyFillDialog.tsx:618
 msgid "Superseded"
 msgstr "Superseded"
 
@@ -11310,7 +11484,7 @@ msgstr "Take applied"
 msgid "Take audio to {outputName}"
 msgstr "Take audio to {outputName}"
 
-#: src/pages/MediaPlayersPage.tsx:303
+#: src/pages/MediaPlayersPage.tsx:307
 msgid "Take exit"
 msgstr "Take exit"
 
@@ -11340,12 +11514,12 @@ msgstr "take pending"
 msgid "Take salvo"
 msgstr "Take salvo"
 
-#: src/pages/MediaPlayersPage.tsx:297
+#: src/pages/MediaPlayersPage.tsx:301
 msgid "Take vamp exit"
 msgstr "Take vamp exit"
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:669
+#: src/pages/MediaPlayersPage.tsx:684
 msgid "Take vamp exit on {0}"
 msgstr "Take vamp exit on {0}"
 
@@ -11506,6 +11680,7 @@ msgstr "Temperature"
 
 #: src/pages/graphics/LibraryView.tsx:121
 #: src/pages/graphics/PlayoutView.tsx:469
+#: src/pages/WindyFillDialog.tsx:671
 msgid "Template"
 msgstr "Template"
 
@@ -11595,7 +11770,7 @@ msgstr "The API authenticates each request with a bearer token in the <0>Authori
 msgid "The API exposes no per-output restart readback."
 msgstr "The API exposes no per-output restart readback."
 
-#: src/pages/MediaPlayersPage.tsx:171
+#: src/pages/MediaPlayersPage.tsx:175
 msgid "The applied event was not observed on the realtime stream. The command may or may not have been applied."
 msgstr "The applied event was not observed on the realtime stream. The command may or may not have been applied."
 
@@ -11659,11 +11834,11 @@ msgstr "The condition must persist this long before the alarm raises."
 msgid "The condition must stay clear this long before the alarm clears."
 msgstr "The condition must stay clear this long before the alarm clears."
 
-#: src/pages/MediaPlayersPage.tsx:724
+#: src/pages/MediaPlayersPage.tsx:739
 msgid "The control plane did not answer. The command may or may not have been applied."
 msgstr "The control plane did not answer. The command may or may not have been applied."
 
-#: src/pages/MediaPlayersPage.tsx:505
+#: src/pages/MediaPlayersPage.tsx:519
 msgid "The control plane does not correlate this command's outcome, so no applied event will arrive."
 msgstr "The control plane does not correlate this command's outcome, so no applied event will arrive."
 
@@ -11952,9 +12127,13 @@ msgstr "The patch cannot be taken"
 msgid "the plan is a dry run that classifies the take. Only Take applies it; a Class-2 migration is accepted asynchronously (HTTP 202 is not applied) and its outcome arrives on the realtime stream."
 msgstr "the plan is a dry run that classifies the take. Only Take applies it; a Class-2 migration is accepted asynchronously (HTTP 202 is not applied) and its outcome arrives on the realtime stream."
 
-#: src/pages/MediaPlayersPage.tsx:186
+#: src/pages/MediaPlayersPage.tsx:190
 msgid "The previous command's outcome is unknown — repeating it could duplicate the command."
 msgstr "The previous command's outcome is unknown — repeating it could duplicate the command."
+
+#: src/pages/WindyFillDialog.tsx:1207
+msgid "The previous request's outcome may be unknown (a network error) — \"Retry same request\" resends it unchanged."
+msgstr "The previous request's outcome may be unknown (a network error) — \"Retry same request\" resends it unchanged."
 
 #: src/pages/docs/concepts/GlossaryPage.tsx:112
 msgid "The procedure WebRTC peers use to find a working network path between them. Each side gathers candidate addresses — its own local address, its public address as seen through NAT (via a STUN server), and, when a direct path is impossible, a relayed address from a TURN server — and the pair probes them to pick one. A TURN relay is what lets WebRTC work across strict firewalls; it is configured on the server, never in the browser."
@@ -12159,6 +12338,10 @@ msgstr "Theme: light. Switch to dark."
 #: src/components/ThemeToggle.tsx:24
 msgid "Theme: system. Switch to light."
 msgstr "Theme: system. Switch to light."
+
+#: src/pages/WindyFillDialog.tsx:1026
+msgid "Then"
+msgstr "Then"
 
 #: src/pages/docs/concepts/LatencyPage.tsx:99
 msgid "These are classes, not promises — encoder settings (especially keyframe interval), network conditions, and the viewer's player all move the number."
@@ -12391,6 +12574,10 @@ msgstr "This toast is announced to assistive technology."
 msgid "This URL must start with http:// or https://."
 msgstr "This URL must start with http:// or https://."
 
+#: src/pages/WindyFillDialog.tsx:1009
+msgid "This would capture {nominalFrames} frames, above the server's cap of {MAX_NOMINAL_FRAMES}. Lower max steps, frame duration or end hold."
+msgstr "This would capture {nominalFrames} frames, above the server's cap of {MAX_NOMINAL_FRAMES}. Lower max steps, frame duration or end hold."
+
 #: src/pages/SwitcherPage.tsx:124
 msgid "Tick"
 msgstr "Tick"
@@ -12433,7 +12620,7 @@ msgstr "Time not known."
 msgid "Time of day (recurring)"
 msgstr "Time of day (recurring)"
 
-#: src/pages/MediaPlayersPage.tsx:364
+#: src/pages/MediaPlayersPage.tsx:368
 msgid "Timecode and scrub are unknown: the player event carries no cadence or asset duration."
 msgstr "Timecode and scrub are unknown: the player event carries no cadence or asset duration."
 
@@ -12466,6 +12653,10 @@ msgstr "Timezone offset (minutes from UTC, optional)"
 #: src/pages/SourcesPage.tsx:627
 msgid "Timezone offset (minutes from UTC)"
 msgstr "Timezone offset (minutes from UTC)"
+
+#: src/pages/WindyFillDialog.tsx:932
+msgid "Timing"
+msgstr "Timing"
 
 #: src/docs/registry.ts:459
 #: src/pages/docs/concepts/TimingSyncPage.tsx:17
@@ -12702,6 +12893,7 @@ msgid "Unavailable: there is no cue list, so cue actions cannot run."
 msgstr "Unavailable: there is no cue list, so cue actions cannot run."
 
 #: src/events/SourceEventsButton.tsx:19
+#: src/pages/WindyFillDialog.tsx:595
 msgid "Uncertain"
 msgstr "Uncertain"
 
@@ -12740,8 +12932,10 @@ msgstr "unhealthy"
 #: src/components/broadcast/ProductionDesk.tsx:217
 #: src/pages/approved/RoutingSurface.tsx:44
 #: src/pages/approved/SourcesSurface.tsx:354
-#: src/pages/MediaPlayersPage.tsx:355
+#: src/pages/MediaPlayersPage.tsx:359
 #: src/pages/OutputFeedRow.tsx:307
+#: src/pages/WindyFillDialog.tsx:597
+#: src/pages/WindyFillDialog.tsx:620
 msgid "Unknown"
 msgstr "Unknown"
 
@@ -12968,11 +13162,11 @@ msgstr "valid to"
 msgid "Validation and import / export"
 msgstr "Validation and import / export"
 
-#: src/pages/MediaPlayersPage.tsx:272
+#: src/pages/MediaPlayersPage.tsx:276
 msgid "Vamp exit"
 msgstr "Vamp exit"
 
-#: src/pages/MediaPlayersPage.tsx:645
+#: src/pages/MediaPlayersPage.tsx:660
 msgid "Vamping"
 msgstr "Vamping"
 
@@ -13201,6 +13395,10 @@ msgstr "Watching"
 #: src/pages/graphics/DataView.tsx:381
 msgid "Weather is unavailable: this server does not provide it yet (backend not deployed)."
 msgstr "Weather is unavailable: this server does not provide it yet (backend not deployed)."
+
+#: src/pages/WindyFillDialog.tsx:664
+msgid "Web capture is not provisioned on this server."
+msgstr "Web capture is not provisioned on this server."
 
 #: src/events/AutomationPanel.tsx:87
 msgid "Webhook URL (optional, http://)"
@@ -13438,9 +13636,21 @@ msgstr "Width (px)"
 msgid "Width and height must both be even numbers from 16 to 8192, at most 3840 × 2160 pixels in area."
 msgstr "Width and height must both be even numbers from 16 to 8192, at most 3840 × 2160 pixels in area."
 
+#: src/pages/WindyFillDialog.tsx:691
+msgid "Wind"
+msgstr "Wind"
+
+#: src/pages/WindyFillDialog.tsx:923
+msgid "Wind only supports realtime capture."
+msgstr "Wind only supports realtime capture."
+
 #: src/pages/SupportPage.tsx:436
 msgid "Window"
 msgstr "Window"
+
+#: src/pages/WindyFillDialog.tsx:789
+msgid "Windy requires a minimum width of 1024px (desktop geometry)."
+msgstr "Windy requires a minimum width of 1024px (desktop geometry)."
 
 #: src/components/broadcast/ProductionDesk.tsx:212
 #: src/components/broadcast/ProductionDesk.tsx:212
@@ -13567,6 +13777,10 @@ msgstr "Zone top (y, 0–1)"
 #: src/pages/ProbesPage.tsx:194
 msgid "Zone width (0–1)"
 msgstr "Zone width (0–1)"
+
+#: src/pages/WindyFillDialog.tsx:753
+msgid "Zoom"
+msgstr "Zoom"
 
 #: src/pages/DevicesPage.tsx:72
 msgid "ZowieBox-class decoder/encoder (zowietek)"
