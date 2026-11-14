@@ -35,7 +35,7 @@ let putIfMatches: (string | null)[] = [];
 let putStatus = 200;
 // The single-layout GET: `getEtag` lets a test simulate a concurrent editor
 // save (a changed ETag/body) between the dialog's open-read and its Save.
-let getEtag = 'v1';
+let getEtag: string | undefined = 'v1';
 let getBodyOverride: Record<string, unknown> | undefined;
 let getCallCount = 0;
 const server = setupServer(
@@ -48,7 +48,7 @@ const server = setupServer(
     }
     return HttpResponse.json(
       getBodyOverride !== undefined ? { ...found, body: getBodyOverride } : found,
-      { headers: { ETag: getEtag } },
+      getEtag !== undefined ? { headers: { ETag: getEtag } } : {},
     );
   }),
   http.put('*/api/v1/layouts/:id', async ({ request, params }) => {
@@ -324,6 +324,22 @@ describe('LayoutsPage Layers column + dialog', () => {
       await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
       await waitFor(() => { expect(putBodies).toHaveLength(1); });
       expect(putIfMatches[0]).toBe('fresh-etag-77');
+    });
+
+    it('fails closed when the fresh read carries no ETag: no Save, no PUT', async () => {
+      getEtag = undefined;
+      page();
+      await screen.findByText('Single');
+      await userEvent.click(layersButton('Single'));
+      const dialog = await screen.findByRole('dialog');
+      await within(dialog).findByText(/Could not load this layout/);
+      expect(within(dialog).queryByLabelText('Audio meters')).toBeNull();
+      const saveBtn = within(dialog).queryByRole('button', { name: 'Save' });
+      if (saveBtn !== null) {
+        expect(saveBtn.hasAttribute('disabled')).toBe(true);
+        await userEvent.click(saveBtn).catch(() => undefined);
+      }
+      expect(putBodies).toHaveLength(0);
     });
 
     it('a 412 shows a clear "this layout changed" message, makes no second PUT, and never replays the stale body', async () => {

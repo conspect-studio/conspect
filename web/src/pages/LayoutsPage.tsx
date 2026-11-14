@@ -250,7 +250,7 @@ interface LayersEditTarget {
   readonly id: string;
   readonly name: string;
   readonly body: unknown;
-  readonly etag: string | undefined;
+  readonly etag: string;
 }
 
 /**
@@ -289,6 +289,12 @@ function LayersDialogSession({
     fetchLayoutForEdit(client, layoutId)
       .then((result): void => {
         if (cancelled) {
+          return;
+        }
+        // Fail closed: without this read's own ETag a save could not be
+        // conditional on it, so a concurrent edit could be overwritten.
+        if (result.etag === undefined) {
+          setTarget('error');
           return;
         }
         setTarget({
@@ -337,7 +343,7 @@ function LayersDialogSession({
       {
         id: target.id,
         create: false,
-        ...(target.etag !== undefined ? { ifMatch: target.etag } : {}),
+        ifMatch: target.etag,
         input: { name: target.name, body: withOverlays(body, draft) },
       },
       {
