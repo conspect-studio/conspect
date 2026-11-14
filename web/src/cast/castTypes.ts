@@ -40,12 +40,25 @@ export declare class ChromeCastLoadRequest {
   constructor(media: ChromeCastMediaInfo);
 }
 
+/** `chrome.cast.media.Track` (the subset this app reads). */
+export interface ChromeCastTrack {
+  readonly trackId: number;
+  /** `chrome.cast.media.TrackType` (`AUDIO`, `TEXT`, `VIDEO`). */
+  readonly type: string;
+  readonly name?: string | null;
+  readonly language?: string | null;
+}
+
 export interface ChromeCastMedia {
   readonly media?: ChromeCastMediaInfo;
   /** `chrome.cast.media.PlayerState` (`IDLE`, `PLAYING`, `PAUSED`, `BUFFERING`). */
   readonly playerState?: string;
   /** `chrome.cast.media.IdleReason` when `playerState` is `IDLE`. */
   readonly idleReason?: string | null;
+  /** The media session's tracks (audio/text/video), from `media.tracks` in MEDIA_STATUS. */
+  readonly tracks?: readonly ChromeCastTrack[] | null;
+  /** The currently active track ids (one per kind that has a selection). */
+  readonly activeTrackIds?: readonly number[] | null;
   addUpdateListener: (listener: (isAlive?: boolean) => void) => void;
   removeUpdateListener: (listener: (isAlive?: boolean) => void) => void;
   stop: (
@@ -53,6 +66,17 @@ export interface ChromeCastMedia {
     successCallback: () => void,
     errorCallback: (error: CastError) => void,
   ) => void;
+  /** `chrome.cast.media.Media.editTracksInfo`: switch active audio/text tracks. */
+  editTracksInfo: (
+    request: ChromeCastEditTracksInfoRequest,
+    successCallback: () => void,
+    errorCallback: (error: CastError) => void,
+  ) => void;
+}
+
+export declare class ChromeCastEditTracksInfoRequest {
+  constructor(activeTrackIds: readonly number[]);
+  activeTrackIds: readonly number[];
 }
 
 export interface CastDevice {
@@ -131,11 +155,13 @@ export interface ChromeCastMediaNamespace {
   MediaInfo: typeof ChromeCastMediaInfo;
   GenericMediaMetadata: typeof ChromeCastGenericMediaMetadata;
   LoadRequest: typeof ChromeCastLoadRequest;
+  EditTracksInfoRequest: typeof ChromeCastEditTracksInfoRequest;
   StreamType: { LIVE: string; BUFFERED: string; OTHER: string };
   HlsSegmentFormat: { TS: string; FMP4: string };
   HlsVideoSegmentFormat: { MPEG2_TS: string; FMP4: string };
   MetadataType: { GENERIC: number };
   PlayerState: { IDLE: string; PLAYING: string; PAUSED: string; BUFFERING: string };
+  TrackType: { AUDIO: string; TEXT: string; VIDEO: string };
   DEFAULT_MEDIA_RECEIVER_APP_ID: string;
 }
 

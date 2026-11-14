@@ -371,4 +371,156 @@ describe('CastController', () => {
     await flush();
     expect(controller.getSnapshot().status).toBe('idle');
   });
+
+  describe('tracks (decision 7)', () => {
+    it('derives audio/text tracks and the active ids from MEDIA_STATUS', async () => {
+      make();
+      await controller.start(PROGRAM);
+      sdk.emitTracks(
+        [
+          { trackId: 1, type: 'AUDIO', name: 'English', language: 'en' },
+          { trackId: 2, type: 'AUDIO', name: 'French', language: 'fr' },
+          { trackId: 10, type: 'TEXT', name: 'English CC', language: 'en' },
+        ],
+        [1, 10],
+      );
+      const snap = controller.getSnapshot();
+      expect(snap.audioTracks).toEqual([
+        { id: 1, name: 'English', language: 'en' },
+        { id: 2, name: 'French', language: 'fr' },
+      ]);
+      expect(snap.textTracks).toEqual([{ id: 10, name: 'English CC', language: 'en' }]);
+      expect(snap.activeAudioId).toBe(1);
+      expect(snap.activeTextId).toBe(10);
+    });
+
+    it('selectAudio sends editTracksInfo with the chosen audio id and the current text id', async () => {
+      make();
+      await controller.start(PROGRAM);
+      sdk.emitTracks(
+        [
+          { trackId: 1, type: 'AUDIO', name: 'English', language: 'en' },
+          { trackId: 2, type: 'AUDIO', name: 'French', language: 'fr' },
+          { trackId: 10, type: 'TEXT', name: 'English CC', language: 'en' },
+        ],
+        [1, 10],
+      );
+      await controller.selectAudio(2);
+      expect(sdk.editTracksInfo).toHaveBeenCalledWith(
+        expect.objectContaining({ activeTrackIds: [2, 10] }),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(controller.getSnapshot().activeAudioId).toBe(2);
+      expect(controller.getSnapshot().trackError).toBeNull();
+    });
+
+    it('selectText(null) switches subtitles off, keeping the current audio id', async () => {
+      make();
+      await controller.start(PROGRAM);
+      sdk.emitTracks(
+        [
+          { trackId: 1, type: 'AUDIO', name: 'English', language: 'en' },
+          { trackId: 10, type: 'TEXT', name: 'English CC', language: 'en' },
+        ],
+        [1, 10],
+      );
+      await controller.selectText(null);
+      expect(sdk.editTracksInfo).toHaveBeenCalledWith(
+        expect.objectContaining({ activeTrackIds: [1] }),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(controller.getSnapshot().activeTextId).toBeNull();
+    });
+
+    it('a failed editTracksInfo surfaces a sentence on trackError without throwing', async () => {
+      make();
+      await controller.start(PROGRAM);
+      sdk.emitTracks(
+        [
+          { trackId: 1, type: 'AUDIO', name: 'English', language: 'en' },
+          { trackId: 2, type: 'AUDIO', name: 'French', language: 'fr' },
+        ],
+        [1],
+      );
+      sdk.failNextEditTracksInfo('media_error');
+      await expect(controller.selectAudio(2)).resolves.toBeUndefined();
+      expect(controller.getSnapshot().trackError).not.toBeNull();
+      // The selection did not change: the failed edit left it alone.
+      expect(controller.getSnapshot().activeAudioId).toBe(1);
+    });
+
+    it('remembers the chosen audio/text language+name and sends it as LOAD customData on the next cast', async () => {
+      make();
+      await controller.start(PROGRAM);
+      sdk.emitTracks(
+        [
+          { trackId: 1, type: 'AUDIO', name: 'English', language: 'en' },
+          { trackId: 2, type: 'AUDIO', name: 'French', language: 'fr' },
+          { trackId: 10, type: 'TEXT', name: 'English CC', language: 'en' },
+        ],
+        [1],
+      );
+      await controller.selectAudio(2);
+      await controller.selectText(10);
+      await controller.stop();
+      // A fresh cast on the same tab (preferences are localStorage-backed, not session state).
+      await controller.start(PROGRAM);
+      const media = loadArg(sdk, 1).media;
+      expect(media.customData).toMatchObject({
+        audioLanguage: 'fr',
+        audioName: 'French',
+        textLanguage: 'en',
+        textName: 'English CC',
+      });
+    });
+  });
+
+  describe('video switch (decision 2)', () => {
+    it('creates the new output stream, LOADs it on the same session, then deletes the old stream, keeping preferences', async () => {
+      api = fakeApi(streamDoc({ id: 'cs-1', output: 'cast-1' }), () => streamDoc({ id: 'cs-1', output: 'cast-1' }));
+      make();
+      await controller.start(PROGRAM);
+      sdk.emitTracks([{ trackId: 1, type: 'AUDIO', name: 'English', language: 'en' }], [1]);
+      await controller.selectAudio(1);
+
+      const order: string[] = [];
+      api.create.mockImplementation(() => {
+        order.push('create');
+        return Promise.resolve(streamDoc({ id: 'cs-2', output: 'cast-2' }));
+      });
+      api.remove.mockImplementation((id: string) => {
+        order.push(`remove:${id}`);
+        return Promise.resolve();
+      });
+      const originalLoad = sdk.loadMedia.getMockImplementation();
+      sdk.loadMedia.mockImplementation((...args: unknown[]) => {
+        order.push('load');
+        return originalLoad?.(...(args as [unknown])) ?? Promise.resolve();
+      });
+
+      await controller.switchOutput('cast-2', 'Output 2');
+
+      expect(order).toEqual(['create', 'load', 'remove:cs-1']);
+      expect(api.create).toHaveBeenCalledWith({ output: 'cast-2' });
+      expect(controller.getSnapshot().output).toBe('cast-2');
+      expect(controller.getSnapshot().streamId).toBe('cs-2');
+      const media = loadArg(sdk, 1).media;
+      expect(media.customData).toMatchObject({ audioLanguage: 'en', audioName: 'English' });
+    });
+
+    it('a refused switch shows the refusal sentence and keeps the previous cast running', async () => {
+      make();
+      await controller.start(PROGRAM);
+      api.create.mockRejectedValueOnce(refusal(409, 'cast-capacity', 'busy'));
+      await controller.switchOutput('cast-2', 'Output 2');
+      const snap = controller.getSnapshot();
+      expect(snap.errorText).toContain('Every cast output is in use');
+      // Still showing the original cast.
+      expect(snap.output).toBe('cast-1');
+      expect(snap.streamId).toBe('cs-1');
+      expect(sdk.loadMedia).toHaveBeenCalledTimes(1);
+    });
+  });
 });

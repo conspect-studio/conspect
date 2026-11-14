@@ -27,10 +27,20 @@ import { receiverErrorCodes, receiverErrorSentence } from './castReport';
 import type { ReceiverReport } from './castReport';
 import { buildLoadRequest, describeCastError, isUserCancellation, waitPlayable } from './castLoad';
 import { SessionWatch } from './castSessionWatch';
+import { EMPTY_TRACKS, deriveTracks } from './castTracks';
+import type { CastTrackOption } from './castTracks';
 import type { CastContext, CastSession } from './castTypes';
 import { loadCastSdk } from './sdkLoader';
 
 export { describeCastError } from './castLoad';
+
+/** Wraps a raw `chrome.cast.Error`-like value so a rejection is always an `Error` (lint rule), while keeping it for `describeCastError`. */
+class CastEditTracksError extends Error {
+  constructor(readonly castError: unknown) {
+    super('editTracksInfo failed.');
+    this.name = 'CastEditTracksError';
+  }
+}
 
 export type CastStatus =
   | 'preparing'
@@ -75,6 +85,13 @@ export interface CastSnapshot {
   readonly muted: boolean | null;
   /** 10 s after LOAD the TV has fetched no playlist from this server. */
   readonly tvUnreachable: boolean;
+  /** The media session's audio/text tracks and active selections (decision 7). */
+  readonly audioTracks: readonly CastTrackOption[];
+  readonly textTracks: readonly CastTrackOption[];
+  readonly activeAudioId: number | null;
+  readonly activeTextId: number | null;
+  /** A failed `selectAudio`/`selectText`/video switch, as a sentence (no throw). */
+  readonly trackError: string | null;
 }
 
 export const IDLE_SNAPSHOT: CastSnapshot = {
@@ -91,6 +108,11 @@ export const IDLE_SNAPSHOT: CastSnapshot = {
   volume: null,
   muted: null,
   tvUnreachable: false,
+  audioTracks: EMPTY_TRACKS.audioTracks,
+  textTracks: EMPTY_TRACKS.textTracks,
+  activeAudioId: null,
+  activeTextId: null,
+  trackError: null,
 };
 
 /** The API the controller calls (injectable for tests). */
@@ -112,12 +134,24 @@ const DEFAULT_API: CastStreamApi = {
 export const TV_UNREACHABLE_MS = 10_000;
 const POLL_MS = 2_000;
 const STORAGE_KEY = 'conspect.cast.active';
+/** Remembered audio/text language+name choice (bounded field length, like `StoredCast`). */
+const PREFS_STORAGE_KEY = 'conspect.cast.trackPrefs';
+const PREF_FIELD_MAX = 64;
 
 interface StoredCast {
   readonly sessionId: string;
   readonly streamId: string;
   readonly key: string;
   readonly name: string;
+}
+
+/** The operator's remembered audio/text choice (language+name, never track ids: ids may differ after a reload). */
+interface StoredTrackPrefs {
+  readonly audioLanguage?: string;
+  readonly audioName?: string;
+  /** `null` = subtitles off. */
+  readonly textLanguage?: string | null;
+  readonly textName?: string | null;
 }
 
 function readStored(): StoredCast | null {
@@ -152,6 +186,52 @@ function writeStored(value: StoredCast | null): void {
   } catch {
     // Storage is optional (private mode): re-attach just will not happen.
   }
+}
+
+function clip(value: string): string {
+  return value.slice(0, PREF_FIELD_MAX);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readTrackPrefs(): StoredTrackPrefs | null {
+  try {
+    const raw = window.localStorage.getItem(PREFS_STORAGE_KEY);
+    if (raw === null) return null;
+    const value: unknown = JSON.parse(raw);
+    if (!isPlainRecord(value)) return null;
+    const v = value;
+    const prefs: StoredTrackPrefs = {
+      ...(typeof v.audioLanguage === 'string' ? { audioLanguage: clip(v.audioLanguage) } : {}),
+      ...(typeof v.audioName === 'string' ? { audioName: clip(v.audioName) } : {}),
+      ...(v.textLanguage === null ? { textLanguage: null } : typeof v.textLanguage === 'string' ? { textLanguage: clip(v.textLanguage) } : {}),
+      ...(v.textName === null ? { textName: null } : typeof v.textName === 'string' ? { textName: clip(v.textName) } : {}),
+    };
+    return prefs;
+  } catch {
+    return null;
+  }
+}
+
+function writeTrackPrefs(value: StoredTrackPrefs): void {
+  try {
+    window.localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(value));
+  } catch {
+    // Storage is optional (private mode): the preference just will not persist.
+  }
+}
+
+/** The `customData` LOAD fields the receiver honours for the remembered choice (decision 1/7). */
+function loadCustomDataFor(prefs: StoredTrackPrefs | null): Record<string, unknown> {
+  if (prefs === null) return {};
+  const data: Record<string, unknown> = {};
+  if (prefs.audioLanguage !== undefined) data.audioLanguage = prefs.audioLanguage;
+  if (prefs.audioName !== undefined) data.audioName = prefs.audioName;
+  if (prefs.textLanguage !== undefined) data.textLanguage = prefs.textLanguage;
+  if (prefs.textName !== undefined) data.textName = prefs.textName;
+  return data;
 }
 
 /** The framework-agnostic browser-cast controller; one per tab (see `CastProvider`). */
@@ -317,7 +397,7 @@ export class CastController {
       const watch = this.makeWatch(context, session, playable.id, receiver.namespace);
       this.watch = watch;
       watch.start();
-      await session.loadMedia(buildLoadRequest(playable, target.name));
+      await session.loadMedia(buildLoadRequest(playable, target.name, loadCustomDataFor(readTrackPrefs())));
       if (!current()) {
         watch.detach();
         if (this.watch === watch) this.watch = null;
@@ -356,6 +436,85 @@ export class CastController {
     }
   }
 
+  /**
+   * Switch the cast output while casting (decision 2): create a stream for
+   * `output`, wait for it to be playable, LOAD it on the SAME Cast session
+   * (one decode per device, keeping the audio/text preferences), then delete
+   * the old stream. A no-op while idle or busy with something else.
+   */
+  async switchOutput(output: string, label: string): Promise<void> {
+    const watch = this.watch;
+    const receiver = this.receiver;
+    if (this.busy || this.disposed || watch === null || receiver === null) return;
+    const generation = ++this.generation;
+    const current = (): boolean => generation === this.generation && !this.disposed;
+    const before = this.snapshot;
+    const previousStreamId = watch.streamId;
+    const session = watch.session;
+    const custom = receiver.appId !== null;
+    const name = this.snapshot.targetName ?? label;
+    const key = this.snapshot.targetKey ?? `output:${output}`;
+    this.emit({ status: 'preparing', errorText: null, errorDetail: null });
+    let stream: CastStream | null = null;
+    const abandon = (): void => {
+      if (stream !== null) void this.api.remove(stream.id).catch(() => undefined);
+    };
+    try {
+      const context = await loadCastSdk(receiver.appId);
+      if (!current()) return;
+      try {
+        stream = await this.api.create({ output });
+      } catch (error) {
+        if (current()) {
+          this.emit({
+            ...before,
+            errorText: castRefusalSentence(error),
+            errorDetail: error instanceof OperationApiError ? (error.detail ?? null) : null,
+          });
+        }
+        return;
+      }
+      if (!current()) {
+        abandon();
+        return;
+      }
+      this.emit({ streamId: stream.id, output: stream.output, status: 'connecting' });
+      const created = stream;
+      const playable = await waitPlayable(created, custom, current, this.now, this.api.get);
+      if (!current()) {
+        abandon();
+        return;
+      }
+      this.emit({ status: 'loading' });
+      watch.detach();
+      if (this.watch === watch) this.watch = null;
+      const newWatch = this.makeWatch(context, session, playable.id, receiver.namespace);
+      this.watch = newWatch;
+      newWatch.start();
+      await session.loadMedia(buildLoadRequest(playable, name, loadCustomDataFor(readTrackPrefs())));
+      if (!current()) {
+        newWatch.detach();
+        if (this.watch === newWatch) this.watch = null;
+        abandon();
+        return;
+      }
+      newWatch.attachMedia();
+      newWatch.ping();
+      this.loadedAt = this.now();
+      writeStored({ sessionId: session.sessionId ?? '', streamId: playable.id, key, name });
+      void this.api.remove(previousStreamId).catch(() => undefined);
+      if (this.snapshot.status === 'loading') this.emit({ status: 'buffering' });
+    } catch (error) {
+      if (!current()) {
+        abandon();
+        return;
+      }
+      this.generation += 1;
+      abandon();
+      this.emit({ ...before, errorText: describeCastError(error), errorDetail: null });
+    }
+  }
+
   private makeWatch(
     context: CastContext,
     session: CastSession,
@@ -368,6 +527,9 @@ export class CastController {
       },
       media: (playerState, idleReason) => {
         if (this.watch === watch) this.applyMedia(playerState, idleReason);
+      },
+      tracks: () => {
+        if (this.watch === watch) this.applyTracks(watch);
       },
       volume: (level, muted) => {
         if (this.watch === watch) this.emit({ volume: level, muted });
@@ -431,6 +593,65 @@ export class CastController {
     } else if (playerState === 'IDLE' && idleReason === 'FINISHED' && this.watch !== null) {
       this.finish(this.watch, null);
     }
+  }
+
+  /** Re-derive the track lists/active ids from the watch's media session (decision 7). */
+  private applyTracks(watch: SessionWatch): void {
+    const tracks = deriveTracks(watch.getMedia());
+    this.emit({
+      audioTracks: tracks.audioTracks,
+      textTracks: tracks.textTracks,
+      activeAudioId: tracks.activeAudioId,
+      activeTextId: tracks.activeTextId,
+    });
+  }
+
+  /** Switch the active audio track, keeping the current text selection. */
+  async selectAudio(trackId: number): Promise<void> {
+    await this.editTracks(trackId, this.snapshot.activeTextId);
+  }
+
+  /** Switch the active text track (`null` = off), keeping the current audio selection. */
+  async selectText(trackId: number | null): Promise<void> {
+    await this.editTracks(this.snapshot.activeAudioId, trackId);
+  }
+
+  private async editTracks(audioId: number | null, textId: number | null): Promise<void> {
+    const watch = this.watch;
+    if (watch === null) return;
+    const media = watch.getMedia();
+    if (media === null) return;
+    const chromeCast = window.chrome?.cast;
+    if (chromeCast === undefined) return;
+    const activeIds = [audioId, textId].filter((id): id is number => id !== null);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        media.editTracksInfo(
+          new chromeCast.media.EditTracksInfoRequest(activeIds),
+          resolve,
+          (error) => { reject(new CastEditTracksError(error)); },
+        );
+      });
+      this.emit({ trackError: null });
+      this.rememberTrackChoice(audioId, textId);
+      if (this.watch === watch) this.applyTracks(watch);
+    } catch (error) {
+      const raw = error instanceof CastEditTracksError ? error.castError : error;
+      this.emit({ trackError: describeCastError(raw) });
+    }
+  }
+
+  /** Persist the operator's choice as language+name for the next LOAD's `customData` (decision 1/7). */
+  private rememberTrackChoice(audioId: number | null, textId: number | null): void {
+    const audio = audioId === null ? undefined : this.snapshot.audioTracks.find((t) => t.id === audioId);
+    const text = textId === null ? undefined : this.snapshot.textTracks.find((t) => t.id === textId);
+    const previous = readTrackPrefs() ?? {};
+    const prefs: StoredTrackPrefs = {
+      ...previous,
+      ...(audio !== undefined ? { audioLanguage: clip(audio.language ?? ''), audioName: clip(audio.name) } : {}),
+      ...(textId === null ? { textLanguage: null, textName: null } : text !== undefined ? { textLanguage: clip(text.language ?? ''), textName: clip(text.name) } : {}),
+    };
+    writeTrackPrefs(prefs);
   }
 
   private applyStream(doc: CastStream): void {
