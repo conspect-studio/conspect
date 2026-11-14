@@ -258,8 +258,12 @@ pub(super) fn rate_output_specs(
                 );
                 indexes
             }
-            #[allow(unreachable_patterns)]
-            _ => Vec::new(),
+            // Config admits only converting kinds as rate outputs; WebRTC is
+            // never one (#343), nor is NDI, so they carry no lane audio.
+            #[cfg(feature = "webrtc-native")]
+            RunnableOutput::WebRtc { .. } => Vec::new(),
+            #[cfg(feature = "ndi-bindings")]
+            RunnableOutput::Ndi { .. } => Vec::new(),
         };
         if declared.effective_audio().is_some() && !audio_tracks.is_empty() {
             declared_audio_outputs.push((id.clone(), audio_tracks.clone()));
