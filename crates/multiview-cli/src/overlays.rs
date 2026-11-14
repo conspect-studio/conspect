@@ -457,9 +457,15 @@ impl OverlayBaker {
     /// `safe_area` the per-tile safe-area markers.
     #[must_use]
     pub fn with_layers(mut self, layers: LayoutOverlays) -> Self {
+        self.set_layers(layers);
+        self
+    }
+
+    /// Replace the drawn overlay layers in place (a routed layout's edited
+    /// body), see [`OverlayBaker::with_layers`].
+    pub fn set_layers(&mut self, layers: LayoutOverlays) {
         self.per_tile_safe_area = layers.safe_area;
         self.layers = layers;
-        self
     }
 
     /// The overlay layers this baker draws.
@@ -1865,7 +1871,9 @@ fn tally_thickness(geom: TileGeometry) -> u32 {
 /// live relayout drain and a routed layout's aux bake all use this one
 /// resolver, so a cell's chrome lands on the same pixels everywhere.
 #[must_use]
-pub fn tile_specs_for_layout(
+// Its callers (Program's pipeline and live drain) are ffmpeg-gated.
+#[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
+pub(crate) fn tile_specs_for_layout(
     layout: &multiview_core::layout::Layout,
     labels: &HashMap<String, String>,
 ) -> Vec<TileSpec> {
@@ -4034,7 +4042,7 @@ mod tests {
         let (full, geom) = layered(all, TileTally::Off);
         assert!(glyphs_in(&full, label_band(geom)) > 0, "label drawn");
         assert!(glyphs_in(&full, chip_band(geom)) > 0, "chip + badge drawn");
-        assert!(!meter_fill_in(&full, geom).is_empty(), "meter drawn");
+        assert_ne!(meter_fill_in(&full, geom).len(), 0, "meter drawn");
         assert!(clock_band_glyphs(&full) > 0, "clock drawn");
 
         let (no_labels, _) = layered(
@@ -4050,7 +4058,7 @@ mod tests {
             "labels off: no label glyphs"
         );
         assert!(glyphs_in(&no_labels, chip_band(geom)) > 0);
-        assert!(!meter_fill_in(&no_labels, geom).is_empty());
+        assert_ne!(meter_fill_in(&no_labels, geom).len(), 0);
 
         let (no_meters, _) = layered(
             LayoutOverlays {
@@ -4078,7 +4086,7 @@ mod tests {
             "flags off: no chip, no badge"
         );
         assert!(glyphs_in(&no_flags, label_band(geom)) > 0);
-        assert!(!meter_fill_in(&no_flags, geom).is_empty());
+        assert_ne!(meter_fill_in(&no_flags, geom).len(), 0);
 
         let (no_clock, _) = layered(
             LayoutOverlays {
@@ -4107,7 +4115,7 @@ mod tests {
         let (pgm, geom) = layered(layers, TileTally::Program);
         let red = tally_lines(&pgm, RED);
         assert_eq!(red.len(), 4, "a four-sided red border");
-        assert!(tally_lines(&pgm, GREEN).is_empty());
+        assert_eq!(tally_lines(&pgm, GREEN).len(), 0);
         let thick = (geom.width.min(geom.height) / 90).max(2);
         for rect in &red {
             assert!(rect.width == thick || rect.height == thick);
@@ -4129,9 +4137,10 @@ mod tests {
             4,
             "a four-sided green border"
         );
-        assert!(tally_lines(&pvw, RED).is_empty());
+        assert_eq!(tally_lines(&pvw, RED).len(), 0);
         let (off, _) = layered(layers, TileTally::Off);
-        assert!(tally_lines(&off, RED).is_empty() && tally_lines(&off, GREEN).is_empty());
+        assert_eq!(tally_lines(&off, RED).len(), 0);
+        assert_eq!(tally_lines(&off, GREEN).len(), 0);
         // The tally layer off draws no border even for a Program source.
         let (masked, _) = layered(
             LayoutOverlays {
@@ -4140,7 +4149,7 @@ mod tests {
             },
             TileTally::Program,
         );
-        assert!(tally_lines(&masked, RED).is_empty());
+        assert_eq!(tally_lines(&masked, RED).len(), 0);
     }
 
     #[test]

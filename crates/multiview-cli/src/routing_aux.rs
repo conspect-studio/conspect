@@ -299,6 +299,10 @@ pub struct AuxInputs {
     pub program_lateness: Option<ProgramLateness>,
     /// The output tick period in nanoseconds (the back-off threshold is half).
     pub tick_ns: u64,
+    /// What a routed layout's overlay bake reads (`None`: layouts are
+    /// published clean, as in builds without the `overlay` feature).
+    #[cfg(feature = "overlay")]
+    pub overlays: Option<crate::aux_overlays::AuxOverlayInputs>,
 }
 
 /// Program's lateness histogram, published once Program runs (the slot the
@@ -461,6 +465,14 @@ fn run(inputs: &AuxInputs, failed: &AtomicBool, halved: &AtomicBool) {
 struct AuxState {
     feeds_seen: Option<Arc<Vec<AuxFeed>>>,
     per_feed: HashMap<Arc<str>, FeedState>,
+    /// Set when the feed set or a layout body changed: `wanted` is
+    /// recomputed at the end of that tick only (never per tick).
+    #[cfg(feature = "overlay")]
+    bakes_changed: bool,
+    /// The signals snapshot loaded once for this tick (only when some layout
+    /// bakes).
+    #[cfg(feature = "overlay")]
+    signals: Option<Arc<crate::aux_overlays::AuxOverlaySignals>>,
 }
 
 #[derive(Default)]
@@ -471,6 +483,10 @@ struct FeedState {
     warned_color: bool,
     /// A routed layout's compose state (rebuilt when the body changes).
     layout: Option<crate::aux_layout::LayoutCanvas>,
+    /// A routed layout's overlay bake (`None`: every layer off, or no
+    /// overlay inputs). Rebuilt with `layout`.
+    #[cfg(feature = "overlay")]
+    bake: Option<crate::aux_overlays::LayoutOverlayBake>,
 }
 
 impl AuxState {
@@ -485,6 +501,14 @@ impl AuxState {
             self.per_feed
                 .retain(|key, _| feeds.iter().any(|f| f.key == *key));
             self.feeds_seen = Some(Arc::clone(&feeds));
+            #[cfg(feature = "overlay")]
+            {
+                self.bakes_changed = true;
+            }
+        }
+        #[cfg(feature = "overlay")]
+        {
+            self.signals = None;
         }
         for feed in feeds.iter() {
             let source: Arc<str> = match &feed.bus {
@@ -529,6 +553,22 @@ impl AuxState {
             })));
             feed.slot.composed.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "overlay")]
+        self.refresh_wanted(inputs);
+    }
+
+    /// Raise `wanted` while some active layout feed bakes overlays (the bake
+    /// consumer then publishes its signals). Recomputed only when the feed
+    /// set changed or a body was rebuilt — not per tick.
+    #[cfg(feature = "overlay")]
+    fn refresh_wanted(&mut self, inputs: &AuxInputs) {
+        if !std::mem::take(&mut self.bakes_changed) {
+            return;
+        }
+        if let Some(overlays) = inputs.overlays.as_ref() {
+            let wanted = self.per_feed.values().any(|f| f.bake.is_some());
+            overlays.wanted.store(wanted, Ordering::Relaxed);
+        }
     }
 }
 
@@ -552,12 +592,50 @@ impl AuxState {
                 inputs.layout_canvas,
             );
             entry.generation = entry.generation.wrapping_add(1);
+            #[cfg(feature = "overlay")]
+            {
+                entry.bake = match (entry.bake.take(), inputs.overlays.as_ref()) {
+                    (_, None) => None,
+                    _ if entry.layout.is_none() => None,
+                    // An edited body of the same layout keeps its fonts and
+                    // meter ballistics.
+                    (Some(mut bake), Some(overlays)) => {
+                        bake.rebuild(&layout.body, &overlays.labels).then_some(bake)
+                    }
+                    (None, Some(overlays)) => {
+                        crate::aux_overlays::LayoutOverlayBake::new(&layout.body, overlays)
+                    }
+                };
+                self.bakes_changed = true;
+            }
         }
         let Some(canvas) = entry.layout.as_mut() else {
             return; // a layout for another canvas size: never composed (hold)
         };
         let Some(picture) = canvas.compose(&inputs.stores, tick.pts) else {
             return;
+        };
+        #[cfg(feature = "overlay")]
+        let picture = match entry.bake.as_mut() {
+            None => picture,
+            Some(bake) => {
+                let signals: Arc<crate::aux_overlays::AuxOverlaySignals> =
+                    Arc::clone(self.signals.get_or_insert_with(|| {
+                        inputs
+                            .overlays
+                            .as_ref()
+                            .map(|o| o.signals.load())
+                            .unwrap_or_default()
+                    }));
+                let preview = inputs.preview_selection.as_ref().and_then(|s| s.load());
+                bake.bake(
+                    &picture,
+                    tick.pts,
+                    canvas.cell_states(),
+                    &signals,
+                    preview.as_deref(),
+                )
+            }
         };
         feed.slot.latest.store(Some(Arc::new(AuxFrame {
             tick: tick.index,
@@ -917,6 +995,8 @@ mod tests {
             },
             program_lateness: None,
             tick_ns: 0,
+            #[cfg(feature = "overlay")]
+            overlays: None,
         })
         .unwrap();
         (tx, handle)
@@ -1198,4 +1278,5 @@ codec = "h264"
         }
         assert!(!off.observe(t0 + Duration::from_secs(11), lateness.snapshot()));
     }
+
 }

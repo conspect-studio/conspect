@@ -3923,6 +3923,10 @@ impl Pipeline {
         // Filled once this run's Program exists (§7 back-off input).
         let program_lateness: crate::routing_aux::ProgramLateness =
             Arc::new(multiview_framestore::SwapCell::empty());
+        // Routed layouts' overlay layers: the consumer publishes its signals
+        // into this wait-free slot only while the aux thread wants them.
+        #[cfg(feature = "overlay")]
+        let (aux_overlays, aux_signals) = self.aux_overlay_inputs(aux_tx.active_flag());
         let aux = crate::routing_aux::spawn_routing_aux(crate::routing_aux::AuxInputs {
             rx: aux_rx,
             feeds: Arc::clone(&feeds),
@@ -3932,6 +3936,8 @@ impl Pipeline {
             layout_canvas: self.layout_canvas_spec(),
             program_lateness: Some(Arc::clone(&program_lateness)),
             tick_ns: u64::try_from(self.encode_cfg.cadence.period_nanos()).unwrap_or(0),
+            #[cfg(feature = "overlay")]
+            overlays: Some(aux_overlays),
         })
         .map_err(spawn_err)?;
         let base_force: Vec<Arc<AtomicU64>> = self
@@ -3996,7 +4002,47 @@ impl Pipeline {
             preview_selection,
             aux,
             program_lateness,
+            #[cfg(feature = "overlay")]
+            aux_signals,
         })
+    }
+
+    /// The routed-layout overlay inputs for the aux thread and the matching
+    /// consumer-side publisher (cfg `overlay`). Labels: the config display
+    /// names first, then the live catalogue's `display_name` (wait-free
+    /// `SwapCell` load), else `None` (the bake falls back to the id).
+    #[cfg(feature = "overlay")]
+    fn aux_overlay_inputs(
+        &self,
+        active: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        crate::aux_overlays::AuxOverlayInputs,
+        crate::aux_overlays::AuxSignalsPublisher,
+    ) {
+        let signals = crate::aux_overlays::signals_slot();
+        let wanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let config_labels = self.tile_labels.clone();
+        let catalogue = Arc::clone(&self.catalogue);
+        let labels: crate::aux_overlays::LabelLookup = Arc::new(move |id: &str| {
+            config_labels.get(id).cloned().or_else(|| {
+                catalogue
+                    .load()
+                    .get(id)
+                    .and_then(|entry| entry.source().display_name.clone())
+            })
+        });
+        let inputs = crate::aux_overlays::AuxOverlayInputs {
+            signals: Arc::clone(&signals),
+            wanted: Arc::clone(&wanted),
+            labels,
+            watermark: self.watermark_signal.clone(),
+            wall_clock: crate::wallclock::WallClockSource::system(),
+            canvas_color: self.canvas_color,
+        };
+        (
+            inputs,
+            crate::aux_overlays::AuxSignalsPublisher::new(signals, wanted, active),
+        )
     }
 
     /// Issue one audio-only take per output whose persisted audio feed is not
@@ -5435,7 +5481,8 @@ impl Pipeline {
         // The consumer owns a Send `BakeContext` and builds its own (non-Send)
         // overlay baker from it, plus the single `ProgramEncoder`; the bake +
         // encode math moved off the hot loop, never onto it.
-        let bake_ctx = self.bake_context();
+        #[cfg_attr(not(feature = "overlay"), allow(unused_mut))]
+        let mut bake_ctx = self.bake_context();
         #[cfg(feature = "overlay")]
         let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
         // Output routing (ADR-0108 slice 1): the clock's aux tick sender (inert
@@ -5449,7 +5496,13 @@ impl Pipeline {
             preview_selection,
             aux: _routing_aux,
             program_lateness,
+            #[cfg(feature = "overlay")]
+            aux_signals,
         } = routing;
+        #[cfg(feature = "overlay")]
+        {
+            bake_ctx.aux_signals = Some(aux_signals);
+        }
         demand.start();
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
@@ -6108,6 +6161,7 @@ impl Pipeline {
                 .demand
                 .as_ref()
                 .map(|manager| (manager.activity_reader(), Arc::clone(&self.catalogue))),
+            aux_signals: None,
         }
     }
 
@@ -6175,6 +6229,11 @@ struct BakeContext {
         multiview_engine::ActivityReader,
         crate::source_rails::Catalogue,
     )>,
+    /// Routed layouts' overlay signals: published at most once per baked
+    /// frame, only while a routed layout wants them (one relaxed load
+    /// otherwise). `None` before routing is wired and in tests.
+    #[cfg(feature = "overlay")]
+    aux_signals: Option<crate::aux_overlays::AuxSignalsPublisher>,
 }
 
 impl BakeContext {
@@ -6435,7 +6494,27 @@ impl StreamBaker {
             .map_err(|e| PipelineError::Engine(format!("overlay draw: {e}")))?;
         let overlaid = apply_overlays_to_nv12(&item.canvas, &list, self.canvas_color)
             .map_err(|e| PipelineError::Engine(format!("overlay blend: {e}")))?;
+        self.publish_aux_signals(item);
         Ok(Arc::new(overlaid))
+    }
+
+    /// Hand routed layouts the per-source signals this frame carries (live
+    /// meters, content faults, the sources on Program) — at most once per
+    /// baked frame, and only while some routed layout bakes overlays: one
+    /// relaxed load otherwise. A wait-free store; the aux thread never waits
+    /// on it and this never waits on the aux thread.
+    fn publish_aux_signals(&self, item: &StreamItem) {
+        let Some(publisher) = self.meter.aux_signals.as_ref() else {
+            return;
+        };
+        if !publisher.wanted() {
+            return;
+        }
+        publisher.publish(crate::aux_overlays::AuxOverlaySignals {
+            meters: self.live_meter_db.clone(),
+            faults: item.faults.clone(),
+            program: item.source_states.keys().cloned().collect(),
+        });
     }
 }
 
@@ -7688,6 +7767,9 @@ struct RunRouting {
     aux: crate::routing_aux::RoutingAuxHandle,
     /// Where the run publishes Program's lateness for the aux back-off.
     program_lateness: crate::routing_aux::ProgramLateness,
+    /// The consumer's side of the routed-layout overlay signals.
+    #[cfg(feature = "overlay")]
+    aux_signals: crate::aux_overlays::AuxSignalsPublisher,
 }
 
 /// Output-routing state the bake consumer owns for one run (ADR-0108).
@@ -22289,6 +22371,7 @@ mod live_overlay_bake_tests {
             canvas_height: 180,
             overlay_apply: Some(Arc::clone(slot)),
             activity: None,
+            aux_signals: None,
         }
     }
 
