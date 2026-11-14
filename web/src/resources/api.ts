@@ -426,7 +426,19 @@ export function toSourceView(record: ResourceRecord): SourceView {
     editable: parseSourceFormKind(raw) !== undefined,
     locator,
     eventObservation: eventObservationFor(kind, record.body),
+    hasCaptions: hasCaptions(record.body),
   };
+}
+
+/**
+ * Whether a source document declares captions (`captions` present and its
+ * `mode` not `off`): mirrors the server's `source-has-no-captions` plan note
+ * (`absent or off`, ADR-0110 §12.8).
+ */
+function hasCaptions(body: Record<string, unknown>): boolean {
+  const captions = body.captions;
+  if (!isRecord(captions)) return false;
+  return captions.mode !== 'off';
 }
 
 /**
