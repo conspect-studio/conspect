@@ -243,8 +243,10 @@ const MAX_STDERR_BYTES: usize = 256 * 1024;
 /// ([`YoutubeError::Unavailable`] for spawn failure/timeout,
 /// [`YoutubeError::Resolve`] carrying bounded stderr for a non-zero exit or
 /// an over-limit output). Both pipes are drained concurrently under byte caps
-/// while the child runs; on overflow, timeout or cancellation the child is
-/// killed (`kill_on_drop`) and reaped by tokio.
+/// while the child runs, so memory stays bounded; an overflow on one pipe
+/// stops keeping its bytes, and the run ends when the other pipe closes or at
+/// the deadline, whichever is first. On overflow, timeout or cancellation the
+/// child is killed (`kill_on_drop`) and reaped by tokio.
 async fn run_once(config: &ResolverConfig, args: &[String]) -> Result<String, YoutubeError> {
     let mut child = Command::new(&config.yt_dlp_path)
         .args(args)
