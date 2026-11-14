@@ -598,8 +598,9 @@ fn push_unique<T: PartialEq>(items: &mut Vec<T>, candidate: T) {
 /// outputs may share. They never encode a second time.
 /// The number of distinct base video encoder keys the document needs (#342
 /// review A2), counting every output whose codec is known: one per distinct
-/// (codec, format, settings, placement, orientation). Unknown codec tokens
-/// are left to the plan's own refusal.
+/// (codec, format, settings, placement, orientation), plus one per output at
+/// a rate other than Program's (#343 review A1: every rate output opens its
+/// own encoder). Unknown codec tokens are left to the plan's own refusal.
 #[must_use]
 pub fn distinct_base_video_keys(config: &MultiviewConfig) -> usize {
     /// Every codec counts: availability is the plan's question, not this one.
@@ -616,7 +617,17 @@ pub fn distinct_base_video_keys(config: &MultiviewConfig) -> usize {
     let cadence = config.canvas.fps.rational().reduce();
     let color = RenditionColorKey::from_canvas(&config.canvas.color);
     let mut keys: Vec<VideoRenditionKey> = Vec::new();
+    // #343 review A1: a rate output never shares an encoder (each opens its
+    // own on its rate lane), so each counts as its own key.
+    let mut rate_encoders = 0_usize;
     for (index, output) in config.outputs.iter().enumerate() {
+        // #343 review A2: a rate output counts whatever its codec token (an
+        // encoder alias such as `h264_nvenc` has no rendition key but still
+        // opens an encoder on its lane).
+        if crate::output_format::output_rate(output, &config.canvas).is_some() {
+            rate_encoders = rate_encoders.saturating_add(1);
+            continue;
+        }
         let key = video_key_for_output(output, index, &program_id, config, cadence, &color, &Any);
         if let Ok(Some(key)) = key {
             if !keys.contains(&key) {
@@ -624,7 +635,7 @@ pub fn distinct_base_video_keys(config: &MultiviewConfig) -> usize {
             }
         }
     }
-    keys.len()
+    keys.len().saturating_add(rate_encoders)
 }
 
 fn video_key_for_output(
@@ -690,7 +701,9 @@ fn video_key_for_output(
         height,
         fit,
         bitrate_kbps: output.video_slot0().and_then(|slot| slot.bitrate_kbps),
-        cadence,
+        // #343: a rate output's encoder runs at its own rate.
+        cadence: crate::output_format::output_rate(output, &config.canvas)
+            .map_or(cadence, |fps| fps.rational().reduce()),
         pixel_format: config.canvas.pixel_format.clone(),
         color: color.clone(),
         gpu_pin: output.gpu_pin().cloned(),

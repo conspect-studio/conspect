@@ -2069,7 +2069,7 @@ comes later. `fit.anchor` is one of `center`, `top`, `bottom`, `left`, `right`, 
 `top_right`, `bottom_left`, `bottom_right`. Validation reports a typed message prefix:
 `slot-medium-mismatch:` (more slots than `Output::slot_capability()` allows, a codec on a raw
 output, a video slot on `aes67`) or `slot-format-unsupported:` (a codec the medium does not carry,
-fps ≠ Program (slice C, #343), `tff`/`bff`, colour ≠ canvas (#310), pixel format ≠ canvas, an
+an fps other than Program's that is not an output rate (`num/den`, `den` 1 or 1001, 4..=120 fps) or is on a kind that does not convert (slice C, #343, §12.6), `tff`/`bff`, colour ≠ canvas (#310), pixel format ≠ canvas, an
 anamorphic `aspect`, a size that is odd, outside 16..=8192 or above 3840×2160 in area, or a
 non-canvas format on a kind slice B does not convert for: `webrtc`, `whip_push`, `ndi`, `display`,
 `aes67`, `rtsp_server`). Only an explicitly declared slot codec is checked. Absent `format` and
@@ -2523,6 +2523,40 @@ invariant #3), so the jitter-buffer delay is applied to audio as well (bounded b
 - **Isolation.** A per-output clock is an OS thread, never on the runtime that hosts Program's
   clock (the clock-thread work of #311 / PR #332 is reused). It never takes a lock Program holds;
   its stores are read wait-free.
+
+**As built in slice C (#343).** `[outputs.format] fps` may differ from the canvas on a
+converting kind (`hls`, `ll_hls`, `srt`, `rist`, `rtmp`) when it is an output rate (`num/den`,
+`den` 1 or 1001, 4..=120 fps: the dispatcher assembles one A/V window per output tick and needs a
+tick of at most 250 ms). `[routing] max_output_clocks` (default 2, max 8) bounds the distinct
+non-Program rates (more is refused `capacity:`); at least one packet output stays at Program's
+rate; a persisted `[[routing.output]]` row feeding a non-Program bus to a rate output is refused
+`slot-format-unsupported:`. Outputs at Program's rate are untouched. A rate output leaves the
+Program egress and runs in a rate lane (`crates/multiview-cli/src/output_lanes.rs`):
+- Program's bake consumer publishes each baked canvas (substituted ticks included) into a
+  `ProgramLatch` (wait-free, 8 entries, drop-oldest) only when a rate lane exists; zero work otherwise.
+- Per distinct rate one output clock thread (`clock-out-<fps>`, ADR-0109 absolute-deadline pacing,
+  same `TimeSource`, seeded with Program's seed, so output tick 0 is Program tick 0). Tick k is due
+  at `seed + k/fps + LATCH_DELAY` (100 ms, so the Program frame for `k/fps` is baked); its PTS is
+  `k`, the delay never enters a stamp. It latches nearest-not-after and offers the frame
+  non-blocking to each output's encode worker (full = dropped + counted; the worker gap-fills,
+  a gap beyond 2 s of ticks fails that output alone). Late by more than 8 ticks, it skips to the
+  tick due now (counted). Before the first Program frame it offers black at the output format.
+- Per output: encode worker (format convert + gap fill, encoder at the output rate), its own
+  dispatcher, delivery and sink thread. Audio deviates from the text above in mechanism, not in
+  result: the lane carries Program's AAC packets themselves (already on the global sample counter
+  and 1024 grid), fanned out by a bounded `try_send` per lane from Program's audio worker, and
+  released to the lane dispatcher at most 4 output ticks ahead of its video. No extra encode.
+- A rate output is listed by the routing API but `routable: false`: a take answers `unroutable`.
+  Subtitle slots (slice F, #345) are sampled at Program's cadence and are refused on a rate output
+  (`slot-format-unsupported:`) until a follow-up carries them.
+- A wedged or panicking lane clock, encoder, consumer or sink ends only its outputs and becomes a
+  run-report line; Program and other outputs never wait on it. At run end the lanes run until they
+  pass Program's last frame (at most 2 s), stop, and are joined with bounded graces.
+- `GET /api/v1/metrics/program` gains `output_clocks[]` (fps, outputs, ticks, lateness p50/p99/max,
+  skipped ticks, dropped offers, late latches, dropped audio).
+- **Not in slice C:** takes/patches onto a rate output, latching sources/layouts/Preview (only
+  `bus:program` is latched), a shared encoder per equal-format output on one lane, blended
+  conversion, live fps change (an fps change restarts the run through the normal apply path).
 
 ### 12.7 Program stays special
 

@@ -474,12 +474,18 @@ fn merge_routing(
             &n.max_aux_canvases,
             &a.max_aux_canvases,
         ),
+        max_output_clocks: section(
+            &p.max_output_clocks,
+            &n.max_output_clocks,
+            &a.max_output_clocks,
+        ),
     };
     let none = merged.video.is_empty()
         && merged.audio.is_empty()
         && merged.subtitle.is_empty()
         && merged.output.is_empty()
-        && merged.max_aux_canvases.is_none();
+        && merged.max_aux_canvases.is_none()
+        && merged.max_output_clocks.is_none();
     (!none).then_some(merged)
 }
 

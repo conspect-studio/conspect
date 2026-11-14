@@ -124,10 +124,10 @@ pub use network_tls::{
 };
 pub use origin::{Origin, OriginParseError};
 pub use output_format::{
-    validate_output_format, validate_subtitle_sources, Anchor, AudioSlot, CodecFamily, OutputFit,
-    OutputFitMode, OutputFormat, OutputSlots, Scan, SlotCapability, SubtitleFormat, SubtitleSlot,
-    VideoSlot, MAX_SLOT_BITRATE_KBPS, MAX_SUBTITLE_SLOTS, SLOT_FORMAT_UNSUPPORTED,
-    SLOT_MEDIUM_MISMATCH,
+    is_output_rate, output_rate, validate_output_format, validate_subtitle_sources, Anchor,
+    AudioSlot, CodecFamily, OutputFit, OutputFitMode, OutputFormat, OutputSlots, Scan,
+    SlotCapability, SubtitleFormat, SubtitleSlot, VideoSlot, MAX_OUTPUT_FPS, MAX_SLOT_BITRATE_KBPS,
+    MAX_SUBTITLE_SLOTS, MIN_OUTPUT_FPS, SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
 };
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use playback::{
@@ -145,7 +145,7 @@ pub use rendition::{
 pub use routing::{
     AudioCrosspoint, AudioFeed, FollowAudio, OutputBus, OutputCrosspoint, OutputRef, RoutingRefs,
     RoutingTable, StreamRef, StreamSelector, SubtitleCrosspoint, VideoCrosspoint, VideoFeed,
-    MAIN_PROGRAM,
+    DEFAULT_MAX_OUTPUT_CLOCKS, MAIN_PROGRAM, MAX_OUTPUT_CLOCKS_LIMIT,
 };
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
@@ -1522,6 +1522,7 @@ impl MultiviewConfig {
                 )));
             }
         }
+        self.validate_output_clocks()?;
         // #342 review A2: every distinct base video key is a real encoder
         // (one per distinct format and slot settings): hold the per-program
         // ceiling on the keys the engine will actually open. A document that
@@ -1538,9 +1539,96 @@ impl MultiviewConfig {
         if keys > rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM {
             return Err(ConfigError::Validation(format!(
                 "{SLOT_FORMAT_UNSUPPORTED}: the outputs need {keys} distinct video encoders \
-                 (one per distinct codec, format and settings); at most {} per program",
+                 (one per distinct codec, format and settings, and one per output at its own \
+                 rate); at most {} per program",
                 rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM
             )));
+        }
+        Ok(())
+    }
+
+    /// Slice C (#343, §12.6): outputs at a rate other than Program's.
+    ///
+    /// * the distinct non-Program rates are at most `routing.max_output_clocks`
+    ///   (refused `capacity:`);
+    /// * at least one Program-egress output stays at Program's rate (the
+    ///   Program egress needs a binding; refused `slot-format-unsupported:`);
+    /// * a persisted `[[routing.output]]` feed other than Program onto a rate
+    ///   output — video, or an audio feed other than `follow`/`program` — is
+    ///   refused `slot-format-unsupported:` (takes onto a rate output are a
+    ///   follow-up).
+    fn validate_output_clocks(&self) -> Result<(), ConfigError> {
+        let mut rates: Vec<Fps> = Vec::new();
+        let mut rate_outputs: Vec<String> = Vec::new();
+        for output in &self.outputs {
+            if let Some(fps) = output_format::output_rate(output, &self.canvas) {
+                if !rates.iter().any(|r| output_format::same_rate(*r, fps)) {
+                    rates.push(fps);
+                }
+                // Subtitle slots (slice F) are sampled on Program's bake
+                // consumer at Program's cadence; a rate output does not carry
+                // them yet (follow-up of #343).
+                if output
+                    .slots()
+                    .is_some_and(|slots| !slots.subtitle.is_empty())
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "{SLOT_FORMAT_UNSUPPORTED}: output {:?} runs at its own rate; subtitle \
+                         slots on a rate output are not supported yet",
+                        output.id()
+                    )));
+                }
+                rate_outputs.push(output.id());
+            }
+        }
+        if rates.is_empty() {
+            return Ok(());
+        }
+        let max = self.max_output_clocks();
+        if rates.len() > max {
+            return Err(ConfigError::Validation(format!(
+                "capacity: the outputs need {} distinct output rates other than the Program's {} \
+                 (one output clock each); routing.max_output_clocks allows {max}",
+                rates.len(),
+                self.canvas.fps
+            )));
+        }
+        let program_rate = self.outputs.iter().any(|o| {
+            output_format::is_packet_output(o)
+                && output_format::output_rate(o, &self.canvas).is_none()
+        });
+        if !program_rate {
+            return Err(ConfigError::Validation(format!(
+                "{SLOT_FORMAT_UNSUPPORTED}: every output runs at a rate other than the Program's \
+                 {}; keep at least one output at the Program's rate (the Program egress carries \
+                 the run and rate outputs latch it)",
+                self.canvas.fps
+            )));
+        }
+        if let Some(table) = &self.routing {
+            for xp in &table.output {
+                if !rate_outputs.contains(&xp.output) {
+                    continue;
+                }
+                if xp.effective_video() != VideoFeed::PROGRAM {
+                    return Err(ConfigError::Validation(format!(
+                        "{SLOT_FORMAT_UNSUPPORTED}: output {:?} runs at its own rate; its feed must \
+                         be Program (routing another feed onto a rate output is not supported yet)",
+                        xp.output
+                    )));
+                }
+                // #343 review M2: a rate output carries the Program audio
+                // (the lane fans out Program's AAC packets); any other audio
+                // feed would be silently ignored, so it is refused.
+                if !matches!(xp.audio, AudioFeed::Follow | AudioFeed::Program) {
+                    return Err(ConfigError::Validation(format!(
+                        "{SLOT_FORMAT_UNSUPPORTED}: output {:?} runs at its own rate; its audio \
+                         feed must be Program (follow or program; another audio feed onto a rate \
+                         output is not supported yet)",
+                        xp.output
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -1886,6 +1974,16 @@ impl MultiviewConfig {
         self.routing.as_ref().map_or(
             routing::DEFAULT_MAX_AUX_CANVASES,
             RoutingTable::max_aux_canvases,
+        )
+    }
+
+    /// `routing.max_output_clocks` (#343, §12.6): distinct non-Program output
+    /// rates; the default when the document sets none.
+    #[must_use]
+    pub fn max_output_clocks(&self) -> usize {
+        self.routing.as_ref().map_or(
+            routing::DEFAULT_MAX_OUTPUT_CLOCKS,
+            RoutingTable::max_output_clocks,
         )
     }
 
