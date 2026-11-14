@@ -7281,3 +7281,190 @@ fn a_producer_refilling_the_mailbox_never_starves_a_tick() {
     let sent = producer.join().unwrap();
     assert!(sent > 2 * budget, "the producer kept refilling: {sent}");
 }
+
+/// Route output 2's audio to silence on its own private bus (a single
+/// audio-only take), settled and bound; returns the bus's dispatcher key and
+/// the next tick.
+fn silence_on_private_bus(x: &mut AudioHarness) -> (usize, u64) {
+    let t = x.run(0, 4);
+    x.h.try_take(audio_only("silence", 2, AudioChoice::Silence))
+        .unwrap();
+    let (o, t) = x.until(t, "silence", 120);
+    assert_eq!(o.outcome, TakeResult::Applied);
+    let t = x.run(t, 8);
+    let key = x.d.binding_audio_key(2).expect("on its private bus");
+    assert_eq!(x.r.audio.as_ref().unwrap().private_buses(), 1);
+    (key, t)
+}
+
+/// A-4: a set member staying on its video whose output already reads a
+/// private bus (silence) and whose audio changes (to `bars`) switches at
+/// T's grid boundary through a staged bus; the old bus never carries
+/// `bars`, and closes once the staged bus is on air.
+#[test]
+fn a_staying_member_on_a_private_bus_switches_through_a_staged_bus_at_t() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(3, CADENCE, open);
+    let (old_key, mut t) = silence_on_private_bus(&mut x);
+    let set_start = x.clock.total_at(t);
+    let arm = Arc::new(SetArm::new());
+    assert!(arm.switcher_ready());
+    let mut set = take_set(
+        "salvo",
+        "p",
+        &[(1, src()), (2, PictureBus::Program)],
+        Some(&arm),
+    );
+    set.members[1].audio = Some(bars_src());
+    x.h.try_take_set(set).unwrap();
+    let mut got = Vec::new();
+    for _ in 0..120 {
+        x.tick(t);
+        clock_composes(&arm, t);
+        got.extend(
+            x.outcomes
+                .try_iter()
+                .map(|o| (o.output_index, o.tick, o.outcome, o.audio)),
+        );
+        t += 1;
+        if got.len() >= 2 {
+            break;
+        }
+    }
+    assert_eq!(arm.state(), ArmState::Committed);
+    let at = arm.tick();
+    let g = grid_ceil(x.clock.total_at(at), AAC_FRAME_SAMPLES);
+    assert!(
+        got.contains(&(1, at, TakeResult::Applied, Some(AudioChoice::Follow))),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&(2, at, TakeResult::Applied, Some(bars_src()))),
+        "{got:?}"
+    );
+    t = x.run(t, 8);
+    let _ = t;
+    // The slot reads a new bus; the old one closed: one bus again.
+    let new_key = x.d.binding_audio_key(2).expect("on a private bus");
+    assert_ne!(new_key, old_key, "moved onto the staged bus");
+    assert!(x.d.is_audio_key_failed(old_key), "the old bus closed");
+    let audio = x.r.audio.as_ref().unwrap();
+    // Output 2's old bus closed; output 1 (moved to `src`) runs its own.
+    assert_eq!(audio.private_buses(), 2, "one bus per output");
+    assert!(audio.has_private_bus(1) && audio.has_private_bus(2));
+    assert_eq!(audio.choice(2), bars_src());
+    let late = x.clock.total_at(t - 3);
+    let tap = x.tap.lock().unwrap();
+    // The bus on air until T only ever carried silence.
+    for (_, start, pcm) in tap.private.iter().filter(|p| p.0 == 2) {
+        if *start >= set_start && *start < g {
+            assert!(pcm.iter().all(|v| *v == 0.0), "old bus at {start}");
+        }
+    }
+    // One fade for the first take, one at T's grid boundary on the staged
+    // bus (silence -> bars).
+    let fades: Vec<u64> = tap.fades.iter().filter(|f| f.0 == 2).map(|f| f.1).collect();
+    assert_eq!(fades.len(), 2, "{fades:?}");
+    assert_eq!(fades[1], g, "the fade lands at T's grid boundary");
+    // The staged bus carried silence before G.
+    let mut staged_before_g = 0;
+    for (_, start, pcm) in tap.staged.iter().filter(|s| s.0 == 2) {
+        for (i, v) in pcm.chunks(2).enumerate() {
+            if start + u64::try_from(i).unwrap() < g {
+                staged_before_g += 1;
+                assert_eq!(v[0], 0.0, "staged bus before G");
+            }
+        }
+    }
+    assert!(staged_before_g >= 2048, "the staged bus warmed before G");
+    // Long after T the output's bus carries bars only.
+    let mut bars_seen = 0;
+    for (_, start, pcm) in tap.private.iter().filter(|p| p.0 == 2 && p.1 >= late) {
+        for (i, v) in pcm.chunks(2).enumerate() {
+            let n = start + u64::try_from(i).unwrap();
+            assert!((v[0] - bars(n)).abs() < 1e-6, "bars at {n}");
+            bars_seen += 1;
+        }
+    }
+    assert!(bars_seen > 1024, "bars fed on the promoted bus");
+}
+
+/// A-4: the same set REJECTED at its decision (the mixer never commits T):
+/// the output's audio stays silence on the bus it reads (no `bars` sample
+/// ever encoded into it), every member is refused, the staged bus closed and
+/// the choice restored.
+#[test]
+fn a_rejected_set_never_switches_a_staying_members_private_bus_audio() {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let open: OpenFn = Box::new(move |_| {
+        let enc: Box<dyn LiveEncoder> = Box::new(FakeEnc {
+            forced: false,
+            encoded: Arc::clone(&encoded),
+        });
+        Ok(enc)
+    });
+    let mut x = audio_harness(3, CADENCE, open);
+    let (old_key, mut t) = silence_on_private_bus(&mut x);
+    let set_start = x.clock.total_at(t);
+    let arm = Arc::new(SetArm::new());
+    assert!(arm.switcher_ready());
+    let mut set = take_set(
+        "salvo",
+        "p",
+        &[(1, src()), (2, PictureBus::Program)],
+        Some(&arm),
+    );
+    set.members[1].audio = Some(bars_src());
+    x.h.try_take_set(set).unwrap();
+    let mut got = Vec::new();
+    let mut proposed = None;
+    for _ in 0..120 {
+        x.tick(t);
+        // The switcher never composes T: the dispatcher's decision refuses.
+        if arm.state() == ArmState::Proposed {
+            proposed = Some(arm.tick());
+        }
+        got.extend(x.outcomes.try_iter().map(|o| (o.output_index, o.outcome)));
+        t += 1;
+        if got.len() >= 2 {
+            break;
+        }
+    }
+    let at = proposed.expect("T was proposed");
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(
+        got.iter().all(|(_, r)| matches!(r, TakeResult::Refused(_))),
+        "{got:?}"
+    );
+    t = x.run(t, 8);
+    let _ = t;
+    assert_eq!(x.d.binding_audio_key(2), Some(old_key), "the old bus stays");
+    assert_eq!(x.d.binding_video_key(1), Some(0));
+    let audio = x.r.audio.as_ref().unwrap();
+    // Output 1's refused bus closed too: only output 2's old bus remains.
+    assert_eq!(audio.private_buses(), 1, "the staged bus closed");
+    assert!(audio.has_private_bus(2));
+    assert_eq!(audio.choice(2), AudioChoice::Silence, "choice restored");
+    let tap = x.tap.lock().unwrap();
+    let g = grid_ceil(x.clock.total_at(at), AAC_FRAME_SAMPLES);
+    let fed_after_g: usize = tap
+        .private
+        .iter()
+        .filter(|p| p.0 == 2 && p.1 >= g)
+        .map(|p| p.2.len())
+        .sum();
+    assert!(fed_after_g > 4096, "the old bus kept running past G");
+    for (_, start, pcm) in tap.private.iter().filter(|p| p.0 == 2 && p.1 >= set_start) {
+        assert!(
+            pcm.iter().all(|v| *v == 0.0),
+            "no bars sample ever reached the bus on air (block at {start})"
+        );
+    }
+}

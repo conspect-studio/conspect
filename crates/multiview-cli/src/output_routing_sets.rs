@@ -897,10 +897,9 @@ impl OutputRouter {
                 continue;
             };
             let bus = bus.unwrap_or(PictureBus::Program);
-            let prep = self
-                .audio
-                .as_mut()
-                .map_or(AudioPrep::Failed, |a| a.prepare(i, &bus, &choice));
+            let prep = self.audio.as_mut().map_or(AudioPrep::Failed, |a| {
+                a.prepare(i, &bus, &choice, tick, dispatcher)
+            });
             match prep {
                 AudioPrep::Unchanged => {}
                 AudioPrep::Ready => stays.push((i, key)),

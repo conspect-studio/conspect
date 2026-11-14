@@ -1353,8 +1353,21 @@ impl RenditionDispatcher {
             if b.video_key == Some(key) {
                 // A member that stays on its key (its audio changes at `at`,
                 // review A-3): no RAP, no decoder-config decision, but window
-                // `at` must not have gone out yet.
+                // `at` must not have gone out yet, and its audio move gated
+                // on this move must still stand (a staged or new private bus
+                // that failed or was refused refuses the set, review A-4).
                 if b.pending.front().is_some_and(|head| head.index > g.at) {
+                    return Some(Err(MoveRefusal::EncoderNotReady));
+                }
+                let audio_ok = b.audio_mv.is_some_and(|am| {
+                    am.after_video == Some((key, generation))
+                        && am.key.is_none_or(|k| {
+                            self.dyn_audio.get(k).is_some_and(|a| {
+                                !a.failed && !a.retired && a.generation == am.generation
+                            })
+                        })
+                });
+                if !audio_ok {
                     return Some(Err(MoveRefusal::EncoderNotReady));
                 }
                 continue;

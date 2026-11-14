@@ -348,6 +348,9 @@ pub(crate) struct AudioTap {
     pub(crate) fades: Vec<(usize, u64, u64)>,
     /// Each issued return to the shared stream: `(output, G')`.
     pub(crate) returns: Vec<(usize, u64)>,
+    /// PCM fed to each output's *staged* bus (#308 review A-4), as
+    /// `private`; once promoted, its PCM is recorded in `private`.
+    pub(crate) staged: Vec<(usize, u64, Vec<f32>)>,
 }
 
 /// Shared [`AudioTap`] (router, handle and test).
@@ -363,7 +366,43 @@ struct OutputAudio {
     /// before it (faded back to on refusal).
     pending_change: Option<AudioSource>,
     bus: Option<PrivateBus>,
+    /// An atomic set member's audio change while the output reads `bus`
+    /// (#308 review A-4): a second bus carrying the new audio, its slot
+    /// move gated on the set's shared decision. `bus` keeps carrying the
+    /// old audio untouched until the move lands (then this bus replaces
+    /// it); a refused set closes it and nothing fades. At most one.
+    staged: Option<Staged>,
     watch: Option<Watch>,
+}
+
+struct Staged {
+    bus: PrivateBus,
+    /// The choice before the set installed its audio (restored when the
+    /// staged bus closes without its move landing).
+    restore: Option<AudioChoice>,
+}
+
+/// One tick's PCM inputs, shared by every bus `feed` feeds.
+struct FeedCtx<'a> {
+    program: &'a AudioBlock,
+    inputs: &'a [(&'a str, &'a AudioBlock)],
+    preview: Option<&'a str>,
+    gain: &'a (dyn Fn(&str) -> f32 + Send + Sync),
+    frames: usize,
+    channels: usize,
+    end: u64,
+    block_start: u64,
+    len: u64,
+    program_config: Option<&'a Vec<u8>>,
+}
+
+/// How one bus's feed went.
+enum Fed {
+    Ok,
+    /// The bus failed (worker, full queue).
+    Failed,
+    /// Its deferred slot move was refused (format mismatch).
+    Refused,
 }
 
 /// The routed-audio manager, owned by the router on the bake consumer.
@@ -412,6 +451,7 @@ impl RoutedAudio {
                     restore: None,
                     pending_change: None,
                     bus: None,
+                    staged: None,
                     watch: None,
                 })
                 .collect(),
@@ -432,7 +472,10 @@ impl RoutedAudio {
     }
 
     pub(crate) fn private_buses(&self) -> usize {
-        self.outputs.iter().filter(|o| o.bus.is_some()).count()
+        self.outputs
+            .iter()
+            .map(|o| usize::from(o.bus.is_some()) + usize::from(o.staged.is_some()))
+            .sum()
     }
 
     /// Whether `output` runs a private audio bus now.
@@ -456,7 +499,7 @@ impl RoutedAudio {
     fn carried(&self, output: usize) -> AudioSource {
         self.outputs
             .get(output)
-            .and_then(|o| o.bus.as_ref())
+            .and_then(|o| o.staged.as_ref().map(|s| &s.bus).or(o.bus.as_ref()))
             .map_or(AudioSource::Program, |b| b.target().clone())
     }
 
@@ -526,18 +569,27 @@ impl RoutedAudio {
     /// video `target`) at a set's tick: its private bus (opened by
     /// [`Self::admit`]) must be live and bindable now, so the change never
     /// fails after the other members moved.
+    ///
+    /// An output that already reads a private bus (#308 review A-4) gets a
+    /// **staged** bus instead: opened here at `tick`, carrying the same
+    /// audio as the bus on air (both encoders code one signal up to `G`),
+    /// warmed like a fresh bus. The set's tick then moves the slot onto it,
+    /// gated on the set's shared decision; the bus on air is never touched
+    /// before that decision, so a refused set delivers its old audio.
     pub(crate) fn prepare(
         &mut self,
         output: usize,
         target: &PictureBus,
         choice: &AudioChoice,
+        tick: u64,
+        dispatcher: &mut RenditionDispatcher,
     ) -> AudioPrep {
         let to = choice.resolve(target);
         let program_config = self.program_config.clone();
-        let Some(o) = self.outputs.get_mut(output) else {
+        let Some(o) = self.outputs.get(output) else {
             return AudioPrep::Failed;
         };
-        let Some(bus) = o.bus.as_mut() else {
+        let Some(bus) = o.bus.as_ref() else {
             return if to == AudioSource::Program {
                 AudioPrep::Unchanged
             } else {
@@ -548,10 +600,48 @@ impl RoutedAudio {
             return AudioPrep::Failed;
         }
         if *bus.target() == to && bus.bind.on_air() {
+            self.close_staged(output, false, dispatcher);
             return AudioPrep::Unchanged;
         }
-        // Warm (rule 2): the bus coded WARM_FRAMES before any `G` it may
-        // fade at, so the change lands at the set's tick, not later.
+        if !bus.bind.on_air() && !matches!(bus.bind, Bind::Returning(_)) {
+            // Not on air: the change moves the slot onto this bus at `G`.
+            let Some(bus) = self.outputs.get_mut(output).and_then(|o| o.bus.as_mut()) else {
+                return AudioPrep::Failed;
+            };
+            return Self::bus_ready(bus, program_config.as_ref());
+        }
+        // On air: stage a second bus once the one on air carries one settled
+        // signal (no fade, nothing queued, its slot move landed).
+        if bus.bind != Bind::Bound || bus.fade.is_some() || bus.queued.is_some() {
+            return AudioPrep::Pending;
+        }
+        let carried = bus.current.clone();
+        let stale = o.staged.as_ref().is_some_and(|s| {
+            s.bus.current != carried || s.bus.fade.is_some() || s.bus.bind != Bind::Unbound
+        });
+        if stale {
+            self.close_staged(output, false, dispatcher);
+        }
+        if self.outputs.get(output).is_some_and(|o| o.staged.is_none()) {
+            let Some(bus) = self.spawn_bus(tick, carried, dispatcher) else {
+                return AudioPrep::Failed;
+            };
+            if let Some(o) = self.outputs.get_mut(output) {
+                o.staged = Some(Staged { bus, restore: None });
+            }
+        }
+        let Some(staged) = self.outputs.get_mut(output).and_then(|o| o.staged.as_mut()) else {
+            return AudioPrep::Failed;
+        };
+        if staged.bus.failed.load(Ordering::Acquire) {
+            return AudioPrep::Failed;
+        }
+        Self::bus_ready(&mut staged.bus, program_config.as_ref())
+    }
+
+    /// Whether `bus` is warm (rule 2: it coded `WARM_FRAMES` before any `G`
+    /// it may fade at) and its encoder reported the program's configuration.
+    fn bus_ready(bus: &mut PrivateBus, program_config: Option<&Vec<u8>>) -> AudioPrep {
         let warm = bus
             .start
             .saturating_add(WARM_FRAMES.saturating_mul(AAC_FRAME_SAMPLES));
@@ -566,7 +656,7 @@ impl RoutedAudio {
             }
         }
         match &bus.config_seen {
-            ConfigState::Known(Some(c)) if program_config.as_ref() == Some(c) => AudioPrep::Ready,
+            ConfigState::Known(Some(c)) if program_config == Some(c) => AudioPrep::Ready,
             _ => AudioPrep::Failed,
         }
     }
@@ -578,13 +668,29 @@ impl RoutedAudio {
         if self.outputs.get(output).is_none_or(|o| o.bus.is_some()) {
             return false;
         }
-        let start = grid_ceil(self.clock.total_at(tick), AAC_FRAME_SAMPLES);
-        let Ok(start_i64) = i64::try_from(start) else {
+        let Some(bus) = self.spawn_bus(tick, AudioSource::Program, dispatcher) else {
             return false;
         };
+        let Some(o) = self.outputs.get_mut(output) else {
+            return false;
+        };
+        o.bus = Some(bus);
+        true
+    }
+
+    /// Start one private bus (its dispatcher stage and encode thread) at
+    /// the grid boundary at or after `total_at(tick)`, carrying `current`.
+    fn spawn_bus(
+        &mut self,
+        tick: u64,
+        current: AudioSource,
+        dispatcher: &mut RenditionDispatcher,
+    ) -> Option<PrivateBus> {
+        let start = grid_ceil(self.clock.total_at(tick), AAC_FRAME_SAMPLES);
+        let start_i64 = i64::try_from(start).ok()?;
         let Ok((key, generation)) = dispatcher.add_audio_key() else {
             self.counters.refused = self.counters.refused.saturating_add(1);
-            return false;
+            return None;
         };
         let failed = Arc::new(AtomicBool::new(false));
         let (config_tx, config_rx) = mpsc::sync_channel(1);
@@ -604,13 +710,10 @@ impl RoutedAudio {
         let Ok(jobs) = spawned else {
             let _ = dispatcher.retire_audio_key(key);
             self.counters.failed = self.counters.failed.saturating_add(1);
-            return false;
+            return None;
         };
         self.counters.opened = self.counters.opened.saturating_add(1);
-        let Some(o) = self.outputs.get_mut(output) else {
-            return false;
-        };
-        o.bus = Some(PrivateBus {
+        Some(PrivateBus {
             key,
             generation,
             start,
@@ -618,15 +721,77 @@ impl RoutedAudio {
             config: config_rx,
             config_seen: ConfigState::Pending,
             failed,
-            current: AudioSource::Program,
+            current,
             fade: None,
             queued: None,
             bind: Bind::Unbound,
             reserved: false,
             fed: start,
             settled_from: start,
-        });
+        })
+    }
+
+    /// Schedule a staged bus's change to `to` at `move_tick`'s grid
+    /// boundary, its slot move gated on the video move to `after`. Returns
+    /// `false` (the staged bus closed, the choice restored) when refused.
+    fn schedule_staged(
+        &mut self,
+        output: usize,
+        to: &AudioSource,
+        move_tick: u64,
+        after: Option<usize>,
+        dispatcher: &mut RenditionDispatcher,
+    ) -> bool {
+        let len = take_fade_len(&self.clock, move_tick);
+        let at = self.clock.total_at(move_tick);
+        let program_config = self.program_config.clone();
+        let Some(st) = self.outputs.get_mut(output).and_then(|o| o.staged.as_mut()) else {
+            return false;
+        };
+        let bus = &mut st.bus;
+        let warm = bus
+            .start
+            .saturating_add(WARM_FRAMES.saturating_mul(AAC_FRAME_SAMPLES));
+        let at_g = grid_ceil(at.max(warm).max(bus.fed), AAC_FRAME_SAMPLES);
+        if bus.current != *to {
+            bus.fade = Some(Fade {
+                xf: TakeCrossfade { start: at_g, len },
+                from: bus.current.clone(),
+                to: to.clone(),
+            });
+        }
+        bus.bind = Bind::Deferred { after };
+        if !Self::try_bind(output, bus, program_config.as_ref(), dispatcher) {
+            self.counters.refused = self.counters.refused.saturating_add(1);
+            tracing::info!(output, "routing: staged audio move refused");
+            self.close_staged(output, true, dispatcher);
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(Ok(mut t)) = self.tap.as_ref().map(|t| t.lock()) {
+            t.moves.push((output, at_g));
+        }
         true
+    }
+
+    /// Close the output's staged bus without its move landing: its stage is
+    /// retired (a move toward it is dropped), the bus on air keeps its
+    /// audio; `restore` restores the choice the set installed.
+    fn close_staged(&mut self, output: usize, restore: bool, dispatcher: &mut RenditionDispatcher) {
+        let Some(o) = self.outputs.get_mut(output) else {
+            return;
+        };
+        let Some(st) = o.staged.take() else {
+            return;
+        };
+        if restore {
+            if let Some(old) = st.restore {
+                o.choice = old;
+                o.restore = None;
+            }
+        }
+        let _ = dispatcher.retire_audio_key(st.bus.key);
+        drop(st.bus.jobs);
     }
 
     /// The router issued the output's video move at move tick `move_tick`
@@ -662,6 +827,16 @@ impl RoutedAudio {
             bus.reserved = false;
         }
         let to = o.choice.resolve(target);
+        if o.staged.is_some() {
+            // A set member staying on its video (review A-4): the staged
+            // bus takes the change; the bus on air is untouched until the
+            // set's decision lands the slot move.
+            if let (Some(st), Some(old)) = (o.staged.as_mut(), o.restore.clone()) {
+                st.restore = Some(old);
+            }
+            let _ = self.schedule_staged(output, &to, move_tick, after_video, dispatcher);
+            return;
+        }
         let changed = self.change(output, &to, move_tick, Mode::Bind(after_video), dispatcher);
         if let (Change::Scheduled(_), Some(_)) = (changed, after_video) {
             if let Some(o) = self.outputs.get_mut(output) {
@@ -705,6 +880,9 @@ impl RoutedAudio {
         tick: u64,
         dispatcher: &mut RenditionDispatcher,
     ) {
+        // A staged change (review A-4) never reached the output: close it;
+        // the bus on air carried the old audio throughout, nothing fades.
+        self.close_staged(output, true, dispatcher);
         let Some(o) = self.outputs.get_mut(output) else {
             return;
         };
@@ -834,6 +1012,19 @@ impl RoutedAudio {
         mode: Mode,
         dispatcher: &mut RenditionDispatcher,
     ) -> Change {
+        // A staged change (review A-4) already heading to `to` stands; any
+        // other change supersedes it (at most one staged bus per output).
+        let staged_to = self
+            .outputs
+            .get(output)
+            .and_then(|o| o.staged.as_ref())
+            .map(|s| s.bus.target() == to);
+        if staged_to == Some(true) {
+            return Change::Unchanged;
+        }
+        if staged_to.is_some() {
+            self.close_staged(output, false, dispatcher);
+        }
         let has_bus = self.outputs.get(output).is_some_and(|o| o.bus.is_some());
         if !has_bus {
             if *to == AudioSource::Program || matches!(mode, Mode::Quiet) {
@@ -981,6 +1172,29 @@ impl RoutedAudio {
             MoveOutcome::AudioApplied {
                 output_index, key, ..
             } => {
+                let promoted = self
+                    .outputs
+                    .get(output_index)
+                    .is_some_and(|o| o.staged.as_ref().is_some_and(|s| key == Some(s.bus.key)));
+                if promoted {
+                    // The set's decision landed the staged move (review
+                    // A-4): the staged bus becomes the output's bus; the old
+                    // one, read by nobody now, closes.
+                    let Some(o) = self.outputs.get_mut(output_index) else {
+                        return;
+                    };
+                    let Some(mut st) = o.staged.take() else {
+                        return;
+                    };
+                    st.bus.bind = Bind::Bound;
+                    o.restore = None;
+                    o.pending_change = None;
+                    if let Some(old) = o.bus.replace(st.bus) {
+                        let _ = dispatcher.retire_audio_key(old.key);
+                        drop(old.jobs);
+                    }
+                    return;
+                }
                 let Some(bus) = self
                     .outputs
                     .get_mut(output_index)
@@ -999,6 +1213,17 @@ impl RoutedAudio {
                 }
             }
             MoveOutcome::AudioRefused { output_index } => {
+                // A staged move dropped (its gating video move refused or
+                // superseded): the staged bus closes, nothing changed.
+                let staged_gated = self
+                    .outputs
+                    .get(output_index)
+                    .and_then(|o| o.staged.as_ref())
+                    .is_some_and(|s| matches!(s.bus.bind, Bind::Gated | Bind::Requested));
+                if staged_gated {
+                    self.close_staged(output_index, true, dispatcher);
+                    return;
+                }
                 let Some(o) = self.outputs.get_mut(output_index) else {
                     return;
                 };
@@ -1015,10 +1240,10 @@ impl RoutedAudio {
         }
     }
 
-    /// Feed one tick of PCM to every private bus. `program` is the
-    /// post-loudnorm program block; `inputs` the per-source clean blocks of
-    /// the same mix. Never blocks: a full queue fails that bus alone.
-    #[allow(clippy::too_many_lines)] // One per-bus feed state machine.
+    /// Feed one tick of PCM to every private bus (and staged bus). `program`
+    /// is the post-loudnorm program block; `inputs` the per-source clean
+    /// blocks of the same mix. Never blocks: a full queue fails that bus
+    /// alone.
     pub(crate) fn feed(
         &mut self,
         tick: u64,
@@ -1027,130 +1252,64 @@ impl RoutedAudio {
         dispatcher: &mut RenditionDispatcher,
     ) {
         let frames = program.frame_count();
-        if frames == 0 || self.outputs.iter().all(|o| o.bus.is_none()) {
+        if frames == 0
+            || self
+                .outputs
+                .iter()
+                .all(|o| o.bus.is_none() && o.staged.is_none())
+        {
             return;
         }
         let end = self.clock.total_at(tick.saturating_add(1));
-        let block_start = end.saturating_sub(u64::try_from(frames).unwrap_or(u64::MAX));
-        let len = take_fade_len(&self.clock, tick);
         let preview: Option<Arc<str>> = self.preview.as_ref().and_then(|p| p.load());
         let program_config = self.program_config.clone();
+        let ctx = FeedCtx {
+            program,
+            inputs,
+            preview: preview.as_deref(),
+            gain: &*self.route_gain,
+            frames,
+            channels: self.channels,
+            end,
+            block_start: end.saturating_sub(u64::try_from(frames).unwrap_or(u64::MAX)),
+            len: take_fade_len(&self.clock, tick),
+            program_config: program_config.as_ref(),
+        };
         let mut failed = Vec::new();
         let mut refused = Vec::new();
+        let mut staged_failed = Vec::new();
         for (output, o) in self.outputs.iter_mut().enumerate() {
-            let Some(bus) = o.bus.as_mut() else {
-                continue;
-            };
-            if bus.failed.load(Ordering::Acquire) {
-                failed.push(output);
-                continue;
-            }
-            if let Bind::Deferred { .. } = bus.bind {
-                if !Self::try_bind(output, bus, program_config.as_ref(), dispatcher) {
-                    refused.push(output);
-                    continue;
-                }
-                // Still unknown: hold the old signal (both encoders code it)
-                // until the slot can move; the fade starts later.
-                if let (Bind::Deferred { .. }, Some(f)) = (bus.bind, bus.fade.as_mut()) {
-                    if f.xf.start >= bus.fed && f.xf.start < end {
-                        f.xf.start = grid_ceil(end, AAC_FRAME_SAMPLES);
-                        if let Some(w) = o.watch.as_mut() {
-                            w.g = Some(f.xf.start);
-                        }
-                    }
-                }
-            }
-            if end <= bus.start {
-                continue;
-            }
-            let from = bus.start.max(block_start).max(bus.fed);
-            let skip = usize::try_from(from.saturating_sub(block_start)).unwrap_or(usize::MAX);
-            let ch = self.channels;
-            let gain = &*self.route_gain;
-            let (old, new, out) = (
-                &mut self.scratch.0,
-                &mut self.scratch.1,
-                &mut self.scratch.2,
-            );
-            let pcm_into = |src: &AudioSource, dst: &mut Vec<f32>| {
-                source_pcm_into(
-                    dst,
-                    src,
-                    program,
-                    inputs,
-                    preview.as_deref(),
-                    gain,
-                    frames,
-                    ch,
-                );
-            };
-            out.clear();
-            match bus.fade.as_ref() {
-                Some(fade) => {
-                    pcm_into(&fade.from, old);
-                    pcm_into(&fade.to, new);
-                    fade.xf.mix_into(old, new, ch, block_start, out);
+            if let Some(bus) = o.bus.as_mut() {
+                let fed = Self::feed_bus(
+                    output,
+                    bus,
+                    o.watch.as_mut(),
+                    &ctx,
+                    &mut self.scratch,
+                    dispatcher,
                     #[cfg(test)]
-                    if fade.xf.start >= from && fade.xf.start < end {
-                        if let Some(Ok(mut t)) = self.tap.as_ref().map(|t| t.lock()) {
-                            t.fades.push((output, fade.xf.start, fade.xf.len));
-                        }
-                    }
-                }
-                None => pcm_into(&bus.current, out),
-            }
-            // The one per-tick allocation: the job crosses to the bus's
-            // encode thread by value.
-            let tail = out.get(skip.saturating_mul(ch)..).map(<[f32]>::to_vec);
-            let Some(tail) = tail else {
-                continue;
-            };
-            if tail.is_empty() {
-                continue;
-            }
-            #[cfg(test)]
-            if let Some(Ok(mut t)) = self.tap.as_ref().map(|t| t.lock()) {
-                t.private.push((output, from, tail.clone()));
-            }
-            bus.fed = end;
-            let ended = bus
-                .fade
-                .as_ref()
-                .filter(|f| end >= f.xf.end())
-                .map(|f| f.xf.end());
-            if let Some(fade_end) = ended {
-                if let Some(f) = bus.fade.take() {
-                    bus.current = f.to;
-                }
-                bus.settled_from = fade_end;
-                if let Some(next) = bus.queued.take() {
-                    if next != bus.current {
-                        let g = grid_ceil(fade_end.max(end), AAC_FRAME_SAMPLES);
-                        bus.fade = Some(Fade {
-                            xf: TakeCrossfade { start: g, len },
-                            from: bus.current.clone(),
-                            to: next,
-                        });
-                        if let Some(w) = o.watch.as_mut().filter(|w| w.g.is_none()) {
-                            w.g = Some(g);
-                        }
-                        #[cfg(test)]
-                        if let Some(Ok(mut t)) = self.tap.as_ref().map(|t| t.lock()) {
-                            t.moves.push((output, g));
-                        }
-                    }
+                    self.tap.as_ref().map(|t| (t, false)),
+                );
+                match fed {
+                    Fed::Ok => {}
+                    Fed::Failed => failed.push(output),
+                    Fed::Refused => refused.push(output),
                 }
             }
-            let sent = bus
-                .jobs
-                .as_ref()
-                .is_some_and(|jobs| match jobs.try_send(tail) {
-                    Ok(()) => true,
-                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
-                });
-            if !sent {
-                failed.push(output);
+            if let Some(st) = o.staged.as_mut() {
+                let fed = Self::feed_bus(
+                    output,
+                    &mut st.bus,
+                    None,
+                    &ctx,
+                    &mut self.scratch,
+                    dispatcher,
+                    #[cfg(test)]
+                    self.tap.as_ref().map(|t| (t, true)),
+                );
+                if !matches!(fed, Fed::Ok) {
+                    staged_failed.push(output);
+                }
             }
         }
         for output in refused {
@@ -1163,7 +1322,138 @@ impl RoutedAudio {
         for output in failed {
             self.fail(output, dispatcher);
         }
+        for output in staged_failed {
+            self.fail_staged(output, dispatcher);
+        }
         self.settle(dispatcher);
+    }
+
+    /// Feed one tick of PCM to one bus (its fade, queued change and
+    /// deferred slot move advanced). Never blocks.
+    #[allow(clippy::too_many_lines)] // One per-bus feed state machine.
+    fn feed_bus(
+        output: usize,
+        bus: &mut PrivateBus,
+        mut watch: Option<&mut Watch>,
+        ctx: &FeedCtx<'_>,
+        scratch: &mut (Vec<f32>, Vec<f32>, Vec<f32>),
+        dispatcher: &mut RenditionDispatcher,
+        #[cfg(test)] tap: Option<(&AudioTapCell, bool)>,
+    ) -> Fed {
+        let (end, block_start, len) = (ctx.end, ctx.block_start, ctx.len);
+        if bus.failed.load(Ordering::Acquire) {
+            return Fed::Failed;
+        }
+        if let Bind::Deferred { .. } = bus.bind {
+            if !Self::try_bind(output, bus, ctx.program_config, dispatcher) {
+                return Fed::Refused;
+            }
+            // Still unknown: hold the old signal (both encoders code it)
+            // until the slot can move; the fade starts later.
+            if let (Bind::Deferred { .. }, Some(f)) = (bus.bind, bus.fade.as_mut()) {
+                if f.xf.start >= bus.fed && f.xf.start < end {
+                    f.xf.start = grid_ceil(end, AAC_FRAME_SAMPLES);
+                    if let Some(w) = watch.as_deref_mut() {
+                        w.g = Some(f.xf.start);
+                    }
+                }
+            }
+        }
+        if end <= bus.start {
+            return Fed::Ok;
+        }
+        let from = bus.start.max(block_start).max(bus.fed);
+        let skip = usize::try_from(from.saturating_sub(block_start)).unwrap_or(usize::MAX);
+        let ch = ctx.channels;
+        let (old, new, out) = (&mut scratch.0, &mut scratch.1, &mut scratch.2);
+        let pcm_into = |src: &AudioSource, dst: &mut Vec<f32>| {
+            source_pcm_into(
+                dst,
+                src,
+                ctx.program,
+                ctx.inputs,
+                ctx.preview,
+                ctx.gain,
+                ctx.frames,
+                ch,
+            );
+        };
+        out.clear();
+        match bus.fade.as_ref() {
+            Some(fade) => {
+                pcm_into(&fade.from, old);
+                pcm_into(&fade.to, new);
+                fade.xf.mix_into(old, new, ch, block_start, out);
+                #[cfg(test)]
+                if fade.xf.start >= from && fade.xf.start < end {
+                    if let Some(Ok(mut t)) = tap.map(|t| t.0.lock()) {
+                        t.fades.push((output, fade.xf.start, fade.xf.len));
+                    }
+                }
+            }
+            None => pcm_into(&bus.current, out),
+        }
+        // The one per-tick allocation: the job crosses to the bus's encode
+        // thread by value.
+        let tail = out.get(skip.saturating_mul(ch)..).map(<[f32]>::to_vec);
+        let Some(tail) = tail else {
+            return Fed::Ok;
+        };
+        if tail.is_empty() {
+            return Fed::Ok;
+        }
+        #[cfg(test)]
+        if let Some((cell, staged)) = tap {
+            if let Ok(mut t) = cell.lock() {
+                let rec = (output, from, tail.clone());
+                if staged {
+                    t.staged.push(rec);
+                } else {
+                    t.private.push(rec);
+                }
+            }
+        }
+        bus.fed = end;
+        let ended = bus
+            .fade
+            .as_ref()
+            .filter(|f| end >= f.xf.end())
+            .map(|f| f.xf.end());
+        if let Some(fade_end) = ended {
+            if let Some(f) = bus.fade.take() {
+                bus.current = f.to;
+            }
+            bus.settled_from = fade_end;
+            if let Some(next) = bus.queued.take() {
+                if next != bus.current {
+                    let g = grid_ceil(fade_end.max(end), AAC_FRAME_SAMPLES);
+                    bus.fade = Some(Fade {
+                        xf: TakeCrossfade { start: g, len },
+                        from: bus.current.clone(),
+                        to: next,
+                    });
+                    if let Some(w) = watch.filter(|w| w.g.is_none()) {
+                        w.g = Some(g);
+                    }
+                    #[cfg(test)]
+                    if let Some(Ok(mut t)) = tap.map(|t| t.0.lock()) {
+                        t.moves.push((output, g));
+                    }
+                }
+            }
+        }
+        let sent = bus
+            .jobs
+            .as_ref()
+            .is_some_and(|jobs| match jobs.try_send(tail) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+            });
+        if sent {
+            Fed::Ok
+        } else {
+            Fed::Failed
+        }
     }
 
     /// Return idle buses to the shared program stream (§5.2) and close buses
@@ -1178,7 +1468,8 @@ impl RoutedAudio {
                 || bus.fade.is_some()
                 || bus.queued.is_some()
                 || o.watch.is_some()
-                || o.pending_change.is_some();
+                || o.pending_change.is_some()
+                || o.staged.is_some();
             if busy {
                 continue;
             }
@@ -1240,7 +1531,7 @@ impl RoutedAudio {
             let Some(key) = self
                 .outputs
                 .iter()
-                .filter_map(|o| o.bus.as_ref())
+                .flat_map(|o| o.bus.iter().chain(o.staged.iter().map(|s| &s.bus)))
                 .find(|b| b.generation == event.generation && b.key == event.key)
                 .map(|b| b.key)
             else {
@@ -1276,6 +1567,20 @@ impl RoutedAudio {
         for output in gone {
             self.fail(output, dispatcher);
         }
+        let gone_staged: Vec<usize> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                o.staged
+                    .as_ref()
+                    .filter(|s| dispatcher.is_audio_key_failed(s.bus.key))
+                    .map(|_| i)
+            })
+            .collect();
+        for output in gone_staged {
+            self.fail_staged(output, dispatcher);
+        }
         Ok(())
     }
 
@@ -1294,10 +1599,21 @@ impl RoutedAudio {
         self.close(output, dispatcher);
     }
 
+    /// The output's staged bus failed before its move landed: it closes
+    /// alone; the bus on air keeps the old audio (the set's move of this
+    /// output's audio is dropped, so the set refuses as a whole).
+    fn fail_staged(&mut self, output: usize, dispatcher: &mut RenditionDispatcher) {
+        self.counters.failed = self.counters.failed.saturating_add(1);
+        tracing::warn!(output, "routing: the output's staged audio bus failed");
+        self.close_staged(output, true, dispatcher);
+    }
+
     /// Retire the bus's stage and close its input (the thread finishes and
     /// ends on its own; never joined here). The output's slot returns to the
-    /// shared program stage (the dispatcher's `AudioFallback`).
+    /// shared program stage (the dispatcher's `AudioFallback`). A staged bus
+    /// closes with it.
     fn close(&mut self, output: usize, dispatcher: &mut RenditionDispatcher) {
+        self.close_staged(output, true, dispatcher);
         if let Some(bus) = self.outputs.get_mut(output).and_then(|o| o.bus.take()) {
             let _ = dispatcher.retire_audio_key(bus.key);
             drop(bus.jobs);

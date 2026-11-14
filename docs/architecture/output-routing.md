@@ -2327,6 +2327,18 @@ slots at the grid boundary G(T).
   carries its previous source.
 - If any member fails, nothing changes and every member gets the same refusal. A single take for a
   member that lands first supersedes the set as a whole (ADR-0108 §6.2).
+- **Audio of a member that keeps its video** (#308 reviews A-3, A-4). Its audio change is part of
+  the shared decision: the slot move is gated on that member's grouped (no-cut) move, and the set
+  is proposed only once that audio is ready (bus warm for 2 AAC frames, `AudioSpecificConfig`
+  identical to the program's), else the set waits or is refused whole. An output that reads the
+  shared program stage gets a new private bus. An output that already reads a private bus gets a
+  **staged** second bus. It is opened at preparation carrying the same audio as the bus on air,
+  and it is the only bus that fades to the new audio at G(T). The bus on air is never touched
+  before the decision. When the group applies, the slot moves onto the staged bus at G(T) and the
+  old bus closes. When the group is refused, superseded or failed, the staged bus closes, the
+  output keeps its old audio, nothing fades and the choice is restored. There is at most one staged
+  bus per output (a newer change replaces it), and it counts as a live private bus against the
+  dynamic audio-stage cap.
 
 **Admission of a multi-crosspoint take (per principal; §4.3 and §6.4 carried forward).**
 
