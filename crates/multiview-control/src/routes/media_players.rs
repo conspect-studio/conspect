@@ -49,6 +49,7 @@ use crate::state::AppState;
 /// needs no body (`play`/`pause`/`stop`, or `cue`/`seek` to the in-point) may
 /// carry an empty body.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TransportBody {
     /// The media-library asset id (required for `load`, ignored otherwise).
@@ -58,6 +59,23 @@ pub struct TransportBody {
     /// (ADR-T015); used by `cue`/`seek`. Absent cues/seeks to the in-point.
     #[serde(default)]
     pub frame: Option<u64>,
+    /// Exact completed capture identity; mutually exclusive with legacy asset.
+    #[serde(default, rename = "artifactRef")]
+    pub artifact_ref: Option<crate::player_load::ArtifactRef>,
+    /// Native commit landing intent; defaults to cue.
+    #[serde(default)]
+    pub then: crate::player_load::LoadThen,
+}
+
+/// Wire responses of the legacy command and explicit native artifact load.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum LoadResponse {
+    /// Existing command-bus receipt, not proof of native adoption.
+    Legacy(crate::routes::AcceptedBody),
+    /// Native operation and its actual adoption state.
+    Artifact(crate::player_load::LoadOperation),
 }
 
 /// Parse an optional transport body: an **empty** request body yields the
@@ -179,10 +197,11 @@ pub(crate) async fn get_player(
         post,
         path = "/api/v1/media/players/{id}/load",
         tag = "media-players",
-        params(("id" = String, Path, description = "Media-player id.")),
+        params(("id" = String, Path, description = "Media-player id."),
+               ("Idempotency-Key" = String, Header, description = "Required for artifactRef; stable actor-scoped retry key.")),
         request_body = TransportBody,
         responses(
-            (status = 202, description = "Load accepted; outcome on the realtime stream.", body = crate::routes::AcceptedBody),
+            (status = 202, description = "Legacy load returns an accepted command; artifactRef load returns an operation whose completion requires native video and audio adoption.", body = LoadResponse),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized.", body = crate::problem::Problem),
             (status = 404, description = "No media player with that id.", body = crate::problem::Problem),
@@ -199,6 +218,50 @@ pub(crate) async fn load_player(
     body: Bytes,
 ) -> ControlResult<Response> {
     let parsed = parse_transport_body(&body)?;
+    if let Some(reference) = parsed.artifact_ref {
+        if reference.artifact_id.len() > 256 || reference.artifact_id.is_empty() {
+            return Err(ControlError::Validation(
+                "invalid artifact identity length".into(),
+            ));
+        }
+        if parsed.asset.is_some() || parsed.frame.is_some() {
+            return Err(ControlError::Validation(
+                "artifactRef is exclusive with asset/frame".into(),
+            ));
+        }
+        principal.role.require(Action::Write)?;
+        crate::auth::authorize_object(&principal, &id)?;
+        state.media_players.get(&id)?;
+        let key = idem.0.ok_or_else(|| {
+            ControlError::Validation("artifact load requires Idempotency-Key".into())
+        })?;
+        if key.is_empty() || key.len() > 256 || !key.is_ascii() {
+            return Err(ControlError::Validation(
+                "invalid artifact load Idempotency-Key".into(),
+            ));
+        }
+        let audit_player = id.clone();
+        let audit_actor = principal.key_id.clone();
+        let audit_state = state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let lease = state.web_capture.pin_for_player(
+                &principal,
+                reference.capture_job_id,
+                &reference.artifact_id,
+            )?;
+            state
+                .player_load
+                .load(&id, &principal, &key, reference, parsed.then, lease)
+        })
+        .await
+        .map_err(|_| ControlError::EngineBusy)??;
+        audit_state.audit(&audit_actor, crate::audit::AuditAction::Command, "media-player", &audit_player,
+            Some(serde_json::json!({"kind":"artifact_load", "operation":result.operation, "state":result.state})));
+        return Ok(axum::response::IntoResponse::into_response((
+            axum::http::StatusCode::ACCEPTED,
+            Json(result),
+        )));
+    }
     let asset = parsed.asset.ok_or_else(|| {
         ControlError::Validation("media player load requires an `asset` id".to_owned())
     })?;
@@ -209,6 +272,35 @@ pub(crate) async fn load_player(
         &idem,
         MediaTransportVerb::Load { asset },
     )
+}
+
+/// Read one actor- and player-scoped native load operation.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/api/v1/media/players/{id}/load-operations/{operation}",
+    operation_id = "get_player_load_operation",
+    tag = "media-players",
+    params(("id" = String, Path, description = "Authorized player identity."),
+           ("operation" = u64, Path, description = "Native load generation.")),
+    responses(
+        (status = 200, description = "Actual native load outcome.", body = crate::player_load::LoadOperation),
+        (status = 401, description = "Authentication required.", body = crate::problem::Problem),
+        (status = 403, description = "Player access denied.", body = crate::problem::Problem),
+        (status = 404, description = "Operation is unknown or belongs to another actor.", body = crate::problem::Problem),
+        (status = 503, description = "Native player provider unavailable.", body = crate::problem::Problem)
+    )
+))]
+pub(crate) async fn load_operation(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((id, operation)): Path<(String, u64)>,
+) -> ControlResult<Json<crate::player_load::LoadOperation>> {
+    principal.role.require(Action::Read)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    state.media_players.get(&id)?;
+    Ok(Json(
+        state.player_load.operation(&id, &principal, operation)?,
+    ))
 }
 
 /// `POST /api/v1/media/players/{id}/cue` — cue to in-point or a frame
