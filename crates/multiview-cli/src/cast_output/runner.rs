@@ -233,7 +233,17 @@ impl CastRunner {
             window: CAST_WINDOW,
             target_segment_ns: CAST_TARGET_SEGMENT_NANOS,
             video: self.setup.video.clone(),
-            audio: self.setup.audio.clone(),
+            // #418 stage A minimal compile fix: the single program audio as
+            // rendition 0; stage B wires every selected track and subtitles.
+            audio: self
+                .setup
+                .audio
+                .clone()
+                .map(multiview_output::hls::cast::CastAudioRendition::program)
+                .into_iter()
+                .collect(),
+            subtitles: Vec::new(),
+            subtitle_feed: None,
             epoch: Some(self.setup.epoch.clone()),
             wall_anchor,
         };
@@ -259,10 +269,13 @@ impl CastRunner {
                 config_changed: input.config_changed,
                 data: input.data,
             }),
-            CastInputKind::Audio => packager.push_audio(AudioUnit {
-                pts: input.pts,
-                data: input.data,
-            }),
+            CastInputKind::Audio => packager.push_audio(
+                0,
+                AudioUnit {
+                    pts: input.pts,
+                    data: input.data,
+                },
+            ),
         };
         match result {
             Ok(()) => {
