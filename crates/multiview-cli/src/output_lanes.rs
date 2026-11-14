@@ -23,8 +23,9 @@
 //! tick and one `try_send` per lane per audio tick, both on the bake consumer /
 //! audio worker (never the Program clock), and only when a lane exists. A
 //! wedged or failed lane clock, worker, consumer or sink ends only its outputs;
-//! nothing on the Program side ever waits on a lane. Run end: after Program's
-//! egress joined, each lane runs on until it passed the last Program frame
+//! nothing on the Program side ever waits on a lane. Run end: the bake
+//! consumer marks the last Program frame as soon as it published it; after
+//! Program's egress joined, each lane runs on until it passed that frame
 //! (bounded), then stops; every join is bounded and detaches beyond its grace.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -119,6 +120,9 @@ struct AudioTap {
 pub(super) struct ProgramTaps {
     latch: Option<Arc<ProgramLatch<Nv12Image>>>,
     audio: Arc<Vec<AudioTap>>,
+    /// The run-end marker the lane clocks read, with Program's cadence
+    /// (#343 review M1).
+    end: Option<(Arc<RunEnd>, Rational)>,
 }
 
 impl ProgramTaps {
@@ -126,6 +130,16 @@ impl ProgramTaps {
     pub(super) fn publish(&self, tick: u64, pts: MediaTime, frame: &Arc<Nv12Image>) {
         if let Some(latch) = self.latch.as_ref() {
             latch.publish(tick, pts, Arc::clone(frame));
+        }
+    }
+
+    /// The bake consumer published its last Program frame (#343 review M1):
+    /// mark the run end at that frame's PTS now, so no lane offers a frame
+    /// past it while Program's sinks finalise. Wait-free, idempotent; a
+    /// no-op without a lane.
+    pub(super) fn finish(&self) {
+        if let (Some(latch), Some((end, cadence))) = (self.latch.as_ref(), self.end.as_ref()) {
+            end.mark_once(final_pts_ns(latch, *cadence));
         }
     }
 
@@ -137,6 +151,15 @@ impl ProgramTaps {
                 tap.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+/// Marks the lanes' run end when dropped (the bake consumer's early exits).
+pub(super) struct LaneEndGuard(pub(super) ProgramTaps);
+
+impl Drop for LaneEndGuard {
+    fn drop(&mut self) {
+        self.0.finish();
     }
 }
 
@@ -305,6 +328,8 @@ struct PreparedOutput {
 pub(super) struct PreparedLanes {
     outputs: Vec<PreparedOutput>,
     latch: Arc<ProgramLatch<Nv12Image>>,
+    /// Shared with [`ProgramTaps`]: the bake consumer marks it.
+    end: Arc<RunEnd>,
     program_cadence: Rational,
     audio: LaneAudio,
     hooks: LaneHooks,
@@ -405,14 +430,17 @@ pub(super) fn prepare(
             dropped_audio,
         });
     }
+    let end = Arc::new(RunEnd::default());
     let program_taps = ProgramTaps {
         latch: Some(Arc::clone(&latch)),
         audio: Arc::new(taps),
+        end: Some((Arc::clone(&end), program_cadence)),
     };
     Some((
         PreparedLanes {
             outputs,
             latch,
+            end,
             program_cadence,
             audio,
             hooks,
@@ -440,6 +468,7 @@ impl PreparedLanes {
         let PreparedLanes {
             outputs,
             latch,
+            end,
             program_cadence,
             audio,
             hooks,
@@ -447,7 +476,6 @@ impl PreparedLanes {
             push_links: _,
         } = self;
         let stop = StopSignal::new();
-        let end = Arc::new(RunEnd::default());
         let audio_bases = audio.bases();
         let mut running_outputs = Vec::new();
         // Per distinct rate: (rate, ids, offer targets).
@@ -563,16 +591,29 @@ pub(super) fn rate_label(rate: Rational) -> String {
     format!("{}/{}", rate.num, rate.den)
 }
 
-/// The run-end marker the lane clocks read: once Program's egress joined, the
-/// PTS of the last Program frame. A lane tick after it offers nothing.
+/// The PTS (ns) of the newest published Program frame, `-1` before any.
+fn final_pts_ns(latch: &ProgramLatch<Nv12Image>, program_cadence: Rational) -> i64 {
+    latch.newest_tick().map_or(-1, |tick| {
+        MediaTime::from_tick(i64::try_from(tick).unwrap_or(i64::MAX), program_cadence).as_nanos()
+    })
+}
+
+/// The run-end marker the lane clocks read: the PTS of the last Program
+/// frame, set as soon as the bake consumer published it (#343 review M1),
+/// never later than the lanes' shutdown. A lane tick after it offers nothing.
 #[derive(Default)]
-struct RunEnd {
+pub(super) struct RunEnd {
     ended: AtomicBool,
     final_pts_ns: AtomicI64,
 }
 
 impl RunEnd {
-    fn mark(&self, final_pts_ns: i64) {
+    /// Set the end once; a later mark keeps the first (the final frame
+    /// cannot change after the consumer ended).
+    fn mark_once(&self, final_pts_ns: i64) {
+        if self.ended.load(Ordering::Acquire) {
+            return;
+        }
         self.final_pts_ns.store(final_pts_ns, Ordering::Release);
         self.ended.store(true, Ordering::Release);
     }
@@ -1099,11 +1140,8 @@ impl RunningLanes {
             metrics: _,
             mut lines,
         } = self;
-        let final_pts = latch.newest_tick().map_or(-1, |tick| {
-            MediaTime::from_tick(i64::try_from(tick).unwrap_or(i64::MAX), program_cadence)
-                .as_nanos()
-        });
-        end.mark(final_pts);
+        // Normally marked by the bake consumer already (#343 review M1).
+        end.mark_once(final_pts_ns(&latch, program_cadence));
         let drain_until = Instant::now() + LANE_DRAIN_GRACE;
         while Instant::now() < drain_until
             && !clocks

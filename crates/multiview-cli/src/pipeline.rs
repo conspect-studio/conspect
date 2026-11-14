@@ -8354,6 +8354,11 @@ fn consumer_main<D: WindowDelivery>(
         convert_hook,
         lane_taps,
     } = routing;
+    // #343 review M1: the rate lanes learn the run's last Program frame the
+    // moment this consumer stops publishing — at the end of the tick loop
+    // below, or on any early return (this guard) — never only after
+    // Program's sinks finalised.
+    let _lane_end = output_lanes::LaneEndGuard(lane_taps.clone());
     // #342 review I1/I2: one `format-convert` thread per distinct non-canvas
     // base format, fed non-blocking right after the bake. Empty (no thread,
     // no work) for a run whose base keys are all at the canvas format.
@@ -8972,6 +8977,9 @@ fn consumer_main<D: WindowDelivery>(
             }
         }
     }
+    // #343 review M1: every Program frame is published; mark the lanes' end
+    // before the (possibly slow) worker flush and sink finalisation.
+    lane_taps.finish();
     // End of run: close every worker's input and let them flush. The workers
     // and this thread share `event_tx`/`event_rx` (bounded); a worker blocked
     // sending its tail into a full channel would deadlock a plain `join` here,

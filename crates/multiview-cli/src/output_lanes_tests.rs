@@ -48,6 +48,7 @@ const WIDE_LATCH: Duration = Duration::from_millis(500);
 
 /// What to put in the document.
 #[derive(Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent document switches.
 struct Doc {
     /// A second Program-rate output (`out_sib`, same settings as `out_pgm`).
     sibling: bool,
@@ -55,12 +56,15 @@ struct Doc {
     switcher: bool,
     /// An `[audio]` section (program bus) for `enable_program_audio`.
     audio: bool,
+    /// A second rate output `out_rate24` at 24/1 (a second output clock).
+    second_rate: bool,
 }
 
 /// Program at 30000/1001, 64x64; `out_pgm` (and `out_sib`) at Program's
 /// rate; `out_rate` with `[outputs.format] fps = "25/1"` at the same size.
 /// Output order in the document: Program-rate outputs first, the rate output
 /// last (the test runners follow config order on each side).
+#[allow(clippy::too_many_lines)] // One TOML document, section by section.
 fn document(prefix: &str, doc: Doc) -> String {
     let mut text = String::from(
         r##"
@@ -142,6 +146,22 @@ height = 64
 fps = "25/1"
 "#,
     );
+    if doc.second_rate {
+        text.push_str(
+            r#"
+[[outputs]]
+id = "out_rate24"
+kind = "hls"
+path = "/tmp/multiview-lanes-e2e/@/rate24/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[outputs.format]
+width = 64
+height = 64
+fps = "24/1"
+"#,
+        );
+    }
     if doc.switcher {
         text.push_str(
             r#"
@@ -176,14 +196,16 @@ fn record(rec: &Shared, packet: &EncodedPacket) {
     }
 }
 
-/// A Program-rate output's recorder (through `StreamTestParams.runners`).
-fn program_recorder(rec: Shared) -> TestSinkRunner {
+/// A Program-rate output's recorder (through `StreamTestParams.runners`);
+/// `finalise` is how long it takes to finalise after its last packet.
+fn program_recorder(rec: Shared, finalise: Duration) -> TestSinkRunner {
     Box::new(move |rx: Receiver<EncodedPacket>| {
         let mut frames = 0;
         while let Ok(packet) = rx.recv() {
             frames += 1;
             record(&rec, &packet);
         }
+        std::thread::sleep(finalise);
         TestSinkOutcome { frames }
     })
 }
@@ -212,7 +234,26 @@ struct Hooks {
     on_tick: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     on_encode: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     latch_delay: Option<Duration>,
+    /// How long each Program-rate sink takes to finalise.
+    program_finalise: Duration,
 }
+
+/// What a test's controller thread gets while the run is live.
+struct Ctl {
+    /// Program ticks emitted so far.
+    observer: Arc<AtomicU64>,
+    /// The M/E, when the document declares one.
+    switcher: Option<multiview_engine::switcher_control::SwitcherControl>,
+    /// The Program-rate outputs' recorders (config order).
+    program: Vec<Arc<Mutex<Rec>>>,
+    /// While set, the manual clock waits for Program at most
+    /// [`LOOSE_PATIENCE`] per tick, then advances anyway: a Program that
+    /// waited on something else would then fall behind (and not progress).
+    loose: Arc<AtomicBool>,
+}
+
+/// The gated clock's patience with Program while [`Ctl::loose`] is set.
+const LOOSE_PATIENCE: Duration = Duration::from_millis(250);
 
 struct LaneRun {
     /// Program ticks emitted (`report.frames`).
@@ -223,6 +264,8 @@ struct LaneRun {
     program: Vec<Rec>,
     /// The rate output.
     rate: Rec,
+    /// The 24/1 rate output (empty unless declared).
+    rate24: Rec,
     /// Every lane tick's latch: (output tick, latched Program tick).
     latches: Vec<(u64, Option<u64>)>,
     /// The run's metric handles (Program repeats, the lane clock counters).
@@ -231,14 +274,13 @@ struct LaneRun {
 
 /// Drive `ticks` Program ticks of `doc`. `control` runs on its own thread
 /// with the Program tick observer (and the switcher, when declared).
+#[allow(clippy::too_many_lines)] // One linear harness: build, drive, collect.
 fn drive(
     prefix: &str,
     doc: Doc,
     ticks: u64,
     hooks: Hooks,
-    control: impl FnOnce(Arc<AtomicU64>, Option<multiview_engine::switcher_control::SwitcherControl>)
-        + Send
-        + 'static,
+    control: impl FnOnce(Ctl) + Send + 'static,
 ) -> LaneRun {
     let config = multiview_config::MultiviewConfig::load_from_toml(&document(prefix, doc)).unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
@@ -248,6 +290,11 @@ fn drive(
         .map(|_| Arc::new(Mutex::new(Rec::default())))
         .collect();
     let rate: Shared = Arc::new(Mutex::new(Rec::default()));
+    let rate24: Shared = Arc::new(Mutex::new(Rec::default()));
+    let mut lane_runners = vec![rate_recorder("out_rate", Arc::clone(&rate))];
+    if doc.second_rate {
+        lane_runners.push(rate_recorder("out_rate24", Arc::clone(&rate24)));
+    }
     let latches = Arc::new(Mutex::new(Vec::new()));
     let observe = Arc::clone(&latches);
     pipeline.set_lane_hooks(LaneHooks {
@@ -258,7 +305,7 @@ fn drive(
             observe.lock().unwrap().push((tick, latched));
         })),
         latch_delay: hooks.latch_delay,
-        runners: vec![rate_recorder("out_rate", Arc::clone(&rate))],
+        runners: lane_runners,
     });
     if doc.audio {
         pipeline.enable_program_audio();
@@ -271,21 +318,23 @@ fn drive(
     });
     let runners: Vec<TestSinkRunner> = program
         .iter()
-        .map(|rec| program_recorder(Arc::clone(rec)))
+        .map(|rec| program_recorder(Arc::clone(rec), hooks.program_finalise))
         .collect();
     let clock = Arc::new(ManualTimeSource::new());
     let observer = Arc::new(AtomicU64::new(0));
     let stop_clock = Arc::new(AtomicBool::new(false));
+    let loose = Arc::new(AtomicBool::new(false));
     let metrics_out = Arc::new(Mutex::new(None::<Arc<ProgramMetricsHandles>>));
     let pacer = {
         let clock = Arc::clone(&clock);
         let observer = Arc::clone(&observer);
         let stop = Arc::clone(&stop_clock);
+        let loose = Arc::clone(&loose);
         let anchor = pipeline.epoch_anchor_slot();
         let metrics_slot = pipeline.program_metrics();
         let metrics_out = Arc::clone(&metrics_out);
         std::thread::spawn(move || {
-            gated_clock(&clock, &observer, &stop, ticks, || {
+            gated_clock(&clock, &observer, &stop, &loose, ticks, || {
                 let seed = anchor.load()?.seed_nanos();
                 *metrics_out.lock().unwrap() = metrics_slot.load();
                 Some(seed)
@@ -293,8 +342,13 @@ fn drive(
         })
     };
     let controller = {
-        let observer = Arc::clone(&observer);
-        std::thread::spawn(move || control(observer, switcher))
+        let ctl = Ctl {
+            observer: Arc::clone(&observer),
+            switcher,
+            program: program.iter().map(Arc::clone).collect(),
+            loose,
+        };
+        std::thread::spawn(move || control(ctl))
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -330,6 +384,7 @@ fn drive(
         lines: result.report.outputs,
         program: program.iter().map(take).collect(),
         rate: take(&rate),
+        rate24: take(&rate24),
         latches,
         metrics,
     }
@@ -341,6 +396,7 @@ fn gated_clock(
     clock: &ManualTimeSource,
     observer: &AtomicU64,
     stop: &AtomicBool,
+    loose: &AtomicBool,
     ticks: u64,
     mut seed: impl FnMut() -> Option<i64>,
 ) {
@@ -363,10 +419,15 @@ fn gated_clock(
             std::thread::sleep(due - now);
         }
         // Program tick `i` becomes due only once ticks 0..i were emitted:
-        // never two Program ticks due at once.
+        // never two Program ticks due at once. While `loose`, only for
+        // LOOSE_PATIENCE: time then advances whether Program follows or not.
+        let waited = Instant::now();
         while i < ticks && observer.load(Ordering::Acquire) < i {
             if stop.load(Ordering::Acquire) {
                 return;
+            }
+            if loose.load(Ordering::Acquire) && waited.elapsed() >= LOOSE_PATIENCE {
+                break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -518,13 +579,7 @@ fn mean_luma(packets: &[EncodedPacket]) -> std::collections::BTreeMap<i64, u32> 
 #[test]
 fn a_25_fps_output_beside_a_29_97_program_keeps_both_cadences() {
     const TICKS: u64 = 240;
-    let run = drive(
-        "lanes_cad",
-        Doc::default(),
-        TICKS,
-        Hooks::default(),
-        |_, _| {},
-    );
+    let run = drive("lanes_cad", Doc::default(), TICKS, Hooks::default(), |_| {});
     assert_program(&run, TICKS);
     assert_rate_video(&run, TICKS);
     assert_latch_not_after(&run);
@@ -561,7 +616,10 @@ fn a_program_cut_lands_on_exactly_one_rate_output_frame() {
         latch_delay: Some(WIDE_LATCH),
         ..Hooks::default()
     };
-    let run = drive("lanes_cut", doc, TICKS, hooks, move |observer, switcher| {
+    let run = drive("lanes_cut", doc, TICKS, hooks, move |ctl| {
+        let Ctl {
+            observer, switcher, ..
+        } = ctl;
         let control = switcher.expect("an M/E");
         let start = Instant::now();
         while !(control.is_ready() && observer.load(Ordering::Acquire) >= CUT_AFTER) {
@@ -695,7 +753,7 @@ fn a_rate_output_carries_the_program_audio_packets_with_a_bounded_av_offset() {
         latch_delay: Some(WIDE_LATCH),
         ..Hooks::default()
     };
-    let run = drive("lanes_av", doc, TICKS, hooks, |_, _| {});
+    let run = drive("lanes_av", doc, TICKS, hooks, |_| {});
     assert_program(&run, TICKS);
     assert_rate_video(&run, TICKS);
     no_lane_failure(&run.lines);
@@ -796,7 +854,7 @@ fn a_wedged_lane_clock_never_moves_program_or_its_sibling() {
         })),
         ..Hooks::default()
     };
-    let run = drive("lanes_wedge", doc, TICKS, hooks, |_, _| {});
+    let run = drive("lanes_wedge", doc, TICKS, hooks, |_| {});
     assert!(wedged.load(Ordering::Acquire), "the lane clock wedged");
     assert_program(&run, TICKS);
     assert_eq!(run.program.len(), 2);
@@ -841,6 +899,30 @@ fn a_wedged_lane_clock_never_moves_program_or_its_sibling() {
     );
 }
 
+/// #343 review M1: the lanes learn the last Program frame from the bake
+/// consumer, not from Program's sink joins. A Program sink that takes 1.5 s
+/// to finalise (far beyond the 100 ms latch delay; the test clock keeps
+/// advancing meanwhile) must not let the rate output carry frames past the
+/// last Program frame: the design's upper count bound still holds.
+#[test]
+fn a_slow_program_sink_finalisation_adds_no_rate_frame_past_program_end() {
+    const TICKS: u64 = 150;
+    let hooks = Hooks {
+        program_finalise: Duration::from_millis(1_500),
+        ..Hooks::default()
+    };
+    let run = drive("lanes_end", Doc::default(), TICKS, hooks, |_| {});
+    assert_program(&run, TICKS);
+    assert_rate_video(&run, TICKS);
+    assert_latch_not_after(&run);
+    no_lane_failure(&run.lines);
+    let last = pts_ns(TICKS - 1, PROGRAM);
+    assert!(
+        run.latches.iter().all(|&(k, _)| pts_ns(k, RATE) <= last),
+        "no lane tick past the last Program frame was latched"
+    );
+}
+
 /// Chaos: the lane encoder panics at output tick 30. Only that output ends
 /// (its report line says FAILED); Program and its Program-rate sibling
 /// complete fully, one frame per tick.
@@ -858,7 +940,7 @@ fn a_panicking_lane_encoder_ends_only_its_output() {
         })),
         ..Hooks::default()
     };
-    let run = drive("lanes_panic", doc, TICKS, hooks, |_, _| {});
+    let run = drive("lanes_panic", doc, TICKS, hooks, |_| {});
     assert_program(&run, TICKS);
     assert_eq!(
         video_pts(&run.program[1].video),
