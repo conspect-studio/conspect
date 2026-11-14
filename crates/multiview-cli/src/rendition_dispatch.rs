@@ -466,6 +466,10 @@ struct BindingState {
     /// key has an extractor); `None` = unknown (never seen, or the last scan
     /// was rejected), which a switch to a key with sets treats as a change.
     last_sets: Option<Vec<u8>>,
+    /// A steady-state keyframe of the current key failed its scan: the
+    /// output's configuration is unknown, so the next keyframe with sets is a
+    /// change (#344 D2a). Cleared by the next recorded sets.
+    steady_unknown: bool,
     /// The dynamic audio stage carrying this output's program-audio slot
     /// (`None` = the shared program stage, today's behaviour).
     audio_key: Option<usize>,
@@ -643,6 +647,7 @@ impl RenditionDispatcher {
                 mv: None,
                 fallback_gate_pending: false,
                 last_sets: None,
+                steady_unknown: false,
                 audio_key: None,
                 audio_mv: None,
                 inband_ok: binding.inband_parameter_changes_ok,
@@ -1372,6 +1377,8 @@ impl RenditionDispatcher {
                             } else {
                                 skip = at;
                                 let _ = decide_sets(&mut b.last_sets, cut_sets);
+                                // A switch decides (and signals) by itself.
+                                b.steady_unknown = false;
                                 if changed {
                                     let stream =
                                         self.video_meta.get(m.key).and_then(|x| x.stream.clone());
@@ -1471,6 +1478,7 @@ impl RenditionDispatcher {
                             .and_then(|m| m.params.as_ref())
                             .and_then(|f| packets.get(at).map(f))
                             .unwrap_or(RapParameterSets::Absent);
+                        b.steady_unknown = false;
                         if decide_sets(&mut b.last_sets, cut) {
                             let stream = cur
                                 .and_then(|k| self.video_meta.get(k))
@@ -1500,21 +1508,44 @@ impl RenditionDispatcher {
             // Steady state: track the CURRENT key's configuration from its own
             // RAPs so the next switch compares against what the output carries.
             // Never on a switch window (decided above, never overridden).
+            //
+            // #344 D2a: a keyframe whose sets differ from a configuration the
+            // output is known to carry (or follow a rejected scan) is a
+            // decoder-config change inside the key (a passthrough key switching
+            // source <-> slate, or its source changing sets): on an in-band
+            // output it is signalled once, before this window is offered, so
+            // HLS marks the segment that IDR starts discontinuous. An ordinary
+            // encoder's sets never change, so it never reaches the signal.
+            // Out-of-band outputs only record (they cannot re-init mid-stream;
+            // passthrough is not offered there).
             if let Some(f) = cur
                 .and_then(|k| self.video_meta.get(k))
                 .and_then(|m| m.params.as_ref())
                 .filter(|_| !switched)
             {
+                let mut changed = false;
                 for p in packets.iter().filter(|p| p.is_keyframe()) {
                     match f(p) {
                         RapParameterSets::Absent => {}
-                        RapParameterSets::Rejected => b.last_sets = None,
+                        RapParameterSets::Rejected => {
+                            changed |= b.last_sets.is_some() || b.steady_unknown;
+                            b.last_sets = None;
+                            b.steady_unknown = true;
+                        }
                         RapParameterSets::Sets(sets) => {
                             if b.last_sets.as_ref() != Some(&sets) {
+                                changed |= b.last_sets.is_some() || b.steady_unknown;
                                 b.last_sets = Some(sets);
+                                b.steady_unknown = false;
                             }
                         }
                     }
+                }
+                if changed && b.inband_ok {
+                    let stream = cur
+                        .and_then(|k| self.video_meta.get(k))
+                        .and_then(|x| x.stream.clone());
+                    signal_sets_change(delivery, b.output_index, b.inband_ok, stream);
                 }
             }
             drop_orphan_audio_move(b, &mut self.outcomes);
@@ -3492,6 +3523,131 @@ mod tests {
             ]
         );
         assert_eq!((discontinuities, key), (2, Some(1)));
+    }
+
+    /// A gated RAP of `len` bytes (`len >= 6`).
+    fn rap_len(dts: i64, len: usize) -> EncodedPacket {
+        let mut bytes = vec![0_u8; len];
+        bytes[..6].copy_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
+        let mut raw = Packet::copy(&bytes);
+        raw.set_pts(Some(dts));
+        raw.set_dts(Some(dts));
+        raw.set_flags(Flags::KEY);
+        EncodedPacket::with_kind(raw, StreamKind::Video)
+    }
+
+    /// Extractor whose keyframe sets are the packet length (`[len]`).
+    fn len_sets() -> ParameterSets {
+        Box::new(|p: &EncodedPacket| {
+            if p.is_keyframe() {
+                RapParameterSets::Sets(vec![u8::try_from(p.len()).unwrap()])
+            } else {
+                RapParameterSets::Absent
+            }
+        })
+    }
+
+    /// One output on base key 0 fed `frames` (one packet per window); returns
+    /// the discontinuities seen and each delivered lease's config flag.
+    fn steady(inband: bool, sets: ParameterSets, frames: &[EncodedPacket]) -> (usize, Vec<bool>) {
+        let now = Instant::now();
+        let mut b = binding(0, 0, 1);
+        b.inband_parameter_changes_ok = inband;
+        let mut d = RenditionDispatcher::new(gated_cfg(vec![b], 1, 1)).unwrap();
+        let mut sink = FakeDelivery::new(1);
+        d.set_parameter_sets(0, sets).unwrap();
+        let mut discontinuities = 0;
+        let mut flags = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            let i = i64::try_from(i).unwrap();
+            let p = f.clone_shared_ref().unwrap();
+            feed_base(&mut d, &mut sink, 1, i, now, move |_| {
+                p.clone_shared_ref().unwrap()
+            })
+            .unwrap();
+            while let Ok(Some(lease)) = sink.queues[0].pop_at(now) {
+                flags.push(lease.decoder_config_changed());
+            }
+            if sink.queues[0].take_discontinuity().is_some() {
+                discontinuities += 1;
+            }
+        }
+        (discontinuities, flags)
+    }
+
+    /// #344 D2a (behaviour change): a keyframe of the CURRENT key whose
+    /// parameter sets differ from the ones the output carries (a passthrough
+    /// key switching source <-> slate, or a source changing its sets) signals
+    /// exactly one decoder-config change on an in-band output, on the lease
+    /// of the window that carries it; equal later keyframes signal nothing.
+    #[test]
+    fn a_steady_state_set_change_on_the_current_key_signals_exactly_once() {
+        let frames = [
+            rap_len(0, 77),
+            video(1, 8, false),
+            rap_len(2, 77),
+            rap_len(3, 78),
+            video(4, 8, false),
+            rap_len(5, 78),
+            rap_len(6, 78),
+        ];
+        let (discontinuities, flags) = steady(true, len_sets(), &frames);
+        assert_eq!(discontinuities, 1);
+        assert_eq!(flags, [false, false, false, true, false, false, false]);
+        // Back to the first sets is another real change: one more.
+        let frames = [rap_len(0, 77), rap_len(1, 78), rap_len(2, 77)];
+        assert_eq!(steady(true, len_sets(), &frames).0, 2);
+    }
+
+    /// An ordinary encoder's sets never change: no config change, ever, on
+    /// an in-band or an out-of-band output (the steady-state tracking only
+    /// records the first keyframe's sets).
+    #[test]
+    fn an_ordinary_encoder_never_signals_a_steady_state_set_change() {
+        let frames: Vec<EncodedPacket> = (0..40)
+            .map(|i| {
+                if i % 5 == 0 {
+                    rap_len(i, 77)
+                } else {
+                    video(i, 8, false)
+                }
+            })
+            .collect();
+        for inband in [true, false] {
+            let fixed = fixed_sets(RapParameterSets::Sets(vec![9, 9]));
+            let (discontinuities, flags) = steady(inband, fixed, &frames);
+            assert_eq!(discontinuities, 0, "inband {inband}");
+            assert!(flags.iter().all(|f| !f));
+            let (discontinuities, _) = steady(inband, len_sets(), &frames);
+            assert_eq!(discontinuities, 0, "inband {inband}");
+        }
+    }
+
+    /// A steady-state keyframe whose scan is rejected leaves the output's
+    /// configuration unknown: that keyframe is one change, and the next
+    /// keyframe with sets is another (never a silent splice).
+    #[test]
+    fn a_rejected_steady_state_scan_is_a_change_and_so_is_the_next_set() {
+        let sets: ParameterSets = Box::new(|p: &EncodedPacket| match (p.is_keyframe(), p.len()) {
+            (false, _) => RapParameterSets::Absent,
+            (true, 79) => RapParameterSets::Rejected,
+            (true, len) => RapParameterSets::Sets(vec![u8::try_from(len).unwrap()]),
+        });
+        let frames = [
+            rap_len(0, 77),
+            rap_len(1, 79),
+            rap_len(2, 77),
+            rap_len(3, 77),
+        ];
+        assert_eq!(steady(true, sets, &frames).0, 2);
+    }
+
+    /// An out-of-band output cannot take a decoder-config change mid-stream
+    /// (fMP4 init, FLV header, SDP): steady-state tracking only records there.
+    #[test]
+    fn a_steady_state_set_change_on_an_out_of_band_output_is_only_recorded() {
+        let frames = [rap_len(0, 77), rap_len(1, 78), rap_len(2, 78)];
+        assert_eq!(steady(false, len_sets(), &frames).0, 0);
     }
 
     /// Extractor whose keyframe sets are `sets` (any non-keyframe: Absent).
