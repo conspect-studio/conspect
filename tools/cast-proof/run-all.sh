@@ -2,18 +2,19 @@
 # Run the whole proof: reference stream generator + harness server, then tests 1-4 on the reference stream and the
 # two documented-failure runs on the production-shaped TS stream. Writes <out>/summary.json and one log per test.
 #   ./run-all.sh [--seconds 60] [--out <dir>] [--stream-base <dir or http(s) base URL of a live cast stream>]
-#                [--skip-faults] [--skip-prod]
+#                [--skip-faults] [--skip-prod] [--skip-tracks]
 #   LIVE_URL=<base URL> ./run-all.sh   also runs tests 1 and 3 (CAF defaults) once, 40 s each, against that live
 #                                      HLS base (through the server's proxy route; read-only GETs).
+# Test 5 (test-receiver-tracks.mjs, #418) generates its own stream with 2 audio + 1 WebVTT rendition (gen-tracks-stream.mjs).
 # --stream-base: test the real engine's cast output instead of the ffmpeg reference stream (tests 1-3; the fault
 # test always generates its own stream because it restarts the generator).
 # Exit code = number of failures. Only one harness can run per host: the CAF SDK hard-codes ws://localhost:8008.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
-seconds=60; out="$here/../out"; stream_base=""; skip_faults=0; skip_prod=0
+seconds=60; out="$here/../out"; stream_base=""; skip_faults=0; skip_prod=0; skip_tracks=0
 while [ $# -gt 0 ]; do case "$1" in
   --seconds) seconds="$2"; shift 2 ;; --out) out="$2"; shift 2 ;; --stream-base) stream_base="$2"; shift 2 ;;
-  --skip-faults) skip_faults=1; shift ;; --skip-prod) skip_prod=1; shift ;;
+  --skip-faults) skip_faults=1; shift ;; --skip-prod) skip_prod=1; shift ;; --skip-tracks) skip_tracks=1; shift ;;
   *) echo "unknown argument $1" >&2; exit 2 ;; esac; done
 mkdir -p "$out"; out="$(cd "$out" && pwd)"
 HARNESS_RUN_ID="run$$-$(date +%s)"; export OUT_DIR="$out" HARNESS_RUN_ID
@@ -94,6 +95,10 @@ fi
 if [ "$skip_faults" = 0 ]; then
   run test-receiver-faults 1500 node "$here/test-receiver-faults.mjs"
   specs+=("4-receiver-faults=$out/test-receiver-faults.log")
+fi
+if [ "$skip_tracks" = 0 ]; then
+  run test-receiver-tracks 720 node "$here/test-receiver-tracks.mjs"
+  specs+=("5-receiver-tracks=$out/test-receiver-tracks.log")
 fi
 
 node "$here/stream-health.mjs" "$H/cast/$REF/video.m3u8" > "$out/stream-health-after.json" 2>/dev/null

@@ -51,6 +51,31 @@ stream means the host starved the encoder, so latency failures then describe the
 (`server.mjs`, which applies the engine's CSP), needed by `test-receiver-faults.mjs` for faults the engine cannot
 be told to produce (held segments, corrupt segments, an unreachable server, generator restart).
 
+## Tracks (#418): `test-receiver-tracks.mjs`
+
+Run by `run-all.sh` (skip with `--skip-tracks`) or alone: `node test-receiver-tracks.mjs [--cases a,b,c,d,e,f]
+[--offset 100000]`. Its stream comes from `gen-tracks-stream.mjs`: ffmpeg writes video + two AAC renditions
+("Program"/en 440 Hz, "Commentary"/de 880 Hz) as CMAF fMP4 with the media timeline (`tfdt`) starting at `--offset`
+seconds (default 100000 s, past the 33-bit MPEG-TS wrap at 95443.7 s, like an engine that has run for a day); the
+script adds a segmented WebVTT rendition ("Captions"/en, one `.vtt` per video segment, same sequence numbers,
+EXTINF and PDT, one cue `CUE <seq> T=<tfdt s> PDT=<ms>` at 0-1.5 s of the segment) and the master.
+
+| case | proves |
+|---|---|
+| a | CAF publishes `media.tracks` (2 AUDIO + 1 TEXT, names/languages from the manifest) and `activeTrackIds` [Program] |
+| b | `EDIT_TRACKS_INFO` [Commentary, Captions]: Shaka's active variant becomes de, no BUFFERING or stall > 1 s; the text track is shown, every cue starts at its segment's media time (+-0.5 s, timed by PDT, not by X-TIMESTAMP-MAP) and a known cue is active at its time; reports carry `tracks` |
+| c | LOAD `customData.audioLanguage: 'de'` starts on Commentary (the first audio segment fetched is Commentary's) |
+| d | the choice survives the receiver's own reload (segments held 36 s -> the 20 s BUFFERING watchdog reloads) |
+| e | LOAD `activeTrackIds` is honoured; a sender's `media.tracks` (with a text track URL) is dropped and the URL never fetched; `EDIT_TRACKS_INFO` with an unknown id is refused by CAF and changes nothing |
+| f | `customData.textLanguage: 'en'` starts with subtitles, `textLanguage: null` without |
+
+X-TIMESTAMP-MAP with Shaka 4.15.56 (measured with this stream; source `lib/text/vtt_text_parser.js`
+`computeHlsOffset_`, `lib/media/media_source_engine.js` `appendBuffer`): the text timestamp offset is the VIDEO
+SourceBuffer's offset (playlist time - video `tfdt`), so `MPEGTS` is the video `tfdt` of the segment start in
+90 kHz, with `LOCAL:00:00:00.000`. Shaka undoes the 33-bit wrap itself (it adds 2^33 while the segment's media time
+is at least 95443.7 s), so `MPEGTS` must be written modulo 2^33: with `tfdt` at 100000 s the wrapped value puts every
+cue on time (0.008 s), the unwrapped value puts them 95443.7 s late (never shown).
+
 ## What it cannot prove
 
 - A real device: certificate trust of the Let's Encrypt chain on Chromecast firmware, the device's hardware
