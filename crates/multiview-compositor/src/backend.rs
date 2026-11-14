@@ -24,9 +24,13 @@
 //! byte-for-byte dispatch to the free function (no re-encode, no reorder).
 //!
 //! Neither variant blocks on an input or a client. The GPU `composite` is a
-//! synchronous submit+readback that **returns** a typed error on a runtime
-//! failure (it does not wait forever); callers on the hot path treat such an
-//! error as a per-tick fault and hold last-good rather than crashing.
+//! synchronous submit+readback whose wait is **bounded** by the per-frame
+//! readback deadline ([`crate::readback`], issue #395): a readback that misses
+//! it returns [`crate::error::Error::GpuDeadline`] (the engine repeats
+//! last-good under the tick, counted), a GPU stalled past
+//! [`crate::readback::STALL_HOLD`] gets its frames composited on the CPU
+//! reference, and a genuine runtime failure re-composites that one frame on
+//! the CPU. A hung GPU therefore never stalls the output clock.
 
 use crate::blend::LinearRgba;
 use crate::error::Result;
@@ -186,6 +190,9 @@ pub enum RunBackendKind {
     /// The portable wgpu GPU compositor ([`crate::gpu::GpuCompositor`]).
     #[cfg(feature = "wgpu")]
     Gpu,
+    /// The simulated GPU chaos-test seam ([`RunBackend::simulated_gpu`]).
+    #[doc(hidden)]
+    SimulatedGpu,
 }
 
 /// The persistent CPU-reference backend: owns the transfer-LUT cache and the
@@ -305,6 +312,11 @@ pub enum RunBackend {
     /// The wgpu GPU compositor, holding its initialized device/pipelines.
     #[cfg(feature = "wgpu")]
     Gpu(Box<crate::gpu::GpuCompositor>),
+    /// **Test seam only** (never constructed in production): CPU-reference
+    /// pixels routed through the GPU readback deadline/stall state machine with
+    /// a fake device ([`RunBackend::simulated_gpu`]).
+    #[doc(hidden)]
+    SimulatedGpu(std::sync::Arc<crate::readback::SimulatedGpu>),
 }
 
 impl RunBackend {
@@ -312,6 +324,50 @@ impl RunBackend {
     #[must_use]
     pub fn cpu() -> Self {
         Self::Cpu(CpuBackend::default())
+    }
+
+    /// The GPU-free chaos seam: a backend that composites on the CPU reference
+    /// but routes every frame through the SAME readback deadline/stall state
+    /// machine as the GPU compositor, over a fake device whose readback
+    /// completes `latency` after submit (or never while hung). The returned
+    /// [`crate::readback::SimulatedGpuControl`] changes latency, hangs and
+    /// releases the device. Production never constructs this.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn simulated_gpu(
+        latency: std::time::Duration,
+    ) -> (Self, crate::readback::SimulatedGpuControl) {
+        let sim = crate::readback::SimulatedGpu::new(latency);
+        (
+            Self::SimulatedGpu(std::sync::Arc::clone(&sim)),
+            crate::readback::SimulatedGpuControl(sim),
+        )
+    }
+
+    /// Bound the GPU readback wait by the output frame `period`:
+    /// `min(10 ms, period / 2)` ([`crate::readback::readback_deadline`]). A
+    /// no-op on the CPU backend. The engine calls it whenever the canvas
+    /// cadence is set or changes.
+    pub fn set_frame_period(&self, period: std::time::Duration) {
+        match self {
+            Self::Cpu(_) => {}
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(gpu) => gpu.set_frame_period(period),
+            Self::SimulatedGpu(sim) => sim.set_frame_period(period),
+        }
+    }
+
+    /// Frames whose GPU readback missed its deadline or failed fast while an
+    /// earlier readback was outstanding ([`crate::error::Error::GpuDeadline`]).
+    /// `0` for the CPU backend.
+    #[must_use]
+    pub fn gpu_deadline_misses(&self) -> u64 {
+        match self {
+            Self::Cpu(_) => 0,
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(gpu) => gpu.readback_deadline_misses(),
+            Self::SimulatedGpu(sim) => sim.deadline_misses(),
+        }
     }
 
     /// Select a backend, GPU-preferred-with-CPU-fallback, pinned to `target`.
@@ -371,6 +427,7 @@ impl RunBackend {
             Self::Cpu(_) => RunBackendKind::Cpu,
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => RunBackendKind::Gpu,
+            Self::SimulatedGpu(_) => RunBackendKind::SimulatedGpu,
         }
     }
 
@@ -381,6 +438,7 @@ impl RunBackend {
             Self::Cpu(_) => false,
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => true,
+            Self::SimulatedGpu(_) => false,
         }
     }
 
@@ -398,6 +456,7 @@ impl RunBackend {
             Self::Cpu(cpu) => cpu.lut_build_count(),
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => 0,
+            Self::SimulatedGpu(_) => 0,
         }
     }
 
@@ -412,6 +471,7 @@ impl RunBackend {
             Self::Cpu(cpu) => cpu.scratch_alloc_count(),
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => 0,
+            Self::SimulatedGpu(_) => 0,
         }
     }
 
@@ -432,6 +492,7 @@ impl RunBackend {
             Self::Cpu(cpu) => cpu.band_count(),
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => 0,
+            Self::SimulatedGpu(_) => 0,
         }
     }
 
@@ -445,16 +506,18 @@ impl RunBackend {
     /// matches it within an SSIM/PSNR threshold (GPU is never bit-exact).
     ///
     /// This call is synchronous and **never blocks on an input or a client**.
-    /// On the GPU path a submit/readback failure surfaces as a typed
-    /// [`crate::error::Error`] (it does not wait forever), so a hot-loop caller
-    /// can hold last-good on error rather than stalling the output clock
-    /// (invariant #1, safety rule §3).
+    /// On the GPU path the readback wait is bounded by the per-frame deadline
+    /// ([`RunBackend::set_frame_period`]): a miss returns
+    /// [`crate::error::Error::GpuDeadline`] (not re-composited on the CPU — the
+    /// budget is spent; the engine repeats last-good under the tick), and a
+    /// genuine GPU failure re-composites the frame on the CPU reference, so the
+    /// output clock is never stalled (invariant #1, safety rule §3).
     ///
     /// # Errors
     ///
     /// Propagates the compositor [`crate::error::Error`] for a structurally
     /// invalid request (odd/zero canvas, unresolved/unsupported color axis) or,
-    /// on the GPU path, a `GpuLimit`/`GpuRuntime` failure.
+    /// on a GPU path, [`crate::error::Error::GpuDeadline`].
     pub fn composite(
         &self,
         canvas_w: u32,
@@ -475,6 +538,16 @@ impl RunBackend {
                 background,
                 tiles,
             ),
+            Self::SimulatedGpu(sim) => frame_fallback(
+                sim.cpu_fallback_backend(),
+                || sim.record_cpu_fallback(),
+                sim.composite(canvas_w, canvas_h, canvas, background, tiles),
+                canvas_w,
+                canvas_h,
+                canvas,
+                background,
+                tiles,
+            ),
         }
     }
 
@@ -487,6 +560,7 @@ impl RunBackend {
             Self::Cpu(_) => 0,
             #[cfg(feature = "wgpu")]
             Self::Gpu(gpu) => gpu.cpu_fallback_frames(),
+            Self::SimulatedGpu(sim) => sim.cpu_fallback_frames(),
         }
     }
 
@@ -532,20 +606,39 @@ impl RunBackend {
                     tiles,
                 )
             }
+            Self::SimulatedGpu(sim) => {
+                let _ = n_threads;
+                frame_fallback(
+                    sim.cpu_fallback_backend(),
+                    || sim.record_cpu_fallback(),
+                    sim.composite(canvas_w, canvas_h, canvas, background, tiles),
+                    canvas_w,
+                    canvas_h,
+                    canvas,
+                    background,
+                    tiles,
+                )
+            }
         }
     }
 }
 
 /// Per-frame CPU fallback for a **genuine GPU failure** only.
 ///
-/// A `GpuRuntime` (submit / map / lock failure) or `GpuLimit` (more tiles than
-/// the GPU arrays hold) error re-composites THIS frame on the CPU reference so
-/// the output clock still gets a frame (invariant #1); the next frame tries the
-/// GPU again. Each fallback is counted and logged at `warn` (rate-limited to
+/// A `GpuRuntime` (submit / map / lock failure, or a readback stalled past
+/// [`crate::readback::STALL_HOLD`]) or `GpuLimit` (more tiles than the GPU
+/// arrays hold) error re-composites THIS frame on the CPU reference so the
+/// output clock still gets a frame (invariant #1); the next frame tries the GPU
+/// again. Each fallback is counted and logged at `warn` (rate-limited to
 /// power-of-two counts so a persistently failing device cannot flood the log).
-/// Every other error (geometry, unsupported/unresolved colour) is a request
-/// error the CPU would reject too, so it propagates unchanged. Alpha tiles are
-/// NOT a fallback reason: the GPU samples per-tile alpha itself (ADR-0058).
+///
+/// A [`crate::error::Error::GpuDeadline`] is **not** a fallback reason: the
+/// frame's budget was already spent waiting on the readback (or an earlier
+/// readback is still mid-map), so it propagates and the engine repeats
+/// last-good under the tick. Every other error (geometry, unsupported /
+/// unresolved colour) is a request error the CPU would reject too, so it
+/// propagates unchanged. Alpha tiles are NOT a fallback reason: the GPU samples
+/// per-tile alpha itself (ADR-0058).
 #[cfg(feature = "wgpu")]
 fn gpu_or_frame_fallback(
     gpu: &crate::gpu::GpuCompositor,
@@ -556,20 +649,66 @@ fn gpu_or_frame_fallback(
     background: LinearRgba,
     tiles: &[Tile<'_>],
 ) -> Result<Nv12Image> {
+    frame_fallback(
+        gpu.cpu_fallback_backend(),
+        || gpu.record_cpu_fallback(),
+        result,
+        canvas_w,
+        canvas_h,
+        canvas,
+        background,
+        tiles,
+    )
+}
+
+/// The backend-independent body of [`gpu_or_frame_fallback`]: `record` counts
+/// one CPU-fallback frame and returns the new total.
+#[allow(clippy::too_many_arguments)]
+fn frame_fallback(
+    cpu: &CpuBackend,
+    record: impl FnOnce() -> u64,
+    result: Result<Nv12Image>,
+    canvas_w: u32,
+    canvas_h: u32,
+    canvas: CanvasColor,
+    background: LinearRgba,
+    tiles: &[Tile<'_>],
+) -> Result<Nv12Image> {
     match result {
-        Err(err @ (crate::error::Error::GpuRuntime(_) | crate::error::Error::GpuLimit(_))) => {
-            let frames = gpu.record_cpu_fallback();
-            if frames.is_power_of_two() {
-                tracing::warn!(
-                    error = %err,
-                    fallback_frames = frames,
-                    "GPU composite failed; compositing this frame on the CPU reference"
-                );
-            }
-            crate::pipeline::composite(canvas_w, canvas_h, canvas, background, tiles)
-        }
+        Err(err @ crate::error::Error::GpuRuntime(_)) => fallback(
+            cpu, record, &err, canvas_w, canvas_h, canvas, background, tiles,
+        ),
+        #[cfg(feature = "wgpu")]
+        Err(err @ crate::error::Error::GpuLimit(_)) => fallback(
+            cpu, record, &err, canvas_w, canvas_h, canvas, background, tiles,
+        ),
         other => other,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fallback(
+    cpu: &CpuBackend,
+    record: impl FnOnce() -> u64,
+    err: &crate::error::Error,
+    canvas_w: u32,
+    canvas_h: u32,
+    canvas: CanvasColor,
+    background: LinearRgba,
+    tiles: &[Tile<'_>],
+) -> Result<Nv12Image> {
+    let frames = record();
+    if frames.is_power_of_two() {
+        tracing::warn!(
+            error = %err,
+            fallback_frames = frames,
+            "GPU composite failed; compositing this frame on the CPU reference"
+        );
+    }
+    // The persistent CPU backend (memoized LUTs, reused band scratch, the
+    // auto worker fan-out): the same per-tick cost as a CPU-backend Program,
+    // never the from-scratch free function (#395 review INV-1).
+    cpu.composite(canvas_w, canvas_h, canvas, background, tiles)
 }
 
 #[cfg(test)]
