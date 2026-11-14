@@ -6680,3 +6680,126 @@ fn a_take_superseded_before_the_next_read_is_never_sampled() {
     );
     assert_eq!(cues.last().unwrap().lines[0], "from cam_c");
 }
+
+/// Review COR3-1: after the consumer exited (the tables are still held
+/// until teardown clears them), a take for an output absent from the run is
+/// `Busy`, not `NotInRun`: the ended check precedes the output lookup. In a
+/// live run the same take is `NotInRun`, and the state is not left stuck.
+#[test]
+fn after_consumer_exit_an_absent_output_is_busy_not_not_in_run() {
+    use multiview_control::output_routing::{OutputRouting, SubtitleTakeError};
+    let (h, _routes, _tick) = subtitle_run_handle();
+    let h = Arc::new(h);
+    let exit = h.subtitle_consumer_exit();
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::clone(&h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    // Live: absent output is NotInRun, twice (the lookup failure does not
+    // leave admission stuck), and a present one still applies.
+    for _ in 0..2 {
+        assert_eq!(
+            adapter.try_take_subtitles(subtitle_request("absent", vec![(0, None)])),
+            Err(SubtitleTakeError::NotInRun)
+        );
+    }
+    assert!(adapter
+        .try_take_subtitles(subtitle_request("hls-1", vec![(1, None)]))
+        .is_ok());
+    drop(exit);
+    assert!(
+        h.subtitle_routes_for_test("hls-1").is_some(),
+        "tables still held"
+    );
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request("absent", vec![(0, None)])),
+        Err(SubtitleTakeError::Busy)
+    );
+}
+
+/// Review INV3-1, exit BEFORE publication: the consumer exits while a take
+/// is about to be admitted; the take finds the run ended at its one
+/// admission point, publishes nothing, and is `Busy`.
+#[test]
+fn a_consumer_exit_before_admission_publishes_nothing() {
+    use multiview_control::output_routing::{OutputRouting, SubtitleTakeError};
+    let (h, routes, _tick) = subtitle_run_handle();
+    let h = Arc::new(h);
+    let exit = Mutex::new(Some(h.subtitle_consumer_exit()));
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::clone(&h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let stages = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&stages);
+    h.set_repoint_hook(Box::new(move |stage| log.lock().unwrap().push(stage)));
+    // The exit lands first (the take has loaded the handle, not admitted).
+    drop(exit.lock().unwrap().take());
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))]
+        )),
+        Err(SubtitleTakeError::Busy)
+    );
+    assert!(stages.lock().unwrap().is_empty(), "never admitted");
+    assert_eq!(routes.load().to_vec(), vec![Some("cam_a".to_owned()), None]);
+}
+
+/// Review INV3-1, exit AFTER publication: a take is admitted and publishes;
+/// the consumer samples the new route and exits (its guard ends admission)
+/// while the take is still between publication and return. The take stays
+/// applied: the table is NOT rolled back (what the consumer sampled is what
+/// is applied and then persisted), and later takes are `Busy`.
+#[test]
+fn a_consumer_exit_after_publication_keeps_the_take_applied() {
+    use crate::subtitle_slots::{CueResolver, SubtitleOutputSampler, SubtitleRun};
+    use multiview_control::output_routing::{OutputRouting, SubtitleTakeError};
+    use multiview_output::hls::subtitle::subtitle_feed_with_capacity;
+    let (h, routes, tick) = subtitle_run_handle();
+    let h = Arc::new(h);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::clone(&h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let (feed, rx) = subtitle_feed_with_capacity(64);
+    let resolve: CueResolver = Box::new(|id, _| Some(vec![format!("from {id}")]));
+    let run = SubtitleRun::new(
+        vec![SubtitleOutputSampler::new(Arc::clone(&routes), feed, 2)],
+        resolve,
+        CADENCE,
+    )
+    .with_tick_cell(Arc::clone(&tick));
+    // The consumer: its run and its exit guard.
+    let consumer = Mutex::new(Some((run, h.subtitle_consumer_exit())));
+    consumer.lock().unwrap().as_mut().unwrap().0.tick(10);
+    let consumer = Arc::new(consumer);
+    let on_publish = Arc::clone(&consumer);
+    h.set_repoint_hook(Box::new(move |stage| {
+        if stage == RepointStage::Published {
+            // Paused after publication: the consumer samples the new route,
+            // then exits (dropping its guard).
+            let (mut run, exit) = on_publish.lock().unwrap().take().unwrap();
+            run.tick(11);
+            drop(exit);
+            drop(run);
+        }
+    }));
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request(
+            "hls-1",
+            vec![(0, Some("cam_b".to_owned()))]
+        )),
+        Ok(10),
+        "applied: it was published (and sampled)"
+    );
+    let cues = rx.drain();
+    assert_eq!(cues.last().unwrap().lines[0], "from cam_b", "{cues:?}");
+    assert_eq!(
+        routes.load().to_vec(),
+        vec![Some("cam_b".to_owned()), None],
+        "never rolled back"
+    );
+    assert!(!h.subtitles_live());
+    assert_eq!(
+        adapter.try_take_subtitles(subtitle_request("hls-1", vec![(0, None)])),
+        Err(SubtitleTakeError::Busy)
+    );
+}

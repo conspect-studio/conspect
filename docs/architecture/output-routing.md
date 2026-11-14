@@ -2519,13 +2519,18 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   (`OutputRoutingHandle::repoint_subtitles` → `subtitle_slots::repoint`). Admission ends as soon
   as the run can no longer sample: teardown ends the gate the moment the clock returns (before
   the egress join and ingest teardown), the bake consumer ends it wait-free on any exit (it
-  holds `SubtitleConsumerExit`, one atomic swap; a re-point that loses that race restores the
-  table it replaced and is refused), and `SubtitleRunEnd` still ends it on every other exit path
-  of `drive_streaming`. A take that loaded the handle before the run ended or was replaced is
-  refused and never mutates the obsolete table, and the live readback of an ended run is gone. No running engine, or an
-  ended run → 503 `engine-busy` (key freed, rate slot refunded); an output the run does not
-  sample (not in this run, or slots declared after it started) → `subtitle:refused:not-in-run`,
-  nothing changes. Without an output-routing seam the routes answer 409 `routing-unavailable`
+  holds `SubtitleConsumerExit`, one atomic swap), and `SubtitleRunEnd` still ends it on every
+  other exit path of `drive_streaming`. A re-point has ONE linearization point: the
+  compare-exchange of the run's admission state from live to writing, taken before the output
+  lookup and before anything is published. It fails on an ended run (refused, nothing
+  published); once it succeeds the table is published and the take is applied, with no
+  rollback: a consumer that exits afterwards may have sampled it, which the contract allows,
+  and it is persisted either way. The consumer never waits on a writer. A take that loaded the
+  handle before the run ended or was replaced is refused and never mutates the obsolete table,
+  and the live readback of an ended run is gone. No running engine, or an ended run (for any
+  output, in the run or not) → 503 `engine-busy` (key freed, rate slot refunded); in a live
+  run, an output it does not sample (not in this run, or slots declared after it started) →
+  `subtitle:refused:not-in-run`, nothing changes. Without an output-routing seam the routes answer 409 `routing-unavailable`
   as the video path does.
 - **Landing tick (honest contract).** `subtitle:applied` means the route table was swapped. The
   outcome's `tick` is a completed-tick lower bound observed before the swap (the sampler

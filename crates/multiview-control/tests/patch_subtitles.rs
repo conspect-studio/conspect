@@ -147,6 +147,9 @@ struct FakeState {
     /// Live route tables by output config id (the engine's view).
     tables: std::collections::HashMap<String, Vec<Option<String>>>,
     busy: bool,
+    /// The run's consumer exited (tables still held): every take is Busy,
+    /// whether or not the output is in the run (review COR3-1).
+    ended: bool,
 }
 
 struct Fake {
@@ -175,7 +178,7 @@ impl OutputRouting for Fake {
     }
     fn try_take_subtitles(&self, take: SubtitleTakeRequest) -> Result<u64, SubtitleTakeError> {
         let mut state = self.state.lock().unwrap();
-        if state.busy {
+        if state.busy || state.ended {
             return Err(SubtitleTakeError::Busy);
         }
         let Some(table) = state.tables.get_mut(&take.output) else {
@@ -917,4 +920,35 @@ async fn after_the_run_stops_get_is_not_live_and_a_take_is_busy() {
     assert_eq!(rig.takes(), Vec::new());
     let control = rig.state.output_routing.as_ref().unwrap();
     assert_eq!(control.subtitle_persist_pending(), 0);
+}
+
+/// Review COR3-1 (HTTP): after the run's consumer exited, a take for an
+/// output the run does not sample is 503 `engine-busy` (not 202
+/// `not-in-run`): its key is released (the retry is a fresh take, not a
+/// replay of a refusal) and its rate slot refunded.
+#[tokio::test]
+async fn after_consumer_exit_a_take_on_an_output_absent_from_the_run_is_busy_and_frees_its_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    rig.fake.state.lock().unwrap().ended = true;
+    // output-2 is not in the engine's tables (a restart-pending output).
+    let body = || patch(vec![sub("output-2", 0, json!({"source": "cam_a"}))]);
+    for _ in 0..3 {
+        // Three refusals in one second: never 429, so each was refunded.
+        let (status, problem) = take(&rig, OPERATOR_TOKEN, "ended", body()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{problem}");
+        assert!(problem["type"].as_str().unwrap().ends_with("engine-busy"));
+    }
+    // The next run: the same key is a fresh take (not a replayed refusal).
+    {
+        let mut state = rig.fake.state.lock().unwrap();
+        state.ended = false;
+        state
+            .tables
+            .insert(OUT_C.to_owned(), vec![Some("secret-cam".to_owned())]);
+    }
+    let (status, body_json) = take(&rig, OPERATOR_TOKEN, "ended", body()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body_json}");
+    assert_eq!(rig.takes().len(), 1);
+    assert_eq!(rig.takes()[0].output, OUT_C);
 }

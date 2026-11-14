@@ -517,14 +517,45 @@ struct HandleSubtitles {
     /// The run's subtitle admission state ([`SUBTITLES_LIVE`],
     /// [`SUBTITLES_WRITING`], [`SUBTITLES_ENDED`]): the bake consumer ends it
     /// wait-free (one atomic swap, never the mutex) when it exits for any
-    /// reason (review INV2-1); a re-point that loses that race restores the
-    /// table it replaced and is refused.
+    /// reason (review INV2-1); a re-point is admitted by ONE compare-exchange
+    /// from live (review INV3-1), never rolled back.
     state: Arc<std::sync::atomic::AtomicU8>,
     /// The last output tick the subtitle sampler completed (0 before any).
     tick: Arc<std::sync::atomic::AtomicU64>,
     /// Every table the run had, kept for tests after the gate is cleared.
     #[cfg(test)]
     test_tables: Arc<Mutex<SubtitleTables>>,
+    /// Test seam: called at each [`RepointStage`] of a re-point.
+    #[cfg(test)]
+    hook: Arc<Mutex<Option<RepointHook>>>,
+}
+
+/// A test hook on a re-point's stages.
+#[cfg(test)]
+type RepointHook = Box<dyn Fn(RepointStage) + Send + Sync>;
+
+/// Where a re-point is (test seam, review INV3-1).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepointStage {
+    /// Past the admission point, nothing published yet.
+    Admitted,
+    /// The table is published (or the lookup refused it).
+    Published,
+}
+
+#[cfg(test)]
+impl HandleSubtitles {
+    fn hook(&self, stage: RepointStage) {
+        if let Some(hook) = self
+            .hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(stage);
+        }
+    }
 }
 
 impl Default for HandleSubtitles {
@@ -534,6 +565,8 @@ impl Default for HandleSubtitles {
             state: Arc::new(std::sync::atomic::AtomicU8::new(SUBTITLES_LIVE)),
             #[cfg(test)]
             test_tables: Arc::new(Mutex::new(Arc::from(Vec::new()))),
+            #[cfg(test)]
+            hook: Arc::default(),
             tick: Arc::default(),
         }
     }
@@ -541,7 +574,7 @@ impl Default for HandleSubtitles {
 
 /// Subtitle admission open: no re-point in progress.
 const SUBTITLES_LIVE: u8 = 0;
-/// A control-plane re-point is between its check and its store.
+/// A control-plane re-point was admitted and is publishing.
 const SUBTITLES_WRITING: u8 = 1;
 /// The run's subtitle routing ended (consumer exit or teardown).
 const SUBTITLES_ENDED: u8 = 2;
@@ -709,9 +742,18 @@ impl OutputRoutingHandle {
     }
 
     /// Re-point subtitle slots of the output whose config id is `output`
-    /// (part F2), under the run's subtitle gate: a run that ended (consumer
-    /// exited, teardown started, or replaced) refuses with
-    /// [`SubtitleRepoint::Ended`] and its table is left as it was.
+    /// (part F2), under the run's subtitle gate.
+    ///
+    /// ONE linearization point decides admission (review INV3-1): the
+    /// compare-exchange of the admission state from live to writing. A run
+    /// already ended (consumer exited, teardown started, or replaced) fails
+    /// it and is refused [`SubtitleRepoint::Ended`] BEFORE any output lookup
+    /// (review COR3-1), and nothing is published. Once it succeeds the take
+    /// is admitted and its table is published; there is no rollback. A
+    /// consumer that exits after the admission may or may not have sampled
+    /// it, which the contract allows (an applied take may never be sampled
+    /// when the run ends first); it is applied and persisted either way. The
+    /// consumer never waits: its exit is one atomic swap.
     ///
     /// `Ok(tick)` is a completed-tick LOWER BOUND observed before the swap:
     /// the sampler had completed tick `tick` (or, when `0`, possibly no tick
@@ -731,31 +773,43 @@ impl OutputRoutingHandle {
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
         let gate = self.subtitle_gate();
         let tables = gate.as_ref().ok_or(SubtitleRepoint::Ended)?;
-        let routes = tables
-            .iter()
-            .find(|(id, _)| id == output)
-            .map(|(_, routes)| routes)
-            .ok_or(SubtitleRepoint::NotInRun)?;
+        // The linearization point: admitted, or ended (nothing published).
         self.sub
             .state
             .compare_exchange(SUBTITLES_LIVE, SUBTITLES_WRITING, AcqRel, Acquire)
             .map_err(|_| SubtitleRepoint::Ended)?;
-        let tick = self.sub.tick.load(Acquire);
-        let before = routes.load();
-        let swapped = crate::subtitle_slots::repoint(routes, slots);
-        if self
+        #[cfg(test)]
+        self.sub.hook(RepointStage::Admitted);
+        let published = tables
+            .iter()
+            .find(|(id, _)| id == output)
+            .map(|(_, routes)| routes)
+            .ok_or(SubtitleRepoint::NotInRun)
+            .and_then(|routes| {
+                let tick = self.sub.tick.load(Acquire);
+                crate::subtitle_slots::repoint(routes, slots)
+                    .map(|()| tick)
+                    .map_err(|_| SubtitleRepoint::NotInRun)
+            });
+        #[cfg(test)]
+        self.sub.hook(RepointStage::Published);
+        // Back to live, unless the consumer ended the run meanwhile (then it
+        // stays ended; the admitted take keeps its answer).
+        let _ = self
             .sub
             .state
-            .compare_exchange(SUBTITLES_WRITING, SUBTITLES_LIVE, AcqRel, Acquire)
-            .is_err()
-        {
-            // The consumer ended the run during this re-point: it reads no
-            // table any more, so restoring the old one is unobservable.
-            routes.store(before);
-            return Err(SubtitleRepoint::Ended);
-        }
-        swapped.map_err(|_| SubtitleRepoint::NotInRun)?;
-        Ok(tick)
+            .compare_exchange(SUBTITLES_WRITING, SUBTITLES_LIVE, AcqRel, Acquire);
+        published
+    }
+
+    /// Test seam: run `hook` at each stage of a re-point (review INV3-1).
+    #[cfg(test)]
+    pub(crate) fn set_repoint_hook(&self, hook: Box<dyn Fn(RepointStage) + Send + Sync>) {
+        *self
+            .sub
+            .hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
     /// The live subtitle route table of `output`, `None` when the run does

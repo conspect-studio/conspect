@@ -1164,12 +1164,17 @@ impl OutputRoutingControl {
         self.subtitle_queue().pending
     }
 
-    /// Replace the subtitle persistence capacity (at least 1; tests shrink
-    /// it to reach the bound within the take limits).
+    /// Test seam (review INV3-2): shrink the subtitle persistence capacity
+    /// so a test reaches the bound within the take limits. Clamped to
+    /// `1..=`[`MAX_PENDING_SUBTITLE_PERSISTS`] (never above the documented
+    /// ceiling). Only with the test-only `_test-seams` feature, which no
+    /// release build enables (CI "release-feature guard").
+    #[cfg(feature = "_test-seams")]
     pub fn set_subtitle_persist_capacity(&self, capacity: usize) {
-        self.subtitles
-            .capacity
-            .store(capacity.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.subtitles.capacity.store(
+            capacity.clamp(1, MAX_PENDING_SUBTITLE_PERSISTS),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Start the single serial subtitle persistence worker once (lazily, on
