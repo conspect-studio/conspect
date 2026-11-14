@@ -846,7 +846,22 @@ fn start_output(
     let sink_tracks = audio.tracks.clone();
     let sink = std::thread::Builder::new()
         .name("multiview-rate-sink".to_owned())
-        .spawn(move || runner(rx, params, time_base, sink_audio, sink_tracks))
+        .spawn(move || {
+            // #343 review I4: the final playlist is written HERE, on the sink
+            // thread, so the bounded shutdown poll covers its file I/O (a
+            // stalled filesystem detaches this thread, never the run end).
+            let mut outcome = runner(rx, params, time_base, sink_audio, sink_tracks)?;
+            if let Some((path, text)) = outcome.playlist.take() {
+                if let Err(e) = std::fs::write(&path, text.as_bytes()) {
+                    outcome.line = format!(
+                        "{}; writing playlist {} FAILED: {e}",
+                        outcome.line,
+                        path.display()
+                    );
+                }
+            }
+            Ok(outcome)
+        })
         .map_err(|e| PipelineError::thread_spawn("rate output sink", e))?;
     let (video_tx, video_rx) = std::sync::mpsc::sync_channel::<DispatchEvent>(LANE_VIDEO_QUEUE);
     let gate = AudioGate {
@@ -1234,17 +1249,8 @@ fn join_output(output: RunningOutput) -> Vec<String> {
     }
     if sink.is_finished() {
         match sink.join() {
-            Ok(Ok(outcome)) => {
-                if let Some((path, text)) = outcome.playlist {
-                    if let Err(e) = std::fs::write(&path, text.as_bytes()) {
-                        lines.push(format!(
-                            "{id}: writing playlist {} FAILED: {e}",
-                            path.display()
-                        ));
-                    }
-                }
-                lines.push(outcome.line);
-            }
+            // The sink thread already wrote the playlist (I4).
+            Ok(Ok(outcome)) => lines.push(outcome.line),
             Ok(Err(error)) => lines.push(format!("{id}: rate output sink FAILED ({error})")),
             Err(_) => lines.push(format!("{id}: rate output sink FAILED (panicked)")),
         }

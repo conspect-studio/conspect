@@ -211,7 +211,11 @@ fn program_recorder(rec: Shared, finalise: Duration) -> TestSinkRunner {
 }
 
 /// A rate output's recorder (through `LaneHooks.runners`).
-fn rate_recorder(id: &'static str, rec: Shared) -> SinkRunner {
+fn rate_recorder(
+    id: &'static str,
+    rec: Shared,
+    playlist: Option<std::path::PathBuf>,
+) -> SinkRunner {
     Box::new(
         move |rx: Receiver<LeasedPacket>, _params, _tb, _audio, _tracks| {
             let mut frames = 0;
@@ -221,7 +225,7 @@ fn rate_recorder(id: &'static str, rec: Shared) -> SinkRunner {
             }
             Ok(SinkRunOutcome {
                 line: format!("{id}: test rate sink: {frames} packet(s)"),
-                playlist: None,
+                playlist: playlist.map(|path| (path, "#EXTM3U\n".to_owned())),
                 frames,
             })
         },
@@ -236,6 +240,9 @@ struct Hooks {
     latch_delay: Option<Duration>,
     /// How long each Program-rate sink takes to finalise.
     program_finalise: Duration,
+    /// Where the 25 fps rate sink's final playlist is written (a FIFO with
+    /// no reader models a stalled filesystem).
+    rate_playlist: Option<std::path::PathBuf>,
 }
 
 /// What a test's controller thread gets while the run is live.
@@ -291,9 +298,13 @@ fn drive(
         .collect();
     let rate: Shared = Arc::new(Mutex::new(Rec::default()));
     let rate24: Shared = Arc::new(Mutex::new(Rec::default()));
-    let mut lane_runners = vec![rate_recorder("out_rate", Arc::clone(&rate))];
+    let mut lane_runners = vec![rate_recorder(
+        "out_rate",
+        Arc::clone(&rate),
+        hooks.rate_playlist.clone(),
+    )];
     if doc.second_rate {
-        lane_runners.push(rate_recorder("out_rate24", Arc::clone(&rate24)));
+        lane_runners.push(rate_recorder("out_rate24", Arc::clone(&rate24), None));
     }
     let latches = Arc::new(Mutex::new(Vec::new()));
     let observe = Arc::clone(&latches);
@@ -1063,6 +1074,72 @@ fn a_wedged_lane_never_holds_a_healthy_lane_or_the_run_end() {
         run_end < Duration::from_secs(6),
         "run end took {run_end:?} after Program's last tick"
     );
+}
+
+/// Chaos (#343 review I4): a rate output's final playlist write blocks (a
+/// FIFO with no reader: a stalled filesystem). The write happens on that
+/// output's sink thread, so the bounded lane shutdown detaches it and the run
+/// end stays within the lanes' budget; Program completes fully. Without the
+/// fix the write ran on the shutdown caller: the run end waited until the
+/// test's backstop reader opened the FIFO (10 s).
+#[test]
+#[cfg(unix)] // mkfifo
+fn a_stalled_playlist_write_never_holds_the_run_end() {
+    const TICKS: u64 = 90;
+    let dir = std::env::temp_dir().join(format!(
+        "multiview-lanes-fifo-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("index.m3u8");
+    let _ = std::fs::remove_file(&fifo);
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "mkfifo");
+    // Backstop: unblock the writer after 10 s whatever happens, so a
+    // regression fails on the bound below instead of hanging the binary.
+    let backstop = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(10));
+            let _ = std::fs::File::open(&fifo).map(|mut f| {
+                let mut sink = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut f, &mut sink);
+            });
+        })
+    };
+    let hooks = Hooks {
+        rate_playlist: Some(fifo.clone()),
+        ..Hooks::default()
+    };
+    let ended = Arc::new(Mutex::new(None::<Instant>));
+    let mark = Arc::clone(&ended);
+    let run = drive("lanes_fifo", Doc::default(), TICKS, hooks, move |ctl| {
+        let start = Instant::now();
+        while ctl.observer.load(Ordering::Acquire) < TICKS {
+            assert!(start.elapsed() < Duration::from_secs(40), "Program ends");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *mark.lock().unwrap() = Some(Instant::now());
+    });
+    let run_end = ended.lock().unwrap().expect("Program ended").elapsed();
+    assert_program(&run, TICKS);
+    assert!(
+        run.lines
+            .iter()
+            .any(|l| l.starts_with("out_rate:") && l.contains("sink WEDGED")),
+        "the stalled sink is detached and reported: {:#?}",
+        run.lines
+    );
+    assert!(
+        run_end < Duration::from_secs(6),
+        "run end took {run_end:?} after Program's last tick"
+    );
+    backstop.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Chaos: the lane encoder panics at output tick 30. Only that output ends
