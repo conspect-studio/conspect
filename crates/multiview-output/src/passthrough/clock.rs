@@ -578,6 +578,7 @@ impl PassthroughClock {
 
     /// Output ticks of `ts` (relative to a zero epoch) in time base `tb`, or
     /// `None` when off grid, overflowing or degenerate.
+    #[cfg(test)]
     fn to_ticks(&self, ts: i64, tb: Rational) -> Option<i128> {
         match self.convert(i128::from(ts), tb) {
             Conv::Tick(t) => Some(t),
@@ -630,12 +631,11 @@ impl PassthroughClock {
             self.malformed(au.dts);
             return;
         }
-        let epoch = match self.epoch_ts {
-            Some(e) => e,
-            None => {
-                self.re_epoch(au.dts);
-                au.dts
-            }
+        let epoch = if let Some(e) = self.epoch_ts {
+            e
+        } else {
+            self.re_epoch(au.dts);
+            au.dts
         };
         let rel = |ts: i64, e: i64| i128::from(ts) - i128::from(e);
         let dts_t = match self.convert(rel(au.dts, epoch), au.time_base) {
@@ -1123,6 +1123,7 @@ impl PassthroughClock {
     /// set at queue indices `k..i` and the IDR at `i`. Every queued AU it
     /// looks at must be of the run's epoch; all arithmetic is checked (an
     /// overflow plans nothing).
+    #[allow(clippy::many_single_char_names)] // t, k, i, m, p as in the docs
     fn plan_deep(
         &self,
         t: i128,

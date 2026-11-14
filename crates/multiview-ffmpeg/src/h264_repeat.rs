@@ -547,6 +547,7 @@ pub fn parse_pps(nal: &[u8]) -> Option<H264Pps> {
 // ---------------------------------------------------------------------------
 
 /// What the repeat picture needs to know about the previous picture.
+#[allow(clippy::struct_excessive_bools)] // mirrors the slice header's flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrevSlice {
     /// `nal_ref_idc` of the previous picture.
@@ -761,7 +762,7 @@ fn first_vcl_prefix(au: &[u8], framing: NalFraming) -> Option<&[u8]> {
                 let end = region
                     .windows(3)
                     .position(|w| w == [0, 0, 1])
-                    .map_or(region.len(), |p| p);
+                    .unwrap_or(region.len());
                 let mut body = region.get(..end)?;
                 while let Some(rest) = body.strip_suffix(&[0]) {
                     body = rest;
@@ -803,7 +804,8 @@ fn first_vcl_prefix(au: &[u8], framing: NalFraming) -> Option<&[u8]> {
     }
 }
 
-/// Split an access unit into NAL bodies under `framing` (bounded).
+/// Split an access unit into NAL bodies under `framing` (bounded; tests).
+#[cfg(test)]
 fn split_nals(au: &[u8], framing: NalFraming) -> Option<Vec<&[u8]>> {
     let mut out = Vec::new();
     match framing {
@@ -1774,7 +1776,7 @@ mod tests {
             .is_none());
     }
 
-    /// A CAVLC baseline P slice header (frame_num 3) with the given
+    /// A CAVLC baseline P slice header (`frame_num` 3) with the given
     /// `nal_ref_idc` and marking: `None` = sliding window, `Some(ops)` =
     /// adaptive marking with `(mmco, args)` then 0.
     fn p_slice(nal_ref_idc: u8, marking: Option<&[(u32, &[u32])]>) -> Vec<u8> {
@@ -1930,12 +1932,12 @@ mod tests {
     #[test]
     fn work_is_bounded() {
         // R1-A6: oversize parameter sets are refused before unescaping.
-        let mut big_sps = BASE_SPS.to_vec();
-        big_sps.resize(MAX_PARAM_SET_BYTES + 1, 0);
-        assert!(parse_sps(&big_sps).is_none());
-        let mut big_pps = BASE_PPS.to_vec();
-        big_pps.resize(MAX_PARAM_SET_BYTES + 1, 0);
-        assert!(parse_pps(&big_pps).is_none());
+        let mut sps_over = BASE_SPS.to_vec();
+        sps_over.resize(MAX_PARAM_SET_BYTES + 1, 0);
+        assert!(parse_sps(&sps_over).is_none());
+        let mut long_pps_nal = BASE_PPS.to_vec();
+        long_pps_nal.resize(MAX_PARAM_SET_BYTES + 1, 0);
+        assert!(parse_pps(&long_pps_nal).is_none());
         // A huge previous slice: only the prefix is parsed; still correct.
         let b = RepeatAuBuilder::new(BASE_SPS, BASE_PPS).unwrap();
         let mut big = BASE_P1.to_vec();
@@ -1961,8 +1963,9 @@ mod tests {
             .repeat_after(&frame_nals(&nals, lp).unwrap(), lp)
             .is_none());
         // The emulation counters saturate (no overflow on long zero runs).
-        assert_eq!(unescape(&[0; 70_000]).len(), 70_000);
-        assert!(escape(&[0; 70_000]).len() > 70_000);
+        let zero_run = vec![0_u8; 70_000];
+        assert_eq!(unescape(&zero_run).len(), 70_000);
+        assert!(escape(&zero_run).len() > 70_000);
     }
 
     #[test]

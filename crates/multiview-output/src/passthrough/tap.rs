@@ -201,18 +201,27 @@ impl CompressedTap {
             }
         };
         let mut disconnected = false;
-        for consumer in senders.iter() {
-            // An `Arc` clone of the bytes, never a copy.
-            match consumer.tx.try_send(au.clone()) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    self.shared.dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(TrySendError::Disconnected(_)) => disconnected = true,
+        if let Some((last, rest)) = senders.split_last() {
+            // An `Arc` clone of the bytes per consumer, never a copy.
+            for consumer in rest {
+                disconnected |= self.send_one(&consumer.tx, au.clone());
             }
+            disconnected |= self.send_one(&last.tx, au);
         }
         if disconnected {
             senders.retain(|c| c.alive.load(Ordering::Acquire));
+        }
+    }
+
+    /// `try_send` one AU; `true` when the consumer is gone.
+    fn send_one(&self, tx: &SyncSender<TapAu>, au: TapAu) -> bool {
+        match tx.try_send(au) {
+            Ok(()) => false,
+            Err(TrySendError::Full(_)) => {
+                self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => true,
         }
     }
 
