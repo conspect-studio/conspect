@@ -467,7 +467,7 @@ msgstr "▲ PREVIEW"
 msgid "△ PREVIEW — unconfirmed"
 msgstr "△ PREVIEW — unconfirmed"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "○ Dark — neither bus"
 msgstr "○ Dark — neither bus"
 
@@ -475,7 +475,7 @@ msgstr "○ Dark — neither bus"
 msgid "○ PROGRAM — unconfirmed"
 msgstr "○ PROGRAM — unconfirmed"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "● Amber — PREVIEW"
 msgstr "● Amber — PREVIEW"
 
@@ -495,7 +495,7 @@ msgstr "● on PGM"
 msgid "● RED — on air"
 msgstr "● RED — on air"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "● Red — PROGRAM"
 msgstr "● Red — PROGRAM"
 
@@ -931,11 +931,11 @@ msgstr "Active NVENC sessions out of the discovered ceiling"
 msgid "Active only"
 msgstr "Active only"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Active system alarm summary"
 msgstr "Active system alarm summary"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Active system alarms only"
 msgstr "Active system alarms only"
 
@@ -1139,7 +1139,7 @@ msgstr "Alarm acknowledged"
 msgid "Alarm policy (dwell, severity, latching)"
 msgstr "Alarm policy (dwell, severity, latching)"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Alarm summary unavailable"
 msgstr "Alarm summary unavailable"
 
@@ -1149,7 +1149,7 @@ msgstr "Alarm when offline"
 
 #: src/app/navigation.tsx:70
 #: src/components/broadcast/BroadcastShell.tsx:47
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:317
 #: src/docs/registry.ts:262
 #: src/pages/AlarmsPage.tsx:152
 #: src/pages/docs/FeaturesPage.tsx:164
@@ -1157,7 +1157,7 @@ msgid "Alarms"
 msgstr "Alarms"
 
 #. placeholder {0}: alarms.data.length
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:317
 msgid "Alarms — {0} active system"
 msgstr "Alarms — {0} active system"
 
@@ -1165,7 +1165,7 @@ msgstr "Alarms — {0} active system"
 msgid "Alarms — {alarmCount} active system"
 msgstr "Alarms — {alarmCount} active system"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Alarms & engine health"
 msgstr "Alarms & engine health"
 
@@ -1438,7 +1438,7 @@ msgstr "Apply mode"
 msgid "Apply requested configuration"
 msgstr "Apply requested configuration"
 
-#: src/components/broadcast/ProductionDesk.tsx:271
+#: src/components/broadcast/ProductionDesk.tsx:335
 msgid "Apply to {kindLabel}"
 msgstr "Apply to {kindLabel}"
 
@@ -1689,16 +1689,16 @@ msgstr "Auto (drop leading zero units)"
 msgid "Auto (first usable track)"
 msgstr "Auto (first usable track)"
 
-#: src/components/broadcast/ProductionDesk.tsx:261
+#: src/components/broadcast/ProductionDesk.tsx:325
 msgid "AUTO {kindLabel} over {frames} frames"
 msgstr "AUTO {kindLabel} over {frames} frames"
 
-#: src/components/broadcast/ProductionDesk.tsx:262
+#: src/components/broadcast/ProductionDesk.tsx:326
 #: src/pages/SwitcherPage.tsx:148
 msgid "Auto frames"
 msgstr "Auto frames"
 
-#: src/components/broadcast/ProductionDesk.tsx:262
+#: src/components/broadcast/ProductionDesk.tsx:326
 msgid "AUTO frames"
 msgstr "AUTO frames"
 
@@ -1890,7 +1890,7 @@ msgstr "BOM daily forecasts carry seven days and no hourly or morning/afternoon 
 msgid "Border"
 msgstr "Border"
 
-#: src/components/broadcast/ProductionDesk.tsx:269
+#: src/components/broadcast/ProductionDesk.tsx:333
 #: src/pages/OverlaysPage.tsx:124
 msgid "Border colour"
 msgstr "Border colour"
@@ -1899,7 +1899,7 @@ msgstr "Border colour"
 msgid "Border colour must be a hex value like #101014 or #abc."
 msgstr "Border colour must be a hex value like #101014 or #abc."
 
-#: src/components/broadcast/ProductionDesk.tsx:268
+#: src/components/broadcast/ProductionDesk.tsx:332
 msgid "Border width"
 msgstr "Border width"
 
@@ -1928,7 +1928,7 @@ msgstr "Bounded skew"
 msgid "Bounded skew: the decoder runs its own clock, so its presentation drifts within roughly ±100–500 ms between re-aligns. An optional scheduled re-align tightens it but blanks that device for one to three seconds — never silently, never mid-show without the policy enabled."
 msgstr "Bounded skew: the decoder runs its own clock, so its presentation drifts within roughly ±100–500 ms between re-aligns. An optional scheduled re-align tightens it but blanks that device for one to three seconds — never silently, never mid-show without the policy enabled."
 
-#: src/components/broadcast/ProductionDesk.tsx:249
+#: src/components/broadcast/ProductionDesk.tsx:313
 msgid "Box wipe"
 msgstr "Box wipe"
 
@@ -2031,7 +2031,7 @@ msgid "Camera 1"
 msgstr "Camera 1"
 
 #: src/components/broadcast/BroadcastShell.tsx:45
-#: src/components/broadcast/ProductionDesk.tsx:277
+#: src/components/broadcast/ProductionDesk.tsx:341
 #: src/components/switcher/MixerInputBank.tsx:75
 #: src/events/AutomationPanel.tsx:135
 #: src/iptv/AddSourceDialog.tsx:79
@@ -2422,7 +2422,7 @@ msgstr "Choosing a transport"
 msgid "Chroma subsampling"
 msgstr "Chroma subsampling"
 
-#: src/components/broadcast/ProductionDesk.tsx:249
+#: src/components/broadcast/ProductionDesk.tsx:313
 msgid "Circle wipe"
 msgstr "Circle wipe"
 
@@ -2798,11 +2798,11 @@ msgstr "Confirm a take on a Program output?"
 msgid "Confirm on-air re-patch"
 msgstr "Confirm on-air re-patch"
 
-#: src/components/broadcast/ProductionDesk.tsx:277
+#: src/components/broadcast/ProductionDesk.tsx:341
 msgid "Confirm program change"
 msgstr "Confirm program change"
 
-#: src/components/broadcast/ProductionDesk.tsx:277
+#: src/components/broadcast/ProductionDesk.tsx:341
 #: src/pages/OutputFeedRow.tsx:466
 #: src/pages/RoutingPage.tsx:662
 msgid "Confirm take"
@@ -2933,7 +2933,7 @@ msgstr "Continuous output and fault isolation are design objectives, not warrant
 msgid "Control"
 msgstr "Control"
 
-#: src/components/broadcast/ProductionDesk.tsx:254
+#: src/components/broadcast/ProductionDesk.tsx:318
 msgid "Controls disabled"
 msgstr "Controls disabled"
 
@@ -3590,7 +3590,7 @@ msgstr "Cut"
 msgid "CUT"
 msgstr "CUT"
 
-#: src/components/broadcast/ProductionDesk.tsx:261
+#: src/components/broadcast/ProductionDesk.tsx:325
 msgid "CUT — Preview and Program carry the same source"
 msgstr "CUT — Preview and Program carry the same source"
 
@@ -3602,7 +3602,7 @@ msgstr "Cut Program"
 msgid "CUT will execute without another confirmation. AUTO remains unavailable. Direct program selection remains guarded."
 msgstr "CUT will execute without another confirmation. AUTO remains unavailable. Direct program selection remains guarded."
 
-#: src/components/broadcast/ProductionDesk.tsx:261
+#: src/components/broadcast/ProductionDesk.tsx:325
 msgid "Cuts to"
 msgstr "Cuts to"
 
@@ -3982,7 +3982,7 @@ msgstr "Diagnostics snapshot"
 msgid "Diagnostics snapshot ready"
 msgstr "Diagnostics snapshot ready"
 
-#: src/components/broadcast/ProductionDesk.tsx:249
+#: src/components/broadcast/ProductionDesk.tsx:313
 msgid "Diagonal wipe"
 msgstr "Diagonal wipe"
 
@@ -3998,8 +3998,8 @@ msgstr "Different hardware can only achieve different sync quality, and Conspect
 msgid "Digital (HH:MM:SS readout)"
 msgstr "Digital (HH:MM:SS readout)"
 
-#: src/components/broadcast/ProductionDesk.tsx:270
-#: src/components/broadcast/ProductionDesk.tsx:270
+#: src/components/broadcast/ProductionDesk.tsx:334
+#: src/components/broadcast/ProductionDesk.tsx:334
 msgid "Dip colour"
 msgstr "Dip colour"
 
@@ -4587,7 +4587,7 @@ msgstr "Engine default (mixed program bus)"
 msgid "Engine default (reclock to house)"
 msgstr "Engine default (reclock to house)"
 
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:317
 msgid "ENGINE TICK"
 msgstr "ENGINE TICK"
 
@@ -4600,8 +4600,8 @@ msgstr "Engine-confirmed bus"
 msgid "Enrollment"
 msgstr "Enrollment"
 
-#: src/components/broadcast/ProductionDesk.tsx:226
-#: src/components/broadcast/ProductionDesk.tsx:248
+#: src/components/broadcast/ProductionDesk.tsx:290
+#: src/components/broadcast/ProductionDesk.tsx:312
 msgid "Enter 1–1000 frames"
 msgstr "Enter 1–1000 frames"
 
@@ -5405,9 +5405,9 @@ msgstr "Height (%)"
 msgid "Height (px)"
 msgstr "Height (px)"
 
-#: src/components/broadcast/ProductionDesk.tsx:253
-#: src/components/broadcast/ProductionDesk.tsx:253
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:317
+#: src/components/broadcast/ProductionDesk.tsx:317
+#: src/components/broadcast/ProductionDesk.tsx:317
 #: src/pages/approved/MediaSurface.tsx:135
 #: src/pages/approved/RoutingSurface.tsx:94
 #: src/pages/approved/ShowPage.tsx:41
@@ -5490,7 +5490,7 @@ msgstr "Hold at 00:00:00"
 msgid "Hold cue"
 msgstr "Hold cue"
 
-#: src/components/broadcast/ProductionDesk.tsx:249
+#: src/components/broadcast/ProductionDesk.tsx:313
 msgid "Horizontal wipe"
 msgstr "Horizontal wipe"
 
@@ -6134,7 +6134,7 @@ msgid "layout: {id}"
 msgstr "layout: {id}"
 
 #: src/app/navigation.tsx:53
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 #: src/docs/registry.ts:227
 #: src/pages/DashboardPage.tsx:58
 #: src/pages/docs/FeaturesPage.tsx:25
@@ -6413,7 +6413,7 @@ msgstr "Loaded"
 msgid "Loading"
 msgstr "Loading"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Loading alarm summary"
 msgstr "Loading alarm summary"
 
@@ -6666,7 +6666,7 @@ msgstr "Low–medium (window-tuned)"
 msgid "Luma threshold (0–255)"
 msgstr "Luma threshold (0–255)"
 
-#: src/components/broadcast/ProductionDesk.tsx:259
+#: src/components/broadcast/ProductionDesk.tsx:323
 msgid "M/E 1 — Switcher"
 msgstr "M/E 1 — Switcher"
 
@@ -7095,7 +7095,7 @@ msgstr "Multicast"
 msgid "Multicast Listener Discovery version 2 — the IPv6 protocol a receiver uses to tell the network which multicast groups (and, with source-specific multicast, which senders) it wants. It is the IPv6 successor to IPv4's IGMP and the primary group-join mechanism in Conspect's IPv6-first multicast support."
 msgstr "Multicast Listener Discovery version 2 — the IPv6 protocol a receiver uses to tell the network which multicast groups (and, with source-specific multicast, which senders) it wants. It is the IPv6 successor to IPv4's IGMP and the primary group-join mechanism in Conspect's IPv6-first multicast support."
 
-#: src/components/broadcast/ProductionDesk.tsx:258
+#: src/components/broadcast/ProductionDesk.tsx:322
 msgid "Multiview wall"
 msgstr "Multiview wall"
 
@@ -7342,7 +7342,7 @@ msgstr "No {0} address"
 msgid "No active stream."
 msgstr "No active stream."
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "No active system alarms reported"
 msgstr "No active system alarms reported"
 
@@ -7650,7 +7650,7 @@ msgstr "No salvos are defined yet."
 msgid "No services discovered yet. Run a scan to browse the network."
 msgstr "No services discovered yet. Run a scan to browse the network."
 
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:317
 msgid "No show clock in the engine API"
 msgstr "No show clock in the engine API"
 
@@ -7669,7 +7669,7 @@ msgstr "NO SIGNAL"
 msgid "No source"
 msgstr "No source"
 
-#: src/components/broadcast/ProductionDesk.tsx:258
+#: src/components/broadcast/ProductionDesk.tsx:322
 msgid "No source catalog available"
 msgstr "No source catalog available"
 
@@ -7677,7 +7677,7 @@ msgstr "No source catalog available"
 msgid "No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile."
 msgstr "No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile."
 
-#: src/components/broadcast/ProductionDesk.tsx:260
+#: src/components/broadcast/ProductionDesk.tsx:324
 msgid "No sources available"
 msgstr "No sources available"
 
@@ -7722,7 +7722,7 @@ msgstr "No temperature reported."
 msgid "No tickets yet."
 msgstr "No tickets yet."
 
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:317
 msgid "No timecode source in the engine API"
 msgstr "No timecode source in the engine API"
 
@@ -7958,7 +7958,7 @@ msgstr "Observed"
 msgid "Observed {0} at {1}: {2} (feels like {3}), humidity {4}, wind {5} {6}, pressure {7}."
 msgstr "Observed {0} at {1}: {2} (feels like {3}), humidity {4}, wind {5} {6}, pressure {7}."
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Observed tiles"
 msgstr "Observed tiles"
 
@@ -8101,7 +8101,7 @@ msgstr "open"
 msgid "Open a ticket to read and reply to its thread."
 msgstr "Open a ticket to read and reply to its thread."
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Open alarms"
 msgstr "Open alarms"
 
@@ -8118,7 +8118,7 @@ msgstr "Open HLS playlist"
 msgid "Open in VLC"
 msgstr "Open in VLC"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Open live monitoring"
 msgstr "Open live monitoring"
 
@@ -8248,7 +8248,7 @@ msgstr "Out of spec"
 msgid "Outbound publishing is a separate path (Routing)"
 msgstr "Outbound publishing is a separate path (Routing)"
 
-#: src/components/broadcast/ProductionDesk.tsx:254
+#: src/components/broadcast/ProductionDesk.tsx:318
 msgid "Outcome unknown; controls remain blocked until a correlated terminal event"
 msgstr "Outcome unknown; controls remain blocked until a correlated terminal event"
 
@@ -8462,7 +8462,7 @@ msgstr "Per-family result for {0}"
 msgid "PGM"
 msgstr "PGM"
 
-#: src/components/broadcast/ProductionDesk.tsx:260
+#: src/components/broadcast/ProductionDesk.tsx:324
 msgid "PGM bus — direct taps always confirm"
 msgstr "PGM bus — direct taps always confirm"
 
@@ -8695,11 +8695,11 @@ msgid "Preview — input {0}"
 msgstr "Preview — input {0}"
 
 #. placeholder {0}: source.name
-#: src/components/broadcast/ProductionDesk.tsx:258
+#: src/components/broadcast/ProductionDesk.tsx:322
 msgid "Preview {0}"
 msgstr "Preview {0}"
 
-#: src/components/broadcast/ProductionDesk.tsx:226
+#: src/components/broadcast/ProductionDesk.tsx:290
 msgid "Preview and Program carry the same source"
 msgstr "Preview and Program carry the same source"
 
@@ -8717,7 +8717,7 @@ msgid "Preview negotiation failed."
 msgstr "Preview negotiation failed."
 
 #. placeholder {0}: patternName(draft.pattern)
-#: src/components/broadcast/ProductionDesk.tsx:265
+#: src/components/broadcast/ProductionDesk.tsx:329
 msgid "Preview of {0} at 50%"
 msgstr "Preview of {0} at 50%"
 
@@ -8818,8 +8818,8 @@ msgid "Product telemetry"
 msgstr "Product telemetry"
 
 #: src/app/navigation.tsx:51
-#: src/components/broadcast/ProductionDesk.tsx:252
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:316
+#: src/components/broadcast/ProductionDesk.tsx:317
 msgid "Production desk"
 msgstr "Production desk"
 
@@ -8937,7 +8937,7 @@ msgstr "Program still image for output {0}"
 msgid "Program tally is not confirmed right now (switcher state missing or stale), so it is not guessed."
 msgstr "Program tally is not confirmed right now (switcher state missing or stale), so it is not guessed."
 
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:317
 msgid "Program timecode"
 msgstr "Program timecode"
 
@@ -9021,7 +9021,7 @@ msgstr "Push to/from streaming platforms"
 msgid "PVW"
 msgstr "PVW"
 
-#: src/components/broadcast/ProductionDesk.tsx:260
+#: src/components/broadcast/ProductionDesk.tsx:324
 msgid "PVW bus"
 msgstr "PVW bus"
 
@@ -9564,7 +9564,7 @@ msgstr "Retry live preview"
 msgid "Reveal {label}"
 msgstr "Reveal {label}"
 
-#: src/components/broadcast/ProductionDesk.tsx:266
+#: src/components/broadcast/ProductionDesk.tsx:330
 msgid "Reverse"
 msgstr "Reverse"
 
@@ -9645,7 +9645,7 @@ msgstr "Route {0}"
 msgid "Route {row}"
 msgstr "Route {row}"
 
-#: src/components/broadcast/ProductionDesk.tsx:258
+#: src/components/broadcast/ProductionDesk.tsx:322
 msgid "Route / patch"
 msgstr "Route / patch"
 
@@ -10020,19 +10020,19 @@ msgstr "Select {0} to {1}"
 msgid "Select {name} for bulk add"
 msgstr "Select {name} for bulk add"
 
-#: src/components/broadcast/ProductionDesk.tsx:261
+#: src/components/broadcast/ProductionDesk.tsx:325
 msgid "Select a DIP for the next AUTO"
 msgstr "Select a DIP for the next AUTO"
 
-#: src/components/broadcast/ProductionDesk.tsx:261
+#: src/components/broadcast/ProductionDesk.tsx:325
 msgid "Select a MIX for the next AUTO"
 msgstr "Select a MIX for the next AUTO"
 
-#: src/components/broadcast/ProductionDesk.tsx:258
+#: src/components/broadcast/ProductionDesk.tsx:322
 msgid "Select a source to Preview"
 msgstr "Select a source to Preview"
 
-#: src/components/broadcast/ProductionDesk.tsx:261
+#: src/components/broadcast/ProductionDesk.tsx:325
 msgid "Select a WIPE for the next AUTO"
 msgstr "Select a WIPE for the next AUTO"
 
@@ -10296,7 +10296,7 @@ msgstr "Snap to grid"
 msgid "Snapshot {0} assembled."
 msgstr "Snapshot {0} assembled."
 
-#: src/components/broadcast/ProductionDesk.tsx:267
+#: src/components/broadcast/ProductionDesk.tsx:331
 msgid "Softness"
 msgstr "Softness"
 
@@ -10329,7 +10329,7 @@ msgstr "Source ↓ / Dest →"
 msgid "Source bound"
 msgstr "Source bound"
 
-#: src/components/broadcast/ProductionDesk.tsx:258
+#: src/components/broadcast/ProductionDesk.tsx:322
 msgid "Source catalog unavailable"
 msgstr "Source catalog unavailable"
 
@@ -10378,7 +10378,7 @@ msgstr "Source preview"
 msgid "Source still preview"
 msgstr "Source still preview"
 
-#: src/components/broadcast/ProductionDesk.tsx:261
+#: src/components/broadcast/ProductionDesk.tsx:325
 msgid "source unknown"
 msgstr "source unknown"
 
@@ -10828,12 +10828,12 @@ msgid "Switched to the alternative"
 msgstr "Switched to the alternative"
 
 #: src/app/navigation.tsx:63
-#: src/components/broadcast/ProductionDesk.tsx:254
+#: src/components/broadcast/ProductionDesk.tsx:318
 #: src/pages/SwitcherPage.tsx:119
 msgid "Switcher"
 msgstr "Switcher"
 
-#: src/components/broadcast/ProductionDesk.tsx:254
+#: src/components/broadcast/ProductionDesk.tsx:318
 #: src/pages/SwitcherPage.tsx:121
 msgid "Switcher operation rejected"
 msgstr "Switcher operation rejected"
@@ -10968,7 +10968,7 @@ msgstr "Takes locked"
 msgid "Takes unlocked"
 msgstr "Takes unlocked"
 
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:317
 msgid "Takes: when locked, CUT confirms once, naming both sources. PGM bus taps always confirm."
 msgstr "Takes: when locked, CUT confirms once, naming both sources. PGM bus taps always confirm."
 
@@ -10983,7 +10983,7 @@ msgstr "Takes: when locked, CUT confirms once, naming both sources. PGM bus taps
 msgid "Tally"
 msgstr "Tally"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Tally & engine status"
 msgstr "Tally & engine status"
 
@@ -10991,15 +10991,15 @@ msgstr "Tally & engine status"
 msgid "Tally binding (optional)"
 msgstr "Tally binding (optional)"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Tally follows the engine bus IDs; source presence does not prove signal."
 msgstr "Tally follows the engine bus IDs; source presence does not prove signal."
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Tally is separate from signal and output transmission."
 msgstr "Tally is separate from signal and output transmission."
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "Tally legend"
 msgstr "Tally legend"
 
@@ -11015,7 +11015,7 @@ msgstr "Tally shows which sources are on-air. A tally profile maps the bits of a
 msgid "Tally unknown"
 msgstr "Tally unknown"
 
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:317
 msgid "Tally vs signal: the wall border and lamp are tally (red = on program, amber = cue); the chip is signal state. A source can be live and red, or live and dark — never one merged state."
 msgstr "Tally vs signal: the wall border and lamp are tally (red = on program, amber = cue); the chip is signal state. A source can be live and red, or live and dark — never one merged state."
 
@@ -11308,7 +11308,7 @@ msgstr "The driver probes on its own cadence; the latest status shows here as it
 msgid "The effective build-profile licence of this artifact (its codec-linking licence), distinct from the project’s source-available licence."
 msgstr "The effective build-profile licence of this artifact (its codec-linking licence), distinct from the project’s source-available licence."
 
-#: src/components/broadcast/ProductionDesk.tsx:220
+#: src/components/broadcast/ProductionDesk.tsx:284
 msgid "The engine refused this plan"
 msgstr "The engine refused this plan"
 
@@ -11502,7 +11502,7 @@ msgstr "The procedure WebRTC peers use to find a working network path between th
 msgid "The production rundown is unavailable: no show-control contract exists. No video switch occurs here; the Desk PROGRAM monitor is the only truth for what viewers see."
 msgstr "The production rundown is unavailable: no show-control contract exists. No video switch occurs here; the Desk PROGRAM monitor is the only truth for what viewers see."
 
-#: src/components/broadcast/ProductionDesk.tsx:277
+#: src/components/broadcast/ProductionDesk.tsx:341
 msgid "The program bus changes what viewers see. Acceptance is not completion."
 msgstr "The program bus changes what viewers see. Acceptance is not completion."
 
@@ -12070,7 +12070,9 @@ msgstr "Transfer ownership"
 msgid "Transition"
 msgstr "Transition"
 
-#: src/components/broadcast/ProductionDesk.tsx:263
+#: src/components/broadcast/ProductionDesk.tsx:327
+#: src/components/broadcast/ProductionDesk.tsx:327
+#: src/components/broadcast/ProductionDesk.tsx:327
 msgid "Transition parameters"
 msgstr "Transition parameters"
 
@@ -12078,7 +12080,7 @@ msgstr "Transition parameters"
 msgid "Transition running"
 msgstr "Transition running"
 
-#: src/components/broadcast/ProductionDesk.tsx:261
+#: src/components/broadcast/ProductionDesk.tsx:325
 msgid "Transition type"
 msgstr "Transition type"
 
@@ -12156,12 +12158,12 @@ msgstr "UMD (Under-Monitor Display)"
 msgid "Unacknowledged"
 msgstr "Unacknowledged"
 
-#: src/components/broadcast/ProductionDesk.tsx:253
-#: src/components/broadcast/ProductionDesk.tsx:253
+#: src/components/broadcast/ProductionDesk.tsx:317
+#: src/components/broadcast/ProductionDesk.tsx:317
 msgid "unavailable"
 msgstr "unavailable"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 #: src/pages/approved/MediaSurface.tsx:30
 msgid "Unavailable"
 msgstr "Unavailable"
@@ -12217,8 +12219,8 @@ msgstr "unhealthy"
 
 #: src/components/broadcast/library/MetadataInspector.tsx:201
 #: src/components/broadcast/ProducerStatus.tsx:72
-#: src/components/broadcast/ProductionDesk.tsx:277
-#: src/components/broadcast/ProductionDesk.tsx:277
+#: src/components/broadcast/ProductionDesk.tsx:341
+#: src/components/broadcast/ProductionDesk.tsx:341
 #: src/pages/approved/RoutingSurface.tsx:44
 #: src/pages/approved/SourcesSurface.tsx:326
 #: src/pages/MediaPlayersPage.tsx:355
@@ -12237,7 +12239,7 @@ msgstr "Unknown — no measured readback"
 msgid "Unknown error"
 msgstr "Unknown error"
 
-#: src/components/broadcast/ProductionDesk.tsx:261
+#: src/components/broadcast/ProductionDesk.tsx:325
 msgid "unknown source"
 msgstr "unknown source"
 
@@ -12420,7 +12422,7 @@ msgstr "User-Agent"
 msgid "User-Agent header (optional)"
 msgstr "User-Agent header (optional)"
 
-#: src/components/broadcast/ProductionDesk.tsx:275
+#: src/components/broadcast/ProductionDesk.tsx:339
 msgid "USK, DSK and AUX have no supported control contract."
 msgstr "USK, DSK and AUX have no supported control contract."
 
@@ -12453,7 +12455,7 @@ msgstr "Vendor marker (unverified presence only)"
 msgid "version"
 msgstr "version"
 
-#: src/components/broadcast/ProductionDesk.tsx:249
+#: src/components/broadcast/ProductionDesk.tsx:313
 msgid "Vertical wipe"
 msgstr "Vertical wipe"
 
@@ -12619,15 +12621,15 @@ msgstr "Waiting for meter telemetry…"
 msgid "Waiting for the first metrics sample…"
 msgstr "Waiting for the first metrics sample…"
 
-#: src/components/broadcast/ProductionDesk.tsx:165
+#: src/components/broadcast/ProductionDesk.tsx:216
 msgid "Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still."
 msgstr "Wall tiles are live video from one shared MoQ stream; a tile without a live cell shows its still."
 
-#: src/components/broadcast/ProductionDesk.tsx:165
+#: src/components/broadcast/ProductionDesk.tsx:216
 msgid "Wall tiles are live video from one shared WebRTC session; a tile without a live cell shows its still."
 msgstr "Wall tiles are live video from one shared WebRTC session; a tile without a live cell shows its still."
 
-#: src/components/broadcast/ProductionDesk.tsx:166
+#: src/components/broadcast/ProductionDesk.tsx:217
 msgid "Wall tiles are still previews refreshed every ~2 s — not live video."
 msgstr "Wall tiles are still previews refreshed every ~2 s — not live video."
 
@@ -12895,19 +12897,19 @@ msgstr "Width and height must both be even numbers from 16 to 8192, at most 3840
 msgid "Window"
 msgstr "Window"
 
-#: src/components/broadcast/ProductionDesk.tsx:269
+#: src/components/broadcast/ProductionDesk.tsx:333
 msgid "Wipe border colour"
 msgstr "Wipe border colour"
 
-#: src/components/broadcast/ProductionDesk.tsx:268
+#: src/components/broadcast/ProductionDesk.tsx:332
 msgid "Wipe border width"
 msgstr "Wipe border width"
 
-#: src/components/broadcast/ProductionDesk.tsx:264
+#: src/components/broadcast/ProductionDesk.tsx:328
 msgid "Wipe pattern"
 msgstr "Wipe pattern"
 
-#: src/components/broadcast/ProductionDesk.tsx:267
+#: src/components/broadcast/ProductionDesk.tsx:331
 msgid "Wipe softness"
 msgstr "Wipe softness"
 

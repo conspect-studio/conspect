@@ -178,8 +178,12 @@
 .bd-transitions button{min-width:48px;min-height:48px;padding:4px 6px;border:1px solid var(--bd-line2);border-radius:4px;background:var(--bd-bg3);color:var(--bd-text);font-size:12px;font-weight:700}
 
 .bd-transitions button[aria-pressed=true]{border-color:#6aa6ff;color:#6aa6ff}
-.bd-transition-params{display:flex;flex-wrap:wrap;gap:8px;align-items:center;border:0;margin:0 0 8px;padding:0}
-.bd-transition-params legend{width:100%;padding:8px 0 4px;font-weight:700}
+.bd-more .bd-transition-menu{position:relative;margin:0;border:0;padding:0;font-size:12px;color:inherit}
+.bd-transition-menu>summary{min-height:48px;display:flex;align-items:center;padding:0 10px;cursor:pointer;list-style:none;color:var(--bd-text);font-weight:700}
+.bd-transition-menu>summary::-webkit-details-marker{display:none}
+.bd-transition-menu>summary::before{content:'▸';margin-right:8px}
+.bd-transition-menu[open]>summary::before{content:'▾'}
+.bd-transition-params{position:absolute;bottom:100%;right:0;z-index:10;width:min(560px,90vw);max-height:65dvh;overflow:auto;display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0;padding:12px;border:1px solid var(--bd-line2);background:var(--bd-bg1);box-shadow:0 8px 32px #0008}
 .bd-patterns{display:flex;gap:4px}
 .bd-patterns button{display:inline-flex;align-items:center;justify-content:center;min-width:48px;min-height:48px;border:1px solid var(--bd-line2);border-radius:4px;background:var(--bd-bg3)}
 .bd-patterns button[aria-pressed=true]{border-color:#6aa6ff}
@@ -421,8 +425,10 @@
 .bd-desk-status>summary::before{content:'▸';margin-right:8px}
 .bd-desk-status[open]>summary::before{content:'▾'}
 .bd-desk-status .bd-rail{position:absolute;bottom:100%;right:0;width:min(640px,90vw);max-height:65dvh;overflow:auto;z-index:10;background:var(--bd-bg1);padding:12px;border:1px solid var(--bd-line2);box-shadow:0 8px 32px #0008;grid-template-columns:1fr 1fr}
-.production-desk .bd-more{margin:0;padding:0;border:0}
-.production-desk .bd-more label{padding:0;gap:8px;display:flex;align-items:center}
+.production-desk .bd-more{margin:0;padding:0;border:0;display:flex;align-items:center;gap:6px;flex-wrap:nowrap;min-width:0}
+.production-desk .bd-more label{padding:0;gap:6px;display:flex;align-items:center;flex:none}
+.production-desk .bd-more .bd-transition-menu{flex:1;min-width:0}
+.production-desk .bd-more .bd-transition-menu>summary{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 6px}
 .bd-monitor-actions{float:right;min-width:44px;min-height:44px}
 @media(min-width:1280px) and (min-height:600px){
  .production-desk .bd-desk-status{grid-area:status}
