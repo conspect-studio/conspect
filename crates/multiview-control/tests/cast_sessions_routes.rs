@@ -629,6 +629,7 @@ async fn save_allows_a_scoped_principal_to_promote_its_own_session() {
             output: "out-b".to_owned(),
             media_url: "http://192.0.2.7:8080/hls/out-b/b.m3u8".to_owned(),
             started_unix_ns: None,
+            ..CastSessionRecord::default()
         });
         state.with_cast_delivery(delivery())
     });
@@ -675,6 +676,7 @@ async fn list_filters_sessions_to_the_scoped_allowlist() {
             output: "out-a".to_owned(),
             media_url: "http://192.0.2.7:8080/hls/out-a/a.m3u8".to_owned(),
             started_unix_ns: None,
+            ..CastSessionRecord::default()
         });
         // Out-of-scope: another tenant's session — the scoped principal must not
         // enumerate it.
@@ -685,6 +687,7 @@ async fn list_filters_sessions_to_the_scoped_allowlist() {
             output: "out-b".to_owned(),
             media_url: "http://192.0.2.7:8080/hls/out-b/b.m3u8".to_owned(),
             started_unix_ns: None,
+            ..CastSessionRecord::default()
         });
         state.with_cast_delivery(delivery())
     });
@@ -1364,4 +1367,45 @@ async fn a_create_queued_behind_a_delete_still_starts_its_poller() {
         registry.is_running("dev-queued"),
         "the delete's tombstone refused the newer create's poller"
     );
+}
+
+#[tokio::test]
+async fn a_feed_without_a_cast_output_is_refused_and_the_hls_path_is_unchanged() {
+    // ADR-0111 C2: `feed` needs a cast output; without one the request is
+    // refused before any side effect and the `/hls/` behaviour stays.
+    let h = cast_harness();
+    let mut body = start_body(Some("out-a"));
+    body["feed"] = serde_json::json!({"bus": "program"});
+    let resp = send(
+        &h.router,
+        post_json("/api/v1/cast/sessions", OPERATOR_TOKEN, &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let problem = body_json(resp).await;
+    assert!(
+        problem["type"]
+            .as_str()
+            .unwrap()
+            .ends_with("cast-unavailable"),
+        "{problem}"
+    );
+    let resp = send(&h.router, get("/api/v1/cast/sessions", OPERATOR_TOKEN)).await;
+    assert_eq!(body_json(resp).await, serde_json::json!([]));
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/cast/sessions",
+            OPERATOR_TOKEN,
+            &start_body(Some("out-a")),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    assert_eq!(
+        created["media_url"],
+        "http://192.0.2.7:8080/hls/out-a/a.m3u8"
+    );
+    assert!(created.get("stream_id").is_none());
 }

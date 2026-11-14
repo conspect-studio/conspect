@@ -282,6 +282,10 @@ pub mod player;
 
 #[cfg(feature = "ffmpeg")]
 mod binding_delivery;
+/// The engine side of a cast output (ADR-0111): activation gate, pre-roll
+/// ring, directory ownership and the packager sink.
+#[cfg(feature = "ffmpeg")]
+pub mod cast_output;
 /// Bounded process exit after a fatal fault or a stop signal (#309).
 pub mod exit_watchdog;
 /// Existing encoded output conversion and authorized MoQ family adapter.

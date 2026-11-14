@@ -2240,7 +2240,7 @@ restart".
   written segments (`PacketMuxSink::subtitle_stats`).
 - **Engine** (`multiview-cli::subtitle_slots`). Each HLS output with subtitle slots gets a route
   table `Arc<SwapCell<Arc<[Option<String>]>>>` (slot → source, from config `source`; F2
-  re-points it live). Once per item the **bake consumer** (never the output clock; the hot-loop
+  re-points it live, see §12.8 "As built in slice F (#345, part F2)"). Once per item the **bake consumer** (never the output clock; the hot-loop
   projection gains no work) reads the table, asks the source's caption store for the text cue at
   the picture the compositor latches for that tick (`TileStore::peek_at_with_source_time`: the same
   selection as `read_at`, without moving the prune watermark) and the bounded text projection of
@@ -2250,7 +2250,8 @@ restart".
   segment it covers. A re-point lands on one tick: the old source's cue ends at tick T and the new
   source's cue may start at T. A source without a caption store yields no cues.
 - **Follow-ups:** LL-HLS WebVTT (fMP4 parts), CEA-608 in A53 SEI for TS/RTMP, DVB subtitles;
-  the patch API plane, live re-patch and persistence (F2); the Outputs editor and matrix tab (F3).
+  the Outputs editor and matrix tab (F3). The patch API plane, live re-patch and persistence
+  landed in F2 (§12.8).
 
 ### 12.4 The cheapest path per crosspoint
 
@@ -2782,7 +2783,7 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   Other requests are refused:
   - video slot ≥ 1 → 422 `unknown-slot`;
   - other audio slots → 422 `slot-medium-mismatch` (they are fixed by config in this slice);
-  - `subtitle` → 422 `slot-medium-mismatch` (#345);
+  - `subtitle` crosspoints: see part F2 below (#345);
   - a layout or bus on a mixer input → 422 `unknown-source` (#307).
 
   A request carries either mixer-input crosspoints or one output's crosspoints. Two outputs, or a
@@ -2816,6 +2817,73 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   size, is opaque and carries the canvas colour; any fit of an equal-size picture is the identity.
 - **Audio slot 0 in `GET /patch`.** It reports the output's accepted audio feed exactly as
   `GET /routing` projects and redacts it (default `follow`).
+
+**As built in slice F (#345, part F2): live subtitle re-patch.**
+- **Request.** `POST /patch/plan` and `/patch/take` accept plane `subtitle` crosspoints,
+  destination `{output, slot}`, source `{"source": id}` or `"none"` (unpatch). A request with a
+  subtitle crosspoint carries ONLY subtitle crosspoints of ONE output, each slot once; mixing
+  with video/audio, a second output or a repeated slot → 422 `unknown-slot`. A slot ≥ the
+  output's declared `slots.subtitle` count → 422 `unknown-slot`; an output kind whose medium
+  carries no subtitles (`subtitle_max = 0`) → 422 `slot-medium-mismatch`; a `{layout}` or
+  `{bus}` → 422 `slot-medium-mismatch` (subtitle essences come from sources).
+- **Authorization** is the video output path's, in the same order: role Write, then for every
+  crosspoint `authorize_output_end` (object AND output axis) and Read on the named source, all
+  BEFORE shape and any existence answer (review T-A1): a denied caller gets 403, never 404 or
+  a 422 that reveals the output or source. A replay re-authorizes.
+- **Plan.** Each crosspoint has path `subtitle`. An unknown source is an `unknown-source`
+  refusal in the plan (422 `unknown-feed` on take, the video take's mapping). A source that
+  declares no `captions` (absent or `off`) gets `note: "source-has-no-captions"`: not a
+  refusal, the slot then carries an empty track.
+- **Take.** The take-scoped idempotency store under the slot-0 key namespace
+  (`slot0_take_key`): a key is bound to the whole take (output + slot→source map, sorted by
+  slot), so the same key with another body, or with a video take, is 409 `conflict`; a replay
+  answers its first operation and never re-applies. One request is one take against the
+  per-output 2/s and per-principal 10/s limiter. `202 {operation_id, status: "accepted"}`.
+- **Engine.** `OutputRouting::try_take_subtitles` (wait-free, no channel). The run publishes
+  its route tables, keyed by output config id, on the `OutputRoutingHandle`
+  (`with_subtitles`), behind a per-run subtitle gate (a control-plane mutex the sampler never
+  takes; the sampler holds its own tables and only loads them once per tick). The adapter
+  RCU-replaces the output's `SubtitleRoutes` table under that gate
+  (`OutputRoutingHandle::repoint_subtitles` → `subtitle_slots::repoint`). Admission ends as soon
+  as the run can no longer sample: teardown ends the gate the moment the clock returns (before
+  the egress join and ingest teardown), the bake consumer ends it wait-free on any exit (it
+  holds `SubtitleConsumerExit`, one atomic swap), and `SubtitleRunEnd` still ends it on every
+  other exit path of `drive_streaming`. A re-point has ONE linearization point: the
+  compare-exchange of the run's admission state from live to writing, taken before the output
+  lookup and before anything is published. It fails on an ended run (refused, nothing
+  published); once it succeeds the table is published and the take is applied, with no
+  rollback: a consumer that exits afterwards may have sampled it, which the contract allows,
+  and it is persisted either way. The consumer never waits on a writer. A take that loaded the
+  handle before the run ended or was replaced is refused and never mutates the obsolete table,
+  and the live readback of an ended run is gone. No running engine, or an ended run (for any
+  output, in the run or not) → 503 `engine-busy` (key freed, rate slot refunded); in a live
+  run, an output it does not sample (not in this run, or slots declared after it started) →
+  `subtitle:refused:not-in-run`, nothing changes. Without an output-routing seam the routes answer 409 `routing-unavailable`
+  as the video path does.
+- **Landing tick (honest contract).** `subtitle:applied` means the route table was swapped. The
+  outcome's `tick` is a completed-tick lower bound observed before the swap (the sampler
+  publishes a tick only after reading every table of that tick; `0` means possibly no tick
+  completed yet); it is not a landing tick. A sample already in flight finishes on the old
+  table; the first table read that STARTS after the swap sees the new route (its old cue ends
+  and the new one may start at that tick), unless a later take supersedes it first (then this
+  one is never sampled) or the run ends first. Shed items are not sampled, so no tick index is
+  promised.
+- **Ordering and bounded persistence.** One serialization (the control plane's subtitle queue
+  lock) covers admission, the engine swap, the take's settlement and the enqueue of its
+  outcome with a monotonic sequence, so the queue order is the swap order. The queue is
+  bounded (`MAX_PENDING_SUBTITLE_PERSISTS` = 16, queued plus in flight): a take that finds it
+  full is refused 503 `engine-busy` BEFORE the engine is asked (no route changes, key freed,
+  rate slot refunded). ONE serial worker task drains it: per batch it coalesces each
+  (output, slot) to the highest-sequence source, persists each output's
+  `slots.subtitle[i].source` under the config-mutation lock, keeping the accepted output
+  identities (`persist_subtitle_routes`), only for `applied` outcomes, then publishes the
+  outcomes on `route.output` in swap order. A run builds each slot's route from the accepted
+  state, so a restart starts from the last swapped source.
+- **`GET /patch`.** Each output gains `subtitle: [{slot, format, language, name, live,
+  source}]`, decided per slot: from the engine's live route table when the running engine has
+  that slot (`live: true`), else from the accepted config (`live: false`: no run, an ended run,
+  an output not in this run, or a slot beyond the run's shorter table). A source the caller
+  cannot Read is `{redacted: true}`; an unpatched slot is `null`.
 
 **As built in slice E1 (#308, engine half; the HTTP/salvo/UI PRs follow).**
 - **Handshake.** A set's two halves meet in one `SetArm` (`multiview-engine/src/patch_set.rs`), a
