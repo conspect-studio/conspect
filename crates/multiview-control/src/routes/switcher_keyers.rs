@@ -1151,8 +1151,7 @@ async fn settle_set(
             .any(|d| Arc::ptr_eq(d, &pending.def))
     });
     if applied {
-        settle_seam::point(&pending.op).await;
-        reconcile_keyers(&state, &handle).await;
+        reconcile_keyers(&state, &handle, &pending.op).await;
     }
     // The demand set now holds the new sources (make-before-break): the
     // request's own leases are released here, and its DSK reservation (an
@@ -1164,7 +1163,8 @@ async fn settle_set(
 
 /// Test seam (deterministic interleaving of `keyer_set` settlements, review
 /// J1): a test registers an operation id; its settlement then signals when it
-/// reaches the point after its outcome was observed and waits for a release,
+/// reaches reconciliation, just before it takes the config-mutation lock, and
+/// waits for a release,
 /// and signals again once it settled. Unregistered ids pass straight through.
 /// Compiled only for tests and the `_test-seams` feature.
 #[cfg(any(test, feature = "_test-seams"))]
@@ -1264,7 +1264,11 @@ mod settle_seam {
 /// last writes the newest version: a settlement descheduled after its
 /// outcome can never republish or persist an older definition over a newer
 /// one (stale demand could release sources the engine still keys).
-async fn reconcile_keyers(state: &AppState, handle: &SwitcherControl) {
+async fn reconcile_keyers(state: &AppState, handle: &SwitcherControl, op: &str) {
+    // The test seam sits between "about to serialize" and the lock (review
+    // J1 round 3): a definitions read placed before the lock would happen
+    // while a paused settlement waits here and see an older version.
+    settle_seam::point(op).await;
     let mutation = state.lock_config_mutation().await;
     let Some(defs) = handle.keyer_definitions() else {
         return;

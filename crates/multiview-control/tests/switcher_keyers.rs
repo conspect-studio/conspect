@@ -1285,10 +1285,13 @@ impl multiview_engine::RailDriver<Nv12Image> for NoRails {
 }
 
 /// Review J1: two applied `keyer_set`s settle concurrently. A (version N)
-/// is paused after its outcome, B (N+1) applies and settles in full, then
-/// A resumes. Neither the durable document nor the keyer demand set may go
-/// back to N: reconciliation reads the latest committed definitions inside
-/// its serialization. Deterministic: the settlement seam, no sleeps.
+/// is paused in reconciliation just before it takes the config-mutation
+/// lock, B (N+1) applies and settles in full, then A resumes and runs last.
+/// Neither the durable document nor the keyer demand set may go back to N:
+/// reconciliation reads the latest committed definitions INSIDE the lock. A
+/// read moved before the lock happens while A is paused, sees N, and fails
+/// this test (checked by hand, review J1 round 3). Deterministic: the
+/// settlement seam, no sleeps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_settlement_never_overwrites_a_newer_definition() {
     use multiview_control::routes::switcher_keyers::settle_seam;
@@ -1313,7 +1316,7 @@ async fn a_stale_settlement_never_overwrites_a_newer_definition() {
         )
     };
     let op_of = |v: Value| v["operation_id"].as_str().unwrap().to_owned();
-    // A defines dsk2 on gfx (version N) and pauses after its outcome.
+    // A defines dsk2 on gfx (version N) and pauses just before the lock.
     let a = op_of(body_json(command(&rig, FULL, "a", &define("gfx")).await).await);
     let pause_a = settle_seam::pause(&a);
     tick(&mut rig.driver, 1);
