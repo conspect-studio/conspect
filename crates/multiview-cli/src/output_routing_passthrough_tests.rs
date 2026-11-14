@@ -1086,3 +1086,54 @@ fn a_source_that_stops_matching_takes_the_output_off_p0() {
     assert!(!p.on_p0(0), "never back while it does not match");
     p.assert_one_packet_per_tick(0);
 }
+
+/// Review R2-A-2: adopting another principal's lingering key for a bridge
+/// counts the patching principal's unissued set reservations (canonical
+/// accounting): with one session left that a set of the same principal has
+/// reserved, the bridge does not adopt; the output stays on the slate.
+#[test]
+fn a_bridge_adoption_counts_the_principals_set_reservations() {
+    let mut p = P0::new(2, 6, Script::default(), true);
+    p.step();
+    p.take_cam(0);
+    p.run_until(200, |p| p.on_p0(0)).expect("on P0");
+    p.run_until(LINGER_TICKS + 5, |_| false);
+    // Another principal's cam key lingers.
+    p.x.h.try_take(take_by("o1", 1, "other")).unwrap();
+    p.run_until(OPEN_DEADLINE_TICKS, |p| p.view(1).bus == "src:cam")
+        .expect("other's take lands");
+    p.x.h
+        .try_take(OutputTake {
+            principal: "other".to_owned(),
+            ..take("o2", 1, PictureBus::Program)
+        })
+        .unwrap();
+    p.run_until(60, |p| p.view(1).bus == "program")
+        .expect("other left");
+    // "p" may hold 1 session and a set of "p" has reserved it.
+    p.x.r.cfg.max_per_principal = 1;
+    p.x.r.reserve_for_test("p", 1, p.t);
+    assert_eq!(p.x.r.principal_held("p"), 1);
+    let at = p.t;
+    p.src.script.lock().unwrap().stall = Some(at..at + 10);
+    p.run_until(60, |p| {
+        p.view(0)
+            .passthrough
+            .is_some_and(|v| v.reason.as_deref() == Some(crate::output_routing::NO_BRIDGE_SESSION))
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "not slate-only: {:?} dyn {:?} held {}",
+            p.view(0),
+            p.x.r
+                .dynamic
+                .iter()
+                .map(|d| d.principal.clone())
+                .collect::<Vec<_>>(),
+            p.x.r.principal_held("p")
+        )
+    });
+    assert!(p.on_p0(0));
+    assert!(p.x.r.dynamic.iter().all(|d| d.principal == "other"));
+    assert!(p.x.r.principal_held("p") <= 1, "never above the cap");
+}

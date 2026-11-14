@@ -1276,17 +1276,9 @@ impl OutputRouter {
     /// Whether `principal` may take one more encoder session by adopting a
     /// lingering key (it does not grow the global count).
     fn adoption_fits(&self, principal: &str) -> bool {
-        let mine = self
-            .dynamic
-            .iter()
-            .filter(|d| d.principal == principal)
-            .count()
-            + self
-                .opens
-                .values()
-                .filter(|o| o.principal == principal)
-                .count();
-        mine < self.cfg.max_per_principal
+        // The canonical accounting (review R2-A-2): live keys, opens in
+        // flight and the principal's sets' unissued reservations.
+        self.principal_held(principal) < self.cfg.max_per_principal
     }
 
     /// A forced move onto the warm bridge `key` (an IDR within the floor).

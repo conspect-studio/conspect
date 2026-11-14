@@ -163,6 +163,25 @@ impl OutputRouter {
             .and_then(|p| p.group)
     }
 
+    /// Test seam: an admitted set of `principal` holding `reserved`
+    /// unissued encoder opens (a set whose members are still priming).
+    #[cfg(test)]
+    pub(super) fn reserve_for_test(&mut self, principal: &str, reserved: usize, tick: u64) {
+        let id = self.sets.next_id;
+        self.sets.next_id = self.sets.next_id.wrapping_add(1);
+        self.sets.active.push(ActiveSet {
+            id,
+            operation_id: "reserved".to_owned(),
+            principal: principal.to_owned(),
+            members: Vec::new(),
+            arm: None,
+            admitted: tick,
+            reserved,
+            proposed: None,
+            grouped: false,
+        });
+    }
+
     /// Unissued open reservations of every set, and of `principal`'s.
     pub(super) fn set_reservations(&self, principal: &str) -> (usize, usize) {
         self.sets.active.iter().fold((0, 0), |(all, mine), s| {
@@ -179,7 +198,7 @@ impl OutputRouter {
 
     /// Encoders charged to `principal`: live keys, opens in flight and its
     /// sets' unissued reservations.
-    fn principal_held(&self, principal: &str) -> usize {
+    pub(super) fn principal_held(&self, principal: &str) -> usize {
         self.dynamic
             .iter()
             .filter(|d| d.principal == principal)
