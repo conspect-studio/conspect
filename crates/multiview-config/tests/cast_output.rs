@@ -558,3 +558,105 @@ fn a_cast_output_refuses_nine_subtitle_slots_and_cea608() {
         "cast and HLS refuse cea608 the same way"
     );
 }
+
+/// `n` extra sources `s0..` each routed to its own discrete track `t0..`.
+fn many_tracks(n: usize) -> String {
+    use std::fmt::Write as _;
+    let mut doc = String::new();
+    for i in 0..n {
+        let _ = write!(doc, "\n[[sources]]\nid = \"s{i}\"\nkind = \"bars\"\n");
+    }
+    doc.push_str("\n[audio]\nsample_rate_hz = 48000\n");
+    for i in 0..n {
+        let _ = write!(
+            doc,
+            "[[audio.routes]]\ninput_id = \"s{i}\"\nchannels = {{ kind = \"stereo\" }}\ntarget_track = \"t{i}\"\n"
+        );
+    }
+    doc
+}
+
+fn slots_doc(tracks: usize, declared: usize) -> String {
+    use std::fmt::Write as _;
+    let mut doc = format!("{CAST}[[outputs.slots.audio]]\n");
+    for i in 0..tracks {
+        let _ = write!(doc, "[[outputs.slots.audio]]\ntrack = \"t{i}\"\n");
+    }
+    doc + &many_tracks(declared)
+}
+
+/// #418 review INV418-1 / MEDIA-3: a cast stream carries at most 16 audio
+/// renditions (program included). The boundary is validated after resolving
+/// `slots.audio`, `tracks` and `auto` against the declared tracks, so the
+/// engine never silently drops a selected track.
+#[test]
+fn a_cast_output_carries_at_most_16_audio_renditions() {
+    use multiview_config::MAX_CAST_AUDIO_RENDITIONS as MAX;
+    assert_eq!(MAX, 16);
+    let out: Output = toml::from_str("kind = \"cast\"\nid = \"c\"\n").unwrap();
+    assert_eq!(out.slot_capability().audio_max, Some(MAX));
+    // Slots: program + 15 tracks = 16 ok; program + 16 = 17 refused.
+    load_hd(&slots_doc(15, 16)).unwrap();
+    let err = load_hd(&slots_doc(16, 16)).unwrap_err();
+    assert!(
+        err.contains("slot-medium-mismatch") && err.contains("declares 17 audio slot(s)"),
+        "{err}"
+    );
+    // `tracks`: 16 total ok (with or without the program), 17 refused.
+    let tracks = |names: Vec<String>, declared: usize| {
+        let list = names
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{CAST}audio = {{ mode = \"tracks\", tracks = [{list}] }}\n{}",
+            many_tracks(declared)
+        )
+    };
+    let named = |n: usize| (0..n).map(|i| format!("t{i}")).collect::<Vec<_>>();
+    let with_prog = |n: usize| {
+        let mut v = vec!["prog".to_owned()];
+        v.extend(named(n));
+        v
+    };
+    load_hd(&tracks(with_prog(15), 16)).unwrap();
+    load_hd(&tracks(named(16), 16)).unwrap();
+    let err = load_hd(&tracks(with_prog(16), 16)).unwrap_err();
+    assert!(
+        err.contains("slot-format-unsupported")
+            && err.contains("carries 17 audio rendition(s)")
+            && err.contains("at most 16"),
+        "{err}"
+    );
+    // `auto`: program + every declared track.
+    let auto = |declared: usize| {
+        format!(
+            "{CAST}audio = {{ mode = \"auto\" }}\n{}",
+            many_tracks(declared)
+        )
+    };
+    load_hd(&auto(15)).unwrap();
+    let err = load_hd(&auto(16)).unwrap_err();
+    assert!(err.contains("carries 17 audio rendition(s)"), "{err}");
+    // An HLS output keeps no such bound.
+    load_hd(&format!(
+        "\n[[outputs]]\nid = \"h2\"\nkind = \"hls\"\npath = \"/srv/hls/h2/index.m3u8\"\ncodec = \"h264\"\naudio = {{ mode = \"auto\" }}\n{}",
+        many_tracks(16)
+    ))
+    .unwrap();
+}
+
+/// #418 review ABUSE-2: the shared resolution of what an output carries.
+#[test]
+fn carried_audio_resolves_slots_tracks_and_auto_against_the_declared_tracks() {
+    let cfg = load_hd(&slots_doc(2, 3)).unwrap();
+    let cast = cfg.outputs.iter().find(|o| o.id() == "cast-1").unwrap();
+    let declared = ["t0", "t1", "t2"];
+    assert_eq!(cast.carried_audio(&declared), (true, vec!["t0", "t1"]));
+    let plain: Output = toml::from_str("kind = \"cast\"\nid = \"c\"\n").unwrap();
+    assert_eq!(plain.carried_audio(&declared), (true, Vec::<&str>::new()));
+    let auto: Output =
+        toml::from_str("kind = \"cast\"\nid = \"c\"\naudio = { mode = \"auto\" }\n").unwrap();
+    assert_eq!(auto.carried_audio(&declared), (true, declared.to_vec()));
+}

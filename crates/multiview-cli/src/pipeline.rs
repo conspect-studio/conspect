@@ -10091,6 +10091,8 @@ fn cast_audio_renditions(
     crate::cast_output::CastAudioRoutes,
 ) {
     use multiview_output::hls::cast::{CastAudioRendition, MAX_CAST_AUDIO_RENDITIONS};
+    // Config validation refuses exactly what the packager cannot carry.
+    const _: () = assert!(MAX_CAST_AUDIO_RENDITIONS == multiview_config::MAX_CAST_AUDIO_RENDITIONS);
     let mut renditions: Vec<CastAudioRendition> = Vec::new();
     let mut routes = crate::cast_output::CastAudioRoutes {
         program: None,
@@ -10110,6 +10112,13 @@ fn cast_audio_renditions(
     }
     for track in &selection.tracks {
         if renditions.len() >= MAX_CAST_AUDIO_RENDITIONS {
+            // Defence only: config validation refuses a cast output carrying
+            // more (#418 review INV418-1), so this never fires on a valid run.
+            tracing::warn!(
+                selected = usize::from(selection.program) + selection.tracks.len(),
+                max = MAX_CAST_AUDIO_RENDITIONS,
+                "cast: audio selection exceeds the cast rendition limit; extra tracks dropped"
+            );
             break;
         }
         let index = usize::from(track.index);
@@ -14698,18 +14707,12 @@ fn output_audio_selection(
     output: &Output,
     tracks: &[DeclaredTrack],
 ) -> multiview_output::AudioSelection {
-    // `slots.audio`, when declared, is the output's selection (#342).
-    let Some(selection) = output.effective_audio() else {
-        return multiview_output::AudioSelection::default();
-    };
+    // `slots.audio`, when declared, is the output's selection (#342); the
+    // resolution is shared with the control plane's cast-token authorization
+    // (#418 review ABUSE-2), so both agree on what an output carries.
+    // No selection resolves to the program only (the default).
     let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
-    let (program, mut chosen) = selection.resolve(&names);
-    let capacity = output.audio_capability().discrete_capacity;
-    let auto_capped = selection.mode == multiview_config::OutputAudioMode::Auto
-        && capacity != multiview_config::TrackCapacity::Unlimited;
-    if auto_capped || capacity == multiview_config::TrackCapacity::AtMost(0) {
-        chosen.clear();
-    }
+    let (program, chosen) = output.carried_audio(&names);
     multiview_output::AudioSelection {
         program,
         tracks: tracks
