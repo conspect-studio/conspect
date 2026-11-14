@@ -133,8 +133,14 @@ tile. No switcher or drive code changes.
   `ScratchFrame` (its frame is never exposed mutably, so its geometry cannot
   be raised over a small allocation) and re-validates every destination
   plane against the frame's own buffers, and that the buffers are writable,
-  before libswscale or the identity copy writes. Decoded
-  alpha is read through `frame::plane_rows`, which validates the plane,
+  before libswscale or the identity copy writes. Both `Scaler::run` and
+  `run_into` validate every source plane the same way before libswscale,
+  `av_frame_copy` or the identity row copy reads it (`frame::check_source`:
+  row bytes from the format and width, subsampled plane height, signed
+  linesize, every row inside one of the frame's own refcounted buffers; a
+  frame without such buffers is an error), so a source whose geometry was
+  raised over a small allocation is an error, not an out-of-bounds read.
+  Decoded alpha is read through `frame::plane_rows`, which validates the plane,
   its signed linesize, its subsampled height and that every row lies in
   one of the frame's own buffers before yielding single-row slices, so a
   bottom-up (negative linesize) frame copies in display order instead of
@@ -148,7 +154,9 @@ tile. No switcher or drive code changes.
   complete while another thread holds the Y or UV cache lock). FFI:
   `multiview-ffmpeg` `frame::tests`, `alpha::tests` (negative linesize,
   mismatched layout), `scale::run_into_tests` (an undersized or shared
-  destination is an error, a null frame allocation never becomes a
+  destination is an error, an undersized or unbuffered source is an error
+  in the conversion and identity paths of `run` and `run_into`, a
+  bottom-up source still converts, a null frame allocation never becomes a
   `ScratchFrame`) and `tests/scale_resample.rs` (bottom-up identity
   `run_into`). Player path
   (ffmpeg): `pipeline::media_alpha::tests` (yuva → NV12+A, rgba/argb/bgra

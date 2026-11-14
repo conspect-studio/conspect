@@ -17,7 +17,7 @@ use ffmpeg::util::frame::Video;
 use ffmpeg_next as ffmpeg;
 
 use crate::error::{FfmpegError, Result};
-use crate::frame::{alloc_video, plane_rows, ScratchFrame};
+use crate::frame::{alloc_video, check_source, plane_rows, ScratchFrame};
 
 /// A `(format, width, height)` description of a scaler endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +122,9 @@ impl Scaler {
     ///
     /// # Errors
     /// * [`FfmpegError::FrameMismatch`] — `input` does not match the source spec.
+    /// * [`FfmpegError::FrameLayout`] — an `input` plane is not inside the
+    ///   frame's own buffers for its geometry, or the frame has no
+    ///   refcounted buffers ([`check_source`]).
     /// * [`FfmpegError::Convert`] — libswscale reported a conversion error.
     pub fn run(&mut self, input: &Video) -> Result<Video> {
         if input.format() != self.src.format
@@ -132,6 +135,10 @@ impl Scaler {
                 "input geometry/format differs from the scaler's source spec",
             ));
         }
+        // The spec match says nothing about the buffers: a safe caller can
+        // raise a small frame's height with `Video::set_height`. Prove every
+        // source plane lies in the frame's own buffers before libav reads it.
+        check_source(input)?;
         // The identity predicate is `ScaleSpec` equality (format + geometry) —
         // the complete set of fields this wrapper feeds into `sws_scale`. If the
         // scaler ever gains colour/range/matrix conversion, extend `ScaleSpec`'s
@@ -149,7 +156,9 @@ impl Scaler {
             // SAFETY: both pointers are live `AVFrame`s owned by `output` and
             // `input`; `output` has buffers of the same format and size as
             // `input` (checked above and by `alloc_video`), which is what
-            // `av_frame_copy` requires; `av_frame_copy_props` copies metadata.
+            // `av_frame_copy` requires, and `check_source` proved every
+            // plane it reads lies inside `input`'s own buffers;
+            // `av_frame_copy_props` copies metadata.
             let (copied, props) = unsafe {
                 (
                     ffmpeg::ffi::av_frame_copy(output.as_mut_ptr(), input.as_ptr()),
@@ -161,6 +170,8 @@ impl Scaler {
             }
             return Ok(output);
         }
+        // `check_source` proved every row libswscale reads (the spec's
+        // geometry) lies inside `input`'s buffers.
         // Checked allocation: `sws.run` would otherwise allocate an empty
         // output with an unchecked `av_frame_get_buffer`.
         let mut output = alloc_video(self.dst.format, self.dst.width, self.dst.height)?;
@@ -183,9 +194,10 @@ impl Scaler {
     /// scale, #391). Before anything is written every destination plane is
     /// re-validated against the frame's own buffers and the buffers must be
     /// writable (`av_frame_is_writable`); a failure is an error, never a
-    /// write. An identity spec copies the planes row by row through
-    /// validated row views ([`plane_rows`]), so a bottom-up (negative
-    /// linesize) input is fine.
+    /// write. Every source plane is validated the same way, read-only
+    /// ([`check_source`]), before either path reads it. An identity spec
+    /// copies the planes row by row through validated row views
+    /// ([`plane_rows`]), so a bottom-up (negative linesize) input is fine.
     ///
     /// # Errors
     /// As [`Self::run`], plus [`FfmpegError::FrameLayout`] /
@@ -200,6 +212,10 @@ impl Scaler {
                 "input geometry/format differs from the scaler's source spec",
             ));
         }
+        // The spec match says nothing about the buffers: a safe caller can
+        // raise a small frame's height with `Video::set_height`. Prove every
+        // source plane lies in the frame's own buffers before libav reads it.
+        check_source(input)?;
         if !output.matches(self.dst.format, self.dst.width, self.dst.height) {
             *output = ScratchFrame::alloc(self.dst.format, self.dst.width, self.dst.height)?;
         }
@@ -237,7 +253,8 @@ impl Scaler {
         }
         // `check_destination` proved every plane of the (unchanged) frame
         // is writable, forward and inside its own buffers for the spec's
-        // geometry, which is exactly what `sws_scale` writes.
+        // geometry, which is exactly what `sws_scale` writes; `check_source`
+        // proved the same, read-only, for every input plane it reads.
         self.sws
             .run(input, output.video_mut())
             .map_err(FfmpegError::Convert)
@@ -292,6 +309,113 @@ mod run_into_tests {
         let mut out = undersized(4, 1, 512);
         let err = identity.run_into(&tall, &mut out).unwrap_err();
         assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
+    }
+
+    /// The error of a `run` that must fail (`Video` is not `Debug`).
+    fn run_err(scaler: &mut Scaler, input: &Video) -> FfmpegError {
+        match scaler.run(input) {
+            Ok(_) => panic!("run unexpectedly succeeded"),
+            Err(e) => e,
+        }
+    }
+
+    /// A small `GRAY8` source allocation whose height was raised afterwards
+    /// with the safe `Video::set_height`, so it matches a taller source spec
+    /// while its buffers hold only `small_h` rows.
+    fn undersized_source(w: u32, small_h: u32, claimed_h: u32) -> Video {
+        let mut frame = gray(w, small_h);
+        frame.set_height(claimed_h);
+        frame
+    }
+
+    /// R3 round 3: an undersized source is an error before libswscale
+    /// reads it (conversion), for `run` and `run_into`.
+    #[test]
+    fn an_undersized_source_is_an_error_in_the_conversion_path() {
+        let src = undersized_source(64, 1, 4096);
+        let mut scale = Scaler::new(
+            ScaleSpec::new(Pixel::GRAY8, 64, 4096),
+            ScaleSpec::new(Pixel::GRAY8, 32, 16),
+        )
+        .unwrap();
+        let err = run_err(&mut scale, &src);
+        assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
+        let mut out = ScratchFrame::alloc(Pixel::GRAY8, 32, 16).unwrap();
+        let err = scale.run_into(&src, &mut out).unwrap_err();
+        assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
+    }
+
+    /// R3 round 3: an undersized source is an error before the identity
+    /// copy reads it, for `run` (`av_frame_copy`) and `run_into`.
+    #[test]
+    fn an_undersized_source_is_an_error_in_the_identity_path() {
+        let src = undersized_source(64, 1, 4096);
+        let spec = ScaleSpec::new(Pixel::GRAY8, 64, 4096);
+        let mut identity = Scaler::new(spec, spec).unwrap();
+        let err = run_err(&mut identity, &src);
+        assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
+        let mut out = ScratchFrame::alloc(Pixel::GRAY8, 64, 4096).unwrap();
+        let err = identity.run_into(&src, &mut out).unwrap_err();
+        assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
+    }
+
+    /// R3 round 3: a source with plane pointers but no refcounted buffers
+    /// (nothing to bound its planes against) is refused, not read.
+    #[test]
+    fn a_source_without_refcounted_buffers_is_refused() {
+        let backing = gray(4, 2);
+        let mut borrowed = Video::empty();
+        #[allow(unsafe_code)]
+        // SAFETY: both frames are live and owned here; `borrowed` gets
+        // `backing`'s plane pointers and geometry but no `buf` reference
+        // (so its Drop frees nothing); `backing` outlives every use.
+        unsafe {
+            let (dst, src) = (borrowed.as_mut_ptr(), backing.as_ptr());
+            (*dst).format = (*src).format;
+            (*dst).width = (*src).width;
+            (*dst).height = (*src).height;
+            (*dst).data = (*src).data;
+            (*dst).linesize = (*src).linesize;
+        }
+        let mut scale = Scaler::new(
+            ScaleSpec::new(Pixel::GRAY8, 4, 2),
+            ScaleSpec::new(Pixel::GRAY8, 8, 4),
+        )
+        .unwrap();
+        let err = run_err(&mut scale, &borrowed);
+        assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
+        let mut out = ScratchFrame::alloc(Pixel::GRAY8, 8, 4).unwrap();
+        let err = scale.run_into(&borrowed, &mut out).unwrap_err();
+        assert!(matches!(err, FfmpegError::FrameLayout(_)), "{err}");
+        drop(borrowed);
+        drop(backing);
+    }
+
+    /// The validation accepts the frames the decode path really produces:
+    /// a bottom-up (negative linesize) source still converts.
+    #[test]
+    fn a_bottom_up_source_still_converts() {
+        let mut src = gray(4, 2);
+        #[allow(unsafe_code)]
+        // SAFETY: flip plane 0 in place: point `data[0]` at the last row and
+        // negate the linesize; every row stays inside the frame's buffer.
+        unsafe {
+            let raw = src.as_mut_ptr();
+            let stride = (*raw).linesize[0];
+            (*raw).data[0] = (*raw).data[0].offset(isize::try_from(stride).unwrap());
+            (*raw).linesize[0] = -stride;
+        }
+        let mut scale = Scaler::new(
+            ScaleSpec::new(Pixel::GRAY8, 4, 2),
+            ScaleSpec::new(Pixel::GRAY8, 8, 4),
+        )
+        .unwrap();
+        scale.run(&src).unwrap();
+        let mut out = ScratchFrame::alloc(Pixel::GRAY8, 8, 4).unwrap();
+        scale.run_into(&src, &mut out).unwrap();
+        let spec = ScaleSpec::new(Pixel::GRAY8, 4, 2);
+        let mut identity = Scaler::new(spec, spec).unwrap();
+        identity.run(&src).unwrap();
     }
 
     /// R3 round 2 #1: a destination whose buffers are shared with another

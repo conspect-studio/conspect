@@ -301,6 +301,92 @@ fn format_planes(format: Pixel) -> Result<usize> {
     }
 }
 
+/// Active bytes of one row of `plane` of `frame` (`av_image_get_linesize`
+/// for the frame's format and width).
+fn row_bytes(frame: &Video, plane: usize) -> Result<usize> {
+    let width = libc::c_int::try_from(frame.width())
+        .map_err(|_| FfmpegError::FrameLayout("frame width overflows"))?;
+    let index =
+        libc::c_int::try_from(plane).map_err(|_| FfmpegError::FrameLayout("plane index"))?;
+    #[allow(unsafe_code)]
+    // SAFETY: `av_image_get_linesize` reads the static format table; a
+    // negative result (invalid plane/width/format) is rejected below.
+    let bytes = unsafe {
+        ffi::av_image_get_linesize(ffi::AVPixelFormat::from(frame.format()), width, index)
+    };
+    usize::try_from(bytes).map_err(|_| FfmpegError::FrameLayout("plane row size"))
+}
+
+/// Size in bytes of the palette libav keeps in `data[1]` of a paletted
+/// (`AV_PIX_FMT_FLAG_PAL`) frame: 256 `u32` entries.
+const PALETTE_BYTES: usize = 256 * 4;
+
+/// Validate every plane of `frame` as a full-frame **source** for a libav
+/// read (`sws_scale`, `av_frame_copy`) or a row copy: for each plane of the
+/// format, the row size from `av_image_get_linesize` (format + width), the
+/// plane height with chroma subsampling applied and the signed linesize
+/// must put every row inside one of the frame's own reference-counted
+/// buffers ([`plane_rows`]); a paletted format's `data[1]` palette must lie
+/// in one too. Either linesize sign is accepted (libswscale and
+/// `av_image_copy` read bottom-up planes). A frame with no refcounted
+/// buffers (nothing to bound it against), zero dimensions or a
+/// hardware/unknown format is refused.
+///
+/// # Errors
+/// [`FfmpegError::FrameLayout`] naming the first failure.
+pub fn check_source(frame: &Video) -> Result<()> {
+    let planes = format_planes(frame.format())?;
+    if frame.width() == 0 || frame.height() == 0 {
+        return Err(FfmpegError::FrameLayout(
+            "frame dimensions must be non-zero",
+        ));
+    }
+    for plane in 0..planes {
+        let bytes = row_bytes(frame, plane)?;
+        let rows = plane_rows(frame, plane, bytes)?;
+        if rows.rows == 0 {
+            return Err(FfmpegError::FrameLayout("plane is empty"));
+        }
+    }
+    let av_format = ffi::AVPixelFormat::from(frame.format());
+    let flags =
+        descriptor_flags(av_format).ok_or(FfmpegError::FrameLayout("unknown pixel format"))?;
+    let pal = u64::try_from(ffi::AV_PIX_FMT_FLAG_PAL).unwrap_or(u64::MAX);
+    if flags & pal != 0 {
+        #[allow(unsafe_code)]
+        // SAFETY: the pointer is `frame`'s own `AVFrame` (non-null:
+        // `plane_rows` above already refused a null frame); `data` has
+        // `AV_NUM_DATA_POINTERS` entries, so index 1 exists.
+        let (raw, palette) = unsafe {
+            let raw = frame.as_ptr();
+            (raw, (*raw).data[1])
+        };
+        if palette.is_null() {
+            return Err(FfmpegError::FrameLayout("paletted frame has no palette"));
+        }
+        let low = palette.expose_provenance();
+        let high = low
+            .checked_add(PALETTE_BYTES)
+            .ok_or(FfmpegError::FrameLayout("palette span overflows"))?;
+        if !span_in_buffers(raw, low, high) {
+            return Err(FfmpegError::FrameLayout(
+                "palette lies outside the frame's buffers",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the address range `[low, high)` lies inside one buffer `raw`
+/// holds a reference to.
+fn span_in_buffers(raw: *const ffi::AVFrame, low: usize, high: usize) -> bool {
+    owned_buffers(raw).any(|(start, size)| {
+        start
+            .checked_add(size)
+            .is_some_and(|end| low >= start && high <= end)
+    })
+}
+
 /// `(first byte, span length, stride)` of `plane` of `frame`, a forward
 /// (positive linesize) plane whose every row's active bytes
 /// (`av_image_get_linesize`) lie in one buffer the frame owns — checked by
@@ -311,18 +397,7 @@ fn writable_span(frame: &Video, plane: usize) -> Result<(*mut u8, usize, usize)>
     if plane >= planes {
         return Err(FfmpegError::FrameLayout("plane is not part of the format"));
     }
-    let width = libc::c_int::try_from(frame.width())
-        .map_err(|_| FfmpegError::FrameLayout("frame width overflows"))?;
-    let index =
-        libc::c_int::try_from(plane).map_err(|_| FfmpegError::FrameLayout("plane index"))?;
-    #[allow(unsafe_code)]
-    // SAFETY: `av_image_get_linesize` reads the static format table; a
-    // negative result (invalid plane/width) is rejected below.
-    let row_bytes = unsafe {
-        ffi::av_image_get_linesize(ffi::AVPixelFormat::from(frame.format()), width, index)
-    };
-    let row_bytes =
-        usize::try_from(row_bytes).map_err(|_| FfmpegError::FrameLayout("plane row size"))?;
+    let row_bytes = row_bytes(frame, plane)?;
     let rows = plane_rows(frame, plane, row_bytes)?;
     if rows.rows == 0 || row_bytes == 0 {
         return Err(FfmpegError::FrameLayout("plane is empty"));
