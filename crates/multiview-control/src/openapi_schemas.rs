@@ -2544,3 +2544,157 @@ pub struct OutputLinkDoc {
     /// Attached peer addresses: an SRT listener's callers, or a caller's target.
     pub peers: Vec<String>,
 }
+
+/// `OpenAPI` mirror of [`multiview_core::switcher::WipePattern`] (ADR-0112 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WipePatternDoc {
+    /// A straight vertical edge sweeping left to right (horizontal wipe).
+    LinearEdge,
+    /// A straight horizontal edge sweeping top to bottom (vertical wipe).
+    Vertical,
+    /// A diagonal edge sweeping from the top-left to the bottom-right corner.
+    Diagonal,
+    /// A rectangle growing from the pattern origin.
+    Box,
+    /// A circle/ring growing from the pattern origin.
+    Circle,
+}
+
+/// `OpenAPI` mirror of [`multiview_core::switcher::DveDirection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DveDirectionDoc {
+    /// Travel toward the left edge.
+    Left,
+    /// Travel toward the right edge.
+    Right,
+    /// Travel toward the top edge.
+    Up,
+    /// Travel toward the bottom edge.
+    Down,
+}
+
+/// `OpenAPI` mirror of the dip switch point: an exact rational `num/den`
+/// strictly inside `(0, 1)`. Unknown fields are refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchPointDoc {
+    /// Numerator.
+    pub num: i64,
+    /// Denominator.
+    pub den: i64,
+}
+
+fn default_switch_point_doc() -> SwitchPointDoc {
+    SwitchPointDoc { num: 1, den: 2 }
+}
+
+fn default_position_xy_doc() -> [f32; 2] {
+    [0.5, 0.5]
+}
+
+/// `OpenAPI` mirror of [`multiview_core::switcher::TransitionDescriptor`]
+/// (ADR-0055 §3, ADR-0112 §4).
+///
+/// Serde-equivalent: internally tagged on `kind`, `snake_case`, unknown
+/// fields (and fields of another kind) refused. Durations (`rate`, …) are
+/// whole output frames, at least 1; colours are `"#rgb"`/`"#rrggbb"`.
+/// The control API selects only what the Program drive renders (`cut`,
+/// `mix`, `dip` to a colour, `wipe` without `flip_flop`/`border_fill_source`)
+/// with a rate of at most 1000 frames; the other kinds are documented
+/// because the engine's descriptor carries them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum TransitionDescriptorDoc {
+    /// Atomic frame-boundary swap.
+    Cut,
+    /// Dissolve.
+    Mix {
+        /// Duration in output frames.
+        #[schema(minimum = 1)]
+        rate: u32,
+    },
+    /// Two chained mixes through a solid colour (or, not rendered yet, a source).
+    Dip {
+        /// Duration in output frames (at least 2).
+        #[schema(minimum = 2)]
+        rate: u32,
+        /// Source dipped through (refused: not rendered yet).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dip_source: Option<String>,
+        /// The colour dipped through, `"#rrggbb"`; absent means black.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
+        /// Where the outgoing/incoming swap happens; default `1/2`.
+        #[serde(default = "default_switch_point_doc")]
+        switch_point: SwitchPointDoc,
+    },
+    /// Masked wipe.
+    Wipe {
+        /// The mask shape.
+        pattern: WipePatternDoc,
+        /// Duration in output frames.
+        #[schema(minimum = 1)]
+        rate: u32,
+        /// Edge softness, a fraction of the canvas height in `[0, 1]`.
+        #[serde(default)]
+        #[schema(minimum = 0, maximum = 1)]
+        softness: f32,
+        /// Border band width, a fraction of the canvas height in `[0, 1]`.
+        #[serde(default)]
+        #[schema(minimum = 0, maximum = 1)]
+        border_width: f32,
+        /// Source filling the border band (refused: not rendered yet).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        border_fill_source: Option<String>,
+        /// Border band colour, `"#rrggbb"`; absent means no band.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        border_color: Option<String>,
+        /// Box/circle origin `[x, y]`, each in `[0, 1]`; default centre.
+        #[serde(default = "default_position_xy_doc")]
+        position_xy: [f32; 2],
+        /// Mirror the travel direction.
+        #[serde(default)]
+        reverse: bool,
+        /// Alternate the direction on successive takes (refused: not rendered yet).
+        #[serde(default)]
+        flip_flop: bool,
+    },
+    /// Animated translate (not rendered yet).
+    DvePush {
+        /// Travel direction.
+        direction: DveDirectionDoc,
+        /// Duration in output frames.
+        #[schema(minimum = 1)]
+        rate: u32,
+    },
+    /// Animated scale (not rendered yet).
+    DveSqueeze {
+        /// Travel direction.
+        direction: DveDirectionDoc,
+        /// Duration in output frames.
+        #[schema(minimum = 1)]
+        rate: u32,
+    },
+    /// Media transition (not rendered yet).
+    Stinger {
+        /// The bound media player's id.
+        player: String,
+        /// Pre-roll frames.
+        #[schema(minimum = 1)]
+        pre_roll: u32,
+        /// Clip length in frames.
+        #[schema(minimum = 1)]
+        clip_duration: u32,
+        /// Frame the underlying mix starts on.
+        #[schema(minimum = 1)]
+        trigger_point: u32,
+        /// Mix window in frames.
+        #[schema(minimum = 1)]
+        mix_rate: u32,
+    },
+}

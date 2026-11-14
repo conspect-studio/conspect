@@ -56,8 +56,14 @@ pub struct SwitcherRequest {
     /// `stinger`, DVE kinds, a dip through a source, `flip_flop` and
     /// `border_fill_source`; with `invalid-transition`: anything that does not
     /// parse or is out of range.
+    ///
+    /// Parsed from raw JSON so a malformed descriptor is a typed 422; the
+    /// documented shape is [`crate::openapi_schemas::TransitionDescriptorDoc`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = Option<crate::openapi_schemas::TransitionDescriptorDoc>)
+    )]
     pub transition: Option<serde_json::Value>,
 }
 
@@ -100,10 +106,13 @@ pub struct SwitcherStateResponse {
     pub preview_source: String,
     /// Active AUTO status.
     pub in_flight: bool,
-    /// The selected transition (during an AUTO, the flight's own, carrying
-    /// the AUTO's rate), as the engine applied it (ADR-0112 §4). Same shape
-    /// as the request's `transition`.
-    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    /// The operator's selected transition, as the engine applied it
+    /// (ADR-0112 §4); an AUTO's own rate never replaces it. Same shape as
+    /// the request's `transition`.
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = crate::openapi_schemas::TransitionDescriptorDoc)
+    )]
     pub transition: TransitionDescriptor,
 }
 

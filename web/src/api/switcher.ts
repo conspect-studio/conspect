@@ -5,23 +5,16 @@ import { apiUrl, buildHeaders, OperationApiError, readPendingProblem, newIdempot
 import type { RequestOptions } from './operations';
 
 /** The five rendered wipe patterns (ADR-0112 §3). */
-export const WIPE_PATTERNS = ['linear_edge', 'vertical', 'diagonal', 'box', 'circle'] as const;
+export const WIPE_PATTERNS = ['linear_edge', 'vertical', 'diagonal', 'box', 'circle'] as const satisfies readonly components['schemas']['WipePatternDoc'][];
 export type WipePattern = (typeof WIPE_PATTERNS)[number];
-/**
- * The M/E transition descriptor (ADR-0112 §4), tagged on `kind`. OpenAPI
- * types it as an opaque object (the core enum has no schema); this narrows it.
- */
-export type TransitionDescriptor =
-  | { kind: 'cut' }
-  | { kind: 'mix'; rate: number }
-  | { kind: 'dip'; rate: number; color?: string; switch_point?: { num: number; den: number } }
-  | { kind: 'wipe'; pattern: WipePattern; rate: number; reverse?: boolean; softness?: number; border_width?: number; border_color?: string; position_xy?: [number, number] };
+/** The M/E transition descriptor (ADR-0112 §4), generated from OpenAPI: tagged on `kind`. */
+export type TransitionDescriptor = components['schemas']['TransitionDescriptorDoc'];
 
 // `input` (ADR-0110 §12.8) and `transition` (ADR-0112 §4) are served by main;
 // the pending superset still shadows SwitcherRequest/SwitcherStateResponse
-// without them, so they are added here until pending/ goes.
-export type SwitcherRequest = Omit<components['schemas']['SwitcherRequest'], 'transition'> & { input?: number | null; transition?: TransitionDescriptor | null };
-export type SwitcherState = Omit<components['schemas']['SwitcherStateResponse'], 'transition'> & { transition?: TransitionDescriptor | { kind: string } };
+// without them, so main's generated fields are added here until pending/ goes.
+export type SwitcherRequest = components['schemas']['SwitcherRequest'] & { input?: number | null; transition?: TransitionDescriptor | null };
+export type SwitcherState = components['schemas']['SwitcherStateResponse'] & { transition?: TransitionDescriptor };
 export type SwitcherPlan = components['schemas']['SwitcherPlan'];
 export type SwitcherAccepted = components['schemas']['SwitcherAccepted'];
 export type SwitcherAction = 'select_program' | 'select_preview' | 'cut' | 'auto' | 'set_transition';

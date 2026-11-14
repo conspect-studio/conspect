@@ -658,3 +658,58 @@ async fn an_applied_selection_is_persisted_after_the_tick_and_survives_a_reload(
         "a restart reads the same selection"
     );
 }
+
+/// MED-P3-3: the published schema is the descriptor's tagged union, and the
+/// mirror accepts and refuses exactly what the core type does.
+#[test]
+fn the_documented_transition_schema_is_a_tagged_union_matching_the_core_type() {
+    use multiview_control::openapi_schemas::TransitionDescriptorDoc;
+    use utoipa::OpenApi;
+    let doc = serde_json::to_value(multiview_control::openapi::ApiDoc::openapi()).unwrap();
+    let schemas = &doc["components"]["schemas"];
+    let request = &schemas["SwitcherRequest"]["properties"]["transition"];
+    let state = &schemas["SwitcherStateResponse"]["properties"]["transition"];
+    assert!(
+        request.to_string().contains("TransitionDescriptorDoc"),
+        "{request}"
+    );
+    assert!(state.to_string().contains("TransitionDescriptorDoc"), "{state}");
+    let union = &schemas["TransitionDescriptorDoc"];
+    let variants = union["oneOf"].as_array().expect("oneOf");
+    let mut kinds: Vec<&str> = variants
+        .iter()
+        .map(|v| v["properties"]["kind"]["enum"][0].as_str().unwrap())
+        .collect();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        ["cut", "dip", "dve_push", "dve_squeeze", "mix", "stinger", "wipe"]
+    );
+    for case in [
+        json!({"kind": "cut"}),
+        json!({"kind": "mix", "rate": 30}),
+        json!({"kind": "dip", "rate": 20, "color": "#ffffff", "switch_point": {"num": 1, "den": 3}}),
+        wipe(),
+        json!({"kind": "wipe", "pattern": "box", "rate": 12, "softness": 0.3, "border_width": 0.0,
+            "position_xy": [0.2, 0.8], "reverse": true, "flip_flop": false}),
+        json!({"kind": "dve_push", "direction": "left", "rate": 15}),
+        json!({"kind": "stinger", "player": "p", "pre_roll": 5, "clip_duration": 40,
+            "trigger_point": 10, "mix_rate": 20}),
+    ] {
+        let core: TransitionDescriptor = serde_json::from_value(case.clone()).unwrap();
+        let mirror: TransitionDescriptorDoc = serde_json::from_value(case.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&core).unwrap(),
+            serde_json::to_value(&mirror).unwrap(),
+            "{case}"
+        );
+    }
+    for case in [
+        json!({"kind": "mix", "rate": 10, "reverse": true}),
+        json!({"kind": "dip", "rate": 10, "switch_point": {"num": 1, "den": 2, "x": 0}}),
+        json!({"kind": "spin"}),
+    ] {
+        assert!(serde_json::from_value::<TransitionDescriptor>(case.clone()).is_err());
+        assert!(serde_json::from_value::<TransitionDescriptorDoc>(case.clone()).is_err());
+    }
+}
