@@ -678,6 +678,7 @@ mod player_tests {
             location: super::super::SourceLocation::Path(clip.to_path_buf()),
             http_headers: super::super::HttpHeaders::default(),
             player: Some(handle),
+            tap: None,
             tile_w: W,
             tile_h: H,
             display: None,
