@@ -27,7 +27,9 @@ use std::sync::Arc;
 
 use multiview_compositor::key::{KeyKind, KeyMask};
 use multiview_compositor::pipeline::Nv12Image;
-use multiview_config::{DownstreamKeyerConfig, KeyerLossPolicy, KeyerLossTrigger, KeyerType};
+use multiview_config::{
+    DownstreamKeyerConfig, KeyerLossPolicy, KeyerLossTrigger, KeyerType, MAX_KEYER_RATE,
+};
 use multiview_core::switcher::{kernel, FrameCount, Progress};
 use multiview_core::traits::SourceState;
 use multiview_framestore::{TileRead, TileStore};
@@ -60,6 +62,8 @@ pub const REFUSE_KEYER_AUTO_INTERRUPTED: &str = "keyer AUTO interrupted by a key
 /// Typed refusal: a keyer source reached its loss trigger during an AUTO.
 pub const REFUSE_KEYER_SOURCE_LOST: &str =
     "source-lost: a keyer source reached its loss trigger; the keyer was taken off air";
+/// Typed refusal: a keyer AUTO rate override above [`MAX_KEYER_RATE`].
+pub const REFUSE_KEYER_RATE: &str = "keyer-rate: the AUTO rate is outside 1..=300 frames";
 /// Typed refusal: a held keyer command expired while Program repeated.
 pub const REFUSE_KEYER_REPEAT_DEADLINE: &str =
     "keyer take deadline expired while program repeated last-good";
@@ -887,6 +891,15 @@ impl KeyerRuntime {
             sink.refused(operation_id, REFUSE_KEYER_UNKNOWN);
             return;
         };
+        // Review F5: the rate override is bounded like the configured rate,
+        // and refused before any state changes (a `u32::MAX` ramp would hold
+        // the keyer mid-AUTO for years).
+        if let KeyerAction::Auto(_, Some(rate)) = action {
+            if rate.get() > MAX_KEYER_RATE {
+                sink.refused(operation_id, REFUSE_KEYER_RATE);
+                return;
+            }
+        }
         if slot.flags.pending.is_some() {
             if slot.pending_op.is_some() {
                 sink.refused(operation_id, REFUSE_KEYER_PENDING);

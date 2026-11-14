@@ -621,3 +621,63 @@ fn preview_is_not_program_tallied_at_mix_p_zero() {
 fn preview_is_not_program_tallied_before_a_dip_switch_point() {
     preview_tally_follows_the_incoming_tile(true);
 }
+
+/// Review F5: a keyer AUTO rate override is bounded like the configured rate
+/// (1..=300) and an over-limit one is refused before any state change.
+#[test]
+fn a_keyer_auto_rate_override_is_bounded() {
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[dsk("dsk1", "gfx", None, 1)], 3.0, "a", "b");
+    let mut outcomes = handle.outcomes();
+    let mut index = 0;
+    for (op, frames) in [("301", 301_u32), ("max", u32::MAX)] {
+        handle
+            .try_send(cmd(
+                op,
+                SwitcherVerb::KeyerAuto {
+                    keyer: 0,
+                    on: true,
+                    rate: Some(FrameCount::try_from(frames).unwrap()),
+                },
+            ))
+            .unwrap();
+        keep_fresh(&rig, index);
+        step(&mut hook, &mut drive, index);
+        index += 1;
+        let outcome = drain(&mut outcomes).0;
+        assert_eq!(outcome.len(), 1, "{op}: {outcome:?}");
+        assert_eq!(outcome[0].tick, index - 1);
+        assert!(
+            outcome[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("keyer-rate")),
+            "{op}: {outcome:?}"
+        );
+        let flags = hook.driver.keyers().flags(0).unwrap();
+        assert!(flags.ramp.is_none() && !flags.on_air && flags.pending.is_none());
+        assert_eq!(weight_of(&drive, 0), None);
+    }
+    // The limit itself is accepted and ramps.
+    handle
+        .try_send(cmd(
+            "300",
+            SwitcherVerb::KeyerAuto {
+                keyer: 0,
+                on: true,
+                rate: Some(FrameCount::try_from(300).unwrap()),
+            },
+        ))
+        .unwrap();
+    keep_fresh(&rig, index);
+    step(&mut hook, &mut drive, index);
+    let ramp = hook.driver.keyers().flags(0).unwrap().ramp.unwrap();
+    assert_eq!(
+        (ramp.start, ramp.rate.get(), ramp.to_on),
+        (index, 300, true)
+    );
+    assert!(
+        drain(&mut outcomes).0.is_empty(),
+        "in flight, no outcome yet"
+    );
+}
