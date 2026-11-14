@@ -381,6 +381,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::media_players::TransportBody,
         crate::routes::SwapRequest,
         crate::routes::ApplyLayoutRequest,
+        crate::routes::ApplyLayoutTarget,
         crate::auth::Role,
         crate::command::OperationId,
         crate::audit::AuditEntry,

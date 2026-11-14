@@ -766,7 +766,7 @@ msgid "About display nodes"
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:300
-#: src/pages/LayoutsPage.tsx:251
+#: src/pages/LayoutsPage.tsx:247
 msgid "About layouts"
 msgstr ""
 
@@ -839,7 +839,7 @@ msgstr ""
 msgid "Accept the publisher's audio (Opus)"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:327
+#: src/pages/LayoutsPage.tsx:323
 msgid "Accessible editing path: Cells form + Inspector in the editor"
 msgstr ""
 
@@ -894,7 +894,7 @@ msgstr ""
 #: src/pages/CastPage.tsx:393
 #: src/pages/DevicesPage.tsx:634
 #: src/pages/graphics/DataView.tsx:365
-#: src/pages/LayoutsPage.tsx:102
+#: src/pages/LayoutsPage.tsx:94
 #: src/pages/OverlaysPage.tsx:194
 #: src/pages/ProbesPage.tsx:452
 #: src/pages/SyncGroupsPage.tsx:295
@@ -1194,7 +1194,7 @@ msgstr ""
 msgid "All cells showing this source"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:294
+#: src/pages/LayoutsPage.tsx:290
 msgid "All configured layouts."
 msgstr ""
 
@@ -1421,7 +1421,7 @@ msgid "Applies on the next restart."
 msgstr ""
 
 #: src/iptv/SourceLinks.tsx:359
-#: src/pages/LayoutsPage.tsx:123
+#: src/pages/LayoutsPage.tsx:115
 msgid "Apply"
 msgstr ""
 
@@ -1429,7 +1429,7 @@ msgstr ""
 msgid "Apply filter"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:115
+#: src/pages/LayoutsPage.tsx:107
 msgid "Apply layout to engine"
 msgstr ""
 
@@ -2051,7 +2051,7 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1211
 #: src/pages/graphics/DataView.tsx:320
 #: src/pages/graphics/LibraryView.tsx:155
-#: src/pages/LayoutsPage.tsx:365
+#: src/pages/LayoutsPage.tsx:361
 #: src/pages/MediaPlayersPage.tsx:894
 #: src/pages/OutputFeedRow.tsx:458
 #: src/pages/OutputsPage.tsx:1604
@@ -2319,7 +2319,7 @@ msgstr ""
 #: src/docs/registry.ts:143
 #: src/layout/components/LayoutEditor.tsx:360
 #: src/pages/docs/ConfigPage.tsx:185
-#: src/pages/LayoutsPage.tsx:95
+#: src/pages/LayoutsPage.tsx:87
 msgid "Cells"
 msgstr ""
 
@@ -3099,7 +3099,7 @@ msgstr ""
 msgid "Could not acknowledge alarm"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:197
+#: src/pages/LayoutsPage.tsx:193
 msgid "Could not apply layout"
 msgstr ""
 
@@ -3160,7 +3160,7 @@ msgstr ""
 msgid "Could not delete"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:230
+#: src/pages/LayoutsPage.tsx:226
 msgid "Could not delete layout"
 msgstr ""
 
@@ -3230,7 +3230,7 @@ msgstr ""
 msgid "Could not load graphics channels."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:278
+#: src/pages/LayoutsPage.tsx:274
 msgid "Could not load layouts:"
 msgstr ""
 
@@ -3519,7 +3519,7 @@ msgstr ""
 msgid "Create today source"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:288
+#: src/pages/LayoutsPage.tsx:284
 msgid "Create your first layout"
 msgstr ""
 
@@ -3854,8 +3854,8 @@ msgid "Degraded event evidence: information may be incomplete."
 msgstr ""
 
 #: src/pages/approved/SourcesSurface.tsx:249
-#: src/pages/LayoutsPage.tsx:151
-#: src/pages/LayoutsPage.tsx:368
+#: src/pages/LayoutsPage.tsx:147
+#: src/pages/LayoutsPage.tsx:364
 #: src/pages/OutputsPage.tsx:1103
 #: src/pages/OutputsPage.tsx:1221
 #: src/pages/OutputsPage.tsx:1661
@@ -3880,11 +3880,11 @@ msgstr ""
 msgid "Delete {0}? If it is on air it is cut off air."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:145
+#: src/pages/LayoutsPage.tsx:141
 msgid "Delete layout"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:342
+#: src/pages/LayoutsPage.tsx:338
 msgid "Delete layout?"
 msgstr ""
 
@@ -4495,7 +4495,7 @@ msgid "EBU R128 (−23 LUFS)"
 msgstr ""
 
 #: src/pages/approved/SourcesSurface.tsx:246
-#: src/pages/LayoutsPage.tsx:139
+#: src/pages/LayoutsPage.tsx:135
 #: src/pages/OutputsPage.tsx:1093
 #: src/pages/OutputsPage.tsx:1211
 #: src/pages/SalvosPage.tsx:296
@@ -5657,7 +5657,7 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1032
 #: src/pages/DeviceDetailPage.tsx:1135
 #: src/pages/DevicesPage.tsx:113
-#: src/pages/LayoutsPage.tsx:86
+#: src/pages/LayoutsPage.tsx:78
 #: src/pages/OutputsPage.tsx:1557
 #: src/pages/OverlaysPage.tsx:268
 #: src/pages/ProbesPage.tsx:520
@@ -6154,7 +6154,7 @@ msgstr ""
 msgid "Layout"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:189
+#: src/pages/LayoutsPage.tsx:185
 msgid "Layout applied live"
 msgstr ""
 
@@ -6162,7 +6162,7 @@ msgstr ""
 msgid "layout cell"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:226
+#: src/pages/LayoutsPage.tsx:222
 msgid "Layout deleted"
 msgstr ""
 
@@ -6171,7 +6171,7 @@ msgstr ""
 msgid "Layout name"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:196
+#: src/pages/LayoutsPage.tsx:192
 msgid "Layout not applied: the switcher is on"
 msgstr ""
 
@@ -6205,7 +6205,7 @@ msgstr ""
 #: src/docs/registry.ts:227
 #: src/pages/DashboardPage.tsx:58
 #: src/pages/docs/FeaturesPage.tsx:25
-#: src/pages/LayoutsPage.tsx:242
+#: src/pages/LayoutsPage.tsx:238
 #: src/pages/OutputFeedRow.tsx:323
 msgid "Layouts"
 msgstr "التخطيطات"
@@ -6533,7 +6533,7 @@ msgstr ""
 msgid "Loading layout…"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:274
+#: src/pages/LayoutsPage.tsx:270
 msgid "Loading layouts…"
 msgstr ""
 
@@ -7221,7 +7221,7 @@ msgstr ""
 #: src/pages/graphics/LibraryView.tsx:117
 #: src/pages/graphics/PlayoutView.tsx:467
 #: src/pages/IptvPage.tsx:253
-#: src/pages/LayoutsPage.tsx:77
+#: src/pages/LayoutsPage.tsx:69
 #: src/pages/OutputsPage.tsx:1569
 #: src/pages/OverlaysPage.tsx:168
 #: src/pages/OverlaysPage.tsx:280
@@ -7361,7 +7361,7 @@ msgid "New instances blocked"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:338
-#: src/pages/LayoutsPage.tsx:265
+#: src/pages/LayoutsPage.tsx:261
 msgid "New layout"
 msgstr ""
 
@@ -7601,7 +7601,7 @@ msgstr ""
 msgid "No layout cells found — enter the cell id to watch."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:283
+#: src/pages/LayoutsPage.tsx:279
 msgid "No layouts are defined yet."
 msgstr ""
 
@@ -7984,7 +7984,7 @@ msgid "Nothing loaded — no bytes at risk"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:128
-#: src/pages/LayoutsPage.tsx:199
+#: src/pages/LayoutsPage.tsx:195
 msgid "Nothing was changed; the current layout keeps running."
 msgstr ""
 
@@ -8287,7 +8287,7 @@ msgstr ""
 
 #: src/api/operationStatus.ts:24
 #: src/pages/LayoutEditorPage.tsx:118
-#: src/pages/LayoutsPage.tsx:190
+#: src/pages/LayoutsPage.tsx:186
 #: src/pages/SalvosPage.tsx:154
 #: src/pages/TallyPage.tsx:142
 msgid "Operation id"
@@ -10541,7 +10541,7 @@ msgstr "المصادر"
 msgid "Sources & library"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:245
+#: src/pages/LayoutsPage.tsx:241
 msgid "Sources → Layouts → Outputs. The accessible editor offers a form-based path equivalent to the drag-and-drop canvas. Save keeps a layout; apply asks the running engine to use it now. Saved layouts are not separate live renderers."
 msgstr ""
 
@@ -11097,7 +11097,7 @@ msgid "Takes are locked and this one changes what is on program (the current PGM
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:118
-#: src/pages/LayoutsPage.tsx:190
+#: src/pages/LayoutsPage.tsx:186
 msgid "Takes effect at the next frame boundary."
 msgstr ""
 
@@ -11787,8 +11787,8 @@ msgstr ""
 msgid "The stream becomes an ordinary source linked to its IPTV-ORG entry. The Sources page opens the create dialog next with this choice already set; nothing is saved until you confirm there."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:131
-msgid "The switcher is on: a multi-cell layout cannot be the Program canvas."
+#: src/pages/LayoutsPage.tsx:123
+msgid "The switcher is on: Program is the M/E bus. Take this layout to an output from <0>Outputs</0>."
 msgstr ""
 
 #: src/pages/docs/concepts/GlossaryPage.tsx:350
@@ -12021,7 +12021,7 @@ msgstr ""
 msgid "This page is not served over HTTPS. A TV only plays an HTTPS address with a valid certificate."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:345
+#: src/pages/LayoutsPage.tsx:341
 msgid "This permanently removes the layout. Running outputs are not affected until a new layout is applied."
 msgstr ""
 
@@ -12739,7 +12739,7 @@ msgstr ""
 msgid "Video using a brightness curve (PQ or HLG) and usually the BT.2020 gamut that represents far brighter highlights and deeper shadows than standard dynamic range (SDR). HDR tiles must be tone-mapped onto an SDR canvas or they look dim and grey."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:259
+#: src/pages/LayoutsPage.tsx:255
 msgid "View current engine program"
 msgstr ""
 

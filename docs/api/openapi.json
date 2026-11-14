@@ -1820,7 +1820,7 @@
           "commands"
         ],
         "summary": "`POST /api/v1/commands/apply-layout` — apply a **stored** layout to the\nrunning multiview, live, at the next frame boundary (role: write;\nper-object authz; 202) — ADR-W019, invariant #11 Class-1.",
-        "description": "The stored layout body is resolved from the layouts repository and solved\n**here, at request time** (off the engine hot path): an unknown id, a body\nthat does not parse as a `{canvas, layout, cells}` document, one that does\nnot solve (bad grid / geometry), a pinned-canvas mismatch (a Class-2\nchange — ADR-R004), or an unknown running canvas (no seeded snapshot — the\ngate fails closed) is an honest `422` **before** any `202`. On `202` the\ncommand carries the solved layout, so the engine's frame-boundary drain\nonly swaps (O(cells), no I/O — invariants #1/#10); the `202` body's\n`applied_live`/`carried_only` arrays state which per-cell property classes\ngenuinely apply on screen. Idempotency reserves **before** resolution: a\nreplayed `Idempotency-Key` returns the original operation id (kind\n`replay`, undecorated) without re-resolving, and a refused resolve\nreleases the key. The submit mirrors [`cmd_swap`] (shed-on-full) and never\nblocks the engine (invariant #10); the outcome rides the realtime stream\nas a `job.progress` event (ADR-W008).",
+        "description": "The stored layout body is resolved from the layouts repository and solved\n**here, at request time** (off the engine hot path): an unknown id, a body\nthat does not parse as a `{canvas, layout, cells}` document, one that does\nnot solve (bad grid / geometry), a pinned-canvas mismatch (a Class-2\nchange — ADR-R004), or an unknown running canvas (no seeded snapshot — the\ngate fails closed) is an honest `422` **before** any `202`. On `202` the\ncommand carries the solved layout, so the engine's frame-boundary drain\nonly swaps (O(cells), no I/O — invariants #1/#10); the `202` body's\n`applied_live`/`carried_only` arrays state which per-cell property classes\ngenuinely apply on screen. Idempotency reserves **before** resolution: a\nreplayed `Idempotency-Key` returns the original operation id (kind\n`replay`, undecorated) without re-resolving, and a refused resolve\nreleases the key. The submit mirrors [`cmd_swap`] (shed-on-full) and never\nblocks the engine (invariant #10); the outcome rides the realtime stream\nas a `job.progress` event (ADR-W008).\n\n#307: with a switcher M/E declared the Program canvas is the M/E bus, so a\nrequest without `target` answers `422 switcher-owns-program` BEFORE any\nidempotency reservation (the key stays free). With `target: {output}` the\nrequest is an output take of the layout (`take_output_as`, the same code\npath as `POST /routing/output/take`).",
         "operationId": "cmd_apply_layout",
         "requestBody": {
           "content": {
@@ -1863,8 +1863,38 @@
               }
             }
           },
+          "404": {
+            "description": "With `target`: unknown output (as `POST /routing/output/take`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "With `target`: the output take's 409s (`routing-unavailable`, `output-kind-unroutable`, `capacity`, `aux-capacity`, …).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "422": {
-            "description": "The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), the running canvas is unknown (no seeded snapshot — the gate fails closed), or a switcher M/E is declared and the layout is not one full-canvas cell bound to its program source (type `/problems/layout-not-admissible-with-switcher`; nothing is applied or persisted).",
+            "description": "The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and a layout as a switcher source). With `target`: the output take's 422s.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "With `target`: over the output take rate limits; see Retry-After.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10249,6 +10279,16 @@
               }
             }
           },
+          "422": {
+            "description": "`switcher-owns-program`: a video→cell take while a switcher M/E is declared (Program is the M/E bus and the take would not change the stored layout; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Refused before the Idempotency-Key is reserved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Engine command bus at capacity; shed.",
             "content": {
@@ -10627,6 +10667,16 @@
               }
             }
           },
+          "422": {
+            "description": "`switcher-owns-program`: a switcher M/E is declared and the salvo recalls a layout or cell sources (Program is the M/E bus; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Nothing is queued. A salvo of only tally/UMD recalls is unaffected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Engine command bus at capacity; shed.",
             "content": {
@@ -10703,6 +10753,16 @@
           },
           "404": {
             "description": "No salvo with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`switcher-owns-program`: a switcher M/E is declared and the salvo recalls a layout or cell sources (Program is the M/E bus; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Refused before the Idempotency-Key is reserved. A salvo of only tally/UMD recalls is unaffected.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14673,8 +14733,33 @@
           "layout": {
             "type": "string",
             "description": "The layout id to make active on the running multiview."
+          },
+          "target": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApplyLayoutTarget",
+                "description": "Optional: take the layout to this output instead of the Program canvas\n(#307). A thin alias for `POST /api/v1/routing/output/take` with\n`{\"layout\": <layout>}` as the video feed: the same authorization (Write\non the output and its output scope, Read on the layout and every source\nit shows), Idempotency-Key contract, limits and response. Allowed with\nor without a switcher."
+              }
+            ]
           }
         }
+      },
+      "ApplyLayoutTarget": {
+        "type": "object",
+        "description": "Where `apply-layout` sends the layout when `target` is present (#307).",
+        "required": [
+          "output"
+        ],
+        "properties": {
+          "output": {
+            "type": "string",
+            "description": "The output API id (the id `/api/v1/outputs/{id}` addresses)."
+          }
+        },
+        "additionalProperties": false
       },
       "AudioChannelsDoc": {
         "oneOf": [
