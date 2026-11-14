@@ -1,7 +1,8 @@
 //! First-slice switcher HTTP surface. No route advertises a 202 unless a real
 //! dual-bus engine handle is installed; operation completion is engine-tick-owned.
 
-use axum::extract::{Path, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -441,12 +442,51 @@ pub(crate) async fn get_switcher(
         .into_response())
 }
 
+/// The [`SwitcherRequest`] body (P3R2-B). Delegates to axum's [`Json`], so a
+/// missing content type, a body limit, a syntax error or a data error keeps
+/// the exact status and shape it had; only an error located inside
+/// `transition` (a number JSON cannot carry, such as `1e400` or a literal
+/// `NaN`) becomes the typed RFC 9457 422 `invalid-transition` that
+/// [`parse_transition`] gives every other malformed descriptor.
+pub(crate) struct SwitcherBody(SwitcherRequest);
+
+impl<S: Send + Sync> FromRequest<S> for SwitcherBody {
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = req.into_parts();
+        let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let rebuilt = Request::from_parts(parts, Body::from(bytes.clone()));
+        match Json::<SwitcherRequest>::from_request(rebuilt, state).await {
+            Ok(Json(req)) => Ok(Self(req)),
+            Err(rejection) => Err(transition_error(&bytes).map_or_else(
+                || rejection.into_response(),
+                |detail| typed("invalid-transition", detail),
+            )),
+        }
+    }
+}
+
+/// The error detail when `bytes` fail to parse *inside* `transition`; `None`
+/// for any other failure (including a body truncated there: that is a
+/// malformed body, not a malformed descriptor).
+fn transition_error(bytes: &[u8]) -> Option<String> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let err = serde_path_to_error::deserialize::<_, SwitcherRequest>(&mut de).err()?;
+    let path = err.path().to_string();
+    let inside =
+        path == "transition" || path.starts_with("transition.") || path.starts_with("transition[");
+    (inside && !err.inner().is_eof()).then(|| format!("{path}: {}", err.inner()))
+}
+
 /// Dry-run command admission, including BOLA on every referenced object.
 #[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, body = SwitcherPlan), (status = 403, body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, body = crate::problem::Problem))))]
 pub(crate) async fn plan_switcher(
     State(state): State<AppState>,
     principal: Principal,
-    Json(req): Json<SwitcherRequest>,
+    SwitcherBody(req): SwitcherBody,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     authorize_refs(&principal, &req)?;
@@ -491,7 +531,7 @@ pub(crate) async fn submit_switcher(
     principal: Principal,
     idem: IdempotencyKey,
     Path(kind): Path<String>,
-    Json(req): Json<SwitcherRequest>,
+    SwitcherBody(req): SwitcherBody,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     authorize_refs(&principal, &req)?;
@@ -592,12 +632,17 @@ pub(crate) async fn submit_switcher(
             op
         }
     };
-    Ok((
+    Ok(accepted(&op, kind))
+}
+
+/// The `202` for an accepted (or replayed) operation.
+fn accepted(op: &crate::command::OperationId, kind: String) -> Response {
+    (
         StatusCode::ACCEPTED,
         Json(SwitcherAccepted {
             operation_id: op.to_string(),
             kind,
         }),
     )
-        .into_response())
+        .into_response()
 }

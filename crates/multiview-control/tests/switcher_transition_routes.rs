@@ -727,3 +727,81 @@ fn the_documented_transition_schema_is_a_tagged_union_matching_the_core_type() {
         assert!(serde_json::from_value::<TransitionDescriptorDoc>(case.clone()).is_err());
     }
 }
+
+fn raw(path: &str, body: &str, key: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", format!("Bearer {OPERATOR_TOKEN}"))
+        .header("content-type", "application/json");
+    if let Some(key) = key {
+        builder = builder.header("Idempotency-Key", key);
+    }
+    builder.body(Body::from(body.to_owned())).unwrap()
+}
+
+/// P3R2-B: a transition number JSON cannot carry (an overflowing `1e400`, a
+/// literal `NaN`) is a typed RFC 9457 `invalid-transition` 422 on both routes,
+/// not the untyped body rejection; other malformed bodies keep their status.
+#[tokio::test]
+async fn unrepresentable_transition_numbers_are_typed_invalid_transition_422s() {
+    let (h, handle, mut driver) = rig();
+    let mut outcomes = handle.outcomes();
+    for (n, number) in ["1e400", "NaN", "-1e400"].into_iter().enumerate() {
+        let body = format!(
+            r#"{{"me":"me1","program":"main","action":"set_transition","transition":{{"kind":"wipe","pattern":"box","rate":10,"softness":{number}}}}}"#
+        );
+        for (path, key) in [
+            ("/api/v1/switcher/plan", None),
+            (
+                "/api/v1/switcher/commands/set_transition",
+                Some(format!("nan{n}")),
+            ),
+        ] {
+            let response = send(&h.router, raw(path, &body, key.as_deref())).await;
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json",
+                "{path} {number}"
+            );
+            assert!(
+                problem_type(response).await.ends_with("invalid-transition"),
+                "{path} {number}"
+            );
+        }
+    }
+    // A malformed body outside the descriptor keeps the existing rejection.
+    for (body, status) in [
+        (
+            r#"{"me":"me1","program":"main","action":"auto","duration_frames":1e400}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (r#"{"me":"me1","program":"main","#, StatusCode::BAD_REQUEST),
+        (
+            r#"{"me":"me1","program":"main","action":"set_transition","transition":{"kind":"mix""#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            r#"{"me":1,"program":"main","action":"cut"}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        for (path, key) in [
+            ("/api/v1/switcher/plan", None),
+            ("/api/v1/switcher/commands/auto", Some("other")),
+        ] {
+            let response = send(&h.router, raw(path, body, key)).await;
+            assert_eq!(response.status(), status, "{path} {body}");
+            assert_ne!(
+                response
+                    .headers()
+                    .get("content-type")
+                    .map(|v| v.to_str().unwrap().to_owned()),
+                Some("application/problem+json".to_owned()),
+                "{path} {body}"
+            );
+        }
+    }
+    tick(&mut driver, 1);
+    assert!(outcomes.try_recv().is_err(), "a refusal queues nothing");
+}
