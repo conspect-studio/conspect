@@ -546,6 +546,27 @@ fn identical_rate_outputs_count_one_encoder_each() {
     );
 }
 
+/// #343 review A2: a rate output whose top-level codec is an encoder alias
+/// (`h264_nvenc`, `libx264`: no rendition key) still counts as an encoder.
+#[test]
+fn rate_outputs_with_an_encoder_alias_codec_count_too() {
+    for codec in ["h264_nvenc", "libx264"] {
+        let rate = |id: usize| {
+            format!(
+                "\n[[outputs]]\nkind = \"hls\"\nid = \"r{id}\"\npath = \"/srv/r{id}\"\ncodec = \"{codec}\"\n\
+                 [outputs.format]\nwidth = 1280\nheight = 720\nfps = \"25/1\"\n"
+            )
+        };
+        let doc = format!("{PLAIN}{}", (0..100).map(rate).collect::<String>());
+        assert_eq!(
+            multiview_config::rendition::distinct_base_video_keys(&parse(&doc)),
+            101,
+            "{codec}"
+        );
+        assert_code(&doc, SLOT_FORMAT_UNSUPPORTED, "distinct video encoders");
+    }
+}
+
 #[test]
 fn colour_different_from_canvas_is_slot_format_unsupported() {
     assert_code(

@@ -621,11 +621,16 @@ pub fn distinct_base_video_keys(config: &MultiviewConfig) -> usize {
     // own on its rate lane), so each counts as its own key.
     let mut rate_encoders = 0_usize;
     for (index, output) in config.outputs.iter().enumerate() {
+        // #343 review A2: a rate output counts whatever its codec token (an
+        // encoder alias such as `h264_nvenc` has no rendition key but still
+        // opens an encoder on its lane).
+        if crate::output_format::output_rate(output, &config.canvas).is_some() {
+            rate_encoders = rate_encoders.saturating_add(1);
+            continue;
+        }
         let key = video_key_for_output(output, index, &program_id, config, cadence, &color, &Any);
         if let Ok(Some(key)) = key {
-            if crate::output_format::output_rate(output, &config.canvas).is_some() {
-                rate_encoders = rate_encoders.saturating_add(1);
-            } else if !keys.contains(&key) {
+            if !keys.contains(&key) {
                 keys.push(key);
             }
         }
