@@ -228,10 +228,10 @@ describe("AppLayout — unchanged shell behaviors", () => {
     expect(document.activeElement).toBe(main);
   });
 
-  it("renders six core links without a primary sidebar", () => {
+  it("renders seven core links without a primary sidebar", () => {
     renderShell("/a");
     const nav = screen.getByRole("navigation", { name: "Core screens" });
-    expect(within(nav).getAllByRole("link")).toHaveLength(6);
+    expect(within(nav).getAllByRole("link")).toHaveLength(7);
     expect(within(nav).getByRole("link", { name: /Desk/ })).toHaveAttribute("href", "/");
     expect(screen.queryByRole("navigation", { name: "Primary" })).toBeNull();
   });

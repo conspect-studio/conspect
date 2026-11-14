@@ -6,10 +6,18 @@ use crate::{
 };
 use multiview_webengine::{
     artifact::{ArtifactStore, Limits},
-    capture::Tools,
+    capture::{BrowserGl, Tools},
     service::{Config, Service},
 };
 use std::{io, path::PathBuf, sync::Arc};
+/// Deployment GL mode: unset/empty is the browser default; anything other than
+/// `default`, `swiftshader` or `egl` aborts configured startup (fail closed).
+fn browser_gl(value: Option<&str>) -> io::Result<BrowserGl> {
+    match value {
+        None | Some("") => Ok(BrowserGl::Default),
+        Some(v) => v.parse(),
+    }
+}
 /// Start capture only when the deployment explicitly enables it.
 /// # Errors
 /// Missing tools, unsafe paths or failed durable recovery abort configured startup.
@@ -32,6 +40,7 @@ pub fn from_environment() -> io::Result<Provider> {
         node: path("CONSPECT_WEB_NODE")?,
         browser: path("CONSPECT_WEB_BROWSER")?,
         ffmpeg: path("CONSPECT_WEB_FFMPEG")?,
+        gl: browser_gl(std::env::var("CONSPECT_WEB_BROWSER_GL").ok().as_deref())?,
     };
     reject_symlink(&root)?;
     for t in [&tools.node, &tools.browser, &tools.ffmpeg] {
@@ -151,5 +160,22 @@ mod tests {
         let file = root.join("file");
         std::fs::write(&file, b"x").unwrap();
         assert!(private_dir(&file).is_err());
+    }
+}
+
+#[cfg(test)]
+mod gl_tests {
+    use super::{browser_gl, BrowserGl};
+    #[test]
+    fn gl_mode_is_bounded_and_defaults_to_no_flags() {
+        assert_eq!(browser_gl(None).ok(), Some(BrowserGl::Default));
+        assert_eq!(browser_gl(Some("")).ok(), Some(BrowserGl::Default));
+        assert_eq!(
+            browser_gl(Some("swiftshader")).ok(),
+            Some(BrowserGl::Swiftshader)
+        );
+        assert_eq!(browser_gl(Some("egl")).ok(), Some(BrowserGl::Egl));
+        assert!(browser_gl(Some("disable-gpu")).is_err());
+        assert!(browser_gl(Some("--use-gl=desktop")).is_err());
     }
 }

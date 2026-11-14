@@ -43,7 +43,17 @@ use std::sync::Arc;
 use multiview_compositor::backend::{RunBackend, RunBackendKind};
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::mask::{MaskShape, WipeMask};
-use multiview_compositor::pipeline::{CanvasColor, Nv12Image, Tile};
+use multiview_compositor::offclock::{FrameJob, JobMeta, SharedTile};
+
+/// The source metadata of one composite, carried with its job so an adopted
+/// late frame reports the sources it actually shows (issue #415).
+#[derive(Debug)]
+struct FrameMeta {
+    source_states: HashMap<String, SourceState>,
+    source_times: HashMap<String, multiview_framestore::tile::SourceFrameTime>,
+    mix: Option<MixOverlay>,
+}
+use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
 use multiview_core::layout::Layout;
 use multiview_core::switcher::Rgb8;
 use multiview_core::time::{MediaTime, Rational};
@@ -267,6 +277,12 @@ pub struct CompositorDrive<T> {
     /// registered store, so starting a clip clones a pointer and never
     /// allocates on the tick (review SA-5).
     stinger_clip: Option<Arc<TileStore<T>>>,
+    /// Bumped by every change to what a composite draws other than the
+    /// source frames' contents (layout, bindings, stores, slates, transition
+    /// step and style). A GPU backend's CPU fallback hands a late result to a
+    /// later frame only under the same epoch (issue #415 review MC-1), so a
+    /// scene a hook staged and then rolled back never reaches the output.
+    scene_epoch: u64,
 }
 
 impl<T> CompositorDrive<T> {
@@ -306,6 +322,7 @@ impl<T> CompositorDrive<T> {
             transition_fill: None,
             transition_fill_builds: 0,
             stinger_clip: None,
+            scene_epoch: 0,
         })
     }
 
@@ -316,9 +333,21 @@ impl<T> CompositorDrive<T> {
     /// unregistered player (no store), draws nothing (never a slate on
     /// Program), so this never fails.
     pub fn set_stinger_clip(&mut self, player: Option<&str>) {
-        self.stinger_clip = player
+        let next = player
             .and_then(|player| self.stores.get(player))
             .map(Arc::clone);
+        let same = match (&self.stinger_clip, &next) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            // What the composite draws changed (the clip tile), so a late
+            // GPU fallback result from before must not stand in for it
+            // (issue #415 review MC-1).
+            self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        }
+        self.stinger_clip = next;
     }
 
     /// The stinger clip's player id, while a clip with a registered store is
@@ -474,6 +503,7 @@ impl<T> CompositorDrive<T> {
     pub fn set_cell_slates(&mut self, mut slates: Vec<FailoverSlate>) {
         slates.truncate(self.layout.cells.len());
         self.cell_slates = slates;
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
     }
 
     /// The cumulative number of distinct failover-slate **images built** so far.
@@ -514,9 +544,15 @@ impl<T> CompositorDrive<T> {
     /// reference (invariant #1 — a missing/failed GPU never stalls or crashes the
     /// run). The default backend is the CPU reference, so callers that never call
     /// this keep the prior behaviour exactly.
+    ///
+    /// The backend's GPU readback deadline is bounded by the canvas cadence
+    /// here (and again on every [`CompositorDrive::set_layout`]): `min(10 ms,
+    /// period / 2)` (issue #395).
     #[must_use]
     pub fn with_backend(mut self, backend: RunBackend) -> Self {
         self.backend = backend;
+        self.backend
+            .set_frame_period(frame_period(self.layout.canvas.cadence()));
         self
     }
 
@@ -545,14 +581,18 @@ impl<T> CompositorDrive<T> {
         layout
             .validate()
             .map_err(|e| Error::InvalidLayout(e.to_string()))?;
+        self.backend
+            .set_frame_period(frame_period(layout.canvas.cadence()));
         self.layout = layout;
         self.layout_generation = self.layout_generation.wrapping_add(1);
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         Ok(())
     }
 
     /// Register or replace a source's frame store.
     pub fn insert_store(&mut self, source_id: impl Into<String>, store: Arc<TileStore<T>>) {
         self.stores.insert(source_id.into(), store);
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
     }
 
     /// The registered frame store for `source_id`, if any.
@@ -575,6 +615,7 @@ impl<T> CompositorDrive<T> {
     /// panic, never a stall (invariants #1/#2). O(1) map removal at the frame
     /// boundary; the producer teardown happens off the clock thread.
     pub fn remove_store(&mut self, source_id: &str) -> bool {
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         self.stores.remove(source_id).is_some()
     }
 
@@ -626,6 +667,7 @@ impl<T> CompositorDrive<T> {
         };
         cell.source = Some(source_id.to_owned());
         self.layout_generation = self.layout_generation.wrapping_add(1);
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         Ok(())
     }
 }
@@ -683,6 +725,7 @@ impl CompositorDrive<Nv12Image> {
             }
         }
         self.transition_style = style;
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         if let Some(mix) = self.mix_overlay.as_mut() {
             mix.style = style;
         }
@@ -701,9 +744,68 @@ impl CompositorDrive<Nv12Image> {
     /// # Errors
     ///
     /// Returns [`Error::Canvas`] only for a structurally impossible canvas the
-    /// compositor rejects (e.g. odd dimensions). Input health is *never* an
-    /// error: a dead source yields its held frame or the slate, not a failure.
+    /// compositor rejects (e.g. odd dimensions), and
+    /// [`Error::ComposeDeadline`] when a GPU backend's readback missed its
+    /// per-frame deadline (or an earlier one is still outstanding): the
+    /// runtime then repeats last-good under this tick (issue #395). Input
+    /// health is *never* an error: a dead source yields its held frame or the
+    /// slate, not a failure.
     pub fn compose(&self, tick: Tick) -> Result<CompositedFrame> {
+        self.compose_with(tick, &self.backend)
+    }
+
+    /// Whether the GPU backend lost its device (issue #415): every frame
+    /// since is composited on the CPU reference. `false` on the CPU backend.
+    #[must_use]
+    pub fn gpu_lost(&self) -> bool {
+        self.backend.gpu_lost()
+    }
+
+    /// A bounded stand-in frame for `tick`: black at canvas size and tag,
+    /// with the current source states. The runtime emits it when a GPU
+    /// backend has no frame ready for the very first tick (there is no
+    /// last-good to repeat yet, issue #415): building it is a memset, never a
+    /// composite, so the first tick is as bounded as every other.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Canvas`] for a canvas the compositor rejects (odd / zero).
+    pub fn placeholder_frame(&self, tick: Tick) -> Result<CompositedFrame> {
+        let canvas = &self.layout.canvas;
+        let tag = self.canvas_color.output_tag();
+        let black_y = match tag.range {
+            multiview_core::color::ColorRange::Full => 0,
+            _ => 16,
+        };
+        let image = Nv12Image::solid(canvas.width, canvas.height, black_y, 128, 128, tag)
+            .map_err(|e| Error::Canvas(e.to_string()))?;
+        Ok(CompositedFrame {
+            tick,
+            canvas: Arc::new(image),
+            source_states: self.sample_states(tick.pts),
+            source_times: HashMap::new(),
+            repeat: true,
+            mix: None,
+        })
+    }
+
+    /// The identity of what the next composite draws apart from the source
+    /// frames' contents: the scene epoch plus the transition step (issue #415
+    /// review MC-1).
+    fn scene_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.scene_epoch.hash(&mut h);
+        if let Some(mix) = &self.mix_overlay {
+            mix.source.hash(&mut h);
+            mix.elapsed.hash(&mut h);
+            mix.duration.hash(&mut h);
+            mix.start.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    fn compose_with(&self, tick: Tick, backend: &RunBackend) -> Result<CompositedFrame> {
         let now = tick.pts;
         let canvas = &self.layout.canvas;
 
@@ -788,58 +890,84 @@ impl CompositorDrive<Nv12Image> {
             });
         }
 
-        // Borrow the held images for the compositor's `Tile` slice. This slice is
-        // a per-tick local, NOT pooled: a `Tile<'_>` borrows into the pooled
-        // `held` vector, so its lifetime is the borrow — a `Vec<Tile<'_>>` cannot
-        // be a reused struct field in safe Rust (`unsafe` is forbidden here). It
-        // is small (one thin `&Nv12Image` + a rect + an opacity per cell), and the
-        // large per-tick churn — the `held` Arc vector, `placements`, and the
-        // z-order index vector — is what the pool eliminates. Each tile carries
-        // its DESTINATION cell rect so the compositor scales the source into the
-        // cell at composite time (scale-at-composite, RT-6 / ADR-0034 / inv #6): a
-        // source decoded at any geometry — including one just re-pointed in —
-        // composites correctly into the cell, never clipped or smeared. When the
-        // source already matches the cell size (the steady state:
-        // decode-at-display-resolution) the scale is a no-op and the result is
-        // byte-for-byte the prior 1:1 placement. The cell's per-tile opacity
-        // drives the compositor's premultiplied linear-light `over` blend.
-        let tiles: Vec<Tile<'_>> = placements
-            .iter()
-            .filter_map(|p| {
-                held.get(p.image_index).map(|img| {
-                    let tile =
-                        Tile::scaled(img.as_ref(), p.dst_x, p.dst_y, p.dst_w, p.dst_h, p.opacity);
-                    match p.mask {
-                        Some(mask) => tile.with_mask(mask),
-                        None => tile,
-                    }
+        // Hand the compositor the held images as owned `Arc`s plus each cell's
+        // DESTINATION rect (no pixel copy): a GPU backend composites the frame
+        // on its own worker thread while the clock waits for it at most a
+        // bounded time (issue #415), so the job must own what it reads. The
+        // compositor scales each source into its cell at composite time
+        // (scale-at-composite, RT-6 / ADR-0034 / inv #6): a source decoded at
+        // any geometry composites correctly into the cell; when it already
+        // matches the cell size (the steady state) the scale is a no-op and
+        // the result is byte-for-byte the prior 1:1 placement. The cell's
+        // per-tile opacity drives the premultiplied linear-light `over` blend.
+        let job = Arc::new(FrameJob {
+            canvas_w: canvas.width,
+            canvas_h: canvas.height,
+            canvas: self.canvas_color,
+            background: self.background,
+            tiles: placements
+                .iter()
+                .filter_map(|p| {
+                    held.get(p.image_index).map(|img| SharedTile {
+                        image: Arc::clone(img),
+                        dst_x: p.dst_x,
+                        dst_y: p.dst_y,
+                        dst_w: p.dst_w,
+                        dst_h: p.dst_h,
+                        opacity: p.opacity,
+                        mask: p.mask,
+                        key: None,
+                        group: multiview_compositor::key::TileGroup::Top,
+                    })
                 })
-            })
-            .collect();
+                .collect(),
+            scene: self.scene_key(),
+            // Only a GPU backend can hand back an earlier job's pixels (its
+            // CPU fallback adopts a late result): it needs that job's source
+            // metadata. The CPU backend composites this job inline.
+            meta: self.backend.is_offclock().then(|| {
+                JobMeta(Arc::new(FrameMeta {
+                    source_states: source_states.clone(),
+                    source_times: source_times.clone(),
+                    mix: self.mix_overlay.clone(),
+                }))
+            }),
+        });
 
         // Dispatch the composite through the selected backend (CPU reference by
-        // default; GPU-with-CPU-fallback when a run prefers the GPU). The call
-        // is synchronous and never blocks on an input or a client; on the GPU
-        // path a submit/readback failure surfaces as a typed error here, which
-        // becomes `Error::Canvas` — the drive returns rather than stalling the
-        // clock, and the caller holds last-good (safety rule §3, invariant #1).
-        let canvas_image = self
-            .backend
-            .composite(
-                canvas.width,
-                canvas.height,
-                self.canvas_color,
-                self.background,
-                tiles.as_slice(),
-            )
-            .map_err(|e| Error::Canvas(e.to_string()))?;
+        // default, inline; GPU off the clock thread with a CPU fallback). The
+        // call never blocks on an input or a client, and every GPU wait is
+        // bounded: a frame not ready in time is `Error::ComposeDeadline`,
+        // which the runtime turns into a counted last-good repeat of this
+        // tick (issues #395, #415). Any other failure becomes `Error::Canvas`.
+        let output = backend.composite_job(&job).map_err(|e| match e {
+            multiview_compositor::Error::GpuDeadline(why) => Error::ComposeDeadline(why),
+            other => Error::Canvas(other.to_string()),
+        })?;
+        // An adopted late result is the picture of an EARLIER job of the same
+        // scene: report that job's source states, times and transition step
+        // with it (issue #415 review MC-R2-1), never this tick's.
+        let mut mix = self.mix_overlay.clone();
+        if let Some(adopted) = output.adopted {
+            let meta = adopted
+                .as_ref()
+                .and_then(|m| m.0.downcast_ref::<FrameMeta>())
+                .ok_or_else(|| {
+                    Error::ComposeDeadline("adopted frame has no source metadata".to_owned())
+                })?;
+            source_states.clone_from(&meta.source_states);
+            source_times.clone_from(&meta.source_times);
+            mix.clone_from(&meta.mix);
+        }
+        let canvas_image = output.image;
 
         // Drop the borrowing tiles, then release the held `Arc`s now (rather than
         // pinning them until the next tick's `begin`), keeping the pooled
         // capacity. The next `begin` clears whatever remains, so correctness does
         // not depend on this; it shortens last-good frame retention to within the
-        // tick. `drop(tiles)` first releases its immutable borrow of `held`.
-        drop(tiles);
+        // tick. The job may still be referenced by a GPU worker that missed
+        // the clock's wait; it owns its own `Arc`s, so this is safe.
+        drop(job);
         held.clear();
         drop(scratch);
 
@@ -849,7 +977,7 @@ impl CompositorDrive<Nv12Image> {
             source_states,
             source_times,
             repeat: false,
-            mix: self.mix_overlay.clone(),
+            mix,
         })
     }
 
@@ -1143,6 +1271,12 @@ impl ComposeScratch {
             self.reservations = self.reservations.saturating_add(1);
         }
     }
+}
+
+/// The output frame period for `cadence` (zero for a degenerate cadence; the
+/// backend then keeps its default readback deadline).
+fn frame_period(cadence: multiview_core::time::Rational) -> std::time::Duration {
+    std::time::Duration::from_nanos(u64::try_from(cadence.period_nanos()).unwrap_or(0))
 }
 
 /// Map a cell's normalized rectangle to a canvas **pixel rectangle**

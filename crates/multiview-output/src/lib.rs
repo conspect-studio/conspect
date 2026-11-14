@@ -90,6 +90,12 @@ pub mod metadata;
 /// always compiled.
 pub mod rtcp;
 
+/// Output-routing §12.5 / ADR-0110 decision 5 — passthrough: the per-source
+/// compressed tap, the match rules and the per-slot passthrough clock (one
+/// correctly stamped AU per tick from a bounded jitter buffer). Pure Rust,
+/// always compiled.
+pub mod passthrough;
+
 /// GP-6 — the per-stream monotonic clamp+offset packet re-stamp (ADR-0030 §4
 /// "Re-stamp rule (#3 for the copy path)"). The COPY-path invariant-#3
 /// primitive a guarded passthrough uses to re-stamp copied input + spliced-slate

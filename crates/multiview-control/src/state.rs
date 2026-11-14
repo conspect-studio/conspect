@@ -443,8 +443,15 @@ const DEFAULT_LOG_RING_CAPACITY: usize = 2000;
 ///   full-pipeline / `ffmpeg` run path only; the software engine has no
 ///   decoder).
 ///
-/// Kinds outside both sets (`ndi`, `youtube`, `aes67`) are never live-applied
-/// in this slice and always answer `restart`.
+/// * `youtube` — a `YouTube` source is an HLS wrapper (ADR-0015) that rides the
+///   same supervised `ingest_loop`; live only when the run wired the network
+///   spawner AND the engine build carries the `youtube` feature (issue #420).
+///
+/// Kinds outside these sets (`ndi`, `aes67`) are never live-applied in this
+/// slice and always answer `restart`.
+// Four independent per-kind flags read by one predicate (`is_live`); an enum
+// set would hide which build/run fact sets which flag.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveSourceCapability {
     /// Synthetic kinds (`bars`/`solid`/`clock`) are live-appliable.
@@ -461,6 +468,10 @@ pub struct LiveSourceCapability {
     /// this from `cfg!(feature = "rist")` (via [`Self::with_rist`]) — the
     /// control plane cannot see the engine's compiled features.
     pub rist: bool,
+    /// `YouTube` (`youtube`) is live-appliable. Like RIST it is feature-gated in
+    /// the engine build (`youtube`); the binary sets it with
+    /// [`Self::with_youtube`] from `cfg!(feature = "youtube")`.
+    pub youtube: bool,
 }
 
 impl LiveSourceCapability {
@@ -472,6 +483,7 @@ impl LiveSourceCapability {
             synthetic: true,
             network: false,
             rist: false,
+            youtube: false,
         }
     }
 
@@ -487,6 +499,9 @@ impl LiveSourceCapability {
             synthetic: true,
             network: true,
             rist: true,
+            // Opt-in: only a build with the `youtube` feature can resolve a
+            // watch URL, which the control plane cannot see (`with_youtube`).
+            youtube: false,
         }
     }
 
@@ -495,6 +510,15 @@ impl LiveSourceCapability {
     #[must_use]
     pub const fn with_rist(mut self, rist: bool) -> Self {
         self.rist = rist;
+        self
+    }
+
+    /// Narrow (or widen) the `YouTube` live-apply capability to the engine
+    /// build's `youtube`-feature truth. Never widens past the network
+    /// capability: without a decoder no `YouTube` source can run live.
+    #[must_use]
+    pub const fn with_youtube(mut self, youtube: bool) -> Self {
+        self.youtube = youtube && self.network;
         self
     }
 
@@ -513,7 +537,10 @@ impl LiveSourceCapability {
         if kind.is_network_media() {
             return self.network;
         }
-        // ndi / youtube / aes67 (and any future kind until explicitly wired):
+        if matches!(kind, multiview_config::SourceKind::Youtube { .. }) {
+            return self.youtube && self.network;
+        }
+        // ndi / aes67 (and any future kind until explicitly wired):
         // never live in this slice — restart, honestly.
         false
     }
@@ -750,6 +777,12 @@ pub struct AppState {
     /// Output feed routing (ADR-0108 slice 1); `None` until the binary installs
     /// the engine seam (routes answer 409 `routing-unavailable`).
     pub output_routing: Option<Arc<crate::output_routing::OutputRoutingControl>>,
+    /// The running engine's cast outputs (ADR-0111); `None` until the binary
+    /// installs the engine seam (no cast output can be used).
+    pub cast_engine: Option<crate::cast_engine::SharedCastEngine>,
+    /// The cast stream tokens (ADR-0111, design §3): bounded, shared by
+    /// every router clone of this state.
+    pub cast_streams: Arc<crate::cast_streams::CastStreams>,
     /// Program tick lateness / repeats (ADR-0108 §10); `None` = 404.
     pub program_metrics: Option<Arc<crate::program_metrics::ProgramMetrics>>,
     /// The network front door's live counters (ADR-0107 slice 3); `None` =
@@ -1034,6 +1067,7 @@ impl AppState {
     // field count, not branching logic.
     #[allow(clippy::too_many_lines)]
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one flat field-per-line struct literal
     pub fn new(
         engine: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
         commands: CommandSender,
@@ -1097,6 +1131,8 @@ impl AppState {
             idempotency: Arc::new(IdempotencyStore::new()),
             switcher: None,
             output_routing: None,
+            cast_engine: None,
+            cast_streams: Arc::new(crate::cast_streams::CastStreams::new()),
             program_metrics: None,
             frontdoor_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
@@ -1550,6 +1586,27 @@ impl AppState {
         self.output_routing = Some(Arc::new(crate::output_routing::OutputRoutingControl::new(
             routing,
         )));
+        self
+    }
+
+    /// Replace the cast stream registry (tests inject a clock).
+    #[must_use]
+    pub fn with_cast_streams(mut self, streams: Arc<crate::cast_streams::CastStreams>) -> Self {
+        self.cast_streams = streams;
+        self
+    }
+
+    /// Set the registered custom Cast receiver app id (already validated).
+    #[must_use]
+    pub fn with_cast_app_id(self, app_id: Option<String>) -> Self {
+        self.cast_streams.set_receiver_app_id(app_id);
+        self
+    }
+
+    /// Install the engine seam of the cast outputs (ADR-0111).
+    #[must_use]
+    pub fn with_cast_engine(mut self, engine: crate::cast_engine::SharedCastEngine) -> Self {
+        self.cast_engine = Some(engine);
         self
     }
 

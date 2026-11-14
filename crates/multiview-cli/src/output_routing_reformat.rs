@@ -28,6 +28,7 @@ use std::sync::Arc;
 use super::{
     DynamicKey, GapFill, OpenRequest, OutputRouter, PendingOpen, ReformatPhase, ReformatRefusal,
     ReformatState, TakeResult, NO_FORCE, OPEN_DEADLINE_TICKS, REFORMAT_DEADLINE_TICKS,
+    REFORMAT_MAILBOX,
 };
 use crate::rendition_dispatch::{DtsTimeBase, RenditionDispatcher};
 use crate::routing_aux::PictureBus;
@@ -36,7 +37,9 @@ impl OutputRouter {
     /// Drain the reformat mailbox: refuse what cannot reset live, supersede
     /// an older reformat of the same output, and start the open.
     pub(super) fn drain_reformats(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
-        loop {
+        // At most one mailbox's worth per tick (review C-1): a producer
+        // refilling it concurrently never starves the rest of the tick.
+        for _ in 0..REFORMAT_MAILBOX {
             let req = match self.reformats.try_recv() {
                 Ok(req) => req,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,

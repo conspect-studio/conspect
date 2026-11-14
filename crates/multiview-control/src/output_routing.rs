@@ -110,6 +110,9 @@ pub struct RoutedLayout {
     /// The layout's `audio` attribute: what an output carries when it routes
     /// this layout and its audio follows (§5.1).
     pub audio: multiview_config::LayoutAudio,
+    /// The layout's `overlays` attribute: which multiview overlay layers the
+    /// engine bakes onto this layout's aux canvas.
+    pub overlays: multiview_config::LayoutOverlays,
     /// Resolution order ([`next_layout_revision`]): a body resolved later
     /// (after a later committed edit) has a higher revision, so the engine
     /// never lets an older body replace a newer one.
@@ -216,6 +219,24 @@ pub struct OutputTakeRequest {
     pub layout: Option<LayoutBody>,
     /// The authenticated key id the take is charged to (never client input).
     pub principal: String,
+}
+
+/// An atomic multi-crosspoint set of output takes (ADR-0110 decision 8,
+/// output-routing.md §12.8, #308), already authorized and validated by the
+/// HTTP layer. Every member lands at one adoption tick or none does; each
+/// member reports one [`OutputOutcome`] carrying the set's `operation_id`.
+#[derive(Debug, Clone)]
+pub struct OutputTakeSet {
+    /// The set's operation id (echoed in every member's outcome).
+    pub operation_id: String,
+    /// The authenticated key id the set is charged to (never client input).
+    pub principal: String,
+    /// One take per distinct output, each with a video feed. The members'
+    /// own `operation_id`/`principal` are ignored (the set's apply).
+    pub members: Vec<OutputTakeRequest>,
+    /// The mixer half's handshake, shared with the `SwitcherVerb::PatchArmed`
+    /// the caller sends to the switcher (`None`: no mixer member).
+    pub arm: Option<Arc<multiview_engine::patch_set::SetArm>>,
 }
 
 /// Why a take could not be enqueued.
@@ -402,6 +423,32 @@ pub struct OutputOutcome {
     pub audio: Option<RoutedAudio>,
 }
 
+/// A live subtitle re-patch of one output (slice F #345 part F2), already
+/// authorized, validated and rate-limited by the HTTP layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleTakeRequest {
+    /// The operation id minted for the take (echoed in its outcome).
+    pub operation_id: String,
+    /// The output's config id.
+    pub output: String,
+    /// Slot index → its new source (`None` = unpatched), each slot once.
+    pub slots: Vec<(usize, Option<String>)>,
+    /// The authenticated key id the take is attributed to.
+    pub principal: String,
+}
+
+/// Why the engine did not apply a subtitle re-patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleTakeError {
+    /// No running engine run (between runs, or the run ended): 503
+    /// `engine-busy`, the key freed.
+    Busy,
+    /// The run does not sample this output's subtitle slots (the output is
+    /// not in this run, or the slot was declared after the run started:
+    /// restart-pending). Reported as `subtitle:refused:not-in-run`.
+    NotInRun,
+}
+
 /// The engine seam the binary implements (all calls non-blocking).
 pub trait OutputRouting: Send + Sync {
     /// Predict a take's cost and refusals.
@@ -443,6 +490,15 @@ pub trait OutputRouting: Send + Sync {
     /// # Errors
     /// [`TakeSubmitError`] when it cannot be enqueued.
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError>;
+    /// Enqueue an authorized atomic set without waiting (#308). The default
+    /// refuses: an engine without set support never half-applies one.
+    ///
+    /// # Errors
+    /// [`TakeSubmitError`] when it cannot be enqueued.
+    fn try_take_set(&self, set: OutputTakeSet) -> Result<(), TakeSubmitError> {
+        let _ = set;
+        Err(TakeSubmitError::Unroutable)
+    }
     /// A stored layout changed in the accepted library (ADR-0108 §10.1):
     /// `Some(body)` is its newly resolved body (outputs on it follow it live,
     /// at an IDR); `None` means it was deleted or no longer routes (outputs
@@ -499,6 +555,32 @@ pub trait OutputRouting: Send + Sync {
             converts: u8::from(cost.needs_encoder),
         })
     }
+
+    /// Re-patch subtitle slots of one output live (slice F #345 part F2):
+    /// the engine replaces that output's route table (RCU, wait-free, never
+    /// waits on the sampler). `Ok(tick)` means the table was swapped; `tick`
+    /// is a completed-tick lower bound observed before the swap (`0`:
+    /// possibly no tick completed yet), not a landing tick. A sample already
+    /// in flight finishes on the old table; the first table read that starts
+    /// after the swap sees the new route, unless a later take supersedes it
+    /// first (then it is never sampled) or the run ends first. A run that
+    /// ended, is tearing down or was replaced is never mutated: `Busy`. Called under the control plane's
+    /// subtitle serialization; must not block. The default answers `Busy`
+    /// (an engine without subtitle slots).
+    ///
+    /// # Errors
+    /// [`SubtitleTakeError`] when it was not applied.
+    fn try_take_subtitles(&self, take: SubtitleTakeRequest) -> Result<u64, SubtitleTakeError> {
+        let _ = take;
+        Err(SubtitleTakeError::Busy)
+    }
+
+    /// The live subtitle route table of `output` (slot → source) from the
+    /// running engine, `None` when no run samples it.
+    fn subtitle_routes(&self, output: &str) -> Option<Vec<Option<String>>> {
+        let _ = output;
+        None
+    }
 }
 
 /// Shared handle to an installed [`OutputRouting`].
@@ -548,6 +630,26 @@ pub fn is_boot_take(operation_id: &str) -> bool {
     operation_id.starts_with(BOOT_TAKE_PREFIX)
 }
 
+/// Operation-id prefix of a take the cast API issues on a cast output
+/// (ADR-0111): `cast:<minted id>`. Such a take is never persisted: a cast
+/// output shows what a cast stream asked for only while that stream lives,
+/// and is back on Program when idle. An operator's take on the Routing page
+/// carries a plain minted id and persists like any other.
+pub const CAST_TAKE_PREFIX: &str = "cast:";
+
+/// Whether `operation_id` names a take issued by the cast API.
+#[must_use]
+pub fn is_cast_take(operation_id: &str) -> bool {
+    operation_id.starts_with(CAST_TAKE_PREFIX)
+}
+
+/// Whether an applied take with this operation id is written to the desired
+/// config: every take except the engine's boot takes and the cast API's.
+#[must_use]
+pub fn persists_when_applied(operation_id: &str) -> bool {
+    !is_boot_take(operation_id) && !is_cast_take(operation_id)
+}
+
 /// A recorded terminal outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedOutcome {
@@ -567,6 +669,9 @@ pub struct PendingTake {
     pub feed: Option<RoutedFeed>,
     /// The audio choice the take carries, if any.
     pub audio: Option<RoutedAudio>,
+    /// A subtitle re-patch (slice F #345 part F2): slot → source, sorted by
+    /// slot, so the key binds the whole take; `None` for a video/audio take.
+    pub subtitles: Option<Vec<(usize, Option<String>)>>,
 }
 
 /// A take's record for the life of its `Idempotency-Key` (or until it is
@@ -937,6 +1042,8 @@ pub struct OutputRoutingControl {
     /// [`crate::concurrency::IdempotencyKey`] extractor), so two principals'
     /// equal raw keys are two takes.
     records: Mutex<TakeStore>,
+    /// Subtitle re-patch outcomes, bounded and in swap order (#345 F2).
+    subtitles: SubtitlePersist,
 }
 
 impl std::fmt::Debug for OutputRoutingControl {
@@ -957,6 +1064,7 @@ impl OutputRoutingControl {
                 MAX_TAKE_RECORDS,
                 MAX_TAKE_RECORDS_PER_PRINCIPAL,
             )),
+            subtitles: SubtitlePersist::default(),
         }
     }
 
@@ -1044,6 +1152,220 @@ impl OutputRoutingControl {
     pub fn records_len(&self) -> usize {
         self.records().by_key.len()
     }
+
+    fn subtitle_queue(&self) -> std::sync::MutexGuard<'_, SubtitleQueue> {
+        self.subtitles
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Apply a subtitle re-patch and queue its outcome, all under ONE
+    /// serialization (slice F #345 part F2, review COR-1/AUZ-1/AUZ-2/INV-3/
+    /// INV-4): capacity is checked BEFORE the engine is asked (a full queue
+    /// refuses without changing any route), and the engine swap, the take's
+    /// settlement and the enqueue happen in the same critical section, so the
+    /// queue order is the swap order. The engine call is wait-free (an RCU
+    /// swap), so the lock is held for no client and no I/O.
+    pub fn take_subtitles(&self, request: SubtitleTakeRequest, api_id: &str) -> SubtitleAdmission {
+        let mut queue = self.subtitle_queue();
+        let capacity = self
+            .subtitles
+            .capacity
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if queue.pending >= capacity {
+            return SubtitleAdmission::Full;
+        }
+        let slots = request.slots.clone();
+        let operation_id = request.operation_id.clone();
+        let output = request.output.clone();
+        let (outcome, tick) = match self.routing.try_take_subtitles(request) {
+            Ok(tick) => (SUBTITLE_APPLIED, tick),
+            Err(SubtitleTakeError::NotInRun) => (SUBTITLE_NOT_IN_RUN, 0),
+            Err(SubtitleTakeError::Busy) => return SubtitleAdmission::Busy,
+        };
+        let outcome = OutputOutcome {
+            operation_id,
+            output,
+            tick,
+            outcome: outcome.to_owned(),
+            feed: None,
+            audio: None,
+        };
+        self.settle(&outcome);
+        queue.next_seq = queue.next_seq.wrapping_add(1);
+        let seq = queue.next_seq;
+        queue.pending = queue.pending.saturating_add(1);
+        queue.jobs.push_back(SubtitleJob {
+            seq,
+            api_id: api_id.to_owned(),
+            slots,
+            outcome: outcome.clone(),
+        });
+        drop(queue);
+        self.subtitles.wake.notify_one();
+        SubtitleAdmission::Queued(outcome)
+    }
+
+    /// Subtitle outcomes queued or being persisted (bounded by the capacity,
+    /// [`MAX_PENDING_SUBTITLE_PERSISTS`] by default).
+    #[must_use]
+    pub fn subtitle_persist_pending(&self) -> usize {
+        self.subtitle_queue().pending
+    }
+
+    /// Test seam (review INV3-2): shrink the subtitle persistence capacity
+    /// so a test reaches the bound within the take limits. Clamped to
+    /// `1..=`[`MAX_PENDING_SUBTITLE_PERSISTS`] (never above the documented
+    /// ceiling). Only with the test-only `_test-seams` feature, which no
+    /// release build enables (CI "release-feature guard").
+    #[cfg(feature = "_test-seams")]
+    pub fn set_subtitle_persist_capacity(&self, capacity: usize) {
+        self.subtitles.capacity.store(
+            capacity.clamp(1, MAX_PENDING_SUBTITLE_PERSISTS),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Start the single serial subtitle persistence worker once (lazily, on
+    /// the first take: a take always runs on the async runtime).
+    pub fn ensure_subtitle_worker(self: &Arc<Self>, state: &crate::AppState) {
+        let mut queue = self.subtitle_queue();
+        if queue.worker {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        queue.worker = true;
+        drop(queue);
+        let state = state.clone();
+        let control = Arc::clone(self);
+        runtime.spawn(Box::pin(subtitle_worker(state, control)));
+    }
+}
+
+/// The outcome of an applied subtitle re-patch on `route.output`.
+pub const SUBTITLE_APPLIED: &str = "subtitle:applied";
+/// The outcome of a re-patch the running engine does not sample (the output
+/// is not in this run, or the slot was declared after the run started).
+pub const SUBTITLE_NOT_IN_RUN: &str = "subtitle:refused:not-in-run";
+
+/// Subtitle outcomes waiting for (or in) persistence, in total: a take that
+/// would exceed it is refused before the engine is asked (503, nothing
+/// changed).
+pub const MAX_PENDING_SUBTITLE_PERSISTS: usize = 16;
+
+/// What [`OutputRoutingControl::take_subtitles`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubtitleAdmission {
+    /// Applied (or refused `not-in-run`) and queued in swap order.
+    Queued(OutputOutcome),
+    /// The persistence queue is full: refused, the engine was not asked.
+    Full,
+    /// No running run (between runs, or the run ended): refused.
+    Busy,
+}
+
+/// One queued subtitle outcome.
+#[derive(Debug)]
+struct SubtitleJob {
+    /// Monotonic, assigned under the same lock as the engine swap.
+    seq: u64,
+    api_id: String,
+    slots: Vec<(usize, Option<String>)>,
+    outcome: OutputOutcome,
+}
+
+#[derive(Debug, Default)]
+struct SubtitleQueue {
+    next_seq: u64,
+    /// Jobs queued plus jobs the worker is persisting now.
+    pending: usize,
+    jobs: VecDeque<SubtitleJob>,
+    worker: bool,
+}
+
+/// The bounded, ordered subtitle persistence queue.
+#[derive(Debug)]
+struct SubtitlePersist {
+    queue: Mutex<SubtitleQueue>,
+    wake: tokio::sync::Notify,
+    capacity: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for SubtitlePersist {
+    fn default() -> Self {
+        Self {
+            queue: Mutex::new(SubtitleQueue::default()),
+            wake: tokio::sync::Notify::new(),
+            capacity: std::sync::atomic::AtomicUsize::new(MAX_PENDING_SUBTITLE_PERSISTS),
+        }
+    }
+}
+
+/// Slot → source, per output config id.
+type SlotSources = Vec<(usize, Option<String>)>;
+
+/// The last source of every (output, slot) named in `jobs`, applied in
+/// sequence order (the highest sequence wins), per output config id.
+fn coalesce(jobs: &[SubtitleJob]) -> Vec<(String, SlotSources)> {
+    let mut ordered: Vec<&SubtitleJob> = jobs.iter().collect();
+    ordered.sort_by_key(|job| job.seq);
+    let mut out: Vec<(String, std::collections::BTreeMap<usize, Option<String>>)> = Vec::new();
+    for job in ordered {
+        if job.outcome.outcome != SUBTITLE_APPLIED {
+            continue;
+        }
+        if !out.iter().any(|(o, _)| *o == job.outcome.output) {
+            out.push((
+                job.outcome.output.clone(),
+                std::collections::BTreeMap::new(),
+            ));
+        }
+        if let Some((_, slots)) = out.iter_mut().find(|(o, _)| *o == job.outcome.output) {
+            for (slot, source) in &job.slots {
+                slots.insert(*slot, source.clone());
+            }
+        }
+    }
+    out.into_iter()
+        .map(|(output, slots)| (output, slots.into_iter().collect()))
+        .collect()
+}
+
+/// The single serial consumer: drain every queued outcome, persist the
+/// coalesced latest slot sources (one commit per output, under the
+/// config-mutation lock), then publish the outcomes on `route.output` in
+/// swap order and free their capacity.
+async fn subtitle_worker(state: crate::AppState, control: Arc<OutputRoutingControl>) {
+    loop {
+        let batch: Vec<SubtitleJob> = control.subtitle_queue().jobs.drain(..).collect();
+        if batch.is_empty() {
+            control.subtitles.wake.notified().await;
+            continue;
+        }
+        for (output, slots) in coalesce(&batch) {
+            if let Err(error) = persist_subtitle_routes(&state, &output, &slots).await {
+                tracing::warn!(%error, %output, "subtitle re-patch applied but not persisted");
+            }
+        }
+        let done = batch.len();
+        for job in batch {
+            state
+                .engine
+                .publish_event(multiview_events::Event::RouteOutput(
+                    multiview_events::RouteOutputEvent {
+                        output: job.api_id,
+                        operation_id: job.outcome.operation_id,
+                        tick: job.outcome.tick,
+                        outcome: job.outcome.outcome,
+                    },
+                ));
+        }
+        let mut queue = control.subtitle_queue();
+        queue.pending = queue.pending.saturating_sub(done);
+    }
 }
 
 /// Start the outcome relay: one OS thread blocks on the engine's outcome
@@ -1095,13 +1417,20 @@ async fn relay_one(
     let Some(api_id) = api_id else {
         return;
     };
+    // ABUSE-1: whatever moved the output (a take, an engine fallback), its
+    // cast tokens must still be readable by their owners.
+    // Relayed at once (not on the 5 s sweep): a feed the gate did not clear
+    // moves the output's generation and re-authorizes its tokens first.
+    crate::cast_streams::reauth::on_outcome(state, &outcome);
     // The feed to persist rides the outcome itself, so an `applied` persists
     // whether or not this process still holds the take's record. An
     // audio-only take (its record says so) keeps the persisted video.
     // A boot take (operation id `boot:…`, see [`is_boot_take`]) re-applies the
     // persisted state at run start: its outcome is NEVER persisted (applied or
-    // not), so it can neither rewrite nor delete the operator's row.
-    if outcome.outcome == "applied" && !is_boot_take(&outcome.operation_id) {
+    // not), so it can neither rewrite nor delete the operator's row. A take
+    // by the cast API (`cast:…`, see [`is_cast_take`]) is not persisted
+    // either: it lasts as long as its cast stream.
+    if outcome.outcome == "applied" && persists_when_applied(&outcome.operation_id) {
         let audio_only = settled.as_ref().is_some_and(|p| p.feed.is_none());
         let feed = if audio_only {
             None
@@ -1225,9 +1554,101 @@ pub async fn persist_route(
     crate::boot_model::commit_desired(state, config, layouts).await
 }
 
+/// Persist an applied subtitle re-patch (slice F #345 part F2): each named
+/// slot's `slots.subtitle[i].source` of the output whose config id is
+/// `output`, under the config-mutation lock, exactly as an applied video take
+/// is persisted ([`persist_route`]). Start-up builds each slot's route from
+/// it, so a restart starts from the persisted source. A slot the accepted
+/// output no longer declares is skipped (the take was validated against the
+/// state it read).
+///
+/// # Errors
+/// The accepted document cannot be read, validated or committed.
+pub async fn persist_subtitle_routes(
+    state: &crate::AppState,
+    output: &str,
+    slots: &[(usize, Option<String>)],
+) -> crate::ControlResult<()> {
+    if state.boot_model.is_none() {
+        return Ok(());
+    }
+    let _mutation = state.lock_config_mutation().await;
+    let mut config: multiview_config::MultiviewConfig =
+        serde_json::from_value(crate::boot_model::current_desired_config(state)?)
+            .map_err(|e| crate::ControlError::Repository(format!("desired configuration: {e}")))?;
+    let Some(target) = config.outputs.iter_mut().find(|o| o.id() == output) else {
+        return Ok(());
+    };
+    let Some(declared) = target.slots_mut().as_mut() else {
+        return Ok(());
+    };
+    let mut changed = false;
+    for (slot, source) in slots {
+        if let Some(entry) = declared.subtitle.get_mut(*slot) {
+            if entry.source != *source {
+                entry.source.clone_from(source);
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    config
+        .validate()
+        .map_err(|e| crate::ControlError::Validation(e.to_string()))?;
+    // Only a slot's body changed, never the output list: keep the accepted
+    // output identities (an id-less output's body edit must not re-derive
+    // them).
+    crate::boot_model::commit_keeping_output_ids(state, config).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine without set support (the trait default) refuses a set
+    /// whole instead of half-applying it (#308).
+    #[test]
+    fn the_default_set_seam_refuses_unroutable() {
+        struct NoSets;
+        impl OutputRouting for NoSets {
+            fn plan(&self, _: &str, _: &RoutedFeed) -> Result<PlanCost, PlanRefusal> {
+                Err(PlanRefusal::OutputKindUnroutable)
+            }
+            fn plan_audio(
+                &self,
+                _: &str,
+                _: Option<&RoutedFeed>,
+                _: Option<&RoutedAudio>,
+            ) -> Result<AudioPlanCost, PlanRefusal> {
+                Err(PlanRefusal::OutputKindUnroutable)
+            }
+            fn try_take(&self, _: OutputTakeRequest) -> Result<(), TakeSubmitError> {
+                Ok(())
+            }
+            fn snapshot(&self) -> Option<RoutingLive> {
+                None
+            }
+            fn subscribe_outcomes(&self) -> Option<std::sync::mpsc::Receiver<OutputOutcome>> {
+                None
+            }
+        }
+        let set = OutputTakeSet {
+            operation_id: "op".into(),
+            principal: "p".into(),
+            members: vec![OutputTakeRequest {
+                operation_id: String::new(),
+                output: "out".into(),
+                video: Some(RoutedFeed::Program),
+                audio: None,
+                layout: None,
+                principal: String::new(),
+            }],
+            arm: Some(Arc::new(multiview_engine::patch_set::SetArm::new())),
+        };
+        assert_eq!(NoSets.try_take_set(set), Err(TakeSubmitError::Unroutable));
+    }
 
     #[test]
     fn per_principal_state_is_bounded_by_the_lru_cap() {
@@ -1272,6 +1693,7 @@ mod tests {
             api_id: "o".to_owned(),
             feed: Some(RoutedFeed::Program),
             audio: None,
+            subtitles: None,
         };
         let mut ops = Vec::new();
         for i in 0..3 {
@@ -1307,6 +1729,7 @@ mod tests {
             api_id: "o".to_owned(),
             feed: Some(RoutedFeed::Program),
             audio: None,
+            subtitles: None,
         }
     }
 

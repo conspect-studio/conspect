@@ -92,6 +92,10 @@ required-features = ["wgpu"]
 name = "gpu_compositor"
 required-features = ["wgpu"]
 
+[[test]]
+name = "keyers_gpu_fallback"
+required-features = ["wgpu"]
+
 # The GPU surface-pool allocation-count test (EFF-0): drives N composite ticks
 # against a real adapter and asserts the GPU buffer/texture CREATION count is
 # bounded (one-time setup), not proportional to N. Skips gracefully GPU-free.

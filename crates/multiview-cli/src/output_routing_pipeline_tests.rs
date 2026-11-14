@@ -108,6 +108,14 @@ fn recorder_with_video(seen: Seen, audio: SeenAudio, video: Option<SeenVideo>) -
 
 struct Run {
     frames: u64,
+    /// Ticks the output clock emitted (counted on the hot loop itself).
+    // reason: only the overlay-gated layout-bake protection tests read it.
+    #[cfg_attr(not(feature = "overlay"), allow(dead_code))]
+    hot_ticks: u64,
+    /// Frames the live policy shed before the consumer (0 offline).
+    // reason: only the overlay-gated layout-bake protection tests read it.
+    #[cfg_attr(not(feature = "overlay"), allow(dead_code))]
+    dropped: u64,
     outputs: Vec<Vec<(i64, bool, bool)>>,
     audio: Vec<Vec<multiview_ffmpeg::EncodedPacket>>,
     rendition_configs: usize,
@@ -218,6 +226,61 @@ fn drive_prepared<F>(
 where
     F: FnOnce(OutputRoutingSlot) + Send + 'static,
 {
+    drive_outputs(
+        template,
+        audio,
+        switcher,
+        prefix,
+        ticks,
+        2,
+        (SendPolicy::BlockForExact, None),
+        prep,
+        control,
+    )
+}
+
+/// As [`drive_config`] (no audio, no M/E) with `outputs` test sinks.
+#[cfg(feature = "overlay")]
+fn drive_runners<F>(
+    template: &str,
+    prefix: &str,
+    ticks: u64,
+    outputs: usize,
+    policy: (SendPolicy, Option<u64>),
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
+    drive_outputs(
+        template,
+        false,
+        false,
+        prefix,
+        ticks,
+        outputs,
+        policy,
+        |_| {},
+        control,
+    )
+}
+
+/// As [`drive_prepared`] with `outputs` test sinks (one per config output).
+#[allow(clippy::too_many_arguments)]
+fn drive_outputs<F>(
+    template: &str,
+    audio: bool,
+    switcher: bool,
+    prefix: &str,
+    ticks: u64,
+    outputs: usize,
+    (policy, shed_at): (SendPolicy, Option<u64>),
+    prep: impl FnOnce(&mut Pipeline),
+    control: F,
+) -> Run
+where
+    F: FnOnce(OutputRoutingSlot) + Send + 'static,
+{
     let config =
         multiview_config::MultiviewConfig::load_from_toml(&template.replace('@', prefix)).unwrap();
     let mut pipeline = Pipeline::build(&config).unwrap();
@@ -235,9 +298,15 @@ where
     }
     let rendition_configs = pipeline.rendition_config_count();
     let slot = pipeline.output_routing();
-    let seen: Vec<Seen> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
-    let seen_audio: Vec<SeenAudio> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
-    let seen_video: Vec<SeenVideo> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+    let seen: Vec<Seen> = (0..outputs)
+        .map(|_| Arc::new(Mutex::new(Vec::new())))
+        .collect();
+    let seen_audio: Vec<SeenAudio> = (0..outputs)
+        .map(|_| Arc::new(Mutex::new(Vec::new())))
+        .collect();
+    let seen_video: Vec<SeenVideo> = (0..outputs)
+        .map(|_| Arc::new(Mutex::new(Vec::new())))
+        .collect();
     let runners: Vec<TestSinkRunner> = seen
         .iter()
         .zip(&seen_audio)
@@ -261,6 +330,7 @@ where
             }
         });
     }
+    let hot_ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let control_slot = Arc::clone(&slot);
     let controller = std::thread::spawn(move || control(control_slot));
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -273,11 +343,11 @@ where
                 time: clock,
                 pacer: multiview_engine::CooperativePacer,
                 max_ticks: Some(ticks),
-                policy: SendPolicy::BlockForExact,
+                policy,
                 runners,
-                hot_tick_observer: None,
+                hot_tick_observer: Some(Arc::clone(&hot_ticks)),
                 consumer_fault_after_ticks: None,
-                shed_at_tick: None,
+                shed_at_tick: shed_at,
             },
             &multiview_engine::StopSignal::new(),
         ))
@@ -290,6 +360,8 @@ where
         .snapshot();
     Run {
         frames: result.report.frames,
+        hot_ticks: hot_ticks.load(Ordering::Acquire),
+        dropped: result.report.dropped,
         outputs: seen.iter().map(|s| s.lock().unwrap().clone()).collect(),
         audio: seen_audio
             .iter()
@@ -1657,6 +1729,59 @@ codec = "mpeg2video"
 segment_ms = 1000
 "##;
 
+/// The decoded limited-range (BT.709, 8-bit) luma of [`LAYOUT_CONFIG`]'s two
+/// solid sources: `@_a` = `#202020` (left on Program) and `@_b` = `#e0e0e0`
+/// (right). `Y = 16 + 219 * v / 255` for a grey `v`.
+///
+/// #426: the routed-layout picture tests compare output 1 against these, not
+/// against output 0's decoded picture. In an `overlay` build Program carries
+/// its baked program-wide chrome (the wall-clock readout and its reference
+/// badge, on by default); on the 64x64 test canvas that chrome covers most of
+/// the luma sample windows, so Program's pixels are not the sources' pixels.
+const LAYOUT_LUMA: (i64, i64) = (16 + 219 * 0x20 / 255, 16 + 219 * 0xe0 / 255);
+
+/// The mean luma of rows `rows` of the 16 px column window inset 8 px into
+/// the 32 px half of a 64x64 plane that starts at column `x0` (clear of the
+/// cell edge).
+fn window_mean(plane: &[u8], x0: usize, rows: std::ops::Range<usize>) -> i64 {
+    let mut sum = 0i64;
+    let mut n = 0i64;
+    for row in rows {
+        for x in x0 + 8..x0 + 24 {
+            sum += i64::from(plane[row * 64 + x]);
+            n += 1;
+        }
+    }
+    sum / n
+}
+
+/// The mean luma of the 16x48 window (rows 8..56) of the half at `x0`.
+fn half_mean(plane: &[u8], x0: usize) -> i64 {
+    window_mean(plane, x0, 8..56)
+}
+
+/// Program's picture is the sources' luma: asserted on the full window in a
+/// build without `overlay`, and in an `overlay` build on rows 56..64, below
+/// the program-wide clock chrome (its readout at y 6, the reference badge at
+/// y 36, its backing ending before row 55 on this canvas). Cells this small (32 px) draw
+/// no per-tile chrome (`MIN_TILE_PX`).
+fn assert_program_is_the_sources(t: i64, plane: &[u8]) {
+    let rows = if cfg!(feature = "overlay") {
+        56..64
+    } else {
+        8..56
+    };
+    let halves = (
+        window_mean(plane, 0, rows.clone()),
+        window_mean(plane, 32, rows),
+    );
+    let (a, b) = LAYOUT_LUMA;
+    assert!(
+        (halves.0 - a).abs() <= 6 && (halves.1 - b).abs() <= 6,
+        "tick {t}: Program's halves {halves:?} are the sources' luma ({a}, {b})"
+    );
+}
+
 /// A routed layout for the 64x64 test canvas: the Program grid with its two
 /// cells swapped (`b` left, `a` right).
 fn swapped_layout(prefix: &str) -> PictureBus {
@@ -1691,6 +1816,7 @@ fn two_cell_layout(prefix: &str, order: [&str; 2]) -> PictureBus {
             id: "swapped".to_owned(),
             slates: vec![multiview_config::FailoverSlate::Black; 2],
             audio: multiview_config::LayoutAudio::default(),
+            overlays: multiview_config::LayoutOverlays::none(),
             revision: crate::output_routing::next_layout_revision(),
             layout,
         },
@@ -1806,20 +1932,11 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
         .filter(|t| routed.contains_key(t) && program.contains_key(t))
         .collect();
     assert!(compared.len() >= 15, "decoded {} pictures", compared.len());
-    let mean = |plane: &[u8], x0: usize| -> i64 {
-        let mut sum = 0i64;
-        let mut n = 0i64;
-        for row in 8..56 {
-            for x in x0 + 8..x0 + 24 {
-                sum += i64::from(plane[row * 64 + x]);
-                n += 1;
-            }
-        }
-        sum / n
-    };
     for t in &compared {
         let (p, r) = (&program[t], &routed[t]);
-        let (pl, pr, rl, rr) = (mean(p, 0), mean(p, 32), mean(r, 0), mean(r, 32));
+        assert_program_is_the_sources(*t, p);
+        let (pl, pr) = LAYOUT_LUMA;
+        let (rl, rr) = (half_mean(r, 0), half_mean(r, 32));
         assert!(
             pr - pl > 100,
             "tick {t}: the halves really differ ({pl}, {pr})"
@@ -1907,17 +2024,6 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
     // Before the edit the halves are swapped; after it they match Program.
     let program = decode_luma(&run.video[0]);
     let routed = decode_luma(&run.video[1]);
-    let mean = |plane: &[u8], x0: usize| -> i64 {
-        let mut sum = 0i64;
-        let mut n = 0i64;
-        for row in 8..56 {
-            for x in x0 + 8..x0 + 24 {
-                sum += i64::from(plane[row * 64 + x]);
-                n += 1;
-            }
-        }
-        sum / n
-    };
     let at = i64::try_from(applied.tick).unwrap();
     let fell_tick = i64::try_from(fell.tick).unwrap();
     let mut swapped_seen = 0;
@@ -1927,7 +2033,9 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         let (Some(p), Some(r)) = (program.get(&t), routed.get(&t)) else {
             continue;
         };
-        let (pl, pr, rl, rr) = (mean(p, 0), mean(p, 32), mean(r, 0), mean(r, 32));
+        assert_program_is_the_sources(t, p);
+        let (pl, pr) = LAYOUT_LUMA;
+        let (rl, rr) = (half_mean(r, 0), half_mean(r, 32));
         if (rl - pr).abs() <= 6 && (rr - pl).abs() <= 6 {
             assert!(
                 unswapped_seen == 0,
@@ -2192,4 +2300,351 @@ fn a_live_reformat_resets_one_output_and_leaves_the_other_untouched() {
     assert_eq!(decode_size(&run.video[1][..at_index]), Some((64, 64)));
     assert_eq!(decode_size(&run.video[1][at_index..]), Some((32, 64)));
     assert_eq!(decode_size(&run.video[0]), Some((64, 64)));
+}
+
+/// Review INV-1 through the real pipeline: while the run is live its
+/// subtitle routing is live; when the run returns, its published handle's
+/// subtitle routing is ended (a stale take is refused, no live readback),
+/// although the handle itself stays in the slot.
+#[test]
+fn a_run_ends_its_subtitle_routing_when_it_returns() {
+    use multiview_control::output_routing::{
+        OutputRouting, SubtitleTakeError, SubtitleTakeRequest,
+    };
+    let seen_live = Arc::new(AtomicBool::new(false));
+    let record = Arc::clone(&seen_live);
+    let kept: Arc<Mutex<Option<OutputRoutingSlot>>> = Arc::new(Mutex::new(None));
+    let keep = Arc::clone(&kept);
+    let run = drive("sub_run_end", 30, move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+            slot.load()
+        });
+        record.store(handle.subtitles_live(), Ordering::Release);
+        *keep.lock().unwrap() = Some(slot);
+    });
+    assert_eq!(run.frames, 30);
+    assert!(seen_live.load(Ordering::Acquire), "live during the run");
+    let slot = kept
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the controller kept the slot");
+    let handle = slot.load().expect("the handle stays published");
+    assert!(!handle.subtitles_live(), "ended with the run");
+    assert_eq!(
+        handle.repoint_subtitles("any", &[(0, None)]),
+        Err(super::SubtitleRepoint::Ended)
+    );
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(slot);
+    assert_eq!(
+        adapter.try_take_subtitles(SubtitleTakeRequest {
+            operation_id: "late".to_owned(),
+            output: "any".to_owned(),
+            slots: vec![(0, None)],
+            principal: "p".to_owned(),
+        }),
+        Err(SubtitleTakeError::Busy)
+    );
+}
+
+/// What the teardown hook observed: (live, table unchanged, take, readback, table).
+type TeardownSeen = (
+    bool,
+    bool,
+    Result<u64, multiview_control::output_routing::SubtitleTakeError>,
+    Option<Vec<Option<String>>>,
+    Vec<Option<String>>,
+);
+
+/// Review INV2-1 through the real pipeline: teardown is paused after the
+/// bake consumer exited (egress joined) and before ingest teardown and the
+/// run's return. There, a subtitle take is `Busy`, the run's table is
+/// unchanged and there is no live readback (GET /patch: `live: false`).
+#[test]
+fn a_subtitle_take_during_teardown_after_the_consumer_exited_is_busy() {
+    use multiview_control::output_routing::{
+        OutputRouting, SubtitleTakeError, SubtitleTakeRequest,
+    };
+    let template = CONFIG.replacen(
+        "segment_ms = 1000\n[[outputs]]",
+        "segment_ms = 1000\n[[outputs.slots.subtitle]]\nlanguage = \"en\"\nsource = \"@_a\"\n[[outputs]]",
+        1,
+    );
+    assert_ne!(template, CONFIG, "out0 declares a subtitle slot");
+    let seen: Arc<Mutex<Option<TeardownSeen>>> = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let live_during_run = Arc::new(AtomicBool::new(false));
+    let live_flag = Arc::clone(&live_during_run);
+    let run = drive_prepared(
+        &template,
+        false,
+        false,
+        "sub_teardown",
+        30,
+        move |pipeline| {
+            let slot = pipeline.output_routing();
+            pipeline.set_teardown_hook(Box::new(move || {
+                let handle = slot.load().expect("the run published its handle");
+                let routes = handle
+                    .subtitle_routes_for_test("out0")
+                    .expect("out0 has a route table");
+                let before = routes.load().to_vec();
+                let adapter =
+                    crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+                let take = adapter.try_take_subtitles(SubtitleTakeRequest {
+                    operation_id: "late".to_owned(),
+                    output: "out0".to_owned(),
+                    slots: vec![(0, None)],
+                    principal: "p".to_owned(),
+                });
+                let after = routes.load().to_vec();
+                *record.lock().unwrap() = Some((
+                    handle.subtitles_live(),
+                    before == after,
+                    take,
+                    adapter.subtitle_routes("out0"),
+                    after,
+                ));
+            }));
+        },
+        move |slot| {
+            let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+                slot.load()
+            });
+            live_flag.store(
+                handle.subtitles_live() && handle.subtitle_table("out0").is_some(),
+                Ordering::Release,
+            );
+        },
+    );
+    assert_eq!(run.frames, 30);
+    assert!(
+        live_during_run.load(Ordering::Acquire),
+        "live during the run"
+    );
+    let (live, unchanged, take, readback, table) =
+        seen.lock().unwrap().take().expect("the teardown hook ran");
+    assert!(!live, "admission ended before the run returned");
+    assert_eq!(take, Err(SubtitleTakeError::Busy));
+    assert!(unchanged, "the ended run's table is untouched: {table:?}");
+    assert_eq!(table, vec![Some("sub_teardown_a".to_owned())]);
+    assert_eq!(readback, None, "no live readback (GET /patch live:false)");
+}
+
+/// [`LAYOUT_CONFIG`] at 128x96 so a routed layout's overlay chrome fits
+/// (64x96 cells; cells under 48 px draw none) while an unoptimised test
+/// build still bakes at cadence and three outputs: output 0 stays on Program.
+#[cfg(feature = "overlay")]
+fn overlay_layout_config() -> String {
+    let three = LAYOUT_CONFIG
+        .replace("width = 64\nheight = 64", "width = 128\nheight = 96")
+        .replace("# keep-video\n", "");
+    format!(
+        "{three}[[outputs]]\nid = \"out2\"\nkind = \"hls\"\npath = \"/tmp/multiview-routing-e2e/@/c/index.m3u8\"\ncodec = \"mpeg2video\"\nsegment_ms = 1000\n"
+    )
+}
+
+/// A 128x96 routed layout `id` with overlays on: both sources side by side.
+#[cfg(feature = "overlay")]
+fn overlay_layout(prefix: &str, id: &str) -> PictureBus {
+    use multiview_core::layout::{Canvas, Cell, Layout};
+    let cell = |x: f32, source: &str| Cell {
+        x,
+        w: 0.5,
+        h: 1.0,
+        source: Some(format!("{prefix}_{source}")),
+        ..Cell::default()
+    };
+    PictureBus::Layout(crate::routing_aux::LayoutRef::new(Arc::new(
+        crate::aux_layout::RoutedLayout {
+            id: id.to_owned(),
+            slates: vec![multiview_config::FailoverSlate::Black; 2],
+            audio: multiview_config::LayoutAudio::default(),
+            overlays: multiview_config::LayoutOverlays::default(),
+            revision: crate::output_routing::next_layout_revision(),
+            layout: Layout {
+                name: id.to_owned(),
+                canvas: Canvas {
+                    width: 128,
+                    height: 96,
+                    fps_num: 25,
+                    fps_den: 1,
+                },
+                cells: vec![cell(0.0, "b"), cell(0.5, "a")],
+            },
+        },
+    )))
+}
+
+/// Program protection (R3, invariants #1/#10) through the real pipeline: two
+/// routed layouts with every default overlay layer on, each on its own
+/// output, while output 0 stays on Program. Output 0 gets every window with a
+/// one-tick PTS step; both routed outputs receive frames; the aux thread
+/// never fails. Count-based only (no timing assertions).
+#[cfg(feature = "overlay")]
+#[test]
+fn two_routed_layouts_with_overlays_never_cost_program_a_window() {
+    const TICKS: u64 = 250;
+    let baked = Arc::new(Mutex::new(Vec::new()));
+    let run = drive_runners(
+        &overlay_layout_config(),
+        "route_overlays",
+        TICKS,
+        3,
+        (SendPolicy::BlockForExact, None),
+        take_two_overlay_layouts("route_overlays", Arc::clone(&baked)),
+    );
+    assert_eq!(run.frames, TICKS);
+    assert_eq!(run.hot_ticks, TICKS);
+    assert_eq!(run.dropped, 0, "offline: nothing shed");
+    let all: Vec<i64> = (0..i64::try_from(TICKS).unwrap()).collect();
+    assert_eq!(
+        pts_of(&run.outputs[0]),
+        all,
+        "output 0 (Program) gets every window, one tick apart"
+    );
+    for output in [1, 2] {
+        let pts = pts_of(&run.outputs[output]);
+        // One packet per tick with a one-tick PTS step across the move onto
+        // the layout; the routed encoder's last frames may still be in
+        // flight when the bounded run ends (count-based, no timing).
+        assert_eq!(pts.first(), Some(&0), "routed output {output}");
+        assert!(
+            pts.windows(2).all(|w| w[1] == w[0] + 1),
+            "routed output {output}: a one-tick PTS step"
+        );
+        assert!(
+            pts.len() + 4 >= all.len(),
+            "routed output {output} received frames to the end: {}",
+            pts.len()
+        );
+    }
+    assert_layouts_baked_and_aux_alive(&run, &baked.lock().unwrap());
+}
+
+/// Program protection under the LIVE policy (I1): the same two baking
+/// layouts with [`SendPolicy::DropOnOverload`], the policy `run_until` uses,
+/// so the hot loop never waits for the consumer. The clock emits every tick
+/// (counted on the hot loop itself) whatever the consumer manages; every
+/// tick is either delivered to Program's sink or shed and counted (never
+/// lost, never blocked); both layouts demonstrably bake; aux never fails.
+/// Count-based only: how many ticks a loaded runner sheds is not asserted,
+/// only that each one is accounted for.
+#[cfg(feature = "overlay")]
+#[test]
+fn two_baking_layouts_never_hold_the_live_clock() {
+    const TICKS: u64 = 250;
+    const SHED_AT: u64 = 200;
+    let baked = Arc::new(Mutex::new(Vec::new()));
+    let run = drive_runners(
+        &overlay_layout_config(),
+        "route_overlays_live",
+        TICKS,
+        3,
+        // A deterministic shed of one tick while both layouts bake (the
+        // seam drops the hot item before the consumer), on top of whatever a
+        // loaded runner sheds by itself.
+        (SendPolicy::DropOnOverload, Some(SHED_AT)),
+        take_two_overlay_layouts("route_overlays_live", Arc::clone(&baked)),
+    );
+    assert_eq!(run.frames, TICKS, "the clock ran every tick");
+    assert_eq!(
+        run.hot_ticks, TICKS,
+        "every tick was emitted on the hot loop, independent of the consumer"
+    );
+    let program = pts_of(&run.outputs[0]);
+    let delivered = u64::try_from(program.len()).unwrap();
+    assert!(
+        program.windows(2).all(|w| w[1] > w[0]),
+        "Program's PTS stay monotonic"
+    );
+    assert!(
+        program
+            .iter()
+            .all(|p| (0..i64::try_from(TICKS).unwrap()).contains(p)),
+        "every Program PTS is a tick of this run"
+    );
+    // Every tick reached Program's encoder, substituted by the consumer's
+    // gap fill, or was shed and counted: none is unaccounted for.
+    assert!(
+        delivered + run.dropped >= TICKS,
+        "delivered {delivered} + shed {} covers {TICKS} ticks",
+        run.dropped
+    );
+    assert!(run.dropped <= TICKS, "drops are bounded by the ticks");
+    // The seam-shed tick (while both layouts bake) is substituted on
+    // Program, not lost: the consumer restamps its last good canvas.
+    assert!(
+        program.contains(&i64::try_from(SHED_AT).unwrap()),
+        "the shed tick {SHED_AT} is substituted on Program"
+    );
+    assert_layouts_baked_and_aux_alive(&run, &baked.lock().unwrap());
+}
+
+/// Both layouts carried baked frames and neither output fell back (an aux
+/// failure moves every routed output to Program, §4.4).
+#[cfg(feature = "overlay")]
+fn assert_layouts_baked_and_aux_alive(run: &Run, baked: &[(String, u64, u64)]) {
+    assert_eq!(baked.len(), 2, "{baked:?}");
+    for (bus, composed, baked_frames) in baked {
+        assert!(*composed > 0, "{bus} composed");
+        assert!(
+            *baked_frames > 0,
+            "{bus} baked overlays ({baked_frames} of {composed})"
+        );
+    }
+    let end = &run.final_snapshot.outputs;
+    assert_eq!(end[1].bus, "aux:news-a", "aux never failed");
+    assert_eq!(end[2].bus, "aux:news-b", "aux never failed");
+}
+
+/// The controller: take output 1 to `news-a` and output 2 to `news-b` (both
+/// with overlays), then, once both have composed for a while, record each
+/// layout feed's (bus, composed, baked) counters into `baked`.
+#[cfg(feature = "overlay")]
+fn take_two_overlay_layouts(
+    prefix: &'static str,
+    baked: Arc<Mutex<Vec<(String, u64, u64)>>>,
+) -> impl FnOnce(OutputRoutingSlot) + Send + 'static {
+    move |slot| {
+        let handle = wait_for("the routing handle", Duration::from_secs(10), || {
+            slot.load()
+        });
+        let outcomes = handle.outcomes().expect("one outcome reader");
+        wait_for("the first routing tick", Duration::from_secs(10), || {
+            (handle.snapshot().video_keys > 0).then_some(())
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        for (op, output, id) in [("l1", 1, "news-a"), ("l2", 2, "news-b")] {
+            handle
+                .try_take(take(op, output, overlay_layout(prefix, id)))
+                .unwrap();
+            let o = wait_for("layout outcome", Duration::from_secs(10), || {
+                outcomes.try_recv().ok()
+            });
+            assert_eq!(o.outcome, TakeResult::Applied, "{o:?}");
+        }
+        let s = wait_for("both layouts routed", Duration::from_secs(2), || {
+            let s = handle.snapshot();
+            (s.outputs[1].bus == "aux:news-a" && s.outputs[2].bus == "aux:news-b").then_some(s)
+        });
+        assert_eq!(s.aux_canvases.len(), 2, "{:?}", s.aux_canvases);
+        // Count-based: wait (bounded) until both layouts have baked frames.
+        let counters = wait_for("both layouts bake", Duration::from_secs(20), || {
+            let feeds = handle.aux_feeds.load();
+            let rows: Vec<(String, u64, u64)> = feeds
+                .iter()
+                .filter(|f| matches!(f.bus, PictureBus::Layout(_)))
+                .map(|f| {
+                    (
+                        f.key.to_string(),
+                        f.slot.composed.load(Ordering::Relaxed),
+                        f.slot.baked.load(Ordering::Relaxed),
+                    )
+                })
+                .collect();
+            (rows.len() == 2 && rows.iter().all(|r| r.2 > 0)).then_some(rows)
+        });
+        *baked.lock().unwrap() = counters;
+    }
 }

@@ -323,6 +323,9 @@ fn openapi_mirrors_accept_what_the_config_types_accept() {
                 "audio": { "mode": "program" } }),
         json!({ "kind": "aes67", "label": "PGM AES67", "multicast": "[ff3e::1]:5004",
                 "depth": "L24", "ptime_ms": 1 }),
+        json!({ "kind": "cast", "id": "cast-1" }),
+        json!({ "kind": "cast", "id": "cast-2", "codec": "h264", "dir": "/var/lib/cast/2",
+                "audio": { "mode": "program" } }),
     ];
     for doc in &outputs {
         let real: Result<multiview_config::Output, _> = serde_json::from_value(doc.clone());
@@ -745,6 +748,68 @@ async fn ndi_youtube_and_aes67_stay_restart_even_when_network_kinds_are_live() {
             "no UpsertSource may ride the bus for a non-live kind ({id}), got {drained:?}"
         );
     }
+}
+
+/// Issue #420: a `YouTube` source is an HLS wrapper. On a run that ingests
+/// network kinds AND whose engine build resolves `YouTube` (`with_youtube`), its
+/// create applies live and rides the bus as `UpsertSource`.
+#[tokio::test]
+async fn youtube_applies_live_when_the_engine_build_resolves_youtube() {
+    let mut h = support::harness_with(|state| {
+        state.with_live_sources(
+            multiview_control::LiveSourceCapability::synthetic_and_network().with_youtube(true),
+        )
+    });
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/yt1",
+            OPERATOR_TOKEN,
+            &json!({ "name": "yt1", "body": {
+                "id": "yt1", "kind": "youtube", "url": "https://www.youtube.com/watch?v=x"
+            }}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(apply_header(&resp), "live");
+    let drained = h.commands.try_drain();
+    assert!(
+        drained.iter().any(|c| matches!(
+            c,
+            multiview_control::Command::UpsertSource { source, .. } if source.id == "yt1"
+        )),
+        "a live-appliable youtube source must enqueue UpsertSource, got {drained:?}"
+    );
+}
+
+/// `with_youtube(true)` never widens past the network capability: a run with
+/// no decoder keeps `YouTube` on restart.
+#[tokio::test]
+async fn youtube_stays_restart_on_a_run_without_network_ingest() {
+    let mut h = support::harness_with(|state| {
+        state.with_live_sources(
+            multiview_control::LiveSourceCapability::synthetic_only().with_youtube(true),
+        )
+    });
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/yt1",
+            OPERATOR_TOKEN,
+            &json!({ "name": "yt1", "body": {
+                "id": "yt1", "kind": "youtube", "url": "https://www.youtube.com/watch?v=x"
+            }}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(apply_header(&resp), "restart");
+    assert!(!h
+        .commands
+        .try_drain()
+        .iter()
+        .any(|c| matches!(c, multiview_control::Command::UpsertSource { .. })));
 }
 
 #[tokio::test]

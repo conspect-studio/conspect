@@ -11,6 +11,7 @@ import { useState } from 'react';
 import type { JSX } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Trans, useLingui } from '@lingui/react/macro';
+import { t as tMacro } from '@lingui/core/macro';
 
 import { useSources } from '../resources/queries';
 import type { SaveResourceVars } from '../resources/queries';
@@ -77,11 +78,57 @@ import { useSystemCapabilities } from '../api/systemQueries';
 import { Info, TriangleAlert } from 'lucide-react';
 import { SourcesSurface } from './approved/SourcesSurface';
 import { useProgramTally } from './approved/useProgramTally';
+import { YoutubeVtClipHint } from '../components/YoutubeVtClipHint';
+import { detectSourceKind } from '../resources/detectSourceKind';
+import type { DetectedSource } from '../resources/detectSourceKind';
 
 /** The form-kind options offered in the picker (no legacy alias). */
 const FORM_KINDS: readonly SourceFormKind[] = SOURCE_KINDS.filter(
   (kind): kind is SourceFormKind => kind !== 'test',
 );
+
+/**
+ * The human label for a source kind, shown in the Kind select with the raw
+ * wire id as secondary text (#419 item 2: an operator should never have to
+ * decode "rtsp"/"ts"/"ndi" to find where a transport belongs).
+ */
+function sourceKindLabel(kind: SourceFormKind): string {
+  switch (kind) {
+    case 'bars':
+      return tMacro`Colour bars`;
+    case 'solid':
+      return tMacro`Solid colour`;
+    case 'clock':
+      return tMacro`Clock`;
+    case 'timer':
+      return tMacro`Timer`;
+    case 'rtsp':
+      return tMacro`RTSP camera / encoder`;
+    case 'hls':
+      return tMacro`HLS stream`;
+    case 'youtube':
+      return tMacro`YouTube live`;
+    case 'ts':
+      return tMacro`MPEG-TS (UDP/HTTP)`;
+    case 'srt':
+      return tMacro`SRT`;
+    case 'rist':
+      return tMacro`RIST`;
+    case 'rtmp':
+      return tMacro`RTMP push`;
+    case 'ndi':
+      return tMacro`NDI`;
+    case 'file':
+      return tMacro`File`;
+    case 'webrtc':
+      return tMacro`WebRTC (WHIP)`;
+  }
+}
+
+/** The Kind select option text: the human label, with the raw id in parens. */
+function sourceKindOptionLabel(kind: SourceFormKind): string {
+  return `${sourceKindLabel(kind)} (${kind})`;
+}
 
 // Radix Select forbids an empty item value, so the "engine default" choice
 // rides a sentinel and maps onto the form's '' (= omit the rtsp block).
@@ -143,6 +190,7 @@ function YoutubeKindNote(): JSX.Element {
           </span>
         </p>
       ) : null}
+      <YoutubeVtClipHint />
     </div>
   );
 }
@@ -1028,6 +1076,82 @@ function readIptvSeed(state: unknown): { ts: number; form: SeedForm } | undefine
     : undefined;
 }
 
+/** Apply a detection onto the form: kind + locator always; id/name only when untouched. */
+function applyDetection(form: SourceFormState, detected: DetectedSource): SourceFormState {
+  const withKind =
+    detected.kind === form.kind ? form : withSourceKind(form, detected.kind);
+  const next: SourceFormState = {
+    ...withKind,
+    ...(detected.locatorField === 'url' ? { url: detected.locator } : { path: detected.locator }),
+  };
+  return {
+    ...next,
+    id: next.id.trim() === '' ? detected.suggestedId : next.id,
+    name: next.name.trim() === '' ? detected.suggestedName : next.name,
+  };
+}
+
+/**
+ * Human text for a detected kind, for the "Detected: …" live region (#419
+ * item 1). Keeps the same labels as the Kind select so the two agree.
+ */
+function detectedKindText(kind: SourceFormKind): string {
+  return sourceKindLabel(kind);
+}
+
+/**
+ * "Paste a link or address" — the prominent first field of the New source
+ * dialog (#419). Detection is pure (`detectSourceKind`) and only fires on
+ * create: applying it sets kind + the locator field always, and id/name only
+ * when the operator has not already typed them, so a later manual edit is
+ * never clobbered. An aria-live polite region names what was detected in
+ * plain text; an unrecognized paste leaves the full manual form untouched.
+ */
+function PasteLinkField({
+  form,
+  setForm,
+  existingIds,
+}: {
+  readonly form: SourceFormState;
+  readonly setForm: (next: SourceFormState) => void;
+  readonly existingIds: ReadonlySet<string>;
+}): JSX.Element {
+  const { t } = useLingui();
+  const [pasted, setPasted] = useState('');
+  const detected = pasted.trim() === '' ? undefined : detectSourceKind(pasted, existingIds);
+  return (
+    <div className="flex flex-col gap-1">
+      <FormField
+        id="source-paste-link"
+        label={t`Paste a link or address`}
+        value={pasted}
+        placeholder="https://www.youtube.com/watch?v=… · rtsp://… · /media/clip.mp4"
+        hint={
+          <Trans>
+            Paste a YouTube link, an HLS/.m3u8 URL, an rtsp(s)/srt/rist/rtmp(s)
+            URL, a udp/rtp address, or a file path — the kind, id and name
+            below fill in automatically.
+          </Trans>
+        }
+        onChange={(next): void => {
+          setPasted(next);
+          const match = next.trim() === '' ? undefined : detectSourceKind(next, existingIds);
+          if (match !== undefined) {
+            setForm(applyDetection(form, match));
+          }
+        }}
+      />
+      <p role="status" aria-live="polite" className="text-xs text-muted-foreground">
+        {detected !== undefined
+          ? t`Detected: ${detectedKindText(detected.kind)}`
+          : pasted.trim() !== ''
+            ? t`No transport detected — pick the Kind manually below.`
+            : ''}
+      </p>
+    </div>
+  );
+}
+
 /** Sources management (ingest). */
 export function SourcesPage(): JSX.Element {
   const { t } = useLingui();
@@ -1047,6 +1171,15 @@ export function SourcesPage(): JSX.Element {
   if (incoming !== undefined && incoming.ts !== seenTs) {
     setSeenTs(incoming.ts);
     setSeed({ key: incoming.ts, creating: true, form: incoming.form });
+  }
+  // The Desk's "Add source" entry point (#419 item 3) links to /sources?new=1:
+  // open the create dialog once per visit with that query present, with the
+  // fully empty manual form (the "Paste a link" field does the rest).
+  const openedByQuery = new URLSearchParams(location.search).get('new') === '1';
+  const [consumedQueryOpen, setConsumedQueryOpen] = useState(false);
+  if (openedByQuery && !consumedQueryOpen) {
+    setConsumedQueryOpen(true);
+    setSeed({ key: -1, creating: true, form: emptySourceForm() });
   }
 
   // The approved surface owns presentation only; the original action
@@ -1172,6 +1305,13 @@ export function SourcesPage(): JSX.Element {
       renderFields={(form, setForm, creating, errors): JSX.Element => (
         <>
           {creating ? (
+            <PasteLinkField
+              form={form}
+              setForm={setForm}
+              existingIds={new Set((sources.data ?? []).map((s) => s.id))}
+            />
+          ) : null}
+          {creating ? (
             // Device-projected streams (ADR-M009 facet (a)): picking one
             // prefills the transport form and stamps device_ref.
             <SourceFromDeviceSection form={form} setForm={setForm} />
@@ -1202,6 +1342,7 @@ export function SourcesPage(): JSX.Element {
             label={t`Kind`}
             value={form.kind}
             options={FORM_KINDS}
+            optionLabel={sourceKindOptionLabel}
             trailing={
               <HelpLink
                 to="/help/concepts/transports#choosing"

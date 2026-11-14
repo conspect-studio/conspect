@@ -37,6 +37,7 @@ use crate::rendition_workers::{
 pub use crate::routing_audio::AudioChoice;
 use crate::routing_audio::{AudioTakeProgress, AudioTakeStart};
 use crate::routing_aux::{AuxFeed, AuxFeeds, AuxFormat, LayoutRef, PictureBus, PictureBusSlot};
+pub use sets::{TakeSet, MAX_SET_MEMBERS};
 
 /// Longest accepted `principal` / `operation_id`, in bytes.
 pub const MAX_TAKE_ID_BYTES: usize = 128;
@@ -301,6 +302,10 @@ pub enum RefuseReason {
     /// The feed's encoder configuration differs from the output's and the
     /// output's container cannot take it in band (output-routing.md §4.2).
     FormatMismatch,
+    /// An atomic set's mixer half re-patches the input on Program under
+    /// `protect` (or the Program/Preview input during an AUTO), §12.8: every
+    /// member of the set reports it.
+    OnAirProtected,
 }
 
 impl RefuseReason {
@@ -317,6 +322,9 @@ impl RefuseReason {
             Self::FormatMismatch => {
                 "This feed's encoder settings differ from the output's; the take was refused \
                  to avoid a corrupt stream"
+            }
+            Self::OnAirProtected => {
+                "The set would re-patch the mixer input on Program; the take was refused"
             }
         }
     }
@@ -476,6 +484,11 @@ pub struct RoutingSnapshot {
     /// The aux thread composes every second tick because Program is late
     /// (ADR-0108 §7 back-off).
     pub aux_halved: bool,
+    /// Atomic multi-crosspoint sets in flight (#308).
+    pub sets_pending: usize,
+    /// Sets whose mixer half committed but whose output members were then
+    /// refused (an encoder died after the commit, §12.8 residual fault).
+    pub set_partial: u64,
 }
 
 /// The control-plane handle (clone freely).
@@ -489,7 +502,12 @@ pub struct RoutingSnapshot {
 pub struct OutputRoutingHandle {
     #[cfg(test)]
     pub(crate) audio_tap: crate::routing_audio::AudioTapCell,
-    takes: SyncSender<OutputTake>,
+    /// The active aux feeds (tests read their slots' counters).
+    #[cfg(test)]
+    // reason: only the overlay-gated layout-bake pipeline tests read it.
+    #[cfg_attr(not(feature = "overlay"), allow(dead_code))]
+    pub(crate) aux_feeds: AuxFeeds,
+    takes: SyncSender<RouterMsg>,
     reformats: SyncSender<Reformat>,
     layout_changes: LayoutInbox,
     snapshot: Arc<SwapCell<Arc<RoutingSnapshot>>>,
@@ -501,7 +519,83 @@ pub struct OutputRoutingHandle {
     /// [`OutputRoutingHandle::with_pictures`].
     pictures: Option<PlanPictures>,
     max_aux_canvases: usize,
+    /// The run's subtitle slots and their admission (slice F #345 F2).
+    sub: HandleSubtitles,
 }
+
+/// A run handle's subtitle state (slice F #345 part F2).
+#[derive(Clone)]
+struct HandleSubtitles {
+    /// The run's subtitle slots (slice F #345 part F2): per output config id,
+    /// its route table, which the patch API re-points live. `None` once the
+    /// run ended ([`OutputRoutingHandle::end_subtitles`], review INV-1): a
+    /// re-point and the run's end are linearized by this control-plane
+    /// mutex (the sampler never takes it; it holds its own tables).
+    tables: Arc<Mutex<Option<SubtitleTables>>>,
+    /// The run's subtitle admission state ([`SUBTITLES_LIVE`],
+    /// [`SUBTITLES_WRITING`], [`SUBTITLES_ENDED`]): the bake consumer ends it
+    /// wait-free (one atomic swap, never the mutex) when it exits for any
+    /// reason (review INV2-1); a re-point is admitted by ONE compare-exchange
+    /// from live (review INV3-1), never rolled back.
+    state: Arc<std::sync::atomic::AtomicU8>,
+    /// The last output tick the subtitle sampler completed (0 before any).
+    tick: Arc<std::sync::atomic::AtomicU64>,
+    /// Every table the run had, kept for tests after the gate is cleared.
+    #[cfg(test)]
+    test_tables: Arc<Mutex<SubtitleTables>>,
+    /// Test seam: called at each [`RepointStage`] of a re-point.
+    #[cfg(test)]
+    hook: Arc<Mutex<Option<RepointHook>>>,
+}
+
+/// A test hook on a re-point's stages.
+#[cfg(test)]
+type RepointHook = Box<dyn Fn(RepointStage) + Send + Sync>;
+
+/// Where a re-point is (test seam, review INV3-1).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepointStage {
+    /// Past the admission point, nothing published yet.
+    Admitted,
+    /// The table is published (or the lookup refused it).
+    Published,
+}
+
+#[cfg(test)]
+impl HandleSubtitles {
+    fn hook(&self, stage: RepointStage) {
+        if let Some(hook) = self
+            .hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(stage);
+        }
+    }
+}
+
+impl Default for HandleSubtitles {
+    fn default() -> Self {
+        Self {
+            tables: Arc::new(Mutex::new(Some(Arc::from(Vec::new())))),
+            state: Arc::new(std::sync::atomic::AtomicU8::new(SUBTITLES_LIVE)),
+            #[cfg(test)]
+            test_tables: Arc::new(Mutex::new(Arc::from(Vec::new()))),
+            #[cfg(test)]
+            hook: Arc::default(),
+            tick: Arc::default(),
+        }
+    }
+}
+
+/// Subtitle admission open: no re-point in progress.
+const SUBTITLES_LIVE: u8 = 0;
+/// A control-plane re-point was admitted and is publishing.
+const SUBTITLES_WRITING: u8 = 1;
+/// The run's subtitle routing ended (consumer exit or teardown).
+const SUBTITLES_ENDED: u8 = 2;
 
 /// What the plan reads to tell an identity picture (P2) from a convert
 /// (P3), #342 B2: the run's store lookup, its canvas and the M/E's PVW
@@ -559,7 +653,36 @@ impl OutputRoutingHandle {
         if take.principal.len() > MAX_TAKE_ID_BYTES || take.operation_id.len() > MAX_TAKE_ID_BYTES {
             return Err(TakeBusy);
         }
-        self.takes.try_send(take).map_err(|_| TakeBusy)
+        self.takes
+            .try_send(RouterMsg::Take(take))
+            .map_err(|_| TakeBusy)
+    }
+
+    /// Enqueue an atomic multi-crosspoint set without waiting (§12.8, #308):
+    /// the same bounded mailbox as [`Self::try_take`] (one slot per set).
+    /// Every member carries the set's `operation_id` and `principal`: the
+    /// members' own (unchecked) id strings are dropped here, before the
+    /// enqueue, so the mailbox never retains them (review B-3).
+    ///
+    /// # Errors
+    /// [`TakeBusy`] when the mailbox is full or the run ended, an id is too
+    /// long, or the set has no or more than [`MAX_SET_MEMBERS`] members.
+    pub fn try_take_set(&self, mut set: TakeSet) -> Result<(), TakeBusy> {
+        if set.principal.len() > MAX_TAKE_ID_BYTES
+            || set.operation_id.len() > MAX_TAKE_ID_BYTES
+            || set.members.is_empty()
+            || set.members.len() > MAX_SET_MEMBERS
+        {
+            return Err(TakeBusy);
+        }
+        for m in &mut set.members {
+            // Replaced (old storage freed); the router stamps the set's ids.
+            m.operation_id = String::new();
+            m.principal = String::new();
+        }
+        self.takes
+            .try_send(RouterMsg::Set(set))
+            .map_err(|_| TakeBusy)
     }
 
     /// Enqueue a live format reset without waiting (#342 B3).
@@ -640,6 +763,154 @@ impl OutputRoutingHandle {
         self
     }
 
+    /// Attach the run's subtitle route tables (per output config id) and the
+    /// sampler's tick cell (slice F #345 part F2).
+    #[must_use]
+    pub fn with_subtitles(
+        mut self,
+        tables: Vec<(String, crate::subtitle_slots::SubtitleRoutes)>,
+        tick: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let tables: SubtitleTables = tables.into();
+        #[cfg(test)]
+        {
+            self.sub.test_tables = Arc::new(Mutex::new(Arc::clone(&tables)));
+        }
+        self.sub.tables = Arc::new(Mutex::new(Some(tables)));
+        self.sub.tick = tick;
+        self
+    }
+
+    fn subtitle_gate(&self) -> std::sync::MutexGuard<'_, Option<SubtitleTables>> {
+        self.sub
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Re-point subtitle slots of the output whose config id is `output`
+    /// (part F2), under the run's subtitle gate.
+    ///
+    /// ONE linearization point decides admission (review INV3-1): the
+    /// compare-exchange of the admission state from live to writing. A run
+    /// already ended (consumer exited, teardown started, or replaced) fails
+    /// it and is refused [`SubtitleRepoint::Ended`] BEFORE any output lookup
+    /// (review COR3-1), and nothing is published. Once it succeeds the take
+    /// is admitted and its table is published; there is no rollback. A
+    /// consumer that exits after the admission may or may not have sampled
+    /// it, which the contract allows (an applied take may never be sampled
+    /// when the run ends first); it is applied and persisted either way. The
+    /// consumer never waits: its exit is one atomic swap.
+    ///
+    /// `Ok(tick)` is a completed-tick LOWER BOUND observed before the swap:
+    /// the sampler had completed tick `tick` (or, when `0`, possibly no tick
+    /// yet) before the table was replaced. `Ok` means the table was swapped,
+    /// nothing more: a sample already in flight finishes on the old table,
+    /// and the first table read that STARTS after the swap sees the new
+    /// route unless a later re-point supersedes it first (then this one is
+    /// never sampled) or the run ends first (review COR2-1/INV2-2).
+    ///
+    /// # Errors
+    /// [`SubtitleRepoint`] when nothing was changed.
+    pub fn repoint_subtitles(
+        &self,
+        output: &str,
+        slots: &[(usize, Option<String>)],
+    ) -> Result<u64, SubtitleRepoint> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let gate = self.subtitle_gate();
+        let tables = gate.as_ref().ok_or(SubtitleRepoint::Ended)?;
+        // The linearization point: admitted, or ended (nothing published).
+        self.sub
+            .state
+            .compare_exchange(SUBTITLES_LIVE, SUBTITLES_WRITING, AcqRel, Acquire)
+            .map_err(|_| SubtitleRepoint::Ended)?;
+        #[cfg(test)]
+        self.sub.hook(RepointStage::Admitted);
+        let published = tables
+            .iter()
+            .find(|(id, _)| id == output)
+            .map(|(_, routes)| routes)
+            .ok_or(SubtitleRepoint::NotInRun)
+            .and_then(|routes| {
+                let tick = self.sub.tick.load(Acquire);
+                crate::subtitle_slots::repoint(routes, slots)
+                    .map(|()| tick)
+                    .map_err(|_| SubtitleRepoint::NotInRun)
+            });
+        #[cfg(test)]
+        self.sub.hook(RepointStage::Published);
+        // Back to live, unless the consumer ended the run meanwhile (then it
+        // stays ended; the admitted take keeps its answer).
+        let _ = self
+            .sub
+            .state
+            .compare_exchange(SUBTITLES_WRITING, SUBTITLES_LIVE, AcqRel, Acquire);
+        published
+    }
+
+    /// Test seam: run `hook` at each stage of a re-point (review INV3-1).
+    #[cfg(test)]
+    pub(crate) fn set_repoint_hook(&self, hook: Box<dyn Fn(RepointStage) + Send + Sync>) {
+        *self
+            .sub
+            .hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// The live subtitle route table of `output`, `None` when the run does
+    /// not sample it or has ended.
+    #[must_use]
+    pub fn subtitle_table(&self, output: &str) -> Option<Vec<Option<String>>> {
+        let gate = self.subtitle_gate();
+        if !self.subtitles_live() {
+            return None;
+        }
+        gate.as_ref()?
+            .iter()
+            .find(|(id, _)| id == output)
+            .map(|(_, routes)| routes.load().to_vec())
+    }
+
+    /// End the run's subtitle routing (its teardown): later re-points are
+    /// refused and the live readback is gone. Idempotent.
+    pub fn end_subtitles(&self) {
+        let mut gate = self.subtitle_gate();
+        self.sub
+            .state
+            .store(SUBTITLES_ENDED, std::sync::atomic::Ordering::Release);
+        *gate = None;
+    }
+
+    /// Whether the run's subtitle routing is still live (not ended).
+    #[must_use]
+    pub fn subtitles_live(&self) -> bool {
+        self.sub.state.load(std::sync::atomic::Ordering::Acquire) != SUBTITLES_ENDED
+    }
+
+    /// The route table of `output` itself, even after the run ended (tests
+    /// check an ended run's table is left unchanged).
+    #[cfg(test)]
+    pub(crate) fn subtitle_routes_for_test(
+        &self,
+        output: &str,
+    ) -> Option<crate::subtitle_slots::SubtitleRoutes> {
+        self.sub
+            .test_tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(id, _)| id == output)
+            .map(|(_, routes)| Arc::clone(routes))
+    }
+
+    /// The wait-free end the bake consumer holds (review INV2-1).
+    #[must_use]
+    pub fn subtitle_consumer_exit(&self) -> SubtitleConsumerExit {
+        SubtitleConsumerExit(Arc::clone(&self.sub.state))
+    }
+
     /// The run's store lookup and canvas, when attached.
     #[must_use]
     pub fn pictures(&self) -> Option<&PlanPictures> {
@@ -670,6 +941,41 @@ impl OutputRoutingHandle {
         self.outputs
             .iter()
             .position(|o| o.id.as_deref() == Some(id))
+    }
+}
+
+/// A run's subtitle route tables, per output config id (part F2).
+pub type SubtitleTables = Arc<[(String, crate::subtitle_slots::SubtitleRoutes)]>;
+
+/// Why [`OutputRoutingHandle::repoint_subtitles`] changed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleRepoint {
+    /// The run ended (or was replaced).
+    Ended,
+    /// The run does not sample this output, or the slot is beyond its table.
+    NotInRun,
+}
+
+/// Held by the bake consumer for its whole life: dropped when it exits, for
+/// any reason, it ends subtitle admission with one atomic swap (no lock, no
+/// wait: the consumer never blocks on the control plane; review INV2-1).
+pub struct SubtitleConsumerExit(Arc<std::sync::atomic::AtomicU8>);
+
+impl Drop for SubtitleConsumerExit {
+    fn drop(&mut self) {
+        self.0
+            .swap(SUBTITLES_ENDED, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Ends a run's subtitle routing when dropped (the run's teardown, on every
+/// exit path; review INV-1). Teardown also ends it explicitly as soon as
+/// the clock returns (review INV2-1).
+pub struct SubtitleRunEnd(pub Arc<OutputRoutingHandle>);
+
+impl Drop for SubtitleRunEnd {
+    fn drop(&mut self) {
+        self.0.end_subtitles();
     }
 }
 
@@ -993,6 +1299,12 @@ struct PendingOpen {
     waiter: Option<usize>,
 }
 
+/// One message on the take mailbox.
+enum RouterMsg {
+    Take(OutputTake),
+    Set(TakeSet),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Waiting for the feed to be fresh.
@@ -1007,12 +1319,18 @@ enum Phase {
     Moving(usize),
     /// An audio-only take's crossfade is scheduled; refused at `deadline`.
     AudioMoving { deadline: u64 },
+    /// A member of an atomic set (#308) whose destination `key` is warm (or
+    /// already on air): it waits for the set's adoption tick, never moving
+    /// on its own.
+    Ready { key: usize },
 }
 
 struct Pending {
     take: OutputTake,
     started: u64,
     phase: Phase,
+    /// The atomic set this take is a member of (#308).
+    group: Option<u64>,
 }
 
 struct OutputState {
@@ -1071,7 +1389,7 @@ struct BusHealth {
 pub struct OutputRouter {
     cfg: RouterConfig,
     aux: AuxWiring,
-    takes: Receiver<OutputTake>,
+    takes: Receiver<RouterMsg>,
     reformats: Receiver<Reformat>,
     /// Whether this run has a reformat opener (else `restart-required`).
     can_reformat: bool,
@@ -1129,6 +1447,16 @@ pub struct OutputRouter {
     boot: BootTakes,
     /// The run's first tick (the boot retry window's origin).
     first_tick: Option<u64>,
+    /// Atomic multi-crosspoint sets (#308).
+    sets: sets::SetState,
+    /// Mailbox messages drained (takes and sets), monotonic (test
+    /// observation of the per-tick budget).
+    #[cfg(test)]
+    takes_drained: u64,
+    /// Test seam: called after each drained mailbox message (a lockstep
+    /// concurrent producer refills the mailbox from here).
+    #[cfg(test)]
+    drain_hook: Option<Box<dyn FnMut() + Send>>,
 }
 
 /// The router's start-up (boot) take state, O(outputs).
@@ -1176,6 +1504,7 @@ impl OutputRouter {
     ///
     /// # Errors
     /// The OS error if a helper thread cannot be spawned.
+    #[allow(clippy::too_many_lines)]
     pub fn new_with_openers(
         cfg: RouterConfig,
         aux: AuxWiring,
@@ -1224,6 +1553,8 @@ impl OutputRouter {
         let handle = OutputRoutingHandle {
             #[cfg(test)]
             audio_tap: Arc::clone(&audio_tap),
+            #[cfg(test)]
+            aux_feeds: Arc::clone(&aux.feeds),
             takes: take_tx,
             reformats: reformat_tx,
             layout_changes: layout_tx,
@@ -1233,6 +1564,7 @@ impl OutputRouter {
             has_preview: cfg.has_preview,
             pictures: None,
             max_aux_canvases: cfg.max_aux_canvases,
+            sub: HandleSubtitles::default(),
         };
         let mut router = Self {
             cfg,
@@ -1277,6 +1609,11 @@ impl OutputRouter {
             audio_tap,
             boot: BootTakes::default(),
             first_tick: None,
+            sets: sets::SetState::default(),
+            #[cfg(test)]
+            takes_drained: 0,
+            #[cfg(test)]
+            drain_hook: None,
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -1302,6 +1639,15 @@ impl OutputRouter {
         #[cfg(test)]
         if let Some(audio) = self.audio.as_mut() {
             audio.tap = Some(Arc::clone(&self.audio_tap));
+        }
+    }
+
+    /// Test seam: the program encoder's codec configuration a private bus
+    /// must match to bind (a mismatch refuses its audio move).
+    #[cfg(test)]
+    pub(crate) fn set_audio_program_config(&mut self, config: Option<Vec<u8>>) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.program_config = config;
         }
     }
 
@@ -1495,6 +1841,7 @@ impl OutputRouter {
         self.expire_orphan_opens(tick);
         self.drain_moves(tick, dispatcher);
         self.advance_takes(tick, pts, dispatcher);
+        self.advance_sets(tick, dispatcher);
         self.advance_reformats(tick, dispatcher);
         self.feed(tick, dispatcher);
         self.check_aux(tick, dispatcher);
@@ -1703,6 +2050,7 @@ impl OutputRouter {
                 take,
                 started: tick,
                 phase: Phase::Priming,
+                group: None,
             });
             self.dirty = true;
             self.start_audio_take(index, tick, dispatcher);
@@ -1753,6 +2101,7 @@ impl OutputRouter {
                     take,
                     started: tick,
                     phase: Phase::Priming,
+                    group: None,
                 });
                 self.dirty = true;
             }
@@ -1908,89 +2257,128 @@ impl OutputRouter {
         // unused key (never retired under a move still landing).
     }
 
+    /// Drain the take mailbox: at most [`TAKE_MAILBOX`] messages (takes and
+    /// sets combined) per tick, so a producer refilling it concurrently can
+    /// never starve the rest of the tick (review C-1). Ops deferred behind a
+    /// set the clock owns run first, once that set resolved.
     fn drain_takes(&mut self, tick: u64, dispatcher: &mut RenditionDispatcher) {
-        loop {
-            let take = match self.takes.try_recv() {
-                Ok(take) => take,
+        self.run_deferred(tick, dispatcher);
+        for _ in 0..TAKE_MAILBOX {
+            match self.takes.try_recv() {
+                Ok(RouterMsg::Take(take)) => self.process_take(take, tick, dispatcher),
+                Ok(RouterMsg::Set(set)) => self.admit_set(set, tick, dispatcher),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
-            };
-            let index = take.output_index;
-            // A boot take enters its retry window; an operator take on the
-            // same output replaces the boot intent for good. One slot per
-            // output, allocated on the first take (bounded by the outputs).
-            if self.boot.slots.len() < self.outputs.len() {
-                self.boot.slots.resize_with(self.outputs.len(), || None);
             }
-            // Any later take on the output replaces a queued boot audio too.
-            self.boot.audio_after.retain(|b| b.output_index != index);
-            if let Some(slot) = self.boot.slots.get_mut(index) {
-                *slot = is_boot_video_take(&take.operation_id).then(|| BootRetry {
-                    take: take.clone(),
-                    issued: tick,
-                    due: None,
-                });
-            }
-            let needs_switcher = matches!(take.bus, Some(PictureBus::Preview | PictureBus::Clean));
-            // §7 rule 1, checked again here (the plan's answer can be stale):
-            // a layout not composing yet needs a free aux canvas.
-            if let Some(PictureBus::Layout(layout)) = &take.bus {
-                if self.layout_take_is_stale(layout) {
-                    self.emit(
-                        take.operation_id,
-                        take.output_index,
-                        tick,
-                        TakeResult::Refused(RefuseReason::Unroutable),
-                    );
-                    continue;
-                }
-                self.remember_state(LayoutChange::Edited(layout.clone()));
-                // A re-take of a composing layout carries its latest body
-                // (an edited layout): the canvas follows it from this tick.
-                let _ = self.refresh_layout_body(layout, tick);
-                if !self.admit_aux_canvas(layout, take.output_index, dispatcher) {
-                    self.emit(
-                        take.operation_id,
-                        take.output_index,
-                        tick,
-                        TakeResult::Refused(RefuseReason::Capacity),
-                    );
-                    continue;
+            #[cfg(test)]
+            {
+                self.takes_drained = self.takes_drained.saturating_add(1);
+                if let Some(hook) = self.drain_hook.as_mut() {
+                    hook();
                 }
             }
-            // Audio rides the output's program-audio slot (§5.5): a run
-            // without program audio, or an output without that slot (NDI,
-            // AES67, display), cannot take an audio choice.
-            let audio_ok = take.audio.is_none()
-                || (self.audio.is_some() && dispatcher.has_program_audio(index));
-            let routable = index < self.outputs.len()
-                && (!needs_switcher || self.cfg.has_preview)
-                && (take.bus.is_some() || take.audio.is_some())
-                && audio_ok;
-            if !routable {
+        }
+    }
+
+    /// One single take from the mailbox (or deferred).
+    pub(super) fn process_take(
+        &mut self,
+        take: OutputTake,
+        tick: u64,
+        dispatcher: &mut RenditionDispatcher,
+    ) {
+        let index = take.output_index;
+        // Newest wins over an older deferred op on this output; while a set
+        // the clock owns holds the output, this take is deferred too.
+        self.supersede_deferred(&[index], tick);
+        if self.output_owned(index, dispatcher) {
+            self.defer(sets::DeferredOp::Take(take));
+            return;
+        }
+        // A boot take enters its retry window; an operator take on the
+        // same output replaces the boot intent for good. One slot per
+        // output, allocated on the first take (bounded by the outputs).
+        if self.boot.slots.len() < self.outputs.len() {
+            self.boot.slots.resize_with(self.outputs.len(), || None);
+        }
+        // Any later take on the output replaces a queued boot audio too.
+        self.boot.audio_after.retain(|b| b.output_index != index);
+        if let Some(slot) = self.boot.slots.get_mut(index) {
+            *slot = is_boot_video_take(&take.operation_id).then(|| BootRetry {
+                take: take.clone(),
+                issued: tick,
+                due: None,
+            });
+        }
+        let needs_switcher = matches!(take.bus, Some(PictureBus::Preview | PictureBus::Clean));
+        // §7 rule 1, checked again here (the plan's answer can be stale):
+        // a layout not composing yet needs a free aux canvas.
+        if let Some(PictureBus::Layout(layout)) = &take.bus {
+            if self.layout_take_is_stale(layout) {
                 self.emit(
                     take.operation_id,
-                    index,
+                    take.output_index,
                     tick,
                     TakeResult::Refused(RefuseReason::Unroutable),
                 );
-                continue;
+                return;
             }
-            self.supersede(index, tick, dispatcher);
-            let audio_only = take.bus.is_none();
-            let Some(out) = self.outputs.get_mut(index) else {
-                continue;
-            };
-            out.pending = Some(Pending {
-                take,
-                started: tick,
-                phase: Phase::Priming,
-            });
-            self.dirty = true;
-            if audio_only {
-                // Adopted at this drain tick: no fresh gate for audio (a
-                // source without audio is silence, §5.1).
-                self.start_audio_take(index, tick, dispatcher);
+            self.remember_state(LayoutChange::Edited(layout.clone()));
+            // A re-take of a composing layout carries its latest body
+            // (an edited layout): the canvas follows it from this tick.
+            let _ = self.refresh_layout_body(layout, tick);
+            if !self.admit_aux_canvas(layout, take.output_index, dispatcher) {
+                self.emit(
+                    take.operation_id,
+                    take.output_index,
+                    tick,
+                    TakeResult::Refused(RefuseReason::Capacity),
+                );
+                return;
             }
+        }
+        // Audio rides the output's program-audio slot (§5.5): a run
+        // without program audio, or an output without that slot (NDI,
+        // AES67, display), cannot take an audio choice.
+        let audio_ok =
+            take.audio.is_none() || (self.audio.is_some() && dispatcher.has_program_audio(index));
+        let routable = index < self.outputs.len()
+            && (!needs_switcher || self.cfg.has_preview)
+            && (take.bus.is_some() || take.audio.is_some())
+            && audio_ok;
+        if !routable {
+            self.emit(
+                take.operation_id,
+                index,
+                tick,
+                TakeResult::Refused(RefuseReason::Unroutable),
+            );
+            return;
+        }
+        // A member of a set the clock already owns (applying or committed
+        // at its tick) is never split: the take waits until the set
+        // resolves (review A-1).
+        if let Some(group) = self.group_of(index) {
+            if !self.try_supersede_set(group, dispatcher) {
+                self.defer(sets::DeferredOp::Take(take));
+                return;
+            }
+        }
+        self.supersede(index, tick, dispatcher);
+        let audio_only = take.bus.is_none();
+        let Some(out) = self.outputs.get_mut(index) else {
+            return;
+        };
+        out.pending = Some(Pending {
+            take,
+            started: tick,
+            phase: Phase::Priming,
+            group: None,
+        });
+        self.dirty = true;
+        if audio_only {
+            // Adopted at this drain tick: no fresh gate for audio (a
+            // source without audio is silence, §5.1).
+            self.start_audio_take(index, tick, dispatcher);
         }
     }
 
@@ -2058,6 +2446,11 @@ impl OutputRouter {
     /// Replace a pending take: the old one is Superseded, an in-dispatcher
     /// move is cancelled by re-asserting the current key.
     fn supersede(&mut self, index: usize, tick: u64, dispatcher: &mut RenditionDispatcher) {
+        // A member of an atomic set: the set is superseded as a whole.
+        if let Some(group) = self.group_of(index) {
+            self.end_set(group, TakeResult::Superseded, tick, dispatcher);
+            return;
+        }
         let Some(old) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) else {
             return;
         };
@@ -2144,6 +2537,10 @@ impl OutputRouter {
             })
             .is_some_and(|k| dispatcher.pending_video_move(index) != Some(k));
         if !stranded {
+            return;
+        }
+        if let Some(group) = self.group_of(index) {
+            self.end_set(group, TakeResult::Superseded, tick, dispatcher);
             return;
         }
         if let Some(old) = self.outputs.get_mut(index).and_then(|o| o.pending.take()) {
@@ -2316,6 +2713,11 @@ impl OutputRouter {
         reason: RefuseReason,
         dispatcher: &mut RenditionDispatcher,
     ) {
+        // A member of an atomic set: every member gets the same refusal.
+        if let Some(group) = self.group_of(index) {
+            self.end_set(group, TakeResult::Refused(reason), tick, dispatcher);
+            return;
+        }
         let phase = self
             .outputs
             .get(index)
@@ -2620,9 +3022,14 @@ impl OutputRouter {
         live && !self.aux.failed.load(Ordering::Acquire) && self.slot_fresh(feed, tick)
     }
 
+    #[allow(clippy::too_many_lines)]
+    // reason: one per-output phase match (Priming/Opening/Warming/Ready/
+    // Moving); the set-member arms (#308) are two-line branches into
+    // `output_routing_sets`, and splitting the match would scatter the
+    // single take state machine.
     fn advance_takes(&mut self, tick: u64, pts: MediaTime, dispatcher: &mut RenditionDispatcher) {
         for index in 0..self.outputs.len() {
-            let Some((bus, choice, started, phase, principal)) =
+            let Some((bus, choice, started, phase, principal, group)) =
                 self.outputs.get(index).and_then(|o| {
                     o.pending.as_ref().map(|p| {
                         (
@@ -2631,6 +3038,7 @@ impl OutputRouter {
                             p.started,
                             p.phase,
                             p.take.principal.clone(),
+                            p.group,
                         )
                     })
                 })
@@ -2646,6 +3054,11 @@ impl OutputRouter {
             };
             match phase {
                 Phase::Moving(_) | Phase::AudioMoving { .. } => {}
+                Phase::Ready { key } => {
+                    if dispatcher.is_key_failed(key) {
+                        self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
+                    }
+                }
                 Phase::Warming { key, deadline } => {
                     let seen = self
                         .dynamic
@@ -2654,6 +3067,9 @@ impl OutputRouter {
                         .map(|d| d.seen_event);
                     if tick >= deadline || seen.is_none() || dispatcher.is_key_failed(key) {
                         self.refuse_pending(index, tick, RefuseReason::EncoderNotReady, dispatcher);
+                    } else if seen == Some(true) && group.is_some() {
+                        // A set member never moves alone: it parks warm.
+                        self.member_ready(index, key);
                     } else if seen == Some(true) {
                         // The key has no subscriber yet: an IDR on it costs no
                         // viewer anything, so the warm-up force skips the floor.
@@ -2692,6 +3108,20 @@ impl OutputRouter {
                 }
                 Phase::Priming => {
                     let current = self.outputs.get(index).map(|o| o.bus.clone());
+                    if group.is_some() && current.as_ref() == Some(&bus) {
+                        // A no-op member: already on air, it lands with the
+                        // set. An audio change it carries is admitted (its
+                        // private bus opened and warming) now, so it can
+                        // switch at the set's tick (review A-3).
+                        if choice.is_some() {
+                            if let Some(audio) = self.audio.as_mut() {
+                                audio.admit(index, &bus, choice.as_ref(), tick, dispatcher);
+                            }
+                        }
+                        let key = self.outputs.get(index).map_or(0, |o| o.key);
+                        self.member_ready(index, key);
+                        continue;
+                    }
                     if current.as_ref() == Some(&bus) {
                         self.cancel_dispatcher_move(index, dispatcher, tick);
                         if choice.is_some() {
@@ -2717,6 +3147,17 @@ impl OutputRouter {
                         continue;
                     }
                     if self.wait_for_shared_open(index, &bus, started, tick, dispatcher) {
+                        continue;
+                    }
+                    if group.is_some() {
+                        self.member_start(
+                            index,
+                            &bus,
+                            choice.as_ref(),
+                            &principal,
+                            tick,
+                            dispatcher,
+                        );
                         continue;
                     }
                     self.start_move(index, &bus, choice.as_ref(), &principal, tick, dispatcher);
@@ -2844,7 +3285,7 @@ impl OutputRouter {
                     && (o.key == key
                         || matches!(
                             o.pending.as_ref().map(|p| p.phase),
-                            Some(Phase::Moving(k) | Phase::Warming { key: k, .. }) if k == key
+                            Some(Phase::Moving(k) | Phase::Warming { key: k, .. } | Phase::Ready { key: k }) if k == key
                         ))
             });
             if dispatcher.rebind_video(index, key, tick, windows).is_ok() {
@@ -2912,7 +3353,10 @@ impl OutputRouter {
     }
 
     fn has_capacity(&self, principal: &str) -> bool {
-        let total = self.dynamic.len() + self.opens.len();
+        // Opens an admitted set reserved and has not issued yet count too
+        // (#308): a single take never takes a set's reserved slot.
+        let (set_all, set_mine) = self.set_reservations(principal);
+        let total = self.dynamic.len() + self.opens.len() + set_all;
         let mine = self
             .dynamic
             .iter()
@@ -2922,7 +3366,8 @@ impl OutputRouter {
                 .opens
                 .values()
                 .filter(|o| o.principal == principal)
-                .count();
+                .count()
+            + set_mine;
         total < self.cfg.max_encoders && mine < self.cfg.max_per_principal
     }
 
@@ -2933,7 +3378,7 @@ impl OutputRouter {
                 o.key == key
                     || matches!(
                         o.pending.as_ref().map(|p| p.phase),
-                        Some(Phase::Moving(k) | Phase::Warming { key: k, .. }) if k == key
+                        Some(Phase::Moving(k) | Phase::Warming { key: k, .. } | Phase::Ready { key: k }) if k == key
                     )
             })
             .count()
@@ -3282,6 +3727,8 @@ impl OutputRouter {
             move_cancel_failures: self.move_cancel_failures,
             aux_canvases: self.layout_buses(),
             aux_halved: self.aux.halved.load(Ordering::Relaxed),
+            sets_pending: self.sets.active.len(),
+            set_partial: self.sets.partial,
         };
         if *self.snapshot.load() != next {
             self.snapshot.store(Arc::new(next));
@@ -3549,6 +3996,9 @@ fn aux_composed(bus: &PictureBus) -> bool {
         PictureBus::Preview | PictureBus::Source(_) | PictureBus::Layout(_)
     )
 }
+
+#[path = "output_routing_sets.rs"]
+mod sets;
 
 #[path = "output_routing_reformat.rs"]
 mod reformat;

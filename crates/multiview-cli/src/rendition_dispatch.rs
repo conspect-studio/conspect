@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::binding_delivery::WindowDelivery;
 use crate::rendition_workers::{DispatchEvent, DtsWatermark};
 use multiview_core::time::Rational;
+use multiview_engine::patch_set::{ArmState, SetArm};
 use multiview_ffmpeg::{EncodedPacket, StreamKind};
 use multiview_output::batch::OfferError;
 
@@ -29,6 +30,10 @@ const MAX_DYNAMIC_SLOTS: usize = 64;
 /// Per-binding FIFO of assembled windows waiting for their video part.
 const MAX_PENDING_WINDOWS: usize = 4;
 const MAX_MOVE_OUTCOMES: usize = 64;
+/// Grouped (atomic-set) moves held at once (#308); a further group is refused.
+pub(crate) const MAX_MOVE_GROUPS: usize = 64;
+/// Output members of one grouped move.
+pub(crate) const MAX_GROUP_MEMBERS: usize = 64;
 
 /// Per-key "is this packet a self-contained random-access point that may
 /// start a rendition on another output" predicate. Injected, never parsed here.
@@ -78,6 +83,17 @@ pub(crate) enum MoveRefusal {
     /// output's container carries it out of band (fMP4 init, FLV sequence
     /// header, SDP): slice 1 never splices that silently, so the output keeps
     /// its feed (output-routing.md §4.2 step 4).
+    FormatMismatch,
+}
+
+/// [`RenditionDispatcher::preflight_group`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupPreflight {
+    /// Every member's destination keeps its output's container valid.
+    Ready,
+    /// A destination has not staged a RAP yet: ask again next tick.
+    Pending,
+    /// A member would change an out-of-band decoder configuration.
     FormatMismatch,
 }
 
@@ -377,6 +393,10 @@ struct VideoMeta {
     failed: bool,
     gate: Option<MoveGate>,
     params: Option<ParameterSets>,
+    /// The decoder configuration of the key's last staged RAP (`None`: no
+    /// RAP seen yet, or no extractor): an atomic set preflights it against
+    /// an out-of-band output before proposing its tick (#308 review A-2).
+    last_rap: Option<RapParameterSets>,
     /// The key's video stream parameters (#342 B3 review V2): handed to an
     /// output's delivery with a decoder-config change onto this key.
     stream: Option<multiview_ffmpeg::StreamCodecParameters>,
@@ -396,6 +416,22 @@ struct PendingMove {
     /// A fallback the output cannot decline (its feed is gone): never
     /// refused for a format mismatch, signalled as a loss instead.
     forced: bool,
+    /// The atomic set this move belongs to (#308): it lands only at
+    /// `at_tick`, together with every other member, or not at all.
+    group: Option<u64>,
+}
+
+/// One atomic set's output moves (#308): decided ONCE for every member at
+/// window `at` (all apply there, or every member is refused).
+struct GroupMove {
+    id: u64,
+    at: i128,
+    /// `(output_index, key, generation)` of every member.
+    members: Vec<(usize, usize, u64)>,
+    /// The mixer half's handshake: the outputs apply only once it committed
+    /// at `at` (`None`: a set without a mixer half).
+    arm: Option<Arc<SetArm>>,
+    decision: Option<Result<(), MoveRefusal>>,
 }
 
 struct Entry {
@@ -466,6 +502,10 @@ struct BindingState {
     /// key has an extractor); `None` = unknown (never seen, or the last scan
     /// was rejected), which a switch to a key with sets treats as a change.
     last_sets: Option<Vec<u8>>,
+    /// A steady-state keyframe of the current key failed its scan: the
+    /// output's configuration is unknown, so the next keyframe with sets is a
+    /// change (#344 D2a). Cleared by the next recorded sets.
+    steady_unknown: bool,
     /// The dynamic audio stage carrying this output's program-audio slot
     /// (`None` = the shared program stage, today's behaviour).
     audio_key: Option<usize>,
@@ -593,6 +633,8 @@ pub(crate) struct RenditionDispatcher {
     next_key_generation: u64,
     /// Dynamic per-output audio stages (never gate base windows).
     dyn_audio: Vec<DynAudio>,
+    /// Grouped (atomic-set) moves, at most [`MAX_MOVE_GROUPS`].
+    groups: Vec<GroupMove>,
     failed: bool,
     finished: bool,
 }
@@ -643,6 +685,7 @@ impl RenditionDispatcher {
                 mv: None,
                 fallback_gate_pending: false,
                 last_sets: None,
+                steady_unknown: false,
                 audio_key: None,
                 audio_mv: None,
                 inband_ok: binding.inband_parameter_changes_ok,
@@ -656,6 +699,7 @@ impl RenditionDispatcher {
                 failed: false,
                 gate: gates.next().flatten(),
                 params: None,
+                last_rap: None,
                 stream: None,
                 generation: 0,
             })
@@ -680,6 +724,7 @@ impl RenditionDispatcher {
             global_staged_bytes: 0,
             next_key_generation: 1,
             dyn_audio: Vec::new(),
+            groups: Vec::new(),
             failed: false,
             finished: false,
         })
@@ -867,11 +912,16 @@ impl RenditionDispatcher {
                     return Err(DispatchError::InvalidEvent);
                 }
                 let _ = tick; // Tick alone does not close delayed DTS.
+                let mut rap = None;
                 for p in packets {
                     if p.kind() != StreamKind::Video {
                         return Err(DispatchError::InvalidEvent);
                     }
+                    rap = self.rap_sets(key_index, &p).or(rap);
                     self.put_video(key_index, p, now)?;
+                }
+                if let (Some(rap), Some(meta)) = (rap, self.video_meta.get_mut(key_index)) {
+                    meta.last_rap = Some(rap);
                 }
                 let stage = self
                     .video
@@ -985,6 +1035,10 @@ impl RenditionDispatcher {
             .get(key)
             .ok_or(DispatchError::InvalidEvent)?;
         let cadence = self.cadence;
+        let mut rap = None;
+        for p in &packets {
+            rap = self.rap_sets(key, p).or(rap);
+        }
         let result = (|| -> Result<(), DispatchError> {
             let stage = self.video.get_mut(key).ok_or(DispatchError::InvalidEvent)?;
             if stage.finished || timebase.is_some_and(|t| !tb.matches(t)) {
@@ -1010,8 +1064,19 @@ impl RenditionDispatcher {
         if result.is_err() {
             // A live key's fault is its own: never the program's.
             self.fail_dynamic(key);
+        } else if let (Some(rap), Some(meta)) = (rap, self.video_meta.get_mut(key)) {
+            meta.last_rap = Some(rap);
         }
         Ok(())
+    }
+    /// The decoder configuration of `packet` when it is a RAP of `key` and
+    /// the key has an extractor (once per GOP, never per packet otherwise).
+    fn rap_sets(&self, key: usize, packet: &EncodedPacket) -> Option<RapParameterSets> {
+        if !packet.is_keyframe() {
+            return None;
+        }
+        let f = self.video_meta.get(key)?.params.as_ref()?;
+        Some(f(packet))
     }
     fn fail_dynamic(&mut self, key: usize) {
         if let Some(meta) = self.video_meta.get_mut(key) {
@@ -1235,12 +1300,159 @@ impl RenditionDispatcher {
             }
             self.reconcile_audio();
         }
+        self.decide_groups();
         for bi in 0..self.bindings.len() {
             if let Some(error) = self.pump_binding(bi, now, delivery)? {
                 first.get_or_insert(error);
             }
         }
+        if !self.groups.is_empty() {
+            let bindings = &self.bindings;
+            self.groups.retain(|g| {
+                bindings
+                    .iter()
+                    .any(|b| b.mv.is_some_and(|m| m.group == Some(g.id)))
+            });
+        }
         Ok(first)
+    }
+
+    /// Decide every undecided group whose window `at` can be judged: apply
+    /// iff the mixer half committed at `at` (or there is none) AND every
+    /// member's move is still pending on a usable key whose window `at` is
+    /// complete, opens at a gated RAP and keeps the output's container
+    /// valid. A member whose window is not complete yet holds the decision
+    /// (and its own binding) until its FIFO is full, then the set is refused.
+    /// O(members) on the decision window only.
+    fn decide_groups(&mut self) {
+        for gi in 0..self.groups.len() {
+            let Some(g) = self.groups.get(gi) else {
+                continue;
+            };
+            if g.decision.is_some() {
+                continue;
+            }
+            let decision = self.judge_group(g);
+            if let Some(g) = self.groups.get_mut(gi) {
+                g.decision = decision;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // One all-members decision, reviewed as a unit.
+    fn judge_group(&self, g: &GroupMove) -> Option<Result<(), MoveRefusal>> {
+        let mut undecided = false;
+        for &(output, key, generation) in &g.members {
+            let Some(b) = self.bindings.iter().find(|b| b.output_index == output) else {
+                return Some(Err(MoveRefusal::EncoderNotReady));
+            };
+            let pending = b.mv.is_some_and(|m| {
+                m.group == Some(g.id) && m.key == key && m.generation == generation
+            });
+            let meta = self.video_meta.get(key);
+            let usable =
+                meta.is_some_and(|x| !x.failed && !x.retired && x.generation == generation);
+            if !pending || !usable {
+                return Some(Err(MoveRefusal::EncoderNotReady));
+            }
+            if b.video_key == Some(key) {
+                // A member that stays on its key (its audio changes at `at`,
+                // review A-3): no RAP, no decoder-config decision, but window
+                // `at` must not have gone out yet, and its audio move gated
+                // on this move must still stand (a staged or new private bus
+                // that failed or was refused refuses the set, review A-4).
+                if b.pending.front().is_some_and(|head| head.index > g.at) {
+                    return Some(Err(MoveRefusal::EncoderNotReady));
+                }
+                let audio_ok = b.audio_mv.is_some_and(|am| {
+                    am.after_video == Some((key, generation))
+                        && am.key.is_none_or(|k| {
+                            self.dyn_audio.get(k).is_some_and(|a| {
+                                !a.failed && !a.retired && a.generation == am.generation
+                            })
+                        })
+                });
+                if !audio_ok {
+                    return Some(Err(MoveRefusal::EncoderNotReady));
+                }
+                continue;
+            }
+            let full = b.pending.len() >= MAX_PENDING_WINDOWS;
+            if b.pending.front().is_some_and(|head| head.index > g.at) {
+                // Window `at` already went out on this output.
+                return Some(Err(MoveRefusal::EncoderNotReady));
+            }
+            let Some(entry) = b.pending.iter().find(|e| e.index == g.at) else {
+                if full {
+                    return Some(Err(MoveRefusal::EncoderNotReady));
+                }
+                undecided = true;
+                continue;
+            };
+            let Some(gate) = meta.and_then(|x| x.gate.as_ref()) else {
+                return Some(Err(MoveRefusal::NoGate));
+            };
+            let dynamic = meta.is_some_and(|x| x.dynamic);
+            let window: Option<Vec<&EncodedPacket>> = if dynamic {
+                let Some(stage) = self.video.get(key) else {
+                    return Some(Err(MoveRefusal::EncoderNotReady));
+                };
+                if !stage.complete(entry.end) {
+                    if full {
+                        return Some(Err(MoveRefusal::EncoderNotReady));
+                    }
+                    undecided = true;
+                    continue;
+                }
+                stage
+                    .peek(g.at)
+                    .map(|w| w.packets.iter().map(AsRef::as_ref).collect())
+            } else {
+                entry
+                    .base
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.iter().collect())
+            };
+            let Some(rap) = window.and_then(|w| w.into_iter().find(|p| gate(p))) else {
+                return Some(Err(MoveRefusal::EncoderNotReady));
+            };
+            let sets = meta
+                .and_then(|x| x.params.as_ref())
+                .map_or(RapParameterSets::Absent, |f| f(rap));
+            if sets_change(b.last_sets.as_ref(), &sets) && !b.inband_ok {
+                return Some(Err(MoveRefusal::FormatMismatch));
+            }
+        }
+        if let Some(arm) = g.arm.as_ref() {
+            let at = u64::try_from(g.at).unwrap_or(u64::MAX);
+            match arm.state() {
+                ArmState::Committed if arm.tick() == at => {}
+                ArmState::Refused | ArmState::Committed => {
+                    return Some(Err(MoveRefusal::EncoderNotReady));
+                }
+                // Not committed yet (the clock composes `T` before `T` is
+                // encoded, so normally it is), or handed back to the router
+                // for a re-proposal (which cancels this group): hold, never
+                // longer than a full pending FIFO.
+                _ => {
+                    let full = g.members.iter().any(|&(o, _, _)| {
+                        self.bindings
+                            .iter()
+                            .any(|b| b.output_index == o && b.pending.len() >= MAX_PENDING_WINDOWS)
+                    });
+                    if full {
+                        return Some(Err(MoveRefusal::EncoderNotReady));
+                    }
+                    undecided = true;
+                }
+            }
+        }
+        if undecided {
+            None
+        } else {
+            Some(Ok(()))
+        }
     }
     /// Deliver, in order, every pending window of one binding whose video part
     /// is available. Resolves video moves and post-fallback RAP gating.
@@ -1258,6 +1470,20 @@ impl RenditionDispatcher {
         while let Some(head) = b.pending.front() {
             let end = head.end;
             let head_index = head.index;
+            // A grouped move's window `at` (and every later one) waits for
+            // the group's single decision: never delivered before it.
+            if let Some(g) =
+                b.mv.and_then(|m| m.group.filter(|_| head.index >= m.at_tick))
+            {
+                if self
+                    .groups
+                    .iter()
+                    .find(|x| x.id == g)
+                    .is_some_and(|x| x.decision.is_none())
+                {
+                    break;
+                }
+            }
             if let Some(k) = b.video_key {
                 if self.video_meta.get(k).is_some_and(|m| m.dynamic) {
                     let Some(stage) = self.video.get(k) else {
@@ -1303,6 +1529,49 @@ impl RenditionDispatcher {
             // Leading video packets of the cut window before its first gated
             // RAP: never delivered after a switch (audio is kept).
             let mut skip = 0_usize;
+            if let Some(m) = b.mv.filter(|m| index >= m.at_tick) {
+                if let Some(g) = m.group {
+                    let decided = self
+                        .groups
+                        .iter()
+                        .find(|x| x.id == g)
+                        .and_then(|x| x.decision)
+                        .unwrap_or(Err(MoveRefusal::EncoderNotReady));
+                    if let Err(reason) = decided {
+                        push_outcome(
+                            &mut self.outcomes,
+                            MoveOutcome::Refused {
+                                output_index: b.output_index,
+                                reason,
+                            },
+                        );
+                        b.mv = None;
+                    }
+                }
+            }
+            if let Some(m) = b
+                .mv
+                .filter(|m| index >= m.at_tick && m.group.is_some() && b.video_key == Some(m.key))
+            {
+                // A grouped member staying on its key (review A-3): the group
+                // decided to apply, so it lands at `at` with nothing to cut;
+                // the audio move gated on it may now land in this window.
+                if let Some(am) = b.audio_mv.as_mut() {
+                    if am.after_video == Some((m.key, m.generation)) {
+                        am.after_video = None;
+                    }
+                }
+                push_outcome(
+                    &mut self.outcomes,
+                    MoveOutcome::Applied {
+                        output_index: b.output_index,
+                        key: m.key,
+                        tick: u64::try_from(index).unwrap_or(u64::MAX),
+                        parameter_sets_changed: false,
+                    },
+                );
+                b.mv = None;
+            }
             if let Some(mut m) = b.mv {
                 if index >= m.at_tick {
                     let usable = self
@@ -1372,6 +1641,8 @@ impl RenditionDispatcher {
                             } else {
                                 skip = at;
                                 let _ = decide_sets(&mut b.last_sets, cut_sets);
+                                // A switch decides (and signals) by itself.
+                                b.steady_unknown = false;
                                 if changed {
                                     let stream =
                                         self.video_meta.get(m.key).and_then(|x| x.stream.clone());
@@ -1471,6 +1742,7 @@ impl RenditionDispatcher {
                             .and_then(|m| m.params.as_ref())
                             .and_then(|f| packets.get(at).map(f))
                             .unwrap_or(RapParameterSets::Absent);
+                        b.steady_unknown = false;
                         if decide_sets(&mut b.last_sets, cut) {
                             let stream = cur
                                 .and_then(|k| self.video_meta.get(k))
@@ -1500,21 +1772,44 @@ impl RenditionDispatcher {
             // Steady state: track the CURRENT key's configuration from its own
             // RAPs so the next switch compares against what the output carries.
             // Never on a switch window (decided above, never overridden).
+            //
+            // #344 D2a: a keyframe whose sets differ from a configuration the
+            // output is known to carry (or follow a rejected scan) is a
+            // decoder-config change inside the key (a passthrough key switching
+            // source <-> slate, or its source changing sets): on an in-band
+            // output it is signalled once, before this window is offered, so
+            // HLS marks the segment that IDR starts discontinuous. An ordinary
+            // encoder's sets never change, so it never reaches the signal.
+            // Out-of-band outputs only record (they cannot re-init mid-stream;
+            // passthrough is not offered there).
             if let Some(f) = cur
                 .and_then(|k| self.video_meta.get(k))
                 .and_then(|m| m.params.as_ref())
                 .filter(|_| !switched)
             {
+                let mut changed = false;
                 for p in packets.iter().filter(|p| p.is_keyframe()) {
                     match f(p) {
                         RapParameterSets::Absent => {}
-                        RapParameterSets::Rejected => b.last_sets = None,
+                        RapParameterSets::Rejected => {
+                            changed |= b.last_sets.is_some() || b.steady_unknown;
+                            b.last_sets = None;
+                            b.steady_unknown = true;
+                        }
                         RapParameterSets::Sets(sets) => {
                             if b.last_sets.as_ref() != Some(&sets) {
+                                changed |= b.last_sets.is_some() || b.steady_unknown;
                                 b.last_sets = Some(sets);
+                                b.steady_unknown = false;
                             }
                         }
                     }
+                }
+                if changed && b.inband_ok {
+                    let stream = cur
+                        .and_then(|k| self.video_meta.get(k))
+                        .and_then(|x| x.stream.clone());
+                    signal_sets_change(delivery, b.output_index, b.inband_ok, stream);
                 }
             }
             drop_orphan_audio_move(b, &mut self.outcomes);
@@ -1786,6 +2081,7 @@ impl RenditionDispatcher {
                 failed: false,
                 gate: Some(gate),
                 params: None,
+                last_rap: None,
                 stream: None,
                 generation,
             };
@@ -1800,6 +2096,7 @@ impl RenditionDispatcher {
             failed: false,
             gate: Some(gate),
             params: None,
+            last_rap: None,
             stream: None,
             generation,
         });
@@ -1958,10 +2255,159 @@ impl RenditionDispatcher {
                 max_windows,
                 failed: 0,
                 forced,
+                group: None,
             });
         }
         self.reconcile_audio_gates();
         Ok(())
+    }
+    /// Register one atomic set's output moves (#308): every member moves to
+    /// its key at window `at_tick` exactly, together, or every member is
+    /// refused (one decision, [`MoveOutcome::Refused`] per member). With
+    /// `arm`, the moves apply only once the set's mixer half committed at
+    /// `at_tick`. Each member's previous pending move is superseded.
+    /// All-or-nothing registration: an invalid member registers nothing.
+    /// A member already reading its key stays on it (no cut): it carries an
+    /// audio change that must land with the set (review A-3), gated on this
+    /// move like any other member's audio.
+    ///
+    /// # Errors
+    /// `InvalidConfig` for an empty or oversized set, a duplicate output, an
+    /// unknown output, an unusable or gate-less key, or [`MAX_MOVE_GROUPS`]
+    /// groups already held.
+    pub(crate) fn rebind_group(
+        &mut self,
+        group: u64,
+        at_tick: u64,
+        members: &[(usize, usize)],
+        arm: Option<Arc<SetArm>>,
+    ) -> Result<(), DispatchError> {
+        if members.is_empty()
+            || members.len() > MAX_GROUP_MEMBERS
+            || self.groups.len() >= MAX_MOVE_GROUPS
+            || self.groups.iter().any(|g| g.id == group)
+        {
+            return Err(DispatchError::InvalidConfig);
+        }
+        let mut resolved = Vec::with_capacity(members.len());
+        for (i, &(output, key)) in members.iter().enumerate() {
+            let b = self
+                .bindings
+                .iter()
+                .find(|b| b.output_index == output)
+                .ok_or(DispatchError::InvalidConfig)?;
+            // A staying member cuts nothing: it needs no gate.
+            let stays = b.video_key == Some(key);
+            let meta = self
+                .video_meta
+                .get(key)
+                .filter(|m| !m.failed && !m.retired && (stays || m.gate.is_some()))
+                .ok_or(DispatchError::InvalidConfig)?;
+            if b.video_key.is_none() || members.iter().take(i).any(|&(o, _)| o == output) {
+                return Err(DispatchError::InvalidConfig);
+            }
+            resolved.push((output, key, meta.generation));
+        }
+        let at = i128::from(at_tick);
+        for &(output, key, generation) in &resolved {
+            if let Some(b) = self.bindings.iter_mut().find(|b| b.output_index == output) {
+                if b.mv.take().is_some() {
+                    push_outcome(
+                        &mut self.outcomes,
+                        MoveOutcome::Superseded {
+                            output_index: output,
+                        },
+                    );
+                }
+                b.mv = Some(PendingMove {
+                    key,
+                    generation,
+                    at_tick: at,
+                    max_windows: 1,
+                    failed: 0,
+                    forced: false,
+                    group: Some(group),
+                });
+            }
+        }
+        // A superseded member of an older group leaves that group refused
+        // at its decision (its member is no longer pending).
+        self.groups.push(GroupMove {
+            id: group,
+            at,
+            members: resolved,
+            arm,
+            decision: None,
+        });
+        self.reconcile_audio_gates();
+        Ok(())
+    }
+    /// Drop every still-pending member move of `group` (each pushes
+    /// `Superseded`). Returns how many were dropped.
+    pub(crate) fn cancel_group(&mut self, group: u64) -> usize {
+        let mut dropped = 0;
+        for b in &mut self.bindings {
+            if b.mv.is_some_and(|m| m.group == Some(group)) {
+                b.mv = None;
+                dropped += 1;
+                push_outcome(
+                    &mut self.outcomes,
+                    MoveOutcome::Superseded {
+                        output_index: b.output_index,
+                    },
+                );
+            }
+        }
+        self.groups.retain(|g| g.id != group);
+        if dropped > 0 {
+            self.reconcile_audio_gates();
+        }
+        dropped
+    }
+    /// Whether `group` is registered and not decided yet (its moves can
+    /// still be cancelled without splitting the set).
+    pub(crate) fn group_undecided(&self, group: u64) -> bool {
+        self.groups
+            .iter()
+            .any(|g| g.id == group && g.decision.is_none())
+    }
+    /// Preflight an atomic set's moves before its tick is proposed (review
+    /// A-2): the rule `judge_group` applies at the decision window, against
+    /// each destination key's last staged RAP. A member whose output carries
+    /// its decoder configuration out of band (`!inband_ok`) and whose
+    /// destination's configuration differs from the output's refuses the
+    /// whole set `FormatMismatch` before anything is armed. A destination
+    /// with an extractor but no RAP seen yet is `Pending`.
+    pub(crate) fn preflight_group(&self, members: &[(usize, usize)]) -> GroupPreflight {
+        let mut pending = false;
+        for &(output, key) in members {
+            let Some(b) = self.bindings.iter().find(|b| b.output_index == output) else {
+                continue;
+            };
+            if b.inband_ok || b.video_key == Some(key) {
+                continue;
+            }
+            let Some(meta) = self.video_meta.get(key).filter(|m| m.params.is_some()) else {
+                continue;
+            };
+            match meta.last_rap.as_ref() {
+                None => pending = true,
+                Some(sets) if sets_change(b.last_sets.as_ref(), sets) => {
+                    return GroupPreflight::FormatMismatch;
+                }
+                Some(_) => {}
+            }
+        }
+        if pending {
+            GroupPreflight::Pending
+        } else {
+            GroupPreflight::Ready
+        }
+    }
+    /// Grouped moves held now (test observation).
+    #[cfg(test)]
+    pub(crate) fn move_groups(&self) -> usize {
+        self.groups.len()
     }
     /// Install the parameter-set extractor of a base or live key (used to
     /// detect a decoder-configuration change at a move).
@@ -3492,6 +3938,131 @@ mod tests {
             ]
         );
         assert_eq!((discontinuities, key), (2, Some(1)));
+    }
+
+    /// A gated RAP of `len` bytes (`len >= 6`).
+    fn rap_len(dts: i64, len: usize) -> EncodedPacket {
+        let mut bytes = vec![0_u8; len];
+        bytes[..6].copy_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
+        let mut raw = Packet::copy(&bytes);
+        raw.set_pts(Some(dts));
+        raw.set_dts(Some(dts));
+        raw.set_flags(Flags::KEY);
+        EncodedPacket::with_kind(raw, StreamKind::Video)
+    }
+
+    /// Extractor whose keyframe sets are the packet length (`[len]`).
+    fn len_sets() -> ParameterSets {
+        Box::new(|p: &EncodedPacket| {
+            if p.is_keyframe() {
+                RapParameterSets::Sets(vec![u8::try_from(p.len()).unwrap()])
+            } else {
+                RapParameterSets::Absent
+            }
+        })
+    }
+
+    /// One output on base key 0 fed `frames` (one packet per window); returns
+    /// the discontinuities seen and each delivered lease's config flag.
+    fn steady(inband: bool, sets: ParameterSets, frames: &[EncodedPacket]) -> (usize, Vec<bool>) {
+        let now = Instant::now();
+        let mut b = binding(0, 0, 1);
+        b.inband_parameter_changes_ok = inband;
+        let mut d = RenditionDispatcher::new(gated_cfg(vec![b], 1, 1)).unwrap();
+        let mut sink = FakeDelivery::new(1);
+        d.set_parameter_sets(0, sets).unwrap();
+        let mut discontinuities = 0;
+        let mut flags = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            let i = i64::try_from(i).unwrap();
+            let p = f.clone_shared_ref().unwrap();
+            feed_base(&mut d, &mut sink, 1, i, now, move |_| {
+                p.clone_shared_ref().unwrap()
+            })
+            .unwrap();
+            while let Ok(Some(lease)) = sink.queues[0].pop_at(now) {
+                flags.push(lease.decoder_config_changed());
+            }
+            if sink.queues[0].take_discontinuity().is_some() {
+                discontinuities += 1;
+            }
+        }
+        (discontinuities, flags)
+    }
+
+    /// #344 D2a (behaviour change): a keyframe of the CURRENT key whose
+    /// parameter sets differ from the ones the output carries (a passthrough
+    /// key switching source <-> slate, or a source changing its sets) signals
+    /// exactly one decoder-config change on an in-band output, on the lease
+    /// of the window that carries it; equal later keyframes signal nothing.
+    #[test]
+    fn a_steady_state_set_change_on_the_current_key_signals_exactly_once() {
+        let frames = [
+            rap_len(0, 77),
+            video(1, 8, false),
+            rap_len(2, 77),
+            rap_len(3, 78),
+            video(4, 8, false),
+            rap_len(5, 78),
+            rap_len(6, 78),
+        ];
+        let (discontinuities, flags) = steady(true, len_sets(), &frames);
+        assert_eq!(discontinuities, 1);
+        assert_eq!(flags, [false, false, false, true, false, false, false]);
+        // Back to the first sets is another real change: one more.
+        let frames = [rap_len(0, 77), rap_len(1, 78), rap_len(2, 77)];
+        assert_eq!(steady(true, len_sets(), &frames).0, 2);
+    }
+
+    /// An ordinary encoder's sets never change: no config change, ever, on
+    /// an in-band or an out-of-band output (the steady-state tracking only
+    /// records the first keyframe's sets).
+    #[test]
+    fn an_ordinary_encoder_never_signals_a_steady_state_set_change() {
+        let frames: Vec<EncodedPacket> = (0..40)
+            .map(|i| {
+                if i % 5 == 0 {
+                    rap_len(i, 77)
+                } else {
+                    video(i, 8, false)
+                }
+            })
+            .collect();
+        for inband in [true, false] {
+            let fixed = fixed_sets(RapParameterSets::Sets(vec![9, 9]));
+            let (discontinuities, flags) = steady(inband, fixed, &frames);
+            assert_eq!(discontinuities, 0, "inband {inband}");
+            assert!(flags.iter().all(|f| !f));
+            let (discontinuities, _) = steady(inband, len_sets(), &frames);
+            assert_eq!(discontinuities, 0, "inband {inband}");
+        }
+    }
+
+    /// A steady-state keyframe whose scan is rejected leaves the output's
+    /// configuration unknown: that keyframe is one change, and the next
+    /// keyframe with sets is another (never a silent splice).
+    #[test]
+    fn a_rejected_steady_state_scan_is_a_change_and_so_is_the_next_set() {
+        let sets: ParameterSets = Box::new(|p: &EncodedPacket| match (p.is_keyframe(), p.len()) {
+            (false, _) => RapParameterSets::Absent,
+            (true, 79) => RapParameterSets::Rejected,
+            (true, len) => RapParameterSets::Sets(vec![u8::try_from(len).unwrap()]),
+        });
+        let frames = [
+            rap_len(0, 77),
+            rap_len(1, 79),
+            rap_len(2, 77),
+            rap_len(3, 77),
+        ];
+        assert_eq!(steady(true, sets, &frames).0, 2);
+    }
+
+    /// An out-of-band output cannot take a decoder-config change mid-stream
+    /// (fMP4 init, FLV header, SDP): steady-state tracking only records there.
+    #[test]
+    fn a_steady_state_set_change_on_an_out_of_band_output_is_only_recorded() {
+        let frames = [rap_len(0, 77), rap_len(1, 78), rap_len(2, 78)];
+        assert_eq!(steady(false, len_sets(), &frames).0, 0);
     }
 
     /// Extractor whose keyframe sets are `sets` (any non-keyframe: Absent).

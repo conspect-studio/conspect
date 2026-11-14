@@ -22,6 +22,7 @@ use multiview_core::color::{
 
 use crate::blend::{over, LinearRgba, PremulRgba};
 use crate::error::{Error, Result};
+use crate::key::{key_factor, SceneMember, SceneMerge, TileGroup, TileKey};
 use crate::transfer_lut::LutSet;
 use crate::{matrix, primaries, range, transfer};
 
@@ -616,8 +617,15 @@ pub struct Tile<'a> {
     /// Destination height (pixels) of the tile on the canvas. The source is
     /// scaled to this height when it differs from `image.height()`.
     pub dst_h: u32,
-    /// Uniform tile opacity in `[0, 1]` (straight alpha).
+    /// Uniform tile opacity in `[0, 1]` (straight alpha). For a keyer this
+    /// carries the keyer's on-air weight (ADR-0113 §3).
     pub opacity: f32,
+    /// Optional key block (ADR-0113 §3): luma/linear matte, key source and
+    /// mask. `None` is an ordinary tile, byte-for-byte the prior behaviour.
+    pub key: Option<TileKey<'a>>,
+    /// Scene group for an exact key-changing transition (ADR-0113 §2).
+    /// [`TileGroup::Top`] (the default) is an ordinary layer.
+    pub group: TileGroup,
     /// An optional wipe mask (ADR-0112 §3): its per-canvas-pixel coverage
     /// multiplies into the tile alpha at the one premultiply step.
     pub mask: Option<crate::mask::WipeMask>,
@@ -636,6 +644,8 @@ impl<'a> Tile<'a> {
             dst_w: image.width,
             dst_h: image.height,
             opacity,
+            key: None,
+            group: TileGroup::Top,
             mask: None,
         }
     }
@@ -660,8 +670,25 @@ impl<'a> Tile<'a> {
             dst_w,
             dst_h,
             opacity,
+            key: None,
+            group: TileGroup::Top,
             mask: None,
         }
+    }
+
+    /// Attach a key block (ADR-0113 §3): this tile becomes a keyer whose
+    /// coverage is `opacity × mask × fill_alpha × matte`.
+    #[must_use]
+    pub const fn with_key(mut self, key: TileKey<'a>) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    /// Put this tile in a transition scene group (ADR-0113 §2).
+    #[must_use]
+    pub const fn in_group(mut self, group: TileGroup) -> Self {
+        self.group = group;
+        self
     }
 
     /// This tile, drawn through a wipe `mask` (ADR-0112 §3).
@@ -671,9 +698,19 @@ impl<'a> Tile<'a> {
         self
     }
 
-    /// The mask coverage at canvas pixel `(px, py)`; `1` without a mask.
-    fn mask_coverage(&self, px: u32, py: u32) -> f32 {
-        self.mask.as_ref().map_or(1.0, |mask| mask.coverage(px, py))
+    /// The mask coverage at canvas pixel `(px, py)` of a `canvas_w x canvas_h`
+    /// canvas; `1` without a mask. `WipeMask` has public fields: a mask not
+    /// valid for this canvas ([`crate::mask::WipeMask::is_valid_for`]) covers
+    /// nothing, and any coverage is clamped to `[0, 1]` with NaN read as 0, so
+    /// it can never poison the layers beneath.
+    fn mask_coverage(&self, px: u32, py: u32, canvas_wh: (u32, u32)) -> f32 {
+        self.mask.as_ref().map_or(1.0, |mask| {
+            if mask.is_valid_for(canvas_wh.0, canvas_wh.1) {
+                crate::key::unit(mask.coverage(px, py))
+            } else {
+                0.0
+            }
+        })
     }
 
     /// The destination width in pixels (the source is scaled to it). Falls back
@@ -818,32 +855,11 @@ pub(crate) struct BandScratch {
     acc: Vec<PremulRgba>,
     /// Coverage sentinel parallel to `acc`.
     cover: Coverage,
-}
-
-impl BandScratch {
-    /// Prepare this scratch for a composite over `span_pixels` pixels and return
-    /// the `(accumulator, coverage)` split. Grows `acc`/`cover` only when shorter
-    /// than the span (bumping `counter` once per growth); the coverage generation
-    /// is advanced so neither buffer needs a per-tick clear. The returned
-    /// accumulator slice is exactly `span_pixels` long.
-    fn begin(
-        &mut self,
-        span_pixels: usize,
-        counter: &AtomicU64,
-    ) -> (&mut [PremulRgba], &mut Coverage) {
-        if self.acc.len() < span_pixels {
-            self.acc.resize(span_pixels, PremulRgba::TRANSPARENT);
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
-        if self.cover.begin(span_pixels) {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
-        let acc = match self.acc.get_mut(..span_pixels) {
-            Some(slice) => slice,
-            None => &mut [], // unreachable after the resize above; total, no panic
-        };
-        (acc, &mut self.cover)
-    }
+    /// Outgoing-scene accumulator of a key-changing transition (ADR-0113 §2).
+    /// Empty until the first grouped composite; grow-only, pooled.
+    scene_out: Vec<PremulRgba>,
+    /// Incoming-scene accumulator, parallel to `scene_out`.
+    scene_in: Vec<PremulRgba>,
 }
 
 /// The per-run pool of band scratch buffers the CPU compositor reuses every tick
@@ -960,8 +976,11 @@ impl LutCache {
     /// same transfers — dedup is first-seen and lookups are by transfer value, so
     /// the input order never matters — hence the composite output is unchanged.
     pub(crate) fn ensure(&mut self, canvas: CanvasColor, tiles: &[Tile<'_>]) -> &LutSet {
-        let want = present_transfers(canvas, tiles);
-        if !self.have || !same_transfer_set(&self.key, &want) {
+        // The steady-state check is allocation-free: the frame's transfer set is
+        // compared against the cached one in place, and only a changed set builds
+        // the deduped list (and the tables).
+        if !self.have || !matches_transfer_set(&self.key, canvas, tiles) {
+            let want = present_transfers(canvas, tiles);
             self.luts = LutSet::for_transfers(want.iter().copied());
             self.key = want;
             self.have = true;
@@ -990,9 +1009,23 @@ fn push_unique(set: &mut Vec<TransferCharacteristic>, t: TransferCharacteristic)
     }
 }
 
-/// Order-independent set equality of two deduped transfer lists.
-fn same_transfer_set(a: &[TransferCharacteristic], b: &[TransferCharacteristic]) -> bool {
-    a.len() == b.len() && a.iter().all(|t| b.contains(t))
+/// Whether the deduped list `key` equals, as a set, the transfers present across
+/// `canvas` and `tiles` (the set [`present_transfers`] would build), without
+/// allocating: every present transfer is in `key`, and every `key` entry is
+/// present.
+fn matches_transfer_set(
+    key: &[TransferCharacteristic],
+    canvas: CanvasColor,
+    tiles: &[Tile<'_>],
+) -> bool {
+    let present = |t: &TransferCharacteristic| {
+        canvas.transfer == *t || tiles.iter().any(|tile| tile.image.color().transfer == *t)
+    };
+    key.contains(&canvas.transfer)
+        && tiles
+            .iter()
+            .all(|tile| key.contains(&tile.image.color().transfer))
+        && key.iter().all(present)
 }
 
 /// Composite a back-to-front stack of [`Tile`]s onto a `canvas_w x canvas_h`
@@ -1173,6 +1206,7 @@ pub(crate) fn composite_core(
                 w,
                 0,
                 canvas_h,
+                (canvas_w, canvas_h),
                 canvas,
                 background,
                 tiles,
@@ -1188,6 +1222,7 @@ pub(crate) fn composite_core(
             w,
             total_pairs,
             workers,
+            (canvas_w, canvas_h),
             canvas,
             background,
             tiles,
@@ -1259,6 +1294,7 @@ pub fn composite_reference(
         w,
         0,
         canvas_h,
+        (canvas_w, canvas_h),
         canvas,
         background,
         tiles,
@@ -1282,6 +1318,7 @@ fn composite_parallel(
     w: usize,
     total_pairs: usize,
     workers: usize,
+    canvas_wh: (u32, u32),
     canvas: CanvasColor,
     background: LinearRgba,
     tiles: &[Tile<'_>],
@@ -1326,6 +1363,7 @@ fn composite_parallel(
                     w,
                     py_start,
                     band_h,
+                    canvas_wh,
                     canvas,
                     background,
                     tiles,
@@ -1387,6 +1425,7 @@ fn composite_band_reference(
     w: usize,
     py_start: u32,
     band_h: u32,
+    canvas_wh: (u32, u32),
     canvas: CanvasColor,
     background: LinearRgba,
     tiles: &[Tile<'_>],
@@ -1396,31 +1435,45 @@ fn composite_band_reference(
     for py_local in 0..band_h {
         let py = py_start.saturating_add(py_local);
         for px in 0..u32::try_from(w).unwrap_or(u32::MAX) {
-            // Fold the covering tiles back-to-front in linear light.
+            // Fold the covering tiles back-to-front in linear light. Scene
+            // groups (ADR-0113 §2) fold into two accumulators that merge at the
+            // next `Top` layer (or the end of the list).
             let mut acc = bg_premul;
+            let mut seg: Option<(PremulRgba, PremulRgba, SceneMerge)> = None;
             for tile in tiles {
-                let Some((sx, sy)) = tile_local_coords(tile, px, py) else {
-                    continue;
-                };
-                let Some((y8, cb8, cr8)) = tile.image.sample(sx, sy) else {
-                    continue;
-                };
-                let lin = match luts {
-                    Some(lut) => {
-                        lut.tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?
+                if tile.group == TileGroup::Top {
+                    if let Some((o, i, merge)) = seg.take() {
+                        acc = merge.apply(o, i);
                     }
-                    None => tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?,
-                };
-                let src = LinearRgba {
-                    r: lin[0],
-                    g: lin[1],
-                    b: lin[2],
-                    a: tile.opacity.clamp(0.0, 1.0)
-                        * tile_alpha(tile.image, sx, sy)
-                        * tile.mask_coverage(px, py),
                 }
-                .premultiplied();
-                acc = over(src, acc);
+                let src = match tile_dst_offset(tile, px, py) {
+                    Some((ddx, ddy)) => {
+                        tile_pixel(tile, ddx, ddy, (px, py), canvas_wh, canvas, luts)?
+                    }
+                    None => None,
+                };
+                match tile.group {
+                    TileGroup::Top => {
+                        if let Some(src) = src {
+                            acc = over(src, acc);
+                        }
+                    }
+                    TileGroup::Scene { member, merge } => {
+                        let (o, i, m) = seg.get_or_insert((acc, acc, merge));
+                        *m = merge;
+                        if let Some(src) = src {
+                            if member != SceneMember::In {
+                                *o = over(src, *o);
+                            }
+                            if member != SceneMember::Out {
+                                *i = over(src, *i);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((o, i, merge)) = seg {
+                acc = merge.apply(o, i);
             }
             let straight = PremulRgba {
                 r: acc.r,
@@ -1491,6 +1544,7 @@ fn composite_band(
     w: usize,
     py_start: u32,
     band_h: u32,
+    canvas_wh: (u32, u32),
     canvas: CanvasColor,
     background: LinearRgba,
     tiles: &[Tile<'_>],
@@ -1525,7 +1579,13 @@ fn composite_band(
     //    band — inv #5: the scratch is O(covered_rows × width), never the whole
     //    frame. Rows outside the span keep the background constant the fill
     //    wrote, so an all-background band allocates no accumulator at all.
-    let Some((span_start, span_end)) = covered_row_span(band_rows, py_start, tiles) else {
+    let span = if tiles.iter().any(|t| t.group != TileGroup::Top) {
+        // A scene merge covers the whole band (see below).
+        Some((0, band_rows))
+    } else {
+        covered_row_span(band_rows, py_start, tiles)
+    };
+    let Some((span_start, span_end)) = span else {
         return Ok(()); // no tile touches this band: it is all background
     };
     let span_rows = span_end.saturating_sub(span_start);
@@ -1538,18 +1598,137 @@ fn composite_band(
     //    the resident accumulator. That is byte-for-byte the old
     //    `vec![bg_premul; span_pixels]` + `vec![false; span_pixels]` algorithm,
     //    without either per-tick allocation or full-span initialisation.
-    let (acc, covered) = scratch.begin(span_pixels, alloc_count);
-    for tile in tiles {
-        fold_tile_into_band(
-            acc, covered, bg_premul, w, span_start, span_rows, py_start, tile, canvas, luts,
-        )?;
-    }
+    let geom = BandGeom {
+        w,
+        span_start,
+        span_rows,
+        py_start,
+        canvas_wh,
+    };
+    let (acc, covered) = fold_tiles(
+        scratch,
+        &geom,
+        span_pixels,
+        bg_premul,
+        tiles,
+        canvas,
+        luts,
+        alloc_count,
+    )?;
 
     // 4. Re-encode through the back half ONLY the pixels a tile touched; the
     //    rest already hold the precomputed background constant.
     encode_covered_pixels(
         band_y, band_uv, w, span_start, span_rows, acc, covered, canvas, luts,
     )
+}
+
+/// Fold every tile into the band accumulator in slice order (step 3 of
+/// [`composite_band`]). `Top` tiles fold `over` the main accumulator; a run of
+/// scene-grouped tiles (ADR-0113 §2) folds into the pooled outgoing/incoming
+/// accumulators and is merged into the main one at the next `Top` tile or the
+/// end of the list. Returns the main accumulator and its coverage.
+#[allow(clippy::too_many_arguments)]
+// reason: the band scratch, geometry and the shared composite parameters.
+fn fold_tiles<'s>(
+    scratch: &'s mut BandScratch,
+    geom: &BandGeom,
+    span_pixels: usize,
+    bg_premul: PremulRgba,
+    tiles: &[Tile<'_>],
+    canvas: CanvasColor,
+    luts: Option<&LutSet>,
+    alloc_count: &AtomicU64,
+) -> Result<(&'s [PremulRgba], &'s Coverage)> {
+    let grouped = tiles.iter().any(|t| t.group != TileGroup::Top);
+    let BandScratch {
+        acc,
+        cover,
+        scene_out,
+        scene_in,
+    } = scratch;
+    let (acc, covered) = begin_main(acc, cover, span_pixels, alloc_count);
+    if grouped {
+        // A scene merge applies to every pixel of the band (a DIP colours
+        // even pixels no grouped tile covers), so the pooled scene
+        // accumulators span the whole band; they exist only while a
+        // key-changing transition runs (ADR-0113 §2).
+        grow_scene(scene_out, span_pixels, alloc_count);
+        grow_scene(scene_in, span_pixels, alloc_count);
+    }
+    let mut seg: Option<SceneMerge> = None;
+    for tile in tiles {
+        match tile.group {
+            TileGroup::Top => {
+                if let Some(merge) = seg.take() {
+                    merge_scenes(
+                        acc,
+                        covered,
+                        bg_premul,
+                        scene_out,
+                        scene_in,
+                        span_pixels,
+                        merge,
+                    );
+                }
+                fold_tile_into_band(geom, tile, canvas, luts, |idx, src| {
+                    let base = if covered.is_covered(idx) {
+                        acc.get(idx).copied().unwrap_or(bg_premul)
+                    } else {
+                        bg_premul
+                    };
+                    if let Some(slot) = acc.get_mut(idx) {
+                        *slot = over(src, base);
+                    }
+                    covered.mark(idx);
+                })?;
+            }
+            TileGroup::Scene { member, merge } => {
+                if seg.is_none() {
+                    // Both scenes start from what lies beneath.
+                    for idx in 0..span_pixels {
+                        let v = if covered.is_covered(idx) {
+                            acc.get(idx).copied().unwrap_or(bg_premul)
+                        } else {
+                            bg_premul
+                        };
+                        if let Some(o) = scene_out.get_mut(idx) {
+                            *o = v;
+                        }
+                        if let Some(i) = scene_in.get_mut(idx) {
+                            *i = v;
+                        }
+                    }
+                }
+                seg = Some(merge);
+                fold_tile_into_band(geom, tile, canvas, luts, |idx, src| {
+                    if member != SceneMember::In {
+                        if let Some(o) = scene_out.get_mut(idx) {
+                            *o = over(src, *o);
+                        }
+                    }
+                    if member != SceneMember::Out {
+                        if let Some(i) = scene_in.get_mut(idx) {
+                            *i = over(src, *i);
+                        }
+                    }
+                })?;
+            }
+        }
+    }
+    if let Some(merge) = seg {
+        merge_scenes(
+            acc,
+            covered,
+            bg_premul,
+            scene_out,
+            scene_in,
+            span_pixels,
+            merge,
+        );
+    }
+
+    Ok((acc, covered))
 }
 
 /// The band-local **covered row range** `[start, end)` (half-open) of the rows
@@ -1618,31 +1797,141 @@ pub fn covered_row_span(
     Some((start, end))
 }
 
-/// Fold one tile's `rect ∩ accumulator-span` into the premultiplied accumulator
-/// `acc` (back-to-front `over`), marking `covered` for each touched pixel. The
-/// accumulator covers `span_rows` band-local rows starting at band-local row
-/// `span_start`; `py_start` is the band's global top row. Only the pixels inside
-/// the tile's clipped destination rect are visited — the tile-driven inner loop
-/// (vs. the reference's per-pixel-all-tiles scan).
-#[allow(clippy::too_many_arguments)]
-// reason: the band accumulator + coverage, the band geometry, and the tile +
-// shared composite parameters; a struct would not shrink the surface.
-fn fold_tile_into_band(
-    acc: &mut [PremulRgba],
-    covered: &mut Coverage,
-    bg_premul: PremulRgba,
+/// The band geometry an accumulator covers: `span_rows` band-local rows from
+/// band-local row `span_start` of a band whose global top row is `py_start`.
+struct BandGeom {
     w: usize,
     span_start: usize,
     span_rows: usize,
     py_start: u32,
+    /// The whole canvas `(width, height)` (a wipe mask is valid only for it).
+    canvas_wh: (u32, u32),
+}
+
+/// Begin the main accumulator + coverage for a composite over `span_pixels`
+/// (the prior `BandScratch::begin`, split so the scene accumulators can be
+/// borrowed alongside).
+fn begin_main<'s>(
+    acc: &'s mut Vec<PremulRgba>,
+    cover: &'s mut Coverage,
+    span_pixels: usize,
+    counter: &AtomicU64,
+) -> (&'s mut [PremulRgba], &'s mut Coverage) {
+    if acc.len() < span_pixels {
+        acc.resize(span_pixels, PremulRgba::TRANSPARENT);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    if cover.begin(span_pixels) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    let acc = match acc.get_mut(..span_pixels) {
+        Some(slice) => slice,
+        None => &mut [], // unreachable after the resize above; total, no panic
+    };
+    (acc, cover)
+}
+
+/// Grow a pooled scene accumulator to `span_pixels` (grow-only, counted).
+fn grow_scene(buf: &mut Vec<PremulRgba>, span_pixels: usize, counter: &AtomicU64) {
+    if buf.len() < span_pixels {
+        buf.resize(span_pixels, PremulRgba::TRANSPARENT);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Close a scene segment: write `merge(out, in)` for every pixel of the span
+/// into the main accumulator and mark it covered (ADR-0113 §2).
+fn merge_scenes(
+    acc: &mut [PremulRgba],
+    covered: &mut Coverage,
+    bg_premul: PremulRgba,
+    scene_out: &[PremulRgba],
+    scene_in: &[PremulRgba],
+    span_pixels: usize,
+    merge: SceneMerge,
+) {
+    for idx in 0..span_pixels {
+        let o = scene_out.get(idx).copied().unwrap_or(bg_premul);
+        let i = scene_in.get(idx).copied().unwrap_or(bg_premul);
+        if let Some(slot) = acc.get_mut(idx) {
+            *slot = merge.apply(o, i);
+        }
+        covered.mark(idx);
+    }
+}
+
+/// One tile's premultiplied-linear source value at destination-rect offset
+/// `(ddx, ddy)`: the fixed front half (#8 steps 1-4) and the coverage
+/// `opacity × fill_alpha × wipe_mask(canvas_px) × key_mask × matte`
+/// (ADR-0113 §3, ADR-0112 §3), premultiplied once.
+/// `None` when the source sample is out of bounds (defensive).
+fn tile_pixel(
+    tile: &Tile<'_>,
+    ddx: u32,
+    ddy: u32,
+    canvas_px: (u32, u32),
+    canvas_wh: (u32, u32),
+    canvas: CanvasColor,
+    luts: Option<&LutSet>,
+) -> Result<Option<PremulRgba>> {
+    // Scale-at-composite: map the destination-rect offset to the source
+    // pixel (nearest-neighbour; identity when dst size == src size).
+    let (sx, sy) = tile.src_pixel_for(ddx, ddy);
+    let Some((y8, cb8, cr8)) = tile.image.sample(sx, sy) else {
+        return Ok(None);
+    };
+    let lin = match luts {
+        Some(lut) => lut.tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?,
+        None => tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?,
+    };
+    // `unit` maps a NaN opacity (a keyer's weight rides it) to 0, so a bad
+    // weight never poisons the layers beneath; finite values clamp as before.
+    // The wipe mask (ADR-0112 §3) multiplies in at the same single premultiply.
+    let mut a = crate::key::unit(tile.opacity)
+        * tile_alpha(tile.image, sx, sy)
+        * tile.mask_coverage(canvas_px.0, canvas_px.1, canvas_wh);
+    if let Some(key) = &tile.key {
+        // Post-range-expand fill Y (pipeline step 1) for a luma self key.
+        let fill_y = range::expand_luma(y8, range::require_resolved(tile.image.color().range)?);
+        a *= key_factor(
+            key,
+            sx,
+            sy,
+            ddx,
+            ddy,
+            tile.eff_dst_w(),
+            tile.eff_dst_h(),
+            fill_y,
+        )?;
+    }
+    Ok(Some(
+        LinearRgba {
+            r: lin[0],
+            g: lin[1],
+            b: lin[2],
+            a,
+        }
+        .premultiplied(),
+    ))
+}
+
+/// Visit one tile's `rect ∩ accumulator-span`, calling `fold(idx, src)` with
+/// the accumulator index and the tile's premultiplied source value for each
+/// pixel. Only the pixels inside the tile's clipped destination rect are
+/// visited — the tile-driven inner loop (vs. the reference's
+/// per-pixel-all-tiles scan).
+fn fold_tile_into_band(
+    geom: &BandGeom,
     tile: &Tile<'_>,
     canvas: CanvasColor,
     luts: Option<&LutSet>,
+    mut fold: impl FnMut(usize, PremulRgba),
 ) -> Result<()> {
+    let w = geom.w;
     // Global top/bottom (exclusive) of the accumulator's covered span.
-    let band_top = i64::from(py_start);
-    let span_top = band_top.saturating_add(i64::try_from(span_start).unwrap_or(0));
-    let span_bottom = span_top.saturating_add(i64::try_from(span_rows).unwrap_or(0)); // exclusive
+    let band_top = i64::from(geom.py_start);
+    let span_top = band_top.saturating_add(i64::try_from(geom.span_start).unwrap_or(0));
+    let span_bottom = span_top.saturating_add(i64::try_from(geom.span_rows).unwrap_or(0)); // exclusive
     let w_i64 = i64::try_from(w).unwrap_or(i64::MAX);
 
     let dst_x = i64::from(tile.dst_x);
@@ -1662,7 +1951,6 @@ fn fold_tile_into_band(
     if gx0 >= gx1 || gy0 >= gy1 {
         return Ok(()); // disjoint from the accumulator span (or fully off-canvas)
     }
-    let opacity = tile.opacity.clamp(0.0, 1.0);
 
     let mut gy = gy0;
     while gy < gy1 {
@@ -1682,45 +1970,14 @@ fn fold_tile_into_band(
                 gx += 1;
                 continue;
             };
-            // Scale-at-composite: map the destination-rect offset to the source
-            // pixel (nearest-neighbour; identity when dst size == src size).
-            let (src_x, src_y) = tile.src_pixel_for(ddx, ddy);
-            if let Some((y8, cb8, cr8)) = tile.image.sample(src_x, src_y) {
-                let lin = match luts {
-                    Some(lut) => {
-                        lut.tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?
-                    }
-                    None => tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?,
-                };
-                // Canvas pixel for the wipe mask (bands split rows only).
-                let canvas_px = (
-                    u32::try_from(gx).unwrap_or(0),
-                    u32::try_from(gy).unwrap_or(0),
-                );
-                let src = LinearRgba {
-                    r: lin[0],
-                    g: lin[1],
-                    b: lin[2],
-                    a: opacity
-                        * tile_alpha(tile.image, src_x, src_y)
-                        * tile.mask_coverage(canvas_px.0, canvas_px.1),
-                }
-                .premultiplied();
-                // The accumulator destination: the resident value if this pixel
-                // was already folded this tick, else the background constant (its
-                // first touch). Reproduces the old `vec![bg_premul; ..]` prefill
-                // exactly (back-to-front `over` from `bg_premul`) without a fill.
-                let idx = row_base + col;
-                let base = if covered.is_covered(idx) {
-                    acc.get(idx).copied().unwrap_or(bg_premul)
-                } else {
-                    bg_premul
-                };
-                let blended = over(src, base);
-                if let Some(slot) = acc.get_mut(idx) {
-                    *slot = blended;
-                }
-                covered.mark(idx);
+            // Canvas pixel for the wipe mask (bands split rows only).
+            let canvas_px = (
+                u32::try_from(gx).unwrap_or(0),
+                u32::try_from(gy).unwrap_or(0),
+            );
+            if let Some(src) = tile_pixel(tile, ddx, ddy, canvas_px, geom.canvas_wh, canvas, luts)?
+            {
+                fold(row_base + col, src);
             }
             gx += 1;
         }
@@ -1828,20 +2085,21 @@ fn fill_band_solid(
     }
 }
 
-/// Map a canvas pixel to the **source** coordinate the tile samples there, or
-/// [`None`] if the pixel is outside the tile's destination rectangle.
+/// Map a canvas pixel to its **destination-rect offset** `(ddx, ddy)` in the
+/// tile, or [`None`] if the pixel is outside the tile's destination rectangle.
+/// [`Tile::src_pixel_for`] then maps the offset to the source pixel.
 ///
 /// The destination rect is `[dst_x, dst_x + dst_w) × [dst_y, dst_y + dst_h)`; a
 /// pixel inside it maps to a source pixel via nearest-neighbour scaling
 /// ([`Tile::src_pixel_for`]). When `dst_w`/`dst_h` equal the source size this is
 /// the identity, so a 1:1 tile is byte-for-byte the prior behaviour.
-fn tile_local_coords(tile: &Tile<'_>, px: u32, py: u32) -> Option<(u32, u32)> {
+fn tile_dst_offset(tile: &Tile<'_>, px: u32, py: u32) -> Option<(u32, u32)> {
     let ddx = px.checked_sub(tile.dst_x)?;
     let ddy = py.checked_sub(tile.dst_y)?;
     if ddx >= tile.eff_dst_w() || ddy >= tile.eff_dst_h() {
         return None;
     }
-    Some(tile.src_pixel_for(ddx, ddy))
+    Some((ddx, ddy))
 }
 
 /// Write one output pixel's `(y, cb, cr)` into the NV12 planes. Chroma is
@@ -1880,5 +2138,61 @@ fn write_chroma(uv_plane: &mut [u8], w: usize, px: u32, py: u32, cb: u8, cr: u8)
     }
     if let Some(slot) = uv_plane.get_mut(uv_index + 1) {
         *slot = cr;
+    }
+}
+
+#[cfg(test)]
+mod transfer_set_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::{matches_transfer_set, present_transfers, CanvasColor, Nv12Image, Tile};
+    use multiview_core::color::{
+        ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic as T,
+    };
+
+    fn img(transfer: T) -> Nv12Image {
+        let color = ColorInfo {
+            primaries: ColorPrimaries::Bt709,
+            transfer,
+            matrix: MatrixCoefficients::Bt709,
+            range: ColorRange::Limited,
+        };
+        Nv12Image::solid(2, 2, 128, 128, 128, color).unwrap()
+    }
+
+    /// The allocation-free check agrees with set equality against the list
+    /// `present_transfers` builds, for every key and frame drawn from a small
+    /// universe (review A-1 round 2).
+    #[test]
+    fn matches_transfer_set_equals_set_equality_with_present_transfers() {
+        let all = [T::Bt709, T::Pq, T::Hlg, T::Srgb];
+        let imgs: Vec<Nv12Image> = all.iter().map(|&t| img(t)).collect();
+        let canvas = CanvasColor::default();
+        // Every subset of tiles (as a frame) against every subset-derived key.
+        for frame_mask in 0_u32..16 {
+            let tiles: Vec<Tile<'_>> = (0..4)
+                .filter(|i| frame_mask & (1 << i) != 0)
+                .map(|i| Tile::placed(&imgs[i], 0, 0, 1.0))
+                .collect();
+            let want = present_transfers(canvas, &tiles);
+            for key_mask in 0_u32..16 {
+                let key_tiles: Vec<Tile<'_>> = (0..4)
+                    .filter(|i| key_mask & (1 << i) != 0)
+                    .map(|i| Tile::placed(&imgs[i], 0, 0, 1.0))
+                    .collect();
+                let mut key = present_transfers(canvas, &key_tiles);
+                key.reverse(); // order never matters
+                let expected = key.len() == want.len() && key.iter().all(|t| want.contains(t));
+                assert_eq!(
+                    matches_transfer_set(&key, canvas, &tiles),
+                    expected,
+                    "frame {frame_mask:04b} key {key_mask:04b}"
+                );
+            }
+        }
+        assert!(
+            !matches_transfer_set(&[], canvas, &[]),
+            "an empty key never matches"
+        );
     }
 }

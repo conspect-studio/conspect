@@ -23,10 +23,18 @@
 //! `background`; the output carries the canvas tag. The CPU variant is a thin,
 //! byte-for-byte dispatch to the free function (no re-encode, no reorder).
 //!
-//! Neither variant blocks on an input or a client. The GPU `composite` is a
-//! synchronous submit+readback that **returns** a typed error on a runtime
-//! failure (it does not wait forever); callers on the hot path treat such an
-//! error as a per-tick fault and hold last-good rather than crashing.
+//! Neither variant blocks on an input or a client. On the output clock
+//! ([`RunBackend::composite_job`]) a GPU backend composites on its own
+//! prewarmed worker thread and the clock waits for it at most a bounded time
+//! ([`crate::offclock`], issue #415). The readback inside the job is bounded
+//! too ([`crate::readback`], issue #395). A frame that is not ready in time
+//! returns [`crate::error::Error::GpuDeadline`] (the engine repeats last-good
+//! under the tick, counted). A GPU stalled past
+//! [`crate::readback::STALL_HOLD`], or one that hit a genuine runtime failure,
+//! gets its frames composited on the CPU reference, also off the clock. A lost
+//! device (callback, uncaptured error, or a wgpu panic) goes to the CPU for
+//! good. A hung or lost GPU therefore never stalls, ends or panics the output
+//! clock, and the GPU compositor is never torn down on the clock thread.
 
 use crate::blend::LinearRgba;
 use crate::error::Result;
@@ -186,6 +194,9 @@ pub enum RunBackendKind {
     /// The portable wgpu GPU compositor ([`crate::gpu::GpuCompositor`]).
     #[cfg(feature = "wgpu")]
     Gpu,
+    /// The simulated GPU chaos-test seam ([`RunBackend::simulated_gpu`]).
+    #[doc(hidden)]
+    SimulatedGpu,
 }
 
 /// The persistent CPU-reference backend: owns the transfer-LUT cache and the
@@ -225,7 +236,7 @@ impl CpuBackend {
 
     /// Composite one CPU frame with memoized transfer LUTs + reused band scratch,
     /// fanning across [`auto_thread_count`] worker threads (the production path).
-    fn composite(
+    pub(crate) fn composite(
         &self,
         canvas_w: u32,
         canvas_h: u32,
@@ -249,7 +260,7 @@ impl CpuBackend {
     /// byte-identical for any `n_threads` (the band split only partitions work;
     /// [`crate::pipeline::composite_with_threads`] documents the invariant), so
     /// this changes only *which* code path runs, never the pixels.
-    fn composite_with_thread_count(
+    pub(crate) fn composite_with_thread_count(
         &self,
         canvas_w: u32,
         canvas_h: u32,
@@ -273,19 +284,31 @@ impl CpuBackend {
         )
     }
 
+    /// [`CpuBackend::composite`] for the off-clock CPU fallback worker.
+    pub(crate) fn composite_persistent(
+        &self,
+        canvas_w: u32,
+        canvas_h: u32,
+        canvas: CanvasColor,
+        background: LinearRgba,
+        tiles: &[Tile<'_>],
+    ) -> Result<Nv12Image> {
+        self.composite(canvas_w, canvas_h, canvas, background, tiles)
+    }
+
     /// Number of transfer-LUT set builds since this backend was constructed.
-    fn lut_build_count(&self) -> u64 {
+    pub(crate) fn lut_build_count(&self) -> u64 {
         self.lock_scratch().luts.build_count()
     }
 
     /// Number of per-band scratch allocations since this backend was constructed.
-    fn scratch_alloc_count(&self) -> u64 {
+    pub(crate) fn scratch_alloc_count(&self) -> u64 {
         self.lock_scratch().pool.alloc_count()
     }
 
     /// Number of per-band scratch slots the reused pool holds (grow-only): `1`
     /// after a serial composite, the clamped worker count after a parallel one.
-    fn band_count(&self) -> usize {
+    pub(crate) fn band_count(&self) -> usize {
         self.lock_scratch().pool.band_count()
     }
 }
@@ -302,9 +325,16 @@ pub enum RunBackend {
     /// The pure-Rust CPU reference compositor. Always available; owns its
     /// run-persistent transfer-LUT cache + reusable band scratch.
     Cpu(CpuBackend),
-    /// The wgpu GPU compositor, holding its initialized device/pipelines.
+    /// The wgpu GPU compositor, driven off the clock thread by its own
+    /// prewarmed worker with a CPU fallback worker ([`crate::offclock`]).
     #[cfg(feature = "wgpu")]
-    Gpu(Box<crate::gpu::GpuCompositor>),
+    Gpu(Box<crate::offclock::OffClockGpu<crate::gpu::GpuCompositor>>),
+    /// **Test seam only** (never constructed in production): CPU-reference
+    /// pixels routed through the GPU readback deadline/stall state machine with
+    /// a fake device ([`RunBackend::simulated_gpu`]), driven off the clock
+    /// thread exactly like the wgpu variant.
+    #[doc(hidden)]
+    SimulatedGpu(Box<crate::offclock::OffClockGpu<crate::readback::SimulatedGpu>>),
 }
 
 impl RunBackend {
@@ -312,6 +342,113 @@ impl RunBackend {
     #[must_use]
     pub fn cpu() -> Self {
         Self::Cpu(CpuBackend::default())
+    }
+
+    /// The GPU-free chaos seam: a backend that composites on the CPU reference
+    /// but routes every frame through the SAME readback deadline/stall state
+    /// machine as the GPU compositor, over a fake device whose readback
+    /// completes `latency` after submit (or never while hung). The returned
+    /// [`crate::readback::SimulatedGpuControl`] changes latency, hangs and
+    /// releases the device. Production never constructs this. It is
+    /// admitted against its own unbounded pool (tests build many).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::Error::GpuRuntime`] when a worker thread cannot be
+    /// spawned.
+    #[doc(hidden)]
+    pub fn simulated_gpu(
+        latency: std::time::Duration,
+    ) -> Result<(Self, crate::readback::SimulatedGpuControl)> {
+        static SIM_POOL: std::sync::OnceLock<std::sync::Arc<crate::offclock::Admission>> =
+            std::sync::OnceLock::new();
+        let pool =
+            SIM_POOL.get_or_init(|| std::sync::Arc::new(crate::offclock::Admission::new(u64::MAX)));
+        let sim = crate::readback::SimulatedGpu::new(latency);
+        let control = crate::readback::SimulatedGpuControl::new(&sim);
+        let backend = crate::offclock::OffClockGpu::build(pool, move || Ok(sim))?;
+        Ok((Self::SimulatedGpu(Box::new(backend)), control))
+    }
+
+    /// Bound the GPU readback wait by the output frame `period`:
+    /// `min(10 ms, period / 2)` ([`crate::readback::readback_deadline`]). A
+    /// no-op on the CPU backend. The engine calls it whenever the canvas
+    /// cadence is set or changes.
+    pub fn set_frame_period(&self, period: std::time::Duration) {
+        match self {
+            Self::Cpu(_) => {}
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(gpu) => gpu.set_frame_period(period),
+            Self::SimulatedGpu(sim) => sim.set_frame_period(period),
+        }
+    }
+
+    /// Frames whose GPU readback missed its deadline or failed fast while an
+    /// earlier readback was outstanding ([`crate::error::Error::GpuDeadline`]).
+    /// `0` for the CPU backend.
+    #[must_use]
+    pub fn gpu_deadline_misses(&self) -> u64 {
+        match self {
+            Self::Cpu(_) => 0,
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(gpu) => gpu.deadline_misses(),
+            Self::SimulatedGpu(sim) => sim.deadline_misses(),
+        }
+    }
+
+    /// Whether the GPU device was lost (issue #415): every frame since is
+    /// composited on the CPU reference. `false` for the CPU backend.
+    #[must_use]
+    pub fn gpu_lost(&self) -> bool {
+        match self {
+            Self::Cpu(_) => false,
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(gpu) => gpu.health().is_lost(),
+            Self::SimulatedGpu(sim) => sim.health().is_lost(),
+        }
+    }
+
+    /// **Test seam**: lose the GPU device (wgpu `Device::destroy`). A no-op
+    /// on the CPU and simulated backends.
+    #[doc(hidden)]
+    pub fn destroy_gpu_device_for_test(&self) {
+        #[cfg(feature = "wgpu")]
+        if let Self::Gpu(gpu) = self {
+            let _ = gpu.with_gpu(crate::gpu::GpuCompositor::destroy_device_for_test);
+        }
+    }
+
+    /// The output-clock composite (issue #415): the same semantics as
+    /// [`RunBackend::composite`], but a GPU backend composites the frame on
+    /// its own worker thread and the clock waits for it at most a bounded
+    /// time ([`crate::offclock::frame_budget`]). A frame not ready in time is
+    /// [`crate::error::Error::GpuDeadline`] (the engine repeats last-good);
+    /// a lost device composites on the CPU fallback worker. The CPU backend
+    /// composites inline, exactly as [`RunBackend::composite`].
+    ///
+    /// # Errors
+    ///
+    /// As [`RunBackend::composite`].
+    pub fn composite_job(
+        &self,
+        job: &std::sync::Arc<crate::offclock::FrameJob>,
+    ) -> Result<crate::offclock::JobOutput> {
+        match self {
+            Self::Cpu(cpu) => {
+                let tiles = job.borrowed_tiles();
+                cpu.composite(
+                    job.canvas_w,
+                    job.canvas_h,
+                    job.canvas,
+                    job.background,
+                    &tiles,
+                )
+                .map(crate::offclock::JobOutput::fresh)
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(gpu) => gpu.composite_job(job),
+            Self::SimulatedGpu(sim) => sim.composite_job(job),
+        }
     }
 
     /// Select a backend, GPU-preferred-with-CPU-fallback, pinned to `target`.
@@ -340,7 +477,19 @@ impl RunBackend {
         if let Some(target) = target {
             #[cfg(feature = "wgpu")]
             {
-                match crate::gpu::GpuCompositor::new(target.is_some().then_some(&target)) {
+                // Admission before the device exists, and the device is built
+                // (and later dropped) on its own worker thread, never on the
+                // caller (issue #415). A process that already pins the cap of
+                // live GPU backends (some may be wedged in a hung driver)
+                // builds no further device.
+                let gpu = crate::offclock::OffClockGpu::build(
+                    &crate::offclock::gpu_admission(),
+                    move || {
+                        crate::gpu::GpuCompositor::new(target.is_some().then_some(&target))
+                            .map(std::sync::Arc::new)
+                    },
+                );
+                match gpu {
                     Ok(gpu) => {
                         tracing::info!("compositor backend: GPU (wgpu) selected");
                         return Self::Gpu(Box::new(gpu));
@@ -371,6 +520,20 @@ impl RunBackend {
             Self::Cpu(_) => RunBackendKind::Cpu,
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => RunBackendKind::Gpu,
+            Self::SimulatedGpu(_) => RunBackendKind::SimulatedGpu,
+        }
+    }
+
+    /// `true` if this backend composites off the caller's thread (a GPU
+    /// backend, or the simulated one): its [`RunBackend::composite_job`] may
+    /// return an adopted earlier frame (issue #415).
+    #[must_use]
+    pub const fn is_offclock(&self) -> bool {
+        match self {
+            Self::Cpu(_) => false,
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(_) => true,
+            Self::SimulatedGpu(_) => true,
         }
     }
 
@@ -381,13 +544,15 @@ impl RunBackend {
             Self::Cpu(_) => false,
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => true,
+            Self::SimulatedGpu(_) => false,
         }
     }
 
     /// The number of transfer-LUT set builds the persistent CPU backend has
     /// performed since construction. A stable transfer set builds once across
-    /// any number of ticks (efficiency finding #5). Returns `0` for the GPU
-    /// backend, whose shader transfer functions do not use CPU LUTs.
+    /// any number of ticks (efficiency finding #5). For the GPU backend this is
+    /// its persistent per-frame CPU fallback's count (the shader itself uses no
+    /// CPU LUTs).
     ///
     /// This counter is an observability/test seam, not part of the composite
     /// algorithm; reading it does not mutate or rebuild the cache.
@@ -397,21 +562,25 @@ impl RunBackend {
         match self {
             Self::Cpu(cpu) => cpu.lut_build_count(),
             #[cfg(feature = "wgpu")]
-            Self::Gpu(_) => 0,
+            Self::Gpu(gpu) => gpu.cpu_fallback_lut_builds(),
+            Self::SimulatedGpu(_) => 0,
         }
     }
 
     /// The number of reusable CPU band-scratch allocations since construction.
     /// The count may grow during warmup/resizes but stays constant across steady-
-    /// state ticks (efficiency finding #6). Returns `0` for the GPU backend,
-    /// which exposes its own surface-pool counter.
+    /// state ticks (efficiency finding #6). For the GPU backend this is its
+    /// persistent per-frame CPU fallback's count (keyed frames until the GPU
+    /// key path lands, ADR-0113 K1); the GPU exposes its own surface-pool
+    /// counter.
     #[doc(hidden)]
     #[must_use]
     pub fn scratch_alloc_count(&self) -> u64 {
         match self {
             Self::Cpu(cpu) => cpu.scratch_alloc_count(),
             #[cfg(feature = "wgpu")]
-            Self::Gpu(_) => 0,
+            Self::Gpu(gpu) => gpu.cpu_fallback_scratch_allocs(),
+            Self::SimulatedGpu(_) => 0,
         }
     }
 
@@ -432,6 +601,7 @@ impl RunBackend {
             Self::Cpu(cpu) => cpu.band_count(),
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => 0,
+            Self::SimulatedGpu(_) => 0,
         }
     }
 
@@ -445,16 +615,20 @@ impl RunBackend {
     /// matches it within an SSIM/PSNR threshold (GPU is never bit-exact).
     ///
     /// This call is synchronous and **never blocks on an input or a client**.
-    /// On the GPU path a submit/readback failure surfaces as a typed
-    /// [`crate::error::Error`] (it does not wait forever), so a hot-loop caller
-    /// can hold last-good on error rather than stalling the output clock
-    /// (invariant #1, safety rule §3).
+    /// On the GPU path the readback wait is bounded by the per-frame deadline
+    /// ([`RunBackend::set_frame_period`]): a miss returns
+    /// [`crate::error::Error::GpuDeadline`] (not re-composited on the CPU — the
+    /// budget is spent; the engine repeats last-good under the tick), and a
+    /// genuine GPU failure re-composites the frame on the CPU reference; a
+    /// panic out of a GPU call is caught and marks the device lost (CPU for
+    /// good). This synchronous path runs the GPU on the caller's thread: the
+    /// output clock uses [`RunBackend::composite_job`] instead (issue #415).
     ///
     /// # Errors
     ///
     /// Propagates the compositor [`crate::error::Error`] for a structurally
     /// invalid request (odd/zero canvas, unresolved/unsupported color axis) or,
-    /// on the GPU path, a `GpuLimit`/`GpuRuntime` failure.
+    /// on a GPU path, [`crate::error::Error::GpuDeadline`].
     pub fn composite(
         &self,
         canvas_w: u32,
@@ -466,15 +640,10 @@ impl RunBackend {
         match self {
             Self::Cpu(cpu) => cpu.composite(canvas_w, canvas_h, canvas, background, tiles),
             #[cfg(feature = "wgpu")]
-            Self::Gpu(gpu) => gpu_or_frame_fallback(
-                gpu,
-                gpu.composite(canvas_w, canvas_h, canvas, background, tiles),
-                canvas_w,
-                canvas_h,
-                canvas,
-                background,
-                tiles,
-            ),
+            Self::Gpu(gpu) => gpu.composite_inline(canvas_w, canvas_h, canvas, background, tiles),
+            Self::SimulatedGpu(sim) => {
+                sim.composite_inline(canvas_w, canvas_h, canvas, background, tiles)
+            }
         }
     }
 
@@ -487,6 +656,7 @@ impl RunBackend {
             Self::Cpu(_) => 0,
             #[cfg(feature = "wgpu")]
             Self::Gpu(gpu) => gpu.cpu_fallback_frames(),
+            Self::SimulatedGpu(sim) => sim.cpu_fallback_frames(),
         }
     }
 
@@ -522,53 +692,13 @@ impl RunBackend {
             #[cfg(feature = "wgpu")]
             Self::Gpu(gpu) => {
                 let _ = n_threads;
-                gpu_or_frame_fallback(
-                    gpu,
-                    gpu.composite(canvas_w, canvas_h, canvas, background, tiles),
-                    canvas_w,
-                    canvas_h,
-                    canvas,
-                    background,
-                    tiles,
-                )
+                gpu.composite_inline(canvas_w, canvas_h, canvas, background, tiles)
+            }
+            Self::SimulatedGpu(sim) => {
+                let _ = n_threads;
+                sim.composite_inline(canvas_w, canvas_h, canvas, background, tiles)
             }
         }
-    }
-}
-
-/// Per-frame CPU fallback for a **genuine GPU failure** only.
-///
-/// A `GpuRuntime` (submit / map / lock failure) or `GpuLimit` (more tiles than
-/// the GPU arrays hold) error re-composites THIS frame on the CPU reference so
-/// the output clock still gets a frame (invariant #1); the next frame tries the
-/// GPU again. Each fallback is counted and logged at `warn` (rate-limited to
-/// power-of-two counts so a persistently failing device cannot flood the log).
-/// Every other error (geometry, unsupported/unresolved colour) is a request
-/// error the CPU would reject too, so it propagates unchanged. Alpha tiles are
-/// NOT a fallback reason: the GPU samples per-tile alpha itself (ADR-0058).
-#[cfg(feature = "wgpu")]
-fn gpu_or_frame_fallback(
-    gpu: &crate::gpu::GpuCompositor,
-    result: Result<Nv12Image>,
-    canvas_w: u32,
-    canvas_h: u32,
-    canvas: CanvasColor,
-    background: LinearRgba,
-    tiles: &[Tile<'_>],
-) -> Result<Nv12Image> {
-    match result {
-        Err(err @ (crate::error::Error::GpuRuntime(_) | crate::error::Error::GpuLimit(_))) => {
-            let frames = gpu.record_cpu_fallback();
-            if frames.is_power_of_two() {
-                tracing::warn!(
-                    error = %err,
-                    fallback_frames = frames,
-                    "GPU composite failed; compositing this frame on the CPU reference"
-                );
-            }
-            crate::pipeline::composite(canvas_w, canvas_h, canvas, background, tiles)
-        }
-        other => other,
     }
 }
 

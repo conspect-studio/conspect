@@ -524,10 +524,49 @@ fn worker_loop(
             HubRequest::Shutdown => break,
         }
     }
-    // Shutdown requested (or every sender gone): stop + join everything we own.
+    // Shutdown requested (or every sender gone): stop + join everything we own,
+    // AND every registered `{id}/` companion of it (a live-added YouTube
+    // source's re-resolution loop is a detached companion sharing the video
+    // stop flag), then bounded-wait for those to leave (issue #420 review).
+    let companions = take_companions(owned.keys(), registry);
+    for producer in &companions {
+        producer.stop.store(true, Ordering::Release);
+    }
     for (id, producer) in owned {
         producer.stop.store(true, Ordering::Release);
         join_bounded(&id, producer.handle);
+    }
+    await_exits("hub shutdown", &companions);
+}
+
+/// Remove from `registry` every entry registered under one of `ids` or an
+/// `{id}/` companion of it, returning them.
+fn take_companions<'a>(
+    ids: impl Iterator<Item = &'a String>,
+    registry: &StopRegistry,
+) -> Vec<ProducerStop> {
+    let ids: Vec<&String> = ids.collect();
+    match registry.lock() {
+        Ok(mut map) => {
+            let keys: Vec<String> = map
+                .keys()
+                .filter(|key| {
+                    ids.iter().any(|id| {
+                        key.as_str() == id.as_str()
+                            || key
+                                .strip_prefix(id.as_str())
+                                .is_some_and(|rest| rest.starts_with('/'))
+                    })
+                })
+                .cloned()
+                .collect();
+            keys.iter().filter_map(|key| map.remove(key)).collect()
+        }
+        Err(poisoned) => {
+            tracing::warn!("stop registry poisoned during hub shutdown");
+            drop(poisoned);
+            Vec::new()
+        }
     }
 }
 
@@ -963,5 +1002,51 @@ mod tests {
         let seq = store.sequence();
         std::thread::sleep(Duration::from_millis(120));
         assert_eq!(store.sequence(), seq, "shutdown stops every owned producer");
+    }
+
+    /// Issue #420 review: hub shutdown also stops and AWAITS a detached
+    /// `{id}/` companion of an owned producer (a live-added `YouTube` source's
+    /// re-resolution loop), not just the owned thread.
+    #[test]
+    fn shutdown_stops_and_awaits_owned_producers_companions() {
+        let registry = stop_registry();
+        let preview = shared_stores(HashMap::new());
+        let hub = LiveSourceHub::start(Arc::clone(&registry), Arc::clone(&preview));
+        let store = Arc::new(TileStore::<Nv12Image>::with_defaults("s-companion"));
+        assert!(matches!(
+            hub.handle().request_spawn_synth(SynthSpawn {
+                id: "s-companion".to_owned(),
+                kind: SyntheticKind::Bars,
+                store: Arc::clone(&store),
+                width: 64,
+                height: 64,
+                canvas: CanvasColor::default(),
+                cadence: Rational::new(25, 1),
+            }),
+            HubSubmit::Accepted
+        ));
+        assert!(wait_for(Duration::from_secs(5), || store.is_primed()));
+        // A detached companion with its OWN flag: only shutdown's companion
+        // sweep can stop it. It takes 200 ms to leave after the stop.
+        let flag = Arc::new(AtomicBool::new(false));
+        let exited = register_stop(&registry, "s-companion/youtube-reresolve", &flag);
+        let guard = ExitGuard::new(&exited);
+        let thread_flag = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            let _exit = guard;
+            while !thread_flag.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        hub.shutdown();
+        assert!(
+            flag.load(Ordering::Acquire),
+            "shutdown raised the companion"
+        );
+        assert!(
+            exited.load(Ordering::Acquire),
+            "shutdown returned only after the companion left"
+        );
     }
 }

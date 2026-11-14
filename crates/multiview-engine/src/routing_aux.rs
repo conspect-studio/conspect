@@ -117,6 +117,15 @@ impl<C: FrameControl> FrameControl for WithAuxTick<C> {
     fn on_repeat(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
         self.inner.on_repeat(drive, tick);
     }
+
+    fn on_compose_failed(
+        &mut self,
+        drive: &mut CompositorDrive<Nv12Image>,
+        tick: Tick,
+        reason: &str,
+    ) {
+        self.inner.on_compose_failed(drive, tick, reason);
+    }
 }
 
 /// Public [`FrameControl`] adapter for a legacy per-boundary closure. Behaves

@@ -22,6 +22,8 @@
 //!
 //! ## Module map
 //!
+//! - [`key`] — keyer coverage (luma/linear matte, key source, mask) and the
+//!   scene groups of an exact key-changing transition (ADR-0113).
 //! - [`range`] — limited<->full quantization range expand/compress (8-bit).
 //! - [`matrix`] — YUV'<->R'G'B' matrices (BT.601/709/2020-NCL).
 //! - [`transfer`] — EOTF/OETF (sRGB, BT.709/BT.1886, PQ ST 2084, HLG B67).
@@ -39,6 +41,8 @@
 //!   swash shaping/rasterization into an etagere shelf-packed, byte-capped,
 //!   LRU-evicting glyph atlas with bundled OFL fonts (ADR-0016 §3.2). Pure-Rust,
 //!   GPU-free; the GPU sub-pass and CPU-reference blit consume it.
+//! - [`readback`] — the bounded GPU readback deadline/stall state machine
+//!   (issue #395) and its GPU-free simulated-device test seam.
 //! - [`error`] — the per-crate [`Error`] taxonomy.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -48,19 +52,23 @@ pub mod blend;
 pub mod error;
 #[cfg(feature = "wgpu")]
 pub mod gpu;
+pub mod key;
 pub mod mask;
 pub mod matrix;
 pub mod native;
+pub mod offclock;
 #[cfg(feature = "overlay")]
 pub mod overlay;
 pub mod pipeline;
 pub mod primaries;
 pub mod range;
+pub mod readback;
 pub mod transfer;
 pub mod transfer_lut;
 
 pub use backend::{normalize_pci_bus_id, AdapterMatchInfo, GpuTarget, RunBackend, RunBackendKind};
 pub use error::{Error, Result};
+pub use key::{KeyKind, KeyMask, SceneMember, SceneMerge, TileGroup, TileKey};
 pub use native::{
     admit_native_composite, CompositeBackend, NativeAdmission, NativeRejection, TileFormats,
 };

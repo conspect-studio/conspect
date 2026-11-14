@@ -76,9 +76,30 @@ pub enum Error {
     ShaderValidation(String),
 
     /// A GPU operation (buffer map, submission, readback) failed at runtime.
-    #[cfg(feature = "wgpu")]
+    ///
+    /// Not feature-gated: the GPU-free readback state machine
+    /// ([`crate::readback`]) also returns it once a stalled readback has been
+    /// held for [`crate::readback::STALL_HOLD`], so the run backend composites
+    /// the frame on the CPU reference.
     #[error("GPU runtime error: {0}")]
     GpuRuntime(String),
+
+    /// The GPU readback missed its per-frame deadline, or an earlier missed
+    /// readback is still outstanding (issue #395, ADR-0109 §9). The frame's
+    /// budget is spent: the run backend does **not** re-composite it on the
+    /// CPU; the engine repeats last-good under this tick instead. Not
+    /// feature-gated (the simulated chaos backend returns it in the default
+    /// build).
+    #[error("GPU readback deadline: {0}")]
+    GpuDeadline(String),
+
+    /// The GPU device is lost or faulted (issue #415): wgpu's device-lost
+    /// callback fired, an uncaptured device error was reported, or a device
+    /// call panicked (wgpu 30 `Device::poll` on a lost device). Permanent: the
+    /// run backend composites every later frame on the CPU reference. Not
+    /// feature-gated (the simulated chaos backend uses it).
+    #[error("GPU device lost: {0}")]
+    GpuLost(String),
 
     /// The composite request exceeded a fixed GPU resource limit (e.g. more
     /// tiles than the bound tile-array / storage buffer was sized for).
