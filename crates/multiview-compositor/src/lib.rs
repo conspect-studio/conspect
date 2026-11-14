@@ -48,6 +48,7 @@ pub mod blend;
 pub mod error;
 #[cfg(feature = "wgpu")]
 pub mod gpu;
+pub mod mask;
 pub mod matrix;
 pub mod native;
 #[cfg(feature = "overlay")]
