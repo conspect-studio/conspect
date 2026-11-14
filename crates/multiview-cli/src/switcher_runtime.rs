@@ -72,6 +72,34 @@ pub fn mixer_inputs(me: &MixEffectsConfig) -> Result<Option<MixerInputs>, String
     .map(Some)
 }
 
+/// The off-clock stinger roll for these media-player mailboxes (ADR-0112
+/// §5): `Cue` (to the in-point) then `Play`, submitted to the player's
+/// bounded two-class transport mailbox from the roll worker, never from the
+/// output clock. `None` without media players or when the worker cannot
+/// start (logged; a stinger then still takes on schedule).
+#[must_use]
+pub fn player_roll<S: std::hash::BuildHasher + Send + 'static>(
+    mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>, S>,
+) -> Option<multiview_engine::player_roll::PlayerRollSender> {
+    if mailboxes.is_empty() {
+        return None;
+    }
+    let ids: Vec<String> = mailboxes.keys().cloned().collect();
+    let spawned = multiview_engine::player_roll::PlayerRollSender::spawn(ids, move |player| {
+        if let Some(mailbox) = mailboxes.get(player) {
+            mailbox.submit(crate::player::TransportVerb::Cue { frame: None });
+            mailbox.submit(crate::player::TransportVerb::Play);
+        }
+    });
+    match spawned {
+        Ok(roll) => Some(roll),
+        Err(error) => {
+            tracing::warn!(%error, "stinger player roll worker could not start; stingers will not roll their player");
+            None
+        }
+    }
+}
+
 /// The M/E value machine at boot: the starting buses and the persisted
 /// transition selection (ADR-0112 §4), applied before the clock starts so the
 /// first AUTO already uses it.
@@ -134,6 +162,11 @@ pub fn attach_first_slice(
     let (control, mut driver) = SwitcherControl::new(boot_machine(&me, program, preview)?);
     // Shares the already-allocated stores; the driver only samples `is_primed`.
     driver.set_prime_stores(pipeline.preview_stores());
+    // ADR-0112 §5: a stinger AUTO cues then plays its media player through
+    // the player's bounded transport mailbox, from an off-clock worker.
+    if let Some(roll) = player_roll(pipeline.player_mailboxes()) {
+        driver.set_player_roll(roll);
+    }
     if let Some(inputs) = inputs {
         // Installed before the clock starts; validation guaranteed that the
         // starting inputs are patched to program_source/preview_source, so the
@@ -223,6 +256,36 @@ number = 5
         let mut legacy = me;
         legacy.inputs.clear();
         assert!(mixer_inputs(&legacy).unwrap().is_none());
+    }
+
+    /// ADR-0112 §5: the roll submits Cue then Play to the named player's
+    /// mailbox, off the caller's thread, and ignores an unknown player.
+    #[test]
+    fn the_stinger_roll_cues_then_plays_the_named_player() {
+        let mailbox = Arc::new(crate::player::TransportMailbox::new());
+        let other = Arc::new(crate::player::TransportMailbox::new());
+        let roll = player_roll(std::collections::HashMap::from([
+            ("mp1".to_owned(), Arc::clone(&mailbox)),
+            ("mp2".to_owned(), Arc::clone(&other)),
+        ]))
+        .expect("a worker");
+        assert!(roll.roll(&SourceRef::new("mp1")));
+        assert!(!roll.roll(&SourceRef::new("ghost")));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut verbs = Vec::new();
+        while verbs.len() < 2 && std::time::Instant::now() < deadline {
+            verbs.extend(mailbox.drain());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            verbs,
+            vec![
+                crate::player::TransportVerb::Cue { frame: None },
+                crate::player::TransportVerb::Play
+            ]
+        );
+        assert_eq!(other.drain(), Vec::new());
+        assert!(player_roll(std::collections::HashMap::new()).is_none());
     }
 
     /// ADR-0112 §4 restart truth: a persisted selection boots the machine
