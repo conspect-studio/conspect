@@ -550,8 +550,11 @@ async fn unsupported_output_slots_are_typed_422s() {
             vec![
                 json!({ "plane": "subtitle", "destination": {"output": "output-0", "slot": 0}, "source": bars() }),
             ],
-            "slot-medium-mismatch",
-            "#345",
+            // #345 F2: subtitle slots are patchable; output-0 declares none,
+            // so slot 0 does not exist (the subtitle rules are covered in
+            // `patch_subtitles.rs`).
+            "unknown-slot",
+            "declares 0 subtitle slot",
         ),
         (
             vec![

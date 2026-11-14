@@ -32,6 +32,7 @@
 pub mod admission;
 pub mod api;
 pub mod audio;
+pub mod cast_dir;
 pub mod catalogues;
 pub mod device;
 pub mod diff;
@@ -193,6 +194,15 @@ pub enum StartMode {
     Resume,
 }
 
+/// A Cast receiver app id in its canonical form (8 upper-case hexadecimal
+/// characters), or `None` when `raw` (surrounding whitespace trimmed) is not
+/// one (ADR-0111).
+#[must_use]
+pub fn normalize_cast_app_id(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    (raw.len() == 8 && raw.bytes().all(|b| b.is_ascii_hexdigit())).then(|| raw.to_ascii_uppercase())
+}
+
 /// The management control-plane listener.
 ///
 /// When present, `multiview run` serves the REST + WebSocket + SSE API, the
@@ -231,6 +241,13 @@ pub struct ControlConfig {
     /// are refused).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_media_base: Option<String>,
+    /// The registered custom Cast receiver app id (ADR-0111): exactly 8
+    /// hexadecimal characters, as the Google Cast SDK Developer Console
+    /// issued it (case-insensitive; used upper-case). Absent = no custom
+    /// receiver: the browser sender uses Google's Default Media Receiver.
+    /// The environment variable `MULTIVIEW_CAST_APP_ID` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_app_id: Option<String>,
     /// The externally-reachable **hostname** (no scheme, no port) viewer
     /// playback URLs are derived against (`GET
     /// /api/v1/outputs/{id}/playback`): substituted for a wildcard/loopback
@@ -1168,6 +1185,15 @@ impl MultiviewConfig {
                     )));
                 }
             }
+            if let Some(app_id) = &control.cast_app_id {
+                if normalize_cast_app_id(app_id).is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "control.cast_app_id {app_id:?} must be the 8 hexadecimal characters of \
+                         a registered Cast receiver app id (omit it to use Google's Default \
+                         Media Receiver)"
+                    )));
+                }
+            }
             if let Some(host) = &control.public_host {
                 // A bare hostname/IP literal: non-empty, no scheme, no path/query,
                 // no port (every output's own port is substituted in per-URL). A
@@ -1542,6 +1568,50 @@ impl MultiviewConfig {
                 rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM
             )));
         }
+        cast_dir::validate_cast_dirs(&self.outputs)?;
+        self.validate_cast_pictures()
+    }
+
+    /// The picture a cast output carries must be one a Cast receiver
+    /// decodes: at most 1920x1080 at 30 fps. The picture is the output's
+    /// `format` when declared, else the canvas; the rate is the canvas rate
+    /// (compared exactly on the rational; per-output rates are #343).
+    fn validate_cast_pictures(&self) -> Result<(), ConfigError> {
+        let canvas = &self.canvas;
+        let fps = canvas.fps.rational();
+        let too_fast = fps.den <= 0
+            || i128::from(fps.num) > i128::from(schema::CAST_MAX_FPS) * i128::from(fps.den);
+        for output in &self.outputs {
+            let Output::Cast { id, format, .. } = output else {
+                continue;
+            };
+            let (width, height) = format
+                .as_ref()
+                .map_or((canvas.width, canvas.height), |f| (f.width, f.height));
+            if width > schema::CAST_MAX_WIDTH || height > schema::CAST_MAX_HEIGHT {
+                return Err(ConfigError::Validation(format!(
+                    "cast output {id:?}: the picture is {width}x{height}; a Cast receiver decodes \
+                     at most {}x{} at {} fps. Add [outputs.format] width = {} height = {} to this \
+                     output.",
+                    schema::CAST_MAX_WIDTH,
+                    schema::CAST_MAX_HEIGHT,
+                    schema::CAST_MAX_FPS,
+                    schema::CAST_MAX_WIDTH,
+                    schema::CAST_MAX_HEIGHT,
+                )));
+            }
+            if too_fast {
+                return Err(ConfigError::Validation(format!(
+                    "cast output {id:?}: the canvas runs at {} fps; a Cast receiver decodes at \
+                     most {}x{} at {} fps, so a cast output cannot be used on this canvas until \
+                     per-output frame rates exist (#343)",
+                    canvas.fps,
+                    schema::CAST_MAX_WIDTH,
+                    schema::CAST_MAX_HEIGHT,
+                    schema::CAST_MAX_FPS,
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1823,6 +1893,19 @@ impl MultiviewConfig {
                 }
             }
             AudioFeed::Tracks(tracks) => {
+                // A cast stream has one audio rendition, the program audio
+                // (or the routed feed's own audio): no discrete track.
+                let is_cast = self
+                    .outputs
+                    .iter()
+                    .any(|o| matches!(o, Output::Cast { id, .. } if *id == xp.output));
+                if is_cast {
+                    return Err(ConfigError::Validation(format!(
+                        "output {:?}: a cast output carries the program audio only; discrete \
+                         audio tracks cannot be routed to it",
+                        xp.output
+                    )));
+                }
                 if tracks.is_empty() {
                     return Err(ConfigError::Validation(format!(
                         "output {:?}: an audio `tracks` feed needs at least one track",
@@ -2305,7 +2388,8 @@ impl Output {
             | Output::Srt { codec, .. }
             | Output::Rist { codec, .. }
             | Output::Webrtc { codec, .. }
-            | Output::WhipPush { codec, .. } => Some(codec),
+            | Output::WhipPush { codec, .. }
+            | Output::Cast { codec, .. } => Some(codec),
             // NDI carries a channel-map, AES67 sends raw PCM, and a display
             // head scans out raw frames — none has a (video) codec to validate.
             Output::Ndi { .. } | Output::Aes67 { .. } | Output::Display { .. } => None,
@@ -2367,7 +2451,53 @@ impl Output {
         if let Some(orientation) = self.orientation() {
             orientation.validate(&self.label(), self.orientation_tag_capability())?;
         }
+        self.validate_cast_rules()?;
         self.validate_webrtc_rules()
+    }
+
+    /// The cast-kind-specific per-item rules (ADR-0111): the id is 1 to 64
+    /// characters of `[A-Za-z0-9_-]` (it names a directory and an API
+    /// resource), the codec (and a declared video slot's codec) is H.264,
+    /// and an authored `dir` is not empty. The picture limit is a
+    /// document-level rule ([`MultiviewConfig::validate`]).
+    fn validate_cast_rules(&self) -> Result<(), ConfigError> {
+        let Output::Cast { id, codec, dir, .. } = self else {
+            return Ok(());
+        };
+        let id_ok = (1..=64).contains(&id.len())
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !id_ok {
+            return Err(ConfigError::Validation(format!(
+                "cast output id {id:?} must be 1 to 64 characters of letters, digits, '_' or '-'"
+            )));
+        }
+        let not_h264 = |codec: &str| {
+            ConfigError::Validation(format!(
+                "cast output {id:?}: codec {codec:?} is not supported: a cast output needs \"h264\""
+            ))
+        };
+        if rendition::RenditionVideoCodec::parse(codec)
+            != Some(rendition::RenditionVideoCodec::H264)
+        {
+            return Err(not_h264(codec));
+        }
+        // A declared video slot names the encoded codec (it wins over
+        // `codec`), so it must be H.264 too (encoder names included).
+        if let Some(slot_codec) = self.video_slot0().and_then(|slot| slot.codec.as_deref()) {
+            if output_format::CodecFamily::of(slot_codec) != Some(output_format::CodecFamily::H264)
+            {
+                return Err(not_h264(slot_codec));
+            }
+        }
+        if matches!(dir.as_deref(), Some("")) {
+            return Err(ConfigError::Validation(format!(
+                "cast output {id:?}: dir, when set, must be non-empty (omit `dir` for the \
+                 default <state dir>/cast/{id})"
+            )));
+        }
+        Ok(())
     }
 
     /// The WebRTC-kind-specific rules (ADR-0049): `codec = "h264"` is the only
@@ -2408,7 +2538,8 @@ impl Output {
             | Output::Srt { .. }
             | Output::Rist { .. }
             | Output::Aes67 { .. }
-            | Output::Display { .. } => Ok(()),
+            | Output::Display { .. }
+            | Output::Cast { .. } => Ok(()),
         }
     }
 

@@ -18,7 +18,12 @@
 //!   CORS (a Cast receiver fetches cross-origin from a Google origin; every
 //!   browser player benefits identically). Pure Rust, default build.
 //!
-//! The CMAF segmenter and the blocking-reload LL-HLS origin (held GETs) live
+//! - [`cmaf`] / [`cast`] / [`cast_check`] — the pure-Rust CMAF box writer, the
+//!   Cast packager built on it (HLS with fMP4 segments, separate video and
+//!   audio renditions, 2 s segments, 10-segment window) and the strict
+//!   validator that reads such a directory back as a player would.
+//!
+//! The LL-HLS CMAF segmenter and the blocking-reload LL-HLS origin (held GETs) live
 //! behind the off-by-default transport features; they feed segment/part
 //! metadata into these builders and will mount behind [`http`]'s CORS layer.
 //!
@@ -26,6 +31,9 @@
 //! outbound presentation epoch ([`crate::epoch::SharedEpoch`]): segment first-
 //! sample wall time = `epoch.wall_at(first PTS)`, rendered by the pure integer
 //! [`format_program_date_time`] — the same anchor the control WS publishes.
+pub mod cast;
+pub mod cast_check;
+pub mod cmaf;
 pub mod http;
 mod live;
 mod master;
