@@ -2607,9 +2607,16 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
 - **Limits and capacity.** `patch_limiter.admit_set` counts one take for the principal and one per
   destination (`me1.in<N>`, output API ids), so 64 crosspoints never multiply either budget. The
   set's NEW encoder delta counts members whose plan needs an encoder, deduplicated per identical
-  (feed, output format). It is checked against the caller's cap and the global sessions. The cap
+  engine encoder identity: the router's sharing key (feed at the output's format, the output's
+  encoder settings and its landed live reset's settings), read through the defaulted seam
+  `OutputRouting::encoder_identity`. Same feed and format with different encoder settings is two
+  encoders; an unknown identity counts the member as its own encoder, never under-counting. It is
+  checked against the caller's cap and the global sessions. The cap
   comes from a new defaulted seam, `OutputRouting::principal_sessions`, which the run adapter reads
-  from the router snapshot (`principals_held`, `max_per_principal`). Over the cap is 409
+  from the router snapshot (`principals_held`, `max_per_principal`). The router rebuilds
+  `principals_held` only when a holding changed (a key created, adopted or retired, an open started
+  or ended, a set reservation changed); an unchanged snapshot publication on the bake consumer
+  shares the cached list without a scan or an allocation. Over the cap is 409
   `capacity`, before anything is enqueued. The engine's own admission still refuses an over-cap
   set whole.
 - **Enqueue.** With a mixer half and outputs, the switcher's `PatchArmed` is sent first (bounded
@@ -2621,7 +2628,9 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   are never evicted. It is separate from the slot-0 take store and from the global store. Keys are
   namespaced `patch-set` (`/patch/take`) or `salvo-take:<id>` and bound to a SHA-256 of the
   canonical body (crosspoints sorted, `on_air`). The same body in any order replays its first 202
-  without re-planning. Another body is 409 `conflict`.
+  without re-planning. Another body is 409 `conflict`. The key record and the set's pending
+  outcome slot are reserved under one lock, so concurrent admissions never exceed the 256
+  pending bound; every failed enqueue releases both, and settlement or the deadline frees the slot.
 - **`patch.take`.** The event is `{operation_id, tick, outcome: applied|refused, refusal?,
   destination}`. An off-clock aggregator task, fed by the bounded engine event stream, collects
   each output member's `route.output` and the mixer half's `switcher.operation` (all carry the
@@ -2632,7 +2641,8 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   - `applied` requires every member applied at the same tick. Otherwise the set is `refused` with
     the first cause, mapped to the typed kinds: `unroutable` → `slot-medium-mismatch`,
     `format-mismatch` → `slot-format-unsupported`; `feed-not-fresh`, `capacity`,
-    `encoder-not-ready`, `on-air-protected` and `superseded` as is.
+    `encoder-not-ready`, `on-air-protected` and `superseded` as is. The mixer half's
+    `refused:<code>` goes through the same mapping as an output member's.
   - At most 256 sets wait for their outcome (admission fails closed with `idempotency-capacity`
     beyond). A set without a final outcome 10 s after admission is published `refused` /
     `deadline`.
@@ -2653,7 +2663,10 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
   - `POST /salvos/{id}/plan` returns the patch plan. `arm` keeps its legacy meaning. A salvo with
     only legacy fields keeps its path byte-for-byte.
 - **Plan.** A set's plan lists every member in request order. It adds `set: {new_encoders, fits}`,
-  and `can_take` requires every member and the delta to fit.
+  and `can_take` requires every member and the delta to fit. OpenAPI declares the `200` of
+  `POST /patch/plan` and `POST /salvos/{id}/plan` as `oneOf` `PatchPlan` | `SetPlan`, and the
+  `202` of `POST /salvos/{id}/take` as `oneOf` `AcceptedBody` | `PatchAccepted` (document-only
+  schemas; the Rust types stay distinct).
 - **Deviations from the E2 design note.**
   - The set key's replay/conflict is checked right after shape, before existence and plan gates,
     not after them. This follows the slot-0 alias: a replay never re-plans, which matters because
