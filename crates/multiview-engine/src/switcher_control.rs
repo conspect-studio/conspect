@@ -79,7 +79,7 @@ pub const REFUSE_NOT_AN_INPUT: &str =
     "not-on-an-input: this M/E selects numbered inputs; select an input, not a source";
 /// Typed refusal: the transition kind or one of its options is not rendered.
 pub const REFUSE_UNSUPPORTED_TRANSITION: &str =
-    "unsupported-transition: this engine renders cut, mix and dip to a colour";
+    "unsupported-transition: this engine renders cut, mix, dip to a colour and wipe";
 
 /// Is `descriptor` a transition the Program drive renders (ADR-0112)?
 #[must_use]
@@ -87,6 +87,11 @@ pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
     match descriptor {
         TransitionDescriptor::Cut | TransitionDescriptor::Mix { .. } => true,
         TransitionDescriptor::Dip { dip_source, .. } => dip_source.is_none(),
+        TransitionDescriptor::Wipe {
+            border_fill_source,
+            flip_flop,
+            ..
+        } => border_fill_source.is_none() && !flip_flop,
         _ => false,
     }
 }

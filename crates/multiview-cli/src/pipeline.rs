@@ -2937,28 +2937,33 @@ impl Pipeline {
         // must not depend on tile-sizing at all). Fail-closed.
         #[cfg(feature = "aes67")]
         ensure_no_cell_binds_an_aes67_source(config)?;
-        let layout = Arc::new(config.solve_layout()?);
         let switcher_me = config
             .switcher
             .as_ref()
             .and_then(|s| s.mix_effects.first())
             .cloned();
-        // This slice admits a single real full-canvas source cell. A running
-        // legacy multiview with multiple cells remains untouched when the M/E
-        // block is absent; an opted-in unsupported layout fails loudly instead
-        // of replacing the operator's canvas with a guessed source.
-        // The SAME admission rules the control plane applies before it persists an
-        // accepted state (#317): `multiview_config::switcher_canvas_admission`,
-        // and (ADR-0108 slice 1, step 1) `outputs_carry_program`: an output fed
-        // directly by a source is validated and read back, but this engine does
-        // not carry it yet — fail loudly rather than put Program on it.
-        config
-            .switcher_canvas_admission(&layout)
+        // The Program canvas (#307, `docs/architecture/output-routing.md` §3):
+        // with an M/E declared it IS the M/E bus, one full-canvas cell bound to
+        // `program_source`. A document already of that shape is used unchanged
+        // (same cell id); any other document (a multi-cell wall) keeps its
+        // layout as a stored layout, routable to outputs, and Program is the
+        // synthesized one-cell bus. Without an M/E the legacy multiview is
+        // untouched. The SAME function the control plane applies before it
+        // persists an accepted state (#317); it still refuses overlays with an
+        // M/E. And (ADR-0108 slice 1, step 1) `outputs_carry_program`.
+        let program = config
+            .program_canvas(config.solve_layout()?)
             .map_err(|refusal| PipelineError::Engine(refusal.to_string()))?;
         ensure_outputs_carry_program(config)?;
-        let switcher_cell_id = switcher_me
-            .as_ref()
-            .and_then(|_| config.cells.first().map(|cell| cell.id.clone()));
+        if program.synthesized {
+            tracing::info!(
+                cells = config.cells.len(),
+                "switcher declared: Program is the one-cell M/E bus; the configured \
+                 layout stays a stored layout, routable to outputs"
+            );
+        }
+        let switcher_cell_id = switcher_me.as_ref().and(program.cell_id);
+        let layout = Arc::new(program.layout);
         let cadence = config.canvas.fps.rational();
         let canvas_color = CanvasColor::default();
         let tag = canvas_color.output_tag();

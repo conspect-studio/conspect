@@ -396,6 +396,35 @@ working. The configs that fail today (switcher plus multi-cell) start, with Prog
 default their outputs carry Program, and the operator routes `layout:config` to the outputs that
 should keep the wall.
 
+*As built (#307 PR 1).* One pure function, `MultiviewConfig::program_canvas`
+(`crates/multiview-config/src/admission.rs`), derives the Program canvas for `Pipeline::build`, the
+control plane's start-up admission (`boot_model::admit_for_boot`, every `desired.json` commit, the
+config watcher) and the engine command drain. A document that already is one unstyled, full-canvas,
+opaque cell bound to `program_source` is used unchanged (same cell id, byte-identical first-slice
+behaviour). Any other document gets a synthesized cell: x = y = 0, w = h = 1, z 0, `fill`, opacity 1,
+bound to `program_source`, on the same canvas, with the reserved id `me1.program` (lengthened with
+`~` if an authored cell already carries it). Overlays with a switcher are still refused. Deviations:
+the configured layout's library id is its seeded working-layout id (`schema_v1`, from
+`state.rs` `seed_working_layout`), not literally `config`; it is routed with
+`POST /routing/output/take` `{"layout":"schema_v1"}`. With a switcher, the drain keys the Program
+drive by the M/E's cell alone; a stored layout from the config watcher (an accepted edit) updates
+only the document mirror, never the Program drive, and never resets the M/E's Program binding.
+
+**Cell edits are refused under a switcher (#307 review M1).** `POST /commands/swap`, a video→cell
+`POST /routing/video/take`, and a salvo take/fire (`POST /salvos/{id}/take`, `/fire`) whose salvo
+recalls a layout or cell sources would change neither Program (the M/E bus) nor the stored layout
+outputs consume, so they would be silent no-ops. With a switcher M/E declared in the accepted
+config they answer 422 `switcher-owns-program`, after the route's role and per-object
+authorization (no existence leak) and before the idempotency reservation (no key burned, nothing
+sent). The detail says Program is the M/E bus and names what to use instead: edit the stored layout
+with `PUT /api/v1/layouts/{id}` (routed outputs showing it update live) or a switcher select
+(`POST /switcher/commands/select_preview` / `select_program`). Audio/subtitle takes, salvo arm and
+cancel, and a salvo of only tally/UMD recalls are unaffected. The drain keeps a backstop: such a
+command that still reaches it (for example from event automation) is dropped with one warning per
+drain (debug afterwards) and does **not** touch the working-config mirror, so the mirror never
+diverges from the accepted state. Without a switcher every route behaves as before. Tally and audio-follow-video read the one bound Program
+source as before; removing the source on Program still slates the Program cell (fail-closed).
+
 **`apply-layout` in the new model.** It means "route layout X to the feed `program`'s canvas".
 
 - **No switcher declared.** It keeps today's meaning exactly: the Program canvas swaps to X at the
@@ -404,9 +433,16 @@ should keep the wall.
   (`crates/multiview-engine/src/switcher_hook.rs:66` rebinds a named cell that a foreign layout does not have). The call answers
   422 `switcher-owns-program`. The detail names the two operations that do what the operator means:
   `POST /routing/output/take` (layout to an output) and `POST /switcher/commands/select_preview`
-  with `layout:<id>`. It never silently changes something else.
+  with `layout:<id>`. It never silently changes something else. *As built (#307 PR 1):* the check
+  runs before the idempotency reservation (nothing reserved, persisted or sent); the detail
+  describes the second operation as "a layout as a switcher source" until it lands in PR 2. The
+  old `layout-not-admissible-with-switcher` problem is no longer returned by apply-layout; its
+  slug remains only for the overlays refusal on persisting commands.
 - An optional body field `target: {output: id}` makes `apply-layout` a thin alias for an output
-  take, so the Layouts page "Apply" can offer "Apply to output …".
+  take, so the Layouts page "Apply" can offer "Apply to output …". *As built:* it calls the take's
+  own handler body (`take_output_as`), so authorization (Write and output scope on the output,
+  Read on the layout and its whole source closure), the Idempotency-Key contract, limits and the
+  response are the output take's. It works with or without a switcher.
 
 ---
 
