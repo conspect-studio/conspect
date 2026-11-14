@@ -52,6 +52,7 @@ fn tools() -> Option<Tools> {
             node: var("CONSPECT_WEB_NODE").or_else(|| which("node"))?,
             browser: var("CONSPECT_WEB_BROWSER").or_else(discover_browser)?,
             ffmpeg: var("CONSPECT_WEB_FFMPEG").or_else(|| which("ffmpeg"))?,
+            gl: multiview_webengine::capture::BrowserGl::Default,
         })
     })();
     if found.is_none() {
@@ -78,6 +79,7 @@ fn page(background: Background) -> Capture {
 <div style='position:absolute;left:107px;top:0;width:107px;height:180px;background:rgb(255,0,0)'></div>\
 <div style='position:absolute;left:214px;top:0;width:106px;height:180px;background:rgba(0,0,255,0.5)'></div></body>"
             .to_owned(),
+        capture: multiview_webengine::capture::CaptureOptions::default(),
     }
 }
 fn provenance() -> Provenance {

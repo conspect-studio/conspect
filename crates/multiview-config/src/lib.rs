@@ -124,9 +124,10 @@ pub use network_tls::{
 };
 pub use origin::{Origin, OriginParseError};
 pub use output_format::{
-    is_output_rate, output_rate, validate_output_format, Anchor, AudioSlot, CodecFamily, OutputFit,
-    OutputFitMode, OutputFormat, OutputSlots, Scan, SlotCapability, VideoSlot, MAX_OUTPUT_FPS,
-    MAX_SLOT_BITRATE_KBPS, MIN_OUTPUT_FPS, SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
+    is_output_rate, output_rate, validate_output_format, validate_subtitle_sources, Anchor,
+    AudioSlot, CodecFamily, OutputFit, OutputFitMode, OutputFormat, OutputSlots, Scan,
+    SlotCapability, SubtitleFormat, SubtitleSlot, VideoSlot, MAX_OUTPUT_FPS, MAX_SLOT_BITRATE_KBPS,
+    MAX_SUBTITLE_SLOTS, MIN_OUTPUT_FPS, SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
 };
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use playback::{
@@ -1506,11 +1507,14 @@ impl MultiviewConfig {
             .into_iter()
             .filter(|t| *t != PROGRAM_TRACK)
             .collect();
+        let source_ids: Vec<&str> = self.sources.iter().map(|s| s.id.as_str()).collect();
         for output in &self.outputs {
             output.validate()?;
             // Slice B (#342): the output's format and slots against the canvas
             // and its medium's slot capability.
             validate_output_format(output, &self.canvas, &discrete)?;
+            // Slice F (#345): a subtitle slot's patch names a declared source.
+            validate_subtitle_sources(output, &source_ids)?;
             let id = output.id();
             if !seen_ids.insert(id.clone()) {
                 return Err(ConfigError::Validation(format!(
@@ -1560,6 +1564,19 @@ impl MultiviewConfig {
             if let Some(fps) = output_format::output_rate(output, &self.canvas) {
                 if !rates.iter().any(|r| output_format::same_rate(*r, fps)) {
                     rates.push(fps);
+                }
+                // Subtitle slots (slice F) are sampled on Program's bake
+                // consumer at Program's cadence; a rate output does not carry
+                // them yet (follow-up of #343).
+                if output
+                    .slots()
+                    .is_some_and(|slots| !slots.subtitle.is_empty())
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "{SLOT_FORMAT_UNSUPPORTED}: output {:?} runs at its own rate; subtitle \
+                         slots on a rate output are not supported yet",
+                        output.id()
+                    )));
                 }
                 rate_outputs.push(output.id());
             }
