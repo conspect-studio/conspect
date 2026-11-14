@@ -118,6 +118,7 @@ pub struct OutputLaneStats {
     ticks: AtomicU64,
     skipped_ticks: AtomicU64,
     lateness: TickLateness,
+    exhausted: std::sync::atomic::AtomicBool,
 }
 
 impl OutputLaneStats {
@@ -131,6 +132,16 @@ impl OutputLaneStats {
     #[must_use]
     pub fn skipped_ticks(&self) -> u64 {
         self.skipped_ticks.load(Ordering::Acquire)
+    }
+
+    /// Whether the lane ended because its timeline was exhausted: the next
+    /// tick's PTS or deadline no longer strictly increases (saturated `i64`
+    /// arithmetic on an extreme seed/time). Never true in a real run (~292
+    /// years of ticks); it turns a would-be hot loop of identical stamps into
+    /// an explicit, logged end of this lane only.
+    #[must_use]
+    pub fn exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::Acquire)
     }
 
     /// The wake-lateness histogram against each tick's deadline.
@@ -205,9 +216,9 @@ impl OutputLaneHandle {
     /// [`LaneJoinError::Detached`] if the lane outlived `grace`.
     pub fn join_within(self, grace: Duration) -> Result<(), LaneJoinError> {
         self.stop();
-        let deadline = Instant::now() + grace;
+        let started = Instant::now();
         while !self.thread.is_finished() {
-            if Instant::now() >= deadline {
+            if started.elapsed() >= grace {
                 tracing::warn!(lane = %self.name, "output clock wedged past its grace; detached");
                 return Err(LaneJoinError::Detached);
             }
@@ -321,11 +332,27 @@ where
                 clock.skip_to(due);
             }
             let tick = clock.tick();
-            body_stats
-                .lateness
-                .record(now, cfg.deadline_nanos(&clock, tick.index));
+            let tick_deadline = cfg.deadline_nanos(&clock, tick.index);
+            body_stats.lateness.record(now, tick_deadline);
             body_stats.ticks.fetch_add(1, Ordering::AcqRel);
             on_tick(tick);
+            // Timeline exhaustion (P2-A1): if the next tick would not be
+            // strictly later — in PTS or in deadline — every further tick
+            // would be due at once with a repeated stamp. End this lane
+            // explicitly instead of looping hot.
+            let next = clock.next_index();
+            if next == tick.index
+                || clock.pts_at(next) <= tick.pts
+                || cfg.deadline_nanos(&clock, next) <= tick_deadline
+            {
+                body_stats.exhausted.store(true, Ordering::Release);
+                tracing::error!(
+                    lane = %cfg.name,
+                    tick = tick.index,
+                    "output clock timeline exhausted (saturated PTS/deadline); lane ended"
+                );
+                return;
+            }
         }
     })?;
     Ok(OutputLaneHandle {
@@ -642,12 +669,60 @@ mod tests {
         let reads = Arc::new(AtomicU64::new(0));
         let counting: Arc<dyn TimeSource> = Arc::new(Counting(manual, Arc::clone(&reads)));
         let lane = spawn_output_lane(cfg, counting, StopSignal::new(), |_| {}).unwrap();
+        let started = Instant::now();
         std::thread::sleep(Duration::from_millis(100));
-        // With a >= 1 ms step, 100 ms of a frozen clock is at most ~100
-        // reads (a spin would be millions).
+        // Bound the reads by the MEASURED elapsed time: a >= 1 ms step reads
+        // the source about twice per elapsed millisecond (a stall of the test
+        // thread only raises the allowance); a busy loop reads millions.
         let n = reads.load(Ordering::Relaxed);
-        assert!(n <= 400, "{n} time reads in 100 ms: spinning");
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let allowed = elapsed_ms.saturating_add(10).saturating_mul(4);
+        assert!(n <= allowed, "{n} time reads in {elapsed_ms} ms: spinning");
         assert_eq!(lane.join_within(Duration::from_secs(1)), Ok(()));
+    }
+
+    /// P2-A1: on extreme seeds/time the timeline saturates; the lane ends
+    /// itself (exhausted) after a bounded number of callbacks, never a hot
+    /// loop of identical stamps.
+    #[test]
+    fn a_saturated_timeline_ends_the_lane_after_bounded_callbacks() {
+        for (seed, now) in [(0, i64::MAX), (i64::MIN, i64::MAX), (i64::MIN, 0)] {
+            let manual = Arc::new(ManualTimeSource::new());
+            manual.set(now);
+            let time: Arc<dyn TimeSource> = manual;
+            let mut cfg = OutputLaneClock::new("sat", Rational::FPS_25, seed);
+            cfg.latch_delay = Duration::ZERO;
+            cfg.pacing = STEP;
+            let calls = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&calls);
+            let lane = spawn_output_lane(cfg, time, StopSignal::new(), move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            let n = calls.load(Ordering::Relaxed);
+            if now == i64::MAX {
+                assert!(wait_for(|| lane.is_finished()), "seed {seed}: lane ended");
+                assert!(lane.stats().exhausted(), "seed {seed}");
+                assert!(n <= 2, "seed {seed}: {n} callbacks");
+            } else {
+                // seed i64::MIN, now 0: paced normally (one catch-up tick);
+                // never a hot loop.
+                assert!(n <= 2, "seed {seed}: {n} callbacks");
+            }
+            assert_eq!(lane.join_within(Duration::from_secs(1)), Ok(()));
+        }
+    }
+
+    #[test]
+    fn join_within_accepts_an_unbounded_grace() {
+        let time: Arc<dyn TimeSource> = Arc::new(ManualTimeSource::new());
+        let run_stop = StopSignal::new();
+        run_stop.stop();
+        let lane =
+            spawn_output_lane(manual_cfg(Rational::FPS_25, 0), time, run_stop, |_| {}).unwrap();
+        assert!(wait_for(|| lane.is_finished()));
+        assert_eq!(lane.join_within(Duration::MAX), Ok(()));
     }
 
     #[test]
