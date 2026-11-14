@@ -15,11 +15,27 @@
 //! ## Time
 //!
 //! The output time base is `1/fps`, so a rebased DTS **is** the tick index.
-//! A source timestamp converts exactly (i128): `ts * tb.num * fps.num /
-//! (tb.den * fps.den)` must divide evenly, else the AU is **off grid** and is
-//! never emitted (a stall at its tick, never a clamp-fixed stamp). A run fixes
-//! one integer `offset`: `dts' = dts_ticks + offset`, `pts' = pts_ticks +
-//! offset`, so raw deltas and the B-frame reorder pass through unchanged.
+//! A source timestamp converts exactly (checked i128) **relative to a
+//! per-stream epoch** (the raw DTS of the first AU, re-anchored after a
+//! malformed AU, a time-base change or a DTS off the current epoch's grid):
+//! `(ts - epoch) * tb.num * fps.num / (tb.den * fps.den)` must divide evenly
+//! (else the PTS / AU is off grid: never emitted, a stall at its tick), and
+//! its magnitude must stay within [`MAX_ABS_TICKS`] (else malformed). AUs of
+//! an older epoch never mix with a run of a newer one. A run fixes one integer
+//! `offset`: `dts' = dts_ticks + offset`, `pts' = pts_ticks + offset + extra`,
+//! so raw deltas and the B-frame reorder pass through unchanged. Every
+//! offset/rebase sum is checked; an overflow ends the run as malformed.
+//!
+//! ## Presentation delay across bridges
+//!
+//! After a run with B-frames, pictures already emitted may present after the
+//! tick on which the run ends. The bridge then carries one constant delay
+//! (`pts = tick + bridge_delay`, `bridge_delay = max(0, max_emitted_pts + 1 -
+//! t)`), fixed when the run ends; a slate is forward-predicted, so a constant
+//! delay is a valid stream. A new run adds the smallest constant `extra` to its
+//! PTS' so its IDR presents after everything emitted before it (bounded by
+//! [`MAX_PRESENTATION_DELAY`]; beyond it the slot stays bridged until
+//! [`PassthroughClock::reset_timeline`] at a signalled discontinuity).
 //!
 //! ## The jitter buffer
 //!
@@ -80,7 +96,7 @@ use std::sync::Arc;
 
 use multiview_core::time::Rational;
 
-use super::tap::TapAu;
+use super::tap::{TapAu, MAX_AU_BYTES};
 
 /// Target jitter-buffer depth at a run start, in ticks.
 pub const TARGET_DEPTH: u64 = 3;
@@ -97,6 +113,18 @@ pub const STALL_RETURN_TICKS: u32 = 30;
 /// Consecutive on-time ticks with unchanged parameters needed after a
 /// parameter change.
 pub const PARAM_RETURN_TICKS: u32 = 300;
+
+/// Largest converted timestamp magnitude, in output ticks (2^62). Anything
+/// larger is a malformed source; with this bound every offset / rebase sum
+/// below stays far inside `i128` (|ticks| <= 2^62, ticks <= 2^64).
+pub const MAX_ABS_TICKS: i128 = 1 << 62;
+
+/// Largest constant presentation delay (PTS - DTS shift, in ticks) a run or a
+/// bridge may carry after a B-frame run ended mid-GOP. Beyond it the clock
+/// stays bridged ([`BridgeReason::PresentationDelay`]) until the caller resets
+/// the timeline at a signalled discontinuity
+/// ([`PassthroughClock::reset_timeline`]).
+pub const MAX_PRESENTATION_DELAY: i128 = 8;
 
 /// Most AUs the clock takes from its reader per tick. Anything beyond stays
 /// in the reader's bounded channel for the next tick.
@@ -125,6 +153,9 @@ pub enum BridgeReason {
     SlateNotReady,
     /// The source's timestamps are malformed.
     Malformed,
+    /// A new run would need a presentation delay above
+    /// [`MAX_PRESENTATION_DELAY`]; waits for [`PassthroughClock::reset_timeline`].
+    PresentationDelay,
 }
 
 impl BridgeReason {
@@ -142,6 +173,7 @@ impl BridgeReason {
             Self::ParametersNoLongerMatch => "parameters-no-longer-match",
             Self::SlateNotReady => "slate-not-ready",
             Self::Malformed => "malformed",
+            Self::PresentationDelay => "presentation-delay",
         }
     }
 }
@@ -164,20 +196,26 @@ pub enum Emission {
         /// The first AU of a run entered from a bridge.
         run_start: bool,
     },
-    /// A synthesised repeat (skip) picture; `dts == pts == tick`.
+    /// A synthesised repeat (skip) picture; `dts == tick`, `pts == tick +
+    /// the run's constant presentation delay` (0 for a run entered without
+    /// one).
     Repeat {
         /// The repeat AU bytes from the [`RepeatSource`].
         data: Arc<[u8]>,
         /// DTS (the tick).
         dts: i64,
-        /// PTS (the tick).
+        /// PTS.
         pts: i64,
     },
-    /// The caller emits its bridge AU for this tick; `dts == pts == tick`.
+    /// The caller emits its bridge AU for this tick: `dts == tick`,
+    /// `pts == tick + delay` with a delay that is constant for the whole bridge
+    /// (non-zero only after a B-frame run, so a bridge picture never presents
+    /// at or before a picture already emitted). A bridge AU must carry no
+    /// reordering (the slate is forward-predicted).
     Bridge {
         /// DTS (the tick).
         dts: i64,
-        /// PTS (the tick).
+        /// PTS (the tick plus the bridge's presentation delay).
         pts: i64,
         /// Why.
         reason: BridgeReason,
@@ -256,6 +294,8 @@ struct Entry {
     au: TapAu,
     /// Monotonic arrival sequence number.
     seq: u64,
+    /// The timestamp epoch generation `dts_t` / `pts_t` are relative to.
+    epoch: u64,
     /// DTS in output ticks, `None` when off grid.
     dts_t: Option<i128>,
     /// PTS in output ticks, `None` when off grid.
@@ -270,6 +310,19 @@ struct Probe {
     virtual_offset: i128,
     last_dts_t: i128,
     gen: u64,
+    epoch: u64,
+}
+
+/// One exact conversion result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Conv {
+    /// On the output grid.
+    Tick(i128),
+    /// Not a whole number of output ticks.
+    OffGrid,
+    /// Arithmetic overflow, a degenerate rate / time base, or beyond
+    /// [`MAX_ABS_TICKS`]: a malformed source.
+    Overflow,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +338,11 @@ enum State {
         offset: i128,
         start_tick: i128,
         gen: u64,
+        /// The timestamp epoch generation of the run's AUs.
+        epoch: u64,
+        /// The run's constant presentation delay (added to every PTS'), so
+        /// its first IDR presents after everything emitted before it.
+        extra: i128,
         /// A pending new run at a drift-corrected IDR: (IDR seq, new offset).
         rebase: Option<(u64, i128)>,
         /// Any emitted `pts' != dts'` in this run.
@@ -317,6 +375,15 @@ pub struct PassthroughClock {
     last_depth: usize,
     /// Parameter generation of the most recent run (reset by `arm`).
     last_run_gen: Option<u64>,
+    /// The source timestamp epoch (raw DTS) and its generation: converted
+    /// ticks are `(ts - epoch) * tb * fps` (R1-M1: an absolute source
+    /// timestamp need not be a whole number of frame periods).
+    epoch_ts: Option<i64>,
+    epoch_gen: u64,
+    /// The bridge's presentation delay (never decreases while bridged).
+    bridge_delay: i128,
+    /// The highest PTS' emitted so far (every emission kind).
+    max_emitted_pts: Option<i128>,
     counters: ClockCounters,
 }
 
@@ -341,8 +408,28 @@ impl PassthroughClock {
             last_emitted: None,
             last_depth: 0,
             last_run_gen: None,
+            epoch_ts: None,
+            epoch_gen: 0,
+            bridge_delay: 0,
+            max_emitted_pts: None,
             counters: ClockCounters::default(),
         }
+    }
+
+    /// The current bridge presentation delay in ticks.
+    #[must_use]
+    pub fn bridge_delay(&self) -> i64 {
+        i64::try_from(self.bridge_delay).unwrap_or(i64::MAX)
+    }
+
+    /// Forget the presentation history: the next bridge and run start with
+    /// no presentation delay. Call ONLY when the output signals a timeline
+    /// discontinuity at the next emitted IDR (an HLS `EXT-X-DISCONTINUITY`
+    /// / TS `discontinuity_indicator`), e.g. when [`BridgeReason::PresentationDelay`]
+    /// holds the slot bridged.
+    pub fn reset_timeline(&mut self) {
+        self.bridge_delay = 0;
+        self.max_emitted_pts = None;
     }
 
     /// Take the slot into passthrough: the first strict IDR that passes the
@@ -420,14 +507,12 @@ impl PassthroughClock {
     pub fn depth(&self, tick: u64) -> usize {
         let t = i128::from(tick);
         match self.state {
-            State::Run { offset, rebase, .. } => self
-                .queue
-                .iter()
-                .filter(|e| {
-                    e.dts_t
-                        .is_some_and(|d| d + offset_for(offset, rebase, e.seq) >= t)
-                })
-                .count(),
+            State::Run {
+                offset,
+                rebase,
+                epoch,
+                ..
+            } => self.depth_at(t, offset, rebase, epoch),
             State::Bridge { .. } => 0,
         }
     }
@@ -437,6 +522,9 @@ impl PassthroughClock {
     /// [`Emission`] stamped for `tick`. `now_ns` is this tick's time on the
     /// shared monotonic clock (it places each AU's `arrival_ns` on the tick
     /// grid).
+    ///
+    /// A `tick` above `i64::MAX` saturates the emitted stamps; that is
+    /// unreachable (2^63 ticks is about 4.8e9 years at 60 fps).
     pub fn on_tick(
         &mut self,
         tick: u64,
@@ -451,61 +539,138 @@ impl PassthroughClock {
             self.ingest(t, now_ns, au);
         }
         let emission = self.decide(t, gate, repeat);
-        if matches!(emission, Emission::Bridge { .. }) {
-            self.counters.bridge_ticks = self.counters.bridge_ticks.saturating_add(1);
-        }
+        let pts = match &emission {
+            Emission::Bridge { pts, .. } => {
+                self.counters.bridge_ticks = self.counters.bridge_ticks.saturating_add(1);
+                *pts
+            }
+            Emission::Au { pts, .. } | Emission::Repeat { pts, .. } => *pts,
+        };
+        let pts = i128::from(pts);
+        self.max_emitted_pts = Some(self.max_emitted_pts.map_or(pts, |m| m.max(pts)));
         emission
     }
 
-    /// Source ticks of `ts` in time base `tb`, or `None` when off grid.
-    fn to_ticks(&self, ts: i64, tb: Rational) -> Option<i128> {
+    /// Exact output ticks of a source-relative timestamp `rel` (time base
+    /// `tb`). See [`Conv`].
+    fn convert(&self, rel: i128, tb: Rational) -> Conv {
         if tb.num <= 0 || tb.den <= 0 || self.fps.num <= 0 || self.fps.den <= 0 {
-            return None;
+            return Conv::Overflow;
         }
-        let num = i128::from(ts)
-            .checked_mul(i128::from(tb.num))?
-            .checked_mul(i128::from(self.fps.num))?;
-        let den = i128::from(tb.den).checked_mul(i128::from(self.fps.den))?;
-        (num % den == 0).then_some(num / den)
+        let Some(num) = rel
+            .checked_mul(i128::from(tb.num))
+            .and_then(|v| v.checked_mul(i128::from(self.fps.num)))
+        else {
+            return Conv::Overflow;
+        };
+        let Some(den) = i128::from(tb.den).checked_mul(i128::from(self.fps.den)) else {
+            return Conv::Overflow;
+        };
+        if num % den != 0 {
+            return Conv::OffGrid;
+        }
+        let ticks = num / den;
+        if ticks.checked_abs().is_none_or(|a| a > MAX_ABS_TICKS) {
+            return Conv::Overflow;
+        }
+        Conv::Tick(ticks)
+    }
+
+    /// Output ticks of `ts` (relative to a zero epoch) in time base `tb`, or
+    /// `None` when off grid, overflowing or degenerate.
+    fn to_ticks(&self, ts: i64, tb: Rational) -> Option<i128> {
+        match self.convert(i128::from(ts), tb) {
+            Conv::Tick(t) => Some(t),
+            Conv::OffGrid | Conv::Overflow => None,
+        }
     }
 
     /// The output tick on which an AU that arrived at `arrival_ns` landed,
-    /// given that `tick` began at `now_ns`.
+    /// given that `tick` began at `now_ns`. Saturating: an absurd age lands
+    /// at tick 0.
     fn arrival_tick(&self, t: i128, now_ns: u64, arrival_ns: u64) -> i128 {
         let ago_ns = i128::from(now_ns.saturating_sub(arrival_ns));
         let num = i128::from(self.fps.num.max(1));
-        let den = i128::from(self.fps.den.max(1)) * 1_000_000_000;
-        (t - ago_ns * num / den).max(0)
+        let den = i128::from(self.fps.den.max(1)).saturating_mul(1_000_000_000);
+        let ago_ticks = ago_ns.checked_mul(num).map_or(t, |v| v / den);
+        t.saturating_sub(ago_ticks).max(0)
+    }
+
+    /// Start a new timestamp epoch at raw DTS `dts`.
+    fn re_epoch(&mut self, dts: i64) {
+        self.epoch_ts = Some(dts);
+        self.epoch_gen = self.epoch_gen.wrapping_add(1);
+    }
+
+    /// A malformed AU: drop the queue, end a run, restart the epoch on it.
+    fn malformed(&mut self, dts: i64) {
+        self.queue.clear();
+        if matches!(self.state, State::Run { .. }) {
+            self.pending_fault = Some(BridgeReason::Malformed);
+        }
+        self.probe = None;
+        self.stable = 0;
+        self.re_epoch(dts);
     }
 
     fn ingest(&mut self, t: i128, now_ns: u64, au: TapAu) {
+        // R1-A5: a byte budget per AU (the tap enforces it too).
+        if au.data.len() > MAX_AU_BYTES {
+            if matches!(self.state, State::Run { .. }) {
+                self.pending_fault = Some(BridgeReason::Malformed);
+            }
+            return;
+        }
         let malformed = match self.last_rx {
             Some((dts, tb)) => tb != au.time_base || au.dts <= dts,
             None => false,
         };
         self.last_rx = Some((au.dts, au.time_base));
-        let dts_t = self.to_ticks(au.dts, au.time_base);
-        let pts_t = self.to_ticks(au.pts, au.time_base);
+        if malformed {
+            self.malformed(au.dts);
+            return;
+        }
+        let epoch = match self.epoch_ts {
+            Some(e) => e,
+            None => {
+                self.re_epoch(au.dts);
+                au.dts
+            }
+        };
+        let rel = |ts: i64, e: i64| i128::from(ts) - i128::from(e);
+        let dts_t = match self.convert(rel(au.dts, epoch), au.time_base) {
+            Conv::Tick(d) => d,
+            // Off the current epoch's grid (a timestamp jump): a new epoch
+            // starts at this AU. In a run it is foreign (a stall when due).
+            Conv::OffGrid => {
+                self.re_epoch(au.dts);
+                0
+            }
+            Conv::Overflow => {
+                self.malformed(au.dts);
+                return;
+            }
+        };
+        let epoch = self.epoch_ts.unwrap_or(au.dts);
+        let pts_t = match self.convert(rel(au.pts, epoch), au.time_base) {
+            Conv::Tick(p) => Some(p),
+            Conv::OffGrid => None,
+            Conv::Overflow => {
+                self.malformed(au.dts);
+                return;
+            }
+        };
         let arrival_tick = self.arrival_tick(t, now_ns, au.arrival_ns);
         let entry = Entry {
             seq: self.next_seq,
-            dts_t,
+            epoch: self.epoch_gen,
+            dts_t: Some(dts_t),
             pts_t,
             arrival_tick,
             au,
         };
         self.next_seq = self.next_seq.wrapping_add(1);
         self.update_probe(&entry);
-
-        if malformed {
-            self.queue.clear();
-            if matches!(self.state, State::Run { .. }) {
-                self.pending_fault = Some(BridgeReason::Malformed);
-            }
-            self.probe = None;
-            self.stable = 0;
-            return;
-        }
 
         match self.state {
             State::Bridge { .. } => {
@@ -533,7 +698,9 @@ impl PassthroughClock {
 
     fn update_probe(&mut self, e: &Entry) {
         let continues = match (self.probe, e.dts_t) {
-            (Some(p), Some(d)) => d == p.last_dts_t + 1 && p.gen == e.au.params_gen,
+            (Some(p), Some(d)) => {
+                p.epoch == e.epoch && d == p.last_dts_t + 1 && p.gen == e.au.params_gen
+            }
             _ => false,
         };
         match (continues, e.dts_t) {
@@ -543,10 +710,20 @@ impl PassthroughClock {
                 }
             }
             (_, Some(d)) => {
+                let Some(virtual_offset) = e
+                    .arrival_tick
+                    .checked_add(i128::from(TARGET_DEPTH))
+                    .and_then(|v| v.checked_sub(d))
+                else {
+                    self.probe = None;
+                    self.stable = 0;
+                    return;
+                };
                 self.probe = Some(Probe {
-                    virtual_offset: e.arrival_tick + i128::from(TARGET_DEPTH) - d,
+                    virtual_offset,
                     last_dts_t: d,
                     gen: e.au.params_gen,
+                    epoch: e.epoch,
                 });
                 self.stable = 0;
             }
@@ -560,7 +737,11 @@ impl PassthroughClock {
     /// Advance the on-time count for tick `t`.
     fn tick_probe(&mut self, t: i128) {
         match self.probe {
-            Some(p) if p.last_dts_t + p.virtual_offset >= t => {
+            Some(p)
+                if p.last_dts_t
+                    .checked_add(p.virtual_offset)
+                    .is_some_and(|v| v >= t) =>
+            {
                 self.stable = self.stable.saturating_add(1);
             }
             _ => {
@@ -570,16 +751,24 @@ impl PassthroughClock {
         }
     }
 
-    fn bridge(t: i128, reason: BridgeReason) -> Emission {
+    /// A bridge emission for tick `t`: `pts = t + bridge_delay`.
+    fn bridge(&self, t: i128, reason: BridgeReason) -> Emission {
         let tick = i64::try_from(t).unwrap_or(i64::MAX);
+        let pts = t
+            .checked_add(self.bridge_delay)
+            .and_then(|p| i64::try_from(p).ok())
+            .unwrap_or(i64::MAX);
         Emission::Bridge {
             dts: tick,
-            pts: tick,
+            pts,
             reason,
         }
     }
 
-    /// End the current run with `reason` and bridge this tick.
+    /// End the current run with `reason` and bridge this tick. The bridge's
+    /// presentation delay is fixed here, once, for the whole bridge: the
+    /// smallest that keeps every bridge picture presenting after everything
+    /// already emitted (R1-M2; 0 after a run without reordering).
     fn end_run(&mut self, t: i128, reason: BridgeReason) -> Emission {
         let (required, param_fault) = match reason {
             BridgeReason::ParameterChange => {
@@ -604,7 +793,12 @@ impl PassthroughClock {
         self.probe = None;
         self.stable = 0;
         self.pending_fault = None;
-        Self::bridge(t, reason)
+        self.bridge_delay = self
+            .max_emitted_pts
+            .and_then(|m| m.checked_add(1))
+            .and_then(|m| m.checked_sub(t))
+            .map_or(0, |d| d.max(0));
+        self.bridge(t, reason)
     }
 
     fn decide(&mut self, t: i128, gate: &dyn SlotGate, repeat: &mut dyn RepeatSource) -> Emission {
@@ -614,6 +808,7 @@ impl PassthroughClock {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn decide_bridge(
         &mut self,
         t: i128,
@@ -628,15 +823,19 @@ impl PassthroughClock {
             param_fault,
         } = self.state
         else {
-            return Self::bridge(t, BridgeReason::NotArmed);
+            return self.bridge(t, BridgeReason::NotArmed);
         };
         if !self.armed {
             self.queue.clear();
-            return Self::bridge(t, BridgeReason::NotArmed);
+            return self.bridge(t, BridgeReason::NotArmed);
         }
         let mut shown = reason;
         while let Some(head) = self.queue.front() {
-            if !head.au.strict_idr || head.dts_t.is_none() || head.pts_t.is_none() {
+            let (Some(d), Some(p)) = (head.dts_t, head.pts_t) else {
+                self.queue.pop_front();
+                continue;
+            };
+            if !head.au.strict_idr {
                 self.queue.pop_front();
                 continue;
             }
@@ -666,16 +865,43 @@ impl PassthroughClock {
                 self.queue.pop_front();
                 continue;
             }
-            // Start a run at this IDR.
-            let (Some(d), arrival) = (head.dts_t, head.arrival_tick) else {
+            // Start a run at this IDR: its first AU decodes at `start`.
+            let start = t.max(head.arrival_tick.saturating_add(i128::from(TARGET_DEPTH)));
+            let Some(offset) = start.checked_sub(d) else {
                 self.queue.pop_front();
                 continue;
             };
-            let start = t.max(arrival + i128::from(TARGET_DEPTH));
+            // R1-M2: the IDR must present after everything already emitted
+            // and after the starting bridges still to come (t..start, each
+            // presenting at tick + bridge_delay). A run after a B-frame run's
+            // bridge takes the smallest constant delay that achieves it.
+            let floor = if start > t {
+                start
+                    .checked_sub(1)
+                    .and_then(|v| v.checked_add(self.bridge_delay))
+            } else {
+                None
+            }
+            .max(self.max_emitted_pts);
+            let Some(idr_pts) = p.checked_add(offset) else {
+                self.queue.pop_front();
+                continue;
+            };
+            let extra = floor
+                .and_then(|f| f.checked_add(1))
+                .and_then(|f| f.checked_sub(idr_pts))
+                .map_or(0, |e| e.max(0));
+            if extra > MAX_PRESENTATION_DELAY {
+                shown = BridgeReason::PresentationDelay;
+                self.queue.pop_front();
+                continue;
+            }
             self.state = State::Run {
-                offset: start - d,
+                offset,
                 start_tick: start,
                 gen,
+                epoch: head.epoch,
+                extra,
                 rebase: None,
                 reorder: false,
                 max_pts: None,
@@ -689,13 +915,15 @@ impl PassthroughClock {
         if let State::Bridge { reason: r, .. } = &mut self.state {
             if matches!(
                 shown,
-                BridgeReason::ParametersNoLongerMatch | BridgeReason::SlateNotReady
+                BridgeReason::ParametersNoLongerMatch
+                    | BridgeReason::SlateNotReady
+                    | BridgeReason::PresentationDelay
             ) {
                 *r = shown;
             }
             shown = *r;
         }
-        Self::bridge(t, shown)
+        self.bridge(t, shown)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -707,6 +935,8 @@ impl PassthroughClock {
             mut offset,
             start_tick,
             gen,
+            epoch,
+            extra,
             mut rebase,
             reorder,
             max_pts,
@@ -714,17 +944,25 @@ impl PassthroughClock {
             first_pending,
         } = self.state
         else {
-            return Self::bridge(t, BridgeReason::NotArmed);
+            return self.bridge(t, BridgeReason::NotArmed);
         };
         if t < start_tick {
-            return Self::bridge(t, BridgeReason::Starting);
+            return self.bridge(t, BridgeReason::Starting);
         }
 
-        // Late AUs (dts' < t) are discarded and end the run.
+        // Late AUs (dts' < t) are discarded and end the run. An AU from
+        // another timestamp epoch (a jump) is foreign: it ends the run when
+        // it reaches the head (below).
         let mut late = 0_u64;
         while let Some(head) = self.queue.front() {
-            match head.dts_t {
-                Some(d) if d + offset_for(offset, rebase, head.seq) < t => {
+            if head.epoch != epoch {
+                break;
+            }
+            match head
+                .dts_t
+                .and_then(|d| d.checked_add(offset_for(offset, rebase, head.seq)))
+            {
+                Some(d) if d < t => {
                     self.queue.pop_front();
                     late += 1;
                 }
@@ -736,13 +974,13 @@ impl PassthroughClock {
             return self.end_run(t, BridgeReason::Late);
         }
 
-        let depth = self.depth_at(t, offset, rebase);
+        let depth = self.depth_at(t, offset, rebase, epoch);
         self.last_depth = depth;
 
         // Too deep: drop before a queued IDR (one correction per IDR).
         if depth > DEEP_DEPTH && rebase.is_none() && !first_pending {
             if let Some((idr_seq, new_offset, k, i)) =
-                self.plan_deep(t, offset, max_pts, corrected_seq)
+                self.plan_deep(t, offset, epoch, extra, max_pts, corrected_seq)
             {
                 let m = i - k;
                 self.queue.drain(k..i);
@@ -759,12 +997,18 @@ impl PassthroughClock {
         let Some(head) = self.queue.front() else {
             return self.end_run(t, BridgeReason::Stall);
         };
+        if head.epoch != epoch {
+            return self.end_run(t, BridgeReason::Stall);
+        }
         let head_off = offset_for(offset, rebase, head.seq);
         let (Some(hd), Some(hp)) = (head.dts_t, head.pts_t) else {
             self.queue.pop_front();
             return self.end_run(t, BridgeReason::Stall);
         };
-        if hd + head_off > t {
+        let Some(due) = hd.checked_add(head_off) else {
+            return self.end_run(t, BridgeReason::Malformed);
+        };
+        if due > t {
             return self.end_run(t, BridgeReason::Stall);
         }
         if head.au.params_gen != gen {
@@ -785,24 +1029,31 @@ impl PassthroughClock {
                 .last_emitted
                 .as_ref()
                 .and_then(|prev| repeat.repeat_after(prev));
-            if let Some(data) = bytes {
-                offset += 1;
+            if let (Some(data), Some(next_offset), Some(rpts)) =
+                (bytes, offset.checked_add(1), t.checked_add(extra))
+            {
+                offset = next_offset;
                 self.state = State::Run {
                     offset,
                     start_tick,
                     gen,
+                    epoch,
+                    extra,
                     rebase,
                     reorder,
-                    max_pts: max_pts.max(Some(t)),
+                    max_pts: max_pts.max(Some(rpts)),
                     corrected_seq,
                     first_pending,
                 };
                 self.counters.repeats = self.counters.repeats.saturating_add(1);
                 let tick = i64::try_from(t).unwrap_or(i64::MAX);
+                let Ok(rpts) = i64::try_from(rpts) else {
+                    return self.end_run(t, BridgeReason::Malformed);
+                };
                 return Emission::Repeat {
                     data,
                     dts: tick,
-                    pts: tick,
+                    pts: rpts,
                 };
             }
             // No repeat available: keep passing through; a real underrun
@@ -818,8 +1069,12 @@ impl PassthroughClock {
                 rebase = None;
             }
         }
-        let dts = hd + offset;
-        let pts = hp + offset;
+        let (Some(dts), Some(pts)) = (
+            hd.checked_add(offset),
+            hp.checked_add(offset).and_then(|p| p.checked_add(extra)),
+        ) else {
+            return self.end_run(t, BridgeReason::Malformed);
+        };
         let (Ok(dts64), Ok(pts64)) = (i64::try_from(dts), i64::try_from(pts)) else {
             return self.end_run(t, BridgeReason::Malformed);
         };
@@ -831,8 +1086,10 @@ impl PassthroughClock {
             offset,
             start_tick,
             gen,
+            epoch,
+            extra,
             rebase,
-            reorder: reorder || pts != dts,
+            reorder: reorder || pts != dts.saturating_add(extra),
             max_pts: max_pts.max(Some(pts)),
             corrected_seq,
             first_pending: false,
@@ -850,22 +1107,28 @@ impl PassthroughClock {
         emission
     }
 
-    fn depth_at(&self, t: i128, offset: i128, rebase: Option<(u64, i128)>) -> usize {
+    fn depth_at(&self, t: i128, offset: i128, rebase: Option<(u64, i128)>, epoch: u64) -> usize {
         self.queue
             .iter()
             .filter(|e| {
-                e.dts_t
-                    .is_some_and(|d| d + offset_for(offset, rebase, e.seq) >= t)
+                e.epoch == epoch
+                    && e.dts_t
+                        .and_then(|d| d.checked_add(offset_for(offset, rebase, e.seq)))
+                        .is_some_and(|d| d >= t)
             })
             .count()
     }
 
     /// Plan a too-deep correction: `(idr_seq, new_offset, k, i)` with the drop
-    /// set at queue indices `k..i` and the IDR at `i`.
+    /// set at queue indices `k..i` and the IDR at `i`. Every queued AU it
+    /// looks at must be of the run's epoch; all arithmetic is checked (an
+    /// overflow plans nothing).
     fn plan_deep(
         &self,
         t: i128,
         offset: i128,
+        epoch: u64,
+        extra: i128,
         max_emitted_pts: Option<i128>,
         corrected_seq: Option<u64>,
     ) -> Option<(u64, i128, usize, usize)> {
@@ -877,6 +1140,9 @@ impl PassthroughClock {
             .skip(1)
             .find(|(_, e)| e.au.strict_idr)
             .map(|(i, _)| i)?;
+        if self.queue.iter().take(i + 1).any(|e| e.epoch != epoch) {
+            return None;
+        }
         let idr = self.queue.get(i)?;
         if corrected_seq == Some(idr.seq) {
             return None;
@@ -900,9 +1166,9 @@ impl PassthroughClock {
         }
         let k = k?;
         let m = i128::try_from(i - k).ok()?;
-        let new_offset = offset - m;
-        let idr_decode_at = idr.dts_t? + new_offset;
-        let idr_present_at = idr.pts_t? + new_offset;
+        let new_offset = offset.checked_sub(m)?;
+        let idr_decode_at = idr.dts_t?.checked_add(new_offset)?;
+        let idr_present_at = idr.pts_t?.checked_add(new_offset)?.checked_add(extra)?;
         if idr_decode_at < t {
             return None;
         }
@@ -910,13 +1176,14 @@ impl PassthroughClock {
         // before the IDR's new PTS.
         let mut remaining_max = max_emitted_pts;
         for e in self.queue.iter().take(k) {
-            remaining_max = remaining_max.max(Some(e.pts_t? + offset));
+            let p = e.pts_t?.checked_add(offset)?.checked_add(extra)?;
+            remaining_max = remaining_max.max(Some(p));
         }
         if remaining_max.is_some_and(|p| p >= idr_present_at) {
             return None;
         }
         // The IDR takes the first dropped AU's tick: grid stays contiguous.
-        let first_dropped = self.queue.get(k)?.dts_t? + offset;
+        let first_dropped = self.queue.get(k)?.dts_t?.checked_add(offset)?;
         if first_dropped != idr_decode_at {
             return None;
         }
@@ -971,7 +1238,25 @@ impl SlateLoop {
         self.pos = 0;
     }
 
-    /// The slate AU for `tick`, advancing the loop.
+    /// The slate AU for a bridge emission (`dts`, `pts` from
+    /// [`Emission::Bridge`]: the bridge's constant presentation delay is
+    /// honoured), advancing the loop. `None` when `pts < dts`.
+    pub fn next_at(&mut self, dts: i64, pts: i64) -> Option<SlateAu> {
+        if pts < dts {
+            return None;
+        }
+        let data = Arc::clone(self.packets.get(self.pos)?);
+        let keyframe = self.pos == 0;
+        self.pos = (self.pos + 1) % self.packets.len();
+        Some(SlateAu {
+            data,
+            dts,
+            pts,
+            keyframe,
+        })
+    }
+
+    /// The slate AU for `tick` (no presentation delay), advancing the loop.
     pub fn next_for_tick(&mut self, tick: u64) -> Option<SlateAu> {
         let data = Arc::clone(self.packets.get(self.pos)?);
         let keyframe = self.pos == 0;
@@ -1178,5 +1463,183 @@ mod tests {
         }
         assert!(s.next_for_tick(16).unwrap().keyframe, "loops");
         assert!(SlateLoop::new(Arc::from(Vec::<Arc<[u8]>>::new())).is_none());
+    }
+
+    fn au_at(i: i64, epoch: i64, idr: bool) -> TapAu {
+        let mut a = au(i, idr);
+        a.dts = epoch + i * 3003;
+        a.pts = epoch + i * 3003;
+        a
+    }
+
+    fn drive(
+        c: &mut PassthroughClock,
+        ticks: std::ops::Range<u64>,
+        mut f: impl FnMut(u64) -> Option<TapAu>,
+    ) -> Vec<Emission> {
+        ticks
+            .map(|tick| c.on_tick(tick, 0, f(tick).into_iter(), &Open, &mut NoRepeat))
+            .collect()
+    }
+
+    #[test]
+    fn a_shifted_epoch_cfr_stream_starts_a_run() {
+        // R1-M1: absolute DTS 126000 + n*3003 is not a multiple of 3003.
+        for epoch in [126_000_i64, -126_000, 1, -1, 7_777_777] {
+            let mut c = PassthroughClock::new(Rational::FPS_29_97);
+            c.arm();
+            let out = drive(&mut c, 0..20, |t| {
+                let i = i64::try_from(t).unwrap();
+                Some(au_at(i, epoch, i % 10 == 0))
+            });
+            assert!(
+                out.iter().skip(3).all(|e| matches!(e, Emission::Au { .. })),
+                "epoch {epoch}: runs from tick 3"
+            );
+            for (t, e) in out.iter().enumerate() {
+                assert_eq!(e.dts(), i64::try_from(t).unwrap());
+            }
+        }
+    }
+
+    /// Decode-order IBBP: (dts index, pts index, idr). GOP of 6 pictures.
+    fn ibbp(n: i64) -> (i64, i64, bool) {
+        // decode order per GOP: I0 P3 B1 B2 P6? keep within GOP: I(0) P(3) B(1) B(2) P(5) B(4)
+        let g = n / 6;
+        let k = n % 6;
+        let pts = [0, 3, 1, 2, 5, 4][usize::try_from(k).unwrap()];
+        (n, g * 6 + pts + 1, k == 0)
+    }
+
+    fn assert_monotone(out: &[Emission]) {
+        let mut seen = std::collections::HashSet::new();
+        let mut last_dts = None;
+        for e in out {
+            let pts = match e {
+                Emission::Au { pts, .. }
+                | Emission::Repeat { pts, .. }
+                | Emission::Bridge { pts, .. } => *pts,
+            };
+            assert!(seen.insert(pts), "duplicate PTS {pts} in {out:?}");
+            assert!(pts >= e.dts(), "pts before dts");
+            if let Some(l) = last_dts {
+                assert!(e.dts() > l, "dts strictly increasing");
+            }
+            last_dts = Some(e.dts());
+        }
+    }
+
+    #[test]
+    fn b_frame_stalls_and_parameter_changes_never_collide_with_bridge_pts() {
+        // R1-M2: stall mid-GOP on IBBP, then a return, then a parameter
+        // change mid-GOP, then a return; every emission's PTS is unique.
+        for stall_at in [9_u64, 10, 11, 12] {
+            let mut c = PassthroughClock::new(Rational::FPS_29_97);
+            c.arm();
+            let mk = |n: i64, gen: u64| {
+                let (d, p, idr) = ibbp(n);
+                let mut a = au(d, idr);
+                a.pts = p * 3003;
+                a.params_gen = gen;
+                a
+            };
+            let mut out = Vec::new();
+            let mut n = 0_i64;
+            for tick in 0..400_u64 {
+                // Stall: nothing for 3 ticks; the source then skips ahead.
+                let gen = if tick >= 200 { 2 } else { 1 };
+                let a = if (stall_at..stall_at + 3).contains(&tick) {
+                    n += 1;
+                    None
+                } else {
+                    let a = mk(n, gen);
+                    n += 1;
+                    Some(a)
+                };
+                out.push(c.on_tick(tick, 0, a.into_iter(), &Open, &mut NoRepeat));
+            }
+            assert!(c.counters().stalls >= 1);
+            assert!(c.counters().param_changes >= 1 || c.counters().runs >= 2);
+            assert!(c.counters().runs >= 2, "returned after the stall");
+            assert!(
+                out.iter()
+                    .any(|e| matches!(e, Emission::Bridge { dts, pts, .. } if pts > dts)),
+                "a delayed bridge was exercised"
+            );
+            assert_monotone(&out);
+        }
+    }
+
+    #[test]
+    fn extreme_timestamps_fail_closed_never_panic() {
+        // R1-A4.
+        let mut c = PassthroughClock::new(Rational::new(4, 1));
+        c.arm();
+        let mut a = au(0, true);
+        a.time_base = Rational::new(1 << 62, 1);
+        a.dts = i64::MIN;
+        a.pts = i64::MIN;
+        let e = c.on_tick(0, 0, std::iter::once(a), &Open, &mut NoRepeat);
+        assert!(matches!(e, Emission::Bridge { .. }));
+        let mut c = PassthroughClock::new(Rational::new(2, 1));
+        c.arm();
+        let mut out = Vec::new();
+        for (tick, (dts, pts)) in [
+            (i64::MIN, i64::MAX),
+            (i64::MIN + 1, i64::MAX),
+            (0, 0),
+            (1, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut a = au(0, true);
+            a.time_base = Rational::new(i64::MAX, 1);
+            a.dts = dts;
+            a.pts = pts;
+            out.push(c.on_tick(
+                u64::try_from(tick).unwrap(),
+                u64::MAX,
+                std::iter::once(a),
+                &Open,
+                &mut NoRepeat,
+            ));
+        }
+        assert!(out.iter().all(|e| matches!(e, Emission::Bridge { .. })));
+        // Converted magnitude beyond 2^62 ticks is malformed (never emitted).
+        let c = PassthroughClock::new(Rational::new(1, 1));
+        assert_eq!(c.to_ticks(i64::MAX, Rational::new(1, 1)), None);
+        assert_eq!(c.to_ticks(1 << 62, Rational::new(1, 1)), Some(1 << 62));
+    }
+
+    #[test]
+    fn an_oversize_au_ends_a_run() {
+        // R1-A5.
+        let mut c = PassthroughClock::new(Rational::FPS_29_97);
+        c.arm();
+        let out = drive(&mut c, 0..10, |t| {
+            let i = i64::try_from(t).unwrap();
+            Some(au(i, i == 0))
+        });
+        assert!(matches!(out[9], Emission::Au { .. }));
+        let mut big = au(10, false);
+        big.data = Arc::from(vec![0_u8; MAX_AU_BYTES + 1]);
+        let e = c.on_tick(10, 0, std::iter::once(big), &Open, &mut NoRepeat);
+        assert!(matches!(
+            e,
+            Emission::Bridge {
+                reason: BridgeReason::Malformed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn slate_honours_the_bridge_delay() {
+        let pkts: Arc<[Arc<[u8]>]> = (0..2_u8).map(|i| Arc::from(vec![i])).collect();
+        let mut s = SlateLoop::new(pkts).unwrap();
+        let a = s.next_at(10, 12).unwrap();
+        assert_eq!((a.dts, a.pts, a.keyframe), (10, 12, true));
+        assert!(s.next_at(11, 10).is_none());
     }
 }
