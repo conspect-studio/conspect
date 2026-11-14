@@ -54,10 +54,12 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
-        assert!(
-            self.remaining_data == 0,
-            "There is still data to read, please call poll_data() until it returns None."
-        );
+        // conspect patch (issue #403): upstream asserts here. A frame whose
+        // payload is still outstanding must never panic on peer-driven
+        // state: report it as a malformed frame (H3_FRAME_ERROR) instead.
+        if self.remaining_data != 0 {
+            return Poll::Ready(Err(FrameStreamError::Proto(FrameProtocolError::Malformed)));
+        }
 
         loop {
             let end = self.try_recv(cx)?;
@@ -110,6 +112,15 @@ where
         let data = self.stream.buf_mut().take_chunk(self.remaining_data);
 
         match (data, end) {
+            // conspect patch (issue #403): the stream ended with DATA payload
+            // still declared but never sent. Upstream returned `Ok(None)`
+            // here and left `remaining_data` non-zero, so the next
+            // `poll_next` (trailers) hit the assert above: a truncated
+            // frame is H3_FRAME_ERROR (RFC 9114 section 7.1). A
+            // WebTransport stream (`usize::MAX`, no length) ends cleanly.
+            (None, true) if self.remaining_data != usize::MAX => {
+                Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
+            }
             (None, true) => Poll::Ready(Ok(None)),
             (None, false) => Poll::Pending,
             (Some(d), true)
@@ -442,10 +453,9 @@ mod tests {
         );
     }
 
+    // conspect patch (issue #403): upstream expected a panic here; the
+    // outstanding payload is now a protocol error instead.
     #[tokio::test]
-    #[should_panic(
-        expected = "There is still data to read, please call poll_data() until it returns None"
-    )]
     async fn poll_next_reamining_data() {
         let mut recv = FakeRecv::default();
         let mut buf = BytesMut::with_capacity(64);
@@ -460,8 +470,38 @@ mod tests {
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
 
-        // There is still data to consume, poll_next should panic
-        let _ = poll_fn(|cx| stream.poll_next(cx)).await;
+        // There is still data to consume: an error, never a panic.
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Err(FrameStreamError::Proto(FrameProtocolError::Malformed))
+        );
+    }
+
+    // conspect patch (issue #403): a DATA frame header whose payload never
+    // arrives before FIN is an error from `poll_data`, and `poll_next`
+    // (trailers) afterwards errors instead of panicking.
+    #[tokio::test]
+    async fn poll_data_truncated_before_any_payload() {
+        let mut recv = FakeRecv::default();
+        let mut buf = BytesMut::with_capacity(64);
+
+        FrameType::DATA.encode(&mut buf);
+        VarInt::from(22u32).encode(&mut buf);
+        recv.chunk(buf.freeze());
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Ok(Some(Frame::Data(PayloadLen(22))))
+        );
+        assert_poll_matches!(
+            |cx| to_bytes(stream.poll_data(cx)),
+            Err(FrameStreamError::UnexpectedEnd)
+        );
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Err(FrameStreamError::Proto(FrameProtocolError::Malformed))
+        );
     }
 
     #[tokio::test]

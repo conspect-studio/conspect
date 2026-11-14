@@ -22,6 +22,7 @@ moq-tokio = { path = "../../../vendor/moq-tokio" }
 moq-net = { path = "../../../vendor/moq-net" }
 web-transport-moq = { path = "../../../vendor/web-transport-moq" }
 rustls-platform-verifier = { path = "../../../vendor/rustls-platform-verifier" }
+h3 = { path = "../../../vendor/h3" }
 
 [[bin]]
 name = "header_guard"

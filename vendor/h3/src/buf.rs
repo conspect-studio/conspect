@@ -55,7 +55,12 @@ impl BufList<Bytes> {
     where
         T: Buf,
     {
-        debug_assert!(buf.has_remaining());
+        // conspect patch (issue #403): upstream `debug_assert!`s a non-empty
+        // chunk; the chunk comes from the transport (peer-driven), so an
+        // empty one is skipped instead of asserting.
+        if !buf.has_remaining() {
+            return;
+        }
         self.bufs.push_back(buf.copy_to_bytes(buf.remaining()))
     }
 }
