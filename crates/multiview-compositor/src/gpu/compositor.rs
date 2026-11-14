@@ -22,6 +22,7 @@
 //! GPU's f32 / transcendental drift.
 
 use std::num::NonZeroU64;
+use std::time::{Duration, Instant};
 
 use bytemuck::Zeroable;
 use multiview_core::traits::{BackendKind, Compositor};
@@ -33,6 +34,7 @@ use crate::gpu::pool::{self, CachedBuffer, Dim2, Dim3, SurfacePool};
 use crate::gpu::shader::{composite_wgsl, encode_wgsl};
 use crate::gpu::uniforms::{CompositeUniforms, EncodeUniforms, TileParams};
 use crate::pipeline::{CanvasColor, Nv12Image, Tile};
+use crate::readback::{PendingReadback, ReadbackGate, ReadbackPoll};
 
 /// Hard cap on tiles per composite, sizing the tile texture array and storage
 /// buffer. Bounded by design (data-plane memory is fixed, never per-frame).
@@ -86,12 +88,114 @@ pub struct GpuCompositor {
     /// Frames the run backend re-composited on the CPU after a genuine GPU
     /// failure (observability; see `RunBackend::gpu_cpu_fallback_frames`).
     cpu_fallback_frames: std::sync::atomic::AtomicU64,
-    /// The persistent CPU reference used for a per-frame fallback (a genuine
-    /// GPU failure, or a keyed frame until the GPU key path lands): its LUT
-    /// cache and band/scene scratch survive across ticks, so a repeated
-    /// fallback reuses them instead of allocating every frame (ADR-0113 K1
-    /// review I1/A1).
+    /// The persistent CPU reference a GPU-failure frame is composited on (its
+    /// LUTs and band scratch survive across fallback frames, #395 INV-1).
     cpu_fallback: crate::backend::CpuBackend,
+    /// The bounded-readback state machine (issue #395): the per-frame deadline,
+    /// the held stalled readback, and the miss counter. Never waits longer than
+    /// the deadline; never waits at all while a readback is stalled.
+    readback: ReadbackGate<WgpuReadback>,
+}
+
+/// State of one readback buffer's `map_async`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapState {
+    /// The map callback has not fired yet (the buffer must not be reused).
+    Pending,
+    /// Mapped: readable, must be unmapped before reuse.
+    Mapped,
+    /// The map failed or its callback was dropped.
+    Failed,
+}
+
+/// One plane's in-flight map.
+#[derive(Debug)]
+struct PlaneMap {
+    buffer: wgpu::Buffer,
+    rx: std::sync::mpsc::Receiver<std::result::Result<(), wgpu::BufferAsyncError>>,
+    state: MapState,
+}
+
+impl PlaneMap {
+    /// Request the map of the whole `buffer` (the callback only sends; it
+    /// never blocks and tolerates a dropped receiver).
+    fn start(buffer: &wgpu::Buffer) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        Self {
+            buffer: buffer.clone(),
+            rx,
+            state: MapState::Pending,
+        }
+    }
+
+    /// Non-blocking check of the map callback.
+    fn check(&mut self) {
+        if self.state != MapState::Pending {
+            return;
+        }
+        match self.rx.try_recv() {
+            Ok(Ok(())) => self.state = MapState::Mapped,
+            Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.state = MapState::Failed;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
+/// The Y + UV readback of one submission, polled by the [`ReadbackGate`]
+/// with bounded `device.poll` waits only.
+#[derive(Debug)]
+struct WgpuReadback {
+    device: wgpu::Device,
+    submission: wgpu::SubmissionIndex,
+    planes: [PlaneMap; 2],
+}
+
+impl PendingReadback for WgpuReadback {
+    fn poll(&mut self, wait: Option<Duration>) -> ReadbackPoll {
+        // Bounded: `Wait` carries an explicit timeout (never `None`), and a
+        // zero budget is a non-blocking `Poll`.
+        let poll_type = match wait {
+            Some(timeout) if !timeout.is_zero() => wgpu::PollType::Wait {
+                submission_index: Some(self.submission.clone()),
+                timeout: Some(timeout),
+            },
+            _ => wgpu::PollType::Poll,
+        };
+        let polled = self.device.poll(poll_type);
+        for plane in &mut self.planes {
+            plane.check();
+        }
+        if self.planes.iter().all(|p| p.state == MapState::Mapped) {
+            return ReadbackPoll::Ready;
+        }
+        if self.planes.iter().any(|p| p.state == MapState::Failed) {
+            return ReadbackPoll::Failed("readback buffer map failed".to_owned());
+        }
+        match polled {
+            Ok(_) | Err(wgpu::PollError::Timeout) => ReadbackPoll::Pending,
+            Err(e) => ReadbackPoll::Failed(format!("device poll failed: {e}")),
+        }
+    }
+
+    fn outstanding(&self) -> bool {
+        self.planes.iter().any(|p| p.state == MapState::Pending)
+    }
+
+    fn release(&mut self) {
+        for plane in &mut self.planes {
+            // Only a mapped buffer is unmapped: unmapping an idle buffer is a
+            // wgpu validation error (default handler panics).
+            if plane.state == MapState::Mapped {
+                plane.buffer.unmap();
+                plane.state = MapState::Failed;
+            }
+        }
+    }
 }
 
 /// The overlay sub-pass, its content-keyed image-texture cache, and the
@@ -255,7 +359,27 @@ impl GpuCompositor {
             overlay,
             cpu_fallback_frames: std::sync::atomic::AtomicU64::new(0),
             cpu_fallback: crate::backend::CpuBackend::default(),
+            readback: ReadbackGate::default(),
         })
+    }
+
+    /// Bound the per-frame readback wait by the output frame `period`:
+    /// `min(10 ms, period / 2)` ([`crate::readback::readback_deadline`]).
+    pub fn set_frame_period(&self, period: Duration) {
+        self.readback.set_frame_period(period);
+    }
+
+    /// The current per-frame readback deadline.
+    #[must_use]
+    pub fn readback_deadline(&self) -> Duration {
+        self.readback.deadline()
+    }
+
+    /// Frames that returned [`Error::GpuDeadline`]: a readback that missed its
+    /// deadline, or a frame that failed fast while it was still outstanding.
+    #[must_use]
+    pub fn readback_deadline_misses(&self) -> u64 {
+        self.readback.misses()
     }
 
     /// Count one frame the run backend re-composited on the CPU after a GPU
@@ -266,9 +390,8 @@ impl GpuCompositor {
             .saturating_add(1)
     }
 
-    /// The persistent CPU reference this compositor's run backend falls back
-    /// to for one frame.
-    pub(crate) const fn cpu_fallback(&self) -> &crate::backend::CpuBackend {
+    /// The persistent CPU backend GPU-failure frames are composited on.
+    pub(crate) fn cpu_fallback_backend(&self) -> &crate::backend::CpuBackend {
         &self.cpu_fallback
     }
 
@@ -308,7 +431,10 @@ impl GpuCompositor {
     /// - [`Error::GpuLimit`] when `tiles.len()` exceeds [`MAX_TILES`].
     /// - The color `Unsupported*` / `UnresolvedColor` errors when an axis has no
     ///   shader implementation or is unresolved.
-    /// - [`Error::GpuRuntime`] on a buffer-map / submission failure.
+    /// - [`Error::GpuRuntime`] on a buffer-map / submission failure, or when an
+    ///   earlier readback has been stalled for [`crate::readback::STALL_HOLD`].
+    /// - [`Error::GpuDeadline`] when the readback missed its deadline, or an
+    ///   earlier missed readback is still outstanding (returned at once).
     pub fn composite(
         &self,
         canvas_w: u32,
@@ -326,10 +452,18 @@ impl GpuCompositor {
         // a resize). The lock is never held across an `.await` — these methods
         // are synchronous — so it cannot back-pressure the engine (invariant
         // #10).
+        //
+        // A stalled earlier readback is checked first (under the lock, below),
+        // without waiting: while its buffers are mid-map no GPU work is
+        // recorded (issue #395).
         let mut pool = self
             .pool
             .lock()
             .map_err(|_| Error::GpuRuntime("surface pool lock poisoned".to_owned()))?;
+        // Admission is checked UNDER the pool lock, so a concurrent composite
+        // can never pass admission and then reuse buffers another call left
+        // mid-map (#395 review MC-1).
+        self.readback.admit()?;
         let device = self.ctx.device();
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -397,11 +531,16 @@ impl GpuCompositor {
         // (consistent lock order: pool BEFORE overlay), then run the front half
         // into the pooled linear canvas. The lock is never held across an
         // `.await` (these methods are synchronous), so it cannot back-pressure
-        // the engine (invariant #10).
+        // the engine (invariant #10). A stalled earlier readback is checked
+        // first, under the lock, without waiting (issue #395).
         let mut pool = self
             .pool
             .lock()
             .map_err(|_| Error::GpuRuntime("surface pool lock poisoned".to_owned()))?;
+        // Admission is checked UNDER the pool lock, so a concurrent composite
+        // can never pass admission and then reuse buffers another call left
+        // mid-map (#395 review MC-1).
+        self.readback.admit()?;
         let device = self.ctx.device();
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -1149,14 +1288,27 @@ impl GpuCompositor {
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
         )
         .finish();
-        queue.submit(Some(finished));
-
         let y_buf = pooled_buffer(y_readback.as_ref(), "Y readback")?;
-        let y_bytes = self.map_read(y_buf, y_padded, canvas_w, canvas_h, 1)?;
         let uv_buf = pooled_buffer(uv_readback.as_ref(), "UV readback")?;
-        let uv_bytes = self.map_read(uv_buf, uv_padded, canvas_w / 2, canvas_h / 2, 2)?;
+        let submission = queue.submit(Some(finished));
+        let submitted = Instant::now();
 
-        Nv12Image::new(canvas_w, canvas_h, y_bytes, uv_bytes, canvas.output_tag())
+        // ONE bounded wait for both planes, measured from submit (issue #395):
+        // map both, then poll with the remaining budget. A miss holds the
+        // readback as the stall and returns `GpuDeadline`.
+        let pending = WgpuReadback {
+            device: device.clone(),
+            submission,
+            planes: [PlaneMap::start(y_buf), PlaneMap::start(uv_buf)],
+        };
+        let mut ready = self.readback.wait(pending, submitted)?;
+        let y_bytes = copy_plane(y_buf, y_padded, canvas_w, canvas_h, 1);
+        let uv_bytes = copy_plane(uv_buf, uv_padded, canvas_w / 2, canvas_h / 2, 2);
+        // Unmap both (every view was dropped inside `copy_plane`) so the pooled
+        // buffers can be re-copied + re-mapped next tick, even on a copy error.
+        ready.release();
+
+        Nv12Image::new(canvas_w, canvas_h, y_bytes?, uv_bytes?, canvas.output_tag())
     }
 
     /// Reuse-or-resize the pooled readback `slot` for a `width x height` plane,
@@ -1216,68 +1368,49 @@ impl GpuCompositor {
         );
         Ok(padded)
     }
+}
 
-    /// Map a pooled readback buffer and copy out the unpadded plane bytes.
-    fn map_read(
-        &self,
-        buffer: &wgpu::Buffer,
-        padded_bytes_per_row: u32,
-        width: u32,
-        height: u32,
-        bytes_per_px: u32,
-    ) -> Result<Vec<u8>> {
-        let slice = buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            // The receiver may be gone if the device errored; ignore send error.
-            let _ = tx.send(res);
-        });
-        // poll until the map callback fires (headless, no surface to present).
-        self.ctx
-            .device()
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| Error::GpuRuntime(format!("device poll failed: {e}")))?;
-        match rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(Error::GpuRuntime(format!("buffer map failed: {e}"))),
-            Err(e) => return Err(Error::GpuRuntime(format!("map channel closed: {e}"))),
-        }
+/// Copy the unpadded plane bytes out of a **mapped** pooled readback buffer.
+/// Does not unmap (the caller releases both planes together).
+fn copy_plane(
+    buffer: &wgpu::Buffer,
+    padded_bytes_per_row: u32,
+    width: u32,
+    height: u32,
+    bytes_per_px: u32,
+) -> Result<Vec<u8>> {
+    let row_len = usize::try_from(width)
+        .ok()
+        .and_then(|w| w.checked_mul(usize::try_from(bytes_per_px).ok()?))
+        .ok_or_else(|| Error::Geometry("plane row overflow".to_owned()))?;
+    let rows =
+        usize::try_from(height).map_err(|_| Error::Geometry("plane height overflow".to_owned()))?;
+    let padded = usize::try_from(padded_bytes_per_row)
+        .map_err(|_| Error::Geometry("padded stride overflow".to_owned()))?;
 
-        let row_len = usize::try_from(width)
-            .ok()
-            .and_then(|w| w.checked_mul(usize::try_from(bytes_per_px).ok()?))
-            .ok_or_else(|| Error::Geometry("plane row overflow".to_owned()))?;
-        let rows = usize::try_from(height)
-            .map_err(|_| Error::Geometry("plane height overflow".to_owned()))?;
-        let padded = usize::try_from(padded_bytes_per_row)
-            .map_err(|_| Error::Geometry("padded stride overflow".to_owned()))?;
-
-        // wgpu 30 makes `get_mapped_range` fallible (`Result<BufferView,
-        // MapRangeError>`). Propagate a failed map as a typed readback error rather
-        // than unwrapping — safety rule 3: no panics on the compositor readback
-        // path; hold the typed error, never crash the output.
-        let data = slice
-            .get_mapped_range()
-            .map_err(|e| Error::GpuRuntime(format!("buffer get_mapped_range failed: {e}")))?;
-        let mut out = Vec::with_capacity(row_len * rows);
-        for row in 0..rows {
-            let start = row
-                .checked_mul(padded)
-                .ok_or_else(|| Error::Geometry("row offset overflow".to_owned()))?;
-            let end = start
-                .checked_add(row_len)
-                .ok_or_else(|| Error::Geometry("row end overflow".to_owned()))?;
-            let chunk = data
-                .get(start..end)
-                .ok_or_else(|| Error::GpuRuntime("readback short row".to_owned()))?;
-            out.extend_from_slice(chunk);
-        }
-        drop(data);
-        // Unmap so the pooled buffer can be reused (re-copied + re-mapped) next
-        // tick — the whole point of pooling the readback buffer.
-        buffer.unmap();
-        Ok(out)
+    // wgpu 30 makes `get_mapped_range` fallible (`Result<BufferView,
+    // MapRangeError>`). Propagate a failed map as a typed readback error rather
+    // than unwrapping — safety rule 3: no panics on the compositor readback
+    // path; hold the typed error, never crash the output.
+    let data = buffer
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|e| Error::GpuRuntime(format!("buffer get_mapped_range failed: {e}")))?;
+    let mut out = Vec::with_capacity(row_len.saturating_mul(rows));
+    for row in 0..rows {
+        let start = row
+            .checked_mul(padded)
+            .ok_or_else(|| Error::Geometry("row offset overflow".to_owned()))?;
+        let end = start
+            .checked_add(row_len)
+            .ok_or_else(|| Error::Geometry("row end overflow".to_owned()))?;
+        let chunk = data
+            .get(start..end)
+            .ok_or_else(|| Error::GpuRuntime("readback short row".to_owned()))?;
+        out.extend_from_slice(chunk);
     }
+    drop(data);
+    Ok(out)
 }
 
 impl Compositor for GpuCompositor {
