@@ -360,7 +360,10 @@ export function PatchMatrix(): JSX.Element {
     return recallGeneration.current;
   };
   const [recallError, setRecallError] = useState<string | undefined>();
-  const [recalling, setRecalling] = useState(false);
+  /** The recall generation a request is busy for (E3-13): a newer
+   *  selection is never blocked by an older, dropped request. */
+  const [recallingGen, setRecallingGen] = useState<number | undefined>();
+  const recalling = recallingGen !== undefined && recallingGen === recallGen;
 
   const patchQuery = useQuery<PatchView, OperationApiError>({
     queryKey: PATCH_KEY,
@@ -775,7 +778,7 @@ export function PatchMatrix(): JSX.Element {
     const generation = bumpRecallGeneration();
     const latest = (): boolean => recallGeneration.current === generation;
     setRecallPlan(undefined);
-    setRecalling(true);
+    setRecallingGen(generation);
     setRecallError(undefined);
     try {
       // Read the stored version before and after the plan: a salvo replaced
@@ -796,7 +799,7 @@ export function PatchMatrix(): JSX.Element {
       if (!latest()) return;
       setRecallError(error instanceof OperationApiError ? (error.detail ?? error.message) : t`Plan failed`);
     } finally {
-      if (latest()) setRecalling(false);
+      setRecallingGen((busy) => (busy === generation ? undefined : busy));
     }
   };
 
@@ -805,7 +808,7 @@ export function PatchMatrix(): JSX.Element {
     if (!canAct || recallId === '' || recallDisabledReason !== undefined || recallPlan === undefined) return;
     const bound = recallPlan;
     const generation = recallGeneration.current;
-    setRecalling(true);
+    setRecallingGen(generation);
     setRecallError(undefined);
     clearAwaiting();
     try {
@@ -826,7 +829,7 @@ export function PatchMatrix(): JSX.Element {
     } catch (error) {
       setRecallError(error instanceof OperationApiError ? (error.detail ?? error.message) : t`Take failed`);
     } finally {
-      setRecalling(false);
+      setRecallingGen((busy) => (busy === generation ? undefined : busy));
     }
   };
   const onRecallTake = (): void => {

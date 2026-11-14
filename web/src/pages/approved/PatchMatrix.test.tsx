@@ -879,6 +879,13 @@ describe('E3-08 round 2: recall plans bind to generation and salvo content', () 
     await new Promise((resolve) => { setTimeout(resolve, 200); });
     expect(screen.queryByTestId('matrix-recall-plan-line')).toBeNull();
     expect(screen.getByRole('button', { name: 'Take salvo' })).toBeDisabled();
+    // E3-13: the dropped request never leaves the recall actions busy; the
+    // current salvo classifies afresh.
+    expect(screen.getByRole('button', { name: 'Classify salvo' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: 'Classify salvo' }));
+    await waitFor(() => { expect(planCalls).toBe(2); });
+    release();
+    await waitFor(() => { expect(screen.getByTestId('matrix-recall-plan-line')).toHaveTextContent('Can take.'); });
   });
 
   it('changed salvo content under the same id drops the old classification', async () => {
