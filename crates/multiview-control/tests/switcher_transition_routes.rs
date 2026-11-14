@@ -568,6 +568,40 @@ async fn an_applied_selection_is_persisted_after_the_tick_and_survives_a_reload(
         Some(expected.clone()),
         "never mid-flight"
     );
+    // MED-P3-1: the completed AUTO leaves the selection (rate 20), not its
+    // own rate 3, as the persisted descriptor.
+    for index in 3..=6 {
+        tick(&mut driver, index);
+    }
+    let done = handle.snapshot().unwrap();
+    assert!(!done.in_flight);
+    assert_eq!(done.completion_count, 1);
+    assert_eq!(done.transition, expected);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        persisted(&state),
+        Some(expected.clone()),
+        "the selection with its own rate, after completion"
+    );
+    // An AUTO interrupted by a CUT leaves it too.
+    for (id, verb) in [
+        ("auto-2", SwitcherVerb::Auto(FrameCount::try_from(3).unwrap())),
+        ("cut", SwitcherVerb::Cut),
+    ] {
+        handle
+            .try_send(SwitcherCommand {
+                operation_id: id.into(),
+                scene_version: 1,
+                verb,
+            })
+            .unwrap();
+        tick(&mut driver, if id == "cut" { 8 } else { 7 });
+    }
+    let cut = handle.snapshot().unwrap();
+    assert!(!cut.in_flight);
+    assert_eq!(cut.completion_count, 2);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(persisted(&state), Some(expected.clone()), "after a CUT");
     let config: multiview_config::MultiviewConfig = serde_json::from_value(
         multiview_control::boot_model::current_desired_config(&state).unwrap(),
     )

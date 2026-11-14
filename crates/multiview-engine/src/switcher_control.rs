@@ -152,9 +152,9 @@ pub struct SwitcherSnapshot {
     pub in_flight: bool,
     /// Number of completed takes, monotonic within one runtime.
     pub completion_count: u64,
-    /// The selected transition (frozen during a flight), as the machine
-    /// holds it after this tick (ADR-0112 §4). An AUTO's own rate replaces
-    /// the selected rate when it starts.
+    /// The operator's selected transition, as the machine holds it after
+    /// this tick (ADR-0112 §4). An AUTO never changes it: the flight renders
+    /// its own descriptor (the selection at the AUTO's rate).
     pub transition: TransitionDescriptor,
 }
 
@@ -645,14 +645,15 @@ impl SwitcherTickDriver {
                 if !is_rendered_transition(&descriptor) {
                     return Err(REFUSE_UNSUPPORTED_TRANSITION.into());
                 }
+                // The flight renders its own descriptor (the selection at the
+                // AUTO's rate); the selection itself is unchanged (ADR-0112 §4).
                 validate_mix(&pair.program, &pair.preview)
                     .map_err(|e| e.to_string())
                     .and_then(|()| {
                         self.machine
-                            .set_transition(descriptor)
+                            .auto_with(descriptor, tick)
                             .map_err(|e| e.to_string())
                     })
-                    .and_then(|()| self.machine.auto(tick).map_err(|e| e.to_string()))
             }
             SwitcherVerb::SelectPreview(_)
             | SwitcherVerb::Patch(_)
@@ -746,9 +747,16 @@ impl SwitcherTickDriver {
         self.machine.auto_window()
     }
 
-    /// The selected (or, during a flight, the frozen in-flight) transition.
+    /// The descriptor the Program drive renders: the in-flight AUTO's own
+    /// descriptor during a take, else the selection.
     #[must_use]
     pub fn transition(&self) -> &TransitionDescriptor {
+        self.machine.active_transition()
+    }
+
+    /// The operator's selected transition (ADR-0112 §4), unchanged by AUTO.
+    #[must_use]
+    pub fn selected_transition(&self) -> &TransitionDescriptor {
         self.machine.transition()
     }
 

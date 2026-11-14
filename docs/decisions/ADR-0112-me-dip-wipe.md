@@ -24,7 +24,10 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    frozen for the whole flight) and refused with `unsupported-transition` for a
    kind or option the drive does not render. `AUTO(rate)` keeps its own rate and
    uses the selected kind (`SwitcherState::transition_with_rate`); a selected
-   `cut` makes AUTO a MIX, as before.
+   `cut` makes AUTO a MIX, as before. The AUTO's descriptor is the flight's
+   own (`SwitcherState::auto_with` / `active_transition`), cleared when the
+   take completes, is cut or aborted: the selection itself never changes by
+   an AUTO, and the drive renders the flight's descriptor.
 2. **DIP to a colour.** `Dip` gains `color` (`"#rrggbb"`, default black);
    `dip_source` becomes optional and a dip through a source is refused until it
    is rendered. With `t = elapsed / duration` and the exact rational switch
@@ -87,8 +90,10 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    it is persisted as `switcher.mix_effects[0].transition`. Config
    validation applies the same two rules. The persist relay writes the
    selection off the clock, under the config-mutation lock, after the
-   engine applied it and only while no take is in flight, because a
-   flight's descriptor carries the AUTO's own rate. The first-slice
+   engine applied it and only while no take is in flight. The snapshot's
+   `transition` is the selection, never the AUTO's flight descriptor, so a
+   completed or interrupted AUTO persists the selection with its own rate.
+   The first-slice
    launcher sets the persisted selection on the machine before the clock
    starts. The desk enables MIX/WIPE/DIP (pressed state from GET). It has a
    picker with the five patterns as SVG thumbnails, reverse, softness,

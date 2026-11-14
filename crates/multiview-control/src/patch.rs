@@ -54,8 +54,9 @@ async fn persist_relay(state: AppState, control: SwitcherControl) {
                 }
             }
         }
-        // A flight's descriptor carries the AUTO's rate; persist what the
-        // machine holds once the take is over, not mid-flight.
+        // The snapshot carries the operator's selection, never an AUTO's
+        // flight descriptor (MED-P3-1); it is persisted once no take is in
+        // flight, as a selection cannot change during one.
         let Some(snapshot) = snapshot.filter(|s| !s.in_flight) else {
             continue;
         };

@@ -949,3 +949,57 @@ prop_state_machine! {
     #[test]
     fn arbitrary_switcher_verb_sequences(sequential 1..80 => Test);
 }
+
+/// ADR-0112 §4 (MED-P3-1): an AUTO's flight descriptor never becomes the
+/// selection. A CUT selection runs as a MIX at the AUTO's rate (as before),
+/// and a completed, cut-interrupted or aborted take leaves the selection.
+#[test]
+fn an_auto_flight_descriptor_never_replaces_the_selection() {
+    let three = FrameCount::try_from(3).unwrap();
+    let mut state = configured();
+    assert_eq!(state.transition(), &TransitionDescriptor::Cut);
+    let flight = state.transition_with_rate(three);
+    assert_eq!(flight, TransitionDescriptor::Mix { rate: three });
+    assert!(state.auto_with(flight.clone(), tick(10)).unwrap().started);
+    assert_eq!(state.auto_window(), Some((10, three)));
+    assert_eq!(state.active_transition(), &flight);
+    assert_eq!(state.transition(), &TransitionDescriptor::Cut);
+    assert!(state.sample(tick(13)).completed);
+    assert_eq!(state.transition(), &TransitionDescriptor::Cut);
+    assert_eq!(state.active_transition(), &TransitionDescriptor::Cut);
+
+    let selected = TransitionDescriptor::Mix {
+        rate: FrameCount::try_from(20).unwrap(),
+    };
+    state.set_transition(selected.clone()).unwrap();
+    // Interrupted by a CUT.
+    state
+        .auto_with(state.transition_with_rate(three), tick(20))
+        .unwrap();
+    assert_eq!(state.auto_window(), Some((20, three)));
+    assert!(state.cut().unwrap().completed);
+    assert_eq!(state.transition(), &selected);
+    assert_eq!(state.active_transition(), &selected);
+    // Aborted.
+    state
+        .auto_with(state.transition_with_rate(three), tick(30))
+        .unwrap();
+    state.abort();
+    assert_eq!(state.active_transition(), &selected);
+    // A second AUTO during a flight is refused and keeps the first flight.
+    state
+        .auto_with(state.transition_with_rate(three), tick(40))
+        .unwrap();
+    assert_eq!(
+        state.auto_with(selected.clone(), tick(41)),
+        Err(SwitcherError::InFlight)
+    );
+    assert_eq!(state.auto_window(), Some((40, three)));
+    // A plain AUTO (no flight descriptor) still runs at the selected rate.
+    assert!(state.sample(tick(43)).completed);
+    state.auto(tick(50)).unwrap();
+    assert_eq!(
+        state.auto_window(),
+        Some((50, FrameCount::try_from(20).unwrap()))
+    );
+}
