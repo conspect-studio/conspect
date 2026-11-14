@@ -241,7 +241,7 @@ impl AlphaPlanePool {
     ///
     /// # Errors
     /// Returns [`Error::Geometry`] when the alpha plane does not match the image.
-    pub fn attach(self: &Arc<Self>, mut image: Nv12Image, alpha: &[u8]) -> Result<Nv12Image> {
+    pub fn attach(self: &Arc<Self>, image: Nv12Image, alpha: &[u8]) -> Result<Nv12Image> {
         let expected = image.y_plane.len();
         if alpha.len() != expected {
             return Err(Error::Geometry(format!(
@@ -249,6 +249,29 @@ impl AlphaPlanePool {
                 alpha.len()
             )));
         }
+        self.attach_with(image, |plane| {
+            plane.copy_from_slice(alpha);
+            Ok(())
+        })
+    }
+
+    /// Attach a full-resolution straight-alpha plane that `fill` writes in
+    /// place into the pooled buffer (`width * height` bytes, row-major, no
+    /// padding). This is the copy-once form for producers whose alpha lives in
+    /// a strided or packed source (the media player's decoded alpha, #391):
+    /// the pooled plane is the only destination, so no scratch plane is needed.
+    ///
+    /// The buffer handed to `fill` is the reused spare when one was returned,
+    /// so its prior contents are unspecified; `fill` must write every byte.
+    ///
+    /// # Errors
+    /// Whatever `fill` returns; the leased plane goes back to the pool and the
+    /// image is dropped on error.
+    pub fn attach_with<F>(self: &Arc<Self>, mut image: Nv12Image, fill: F) -> Result<Nv12Image>
+    where
+        F: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        let expected = image.y_plane.len();
         let mut spare = self
             .spare
             .lock()
@@ -256,10 +279,25 @@ impl AlphaPlanePool {
         let mut plane = spare.take().unwrap_or_default();
         drop(spare);
         plane.resize(expected, 0);
-        plane.copy_from_slice(alpha);
+        if let Err(err) = fill(&mut plane) {
+            self.give_back(plane);
+            return Err(err);
+        }
         image.alpha_plane = Some(plane);
         image.alpha_return = Some(Arc::clone(self));
         Ok(image)
+    }
+
+    /// Number of planes this pool currently retains for reuse (0 or 1). The
+    /// pool never retains more, so a steady producer cannot grow memory
+    /// through it.
+    #[must_use]
+    pub fn retained(&self) -> usize {
+        let spare = self
+            .spare
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        usize::from(spare.is_some())
     }
 
     fn give_back(&self, plane: Vec<u8>) {
