@@ -493,3 +493,19 @@ fn the_video_key_is_shared_only_without_an_own_format_codec_or_bit_rate() {
     assert_eq!((cap.video_max, cap.audio_max), (1, Some(1)));
     assert!(cap.format_convertible && !cap.raw_video);
 }
+
+/// #343 × ADR-0111: a cast output has no per-output clock yet, so a format
+/// rate other than Program's is refused (at Program's rate it is accepted).
+#[test]
+fn a_cast_output_at_another_rate_is_refused() {
+    let at = |fps: &str| {
+        format!(
+            "\n[[outputs]]\nkind = \"hls\"\nid = \"prog\"\npath = \"/srv/p/index.m3u8\"\ncodec = \"h264\"\n\
+             {CAST}[outputs.format]\nwidth = 1280\nheight = 720\nfps = \"{fps}\"\n"
+        )
+    };
+    let err = load_hd(&at("25/1")).unwrap_err();
+    assert!(err.contains("slot-format-unsupported"), "{err}");
+    assert!(err.contains("per-output clock"), "{err}");
+    load_hd(&at("30000/1001")).expect("Program's rate stays accepted");
+}

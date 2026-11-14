@@ -156,7 +156,7 @@ async fn in_container_mov_text_drives_a_text_cue_into_the_cue_store() {
     let srt = dir.path().join("sub.srt");
     build_text_subtitle_clip(&clip, &srt, "mov_text", "mp4");
 
-    let cue = cue_reaching_store(&clip, &dir.path().join("out_movtext")).await;
+    let cue = Box::pin(cue_reaching_store(&clip, &dir.path().join("out_movtext"))).await;
     assert_text_cue(cue, "mov_text");
 }
 
@@ -167,6 +167,6 @@ async fn in_container_ass_drives_a_text_cue_into_the_cue_store() {
     let srt = dir.path().join("sub.srt");
     build_text_subtitle_clip(&clip, &srt, "ass", "matroska");
 
-    let cue = cue_reaching_store(&clip, &dir.path().join("out_ass")).await;
+    let cue = Box::pin(cue_reaching_store(&clip, &dir.path().join("out_ass"))).await;
     assert_text_cue(cue, "ass");
 }

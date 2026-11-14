@@ -270,8 +270,15 @@ async fn subtitle_cue_burns_into_the_program() {
     assert_eq!(cues.len(), 1, "one cue parsed");
 
     // Identical pipeline, with vs without the subtitle track.
-    let with_sub = run_pipeline(dir.path(), "with_sub", &clip, Some(cues), TICKS).await;
-    let no_sub = run_pipeline(dir.path(), "no_sub", &clip, None, TICKS).await;
+    let with_sub = Box::pin(run_pipeline(
+        dir.path(),
+        "with_sub",
+        &clip,
+        Some(cues),
+        TICKS,
+    ))
+    .await;
+    let no_sub = Box::pin(run_pipeline(dir.path(), "no_sub", &clip, None, TICKS)).await;
 
     // Extract the SAME media instant (1.3s, mid-cue) from both runs.
     let frame_on = dir.path().join("frame_on.png");
@@ -318,8 +325,15 @@ async fn audio_meter_reflects_real_program_loudness() {
     generate_clip_with_audio(&tone_clip, true);
     generate_clip_with_audio(&silent_clip, false);
 
-    let tone_prog = run_pipeline(dir.path(), "tone", &tone_clip, None, TICKS).await;
-    let silent_prog = run_pipeline(dir.path(), "silent", &silent_clip, None, TICKS).await;
+    let tone_prog = Box::pin(run_pipeline(dir.path(), "tone", &tone_clip, None, TICKS)).await;
+    let silent_prog = Box::pin(run_pipeline(
+        dir.path(),
+        "silent",
+        &silent_clip,
+        None,
+        TICKS,
+    ))
+    .await;
 
     // Sample late (1.5s): the peak meter is well established by then.
     let tone_png = dir.path().join("tone.png");
