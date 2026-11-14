@@ -1549,8 +1549,9 @@ impl MultiviewConfig {
     /// * at least one Program-egress output stays at Program's rate (the
     ///   Program egress needs a binding; refused `slot-format-unsupported:`);
     /// * a persisted `[[routing.output]]` feed other than Program onto a rate
-    ///   output is refused `slot-format-unsupported:` (takes onto a rate
-    ///   output are a follow-up).
+    ///   output — video, or an audio feed other than `follow`/`program` — is
+    ///   refused `slot-format-unsupported:` (takes onto a rate output are a
+    ///   follow-up).
     fn validate_output_clocks(&self) -> Result<(), ConfigError> {
         let mut rates: Vec<Fps> = Vec::new();
         let mut rate_outputs: Vec<String> = Vec::new();
@@ -1588,10 +1589,24 @@ impl MultiviewConfig {
         }
         if let Some(table) = &self.routing {
             for xp in &table.output {
-                if rate_outputs.contains(&xp.output) && xp.effective_video() != VideoFeed::PROGRAM {
+                if !rate_outputs.contains(&xp.output) {
+                    continue;
+                }
+                if xp.effective_video() != VideoFeed::PROGRAM {
                     return Err(ConfigError::Validation(format!(
                         "{SLOT_FORMAT_UNSUPPORTED}: output {:?} runs at its own rate; its feed must \
                          be Program (routing another feed onto a rate output is not supported yet)",
+                        xp.output
+                    )));
+                }
+                // #343 review M2: a rate output carries the Program audio
+                // (the lane fans out Program's AAC packets); any other audio
+                // feed would be silently ignored, so it is refused.
+                if !matches!(xp.audio, AudioFeed::Follow | AudioFeed::Program) {
+                    return Err(ConfigError::Validation(format!(
+                        "{SLOT_FORMAT_UNSUPPORTED}: output {:?} runs at its own rate; its audio \
+                         feed must be Program (follow or program; another audio feed onto a rate \
+                         output is not supported yet)",
                         xp.output
                     )));
                 }

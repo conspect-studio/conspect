@@ -480,6 +480,41 @@ fn a_non_program_feed_onto_a_rate_output_is_slot_format_unsupported() {
     );
 }
 
+/// #343 review M2: a rate output carries the Program audio; a persisted
+/// audio feed other than `follow`/`program` (silence, a source's audio, a
+/// track selection) would be silently ignored, so it is refused.
+#[test]
+fn a_non_program_audio_feed_onto_a_rate_output_is_slot_format_unsupported() {
+    let doc = format!(
+        "{PLAIN}\n[[outputs]]\nkind = \"hls\"\nid = \"r25\"\npath = \"/srv/r\"\ncodec = \"h264\"\n\
+         [outputs.format]\nwidth = 1280\nheight = 720\nfps = \"25/1\"\n"
+    );
+    for ok in ["\"follow\"", "\"program\""] {
+        parse(&format!(
+            "{doc}\n[[routing.output]]\noutput = \"r25\"\naudio = {ok}\n"
+        ))
+        .validate()
+        .unwrap_or_else(|e| panic!("audio = {ok} onto a rate output: {e}"));
+    }
+    for feed in [
+        "\"none\"",
+        "{ source = \"cam_b\" }",
+        "{ tracks = [\"program\", \"spa\"] }",
+    ] {
+        assert_code(
+            &format!("{doc}\n[[routing.output]]\noutput = \"r25\"\naudio = {feed}\n"),
+            SLOT_FORMAT_UNSUPPORTED,
+            "its audio feed must be Program",
+        );
+    }
+    // The same feeds stay valid on a Program-rate output.
+    parse(&format!(
+        "{doc}\n[[routing.output]]\noutput = \"plain\"\naudio = \"none\"\n"
+    ))
+    .validate()
+    .expect("silence on a Program-rate output");
+}
+
 #[test]
 fn colour_different_from_canvas_is_slot_format_unsupported() {
     assert_code(
