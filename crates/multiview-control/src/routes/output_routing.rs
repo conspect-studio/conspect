@@ -1016,6 +1016,11 @@ fn replayed(replay: TakeReplay) -> Response {
     })
 }
 
+/// [`too_many`] for sibling routes (one live format reset = one take).
+pub(crate) fn too_many_pub(retry: std::time::Duration) -> Response {
+    too_many(retry)
+}
+
 /// `429` + `Retry-After` (whole seconds, at least 1).
 fn too_many(retry: std::time::Duration) -> Response {
     let secs = retry
