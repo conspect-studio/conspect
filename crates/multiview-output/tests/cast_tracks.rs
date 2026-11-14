@@ -278,7 +278,7 @@ fn two_audio_renditions_and_a_subtitle_with_a_cue_across_a_segment_boundary() {
     );
     assert!(
         master.contains(
-            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",DEFAULT=NO,AUTOSELECT=NO,\
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",DEFAULT=NO,AUTOSELECT=YES,\
          CHANNELS=\"2\",URI=\"audio1.m3u8\",LANGUAGE=\"en\"\n"
         ),
         "{master}"

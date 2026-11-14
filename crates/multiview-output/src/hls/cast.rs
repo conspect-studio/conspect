@@ -1675,6 +1675,7 @@ impl CastPackager {
         master.push_variant(variant);
         if !self.audio.is_empty() {
             master.set_audio_group_id(AUDIO_GROUP);
+            master.set_audio_autoselect_all(true);
         }
         for audio in &self.audio {
             master.push_audio_with_channels(
