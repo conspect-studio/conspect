@@ -326,6 +326,17 @@ impl SubtitleSlot {
             source: None,
         }
     }
+
+    /// The player-menu label of slot `index` (0-based): the explicit `name`,
+    /// else the `language`, else `Subtitles <index + 1>`. Labels of one
+    /// output's slots must be distinct (RFC 8216 §4.3.4.1.1; validated).
+    #[must_use]
+    pub fn effective_name(&self, index: usize) -> String {
+        self.name
+            .clone()
+            .or_else(|| self.language.clone())
+            .unwrap_or_else(|| format!("Subtitles {}", index + 1))
+    }
 }
 
 /// An output's media slots. An empty list means "absent" (today's single slot).
@@ -830,6 +841,26 @@ fn validate_subtitle_slots(
                     ),
                 ));
             }
+        }
+    }
+    // RFC 8216 §4.3.4.1.1: every member of the master's `subs` group needs a
+    // different NAME, so the effective labels (explicit name, else language,
+    // else the default) must be distinct.
+    for (i, slot) in subtitle.iter().enumerate() {
+        let name = slot.effective_name(i);
+        if let Some(first) = subtitle
+            .iter()
+            .take(i)
+            .enumerate()
+            .find_map(|(j, other)| (other.effective_name(j) == name).then_some(j))
+        {
+            return Err(unsupported(
+                output,
+                &format!(
+                    "subtitle slot {i} name {name:?} repeats slot {first}'s (the menu \
+                     label is the name, else the language); give each slot a distinct name"
+                ),
+            ));
         }
     }
     if subtitle.len() > cap.subtitle_max {

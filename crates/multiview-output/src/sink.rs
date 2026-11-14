@@ -2589,7 +2589,10 @@ impl<'a> SegmentState<'a> {
         // aligned with the video playlist (same sequence, same segments).
         let mut subtitle_entries = Vec::with_capacity(subtitles.len());
         let mut sub_slots = Vec::with_capacity(subtitles.len());
-        for (i, rendition) in subtitles.iter().enumerate() {
+        // RFC 8216 §4.3.4.1.1: distinct NAMEs in the group (config validates
+        // this; the sink disambiguates anything unvalidated).
+        let names = crate::hls::subtitle::unique_rendition_names(subtitles);
+        for ((i, rendition), name) in subtitles.iter().enumerate().zip(names) {
             let uri = format!("subs{i}-g{generation}.m3u8");
             let mut subs_live = LivePlaylist::new(parent.join(&uri), window);
             subs_live.set_epoch_source(epoch.clone());
@@ -2599,7 +2602,7 @@ impl<'a> SegmentState<'a> {
                 subs_live.set_initial_discontinuity();
             }
             subtitle_entries.push(SubtitleMedia {
-                name: rendition.name.clone(),
+                name,
                 uri,
                 language: rendition.language.clone(),
             });
@@ -3835,7 +3838,7 @@ fn prune_prior_rendition_manifests_inactive(dir: &Path, active: &[&Path], oldest
             || !(name.starts_with("video-")
                 || name.starts_with("audio-program-")
                 || name.starts_with("audio-track")
-                || name.starts_with("subs")
+                || is_generated_subtitle_manifest(name)
                 || matches!(name, "video.m3u8" | "audio-program.m3u8"))
             || active.contains(&entry.path().as_path())
         {
@@ -3859,6 +3862,23 @@ fn prune_prior_rendition_manifests_inactive(dir: &Path, active: &[&Path], oldest
             }
         }
     }
+}
+
+/// Whether `name` is exactly a subtitle media playlist this sink generates:
+/// `subs<slot>-g<generation>.m3u8` with decimal slot and generation (ABU-2).
+/// Anything else (`subtitles.m3u8`, `subscriptions.m3u8`, …) is not ours and
+/// is never removed by rendition cleanup.
+fn is_generated_subtitle_manifest(name: &str) -> bool {
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix("subs")
+        .and_then(|rest| rest.strip_suffix(".m3u8"))
+        .and_then(|rest| rest.split_once("-g"))
+        .is_some_and(|(slot, generation)| {
+            decimal(slot)
+                && decimal(generation)
+                && slot.parse::<u8>().is_ok()
+                && generation.parse::<u64>().is_ok()
+        })
 }
 
 /// Reap prior-run TS files after the new manifests have advanced beyond them.
@@ -5814,5 +5834,62 @@ mod tests {
         .unwrap();
         prune_prior_live_segments(dir.path(), "seg", 60, 3);
         assert!(dir.path().join("subs0-3.vtt").exists());
+    }
+
+    #[test]
+    fn only_generated_subtitle_manifests_are_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every manifest lists a segment that does not exist, which would
+        // retire a manifest this sink owns.
+        let listing = "#EXTM3U\n#EXTINF:1,\nother-1.ts\n";
+        let foreign = [
+            "subtitles.m3u8",
+            "subscriptions.m3u8",
+            "subs.m3u8",
+            "subs0.m3u8",
+            "subs-g1.m3u8",
+            "subs0-g.m3u8",
+            "subs0-gx.m3u8",
+            "subs0-g1-x.m3u8",
+            "subs999-g1.m3u8",
+            "subs+1-g1.m3u8",
+        ];
+        for name in foreign.iter().chain(&["subs0-g1.m3u8", "subs7-g12.m3u8"]) {
+            std::fs::write(dir.path().join(name), listing).unwrap();
+        }
+        prune_prior_rendition_manifests_inactive(dir.path(), &[], 48);
+        for name in foreign {
+            assert!(dir.path().join(name).exists(), "{name} is not ours");
+        }
+        assert!(!dir.path().join("subs0-g1.m3u8").exists());
+        assert!(!dir.path().join("subs7-g12.m3u8").exists());
+        assert!(super::is_generated_subtitle_manifest("subs3-g0.m3u8"));
+        assert!(!super::is_generated_subtitle_manifest("subtitles.m3u8"));
+    }
+
+    #[test]
+    fn duplicate_subtitle_names_reach_the_master_distinct() {
+        use crate::hls::{subtitle_feed, SubtitleRendition};
+        let _counter_guard = counter_guard();
+        let (packets, params) = sized_packets(160, 120, 0, 6);
+        let dir = tempfile::tempdir().unwrap();
+        let (_feed, rx) = subtitle_feed();
+        let en = || SubtitleRendition {
+            name: "en".to_owned(),
+            language: Some("en".to_owned()),
+        };
+        let mut state = subtitle_state(dir.path(), &params, &rx, &[en(), en()]);
+        let mut source = Switching {
+            packets: packets.into_iter(),
+            switch_pts: -1,
+            params: None,
+            last_pts: None,
+        };
+        state.drive_from_packets(&mut source).unwrap();
+        let mut report = crate::hls::MediaPlaylist::new(crate::hls::SegmentType::MpegTs);
+        state.finish(&mut report, 33_333_333).unwrap();
+        let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+        assert!(master.contains("NAME=\"en\",LANGUAGE"), "{master}");
+        assert!(master.contains("NAME=\"en (2)\",LANGUAGE"), "{master}");
     }
 }

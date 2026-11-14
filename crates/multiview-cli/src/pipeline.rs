@@ -3895,8 +3895,8 @@ impl Pipeline {
     /// slot source and tick, the source's caption store at the picture the
     /// compositor latches for that tick (`peek_at_with_source_time`: the
     /// same selection, without moving the store's prune watermark) and the
-    /// cue store's text cue for that picture's generation. Lock-free reads
-    /// only; it runs on the bake consumer, never the output clock. A source
+    /// cue store's text cue for that picture's generation, projected to
+    /// bounded text without cloning the cue. Lock-free reads only; it runs on the bake consumer, never the output clock. A source
     /// with no caption store (or a build without captions) yields no cues.
     fn subtitle_run(
         &self,
@@ -3927,14 +3927,9 @@ impl Pipeline {
             Box::new(move |id: &str, now: MediaTime| {
                 let store = captions.load().get(id).cloned()?;
                 let picture = stores(id)?.peek_at_with_source_time(now)?;
-                match store.active_at_generation(picture.pts, picture.generation)? {
-                    multiview_ffmpeg::caption::CaptionCue::Text { text, .. }
-                        if !text.lines.is_empty() =>
-                    {
-                        Some(text.lines)
-                    }
-                    _ => None,
-                }
+                // Borrow-and-project (ABU-1/INV-1): bounded text only, a
+                // bitmap cue is skipped without copying its pixels.
+                crate::subtitle_slots::text_cue_lines(&store, picture.pts, picture.generation)
             })
         };
         #[cfg(not(feature = "overlay"))]
@@ -13210,11 +13205,7 @@ fn build_hls_output(
                 .iter()
                 .enumerate()
                 .map(|(i, slot)| multiview_output::hls::SubtitleRendition {
-                    name: slot
-                        .name
-                        .clone()
-                        .or_else(|| slot.language.clone())
-                        .unwrap_or_else(|| format!("Subtitles {}", i + 1)),
+                    name: slot.effective_name(i),
                     language: slot.language.clone(),
                 })
                 .collect();

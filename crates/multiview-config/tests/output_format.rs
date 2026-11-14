@@ -851,6 +851,53 @@ fn subtitle_name_is_validated() {
 }
 
 #[test]
+fn subtitle_rendition_names_must_be_distinct() {
+    // Same language, no names: both would be NAME="en".
+    assert_code(
+        &hls_subs(
+            "[[outputs.slots.subtitle]]\nlanguage = \"en\"\n\
+             [[outputs.slots.subtitle]]\nlanguage = \"en\"\n",
+        ),
+        SLOT_FORMAT_UNSUPPORTED,
+        "subtitle slot 1 name \"en\" repeats slot 0's",
+    );
+    // Duplicate explicit names.
+    assert_code(
+        &hls_subs(
+            "[[outputs.slots.subtitle]]\nname = \"CC\"\nlanguage = \"en\"\n\
+             [[outputs.slots.subtitle]]\nname = \"CC\"\nlanguage = \"de\"\n",
+        ),
+        SLOT_FORMAT_UNSUPPORTED,
+        "subtitle slot 1 name \"CC\" repeats slot 0's",
+    );
+    // An explicit name colliding with another slot's language fallback.
+    assert_code(
+        &hls_subs(
+            "[[outputs.slots.subtitle]]\nlanguage = \"de\"\n\
+             [[outputs.slots.subtitle]]\nname = \"de\"\nlanguage = \"en\"\n",
+        ),
+        SLOT_FORMAT_UNSUPPORTED,
+        "subtitle slot 1 name \"de\" repeats slot 0's",
+    );
+    // ... and with the default label.
+    assert_code(
+        &hls_subs(
+            "[[outputs.slots.subtitle]]\nname = \"Subtitles 2\"\n\
+             [[outputs.slots.subtitle]]\n",
+        ),
+        SLOT_FORMAT_UNSUPPORTED,
+        "subtitle slot 1 name \"Subtitles 2\" repeats slot 0's",
+    );
+    // Same language with distinct names is fine.
+    parse(&hls_subs(
+        "[[outputs.slots.subtitle]]\nlanguage = \"en\"\n\
+         [[outputs.slots.subtitle]]\nlanguage = \"en\"\nname = \"en (SDH)\"\n",
+    ))
+    .validate()
+    .expect("distinct effective names");
+}
+
+#[test]
 fn subtitle_source_must_be_declared() {
     let msg = refusal(&hls_subs(
         "[[outputs.slots.subtitle]]\nsource = \"ghost\"\n",

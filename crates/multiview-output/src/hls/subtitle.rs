@@ -11,8 +11,13 @@
 //!   ns, the same timeline as the video packets' PTS).
 //! - [`SlotCues`] — the bounded per-slot cue holder the sink keeps between
 //!   segment closes.
+//! - [`bound_cue_lines`] — the compact, bounded text projection every cue
+//!   carries (≤ [`MAX_CUE_LINES`] lines, ≤ [`MAX_CUE_TEXT_BYTES`] bytes, fresh
+//!   exact-size allocations), applied by the sampler before it retains,
+//!   compares or enqueues text and again (defensively) at the feed boundary.
 //! - [`render_vtt`] — one `.vtt` segment: the `X-TIMESTAMP-MAP` header and the
 //!   cues overlapping the segment, clipped and made relative to its start.
+//! - [`unique_rendition_names`] — distinct `NAME`s for the `subs` group.
 //! - [`first_video_pts_90k`] — the 90 kHz PTS the first video PES of a written
 //!   MPEG-TS segment actually carries (the `MPEGTS` side of the map).
 
@@ -36,6 +41,102 @@ pub const MAX_CUE_TEXT_BYTES: usize = 512;
 /// Most lines a cue keeps.
 pub const MAX_CUE_LINES: usize = 4;
 
+/// A cue's display lines after [`bound_cue_lines`] (the only constructor, so
+/// the bound is an invariant of the type).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BoundedLines {
+    /// At most [`MAX_CUE_LINES`] non-blank lines, at most
+    /// [`MAX_CUE_TEXT_BYTES`] bytes with their separators; every `String` and
+    /// the `Vec` are fresh allocations of exactly the kept size.
+    lines: Vec<String>,
+    /// Whether anything was cut.
+    truncated: bool,
+}
+
+impl BoundedLines {
+    /// The bounded lines.
+    #[must_use]
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// The bounded lines, by value.
+    #[must_use]
+    pub fn into_lines(self) -> Vec<String> {
+        self.lines
+    }
+
+    /// Whether the projection cut anything.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Whether no line is left.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+}
+
+/// Project `lines` onto a compact, bounded copy: blank lines dropped, at most
+/// [`MAX_CUE_LINES`] lines and [`MAX_CUE_TEXT_BYTES`] bytes (one byte per
+/// separating newline), cut on a UTF-8 char boundary. Only the kept bytes are
+/// copied (never the source allocation), so its work and memory are bounded
+/// whatever the source size.
+#[must_use]
+pub fn bound_cue_lines<S: AsRef<str>>(lines: &[S]) -> BoundedLines {
+    let mut kept: Vec<&str> = Vec::with_capacity(MAX_CUE_LINES);
+    let mut truncated = false;
+    let mut budget = MAX_CUE_TEXT_BYTES;
+    for line in lines.iter().map(AsRef::as_ref) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if kept.len() == MAX_CUE_LINES || budget == 0 {
+            truncated = true;
+            break;
+        }
+        let mut at = line.len().min(budget);
+        while !line.is_char_boundary(at) {
+            at -= 1;
+        }
+        if at < line.len() {
+            truncated = true;
+        }
+        let part = &line[..at];
+        if part.is_empty() {
+            break;
+        }
+        // One byte for the newline separating it from the next line.
+        budget = budget.saturating_sub(part.len() + 1);
+        kept.push(part);
+    }
+    let mut out = Vec::with_capacity(kept.len());
+    out.extend(kept.into_iter().map(String::from));
+    BoundedLines {
+        lines: out,
+        truncated,
+    }
+}
+
+/// Whether `lines` already satisfy [`bound_cue_lines`]'s bounds, including
+/// allocation capacity (so a payload retaining a large source allocation is
+/// re-projected).
+fn is_compact(lines: &[String], capacity: usize) -> bool {
+    capacity <= MAX_CUE_LINES
+        && lines.len() <= MAX_CUE_LINES
+        && lines
+            .iter()
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            .saturating_sub(1)
+            <= MAX_CUE_TEXT_BYTES
+        && lines
+            .iter()
+            .all(|l| l.capacity() <= MAX_CUE_TEXT_BYTES && !l.trim().is_empty())
+}
+
 /// One subtitle rendition the master advertises (one per subtitle slot).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleRendition {
@@ -43,6 +144,24 @@ pub struct SubtitleRendition {
     pub name: String,
     /// Optional BCP-47 language tag.
     pub language: Option<String>,
+}
+
+/// Distinct player-menu labels for `renditions`, in order (RFC 8216
+/// §4.3.4.1.1: every member of a group has a different `NAME`). Config
+/// validation already refuses duplicates; this is the defence for anything
+/// that reaches the master unvalidated: a repeated label gets ` (i+1)` (and
+/// more ` (i+1)` suffixes until unique) — deterministic, first one kept.
+#[must_use]
+pub fn unique_rendition_names(renditions: &[SubtitleRendition]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(renditions.len());
+    for (i, rendition) in renditions.iter().enumerate() {
+        let mut name = rendition.name.clone();
+        while out.contains(&name) {
+            name = format!("{name} ({})", i + 1);
+        }
+        out.push(name);
+    }
+    out
 }
 
 /// One cue on the output timeline (tick-derived ns).
@@ -124,17 +243,51 @@ pub struct SubtitleFeed {
 
 impl SubtitleFeed {
     /// Offer one cue. Returns whether it was queued; a full feed (or a sink
-    /// that already stopped) drops it and counts the drop.
+    /// that already stopped) drops it and counts the drop. The text is
+    /// bounded first (see [`SubtitleFeed::try_offer`]).
     #[allow(clippy::must_use_candidate)]
     // reason: the caller may ignore the outcome; the drop is counted.
     pub fn offer(&self, cue: SubtitleCue) -> bool {
-        match self.tx.try_send(cue) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                self.stats.feed_dropped.fetch_add(1, Ordering::Relaxed);
-                false
-            }
+        if self.try_offer(cue).is_ok() {
+            true
+        } else {
+            self.note_dropped();
+            false
         }
+    }
+
+    /// Offer one cue without dropping it: a full feed (or a stopped sink)
+    /// hands it back so the caller can retry on a later tick (never blocks;
+    /// nothing is counted). The feed boundary enforces the text bound
+    /// defensively: a payload that is not already compact is re-projected
+    /// through [`bound_cue_lines`] (a fresh allocation; truncation counted)
+    /// before it is queued, so no queued cue retains an oversized allocation.
+    ///
+    /// # Errors
+    /// The cue, when the feed is full or the sink is gone.
+    pub fn try_offer(&self, mut cue: SubtitleCue) -> Result<(), SubtitleCue> {
+        if !is_compact(&cue.lines, cue.lines.capacity()) {
+            let bounded = bound_cue_lines(&cue.lines);
+            if bounded.truncated {
+                self.note_truncated();
+            }
+            cue.lines = bounded.lines;
+        }
+        match self.tx.try_send(cue) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(cue) | TrySendError::Disconnected(cue)) => Err(cue),
+        }
+    }
+
+    /// Count one cue dropped on the engine side (a refused or superseded
+    /// pending cue).
+    pub fn note_dropped(&self) {
+        self.stats.feed_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one cue whose text was cut by [`bound_cue_lines`].
+    pub fn note_truncated(&self) {
+        self.stats.truncated.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The shared drop counters.
@@ -215,8 +368,12 @@ impl SlotCues {
                 held.end = cue.start;
             }
         }
-        if bound_lines(&mut cue.lines) {
-            stats.truncated.fetch_add(1, Ordering::Relaxed);
+        if !is_compact(&cue.lines, cue.lines.capacity()) {
+            let bounded = bound_cue_lines(&cue.lines);
+            if bounded.truncated {
+                stats.truncated.fetch_add(1, Ordering::Relaxed);
+            }
+            cue.lines = bounded.lines;
         }
         if cue.lines.is_empty() {
             return;
@@ -264,39 +421,6 @@ impl SlotCues {
     pub fn is_empty(&self) -> bool {
         self.cues.is_empty()
     }
-}
-
-/// Bound `lines` to [`MAX_CUE_LINES`] and [`MAX_CUE_TEXT_BYTES`] (cut on a
-/// char boundary); drop empty lines. Returns whether anything was cut.
-fn bound_lines(lines: &mut Vec<String>) -> bool {
-    lines.retain(|l| !l.trim().is_empty());
-    let mut cut = false;
-    if lines.len() > MAX_CUE_LINES {
-        lines.truncate(MAX_CUE_LINES);
-        cut = true;
-    }
-    let mut budget = MAX_CUE_TEXT_BYTES;
-    let mut kept = 0;
-    for line in lines.iter_mut() {
-        if budget == 0 {
-            cut = true;
-            break;
-        }
-        if line.len() > budget {
-            let mut at = budget;
-            while !line.is_char_boundary(at) {
-                at -= 1;
-            }
-            line.truncate(at);
-            cut = true;
-        }
-        // One byte for the newline separating it from the next line.
-        budget = budget.saturating_sub(line.len() + 1);
-        kept += 1;
-    }
-    lines.truncate(kept);
-    lines.retain(|l| !l.is_empty());
-    cut
 }
 
 /// `HH:MM:SS.mmm` of a non-negative span in ns.
@@ -582,5 +706,94 @@ mod tests {
         assert_eq!(first_video_pts_90k(&p), Some(pts));
         assert_eq!(first_video_pts_90k(&[]), None);
         assert_eq!(pts_90k_of(MediaTime::from_nanos(1_000_000_000)), 90_000);
+    }
+
+    #[test]
+    fn oversized_text_is_projected_compactly_with_fresh_allocations() {
+        // 100 lines of ~2.6 KiB each: ~256 KiB.
+        let big: Vec<String> = (0..100)
+            .map(|i| format!("{i}:{}", "é".repeat(1_300)))
+            .collect();
+        let bounded = bound_cue_lines(&big);
+        assert!(bounded.truncated);
+        assert!(bounded.lines.len() <= MAX_CUE_LINES);
+        assert!(bounded.lines.capacity() <= MAX_CUE_LINES);
+        let bytes: usize = bounded.lines.iter().map(|l| l.len() + 1).sum::<usize>() - 1;
+        assert!(bytes <= MAX_CUE_TEXT_BYTES, "{bytes}");
+        for line in &bounded.lines {
+            assert!(line.capacity() <= MAX_CUE_TEXT_BYTES, "{}", line.capacity());
+            assert!(line.capacity() == line.len(), "exact-size copy");
+        }
+        // Small text passes untouched; blank lines go.
+        let small = bound_cue_lines(&["a", " ", "b"]);
+        assert_eq!(small.lines, ["a", "b"]);
+        assert!(!small.truncated);
+    }
+
+    #[test]
+    fn the_feed_boundary_bounds_an_oversized_payload_and_the_held_copy() {
+        let (feed, rx) = subtitle_feed_with_capacity(4);
+        let mut huge = String::with_capacity(256 * 1024);
+        huge.push_str(&"x".repeat(256 * 1024));
+        let mut lines = Vec::with_capacity(100);
+        lines.push(huge);
+        lines.extend((0..99).map(|i| format!("line {i}")));
+        assert!(feed.offer(SubtitleCue {
+            slot: 0,
+            start: ms(0),
+            end: SubtitleCue::OPEN_END,
+            lines,
+        }));
+        assert_eq!(feed.stats().truncated(), 1);
+        let queued = rx.drain();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].lines.capacity() <= MAX_CUE_LINES);
+        assert!(queued[0]
+            .lines
+            .iter()
+            .all(|l| l.capacity() <= MAX_CUE_TEXT_BYTES));
+        // A held cue never keeps a large source allocation either.
+        let stats = SubtitleStats::default();
+        let mut held = SlotCues::default();
+        let mut wide = String::with_capacity(256 * 1024);
+        wide.push_str("short");
+        held.push(
+            SubtitleCue {
+                slot: 0,
+                start: ms(0),
+                end: ms(10),
+                lines: vec![wide],
+            },
+            &stats,
+        );
+        let all = held.overlapping(ms(0), ms(10));
+        assert_eq!(all[0].lines, ["short"]);
+        assert!(all[0].lines[0].capacity() <= MAX_CUE_TEXT_BYTES);
+        assert_eq!(stats.truncated(), 0, "re-projected, not cut");
+    }
+
+    #[test]
+    fn try_offer_hands_a_refused_cue_back_without_counting() {
+        let (feed, rx) = subtitle_feed_with_capacity(1);
+        assert!(feed.try_offer(cue(0, 0, 1, &["a"])).is_ok());
+        let back = feed.try_offer(cue(0, 1, 2, &["b"])).unwrap_err();
+        assert_eq!(back.lines, ["b"]);
+        assert_eq!(feed.stats().feed_dropped(), 0);
+        assert_eq!(rx.drain().len(), 1);
+        assert!(feed.try_offer(back).is_ok());
+    }
+
+    #[test]
+    fn rendition_names_are_made_unique_deterministically() {
+        let r = |name: &str| SubtitleRendition {
+            name: name.to_owned(),
+            language: None,
+        };
+        let names = unique_rendition_names(&[r("en"), r("en"), r("de"), r("en (2)"), r("en")]);
+        assert_eq!(names, ["en", "en (2)", "de", "en (2) (4)", "en (5)"]);
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len());
     }
 }

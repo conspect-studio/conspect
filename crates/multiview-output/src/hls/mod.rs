@@ -40,6 +40,6 @@ pub use master::{AudioRendition, MasterPlaylist, SubtitleMedia, VariantStream};
 pub use media::{MediaPlaylist, Part, Segment, SegmentType, ServerControl};
 pub use pdt::format_program_date_time;
 pub use subtitle::{
-    subtitle_feed, SubtitleCue, SubtitleFeed, SubtitleFeedReceiver, SubtitleRendition,
-    SubtitleStats,
+    bound_cue_lines, subtitle_feed, BoundedLines, SubtitleCue, SubtitleFeed, SubtitleFeedReceiver,
+    SubtitleRendition, SubtitleStats,
 };
