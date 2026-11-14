@@ -489,6 +489,9 @@ pub struct RoutingSnapshot {
 pub struct OutputRoutingHandle {
     #[cfg(test)]
     pub(crate) audio_tap: crate::routing_audio::AudioTapCell,
+    /// The active aux feeds (tests read their slots' counters).
+    #[cfg(test)]
+    pub(crate) aux_feeds: AuxFeeds,
     takes: SyncSender<OutputTake>,
     reformats: SyncSender<Reformat>,
     layout_changes: LayoutInbox,
@@ -1224,6 +1227,8 @@ impl OutputRouter {
         let handle = OutputRoutingHandle {
             #[cfg(test)]
             audio_tap: Arc::clone(&audio_tap),
+            #[cfg(test)]
+            aux_feeds: Arc::clone(&aux.feeds),
             takes: take_tx,
             reformats: reformat_tx,
             layout_changes: layout_tx,
