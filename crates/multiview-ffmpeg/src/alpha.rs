@@ -88,33 +88,137 @@ impl AlphaSource {
     /// Copy the straight alpha into `dst` as one byte per pixel, rows
     /// `dst_stride` bytes apart, rescaling deeper samples to 8 bits.
     ///
+    /// The frame's layout is validated before any of its memory is viewed:
+    /// `layout` must be the one its pixel format maps to, and the alpha plane
+    /// is read through [`crate::frame::plane_rows`] (signed linesize, plane
+    /// height and every row span checked against the frame's own buffers), one
+    /// row at a time, so a negative (bottom-up) linesize is copied in display
+    /// order rather than becoming a huge slice.
+    ///
     /// # Errors
-    /// [`AlphaError`] when `dst` is too short for the frame or the frame's
-    /// alpha plane is missing.
+    /// [`AlphaError::Layout`] when `layout` does not describe the frame's
+    /// format; [`AlphaError::Geometry`] when `dst` is too short or the frame's
+    /// alpha plane is missing or malformed.
     pub fn copy_to(&self, dst: &mut [u8], dst_stride: usize) -> Result<(), AlphaError> {
-        if self.layout.plane >= self.frame.planes() {
-            return Err(AlphaError::Geometry("frame has no alpha plane"));
+        if alpha_layout(self.frame.format()) != Some(self.layout) {
+            return Err(AlphaError::Layout("layout does not match the frame format"));
         }
         let width = usize::try_from(self.frame.width())
             .map_err(|_| AlphaError::Geometry("width overflows"))?;
         let height = usize::try_from(self.frame.height())
             .map_err(|_| AlphaError::Geometry("height overflows"))?;
-        extract_alpha(
-            self.layout,
-            self.frame.data(self.layout.plane),
-            self.frame.stride(self.layout.plane),
-            width,
-            height,
-            dst,
-            dst_stride,
-        )
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let row_bytes = (width - 1)
+            .checked_mul(self.layout.step)
+            .and_then(|v| v.checked_add(self.layout.offset))
+            .and_then(|v| v.checked_add(self.layout.depth.sample_bytes()))
+            .ok_or(AlphaError::Geometry("row size overflows"))?;
+        let rows = crate::frame::plane_rows(&self.frame, self.layout.plane, row_bytes).map_err(
+            |e| match e {
+                crate::FfmpegError::FrameLayout(why) => AlphaError::Geometry(why),
+                _ => AlphaError::Geometry("alpha plane is unusable"),
+            },
+        )?;
+        let mut copied = 0_usize;
+        for (row, src) in rows.enumerate() {
+            let start = row
+                .checked_mul(dst_stride)
+                .ok_or(AlphaError::Geometry("destination offset overflows"))?;
+            let end = start
+                .checked_add(width)
+                .ok_or(AlphaError::Geometry("destination offset overflows"))?;
+            let out = dst
+                .get_mut(start..end)
+                .ok_or(AlphaError::Geometry("destination plane too short"))?;
+            extract_alpha(self.layout, src, row_bytes, width, 1, out, width)?;
+            copied += 1;
+        }
+        if copied != height {
+            return Err(AlphaError::Geometry("alpha plane height mismatch"));
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::as_conversions,
+        clippy::cast_possible_truncation
+    )]
     use super::*;
+
+    /// A `w x h` RGBA frame whose alpha at `(x, y)` is `10 * y + x`.
+    fn rgba(w: u32, h: u32) -> Video {
+        let mut frame = Video::new(Pixel::RGBA, w, h);
+        let stride = frame.stride(0);
+        let data = frame.data_mut(0);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                data[y * stride + 4 * x..y * stride + 4 * x + 4].copy_from_slice(&[
+                    1,
+                    2,
+                    3,
+                    u8::try_from(10 * y + x).unwrap(),
+                ]);
+            }
+        }
+        frame
+    }
+
+    /// Re-point `frame` plane 0 at its last row with a negated linesize: the
+    /// bottom-up layout libav's `vflip` produces (a valid `AVFrame`).
+    fn flip_bottom_up(frame: &mut Video) {
+        let rows = isize::try_from(frame.height()).unwrap() - 1;
+        #[allow(unsafe_code)]
+        // SAFETY: the test owns `frame` (refcounted buffer from
+        // `av_frame_get_buffer`); the new data pointer is the start of the
+        // last row, inside that buffer, and `av_frame_free` unrefs `buf[0]`
+        // (not `data[0]`), so dropping the frame stays sound.
+        unsafe {
+            let f = frame.as_mut_ptr();
+            let linesize = (*f).linesize[0];
+            (*f).data[0] = (*f).data[0].offset(isize::try_from(linesize).unwrap() * rows);
+            (*f).linesize[0] = -linesize;
+        }
+    }
+
+    /// PB-1: a negative linesize is a valid `AVFrame` layout; the copy walks
+    /// it row by row (never a `linesize * height` slice) and gets the rows in
+    /// display order.
+    #[test]
+    fn negative_linesize_alpha_is_copied_in_display_order() {
+        let (w, h) = (4_u32, 3_u32);
+        let mut frame = rgba(w, h);
+        flip_bottom_up(&mut frame);
+        let source = AlphaSource {
+            frame,
+            layout: alpha_layout(Pixel::RGBA).unwrap(),
+        };
+        let mut dst = [0_u8; 12];
+        source.copy_to(&mut dst, 4).unwrap();
+        // Row 0 of the flipped frame is the original bottom row.
+        assert_eq!(dst, [20, 21, 22, 23, 10, 11, 12, 13, 0, 1, 2, 3]);
+    }
+
+    /// PB-1: a layout that does not describe the frame's format is refused
+    /// before any plane is read.
+    #[test]
+    fn a_layout_that_does_not_match_the_format_is_an_error() {
+        let source = AlphaSource {
+            frame: rgba(4, 2),
+            layout: AlphaLayout::packed(8, 6, AlphaDepth::U16Le { bits: 16 }),
+        };
+        let mut dst = [0_u8; 8];
+        assert!(matches!(
+            source.copy_to(&mut dst, 4),
+            Err(AlphaError::Layout(_))
+        ));
+    }
 
     #[test]
     fn opaque_formats_have_no_alpha_layout() {

@@ -243,6 +243,12 @@ pub mod decode;
 #[cfg(feature = "ffmpeg")]
 pub mod alpha;
 
+/// Checked `AVFrame` allocation and validated, stride-sign-agnostic plane row
+/// access (#391): never trusts `Video::new`'s unchecked allocation or a
+/// `linesize * height` slice. Behind the `ffmpeg` feature.
+#[cfg(feature = "ffmpeg")]
+pub mod frame;
+
 #[cfg(feature = "ffmpeg")]
 pub mod decode_stream;
 

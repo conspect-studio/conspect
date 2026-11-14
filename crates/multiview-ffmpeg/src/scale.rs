@@ -17,6 +17,7 @@ use ffmpeg::util::frame::Video;
 use ffmpeg_next as ffmpeg;
 
 use crate::error::{FfmpegError, Result};
+use crate::frame::{alloc_video, plane_rows};
 
 /// A `(format, width, height)` description of a scaler endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +60,8 @@ pub struct Scaler {
 // satisfies the crate-wide "wrappers are `Send`" rule (CLAUDE.md §7). It is left
 // `!Sync` (no `unsafe impl Sync`): per-context access must stay single-threaded.
 //
-// reason: this single marker assertion is the only `unsafe` outside `hwframe`;
-// it is a trait promise about an owned context, not raw FFI.
+// reason: a trait promise about an owned context, not raw FFI. (The checked
+// allocation/copy blocks below each carry their own `allow` and SAFETY note.)
 #[allow(unsafe_code)]
 // SAFETY: `Sws` owns its `SwsContext` exclusively (freed once in its `Drop`),
 // exposes no interior mutability, and the context carries no thread-local state;
@@ -140,9 +141,29 @@ impl Scaler {
             // `av_frame_copy_props`), never the broken libswscale no-op path.
             // libswscale's no-op converter on FFmpeg 7/8 copies luma but
             // zeroes the interleaved chroma plane of NV12/P010 — Defect A.
-            return Ok(input.clone());
+            //
+            // `Video::clone` allocates through the unchecked `Video::new`, so
+            // allocate checked and copy with the result verified instead.
+            let mut output = alloc_video(self.dst.format, self.dst.width, self.dst.height)?;
+            #[allow(unsafe_code)]
+            // SAFETY: both pointers are live `AVFrame`s owned by `output` and
+            // `input`; `output` has buffers of the same format and size as
+            // `input` (checked above and by `alloc_video`), which is what
+            // `av_frame_copy` requires; `av_frame_copy_props` copies metadata.
+            let (copied, props) = unsafe {
+                (
+                    ffmpeg::ffi::av_frame_copy(output.as_mut_ptr(), input.as_ptr()),
+                    ffmpeg::ffi::av_frame_copy_props(output.as_mut_ptr(), input.as_ptr()),
+                )
+            };
+            if copied < 0 || props < 0 {
+                return Err(FfmpegError::FrameMismatch("identity plane copy failed"));
+            }
+            return Ok(output);
         }
-        let mut output = Video::empty();
+        // Checked allocation: `sws.run` would otherwise allocate an empty
+        // output with an unchecked `av_frame_get_buffer`.
+        let mut output = alloc_video(self.dst.format, self.dst.width, self.dst.height)?;
         self.sws
             .run(input, &mut output)
             .map_err(FfmpegError::Convert)?;
@@ -155,10 +176,15 @@ impl Scaler {
     /// `output` is (re)allocated only when it is empty or does not match the
     /// destination spec, so a steady per-frame caller converts with no heap
     /// allocation after the first frame (the media player's alpha scale,
-    /// #391). An identity spec copies the planes into `output` in place.
+    /// #391). The allocation is checked ([`alloc_video`]): a failure is an
+    /// error before any plane is touched or libswscale runs. An identity spec
+    /// copies the planes into `output` row by row through validated row views
+    /// ([`plane_rows`]), so a bottom-up (negative linesize) input is fine.
     ///
     /// # Errors
-    /// As [`Self::run`].
+    /// As [`Self::run`], plus [`FfmpegError::FrameLayout`] /
+    /// [`FfmpegError::FrameAlloc`] from the output allocation or a malformed
+    /// input plane.
     pub fn run_into(&mut self, input: &Video, output: &mut Video) -> Result<()> {
         if input.format() != self.src.format
             || input.width() != self.src.width
@@ -171,27 +197,63 @@ impl Scaler {
         if output.format() != self.dst.format
             || output.width() != self.dst.width
             || output.height() != self.dst.height
+            || !has_cpu_planes(output)
         {
-            *output = Video::new(self.dst.format, self.dst.width, self.dst.height);
+            *output = alloc_video(self.dst.format, self.dst.width, self.dst.height)?;
         }
         if self.src == self.dst {
             // Never the libswscale no-op path (Defect A, see `run`).
-            for plane in 0..input.planes().min(output.planes()) {
-                let rows = usize::try_from(input.plane_height(plane)).unwrap_or(0);
-                let (s_stride, d_stride) = (input.stride(plane), output.stride(plane));
-                let row = s_stride.min(d_stride);
-                for r in 0..rows {
-                    let src = input.data(plane).get(r * s_stride..r * s_stride + row);
-                    let dst = output
-                        .data_mut(plane)
-                        .get_mut(r * d_stride..r * d_stride + row);
-                    if let (Some(src), Some(dst)) = (src, dst) {
-                        dst.copy_from_slice(src);
-                    }
+            let width = libc::c_int::try_from(self.dst.width)
+                .map_err(|_| FfmpegError::FrameLayout("frame width overflows"))?;
+            let format = ffmpeg::ffi::AVPixelFormat::from(self.dst.format);
+            for plane in 0..output.planes() {
+                let index = libc::c_int::try_from(plane)
+                    .map_err(|_| FfmpegError::FrameLayout("plane index"))?;
+                #[allow(unsafe_code)]
+                // SAFETY: `av_image_get_linesize` only reads the static
+                // pixel-format table; it returns a negative error code for
+                // an invalid plane or width, which is rejected below.
+                let bytes = unsafe { ffmpeg::ffi::av_image_get_linesize(format, width, index) };
+                let bytes = usize::try_from(bytes)
+                    .map_err(|_| FfmpegError::FrameLayout("plane row size"))?;
+                let d_stride = output.stride(plane);
+                let rows = plane_rows(input, plane, bytes)?;
+                let dst = output.data_mut(plane);
+                for (r, src) in rows.enumerate() {
+                    let start = r
+                        .checked_mul(d_stride)
+                        .ok_or(FfmpegError::FrameLayout("plane offset overflows"))?;
+                    let end = start
+                        .checked_add(bytes)
+                        .ok_or(FfmpegError::FrameLayout("plane offset overflows"))?;
+                    dst.get_mut(start..end)
+                        .ok_or(FfmpegError::FrameLayout("output plane too short"))?
+                        .copy_from_slice(src);
                 }
             }
             return Ok(());
         }
         self.sws.run(input, output).map_err(FfmpegError::Convert)
+    }
+}
+
+/// Whether `frame` holds every plane of its format with a positive linesize,
+/// so `stride`/`data_mut` describe real, forward-laid-out memory.
+fn has_cpu_planes(frame: &Video) -> bool {
+    let format = ffmpeg::ffi::AVPixelFormat::from(frame.format());
+    #[allow(unsafe_code)]
+    // SAFETY: `av_pix_fmt_count_planes` reads the static format table; the
+    // frame pointer is `frame`'s own live `AVFrame`, read-only here, and
+    // `planes <= AV_NUM_DATA_POINTERS`.
+    unsafe {
+        let planes = usize::try_from(ffmpeg::ffi::av_pix_fmt_count_planes(format)).unwrap_or(0);
+        let raw = frame.as_ptr();
+        planes > 0
+            && planes <= 8
+            && !raw.is_null()
+            && (0..planes).all(|p| {
+                (*raw).data.get(p).is_some_and(|d| !d.is_null())
+                    && (*raw).linesize.get(p).is_some_and(|&l| l > 0)
+            })
     }
 }

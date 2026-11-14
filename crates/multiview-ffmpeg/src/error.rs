@@ -137,6 +137,16 @@ pub enum FfmpegError {
     #[error("frame does not match the conversion context: {0}")]
     FrameMismatch(&'static str),
 
+    /// A frame's size, pixel format or plane layout is unusable (zero or
+    /// oversized dimensions, a hardware format, a plane whose rows would lie
+    /// outside the frame's buffers). Checked before any plane is touched.
+    #[error("invalid frame layout: {0}")]
+    FrameLayout(&'static str),
+
+    /// libav could not allocate a frame or its buffers.
+    #[error("frame allocation failed: {0}")]
+    FrameAlloc(&'static str),
+
     /// A [`multiview_core`] rational could not be represented as a
     /// libav `AVRational` (its `i32` numerator/denominator) — only possible for
     /// pathological values; real timebases fit.

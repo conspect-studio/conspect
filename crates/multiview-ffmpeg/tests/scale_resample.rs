@@ -140,6 +140,46 @@ fn run_into_reuses_the_output_frame_for_scale_and_identity() {
     }
 }
 
+/// PB-1/PB-2: the identity `run_into` copy walks a bottom-up (negative
+/// linesize) input row by row in display order, never as one
+/// `linesize * height` slice, and its output allocation is checked.
+#[test]
+fn run_into_identity_copies_a_bottom_up_frame_in_display_order() {
+    let (w, h) = (6_u32, 4_u32);
+    let (cols, rows) = (6_usize, 4_usize);
+    let mut src = Video::new(Pixel::GRAY8, w, h);
+    let stride = src.stride(0);
+    for y in 0..rows {
+        for x in 0..cols {
+            src.data_mut(0)[y * stride + x] = u8::try_from(10 * y + x).unwrap();
+        }
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: the test owns `src`; data[0] is moved to the start of the last
+    // row (inside buf[0]) and the linesize negated: libav's bottom-up layout.
+    // `av_frame_free` unrefs buf[0], not data[0].
+    unsafe {
+        let f = src.as_mut_ptr();
+        let ls = (*f).linesize[0];
+        (*f).data[0] = (*f).data[0].offset(isize::try_from(ls * 3).unwrap());
+        (*f).linesize[0] = -ls;
+    }
+    let mut identity = Scaler::new(
+        ScaleSpec::new(Pixel::GRAY8, w, h),
+        ScaleSpec::new(Pixel::GRAY8, w, h),
+    )
+    .unwrap();
+    let mut out = Video::empty();
+    identity.run_into(&src, &mut out).unwrap();
+    let d = out.stride(0);
+    for y in 0..rows {
+        let expected: Vec<u8> = (0..cols)
+            .map(|x| u8::try_from(10 * (3 - y) + x).unwrap())
+            .collect();
+        assert_eq!(&out.data(0)[y * d..y * d + cols], &expected[..], "row {y}");
+    }
+}
+
 /// Build a packed-S16 stereo audio frame of `samples` frames at `rate`.
 fn s16_stereo(samples: usize, rate: u32, pts: i64) -> Audio {
     let mut frame = Audio::new(
