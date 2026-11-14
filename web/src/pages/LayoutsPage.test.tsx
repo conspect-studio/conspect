@@ -326,8 +326,12 @@ describe('LayoutsPage Layers column + dialog', () => {
       expect(putIfMatches[0]).toBe('fresh-etag-77');
     });
 
-    it('fails closed when the fresh read carries no ETag: no Save, no PUT', async () => {
-      getEtag = undefined;
+    it.each([
+      ['absent', undefined],
+      ['empty', ''],
+      ['whitespace', '   '],
+    ])('fails closed when the fresh read\'s ETag is %s: no Save, no PUT', async (_kind, tag) => {
+      getEtag = tag;
       page();
       await screen.findByText('Single');
       await userEvent.click(layersButton('Single'));

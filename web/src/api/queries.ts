@@ -174,6 +174,11 @@ export function useSaveLayout(
         // editing an existing layout — the list carries no ETags), ask the
         // server: a current ETag means update with it as If-Match; a 404
         // means create.
+        // A caller that asked for a conditional write must never get an
+        // unconditional one: an empty explicit tag is refused, not dropped.
+        if (explicitIfMatch !== undefined && explicitIfMatch.trim() === '') {
+          throw new ApiError('Missing ETag for a conditional save', 428);
+        }
         let ifMatch = explicitIfMatch ?? etags[id];
         let isCreate = explicitIfMatch !== undefined ? false : create;
         if (isCreate === undefined && ifMatch === undefined) {

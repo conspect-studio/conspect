@@ -293,7 +293,8 @@ function LayersDialogSession({
         }
         // Fail closed: without this read's own ETag a save could not be
         // conditional on it, so a concurrent edit could be overwritten.
-        if (result.etag === undefined) {
+        const etag = result.etag?.trim();
+        if (etag === undefined || etag === '') {
           setTarget('error');
           return;
         }
@@ -301,7 +302,7 @@ function LayersDialogSession({
           id: result.layout.id,
           name: result.layout.name,
           body: result.layout.body,
-          etag: result.etag,
+          etag,
         });
         setDraft(overlaysFromBody(result.layout.body));
       })
