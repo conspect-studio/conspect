@@ -308,8 +308,10 @@ pub struct ProgramMetricsReport {
     /// Program's rate.
     #[serde(default)]
     pub output_clocks: Vec<OutputClockReport>,
-    /// Source decodes producing at least the full canvas now (#469): the
-    /// GPU-cost bound of sizing routed, PGM and PVW sources at the canvas.
+    /// Running source decoders whose own output (the NVDEC resize, else the
+    /// coded size) is at least the canvas on both axes now (#469): the
+    /// decode cost of sizing routed, PGM and PVW sources at the canvas.
+    /// Transient make-before-break replacements are not counted.
     #[serde(default)]
     pub full_canvas_decodes: u64,
 }

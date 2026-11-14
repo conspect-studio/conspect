@@ -287,9 +287,23 @@ a PVW selected less than the settle ago) is drawn from its old, smaller decode f
 itself is never delayed. Direct routes behave the same way: the take lands at once, the decode
 follows after the settle and one GOP.
 
-Cost bound: `GET /api/v1/metrics/program` reports `full_canvas_decodes`, the number of source
-decodes producing at least the full canvas now. Bus sizing adds at most two (PGM and PVW); direct
-routes add at most one per routed source, which `routing.max_encoders` bounds.
+Cost bound, stated plainly. Two numbers matter:
+
+- **Demand** (what the sizing asks for at one instant): bus sizing names at most two sources (PGM
+  and PVW); direct routes name at most one per routed source feed, and the router's feed set is
+  bounded by `routing.max_encoders` plus one pending take per output (`sync_feeds`). Every name
+  is a configured source, so demand never exceeds the configured source count.
+- **Actual** (what runs): a decoder only shrinks after its new size held for the settle (1.5 s)
+  and at least 5 s after its previous resize, so rotating selections faster than that keeps
+  recently deselected sources at full canvas for up to about 5 s; a downsize whose reopen fails
+  keeps the full-size decoder (host-scaled) until a later change succeeds or the source
+  reconnects; and up to two replacement sessions run at once during handovers. The hard ceiling
+  is therefore one full-size decoder per configured source plus two transient replacements.
+
+`GET /api/v1/metrics/program` reports `full_canvas_decodes`: the number of running decoders whose
+own output (the NVDEC fused resize, else the stream's coded size) is at least the canvas on both
+axes. It counts actual decoders, including a retained one after a failed downsize and a software
+decode at native size, not the host tile size; transient replacement sessions are not counted.
 
 M/E layout sources (`layout:<id>`, #307 part 2) are sized by the routed-layout cells once that
 registry publishes its bodies into aux sizing (follow-up to #469 after #436).

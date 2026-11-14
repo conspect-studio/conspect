@@ -307,5 +307,7 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         {
             self.last_program = Some(restored.clone());
         }
+        // The rolled-back selection is what the decoders size for.
+        self.publish_bus_sizing();
     }
 }

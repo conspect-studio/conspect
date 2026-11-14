@@ -308,6 +308,8 @@ struct SizingRig {
     hook: Hook,
     program: multiview_engine::switcher_hook::BusSizingSlot,
     preview: multiview_engine::switcher_hook::BusSizingSlot,
+    /// The two source stores, to keep them live across a long run.
+    sources: [Arc<TileStore<Nv12Image>>; 2],
 }
 
 /// The rig's no-op legacy control hook.
@@ -324,6 +326,7 @@ fn sizing_rig() -> SizingRig {
             multiview_core::time::MediaTime::ZERO,
         );
     }
+    let sources = [Arc::clone(&a), Arc::clone(&b)];
     let stores = HashMap::from([("a".into(), a), ("b".into(), b)]);
     let drive = CompositorDrive::new(
         layout("a"),
@@ -357,6 +360,7 @@ fn sizing_rig() -> SizingRig {
         hook,
         program,
         preview,
+        sources,
     }
 }
 
@@ -373,6 +377,7 @@ fn the_hook_publishes_bus_sizing_only_when_a_selection_changes() {
         mut hook,
         program,
         preview,
+        ..
     } = sizing_rig();
     let read = |slot: &SwapCell<Option<Arc<str>>>| slot.load().map(|s| s.to_string());
     let tick = |index| multiview_engine::clock::Tick {
@@ -409,21 +414,26 @@ fn the_hook_publishes_bus_sizing_only_when_a_selection_changes() {
 }
 
 /// #469 chaos (inv #1/#10): a CUT on every tick while a decode-side reader
-/// hammers the bus sizing slots. The clock emits exactly one frame per tick,
-/// the reader never blocks it, and the slots end on the final selection.
+/// hammers the bus sizing slots. Sources stay live so the CUTs really apply
+/// and the hook really republishes. The clock emits exactly one frame per
+/// tick, the reader never blocks it, and the slots end on the final
+/// selection.
 #[tokio::test]
 async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     const TICKS: u64 = 300;
+    const TICK_NS: u64 = 40_000_000;
     let SizingRig {
         drive,
         handle,
         hook,
         program,
         preview,
+        sources,
     } = sizing_rig();
     let stop = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(AtomicU64::new(0));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let reader = {
         let (program, preview, stop, reads) = (
             Arc::clone(&program),
@@ -432,13 +442,27 @@ async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
             Arc::clone(&reads),
         );
         std::thread::spawn(move || {
+            let mut changes = 0_u64;
+            let mut last = None;
+            let mut announced = false;
             while !stop.load(Ordering::Acquire) {
-                let _p = program.load();
+                let now = program.load();
                 let _v = preview.load();
+                if now != last {
+                    changes += 1;
+                    last = now;
+                }
                 reads.fetch_add(1, Ordering::Relaxed);
+                if !announced {
+                    ready_tx.send(()).unwrap();
+                    announced = true;
+                }
             }
+            changes
         })
     };
+    ready_rx.recv().unwrap();
+    let color = ColorInfo::default().resolve_defaults(64, 64);
     let clock = Arc::new(ManualTimeSource::new());
     let ts: Arc<dyn TimeSource> = clock.clone();
     let mut runtime = EngineRuntime::new(
@@ -451,7 +475,6 @@ async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
     let mut frames = Vec::new();
     let pace = Arc::clone(&clock);
     let flood = handle.clone();
-    let mut sent = 0_u64;
     runtime
         .run_for_with_frame_control(
             &publisher,
@@ -461,17 +484,19 @@ async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
                 frames.push(frame.tick.index);
                 // One CUT per tick from the control side; a full mailbox
                 // drops, it never waits.
-                if flood
-                    .try_send(SwitcherCommand {
-                        operation_id: format!("cut{sent}"),
-                        scene_version: 1,
-                        verb: SwitcherVerb::Cut,
-                    })
-                    .is_ok()
-                {
-                    sent += 1;
+                let _ = flood.try_send(SwitcherCommand {
+                    operation_id: format!("cut{}", frame.tick.index),
+                    scene_version: 1,
+                    verb: SwitcherVerb::Cut,
+                });
+                pace.advance(std::time::Duration::from_nanos(TICK_NS));
+                let next = i64::try_from((frame.tick.index + 1) * TICK_NS).unwrap();
+                for store in &sources {
+                    store.publish(
+                        Nv12Image::solid(64, 64, 100, 128, 128, color).unwrap(),
+                        multiview_core::time::MediaTime::from_nanos(next),
+                    );
                 }
-                pace.advance(std::time::Duration::from_millis(40));
                 0
             },
             |_| None,
@@ -480,19 +505,62 @@ async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
         .await
         .unwrap();
     stop.store(true, Ordering::Release);
-    reader.join().unwrap();
+    let changes = reader.join().unwrap();
     assert_eq!(
         frames,
         (0..TICKS).collect::<Vec<_>>(),
         "exactly one frame per tick"
     );
-    assert!(reads.load(Ordering::Relaxed) > 0, "the reader ran");
-    assert!(sent > TICKS / 2, "the flood reached the mailbox: {sent}");
     let snapshot = handle.snapshot().unwrap();
+    let applied = snapshot.completion_count;
+    assert!(applied > TICKS / 2, "the CUTs really applied: {applied}");
+    assert!(reads.load(Ordering::Relaxed) > 0, "the reader ran");
+    assert!(changes > 1, "the reader saw the published CUTs: {changes}");
     assert_eq!(
         program.load().as_deref(),
         Some(snapshot.program.as_str()),
         "PGM sizing ends on the final selection"
     );
     assert_eq!(preview.load().as_deref(), Some(snapshot.preview.as_str()));
+}
+
+/// #469 review I1: a CUT whose compose then fails (a GPU readback deadline)
+/// is rolled back; the decode sizing follows the rollback at once instead of
+/// keeping the rejected selection.
+#[test]
+fn a_failed_compose_republishes_the_rolled_back_bus_sizing() {
+    use multiview_engine::runtime::FrameControl;
+    let SizingRig {
+        mut drive,
+        handle,
+        mut hook,
+        program,
+        preview,
+        ..
+    } = sizing_rig();
+    let tick = |index| multiview_engine::clock::Tick {
+        index,
+        pts: multiview_core::time::MediaTime::ZERO,
+    };
+    hook.before_compose(&mut drive, tick(0));
+    let frame = drive.compose(tick(0)).unwrap();
+    hook.after_compose(&frame);
+    handle
+        .try_send(SwitcherCommand {
+            operation_id: "cut".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::Cut,
+        })
+        .unwrap();
+    hook.before_compose(&mut drive, tick(1));
+    assert_eq!(program.load().as_deref(), Some("b"), "the cut is published");
+    hook.on_compose_failed(&mut drive, tick(1), "readback deadline");
+    let snapshot_program = hook.driver.resolved_selections().0.as_str().to_owned();
+    assert_eq!(snapshot_program, "a", "the machine rolled back");
+    assert_eq!(
+        program.load().as_deref(),
+        Some("a"),
+        "sizing follows the rollback"
+    );
+    assert_eq!(preview.load().as_deref(), Some("b"));
 }
