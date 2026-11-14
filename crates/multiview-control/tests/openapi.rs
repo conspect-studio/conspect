@@ -454,3 +454,57 @@ fn routing_plan_200_is_route_plan_or_output_plan() {
         ]
     );
 }
+
+/// The `oneOf` component refs a path's response references.
+fn response_one_of(path: &str, status: &str) -> Vec<String> {
+    use multiview_control::openapi::ApiDoc;
+    use utoipa::OpenApi;
+
+    let json = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+    let schema = &json["paths"][path]["post"]["responses"][status]["content"]["application/json"]
+        ["schema"];
+    let name = schema["$ref"]
+        .as_str()
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+        .unwrap_or_else(|| panic!("{path} {status} references a component schema"));
+    json["components"]["schemas"][name]["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{path} {status} is a oneOf"))
+        .iter()
+        .filter_map(|arm| arm["$ref"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// #308 review A3: a patch salvo's take answers `PatchAccepted` (no
+/// `kind`), a legacy salvo's `AcceptedBody`; the `202` declares both.
+#[test]
+fn salvo_take_202_is_accepted_body_or_patch_accepted() {
+    assert_eq!(
+        response_one_of("/api/v1/salvos/{id}/take", "202"),
+        [
+            "#/components/schemas/AcceptedBody",
+            "#/components/schemas/PatchAccepted"
+        ]
+    );
+}
+
+/// #308 review A4: both plan endpoints declare a set's `SetPlan` (with
+/// `set: {new_encoders, fits}`) beside the single-destination `PatchPlan`.
+#[test]
+fn patch_plans_200_declare_the_set_cost() {
+    for path in ["/api/v1/patch/plan", "/api/v1/salvos/{id}/plan"] {
+        assert_eq!(
+            response_one_of(path, "200"),
+            [
+                "#/components/schemas/PatchPlan",
+                "#/components/schemas/SetPlan"
+            ],
+            "{path}"
+        );
+    }
+    use multiview_control::openapi::ApiDoc;
+    use utoipa::OpenApi;
+    let json = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+    let set = &json["components"]["schemas"]["SetCost"]["properties"];
+    assert!(set["new_encoders"].is_object() && set["fits"].is_object(), "{set}");
+}

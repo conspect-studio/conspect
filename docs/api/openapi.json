@@ -7991,11 +7991,11 @@
         },
         "responses": {
           "200": {
-            "description": "",
+            "description": "The plan: a `PatchPlan`, or for an atomic set of two or more destinations a `SetPlan` that adds `set: {new_encoders, fits}` (#308).",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PatchPlan"
+                  "$ref": "#/components/schemas/PatchPlanResponseDoc"
                 }
               }
             }
@@ -10431,11 +10431,11 @@
         ],
         "responses": {
           "200": {
-            "description": "The patch plan of the salvo's crosspoints (as `POST /patch/plan`).",
+            "description": "The patch plan of the salvo's crosspoints (as `POST /patch/plan`): a `PatchPlan`, or a `SetPlan` with `set: {new_encoders, fits}` for two or more destinations.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PatchPlan"
+                  "$ref": "#/components/schemas/PatchPlanResponseDoc"
                 }
               }
             }
@@ -10535,11 +10535,11 @@
         ],
         "responses": {
           "202": {
-            "description": "Take accepted; outcome on the realtime stream. A salvo with only legacy recalls answers `AcceptedBody` (outcome `salvo.taken`). A patch salvo (#308) answers `{operation_id, status: \"accepted\", recall_operation_id?}`: its crosspoints are taken atomically through the `POST /patch/take` set path (outcome `patch.take`, or as that route for one destination) and a legacy recall, when present, is submitted too (`recall_operation_id`).",
+            "description": "Take accepted; outcome on the realtime stream. A salvo with only legacy recalls answers `AcceptedBody` (outcome `salvo.taken`). A patch salvo (#308) answers `{operation_id, status: \"accepted\", recall_operation_id?}`: its crosspoints are taken atomically through the `POST /patch/take` set path (outcome `patch.take`, for one destination too) and a legacy recall, when present, is submitted too (`recall_operation_id`).",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AcceptedBody"
+                  "$ref": "#/components/schemas/SalvoTakeAcceptedDoc"
                 }
               }
             }
@@ -20750,6 +20750,17 @@
           }
         }
       },
+      "PatchPlanResponseDoc": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/PatchPlan"
+          },
+          {
+            "$ref": "#/components/schemas/SetPlan"
+          }
+        ],
+        "description": "A `PatchPlan` for mixer inputs or one output, or a `SetPlan` (with `set: {new_encoders, fits}`) for an atomic set of two or more destinations."
+      },
       "PatchRefusal": {
         "type": "object",
         "description": "A typed refusal (`type` suffix + detail).",
@@ -22505,6 +22516,17 @@
           }
         }
       },
+      "SalvoTakeAcceptedDoc": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AcceptedBody"
+          },
+          {
+            "$ref": "#/components/schemas/PatchAccepted"
+          }
+        ],
+        "description": "`AcceptedBody` for a salvo with only legacy recalls; `PatchAccepted` for a patch salvo (#308)."
+      },
       "SaveCastSessionRequest": {
         "type": "object",
         "description": "The `POST /api/v1/cast/sessions/{id}/save` request body.",
@@ -22691,7 +22713,7 @@
       },
       "SetCost": {
         "type": "object",
-        "description": "The aggregate cost of a set (`POST /patch/plan`, #308): its NEW encoder\ndelta, deduplicated per identical (feed, output format), against the\ncaller's per-principal cap and the global sessions.",
+        "description": "The aggregate cost of a set (`POST /patch/plan`, #308): its NEW encoder\ndelta, deduplicated per identical engine encoder identity (feed at the\noutput's format, encoder settings, live reset settings), against the\ncaller's per-principal cap and the global sessions.",
         "required": [
           "new_encoders",
           "fits"

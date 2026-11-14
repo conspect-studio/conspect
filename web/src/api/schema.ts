@@ -7010,6 +7010,8 @@ export interface components {
             /** @description Per-crosspoint plan, request order. */
             crosspoints: components["schemas"]["PlannedCrosspoint"][];
         };
+        /** @description A `PatchPlan` for mixer inputs or one output, or a `SetPlan` (with `set: {new_encoders, fits}`) for an atomic set of two or more destinations. */
+        PatchPlanResponseDoc: components["schemas"]["PatchPlan"] | components["schemas"]["SetPlan"];
         /** @description A typed refusal (`type` suffix + detail). */
         PatchRefusal: {
             /** @description Human-readable reason. */
@@ -7921,6 +7923,8 @@ export interface components {
             /** @description UMD label changes. */
             umd?: components["schemas"]["UmdRecallDoc"][];
         };
+        /** @description `AcceptedBody` for a salvo with only legacy recalls; `PatchAccepted` for a patch salvo (#308). */
+        SalvoTakeAcceptedDoc: components["schemas"]["AcceptedBody"] | components["schemas"]["PatchAccepted"];
         /** @description The `POST /api/v1/cast/sessions/{id}/save` request body. */
         SaveCastSessionRequest: {
             /** @description The device id to register the promoted device under. */
@@ -7992,7 +7996,8 @@ export interface components {
         };
         /**
          * @description The aggregate cost of a set (`POST /patch/plan`, #308): its NEW encoder
-         *     delta, deduplicated per identical (feed, output format), against the
+         *     delta, deduplicated per identical engine encoder identity (feed at the
+         *     output's format, encoder settings, live reset settings), against the
          *     caller's per-principal cap and the global sessions.
          */
         SetCost: {
@@ -15997,12 +16002,13 @@ export interface operations {
             };
         };
         responses: {
+            /** @description The plan: a `PatchPlan`, or for an atomic set of two or more destinations a `SetPlan` that adds `set: {new_encoders, fits}` (#308). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PatchPlan"];
+                    "application/json": components["schemas"]["PatchPlanResponseDoc"];
                 };
             };
             /** @description Not authorized for a destination (M/E object + Program scope; an output: object + output axis) or a source. */
@@ -17979,13 +17985,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The patch plan of the salvo's crosspoints (as `POST /patch/plan`). */
+            /** @description The patch plan of the salvo's crosspoints (as `POST /patch/plan`): a `PatchPlan`, or a `SetPlan` with `set: {new_encoders, fits}` for two or more destinations. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PatchPlan"];
+                    "application/json": components["schemas"]["PatchPlanResponseDoc"];
                 };
             };
             /** @description Missing or invalid credentials. */
@@ -18059,13 +18065,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Take accepted; outcome on the realtime stream. A salvo with only legacy recalls answers `AcceptedBody` (outcome `salvo.taken`). A patch salvo (#308) answers `{operation_id, status: "accepted", recall_operation_id?}`: its crosspoints are taken atomically through the `POST /patch/take` set path (outcome `patch.take`, or as that route for one destination) and a legacy recall, when present, is submitted too (`recall_operation_id`). */
+            /** @description Take accepted; outcome on the realtime stream. A salvo with only legacy recalls answers `AcceptedBody` (outcome `salvo.taken`). A patch salvo (#308) answers `{operation_id, status: "accepted", recall_operation_id?}`: its crosspoints are taken atomically through the `POST /patch/take` set path (outcome `patch.take`, for one destination too) and a legacy recall, when present, is submitted too (`recall_operation_id`). */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AcceptedBody"];
+                    "application/json": components["schemas"]["SalvoTakeAcceptedDoc"];
                 };
             };
             /** @description Missing or invalid credentials. */

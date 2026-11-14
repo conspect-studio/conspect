@@ -331,6 +331,29 @@ pub(crate) async fn arm_salvo(
     )
 }
 
+/// `OpenAPI` shape of a `POST /salvos/{id}/take` `202`: `AcceptedBody` for
+/// a salvo with only legacy recalls, `PatchAccepted` for a patch salvo
+/// (#308). Two distinct Rust types; only the document is a `oneOf`.
+#[cfg(feature = "openapi")]
+pub struct SalvoTakeAcceptedDoc;
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for SalvoTakeAcceptedDoc {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{OneOfBuilder, Ref};
+        OneOfBuilder::new()
+            .item(Ref::from_schema_name("AcceptedBody"))
+            .item(Ref::from_schema_name("PatchAccepted"))
+            .description(Some(
+                "`AcceptedBody` for a salvo with only legacy recalls; `PatchAccepted` for a patch salvo (#308).",
+            ))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for SalvoTakeAcceptedDoc {}
+
 /// `POST /api/v1/salvos/{id}/take` — take (apply) the salvo (role: write; 202).
 #[cfg_attr(
     feature = "openapi",
@@ -340,7 +363,7 @@ pub(crate) async fn arm_salvo(
         tag = "salvos",
         params(("id" = String, Path, description = "Salvo id to take."), HeadQuery),
         responses(
-            (status = 202, description = "Take accepted; outcome on the realtime stream. A salvo with only legacy recalls answers `AcceptedBody` (outcome `salvo.taken`). A patch salvo (#308) answers `{operation_id, status: \"accepted\", recall_operation_id?}`: its crosspoints are taken atomically through the `POST /patch/take` set path (outcome `patch.take`, or as that route for one destination) and a legacy recall, when present, is submitted too (`recall_operation_id`).", body = crate::routes::AcceptedBody),
+            (status = 202, description = "Take accepted; outcome on the realtime stream. A salvo with only legacy recalls answers `AcceptedBody` (outcome `salvo.taken`). A patch salvo (#308) answers `{operation_id, status: \"accepted\", recall_operation_id?}`: its crosspoints are taken atomically through the `POST /patch/take` set path (outcome `patch.take`, for one destination too) and a legacy recall, when present, is submitted too (`recall_operation_id`).", body = SalvoTakeAcceptedDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to take (a patch salvo: every member's both ends are re-authorized under the caller's current grants).", body = crate::problem::Problem),
             (status = 404, description = "No salvo with that id.", body = crate::problem::Problem),
@@ -455,7 +478,7 @@ async fn take_patch_salvo(
         tag = "salvos",
         params(("id" = String, Path, description = "Salvo id to plan.")),
         responses(
-            (status = 200, description = "The patch plan of the salvo's crosspoints (as `POST /patch/plan`).", body = crate::routes::patch::PatchPlan),
+            (status = 200, description = "The patch plan of the salvo's crosspoints (as `POST /patch/plan`): a `PatchPlan`, or a `SetPlan` with `set: {new_encoders, fits}` for two or more destinations.", body = crate::routes::patch::PatchPlanResponseDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized for the salvo or for a patch member's destination or source.", body = crate::problem::Problem),
             (status = 404, description = "No salvo with that id.", body = crate::problem::Problem),

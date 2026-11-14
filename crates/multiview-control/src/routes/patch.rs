@@ -189,6 +189,30 @@ pub struct PatchAccepted {
     pub recall_operation_id: Option<String>,
 }
 
+/// `OpenAPI` shape of a patch plan `200` (`POST /patch/plan`,
+/// `POST /salvos/{id}/plan`): a single-destination [`PatchPlan`], or a
+/// `SetPlan` (the same fields plus `set: {new_encoders, fits}`) for an
+/// atomic set of two or more destinations (#308).
+#[cfg(feature = "openapi")]
+pub struct PatchPlanResponseDoc;
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for PatchPlanResponseDoc {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{OneOfBuilder, Ref};
+        OneOfBuilder::new()
+            .item(Ref::from_schema_name("PatchPlan"))
+            .item(Ref::from_schema_name("SetPlan"))
+            .description(Some(
+                "A `PatchPlan` for mixer inputs or one output, or a `SetPlan` (with `set: {new_encoders, fits}`) for an atomic set of two or more destinations.",
+            ))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for PatchPlanResponseDoc {}
+
 pub(crate) fn problem(status: u16, kind: &str, detail: impl Into<String>) -> Response {
     Problem::new(status, kind, "Patch refused")
         .with_detail(detail)
@@ -552,7 +576,7 @@ pub(crate) async fn get_patch(
 /// all can and the set's new encoders fit the caller's caps); no change.
 #[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/patch/plan", tag = "patch", request_body = PatchRequest,
     responses(
-        (status = 200, body = PatchPlan),
+        (status = 200, description = "The plan: a `PatchPlan`, or for an atomic set of two or more destinations a `SetPlan` that adds `set: {new_encoders, fits}` (#308).", body = PatchPlanResponseDoc),
         (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object + output axis) or a source.", body = crate::problem::Problem),
         (status = 404, description = "Unknown output.", body = crate::problem::Problem),
         (status = 409, description = "`switcher-unavailable` or `routing-unavailable`.", body = crate::problem::Problem),
