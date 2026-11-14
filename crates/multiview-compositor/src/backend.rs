@@ -349,18 +349,25 @@ impl RunBackend {
     /// machine as the GPU compositor, over a fake device whose readback
     /// completes `latency` after submit (or never while hung). The returned
     /// [`crate::readback::SimulatedGpuControl`] changes latency, hangs and
-    /// releases the device. Production never constructs this.
+    /// releases the device. Production never constructs this. It is
+    /// admitted against its own unbounded pool (tests build many).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::Error::GpuRuntime`] when a worker thread cannot be
+    /// spawned.
     #[doc(hidden)]
-    #[must_use]
     pub fn simulated_gpu(
         latency: std::time::Duration,
-    ) -> (Self, crate::readback::SimulatedGpuControl) {
+    ) -> Result<(Self, crate::readback::SimulatedGpuControl)> {
+        static SIM_POOL: std::sync::OnceLock<std::sync::Arc<crate::offclock::Admission>> =
+            std::sync::OnceLock::new();
+        let pool =
+            SIM_POOL.get_or_init(|| std::sync::Arc::new(crate::offclock::Admission::new(u64::MAX)));
         let sim = crate::readback::SimulatedGpu::new(latency);
         let control = crate::readback::SimulatedGpuControl::new(&sim);
-        (
-            Self::SimulatedGpu(Box::new(crate::offclock::OffClockGpu::new(sim))),
-            control,
-        )
+        let backend = crate::offclock::OffClockGpu::new_in(pool, sim)?;
+        Ok((Self::SimulatedGpu(Box::new(backend)), control))
     }
 
     /// Bound the GPU readback wait by the output frame `period`:
@@ -469,12 +476,29 @@ impl RunBackend {
         if let Some(target) = target {
             #[cfg(feature = "wgpu")]
             {
-                match crate::gpu::GpuCompositor::new(target.is_some().then_some(&target)) {
+                // Admission before the device exists (issue #415): a process
+                // that already pins the cap of live GPU workers (some may be
+                // wedged in a hung driver) builds no further device.
+                let admission = crate::offclock::gpu_admission();
+                let gpu = match admission.try_acquire() {
+                    None => Err(crate::error::Error::GpuRuntime(format!(
+                        "GPU worker admission cap reached ({} live)",
+                        admission.live()
+                    ))),
+                    Some(permit) => {
+                        crate::gpu::GpuCompositor::new(target.is_some().then_some(&target))
+                            .and_then(|gpu| {
+                                crate::offclock::OffClockGpu::with_permit(
+                                    permit,
+                                    std::sync::Arc::new(gpu),
+                                )
+                            })
+                    }
+                };
+                match gpu {
                     Ok(gpu) => {
                         tracing::info!("compositor backend: GPU (wgpu) selected");
-                        return Self::Gpu(Box::new(crate::offclock::OffClockGpu::new(
-                            std::sync::Arc::new(gpu),
-                        )));
+                        return Self::Gpu(Box::new(gpu));
                     }
                     Err(e) => {
                         tracing::info!(

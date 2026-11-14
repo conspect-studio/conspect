@@ -291,9 +291,8 @@ impl<P: PendingReadback> ReadbackGate<P> {
 pub struct GpuHealth {
     lost: AtomicBool,
     reason: Mutex<Option<String>>,
-    /// Frames the clock side returned [`Error::GpuDeadline`] for (the GPU job
-    /// or the CPU fallback missed the clock's wait, or was still running).
-    clock_misses: AtomicU64,
+    /// Every [`Error::GpuDeadline`] a backend returned to its caller.
+    deadline_returns: AtomicU64,
     /// Frames dispatched to the CPU reference fallback.
     cpu_fallback_frames: AtomicU64,
 }
@@ -341,17 +340,15 @@ impl GpuHealth {
             .clone()
     }
 
-    /// Count one clock-side miss; returns the new total.
-    pub(crate) fn record_clock_miss(&self) -> u64 {
-        self.clock_misses
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1)
+    /// Count one [`Error::GpuDeadline`] returned to the caller.
+    pub(crate) fn record_deadline_return(&self) {
+        self.deadline_returns.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Clock-side misses so far.
+    /// [`Error::GpuDeadline`]s returned to the caller so far.
     #[must_use]
-    pub fn clock_misses(&self) -> u64 {
-        self.clock_misses.load(Ordering::Relaxed)
+    pub fn deadline_returns(&self) -> u64 {
+        self.deadline_returns.load(Ordering::Relaxed)
     }
 }
 
@@ -658,11 +655,10 @@ impl SimulatedGpuControl {
         self.with_sim(SimulatedGpu::cpu_fallback_frames)
     }
 
-    /// Frames that returned [`Error::GpuDeadline`] to the engine (readback
-    /// gate misses plus clock-side waits that gave up).
+    /// Every [`Error::GpuDeadline`] the backend returned to the engine.
     #[must_use]
     pub fn deadline_misses(&self) -> u64 {
-        self.with_sim(|s| s.gate.misses().saturating_add(s.health.clock_misses()))
+        self.with_sim(|s| s.health.deadline_returns())
     }
 
     /// Whether a missed readback is still held.
@@ -822,7 +818,7 @@ mod tests {
     #[test]
     fn simulated_backend_counts_cpu_fallback_and_recovers() {
         let (backend, control) =
-            crate::backend::RunBackend::simulated_gpu(Duration::from_millis(1));
+            crate::backend::RunBackend::simulated_gpu(Duration::from_millis(1)).unwrap();
         backend.set_frame_period(Duration::from_millis(40));
         let canvas = CanvasColor::default();
         let run = || backend.composite(16, 16, canvas, LinearRgba::TRANSPARENT, &[]);

@@ -385,8 +385,8 @@ pub trait FrameControl {
     fn on_repeat(&mut self, _drive: &mut CompositorDrive<Nv12Image>, _tick: Tick) {}
     /// The fresh compose of `tick` (staged by [`FrameControl::before_compose`])
     /// failed — a GPU readback deadline miss (issue #395) — and the runtime
-    /// re-emitted last-good under `tick` instead (not called for the very
-    /// first tick, which is composed on the CPU reference and committed). A hook that staged a take
+    /// re-emitted last-good under `tick` instead (on the very first tick, a
+    /// black stand-in, issue #415). A hook that staged a take
     /// must roll it back: the staged scene never reached the output.
     /// `after_compose` is not called for this tick.
     fn on_compose_failed(
@@ -1119,8 +1119,6 @@ impl<P: Pacer> EngineRuntime<P> {
                     // The GPU missed this tick's readback deadline: never end
                     // the run and never slip — the tick is still emitted.
                     if let Some(last) = last_good.as_mut() {
-                        // Counted here only: a miss on the very first tick is
-                        // composed on the CPU below, not repeated (review MC-2).
                         self.compose_deadline_misses.fetch_add(1, Ordering::AcqRel);
                         // The staged scene never reaches the output: let the
                         // hook roll a staged take back.
@@ -1139,11 +1137,25 @@ impl<P: Pacer> EngineRuntime<P> {
                         self.frames_repeated.fetch_add(1, Ordering::AcqRel);
                         continue;
                     }
-                    // The very first tick has nothing to repeat: compose it on
-                    // the CPU reference so the first frame always exists. The
-                    // staged scene IS composed here, so `after_compose`
-                    // commits it as for any fresh frame.
-                    self.drive.compose_on_cpu(tick)?
+                    // The very first tick has nothing to repeat: emit a black
+                    // stand-in at canvas size (a memset, never a composite,
+                    // so this tick is bounded like every other, issue #415).
+                    // It is counted as a miss, the staged scene is rolled
+                    // back, and it becomes last-good until the GPU (or its
+                    // CPU fallback) delivers.
+                    self.compose_deadline_misses.fetch_add(1, Ordering::AcqRel);
+                    control.on_compose_failed(&mut self.drive, tick, &reason);
+                    let placeholder = self.drive.placeholder_frame(tick)?;
+                    publisher.publish_state(state_of(&placeholder));
+                    if let Some(event) = event_of(&placeholder) {
+                        publisher.publish_event(event);
+                    }
+                    self.record_lateness(tick.index);
+                    emitted = emitted.saturating_add(1);
+                    self.ticks_emitted.fetch_add(1, Ordering::AcqRel);
+                    self.frames_repeated.fetch_add(1, Ordering::AcqRel);
+                    last_good = Some(placeholder);
+                    continue;
                 }
                 Err(other) => return Err(other),
             };

@@ -441,12 +441,30 @@ waited 5.0 s on the clock thread.
   *busy*, and later frames fail fast with no wait. Busy for ≥ `STALL_HOLD` ⇒
   the frame goes to the CPU worker. A late GPU result is discarded: its tick
   was already emitted as a repeat and its staged take rolled back. The CPU
-  worker gets what is left of the budget. If its job is still running, the
-  next frame waits, within its own budget, for that result instead of
-  discarding it. So a fallback slower than a tick still delivers every other
-  frame (the 50 ms chaos variant). A CPU frame not ready in time is a miss.
-  Unclocked callers (period never set) get a 4 s budget, which is twice the
-  2 s unclocked readback deadline.
+  worker gets what is left of the budget. Its result is adopted by a later
+  frame (while still running, or after finishing between two frames) only
+  when the later frame has the same **scene key**. That key covers the drive's
+  scene epoch, bumped by every layout, binding, store, slate or style change,
+  plus the transition step. So a fallback slower than a tick still delivers
+  frames (the 50 ms chaos variant), and a staged-then-rolled-back scene never
+  reaches the output: the adopted frame differs only by source frames sampled
+  a tick earlier. A CPU frame not ready in time is a miss. Unclocked callers
+  (period never set) get a 4 s budget, which is twice the 2 s unclocked
+  readback deadline.
+* **First tick.** With no last-good frame yet, a miss on tick 0 emits a black
+  stand-in at canvas size and tag (`CompositorDrive::placeholder_frame`, a
+  memset, never a composite). It is counted as a miss and a repeat, and the
+  staged scene is rolled back. This replaces #395's inline CPU composite on
+  the clock thread.
+* **No inline fallback, bounded worker count.** If a worker thread cannot be
+  spawned, backend construction fails and the selector uses the CPU
+  reference. GPU work never runs on the caller's thread. A process-wide
+  admission pool (`MAX_LIVE_GPU_WORKERS` = 8) is taken *before* the device is
+  created. Each permit lives in the GPU worker thread, not in its handle. A
+  worker wedged in a hung driver call therefore keeps counting, so repeated
+  construct, wedge and tear-down cycles are refused at the cap instead of
+  piling up threads, devices and retained jobs. Each wedged worker pins at
+  most one `FrameJob`: the `Arc`s of one frame's source images.
 * **Device loss is typed and permanent, never a panic.** `GpuContext::new`
   registers a device-lost callback and an uncaptured-error handler. The
   handler replaces wgpu's panicking default and marks the device faulted,
@@ -457,7 +475,8 @@ waited 5.0 s on the clock thread.
   `PollType::Poll` so wgpu runs the maintenance that reports the loss. Every
   GPU call runs under `catch_unwind` on the worker, or inline for the
   synchronous `RunBackend::composite`, so a panic out of wgpu also becomes
-  `GpuLost`. On `GpuLost` the backend logs `error` once, sets `gpu_lost()`,
+  `GpuLost`. The worker marks the device lost itself, so a panic after the
+  clock stopped waiting still counts. On `GpuLost` the backend logs `error` once, sets `gpu_lost()`,
   and composites every later frame on the CPU worker (counted in
   `cpu_fallback_frames`). It never tries the GPU again: recovering a lost
   wgpu device means a new device, which is a program restart.
@@ -473,8 +492,10 @@ waited 5.0 s on the clock thread.
   `libvulkan` (`vkSetDebugUtilsObjectNameEXT`) racing `vkEnumeratePhysicalDevices`.
   On lavapipe `gpu_surface_pool` crashed 12 of 30 parallel runs before the fix
   and 0 of 30 after.
-* **Counters.** `RunBackend::gpu_deadline_misses()` = readback-gate misses
-  plus clock-side misses (each a `GpuDeadline` the engine repeats).
+* **Counters.** `RunBackend::gpu_deadline_misses()` counts each
+  `GpuDeadline` the backend returned, once, at the return boundary (one
+  engine repeat each). The readback gate's own count, which also includes
+  misses of abandoned jobs, stays a separate diagnostic.
   `gpu_cpu_fallback_frames()` counts frames composited by the CPU fallback.
   `gpu_lost()` reports whether the device was lost.
 * **Trade-off.** While the GPU is down, a host whose CPU composite is slower
@@ -492,6 +513,11 @@ waited 5.0 s on the clock thread.
   emit gap ≥ 600 ms, frames move to the CPU, and the GPU path recovers.
   Teardown with the GPU hung: the drop on the clock thread takes < 500 ms and
   the GPU is dropped on `gpu-compose`. All three fail on the pre-#415 path.
+  A fourth case has the GPU stuck from tick 0 with a 50 ms CPU fallback: the
+  stand-in goes out on time and every tick follows. Unit tests also cover
+  same-scene adoption between frames, refusal of other-scene results, a late
+  panic marking the device lost, spawn failure as an error (never inline),
+  and admission held until the worker thread exits.
   The wgpu tests (they skip without an adapter, as in CI) destroy a real
   device and check that it yields `GpuLost`, never a panic, and that the run
   backend then composites on the CPU for good.

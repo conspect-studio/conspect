@@ -255,6 +255,12 @@ pub struct CompositorDrive<T> {
     transition_fill: Option<(Rgb8, Arc<Nv12Image>)>,
     /// Odometer of `transition_fill` builds (the no-per-tick-allocation gate).
     transition_fill_builds: u64,
+    /// Bumped by every change to what a composite draws other than the
+    /// source frames' contents (layout, bindings, stores, slates, transition
+    /// step and style). A GPU backend's CPU fallback hands a late result to a
+    /// later frame only under the same epoch (issue #415 review MC-1), so a
+    /// scene a hook staged and then rolled back never reaches the output.
+    scene_epoch: u64,
 }
 
 impl<T> CompositorDrive<T> {
@@ -293,6 +299,7 @@ impl<T> CompositorDrive<T> {
             transition_style: TransitionStyle::Mix,
             transition_fill: None,
             transition_fill_builds: 0,
+            scene_epoch: 0,
         })
     }
 
@@ -424,6 +431,7 @@ impl<T> CompositorDrive<T> {
     pub fn set_cell_slates(&mut self, mut slates: Vec<FailoverSlate>) {
         slates.truncate(self.layout.cells.len());
         self.cell_slates = slates;
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
     }
 
     /// The cumulative number of distinct failover-slate **images built** so far.
@@ -505,12 +513,14 @@ impl<T> CompositorDrive<T> {
             .set_frame_period(frame_period(layout.canvas.cadence()));
         self.layout = layout;
         self.layout_generation = self.layout_generation.wrapping_add(1);
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         Ok(())
     }
 
     /// Register or replace a source's frame store.
     pub fn insert_store(&mut self, source_id: impl Into<String>, store: Arc<TileStore<T>>) {
         self.stores.insert(source_id.into(), store);
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
     }
 
     /// The registered frame store for `source_id`, if any.
@@ -533,6 +543,7 @@ impl<T> CompositorDrive<T> {
     /// panic, never a stall (invariants #1/#2). O(1) map removal at the frame
     /// boundary; the producer teardown happens off the clock thread.
     pub fn remove_store(&mut self, source_id: &str) -> bool {
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         self.stores.remove(source_id).is_some()
     }
 
@@ -584,6 +595,7 @@ impl<T> CompositorDrive<T> {
         };
         cell.source = Some(source_id.to_owned());
         self.layout_generation = self.layout_generation.wrapping_add(1);
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         Ok(())
     }
 }
@@ -641,6 +653,7 @@ impl CompositorDrive<Nv12Image> {
             }
         }
         self.transition_style = style;
+        self.scene_epoch = self.scene_epoch.wrapping_add(1);
         if let Some(mix) = self.mix_overlay.as_mut() {
             mix.style = style;
         }
@@ -669,17 +682,55 @@ impl CompositorDrive<Nv12Image> {
         self.compose_with(tick, &self.backend)
     }
 
-    /// As [`CompositorDrive::compose`], but on a fresh CPU reference backend
-    /// regardless of the configured one: the runtime's path for a GPU
-    /// deadline miss on the very first tick, when there is no last-good frame
-    /// to repeat (issue #395). Cold LUT caches: used at most once per run in
-    /// practice.
+    /// Whether the GPU backend lost its device (issue #415): every frame
+    /// since is composited on the CPU reference. `false` on the CPU backend.
+    #[must_use]
+    pub fn gpu_lost(&self) -> bool {
+        self.backend.gpu_lost()
+    }
+
+    /// A bounded stand-in frame for `tick`: black at canvas size and tag,
+    /// with the current source states. The runtime emits it when a GPU
+    /// backend has no frame ready for the very first tick (there is no
+    /// last-good to repeat yet, issue #415): building it is a memset, never a
+    /// composite, so the first tick is as bounded as every other.
     ///
     /// # Errors
     ///
-    /// [`Error::Canvas`] for a canvas the CPU compositor rejects.
-    pub fn compose_on_cpu(&self, tick: Tick) -> Result<CompositedFrame> {
-        self.compose_with(tick, &RunBackend::cpu())
+    /// [`Error::Canvas`] for a canvas the compositor rejects (odd / zero).
+    pub fn placeholder_frame(&self, tick: Tick) -> Result<CompositedFrame> {
+        let canvas = &self.layout.canvas;
+        let tag = self.canvas_color.output_tag();
+        let black_y = match tag.range {
+            multiview_core::color::ColorRange::Full => 0,
+            _ => 16,
+        };
+        let image = Nv12Image::solid(canvas.width, canvas.height, black_y, 128, 128, tag)
+            .map_err(|e| Error::Canvas(e.to_string()))?;
+        Ok(CompositedFrame {
+            tick,
+            canvas: Arc::new(image),
+            source_states: self.sample_states(tick.pts),
+            source_times: HashMap::new(),
+            repeat: true,
+            mix: None,
+        })
+    }
+
+    /// The identity of what the next composite draws apart from the source
+    /// frames' contents: the scene epoch plus the transition step (issue #415
+    /// review MC-1).
+    fn scene_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.scene_epoch.hash(&mut h);
+        if let Some(mix) = &self.mix_overlay {
+            mix.source.hash(&mut h);
+            mix.elapsed.hash(&mut h);
+            mix.duration.hash(&mut h);
+            mix.start.hash(&mut h);
+        }
+        h.finish()
     }
 
     fn compose_with(&self, tick: Tick, backend: &RunBackend) -> Result<CompositedFrame> {
@@ -771,6 +822,7 @@ impl CompositorDrive<Nv12Image> {
                     })
                 })
                 .collect(),
+            scene: self.scene_key(),
         });
 
         // Dispatch the composite through the selected backend (CPU reference by

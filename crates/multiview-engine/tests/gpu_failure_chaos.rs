@@ -114,7 +114,7 @@ fn run(
         .enable_all()
         .build()
         .unwrap();
-    let (backend, gpu) = RunBackend::simulated_gpu(Duration::from_millis(1));
+    let (backend, gpu) = RunBackend::simulated_gpu(Duration::from_millis(1)).unwrap();
     let control = gpu.clone();
     let handle = rt.block_on(async {
         clock_thread::spawn("gpu-fail", move || {
@@ -314,5 +314,42 @@ fn teardown_with_a_hung_gpu_is_bounded_and_off_the_clock_thread() {
     assert_ne!(
         dropped_on, r.clock_thread,
         "the GPU must never be torn down on the clock thread"
+    );
+}
+
+/// Review INV-2: the GPU is stuck from the very first tick (submit blocked)
+/// and the CPU fallback is slower than a tick. There is no last-good yet, but
+/// the first tick is still emitted on time (a black stand-in, never an inline
+/// composite on the clock), every tick follows, and fresh frames arrive.
+#[test]
+fn a_gpu_stuck_from_tick_zero_with_a_slow_cpu_still_emits_every_tick() {
+    let started = Arc::new(AtomicBool::new(false));
+    let (r, _gpu) = run(
+        move |gpu, _tick| {
+            if !started.swap(true, Ordering::AcqRel) {
+                gpu.set_cpu_fallback_cost(Duration::from_millis(50));
+                gpu.block_submit();
+                let gpu = gpu.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(SUBMIT_BLOCK);
+                    gpu.unblock_submit();
+                });
+            }
+        },
+        |_| {},
+    );
+    assert_cadence(&r);
+    println!(
+        "tick-zero stall: first repeat={} cpu_fallbacks={} gpu_frames={} tail_fresh={}",
+        r.seen[0].repeat,
+        r.cpu_fallbacks,
+        r.gpu_frames,
+        tail_fresh(&r)
+    );
+    assert!(r.seen[0].repeat, "tick 0 is the stand-in, not a composite");
+    assert!(r.cpu_fallbacks > 0, "the slow CPU fallback still delivers");
+    assert!(
+        tail_fresh(&r) >= TAIL * 2 / 3,
+        "fresh frames after recovery"
     );
 }
