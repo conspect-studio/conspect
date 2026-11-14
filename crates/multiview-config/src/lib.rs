@@ -1893,19 +1893,6 @@ impl MultiviewConfig {
                 }
             }
             AudioFeed::Tracks(tracks) => {
-                // A cast stream has one audio rendition, the program audio
-                // (or the routed feed's own audio): no discrete track.
-                let is_cast = self
-                    .outputs
-                    .iter()
-                    .any(|o| matches!(o, Output::Cast { id, .. } if *id == xp.output));
-                if is_cast {
-                    return Err(ConfigError::Validation(format!(
-                        "output {:?}: a cast output carries the program audio only; discrete \
-                         audio tracks cannot be routed to it",
-                        xp.output
-                    )));
-                }
                 if tracks.is_empty() {
                     return Err(ConfigError::Validation(format!(
                         "output {:?}: an audio `tracks` feed needs at least one track",

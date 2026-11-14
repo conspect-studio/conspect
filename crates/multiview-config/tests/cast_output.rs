@@ -493,3 +493,72 @@ fn the_video_key_is_shared_only_without_an_own_format_codec_or_bit_rate() {
     assert_eq!((cap.video_max, cap.audio_max), (1, Some(1)));
     assert!(cap.format_convertible && !cap.raw_video);
 }
+
+const TWO_TRACKS: &str = r#"
+[audio]
+sample_rate_hz = 48000
+[[audio.routes]]
+input_id = "a"
+channels = { kind = "stereo" }
+target_track = "eng"
+[[audio.routes]]
+input_id = "b"
+channels = { kind = "stereo" }
+target_track = "fra"
+"#;
+
+#[test]
+fn a_cast_output_with_audio_and_subtitle_slots_validates() {
+    // #418: program + one discrete track + one WebVTT subtitle slot.
+    let doc = format!(
+        "{CAST}[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"eng\"\nlanguage = \"en\"\n\
+         [[outputs.slots.subtitle]]\nformat = \"webvtt\"\nlanguage = \"en\"\nname = \"English\"\n\
+         {TWO_TRACKS}"
+    );
+    let cfg = load_hd(&doc).unwrap();
+    let cast = cfg.outputs.iter().find(|o| o.id() == "cast-1").unwrap();
+    let slots = cast.slots().unwrap();
+    assert_eq!((slots.audio.len(), slots.subtitle.len()), (2, 1));
+    let cap = cast.slot_capability();
+    assert_eq!(cap.subtitle_max, multiview_config::MAX_SUBTITLE_SLOTS);
+    // A routed multi-track feed follows the HLS rule (one track at a time).
+    let routed = |output: &str| {
+        format!(
+            "{CAST}{TWO_TRACKS}\n[[routing.output]]\noutput = \"{output}\"\naudio = {{ tracks = [\"eng\", \"fra\"] }}\n"
+        )
+    };
+    let hls = load_hd(&routed("program-hls")).map(|_| ());
+    let cast = load_hd(&routed("cast-1")).map(|_| ());
+    assert_eq!(hls.is_ok(), cast.is_ok(), "hls {hls:?}, cast {cast:?}");
+}
+
+#[test]
+fn a_cast_output_refuses_nine_subtitle_slots_and_cea608() {
+    let subs = |n: usize, format: &str| {
+        format!(
+            "{CAST}{}",
+            format!("[[outputs.slots.subtitle]]\nformat = \"{format}\"\n").repeat(n)
+        )
+    };
+    let max = multiview_config::MAX_SUBTITLE_SLOTS;
+    load_hd(&subs(max, "webvtt")).unwrap();
+    let err = load_hd(&subs(max + 1, "webvtt")).unwrap_err();
+    assert!(
+        err.contains(multiview_config::SLOT_MEDIUM_MISMATCH) && err.contains("9 subtitle slot(s)"),
+        "{err}"
+    );
+    // CEA-608 is refused exactly like on an HLS output.
+    let cast = load_hd(&subs(1, "cea608")).unwrap_err();
+    assert!(
+        cast.contains(multiview_config::SLOT_MEDIUM_MISMATCH)
+            && cast.contains("\"cea608\" is not carried"),
+        "{cast}"
+    );
+    let hls_doc = "\n[[outputs]]\nkind = \"hls\"\nid = \"h2\"\npath = \"/srv/hls/h2/index.m3u8\"\ncodec = \"h264\"\n[[outputs.slots.subtitle]]\nformat = \"cea608\"\n";
+    let hls = load_hd(hls_doc).unwrap_err();
+    assert_eq!(
+        hls.replace("\"h2\"", "X"),
+        cast.replace("\"cast-1\"", "X"),
+        "cast and HLS refuse cea608 the same way"
+    );
+}

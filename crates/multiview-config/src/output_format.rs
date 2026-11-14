@@ -569,19 +569,20 @@ impl Output {
                 subtitle_medium_formats: NO_SUBTITLES,
                 subtitle_formats: NO_SUBTITLES,
             },
-            // A cast stream is one H.264 video rendition and one audio
-            // rendition (CMAF). It is a packet sink like HLS, so the Program
-            // is converted to its format. The cast packager carries no
-            // subtitles (ADR-0111).
+            // A cast stream is one H.264 video rendition plus N CMAF audio
+            // renditions and N WebVTT subtitle renditions (ADR-0111, #418);
+            // the receiver plays one audio and shows at most one subtitle at a
+            // time. It is a packet sink like HLS, so the Program is converted
+            // to its format.
             Output::Cast { .. } => SlotCapability {
                 video_max: 1,
-                audio_max: Some(1),
+                audio_max: None,
                 video_codecs: H264_ONLY,
                 raw_video: false,
                 format_convertible: true,
-                subtitle_max: 0,
-                subtitle_medium_formats: NO_SUBTITLES,
-                subtitle_formats: NO_SUBTITLES,
+                subtitle_max: MAX_SUBTITLE_SLOTS,
+                subtitle_medium_formats: WEBVTT,
+                subtitle_formats: WEBVTT,
             },
             Output::Ndi { .. } | Output::Display { .. } => SlotCapability {
                 video_max: 1,
