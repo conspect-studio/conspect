@@ -283,6 +283,75 @@ impl<P: PendingReadback> ReadbackGate<P> {
     }
 }
 
+/// Device health shared by a GPU backend and its driver callbacks (issue
+/// #415): once the device is lost (wgpu's device-lost callback, an
+/// uncaptured device error, or a panic out of a device call), the backend
+/// composites every later frame on the CPU reference, for good.
+#[derive(Debug, Default)]
+pub struct GpuHealth {
+    lost: AtomicBool,
+    reason: Mutex<Option<String>>,
+    /// Every [`Error::GpuDeadline`] a backend returned to its caller.
+    deadline_returns: AtomicU64,
+    /// Frames dispatched to the CPU reference fallback.
+    cpu_fallback_frames: AtomicU64,
+}
+
+impl GpuHealth {
+    /// Count one CPU-fallback frame; returns the new total.
+    pub(crate) fn record_cpu_fallback(&self) -> u64 {
+        self.cpu_fallback_frames
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    /// Frames dispatched to the CPU reference fallback so far.
+    #[must_use]
+    pub fn cpu_fallback_frames(&self) -> u64 {
+        self.cpu_fallback_frames.load(Ordering::Relaxed)
+    }
+
+    /// Record the device as lost. Returns `true` the first time only (the
+    /// caller logs the transition once).
+    pub fn mark_lost(&self, reason: &str) -> bool {
+        let mut slot = self
+            .reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = !self.lost.swap(true, Ordering::AcqRel);
+        if first {
+            *slot = Some(reason.to_owned());
+        }
+        first
+    }
+
+    /// Whether the device was lost.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
+    /// Why the device was lost, once it was.
+    #[must_use]
+    pub fn reason(&self) -> Option<String> {
+        self.reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Count one [`Error::GpuDeadline`] returned to the caller.
+    pub(crate) fn record_deadline_return(&self) {
+        self.deadline_returns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [`Error::GpuDeadline`]s returned to the caller so far.
+    #[must_use]
+    pub fn deadline_returns(&self) -> u64 {
+        self.deadline_returns.load(Ordering::Relaxed)
+    }
+}
+
 // --- the GPU-free chaos seam ---------------------------------------------------
 
 /// The fake device shared by a [`SimulatedGpu`] and its control handle.
@@ -293,6 +362,17 @@ struct SimDevice {
     /// Polls that were allowed to block (a non-zero wait): the deterministic
     /// proof that a fail-fast frame never waited (no wall-clock assertion).
     blocking_polls: AtomicU64,
+    /// Device lost: the next poll PANICS, exactly like wgpu 30's
+    /// `Device::poll` on a non-timeout device error (`handle_error_fatal`).
+    lost: AtomicBool,
+    /// While set, "submit" blocks (a driver-side `queue.submit` that never
+    /// returns), polled every millisecond until cleared.
+    submit_blocked: AtomicBool,
+    /// Frames delivered through the simulated GPU.
+    gpu_frames: AtomicU64,
+    /// The name of the thread the simulated GPU was dropped on (teardown
+    /// probe: a hung device must never be torn down on the clock thread).
+    dropped_on: Mutex<Option<String>>,
 }
 
 /// A simulated in-flight readback: ready `latency` after submit unless the
@@ -304,7 +384,11 @@ struct SimPending {
 }
 
 impl PendingReadback for SimPending {
+    #[allow(clippy::panic, clippy::manual_assert)] // reason: the seam reproduces wgpu's device-lost poll panic
     fn poll(&mut self, wait: Option<Duration>) -> ReadbackPoll {
+        if self.device.lost.load(Ordering::Acquire) {
+            panic!("Error in Device::poll: Parent device is lost (simulated)");
+        }
         let ready =
             |p: &Self| !p.device.hung.load(Ordering::Acquire) && Instant::now() >= p.ready_at;
         if ready(self) {
@@ -344,15 +428,14 @@ impl PendingReadback for SimPending {
 pub struct SimulatedGpu {
     device: Arc<SimDevice>,
     gate: ReadbackGate<SimPending>,
-    gpu_frames: AtomicU64,
-    cpu_fallback_frames: AtomicU64,
     /// Extra time each CPU-fallback frame costs (the chaos seam for a fallback
     /// slower than a tick, #395 INV-1); zero by default.
-    cpu_fallback_cost_nanos: AtomicU64,
-    cpu_fallback: crate::backend::CpuBackend,
+    cpu_fallback_cost_nanos: Arc<AtomicU64>,
     /// Stands in for the GPU compositor's surface-pool lock: admission and the
     /// readback of one frame happen under it (review MC-1).
     pool: Mutex<()>,
+    /// Device loss as the backend recorded it.
+    health: Arc<GpuHealth>,
 }
 
 impl SimulatedGpu {
@@ -366,11 +449,9 @@ impl SimulatedGpu {
         Arc::new(Self {
             device,
             gate: ReadbackGate::default(),
-            gpu_frames: AtomicU64::new(0),
-            cpu_fallback_frames: AtomicU64::new(0),
-            cpu_fallback_cost_nanos: AtomicU64::new(0),
-            cpu_fallback: crate::backend::CpuBackend::default(),
+            cpu_fallback_cost_nanos: Arc::new(AtomicU64::new(0)),
             pool: Mutex::new(()),
+            health: Arc::new(GpuHealth::default()),
         })
     }
 
@@ -388,27 +469,13 @@ impl SimulatedGpu {
     /// Frames delivered through the simulated GPU.
     #[must_use]
     pub fn gpu_frames(&self) -> u64 {
-        self.gpu_frames.load(Ordering::Relaxed)
+        self.device.gpu_frames.load(Ordering::Relaxed)
     }
 
     /// Frames the run backend re-composited on the CPU.
     #[must_use]
     pub fn cpu_fallback_frames(&self) -> u64 {
-        self.cpu_fallback_frames.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn record_cpu_fallback(&self) -> u64 {
-        let cost = self.cpu_fallback_cost_nanos.load(Ordering::Relaxed);
-        if cost > 0 {
-            std::thread::sleep(Duration::from_nanos(cost));
-        }
-        self.cpu_fallback_frames
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1)
-    }
-
-    pub(crate) fn cpu_fallback_backend(&self) -> &crate::backend::CpuBackend {
-        &self.cpu_fallback
+        self.health.cpu_fallback_frames()
     }
 
     /// One "GPU" composite: admit, compose (CPU reference), "submit", then the
@@ -431,6 +498,9 @@ impl SimulatedGpu {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.gate.admit()?;
         let image = crate::pipeline::composite(canvas_w, canvas_h, canvas, background, tiles)?;
+        while self.device.submit_blocked.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let submitted = Instant::now();
         let latency = Duration::from_nanos(self.device.latency_nanos.load(Ordering::Relaxed));
         let pending = SimPending {
@@ -438,8 +508,58 @@ impl SimulatedGpu {
             ready_at: submitted.checked_add(latency).unwrap_or(submitted),
         };
         self.gate.wait(pending, submitted)?;
-        self.gpu_frames.fetch_add(1, Ordering::Relaxed);
+        self.device.gpu_frames.fetch_add(1, Ordering::Relaxed);
         Ok(image)
+    }
+}
+
+impl crate::offclock::FrameComposer for SimulatedGpu {
+    fn compose_tiles(
+        &self,
+        canvas_w: u32,
+        canvas_h: u32,
+        canvas: CanvasColor,
+        background: LinearRgba,
+        tiles: &[Tile<'_>],
+    ) -> Result<Nv12Image> {
+        self.composite(canvas_w, canvas_h, canvas, background, tiles)
+    }
+}
+
+impl crate::offclock::GpuComposer for SimulatedGpu {
+    fn set_frame_period(&self, period: Duration) {
+        self.gate.set_frame_period(period);
+    }
+
+    fn gate_misses(&self) -> u64 {
+        self.gate.misses()
+    }
+
+    fn health(&self) -> Arc<GpuHealth> {
+        Arc::clone(&self.health)
+    }
+
+    fn cpu_fallback_cost(&self) -> Option<Arc<AtomicU64>> {
+        Some(Arc::clone(&self.cpu_fallback_cost_nanos))
+    }
+}
+
+impl Drop for SimulatedGpu {
+    fn drop(&mut self) {
+        // Like wgpu's `Queue` drop (`wait_for_idle`): tearing the device down
+        // waits for the stuck submission.
+        while self.device.submit_blocked.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        *self
+            .device
+            .dropped_on
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(name);
     }
 }
 
@@ -447,13 +567,59 @@ impl SimulatedGpu {
 /// fake device, read its counters.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
-pub struct SimulatedGpuControl(pub(crate) Arc<SimulatedGpu>);
+pub struct SimulatedGpuControl {
+    sim: std::sync::Weak<SimulatedGpu>,
+    device: Arc<SimDevice>,
+}
 
 impl SimulatedGpuControl {
+    /// The control handle of `sim`. It holds the simulated GPU only weakly,
+    /// so the backend alone decides where the simulated GPU is dropped.
+    pub(crate) fn new(sim: &Arc<SimulatedGpu>) -> Self {
+        Self {
+            sim: Arc::downgrade(sim),
+            device: Arc::clone(&sim.device),
+        }
+    }
+
+    fn with_sim<R: Default>(&self, f: impl FnOnce(&SimulatedGpu) -> R) -> R {
+        self.sim.upgrade().map(|s| f(&s)).unwrap_or_default()
+    }
+
+    /// Lose the device: the next readback poll panics like wgpu 30's.
+    pub fn lose_device(&self) {
+        self.device.lost.store(true, Ordering::Release);
+    }
+
+    /// Block "submit" until [`Self::unblock_submit`].
+    pub fn block_submit(&self) {
+        self.device.submit_blocked.store(true, Ordering::Release);
+    }
+
+    /// Let a blocked "submit" return.
+    pub fn unblock_submit(&self) {
+        self.device.submit_blocked.store(false, Ordering::Release);
+    }
+
+    /// Whether the backend recorded the device as lost.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.with_sim(|s| s.health.is_lost())
+    }
+
+    /// The thread the simulated GPU was dropped on, once it was dropped.
+    #[must_use]
+    pub fn dropped_on(&self) -> Option<String> {
+        self.device
+            .dropped_on
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Readbacks submitted from now on complete `latency` after submit.
     pub fn set_latency(&self, latency: Duration) {
-        self.0
-            .device
+        self.device
             .latency_nanos
             .store(nanos_u64(latency), Ordering::Relaxed);
     }
@@ -461,43 +627,44 @@ impl SimulatedGpuControl {
     /// Make every CPU-fallback frame cost `cost` extra on the calling thread
     /// (a fallback slower than a tick).
     pub fn set_cpu_fallback_cost(&self, cost: Duration) {
-        self.0
-            .cpu_fallback_cost_nanos
-            .store(nanos_u64(cost), Ordering::Relaxed);
+        self.with_sim(|s| {
+            s.cpu_fallback_cost_nanos
+                .store(nanos_u64(cost), Ordering::Relaxed);
+        });
     }
 
     /// Hang the device: no readback completes until [`Self::release`].
     pub fn hang(&self) {
-        self.0.device.hung.store(true, Ordering::Release);
+        self.device.hung.store(true, Ordering::Release);
     }
 
     /// Un-hang the device.
     pub fn release(&self) {
-        self.0.device.hung.store(false, Ordering::Release);
+        self.device.hung.store(false, Ordering::Release);
     }
 
     /// Frames delivered through the simulated GPU.
     #[must_use]
     pub fn gpu_frames(&self) -> u64 {
-        self.0.gpu_frames()
+        self.device.gpu_frames.load(Ordering::Relaxed)
     }
 
     /// Frames re-composited on the CPU after a stall hold.
     #[must_use]
     pub fn cpu_fallback_frames(&self) -> u64 {
-        self.0.cpu_fallback_frames()
+        self.with_sim(SimulatedGpu::cpu_fallback_frames)
     }
 
-    /// Frames that returned [`Error::GpuDeadline`].
+    /// Every [`Error::GpuDeadline`] the backend returned to the engine.
     #[must_use]
     pub fn deadline_misses(&self) -> u64 {
-        self.0.gate.misses()
+        self.with_sim(|s| s.health.deadline_returns())
     }
 
     /// Whether a missed readback is still held.
     #[must_use]
     pub fn is_stalled(&self) -> bool {
-        self.0.gate.is_stalled()
+        self.with_sim(|s| s.gate.is_stalled())
     }
 }
 
@@ -651,7 +818,7 @@ mod tests {
     #[test]
     fn simulated_backend_counts_cpu_fallback_and_recovers() {
         let (backend, control) =
-            crate::backend::RunBackend::simulated_gpu(Duration::from_millis(1));
+            crate::backend::RunBackend::simulated_gpu(Duration::from_millis(1)).unwrap();
         backend.set_frame_period(Duration::from_millis(40));
         let canvas = CanvasColor::default();
         let run = || backend.composite(16, 16, canvas, LinearRgba::TRANSPARENT, &[]);
