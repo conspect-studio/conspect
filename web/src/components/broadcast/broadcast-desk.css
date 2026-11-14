@@ -183,7 +183,8 @@
 .bd-transition-menu>summary::-webkit-details-marker{display:none}
 .bd-transition-menu>summary::before{content:'▸';margin-right:8px}
 .bd-transition-menu[open]>summary::before{content:'▾'}
-.bd-transition-params{position:absolute;bottom:100%;right:0;z-index:10;width:min(560px,90vw);max-height:65dvh;overflow:auto;display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0;padding:12px;border:1px solid var(--bd-line2);background:var(--bd-bg1);box-shadow:0 8px 32px #0008}
+.bd-transition-menu-icon{display:none;flex:none}
+.bd-transition-params{position:absolute;inset-block-end:100%;inset-inline-end:0;z-index:10;width:min(560px,calc(100vw - 24px));max-height:65dvh;overflow:auto;display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0;padding:12px;border:1px solid var(--bd-line2);background:var(--bd-bg1);box-shadow:0 8px 32px #0008}
 .bd-patterns{display:flex;gap:4px}
 .bd-patterns button{display:inline-flex;align-items:center;justify-content:center;min-width:48px;min-height:48px;border:1px solid var(--bd-line2);border-radius:4px;background:var(--bd-bg3)}
 .bd-patterns button[aria-pressed=true]{border-color:#6aa6ff}
@@ -494,6 +495,12 @@
  .production-desk[data-dense=true] .bd-bus button .bd-key-name{font-size:9px;line-height:10px}
  .production-desk[data-dense=true] .bd-takes{grid-row:2;grid-column:1;grid-template-columns:auto 120px 180px;justify-content:end}
  .production-desk[data-dense=true] .bd-more{grid-row:2;grid-column:2}
+ /* The dense column is narrow: the toggle becomes a fixed 44x44 icon key (never below target) and the text label is dropped — the accessible name still comes from aria-label/title on the summary. */
+ .production-desk[data-dense=true] .bd-more .bd-transition-menu{flex:none}
+ .production-desk[data-dense=true] .bd-more .bd-transition-menu>summary{min-width:44px;min-height:44px;width:44px;height:44px;padding:0;justify-content:center;overflow:visible}
+ .production-desk[data-dense=true] .bd-more .bd-transition-menu>summary::before{content:none;margin:0}
+ .production-desk[data-dense=true] .bd-transition-menu-icon{display:inline-flex}
+ .production-desk[data-dense=true] .bd-transition-menu-label{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
  .production-desk[data-dense=true] .bd-wall-tile{grid-template-rows:minmax(0,1fr) 28px}
  .production-desk[data-dense=true] .bd-wall-tile .bd-source-picture{height:calc(100% - 28px)}
  .production-desk[data-dense=true] .bd-wall-tile>span:last-child{bottom:30px}

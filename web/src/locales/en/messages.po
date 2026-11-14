@@ -12073,6 +12073,7 @@ msgstr "Transition"
 #: src/components/broadcast/ProductionDesk.tsx:327
 #: src/components/broadcast/ProductionDesk.tsx:327
 #: src/components/broadcast/ProductionDesk.tsx:327
+#: src/components/broadcast/ProductionDesk.tsx:327
 msgid "Transition parameters"
 msgstr "Transition parameters"
 
