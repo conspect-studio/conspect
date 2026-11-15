@@ -37,6 +37,8 @@ pub struct ProgramCounters {
     pub phases: PhasesSnapshot,
     /// The run's per-output clocks (#343; empty without a rate output).
     pub output_clocks: Vec<OutputClockCounters>,
+    /// Decodes producing the full canvas now (#469; a gauge).
+    pub full_canvas_decodes: u64,
 }
 
 /// A cumulative reading of one per-output clock (#343, output-routing §12.6).
@@ -158,6 +160,7 @@ impl ProgramMetrics {
                     OutputClockReport::of(clock, &clock.lateness.since(&before))
                 })
                 .collect(),
+            full_canvas_decodes: now.full_canvas_decodes,
             compose_phases: ComposePhases {
                 hook: PhaseHistogram::of(
                     &now.phases.hook,
@@ -305,6 +308,12 @@ pub struct ProgramMetricsReport {
     /// Program's rate.
     #[serde(default)]
     pub output_clocks: Vec<OutputClockReport>,
+    /// Running source decoders whose own output (the NVDEC resize, else the
+    /// coded size) is at least the canvas on both axes now (#469): the
+    /// decode cost of sizing routed, PGM and PVW sources at the canvas.
+    /// Transient make-before-break replacements are not counted.
+    #[serde(default)]
+    pub full_canvas_decodes: u64,
 }
 
 /// One per-output clock in [`ProgramMetricsReport::output_clocks`] (#343).
@@ -416,6 +425,7 @@ mod tests {
                 compose_deadline_misses: 0,
                 phases: PhasesSnapshot::default(),
                 output_clocks: Vec::new(),
+                full_canvas_decodes: 0,
             })
         }
     }
