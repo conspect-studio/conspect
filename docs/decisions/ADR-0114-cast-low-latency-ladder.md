@@ -408,15 +408,93 @@ part of the page, so a 1080p picture would be shown at 720p at best, and painted
 video hardware path. The cast MoQ player therefore wraps each received frame in a CMAF fragment and appends it
 to a `SourceBuffer`, and the `<video>` element plays it: the same decoder and video plane the HLS rung uses on
 that device, which is known to work on the operator's Chromecast. It also removes WebCodecs from the
-requirements, which lowers the Chrome version needed from 94 to 97 for WebTransport alone, and the element keeps
-audio and video in sync. The cost is the element's buffer: the player holds a small target (start at 150 ms)
-and trims by playback rate. Unverified: the latency this reaches on a device; slice 4 measures it. `vdec` and
+requirements: what the rung then needs is WebTransport, that is Chrome 97 or later, and Media Source
+Extensions. The element keeps audio and video in sync. The cost is the element's buffer; its target, its hard
+limits and what happens when they are reached are in "Receiver buffers" below. Unverified: the latency this
+reaches on a device; slice 4 measures it. `vdec` and
 `adec` stay in the probe so that the data shows which devices could run a canvas player, if that is ever wanted.
 The probe gains `mse`: `MediaSource.isTypeSupported` for the stream's codec strings.
 
+#### Receiver buffers: hard bounds and recovery
+
+Reviewer finding D4. A latency target is not a memory bound. Every place where the new receivers hold media
+has a fixed ceiling in count, bytes and time, and a defined action when it is reached. The action always ends
+at a keyframe: after anything is dropped, nothing that depends on it is given to a decoder.
+
+**MoQ player in the Web Receiver (`moq.js`).** Media is held in three places.
+
+| Place | Ceiling | When reached |
+| --- | --- | --- |
+| Groups being read from the transport | 2 per track: the one being appended and the newest | An older group's stream is cancelled, which stops its delivery. What the browser holds unread is limited by QUIC flow control, not by this script |
+| Pending fragments (received, not yet appended), per track | 60 fragments, 4 MiB, 1 s between the oldest and the newest timestamp | **Soft reset** |
+| Retained in each `SourceBuffer` | 2 s behind the playhead, 3 s ahead of it; 16 MiB by the player's own account | Behind: removed. Ahead above 1.5 s: the playhead jumps forward. Ahead above 3 s, or the byte account above 16 MiB: **hard reset** |
+
+- *Appends.* One `appendBuffer` per track at a time. On each `updateend` the player appends everything pending
+  for that track as one buffer (at most 4 MiB by the ceiling above). It never calls `appendBuffer` while
+  `updating` is true.
+- *Back buffer.* Once a second, when the buffer is idle, the player calls `remove(0, currentTime - 2)`. The
+  browser may remove more than asked, up to the next random access point (Cited: coded frame removal,
+  [Media Source Extensions](https://www.w3.org/TR/media-source-2/)); that is behind the playhead and harmless.
+- *Byte account.* The browser does not report what a `SourceBuffer` holds. The player keeps, per track, a ring
+  of at most 512 entries (timestamp, size) for fragments it appended and has not removed, and sums them. This
+  is an account of bytes appended, not of the browser's memory. The browser's own limit is the second line: an
+  append it cannot fit throws `QuotaExceededError` (Cited: prepare append, same specification).
+- *Playhead.* Target 150 ms ahead of the playhead. Above 250 ms the playback rate is 1.03 until it is back at
+  the target; above 1.5 s the player sets `currentTime` to the buffered end minus the target.
+
+**Soft reset** (pending overflow; a gap in the frame sequence of a group; a group abandoned part-way; a frame
+that arrives after a later one). The player discards the pending fragments of *both* tracks, discards every
+arriving video frame until the first frame of a new group (a keyframe), and discards arriving audio frames
+older than that keyframe's timestamp minus one audio frame. It then appends from there and moves the playhead
+to the start of the new buffered range. Both tracks keep the base `B` of the attachment (decision 2), so audio
+and video stay on one timeline and the element keeps them in sync. Cost: the picture holds its last frame for
+at most one GOP.
+
+**Hard reset** (no `updateend` or `error` within 2 s of an `appendBuffer` or `remove`; a `SourceBuffer` error
+event; a media element decode error; retained ceilings exceeded; a second `QuotaExceededError`). The player
+drops the `MediaSource`: it detaches the element, revokes the object URL, creates a new `MediaSource` and new
+`SourceBuffer`s, appends the initialisation segments, and continues as after a soft reset. The transport
+session is kept.
+
+**`QuotaExceededError`.** The player does not retry the same append at once. It removes everything up to
+`currentTime - 0.5`, waits for that `updateend`, and retries once. A second failure is a hard reset.
+
+**Not playing.** When the element is paused or the receiver page is hidden for more than 2 s (the TV shows
+another input), the player ends the attachment instead of buffering a live stream it does not show. It
+attaches again when the page is visible, with a new ladder call.
+
+**Reset budget.** More than 3 hard resets, or more than 10 soft resets, within 60 s: the receiver steps down
+(stage `stall`). Every reset is counted in the report (`resets.soft`, `resets.hard`, with the last cause).
+
+**WebRTC player in the Web Receiver (`rtc.js`).** The script holds no media: the browser's jitter buffer and
+decoder do, and their limits are the browser's. The player sets `jitterBufferTarget` to 0 where the attribute
+exists (Cited: `RTCRtpReceiver`, [WebRTC](https://www.w3.org/TR/webrtc/)). Unverified on a Cast device: that
+it exists and what the buffer then holds. The player's own bound is on time: no frame for 2 s is the existing
+step-down cause, and the same pause and hidden rule applies.
+
+**Android TV app.**
+
+| Place | Ceiling | When reached |
+| --- | --- | --- |
+| libsrt receive buffer | `SRTO_RCVBUF` set to 2 MiB (libsrt's default is 8 192 packet buffers, about 12 MiB; Cited: socket options) | libsrt discards. With too-late packet drop, on by default in live mode, late packets are skipped (Cited: `SRTO_TLPKTDROP`) |
+| Between libsrt and the player | none: the `DataSource` reads from the socket into the player's own buffer when asked. There is no queue of the app's | n/a |
+| Player buffer | `DefaultLoadControl`: maximum 2 s, target 16 MiB, size limit enforced over time (`setPrioritizeTimeOverSizeThresholds(false)`), no back buffer (Read: the builder's methods, `DefaultLoadControl.java:168-235`, Media3 1.8.0) | The player stops reading; the socket buffer fills and libsrt discards |
+
+Unverified: that libsrt discards, instead of growing or blocking, when the application stops reading. Slice 6
+asserts it in a test before the rung is enabled.
+
+Recovery in the app. Loss is detected in two ways: libsrt's receive-drop counter increases, or the
+`DataSource` sees a gap in the continuity counter of the video packets. Either one flushes the player. After a
+flush Media3's sample queue discards samples until a keyframe (Read: `upstreamKeyframeRequired`,
+`SampleQueue.java:100`, `:183`, `:623`), so no dependent frame is decoded; audio restarts with it on the same
+timestamps. A live offset above 1 s is corrected by a seek to the live edge, which is the same flush. More
+than 3 flushes in 60 s: the app steps down to HLS.
+
+#### Cast media status
+
 **Cast media status in the Web Receiver is the open risk of the MoQ and WebRTC rungs.** CAF builds the media
-status that senders and Google Home show from its own player. MoQ draws on a canvas and WebRTC plays a
-`MediaStream`; neither goes through CAF's player. Cited: a LOAD interceptor may return `null` so that CAF does
+status that senders and Google Home show from its own player. The MoQ player feeds a `<video>` element through
+a `MediaSource` of its own and the WebRTC player gives one a `MediaStream`; neither goes through CAF's player. Cited: a LOAD interceptor may return `null` so that CAF does
 not handle the request, and `PlayerManager` has `setMediaElement`, `setMediaInformation` and `broadcastStatus`
 ([PlayerManager](https://developers.google.com/cast/docs/reference/web_receiver/cast.framework.PlayerManager)).
 Both players here end in a `<video>` element, which is what `setMediaElement` takes. Unverified: whether any
@@ -755,18 +833,50 @@ no-reorder proof holds for the production encoder on mda001 (a subscription is r
 attachment activates the output exactly as the first HLS playlist request does today, and the last one ending
 starts the same 10 s linger. A push rung does not use the 20 s pre-roll ring; it starts at the next keyframe.
 
-**Queues (invariant #10).** Every hand-off toward a viewer is bounded and drops:
+**Queues (invariant #10).** Every hand-off toward a viewer has a ceiling in count, in bytes and in age, and
+drops when any one is reached (reviewer finding D4). The packets in these queues are reference-counted views of
+the encoder's output, so a byte ceiling is what limits how much encoder output a slow viewer keeps alive.
 
-| Hand-off | Bound | When full |
-| --- | --- | --- |
-| Dispatcher to a rung's subscription | 2 windows | whole window dropped, discontinuity, resume at a keyframe |
-| MoQ subscription | 8 MiB per subscription, 64 MiB in total, 16 sessions (Read: `crates/multiview-moq/src/provider.rs:454-455`, `:867`) | window refused, lease survives or ends by class of error |
-| SRT attachment | its own writer thread and a 512-packet queue, as the SRT listener output (Read: `crates/multiview-output/src/sink/push.rs:69`) | shed, then re-gated to the next keyframe |
-| WebRTC attachment | the bounded drop-oldest egress feed (Read: `crates/multiview-webrtc/src/transport/whep_serve.rs:22-28`) | oldest dropped |
-| Opus tap | fixed block count, drop-oldest | oldest dropped |
+| Hand-off | Count | Bytes | Age | When reached |
+| --- | --- | --- | --- | --- |
+| Dispatcher to a rung's subscription | 2 windows in hand-off; the binding queue behind it 512 packets | 16 MiB | 2 s | whole window dropped, discontinuity, resume at a verified keyframe (Read: `MAX_QUEUE_PACKETS`, `MAX_QUEUE_BYTES`, `MAX_QUEUE_AGE`, `crates/multiview-output/src/batch.rs:30-36`; `WINDOW_HANDOFF`, `output_window_registry.rs:43`) |
+| MoQ subscription | 16 sessions | 8 MiB per subscription, 64 MiB in total (Read: `crates/multiview-moq/src/provider.rs:454-455`, `:867`) | 2 s per track (Read: `with_max_age`, `crates/multiview-moq/src/lib.rs`) | window refused; the lease survives or ends by class of error |
+| SRT attachment queue | 512 packets | **8 MiB, new** | **2 s, new** | everything queued is discarded, then the session is re-gated to the next keyframe |
+| SRT library send buffer, per connection | set by `SRTO_SNDBUF` | **2 MiB, set explicitly** (libsrt's default is 8 192 packet buffers, about 12 MiB) | the negotiated latency: libsrt drops packets too late to deliver (Cited: `SRTO_TLPKTDROP`, socket options) | libsrt drops; a send that cannot complete ends at the existing 5 s write deadline and the attachment closes |
+| WebRTC egress feed, per cast output | 512 samples | **8 MiB, new** | **2 s, new** | oldest dropped, then video is held back until the next keyframe |
+| WebRTC library send buffers, per viewer | str0m's defaults, set explicitly: 1 000 video packets, 50 audio packets (Read: str0m 0.16.2 `src/config.rs:572-573`) | about 1.2 MiB at one MTU each | n/a | the library's own eviction |
+| Opus tap, per cast output | **8 blocks** | fixed: a block is 40 ms of 48 kHz stereo float, so about 123 KiB | 320 ms | oldest dropped |
+| Encoded Opus toward the feed | counted inside the egress feed above | | | |
+
+What is new and why. The SRT listener output on `main` bounds its per-caller queue by packets only (Read:
+`CLIENT_QUEUE_CAP`, `crates/multiview-output/src/sink/push.rs:69`). A packet is one access unit, and a keyframe
+at 1080p can be several hundred kilobytes, so 512 of them is not a memory bound. The cast attachment adds a
+byte and an age ceiling and discards the whole queue when one is reached, because dropping from the middle of a
+GOP would hand the muxer frames whose reference is gone. The WebRTC egress feed has the same gap (Read:
+`MAX_EGRESS`, `crates/multiview-webrtc/src/egress.rs:36`, a count only) and gets the same two ceilings. Both
+changes also improve the existing outputs that use those types; they ship in slices 5 and 6 behind tests. The
+Opus tap follows the preview tap's size (Read: `PROGRAM_AUDIO_RING`, `crates/multiview-cli/src/preview.rs:71`).
+
+Totals at the caps (16 SRT attachments, 16 MoQ sessions, 32 WebRTC viewers on at most 32 tokens): SRT
+16 x (8 + 2) MiB = 160 MiB; MoQ 64 MiB; WebRTC 8 MiB per cast output plus 32 x 1.2 MiB. These are ceilings of
+referenced encoder output, reached only when every viewer is stalled at once.
 
 No hand-off waits for a viewer. Nothing a device sends (probe, report, SDP, SRT handshake) reaches a data-plane
 thread: control routes answer from the registry, and the SRT listen callback reads a bounded table.
+
+**Long-run and stalled-consumer proof.** A short successful playback proves none of the above. Each push rung
+has these tests, asserting counts and bytes against the ceilings, never percentiles:
+
+| Test | Runs | Asserts |
+| --- | --- | --- |
+| Receiver soak (MoQ, slice 4) | 30 minutes in the harness with the real CAF SDK, taking a heap sample and the buffered ranges every 10 s | retained range never above 5 s; the player's byte account never above 16 MiB; JS heap after the first minute never more than 32 MiB above its value at one minute; zero resets on a clean link |
+| `updateend` withheld (MoQ) | the harness wraps `SourceBuffer` so that an append never completes | pending never above 60 fragments, 4 MiB, 1 s; a hard reset within 2.5 s; picture again within one GOP after it |
+| Decoder slower than real time (MoQ) | the harness throttles the page's CPU | soft resets, each resuming at a keyframe; no frame appended whose group lost an earlier frame; step-down after the reset budget |
+| `QuotaExceededError` injected (MoQ) | on the next append, then twice in a row | one removal and one retry; then a hard reset |
+| A/V after recovery (every rung) | the latency slate with a tone burst on a known tick, before and after a forced reset or flush | the audio burst and its picture are within 80 ms of each other after recovery |
+| Engine: viewer stops reading (every push rung) | a real client that stops reading for 60 s, then resumes | each ceiling in the table above holds throughout; the process's resident memory returns to within 16 MiB of its starting value; the clock loses zero ticks and every other binding zero packets, with a negative control that must fail |
+| Engine: many stalled viewers | every attachment slot filled with stalled clients | the totals above hold; admission refuses the next attachment |
+| App: reader stalls (SRT, slice 6) | instrumented test that stops the `DataSource` from reading for 10 s | libsrt's buffer stays at its 2 MiB setting; after resuming, a flush and a keyframe start; no growth of the Java heap beyond the player's 16 MiB target |
 
 **Keyframes.** No rung can request a keyframe from the shared encoder. A WebRTC PLI or FIR is counted and
 ignored; the viewer recovers at the next scheduled keyframe, at most one GOP away. One viewer on a bad network
