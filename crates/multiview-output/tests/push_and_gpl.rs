@@ -78,6 +78,7 @@ impl VideoFrameSource for GrayNv12Source {
             meta,
             raw_pts: None,
             a53_cc: None,
+            alpha: None,
         }))
     }
 }

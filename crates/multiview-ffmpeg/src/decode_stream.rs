@@ -60,6 +60,17 @@ pub struct DecodedVideoFrame {
     /// [`CaptionDecoder`](crate::CaptionDecoder) feeds these bytes to `cc_dec`
     /// anchored at [`Self::raw_pts`]. Sampled, never paced (invariants #2/#10).
     pub a53_cc: Option<Vec<u8>>,
+    /// The decoder's own pre-NV12 output frame when its pixel format carries
+    /// straight alpha (`ProRes` 4444 `yuva444p10le`, `qtrle` `argb`, PNG `rgba`,
+    /// `libvpx-vp9` `yuva420p`, ...), or [`None`] for every opaque format.
+    ///
+    /// The NV12 conversion drops alpha, so — like [`Self::a53_cc`] — it can
+    /// only be reached here. It is the decoded `AVFrame` moved out of the
+    /// decoder (a reference, never a pixel copy); a media player turns it
+    /// into the full-resolution straight-alpha plane of an NV12+A image
+    /// (ADR-0058, #391). Opaque sources pay nothing: the format check is one
+    /// `match` and this stays `None`.
+    pub alpha: Option<crate::alpha::AlphaSource>,
 }
 
 /// A video decoder that consumes caller-supplied packets and yields NV12 host
@@ -125,6 +136,34 @@ impl StreamVideoDecoder {
             hw_device: None,
             hw_resize: None,
         })
+    }
+
+    /// Build a **software** decoder that opens the libav decoder registered as
+    /// `name` (e.g. `"libvpx-vp9"`) instead of the codec id's default decoder.
+    ///
+    /// The media player uses this for VP9-with-alpha (ADR-0058 §3, #391):
+    /// libav's native `vp9` decoder ignores the `WebM` `BlockAdditional` alpha
+    /// side stream, while `libvpx-vp9` merges it and emits `yuva420p`.
+    /// `libvpx` is BSD-licensed, so this keeps the build LGPL-clean.
+    ///
+    /// # Errors
+    /// [`FfmpegError::CodecNotFound`] when the linked libav has no decoder of
+    /// that name; [`FfmpegError::OpenDecoder`] when it cannot be opened.
+    pub fn new_named(
+        parameters: ffmpeg::codec::Parameters,
+        time_base: Rational,
+        name: &'static str,
+    ) -> Result<Self> {
+        let codec = ffmpeg::decoder::find_by_name(name).ok_or(FfmpegError::CodecNotFound(name))?;
+        let ctx = ffmpeg::codec::context::Context::from_parameters(parameters)
+            .map_err(FfmpegError::OpenDecoder)?;
+        let decoder = ctx
+            .decoder()
+            .open_as(codec)
+            .map_err(FfmpegError::OpenDecoder)?
+            .video()
+            .map_err(FfmpegError::OpenDecoder)?;
+        Ok(Self::from_parts(decoder, time_base))
     }
 
     /// Wrap an already-opened libav video decoder (crate-internal): the
@@ -463,7 +502,18 @@ impl StreamVideoDecoder {
         // most frames carry none (a cheap `None`). The downstream embedded-CC
         // decoder feeds these to `cc_dec`. Sampled, never paced.
         let a53_cc = crate::caption_decode::extract_a53_cc(&decoded);
-        let nv12 = self.ensure_nv12(decoded)?;
+        // An alpha format is never a working format, so it always converts;
+        // keep the decoded frame (a move, not a copy) as the alpha source.
+        let (nv12, alpha) = match crate::alpha::alpha_layout(decoded.format()) {
+            Some(layout) => {
+                let nv12 = self.convert_to_nv12(&decoded)?;
+                // Straight from the decoder, metadata untouched: the
+                // trusted provenance `AlphaSource::copy_to` needs (PB-14).
+                let alpha = crate::alpha::AlphaSource::from_decoder(decoded, layout);
+                (nv12, Some(alpha))
+            }
+            None => (self.ensure_nv12(decoded)?, None),
+        };
 
         // After `ensure_nv12` the frame is NV12 (8-bit) or P010LE (10-bit); any
         // other format is impossible, so it defaults to NV12-shaped metadata
@@ -486,6 +536,7 @@ impl StreamVideoDecoder {
             meta,
             raw_pts,
             a53_cc,
+            alpha,
         }))
     }
 
@@ -495,22 +546,26 @@ impl StreamVideoDecoder {
         match decoded.format() {
             // Already on the NV12-throughout timeline (or its 10-bit sibling).
             Pixel::NV12 | Pixel::P010LE => Ok(decoded),
-            src_fmt => {
-                let src = ScaleSpec::new(src_fmt, decoded.width(), decoded.height());
-                let dst = ScaleSpec::new(Pixel::NV12, decoded.width(), decoded.height());
-                let rebuild = match &self.to_nv12 {
-                    Some(s) => s.source() != src || s.destination() != dst,
-                    None => true,
-                };
-                if rebuild {
-                    self.to_nv12 = Some(Scaler::new(src, dst)?);
-                }
-                let scaler = self.to_nv12.as_mut().ok_or(FfmpegError::FrameMismatch(
-                    "NV12 scaler unexpectedly absent",
-                ))?;
-                scaler.run(&decoded)
-            }
+            _ => self.convert_to_nv12(&decoded),
         }
+    }
+
+    /// Convert `decoded` to same-size NV12 through the cached converter,
+    /// rebuilding it when the source geometry/format changes.
+    fn convert_to_nv12(&mut self, decoded: &Video) -> Result<Video> {
+        let src = ScaleSpec::new(decoded.format(), decoded.width(), decoded.height());
+        let dst = ScaleSpec::new(Pixel::NV12, decoded.width(), decoded.height());
+        let rebuild = match &self.to_nv12 {
+            Some(s) => s.source() != src || s.destination() != dst,
+            None => true,
+        };
+        if rebuild {
+            self.to_nv12 = Some(Scaler::new(src, dst)?);
+        }
+        let scaler = self.to_nv12.as_mut().ok_or(FfmpegError::FrameMismatch(
+            "NV12 scaler unexpectedly absent",
+        ))?;
+        scaler.run(decoded)
     }
 
     /// Rebase a raw stream PTS into the internal nanosecond timeline using the

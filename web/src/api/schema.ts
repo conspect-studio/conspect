@@ -7780,6 +7780,14 @@ export interface components {
              */
             frames_repeated_window: number;
             /**
+             * Format: int64
+             * @description Running source decoders whose own output (the NVDEC resize, else the
+             *     coded size) is at least the canvas on both axes now (#469): the
+             *     decode cost of sizing routed, PGM and PVW sources at the canvas.
+             *     Transient make-before-break replacements are not counted.
+             */
+            full_canvas_decodes?: number;
+            /**
              * Format: double
              * @description Largest lateness since the run started, ms.
              */

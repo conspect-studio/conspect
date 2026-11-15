@@ -349,6 +349,7 @@ fn slate_frame(kind: SlateKind, video: &SlateVideoSpec) -> DecodedVideoFrame {
         raw_pts: None,
         // A synthetic slate card carries no embedded (A53) captions.
         a53_cc: None,
+        alpha: None,
     }
 }
 

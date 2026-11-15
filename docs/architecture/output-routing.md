@@ -61,7 +61,7 @@ not disturb any other output.
 | The take gate: `TAKE_PRIME_DEADLINE_TICKS = 50` and the `state_at(...).is_live()` freshness rule | `crates/multiview-engine/src/switcher_control.rs:57`, ADR-0104 §2 |
 | The production output clock is a `tokio::spawn`ed task | `crates/multiview-engine/src/programset.rs:546` |
 | The frame hook runs on the clock: `before_compose` and `after_compose` | `crates/multiview-engine/src/runtime.rs:244-251` |
-| Decode size is the per-axis supremum over the cells that bind a source; an unbound source decodes at 640x360 | `crates/multiview-cli/src/display_size.rs:72-93` |
+| Decode size is the per-axis supremum over the cells that bind a source, routed layouts' cells, direct source routes and the M/E PGM/PVW selections (#469, §2.4); an unbound source decodes at 640x360 | `crates/multiview-cli/src/display_size.rs:72-93` |
 | `migration::OutputCrosspoint` / `PacketRouter::move_sink` have no production caller. `RestampAccumulator` is used only by `crates/multiview-output/src/guarded.rs` | `crates/multiview-engine/src/migration.rs:145-235`, `crates/multiview-output/src/restamp.rs:40` |
 
 **What "route audio to an output" can do today.** An output can carry one source alone, but only
@@ -262,6 +262,51 @@ unbound source decodes at 640x360 (`crates/multiview-cli/src/display_size.rs:72-
 therefore adds **aux sizing**: the control drain publishes into the existing `DisplayLayoutSlot` a
 *sizing layout*, which is the Program layout plus one full-canvas cell per source an active aux
 canvas binds. So `cell_pixel_size` takes the per-axis supremum over both.
+
+**What the sizing supremum counts (#469).** A decode's size is the per-axis supremum over:
+
+1. the cells of the live Program layout (the control drain, `DisplayLayoutSlot`);
+2. the cells of every routed layout composing now (the output router, `AuxSizingSlot`);
+3. every source routed to an output as a bare `src:<id>` feed, at the size it is composed at: the
+   output's feed format, or the canvas (the output router, `SourceSizingSlot`, published only when
+   the feed set changes);
+4. the M/E's PGM and PVW selections as full-canvas cells (the switcher frame hook,
+   `BusSizing`, published only when a resolved selection changes). PGM covers Clean (the
+   pre-bake Program); PVW covers the incoming source of a MIX/DIP/WIPE in flight, which is the PVW
+   selection for the whole transition.
+
+Each publisher does one wait-free `SwapCell` store on a change and nothing per tick; the decode
+threads poll the slots between packets and act through the same `SettleGate` and `Handover`
+(make-before-break) as a layout change, so nothing new reaches the output clock (inv #1/#10).
+A source that leaves every consumer returns to its cell size, or to 640x360, after the settle.
+
+Lag, stated plainly: a source selected on PVW is full canvas before the operator cuts it to PGM
+(PVW-first is the normal workflow). A source taken straight to PGM (a `select_program`, or a cut of
+a PVW selected less than the settle ago) is drawn from its old, smaller decode for the settle
+(1.5 s) plus the replacement's first keyframe (one GOP), then from the full-canvas decode; the cut
+itself is never delayed. Direct routes behave the same way: the take lands at once, the decode
+follows after the settle and one GOP.
+
+Cost bound, stated plainly. Two numbers matter:
+
+- **Demand** (what the sizing asks for at one instant): bus sizing names at most two sources (PGM
+  and PVW); direct routes name at most one per routed source feed, and the router's feed set is
+  bounded by `routing.max_encoders` plus one pending take per output (`sync_feeds`). Every name
+  is a configured source, so demand never exceeds the configured source count.
+- **Actual** (what runs): a decoder only shrinks after its new size held for the settle (1.5 s)
+  and at least 5 s after its previous resize, so rotating selections faster than that keeps
+  recently deselected sources at full canvas for up to about 5 s; a downsize whose reopen fails
+  keeps the full-size decoder (host-scaled) until a later change succeeds or the source
+  reconnects; and up to two replacement sessions run at once during handovers. The hard ceiling
+  is therefore one full-size decoder per configured source plus two transient replacements.
+
+`GET /api/v1/metrics/program` reports `full_canvas_decodes`: the number of running decoders whose
+own output (the NVDEC fused resize, else the stream's coded size) is at least the canvas on both
+axes. It counts actual decoders, including a retained one after a failed downsize and a software
+decode at native size, not the host tile size; transient replacement sessions are not counted.
+
+M/E layout sources (`layout:<id>`, #307 part 2) are sized by the routed-layout cells once that
+registry publishes its bodies into aux sizing (follow-up to #469 after #436).
 
 The resize uses the existing make-before-break handover (`crates/multiview-cli/src/display_size.rs:1-17`):
 
