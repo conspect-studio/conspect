@@ -115,6 +115,15 @@ use multiview_output::sink::{
 };
 use multiview_output::{display_matrix, DisplayMatrix};
 
+/// Rate lanes: outputs at a frame rate other than Program's (#343).
+#[path = "output_lanes.rs"]
+mod output_lanes;
+
+/// Rate lanes end to end through the real pipeline (#343).
+#[cfg(test)]
+#[path = "output_lanes_tests.rs"]
+mod output_lanes_tests;
+
 /// The per-subscriber drop-oldest depth of the engine's outbound event stream.
 /// The pipeline has no realtime consumers wired here, but the publisher still
 /// needs a positive ring (invariant #10).
@@ -2155,6 +2164,26 @@ pub struct ProgramMetricsHandles {
     pub frames_repeated: Arc<std::sync::atomic::AtomicU64>,
     /// Cumulative GPU readback deadline misses repeated as last-good (#395).
     pub compose_deadline_misses: Arc<std::sync::atomic::AtomicU64>,
+    /// The run's per-output clocks (#343; empty without a rate output).
+    pub output_clocks: Vec<OutputClockMetrics>,
+}
+
+/// One per-output clock's wait-free counters (#343, output-routing §12.6).
+#[derive(Debug, Clone)]
+pub struct OutputClockMetrics {
+    /// The clock's output rate.
+    pub cadence: Rational,
+    /// The config ids of the outputs on this clock.
+    pub outputs: Vec<String>,
+    /// Ticks, skipped ticks and the lateness histogram.
+    pub stats: Arc<multiview_engine::OutputLaneStats>,
+    /// Offers a full (or ended) output worker refused.
+    pub dropped_offers: Arc<AtomicU64>,
+    /// Ticks whose latched Program frame was older than one Program period
+    /// before the tick (or older than every retained frame).
+    pub late_latches: Arc<AtomicU64>,
+    /// Per output: Program audio events dropped on its lane.
+    pub dropped_audio: Vec<Arc<AtomicU64>>,
 }
 
 /// Where a run publishes its [`ProgramMetricsHandles`].
@@ -2449,6 +2478,11 @@ pub struct Pipeline {
     /// thread before each convert (a chaos test wedges it). Always `None`
     /// outside tests.
     convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// Outputs at a rate other than Program's (#343): they run in rate lanes,
+    /// outside the Program egress. Taken by the run.
+    rate_outputs: Vec<output_lanes::LaneOutputSpec>,
+    /// Test seams of the rate lanes (empty in production).
+    lane_hooks: Box<output_lanes::LaneHooks>,
     /// Test seam (review INV2-1): run in teardown after the egress join
     /// (the bake consumer has exited) and before ingest teardown.
     #[cfg(test)]
@@ -3429,6 +3463,9 @@ impl Pipeline {
         let discrete_track_inputs: Vec<String> =
             discrete_tracks.iter().map(|t| t.input_id.clone()).collect();
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
+        // #343: an output at a rate other than Program's leaves the Program
+        // egress (its runner, key and binding) and runs in a rate lane.
+        let (outputs, rate_runnables) = output_lanes::split_rate_outputs(outputs, config);
         let mut rendition_configs = Vec::<EncodeConfig>::new();
         // #342: per rendition key, the picture format its worker converts the
         // Program canvas to (`None` = the canvas, the zero-copy path).
@@ -3556,6 +3593,14 @@ impl Pipeline {
                 declared_audio_outputs.push((output.id().to_owned(), tracks));
             }
         }
+
+        let rate_outputs = output_lanes::rate_output_specs(
+            rate_runnables,
+            config,
+            &cfg,
+            aux_canvas,
+            &mut declared_audio_outputs,
+        )?;
 
         // Derive the PER-SOURCE per-tick audio-loudness timelines off the
         // build path: decode each file-backed source's OWN audio with
@@ -3714,6 +3759,8 @@ impl Pipeline {
             rendition_configs,
             rendition_formats,
             convert_hook: None,
+            rate_outputs,
+            lane_hooks: Box::default(),
             #[cfg(test)]
             teardown_hook: None,
             output_formats,
@@ -3991,6 +4038,10 @@ impl Pipeline {
                     .map(|cfg| cfg.codec_name.clone())
                     .unwrap_or_default(),
             })
+            // #343: a rate output is addressable but never routable: takes
+            // onto it answer `unroutable` (a follow-up). Its index is past
+            // every router output, so the engine refuses it too.
+            .chain(self.rate_outputs.iter().map(output_lanes::unroutable_run_output))
             .collect()
     }
 
@@ -4192,6 +4243,7 @@ impl Pipeline {
                 inband_sets: self.output_inband_sets.clone(),
                 base_formats: self.rendition_formats.clone(),
                 convert_hook: self.convert_hook.clone(),
+                lane_taps: output_lanes::ProgramTaps::default(),
                 subtitles: Box::new(
                     self.subtitle_run(subtitle_stores)
                         .with_tick_cell(subtitle_tick),
@@ -4666,6 +4718,12 @@ impl Pipeline {
         self.convert_hook = Some(hook);
     }
 
+    /// Test seam (#343): the rate lanes' hooks and fake sinks.
+    #[cfg(test)]
+    pub(crate) fn set_lane_hooks(&mut self, hooks: output_lanes::LaneHooks) {
+        *self.lane_hooks = hooks;
+    }
+
     /// How many distinct video rendition configs (= Program encoder keys)
     /// this pipeline opens per run.
     #[cfg(test)]
@@ -4766,18 +4824,20 @@ impl Pipeline {
             binding_ids,
         };
         let preview = crate::preview::program_slot();
-        let out = self
-            .drive_streaming(
-                time,
-                RealtimePacer,
-                &stop,
-                Some(max_ticks),
-                plan,
-                publisher,
-                &preview,
-                |_: &mut CompositorDrive<Nv12Image>| {},
-            )
-            .await?;
+        // Boxed: the streaming drive's state machine is large (clippy
+        // `large_futures` on the ffmpeg-linked targets); one heap allocation
+        // per bounded run, never per tick.
+        let out = Box::pin(self.drive_streaming(
+            time,
+            RealtimePacer,
+            &stop,
+            Some(max_ticks),
+            plan,
+            publisher,
+            &preview,
+            |_: &mut CompositorDrive<Nv12Image>| {},
+        ))
+        .await?;
         Ok(out.report)
     }
 
@@ -5922,7 +5982,7 @@ impl Pipeline {
         self.issue_boot_audio_takes();
         let RunRouting {
             subtitle_end,
-            consumer: consumer_routing,
+            consumer: mut consumer_routing,
             aux_tx,
             preview_selection,
             aux: _routing_aux,
@@ -5930,6 +5990,34 @@ impl Pipeline {
             #[cfg(feature = "overlay")]
             aux_signals,
         } = routing;
+        // #343: open the rate lanes' encoders now (off the clock); they
+        // start once Program's seed is known. Program's taps feed them.
+        let lanes = output_lanes::prepare(
+            std::mem::take(&mut self.rate_outputs),
+            self.cadence,
+            self.aux_canvas(),
+            output_lanes::LaneAudio {
+                program: audio_encoder
+                    .as_ref()
+                    .map(|encoder| (encoder.codec_params().clone(), encoder.time_base())),
+                tracks: audio_encoder
+                    .as_ref()
+                    .map_or_else(Vec::new, AudioRenditionEncoder::track_streams),
+            },
+            *std::mem::take(&mut self.lane_hooks),
+        );
+        let prepared_lanes = lanes.map(|(prepared, taps)| {
+            consumer_routing.lane_taps = taps;
+            let links = prepared.push_links();
+            if !links.is_empty() {
+                let mut all = (*self.push_links.load()).clone();
+                all.extend(links);
+                self.push_links.store(Arc::new(all));
+            }
+            // Boxed: this state lives across the run's awaits; inline it
+            // would grow the run future (clippy::large_futures).
+            Box::new(prepared)
+        });
         #[cfg(feature = "overlay")]
         {
             bake_ctx.aux_signals = Some(aux_signals);
@@ -5983,6 +6071,7 @@ impl Pipeline {
         // source to bracket its wall reads on the SAME timeline tick 0 is
         // seeded on; clone the handle before the program takes ownership.
         let ts_for_anchor = Arc::clone(&ts);
+        let ts_for_lanes = Arc::clone(&ts);
         let mut program =
             MultiviewProgram::new(&self.program_spec, clock, drive, ts, pacer, stop.clone())
                 .map_err(|e| PipelineError::Program {
@@ -5992,12 +6081,19 @@ impl Pipeline {
         // Publish the Program's wait-free counters for the metrics route
         // (one store per run, never per tick).
         program_lateness.store(Some(program.lateness()));
+        // #343: the rate lanes' clocks start on Program's seed (tick 0 of
+        // every output clock is aligned with Program tick 0).
+        let running_lanes =
+            prepared_lanes.map(|lanes| Box::new(lanes.start(&ts_for_lanes, program.seed_nanos())));
         self.program_metrics
             .store(Some(Arc::new(ProgramMetricsHandles {
                 lateness: program.lateness(),
                 phases: program.phases(),
                 frames_repeated: program.frames_repeated_counter(),
                 compose_deadline_misses: program.compose_deadline_misses_counter(),
+                output_clocks: running_lanes
+                    .as_deref()
+                    .map_or_else(Vec::new, output_lanes::RunningLanes::metrics),
             })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
         // the shared slot — a single lock-free store the off-hot-path
@@ -6455,6 +6551,10 @@ impl Pipeline {
             crate::exit_watchdog::arm(crate::exit_watchdog::ExitCause::Fatal);
         }
         stage("egress-joined");
+        // #343: the rate lanes end after Program's egress (every Program frame
+        // is latched by now); bounded, and a lane failure is a report line.
+        let lane_lines = running_lanes.map_or_else(Vec::new, |lanes| lanes.shutdown());
+        stage("rate-lanes-joined");
         #[cfg(test)]
         if let Some(hook) = self.teardown_hook.as_ref() {
             hook();
@@ -6481,7 +6581,7 @@ impl Pipeline {
             canvas_width: self.layout.canvas.width,
             canvas_height: self.layout.canvas.height,
             encoder: self.encoder.name.clone(),
-            outputs: egress_out.lines,
+            outputs: egress_out.lines.into_iter().chain(lane_lines).collect(),
             // Honest falter (ADR-0025): a live run that shed frames faltered;
             // offline never drops, so it never falters here.
             dropped: dropped_count,
@@ -6604,6 +6704,7 @@ impl Pipeline {
             #[cfg(test)]
             consumer_stall: None,
             aux_signals: None,
+            sidecar_truncated: crate::overlays::TruncationTally::new(),
         }
     }
 
@@ -6684,6 +6785,9 @@ struct BakeContext {
     /// otherwise). `None` before routing is wired and in tests.
     #[cfg(feature = "overlay")]
     aux_signals: Option<crate::aux_overlays::AuxSignalsPublisher>,
+    /// Issue #430: counts a cut sidecar cue once, keyed by its track index.
+    #[cfg(feature = "overlay")]
+    sidecar_truncated: crate::overlays::TruncationTally,
 }
 
 impl BakeContext {
@@ -6709,12 +6813,17 @@ impl BakeContext {
         if self.sidecar_target.as_deref() != Some(id) {
             return None;
         }
-        let cue = self.subtitles.as_ref().and_then(|t| t.active_cue(pts))?;
-        if cue.lines.is_empty() {
-            None
-        } else {
-            Some(cue.lines.clone())
-        }
+        let track = self.subtitles.as_ref()?;
+        // Issue #430: an indexed (O(log n)) lookup, then only the bounded
+        // burn-in projection is copied; a cut cue is counted once.
+        let index = track.active_cue_index(pts)?;
+        let cue = track.cues().get(index)?;
+        let bounded = multiview_output::hls::bound_cue_lines(&cue.lines);
+        self.sidecar_truncated.observe(
+            u64::try_from(index).unwrap_or(u64::MAX),
+            bounded.truncated(),
+        );
+        (!bounded.is_empty()).then(|| bounded.into_lines())
     }
 }
 
@@ -7060,7 +7169,7 @@ struct StreamItem {
 
 /// The human report line + optional playlist text one sink runner produced, plus
 /// the number of frames it consumed (for the test seam's observability).
-struct SinkRunOutcome {
+pub(crate) struct SinkRunOutcome {
     /// The human-facing report line for this output (path + packet/segment counts).
     line: String,
     /// For an HLS sink, the rendered media playlist text + its on-disk path to
@@ -8268,6 +8377,9 @@ struct ConsumerRouting {
     /// Chaos/test hook run on every convert thread before each convert
     /// (#342 review I3); `None` in production.
     convert_hook: Option<crate::format_convert::ConvertHook>,
+    /// The rate lanes' Program taps (#343): the latch the bake consumer
+    /// publishes to and the audio fan-out. Empty = zero work.
+    lane_taps: output_lanes::ProgramTaps,
     /// The subtitle-slot cue sampler (slice F #345), ticked once per item.
     /// Boxed for `clippy::large_futures`, like the router.
     subtitles: Box<crate::subtitle_slots::SubtitleRun>,
@@ -8821,9 +8933,15 @@ fn consumer_main<D: WindowDelivery>(
         inband_sets,
         base_formats,
         convert_hook,
+        lane_taps,
         mut subtitles,
         subtitle_exit,
     } = routing;
+    // #343 review M1: the rate lanes learn the run's last Program frame the
+    // moment this consumer stops publishing — at the end of the tick loop
+    // below, or on any early return (this guard) — never only after
+    // Program's sinks finalised.
+    let _lane_end = output_lanes::LaneEndGuard(lane_taps.clone());
     // Dropped when this function returns (any path, a panic included):
     // the consumer samples no subtitle table after that (review INV2-1).
     let _subtitle_exit = subtitle_exit;
@@ -9011,6 +9129,8 @@ fn consumer_main<D: WindowDelivery>(
             let tail_preview = optional.clone();
             let specs = audio_specs.clone();
             let bases = audio_bases.clone();
+            let taps = lane_taps.clone();
+            let tail_taps = lane_taps.clone();
             Some(crate::rendition_workers::AudioEncodeWorker::spawn(
                 ProgramAudioWork { encoder },
                 move |tick, packets| {
@@ -9018,6 +9138,9 @@ fn consumer_main<D: WindowDelivery>(
                     if let Some(preview) = preview.as_ref() {
                         preview.audio(&event);
                     }
+                    // #343: the rate lanes carry these very packets (bounded
+                    // try_send per lane; never waits).
+                    taps.fan_audio(&event);
                     tx.send(event).map_err(|e| PipelineError::Output {
                         kind: "audio-dispatch",
                         reason: e.to_string(),
@@ -9028,6 +9151,7 @@ fn consumer_main<D: WindowDelivery>(
                     if let Some(preview) = tail_preview.as_ref() {
                         preview.audio(&event);
                     }
+                    tail_taps.fan_audio(&event);
                     tail_tx.send(event).map_err(|e| PipelineError::Output {
                         kind: "audio-dispatch",
                         reason: e.to_string(),
@@ -9199,6 +9323,12 @@ fn consumer_main<D: WindowDelivery>(
         // fails the run explicitly (never silently skips forward).
         for missing_tick in missing {
             let canvas = last_baked.as_ref().unwrap_or(&overlaid);
+            // #343: the rate lanes latch substituted ticks too (wait-free).
+            lane_taps.publish(
+                missing_tick,
+                MediaTime::from_tick(i64::try_from(missing_tick).unwrap_or(i64::MAX), cadence),
+                canvas,
+            );
             convert_stages.offer(missing_tick, canvas);
             for worker in &workers {
                 worker
@@ -9224,6 +9354,8 @@ fn consumer_main<D: WindowDelivery>(
         // #342: the non-canvas base formats' convert threads get it first
         // (try_send, never blocks; a full queue drops and counts).
         convert_stages.offer(item.tick_index, &overlaid);
+        // #343: one wait-free latch publish for the rate lanes (no-op without).
+        lane_taps.publish(item.tick_index, tick_pts, &overlaid);
         for worker in &workers {
             worker
                 .offer_within(
@@ -9447,6 +9579,9 @@ fn consumer_main<D: WindowDelivery>(
             }
         }
     }
+    // #343 review M1: every Program frame is published; mark the lanes' end
+    // before the (possibly slow) worker flush and sink finalisation.
+    lane_taps.finish();
     // End of run: close every worker's input and let them flush. The workers
     // and this thread share `event_tx`/`event_rx` (bounded); a worker blocked
     // sending its tail into a full channel would deadlock a plain `join` here,
@@ -10231,9 +10366,23 @@ fn sample_caption_bitmaps(
         let Some(selected) = times.get(id) else {
             continue;
         };
-        if let Some(multiview_ffmpeg::caption::CaptionCue::Bitmap { bitmap, .. }) =
-            store.active_at_generation(selected.pts, selected.generation)
-        {
+        // Issue #430: borrow the cue and copy its pixels only within the
+        // burn-in bounds (an oversize cue is refused and counted, never
+        // copied on the clock thread).
+        let bitmap = store
+            .with_active_at_generation(selected.pts, selected.generation, |cue| match cue {
+                multiview_ffmpeg::caption::CaptionCue::Bitmap { bitmap, .. } => {
+                    if crate::overlays::bitmap_within_burn_bounds(bitmap) {
+                        Some(bitmap.clone())
+                    } else {
+                        crate::overlays::caption_burn_stats().note_bitmap_refused();
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .flatten();
+        if let Some(bitmap) = bitmap {
             out.insert(id.clone(), bitmap);
         }
     }
@@ -24758,7 +24907,165 @@ mod live_overlay_bake_tests {
             activity: None,
             consumer_stall: None,
             aux_signals: None,
+            sidecar_truncated: crate::overlays::TruncationTally::new(),
         }
+    }
+
+    /// Issue #430 (MED-2): a truncated sidecar cue is counted exactly once
+    /// while held, its truncated successor once more, and a small cue never.
+    #[test]
+    fn sidecar_truncation_is_counted_once_per_cue() {
+        let pad = "y".repeat(8 * 1024);
+        let srt = format!(
+            "1\n00:00:01,000 --> 00:00:02,000\nfirst {pad}\n\n\
+             2\n00:00:02,000 --> 00:00:03,000\nsecond {pad}\n\n\
+             3\n00:00:03,000 --> 00:00:04,000\nsmall\n"
+        );
+        let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut ctx = bake_context(&slot);
+        ctx.subtitles = Some(multiview_overlay::subtitle::CueTrack::parse_srt(&srt).unwrap());
+        ctx.sidecar_target = Some("in_a".to_owned());
+        ctx.sidecar_truncated = crate::overlays::TruncationTally::with_stats(stats);
+        let at = |ms: i64| multiview_core::time::MediaTime::from_nanos(ms * 1_000_000);
+        for ms in (1_000..2_000).step_by(40) {
+            let lines = ctx.sidecar_caption_lines("in_a", at(ms)).unwrap();
+            assert!(lines.iter().map(String::len).sum::<usize>() <= 512);
+        }
+        assert_eq!(stats.text_truncated(), 1, "a held cut cue counts once");
+        for ms in (2_000..3_000).step_by(40) {
+            assert!(ctx.sidecar_caption_lines("in_a", at(ms)).is_some());
+        }
+        assert_eq!(
+            stats.text_truncated(),
+            2,
+            "its cut successor counts once more"
+        );
+        for ms in (3_000..4_000).step_by(40) {
+            assert_eq!(
+                ctx.sidecar_caption_lines("in_a", at(ms)),
+                Some(vec!["small".to_owned()])
+            );
+        }
+        assert_eq!(stats.text_truncated(), 2, "a small cue is not counted");
+        assert!(ctx.sidecar_caption_lines("other", at(1_500)).is_none());
+    }
+
+    /// Issue #430 (MED2-1): overlapping cut sidecar cues count once each,
+    /// however the newest-active selection alternates between them.
+    #[test]
+    fn sidecar_overlapping_cut_cues_count_once_each() {
+        let pad = "z".repeat(8 * 1024);
+        let probe = |srt: String, samples: &[i64]| {
+            let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+            let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+            let mut ctx = bake_context(&slot);
+            ctx.subtitles = Some(multiview_overlay::subtitle::CueTrack::parse_srt(&srt).unwrap());
+            ctx.sidecar_target = Some("in_a".to_owned());
+            ctx.sidecar_truncated = crate::overlays::TruncationTally::with_stats(stats);
+            let seen: Vec<String> = samples
+                .iter()
+                .map(|s| {
+                    let at = multiview_core::time::MediaTime::from_nanos(s * 1_000_000_000);
+                    let lines = ctx.sidecar_caption_lines("in_a", at).unwrap();
+                    lines.first().unwrap().get(..1).unwrap().to_owned()
+                })
+                .collect();
+            (seen, stats.text_truncated())
+        };
+        // A = [0, 10) s, B = [2, 3) s: samples 1, 2, 4 select A, B, A.
+        let (seen, count) = probe(
+            format!(
+                "1\n00:00:00,000 --> 00:00:10,000\nA {pad}\n\n\
+                 2\n00:00:02,000 --> 00:00:03,000\nB {pad}\n"
+            ),
+            &[1, 2, 4],
+        );
+        assert_eq!(seen, ["A", "B", "A"]);
+        assert_eq!(count, 2, "A, B, A is two cut cues");
+        // An older overlapping cue first surfaces after the newer one ends:
+        // A = [0, 10) and B = [0, 5) (equal starts: the later one in the
+        // document wins until it ends).
+        let (seen, count) = probe(
+            format!(
+                "1\n00:00:00,000 --> 00:00:10,000\nA {pad}\n\n\
+                 2\n00:00:00,000 --> 00:00:05,000\nB {pad}\n"
+            ),
+            &[1, 2, 6, 7, 3, 8],
+        );
+        assert_eq!(seen, ["B", "B", "A", "A", "B", "A"]);
+        assert_eq!(count, 2, "B then the exposed A, each once");
+    }
+
+    /// Issue #430 (MED3-1), caller level: a long cut sidecar cue A hidden
+    /// behind short cut cues is recounted exactly when 64 other distinct cut
+    /// cues were shown since its last appearance — not at 63, and not when
+    /// its own middle appearance refreshed it (A, 63 shorts, A, B, A).
+    #[test]
+    fn sidecar_long_cue_recount_follows_the_exact_tally_bound() {
+        let pad = "w".repeat(8 * 1024);
+        let ts = |ms: u64| {
+            format!(
+                "{:02}:{:02}:{:02},{:03}",
+                ms / 3_600_000,
+                ms / 60_000 % 60,
+                ms / 1_000 % 60,
+                ms % 1_000
+            )
+        };
+        // A = [0, 1000) s; short k = [10 + 2k, 11 + 2k) s, k = 0..64.
+        let mut srt = format!("1\n{} --> {}\nA {pad}\n\n", ts(0), ts(1_000_000));
+        for k in 0..64_u64 {
+            let start = 10_000 + 2_000 * k;
+            std::fmt::Write::write_fmt(
+                &mut srt,
+                format_args!(
+                    "{}\n{} --> {}\nS{k} {pad}\n\n",
+                    k + 2,
+                    ts(start),
+                    ts(start + 1_000)
+                ),
+            )
+            .unwrap();
+        }
+        let track = multiview_overlay::subtitle::CueTrack::parse_srt(&srt).unwrap();
+        let run = |samples: &[i64]| {
+            let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+            let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+            let mut ctx = bake_context(&slot);
+            ctx.subtitles = Some(track.clone());
+            ctx.sidecar_target = Some("in_a".to_owned());
+            ctx.sidecar_truncated = crate::overlays::TruncationTally::with_stats(stats);
+            for &ms in samples {
+                let at = multiview_core::time::MediaTime::from_nanos(ms * 1_000_000);
+                assert!(
+                    ctx.sidecar_caption_lines("in_a", at).is_some(),
+                    "at {ms} ms"
+                );
+            }
+            stats.text_truncated()
+        };
+        // Inside short k, and in the gap after it (A shows again).
+        let short = |k: i64| 10_500 + 2_000 * k;
+        let gap_after = |k: i64| 11_500 + 2_000 * k;
+        // A, 63 shorts, A: A not recounted.
+        let below: Vec<i64> = std::iter::once(1_000)
+            .chain((0..63).map(short))
+            .chain([gap_after(62)])
+            .collect();
+        assert_eq!(run(&below), 64, "63 intervening: A once");
+        // A, 64 shorts, A: A recounted.
+        let at_bound: Vec<i64> = std::iter::once(1_000)
+            .chain((0..64).map(short))
+            .chain([gap_after(63)])
+            .collect();
+        assert_eq!(run(&at_bound), 66, "64 intervening: A twice");
+        // A, 63 shorts, A, B (the 64th short), A: A once.
+        let refreshed: Vec<i64> = std::iter::once(1_000)
+            .chain((0..63).map(short))
+            .chain([gap_after(62), short(63), gap_after(63)])
+            .collect();
+        assert_eq!(run(&refreshed), 65, "A, 63, A, B, A: A once");
     }
 
     /// One streamed tick over a uniform dark canvas.
@@ -31080,6 +31387,13 @@ loop_default = true
 /// The slots carry a source (`cc`) that is ingested but not shown in a cell,
 /// so the run measures the subtitle-slot path alone: burning such a cue into
 /// a displayed tile is the separate overlay path, which this does not cover.
+/// One real-time chaos pipeline at a time per test process: two concurrent
+/// wall-clock runs start each other late (observed: 63 of ~100 ticks for
+/// whichever starts second), so they would measure each other rather than
+/// the path under test.
+#[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
+static REALTIME_CHAOS_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
 mod subtitle_wedge_chaos {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -31170,6 +31484,7 @@ source = "cc"
     #[allow(clippy::too_many_lines)]
     // reason: one end-to-end chaos run checked across clock, sink and files.
     async fn a_wedged_subtitle_sink_with_hostile_captions_never_stalls_video() {
+        let _serial = super::REALTIME_CHAOS_SERIAL.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let playlist = dir.path().join("index.m3u8");
         let mut pipeline = Pipeline::build(&config(&playlist)).expect("pipeline builds");
@@ -31351,5 +31666,200 @@ mod media_url_for_log_tests {
             assert!(!logged.contains(secret), "{secret} leaked: {logged}");
         }
         assert_eq!(media_url_for_log("/media/clip.mp4"), "/media/clip.mp4");
+    }
+}
+
+/// Issue #430 chaos (R3, invariant #1): a captioned source DISPLAYED in a
+/// cell, fed hostile padded text cues (8 KiB and 64 KiB) changing every
+/// 100 ms, through the real pipeline (clock → hot-loop caption sampling →
+/// bake consumer burn-in → encode → HLS). The burn-in projection is bounded
+/// before any clone/shaping and the raster is cached per cue change, so the
+/// consumer keeps the cadence: no "fell behind the clock" fault (the run
+/// succeeds), shed ticks within the design bound, tick-exact video PTS, and
+/// the truncation counter records the cut.
+#[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
+mod caption_burnin_chaos {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    const FPS: u64 = 25;
+    const RUN_SECS: u64 = 4;
+    /// A new cue every 100 ms across the run (plus 2 s headroom).
+    const CUES: i64 = 60;
+
+    fn config(playlist: &std::path::Path) -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+"##,
+            playlist.display()
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    }
+
+    /// `pts` of every video packet of an MPEG-TS file.
+    fn video_pts(ts: &std::path::Path) -> Vec<i64> {
+        let out = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(ts)
+            .output()
+            .expect("ffprobe runs");
+        assert!(out.status.success(), "ffprobe: {out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+            .collect()
+    }
+
+    /// A visible-glyph cue line of about `bytes` bytes (worst case for
+    /// shaping and raster: every byte inks).
+    fn padded(i: i64, bytes: usize) -> String {
+        let mut line = format!("cue {i} ");
+        while line.len() < bytes {
+            line.push_str("Lorem ipsum dolor sit amet ");
+        }
+        line
+    }
+
+    #[allow(clippy::too_many_lines)]
+    // reason: one end-to-end chaos run checked across clock, consumer and files.
+    async fn run_with_cue_bytes(bytes: usize) {
+        let _serial = super::REALTIME_CHAOS_SERIAL.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let playlist = dir.path().join("index.m3u8");
+        let mut pipeline = Pipeline::build(&config(&playlist)).expect("pipeline builds");
+        let truncated_before = crate::overlays::caption_burn_stats().text_truncated();
+        // The DISPLAYED source carries the hostile cues: each 100 ms window
+        // holds a padded line, a blank line and a tail (three lines, the first
+        // `bytes` long), so the burn-in path must bound before it shapes.
+        let store = pipeline.attach_caption_store(
+            "in_a",
+            Arc::new(crate::captions::CueStore::with_capacity(128)),
+        );
+        for i in 0..CUES {
+            let (start, end) = (
+                MediaTime::from_nanos(i * 100_000_000),
+                MediaTime::from_nanos((i + 1) * 100_000_000),
+            );
+            let lines = vec![padded(i, bytes), String::new(), format!("tail {i}")];
+            let cue = multiview_ffmpeg::caption::CaptionCue::try_text(start, end, lines, None)
+                .expect("text cue");
+            store.publish(start, end, cue);
+        }
+        let stop = StopSignal::new();
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(RUN_SECS));
+                stop.stop();
+            })
+        };
+        let started = std::time::Instant::now();
+        // A consumer more than a queue's worth of ticks behind fails the run
+        // ("output fell N ticks behind the clock"): success proves it never did.
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(RUN_SECS + 60),
+            pipeline.run_until(&stop),
+        )
+        .await
+        .expect("the run ends")
+        .expect("the run succeeds: the consumer never fell behind the clock");
+        stopper.join().expect("stopper");
+        let elapsed = started.elapsed().as_secs_f64();
+        // Recorded on success too (the before/after numbers of #430).
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "caption_burnin_chaos {bytes} B: frames {} dropped {} over {elapsed:.2} s\n",
+                report.frames, report.dropped
+            ),
+        );
+
+        // The clock kept its cadence (CI-load tolerant: >= 90 %).
+        let expected = elapsed * f64::from(u32::try_from(FPS).unwrap());
+        let frames = f64::from(u32::try_from(report.frames).expect("small"));
+        assert!(
+            frames >= 0.9 * expected.min(f64::from(u32::try_from(RUN_SECS * FPS).unwrap())),
+            "clock ticks {frames} over {elapsed:.2} s (expected ~{expected:.0})"
+        );
+        // Design bound: per-tick burn-in cost is O(bounded) and the raster is
+        // cached per cue change, so the consumer sheds nothing from captions;
+        // <= 1 % absorbs a loaded CI runner's scheduling hiccups.
+        assert!(
+            report.dropped * 100 <= report.frames,
+            "consumer shed {} of {} ticks",
+            report.dropped,
+            report.frames
+        );
+        assert!(
+            crate::overlays::caption_burn_stats().text_truncated() > truncated_before,
+            "the hostile cues were cut by the burn-in projection"
+        );
+        // Video kept flowing with tick-derived stamps: consecutive packets of
+        // each written segment are exactly one tick apart (90 kHz / 25).
+        let segments: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("output dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+            .collect();
+        assert!(segments.len() >= 2, "video segments written: {segments:?}");
+        let tick_90k = i64::try_from(90_000 / FPS).unwrap();
+        for seg in &segments {
+            let mut pts = video_pts(seg);
+            pts.sort_unstable();
+            assert!(!pts.is_empty(), "{} carries video", seg.display());
+            assert!(
+                pts.windows(2)
+                    .all(|w| matches!(w, [a, b] if b - a == tick_90k)),
+                "{}: {pts:?}",
+                seg.display()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn displayed_8kib_captions_keep_the_cadence() {
+        run_with_cue_bytes(8 * 1024).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn displayed_64kib_captions_keep_the_cadence() {
+        run_with_cue_bytes(64 * 1024).await;
     }
 }

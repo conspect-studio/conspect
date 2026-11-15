@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_control::output_routing::{
     AudioPlanCost, LayoutBody, OutputLive, OutputOutcome, OutputReformatRequest, OutputRouting,
-    OutputTakeRequest, OutputTakeSet, PlanCost, PlanPath, PlanRefusal, ReformatSubmitError,
-    RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, SubtitleTakeError, SubtitleTakeRequest,
-    TakeSubmitError,
+    OutputTakeRequest, OutputTakeSet, PlanCost, PlanPath, PlanRefusal, PrincipalSessions,
+    ReformatSubmitError, RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, SubtitleTakeError,
+    SubtitleTakeRequest, TakeSubmitError,
 };
 
 use crate::output_routing::{
@@ -182,6 +182,18 @@ fn take_audio(audio: Option<&RoutedAudio>, program_audio: bool) -> Option<AudioC
 /// §12.4 P1): an output with the same settings carries it at the same feed
 /// name, or a live (lingering) encoder for (feed name, settings) runs. The one predicate behind the plan's +0
 /// and the readback's P1 (#342 review M5).
+/// The live-key feed name of `feed` on `run_output`: #342, a routed
+/// source/PVW is encoded at the output's feed format, so its key is
+/// `bus@format`; Program/Clean/a layout stay the bus name.
+fn feed_key_name(feed: &RoutedFeed, run_output: &crate::output_routing::RunOutput) -> String {
+    let routed = matches!(feed, RoutedFeed::Source(_) | RoutedFeed::Preview);
+    match picture_bus(feed, None).filter(|_| routed) {
+        // Only a source/PVW feed is routed here; it never needs a body.
+        Some(b) => crate::routing_aux::feed_name(&b, run_output.feed_format),
+        None => feed.bus_name(),
+    }
+}
+
 fn carried_by_live_key(
     handle: &OutputRoutingHandle,
     snapshot: &crate::output_routing::RoutingSnapshot,
@@ -189,24 +201,10 @@ fn carried_by_live_key(
     feed: &RoutedFeed,
 ) -> bool {
     let bus = feed.bus_name();
-    // #342: a routed source/PVW is encoded at the output's feed format, so
-    // its key is (bus@format, settings); Program/Clean stay the bus.
-    let routed = matches!(feed, RoutedFeed::Source(_) | RoutedFeed::Preview);
-    let key_name = |format: Option<crate::routing_aux::AuxFormat>| -> String {
-        if routed {
-            // Only a source/PVW feed is routed here; it never needs a body.
-            picture_bus(feed, None).map_or_else(
-                || bus.clone(),
-                |b| crate::routing_aux::feed_name(&b, format),
-            )
-        } else {
-            bus.clone()
-        }
-    };
-    let wanted = key_name(run_output.feed_format);
+    let wanted = feed_key_name(feed, run_output);
     handle.outputs().iter().enumerate().any(|(i, o)| {
         o.settings == run_output.settings
-            && key_name(o.feed_format) == wanted
+            && feed_key_name(feed, o) == wanted
             && snapshot.outputs.get(i).is_some_and(|v| v.bus == bus)
     }) || snapshot
         .live_keys
@@ -660,6 +658,36 @@ impl OutputRouting for OutputRoutingAdapter {
             .map_err(|_| TakeSubmitError::Busy)
     }
 
+    /// The router's encoder-sharing identity (`admit_set`: bus, format,
+    /// settings, reset): the feed's key name at the output's feed format,
+    /// the output's settings index and its landed live reset's settings.
+    fn encoder_identity(&self, output: &str, feed: &RoutedFeed) -> Option<String> {
+        let handle = self.handle()?;
+        let index = handle.index_of(output)?;
+        let run_output = handle.outputs().get(index)?;
+        let snapshot = handle.snapshot();
+        let reset = snapshot.outputs.get(index).and_then(|v| v.reset.as_ref());
+        Some(format!(
+            "{}|{}|{reset:?}",
+            feed_key_name(feed, run_output),
+            run_output.settings
+        ))
+    }
+
+    fn principal_sessions(&self, principal: &str) -> Option<PrincipalSessions> {
+        let handle = self.handle()?;
+        let snapshot = handle.snapshot();
+        let held = snapshot
+            .principals_held
+            .iter()
+            .find(|(p, _)| p == principal)
+            .map_or(0, |(_, held)| *held);
+        Some(PrincipalSessions {
+            held,
+            max: snapshot.max_per_principal,
+        })
+    }
+
     fn snapshot(&self) -> Option<RoutingLive> {
         let handle = self.handle()?;
         let snapshot = handle.snapshot();
@@ -807,6 +835,30 @@ impl multiview_control::program_metrics::ProgramMetricsSource for ProgramMetrics
             compose_deadline_misses: handles
                 .compose_deadline_misses
                 .load(std::sync::atomic::Ordering::Acquire),
+            // #343: one entry per per-output clock (wait-free loads).
+            output_clocks: handles
+                .output_clocks
+                .iter()
+                .map(
+                    |clock| multiview_control::program_metrics::OutputClockCounters {
+                        fps: format!("{}/{}", clock.cadence.num, clock.cadence.den),
+                        outputs: clock.outputs.clone(),
+                        lateness: clock.stats.lateness().snapshot(),
+                        skipped_ticks: clock.stats.skipped_ticks(),
+                        dropped_offers: clock
+                            .dropped_offers
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        late_latches: clock
+                            .late_latches
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        dropped_audio: clock
+                            .dropped_audio
+                            .iter()
+                            .map(|d| d.load(std::sync::atomic::Ordering::Relaxed))
+                            .sum(),
+                    },
+                )
+                .collect(),
         })
     }
 }
@@ -851,6 +903,7 @@ mod tests {
             audio: audio.to_owned(),
             audio_choice: choice.to_owned(),
             private_audio: private,
+            reset: None,
         }
     }
 

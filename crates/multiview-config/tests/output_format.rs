@@ -353,19 +353,218 @@ codec = "h264"
     )
 }
 
+/// Slice C (#343) intentionally replaces slice B's blanket "slice C"
+/// refusal: a converting kind at a valid rate is accepted (it runs on its own
+/// output clock) while a Program-rate output remains.
 #[test]
-fn fps_different_from_canvas_is_slot_format_unsupported() {
-    assert_code(
-        &hls_format("width = 1280\nheight = 720\nfps = \"25/1\""),
-        SLOT_FORMAT_UNSUPPORTED,
-        "slice C",
+fn fps_different_from_canvas_is_accepted_on_a_converting_kind() {
+    let doc = format!(
+        "{PLAIN}{}",
+        hls_format("width = 1280\nheight = 720\nfps = \"25/1\"")
     );
-    // An equal rate written differently is the same rate.
+    parse(&doc)
+        .validate()
+        .expect("a 25 fps output beside Program");
+    // An equal rate written differently is the same rate (no clock at all).
     parse(&hls_format(
         "width = 1280\nheight = 720\nfps = \"60000/2002\"",
     ))
     .validate()
     .expect("equal rational rate");
+    // Every converting kind may carry its own rate.
+    for (kind, extra) in [
+        ("srt", "url = \"srt://[::1]:9000\""),
+        ("rist", "url = \"rist://[::1]:9001\""),
+        ("rtmp", "url = \"rtmp://[::1]/live/k\""),
+        ("ll_hls", "path = \"/srv/ll\""),
+    ] {
+        let doc = format!(
+            "{PLAIN}\n[[outputs]]\nkind = \"{kind}\"\nid = \"r-{kind}\"\n{extra}\ncodec = \"h264\"\n\
+             [outputs.format]\nwidth = 1920\nheight = 1080\nfps = \"50/1\"\n"
+        );
+        match MultiviewConfig::load_from_toml(&format!("{HEAD}\n{doc}")) {
+            Ok(cfg) => cfg.validate().unwrap_or_else(|e| panic!("{kind}: {e}")),
+            // A kind whose minimal fields differ here is not what this test
+            // pins; parse failures are reported, never silently passed.
+            Err(e) => panic!("{kind} did not parse: {e}"),
+        }
+    }
+}
+
+#[test]
+fn an_invalid_output_rate_is_slot_format_unsupported() {
+    for fps in ["24000/1000", "121/1", "0/1", "25/2", "240000/1001", "3/1"] {
+        assert_code(
+            &format!(
+                "{PLAIN}{}",
+                hls_format(&format!("width = 1280\nheight = 720\nfps = \"{fps}\""))
+            ),
+            SLOT_FORMAT_UNSUPPORTED,
+            "not an output rate",
+        );
+    }
+}
+
+#[test]
+fn a_rate_on_a_kind_without_an_output_clock_is_slot_format_unsupported() {
+    assert_code(
+        &format!(
+            "{PLAIN}{}",
+            r#"
+[[outputs]]
+kind = "webrtc"
+label = "web"
+[outputs.format]
+width = 1920
+height = 1080
+fps = "25/1"
+"#
+        ),
+        SLOT_FORMAT_UNSUPPORTED,
+        "no per-output clock",
+    );
+}
+
+#[test]
+fn more_distinct_rates_than_max_output_clocks_is_capacity() {
+    let rate = |id: &str, fps: &str| {
+        format!(
+            "\n[[outputs]]\nkind = \"hls\"\nid = \"{id}\"\npath = \"/srv/{id}\"\ncodec = \"h264\"\n\
+             [outputs.format]\nwidth = 1280\nheight = 720\nfps = \"{fps}\"\n"
+        )
+    };
+    // Two distinct rates (and a repeat) fit the default of 2.
+    let two = format!(
+        "{PLAIN}{}{}{}",
+        rate("a", "25/1"),
+        rate("b", "50/1"),
+        rate("c", "25/1")
+    );
+    parse(&two).validate().expect("two clocks fit the default");
+    let three = format!("{two}{}", rate("d", "24000/1001"));
+    let msg = refusal(&three);
+    assert!(msg.starts_with("capacity: "), "{msg}");
+    assert!(msg.contains("max_output_clocks allows 2"), "{msg}");
+    // Raising the bound admits it; above the hard max is refused.
+    parse(&format!("{three}\n[routing]\nmax_output_clocks = 3\n"))
+        .validate()
+        .expect("raised bound");
+    let msg = refusal(&format!("{three}\n[routing]\nmax_output_clocks = 9\n"));
+    assert!(msg.contains("max_output_clocks must be at most 8"), "{msg}");
+}
+
+#[test]
+fn every_output_at_another_rate_is_slot_format_unsupported() {
+    assert_code(
+        &hls_format("width = 1280\nheight = 720\nfps = \"25/1\""),
+        SLOT_FORMAT_UNSUPPORTED,
+        "keep at least one output at the Program's rate",
+    );
+}
+
+#[test]
+fn a_non_program_feed_onto_a_rate_output_is_slot_format_unsupported() {
+    let doc = format!(
+        "{PLAIN}\n[[outputs]]\nkind = \"hls\"\nid = \"r25\"\npath = \"/srv/r\"\ncodec = \"h264\"\n\
+         [outputs.format]\nwidth = 1280\nheight = 720\nfps = \"25/1\"\n"
+    );
+    parse(&format!(
+        "{doc}\n[[routing.output]]\noutput = \"r25\"\nvideo = {{ bus = \"program\" }}\n"
+    ))
+    .validate()
+    .expect("Program onto a rate output");
+    assert_code(
+        &format!("{doc}\n[[routing.output]]\noutput = \"r25\"\nvideo = {{ source = \"cam_a\" }}\n"),
+        SLOT_FORMAT_UNSUPPORTED,
+        "its feed must be Program",
+    );
+}
+
+/// #343 review M2: a rate output carries the Program audio; a persisted
+/// audio feed other than `follow`/`program` (silence, a source's audio, a
+/// track selection) would be silently ignored, so it is refused.
+#[test]
+fn a_non_program_audio_feed_onto_a_rate_output_is_slot_format_unsupported() {
+    let doc = format!(
+        "{PLAIN}\n[[outputs]]\nkind = \"hls\"\nid = \"r25\"\npath = \"/srv/r\"\ncodec = \"h264\"\n\
+         [outputs.format]\nwidth = 1280\nheight = 720\nfps = \"25/1\"\n"
+    );
+    for ok in ["\"follow\"", "\"program\""] {
+        parse(&format!(
+            "{doc}\n[[routing.output]]\noutput = \"r25\"\naudio = {ok}\n"
+        ))
+        .validate()
+        .unwrap_or_else(|e| panic!("audio = {ok} onto a rate output: {e}"));
+    }
+    for feed in [
+        "\"none\"",
+        "{ source = \"cam_b\" }",
+        "{ tracks = [\"program\", \"spa\"] }",
+    ] {
+        assert_code(
+            &format!("{doc}\n[[routing.output]]\noutput = \"r25\"\naudio = {feed}\n"),
+            SLOT_FORMAT_UNSUPPORTED,
+            "its audio feed must be Program",
+        );
+    }
+    // The same feeds stay valid on a Program-rate output.
+    parse(&format!(
+        "{doc}\n[[routing.output]]\noutput = \"plain\"\naudio = \"none\"\n"
+    ))
+    .validate()
+    .expect("silence on a Program-rate output");
+}
+
+/// #343 review A1: every rate output opens its own encoder, so identical
+/// rate outputs count one encoder each toward the per-program ceiling.
+#[test]
+fn identical_rate_outputs_count_one_encoder_each() {
+    let rate = |id: usize| {
+        format!(
+            "\n[[outputs]]\nkind = \"hls\"\nid = \"r{id}\"\npath = \"/srv/r{id}\"\ncodec = \"h264\"\n\
+             [outputs.format]\nwidth = 1280\nheight = 720\nfps = \"25/1\"\n"
+        )
+    };
+    let with = |n: usize| format!("{PLAIN}{}", (0..n).map(rate).collect::<String>());
+    let max = multiview_config::rendition::MAX_VIDEO_RENDITIONS_PER_PROGRAM;
+    // Program's encoder + (max - 1) rate encoders fit.
+    let fits = parse(&with(max - 1));
+    assert_eq!(
+        multiview_config::rendition::distinct_base_video_keys(&fits),
+        max
+    );
+    fits.validate().expect("at the ceiling");
+    assert_code(
+        &with(max),
+        SLOT_FORMAT_UNSUPPORTED,
+        "distinct video encoders",
+    );
+    assert_code(
+        &with(100),
+        SLOT_FORMAT_UNSUPPORTED,
+        "distinct video encoders",
+    );
+}
+
+/// #343 review A2: a rate output whose top-level codec is an encoder alias
+/// (`h264_nvenc`, `libx264`: no rendition key) still counts as an encoder.
+#[test]
+fn rate_outputs_with_an_encoder_alias_codec_count_too() {
+    for codec in ["h264_nvenc", "libx264"] {
+        let rate = |id: usize| {
+            format!(
+                "\n[[outputs]]\nkind = \"hls\"\nid = \"r{id}\"\npath = \"/srv/r{id}\"\ncodec = \"{codec}\"\n\
+                 [outputs.format]\nwidth = 1280\nheight = 720\nfps = \"25/1\"\n"
+            )
+        };
+        let doc = format!("{PLAIN}{}", (0..100).map(rate).collect::<String>());
+        assert_eq!(
+            multiview_config::rendition::distinct_base_video_keys(&parse(&doc)),
+            101,
+            "{codec}"
+        );
+        assert_code(&doc, SLOT_FORMAT_UNSUPPORTED, "distinct video encoders");
+    }
 }
 
 #[test]
@@ -911,4 +1110,21 @@ fn subtitle_source_must_be_declared() {
     ))
     .validate()
     .expect("declared source");
+}
+
+/// #343 × #345: subtitle slots are sampled at Program's cadence; a rate
+/// output does not carry them yet, so the pair is refused.
+#[test]
+fn subtitle_slots_on_a_rate_output_are_slot_format_unsupported() {
+    let rate_subs = format!(
+        "{PLAIN}{}",
+        hls_subs(&format!(
+            "[outputs.format]\nwidth = 1280\nheight = 720\nfps = \"25/1\"\n{TWO_SUBS}"
+        ))
+    );
+    assert_code(
+        &rate_subs,
+        SLOT_FORMAT_UNSUPPORTED,
+        "subtitle slots on a rate output",
+    );
 }

@@ -140,6 +140,12 @@ pub struct TextEngine {
     font_system: FontSystem,
     swash: SwashCache,
     atlas: GlyphAtlas,
+    /// Entries (missing-glyph `None`s included) and pixel bytes held by
+    /// `swash.image_cache`, tracked because cosmic-text never evicts it.
+    swash_entries: usize,
+    swash_bytes: usize,
+    /// Times the swash image cache was cleared for exceeding its cap.
+    swash_clears: u64,
 }
 
 impl TextEngine {
@@ -148,6 +154,14 @@ impl TextEngine {
     /// engine is bounded out of the box (T4). Callers with tighter budgets use
     /// [`TextEngine::with_atlas_byte_cap`].
     pub const DEFAULT_ATLAS_BYTE_CAP: usize = 4 * 1024 * 1024;
+
+    /// Most glyph images (missing-glyph entries included) the rasterization
+    /// cache keeps before it is cleared (issue #430: cosmic-text's
+    /// `SwashCache` never evicts, so text that rotates through distinct
+    /// glyphs would otherwise grow it without bound).
+    pub const SWASH_CACHE_MAX_ENTRIES: usize = 2048;
+    /// Most coverage bytes the rasterization cache keeps before it is cleared.
+    pub const SWASH_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
     /// Build the engine with the default atlas byte cap.
     ///
@@ -169,6 +183,9 @@ impl TextEngine {
             font_system,
             swash: SwashCache::new(),
             atlas: GlyphAtlas::new(GlyphAtlas::DEFAULT_SIDE, byte_cap),
+            swash_entries: 0,
+            swash_bytes: 0,
+            swash_clears: 0,
         })
     }
 
@@ -188,6 +205,31 @@ impl TextEngine {
     #[must_use]
     pub fn atlas_byte_cap(&self) -> usize {
         self.atlas.byte_cap()
+    }
+
+    /// Glyph images currently retained by the rasterization (swash) cache,
+    /// missing-glyph entries included (≤ [`Self::SWASH_CACHE_MAX_ENTRIES`]).
+    #[must_use]
+    pub fn swash_cache_entries(&self) -> usize {
+        self.swash.image_cache.len()
+    }
+
+    /// Coverage bytes currently retained by the rasterization cache
+    /// (≤ [`Self::SWASH_CACHE_MAX_BYTES`]), measured on the cache itself.
+    #[must_use]
+    pub fn swash_cache_bytes(&self) -> usize {
+        self.swash
+            .image_cache
+            .values()
+            .flatten()
+            .map(|image| image.data.len())
+            .sum()
+    }
+
+    /// How many times the rasterization cache was cleared for its cap.
+    #[must_use]
+    pub const fn swash_cache_clears(&self) -> u64 {
+        self.swash_clears
     }
 
     /// Shape `text` in `family` at `size_px`, ensure every inked glyph is resident
@@ -308,11 +350,7 @@ impl TextEngine {
     /// Returns `None` for a whitespace / zero-area / non-mask (color emoji)
     /// glyph, which inks nothing and is skipped by both consumers.
     fn ensure_resident(&mut self, placed: &PlacedGlyph) -> Result<Option<ResidentGlyph>> {
-        let Some(image) = self
-            .swash
-            .get_image(&mut self.font_system, placed.key)
-            .clone()
-        else {
+        let Some(image) = self.cached_image(placed.key) else {
             return Ok(None);
         };
         // Stage 1 inks only straight-coverage masks; color/subpixel bitmaps are a
@@ -336,6 +374,44 @@ impl TextEngine {
             dest_y,
             image,
         }))
+    }
+}
+
+impl TextEngine {
+    /// The swash image for `key`, through the bounded rasterization cache:
+    /// when inserting a new image would exceed
+    /// [`Self::SWASH_CACHE_MAX_ENTRIES`] / [`Self::SWASH_CACHE_MAX_BYTES`], the
+    /// whole cache is cleared first (and counted). A clear costs only a
+    /// re-rasterization of glyphs used again; the atlas keeps its own,
+    /// independently bounded slots (it never borrows these images).
+    fn cached_image(&mut self, key: CacheKey) -> Option<SwashImage> {
+        if !self.swash.image_cache.contains_key(&key)
+            && self.swash_entries >= Self::SWASH_CACHE_MAX_ENTRIES
+        {
+            self.clear_swash_cache();
+        }
+        let fresh = !self.swash.image_cache.contains_key(&key);
+        let image = self.swash.get_image(&mut self.font_system, key).clone();
+        if fresh {
+            let bytes = image.as_ref().map_or(0, |i| i.data.len());
+            if self.swash_bytes.saturating_add(bytes) > Self::SWASH_CACHE_MAX_BYTES {
+                // Over the byte cap: drop everything, this image included
+                // (the caller already holds its copy).
+                self.clear_swash_cache();
+            } else {
+                self.swash_entries = self.swash_entries.saturating_add(1);
+                self.swash_bytes = self.swash_bytes.saturating_add(bytes);
+            }
+        }
+        image
+    }
+
+    fn clear_swash_cache(&mut self) {
+        self.swash.image_cache.clear();
+        self.swash.outline_command_cache.clear();
+        self.swash_entries = 0;
+        self.swash_bytes = 0;
+        self.swash_clears = self.swash_clears.saturating_add(1);
     }
 }
 
