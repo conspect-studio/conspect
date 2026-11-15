@@ -85,6 +85,7 @@ pub mod nmos;
 pub mod notify;
 pub mod output_routing;
 pub mod patch;
+pub mod patch_set;
 pub mod pending_actions;
 pub mod player_load;
 pub mod preview;
@@ -317,6 +318,7 @@ pub fn router_with(state: AppState, surface: Surface) -> Router {
                 switcher_events::ME_LAYOUT_SWEEP_INTERVAL,
             ));
         }
+        patch_set::spawn_aggregator(&state);
         cast_streams::lifecycle::spawn_sweeper(&state);
         if let Some(metrics) = state.program_metrics.as_ref() {
             program_metrics::spawn_sampler(metrics);

@@ -224,6 +224,60 @@ Efficiency rules (consistent with [conventions invariants 6, 9](../architecture/
 - **Discrete passthrough** to outputs (where the format allows) is governed separately by
   [ADR-R007](../decisions/ADR-R007.md) / [io/outputs.md](outputs.md); this doc is the **ingest** side.
 
+### 7.1 Bounded burn-in of hostile cues (issue #430)
+
+Cue text is remote-controlled, so its size must never reach the per-tick cost. Before #430 an 8 KiB
+cue shed about two thirds of the ticks and a 64 KiB cue stopped the run ("output fell N ticks behind the
+clock"). The cost came from two places. The output clock thread cloned the whole cue every tick
+(`CueStoreSource::active_at`). The bake consumer then shaped and rasterized every line twice per tick
+(`OverlayBaker::draw_tile_caption`: once for the ink width, once for the glyphs).
+
+- **Bound before any clone or shaping.** Both stages use the one projection
+  `multiview_output::hls::bound_cue_lines`, which the subtitle slots also use (#417). It inspects at
+  most 16 lines / 4 KiB and keeps at most 4 lines / 512 B in fresh allocations. On the clock thread,
+  `CueStoreSource` *borrows* the active cue (`with_active_at_generation`) and copies out only that
+  projection, so the clock-thread cost is O(bounded). The baker bounds again before it draws (a no-op for
+  native cues; the guard for the sidecar and any other producer). The sidecar path copies only the
+  projection too.
+- **Shape once per cue change.** The baker keeps a per-tile cache of the last caption block: the bounded
+  lines plus the cell rect as the key, and the clipped glyph primitives as the value. A held cue re-emits
+  the cached primitives, so steady ticks never shape or rasterize. A cue change or relayout re-shapes
+  exactly once. A tile with no cue clears its entry, so the cache holds only what is on screen (≤ 1 block
+  per tile).
+- **Thread placement.** We kept shaping on the existing off-clock bake consumer (`StreamBaker::bake`),
+  because that is where the glyph atlas and text engine live. We bounded and cached it there rather than
+  adding a new preparation stage. The clock thread only samples the bounded projection. The bounded
+  drop-on-overload queue still separates the clock from the consumer (inv #1/#10).
+- **Bitmap (DVB-sub) cues.** These were deep-copied per tick on the clock thread
+  (`sample_caption_bitmaps`). The copy now happens only for a cue within ≤ 4096 px per side and ≤ 256 KiB
+  RGBA, which is the decoder's own payload cap. A larger cue is refused and counted, never copied. The
+  baker checks the same bound before drawing.
+- **Rasterization cache.** cosmic-text's `SwashCache` never evicts. A source that rotates through
+  distinct glyphs (Unicode ranges, sizes, missing glyphs) would grow it on every cue change. `TextEngine`
+  tracks the entries (missing-glyph entries included) and the coverage bytes it inserts. It clears the
+  whole cache before it exceeds 2048 entries or 8 MiB and counts each clear (`swash_cache_clears`). We
+  chose this as the simplest correct bound: a clear only costs re-rasterizing glyphs that are used again,
+  and the glyph atlas keeps its own, independently bounded slots.
+- **Sidecar (`--subtitles`) lookup.** `CueTrack` builds a step-function index of the active cue once, at
+  parse or deserialize time. Each tick's lookup is then a binary search: O(log n) with no per-tick scan,
+  even before the first cue or in a gap. Overlapping cues still resolve to the newest-starting one. A cut
+  sidecar cue is counted like a native one.
+- **Counters.** `overlays::caption_burn_stats()` counts `text_truncated` (exactly once per cut cue),
+  `bitmap_refused` and `text_rasters` (cache misses). A cue's identity is the cue store's per-cue
+  publish sequence, which is new for every published cue, including a same-window replacement or a cue
+  after a generation change. For the sidecar, the identity is the track index. The tally remembers up to 64
+  distinct cut-cue identities, replacing the least recently observed one. Every cut observation refreshes
+  an identity to most recent. A held cue, or an overlapping cue that resurfaces (A, a newer B, then A
+  again), is therefore never re-counted. Exact bound: a cue is counted again only when it reappears after
+  64 or more other distinct cut cues were observed since its own last cut observation. With 63 or fewer
+  it is not recounted, however often those others repeat. For a native store, that needs 64 other cut
+  cues selected while the cue is retained; the default store keeps 16. Per sample the tally scans 64
+  slots, lock-free and with no allocation.
+- **Chaos test.** `pipeline::caption_burnin_chaos` runs a displayed captioned source with 8 KiB and
+  64 KiB cues changing every 100 ms. It asserts that the run succeeds (never behind the clock), that at
+  most 1 % of ticks are shed, that video PTS steps are tick-exact, and that the truncation counter is
+  above zero.
+
 ---
 
 ## 8. Invariants upheld

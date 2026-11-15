@@ -24,7 +24,9 @@
 //! of `POST /routing/output/take` (that route is the slot-0 alias): the take
 //! store's replay, the per-output and per-principal limits, the bounded
 //! `try_send`, the `route.output` outcome and persistence on `applied`.
-//! Atomic multi-destination sets arrive with patch salvos (#308).
+//! Two or more destinations (outputs, or mixer + output) are an atomic set
+//! (#308, `super::patch_set`); subtitle crosspoints (#345) go through
+//! `super::patch_subtitle` and are never part of a set.
 
 use std::time::Instant;
 
@@ -47,11 +49,9 @@ use crate::error::{ControlError, ControlResult};
 use crate::problem::Problem;
 use crate::state::AppState;
 
-/// The refusal of a request mixing destinations (two outputs, or mixer +
-/// output).
-pub(crate) const MULTI_DESTINATION: &str =
-    "multi-destination patch sets arrive with patch salvos (#308); one request patches mixer \
-     inputs or the slots of one output";
+/// Most distinct stored layouts one patch set may name: each costs one
+/// bounded off-handler read (#308).
+pub(crate) const MAX_SET_LAYOUTS: usize = 4;
 
 /// How long a take naming a newly registered layout waits for the output
 /// clock to adopt its store (#307). Ten ticks at 25 fps; on timeout the take
@@ -59,8 +59,8 @@ pub(crate) const MULTI_DESTINATION: &str =
 const ME_LAYOUT_ADOPT_WAIT: std::time::Duration = std::time::Duration::from_millis(1_000);
 
 /// The first slice's one M/E and its program.
-const ME: &str = "me1";
-const PROGRAM: &str = "main";
+pub(crate) const ME: &str = "me1";
+pub(crate) const PROGRAM: &str = "main";
 
 /// One crosspoint destination: a mixer input (`{"mixer","input"}`) or, in a
 /// later slice, an output slot (`{"output","slot"}`).
@@ -84,7 +84,7 @@ pub struct PatchDestination {
 }
 
 /// One crosspoint `{ plane, destination, source }`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct PatchCrosspoint {
@@ -193,7 +193,9 @@ pub struct PatchPlan {
     pub can_take: bool,
 }
 
-/// `POST /patch/take` 202 answer; the outcome arrives as `switcher.operation`.
+/// `POST /patch/take` 202 answer. The outcome arrives as `switcher.operation`
+/// (mixer inputs), `route.output` (one output) or, for a set of two or more
+/// destinations, `patch.take` (#308).
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PatchAccepted {
@@ -201,7 +203,40 @@ pub struct PatchAccepted {
     pub operation_id: String,
     /// Always `accepted`; never `applied`.
     pub status: &'static str,
+    /// A patch salvo that also recalls layout/sources/tally/UMD: the
+    /// operation id of that recall (its outcome rides `salvo.taken`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_operation_id: Option<String>,
 }
+
+/// `OpenAPI` shape of a patch plan `200` (`POST /patch/plan`,
+/// `POST /salvos/{id}/plan`): a single-destination [`PatchPlan`], or a
+/// `SetPlan` (the same fields plus `set: {new_encoders, fits}`) for an
+/// atomic set of two or more destinations (#308).
+#[cfg(feature = "openapi")]
+pub struct PatchPlanResponseDoc;
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for PatchPlanResponseDoc {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        // `anyOf`, not `oneOf`: `SetPlan` flattens `PatchPlan` plus `set`, so
+        // every `SetPlan` instance also matches the `PatchPlan` schema (which
+        // has no `additionalProperties: false`). `oneOf` requires exactly one
+        // match and would reject every genuine `SetPlan` response (#308
+        // review A5).
+        use utoipa::openapi::schema::{AnyOfBuilder, Ref};
+        AnyOfBuilder::new()
+            .item(Ref::from_schema_name("PatchPlan"))
+            .item(Ref::from_schema_name("SetPlan"))
+            .description(Some(
+                "A `PatchPlan` for mixer inputs or one output, or a `SetPlan` (with `set: {new_encoders, fits}`) for an atomic set of two or more destinations.",
+            ))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for PatchPlanResponseDoc {}
 
 pub(crate) fn problem(status: u16, kind: &str, detail: impl Into<String>) -> Response {
     Problem::new(status, kind, "Patch refused")
@@ -209,7 +244,7 @@ pub(crate) fn problem(status: u16, kind: &str, detail: impl Into<String>) -> Res
         .into_response()
 }
 
-fn too_many(retry: std::time::Duration) -> Response {
+pub(crate) fn too_many(retry: std::time::Duration) -> Response {
     let secs = retry
         .as_secs()
         .saturating_add(u64::from(retry.subsec_nanos() > 0))
@@ -229,10 +264,10 @@ fn source_id(source: &Value) -> Option<&str> {
 }
 
 /// Authorize both ends of every crosspoint (BOLA), before any existence check.
-fn authorize(
+pub(crate) fn authorize(
     principal: &Principal,
     req: &PatchRequest,
-    layout: Option<&super::output_routing::LayoutRead>,
+    layouts: &[super::output_routing::LayoutRead],
 ) -> ControlResult<()> {
     for xp in &req.crosspoints {
         let destination = &xp.destination;
@@ -249,7 +284,8 @@ fn authorize(
         // A layout: its id AND its whole current source closure, before any
         // output or feed existence answer (#342 review T-A1).
         if let Some(id) = xp.source.get("layout").and_then(Value::as_str) {
-            super::output_routing::authorize_layout_feed(principal, id, layout)?;
+            let read = layouts.iter().find(|l| l.id == id);
+            super::output_routing::authorize_layout_feed(principal, id, read)?;
         }
         if xp.source.get("bus").is_some() {
             authorize_object(principal, ME)?;
@@ -259,44 +295,66 @@ fn authorize(
     Ok(())
 }
 
-/// The request's ONE stored-layout read (#342 review T-I1): the layout a
-/// crosspoint names (an output slot's, or a mixer input's, #307), read off the async worker under the
-/// layout-read permit BEFORE any authorization answer, and only once every
-/// destination passed its own authorization, so an unauthorized caller
-/// never costs a read. The body feeds the closure authorization (T-A1) and
+/// The request's stored-layout reads (#342 review T-I1; #308): one read per
+/// DISTINCT layout a crosspoint names (an output slot's, or a mixer input's,
+/// #307), at most [`MAX_SET_LAYOUTS`], each off the async worker under the
+/// layout-read permit, BEFORE any closure answer, and only once every
+/// destination and every layout id passed its own authorization, so an
+/// unauthorized caller never costs a read. The bodies feed the closure
+/// authorization (T-A1) and
 /// the later resolve.
 ///
 /// # Errors
-/// 403 for a destination; `EngineBusy` without a read permit; repository
-/// errors.
-async fn read_patch_layout(
+/// 403 for a destination or a layout id; 422 `unknown-source` for more than
+/// [`MAX_SET_LAYOUTS`] layouts; `EngineBusy` without a read permit;
+/// repository errors.
+pub(crate) async fn read_patch_layouts(
     state: &AppState,
     principal: &Principal,
     req: &PatchRequest,
-) -> ControlResult<Option<super::output_routing::LayoutRead>> {
-    let Some(id) = req
+) -> ControlResult<Result<Vec<super::output_routing::LayoutRead>, Response>> {
+    let mut ids: Vec<&str> = Vec::new();
+    for id in req
         .crosspoints
         .iter()
-        .find_map(|xp| xp.source.get("layout").and_then(Value::as_str))
-    else {
-        return Ok(None);
-    };
-    authorize(principal, req, None)?;
-    authorize_object(principal, id)?;
-    Ok(Some(super::output_routing::read_layout(state, id).await?))
+        .filter_map(|xp| xp.source.get("layout").and_then(Value::as_str))
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    authorize(principal, req, &[])?;
+    for id in &ids {
+        authorize_object(principal, id)?;
+    }
+    if ids.len() > MAX_SET_LAYOUTS {
+        return Ok(Err(problem(
+            422,
+            "unknown-source",
+            format!("too many layouts in one set (at most {MAX_SET_LAYOUTS})"),
+        )));
+    }
+    let mut reads = Vec::with_capacity(ids.len());
+    for id in ids {
+        reads.push(super::output_routing::read_layout(state, id).await?);
+    }
+    Ok(Ok(reads))
 }
 
 /// A validated mixer crosspoint. `source` is the engine source id
 /// (`layout:<id>` for a stored layout).
-struct Member {
-    input: u16,
-    source: Option<String>,
+pub(crate) struct Member {
+    pub(crate) input: u16,
+    pub(crate) source: Option<String>,
     /// The stored layout id, for a `{"layout": id}` crosspoint.
-    layout: Option<String>,
+    pub(crate) layout: Option<String>,
 }
 
 /// Shape checks: this slice's plane/destination/source kinds, no duplicates.
-fn shape(req: &PatchRequest) -> Result<Vec<Member>, Box<Response>> {
+pub(crate) fn shape(req: &PatchRequest) -> Result<Vec<Member>, Box<Response>> {
     let mut members = Vec::with_capacity(req.crosspoints.len());
     for xp in &req.crosspoints {
         if xp.plane != "video" {
@@ -312,7 +370,11 @@ fn shape(req: &PatchRequest) -> Result<Vec<Member>, Box<Response>> {
         }
         let destination = &xp.destination;
         if destination.output.is_some() || destination.slot.is_some() {
-            return Err(Box::new(problem(422, "unknown-slot", MULTI_DESTINATION)));
+            return Err(Box::new(problem(
+                422,
+                "unknown-slot",
+                "a destination is a mixer input or an output slot, not both",
+            )));
         }
         let (Some(_), Some(input)) = (&destination.mixer, destination.input) else {
             return Err(Box::new(problem(
@@ -358,7 +420,7 @@ fn shape(req: &PatchRequest) -> Result<Vec<Member>, Box<Response>> {
     Ok(members)
 }
 
-fn configured_sources(state: &AppState) -> ControlResult<Vec<String>> {
+pub(crate) fn configured_sources(state: &AppState) -> ControlResult<Vec<String>> {
     Ok(crate::boot_model::accepted_resources(state, "sources")?
         .map_or_else(|| state.sources.list(), Ok)?
         .into_iter()
@@ -367,7 +429,7 @@ fn configured_sources(state: &AppState) -> ControlResult<Vec<String>> {
 }
 
 /// Live engine handle with numbered inputs, or the typed refusal.
-fn engine_with_inputs(
+pub(crate) fn engine_with_inputs(
     state: &AppState,
 ) -> Result<(&SwitcherControl, std::sync::Arc<InputsReadback>), Box<Response>> {
     let Some(handle) = state.switcher.as_ref() else {
@@ -395,21 +457,21 @@ fn engine_with_inputs(
 }
 
 /// Everything after authorization and shape: existence and the on-air guard.
-struct Checked {
-    members: Vec<Member>,
+pub(crate) struct Checked {
+    pub(crate) members: Vec<Member>,
     /// Resolved stored layouts the members patch (#307), registered at take.
-    bodies: Vec<crate::output_routing::LayoutBody>,
-    plan: PatchPlan,
-    first_refusal: Option<PatchRefusal>,
+    pub(crate) bodies: Vec<crate::output_routing::LayoutBody>,
+    pub(crate) plan: PatchPlan,
+    pub(crate) first_refusal: Option<PatchRefusal>,
 }
 
-fn check(
+pub(crate) fn check(
     state: &AppState,
     principal: &Principal,
     req: &PatchRequest,
     inputs: &InputsReadback,
     snapshot: Option<&SwitcherSnapshot>,
-    layout: Option<&super::output_routing::LayoutRead>,
+    layouts: &[super::output_routing::LayoutRead],
 ) -> ControlResult<Result<Checked, Response>> {
     let members = match shape(req) {
         Ok(members) => members,
@@ -440,7 +502,8 @@ fn check(
         if let Some(id) = &member.layout {
             // A stored layout (#307): admissible as an M/E source, resolved
             // from the request's one read (closure authorized already).
-            match super::output_routing::resolve_me_layout(state, principal, id, layout)? {
+            let read = layouts.iter().find(|l| l.id == *id);
+            match super::output_routing::resolve_me_layout(state, principal, id, read)? {
                 Ok(body) => bodies.push(body),
                 Err((status, kind, detail)) => return Ok(Err(problem(status, kind, detail))),
             }
@@ -495,24 +558,11 @@ fn check(
     }))
 }
 
-fn validate_count(req: &PatchRequest) -> ControlResult<()> {
+pub(crate) fn validate_count(req: &PatchRequest) -> ControlResult<()> {
     if req.crosspoints.is_empty() || req.crosspoints.len() > MAX_PATCH_MEMBERS {
         return Err(ControlError::Validation(format!(
             "a patch carries 1..={MAX_PATCH_MEMBERS} crosspoints"
         )));
-    }
-    // The request reads ONE stored layout (its closure is authorized from
-    // that read), so every `{layout}` crosspoint must name the same one.
-    let mut layouts = req
-        .crosspoints
-        .iter()
-        .filter_map(|xp| xp.source.get("layout").and_then(Value::as_str));
-    if let Some(first) = layouts.next() {
-        if layouts.any(|other| other != first) {
-            return Err(ControlError::Validation(
-                "one patch request names at most one stored layout".into(),
-            ));
-        }
     }
     Ok(())
 }
@@ -574,15 +624,17 @@ pub(crate) async fn get_patch(
         .into_response())
 }
 
-/// Plan 1..64 mixer crosspoints (path, on-air flag, refusals) or the slots of
-/// one output (§12.4 path P1/P2/P3 and cost); no change.
+/// Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the
+/// slots of one output (§12.4 path P1/P2/P3 and cost), or an atomic set
+/// over many destinations (#308: every member planned, `can_take` only when
+/// all can and the set's new encoders fit the caller's caps); no change.
 #[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/patch/plan", tag = "patch", request_body = PatchRequest,
     responses(
-        (status = 200, body = PatchPlan),
+        (status = 200, description = "The plan: a `PatchPlan`, or for an atomic set of two or more destinations a `SetPlan` that adds `set: {new_encoders, fits}` (#308).", body = PatchPlanResponseDoc),
         (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object + output axis) or a source.", body = crate::problem::Problem),
         (status = 404, description = "Unknown output.", body = crate::problem::Problem),
         (status = 409, description = "`switcher-unavailable` or `routing-unavailable`.", body = crate::problem::Problem),
-        (status = 422, description = "`slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; two outputs, mixer + output, or subtitle crosspoints mixed with video/audio ones: multi-destination sets arrive with patch salvos #308), `unknown-source` (a bus on a mixer input, an unknown source or stored layout; an unknown feed), `layout-not-admissible` (a mixer input's `{layout}`: not on the running canvas, a translucent cell, or a cell binding another layout or a bus — nested layouts and buses are not M/E sources), or not 1..=64 crosspoints, or two different stored layouts in one request. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A plan never registers a mixer input's layout. A subtitle slot (`{\"source\": id}` or `\"none\"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track).", body = crate::problem::Problem),
+        (status = 422, description = "`slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; subtitle crosspoints mixed with video/audio ones or naming two outputs), `unknown-source` (a bus on a mixer input; a mixer input's `{layout}` inside a multi-destination set; an unknown source or stored layout; an unknown feed; more than 4 distinct layouts in one request), `layout-not-admissible` (a mixer input's `{layout}`: not on the running canvas, a translucent cell, or a cell binding another layout or a bus — nested layouts and buses are not M/E sources), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A plan never registers a mixer input's layout. A subtitle slot (`{\"source\": id}` or `\"none\"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track).", body = crate::problem::Problem),
         (status = 503, description = "`engine-busy`: an output slot's `{layout}` could not be read now (every layout-read slot is in use); retry.", body = crate::problem::Problem),
     )))]
 pub(crate) async fn plan_patch(
@@ -590,68 +642,87 @@ pub(crate) async fn plan_patch(
     principal: Principal,
     Json(req): Json<PatchRequest>,
 ) -> ControlResult<Response> {
+    plan_request(&state, &principal, &req).await
+}
+
+/// The whole plan of a patch request (role → count → layout reads →
+/// authorize every member → shape → existence → plan), shared by
+/// `POST /patch/plan` and `POST /salvos/{id}/plan` (#308).
+pub(crate) async fn plan_request(
+    state: &AppState,
+    principal: &Principal,
+    req: &PatchRequest,
+) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
-    validate_count(&req)?;
-    if super::patch_subtitle::has_subtitle(&req) {
+    validate_count(req)?;
+    if super::patch_subtitle::has_subtitle(req) {
         // Both ends of every crosspoint are authorized BEFORE shape and any
         // existence answer (T-A1 ordering); a subtitle request reads no
-        // layout (a `{layout}` source is refused by shape).
-        authorize(&principal, &req, None)?;
-        let patch = match super::patch_subtitle::shape(&req) {
+        // layout (a `{layout}` source is refused by shape) and is never a
+        // set (shape refuses subtitle crosspoints beside others).
+        authorize(principal, req, &[])?;
+        let patch = match super::patch_subtitle::shape(req) {
             Ok(patch) => patch,
             Err(response) => return Ok(*response),
         };
-        return Ok(match super::patch_subtitle::plan(&state, &req, &patch)? {
+        return Ok(match super::patch_subtitle::plan(state, req, &patch)? {
             Ok(plan) => (StatusCode::OK, Json(plan)).into_response(),
             Err(response) => response,
         });
     }
-    let layout = read_patch_layout(&state, &principal, &req).await?;
-    authorize(&principal, &req, layout.as_ref())?;
-    if super::patch_output::has_output(&req) {
-        let patch = match super::patch_output::shape(&req) {
+    let layouts = match read_patch_layouts(state, principal, req).await? {
+        Ok(layouts) => layouts,
+        Err(response) => return Ok(response),
+    };
+    authorize(principal, req, &layouts)?;
+    if super::patch_set::is_set(req) {
+        return super::patch_set::plan_set(state, principal, req, &layouts);
+    }
+    if super::patch_output::has_output(req) {
+        let patch = match super::patch_output::shape(req) {
             Ok(patch) => patch,
             Err(response) => return Ok(*response),
         };
         return Ok(
-            match super::patch_output::plan(&state, &principal, &req, &patch, layout.as_ref())? {
+            match super::patch_output::plan(state, principal, req, &patch, layouts.first())? {
                 Ok(plan) => (StatusCode::OK, Json(plan)).into_response(),
                 Err(response) => response,
             },
         );
     }
-    let (handle, inputs) = match engine_with_inputs(&state) {
+    let (handle, inputs) = match engine_with_inputs(state) {
         Ok(found) => found,
         Err(response) => return Ok(*response),
     };
     let snapshot = handle.snapshot();
     match check(
-        &state,
-        &principal,
-        &req,
+        state,
+        principal,
+        req,
         &inputs,
         snapshot.as_deref(),
-        layout.as_ref(),
+        &layouts,
     )? {
         Ok(checked) => Ok((StatusCode::OK, Json(checked.plan)).into_response()),
         Err(response) => Ok(response),
     }
 }
 
-/// Take 1..64 mixer crosspoints atomically at one engine tick, or one
-/// output's video slot 0 (+ audio slot 0 follow) through the same machinery
-/// as `POST /routing/output/take` (the slot-0 alias; shared idempotency
-/// store and limits; the outcome rides `route.output`).
+/// Take 1..64 mixer crosspoints atomically at one engine tick, one output's
+/// video slot 0 (+ audio slot 0 follow) through the same machinery as
+/// `POST /routing/output/take` (the slot-0 alias; shared idempotency store
+/// and limits; the outcome rides `route.output`), or an atomic set over many
+/// destinations (#308; outcome `patch.take`).
 #[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/patch/take", tag = "patch", request_body = PatchRequest,
     params(("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")),
     responses(
-        (status = 202, body = PatchAccepted),
-        (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source; a replayed key is re-authorized.", body = crate::problem::Problem),
+        (status = 202, description = "Accepted. A set of two or more destinations (#308) settles on `patch.take` (one delivery per destination, scoped by it); mixer inputs alone on `switcher.operation`; one output on `route.output`.", body = PatchAccepted),
+        (status = 403, description = "Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source (a layout: its id and whole source closure) of ANY member; nothing is enqueued and no key is burned; a replayed key is re-authorized.", body = crate::problem::Problem),
         (status = 404, description = "Unknown output.", body = crate::problem::Problem),
-        (status = 409, description = "`conflict` (an output take's Idempotency-Key first used for another output, feed or subtitle slot map; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `layout-changed` (a mixer input's `{layout}` was edited or deleted while this request was in flight; the key is released, retry), `aux-capacity` (no free layout canvas), or no source lease.", body = crate::problem::Problem),
-        (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's or a mixer input's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run`, after an applied one is persisted as the slots' `source` (in swap order). `subtitle:applied` means the route table was swapped. The outcome's `tick` is a completed-tick lower bound observed before the swap: the subtitle sampler had completed that tick (`0`: possibly none yet) before the swap; it is not a landing tick. A sample already in flight finishes on the old table; the first table read that starts after the swap sees the new route, unless a later take supersedes it first (then this one is never sampled) or the run ends first.", body = crate::problem::Problem),
-        (status = 429, description = "Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After.", body = crate::problem::Problem),
-        (status = 503, description = "`engine-busy` (the key and leases are released; a subtitle take between engine runs or after the run ended, or while the bounded subtitle persistence queue is full: nothing changed, the key freed and the rate slot refunded; or a `{layout}` could not be read now: every layout-read slot is in use; or the output clock did not adopt a newly registered mixer-input layout within 1 s) or `idempotency-capacity`.", body = crate::problem::Problem),
+        (status = 409, description = "`conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions; also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `layout-changed` (a mixer input's `{layout}` was edited or deleted while this request was in flight; the key is released, retry), `aux-capacity` (no free layout canvas), or no source lease.", body = crate::problem::Problem),
+        (status = 422, description = "`slot-medium-mismatch`, `unknown-slot`, `unknown-source` (also: a mixer input's `{layout}` inside a multi-destination set), `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's or a mixer input's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run` (see the subtitle design note).", body = crate::problem::Problem),
+        (status = 429, description = "Over 2 takes/s per destination or 10/s per principal (one request = one take, whatever its crosspoint count; a set counts once per destination); see Retry-After.", body = crate::problem::Problem),
+        (status = 503, description = "`engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use; or the output clock did not adopt a newly registered mixer-input layout within 1 s) or `idempotency-capacity` (also: 256 sets already await their outcome).", body = crate::problem::Problem),
     )))]
 #[allow(clippy::too_many_lines)]
 // reason: one linear admission sequence whose order (authz → shape → existence
@@ -666,7 +737,7 @@ pub(crate) async fn take_patch(
     validate_count(&req)?;
     if super::patch_subtitle::has_subtitle(&req) {
         // As the plan: authorize every end first (a replay re-authorizes).
-        authorize(&principal, &req, None)?;
+        authorize(&principal, &req, &[])?;
         let patch = match super::patch_subtitle::shape(&req) {
             Ok(patch) => patch,
             Err(response) => return Ok(*response),
@@ -678,15 +749,27 @@ pub(crate) async fn take_patch(
             },
         );
     }
-    let layout = read_patch_layout(&state, &principal, &req).await?;
-    authorize(&principal, &req, layout.as_ref())?;
+    let layouts = match read_patch_layouts(&state, &principal, &req).await? {
+        Ok(layouts) => layouts,
+        Err(response) => return Ok(response),
+    };
+    authorize(&principal, &req, &layouts)?;
+    if super::patch_set::is_set(&req) {
+        let key = super::patch_set::set_key(&idem, "patch-set")?;
+        return Ok(
+            match super::patch_set::take_set(&state, &principal, &key, &req, &layouts)? {
+                Ok(op) => accepted(op),
+                Err(response) => response,
+            },
+        );
+    }
     if super::patch_output::has_output(&req) {
         let patch = match super::patch_output::shape(&req) {
             Ok(patch) => patch,
             Err(response) => return Ok(*response),
         };
         return Ok(
-            match super::patch_output::take(&state, &principal, &idem, &patch, layout.as_ref())? {
+            match super::patch_output::take(&state, &principal, &idem, &patch, layouts.first())? {
                 Ok(op) => accepted(op),
                 Err(response) => response,
             },
@@ -703,7 +786,7 @@ pub(crate) async fn take_patch(
         &req,
         &inputs,
         snapshot.as_deref(),
-        layout.as_ref(),
+        &layouts,
     )? {
         Ok(checked) => checked,
         Err(response) => return Ok(response),
@@ -772,43 +855,17 @@ pub(crate) async fn take_patch(
             return Err(ControlError::EngineBusy);
         }
     }
-    // On-demand leases for a newly patched source landing on PGM or PVW, so
-    // an on-demand source starts before the engine needs its fresh frame.
-    let program_input = snapshot.as_ref().and_then(|s| s.program_input);
-    let preview_input = snapshot.as_ref().and_then(|s| s.preview_input);
-    let lease_for = |bus: Option<u16>, label: &str| {
-        // A layout member takes no source lease: the registry holds leases
-        // on every source it binds.
-        let member = checked
-            .members
-            .iter()
-            .find(|m| Some(m.input) == bus && m.source.is_some() && m.layout.is_none())?;
-        let source = member.source.clone()?;
-        Some((source, label.to_owned()))
-    };
-    let wanted = [
-        lease_for(program_input, "switcher:me1:pgm:patch"),
-        lease_for(preview_input, "switcher:me1:pvw:patch"),
-    ];
-    let mut leases = [None, None];
-    if let Some(demand) = state.source_demand.as_ref() {
-        for (slot, want) in leases.iter_mut().zip(&wanted) {
-            if let Some((source, label)) = want {
-                let Some(lease) = demand.switcher_preview_lease(source, label) else {
-                    state.idempotency.release(Some(key), &op);
-                    return Ok(problem(
-                        409,
-                        "capacity",
-                        "source lease unavailable (unknown source or lease limit)",
-                    ));
-                };
-                *slot = Some((
-                    source.clone(),
-                    crate::source_demand::SwitcherPreviewLease::new(lease),
-                ));
-            }
+    let leases = match mixer_leases(
+        state.source_demand.as_ref(),
+        &checked.members,
+        snapshot.as_deref(),
+    ) {
+        Ok(leases) => leases,
+        Err(response) => {
+            state.idempotency.release(Some(key), &op);
+            return Ok(*response);
         }
-    }
+    };
     let command = SwitcherCommand {
         operation_id: op.to_string(),
         scene_version,
@@ -825,18 +882,86 @@ pub(crate) async fn take_patch(
             ..SelectionGuard::default()
         }),
     };
+    let admitted = admit_with_leases(&state, handle, &op.to_string(), leases, command);
+    if !admitted {
+        state.idempotency.release(Some(key), &op);
+        return Err(ControlError::EngineBusy);
+    }
+    Ok(accepted(op.to_string()))
+}
+
+/// The on-demand source leases of a mixer patch whose newly patched source
+/// lands on PGM or PVW, so an on-demand source starts before the engine
+/// needs its fresh frame. `Err` is the typed 409 (no lease).
+pub(crate) type MixerLeases = [Option<(String, crate::source_demand::SwitcherPreviewLease)>; 2];
+
+/// Acquire [`MixerLeases`] for `members` against the live PGM/PVW inputs.
+///
+/// # Errors
+/// The 409 `capacity` response when a lease is unavailable (the leases
+/// already taken are dropped, which releases them).
+pub(crate) fn mixer_leases(
+    demand: Option<&crate::source_demand::SharedSourceDemand>,
+    members: &[Member],
+    snapshot: Option<&SwitcherSnapshot>,
+) -> Result<MixerLeases, Box<Response>> {
+    let program_input = snapshot.and_then(|s| s.program_input);
+    let preview_input = snapshot.and_then(|s| s.preview_input);
+    let lease_for = |bus: Option<u16>, label: &str| {
+        // A layout member takes no source lease: the registry holds leases
+        // on every source it binds (#307).
+        let member = members
+            .iter()
+            .find(|m| Some(m.input) == bus && m.source.is_some() && m.layout.is_none())?;
+        let source = member.source.clone()?;
+        Some((source, label.to_owned()))
+    };
+    let wanted = [
+        lease_for(program_input, "switcher:me1:pgm:patch"),
+        lease_for(preview_input, "switcher:me1:pvw:patch"),
+    ];
+    let mut leases = [None, None];
+    if let Some(demand) = demand {
+        for (slot, want) in leases.iter_mut().zip(&wanted) {
+            if let Some((source, label)) = want {
+                let Some(lease) = demand.switcher_preview_lease(source, label) else {
+                    return Err(Box::new(problem(
+                        409,
+                        "capacity",
+                        "source lease unavailable (unknown source or lease limit)",
+                    )));
+                };
+                *slot = Some((
+                    source.clone(),
+                    crate::source_demand::SwitcherPreviewLease::new(lease),
+                ));
+            }
+        }
+    }
+    Ok(leases)
+}
+
+/// Enqueue `command` on the switcher with its [`MixerLeases`]: the first
+/// lease owns the enqueue (reserve-then-send under the owner's lock); a
+/// dropped lease value is released at once (refusal path). `false` when the
+/// bounded mailbox refused it.
+pub(crate) fn admit_with_leases(
+    state: &AppState,
+    handle: &SwitcherControl,
+    op: &str,
+    leases: MixerLeases,
+    command: SwitcherCommand,
+) -> bool {
     let [program_lease, preview_lease] = leases;
     let owner = &state.switcher_preview_lease;
     let enqueue = || {
         handle.try_send(command).map_err(|_| ())?;
         Ok(handle.composed_count())
     };
-    // The first lease owns the enqueue (reserve-then-send under the owner's
-    // lock); a dropped lease value is released at once (refusal path).
-    let admitted = match (program_lease, preview_lease) {
+    match (program_lease, preview_lease) {
         (Some((target, lease)), preview) => {
             let sent = owner
-                .admit_program(op.to_string(), target, lease, handle, enqueue)
+                .admit_program(op.to_owned(), target, lease, handle, enqueue)
                 .is_ok();
             if sent {
                 if let Some((target, lease)) = preview {
@@ -849,15 +974,10 @@ pub(crate) async fn take_patch(
             sent
         }
         (None, Some((target, lease))) => owner
-            .admit(op.to_string(), target, lease, handle, enqueue)
+            .admit(op.to_owned(), target, lease, handle, enqueue)
             .is_ok(),
         (None, None) => enqueue().is_ok(),
-    };
-    if !admitted {
-        state.idempotency.release(Some(key), &op);
-        return Err(ControlError::EngineBusy);
     }
-    Ok(accepted(op.to_string()))
 }
 
 /// The patch routes, merged into the API router.
@@ -869,12 +989,13 @@ pub(crate) fn router() -> axum::Router<AppState> {
         .route("/patch/take", post(take_patch))
 }
 
-fn accepted(operation_id: String) -> Response {
+pub(crate) fn accepted(operation_id: String) -> Response {
     (
         StatusCode::ACCEPTED,
         Json(PatchAccepted {
             operation_id,
             status: "accepted",
+            recall_operation_id: None,
         }),
     )
         .into_response()
