@@ -213,7 +213,7 @@ fn shape(kind: &str, fields: &KeyerFields, other_refs: bool) -> Result<String, B
         return Err(Box::new(typed(
             422,
             "validation",
-            "keyer verbs take no source, input, layout, output or duration besides their own fields",
+            "keyer verbs take no source, input, layout, output, transition or duration besides their own fields",
         )));
     }
     for source in fields.sources() {
@@ -965,8 +965,14 @@ pub fn plan(
     })
 }
 
+/// A keyer verb carries none of the background verbs' fields; a
+/// `transition` belongs to `set_transition` only (ADR-0112 §4).
 fn other_refs(req: &super::switcher::SwitcherRequest) -> bool {
-    req.source.is_some() || req.input.is_some() || req.layout.is_some() || req.output.is_some()
+    req.source.is_some()
+        || req.input.is_some()
+        || req.layout.is_some()
+        || req.output.is_some()
+        || req.transition.is_some()
 }
 
 /// A pending `keyer_set`: the leases it took (make-before-break) and the
@@ -1389,6 +1395,7 @@ mod tests {
             inputs_version: 0,
             in_flight: false,
             completion_count: 0,
+            transition: multiview_core::switcher::TransitionDescriptor::Cut,
             keyers: [None; MAX_DSK],
             tally: KeyerTally {
                 program: TallySet::from_roles([

@@ -778,6 +778,23 @@ async fn in_n_is_refused_with_422_for_fill_and_key() {
     }
 }
 
+/// The merge with the transition API (#429): `transition` belongs to
+/// `set_transition` only, so a keyer verb carrying one is a 422 on both the
+/// plan and the command, and nothing is enqueued.
+#[tokio::test]
+async fn a_keyer_verb_carrying_a_transition_is_refused_with_422() {
+    let (_dir, path) = temp_boot(DOC);
+    let rig = rig(&path);
+    let verb = body(
+        "keyer_cut",
+        json!({"keyer":"dsk1","on":true,"transition":{"kind":"cut"}}),
+    );
+    let (status, _) = kind_of(command(&rig, ADMIN, "kt", &verb).await).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = kind_of(plan(&rig, ADMIN, &verb).await).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 #[tokio::test]
 async fn capacity_refusal_is_generic_for_scoped_callers_and_releases_everything() {
     let (_dir, path) = temp_boot(DOC);
