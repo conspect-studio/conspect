@@ -685,10 +685,18 @@ where
     };
     #[cfg(not(unix))]
     let reconciler: Option<AbortTask> = configured_cloudflare()?.map(|never| match never {});
+    // Scheduled `[[media_fill]]` refresh (issue #472): a management-plane task
+    // over the same capture/load providers the HTTP routes use. It never runs
+    // on, or is awaited by, the engine; its guard lives with the server.
+    let fill_refresh = AbortTask(multiview_control::fill_refresh::spawn_for_state(
+        &state,
+        &config.media_fills,
+    ));
     // Keep the abort guard inside the server's shutdown future. It also runs if
     // the server future is dropped, so no management task survives the server.
     let shutdown = async move {
         let _reconciler = reconciler;
+        let _fill_refresh = fill_refresh;
         #[cfg(feature = "moq-output")]
         let outgoing = outgoing;
         shutdown.await;

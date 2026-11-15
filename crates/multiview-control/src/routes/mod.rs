@@ -34,6 +34,7 @@ pub mod cloudflare;
 pub mod config;
 pub mod devices;
 pub mod discovery;
+pub(crate) mod fill_refresh;
 pub mod graphics;
 pub mod health;
 pub mod inputs;
@@ -1554,6 +1555,13 @@ pub fn api_router() -> Router<AppState> {
         .route(
             "/media/captures/{id}/cancel",
             post(web_capture::cancel),
+        )
+        .route("/media/fills/refresh", get(fill_refresh::list))
+        .route(
+            "/media/fills/{id}/refresh",
+            get(fill_refresh::get)
+                .put(fill_refresh::put)
+                .delete(fill_refresh::delete),
         )
         .route("/media/players", get(media_players::list_players))
         .route("/media/players/{id}", get(media_players::get_player))
