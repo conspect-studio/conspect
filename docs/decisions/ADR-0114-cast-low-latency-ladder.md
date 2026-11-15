@@ -44,16 +44,17 @@ Each fact below carries one of these labels.
    [another](https://github.com/jaupi-enrico/cast-receiver)); a user-agent list shows Chrome 92 with `CrKey/1.56`
    on a smart speaker ([user-agents.net](https://user-agents.net/devices/tvs/chromecast)). Both are below 94.
    Google publishes no version table. Unverified for every device this product will meet: the receiver's Chrome
-   version, and whether WebTransport, WebCodecs and `RTCPeerConnection` work there. The engine has no record of
-   the operator's Chromecast user agent that the author could find (Measured: no `CrKey` line in the engine
-   journal on mda001 since 13 Nov; nginx is no longer installed there). Slice 1 records it.
+   version, and whether WebTransport, WebCodecs and `RTCPeerConnection` work there. The author found no record of
+   the operator's Chromecast user agent: the engine keeps the last fetcher's user agent per stream in memory
+   only (Read: `CastFetches`, `cast_streams/mod.rs:113-126`), and a search of the engine journal on mda001 for
+   `CrKey` since 13 Nov found nothing, which shows only that it is not logged. Slice 1 records it.
 3. **One video decoder.** A Chromecast decodes one stream at a time (ADR-0111 decision 8 in lane cast2). Two
    transports cannot play side by side during a switch.
 4. **The shared encode already suits low latency in structure.** Read: every encoder opens with B-frames off
    (`crates/multiview-ffmpeg/src/encode.rs:149`), the Program GOP is one second
    (`crates/multiview-cli/src/pipeline.rs:3413`), audio is AAC-LC 48 kHz stereo (`pipeline.rs:4558`).
    Unverified: the encoder's own delay. `program_h264_options` sets only the profile
-   (`crates/multiview-ffmpeg/src/encode_options.rs:222-234`); it does not ask for a zero-delay mode. Slice 1
+   (`crates/multiview-ffmpeg/src/encode_options.rs:232-243`); it does not ask for a zero-delay mode. Slice 1
    measures tick-to-packet delay, which bounds every rung.
 
 ## Decision
@@ -336,9 +337,11 @@ Decisions:
    listener must not rest on that doubt, so the engine checks the loaded version and reports
    `cast-srt-libsrt-too-old` instead of listening. The same doubt applies to the listener already on UDP 9000;
    that is outside this ADR and is reported to the lead.
-5. **Latency setting.** 250 ms receive latency on both ends at first. libsrt's guidance is a multiple of the
-   round-trip time; 250 ms covers a 60 ms round trip four times. The app reports the measured round trip; slice
-   7 sets the final value from device data.
+5. **Latency setting.** 250 ms receive latency on both ends at first. Cited: "The recommended value of
+   TsbpdDelay is 3-4 times RTT", minimum 120 ms
+   ([draft-sharabayko-srt-01](https://www.ietf.org/archive/id/draft-sharabayko-srt-01.txt), section 4.5.1). 250 ms
+   covers a 60 ms round trip four times. The app reports the measured round trip; slice 7 sets the final value
+   from device data.
 6. **SRT is off until configured.** `[cast.srt] enabled = false` by default: an install whose firewall does not
    forward the port would make every Android TV cast pay a failed attempt. The engine cannot test its own
    public reachability, so it shows, per cast output, how many SRT attempts failed at connect in the last hour.
@@ -351,8 +354,8 @@ Decisions:
    | UDP, and only real TLS passes on 443 (inspecting proxy) | ICE-TCP fails | HLS. TURN over TLS is ADR-0107 slice 8, not built |
 
    HLS needs only HTTPS on TCP 443, which the cast needs anyway to load the receiver and the token.
-8. **Flood floor for the SRT port.** libsrt answers the first handshake packet with a cookie and keeps no state
-   until the caller returns it. The runbook adds a per-source nftables limit for the port, as the UDP 443 floor
+8. **Flood floor for the SRT port.** The first handshake step only sets a cookie, "so that it doesn't allocate
+   resources" on the listener (Cited: the same draft, section 4.3.1.1). The runbook adds a per-source nftables limit for the port, as the UDP 443 floor
    does. The listen callback does a bounded table lookup and nothing else.
 
 ### 5. Security
@@ -564,7 +567,7 @@ Order matters: the first three slices decide whether the later ones are built as
 
 | # | Pull request | Class | Depends on | What it proves |
 | --- | --- | --- | --- | --- |
-| 0 | This ADR, the index line, the cast runbook's pointer | R0 | none | The design is reviewed before code |
+| 0 | This ADR and its line in the index. The cast runbook is not touched: it describes what runs, and nothing here runs yet | R0 | none | The design is reviewed before code |
 | 1 | **Latency slate and evidence.** A test source that draws the engine clock (ms) and the tick; the reference clock page; tick-to-packet delay of the shared encoder as a metric; the receiver's HLS reports gain tick-to-present | R2 | PR 466 merged | The baseline: glass-to-glass and tick-to-present for today's HLS on the operator's Chromecast, and the encoder delay that bounds every rung. Records the device's user agent |
 | 2 | **Ladder endpoint and one authorization.** `POST /cast/<token>/ladder` with the probe stored and shown; the shared token check; attachment fences set on revoke, expiry and feed change; liveness by report; `[cast] ladder`. The answer offers `hls` only. `receiver.js` sends the probe and still plays HLS | R3 | 1 | One token governs every transport: the PR 409 abuse tests pass against a fake push attachment, including a forced engine fallback (zero packets of a feed the owner may not read). From the first device cast: the real capability table of that device |
 | 3 | **CAF spike, in the harness, no product code path.** A `<video>` element fed from outside CAF's player; LOAD interceptor returning `null`; `setMediaElement`, `setMediaInformation`, `broadcastStatus` | R1 (tools only) | 2 | Whether a Web Receiver can show a picture CAF did not load and still give senders a correct media session. Checks the page policy against a cross-origin WebTransport session. A fail ends slices 4 and 5 |
@@ -608,4 +611,71 @@ captain as one list; none blocks slices 0 to 5 from merging.
 | 9 | Google Play listing and publishing the Cast application, if casting to unregistered Android TV devices is wanted | general availability of the SRT rung | after slice 7 |
 | 10 | Licence notices for the app (libsrt MPL-2.0 source offer, Apache-2.0 notices): legal text is not written as engineering work | distributing the APK beyond test devices | before step 9 |
 
-<!-- NEXT -->
+## Rationale
+
+- **Why a ladder decided by the receiver's report, not by the sender.** The sender cannot see what the device's
+  browser supports or what its network passes. The receiver can test both. Keeping the LOAD unchanged also
+  keeps every existing sender, including the engine-side one, working without a release in step.
+- **Why SRT only in a native app.** It is the only place a UDP socket exists. It also has the best decoder
+  path: `MediaCodec` to a video surface, with no browser between the stream and the screen.
+- **Why MoQ before WebRTC in the Web Receiver.** Same picture bytes as every other output, AAC kept, every
+  audio track kept, no per-viewer encoder state, and the product already runs it for the desk. WebRTC brings an
+  Opus encode and per-peer ICE state; its strength is reach (TCP 443), which is why it sits below.
+- **Why HLS stays the floor and stays untouched.** It is the only rung proven on a real device (14 Nov 2026).
+  Every other rung may be absent on a given device or network, and the cast must still play.
+- **Why no automatic step up.** With one decoder a step up is a visible glitch on a picture that was playing.
+  A step down fixes something the viewer already sees as broken; a step up does not.
+- **Why one port and derived SRT credentials.** One firewall rule covers any number of casts, and nothing
+  secret is added to the LOAD, to argv, or to storage: the token already in the URL is the only secret.
+
+## Alternatives considered
+
+| Alternative | Rejected because |
+| --- | --- |
+| LL-HLS parts on the existing stream | ADR-0111 found the Cast receiver runs Shaka with low-latency mode off. Even working, it lands at 2 to 5 s (Reported), above every target here |
+| WebRTC first in the Web Receiver, no MoQ | Adds an Opus encode for every cast and drops multi-track audio, where MoQ carries the shared encode unchanged. Kept as the second rung |
+| MoQ over WebSocket when WebTransport is absent | TCP head-of-line blocking; the MoQ design note already excludes that fallback for the desk; it would be a third web transport to test on devices |
+| MoQ, WebRTC and SRT players all in the Android TV app | Three media stacks in one app. The launch checker reaches the Web Receiver's rungs for free |
+| A new Cast application id for the low-latency receiver | The brief fixes `8E05190C`; Cast Connect is designed for one id with two receivers |
+| The sender picks the rung and sends it in `customData` | The sender does not know the device's capabilities; the engine-side sender and Google Home would need the same logic |
+| A second, zero-delay encode for cast | An encoder session per cast output. Decided only by data: if slice 1 shows the shared encoder's delay is a large part of the budget, a tuned encode becomes its own decision |
+| A per-stream SRT passphrase sent in the LOAD or the ladder answer | A second secret in transit and in device logs. Derivation needs none |
+| One SRT port per cast stream | A firewall rule per stream; the listen callback gives per-stream keys on one port |
+| Canvas rendering for MoQ on the device (the desk player as it is) | The receiver page is a 720p graphics plane on a Chromecast; see decision 3 |
+
+## Consequences
+
+- **Invariants #1 and #10.** Stated in decision 6. Slices 2, 4, 5 and 6 are R3, each with a design note and
+  chaos tests.
+- **Invariant #7.** No video encoder is added. One Opus encoder per cast output exists while it has WebRTC
+  viewers.
+- **New surface.** Three token routes (`ladder`, `whep` POST and DELETE), one UDP listener (off by default),
+  two receiver script files, one Android app, one CI job with the Android toolchain. No Android toolchain
+  exists in the build environment today (Measured: no `java`, `gradle` or Android SDK on the build host).
+- **Default build.** Unchanged: `cargo check --workspace` gains no native dependency. The SRT rung needs the
+  existing opt-in `srt-libsrt` feature and libsrt 1.5.7 or later on the host.
+- **Operations.** mda001 needs libsrt 1.5.7 before the SRT rung can be enabled there (Debian trixie ships
+  1.5.4; 1.5.7 is in forky and sid, Read: Debian's security tracker for `srt`). That is a deploy step for the
+  lead. Receiver changes still ship twice, engine copy and hosted copy.
+- **What a viewer sees when things go wrong.** A slower start by at most the sum of the deadlines of the rungs
+  that failed, once per 15 minutes; then a picture. Never a blank screen that HLS would have filled.
+- **Honest limit.** Until slice 7, every latency figure in this document is a target. If the measured ladder
+  shows no rung under 2 s on class A devices, the result for those devices is "HLS, 6 to 10 s", and this ADR
+  will say so.
+
+## Open questions, and the slice that closes each
+
+| Question | Closed by |
+| --- | --- |
+| Chrome version, `WebTransport`, WebCodecs, `RTCPeerConnection` and MSE support on the operator's Chromecast and on a Google TV device's Web Receiver | slice 2 (probe stored on the first cast) |
+| Delay of the shared encoder from tick to packet | slice 1 |
+| Whether CAF gives senders a correct media session for a picture it did not load | slice 3 |
+| Whether the receiver page's policy admits a cross-origin WebTransport session | slice 3 |
+| Whether a `cast` output is admitted to the effective-output registry and has the no-reorder proof | slice 2 |
+| How the dispatcher labels windows with their picture bus (the data-path fallback check) | slice 2 design note |
+| What the Cast platform does when `androidReceiverCompatible` is set and the app is not installed | slice 6, first device step |
+| Whether `supportedAppTypes` in the engine-side LAUNCH selects the Android TV app | slice 6 device test |
+| Whether UDP 443 and UDP 9010 pass from the network the Cast devices are on | slices 4 and 6 device tests |
+| Whether Debian's libsrt 1.5.4-1+deb13u1 is affected by GHSA-m96h-3rc9-xx6h (concerns the existing listener on UDP 9000) | reported to the lead; outside this ADR |
+| Minimum Android API of Media3 and the Cast TV library | slice 6 |
+
