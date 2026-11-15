@@ -208,6 +208,135 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
      lasts exactly `mix_rate` ticks of samples and completes on the swap
      boundary. MIX/DIP/WIPE keep `duration - elapsed`.
 
+### 5. Stinger media — PR B: alpha decode (#391 subset)
+
+A media player whose asset has an alpha channel publishes NV12 plus a
+straight, full-resolution R8 alpha plane on every frame (ADR-0058 NV12+A).
+This is a general media-player output, not stinger-private: the plane is
+the existing `Nv12Image::alpha_plane` in `multiview-compositor`, so the
+stinger (PR A) and keyers K6 (ADR-0113 `fill_alpha`) consume the same
+tile. No switcher or drive code changes.
+
+- **Shared types.** The pure "where is the alpha sample" description and
+  the copy/rescale routine live in `multiview-core::alpha`
+  (`AlphaLayout`, `AlphaDepth`, `extract_alpha`; no libav, unit-tested in
+  the default build). `multiview-ffmpeg::alpha` maps libav pixel formats
+  to a layout (`alpha_layout`) and `DecodedVideoFrame::alpha` carries the
+  decoder's own pre-NV12 frame (a moved `AVFrame` reference, not a copy)
+  when the format has alpha, `None` otherwise.
+- **Formats.** Planar `yuva420p/422p/444p` at 8/9/10/12/16 bits (ProRes
+  4444 decodes to `yuva444p10le`/`yuva444p12le`, `libvpx-vp9` to
+  `yuva420p`), `gbrap*`, packed `argb/rgba/abgr/bgra` (`qtrle` is `argb`,
+  PNG `rgba`, TGA `bgra`), `rgba64/bgra64` (16-bit PNG) and `ya8/ya16`.
+  Deeper samples round to nearest 8-bit (`(v*255 + max/2)/max`). VP9 with
+  alpha (WebM `alpha_mode=1`) opens the BSD-licensed `libvpx-vp9` decoder
+  for player sources only, because libav's native `vp9` drops the alpha
+  side stream; if it is not linked or fails to open the asset plays opaque
+  with a warning. Not covered: paletted `pal8` (PNG/GIF palette alpha),
+  HEVC alpha (libav decodes it opaque; ADR-0058 §3 rejects it at import),
+  and alpha in non-player sources (ADR-0058 §5: NDI and ordinary video
+  stay opaque).
+- **Colour.** Unchanged: the NV12 conversion is the same libswscale
+  same-size conversion followed by the same `TileScaler`, so matrix, range
+  and order are exactly today's. Alpha is coverage, so it is never
+  range-mapped or linearized; the compositor premultiplies once in linear
+  light (ADR-0058 §2). Every supported decoder emits straight alpha and
+  none marks premultiplied output, so nothing is un-premultiplied; a
+  premultiplied-authored asset must be normalized at import (ADR-0057).
+- **Scale.** Alpha uses the luma's scaler geometry: decoded size to tile
+  size with the same Lanczos + accurate-rounding filter, `GRAY8` to `GRAY8`
+  (no colour step). Same-size frames copy straight into the pooled plane.
+- **Memory.** One pooled plane per frame from the bounded
+  `AlphaPlanePool` (`attach_with` writes it in place); the decoded-size and
+  tile-size scratch frames and the alpha scaler are reused across frames
+  (`Scaler::run_into`) and rebuilt only on a geometry change, so the steady
+  state does not grow the heap. Opaque assets build none of it. Returning
+  a plane never waits: the frame's `Drop` (possibly on the output clock
+  thread) only `try_lock`s the pool and frees the plane on contention, and
+  `attach_with` holds the lock only to take the spare, never across the
+  copy/scale/extract (invariants #1/#10). The same rule now covers the CPU
+  compositor's output-plane scratch pool (`PlaneReturn`/`ScratchPool`, a
+  pre-existing blocking path fixed in this PR): a canvas's `Drop` only
+  `try_lock`s the Y/UV spare caches and frees a plane on contention, and the
+  clock's lease only `try_lock`s and allocates a fresh plane on contention
+  (both counted; the caches never grow past their cap), so no frame holder
+  can stall the output clock.
+- **FFI safety.** Every `ScratchFrame` has all its owned buffer bytes (rows,
+  row padding, tail) initialised once at allocation, since
+  `av_frame_get_buffer` storage is not zeroed (review PB-12); plain
+  `alloc_video` frames (e.g. `Scaler::run`'s per-frame output) are not
+  filled, because this crate never reads them in Rust (review PB-16). `plane_rows` never yields
+  more than a row's active bytes (`av_image_get_linesize`), so a decoder
+  frame's unwritten stride padding is never a Rust slice (review PB-13). Scratch frames are `multiview_ffmpeg::frame::ScratchFrame`s,
+  which only the checked `alloc_video` (null `AVFrame`, dimension cap, CPU
+  format, `av_frame_get_buffer` result) creates — never the unchecked
+  `Video::new`/`Video::empty`. `Scaler::run_into` reuses only a
+  `ScratchFrame` (its frame is never exposed mutably, so its geometry cannot
+  be raised over a small allocation) and re-validates every destination
+  plane against the frame's own buffers, and that the buffers are writable,
+  before libswscale or the identity copy writes. Both `Scaler::run` and
+  `run_into` validate every source plane the same way before libswscale
+  or `av_frame_copy` (both identity paths) reads it (`frame::check_source`:
+  row bytes from the format and width, subsampled plane height, signed
+  linesize, every row inside one of the frame's own refcounted buffers; a
+  frame without such buffers is an error), so a source whose geometry was
+  raised over a small allocation is an error, not an out-of-bounds read.
+  Before `sws_scale` (not the identity copies, which read only active
+  bytes) both sides must also have the 16 bytes `libavutil/frame.h` says
+  libswscale may read beyond a plane, after the plane's highest active
+  byte (the last row, or row 0 of a bottom-up plane) in the same owning
+  buffer (`frame::check_swscale_source`/`check_swscale_destination`;
+  checked even for `alloc_video` outputs, not assumed), so an exact-size
+  allocation whose padding became active rows is an error. The buffer scan
+  walks `buf[]`/`extended_buf` in place, allocation-free.
+  No public path builds a Rust slice over a caller-supplied `Video`, whose
+  geometry the safe `Video::set_width`/`set_height`/`set_format` could widen
+  over unwritten padding inside its allocation (review PB-14), nor over a
+  libav copy of one (review PB-15): `Scaler::run_into` takes its *source*
+  as a `ScratchFrame` too, so a `ScratchFrame`'s bytes come only from the
+  zero fill, checked `plane_mut` writes and `run_into` from another
+  `ScratchFrame` (its documented provenance invariant); `Scaler::run`
+  still takes any `&Video` but returns a plain `Video`, which no safe API
+  turns into a `ScratchFrame` or `AlphaSource`; `plane_rows` is
+  crate-private and only sees frames with trusted metadata, and
+  `alpha::AlphaSource` has private fields — it is built only by the decoder
+  in this crate (its untouched output frame) or from a `ScratchFrame`
+  (`AlphaSource::from_checked`), and hands out only `&Video`.
+  Decoded alpha is read through `frame::plane_rows`, which validates the plane,
+  its signed linesize, its subsampled height and that every row lies in
+  one of the frame's own buffers before yielding single-row slices, so a
+  bottom-up (negative linesize) frame copies in display order instead of
+  forming an out-of-bounds slice.
+- **Tests.** Pure: `multiview-core` `alpha::tests` (odd sizes, padded
+  strides, 10/16-bit rescale, packed channels, bad input as errors).
+  Compositor: `tests/nv12_alpha.rs` pool reuse with no growth, and
+  `pipeline::alpha_pool_tests` (dropping an alpha frame while another thread
+  holds the pool lock completes and frees the plane), and
+  `pipeline::plane_return_tests` (a canvas drop and a plane lease each
+  complete while another thread holds the Y or UV cache lock). FFI:
+  `multiview-ffmpeg` `frame::tests`, `alpha::tests` (negative linesize,
+  mismatched layout), `scale::run_into_tests` (an undersized or shared
+  destination is an error, an undersized or unbuffered source is an error
+  in the conversion and identity paths of `run`, a source or destination
+  without the 16-byte swscale padding — exact-end or 15-byte tail,
+  top-down or bottom-up — is refused before `sws_scale` while a padded or
+  normally allocated one converts, a bottom-up source still converts, a
+  null frame allocation never becomes a `ScratchFrame`, a widened decoder
+  frame through `run` stays a plain `Video`), `compile_fail` doctests on
+  `Scaler::run_into` / `Scaler::run` (a `Video` source, undersized,
+  unbuffered or widened, does not compile in `run_into`; `run`'s output
+  cannot become an `AlphaSource` or `ScratchFrame`) and
+  `tests/scale_resample.rs` (`ScratchFrame`-sourced `run_into` reuse,
+  bottom-up identity copy). Player path
+  (ffmpeg): `pipeline::media_alpha::tests` (yuva → NV12+A, rgba/argb/bgra
+  → NV12+A, odd-size scaling, steady-state reuse, an unallocatable scratch
+  frame as an error, the no-alpha-decoder warning) and
+  `pipeline::media_alpha::player_tests`, which encode tiny qtrle, ProRes
+  4444, PNG-in-MOV and VP9-alpha clips with the `ffmpeg` CLI at test time
+  (printing `SKIP` when an encoder is missing), play them through the real
+  player executor and check the alpha at band centres, plus an opaque
+  MPEG-2 asset that publishes no alpha plane.
+
 ## Invariants
 
 - **#1:** a DIP or a bordered WIPE adds at most one tile to a dissolve's

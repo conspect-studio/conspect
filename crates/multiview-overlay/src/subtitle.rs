@@ -64,11 +64,42 @@ pub enum SubtitleFormat {
 ///
 /// Parse one with [`CueTrack::parse_srt`] / [`CueTrack::parse_vtt`]; query the
 /// cue visible at a given media time with [`CueTrack::active_cue`]. Cues are
-/// sorted by start time so the lookup is a simple scan (cue counts are small).
+/// sorted by start time, and an **active-cue index** is built once at parse
+/// (or deserialize) time, so a lookup is a binary search — O(log n) whatever
+/// the track size, at early timestamps and in gaps alike (issue #430: the
+/// renderer queries it every output tick).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RawCueTrack", into = "RawCueTrack")]
 pub struct CueTrack {
     format: SubtitleFormat,
     cues: Vec<Cue>,
+    /// The active-cue answer as a step function of media time: `(t, cue)`
+    /// means "from `t` (inclusive) until the next entry, `cue` (an index into
+    /// `cues`) is active, or none". Sorted by `t`, at most `2 * cues.len()`
+    /// entries, derived from `cues` only.
+    index: Vec<(i64, Option<usize>)>,
+}
+
+/// The serialized shape of a [`CueTrack`] (the index is rebuilt on load).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawCueTrack {
+    format: SubtitleFormat,
+    cues: Vec<Cue>,
+}
+
+impl From<RawCueTrack> for CueTrack {
+    fn from(raw: RawCueTrack) -> Self {
+        Self::from_cues(raw.format, raw.cues)
+    }
+}
+
+impl From<CueTrack> for RawCueTrack {
+    fn from(track: CueTrack) -> Self {
+        Self {
+            format: track.format,
+            cues: track.cues,
+        }
+    }
 }
 
 impl CueTrack {
@@ -122,7 +153,37 @@ impl CueTrack {
     /// start wins, matching the conventional "newest caption on top" behaviour.
     #[must_use]
     pub fn active_cue(&self, now: MediaTime) -> Option<&Cue> {
-        self.cues.iter().rev().find(|cue| cue.is_active_at(now))
+        self.active_cue_index(now)
+            .and_then(|index| self.cues.get(index))
+    }
+
+    /// The index (into [`CueTrack::cues`]) of the cue [`CueTrack::active_cue`]
+    /// returns: a stable identity for "the same cue" across lookups.
+    #[must_use]
+    pub fn active_cue_index(&self, now: MediaTime) -> Option<usize> {
+        self.active_cue_index_probed(now).0
+    }
+
+    /// [`CueTrack::active_cue_index`] plus the number of index entries the
+    /// lookup compared (its work bound: at most `⌈log2(2n + 1)⌉ + 1`).
+    #[must_use]
+    pub fn active_cue_index_probed(&self, now: MediaTime) -> (Option<usize>, usize) {
+        let now = now.as_nanos();
+        // Binary search for the first entry starting after `now`.
+        let (mut lo, mut hi, mut probes) = (0_usize, self.index.len(), 0_usize);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            probes += 1;
+            match self.index.get(mid) {
+                Some(&(t, _)) if t <= now => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        let active = lo
+            .checked_sub(1)
+            .and_then(|at| self.index.get(at))
+            .and_then(|&(_, cue)| cue);
+        (active, probes)
     }
 
     /// Shared SRT/VTT parser: split into blocks, parse the timing line, collect
@@ -134,9 +195,62 @@ impl CueTrack {
                 cues.push(cue);
             }
         }
-        cues.sort_by_key(|c| c.start.as_nanos());
-        Ok(Self { format, cues })
+        Ok(Self::from_cues(format, cues))
     }
+
+    /// Sort `cues` by start (stable: equal starts keep document order) and
+    /// build the active-cue index.
+    fn from_cues(format: SubtitleFormat, mut cues: Vec<Cue>) -> Self {
+        cues.sort_by_key(|c| c.start.as_nanos());
+        let index = build_index(&cues);
+        Self {
+            format,
+            cues,
+            index,
+        }
+    }
+}
+
+/// Sweep every cue boundary in time order, keeping the set of active cue
+/// indexes; the answer at each boundary is the highest active index (the
+/// last-starting cue, matching a reverse scan). O(n log n), once per track.
+fn build_index(cues: &[Cue]) -> Vec<(i64, Option<usize>)> {
+    // An empty window (`end <= start`, only reachable via deserialize) is
+    // never active, exactly as `Cue::is_active_at` says.
+    let live = || {
+        cues.iter()
+            .enumerate()
+            .filter(|(_, c)| c.end.as_nanos() > c.start.as_nanos())
+    };
+    let mut starts: Vec<(i64, usize)> = live().map(|(i, c)| (c.start.as_nanos(), i)).collect();
+    let mut ends: Vec<(i64, usize)> = live().map(|(i, c)| (c.end.as_nanos(), i)).collect();
+    starts.sort_unstable();
+    ends.sort_unstable();
+    let mut active = std::collections::BTreeSet::new();
+    let mut index: Vec<(i64, Option<usize>)> = Vec::new();
+    let (mut si, mut ei) = (0_usize, 0_usize);
+    loop {
+        let next = match (starts.get(si), ends.get(ei)) {
+            (Some(&(s, _)), Some(&(e, _))) => s.min(e),
+            (Some(&(s, _)), None) => s,
+            (None, Some(&(e, _))) => e,
+            (None, None) => break,
+        };
+        // `[start, end)`: a cue ending at `next` is gone, one starting is in.
+        while let Some(&(_, i)) = ends.get(ei).filter(|(e, _)| *e == next) {
+            active.remove(&i);
+            ei += 1;
+        }
+        while let Some(&(_, i)) = starts.get(si).filter(|(s, _)| *s == next) {
+            active.insert(i);
+            si += 1;
+        }
+        let answer = active.last().copied();
+        if index.last().map(|&(_, a)| a) != Some(answer) {
+            index.push((next, answer));
+        }
+    }
+    index
 }
 
 /// Split a document into blocks separated by one or more blank lines. A leading
@@ -282,4 +396,92 @@ fn strip_markup(line: &str) -> String {
         }
     }
     out.trim().to_owned()
+}
+
+#[cfg(test)]
+mod index_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+
+    fn cue(start: i64, end: i64, text: &str) -> Cue {
+        Cue {
+            start: MediaTime::from_nanos(start),
+            end: MediaTime::from_nanos(end),
+            lines: vec![text.to_owned()],
+        }
+    }
+
+    /// The pre-index reference semantics: newest-starting active cue wins.
+    fn linear(cues: &[Cue], now: i64) -> Option<usize> {
+        cues.iter()
+            .enumerate()
+            .rev()
+            .find(|(_, c)| c.is_active_at(MediaTime::from_nanos(now)))
+            .map(|(i, _)| i)
+    }
+
+    #[test]
+    fn indexed_lookup_matches_the_reverse_scan_with_overlaps() {
+        let track = CueTrack::from_cues(
+            SubtitleFormat::SubRip,
+            vec![
+                cue(0, 100, "long"),
+                cue(10, 20, "a"),
+                cue(10, 30, "b"),
+                cue(15, 18, "c"),
+                cue(40, 50, "d"),
+                cue(50, 60, "e"),
+                cue(55, 200, "f"),
+                cue(70, 80, "g"),
+                cue(90, 90, "empty"),
+            ],
+        );
+        for now in -5..220 {
+            assert_eq!(
+                track.active_cue_index(MediaTime::from_nanos(now)),
+                linear(track.cues(), now),
+                "at {now}"
+            );
+        }
+    }
+
+    #[test]
+    fn serde_round_trip_rebuilds_the_index() {
+        let track = CueTrack::parse_srt("1\n00:00:01,000 --> 00:00:03,000\nhi\n").unwrap();
+        let json = serde_json::to_string(&track).unwrap();
+        let back: CueTrack = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, track);
+        assert!(back
+            .active_cue(MediaTime::from_nanos(2_000_000_000))
+            .is_some());
+    }
+
+    /// Issue #430 (ABU-2): a large track costs a logarithmic number of index
+    /// probes per lookup — before the first cue, in a gap, inside a cue and
+    /// past the end — never a scan of every cue.
+    #[test]
+    fn large_track_lookup_is_logarithmic_at_early_times_and_gaps() {
+        const N: i64 = 100_000;
+        // Cues at [10k, 10k + 5), so [10k + 5, 10k + 10) is a gap.
+        let cues: Vec<Cue> = (0..N)
+            .map(|k| cue(1_000 + k * 10, 1_005 + k * 10, "x"))
+            .collect();
+        let track = CueTrack::from_cues(SubtitleFormat::SubRip, cues);
+        let n = usize::try_from(N).unwrap();
+        // ceil(log2(2n + 1)) + 1.
+        let bound = usize::try_from((2 * n + 1).ilog2()).unwrap() + 2;
+        for (now, expect) in [
+            (0, None),
+            (999, None),
+            (1_000, Some(0)),
+            (1_007, None),
+            (1_000 + 50_000 * 10 + 7, None),
+            (1_000 + 99_999 * 10 + 4, Some(n - 1)),
+            (i64::MAX, None),
+        ] {
+            let (found, probes) = track.active_cue_index_probed(MediaTime::from_nanos(now));
+            assert_eq!(found, expect, "at {now}");
+            assert!(probes <= bound, "{probes} probes at {now} (bound {bound})");
+        }
+    }
 }

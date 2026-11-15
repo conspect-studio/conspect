@@ -108,6 +108,197 @@ const CHROME_BG: OverlayColor = OverlayColor::new(0.0, 0.0, 0.0, 0.55);
 /// convention). The meaning is still the text, not the colour (#38).
 const CLOCK_BG: OverlayColor = OverlayColor::new(0.0, 0.0, 0.0, 0.92);
 
+/// Counters of the per-tile caption burn-in (issue #430), process-wide like
+/// [`crate::aux_overlays::skipped_bakes`]: every bound or cache decision is
+/// visible, never silent.
+#[derive(Debug, Default)]
+pub struct CaptionBurnStats {
+    text_truncated: std::sync::atomic::AtomicU64,
+    bitmap_refused: std::sync::atomic::AtomicU64,
+    text_rasters: std::sync::atomic::AtomicU64,
+}
+
+impl CaptionBurnStats {
+    /// Text cues cut by the bounded burn-in projection
+    /// ([`multiview_output::hls::bound_cue_lines`]), counted once per cue.
+    #[must_use]
+    pub fn text_truncated(&self) -> u64 {
+        self.text_truncated
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bitmap (DVB-sub) cues refused for burn-in because they exceed
+    /// [`MAX_BURN_BITMAP_DIM`] / [`MAX_BURN_BITMAP_BYTES`] (counted per sample).
+    #[must_use]
+    pub fn bitmap_refused(&self) -> u64 {
+        self.bitmap_refused
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Caption text blocks shaped and rasterized (cache misses: one per cue
+    /// change or tile relayout, never one per tick).
+    #[must_use]
+    pub fn text_rasters(&self) -> u64 {
+        self.text_rasters.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count one text cue cut by the burn-in projection.
+    pub fn note_text_truncated(&self) {
+        self.text_truncated
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Count one oversize bitmap cue refused for burn-in.
+    pub fn note_bitmap_refused(&self) {
+        self.bitmap_refused
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn note_text_raster(&self) {
+        self.text_rasters
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The process-wide [`CaptionBurnStats`].
+#[must_use]
+pub fn caption_burn_stats() -> &'static CaptionBurnStats {
+    static STATS: CaptionBurnStats = CaptionBurnStats {
+        text_truncated: std::sync::atomic::AtomicU64::new(0),
+        bitmap_refused: std::sync::atomic::AtomicU64::new(0),
+        text_rasters: std::sync::atomic::AtomicU64::new(0),
+    };
+    &STATS
+}
+
+/// Distinct cut-cue identities a [`TruncationTally`] remembers.
+pub const TRUNCATION_TALLY_RING: usize = 64;
+
+/// Counts a truncated caption cue **once per cue identity** (issue #430).
+///
+/// A reader samples the active cue on every tick, and with overlapping cues
+/// the active one can alternate (A, then a newer B, then A again once B
+/// ends) or an older cue can first surface after a newer one ends. The tally
+/// therefore remembers up to [`TRUNCATION_TALLY_RING`] distinct cut-cue
+/// identities with least-recently-observed replacement: every cut
+/// observation of a remembered identity refreshes it to most recent, and a
+/// new identity replaces the one observed longest ago. A cue is counted the
+/// first time it is observed cut.
+///
+/// Exact bound: an identity is counted again only when it reappears after
+/// **64 or more other distinct cut identities** were observed since its own
+/// last cut observation; with 63 or fewer it is not recounted, however often
+/// any of them repeat. For a native store that needs 64 other cut cues
+/// selected while a cue is retained (the default store retains 16); for a
+/// sidecar, 64 other cut cues shown while one long cue is hidden behind them.
+/// Uncut observations neither count nor refresh. Work per sample is a scan
+/// of 64 slots, lock-free and allocation-free (relaxed atomics; one sampler
+/// per tally).
+///
+/// The identity is supplied by the caller — the cue store's per-cue publish
+/// sequence, or a sidecar track index — and must change whenever the cue does
+/// (replacement, generation change).
+#[derive(Debug)]
+pub struct TruncationTally {
+    /// Per slot: `1 +` the identity (`0` = empty) and the observation stamp
+    /// of its last cut observation. Boxed so embedding a tally keeps its
+    /// owner small.
+    slots:
+        Box<[(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); TRUNCATION_TALLY_RING]>,
+    /// Monotonic observation stamp (cut observations only).
+    clock: std::sync::atomic::AtomicU64,
+    stats: &'static CaptionBurnStats,
+}
+
+impl TruncationTally {
+    /// A tally counting into the process-wide [`caption_burn_stats`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_stats(caption_burn_stats())
+    }
+
+    /// A tally counting into `stats` (tests use a private sink).
+    #[must_use]
+    pub fn with_stats(stats: &'static CaptionBurnStats) -> Self {
+        use std::sync::atomic::AtomicU64;
+        Self {
+            slots: Box::new(std::array::from_fn(|_| {
+                (AtomicU64::new(0), AtomicU64::new(0))
+            })),
+            clock: AtomicU64::new(0),
+            stats,
+        }
+    }
+
+    /// Record one sample of cue `identity`. When `truncated`, counts it
+    /// unless it is remembered (see the type's exact bound), and marks it as
+    /// the most recently observed identity either way.
+    pub fn observe(&self, identity: u64, truncated: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !truncated {
+            return;
+        }
+        let key = identity.wrapping_add(1).max(1);
+        let now = self.clock.load(Relaxed).wrapping_add(1);
+        self.clock.store(now, Relaxed);
+        // One pass: a hit, else the empty or least-recently-observed slot.
+        let mut victim: Option<(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64)> =
+            None;
+        let mut oldest = u64::MAX;
+        for (slot_key, slot_stamp) in &*self.slots {
+            let held = slot_key.load(Relaxed);
+            if held == key {
+                slot_stamp.store(now, Relaxed);
+                return;
+            }
+            let stamp = if held == 0 {
+                0
+            } else {
+                slot_stamp.load(Relaxed)
+            };
+            if stamp < oldest {
+                oldest = stamp;
+                victim = Some((slot_key, slot_stamp));
+            }
+        }
+        if let Some((slot_key, slot_stamp)) = victim {
+            slot_key.store(key, Relaxed);
+            slot_stamp.store(now, Relaxed);
+        }
+        self.stats.note_text_truncated();
+    }
+}
+
+impl Default for TruncationTally {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Widest / tallest bitmap caption cue burned in, in source pixels.
+pub const MAX_BURN_BITMAP_DIM: u32 = 4096;
+/// Largest bitmap caption cue burned in (premultiplied RGBA bytes): the
+/// caption decoder's own payload cap, so a decoded cue always fits and only a
+/// payload that bypassed the decoder is refused.
+pub const MAX_BURN_BITMAP_BYTES: usize = 256 * 1024;
+
+/// Whether a bitmap cue fits the burn-in bounds (checked on the borrowed cue,
+/// before its pixels are copied).
+#[must_use]
+pub fn bitmap_within_burn_bounds(bitmap: &multiview_ffmpeg::caption::CueBitmap) -> bool {
+    bitmap.rect.width <= MAX_BURN_BITMAP_DIM
+        && bitmap.rect.height <= MAX_BURN_BITMAP_DIM
+        && bitmap.rgba.len() <= MAX_BURN_BITMAP_BYTES
+}
+
+/// One tile's last rasterized caption block: the bounded lines and the cell
+/// it was laid out for (the cache key), and the clipped glyph primitives.
+struct CaptionRaster {
+    lines: Vec<String>,
+    rect: PixelRect,
+    primitives: Vec<OverlayPrimitive>,
+}
+
 /// The static placement of one multiview tile's overlay surface: the cell's pixel
 /// rectangle on the canvas plus the (immutable) label text for the bound source.
 ///
@@ -342,6 +533,13 @@ pub struct OverlayBaker {
     /// pace or stall the output clock (invariant #1). Carries the canvas geometry
     /// the corner mark is anchored to.
     watermark: Option<WatermarkPlacement>,
+    /// Per-tile (by index) cache of the last shaped + rasterized caption
+    /// block (issue #430): a cue held across ticks re-emits its cached glyph
+    /// primitives instead of re-shaping, so per-tick caption cost is a bounded
+    /// copy, independent of how often the cue is sampled.
+    caption_cache: Vec<Option<CaptionRaster>>,
+    /// Caption blocks this baker shaped + rasterized (cache misses).
+    caption_rasters: u64,
 }
 
 /// The Conspect tile-watermark placement: the wait-free
@@ -446,6 +644,8 @@ impl OverlayBaker {
                 ..LayoutOverlays::default()
             },
             watermark: None,
+            caption_cache: Vec::new(),
+            caption_rasters: 0,
         })
     }
 
@@ -555,6 +755,15 @@ impl OverlayBaker {
             .collect();
         self.tiles = tiles;
         self.meters = meters;
+        // Tile indexes may now name other cells: drop every cached caption.
+        self.caption_cache.clear();
+    }
+
+    /// Caption blocks this baker has shaped + rasterized: one per cue change
+    /// or relayout, never one per tick (issue #430's cache).
+    #[must_use]
+    pub const fn caption_rasters(&self) -> u64 {
+        self.caption_rasters
     }
 
     /// The tiles this baker draws (their static placement), in declaration order.
@@ -665,16 +874,31 @@ impl OverlayBaker {
 
             // Burn this source's active caption (if any) into THIS tile's cell
             // rect, bottom-centre — never canvas-wide.
-            let cue_lines = captions.get(&source_id).cloned().unwrap_or_default();
-            if !cue_lines.is_empty() {
-                self.draw_tile_caption(&mut list, rect, &cue_lines)?;
+            // Issue #430: the lines are re-bounded here (a no-op for the
+            // already-bounded native path, the guard for any other producer),
+            // and the shaped block is cached per tile so a held cue is never
+            // re-shaped per tick.
+            match captions.get(&source_id) {
+                Some(lines) if !lines.is_empty() => {
+                    self.draw_tile_caption_cached(&mut list, i, rect, lines)?;
+                }
+                _ => {
+                    if let Some(slot) = self.caption_cache.get_mut(i) {
+                        *slot = None;
+                    }
+                }
             }
 
             // Burn this source's active BITMAP caption (DVB-sub) into THIS tile's
             // cell rect, bottom-anchored — the per-tile bitmap burn-in. A bitmap
-            // and a text cue can both be present; both are cell-local.
+            // and a text cue can both be present; both are cell-local. An
+            // oversize bitmap is refused and counted (never copied).
             if let Some(bitmap) = bitmaps.get(&source_id) {
-                draw_tile_bitmap(&mut list, rect, bitmap);
+                if bitmap_within_burn_bounds(bitmap) {
+                    draw_tile_bitmap(&mut list, rect, bitmap);
+                } else {
+                    caption_burn_stats().note_bitmap_refused();
+                }
             }
         }
 
@@ -861,6 +1085,49 @@ impl OverlayBaker {
             )?;
         }
         Ok(list)
+    }
+
+    /// Burn `cue_lines` into tile `index`'s cell `rect` through the per-tile
+    /// raster cache (issue #430). The lines are first bounded with
+    /// [`multiview_output::hls::bound_cue_lines`] (≤ 16 lines / 4 KiB
+    /// inspected, ≤ 4 lines / 512 B kept), so neither the comparison nor the
+    /// shaping can scale with the source cue. On a hit (same bounded lines,
+    /// same cell) the cached glyph primitives are re-emitted without shaping;
+    /// on a miss (a cue change or relayout) the block is shaped and
+    /// rasterized once and cached.
+    fn draw_tile_caption_cached(
+        &mut self,
+        list: &mut OverlayDrawList,
+        index: usize,
+        rect: PixelRect,
+        cue_lines: &[String],
+    ) -> Result<(), CompositorError> {
+        let bounded = multiview_output::hls::bound_cue_lines(cue_lines);
+        if bounded.is_empty() {
+            return Ok(());
+        }
+        if self.caption_cache.len() < self.tiles.len() {
+            self.caption_cache.resize_with(self.tiles.len(), || None);
+        }
+        if let Some(Some(hit)) = self.caption_cache.get(index) {
+            if hit.rect == rect && hit.lines.as_slice() == bounded.lines() {
+                list.primitives.extend(hit.primitives.iter().cloned());
+                return Ok(());
+            }
+        }
+        let mut block = OverlayDrawList::new();
+        self.draw_tile_caption(&mut block, rect, bounded.lines())?;
+        caption_burn_stats().note_text_raster();
+        self.caption_rasters = self.caption_rasters.saturating_add(1);
+        list.primitives.extend(block.primitives.iter().cloned());
+        if let Some(slot) = self.caption_cache.get_mut(index) {
+            *slot = Some(CaptionRaster {
+                lines: bounded.into_lines(),
+                rect,
+                primitives: block.primitives,
+            });
+        }
+        Ok(())
     }
 
     /// Burn `cue_lines` into the cell `rect`, bottom-centre of THAT tile (never
@@ -2839,6 +3106,208 @@ mod tests {
             glyphs_in(&list, in_a_cell) >= a_caption,
             "every in_a caption glyph must fall inside in_a's cell rect"
         );
+    }
+
+    /// Issue #430 (MED2-1/MED3-1): the tally dedupes every remembered cut
+    /// cue, refreshing on each observation, with the exact documented bound.
+    #[test]
+    fn truncation_tally_dedupes_resurfacing_cues_with_exact_bound() {
+        let ring = u64::try_from(TRUNCATION_TALLY_RING).unwrap();
+        let fresh = || {
+            let stats: &'static CaptionBurnStats = Box::leak(Box::default());
+            (TruncationTally::with_stats(stats), stats)
+        };
+        // Alternation and uncut samples.
+        let (tally, stats) = fresh();
+        for id in [7, 9, 7, 9, 7] {
+            tally.observe(id, true);
+        }
+        tally.observe(11, false);
+        assert_eq!(stats.text_truncated(), 2, "A, B, A, B, A is two cues");
+        // Boundary: 63 other distinct cut cues since A's last observation
+        // keep A remembered...
+        let (tally, stats) = fresh();
+        tally.observe(0, true);
+        for id in 1..ring {
+            tally.observe(id, true);
+        }
+        tally.observe(0, true);
+        assert_eq!(
+            stats.text_truncated(),
+            ring,
+            "63 intervening: A not recounted"
+        );
+        // ...64 make it count again.
+        let (tally, stats) = fresh();
+        tally.observe(0, true);
+        for id in 1..=ring {
+            tally.observe(id, true);
+        }
+        tally.observe(0, true);
+        assert_eq!(
+            stats.text_truncated(),
+            ring + 2,
+            "64 intervening: A recounted"
+        );
+        // The reviewer's trace: A, 63 distinct, A, B, A — A counts once
+        // (its middle observation refreshed it, so B evicts another cue).
+        let (tally, stats) = fresh();
+        tally.observe(0, true);
+        for id in 1..ring {
+            tally.observe(id, true);
+        }
+        tally.observe(0, true);
+        tally.observe(1_000, true);
+        tally.observe(0, true);
+        assert_eq!(stats.text_truncated(), ring + 1, "A, 63, A, B, A: A once");
+        // Repeats of remembered cues do not advance the bound.
+        let (tally, stats) = fresh();
+        tally.observe(0, true);
+        for _ in 0..10 {
+            for id in 1..ring {
+                tally.observe(id, true);
+            }
+        }
+        tally.observe(0, true);
+        assert_eq!(
+            stats.text_truncated(),
+            ring,
+            "repeats of 63 others never evict A"
+        );
+    }
+
+    /// Issue #430: a hostile cue (many padded lines) burns at most the bounded
+    /// projection — the same lines `bound_cue_lines` keeps, no more glyphs.
+    #[test]
+    fn hostile_caption_burns_only_the_bounded_projection() {
+        let tiles = quad_tiles();
+        let dyns = dynamics(&[("in_a", -3.0, SourceState::Live)]);
+        let pts = MediaTime::from_nanos(1_500_000_000);
+        let pad = "W".repeat(64 * 1024);
+        let mut hostile: Vec<String> = (0..64).map(|i| format!("L{i} {pad}")).collect();
+        hostile.insert(1, String::new());
+        let projected = multiview_output::hls::bound_cue_lines(&hostile);
+        assert!(projected.truncated());
+        assert!(projected.inspected_bytes() <= 4096 && projected.inspected_lines() <= 16);
+        assert!(projected.lines().len() <= 4);
+        assert!(projected.lines().iter().map(String::len).sum::<usize>() <= 512);
+        let before = caption_burn_stats().text_rasters();
+
+        let mut raw = OverlayBaker::new(tiles.clone(), epoch_clock()).unwrap();
+        let mut caps = HashMap::new();
+        caps.insert("in_a".to_owned(), hostile);
+        let hostile_list = raw.draw_list(pts, &dyns, &caps, &no_bitmaps()).unwrap();
+
+        let mut bounded = OverlayBaker::new(tiles, epoch_clock()).unwrap();
+        let mut caps = HashMap::new();
+        caps.insert("in_a".to_owned(), projected.into_lines());
+        let bounded_list = bounded.draw_list(pts, &dyns, &caps, &no_bitmaps()).unwrap();
+
+        assert_eq!(hostile_list, bounded_list, "only the projection is drawn");
+        assert_eq!(raw.caption_rasters(), 1);
+        assert!(caption_burn_stats().text_rasters() >= before + 2);
+    }
+
+    /// Issue #430: an unchanged cue across ticks hits the per-tile raster
+    /// cache (no re-shape); a cue change or relayout re-shapes exactly once.
+    #[test]
+    fn unchanged_caption_is_shaped_once_across_ticks() {
+        let tiles = quad_tiles();
+        let mut baker = OverlayBaker::new(tiles.clone(), epoch_clock()).unwrap();
+        let dyns = dynamics(&[("in_a", -3.0, SourceState::Live)]);
+        let caps = captions(&[("in_a", &["Held caption", "second line"])]);
+        let first = baker
+            .draw_list(MediaTime::from_nanos(0), &dyns, &caps, &no_bitmaps())
+            .unwrap();
+        assert_eq!(baker.caption_rasters(), 1);
+        for tick in 1..50_i64 {
+            let list = baker
+                .draw_list(
+                    MediaTime::from_nanos(tick * 40_000_000),
+                    &dyns,
+                    &caps,
+                    &no_bitmaps(),
+                )
+                .unwrap();
+            let glyphs = |l: &OverlayDrawList| {
+                l.primitives
+                    .iter()
+                    .filter(|p| matches!(p, OverlayPrimitive::Glyph { .. }))
+                    .count()
+            };
+            assert_eq!(glyphs(&list), glyphs(&first));
+        }
+        assert_eq!(baker.caption_rasters(), 1, "a held cue is never re-shaped");
+        let changed = captions(&[("in_a", &["New caption"])]);
+        baker
+            .draw_list(
+                MediaTime::from_nanos(2_000_000_000),
+                &dyns,
+                &changed,
+                &no_bitmaps(),
+            )
+            .unwrap();
+        baker
+            .draw_list(
+                MediaTime::from_nanos(2_040_000_000),
+                &dyns,
+                &changed,
+                &no_bitmaps(),
+            )
+            .unwrap();
+        assert_eq!(baker.caption_rasters(), 2, "a change re-shapes once");
+        // A gap (no cue) then the same cue again re-shapes: the cache holds
+        // only what is on screen.
+        baker
+            .draw_list(
+                MediaTime::from_nanos(2_080_000_000),
+                &dyns,
+                &no_captions(),
+                &no_bitmaps(),
+            )
+            .unwrap();
+        baker
+            .draw_list(
+                MediaTime::from_nanos(2_120_000_000),
+                &dyns,
+                &changed,
+                &no_bitmaps(),
+            )
+            .unwrap();
+        assert_eq!(baker.caption_rasters(), 3);
+        baker.set_tiles(tiles);
+        baker
+            .draw_list(
+                MediaTime::from_nanos(2_160_000_000),
+                &dyns,
+                &changed,
+                &no_bitmaps(),
+            )
+            .unwrap();
+        assert_eq!(baker.caption_rasters(), 4, "a relayout re-shapes once");
+    }
+
+    /// Issue #430: an oversize bitmap cue is refused (no Image) and counted.
+    #[test]
+    fn oversize_bitmap_caption_is_refused_and_counted() {
+        let tiles = quad_tiles();
+        let mut baker = OverlayBaker::new(tiles, epoch_clock()).unwrap();
+        let dyns = dynamics(&[("in_a", -3.0, SourceState::Live)]);
+        // 400 x 200 x 4 = 320 000 B > MAX_BURN_BITMAP_BYTES.
+        let big = bitmaps(&[("in_a", 400, 200)]);
+        assert!(!big.values().all(bitmap_within_burn_bounds));
+        let before = caption_burn_stats().bitmap_refused();
+        let list = baker
+            .draw_list(MediaTime::from_nanos(0), &dyns, &no_captions(), &big)
+            .unwrap();
+        assert!(!list
+            .primitives
+            .iter()
+            .any(|p| matches!(p, OverlayPrimitive::Image { .. })));
+        assert!(caption_burn_stats().bitmap_refused() > before);
+        assert!(bitmaps(&[("in_a", 400, 60)])
+            .values()
+            .all(bitmap_within_burn_bounds));
     }
 
     /// Build a per-source bitmap-cue map: `source_id -> CueBitmap`. The
