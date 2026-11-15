@@ -447,6 +447,17 @@ const CLOCK_WAIT_BOUND: Duration = Duration::from_millis(300);
 /// rest of the run (#461).
 const CLOCK_GIVE_UP: u32 = 20;
 
+/// Let `ticks` output ticks pass on the router (#461). The controllers used
+/// to sleep the wall-clock equivalent at 25 fps (`ticks * 40 ms`); with the
+/// synthetic clock paced on the threads it drives, a loaded host runs fewer
+/// ticks in that time, so they now wait for the ticks themselves (bounded).
+fn wait_ticks(handle: &super::OutputRoutingHandle, ticks: u64) {
+    let from = handle.ticked.load(Ordering::Acquire);
+    wait_for("output ticks", Duration::from_secs(60), || {
+        (handle.ticked.load(Ordering::Acquire) >= from + ticks).then_some(())
+    });
+}
+
 fn wait_for<T>(what: &str, bound: Duration, mut f: impl FnMut() -> Option<T>) -> T {
     let start = Instant::now();
     loop {
@@ -498,7 +509,7 @@ fn a_take_to_a_source_and_back_through_the_real_pipeline() {
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(800));
+        wait_ticks(&handle, 800 / 40);
         // A take applies, or is refused FeedNotFresh when the (wall-clock)
         // synthetic producer was starved by a loaded host — the correct
         // refusal; the take is then re-issued (at most 5 attempts).
@@ -530,7 +541,7 @@ fn a_take_to_a_source_and_back_through_the_real_pipeline() {
             (s.outputs[1].bus == "src:route_take_b").then_some(s.video_keys)
         });
         record.lock().unwrap().to_source = Some((o, keys));
-        std::thread::sleep(Duration::from_millis(600));
+        wait_ticks(&handle, 600 / 40);
         let o = applied(&|| take("to-program", 1, PictureBus::Program));
         let keys = wait_for("snapshot", Duration::from_secs(1), || {
             let s = handle.snapshot();
@@ -718,7 +729,7 @@ fn audio_follows_a_take_to_a_source_with_a_crossfade_through_the_real_pipeline()
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(800));
+        wait_ticks(&handle, 800 / 40);
         let applied = |make: &dyn Fn() -> OutputTake| {
             for _ in 0..5 {
                 let op = make().operation_id;
@@ -736,7 +747,7 @@ fn audio_follows_a_take_to_a_source_with_a_crossfade_through_the_real_pipeline()
         };
         let o = applied(&|| take("to-bars", 1, PictureBus::Source("route_audio_b".to_owned())));
         record.lock().unwrap().to_source = Some((o, 0));
-        std::thread::sleep(Duration::from_millis(1600));
+        wait_ticks(&handle, 1600 / 40);
         let o = applied(&|| take("to-program", 1, PictureBus::Program));
         record.lock().unwrap().to_program = Some((o, 0));
     });
@@ -834,7 +845,7 @@ fn a_private_bus_is_fed_the_post_loudnorm_program_pcm_up_to_g() {
             (handle.snapshot().video_keys > 0).then_some(())
         });
         // After the normaliser's 3 s short-term window: a non-unity gain.
-        std::thread::sleep(Duration::from_millis(4500));
+        wait_ticks(&handle, 4500 / 40);
         for _ in 0..5 {
             let t = take("to-solid", 1, PictureBus::Source("route_ln_a".to_owned()));
             handle.try_take(t).unwrap();
@@ -1030,7 +1041,7 @@ fn a_take_to_clean_carries_the_pre_bake_canvas_through_the_real_pipeline() {
             wait_for("the first routing tick", Duration::from_secs(10), || {
                 (handle.snapshot().video_keys > 0).then_some(())
             });
-            std::thread::sleep(Duration::from_millis(400));
+            wait_ticks(&handle, 400 / 40);
             handle
                 .try_take(take("to-clean", 1, PictureBus::Clean))
                 .unwrap();
@@ -1640,7 +1651,7 @@ fn an_audio_only_take_routes_a_source_and_returns_to_the_shared_stream() {
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(800));
+        wait_ticks(&handle, 800 / 40);
         let audio_take = |op: &str, choice: super::AudioChoice| {
             handle
                 .try_take(OutputTake {
@@ -1666,7 +1677,7 @@ fn an_audio_only_take_routes_a_source_and_returns_to_the_shared_stream() {
         assert_eq!(s.outputs[1].bus, "program", "the video stays");
         assert_eq!(s.outputs[1].audio, "src:route_ao_b");
         record.lock().unwrap().to_source = Some((o, s.audio_buses_live));
-        std::thread::sleep(Duration::from_millis(1600));
+        wait_ticks(&handle, 1600 / 40);
         let o = audio_take("to-program", super::AudioChoice::Program);
         record.lock().unwrap().to_program = Some((o, 0));
         // Back on the shared stream within ~10 ticks (4 frames + a fade):
@@ -1917,7 +1928,7 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(800));
+        wait_ticks(&handle, 800 / 40);
         let layout = swapped_layout("route_layout");
         handle
             .try_take(take("to-layout", 1, layout.clone()))
@@ -1933,7 +1944,7 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
         });
         assert_eq!(s.aux_canvases, vec!["aux:swapped".to_owned()]);
         assert_eq!(s.video_keys, 2, "+1 encoder for the layout bus");
-        std::thread::sleep(Duration::from_millis(1500));
+        wait_ticks(&handle, 1500 / 40);
         // The flood: 12 takes, no waiting between them.
         let flood: Vec<String> = (0..12).map(|i| format!("flood-{i}")).collect();
         for (i, op) in flood.iter().enumerate() {
@@ -2039,7 +2050,7 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(800));
+        wait_ticks(&handle, 800 / 40);
         let swapped = swapped_layout("live_edit");
         handle.try_take(take("to-layout", 1, swapped)).unwrap();
         let applied = wait_for("to-layout outcome", Duration::from_secs(10), || {
@@ -2047,7 +2058,7 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         });
         assert_eq!(applied.outcome, TakeResult::Applied, "{applied:?}");
         // Past the per-key IDR floor, then the live edit.
-        std::thread::sleep(Duration::from_millis(1500));
+        wait_ticks(&handle, 1500 / 40);
         let PictureBus::Layout(edited) = two_cell_layout("live_edit", ["a", "b"]) else {
             panic!("a layout bus");
         };
@@ -2055,7 +2066,7 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         handle
             .try_layout_change(crate::output_routing::LayoutChange::Edited(edited))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(1500));
+        wait_ticks(&handle, 1500 / 40);
         assert!(outcomes.try_recv().is_err(), "a live edit is not a take");
         assert_eq!(handle.snapshot().outputs[1].bus, "aux:swapped");
         handle
@@ -2294,7 +2305,7 @@ fn a_live_reformat_resets_one_output_and_leaves_the_other_untouched() {
             wait_for("the first routing tick", Duration::from_secs(10), || {
                 (handle.snapshot().video_keys > 0).then_some(())
             });
-            std::thread::sleep(Duration::from_millis(600));
+            wait_ticks(&handle, 600 / 40);
             let cover = crate::routing_aux::AuxFormat::new(
                 32,
                 64,
@@ -2685,7 +2696,7 @@ fn take_two_overlay_layouts(
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(400));
+        wait_ticks(&handle, 400 / 40);
         for (op, output, id) in [("l1", 1, "news-a"), ("l2", 2, "news-b")] {
             handle
                 .try_take(take(op, output, overlay_layout(prefix, id)))
