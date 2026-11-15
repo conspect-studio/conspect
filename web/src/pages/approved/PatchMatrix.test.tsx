@@ -33,7 +33,8 @@ vi.mock('../../realtime/shared', () => ({
 
 import { i18n } from '@lingui/core';
 import { t } from '@lingui/core/macro';
-import { messages as pseudoMessages } from '../../locales/pseudo/messages';
+import type { Messages } from '@lingui/core';
+import { messages as enMessages } from '../../locales/en/messages';
 import { renderWithProviders } from '../../test/render';
 import { PatchMatrix } from './PatchMatrix';
 
@@ -725,6 +726,23 @@ describe('E3-10 audio and subtitle planes', () => {
     expect(screen.getByRole('button', { name: 'Classify selection' })).toBeDisabled();
   });
 });
+
+/**
+ * A stand-in pseudo catalog derived from the committed `en` one (the compiled
+ * `pseudo` catalog is gitignored, so CI's type check never sees it): every
+ * plain string message is marked, so a string that bypasses Lingui stays
+ * unmarked and fails the assertions below.
+ */
+const pseudoMessages: Messages = Object.fromEntries(
+  Object.entries(enMessages).map(([id, message]) => [
+    id,
+    Array.isArray(message)
+      ? message.map((part) => (typeof part === 'string' ? `⟦${part}⟧` : part))
+      : typeof message === 'string'
+        ? `⟦${message}⟧`
+        : message,
+  ]),
+);
 
 describe('E3-11 group headings and built-in rows go through Lingui', () => {
   it('translates group headings and the built-in bus names at render', async () => {
