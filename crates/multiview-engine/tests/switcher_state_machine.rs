@@ -1003,3 +1003,39 @@ fn an_auto_flight_descriptor_never_replaces_the_selection() {
         Some((50, FrameCount::try_from(20).unwrap()))
     );
 }
+
+/// Review (stinger final, invariants lens): ending a stinger's clip tail from
+/// the T-bar re-applies the lever re-arm rule (ADR-0055 §5-6), as every other
+/// take end does: a lever left off the bottom when the take ended stays
+/// parked until it returns to zero, instead of starting a manual take at once.
+#[test]
+fn a_tbar_in_a_stinger_tail_honours_the_parked_lever() {
+    let mut state = configured();
+    state
+        .set_transition(
+            serde_json::from_value(serde_json::json!({
+                "kind": "stinger", "player": "p", "pre_roll": 1,
+                "clip_duration": 10, "trigger_point": 2, "mix_rate": 2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    // The operator leaves the lever part-way up (in sync, nonzero) and AUTO
+    // takes over the stinger from there.
+    state.tbar(20_000, tick(1)).unwrap();
+    state.auto(tick(10)).unwrap();
+    for t in 11..=16 {
+        state.sample(tick(t));
+    }
+    assert!(state.is_in_flight(), "in the clip tail");
+    let program = state.program().clone();
+    // A different nonzero lever sample ends the tail but must not take: the
+    // lever is off the bottom, so it is parked like after any other take.
+    let projection = state.tbar(40_000, tick(17)).unwrap();
+    assert!(!projection.started, "a parked lever never starts a take");
+    assert!(!state.is_in_flight());
+    assert_eq!(state.program(), &program, "the buses are unchanged");
+    // Back to zero re-arms; then the lever moves the next take.
+    state.tbar(0, tick(18)).unwrap();
+    assert!(state.tbar(40_000, tick(19)).unwrap().started);
+}

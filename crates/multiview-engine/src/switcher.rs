@@ -547,6 +547,9 @@ impl SwitcherState {
         if matches!(self.flight, Some(Flight::Auto { swapped: true, .. })) {
             self.flight = None;
             self.flight_transition = None;
+            // As every other take end (ADR-0055 §5-6): a lever left off the
+            // bottom stays parked until it returns to zero.
+            self.lever_out_of_sync = self.last_manual_position != 0;
         }
     }
 
