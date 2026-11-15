@@ -5073,10 +5073,6 @@ msgstr "Every input on the program mix is muted. Unmute at least one, or take th
 msgid "Every N minutes"
 msgstr "Every N minutes"
 
-#: src/pages/WindyFillDialog.tsx:875
-#~ msgid "Every N minutes (coming soon — no scheduler yet)"
-#~ msgstr "Every N minutes (coming soon — no scheduler yet)"
-
 #: src/layout/components/validationMessages.tsx:69
 msgid "Every named area must form a contiguous rectangle."
 msgstr "Every named area must form a contiguous rectangle."

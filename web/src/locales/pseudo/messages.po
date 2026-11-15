@@ -5073,10 +5073,6 @@ msgstr ""
 msgid "Every N minutes"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:875
-#~ msgid "Every N minutes (coming soon — no scheduler yet)"
-#~ msgstr ""
-
 #: src/layout/components/validationMessages.tsx:69
 msgid "Every named area must form a contiguous rectangle."
 msgstr ""
