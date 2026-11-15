@@ -83,7 +83,7 @@ function matchesCommandKind(kind: string, expectation: OperationExpectation): bo
   if (!isCorrelatedKind(kind) || typeof expectation.resource !== 'string' || !expectation.resource.trim()) return false;
   if (expectation.event === 'switcher.operation')
     return expectation.terminal.me === expectation.resource &&
-      (kind === 'select_program' || kind === 'select_preview' || kind === 'cut' || kind === 'auto');
+      (kind === 'select_program' || kind === 'select_preview' || kind === 'cut' || kind === 'auto' || kind === 'set_transition');
   if (expectation.event === 'output.status') {
     return (kind === 'start' && expectation.terminal.state === 'running') ||
       (kind === 'stop' && expectation.terminal.state === 'idle');

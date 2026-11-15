@@ -497,6 +497,7 @@ fn build_messages_switcher_events() -> serde_json::Map<String, Value> {
         "payload": { "$ref": "#/components/schemas/MediaPlayerEvent" }
     }));
     map.insert("RouteOutputEvent".to_owned(), route_output_message());
+    map.insert("PatchTakeEvent".to_owned(), patch_take_message());
     map.insert("GraphicsChannelEvent".to_owned(), json!({
         "name": "GraphicsChannelEvent",
         "title": "Graphics playout channel state",
@@ -728,6 +729,7 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/AudioLoudness" },
         { "$ref": "#/components/schemas/OutputStatus" },
         { "$ref": "#/components/schemas/RouteOutputEvent" },
+        { "$ref": "#/components/schemas/PatchTakeEvent" },
         { "$ref": "#/components/schemas/Alert" },
         { "$ref": "#/components/schemas/HealthWarning" },
         { "$ref": "#/components/schemas/InputConnection" },
@@ -804,6 +806,7 @@ fn core_event_schemas() -> Value {
         "OutputRunState": output_run_state_schema(),
         "OutputStatus": output_status_schema(),
         "RouteOutputEvent": route_output_event_schema(),
+        "PatchTakeEvent": patch_take_event_schema(),
         "AlertSeverity": alert_severity_schema(),
         "Alert": alert_schema(),
         "WarningSeverity": warning_severity_schema(),
@@ -1594,6 +1597,40 @@ fn route_output_message() -> Value {
         "description": "Emitted on topic `outputs` with envelope `id` = output id and `corr` = the take's operation id (ADR-0108 §6.2). Lossless; delivered only to principals that may read the output.",
         "contentType": "application/json",
         "payload": { "$ref": "#/components/schemas/RouteOutputEvent" }
+    })
+}
+
+fn patch_take_message() -> Value {
+    json!({
+        "name": "PatchTakeEvent",
+        "title": "Atomic patch set outcome",
+        "summary": "An atomic multi-destination patch set settled (patch.take).",
+        "description": "Published once per destination when every member of a set (`POST /patch/take` with two or more destinations, or a patch salvo) is terminal (ADR-0110 §12.8, #308). Topic `outputs` for an output (envelope `id` = output id), `switcher` for the mixer (envelope `id` = M/E id); `corr` = the set's operation id. Each delivery is scoped by its own destination, so a principal sees only the destinations it may read. Lossless.",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/PatchTakeEvent" }
+    })
+}
+
+fn patch_take_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Data body of `patch.take` (ADR-0110 §12.8): the terminal outcome of an atomic patch set, for one destination.",
+        "required": ["operation_id", "tick", "outcome", "destination"],
+        "properties": {
+            "operation_id": { "type": "string", "description": "The set's operation id (the 202's `operation_id`)." },
+            "tick": { "type": "integer", "format": "uint64", "description": "The tick the set was decided (the adoption tick when applied)." },
+            "outcome": { "type": "string", "enum": ["applied", "refused"] },
+            "refusal": { "type": "string", "description": "First cause when refused: capacity, feed-not-fresh, encoder-not-ready, slot-medium-mismatch, slot-format-unsupported, on-air-protected, unknown-slot, unknown-source, superseded, deadline, engine-busy, refused." },
+            "destination": {
+                "type": "object",
+                "description": "Exactly one of `output` (an output API id) or `mixer` (+ `program`).",
+                "properties": {
+                    "output": { "type": "string" },
+                    "mixer": { "type": "string" },
+                    "program": { "type": "string" }
+                }
+            }
+        }
     })
 }
 

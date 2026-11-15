@@ -2,7 +2,8 @@
 //! #342 B2): the `outputs` section of `GET /api/v1/patch`, and the output
 //! crosspoints of `POST /patch/plan` and `POST /patch/take`.
 //!
-//! A request patches the slots of ONE output: its video slot 0 (`{source}`,
+//! A single-output request (a set over several destinations is
+//! [`super::patch_set`], #308) patches the slots of ONE output: its video slot 0 (`{source}`,
 //! `{bus}` or `{layout}`: a stored layout, ADR-0108 slice 3) and optionally audio slot 0 with `"follow"`, which rides the
 //! video take. Other slots are fixed by config in this slice. The take goes
 //! through [`super::output_routing::take_output_slot0`], the same machinery
@@ -92,11 +93,12 @@ pub(crate) fn shape(req: &PatchRequest) -> Result<OutputPatch, Box<Response>> {
     for xp in &req.crosspoints {
         let d = &xp.destination;
         let Some(this) = d.output.as_deref() else {
-            // A mixer crosspoint beside an output one.
+            // A mixer crosspoint beside an output one is a set (#308); here
+            // (one output's members) it never is.
             return Err(Box::new(problem(
                 422,
                 "unknown-slot",
-                super::patch::MULTI_DESTINATION,
+                "a destination is a mixer input or an output slot",
             )));
         };
         if d.mixer.is_some() || d.input.is_some() {
@@ -107,10 +109,11 @@ pub(crate) fn shape(req: &PatchRequest) -> Result<OutputPatch, Box<Response>> {
             )));
         }
         if output.is_some_and(|o| o != this) {
+            // Two outputs are a set (#308); one output's members never are.
             return Err(Box::new(problem(
                 422,
                 "unknown-slot",
-                super::patch::MULTI_DESTINATION,
+                "one output's crosspoints name one output",
             )));
         }
         output = Some(this);

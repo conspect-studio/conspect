@@ -71,7 +71,12 @@ pub struct SwitcherState {
     preview: SourceRef,
     keys_on_air: Vec<bool>,
     armed: ArmedSet,
+    /// The operator's selection (ADR-0112 §4): never changed by an AUTO.
     transition: TransitionDescriptor,
+    /// The descriptor an AUTO started with [`Self::auto_with`] renders: the
+    /// selection with the AUTO's own rate. `None` when the flight (or the
+    /// idle machine) follows the selection itself.
+    flight_transition: Option<TransitionDescriptor>,
     flip_flop: bool,
     flight: Option<Flight>,
     completion_count: u64,
@@ -91,6 +96,7 @@ impl SwitcherState {
             keys_on_air,
             armed: ArmedSet::default().with_background(),
             transition: TransitionDescriptor::Cut,
+            flight_transition: None,
             flip_flop: true,
             flight: None,
             completion_count: 0,
@@ -119,10 +125,17 @@ impl SwitcherState {
     pub fn armed(&self) -> &ArmedSet {
         &self.armed
     }
-    /// The selected transition descriptor.
+    /// The selected transition descriptor: the operator's selection, which
+    /// an AUTO's own rate never replaces (ADR-0112 §4).
     #[must_use]
     pub fn transition(&self) -> &TransitionDescriptor {
         &self.transition
+    }
+    /// The descriptor the active take renders: the AUTO's flight descriptor
+    /// (see [`Self::auto_with`]) while one is in flight, else the selection.
+    #[must_use]
+    pub fn active_transition(&self) -> &TransitionDescriptor {
+        self.flight_transition.as_ref().unwrap_or(&self.transition)
     }
     /// Whether completed background takes swap program and preview.
     #[must_use]
@@ -208,34 +221,7 @@ impl SwitcherState {
         if self.flight.is_some() {
             return Err(SwitcherError::InFlight);
         }
-        let valid = match &descriptor {
-            TransitionDescriptor::Dip {
-                rate, switch_point, ..
-            } => {
-                rate.get() >= 2
-                    && switch_point.num > 0
-                    && switch_point.den > 0
-                    && switch_point.num < switch_point.den
-            }
-            TransitionDescriptor::Wipe {
-                softness,
-                border_width,
-                position_xy,
-                ..
-            } => [*softness, *border_width, position_xy[0], position_xy[1]]
-                .iter()
-                .all(|x| x.is_finite() && (0.0..=1.0).contains(x)),
-            TransitionDescriptor::Stinger {
-                trigger_point,
-                mix_rate,
-                clip_duration,
-                ..
-            } => trigger_point
-                .get()
-                .checked_add(mix_rate.get())
-                .is_some_and(|sum| sum <= clip_duration.get()),
-            _ => true,
-        };
+        let valid = descriptor.is_valid();
         if !valid {
             return Err(SwitcherError::InvalidTransition);
         }
@@ -274,7 +260,7 @@ impl SwitcherState {
             }
             None => {}
         }
-        if matches!(self.transition, TransitionDescriptor::Cut) {
+        if matches!(self.active_transition(), TransitionDescriptor::Cut) {
             return self.cut();
         }
         let rate = self.rate();
@@ -288,6 +274,35 @@ impl SwitcherState {
             started: true,
             completed: false,
         })
+    }
+
+    /// Start an idle AUTO that renders `descriptor` (typically
+    /// [`Self::transition_with_rate`]) without changing the selection: the
+    /// flight carries its own descriptor, cleared when the take ends.
+    ///
+    /// # Errors
+    /// [`SwitcherError::InFlight`] during an active take,
+    /// [`SwitcherError::InvalidTransition`] for an inadmissible descriptor,
+    /// or [`SwitcherError::NothingArmed`].
+    pub fn auto_with(
+        &mut self,
+        descriptor: TransitionDescriptor,
+        tick: Tick,
+    ) -> Result<SwitcherProjection, SwitcherError> {
+        if self.flight.is_some() {
+            return Err(SwitcherError::InFlight);
+        }
+        if !descriptor.is_valid() {
+            return Err(SwitcherError::InvalidTransition);
+        }
+        self.require_armed()?;
+        self.flight_transition = Some(descriptor);
+        let projection = self.auto(tick);
+        if self.flight.is_none() {
+            // Completed at once (a cut) or refused: nothing is in flight.
+            self.flight_transition = None;
+        }
+        projection
     }
 
     /// Set the absolute u16 T-bar position; duplicates do not advance progress.
@@ -359,6 +374,7 @@ impl SwitcherState {
     /// Cancel the active flight, keeping PGM/PVW, key states and arming intact.
     pub fn abort(&mut self) -> SwitcherProjection {
         self.flight = None;
+        self.flight_transition = None;
         self.lever_out_of_sync = self.last_manual_position != 0;
         SwitcherProjection::idle()
     }
@@ -366,6 +382,7 @@ impl SwitcherState {
     /// Punch a scene directly onto program without a preview swap or key change.
     pub fn punch(&mut self, scene: SourceRef) -> SwitcherProjection {
         self.flight = None;
+        self.flight_transition = None;
         self.lever_out_of_sync = self.last_manual_position != 0;
         self.program = scene;
         self.completion_count = self.completion_count.saturating_add(1);
@@ -449,7 +466,7 @@ impl SwitcherState {
     }
 
     fn rate(&self) -> FrameCount {
-        match &self.transition {
+        match self.active_transition() {
             TransitionDescriptor::Mix { rate }
             | TransitionDescriptor::Dip { rate, .. }
             | TransitionDescriptor::Wipe { rate, .. }
@@ -462,6 +479,7 @@ impl SwitcherState {
 
     fn finish(&mut self) -> SwitcherProjection {
         self.flight = None;
+        self.flight_transition = None;
         self.lever_out_of_sync = self.last_manual_position != 0;
         if self.armed.background {
             if self.flip_flop {

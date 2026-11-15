@@ -70,13 +70,21 @@ pub type DisplayCursors =
 /// `multiview-overlay`'s text [`Cue`](multiview_overlay::subtitle::Cue) models. A
 /// bitmap cue at `now` yields [`None`] here (the bitmap path stays on the existing
 /// per-source `sample_caption_bitmaps` sampling in the pipeline, unchanged).
-/// `active_at(now)` is the same lock-free [`CueStore::active_at`] read the baker
-/// already did, so routing through the layer adds no new hot-path cost and can
-/// neither pace nor stall the engine (invariants #1/#10).
+/// `active_at(now)` **borrows** the active cue from the lock-free store snapshot
+/// ([`CueStore::with_active_at_generation`]) and copies out only its bounded
+/// projection ([`bound_cue_lines`](multiview_output::hls::bound_cue_lines): at
+/// most 16 lines / 4 KiB inspected, at most 4 lines / 512 B kept), so the
+/// per-tick cost on the output clock thread is O(bounded) whatever the cue
+/// size a remote source sent (issue #430, invariants #1/#10). A cut cue is
+/// counted exactly once in
+/// [`caption_burn_stats`](crate::overlays::caption_burn_stats), keyed by the
+/// store's per-cue publish sequence (unique across same-window replacements
+/// and generation changes).
 #[cfg(feature = "overlay")]
-#[derive(Clone)]
 pub struct CueStoreSource {
     store: Arc<CueStore>,
+    /// Counts a cut cue once, keyed by the store's publish sequence.
+    truncated: crate::overlays::TruncationTally,
 }
 
 #[cfg(feature = "overlay")]
@@ -84,25 +92,47 @@ impl CueStoreSource {
     /// Wrap a per-source cue store as a routable text [`CueSource`](multiview_overlay::CueSource).
     #[must_use]
     pub fn new(store: Arc<CueStore>) -> Self {
-        Self { store }
+        Self::with_tally(store, crate::overlays::TruncationTally::new())
+    }
+
+    /// Wrap `store`, counting cut cues through `truncated`.
+    #[must_use]
+    pub fn with_tally(store: Arc<CueStore>, truncated: crate::overlays::TruncationTally) -> Self {
+        Self { store, truncated }
+    }
+}
+
+#[cfg(feature = "overlay")]
+impl Clone for CueStoreSource {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.store))
     }
 }
 
 #[cfg(feature = "overlay")]
 impl multiview_overlay::CueSource for CueStoreSource {
     fn active_at(&self, now: MediaTime) -> Option<multiview_overlay::subtitle::Cue> {
-        match self.store.active_at(now) {
-            Some(CaptionCue::Text { start, end, text }) if !text.lines.is_empty() => {
-                Some(multiview_overlay::subtitle::Cue {
-                    start,
-                    end,
-                    lines: text.lines,
-                })
-            }
-            // A bitmap cue (or an empty-line text cue) is not a text cue: the
-            // text-layer renders nothing for it (the bitmap path is separate).
-            _ => None,
-        }
+        let (seq, start, end, bounded) = self
+            .store
+            .with_active_entry_at_generation(now, self.store.generation(), |seq, cue| match cue {
+                CaptionCue::Text { start, end, text } => Some((
+                    seq,
+                    *start,
+                    *end,
+                    multiview_output::hls::bound_cue_lines(&text.lines),
+                )),
+                // A bitmap cue is not a text cue: the text-layer renders
+                // nothing for it (the bitmap path is separate).
+                _ => None,
+            })
+            .flatten()?;
+        self.truncated.observe(seq, bounded.truncated());
+        // An empty-line text cue renders nothing.
+        (!bounded.is_empty()).then(|| multiview_overlay::subtitle::Cue {
+            start,
+            end,
+            lines: bounded.into_lines(),
+        })
     }
 }
 
@@ -1844,6 +1874,145 @@ input_id = "cam_b"
                 plan.rendition_url
             );
         }
+    }
+
+    /// A hostile text cue over `[start, start + 1000)` ns: 40 padded lines
+    /// after a blank one, tagged `c{tag}`.
+    #[cfg(feature = "overlay")]
+    fn hostile_cue(tag: &str, start: i64) -> CaptionCue {
+        let pad = "x".repeat(256 * 1024);
+        let mut lines: Vec<String> = (0..40).map(|n| format!("c{tag} l{n} {pad}")).collect();
+        lines.insert(0, String::new());
+        CaptionCue::try_text(
+            MediaTime::from_nanos(start),
+            MediaTime::from_nanos(start + 1_000),
+            lines,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Issue #430 (MED2-1): overlapping cut cues count once each, however
+    /// the newest-active selection alternates between them.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn cue_store_source_counts_overlapping_cut_cues_once_each() {
+        use multiview_overlay::CueSource as _;
+        let window = |tag: &str, start: i64, end: i64| {
+            let CaptionCue::Text { text, .. } = hostile_cue(tag, start) else {
+                panic!("text cue");
+            };
+            CaptionCue::try_text(
+                MediaTime::from_nanos(start),
+                MediaTime::from_nanos(end),
+                text.lines,
+                None,
+            )
+            .unwrap()
+        };
+        let probe = |cues: Vec<CaptionCue>, samples: &[i64]| {
+            let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+            let store = Arc::new(CueStore::new());
+            for cue in cues {
+                store.publish(cue.start(), cue.end(), cue);
+            }
+            let source = CueStoreSource::with_tally(
+                store,
+                crate::overlays::TruncationTally::with_stats(stats),
+            );
+            let mut seen = Vec::new();
+            for &t in samples {
+                let cue = source.active_at(MediaTime::from_nanos(t)).unwrap();
+                seen.push(cue.lines.first().unwrap().get(..2).unwrap().to_owned());
+            }
+            (seen, stats.text_truncated())
+        };
+        // A = [0, 10), B = [2, 3): samples 1, 2, 4 select A, B, A.
+        let (seen, count) = probe(vec![window("A", 0, 10), window("B", 2, 3)], &[1, 2, 4]);
+        assert_eq!(seen, ["cA", "cB", "cA"]);
+        assert_eq!(count, 2, "A, B, A is two cut cues");
+        // An older overlapping cue first surfaces after the newer one ends:
+        // A = [0, 10) published, then B = [0, 5) (newest wins until 5).
+        let (seen, count) = probe(
+            vec![window("A", 0, 10), window("B", 0, 5)],
+            &[1, 2, 6, 7, 3, 8],
+        );
+        assert_eq!(seen, ["cB", "cB", "cA", "cA", "cB", "cA"]);
+        assert_eq!(count, 2, "B then the exposed A, each once");
+    }
+
+    /// Issue #430: the clock-thread text projection the burn-in path samples
+    /// is bounded (inspection + output).
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn cue_store_source_projects_hostile_text_bounded() {
+        use multiview_overlay::CueSource as _;
+        let store = Arc::new(CueStore::new());
+        let cue = hostile_cue("0", 0);
+        store.publish(cue.start(), cue.end(), cue);
+        let source = CueStoreSource::new(Arc::clone(&store));
+        for t in 0..10 {
+            let cue = source.active_at(MediaTime::from_nanos(t * 50)).unwrap();
+            assert!(cue.lines.len() <= multiview_output::hls::subtitle::MAX_CUE_LINES);
+            let bytes = cue.lines.iter().map(|l| l.len() + 1).sum::<usize>() - 1;
+            assert!(bytes <= multiview_output::hls::subtitle::MAX_CUE_TEXT_BYTES);
+            assert!(cue.lines.iter().all(|l| l.capacity() <= 512));
+            assert!(cue.lines.first().unwrap().starts_with("c0 l0 "));
+        }
+        // A small cue passes through unchanged.
+        let small_source = CueStoreSource::new(text_store(0, 1_000, "hello"));
+        assert_eq!(
+            small_source
+                .active_at(MediaTime::from_nanos(10))
+                .unwrap()
+                .lines,
+            vec!["hello".to_owned()]
+        );
+    }
+
+    /// Issue #430 (MED-1): a cut cue is counted exactly once per cue
+    /// identity: a held cue once, a same-window replacement once more, the
+    /// same window in a new generation once more, a small cue never.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn cue_store_source_counts_each_cut_cue_exactly_once() {
+        use multiview_overlay::CueSource as _;
+        let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+        let store = Arc::new(CueStore::new());
+        let source = CueStoreSource::with_tally(
+            Arc::clone(&store),
+            crate::overlays::TruncationTally::with_stats(stats),
+        );
+        let hold = |source: &CueStoreSource| {
+            for t in 0..20 {
+                assert!(source.active_at(MediaTime::from_nanos(t * 40)).is_some());
+            }
+        };
+        let cue = hostile_cue("a", 0);
+        store.publish(cue.start(), cue.end(), cue);
+        hold(&source);
+        assert_eq!(stats.text_truncated(), 1, "a held cue counts once");
+        // Same start and end, new content: a replacement is a new cue.
+        let cue = hostile_cue("b", 0);
+        store.publish(cue.start(), cue.end(), cue);
+        hold(&source);
+        assert_eq!(stats.text_truncated(), 2, "a same-start replacement counts");
+        // A reconnect reuses source-relative timestamps.
+        store.begin_generation(2);
+        let cue = hostile_cue("a", 0);
+        store.publish_for_generation(2, cue.start(), cue.end(), cue);
+        hold(&source);
+        assert_eq!(stats.text_truncated(), 3, "a new generation counts");
+        let small = CaptionCue::try_text(
+            MediaTime::from_nanos(2_000),
+            MediaTime::from_nanos(3_000),
+            vec!["small".to_owned()],
+            None,
+        )
+        .unwrap();
+        store.publish_for_generation(2, small.start(), small.end(), small);
+        assert!(source.active_at(MediaTime::from_nanos(2_500)).is_some());
+        assert_eq!(stats.text_truncated(), 3, "a small cue is not counted");
     }
 
     /// RT-10b: a per-source [`CueStore`] carrying one text cue, for the router
