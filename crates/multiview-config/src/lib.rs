@@ -1110,6 +1110,21 @@ impl MultiviewConfig {
                 }
                 _ => {}
             }
+            // Source and player ids share one frame-store namespace (ADR-M012):
+            // a source may reuse a player's id only as that player's own binding.
+            if player_ids.contains(source.id.as_str()) {
+                let own_binding = matches!(
+                    &source.kind,
+                    SourceKind::MediaPlayer { player } if *player == source.id
+                );
+                if !own_binding {
+                    return Err(ConfigError::Validation(format!(
+                        "source {:?} reuses media player id {:?}: only a media_player source \
+                         bound to that same player may share its id",
+                        source.id, source.id
+                    )));
+                }
+            }
         }
 
         Ok(())

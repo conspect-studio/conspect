@@ -216,6 +216,10 @@ pub struct AudioControlHandle {
     declared_tracks: std::collections::HashMap<String, (usize, Option<String>, Option<String>)>,
     /// Shared stable-index source list read by the bake consumer each tick.
     live_track_inputs: Option<Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>>,
+    /// `media_player` source id -> player id (ADR-M012): the player's audio is
+    /// on the bus once, under the player id; a switcher selection naming the
+    /// source resolves to that channel.
+    aliases: std::collections::HashMap<String, String>,
     /// Test-only interleaving point inside [`Self::request_routing`], after the
     /// channel snapshot and before the gain table is published.
     #[cfg(test)]
@@ -306,6 +310,7 @@ impl AudioControlHandle {
             sample_rate: AudioFormat::CANONICAL_RATE,
             declared_tracks: std::collections::HashMap::new(),
             live_track_inputs: None,
+            aliases: std::collections::HashMap::new(),
             #[cfg(test)]
             routing_gap_hook: Arc::default(),
         }
@@ -337,6 +342,19 @@ impl AudioControlHandle {
             next
         });
         self
+    }
+
+    /// Resolve `media_player` source ids to their player's bus channel.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: std::collections::HashMap<String, String>) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    /// The bus channel id a selection names: a `media_player` source resolves
+    /// to its player.
+    fn channel_id<'a>(&'a self, id: &'a str) -> &'a str {
+        self.aliases.get(id).map_or(id, String::as_str)
     }
 
     /// Publish the audio-route consumers through `set` on every live routing
@@ -795,6 +813,8 @@ impl AudioControlHandle {
         tick: u64,
         remaining_ticks: u64,
     ) {
+        let outgoing = outgoing.map(|id| self.channel_id(id));
+        let incoming = self.channel_id(incoming);
         let key = (outgoing.map(str::to_owned), incoming.to_owned(), flight);
         {
             let mut active = self
@@ -841,6 +861,7 @@ impl AudioControlHandle {
         bus: &mut multiview_audio::program::ProgramBus,
         selected: Option<&str>,
     ) {
+        let selected = selected.map(|id| self.channel_id(id));
         *self
             .crossfade
             .lock()
