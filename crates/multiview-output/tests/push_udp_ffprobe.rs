@@ -109,6 +109,7 @@ impl VideoFrameSource for RampNv12Source {
             meta,
             raw_pts: None,
             a53_cc: None,
+            alpha: None,
         }))
     }
 }
