@@ -1,6 +1,7 @@
 # ADR-0114: Cast low-latency transport ladder: SRT in a Cast Connect Android TV app, MoQ then WebRTC in the Web Receiver, HLS as the floor, one cast token for every transport
 
-- **Status:** Proposed (design draft; no code in this change)
+- **Status:** Proposed (design draft; no code in this change). Revised on 2026-11-15 after design review
+  round 1, findings D1 to D4 (reviewer: OpenAI gpt-6-astra, on 9e292130); the revision is not yet re-reviewed
 - **Area:** Streaming / Output / Management / Web/API / Android (invariants #1, #7, #10)
 - **Date:** 2026-11-15
 - **Amends:** [ADR-0111](ADR-0111-cast-output.md) (adds transports beside its CMAF HLS stream; its stream, token
@@ -390,7 +391,9 @@ rungs that cannot carry `need`; rungs in `skip`; rungs removed for the receiver 
 
 The engine keeps the last probe and the playing rung per stream (bounded, like the report) and shows them to the
 stream's owner and to admins in `GET /api/v1/cast/streams/{id}`: `receiver.caps`, `transport.rung`,
-`transport.since`, `transport.fallbacks[]` (at most 8, each with rung, stage, time), `latency_ms.p50/p95`. The
+`transport.since`, `transport.fallbacks[]` (at most 8, each with rung, stage, time), `first_frame_ms`,
+`latency_ms` (median, 95th percentile, sample count, `method`, clock error; `null` when unavailable) and
+`resets` (soft, hard, last cause). The
 sender's cast card shows the rung and the latency. Every cast on a real device therefore adds to the evidence
 of decision 1 without any step by the operator.
 
@@ -756,7 +759,7 @@ Decisions:
    | Source table | 1 024 sources; the least recently seen is evicted | an evicted source starts with a full budget; the listener budget still applies |
    | Listener, all sources | burst 128, refill 32 per second | callback rejects every new handshake |
    | Accepted, not yet attached | the listen backlog, 16 | libsrt rejects (`SRT_REJ_BACKLOG`) |
-   | Pending selectors | 16 (the SRT attachment cap, decision 6) | the ladder does not offer SRT |
+   | Pending selectors | 16 (the SRT connection cap, item 9) | the ladder does not offer SRT |
 
    Before the cookie is returned the listener keeps no state per caller; the nftables floor of decision 4
    limits packets per source there.
@@ -793,9 +796,12 @@ Decisions:
    log" (Read: `moq.rs:77`) and stays so. The ladder answer is `no-store`. Logs carry a token's first 6
    characters at most, as `receiver.js` does today. The engine's SRT link status shows the peer address and
    counters, never the selector.
-9. **Bounds.** Ladder calls: 1 per second per token, burst 4, body 2 KiB. Attachments: one per token per rung,
-   so at most 32 per rung (the token cap, Read: `MAX_STREAMS`, `cast_streams/mod.rs:46`). WHEP offer 64 KiB.
-   Stored probe and fallback history: fixed size per stream.
+9. **Bounds.** Ladder calls: 1 per second per token, burst 4, body 2 KiB. Attachments: one per token per rung;
+   at most 16 push attachments per cast output (the registry's subscriber cap, Read: `MAX_PEERS`,
+   `crates/multiview-cli/src/output_window_registry.rs:38`); at most 16 connections on the cast SRT listener,
+   as an SRT listener output has (Read: `MAX_LISTENER_CLIENTS`, `crates/multiview-output/src/sink/push.rs:85`);
+   at most 32 tokens in all (Read: `MAX_STREAMS`, `cast_streams/mod.rs:46`). WHEP offer 64 KiB. Stored probe,
+   reset counters and fallback history: fixed size per stream. Media buffers: decision 6.
 10. **The receiver page.** The policy already allows `connect-src 'self' https:` and `worker-src blob:` (Read:
     `RECEIVER_CSP`, `routes/cast_public.rs:36`). Unverified in a browser: that this admits a WebTransport
     session to another `https` origin. Slice 3 checks it in the harness. The hosted copy at
@@ -840,12 +846,12 @@ the encoder's output, so a byte ceiling is what limits how much encoder output a
 | Hand-off | Count | Bytes | Age | When reached |
 | --- | --- | --- | --- | --- |
 | Dispatcher to a rung's subscription | 2 windows in hand-off; the binding queue behind it 512 packets | 16 MiB | 2 s | whole window dropped, discontinuity, resume at a verified keyframe (Read: `MAX_QUEUE_PACKETS`, `MAX_QUEUE_BYTES`, `MAX_QUEUE_AGE`, `crates/multiview-output/src/batch.rs:30-36`; `WINDOW_HANDOFF`, `output_window_registry.rs:43`) |
-| MoQ subscription | 16 sessions | 8 MiB per subscription, 64 MiB in total (Read: `crates/multiview-moq/src/provider.rs:454-455`, `:867`) | 2 s per track (Read: `with_max_age`, `crates/multiview-moq/src/lib.rs`) | window refused; the lease survives or ends by class of error |
+| MoQ subscription | 16 sessions | 8 MiB per subscription, 64 MiB in total (Read: `crates/multiview-moq/src/provider.rs:454-455`, `:867`) | 2 s per track (Read: `with_max_age`, `crates/multiview-moq/src/lib.rs:98`) | window refused; the lease survives or ends by class of error |
 | SRT attachment queue | 512 packets | **8 MiB, new** | **2 s, new** | everything queued is discarded, then the session is re-gated to the next keyframe |
 | SRT library send buffer, per connection | set by `SRTO_SNDBUF` | **2 MiB, set explicitly** (libsrt's default is 8 192 packet buffers, about 12 MiB) | the negotiated latency: libsrt drops packets too late to deliver (Cited: `SRTO_TLPKTDROP`, socket options) | libsrt drops; a send that cannot complete ends at the existing 5 s write deadline and the attachment closes |
 | WebRTC egress feed, per cast output | 512 samples | **8 MiB, new** | **2 s, new** | oldest dropped, then video is held back until the next keyframe |
 | WebRTC library send buffers, per viewer | str0m's defaults, set explicitly: 1 000 video packets, 50 audio packets (Read: str0m 0.16.2 `src/config.rs:572-573`) | about 1.2 MiB at one MTU each | n/a | the library's own eviction |
-| Opus tap, per cast output | **8 blocks** | fixed: a block is 40 ms of 48 kHz stereo float, so about 123 KiB | 320 ms | oldest dropped |
+| Opus tap, per cast output | **8 blocks** | fixed by the count: a block is one tick of 48 kHz stereo float audio, about 13 KiB at 29.97 frames per second | 8 ticks | oldest dropped |
 | Encoded Opus toward the feed | counted inside the egress feed above | | | |
 
 What is new and why. The SRT listener output on `main` bounds its per-caller queue by packets only (Read:
@@ -973,16 +979,17 @@ Order matters: the first three slices decide whether the later ones are built as
 | # | Pull request | Class | Depends on | What it proves |
 | --- | --- | --- | --- | --- |
 | 0 | This ADR and its line in the index. The cast runbook is not touched: it describes what runs, and nothing here runs yet | R0 | none | The design is reviewed before code |
-| S | **libsrt floor for every SRT listener.** `srt_getversion` in `multiview-srt-sys`; `SrtListener::bind` refuses below 1.5.7 with a typed error; libsrt 1.5.7 in the container images and the CI jobs; runbook line | R2 | none (touches no cast file; does not wait for PR 466) | A listener on an older library does not bind and says why; the existing SRT listener tests pass on 1.5.7; the image's SRT smoke test passes |
+| S | **libsrt floor for every SRT listener.** *Owned by ship lane `srtfloor`, from `main`; not a task of this team.* `srt_getversion` in `multiview-srt-sys`; `SrtListener::bind` refuses below 1.5.7 with a typed error; libsrt 1.5.7 in the container images and the CI jobs; runbook line | R2 | none (touches no cast file; does not wait for PR 466) | A listener on an older library does not bind and says why; the existing SRT listener tests pass on 1.5.7; the image's SRT smoke test passes |
 | 1 | **Latency slate and evidence.** A test source that draws the engine clock (ms) and the tick; the reference clock page; tick-to-packet delay of the shared encoder as a metric; the receiver's HLS reports gain tick-to-present | R2 | PR 466 merged | The baseline: glass-to-glass and tick-to-present for today's HLS on the operator's Chromecast, and the encoder delay that bounds every rung. Records the device's user agent |
-| 2 | **Ladder endpoint and one authorization.** `POST /cast/<token>/ladder` with the probe stored and shown; the shared token check; attachment fences set on revoke, expiry and feed change; liveness by report; `[cast] ladder`. The answer offers `hls` only. `receiver.js` sends the probe and still plays HLS | R3 | 1 | One token governs every transport: the PR 409 abuse tests pass against a fake push attachment, including a forced engine fallback (zero packets of a feed the owner may not read). From the first device cast: the real capability table of that device |
+| 2 | **Ladder endpoint and one authorization.** `POST /cast/<token>/ladder` with the probe stored and shown; the shared token check; attachment fences set on revoke, expiry and feed change; liveness by report; `[cast] ladder`. The answer offers `hls` only. `receiver.js` sends the probe and still plays HLS | R3 | 1 | One token governs every transport: the PR 409 abuse tests pass against a fake push attachment, and so does every case of the table in decision 5.4 (picture fallback, same picture with a new forbidden audio source, same bus with a new dependency, the production-to-enqueue race, a packet without identity). The clock exchange and its error bound are tested. From the first device cast: the real capability table of that device |
 | 3 | **CAF spike, in the harness, no product code path.** A `<video>` element fed from outside CAF's player; LOAD interceptor returning `null`; `setMediaElement`, `setMediaInformation`, `broadcastStatus` | R1 (tools only) | 2 | Whether a Web Receiver can show a picture CAF did not load and still give senders a correct media session. Checks the page policy against a cross-origin WebTransport session. A fail ends slices 4 and 5 |
-| 4 | **MoQ rung.** Engine: cast outputs admitted to MoQ leases through the ladder; lease renewal by the ladder call. Receiver: `moq.js` (WebTransport, CMAF wrap, `SourceBuffer`), deadlines, step-down, memory | R3 | 3 passed; the probe data shows a device with `wt` and `mse` | MoQ plays through the real CAF SDK in the harness with media status correct; a wedged or stalled MoQ attachment costs the clock zero ticks and other bindings zero packets; device test with glass-to-glass |
-| 5 | **WebRTC rung.** `POST` and `DELETE /cast/<token>/whep`; one Opus encoder per cast output; PLI ignored; receiver `rtc.js`; ICE-TCP | R3 | 3 passed | WebRTC plays in the harness with UDP blocked (TCP 443 only); the Opus encoder count stays one with several viewers; chaos as slice 4; device test |
+| 4 | **MoQ rung.** Engine: cast outputs admitted to MoQ leases through the ladder; lease renewal by the ladder call. Receiver: `moq.js` (WebTransport, CMAF wrap, `SourceBuffer`), deadlines, step-down, memory | R3 | 3 passed; the probe data shows a device with `wt` and `mse` | MoQ plays through the real CAF SDK in the harness with media status correct; the receiver soak and the stalled-append, slow-decoder and quota tests of decision 6 pass; reported latency matches the slate's tick (decision 2); the authorization cases of decision 5.4 pass on the real rung; a wedged or stalled MoQ attachment costs the clock zero ticks and other bindings zero packets; device test with glass-to-glass |
+| 5 | **WebRTC rung.** `POST` and `DELETE /cast/<token>/whep`; one Opus encoder per cast output; PLI ignored; receiver `rtc.js`; ICE-TCP | R3 | 3 passed | WebRTC plays in the harness with UDP blocked (TCP 443 only); wire RTP time equals engine time across the 2^32 wrap and latency is `unavailable`, with no step-down, when the frame metadata lacks it (decision 2); the Opus encoder count stays one with several viewers; the egress byte and age ceilings and the authorization cases of decision 5.4 hold; chaos as slice 4; device test |
 | 6 | **SRT rung and the Android TV app.** Engine: listen callback in `multiview-srt-sys`, the cast SRT listener, one-time selectors and the HKDF passphrase, pre-authentication budgets, attachment per token. App: `android/cast-tv/`, CI job that builds the APK. Senders: `androidReceiverCompatible`, `supportedAppTypes`, behind `[cast] android_tv` | R3 | 2, S | Engine: a libsrt caller with the issued selector and the derived passphrase receives valid MPEG-TS; the test table of decision 5.7 passes (a flood of wrong-passphrase handshakes on a known selector neither evicts nor locks out the valid receiver; unknown, expired and reused selectors and a revoked token get nothing); wire PTS equals engine time (decision 2); churn and a wedged caller do not slow the producer. Device: the app launches when installed, the Web Receiver when not; SRT plays; a blocked port falls to HLS and the next cast to the Web Receiver |
 | 7 | **Measured ladder.** Run the matrix; set the offer order, deadlines, SRT latency and player buffers from the data; remove any rung that does not beat the one below it on a class; enable `android_tv` by default if slice 6's first device step passed; runbook; this ADR to Accepted with the table | R2 | 4, 5, 6 as built | The ladder's order and targets are measurements. Every cell of the table is filled or marked as not built, with the reason |
 
-Slice S is independent of everything else and goes first. Slices 4, 5 and 6 are independent of each other
+Slice S is a security fix for every shipped image, so it is done by ship lane `srtfloor` and not by this team;
+slice 6 still depends on it. Slices 4, 5 and 6 are independent of each other
 after 2 (and 3 for the web rungs). Slice 6 is the largest and
 has the longest operator lead time, so it starts as soon as 2 is merged. If the probe data from slice 2 shows
 that no device in hand has `wt`, slice 4 is deferred, not built blind.
@@ -1087,6 +1094,12 @@ captain as one list; none blocks slices 0 to 5 from merging.
 | What the Cast platform does when `androidReceiverCompatible` is set and the app is not installed | slice 6, first device step |
 | Whether `supportedAppTypes` in the engine-side LAUNCH selects the Android TV app | slice 6 device test |
 | Whether UDP 443 and UDP 9010 pass from the network the Cast devices are on | slices 4 and 6 device tests |
-| How libsrt 1.5.7 reaches the container images and CI (a Debian backport, or a build in the FFmpeg base image, which links libsrt) | slice S |
+| How libsrt 1.5.7 reaches the container images and CI | slice S, lane `srtfloor`. Its plan as told to this team: build 1.5.7 from the pinned upstream tarball in the images |
 | Minimum Android API of Media3 and the Cast TV library | slice 6 |
+| Whether the audio tap carries the engine timestamp of each block (needed to stamp Opus with engine time) | slice 5 |
+| Whether the engine's SRT output writes `PTS = engine time` exactly (libav adds twice `max_delay`, default 0) | slice 6: demux the engine's own output and compare |
+| Whether Media3 reports the extractor's sample time unchanged to the frame listener for a progressive source | slice 6 instrumented test; until it passes, SRT latency is `unavailable` |
+| Whether libsrt discards, and neither grows nor blocks, when the app stops reading | slice 6 test, before the rung is enabled |
+| Whether `jitterBufferTarget` exists on a Cast device and what the jitter buffer then holds | slice 5 device test |
+| Existing `webrtc` output: RTP time becomes 0 for every frame after 2^32 ticks of 90 kHz, 13 h 15 min (read in code, not reproduced) | reported to the lead; outside this ADR |
 
