@@ -1213,6 +1213,10 @@ impl SessionStream {
             // A take outcome carries its own op id (empty for a fallback).
             Event::RouteOutput(outcome) => (!outcome.operation_id.is_empty())
                 .then(|| OperationId::from_string(outcome.operation_id.clone())),
+            // A set outcome carries the set's op id (#308).
+            Event::PatchTake(outcome) => {
+                Some(OperationId::from_string(outcome.operation_id.clone()))
+            }
             _ => self.corr.as_ref().and_then(|registry| {
                 CorrKey::for_event(&event).and_then(|key| registry.resolve(&key, seq_event.seq))
             }),
@@ -1319,6 +1323,12 @@ pub fn event_scope_id(event: &Event) -> Option<String> {
         // the `ids` filter narrows the coarse `switcher` topic to one player.
         Event::SwitcherOperation(e) => Some(e.me.clone()),
         Event::RouteOutput(e) => Some(e.output.clone()),
+        // One `patch.take` delivery per destination (#308): its id.
+        Event::PatchTake(e) => e
+            .destination
+            .output
+            .clone()
+            .or_else(|| e.destination.mixer.clone()),
         Event::MediaPlayerState(e) => Some(e.player.clone()),
         Event::GraphicsChannelState(e) => Some(e.channel.clone()),
         // A catalogue link status scopes by the linked source id.
@@ -1387,6 +1397,10 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // (`Event::is_conflated`), so the session pump excludes it from the
         // lossless replay ring exactly like the other conflated samples (inv #10).
         Event::OutputStatus(_) | Event::RistLinkStats(_) | Event::RouteOutput(_) => Topic::Outputs,
+        // A set outcome rides its destination's lane (#308): an output's on
+        // `outputs` beside `route.output`, the mixer's on `switcher` beside
+        // `switcher.operation`.
+        Event::PatchTake(e) if e.destination.output.is_some() => Topic::Outputs,
         // Operator alerts AND health warnings (SA-0) AND shed-load decisions ride
         // the existing `alerts` lane — a health warning is a richer sibling of an
         // alert (ADR-0035), and a shed-load is a discrete, lossless
@@ -1434,6 +1448,7 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // discrete transport-state transition rides the lossless `switcher`
         // topic (scoped finer by the player `id`), NOT the `$control` catch-all.
         Event::SwitcherOperation(_)
+        | Event::PatchTake(_)
         | Event::MediaPlayerState(_)
         | Event::GraphicsChannelState(_) => Topic::Switcher,
         _ => Topic::Control,

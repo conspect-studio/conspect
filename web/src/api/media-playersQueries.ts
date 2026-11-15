@@ -17,8 +17,12 @@ import {
   armMediaPlayerExit,
   cancelMediaPlayerExit,
   cueMediaPlayer,
+  getPlayerLoadOperation,
+  isTerminalLoadOperationState,
   listMediaPlayers,
   loadMediaPlayer,
+  loadMediaPlayerArtifact,
+  OperationApiError,
   pauseMediaPlayer,
   playMediaPlayer,
   seekMediaPlayer,
@@ -27,12 +31,17 @@ import {
 } from './media-players';
 import type {
   AcceptedBody,
+  ArtifactRef,
+  LoadOperation,
+  LoadResponse,
+  LoadThen,
   MediaPlayer,
-  OperationApiError,
   RequestOptions,
 } from './media-players';
 
-export type { MediaPlayer } from './media-players';
+export type { MediaPlayer, ArtifactRef, LoadOperation, LoadResponse, LoadThen, NativeLoadAck } from './media-players';
+export { isTerminalLoadOperationState } from './media-players';
+export type { LoadOperationState } from './media-players';
 export { OperationApiError } from './operations';
 
 /** Connection options threaded into the media-player hooks. */
@@ -122,5 +131,68 @@ export function useMediaPlayerTransport(
           return cancelMediaPlayerExit(vars.id, base);
       }
     },
+  });
+}
+
+/** Variables for {@link useLoadMediaPlayerArtifact}. */
+export interface LoadArtifactVars {
+  readonly id: string;
+  readonly artifactRef: ArtifactRef;
+  readonly then?: LoadThen;
+  /** Reuse across a retry of the SAME load attempt; omit to mint a fresh one. */
+  readonly idempotencyKey?: string;
+}
+
+/**
+ * Load a completed capture artifact into a player
+ * (`POST .../load`, body `{ artifactRef, then? }`). Returns either the
+ * legacy `202 AcceptedBody` or a `LoadOperation` to poll with
+ * {@link useMediaPlayerLoadOperation}.
+ */
+export function useLoadMediaPlayerArtifact(
+  context: MediaPlayerContext = {},
+): UseMutationResult<LoadResponse, OperationApiError, LoadArtifactVars> {
+  return useMutation<LoadResponse, OperationApiError, LoadArtifactVars>({
+    mutationFn: (vars): Promise<LoadResponse> =>
+      loadMediaPlayerArtifact(vars.id, vars.artifactRef, vars.then, {
+        ...options(context),
+        ...(vars.idempotencyKey !== undefined ? { idempotencyKey: vars.idempotencyKey } : {}),
+      }),
+  });
+}
+
+/** Stable React Query key for one player's polled native load operation. */
+export function mediaPlayerLoadOperationKey(
+  playerId: string,
+  operation: number,
+): readonly unknown[] {
+  return ['media-players', playerId, 'load-operations', operation] as const;
+}
+
+/**
+ * Poll one player's native load operation
+ * (`GET .../load-operations/{operation}`) on a ~2s interval, stopping once
+ * its `state` is terminal (`completed`/`failed`/`superseded` —
+ * {@link isTerminalLoadOperationState}; the actual state set this provider
+ * reports, `crates/multiview-cli/src/player/provider.rs::classify`).
+ */
+export function useMediaPlayerLoadOperation(
+  playerId: string | undefined,
+  operation: number | undefined,
+  context: MediaPlayerContext = {},
+): UseQueryResult<LoadOperation, OperationApiError> {
+  return useQuery<LoadOperation, OperationApiError>({
+    queryKey: mediaPlayerLoadOperationKey(playerId ?? '', operation ?? -1),
+    queryFn: (): Promise<LoadOperation> => {
+      if (playerId === undefined || operation === undefined) {
+        return Promise.reject(new OperationApiError('No player/operation id to poll.'));
+      }
+      return getPlayerLoadOperation(playerId, operation, options(context));
+    },
+    enabled: playerId !== undefined && operation !== undefined,
+    refetchInterval: (query): number | false =>
+      query.state.data !== undefined && isTerminalLoadOperationState(query.state.data.state)
+        ? false
+        : 2000,
   });
 }

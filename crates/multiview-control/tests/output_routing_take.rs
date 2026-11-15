@@ -1462,6 +1462,7 @@ impl multiview_control::program_metrics::ProgramMetricsSource for Counters {
             frames_repeated: 3,
             compose_deadline_misses: 0,
             phases: multiview_engine::lateness::PhasesSnapshot::default(),
+            output_clocks: Vec::new(),
         })
     }
 }
