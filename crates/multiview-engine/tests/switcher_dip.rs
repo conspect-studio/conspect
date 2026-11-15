@@ -338,6 +338,62 @@ fn a_transition_change_during_a_take_is_refused_and_the_flight_keeps_its_dip() {
     assert!(refused.unwrap().contains("active take"));
 }
 
+/// ADR-0112 §4: the published snapshot reports the selection from the tick
+/// the command was applied on, never before, and a refused selection leaves
+/// it unchanged. An AUTO's own rate is the flight's, never the selection's:
+/// the snapshot keeps reporting the operator's selection during and after it.
+#[test]
+fn the_snapshot_carries_the_selected_transition_after_its_command_tick() {
+    let mut rig = rig();
+    rig.step(0);
+    assert_eq!(
+        rig.handle.snapshot().unwrap().transition,
+        TransitionDescriptor::Cut
+    );
+    let selected = wipe(
+        12,
+        "box",
+        &serde_json::json!({"softness": 0.1, "reverse": true, "border_width": 0.02, "border_color": "#ffffff"}),
+    );
+    rig.send("set", SwitcherVerb::SetTransition(selected.clone()));
+    assert_eq!(
+        rig.handle.snapshot().unwrap().transition,
+        TransitionDescriptor::Cut,
+        "queued is not applied"
+    );
+    rig.step(1);
+    let snapshot = rig.handle.snapshot().unwrap();
+    assert_eq!(snapshot.tick, 1);
+    assert_eq!(snapshot.transition, selected);
+    // A refused selection (not rendered) publishes nothing new.
+    rig.send(
+        "refused",
+        SwitcherVerb::SetTransition(wipe(12, "box", &serde_json::json!({"flip_flop": true}))),
+    );
+    rig.step(2);
+    assert_eq!(rig.handle.snapshot().unwrap().transition, selected);
+    // A steady tick republishes nothing (change-only publication).
+    let before = rig.handle.snapshot().unwrap();
+    rig.step(3);
+    assert!(Arc::ptr_eq(&before, &rig.handle.snapshot().unwrap()));
+    // The AUTO's rate is the flight's rate; the snapshot keeps the selection.
+    rig.send("auto", SwitcherVerb::Auto(FrameCount::try_from(5).unwrap()));
+    rig.step(4);
+    let flight = rig.handle.snapshot().unwrap();
+    assert!(flight.in_flight);
+    assert_eq!(flight.transition, selected, "the selection, not the flight");
+    for index in 5..=9 {
+        rig.step(index);
+    }
+    let done = rig.handle.snapshot().unwrap();
+    assert!(!done.in_flight);
+    assert_eq!(done.completion_count, flight.completion_count + 1);
+    assert_eq!(
+        done.transition, selected,
+        "completion restores nothing: it never changed"
+    );
+}
+
 /// Invariant #1 allocation gate: the colour is coded once per distinct colour,
 /// and repeated dips grow neither the fill odometer nor the scratch pool.
 #[test]
@@ -480,9 +536,16 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
                     2 => SwitcherVerb::SetTransition(TransitionDescriptor::Mix {
                         rate: FrameCount::try_from(6).unwrap(),
                     }),
-                    3 if n % 2 == 0 => {
+                    // Invalid (a one-frame dip) and unrendered (flip-flop)
+                    // selections are refused at the tick, never published.
+                    3 if n % 4 == 0 => {
                         SwitcherVerb::SetTransition(dip(1, None, Rational::new(1, 2)))
                     }
+                    3 if n % 2 == 0 => SwitcherVerb::SetTransition(wipe(
+                        6,
+                        "vertical",
+                        &serde_json::json!({"flip_flop": true}),
+                    )),
                     3 => SwitcherVerb::SetTransition(wipe(
                         6,
                         ["box", "circle", "diagonal"][usize::try_from(n % 3).unwrap()],
@@ -573,6 +636,17 @@ async fn a_transition_command_flood_never_moves_the_output_clock() {
         per_tick.values().max()
     );
     assert!(u64::try_from(seen.len()).unwrap() >= TICKS);
+    // ADR-0112 §4: under the flood the published selection is always one
+    // the engine accepted (never a refused or unrendered descriptor).
+    let selection = handle.snapshot().unwrap().transition.clone();
+    assert!(
+        selection.is_rendered() && selection.is_valid(),
+        "{selection:?}"
+    );
+    assert!(
+        !matches!(selection, TransitionDescriptor::Cut),
+        "{selection:?}"
+    );
     // The seeded bordered wipe was composed on its first tick and again on
     // the next one, after the flood's first 16 commands were drained (the
     // first CUT is command 49, at least three drains later).
