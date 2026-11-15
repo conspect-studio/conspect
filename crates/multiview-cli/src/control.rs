@@ -2982,7 +2982,7 @@ impl CommandDrain {
                 // ADR-M012: a media-player binding is a pure alias (no producer).
                 if let multiview_config::SourceKind::MediaPlayer { player } = &source.kind {
                     self.upsert_media_player_source(source, player, drive);
-                } else {
+                } else if self.leave_alias_for_producer(&source.id, drive) {
                     self.upsert_source(source, drive);
                 }
             }
@@ -3315,6 +3315,52 @@ impl CommandDrain {
     /// source reads no-signal. An edit from a decoded/synthetic kind first asks
     /// the hub to stop that producer — never when the id is a player's own,
     /// whose producer is the player channel itself.
+    /// Before a producer kind is upserted under `id`: a declared player's id
+    /// is refused (its store is the player channel; a producer writing into it
+    /// would interleave frames with the player). When `id` was a
+    /// `media_player` alias, its drive entry — the player's shared store — is
+    /// unregistered so `upsert_source` allocates an independent store, and
+    /// its audio alias is withdrawn. Returns whether the upsert may proceed.
+    fn leave_alias_for_producer(
+        &mut self,
+        id: &str,
+        drive: &mut CompositorDrive<Nv12Image>,
+    ) -> bool {
+        if self.config.media_players.iter().any(|p| p.id == id) {
+            tracing::warn!(
+                source = %id,
+                "upsert_source refused: the id is a media player's channel; only a \
+                 media_player binding may share it"
+            );
+            return false;
+        }
+        let was_alias = self.config.sources.iter().any(|s| {
+            s.id == id && matches!(s.kind, multiview_config::SourceKind::MediaPlayer { .. })
+        });
+        if was_alias {
+            // Drop only this id's map entry: the player keeps its own entry
+            // (and store) under the player id.
+            drive.remove_store(id);
+            self.publish_alias(id, None);
+        }
+        true
+    }
+
+    /// Publish a `media_player` alias change to the program-audio consumer
+    /// (one bounded RCU; wait-free reads on the bake consumer), at the same
+    /// frame boundary that rebinds the alias's video.
+    #[cfg(feature = "ffmpeg")]
+    fn publish_alias(&self, alias: &str, player: Option<&str>) {
+        if let Some(handle) = self.audio_route.as_ref().and_then(|slot| slot.load()) {
+            handle.set_alias(alias, player);
+        }
+    }
+
+    /// Without `ffmpeg` there is no program-audio bus to inform.
+    #[cfg(not(feature = "ffmpeg"))]
+    #[allow(clippy::unused_self)] // reason: same signature as the ffmpeg build
+    const fn publish_alias(&self, _alias: &str, _player: Option<&str>) {}
+
     fn upsert_media_player_source(
         &mut self,
         source: &multiview_config::Source,
@@ -3322,6 +3368,15 @@ impl CommandDrain {
         drive: &mut CompositorDrive<Nv12Image>,
     ) {
         let id = source.id.clone();
+        if id != player && self.config.media_players.iter().any(|p| p.id == id) {
+            // Never overwrite another player's channel entry (config
+            // validation enforces the same rule at boot).
+            tracing::warn!(
+                source = %id, player = %player,
+                "media_player source refused: its id is another media player's channel"
+            );
+            return;
+        }
         let replaced_producer = self.config.sources.iter().any(|s| {
             s.id == id && !matches!(s.kind, multiview_config::SourceKind::MediaPlayer { .. })
         });
@@ -3333,6 +3388,8 @@ impl CommandDrain {
                 }
             }
         }
+        // A repoint (alias A -> B) replaces this id's entry with B's store; the
+        // previous player's own entry is never touched.
         if id != player || drive.store(player).is_none() {
             let store = drive.store(player).map_or_else(
                 || {
@@ -3355,6 +3412,9 @@ impl CommandDrain {
             multiview_core::stream::StreamKind::Video,
         );
         self.resolution.set_video_store_key(&stream, id.clone());
+        if id != player {
+            self.publish_alias(&id, Some(player));
+        }
         match self.config.sources.iter_mut().find(|s| s.id == id) {
             Some(slot) => *slot = source.clone(),
             None => self.config.sources.push(source.clone()),
@@ -3427,6 +3487,7 @@ impl CommandDrain {
             if !self.config.media_players.iter().any(|p| p.id == id) {
                 drive.remove_store(id);
             }
+            self.publish_alias(id, None);
             self.config.sources.retain(|s| s.id != id);
             self.applied_media.remove(id);
             self.unapplied.remove(id);

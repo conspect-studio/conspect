@@ -1688,6 +1688,13 @@ impl OutputRouter {
         }
     }
 
+    /// Resolve `media_player` source aliases on routed feeds (ADR-M012).
+    pub(crate) fn set_audio_aliases(&mut self, aliases: crate::routing_audio::ChannelAliases) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.set_aliases(aliases);
+        }
+    }
+
     /// Test seam: the program encoder's codec configuration a private bus
     /// must match to bind (a mismatch refuses its audio move).
     #[cfg(test)]

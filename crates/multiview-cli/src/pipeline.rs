@@ -5838,9 +5838,10 @@ impl Pipeline {
             // The `[audio]` routes decide membership/gain/mute (ADR-0059 §4);
             // with none declared every store rides at unity.
             let mut channels = std::collections::HashMap::new();
-            for (id, gain) in program_bus_gains(
+            for (id, gain) in program_bus_gains_aliased(
                 self.audio_stores.keys().map(String::as_str),
                 self.audio_routing.as_ref(),
+                &self.player_aliases,
             ) {
                 if let Some(store) = self.audio_stores.get(id.as_str()) {
                     let point = bus.add_source(id.clone(), Arc::clone(store), gain);
@@ -9112,6 +9113,9 @@ fn consumer_main<D: WindowDelivery>(
             encoder.codec_params().codec_config_bytes(),
             route_gain,
         );
+        if let Some(handle) = audio_route.clone() {
+            router.set_audio_aliases(Arc::new(move || handle.aliases()));
+        }
     }
     let mut audio_worker = match audio_encoder.take() {
         Some(encoder) => {
@@ -9523,7 +9527,11 @@ fn consumer_main<D: WindowDelivery>(
                     .ok_or_else(|| PipelineError::Engine("audio track bus missing".to_owned()))?;
                 #[cfg(not(feature = "overlay"))]
                 let track_bus = bus;
-                discrete_track_samples(track_bus, &selected_tracks, block.frame_count())
+                let aliases = audio_route
+                    .as_deref()
+                    .map(crate::audio::AudioControlHandle::aliases)
+                    .unwrap_or_default();
+                discrete_track_samples(track_bus, &selected_tracks, &aliases, block.frame_count())
             };
             #[cfg(test)]
             router.tap_program_audio(item.tick_index, &block);
@@ -9635,18 +9643,22 @@ fn consumer_main<D: WindowDelivery>(
 /// pre-mix block, with exactly the program block's `frames`. A source with no
 /// block this tick (or a block of another length) yields `None` = silence, so the
 /// track's clock never skips.
-fn discrete_track_samples(
+/// A track input naming a `media_player` alias (ADR-M012) carries its
+/// player's channel.
+fn discrete_track_samples<S: std::hash::BuildHasher>(
     bus: &multiview_audio::program::ProgramBus,
     track_inputs: &[String],
+    aliases: &std::collections::HashMap<String, String, S>,
     frames: usize,
 ) -> Vec<Option<Vec<f32>>> {
     let inputs = bus.input_tracks();
     track_inputs
         .iter()
         .map(|input_id| {
+            let channel = aliases.get(input_id).unwrap_or(input_id);
             inputs
                 .iter()
-                .find(|(id, _)| *id == input_id.as_str())
+                .find(|(id, _)| *id == channel.as_str())
                 .map(|(_, b)| *b)
                 .filter(|b| b.frame_count() == frames)
                 .map(|b| b.interleaved().to_vec())
@@ -21695,9 +21707,23 @@ impl LiveStamper {
 /// (linear). Every other store still joins the bus at zero gain so its discrete
 /// track is metered (mute ≠ unroute; an operator routes by the meter). With no
 /// routes, every store rides at unity. Sorted by id.
+#[cfg(test)]
 pub(crate) fn program_bus_gains<'a>(
     ids: impl Iterator<Item = &'a str>,
     routing: Option<&multiview_config::AudioRouting>,
+) -> Vec<(String, f64)> {
+    program_bus_gains_aliased(ids, routing, &std::collections::HashMap::new())
+}
+
+/// [`program_bus_gains`] where a route may name a `media_player` source alias
+/// (ADR-M012): `aliases` maps alias id -> player id, and the player's single
+/// bus channel takes the first included, unmuted route naming either the
+/// player or one of its aliases (exactly the unaliased rule). One channel, one
+/// gain: a player is never mixed twice however many aliases route it.
+pub(crate) fn program_bus_gains_aliased<'a, S: std::hash::BuildHasher>(
+    ids: impl Iterator<Item = &'a str>,
+    routing: Option<&multiview_config::AudioRouting>,
+    aliases: &std::collections::HashMap<String, String, S>,
 ) -> Vec<(String, f64)> {
     let mut ids: Vec<&str> = ids.collect();
     ids.sort_unstable();
@@ -21710,9 +21736,13 @@ pub(crate) fn program_bus_gains<'a>(
             // Every input is on the bus so it is METERED (an operator picks what
             // to route by its meter), but only an included, unmuted route is
             // MIXED: everything else rides at zero program gain.
+            let names = |r: &&multiview_config::AudioRoute| {
+                r.input_id == id || aliases.get(&r.input_id).is_some_and(|p| p == id)
+            };
             let gain = routes
                 .iter()
-                .find(|r| r.input_id == id && r.include_in_program_bus && !r.mute)
+                .filter(names)
+                .find(|r| r.include_in_program_bus && !r.mute)
                 .map_or(0.0, |r| {
                     10f64.powf(f64::from(r.gain_db.clamp(-96.0, 24.0)) / 20.0)
                 });
@@ -26657,6 +26687,41 @@ segment_ms = 1000
                 .count(),
             1,
             "exactly one producer: the player's"
+        );
+    }
+
+    /// Review C3: a configured route naming the alias gives the player's
+    /// channel (the only one on the bus for it) the route's gain at startup.
+    #[test]
+    fn a_configured_route_through_the_alias_gains_the_player_channel() {
+        let _budget = crate::player::budget_test_guard();
+        let mut doc = config("vt-a").to_toml().unwrap();
+        doc.push_str(
+            "\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"vt-a\"\n\
+             channels = { kind = \"stereo\" }\ninclude_in_program_bus = true\ngain_db = -6.0\n",
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("parse");
+        config.validate().expect("an alias route validates");
+        let pipeline = Pipeline::build(&config).expect("builds");
+        assert!(
+            pipeline.audio_stores.contains_key("vt-1")
+                && !pipeline.audio_stores.contains_key("vt-a"),
+            "one bus channel per player, keyed by the player"
+        );
+        let gains = super::program_bus_gains_aliased(
+            pipeline.audio_stores.keys().map(String::as_str),
+            pipeline.audio_routing.as_ref(),
+            &pipeline.player_aliases,
+        );
+        let vt1 = gains
+            .iter()
+            .find(|(id, _)| id == "vt-1")
+            .expect("vt-1 on the bus")
+            .1;
+        assert!((vt1 - 10f64.powf(-6.0 / 20.0)).abs() < 1e-9, "{gains:?}");
+        assert!(
+            gains.iter().all(|(id, _)| id != "vt-a"),
+            "never mixed twice"
         );
     }
 

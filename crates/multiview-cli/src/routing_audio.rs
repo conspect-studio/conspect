@@ -36,6 +36,7 @@
 //! full = the bus fails alone). The dispatcher's dynamic audio stage never
 //! gates a base window. The consumer never joins or waits for a bus thread.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -69,6 +70,10 @@ pub(crate) const RETURN_AFTER_SAMPLES: u64 = 4 * AAC_FRAME_SAMPLES;
 /// Per-source linear route gain (`gain_db`, `mute`) of `audio-routing`
 /// (§5.5), read live on the consumer.
 pub(crate) type RouteGain = Arc<dyn Fn(&str) -> f32 + Send + Sync>;
+
+/// The live `media_player` alias map (ADR-M012): a feed `audio = source:<id>`
+/// naming an alias reads its player's strip. One wait-free load per tick.
+pub(crate) type ChannelAliases = Arc<dyn Fn() -> Arc<HashMap<String, String>> + Send + Sync>;
 
 /// Test seam: called by a private bus's encode thread before each job with
 /// the job's index (block or panic to inject a stalled or crashing worker).
@@ -386,6 +391,7 @@ struct Staged {
 struct FeedCtx<'a> {
     program: &'a AudioBlock,
     inputs: &'a [(&'a str, &'a AudioBlock)],
+    aliases: &'a HashMap<String, String>,
     preview: Option<&'a str>,
     gain: &'a (dyn Fn(&str) -> f32 + Send + Sync),
     frames: usize,
@@ -412,6 +418,7 @@ pub(crate) struct RoutedAudio {
     cadence: Rational,
     pub(crate) program_config: Option<Vec<u8>>,
     route_gain: RouteGain,
+    aliases: Option<ChannelAliases>,
     preview: Option<Arc<SwapCell<Option<Arc<str>>>>>,
     channels: usize,
     outputs: Vec<OutputAudio>,
@@ -428,6 +435,11 @@ pub(crate) struct RoutedAudio {
 }
 
 impl RoutedAudio {
+    /// Resolve `media_player` aliases to their player's strip (ADR-M012).
+    pub(crate) fn set_aliases(&mut self, aliases: ChannelAliases) {
+        self.aliases = Some(aliases);
+    }
+
     pub(crate) fn new(
         outputs: usize,
         config: AudioEncodeConfig,
@@ -444,6 +456,7 @@ impl RoutedAudio {
             config,
             program_config,
             route_gain,
+            aliases: None,
             preview,
             outputs: (0..outputs)
                 .map(|_| OutputAudio {
@@ -1263,9 +1276,11 @@ impl RoutedAudio {
         let end = self.clock.total_at(tick.saturating_add(1));
         let preview: Option<Arc<str>> = self.preview.as_ref().and_then(|p| p.load());
         let program_config = self.program_config.clone();
+        let aliases = self.aliases.as_ref().map(|load| load()).unwrap_or_default();
         let ctx = FeedCtx {
             program,
             inputs,
+            aliases: &aliases,
             preview: preview.as_deref(),
             gain: &*self.route_gain,
             frames,
@@ -1372,6 +1387,7 @@ impl RoutedAudio {
                 src,
                 ctx.program,
                 ctx.inputs,
+                ctx.aliases,
                 ctx.preview,
                 ctx.gain,
                 ctx.frames,
@@ -1642,7 +1658,15 @@ fn source_pcm(
 ) -> Vec<f32> {
     let mut out = Vec::new();
     source_pcm_into(
-        &mut out, src, program, inputs, preview, gain, frames, channels,
+        &mut out,
+        src,
+        program,
+        inputs,
+        &HashMap::new(),
+        preview,
+        gain,
+        frames,
+        channels,
     );
     out
 }
@@ -1654,6 +1678,7 @@ fn source_pcm_into(
     src: &AudioSource,
     program: &AudioBlock,
     inputs: &[(&str, &AudioBlock)],
+    aliases: &HashMap<String, String>,
     preview: Option<&str>,
     gain: &(dyn Fn(&str) -> f32 + Send + Sync),
     frames: usize,
@@ -1676,10 +1701,13 @@ fn source_pcm_into(
         AudioSource::Track { input, .. } => (Some(input.as_str()), false),
     };
     out.resize(len, 0.0);
+    // The route gain keys on the id as routed (an alias may carry its own
+    // route); the strip is the player's when the id is an alias (ADR-M012).
     let block = id.and_then(|id| {
+        let strip = aliases.get(id).map_or(id, String::as_str);
         inputs
             .iter()
-            .find(|(i, _)| *i == id)
+            .find(|(i, _)| *i == strip)
             .map(|(_, b)| (if gained { gain(id) } else { 1.0 }, *b))
     });
     if let Some((g, block)) = block {
