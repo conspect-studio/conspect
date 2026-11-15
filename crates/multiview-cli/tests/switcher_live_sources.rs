@@ -250,7 +250,7 @@ async fn switcher_run_adds_and_edits_network_sources_live_and_takes_them() {
         hub.handle(),
         pipeline.drain_demand(),
     );
-    let live_stores = pipeline.live_bus_stores();
+    let catalogue = pipeline.catalogue();
     let stop = StopSignal::new();
     let preview = program_slot();
 
@@ -275,8 +275,8 @@ async fn switcher_run_adds_and_edits_network_sources_live_and_takes_them() {
                 "id": "net1", "kind": "hls", "url": format!("http://[::1]:{port}/net1.m3u8")
             })))
             .unwrap();
-        let catalogued = eventually("net1 in the M/E store map", Duration::from_secs(10), || {
-            live_stores.load().contains_key("net1")
+        let catalogued = eventually("net1 catalogued", Duration::from_secs(10), || {
+            catalogue.load().contains_key("net1")
         })
         .await;
         check(catalogued, "net1 catalogued live");
@@ -337,7 +337,7 @@ async fn switcher_run_adds_and_edits_network_sources_live_and_takes_them() {
             })))
             .unwrap();
         let catalogued = eventually("net2 catalogued", Duration::from_secs(10), || {
-            live_stores.load().contains_key("net2")
+            catalogue.load().contains_key("net2")
         })
         .await;
         check(catalogued, "net2 catalogued");
@@ -373,7 +373,7 @@ async fn switcher_run_adds_and_edits_network_sources_live_and_takes_them() {
                 .unwrap();
             check(
                 eventually("yt1 catalogued", Duration::from_secs(10), || {
-                    live_stores.load().contains_key("yt1")
+                    catalogue.load().contains_key("yt1")
                 })
                 .await,
                 "yt1 catalogued live",

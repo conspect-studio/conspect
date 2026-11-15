@@ -59,23 +59,48 @@ and no stale pixels; refusing it was over-broad.
    engine really does not run gets `409 ... applies on restart`.
 5. **Remove** is unchanged: retire pixels, drop pins, fence.
 
-## Live bus-store map
+## The M/E sees the drive's store set
 
 The switcher tick driver's prime map and the PVW monitor map were fixed at run
-start, so a live-added source could never be primed or monitored. The pipeline
-now owns a `SwapCell<Arc<HashMap<id, store>>>` the spawner RCUs on add/remove
-(hub worker only). The driver and the hook consult it first, then the fixed
-boot map. On the clock this is one wait-free `SwapCell::load` and a hash lookup
-per freshness check: no lock, no allocation, no await.
+start, so a live-added source could never be primed, taken or monitored. The
+drive now carries a `stores_generation` counter bumped only by
+`insert_store`/`remove_store` (the drain's live add/remove). The frame hook
+compares it once per tick; only when it changed does it copy the drive's store
+map into the driver (`sync_live_stores`). That copy is bounded by the drive's
+store count and paced by operator adds. The driver and the PVW monitor look
+there first, then at the boot map. No shared cell is read on the clock.
+
+Review #477 rejected a first version that loaded a hub-written `SwapCell` on
+the clock: `SwapCell::load` is lock-free, not wait-free, and a retired map
+could be dropped on the clock thread.
+
+## In-flight starts of a retired definition
+
+A demand start captures its catalogue entry before it spawns. The edit fence
+advances the lifecycle and withdraws the old entry in one critical section
+under the lifecycle lock. A start mints its lifecycle under the same lock, and
+only if its definition is still the catalogued one with the same store. So a
+start of definition A that resumes after the edit fails instead of publishing
+A into the reused store, even when B never starts. Removal is covered the same
+way.
+
+## Shed removals
+
+A removal whose hub teardown is shed (`Full`) is kept in a bounded set (one
+entry per id, only while unregistered). The drain retries it one per tick until
+the hub takes it, so the catalogue entry, the pins and the producer always go.
 
 ## Invariants
 
-- **#1.** No new work on the output clock beyond the wait-free load above. All
+- **#1.** No new work on the output clock beyond one integer compare per tick
+  and, on a store-set change only, a bounded map copy (above). All
   spawn, teardown, clear and catalogue work stays on the hub worker and the
   demand worker.
 - **#10.** No new queue. The hub queue (32) and the command bus stay bounded and
   shed; the Start wait is a bounded poll on the control task, never the engine.
 - Evidence: `live_source_switcher_` lib tests (add catalogues, edit retires,
-  on-bus refusal) and the chaos test `switcher_live_source_chaos` (20 adds
+  on-bus refusal, in-flight start of a retired definition), the shed-teardown
+  retry test, and the chaos test `switcher_live_source_chaos` (20 adds
   under a command and M/E flood on a deterministic clock: contiguous ticks,
-  tick-derived PTS, zero repeats, every added source ready).
+  tick-derived PTS, zero repeats, live-added sources taken to Program and
+  monitored on PVW mid-flood, every added source ready).

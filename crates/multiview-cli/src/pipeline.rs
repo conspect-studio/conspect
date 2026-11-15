@@ -1492,9 +1492,6 @@ segment_ms = 1000
                 None,
             ),
             clear_on_remove: false,
-            live_bus_stores: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
-                std::collections::HashMap::new(),
-            )),
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
@@ -1610,9 +1607,6 @@ segment_ms = 1000
                 None,
             ),
             clear_on_remove: false,
-            live_bus_stores: std::sync::Arc::new(multiview_framestore::SwapCell::from_pointee(
-                std::collections::HashMap::new(),
-            )),
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
@@ -2257,9 +2251,6 @@ pub struct Pipeline {
     switcher_driver: Option<multiview_engine::switcher_control::SwitcherTickDriver>,
     /// Separate PVW JPEG tap: never silently copy the PGM canvas here.
     switcher_preview: Option<crate::preview::ProgramSlot>,
-    /// Stores of sources added while a switcher run is live (issue #464):
-    /// the hub RCUs them in, the switcher driver/hook load them wait-free.
-    live_bus_stores: multiview_engine::switcher_control::LiveStoreMap,
     /// Per-source native caption cue stores, keyed by source id. Each store is
     /// written by an isolated caption reader thread (HLS `WebVTT` rendition demux)
     /// and **sampled** at each output tick by the overlay baker, which burns the
@@ -3717,9 +3708,6 @@ impl Pipeline {
             switcher_control: None,
             switcher_driver: None,
             switcher_preview: None,
-            live_bus_stores: Arc::new(multiview_framestore::SwapCell::from_pointee(
-                std::collections::HashMap::new(),
-            )),
             stores,
             source_registry,
             source_handles,
@@ -4474,12 +4462,6 @@ impl Pipeline {
         })
     }
 
-    /// The switcher run's live-added source stores (issue #464).
-    #[must_use]
-    pub fn live_bus_stores(&self) -> multiview_engine::switcher_control::LiveStoreMap {
-        Arc::clone(&self.live_bus_stores)
-    }
-
     /// The configured-source catalogue.
     #[must_use]
     pub fn catalogue(&self) -> crate::source_rails::Catalogue {
@@ -4494,7 +4476,6 @@ impl Pipeline {
                 .map(|manager| (Arc::clone(&self.catalogue), manager)),
             source_events: Arc::clone(&self.source_events),
             clear_on_remove: self.switcher_me.is_some(),
-            live_bus_stores: Arc::clone(&self.live_bus_stores),
             layout: Arc::clone(&self.layout),
             display: DisplayFollow::new(
                 Arc::clone(&self.display_layout),
@@ -6426,7 +6407,6 @@ impl Pipeline {
             async {
                 if let Some(mut switcher_driver) = self.switcher_driver.take() {
                     switcher_driver.set_prime_stores(self.catalogue_stores());
-                    switcher_driver.set_live_stores(Arc::clone(&self.live_bus_stores));
                     let Some(preview_slot) = self.switcher_preview.clone() else {
                         return Err(PipelineError::Engine("switcher preview tap missing".into()));
                     };
@@ -6442,7 +6422,6 @@ impl Pipeline {
                     );
                     hook.preview_slot = Some(preview_slot);
                     hook.preview_stores = Some(self.catalogue_stores());
-                    hook.live_stores = Some(Arc::clone(&self.live_bus_stores));
                     hook.preview_selection = preview_selection;
                     // The only clock-side routing duty: one non-blocking `try_send`
                     // after a fresh compose, and only while a routed feed is active.
@@ -11434,9 +11413,6 @@ struct LiveIngestSpawner {
     /// a bus is refused by the control plane before it reaches the engine;
     /// policy-only edits apply live without a restart.
     clear_on_remove: bool,
-    /// The switcher run's live-added source stores (issue #464), so a source
-    /// added after the clock started can be primed, taken and monitored.
-    live_bus_stores: multiview_engine::switcher_control::LiveStoreMap,
     source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved startup layout: the pinned canvas, which a live layout swap
     /// cannot change. Tile sizes come from `display`. Read by the GPU
@@ -11506,11 +11482,6 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
             return false;
         };
         crate::source_rails::catalogue_upsert_with(catalogue, &spawn.source, &spawn.store);
-        if self.clear_on_remove {
-            // The M/E primes, takes and monitors only stores it can see: a
-            // source added after the clock started joins the live map.
-            self.publish_bus_store(&spawn.source.id, Some(&spawn.store));
-        }
         manager.set_pins(
             &spawn.source.id,
             crate::source_demand::standing_pins(&spawn.source),
@@ -11536,8 +11507,23 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         // producer; fence any detached writer with a fresh lifecycle, then
         // retire the old pixels BEFORE the new definition is catalogued, so
         // the M/E can never prime or take the previous media (PR 224).
-        let _fence = begin_live_lifecycle(id);
+        {
+            // One critical section with the start-time check in
+            // `DemandSpawner::begin_current_lifecycle`: the fence and the
+            // withdrawal of the old definition are seen together, so a start
+            // that captured the old entry can never mint a newer lifecycle.
+            // The hub catalogues the new definition right after this returns.
+            let mut tokens = anchor_lifecycle()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            advance_live_lifecycle(id, &mut tokens);
+            crate::source_rails::catalogue_remove(catalogue, id);
+        }
         entry.store().clear();
+        // A demand start of the OLD definition that captured its catalogue
+        // entry before this point must not mint a fresh lifecycle and
+        // republish old media: `DemandSpawner::start_video` re-checks the
+        // catalogue definition under the lifecycle lock (review #477).
         tracing::info!(source = %id, "switcher source edit: old media retired; the new definition starts live");
         false
     }
@@ -11628,9 +11614,6 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         if let Some(store) = retired_store {
             store.clear();
         }
-        if self.clear_on_remove {
-            self.publish_bus_store(id, None);
-        }
         if let Some(lease) = self.source_events.activate(id, lifecycle) {
             lease.retire();
         }
@@ -11692,35 +11675,6 @@ fn spawn_live_audio(
 }
 
 impl LiveIngestSpawner {
-    /// RCU `id`'s store into (or, with `None`, out of) the switcher's live
-    /// store map. Hub worker only; the clock only loads the map.
-    fn publish_bus_store(&self, id: &str, store: Option<&Arc<TileStore<Nv12Image>>>) {
-        let unchanged = {
-            let current = self.live_bus_stores.load();
-            match store {
-                Some(store) => current
-                    .get(id)
-                    .is_some_and(|known| Arc::ptr_eq(known, store)),
-                None => !current.contains_key(id),
-            }
-        };
-        if unchanged {
-            return;
-        }
-        self.live_bus_stores.rcu(|current| {
-            let mut next = current.as_ref().clone();
-            match store {
-                Some(store) => {
-                    next.insert(id.to_owned(), Arc::clone(store));
-                }
-                None => {
-                    next.remove(id);
-                }
-            }
-            next
-        });
-    }
-
     /// The video half of [`crate::live_sources::IngestSpawner::spawn`].
     #[allow(clippy::too_many_lines)]
     // reason: live caption setup shares source planning but runs only on the hub worker.
@@ -11938,8 +11892,14 @@ impl crate::source_rails::RailSpawner for DemandSpawner {
             return self.start_generator(source, kind, store).map(|h| vec![h]);
         }
         probe_on_start(source);
-        // A fresh lifecycle fences any detached writer of a previous run.
-        let lifecycle = begin_live_lifecycle(&source.id);
+        // A fresh lifecycle fences any detached writer of a previous run. It
+        // is minted only while `source` is STILL the catalogued definition
+        // (issue #464 review): a start that captured an edited or removed
+        // definition before the hub retired it fails instead of publishing
+        // stale media into the reused store.
+        let lifecycle = self
+            .begin_current_lifecycle(source, store)
+            .ok_or_else(|| "the source definition changed; restarting".to_owned())?;
         let produced = self
             .live
             .spawn_video(source, Arc::clone(store), &self.registry, lifecycle, size)
@@ -12012,6 +11972,29 @@ impl crate::source_rails::RailSpawner for DemandSpawner {
 }
 
 impl DemandSpawner {
+    /// Advance `source`'s lifecycle only if it is still the catalogued
+    /// definition with this very store. Checked under the lifecycle lock the
+    /// hub's edit fence also takes, so either the hub's fence comes after
+    /// (and fences this start) or this check sees the new definition.
+    fn begin_current_lifecycle(
+        &self,
+        source: &Source,
+        store: &Arc<TileStore<Nv12Image>>,
+    ) -> Option<u64> {
+        let mut tokens = anchor_lifecycle()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((catalogue, _)) = &self.live.demand {
+            let current = catalogue.load().get(&source.id).is_some_and(|entry| {
+                Arc::ptr_eq(entry.store(), store) && entry.source().same_media(source)
+            });
+            if !current {
+                return None;
+            }
+        }
+        Some(advance_live_lifecycle(&source.id, &mut tokens))
+    }
+
     /// Start a synthetic generator: the same fenced loop the startup and live
     /// paths run, at the canvas size.
     fn start_generator(
@@ -12024,7 +12007,9 @@ impl DemandSpawner {
             return Err("this build cannot render this source (needs overlay)".to_owned());
         }
         let id = source.id.clone();
-        let lifecycle = begin_live_lifecycle(&id);
+        let lifecycle = self
+            .begin_current_lifecycle(source, store)
+            .ok_or_else(|| "the source definition changed; restarting".to_owned())?;
         let stop = crate::source_rails::register(&self.registry, &id);
         let thread_store = Arc::clone(store);
         let (width, height) = (
@@ -26817,16 +26802,22 @@ segment_ms = 1000
             before,
             "a detached old writer is fenced"
         );
-        // The catalogue keeps the entry; the hub's upsert replaces it.
-        assert!(rails.store("cam1").is_some());
+        // The old definition is withdrawn with the fence; the hub's upsert
+        // catalogues the new one right after.
+        assert!(rails.store("cam1").is_none());
+        crate::source_rails::catalogue_upsert_with(
+            &pipeline.catalogue(),
+            &config.sources[0],
+            &retained,
+        );
         guarded.source_removed("cam1");
         assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
         assert!(rails.store("cam1").is_none());
     }
 
     /// Issue #464: a NEW id on a switcher run is catalogued live (never
-    /// refused, never clearing anything) and joins the M/E's live store map;
-    /// removing it leaves the map.
+    /// refused, never clearing anything) with the drain's store; removing it
+    /// drops it.
     #[test]
     fn live_source_switcher_new_id_is_catalogued_and_visible_to_the_me() {
         use crate::live_sources::IngestSpawner;
@@ -26854,17 +26845,75 @@ segment_ms = 1000
             catalogued.is_some_and(|entry| Arc::ptr_eq(entry.store(), &store)),
             "the drain's store is catalogued"
         );
-        assert!(
-            pipeline
-                .live_bus_stores()
-                .load()
-                .get("fresh")
-                .is_some_and(|known| Arc::ptr_eq(known, &store)),
-            "the M/E can prime and take the live-added store"
-        );
         guarded.source_removed("fresh");
-        assert!(!pipeline.live_bus_stores().load().contains_key("fresh"));
         assert!(pipeline.catalogue().load().get("fresh").is_none());
+    }
+
+    /// Review #477 (media lens): a demand start that captured the OLD
+    /// definition before a switcher-run edit retired it must not mint a
+    /// lifecycle newer than the fence and republish old media into the reused
+    /// store — even when the new definition never starts.
+    #[test]
+    fn live_source_switcher_in_flight_start_of_an_edited_definition_is_refused() {
+        use crate::live_sources::IngestSpawner;
+        use crate::source_rails::RailSpawner;
+
+        let config = two_cells_one_source_config();
+        let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
+        let _manager = pipeline.demand();
+        let mut guarded = pipeline.live_spawner();
+        guarded.clear_on_remove = true;
+        let starter = DemandSpawner {
+            live: pipeline.live_spawner(),
+            registry: pipeline.stop_registry(),
+        };
+        // A synthetic definition A, catalogued; the demand worker "captures"
+        // it (the entry the start would run with).
+        let a: Source = serde_json::from_value(
+            serde_json::json!({"id": "race1", "kind": "solid", "color": "#f0f0f0"}),
+        )
+        .expect("A");
+        let store = crate::source_rails::catalogue_upsert(&pipeline.catalogue(), &a);
+        let captured = pipeline
+            .catalogue()
+            .load()
+            .get("race1")
+            .cloned()
+            .expect("A catalogued");
+        // The hub edits it to B (fence + clear + withdraw), and B is
+        // catalogued into the same store.
+        assert!(!guarded.invalidate_live_edit("race1"));
+        let b: Source = serde_json::from_value(
+            serde_json::json!({"id": "race1", "kind": "solid", "color": "#101010"}),
+        )
+        .expect("B");
+        crate::source_rails::catalogue_upsert_with(&pipeline.catalogue(), &b, &store);
+        // The delayed start of A resumes: refused, nothing published.
+        let late = starter.start_video(captured.source(), captured.store(), None, false);
+        assert!(
+            late.is_err(),
+            "a start of the retired definition is refused"
+        );
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(store.sequence(), 0, "no old frame reached the reused store");
+        // The same race against a removal: nothing republishes either.
+        guarded.source_removed("race1");
+        assert!(starter
+            .start_video(captured.source(), captured.store(), None, false)
+            .is_err());
+        assert_eq!(store.sequence(), 0);
+        // The current definition still starts.
+        crate::source_rails::catalogue_upsert_with(&pipeline.catalogue(), &b, &store);
+        let b_handles = starter
+            .start_video(&b, &store, None, false)
+            .expect("the current definition starts");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.sequence() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(store.sequence() > 0, "B publishes");
+        crate::live_sources::stop_rail(&pipeline.stop_registry(), "race1", true, false, b_handles);
+        super::remove_live_lifecycle("race1");
     }
 
     #[test]

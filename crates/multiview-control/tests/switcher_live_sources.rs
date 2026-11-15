@@ -29,7 +29,9 @@ use multiview_engine::clock::Tick;
 use multiview_engine::switcher::SwitcherState;
 use multiview_engine::switcher_control::SwitcherControl;
 use serde_json::json;
-use support::{body_json, etag, get, harness_with, post_json, put_json, send, OPERATOR_TOKEN};
+use support::{
+    body_json, etag, get, harness_with, post_json, put_json, send, OPERATOR_TOKEN, SCOPED_TOKEN,
+};
 
 const DOC: &str = r##"
 schema_version = 1
@@ -59,7 +61,7 @@ id = "cam-c"
 kind = "hls"
 url = "http://[::1]:9/c.m3u8"
 [[sources]]
-id = "logo"
+id = "scoped-layout"
 kind = "hls"
 url = "http://[::1]:9/logo.m3u8"
 [[cells]]
@@ -81,7 +83,7 @@ preview_source = "cam-b"
 [[switcher.downstream_keyers]]
 id = "dsk1"
 program = "main"
-fill = "logo"
+fill = "scoped-layout"
 "##;
 
 /// A demand provider whose catalogue gains `late` only once `ready` is set
@@ -165,18 +167,23 @@ fn rig() -> Rig {
 }
 
 async fn put_source(rig: &mut Rig, id: &str, body: serde_json::Value) -> axum::response::Response {
-    let current = send(
-        &rig.h.router,
-        get(&format!("/api/v1/sources/{id}"), OPERATOR_TOKEN),
-    )
-    .await;
+    put_source_as(rig, OPERATOR_TOKEN, id, body).await
+}
+
+async fn put_source_as(
+    rig: &mut Rig,
+    token: &str,
+    id: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    let current = send(&rig.h.router, get(&format!("/api/v1/sources/{id}"), token)).await;
     assert_eq!(current.status(), StatusCode::OK, "GET {id}");
     let tag = etag(&current).unwrap();
     send(
         &rig.h.router,
         put_json(
             &format!("/api/v1/sources/{id}"),
-            OPERATOR_TOKEN,
+            token,
             Some(&tag),
             &json!({ "name": id, "body": body }),
         ),
@@ -199,7 +206,7 @@ async fn live_source_switcher_media_edit_on_a_bus_is_refused_naming_the_bus() {
     for (id, consumer) in [
         ("cam-a", "program bus"),
         ("cam-b", "preview bus"),
-        ("logo", "keyer main/dsk1 fill"),
+        ("scoped-layout", "keyer fill main/dsk1"),
     ] {
         let resp = put_source(
             &mut rig,
@@ -282,4 +289,23 @@ async fn live_source_switcher_start_waits_for_a_live_adopted_source() {
         "{:?}",
         body_json(resp).await
     );
+}
+
+/// BOLA: a key scoped to the edited source but not to the keyer object never
+/// learns the keyer's id from the refusal.
+#[tokio::test]
+async fn live_source_switcher_on_bus_refusal_redacts_unreadable_keyers() {
+    let mut rig = rig();
+    let resp = put_source_as(
+        &mut rig,
+        SCOPED_TOKEN,
+        "scoped-layout",
+        json!({"id": "scoped-layout", "kind": "hls", "url": "http://[::1]:9/edited.m3u8"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let detail = body_json(resp).await["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("keyer fill restricted"), "{detail}");
+    assert!(!detail.contains("dsk1"), "{detail}");
+    assert_eq!(upserts(&mut rig, "scoped-layout"), 0);
 }

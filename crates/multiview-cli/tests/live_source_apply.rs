@@ -951,3 +951,38 @@ async fn an_identical_reapply_after_a_guide_only_edit_retries_the_producer() {
     let _ = server.await;
     hub.shutdown();
 }
+
+/// Review #477 (abuse lens): a removal whose hub teardown was shed on a FULL
+/// queue is retried each tick until the hub takes it — the producer always
+/// stops; nothing the hub owns for the removed id is kept forever.
+#[test]
+fn a_shed_teardown_is_retried_until_the_producer_stops() {
+    let mut rig = ShedRig::start();
+    let a = rig.running();
+    rig.fault.full();
+    rig.sender
+        .try_submit(Command::RemoveSource {
+            op: OperationId::new(),
+            id: "in_a".to_owned(),
+        })
+        .expect("submit remove");
+    for _ in 0..5 {
+        (rig.drain)(&mut rig.drive);
+    }
+    assert!(
+        rig.drive.store("in_a").is_none(),
+        "the store is unregistered"
+    );
+    assert!(
+        !a.stop_requested(),
+        "while the queue is full the teardown is still pending"
+    );
+    rig.fault.clear();
+    (rig.drain)(&mut rig.drive);
+    assert!(
+        wait_for(Duration::from_secs(5), || a.stop_requested()
+            && producer(&rig.registry, "in_a").is_none()),
+        "the retried teardown reached the hub and stopped the producer"
+    );
+    rig.hub.shutdown();
+}

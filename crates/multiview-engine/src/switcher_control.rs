@@ -246,11 +246,6 @@ pub struct SwitcherOutcome {
     pub error: Option<String>,
 }
 
-/// The run's live-added source stores (issue #464): written off the clock by
-/// the live-source hub (RCU), read on the clock with one wait-free load.
-pub type LiveStoreMap =
-    Arc<multiview_framestore::SwapCell<Arc<HashMap<String, Arc<TileStore<Nv12Image>>>>>>;
-
 /// A cloneable control-plane handle; it cannot mutate the machine directly.
 #[derive(Debug, Clone)]
 pub struct SwitcherControl {
@@ -332,7 +327,7 @@ impl SwitcherControl {
             active_auto: None,
             active_auto_scenes: None,
             primed_stores: None,
-            live_stores: None,
+            live_stores: HashMap::new(),
             pending_take: None,
             armed: None,
             last_tick: 0,
@@ -487,9 +482,12 @@ pub struct SwitcherTickDriver {
     composed_count: Arc<std::sync::atomic::AtomicU64>,
     auto_capable: Arc<std::sync::atomic::AtomicBool>,
     primed_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
-    /// Stores of sources added while the run is live (issue #464), consulted
-    /// after the fixed boot map. One wait-free load per lookup.
-    live_stores: Option<LiveStoreMap>,
+    /// The Program drive's current store set (issue #464), owned by the
+    /// driver and resynced by the frame hook only when the drive's store
+    /// generation changes, so a source added live can be primed, patched,
+    /// taken and monitored. Consulted before the boot map: a source removed
+    /// and re-added live has a NEW store here. No shared state is read.
+    live_stores: HashMap<String, Arc<TileStore<Nv12Image>>>,
     pending_take: Option<(SwitcherCommand, u64)>,
     /// The armed mixer half of an atomic set (#308), if any.
     armed: Option<ArmedSet>,
@@ -725,27 +723,26 @@ impl SwitcherTickDriver {
         self.primed_stores = Some(stores);
     }
 
-    /// Install the run's live-added source stores (issue #464): a source
-    /// added after the clock started is primed, patched and taken from this
-    /// map. Consulted before the boot map; the hub worker RCUs it, the
-    /// clock only loads it (wait-free, no allocation).
-    pub fn set_live_stores(&mut self, live: LiveStoreMap) {
-        self.live_stores = Some(live);
+    /// Resync the drive's current store set (issue #464). Called by the frame
+    /// hook on the clock only when the drive's store generation changed, i.e.
+    /// on an operator-paced live add/remove; the steady state never calls it.
+    /// Bounded by the drive's store count (the drain bounds that).
+    pub fn sync_live_stores(&mut self, stores: &HashMap<String, Arc<TileStore<Nv12Image>>>) {
+        self.live_stores.clone_from(stores);
     }
 
-    /// The store for `source`: the live map first (a source removed and
-    /// re-added live has a NEW store there; the boot map keeps the retired
-    /// one), then the boot map.
-    fn store_for(&self, source: &str) -> Option<Arc<TileStore<Nv12Image>>> {
+    /// The drive's current store for `source`, if any (the PVW monitor reads
+    /// this first).
+    #[must_use]
+    pub fn live_store(&self, source: &str) -> Option<&Arc<TileStore<Nv12Image>>> {
+        self.live_stores.get(source)
+    }
+
+    /// The store for `source`: the drive's current set first, then the boot
+    /// map. `None` when no prime map is installed.
+    fn store_for(&self, source: &str) -> Option<&Arc<TileStore<Nv12Image>>> {
         let stores = self.primed_stores.as_ref()?;
-        if let Some(store) = self
-            .live_stores
-            .as_ref()
-            .and_then(|live| live.load().get(source).cloned())
-        {
-            return Some(store);
-        }
-        stores.get(source).cloned()
+        self.live_stores.get(source).or_else(|| stores.get(source))
     }
 
     /// Advertise AUTO. Called only by the frame hook that renders the

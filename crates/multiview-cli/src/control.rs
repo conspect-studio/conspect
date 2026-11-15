@@ -2305,6 +2305,11 @@ pub struct CommandDrain {
     /// mirror runs ahead of the producer, so no upsert may be judged
     /// policy-only until a submission lands. Bounded like `applied_media`.
     unapplied: std::collections::HashSet<String>,
+    /// Removals whose hub teardown was shed (`Full`), retried one per tick
+    /// until accepted, so the hub always learns of a removal (its catalogue
+    /// entry, demand pins and producer go). Bounded: an id is in here at most
+    /// once and only while its store is unregistered (review #477).
+    pending_teardowns: std::collections::BTreeSet<String>,
     /// The live overlay working-set seam (ADR-W022), when wired
     /// ([`command_drain_with_live_overlays`] / [`command_drain_with_seams`]):
     /// the lock-free slot the bake consumer re-derives its overlay render
@@ -2390,6 +2395,7 @@ impl CommandDrain {
             live_sources: None,
             applied_media,
             unapplied: std::collections::HashSet::new(),
+            pending_teardowns: std::collections::BTreeSet::new(),
             live_overlays: None,
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             tile_spec_apply: None,
@@ -2587,6 +2593,7 @@ impl CommandDrain {
             self.cell_ids_set = true;
         }
 
+        self.retry_pending_teardown();
         // Drain the bus, routing commands. Video re-points are enqueued (batched +
         // bounded); every other command is applied immediately as before.
         #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
@@ -3362,13 +3369,16 @@ impl CommandDrain {
         // flags while the drain finishes the binding mutations — the same
         // window-shrinking order as upsert), then unregister the store.
         match seam.request_teardown(id) {
-            crate::live_sources::HubSubmit::Accepted => {}
+            crate::live_sources::HubSubmit::Accepted => {
+                self.pending_teardowns.remove(id);
+            }
             crate::live_sources::HubSubmit::Full => {
                 tracing::warn!(
                     source = %id,
                     "live-source hub queue full; producer teardown shed — the store \
-                     is unregistered (slate) but the producer stops only at run teardown"
+                     is unregistered (slate); the teardown is retried each tick"
                 );
+                self.pending_teardowns.insert(id.to_owned());
             }
             crate::live_sources::HubSubmit::Gone => {
                 tracing::warn!(
@@ -3392,6 +3402,35 @@ impl CommandDrain {
             audio_free.remove(id);
             slot.store(Arc::new(audio_free));
         }
+    }
+
+    /// Resubmit ONE shed removal to the hub (non-blocking `try_send`). A source
+    /// re-added meanwhile (its store registered again) is dropped from the
+    /// retry: its upsert already replaced the definition on the hub.
+    fn retry_pending_teardown(&mut self) {
+        let Some(seam) = self.live_sources.clone() else {
+            return;
+        };
+        let Some(id) = self.pending_teardowns.first().cloned() else {
+            return;
+        };
+        if self.config.sources.iter().any(|s| s.id == id) {
+            self.pending_teardowns.remove(&id);
+            return;
+        }
+        match seam.request_teardown(&id) {
+            crate::live_sources::HubSubmit::Accepted | crate::live_sources::HubSubmit::Gone => {
+                self.pending_teardowns.remove(&id);
+            }
+            crate::live_sources::HubSubmit::Full => {}
+        }
+    }
+
+    /// Shed removals still awaiting a hub teardown (test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_teardowns(&self) -> usize {
+        self.pending_teardowns.len()
     }
 
     /// Apply an `UpsertOverlay` (ADR-W022) at the frame boundary: upsert the

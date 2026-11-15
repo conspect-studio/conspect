@@ -110,7 +110,7 @@ async fn twenty_live_adds_under_load_on_a_switcher_run_never_move_the_clock() {
     let mut pipeline = Pipeline::build(&cfg).expect("pipeline builds");
     let demand = pipeline.demand();
     demand.start();
-    let live_stores = pipeline.live_bus_stores();
+    let catalogue = pipeline.catalogue();
     let hub = LiveSourceHub::start_with_ingest(
         pipeline.stop_registry(),
         shared_stores(pipeline.preview_stores()),
@@ -150,7 +150,6 @@ async fn twenty_live_adds_under_load_on_a_switcher_run_never_move_the_clock() {
         vec![],
     ));
     driver.set_prime_stores(stores.clone());
-    driver.set_live_stores(Arc::clone(&live_stores));
     let mut preview_scene = (*layout).clone();
     preview_scene.cells[0].source = Some("b".into());
     handle
@@ -174,7 +173,11 @@ async fn twenty_live_adds_under_load_on_a_switcher_run_never_move_the_clock() {
         pipeline.drain_demand(),
     );
     let mut hook = SwitcherFrameHook::new(driver, cell_id.clone(), drain);
-    hook.live_stores = Some(Arc::clone(&live_stores));
+    // The PVW monitor path runs too (review #477).
+    let pvw_slot: Arc<multiview_framestore::SwapCell<Option<Arc<Nv12Image>>>> =
+        Arc::new(multiview_framestore::SwapCell::empty());
+    hook.preview_slot = Some(Arc::clone(&pvw_slot));
+    hook.preview_stores = Some(stores.clone());
 
     let clock = Arc::new(ManualTimeSource::new());
     let ts: Arc<dyn TimeSource> = clock.clone();
@@ -241,10 +244,18 @@ async fn twenty_live_adds_under_load_on_a_switcher_run_never_move_the_clock() {
         std::thread::spawn(move || {
             let mut n: u64 = 0;
             while flooding.load(Ordering::Acquire) {
-                let verb = if n % 2 == 0 {
-                    SwitcherVerb::Cut
-                } else {
-                    SwitcherVerb::SelectPreview(SourceRef::new(if n % 4 == 1 { "a" } else { "b" }))
+                // Cuts, and PVW selects of a/b AND of the live-added ids
+                // (refused while uncatalogued, primed once they publish).
+                let verb = match n % 6 {
+                    0 | 3 => SwitcherVerb::Cut,
+                    1 => SwitcherVerb::SelectPreview(SourceRef::new("a")),
+                    2 => SwitcherVerb::SelectPreview(SourceRef::new(added(
+                        usize::try_from(n / 6).unwrap_or(0) % ADDS,
+                    ))),
+                    4 => SwitcherVerb::SelectPreview(SourceRef::new("b")),
+                    _ => SwitcherVerb::SelectPreview(SourceRef::new(added(
+                        usize::try_from(n / 6 + 7).unwrap_or(0) % ADDS,
+                    ))),
                 };
                 if handle
                     .try_send(SwitcherCommand {
@@ -263,6 +274,10 @@ async fn twenty_live_adds_under_load_on_a_switcher_run_never_move_the_clock() {
     };
 
     let mut frames: Vec<(u64, i64)> = Vec::new();
+    let mut live_on_program = 0_u64;
+    let mut live_on_pvw = 0_u64;
+    let snapshots = handle.clone();
+    let pvw_read = Arc::clone(&pvw_slot);
     let pace = Arc::clone(&clock);
     let stop_flood = Arc::clone(&flooding);
     let mut producers = Some((producer, me_flood));
@@ -274,6 +289,14 @@ async fn twenty_live_adds_under_load_on_a_switcher_run_never_move_the_clock() {
             TICKS,
             |frame| {
                 frames.push((frame.tick.index, frame.tick.pts.as_nanos()));
+                if let Some(snapshot) = snapshots.snapshot() {
+                    if snapshot.program.as_str().starts_with("live") {
+                        live_on_program += 1;
+                    }
+                    if snapshot.preview.as_str().starts_with("live") && pvw_read.load().is_some() {
+                        live_on_pvw += 1;
+                    }
+                }
                 if frame.tick.index + 1 == flood_until {
                     stop_flood.store(false, Ordering::Release);
                     let (a, b) = producers.take().unwrap();
@@ -305,6 +328,10 @@ async fn twenty_live_adds_under_load_on_a_switcher_run_never_move_the_clock() {
         );
     }
     assert_eq!(repeated.load(Ordering::Acquire), 0, "0 missed ticks");
+    // The M/E really used the live-added stores on the clock: a live-added
+    // source was taken to Program and monitored on PVW during the floods.
+    assert!(live_on_program > 0, "a live-added source reached Program");
+    assert!(live_on_pvw > 0, "a live-added source was monitored on PVW");
 
     // Invariant #10: the floods met full bounded queues and never blocked.
     assert!(
@@ -328,8 +355,7 @@ async fn twenty_live_adds_under_load_on_a_switcher_run_never_move_the_clock() {
         (0..ADDS)
             .map(added)
             .filter(|id| {
-                !live_stores.load().contains_key(id)
-                    || demand.status(id).phase != DemandPhase::Ready
+                !catalogue.load().contains_key(id) || demand.status(id).phase != DemandPhase::Ready
             })
             .collect()
     };

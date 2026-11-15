@@ -356,6 +356,7 @@ fn live_apply_upsert(
 /// stored or enqueued. Policy/guide-only edits and restart-only kinds pass.
 fn refuse_on_bus_media_edit(
     state: &AppState,
+    principal: Option<&Principal>,
     id: &str,
     previous: Option<&multiview_config::Source>,
     next_body: &serde_json::Value,
@@ -368,7 +369,16 @@ fn refuse_on_bus_media_edit(
     {
         return Ok(());
     }
-    let consumers = switcher_bus_consumers(state, id);
+    let mut consumers = switcher_bus_consumers(state, id);
+    // A keyer object the caller may not read is named `restricted` (BOLA,
+    // the same redaction Stop applies to its holders).
+    if let Some(principal) = principal {
+        redact_holders(principal, &mut consumers);
+    }
+    let consumers: Vec<String> = consumers
+        .iter()
+        .map(|c| format!("{} {}", c.kind, c.label))
+        .collect();
     if consumers.is_empty() {
         return Ok(());
     }
@@ -382,7 +392,11 @@ fn refuse_on_bus_media_edit(
 /// The switcher consumers of `id`: the M/E's current Program and Preview
 /// (engine snapshot, input-resolved), and every declared downstream keyer's
 /// fill and key. Empty on a run with no switcher.
-pub(crate) fn switcher_bus_consumers(state: &AppState, id: &str) -> Vec<String> {
+pub(crate) fn switcher_bus_consumers(
+    state: &AppState,
+    id: &str,
+) -> Vec<crate::source_demand::SourceConsumerView> {
+    use crate::source_demand::SourceConsumerView;
     let mut consumers = Vec::new();
     if let Some(snapshot) = state
         .switcher
@@ -390,19 +404,21 @@ pub(crate) fn switcher_bus_consumers(state: &AppState, id: &str) -> Vec<String> 
         .and_then(multiview_engine::switcher_control::SwitcherControl::snapshot)
     {
         if snapshot.program.as_str() == id {
-            consumers.push("program bus".to_owned());
+            consumers.push(SourceConsumerView::new("program", "bus"));
         }
         if snapshot.preview.as_str() == id {
-            consumers.push("preview bus".to_owned());
+            consumers.push(SourceConsumerView::new("preview", "bus"));
         }
     }
     for keyer in declared_keyers(state) {
         let object = format!("{}/{}", keyer.program, keyer.id);
         if keyer.fill == id {
-            consumers.push(format!("keyer {object} fill"));
+            consumers
+                .push(SourceConsumerView::new("keyer fill", object.clone()).naming(Some(&object)));
         }
         if keyer.key.as_deref() == Some(id) {
-            consumers.push(format!("keyer {object} key"));
+            consumers
+                .push(SourceConsumerView::new("keyer key", object.clone()).naming(Some(&object)));
         }
     }
     consumers
@@ -747,10 +763,16 @@ pub(crate) async fn update_source(
     if let Ok(current) = accepted_source(&state, &id) {
         authorize_written_automation(&principal, Some(&current.resource.body), &input.body)?;
     }
-    let (mode, versioned) =
-        apply_source_update(&state, &principal.key_id, &id, Some(&if_match), input)
-            .await?
-            .into_applied();
+    let (mode, versioned) = apply_source_update(
+        &state,
+        &principal.key_id,
+        Some(&principal),
+        &id,
+        Some(&if_match),
+        input,
+    )
+    .await?
+    .into_applied();
     Ok(with_apply(
         mode,
         source_response(StatusCode::OK, &versioned),
@@ -778,6 +800,7 @@ impl AppliedUpdate {
 pub(crate) async fn apply_source_update(
     state: &AppState,
     actor: &str,
+    actor_principal: Option<&Principal>,
     id: &str,
     if_match: Option<&IfMatch>,
     input: ResourceInput,
@@ -794,7 +817,7 @@ pub(crate) async fn apply_source_update(
         body: validated_body(TypedCollection::Sources, id, &input.body)?,
     };
     let previous = parse_stored_source(&current.resource.body);
-    refuse_on_bus_media_edit(state, id, previous.as_ref(), &input.body)?;
+    refuse_on_bus_media_edit(state, actor_principal, id, previous.as_ref(), &input.body)?;
     crate::boot_model::commit_resource(
         state,
         "sources",
