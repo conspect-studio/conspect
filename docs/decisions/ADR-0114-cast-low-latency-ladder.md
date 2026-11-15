@@ -194,4 +194,221 @@ Two numbers, kept apart.
 
 The ADR moves to Accepted only with a table of both numbers per rung and device class (slice 7).
 
+### 3. The capability probe and the ladder endpoint
+
+One new token route pair carries the probe, the offers and the failure reports. It sits beside the report route
+(`/cast/{token}/{file}`, Read: `crates/multiview-control/src/routes/cast_public.rs:58-61`).
+
+`POST /cast/<token>/ladder`, JSON, at most 2 KiB, at most one per second per token (burst 4), `no-store`, the
+same CORS as the report route.
+
+```json
+{ "v": 1,
+  "receiver": { "kind": "web", "build": "<sha256 prefix of receiver.js>", "ua": "<at most 200 chars>" },
+  "caps": {
+    "wt": true,
+    "vdec": "supported", "vdec_hw": true, "adec": "supported",
+    "rtc": true, "rtc_h264": ["42e01f", "640c1f"], "rtc_opus": true,
+    "rvfc": true, "srt": null },
+  "need": { "subtitles": false, "audio": null },
+  "skip": { "moq": 540 },
+  "failed": null }
+```
+
+- `wt`: `typeof WebTransport === "function"`. It says the API exists, nothing about the network.
+- `vdec`, `adec`: the result of `VideoDecoder.isConfigSupported` and `AudioDecoder.isConfigSupported` for the
+  exact codec strings and picture size of this stream. The receiver knows them before it asks, from the
+  `master.m3u8` it already fetches (Read: `receiver.js:735`). Values: `supported`, `unsupported`, `absent`.
+  `vdec_hw`: the same check with `hardwareAcceleration: "prefer-hardware"`.
+- `rtc_h264`: the `profile-level-id` values of `RTCRtpReceiver.getCapabilities("video")`, at most 8.
+- `rvfc`: `requestVideoFrameCallback` exists (needed for the latency estimate).
+- `srt`: on Android TV, the libsrt version the app loaded; `null` in the Web Receiver.
+- `need`: what the session must carry (decision 2, Tracks).
+- `skip`: rungs in the device's failure memory, with the seconds left.
+- `failed`: on a later call, `{ "rung": "moq", "stage": "connect|first-frame|stall|latency", "ms": 3000 }`.
+
+Every field is a claim by an unauthenticated device. The engine uses it only to leave rungs out. It never widens
+access because of it, and it validates sizes and types strictly (unknown fields ignored, wrong types 400).
+
+The answer:
+
+```json
+{ "v": 1,
+  "clock": { "pts_zero_unix_us": 1794700000000000, "server_unix_us": 1794700012345678 },
+  "attach": { "rung": "moq", "url": "https://<host>/moq?...", "broadcast": "...", "protocol": "...",
+              "video": { "codec": "avc1.640029", "coded_width": 1920, "coded_height": 1080, "description": "..." },
+              "audio": [ { "track": "...", "codec": "mp4a.40.2", "sample_rate": 48000, "number_of_channels": 2 } ],
+              "expires_in_ms": 30000 },
+  "then": ["webrtc", "hls"],
+  "srt": null }
+```
+
+- `attach` is the best rung the engine will serve this receiver now, already admitted. `then` names the rest.
+  The receiver gets the next one by calling again with `failed` set; that call is also the failure report.
+- For `webrtc`, `attach` is `{ "rung": "webrtc", "whep": "whep" }`: the receiver posts its SDP offer to
+  `POST /cast/<token>/whep` (`application/sdp`, at most 64 KiB as `routes/whep_output.rs:30`) and gets the
+  answer; `DELETE /cast/<token>/whep` ends it. The answer carries the UDP 443 host candidates and the passive
+  ICE-TCP candidates on TCP 443 together (Read: [front door](../architecture/network-front-door.md) "Slice 4
+  PR2"), so a network without UDP costs no extra round trip.
+- For `srt`, `attach` is `{ "rung": "srt", "host": "<public host>", "port": 9010, "latency_ms": 250 }`. It holds
+  no secret: the app derives the stream id and the passphrase from the token (decision 5).
+- For `hls`, `attach` is `{ "rung": "hls" }`.
+
+What the engine leaves out, in this order: rungs the build or the run cannot serve (no MoQ provider, no SRT
+listener); rungs disabled in `[cast] ladder`; rungs the caps exclude;
+rungs that cannot carry `need`; rungs in `skip`; rungs removed for the receiver kind by measurement (slice 7).
+
+The engine keeps the last probe and the playing rung per stream (bounded, like the report) and shows them to the
+stream's owner and to admins in `GET /api/v1/cast/streams/{id}`: `receiver.caps`, `transport.rung`,
+`transport.since`, `transport.fallbacks[]` (at most 8, each with rung, stage, time), `latency_ms.p50/p95`. The
+sender's cast card shows the rung and the latency. Every cast on a real device therefore adds to the evidence
+of decision 1 without any step by the operator.
+
+**Old devices never parse new code.** `receiver.js` stays ES5 and stays the only script a device parses at
+start (Reported: on Chrome 70 one unknown syntax form stops the whole script silently,
+[cast-receiver notes](https://github.com/jaupi-enrico/cast-receiver)). The probe is ES5 feature tests. The MoQ
+player and the WebRTC player are separate script files that `receiver.js` adds to the page only after the probe
+passed and the engine answered with that rung.
+
+**Cast media status in the Web Receiver is the open risk of the MoQ and WebRTC rungs.** CAF builds the media
+status that senders and Google Home show from its own player. MoQ draws on a canvas and WebRTC plays a
+`MediaStream`; neither goes through CAF's player. Cited: a LOAD interceptor may return `null` so that CAF does
+not handle the request, and `PlayerManager` has `setMediaElement`, `setMediaInformation` and `broadcastStatus`
+([PlayerManager](https://developers.google.com/cast/docs/reference/web_receiver/cast.framework.PlayerManager)).
+Unverified: whether any combination of these gives senders a correct, stable media session for a picture CAF
+does not play. Slice 3 settles it first, in the existing harness with the real CAF SDK (`tools/cast-proof/`),
+before any player is written. Pass means: the sender's `loadMedia` settles; the session shows as playing with
+the title; volume, mute and stop work; the receiver's own reports arrive. If nothing passes, class A keeps HLS
+only, slices 4 and 5 are dropped, and the SRT rung is unaffected. The Android TV app does not have this risk:
+Cast Connect takes media status from the app's `MediaSession` (Cited: Android TV receiver core features).
+
+### 4. Network
+
+What the test host serves now (Measured 2026-11-15 00:00 UTC, `ss` on mda001 and probes from the build host):
+
+| Port | Listener | Evidence |
+| --- | --- | --- |
+| UDP 443 | engine: MoQ, HTTP/3 and WebRTC on one socket | QUIC version negotiation answered on IPv4 and IPv6 |
+| TCP 443, TCP 80 | engine: site, API, HLS, cast routes, ICE-TCP (`ice_tcp.enabled = true` in the accepted state) | listening |
+| UDP 9000 | engine: the SRT output `srt-multiview` (HEVC, listener) | SRT induction answered on IPv4 and IPv6 |
+| UDP 9001 to 9100 | nothing | no answer on 9001 |
+| UDP 8189 | nothing | not listening. WebRTC moved to UDP 443 with ADR-0107 slice 1 |
+
+Two limits on that evidence. The probes ran from the build host, not from a viewer's network. And the brief for
+this ADR says the estate firewall forwards only UDP 9000 to 9100 and 8189; the lead's office probe of 14 Nov
+16:24 UTC shows the Program monitor playing over MoQ from the office network at 30 frames per second (Read:
+`lead/office-main-5192c285.json`), which needs UDP 443 to pass. The firewall rule itself was not read. No Cast
+device's network path to UDP 443 or to the SRT range has been tested (Unverified; slices 4 and 6).
+
+Decisions:
+
+1. **MoQ and WebRTC use the front door as it is**: UDP 443 and TCP 443 on the public host name. No new port.
+2. **The engine is the SRT listener; the TV app is the caller.** The engine has the public address; the TV is
+   behind NAT. One dedicated listener for every cast output: `[cast.srt] port`, default 9010, dual-stack `[::]`.
+   On mda001 9010 is inside the existing SRT grant (9000 to 9100) and is free. It is not the port of any
+   configured SRT output: those have one passphrase per output and their own caller limit.
+3. **Streams are told apart by stream id, on one port.** The listener installs libsrt's listen callback, which
+   receives the caller's stream id before the connection is accepted and sets that connection's passphrase
+   (Cited: [access control](https://github.com/Haivision/srt/blob/master/docs/features/access-control.md),
+   [`srt_listen_callback`](https://github.com/Haivision/srt/blob/master/docs/API/API-functions.md)).
+   `multiview-srt-sys` does not bind that function today (Read: the function table,
+   `crates/multiview-srt-sys/src/lib.rs:139-156`); slice 6 adds it, with `srt_setrejectreason` and
+   `srt_getversion`.
+4. **The cast listener starts only on libsrt 1.5.7 or later.** Cited: advisory
+   [GHSA-m96h-3rc9-xx6h](https://github.com/Haivision/srt/security/advisories/GHSA-m96h-3rc9-xx6h) (published
+   15 Oct 2026): a handshake packet overflows a heap buffer in a listener before authentication; affected up to
+   1.5.6; fixed in 1.5.7. mda001 runs Debian's 1.5.4-1+deb13u1 (Measured), whose changelog lists patches for
+   CVE-2026-55868 and CVE-2026-55869 only. Whether that package is affected was not tested. A new public
+   listener must not rest on that doubt, so the engine checks the loaded version and reports
+   `cast-srt-libsrt-too-old` instead of listening. The same doubt applies to the listener already on UDP 9000;
+   that is outside this ADR and is reported to the lead.
+5. **Latency setting.** 250 ms receive latency on both ends at first. libsrt's guidance is a multiple of the
+   round-trip time; 250 ms covers a 60 ms round trip four times. The app reports the measured round trip; slice
+   7 sets the final value from device data.
+6. **SRT is off until configured.** `[cast.srt] enabled = false` by default: an install whose firewall does not
+   forward the port would make every Android TV cast pay a failed attempt. The engine cannot test its own
+   public reachability, so it shows, per cast output, how many SRT attempts failed at connect in the last hour.
+7. **When UDP is blocked** (the viewer's network or the engine's):
+
+   | What fails | What the device does | Rung that plays |
+   | --- | --- | --- |
+   | SRT port only | App: SRT connect times out at 1.5 s, plays HLS, declines launches for 15 minutes; next cast loads the Web Receiver | MoQ |
+   | All UDP | Web Receiver: MoQ session does not open in 1.5 s; WebRTC connects over ICE-TCP on TCP 443 | WebRTC over TCP |
+   | UDP, and only real TLS passes on 443 (inspecting proxy) | ICE-TCP fails | HLS. TURN over TLS is ADR-0107 slice 8, not built |
+
+   HLS needs only HTTPS on TCP 443, which the cast needs anyway to load the receiver and the token.
+8. **Flood floor for the SRT port.** libsrt answers the first handshake packet with a cookie and keeps no state
+   until the caller returns it. The runbook adds a per-source nftables limit for the port, as the UDP 443 floor
+   does. The listen callback does a bounded table lookup and nothing else.
+
+### 5. Security
+
+1. **One token, one check, every transport.** Every new route is under `/cast/<token>/`. Each one runs the
+   check the media route runs today: the re-authorization barrier, then "live, and armed at the output's
+   current authorization generation" (Read: `reauth::on_media` then `CastStreams::serve`,
+   `routes/cast_public.rs:175-178`). Slice 2 moves that pair into one function that returns the stream, the
+   output and the generation, and every rung's admission calls it. No rung has a credential of its own.
+2. **An attachment ends when its token would stop being served.** HLS is checked on every request. A push rung
+   delivers without requests, so each attachment registers a fence with the token registry: a flag that stops
+   enqueue at once, as the MoQ lease fence does (Read: `MoqFence`, `crates/multiview-control/src/moq.rs:124-130`).
+   The registry sets the fence inside the same critical section that revokes or re-arms the token: on stop, on
+   expiry, and on every feed change before the change is published (Read: `reauth::before_change`,
+   `cast_streams/reauth.rs:109`). Setting a fence is one atomic store; no I/O happens under the lock. Closing
+   the socket follows on the transport's own thread.
+3. **Feed change (as PR 409).** A token whose owner may read the new feed keeps its attachment; the picture
+   changes in place. A token whose owner may not is revoked first and its attachment is fenced before the new
+   feed's first packet is admitted.
+4. **Engine fallback, fail closed in the data path.** The engine can move an output to another feed by itself.
+   For HLS the media route compares the engine's readback on each request. A push rung has no request, so the
+   check moves to where windows are handed to the attachment: each window carries the picture bus it was
+   encoded from, each attachment holds the set of buses its token is cleared for, and a window from any other
+   bus is dropped and the attachment fenced. The control plane then re-authorizes as today and the receiver
+   re-attaches if its token survives. This needs the dispatcher to label windows with their bus; that code was
+   not read for this draft. Slice 2's design note confirms or replaces the mechanism, and its test is the gate:
+   a forced fallback to a feed the owner may not read delivers zero packets of it on every rung.
+5. **Token lifetime.** Today a live token expires 60 s after its last playlist fetch (Read:
+   `cast_streams/registry.rs:48-50`). A push rung fetches no playlist. A successful report or ladder call from
+   a stream that has a live attachment counts as that fetch. A device that vanishes stops reporting; its
+   transport times out (SRT peer idle 5 s, QUIC idle, ICE consent) and the token expires 60 s later, as today.
+6. **Per-object authorization.** No new route takes an object id from the caller. The token names one stream,
+   which names one output. The SRT stream id and the MoQ broadcast name are looked up, never trusted as an
+   address: an id that matches no live stream is refused the same way as a wrong passphrase. The new fields of
+   `GET /api/v1/cast/streams/{id}` follow the route's existing rule (owner or admin). MoQ and WebRTC admission
+   run with the token owner's current principal (Read: `resolve_owner`, `reauth.rs:282`), so the providers'
+   own dependency checks see the owner's present grants.
+7. **SRT stream id and passphrase come from the token.** With `T` the 32 token bytes:
+
+   ```
+   prk        = HKDF-SHA256-Extract(salt = "conspect-cast-srt-v1", ikm = T)
+   id         = base64url(HKDF-Expand(prk, "stream-id", 16))        22 characters
+   passphrase = base64url(HKDF-Expand(prk, "passphrase", 32))       43 characters
+   stream id  = "#!::r=cast/" + id + ",m=request"
+   ```
+
+   - The passphrase has 256 bits of entropy and fits SRT's 10 to 80 characters (Cited: `SRTO_PASSPHRASE`,
+     [socket options](https://github.com/Haivision/srt/blob/master/docs/API/API-socket-options.md)). Key length
+     32 bytes (AES-256), counter mode. GCM is a preview build option in libsrt (Cited, same page) and is not used.
+   - The stream id travels in clear in the handshake. It reveals neither the token nor the passphrase: the two
+     HKDF outputs are independent. It only selects which passphrase the listener sets.
+   - A wrong passphrase is rejected by libsrt itself (Cited: access control). The callback cannot and does not
+     compare passphrases.
+   - The engine stores nothing new. It can already derive the token from its stored seed and process pepper
+     (Read: `cast_streams/token.rs:85-98`), so it derives `id` and `passphrase` when the stream is created and
+     keeps them in the registry entry, whose `Debug` prints no secret.
+   - One SRT attachment per token. A second authenticated caller with the same id replaces the first (a
+     reconnect). At most 4 failed handshakes per id per minute; then the id is refused for a minute.
+8. **No secret on argv or in logs.** The passphrase goes to libsrt through the socket option
+   (`ListenerOptions::with_encryption`, Read: `multiview-srt-sys/src/lib.rs:350`), never through a `srt://` URL,
+   a libav option string or a process argument, on the engine and in the app. The MoQ lease URL is marked "never
+   log" (Read: `moq.rs:77`) and stays so. The ladder answer is `no-store`. Logs carry a token's first 6
+   characters at most, as `receiver.js` does today. The engine's SRT link status shows the peer address and
+   counters, never the stream id.
+9. **Bounds.** Ladder calls: 1 per second per token, burst 4, body 2 KiB. Attachments: one per token per rung,
+   so at most 32 per rung (the token cap, Read: `MAX_STREAMS`, `cast_streams/mod.rs:46`). WHEP offer 64 KiB.
+   Stored probe and fallback history: fixed size per stream.
+10. **The receiver page.** The policy already allows `connect-src 'self' https:` and `worker-src blob:` (Read:
+    `RECEIVER_CSP`, `routes/cast_public.rs:36`). Unverified in a browser: that this admits a WebTransport
+    session to another `https` origin. Slice 3 checks it in the harness. The hosted copy at
+    `cast.conspect.studio` must send the same policy and the same new files, byte for byte.
+
 <!-- NEXT -->
