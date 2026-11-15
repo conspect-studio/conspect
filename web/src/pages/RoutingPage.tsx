@@ -28,6 +28,7 @@ import { createApiClient } from "../api/client";
 import { useLayouts } from "../api/queries";
 import { useTakeLock } from "../components/broadcast/BroadcastShell";
 import { useAudioRouting } from "../resources/audioRouting";
+import { SubtitlePatchPanel } from "../components/routing/SubtitlePatchPanel";
 import { cellIdsFromLayouts, cellNamesFromLayouts } from "../resources/forms";
 import { Badge } from "../components/ui/badge";
 import type { BadgeProps } from "../components/ui/badge";
@@ -671,6 +672,7 @@ export function RoutingPage(): JSX.Element {
         }
         outputs={<OutputsSurface embedded />}
       />
+      <SubtitlePatchPanel />
     </RoutingFrame>
   );
 }

@@ -86,7 +86,7 @@ describe('mixerColumns / outputVideoColumns / outputAudioColumns / outputSubtitl
     format: { width: 1920, height: 1080 },
     video: [{ slot: 0, live: true, source: { source: 'cam-1' }, path: 'P1', pending: null, degraded: false }],
     audio: [{ slot: 0, source: 'follow' }],
-    subtitle: [{ slot: 0, format: 'webvtt', language: 'en', name: 'English', source: 'none' }],
+    subtitle: [{ slot: 0, format: 'webvtt', language: 'en', name: 'English', live: true, source: null }],
   };
   it('builds one video column per slot', () => {
     expect(outputVideoColumns(output)).toEqual([{ kind: 'output', output: 'hls-1', slot: 0, label: 'hls-1' }]);
@@ -98,19 +98,18 @@ describe('mixerColumns / outputVideoColumns / outputAudioColumns / outputSubtitl
     expect(outputSubtitleColumns(output)).toEqual([{ kind: 'output', output: 'hls-1', slot: 0, label: 'English' }]);
   });
   it('builds no subtitle columns when the output carries none (empty-state)', () => {
+    // An absent wire `subtitle` is normalized to `[]` by getPatch (patch.test.ts).
     expect(outputSubtitleColumns({ ...output, subtitle: [] })).toEqual([]);
-    const withoutSubtitle: typeof output = { output: output.output, format: output.format, video: output.video, audio: output.audio };
-    expect(outputSubtitleColumns(withoutSubtitle)).toEqual([]);
   });
 });
 
 describe('hasSubtitleData', () => {
   it('is false when no output carries subtitle slots', () => {
-    expect(hasSubtitleData([{ output: 'hls-1', format: null, video: [], audio: [] }])).toBe(false);
+    expect(hasSubtitleData([{ output: 'hls-1', format: null, video: [], audio: [], subtitle: [] }])).toBe(false);
   });
   it('is true once one output reports a subtitle slot', () => {
     expect(hasSubtitleData([
-      { output: 'hls-1', format: null, video: [], audio: [], subtitle: [{ slot: 0, format: 'webvtt', source: 'none' }] },
+      { output: 'hls-1', format: null, video: [], audio: [], subtitle: [{ slot: 0, format: 'webvtt', language: null, name: null, live: false, source: null }] },
     ])).toBe(true);
   });
 });

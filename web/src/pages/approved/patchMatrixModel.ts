@@ -7,7 +7,6 @@ import type {
   MixerPatchView,
   OutputAudioSlotView,
   OutputPatchView,
-  OutputSubtitleSlotView,
   OutputVideoSlotView,
   PatchCrosspoint,
   PatchSource,
@@ -39,7 +38,7 @@ export type CellState =
 /**
  * A disabled cell's reason: §8's vocabulary, plus the E2 API limits the
  * matrix must state rather than send (audio slots fixed by configuration,
- * audio `follow` riding a video take, subtitle routing not yet patchable).
+ * audio `follow` riding a video take, subtitle slots patched in the Subtitle patch panel).
  * The page translates each code at render.
  */
 export type DisabledReason =
@@ -50,7 +49,7 @@ export type DisabledReason =
   | 'switcher-required'
   | 'unroutable-output'
   | 'audio-fixed'
-  | 'subtitle-unsupported'
+  | 'subtitle-panel'
   | 'refused';
 
 /** The path glyph suffix (§12.9): passthrough, shared or converted. */
@@ -173,9 +172,9 @@ export function outputAudioColumns(output: OutputPatchView): readonly MatrixColu
   }));
 }
 
-/** Build output subtitle-slot columns (Subtitle tab, patch-f #345). Empty while that tab is unfilled. */
+/** Build output subtitle-slot columns (Subtitle tab, display-only: patch-f's Subtitle patch panel takes them). */
 export function outputSubtitleColumns(output: OutputPatchView): readonly MatrixColumn[] {
-  return (output.subtitle ?? []).map((slot): MatrixColumn => ({
+  return output.subtitle.map((slot): MatrixColumn => ({
     kind: 'output',
     output: output.output,
     slot: slot.slot,
@@ -276,7 +275,8 @@ export function selectionKey(plane: ArmedSelection['plane'], column: MatrixColum
 
 /**
  * The crosspoint one selection sends, or `undefined` when the E2 API cannot
- * take it: audio only as output slot 0 `"follow"`, never subtitle (#345), and
+ * take it: audio only as output slot 0 `"follow"`, never subtitle (the Subtitle
+ * patch panel owns subtitle takes, #345 F3), and
  * never a plane-video crosspoint for a non-video selection.
  */
 export function crosspointOf(sel: ArmedSelection): PatchCrosspoint | undefined {
@@ -415,7 +415,7 @@ export function displayCell(base: MatrixCell, armed: boolean, member: PlannedMem
 
 /** Columns + rows for the empty-state check (Subtitle tab, patch-f note). */
 export function hasSubtitleData(outputs: readonly OutputPatchView[]): boolean {
-  return outputs.some((output) => (output.subtitle ?? []).length > 0);
+  return outputs.some((output) => output.subtitle.length > 0);
 }
 
 /** Sources with captions (Subtitle tab rows, patch-f note): filters by a caller-supplied predicate. */
@@ -427,4 +427,3 @@ export function subtitleRows(
     .map((s): MatrixRow => ({ id: `source:${s.id}`, label: s.name, group: 'sources' }));
 }
 
-export type { OutputSubtitleSlotView };

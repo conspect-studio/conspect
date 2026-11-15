@@ -422,6 +422,13 @@ fn ready_output(
                 "Preview and Clean need a switcher (M/E) in this run".to_owned(),
             )))
         }
+        Err(PlanRefusal::CleanUnavailableWithDsk) => {
+            return Ok(Err(refusal_problem(
+                409,
+                super::output_routing::CLEAN_UNAVAILABLE_WITH_DSK,
+                super::output_routing::CLEAN_WITH_DSK_TEXT.to_owned(),
+            )))
+        }
         Err(PlanRefusal::OutputKindUnroutable) => return Ok(Err(unroutable_kind())),
         Err(PlanRefusal::AudioUnsupported) => {
             return Ok(Err(refusal_problem(

@@ -36,7 +36,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '../../components/ui/ta
 import { subscribeRealtime } from '../../realtime/shared';
 import type { RealtimeStatus } from '../../realtime/connection';
 import { OperationApiError, newIdempotencyKey } from '../../api/operations';
-import { getPatch, parseCrosspoints, planPatch, probePatchWrite, takePatch } from '../../api/patch';
+import { getPatch, parseCrosspoints, planPatch, probePatchWrite, subtitleSlotRedacted, subtitleSlotSource, takePatch } from '../../api/patch';
 import type { OnAir, PatchCrosspoint, PatchPlanResponse, PatchRequest, PatchView } from '../../api/patch';
 import { getSalvo, planSalvo, takePatchSalvo } from '../../api/salvos';
 import type { Salvo } from '../../api/salvos';
@@ -45,7 +45,6 @@ import { useSources } from '../../resources/queries';
 import { useLayouts } from '../../api/queries';
 import { useMediaPlayers } from '../../api/media-playersQueries';
 import { createApiClient } from '../../api/client';
-import { useSubtitleSources } from './useSubtitleSources';
 import {
   ON_AIR_REFUSAL,
   affectsProgram,
@@ -207,7 +206,7 @@ function MatrixGrid({
       case 'switcher-required': return t`switcher required`;
       case 'unroutable-output': return t`unroutable output`;
       case 'audio-fixed': return t`fixed by the output's configuration; only audio slot 0 Follow is patchable in this release`;
-      case 'subtitle-unsupported': return t`subtitle patching is not available in this release (#345)`;
+      case 'subtitle-panel': return t`patch subtitles in the Subtitle patch panel`;
       case 'refused': return cell.refusal?.detail ?? t`refused by the plan`;
     }
   };
@@ -391,7 +390,6 @@ export function PatchMatrix(): JSX.Element {
   const apiClient = useMemo(() => createApiClient(), []);
   const layouts = useLayouts(apiClient);
   const players = useMediaPlayers();
-  const subtitleSources = useSubtitleSources();
   const salvos = useSalvos();
   const saveSalvo = useSaveSalvo();
 
@@ -509,8 +507,8 @@ export function PatchMatrix(): JSX.Element {
   const audioCols = useMemo(() => outputs.flatMap(outputAudioColumns), [outputs]);
   const subtitleCols = useMemo(() => outputs.flatMap(outputSubtitleColumns), [outputs]);
   const subtitleRowList = useMemo(
-    () => subtitleRows((subtitleSources.data ?? []).map((s) => ({ ...s, hasCaptions: true }))),
-    [subtitleSources.data],
+    () => subtitleRows((sources.data ?? []).map((s) => ({ id: s.id, name: s.name, hasCaptions: s.hasCaptions === true }))),
+    [sources.data],
   );
   const subtitleDataPresent = hasSubtitleData(outputs);
 
@@ -593,14 +591,16 @@ export function PatchMatrix(): JSX.Element {
   const cellOfSubtitle = (row: MatrixRow, col: MatrixColumn): MatrixCell => {
     if (col.kind === 'mixer') return { state: 'na' };
     const output = outputs.find((o) => o.output === col.output);
-    const slot = (output?.subtitle ?? []).find((s) => s.slot === col.slot);
-    if (slot === undefined) return { state: 'unknown' };
-    const current = isRecord(slot.source) && typeof slot.source.source === 'string'
-      ? `source:${slot.source.source}` : undefined;
-    // E2 refuses every subtitle crosspoint (`slot-medium-mismatch`, #345):
-    // show what is on air, never arm one.
-    if (current !== row.id) return { state: 'disabled', disabledReason: 'subtitle-unsupported' };
-    return unconfirmed ? { state: 'unknown' } : { state: 'on-air' };
+    const slot = output?.subtitle.find((s) => s.slot === col.slot);
+    if (slot === undefined || subtitleSlotRedacted(slot)) return { state: 'unknown' };
+    const patched = subtitleSlotSource(slot);
+    const current = patched !== undefined ? `source:${patched}` : undefined;
+    // Subtitle crosspoints are taken by the Subtitle patch panel (patch-f,
+    // #345 F3), never here: this tab shows what is patched and never arms
+    // one, so the two take paths cannot disagree. A `live: false` slot is
+    // the accepted config, not on-air evidence.
+    if (current !== row.id) return { state: 'disabled', disabledReason: 'subtitle-panel' };
+    return unconfirmed || !slot.live ? { state: 'unknown' } : { state: 'on-air' };
   };
 
   const resetArming = (): void => {
@@ -937,7 +937,7 @@ export function PatchMatrix(): JSX.Element {
           ) : (
             <>
               <p className="rp-note text-xs" data-testid="matrix-subtitle-note">
-                <Trans>Subtitle patching is not available in this release (#345): this tab shows what is on air only.</Trans>
+                <Trans>This tab shows what is patched only: patch subtitles in the Subtitle patch panel below.</Trans>
               </p>
               <MatrixGrid
                 plane="subtitle"

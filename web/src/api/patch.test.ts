@@ -58,3 +58,38 @@ describe('isPatchView (E3-07 round 2)', () => {
     expect(isPatchView(view([{ ...input, video: {} }]))).toBe(false);
   });
 });
+
+describe('isPatchView output plane (E3 video/audio + patch-f subtitle)', () => {
+  const video = { slot: 0, live: true, source: { source: 'cam-1' }, path: 'P1', pending: null, degraded: false };
+  const sub = { slot: 0, format: 'webvtt', language: 'en', name: null, live: true, source: { source: 'cam-1' } };
+  const view = (output: Record<string, unknown>) => ({ mixer: [], outputs: [{ output: 'o', video: [video], audio: [{ slot: 0, source: 'follow' }], ...output }] });
+  it('accepts video, audio and subtitle slots together, and an output without subtitle', () => {
+    expect(isPatchView(view({ subtitle: [sub, { ...sub, slot: 1, live: false, source: null }, { ...sub, slot: 2, source: { redacted: true } }] }))).toBe(true);
+    expect(isPatchView(view({}))).toBe(true);
+  });
+  it('rejects a malformed subtitle slot (no live, string source, non-array)', () => {
+    const noLive: Record<string, unknown> = { ...sub };
+    delete noLive.live;
+    expect(isPatchView(view({ subtitle: [noLive] }))).toBe(false);
+    expect(isPatchView(view({ subtitle: [{ ...sub, source: 'none' }] }))).toBe(false);
+    expect(isPatchView(view({ subtitle: [{ ...sub, source: {} }] }))).toBe(false);
+    expect(isPatchView(view({ subtitle: null }))).toBe(false);
+  });
+  it('rejects an output missing its video or audio readback', () => {
+    expect(isPatchView({ mixer: [], outputs: [{ output: 'o', audio: [], subtitle: [] }] })).toBe(false);
+    expect(isPatchView({ mixer: [], outputs: [{ output: 'o', video: [], subtitle: [] }] })).toBe(false);
+  });
+});
+
+describe('parseCrosspoints plane/destination shapes', () => {
+  it('keeps a subtitle slot crosspoint and drops shapes no request can carry', () => {
+    expect(parseCrosspoints([
+      { plane: 'subtitle', destination: { output: 'o', slot: 1 }, source: { source: 'cam-1' } },
+      { plane: 'subtitle', destination: { output: 'o', slot: 0 }, source: { bus: 'program' } },
+      { plane: 'audio', destination: { mixer: 'me1', input: 1 }, source: 'follow' },
+    ])).toEqual({
+      crosspoints: [{ plane: 'subtitle', destination: { output: 'o', slot: 1 }, source: { source: 'cam-1' } }],
+      invalid: 2,
+    });
+  });
+});

@@ -460,6 +460,11 @@ pub struct RoutingTable {
     /// routed layouts. Bounded by [`MAX_AUX_CANVASES_LIMIT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_aux_canvases: Option<usize>,
+    /// Distinct non-Program output rates run at once (#343, output-routing
+    /// §12.6): each is one output clock thread. `None` is the default
+    /// ([`DEFAULT_MAX_OUTPUT_CLOCKS`]); bounded by [`MAX_OUTPUT_CLOCKS_LIMIT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_clocks: Option<usize>,
 }
 
 /// Default `routing.max_aux_canvases` (ADR-0108 §7).
@@ -468,11 +473,23 @@ pub const DEFAULT_MAX_AUX_CANVASES: usize = 2;
 /// compose on the one `routing-aux` thread, so the bound stays small.
 pub const MAX_AUX_CANVASES_LIMIT: usize = 8;
 
+/// Default `routing.max_output_clocks` (#343, §12.6).
+pub const DEFAULT_MAX_OUTPUT_CLOCKS: usize = 2;
+/// The largest accepted `routing.max_output_clocks`: every distinct output
+/// rate is one clock thread plus its encoders.
+pub const MAX_OUTPUT_CLOCKS_LIMIT: usize = 8;
+
 impl RoutingTable {
     /// The effective `max_aux_canvases` (the default when unset).
     #[must_use]
     pub fn max_aux_canvases(&self) -> usize {
         self.max_aux_canvases.unwrap_or(DEFAULT_MAX_AUX_CANVASES)
+    }
+
+    /// The effective `max_output_clocks` (the default when unset).
+    #[must_use]
+    pub fn max_output_clocks(&self) -> usize {
+        self.max_output_clocks.unwrap_or(DEFAULT_MAX_OUTPUT_CLOCKS)
     }
 
     /// Validate this table against the document's declared destinations and
@@ -492,7 +509,8 @@ impl RoutingTable {
     ///   the `source.kind` is [`StreamKind::Subtitle`];
     /// * every output crosspoint's `output` resolves to a declared output;
     /// * no cell / track / layer / output is bound by two crosspoints, and
-    /// * `max_aux_canvases` is at most [`MAX_AUX_CANVASES_LIMIT`].
+    /// * `max_aux_canvases` is at most [`MAX_AUX_CANVASES_LIMIT`], and
+    /// * `max_output_clocks` is at most [`MAX_OUTPUT_CLOCKS_LIMIT`].
     ///
     /// # Errors
     ///
@@ -504,6 +522,14 @@ impl RoutingTable {
         {
             return Err(ConfigError::Validation(format!(
                 "routing.max_aux_canvases must be at most {MAX_AUX_CANVASES_LIMIT}"
+            )));
+        }
+        if self
+            .max_output_clocks
+            .is_some_and(|n| n > MAX_OUTPUT_CLOCKS_LIMIT)
+        {
+            return Err(ConfigError::Validation(format!(
+                "routing.max_output_clocks must be at most {MAX_OUTPUT_CLOCKS_LIMIT}"
             )));
         }
         self.validate_video(refs)?;

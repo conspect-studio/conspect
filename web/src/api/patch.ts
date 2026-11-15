@@ -19,14 +19,33 @@ export type PatchSource =
   | { readonly bus: 'program' | 'preview' | 'clean' }
   | 'follow'
   | 'none';
-/** One crosspoint: a mixer input, or an output video/audio slot (#308). */
-export interface PatchCrosspoint {
-  readonly plane: 'video' | 'audio' | 'subtitle';
-  readonly destination:
-    | { readonly mixer: string; readonly input: number }
-    | { readonly output: string; readonly slot: number };
+/** A subtitle slot's source: subtitle essences come from sources only. */
+export type SubtitlePatchSource = { readonly source: string } | 'none';
+/** A mixer-input video crosspoint. */
+export interface MixerPatchCrosspoint {
+  readonly plane: 'video';
+  readonly destination: { readonly mixer: string; readonly input: number };
   readonly source: PatchSource;
 }
+/** An output video/audio slot crosspoint (#308, slice E3). */
+export interface OutputPatchCrosspoint {
+  readonly plane: 'video' | 'audio';
+  readonly destination: { readonly output: string; readonly slot: number };
+  readonly source: PatchSource;
+}
+/**
+ * An output subtitle slot crosspoint (ADR-0110 §12.8, #345 part F2):
+ * `{"source": id}` re-points the slot, `"none"` unpatches it. A request
+ * carries only subtitle crosspoints of ONE output, each slot once (mixing
+ * with video/audio, a second output or a repeated slot is `unknown-slot`).
+ */
+export interface SubtitlePatchCrosspoint {
+  readonly plane: 'subtitle';
+  readonly destination: { readonly output: string; readonly slot: number };
+  readonly source: SubtitlePatchSource;
+}
+/** One crosspoint: a mixer video patch, an output video/audio slot patch, or an output subtitle slot patch. */
+export type PatchCrosspoint = MixerPatchCrosspoint | OutputPatchCrosspoint | SubtitlePatchCrosspoint;
 /** Plan/take body. */
 export interface PatchRequest {
   readonly crosspoints: readonly PatchCrosspoint[];
@@ -82,31 +101,39 @@ export interface OutputAudioSlotView {
   readonly source: unknown;
 }
 
-/** One output subtitle slot (patch-f, #345): columns the Subtitle tab reads. */
-export interface OutputSubtitleSlotView {
+/**
+ * One output's subtitle slot as `GET /patch` reports it (#345 F2): `live: true`
+ * when the running engine samples this slot, else the accepted config
+ * (`live: false`). `source` is `{source}`, `{redacted: true}` (unreadable to
+ * the caller) or `null` (unpatched).
+ */
+export interface PatchSubtitleSlot {
   readonly slot: number;
   readonly format: string;
-  readonly language?: string | null;
-  readonly name?: string | null;
-  /** `{source}` | `"none"` | `{redacted:true}` | null (no readback). */
-  readonly source: unknown;
+  readonly language: string | null;
+  readonly name: string | null;
+  readonly live: boolean;
+  readonly source: { readonly source: string } | { readonly redacted: true } | null;
 }
 
-/** One output's format + live slots, as `GET /patch` `outputs[]` reports it. */
+/**
+ * One output's format + slots, as `GET /patch` `outputs[]` reports it: the
+ * video/audio readback the matrix reads (E3) and the subtitle slots the
+ * Subtitle patch panel patches (patch-f). `subtitle` is `[]` when the server
+ * omits it (a pre-#345 server).
+ */
 export interface OutputPatchView {
   readonly output: string;
   readonly format?: { readonly width?: number; readonly height?: number; readonly fit?: string } | null | undefined;
   readonly video: readonly OutputVideoSlotView[];
   readonly audio: readonly OutputAudioSlotView[];
-  /** patch-f (#345) fills this later; absent/empty renders the Subtitle tab's empty state. */
-  readonly subtitle?: readonly OutputSubtitleSlotView[];
+  readonly subtitle: readonly PatchSubtitleSlot[];
 }
 
-/** `GET /patch`: the mixer plane and, as of slice B/E3, the output plane. */
+/** `GET /patch`: the mixer plane and the output plane (`[]` on a server without it). */
 export interface PatchView {
   readonly mixer: readonly MixerPatchView[];
-  /** Absent on a server that has not yet deployed the output plane (slice B). */
-  readonly outputs?: readonly OutputPatchView[];
+  readonly outputs: readonly OutputPatchView[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -152,22 +179,57 @@ function isAudioSlot(value: unknown): value is OutputAudioSlotView {
     && isOptionalString(value.track) && isOptionalString(value.language)
     && (value.source === undefined || isReadbackSource(value.source));
 }
-function isSubtitleSlot(value: unknown): value is OutputSubtitleSlotView {
-  return isRecord(value) && typeof value.slot === 'number' && typeof value.format === 'string'
-    && isOptionalString(value.name) && isOptionalString(value.language)
-    && (value.source === undefined || isReadbackSource(value.source));
+function isSubtitleSource(value: unknown): value is PatchSubtitleSlot['source'] {
+  return value === null || (isRecord(value)
+    && (typeof value.source === 'string' || value.redacted === true));
 }
-function isOutput(value: unknown): value is OutputPatchView {
+/** A subtitle slot (#345 F2): `language`/`name`/`source` may be omitted (read as null). */
+function isSubtitleSlot(value: unknown): value is PatchSubtitleSlotWire {
+  return isRecord(value) && typeof value.slot === 'number' && typeof value.format === 'string'
+    && isOptionalString(value.language) && isOptionalString(value.name)
+    && typeof value.live === 'boolean' && isSubtitleSource(value.source ?? null);
+}
+function isOutput(value: unknown): value is OutputPatchWire {
   return isRecord(value) && typeof value.output === 'string'
     && (value.format === null || value.format === undefined || (isRecord(value.format) && !Array.isArray(value.format)))
     && Array.isArray(value.video) && value.video.every(isVideoSlot)
     && Array.isArray(value.audio) && value.audio.every(isAudioSlot)
-    && (value.subtitle === undefined || value.subtitle === null || (Array.isArray(value.subtitle) && value.subtitle.every(isSubtitleSlot)));
+    && (value.subtitle === undefined || (Array.isArray(value.subtitle) && value.subtitle.every(isSubtitleSlot)));
 }
-/** Runtime guard for a `GET /patch` body: every field the matrix dereferences is checked. */
-export function isPatchView(value: unknown): value is PatchView {
+/** A subtitle slot as the wire may carry it: optional fields are normalized to null by {@link getPatch}. */
+type PatchSubtitleSlotWire = Omit<PatchSubtitleSlot, 'language' | 'name' | 'source'> & {
+  readonly language?: string | null;
+  readonly name?: string | null;
+  readonly source?: PatchSubtitleSlot['source'];
+};
+/** One output as the wire carries it: `subtitle` is absent on a pre-#345 server. */
+type OutputPatchWire = Omit<OutputPatchView, 'subtitle'> & { readonly subtitle?: readonly PatchSubtitleSlotWire[] };
+/** `GET /patch`'s wire shape: `outputs` is absent on a server without the output plane. */
+export interface PatchViewWire {
+  readonly mixer: readonly MixerPatchView[];
+  readonly outputs?: readonly OutputPatchWire[];
+}
+/** Runtime guard for a `GET /patch` body: every field the matrix and the subtitle panel dereference is checked. */
+export function isPatchView(value: unknown): value is PatchViewWire {
   return isRecord(value) && Array.isArray(value.mixer) && value.mixer.every(isMixer)
     && (value.outputs === undefined || (Array.isArray(value.outputs) && value.outputs.every(isOutput)));
+}
+/** Normalize a validated wire body: absent outputs/subtitle are `[]`, absent subtitle fields `null`. */
+function normalizeView(body: PatchViewWire): PatchView {
+  return {
+    mixer: body.mixer,
+    outputs: (body.outputs ?? []).map((output) => ({
+      ...output,
+      subtitle: (output.subtitle ?? []).map((slot) => ({
+        slot: slot.slot,
+        format: slot.format,
+        language: slot.language ?? null,
+        name: slot.name ?? null,
+        live: slot.live,
+        source: slot.source ?? null,
+      })),
+    })),
+  };
 }
 function isOptionalInteger(value: unknown): boolean {
   return value === undefined || value === null || (typeof value === 'number' && Number.isInteger(value));
@@ -224,7 +286,7 @@ export function inputSource(input: MixerInputView): string | undefined {
 }
 
 /** One video crosspoint onto `me.in<input>`; `source` undefined unpatches. */
-export function mixerCrosspoint(me: string, input: number, source: string | undefined): PatchCrosspoint {
+export function mixerCrosspoint(me: string, input: number, source: string | undefined): MixerPatchCrosspoint {
   return {
     plane: 'video',
     destination: { mixer: me, input },
@@ -233,12 +295,12 @@ export function mixerCrosspoint(me: string, input: number, source: string | unde
 }
 
 /** One video crosspoint onto `output.video[slot]`. */
-export function outputVideoCrosspoint(output: string, slot: number, source: PatchSource): PatchCrosspoint {
+export function outputVideoCrosspoint(output: string, slot: number, source: PatchSource): OutputPatchCrosspoint {
   return { plane: 'video', destination: { output, slot }, source };
 }
 
 /** One audio crosspoint onto `output.audio[slot]` (slot 0 "follow" in this release). */
-export function outputAudioCrosspoint(output: string, slot: number, source: PatchSource): PatchCrosspoint {
+export function outputAudioCrosspoint(output: string, slot: number, source: PatchSource): OutputPatchCrosspoint {
   return { plane: 'audio', destination: { output, slot }, source };
 }
 
@@ -252,13 +314,39 @@ export function isSetRequest(request: PatchRequest): boolean {
   return keys.size >= 2;
 }
 
+/**
+ * One subtitle crosspoint onto `output`'s subtitle `slot`; `source`
+ * undefined unpatches it (ADR-0110 §12.8, #345 part F2).
+ */
+export function subtitleCrosspoint(
+  output: string,
+  slot: number,
+  source: string | undefined,
+): SubtitlePatchCrosspoint {
+  return {
+    plane: 'subtitle',
+    destination: { output, slot },
+    source: source === undefined ? 'none' : { source },
+  };
+}
+
+/** The source id patched to a subtitle slot, if the caller may read it. */
+export function subtitleSlotSource(slot: PatchSubtitleSlot): string | undefined {
+  return slot.source !== null && 'source' in slot.source ? slot.source.source : undefined;
+}
+
+/** Whether a subtitle slot's source is hidden from the caller. */
+export function subtitleSlotRedacted(slot: PatchSubtitleSlot): boolean {
+  return slot.source !== null && 'redacted' in slot.source && slot.source.redacted;
+}
+
 /** Read the live patch (mixer + output planes). */
 export async function getPatch(options: RequestOptions = {}): Promise<PatchView> {
   const response = await fetch(apiUrl(options, '/api/v1/patch'), { headers: buildHeaders(options, false) });
   if (!response.ok) throw await readPendingProblem(response);
   const body: unknown = await response.json();
   if (!isPatchView(body)) throw new OperationApiError('Invalid patch readback');
-  return body;
+  return normalizeView(body);
 }
 
 /** Plan crosspoints: path, on-air flag and refusals (+ `set` cost for 2+ destinations); changes nothing. */
@@ -323,10 +411,26 @@ export function parseCrosspoints(value: unknown): { readonly crosspoints: readon
       invalid += 1;
       continue;
     }
+    // Shapes no request type can carry (a non-video mixer crosspoint, a
+    // subtitle slot fed by a layout/bus/follow) are counted invalid: the
+    // server refuses them anyway (`slot-medium-mismatch`).
     if (typeof d.mixer === 'string' && typeof d.input === 'number') {
-      crosspoints.push({ plane: item.plane, destination: { mixer: d.mixer, input: d.input }, source });
+      if (item.plane !== 'video') {
+        invalid += 1;
+        continue;
+      }
+      crosspoints.push({ plane: 'video', destination: { mixer: d.mixer, input: d.input }, source });
     } else if (typeof d.output === 'string') {
-      crosspoints.push({ plane: item.plane, destination: { output: d.output, slot: typeof d.slot === 'number' ? d.slot : 0 }, source });
+      const destination = { output: d.output, slot: typeof d.slot === 'number' ? d.slot : 0 };
+      if (item.plane === 'subtitle') {
+        if (source !== 'none' && !(typeof source === 'object' && 'source' in source)) {
+          invalid += 1;
+          continue;
+        }
+        crosspoints.push({ plane: 'subtitle', destination, source });
+      } else {
+        crosspoints.push({ plane: item.plane, destination, source });
+      }
     } else {
       invalid += 1;
     }

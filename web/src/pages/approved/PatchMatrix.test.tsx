@@ -707,7 +707,7 @@ describe('E3-10 audio and subtitle planes', () => {
   it('Subtitle cells are disabled with the reason and never arm a crosspoint', async () => {
     const withSubtitle = {
       mixer: [],
-      outputs: [{ ...patchBody.outputs[0]!, subtitle: [{ slot: 0, format: 'webvtt', name: 'English', source: 'none' }] }],
+      outputs: [{ ...patchBody.outputs[0]!, subtitle: [{ slot: 0, format: 'webvtt', language: null, name: 'English', live: true, source: null }] }],
     };
     server.use(
       http.get('*/api/v1/patch', () => HttpResponse.json(withSubtitle)),
@@ -721,7 +721,7 @@ describe('E3-10 audio and subtitle planes', () => {
     await user.click(screen.getByRole('tab', { name: 'Subtitle' }));
     const cell = await screen.findByTestId('cell-subtitle-source:cnn-usa-output:hls-1:0');
     expect(cell).toBeDisabled();
-    expect(cell).toHaveAccessibleName(/subtitle patching is not available/);
+    expect(cell).toHaveAccessibleName(/patch subtitles in the Subtitle patch panel/);
     expect(screen.getByRole('button', { name: 'Classify selection' })).toBeDisabled();
   });
 });

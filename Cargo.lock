@@ -3901,6 +3901,7 @@ dependencies = [
  "multiview-srt-sys",
  "multiview-telemetry",
  "multiview-weather",
+ "multiview-webengine",
  "multiview-webrtc",
  "p256",
  "proptest",
