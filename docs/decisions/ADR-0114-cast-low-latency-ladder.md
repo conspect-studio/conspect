@@ -646,11 +646,15 @@ Decisions:
    the new closure, inside the critical section that re-authorizes tokens today and before the request goes to
    the engine. The old identity leaves the list when the engine reports the outcome.
 
-   **The gate.** Where a window is offered to an attachment, before it is enqueued, every component in it must
-   have an identity that is in the attachment's list for that component. One miss, or a component without an
+   **The gate.** At the last point where media is still common to several viewers and the first where it
+   belongs to one: the registry's offer for a MoQ lease, the distributor's hand-off to an attachment's queue
+   for SRT, the driver's write to a viewer's session for WebRTC (decision 6). There, before anything is
+   enqueued or written for that attachment, every component in the window must have an identity that is in
+   the attachment's list for that component. Identities therefore travel with the packets through the SRT
+   distributor and the WebRTC egress feed. One miss, or a component without an
    identity, and the whole window is refused, the attachment is fenced and nothing later is offered to it. The
-   check is a bounded comparison of a few integers at the place the registry already tests its revocation flag
-   and generation. It takes no lock and does not allocate.
+   check is a bounded comparison of a few integers, of the same kind as the revocation flag and generation the
+   registry tests today. It takes no lock and does not allocate.
 
    **Packets already buffered.** A fence stops enqueue. The attachment's own queue is then discarded, not
    drained: nothing more is handed to the transport, and the transport is closed abruptly (QUIC session close,
@@ -798,11 +802,11 @@ Decisions:
    characters at most, as `receiver.js` does today. The engine's SRT link status shows the peer address and
    counters, never the selector.
 9. **Bounds.** Ladder calls: 1 per second per token, burst 4, body 2 KiB. Attachments: one per token per rung;
-   at most 16 push attachments per cast output (the registry's subscriber cap, Read: `MAX_PEERS`,
-   `crates/multiview-cli/src/output_window_registry.rs:38`); at most 16 connections on the cast SRT listener,
-   as an SRT listener output has (Read: `MAX_LISTENER_CLIENTS`, `crates/multiview-output/src/sink/push.rs:85`);
-   at most 32 tokens in all (Read: `MAX_STREAMS`, `cast_streams/mod.rs:46`). WHEP offer 64 KiB. Stored probe,
-   reset counters and fallback history: fixed size per stream. Media buffers: decision 6.
+   at most 32 tokens in all (Read: `MAX_STREAMS`, `cast_streams/mod.rs:46`); at most 16 connections on the
+   cast SRT listener, as an SRT listener output has (Read: `MAX_LISTENER_CLIENTS`,
+   `crates/multiview-output/src/sink/push.rs:85`); MoQ attachments limited by the run's 16 registry
+   subscriptions, shared with the desk (decision 6). WHEP offer 64 KiB. Stored probe, reset counters and
+   fallback history: fixed size per stream. Media buffers: decision 6.
 10. **The receiver page.** The policy already allows `connect-src 'self' https:` and `worker-src blob:` (Read:
     `RECEIVER_CSP`, `routes/cast_public.rs:36`). Unverified in a browser: that this admits a WebTransport
     session to another `https` origin. Slice 3 checks it in the harness. The hosted copy at
@@ -828,9 +832,24 @@ WebRTC attachments, and closed with the last one. It is declared to the admissio
 **How a rung gets its packets.** On `main` each configured output's delivery is mirrored, whole window by whole
 window, into the effective-output registry, before and independent of the physical sink's own admission (Read:
 `crates/multiview-cli/src/pipeline.rs:7487-7519`). MoQ output leases already subscribe there. The cast rungs
-subscribe to the cast output's entry the same way. Limits already in place: 16 subscribers per producer, a
+subscribe to the cast output's entry the same way. Limits already in place: a
 two-window handoff per subscriber, and a subscriber that falls behind loses its whole window and resumes at the
-next verified keyframe (Read: `output_window_registry.rs:38`, `:43`, module doc). Two things to settle in
+next verified keyframe (Read: `output_window_registry.rs:43`, module doc).
+
+The registry admits 16 subscriptions, and that number is for the whole run, not per output: one counter belongs
+to the one registry that serves every output (Read: `MAX_PEERS`, `try_reserve_slot`, `slots`,
+`output_window_registry.rs:38`, `:376-388`, `:797`). The desk's MoQ viewers use the same 16. The cast rungs
+must not use them up, so they subscribe like this:
+
+| Rung | Registry subscriptions | Fan-out to attachments |
+| --- | --- | --- |
+| MoQ | one per lease, as on `main` | none: the lease is the attachment |
+| SRT | one per cast output that has an SRT attachment | a distributor with one bounded queue and one writer thread per attachment, as the SRT listener output has |
+| WebRTC | one per cast output that has a WebRTC attachment | the egress feed and its driver, as the `webrtc` output has |
+
+A run with two cast outputs therefore uses at most four subscriptions for SRT and WebRTC, however many viewers
+they have. MoQ viewers of cast and of the desk compete for what is left; when none is left the ladder does not
+offer MoQ and the receiver gets the next rung. Raising the cap is not part of this ADR. Two things to settle in
 slice 2, both Unverified here: that a `cast` output's binding enters that registry (nothing in the registry
 names the kind; `binding_ids` covers every configured output, `pipeline.rs:5135-5139`), and that the encoder's
 no-reorder proof holds for the production encoder on mda001 (a subscription is refused without it, Read:
@@ -864,7 +883,7 @@ GOP would hand the muxer frames whose reference is gone. The WebRTC egress feed 
 changes also improve the existing outputs that use those types; they ship in slices 5 and 6 behind tests. The
 Opus tap follows the preview tap's size (Read: `PROGRAM_AUDIO_RING`, `crates/multiview-cli/src/preview.rs:71`).
 
-Totals at the caps (16 SRT attachments, 16 MoQ sessions, 32 WebRTC viewers on at most 32 tokens): SRT
+Totals at the caps (16 SRT connections, 16 MoQ sessions, 32 WebRTC viewers on at most 32 tokens): SRT
 16 x (8 + 2) MiB = 160 MiB; MoQ 64 MiB; WebRTC 8 MiB per cast output plus 32 x 1.2 MiB. These are ceilings of
 referenced encoder output, reached only when every viewer is stalled at once.
 
