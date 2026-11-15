@@ -441,24 +441,18 @@ async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
             Arc::clone(&stop),
             Arc::clone(&reads),
         );
+        // Contention only: this thread asserts nothing it observes.
         std::thread::spawn(move || {
-            let mut changes = 0_u64;
-            let mut last = None;
             let mut announced = false;
             while !stop.load(Ordering::Acquire) {
-                let now = program.load();
+                let _p = program.load();
                 let _v = preview.load();
-                if now != last {
-                    changes += 1;
-                    last = now;
-                }
                 reads.fetch_add(1, Ordering::Relaxed);
                 if !announced {
                     ready_tx.send(()).unwrap();
                     announced = true;
                 }
             }
-            changes
         })
     };
     ready_rx.recv().unwrap();
@@ -475,6 +469,10 @@ async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
     let mut frames = Vec::new();
     let pace = Arc::clone(&clock);
     let flood = handle.clone();
+    // What the slot held after each fresh tick, read on the clock thread
+    // itself (the frame callback), so the observation is deterministic.
+    let mut observed: Vec<Option<Arc<str>>> = Vec::new();
+    let watch = Arc::clone(&program);
     runtime
         .run_for_with_frame_control(
             &publisher,
@@ -482,6 +480,7 @@ async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
             TICKS,
             |frame| {
                 frames.push(frame.tick.index);
+                observed.push(watch.load());
                 // One CUT per tick from the control side; a full mailbox
                 // drops, it never waits.
                 let _ = flood.try_send(SwitcherCommand {
@@ -505,7 +504,8 @@ async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
         .await
         .unwrap();
     stop.store(true, Ordering::Release);
-    let changes = reader.join().unwrap();
+    reader.join().unwrap();
+    let changes = observed.windows(2).filter(|w| w[0] != w[1]).count();
     assert_eq!(
         frames,
         (0..TICKS).collect::<Vec<_>>(),
@@ -515,7 +515,10 @@ async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
     let applied = snapshot.completion_count;
     assert!(applied > TICKS / 2, "the CUTs really applied: {applied}");
     assert!(reads.load(Ordering::Relaxed) > 0, "the reader ran");
-    assert!(changes > 1, "the reader saw the published CUTs: {changes}");
+    assert!(
+        changes > usize::try_from(TICKS / 2).unwrap(),
+        "the hook republished the alternating PGM source: {changes}"
+    );
     assert_eq!(
         program.load().as_deref(),
         Some(snapshot.program.as_str()),
