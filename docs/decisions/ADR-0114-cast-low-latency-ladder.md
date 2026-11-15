@@ -519,7 +519,7 @@ No launch credentials are sent. The cast token in the LOAD is the only credentia
 | --- | --- |
 | Package name | `studio.conspect.cast.tv` (reverse of the domain that hosts the receiver; `tv` leaves room for a phone app) |
 | Source | `android/cast-tv/` in this repository, Kotlin, Gradle. Not a Cargo workspace member: `cargo check --workspace` and the default build do not change |
-| Minimum Android | API 23, the floor of `srtdroid`'s libsrt build; raised if Media3 or the Cast TV library needs more (checked at slice 6) |
+| Minimum Android | the highest floor among the three libraries. `srtdroid` 1.10.1 needs API 21 (Read: `AndroidVersions.MIN_SDK` at that tag); the floors of Media3 and the Cast TV library were not checked (slice 6) |
 | Cast | `com.google.android.gms:play-services-cast-tv` (21.1.1 in Google's guide today), `CastReceiverContext`, `MediaManager` bound to a `MediaSession` |
 | Player | Media3 ExoPlayer: `ProgressiveMediaSource` over a custom `DataSource` that reads SRT payload, `TsExtractor`, platform `MediaCodec` decoders. HLS fallback through Media3's HLS module in the same player |
 | SRT | libsrt 1.5.7 through JNI, from the `io.github.thibaultbee.srtdroid:srtdroid-core` 1.10.1 package, which builds libsrt 1.5.7 with OpenSSL 3.5.1 (Read: its `CMakeLists.txt` at tag 1.10.1) |
@@ -557,5 +557,55 @@ devices. The engine does not serve the APK.
 
 **Version skew.** The app and the engine negotiate through the ladder call (`v`), and the app plays HLS against
 an engine that does not answer it. The app shows its version on its idle screen and in every report.
+
+### 8. Slices
+
+Order matters: the first three slices decide whether the later ones are built as designed.
+
+| # | Pull request | Class | Depends on | What it proves |
+| --- | --- | --- | --- | --- |
+| 0 | This ADR, the index line, the cast runbook's pointer | R0 | none | The design is reviewed before code |
+| 1 | **Latency slate and evidence.** A test source that draws the engine clock (ms) and the tick; the reference clock page; tick-to-packet delay of the shared encoder as a metric; the receiver's HLS reports gain tick-to-present | R2 | PR 466 merged | The baseline: glass-to-glass and tick-to-present for today's HLS on the operator's Chromecast, and the encoder delay that bounds every rung. Records the device's user agent |
+| 2 | **Ladder endpoint and one authorization.** `POST /cast/<token>/ladder` with the probe stored and shown; the shared token check; attachment fences set on revoke, expiry and feed change; liveness by report; `[cast] ladder`. The answer offers `hls` only. `receiver.js` sends the probe and still plays HLS | R3 | 1 | One token governs every transport: the PR 409 abuse tests pass against a fake push attachment, including a forced engine fallback (zero packets of a feed the owner may not read). From the first device cast: the real capability table of that device |
+| 3 | **CAF spike, in the harness, no product code path.** A `<video>` element fed from outside CAF's player; LOAD interceptor returning `null`; `setMediaElement`, `setMediaInformation`, `broadcastStatus` | R1 (tools only) | 2 | Whether a Web Receiver can show a picture CAF did not load and still give senders a correct media session. Checks the page policy against a cross-origin WebTransport session. A fail ends slices 4 and 5 |
+| 4 | **MoQ rung.** Engine: cast outputs admitted to MoQ leases through the ladder; lease renewal by the ladder call. Receiver: `moq.js` (WebTransport, CMAF wrap, `SourceBuffer`), deadlines, step-down, memory | R3 | 3 passed; the probe data shows a device with `wt` and `mse` | MoQ plays through the real CAF SDK in the harness with media status correct; a wedged or stalled MoQ attachment costs the clock zero ticks and other bindings zero packets; device test with glass-to-glass |
+| 5 | **WebRTC rung.** `POST` and `DELETE /cast/<token>/whep`; one Opus encoder per cast output; PLI ignored; receiver `rtc.js`; ICE-TCP | R3 | 3 passed | WebRTC plays in the harness with UDP blocked (TCP 443 only); the Opus encoder count stays one with several viewers; chaos as slice 4; device test |
+| 6 | **SRT rung and the Android TV app.** Engine: listen callback in `multiview-srt-sys`, version floor 1.5.7, the cast SRT listener, HKDF derivation, attachment per token. App: `android/cast-tv/`, CI job that builds the APK. Senders: `androidReceiverCompatible`, `supportedAppTypes`, behind `[cast] android_tv` | R3 | 2 | Engine: a libsrt caller with the derived id and passphrase receives valid MPEG-TS; a wrong passphrase, an unknown id and a revoked token get nothing; churn and a wedged caller do not slow the producer. Device: the app launches when installed, the Web Receiver when not; SRT plays; a blocked port falls to HLS and the next cast to the Web Receiver |
+| 7 | **Measured ladder.** Run the matrix; set the offer order, deadlines, SRT latency and player buffers from the data; remove any rung that does not beat the one below it on a class; enable `android_tv` by default if slice 6's first device step passed; runbook; this ADR to Accepted with the table | R2 | 4, 5, 6 as built | The ladder's order and targets are measurements. Every cell of the table is filled or marked as not built, with the reason |
+
+Slices 4, 5 and 6 are independent of each other after 2 (and 3 for the web rungs). Slice 6 is the largest and
+has the longest operator lead time, so it starts as soon as 2 is merged. If the probe data from slice 2 shows
+that no device in hand has `wt`, slice 4 is deferred, not built blind.
+
+**Lane cast2 (#418, PR 466).** It changes the same files slices 1, 2, 4 and 5 touch: `receiver.js` (263 lines:
+track helpers, `onEditTracks`, `playbackInfo`, a 2000-byte report cap), `cast_streams/` (the gate's history and
+the run-bound view) and `routes/cast_public.rs`. Rule: no slice here opens a pull request against those files
+until PR 466 is merged; each then starts from that `main`. New receiver code goes into new files (`ladder.js`,
+`moq.js`, `rtc.js`); `receiver.js` gets one call at the end of `onLoad` and one in the error path, nothing
+moved or reformatted. The report's `tracks` field and the 2 KiB cap are kept; ladder data travels on the ladder
+route, not in the report. Every receiver change ships to the hosted copy with the new sha256, as ADR-0111 says.
+
+**Tests and proof, by slice.** Slice 2: route tests beside `cast_streams_routes`, each failing on revert.
+Slices 4 to 6: pipeline chaos tests beside `cast_output/pipeline_tests.rs`, asserting counts and bounds, never
+tight percentiles; `tools/cast-proof/run.sh` gains one check per rung. The fake Cast platform cannot show device
+decode, device Chrome, or a TV's delay: every rung needs the device test before its slice is called done.
+
+### 9. Operator-only steps
+
+Nothing here is a decision. Each is an action only the operator's accounts or hands can perform. They go to the
+captain as one list; none blocks slices 0 to 5 from merging.
+
+| # | Step | Needed for | When |
+| --- | --- | --- | --- |
+| 1 | Cast SDK Developer Console, application `8E05190C`: add the Android TV package `studio.conspect.cast.tv` | slice 6 device test | before the first APK is installed |
+| 2 | Same Console: register the Cast serial number of each Google TV or Android TV test device (the software serial shown in the device's Cast settings, not the one on the box), then reboot the device | slice 6: a sideloaded app is launched only on a registered device | with step 1 |
+| 3 | On the test device: enable developer options and USB or network debugging; install the APK from the CI artifact with `adb install` | slice 6 | when slice 6's pull request has a green build |
+| 4 | Estate firewall: confirm UDP 9010 reaches mda001 from the test TV's network (it is inside the existing 9000 to 9100 SRT grant; no new rule is expected). If the TV is on a network other than the office's, name it | slice 6 | before the device test |
+| 5 | Baseline device test: cast the latency slate to the Chromecast over HLS; one photograph or slow-motion clip showing the TV and the reference clock page | slice 1 | after slice 1 is deployed |
+| 6 | Device tests per rung: the same photograph for MoQ and WebRTC on the Chromecast, and for SRT on the Android TV device, plus "app not installed" and "SRT port blocked" on the Android TV device | slices 4, 5, 6, 7 | as each is deployed |
+| 7 | Deploy the receiver files to `cast.conspect.studio` (the Worker in `conspect-studio/web`) at each receiver change. The lead did this for PR 439; listed here because it uses the operator's Cloudflare account | slices 2, 4, 5 | at each merge |
+| 8 | Release signing key for the APK: create it, store it in 1Password, add it as a CI secret | a release-signed APK; not needed for debug builds on registered devices | before any device outside the test set |
+| 9 | Google Play listing and publishing the Cast application, if casting to unregistered Android TV devices is wanted | general availability of the SRT rung | after slice 7 |
+| 10 | Licence notices for the app (libsrt MPL-2.0 source offer, Apache-2.0 notices): legal text is not written as engineering work | distributing the APK beyond test devices | before step 9 |
 
 <!-- NEXT -->
