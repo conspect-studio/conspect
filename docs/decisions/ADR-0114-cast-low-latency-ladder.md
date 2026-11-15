@@ -91,7 +91,7 @@ what it is and what it can do (decision 3).
 | Rung | Transport | Media, unchanged from the shared encode unless stated | Needs on the receiver |
 | --- | --- | --- | --- |
 | SRT | SRT caller to the engine's listener, AES-256 | MPEG-TS, H.264 + AAC-LC | Native code: the Android TV app |
-| MoQ | WebTransport (QUIC, UDP 443) | H.264 + AAC-LC frames, decoded with WebCodecs | `WebTransport`, `VideoDecoder` and `AudioDecoder` accepting the stream's exact configurations |
+| MoQ | WebTransport (QUIC, UDP 443) | H.264 + AAC-LC frames, played through a `<video>` element (decision 3, MoQ renderer) | `WebTransport`, and Media Source Extensions accepting the stream's codec strings |
 | WebRTC | WHEP-style offer and answer; SRTP on UDP 443, or ICE-TCP on TCP 443 | H.264; audio re-encoded once per cast output to Opus | `RTCPeerConnection` with H.264 receive |
 | HLS | ADR-0111 stream | CMAF H.264 + AAC-LC | Media Source Extensions (every Cast device) |
 
@@ -158,7 +158,7 @@ These are targets to test against. None is a measurement.
 | Rung | Target, engine tick to picture on the TV | Main terms of the budget |
 | --- | --- | --- |
 | SRT | at most 0.7 s | encoder delay; SRT receive latency 250 ms (libsrt default is 120 ms, [socket options](https://github.com/Haivision/srt/blob/master/docs/API/API-socket-options.md)); player buffer 100 ms; decode; TV |
-| MoQ | at most 1.0 s | encoder delay; player jitter buffer; WebCodecs decode on the device; TV |
+| MoQ | at most 1.0 s | encoder delay; the `<video>` element's buffer (150 ms target); decode; TV |
 | WebRTC | at most 1.0 s | encoder delay; jitter buffer; decode; TV |
 | HLS | 6 to 10 s (today's player figure) | 6.5 s presentation delay by design |
 
@@ -206,7 +206,7 @@ same CORS as the report route.
 { "v": 1,
   "receiver": { "kind": "web", "build": "<sha256 prefix of receiver.js>", "ua": "<at most 200 chars>" },
   "caps": {
-    "wt": true,
+    "wt": true, "mse": true,
     "vdec": "supported", "vdec_hw": true, "adec": "supported",
     "rtc": true, "rtc_h264": ["42e01f", "640c1f"], "rtc_opus": true,
     "rvfc": true, "srt": null },
@@ -270,13 +270,27 @@ start (Reported: on Chrome 70 one unknown syntax form stops the whole script sil
 player and the WebRTC player are separate script files that `receiver.js` adds to the page only after the probe
 passed and the engine answered with that rung.
 
+**MoQ renderer: a `<video>` element fed through Media Source Extensions, not a canvas.** The desktop MoQ player
+decodes with WebCodecs and paints a canvas (Read: `web/src/preview/MoqPlayer.tsx:93`). On a Chromecast that is
+the wrong surface. Cited: "Chromecast displays the receiver page on a 720p graphics plane"
+([Web Receiver core features](https://developers.google.com/cast/docs/web_receiver/core_features)); a canvas is
+part of the page, so a 1080p picture would be shown at 720p at best, and painted by the page instead of the
+video hardware path. The cast MoQ player therefore wraps each received frame in a CMAF fragment and appends it
+to a `SourceBuffer`, and the `<video>` element plays it: the same decoder and video plane the HLS rung uses on
+that device, which is known to work on the operator's Chromecast. It also removes WebCodecs from the
+requirements, which lowers the Chrome version needed from 94 to 97 for WebTransport alone, and the element keeps
+audio and video in sync. The cost is the element's buffer: the player holds a small target (start at 150 ms)
+and trims by playback rate. Unverified: the latency this reaches on a device; slice 4 measures it. `vdec` and
+`adec` stay in the probe so that the data shows which devices could run a canvas player, if that is ever wanted.
+The probe gains `mse`: `MediaSource.isTypeSupported` for the stream's codec strings.
+
 **Cast media status in the Web Receiver is the open risk of the MoQ and WebRTC rungs.** CAF builds the media
 status that senders and Google Home show from its own player. MoQ draws on a canvas and WebRTC plays a
 `MediaStream`; neither goes through CAF's player. Cited: a LOAD interceptor may return `null` so that CAF does
 not handle the request, and `PlayerManager` has `setMediaElement`, `setMediaInformation` and `broadcastStatus`
 ([PlayerManager](https://developers.google.com/cast/docs/reference/web_receiver/cast.framework.PlayerManager)).
-Unverified: whether any combination of these gives senders a correct, stable media session for a picture CAF
-does not play. Slice 3 settles it first, in the existing harness with the real CAF SDK (`tools/cast-proof/`),
+Both players here end in a `<video>` element, which is what `setMediaElement` takes. Unverified: whether any
+combination of these gives senders a correct, stable media session for a picture CAF did not load itself. Slice 3 settles it first, in the existing harness with the real CAF SDK (`tools/cast-proof/`),
 before any player is written. Pass means: the sender's `loadMedia` settles; the session shows as playing with
 the title; volume, mute and stop work; the receiver's own reports arrive. If nothing passes, class A keeps HLS
 only, slices 4 and 5 are dropped, and the SRT rung is unaffected. The Android TV app does not have this risk:
@@ -410,5 +424,138 @@ Decisions:
     `RECEIVER_CSP`, `routes/cast_public.rs:36`). Unverified in a browser: that this admits a WebTransport
     session to another `https` origin. Slice 3 checks it in the harness. The hosted copy at
     `cast.conspect.studio` must send the same policy and the same new files, byte for byte.
+
+### 6. Engine cost and invariants
+
+**Encodes.** No rung adds a video encoder. Every rung of a cast output consumes the encoded packets that
+output's binding already receives (invariant #7).
+
+| Rung | Video | Audio | Added cost |
+| --- | --- | --- | --- |
+| HLS | shared H.264 | shared AAC | none (ADR-0111) |
+| SRT | shared H.264 | shared AAC, every audio slot | one MPEG-TS mux per attachment |
+| MoQ | shared H.264 | shared AAC, every audio slot | framing per cast output; QUIC send per attachment |
+| WebRTC | shared H.264 | **one Opus encoder per cast output**, 96 kbit/s, running only while that output has a WebRTC attachment | RTP and SRTP per attachment |
+
+The Opus encoder is the one real addition. The preview WHEP path opens an Opus encoder per session today
+(Read: `crates/multiview-cli/src/whep.rs:19`, `:436`); the cast rung must not copy that. It opens one per cast
+output, fed from the output's audio bus through a bounded drop-oldest tap, shared by all of that output's
+WebRTC attachments, and closed with the last one. It is declared to the admission the way routed encoders are.
+
+**How a rung gets its packets.** On `main` each configured output's delivery is mirrored, whole window by whole
+window, into the effective-output registry, before and independent of the physical sink's own admission (Read:
+`crates/multiview-cli/src/pipeline.rs:7487-7519`). MoQ output leases already subscribe there. The cast rungs
+subscribe to the cast output's entry the same way. Limits already in place: 16 subscribers per producer, a
+two-window handoff per subscriber, and a subscriber that falls behind loses its whole window and resumes at the
+next verified keyframe (Read: `output_window_registry.rs:38`, `:43`, module doc). Two things to settle in
+slice 2, both Unverified here: that a `cast` output's binding enters that registry (nothing in the registry
+names the kind; `binding_ids` covers every configured output, `pipeline.rs:5135-5139`), and that the encoder's
+no-reorder proof holds for the production encoder on mda001 (a subscription is refused without it, Read:
+`output_window_registry.rs:581`).
+
+**Activation.** A cast output is gated: it packages nothing until a stream activates it. The first ladder
+attachment activates the output exactly as the first HLS playlist request does today, and the last one ending
+starts the same 10 s linger. A push rung does not use the 20 s pre-roll ring; it starts at the next keyframe.
+
+**Queues (invariant #10).** Every hand-off toward a viewer is bounded and drops:
+
+| Hand-off | Bound | When full |
+| --- | --- | --- |
+| Dispatcher to a rung's subscription | 2 windows | whole window dropped, discontinuity, resume at a keyframe |
+| MoQ subscription | 8 MiB per subscription, 64 MiB in total, 16 sessions (Read: `crates/multiview-moq/src/provider.rs:454-455`, `:867`) | window refused, lease survives or ends by class of error |
+| SRT attachment | its own writer thread and a 512-packet queue, as the SRT listener output (Read: `crates/multiview-output/src/sink/push.rs:69`) | shed, then re-gated to the next keyframe |
+| WebRTC attachment | the bounded drop-oldest egress feed (Read: `crates/multiview-webrtc/src/transport/whep_serve.rs:22-28`) | oldest dropped |
+| Opus tap | fixed block count, drop-oldest | oldest dropped |
+
+No hand-off waits for a viewer. Nothing a device sends (probe, report, SDP, SRT handshake) reaches a data-plane
+thread: control routes answer from the registry, and the SRT listen callback reads a bounded table.
+
+**Keyframes.** No rung can request a keyframe from the shared encoder. A WebRTC PLI or FIR is counted and
+ignored; the viewer recovers at the next scheduled keyframe, at most one GOP away. One viewer on a bad network
+therefore cannot change the bit rate or picture quality of any other output.
+
+**Output clock (invariant #1).** No new work on the clock thread or the bake consumer. Fences are atomics read
+on the delivery path. The token registry's lock is taken by control routes only and never across an `.await`
+(Read: module doc, `cast_streams/mod.rs:23-24`).
+
+**Risk class.** Slices 2, 4, 5 and 6 add subscribers and sinks next to the data plane: R3. Each brings a design
+note and chaos tests of the shape ADR-0111 used: a wedged, a panicking and a stalled attachment cost the clock
+zero ticks and every other binding zero packets, with a negative control that must fail the same assertions.
+
+### 7. Cast Connect and the Android TV app
+
+**Launch.** The same application id serves both receivers. Cited
+([Android TV receiver core features](https://developers.google.com/cast/docs/android_tv_receiver/core_features)):
+
+- the sender sets `androidReceiverCompatible = true` in its Cast options (Web sender: Chromium 87 or later);
+- the Android TV app's package name is added to the application in the Cast Developer Console;
+- "Without registration, Cast Connect will only work for apps installed from the Google Play Store": a
+  sideloaded app is launched only on a device whose Cast serial number is registered in the Console;
+- the LOAD reaches the app as an intent (`com.google.android.gms.cast.tv.action.LOAD`) with the same media
+  information; custom namespaces work (`CastReceiverOptions.setCustomNamespaces`, `sendMessage`);
+- the app may decline a launch in its `LaunchRequestChecker`, and the Web Receiver is then loaded.
+
+Not stated on that page, and so Unverified: what the platform does when the flag is set and the app is not
+installed. The design assumes the Web Receiver loads, as every Cast Connect sender relies on. Slice 6's device
+test has that case as its first step, because the flag goes to every sender and a wrong assumption would break
+casting to every Android TV. Until that step passes, the flag ships behind `[cast] android_tv = false`.
+
+Sender changes, complete list:
+
+1. Web sender: add `androidReceiverCompatible: true` beside `receiverApplicationId` (Read: the options object,
+   `web/src/cast/sdkLoader.ts:81-84`). No button, picker or LOAD change.
+2. Engine-side sender (ADR-M011): its LAUNCH is `{type, requestId, appId}` today (Read:
+   `crates/multiview-control/src/devices/cast/protocol.rs:161`). Chromium's own sender adds
+   `"supportedAppTypes": ["WEB", "ANDROID_TV"]` to that message (Cited:
+   [`cast_message_util.cc`, `CreateLaunchRequest`](https://github.com/chromium/chromium/blob/main/components/media_router/common/providers/cast/channel/cast_message_util.cc)).
+   The engine sends the same field. Unverified against a device; without it the engine-side cast keeps loading
+   the Web Receiver, which is today's behaviour.
+
+No launch credentials are sent. The cast token in the LOAD is the only credential, as in the Web Receiver.
+
+**The app.**
+
+| Item | Decision |
+| --- | --- |
+| Package name | `studio.conspect.cast.tv` (reverse of the domain that hosts the receiver; `tv` leaves room for a phone app) |
+| Source | `android/cast-tv/` in this repository, Kotlin, Gradle. Not a Cargo workspace member: `cargo check --workspace` and the default build do not change |
+| Minimum Android | API 23, the floor of `srtdroid`'s libsrt build; raised if Media3 or the Cast TV library needs more (checked at slice 6) |
+| Cast | `com.google.android.gms:play-services-cast-tv` (21.1.1 in Google's guide today), `CastReceiverContext`, `MediaManager` bound to a `MediaSession` |
+| Player | Media3 ExoPlayer: `ProgressiveMediaSource` over a custom `DataSource` that reads SRT payload, `TsExtractor`, platform `MediaCodec` decoders. HLS fallback through Media3's HLS module in the same player |
+| SRT | libsrt 1.5.7 through JNI, from the `io.github.thibaultbee.srtdroid:srtdroid-core` 1.10.1 package, which builds libsrt 1.5.7 with OpenSSL 3.5.1 (Read: its `CMakeLists.txt` at tag 1.10.1) |
+| Low latency | live target offset 100 ms, minimum buffer 50 ms, playback speed 0.97 to 1.03 to hold the target; values tuned in slice 7 |
+| Namespace | `urn:x-cast:studio.conspect.cast`, the same report shape as the Web Receiver, plus `receiver.kind = "android-tv"` |
+| LOAD check | the same rule as `receiver.js`: `https` only, path `/cast/<token>/master.m3u8`, no credentials, no query |
+| Secrets | the token is held in memory only; never written to preferences, logs or the `MediaSession` metadata |
+| Leanback | declared as a TV app with a launcher banner; opened by hand it shows "Cast from Conspect to this TV" |
+
+**Licences.** No GPL code, and nothing is added to the engine's default build.
+
+| Component | Licence | Source |
+| --- | --- | --- |
+| libsrt | MPL-2.0 | [Haivision/srt](https://github.com/Haivision/srt) |
+| srtdroid (JNI binding) | Apache-2.0 | [ThibaultBee/srtdroid](https://github.com/ThibaultBee/srtdroid) |
+| OpenSSL 3.x (libsrt's crypto) | Apache-2.0 | [OpenSSL licence page](https://www.openssl.org/source/license.html) |
+| AndroidX Media3 | Apache-2.0 | [androidx/media](https://github.com/androidx/media) |
+| Google Play services Cast TV | Google's SDK terms (proprietary, not copyleft) | [Cast SDK terms](https://developers.google.com/cast/docs/terms) |
+
+MPL-2.0 is file-level copyleft: the app ships libsrt unmodified as its own shared library and names where its
+source is. `deny.toml` already allows MPL-2.0 for the engine (Read: line 81). The app's notices file is
+generated by the build from the dependency list. Writing or changing licence or legal text is not part of
+these slices; the list of obligations goes to the lead with slice 6.
+
+Alternatives for SRT on Android, rejected: FFmpeg's libsrt protocol inside the app (a second, large native
+dependency, and licence care for the codec set, to do what Media3 already does); a pure-Kotlin SRT client (none
+found that is maintained; SRT's encryption and retransmission are not a weekend's work); our own JNI binding to
+libsrt (kept as the fallback if `srtdroid` lags a libsrt security release by more than two weeks: the binding
+needed is six calls).
+
+**Distribution.** Sideload first: CI builds a debug-signed APK on every pull request and a release-signed APK
+on a tag, signed with a key held in 1Password and given to CI as a secret. The operator installs it with `adb`.
+Publishing to Google Play is an operator action (account, listing, review) and is not needed for registered
+devices. The engine does not serve the APK.
+
+**Version skew.** The app and the engine negotiate through the ladder call (`v`), and the app plays HLS against
+an engine that does not answer it. The app shows its version on its idle screen and in every report.
 
 <!-- NEXT -->
