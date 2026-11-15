@@ -261,6 +261,7 @@ jobs:
               echo "  sudo apt-get install libgnutls30t64 libopus0 libssl3t64 libva2 libva-drm2 libdrm2 zlib1g"
               echo "  (older releases name these libgnutls30 and libssl3)"
               echo "libsrt is bundled in lib/ (1.5.7, the listener security floor); do not install a distro libsrt."
+              echo "Keep lib/ next to the binary: the SRT listener uses the libsrt libavformat loaded from it."
               if [ "$(uname -m)" = x86_64 ]; then
                 echo "  sudo apt-get install libvpl2   # Intel QSV (oneVPL) on amd64"
               fi

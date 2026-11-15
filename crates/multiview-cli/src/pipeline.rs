@@ -18232,7 +18232,13 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
     // for one (ADR-0039 decision 10, amended) — so this is unreachable there.
     #[cfg(feature = "srt-libsrt")]
     let _srt_listener = match &plan.location {
-        SourceLocation::Url(url) if multiview_output::sink::is_srt_listener_url(url) => {
+        // Below the libsrt security floor no bridge is started at all (its
+        // thread could only retry a refusal that never clears); the open below
+        // reports the reason instead.
+        SourceLocation::Url(url)
+            if multiview_output::sink::is_srt_listener_url(url)
+                && multiview_srt_sys::listener_floor_check().is_ok() =>
+        {
             crate::srt_ingest::acquire(url).ok()
         }
         _ => None,
@@ -19403,6 +19409,11 @@ fn open_and_stream(
             // is unreachable in that build and compiled out.
             #[cfg(feature = "srt-libsrt")]
             let open_url = if multiview_output::sink::is_srt_listener_url(&open_url) {
+                // Security floor (GHSA-m96h-3rc9-xx6h, ADR-0114 decision 4): on
+                // a libsrt below 1.5.7 fail this open with the
+                // `srt-libsrt-too-old` reason (both versions), which the
+                // reconnect bracket logs against the source and backs off.
+                multiview_srt_sys::listener_floor_check().map_err(|e| e.to_string())?;
                 let reader = crate::srt_ingest::acquire(&open_url)?.open_reader()?;
                 let url = reader.url().to_owned();
                 _srt_reader = Some(reader);

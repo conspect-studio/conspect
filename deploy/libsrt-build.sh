@@ -61,8 +61,10 @@ assert_installed() {
 build() {
   local prefix="${1:?usage: libsrt-build.sh build <prefix>}" work tarball
   work="$(mktemp -d)"
-  # shellcheck disable=SC2064  # expand now: ${work} is fixed for this run
-  trap "rm -rf -- '${work}'" EXIT
+  LIBSRT_WORK="${work}"
+  # Expanded when the trap fires, never pasted into the trap text, so no
+  # character in TMPDIR can change what runs.
+  trap 'rm -rf -- "${LIBSRT_WORK}"' EXIT
   tarball="${LIBSRT_TARBALL:-}"
   if [ -z "${tarball}" ]; then
     fetch "${work}"

@@ -185,6 +185,22 @@ impl std::fmt::Display for LibsrtVersion {
 /// for GHSA-6xg9-784j-24rm and GHSA-4mc6-qmpp-g7gw).
 pub const MIN_LISTENER_LIBSRT: LibsrtVersion = LibsrtVersion::new(1, 5, 7);
 
+/// Whether the host libsrt may serve a listener: [`SrtError::LibsrtTooOld`]
+/// when it loads and is below the floor, `Ok` otherwise (including when it
+/// does not load at all, which [`SrtListener::bind`] reports and retries on its
+/// own: a library can appear later, a too-old one cannot become newer). Lets a
+/// caller that fronts a listener with its own retry loop fail closed at once,
+/// with the reason, instead of retrying a refusal that can never clear.
+///
+/// # Errors
+/// [`SrtError::LibsrtTooOld`] as above.
+pub fn listener_floor_check() -> Result<()> {
+    match SrtLib::shared() {
+        Ok(lib) => check_listener_floor(lib.version()),
+        Err(_) => Ok(()),
+    }
+}
+
 /// Refuse `found` when it is below [`MIN_LISTENER_LIBSRT`].
 ///
 /// # Errors

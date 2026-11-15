@@ -442,13 +442,15 @@ export PKG_CONFIG_PATH="${FF_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 #     multiview-srt-sys listener refuses anything older). On Linux build the
 #     pinned, SHA-256-verified upstream 1.5.7 into THIS prefix (it ships with
 #     the libav* libraries), so FFmpeg's srt protocol links it and no distro
-#     libsrt is needed. macOS (Homebrew) and Windows (vcpkg) supply their own.
+#     libsrt is needed. macOS (Homebrew) and Windows (vcpkg) supply their own,
+#     checked against the same floor.
 # -----------------------------------------------------------------------------
 case "${FF_HWACCEL}" in
   vaapi|nvidia)
     bash "${SCRIPT_DIR}/libsrt-build.sh" build "${FF_PREFIX}"
     ;;
-  apple)
+  apple|windows)
+    # Homebrew / vcpkg libsrt (both 1.5.7 today); refuse an older one.
     if ! pkg-config --atleast-version=1.5.7 srt; then
       echo "ffmpeg-build: libsrt $(pkg-config --modversion srt 2>/dev/null || echo missing) is below the 1.5.7 security floor" >&2
       exit 6
