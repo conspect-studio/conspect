@@ -237,6 +237,18 @@ pub mod convert;
 #[cfg(feature = "ffmpeg")]
 pub mod decode;
 
+/// Alpha-capable decoded frames: the libav pixel-format → straight-alpha
+/// layout map and the decoded alpha source a media player turns into an
+/// NV12+A plane (ADR-0058, #391). Behind the `ffmpeg` feature.
+#[cfg(feature = "ffmpeg")]
+pub mod alpha;
+
+/// Checked `AVFrame` allocation and validated, stride-sign-agnostic plane row
+/// access (#391): never trusts `Video::new`'s unchecked allocation or a
+/// `linesize * height` slice. Behind the `ffmpeg` feature.
+#[cfg(feature = "ffmpeg")]
+pub mod frame;
+
 #[cfg(feature = "ffmpeg")]
 pub mod decode_stream;
 

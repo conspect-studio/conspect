@@ -22508,6 +22508,12 @@
             "description": "Last-good repeats in the window.",
             "minimum": 0
           },
+          "full_canvas_decodes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Running source decoders whose own output (the NVDEC resize, else the\ncoded size) is at least the canvas on both axes now (#469): the\ndecode cost of sizing routed, PGM and PVW sources at the canvas.\nTransient make-before-break replacements are not counted.",
+            "minimum": 0
+          },
           "lateness_max_ms": {
             "type": "number",
             "format": "double",

@@ -2166,6 +2166,8 @@ pub struct ProgramMetricsHandles {
     pub compose_deadline_misses: Arc<std::sync::atomic::AtomicU64>,
     /// The run's per-output clocks (#343; empty without a rate output).
     pub output_clocks: Vec<OutputClockMetrics>,
+    /// Decodes producing the full canvas now (#469 GPU-cost bound).
+    pub full_canvas_decodes: crate::display_size::FullCanvasGauge,
 }
 
 /// One per-output clock's wait-free counters (#343, output-routing §12.6).
@@ -2221,6 +2223,12 @@ pub struct Pipeline {
     /// Aux sizing (ADR-0108 §2.4): the routed layouts' cells, written by the
     /// output router, merged into every decode's size decision.
     aux_sizing: crate::display_size::AuxSizingSlot,
+    /// Direct source routes (#469), written by the output router.
+    source_sizing: crate::display_size::SourceSizingSlot,
+    /// The M/E PGM/PVW selections (#469), written by the switcher hook.
+    bus_sizing: crate::display_size::BusSizing,
+    /// Decodes producing the full canvas now (#469 cost bound).
+    full_canvas_decodes: crate::display_size::FullCanvasGauge,
     /// The fixed output cadence (exact rational).
     cadence: Rational,
     /// The single program this pipeline runs (ADR-0030 MP-0). The legacy
@@ -3173,6 +3181,10 @@ impl Pipeline {
         let display_layout: DisplayLayoutSlot =
             Arc::new(multiview_framestore::SwapCell::new(Arc::clone(&layout)));
         let aux_sizing = crate::display_size::aux_sizing_slot();
+        let source_sizing = crate::display_size::source_sizing_slot();
+        let bus_sizing = crate::display_size::BusSizing::new();
+        let full_canvas_decodes: crate::display_size::FullCanvasGauge =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut source_handles: Vec<SourceHandle<Nv12Image>> =
             Vec::with_capacity(config.sources.len());
 
@@ -3270,6 +3282,9 @@ impl Pipeline {
                     Some(Arc::clone(&source_registry)),
                 )
                 .with_aux_sizing(Arc::clone(&aux_sizing))
+                .with_source_sizing(Arc::clone(&source_sizing))
+                .with_bus_sizing(bus_sizing.clone())
+                .with_full_canvas_gauge(Arc::clone(&full_canvas_decodes))
             });
             // Reserve the authoritative epoch before either startup rail starts.
             // Old detached publishers from a previous run retain their old token.
@@ -3715,6 +3730,9 @@ impl Pipeline {
             layout,
             display_layout,
             aux_sizing,
+            source_sizing,
+            bus_sizing,
+            full_canvas_decodes,
             cadence,
             program_spec,
             switcher_me,
@@ -4204,6 +4222,7 @@ impl Pipeline {
                 preview_selection: preview_selection.clone(),
                 halved: Arc::clone(&aux.halved),
                 sizing: Some(Arc::clone(&self.aux_sizing)),
+                source_sizing: Some(Arc::clone(&self.source_sizing)),
             },
             open,
             Some(reformat_open),
@@ -4499,7 +4518,10 @@ impl Pipeline {
                 Arc::clone(&self.display_layout),
                 Some(Arc::clone(&self.source_registry)),
             )
-            .with_aux_sizing(Arc::clone(&self.aux_sizing)),
+            .with_aux_sizing(Arc::clone(&self.aux_sizing))
+            .with_source_sizing(Arc::clone(&self.source_sizing))
+            .with_bus_sizing(self.bus_sizing.clone())
+            .with_full_canvas_gauge(Arc::clone(&self.full_canvas_decodes)),
             canvas_color: self.canvas_color,
             cadence: self.cadence,
             output_origin: Arc::clone(&self.epoch_anchor),
@@ -6096,6 +6118,7 @@ impl Pipeline {
                 output_clocks: running_lanes
                     .as_deref()
                     .map_or_else(Vec::new, output_lanes::RunningLanes::metrics),
+                full_canvas_decodes: Arc::clone(&self.full_canvas_decodes),
             })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
         // the shared slot — a single lock-free store the off-hot-path
@@ -6445,6 +6468,11 @@ impl Pipeline {
                     hook.preview_slot = Some(preview_slot);
                     hook.preview_stores = Some(self.catalogue_stores());
                     hook.preview_selection = preview_selection;
+                    // #469: the decoders size the PGM/PVW sources full-canvas.
+                    hook.bus_sizing = Some([
+                        Arc::clone(&self.bus_sizing.program),
+                        Arc::clone(&self.bus_sizing.preview),
+                    ]);
                     // The only clock-side routing duty: one non-blocking `try_send`
                     // after a fresh compose, and only while a routed feed is active.
                     // The engine run future is boxed (one allocation per run, never
@@ -6706,6 +6734,7 @@ impl Pipeline {
             #[cfg(test)]
             consumer_stall: None,
             aux_signals: None,
+            sidecar_truncated: crate::overlays::TruncationTally::new(),
         }
     }
 
@@ -6786,6 +6815,9 @@ struct BakeContext {
     /// otherwise). `None` before routing is wired and in tests.
     #[cfg(feature = "overlay")]
     aux_signals: Option<crate::aux_overlays::AuxSignalsPublisher>,
+    /// Issue #430: counts a cut sidecar cue once, keyed by its track index.
+    #[cfg(feature = "overlay")]
+    sidecar_truncated: crate::overlays::TruncationTally,
 }
 
 impl BakeContext {
@@ -6811,12 +6843,17 @@ impl BakeContext {
         if self.sidecar_target.as_deref() != Some(id) {
             return None;
         }
-        let cue = self.subtitles.as_ref().and_then(|t| t.active_cue(pts))?;
-        if cue.lines.is_empty() {
-            None
-        } else {
-            Some(cue.lines.clone())
-        }
+        let track = self.subtitles.as_ref()?;
+        // Issue #430: an indexed (O(log n)) lookup, then only the bounded
+        // burn-in projection is copied; a cut cue is counted once.
+        let index = track.active_cue_index(pts)?;
+        let cue = track.cues().get(index)?;
+        let bounded = multiview_output::hls::bound_cue_lines(&cue.lines);
+        self.sidecar_truncated.observe(
+            u64::try_from(index).unwrap_or(u64::MAX),
+            bounded.truncated(),
+        );
+        (!bounded.is_empty()).then(|| bounded.into_lines())
     }
 }
 
@@ -10370,9 +10407,23 @@ fn sample_caption_bitmaps(
         let Some(selected) = times.get(id) else {
             continue;
         };
-        if let Some(multiview_ffmpeg::caption::CaptionCue::Bitmap { bitmap, .. }) =
-            store.active_at_generation(selected.pts, selected.generation)
-        {
+        // Issue #430: borrow the cue and copy its pixels only within the
+        // burn-in bounds (an oversize cue is refused and counted, never
+        // copied on the clock thread).
+        let bitmap = store
+            .with_active_at_generation(selected.pts, selected.generation, |cue| match cue {
+                multiview_ffmpeg::caption::CaptionCue::Bitmap { bitmap, .. } => {
+                    if crate::overlays::bitmap_within_burn_bounds(bitmap) {
+                        Some(bitmap.clone())
+                    } else {
+                        crate::overlays::caption_burn_stats().note_bitmap_refused();
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .flatten();
+        if let Some(bitmap) = bitmap {
             out.insert(id.clone(), bitmap);
         }
     }
@@ -15080,6 +15131,7 @@ pub(crate) fn nv12_to_decoded(image: &Nv12Image) -> Result<DecodedVideoFrame, Pi
         meta,
         raw_pts: None,
         a53_cc: None,
+        alpha: None,
     })
 }
 
@@ -19610,14 +19662,24 @@ fn open_and_stream(
     );
     let reopen_params = params.clone();
     let reopen_ordinal = cuda_ordinal.map(str::to_owned);
-    let (decoder, used_hw) = StreamVideoDecoder::new_preferring_hw_at(
-        params,
-        time_base,
-        want_hw,
-        cuda_ordinal,
-        display_resize,
-    )
-    .map_err(|e| e.to_string())?;
+    // A media player's VP9-with-alpha asset (WebM `alpha_mode=1`) opens
+    // `libvpx-vp9`, the only libav decoder that merges the alpha side stream
+    // (ADR-0058 §3, #391); without it the asset plays opaque, as today.
+    let vp9_alpha =
+        media_alpha::vp9_alpha_decoder(&plan.id, plan.player.is_some(), &input, stream_index);
+    let (decoder, used_hw) = match vp9_alpha
+        .and_then(|name| media_alpha::open_named(&plan.id, params.clone(), time_base, name))
+    {
+        Some(decoder) => (decoder, false),
+        None => StreamVideoDecoder::new_preferring_hw_at(
+            params,
+            time_base,
+            want_hw,
+            cuda_ordinal,
+            display_resize,
+        )
+        .map_err(|e| e.to_string())?,
+    };
     // Feed the declared cadence so the decoder's genpts fallback advances at the
     // source's true rate (PAL 25, film 24, …) rather than an NTSC-shaped guess;
     // an unusable rate is ignored inside `with_declared_fps` (invariant #3).
@@ -20089,6 +20151,10 @@ fn open_and_stream(
     }
 }
 
+/// Media-player NV12+A: attaches a decoded asset's straight alpha plane (#391).
+#[path = "pipeline_alpha.rs"]
+mod media_alpha;
+
 /// Convert a source frame index to a libav `AV_TIME_BASE` (microsecond) seek
 /// target at the given `cadence`, using exact integer rationals — never float
 /// fps (invariant #3). `target_us = frame * 1_000_000 * cadence.den /
@@ -20224,6 +20290,9 @@ fn stream_player(
     // path (bounded-memory data plane, inv #5 / rule 22).
     let mut last_image: Option<Arc<Nv12Image>> = None;
     let mut last_source_pts: Option<MediaTime> = None;
+    // NV12+A (ADR-0058, #391): built on the first alpha frame only, so an
+    // opaque asset never allocates the pool, scratch frames or alpha scaler.
+    let mut media_alpha: Option<media_alpha::MediaAlpha> = None;
     // Whether the decoder has been fully drained (EOF reached with no loop, or a
     // fail-safe gave up): the loop falls through to `heartbeat_player_hold`, which
     // holds last-good forever — the tile rides the framestore state machine and
@@ -20349,6 +20418,15 @@ fn stream_player(
             match player.on_decoded(source_frame) {
                 PlayerAction::Publish { at } => {
                     let image = to_tile.convert(&decoded.frame, tag)?;
+                    // An alpha asset publishes NV12 plus its full-resolution
+                    // straight alpha (same scaler geometry as the luma); an
+                    // opaque asset is untouched (`alpha` is `None`).
+                    let image = match &decoded.alpha {
+                        Some(source) => media_alpha
+                            .get_or_insert_with(Default::default)
+                            .attach(image, source)?,
+                        None => image,
+                    };
                     // Pace to the player's own monotone stamp (invariant #4),
                     // then publish it (latch-on-tick, invariant #1). Re-check
                     // `stop` after the (possibly long) pace wait. Wrap the frame
@@ -24979,7 +25057,165 @@ mod live_overlay_bake_tests {
             activity: None,
             consumer_stall: None,
             aux_signals: None,
+            sidecar_truncated: crate::overlays::TruncationTally::new(),
         }
+    }
+
+    /// Issue #430 (MED-2): a truncated sidecar cue is counted exactly once
+    /// while held, its truncated successor once more, and a small cue never.
+    #[test]
+    fn sidecar_truncation_is_counted_once_per_cue() {
+        let pad = "y".repeat(8 * 1024);
+        let srt = format!(
+            "1\n00:00:01,000 --> 00:00:02,000\nfirst {pad}\n\n\
+             2\n00:00:02,000 --> 00:00:03,000\nsecond {pad}\n\n\
+             3\n00:00:03,000 --> 00:00:04,000\nsmall\n"
+        );
+        let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut ctx = bake_context(&slot);
+        ctx.subtitles = Some(multiview_overlay::subtitle::CueTrack::parse_srt(&srt).unwrap());
+        ctx.sidecar_target = Some("in_a".to_owned());
+        ctx.sidecar_truncated = crate::overlays::TruncationTally::with_stats(stats);
+        let at = |ms: i64| multiview_core::time::MediaTime::from_nanos(ms * 1_000_000);
+        for ms in (1_000..2_000).step_by(40) {
+            let lines = ctx.sidecar_caption_lines("in_a", at(ms)).unwrap();
+            assert!(lines.iter().map(String::len).sum::<usize>() <= 512);
+        }
+        assert_eq!(stats.text_truncated(), 1, "a held cut cue counts once");
+        for ms in (2_000..3_000).step_by(40) {
+            assert!(ctx.sidecar_caption_lines("in_a", at(ms)).is_some());
+        }
+        assert_eq!(
+            stats.text_truncated(),
+            2,
+            "its cut successor counts once more"
+        );
+        for ms in (3_000..4_000).step_by(40) {
+            assert_eq!(
+                ctx.sidecar_caption_lines("in_a", at(ms)),
+                Some(vec!["small".to_owned()])
+            );
+        }
+        assert_eq!(stats.text_truncated(), 2, "a small cue is not counted");
+        assert!(ctx.sidecar_caption_lines("other", at(1_500)).is_none());
+    }
+
+    /// Issue #430 (MED2-1): overlapping cut sidecar cues count once each,
+    /// however the newest-active selection alternates between them.
+    #[test]
+    fn sidecar_overlapping_cut_cues_count_once_each() {
+        let pad = "z".repeat(8 * 1024);
+        let probe = |srt: String, samples: &[i64]| {
+            let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+            let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+            let mut ctx = bake_context(&slot);
+            ctx.subtitles = Some(multiview_overlay::subtitle::CueTrack::parse_srt(&srt).unwrap());
+            ctx.sidecar_target = Some("in_a".to_owned());
+            ctx.sidecar_truncated = crate::overlays::TruncationTally::with_stats(stats);
+            let seen: Vec<String> = samples
+                .iter()
+                .map(|s| {
+                    let at = multiview_core::time::MediaTime::from_nanos(s * 1_000_000_000);
+                    let lines = ctx.sidecar_caption_lines("in_a", at).unwrap();
+                    lines.first().unwrap().get(..1).unwrap().to_owned()
+                })
+                .collect();
+            (seen, stats.text_truncated())
+        };
+        // A = [0, 10) s, B = [2, 3) s: samples 1, 2, 4 select A, B, A.
+        let (seen, count) = probe(
+            format!(
+                "1\n00:00:00,000 --> 00:00:10,000\nA {pad}\n\n\
+                 2\n00:00:02,000 --> 00:00:03,000\nB {pad}\n"
+            ),
+            &[1, 2, 4],
+        );
+        assert_eq!(seen, ["A", "B", "A"]);
+        assert_eq!(count, 2, "A, B, A is two cut cues");
+        // An older overlapping cue first surfaces after the newer one ends:
+        // A = [0, 10) and B = [0, 5) (equal starts: the later one in the
+        // document wins until it ends).
+        let (seen, count) = probe(
+            format!(
+                "1\n00:00:00,000 --> 00:00:10,000\nA {pad}\n\n\
+                 2\n00:00:00,000 --> 00:00:05,000\nB {pad}\n"
+            ),
+            &[1, 2, 6, 7, 3, 8],
+        );
+        assert_eq!(seen, ["B", "B", "A", "A", "B", "A"]);
+        assert_eq!(count, 2, "B then the exposed A, each once");
+    }
+
+    /// Issue #430 (MED3-1), caller level: a long cut sidecar cue A hidden
+    /// behind short cut cues is recounted exactly when 64 other distinct cut
+    /// cues were shown since its last appearance — not at 63, and not when
+    /// its own middle appearance refreshed it (A, 63 shorts, A, B, A).
+    #[test]
+    fn sidecar_long_cue_recount_follows_the_exact_tally_bound() {
+        let pad = "w".repeat(8 * 1024);
+        let ts = |ms: u64| {
+            format!(
+                "{:02}:{:02}:{:02},{:03}",
+                ms / 3_600_000,
+                ms / 60_000 % 60,
+                ms / 1_000 % 60,
+                ms % 1_000
+            )
+        };
+        // A = [0, 1000) s; short k = [10 + 2k, 11 + 2k) s, k = 0..64.
+        let mut srt = format!("1\n{} --> {}\nA {pad}\n\n", ts(0), ts(1_000_000));
+        for k in 0..64_u64 {
+            let start = 10_000 + 2_000 * k;
+            std::fmt::Write::write_fmt(
+                &mut srt,
+                format_args!(
+                    "{}\n{} --> {}\nS{k} {pad}\n\n",
+                    k + 2,
+                    ts(start),
+                    ts(start + 1_000)
+                ),
+            )
+            .unwrap();
+        }
+        let track = multiview_overlay::subtitle::CueTrack::parse_srt(&srt).unwrap();
+        let run = |samples: &[i64]| {
+            let stats: &'static crate::overlays::CaptionBurnStats = Box::leak(Box::default());
+            let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+            let mut ctx = bake_context(&slot);
+            ctx.subtitles = Some(track.clone());
+            ctx.sidecar_target = Some("in_a".to_owned());
+            ctx.sidecar_truncated = crate::overlays::TruncationTally::with_stats(stats);
+            for &ms in samples {
+                let at = multiview_core::time::MediaTime::from_nanos(ms * 1_000_000);
+                assert!(
+                    ctx.sidecar_caption_lines("in_a", at).is_some(),
+                    "at {ms} ms"
+                );
+            }
+            stats.text_truncated()
+        };
+        // Inside short k, and in the gap after it (A shows again).
+        let short = |k: i64| 10_500 + 2_000 * k;
+        let gap_after = |k: i64| 11_500 + 2_000 * k;
+        // A, 63 shorts, A: A not recounted.
+        let below: Vec<i64> = std::iter::once(1_000)
+            .chain((0..63).map(short))
+            .chain([gap_after(62)])
+            .collect();
+        assert_eq!(run(&below), 64, "63 intervening: A once");
+        // A, 64 shorts, A: A recounted.
+        let at_bound: Vec<i64> = std::iter::once(1_000)
+            .chain((0..64).map(short))
+            .chain([gap_after(63)])
+            .collect();
+        assert_eq!(run(&at_bound), 66, "64 intervening: A twice");
+        // A, 63 shorts, A, B (the 64th short), A: A once.
+        let refreshed: Vec<i64> = std::iter::once(1_000)
+            .chain((0..63).map(short))
+            .chain([gap_after(62), short(63), gap_after(63)])
+            .collect();
+        assert_eq!(run(&refreshed), 65, "A, 63, A, B, A: A once");
     }
 
     /// One streamed tick over a uniform dark canvas.
@@ -31466,6 +31702,13 @@ loop_default = true
 /// The slots carry a source (`cc`) that is ingested but not shown in a cell,
 /// so the run measures the subtitle-slot path alone: burning such a cue into
 /// a displayed tile is the separate overlay path, which this does not cover.
+/// One real-time chaos pipeline at a time per test process: two concurrent
+/// wall-clock runs start each other late (observed: 63 of ~100 ticks for
+/// whichever starts second), so they would measure each other rather than
+/// the path under test.
+#[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
+static REALTIME_CHAOS_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
 mod subtitle_wedge_chaos {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -31556,6 +31799,7 @@ source = "cc"
     #[allow(clippy::too_many_lines)]
     // reason: one end-to-end chaos run checked across clock, sink and files.
     async fn a_wedged_subtitle_sink_with_hostile_captions_never_stalls_video() {
+        let _serial = super::REALTIME_CHAOS_SERIAL.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let playlist = dir.path().join("index.m3u8");
         let mut pipeline = Pipeline::build(&config(&playlist)).expect("pipeline builds");
@@ -31737,5 +31981,200 @@ mod media_url_for_log_tests {
             assert!(!logged.contains(secret), "{secret} leaked: {logged}");
         }
         assert_eq!(media_url_for_log("/media/clip.mp4"), "/media/clip.mp4");
+    }
+}
+
+/// Issue #430 chaos (R3, invariant #1): a captioned source DISPLAYED in a
+/// cell, fed hostile padded text cues (8 KiB and 64 KiB) changing every
+/// 100 ms, through the real pipeline (clock → hot-loop caption sampling →
+/// bake consumer burn-in → encode → HLS). The burn-in projection is bounded
+/// before any clone/shaping and the raster is cached per cue change, so the
+/// consumer keeps the cadence: no "fell behind the clock" fault (the run
+/// succeeds), shed ticks within the design bound, tick-exact video PTS, and
+/// the truncation counter records the cut.
+#[cfg(all(test, feature = "ffmpeg", feature = "overlay"))]
+mod caption_burnin_chaos {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    const FPS: u64 = 25;
+    const RUN_SECS: u64 = 4;
+    /// A new cue every 100 ms across the run (plus 2 s headroom).
+    const CUES: i64 = 60;
+
+    fn config(playlist: &std::path::Path) -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+"##,
+            playlist.display()
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    }
+
+    /// `pts` of every video packet of an MPEG-TS file.
+    fn video_pts(ts: &std::path::Path) -> Vec<i64> {
+        let out = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(ts)
+            .output()
+            .expect("ffprobe runs");
+        assert!(out.status.success(), "ffprobe: {out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+            .collect()
+    }
+
+    /// A visible-glyph cue line of about `bytes` bytes (worst case for
+    /// shaping and raster: every byte inks).
+    fn padded(i: i64, bytes: usize) -> String {
+        let mut line = format!("cue {i} ");
+        while line.len() < bytes {
+            line.push_str("Lorem ipsum dolor sit amet ");
+        }
+        line
+    }
+
+    #[allow(clippy::too_many_lines)]
+    // reason: one end-to-end chaos run checked across clock, consumer and files.
+    async fn run_with_cue_bytes(bytes: usize) {
+        let _serial = super::REALTIME_CHAOS_SERIAL.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let playlist = dir.path().join("index.m3u8");
+        let mut pipeline = Pipeline::build(&config(&playlist)).expect("pipeline builds");
+        let truncated_before = crate::overlays::caption_burn_stats().text_truncated();
+        // The DISPLAYED source carries the hostile cues: each 100 ms window
+        // holds a padded line, a blank line and a tail (three lines, the first
+        // `bytes` long), so the burn-in path must bound before it shapes.
+        let store = pipeline.attach_caption_store(
+            "in_a",
+            Arc::new(crate::captions::CueStore::with_capacity(128)),
+        );
+        for i in 0..CUES {
+            let (start, end) = (
+                MediaTime::from_nanos(i * 100_000_000),
+                MediaTime::from_nanos((i + 1) * 100_000_000),
+            );
+            let lines = vec![padded(i, bytes), String::new(), format!("tail {i}")];
+            let cue = multiview_ffmpeg::caption::CaptionCue::try_text(start, end, lines, None)
+                .expect("text cue");
+            store.publish(start, end, cue);
+        }
+        let stop = StopSignal::new();
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(RUN_SECS));
+                stop.stop();
+            })
+        };
+        let started = std::time::Instant::now();
+        // A consumer more than a queue's worth of ticks behind fails the run
+        // ("output fell N ticks behind the clock"): success proves it never did.
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(RUN_SECS + 60),
+            pipeline.run_until(&stop),
+        )
+        .await
+        .expect("the run ends")
+        .expect("the run succeeds: the consumer never fell behind the clock");
+        stopper.join().expect("stopper");
+        let elapsed = started.elapsed().as_secs_f64();
+        // Recorded on success too (the before/after numbers of #430).
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "caption_burnin_chaos {bytes} B: frames {} dropped {} over {elapsed:.2} s\n",
+                report.frames, report.dropped
+            ),
+        );
+
+        // The clock kept its cadence (CI-load tolerant: >= 90 %).
+        let expected = elapsed * f64::from(u32::try_from(FPS).unwrap());
+        let frames = f64::from(u32::try_from(report.frames).expect("small"));
+        assert!(
+            frames >= 0.9 * expected.min(f64::from(u32::try_from(RUN_SECS * FPS).unwrap())),
+            "clock ticks {frames} over {elapsed:.2} s (expected ~{expected:.0})"
+        );
+        // Design bound: per-tick burn-in cost is O(bounded) and the raster is
+        // cached per cue change, so the consumer sheds nothing from captions;
+        // <= 1 % absorbs a loaded CI runner's scheduling hiccups.
+        assert!(
+            report.dropped * 100 <= report.frames,
+            "consumer shed {} of {} ticks",
+            report.dropped,
+            report.frames
+        );
+        assert!(
+            crate::overlays::caption_burn_stats().text_truncated() > truncated_before,
+            "the hostile cues were cut by the burn-in projection"
+        );
+        // Video kept flowing with tick-derived stamps: consecutive packets of
+        // each written segment are exactly one tick apart (90 kHz / 25).
+        let segments: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("output dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+            .collect();
+        assert!(segments.len() >= 2, "video segments written: {segments:?}");
+        let tick_90k = i64::try_from(90_000 / FPS).unwrap();
+        for seg in &segments {
+            let mut pts = video_pts(seg);
+            pts.sort_unstable();
+            assert!(!pts.is_empty(), "{} carries video", seg.display());
+            assert!(
+                pts.windows(2)
+                    .all(|w| matches!(w, [a, b] if b - a == tick_90k)),
+                "{}: {pts:?}",
+                seg.display()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn displayed_8kib_captions_keep_the_cadence() {
+        run_with_cue_bytes(8 * 1024).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn displayed_64kib_captions_keep_the_cadence() {
+        run_with_cue_bytes(64 * 1024).await;
     }
 }

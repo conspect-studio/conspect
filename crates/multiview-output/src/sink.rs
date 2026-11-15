@@ -4298,6 +4298,7 @@ mod tests {
                 },
                 raw_pts: None,
                 a53_cc: None,
+                alpha: None,
             };
             out.extend(enc.encode_frame_at(frame, tick).unwrap());
         }
@@ -5014,6 +5015,7 @@ mod tests {
                     },
                     raw_pts: None,
                     a53_cc: None,
+                    alpha: None,
                 };
                 for packet in rendition
                     .encode_frame_at(frame, tick)
@@ -5076,6 +5078,7 @@ mod tests {
             },
             raw_pts: None,
             a53_cc: None,
+            alpha: None,
         }
     }
 
@@ -5259,6 +5262,7 @@ mod tests {
                     },
                     raw_pts: None,
                     a53_cc: None,
+                    alpha: None,
                 };
                 let packets = rendition.encode_frame_at(frame, tick).unwrap();
                 assert!(

@@ -57,6 +57,7 @@ fn gray_nv12_frame(width: u32, height: u32) -> DecodedVideoFrame {
         },
         raw_pts: None,
         a53_cc: None,
+        alpha: None,
     }
 }
 
