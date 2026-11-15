@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod alarm;
+pub mod alpha;
 pub mod color;
 pub mod error;
 pub mod event_overlay;

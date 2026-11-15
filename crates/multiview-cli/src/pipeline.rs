@@ -15100,6 +15100,7 @@ pub(crate) fn nv12_to_decoded(image: &Nv12Image) -> Result<DecodedVideoFrame, Pi
         meta,
         raw_pts: None,
         a53_cc: None,
+        alpha: None,
     })
 }
 
@@ -19566,14 +19567,24 @@ fn open_and_stream(
     );
     let reopen_params = params.clone();
     let reopen_ordinal = cuda_ordinal.map(str::to_owned);
-    let (decoder, used_hw) = StreamVideoDecoder::new_preferring_hw_at(
-        params,
-        time_base,
-        want_hw,
-        cuda_ordinal,
-        display_resize,
-    )
-    .map_err(|e| e.to_string())?;
+    // A media player's VP9-with-alpha asset (WebM `alpha_mode=1`) opens
+    // `libvpx-vp9`, the only libav decoder that merges the alpha side stream
+    // (ADR-0058 §3, #391); without it the asset plays opaque, as today.
+    let vp9_alpha =
+        media_alpha::vp9_alpha_decoder(&plan.id, plan.player.is_some(), &input, stream_index);
+    let (decoder, used_hw) = match vp9_alpha
+        .and_then(|name| media_alpha::open_named(&plan.id, params.clone(), time_base, name))
+    {
+        Some(decoder) => (decoder, false),
+        None => StreamVideoDecoder::new_preferring_hw_at(
+            params,
+            time_base,
+            want_hw,
+            cuda_ordinal,
+            display_resize,
+        )
+        .map_err(|e| e.to_string())?,
+    };
     // Feed the declared cadence so the decoder's genpts fallback advances at the
     // source's true rate (PAL 25, film 24, …) rather than an NTSC-shaped guess;
     // an unusable rate is ignored inside `with_declared_fps` (invariant #3).
@@ -20045,6 +20056,10 @@ fn open_and_stream(
     }
 }
 
+/// Media-player NV12+A: attaches a decoded asset's straight alpha plane (#391).
+#[path = "pipeline_alpha.rs"]
+mod media_alpha;
+
 /// Convert a source frame index to a libav `AV_TIME_BASE` (microsecond) seek
 /// target at the given `cadence`, using exact integer rationals — never float
 /// fps (invariant #3). `target_us = frame * 1_000_000 * cadence.den /
@@ -20180,6 +20195,9 @@ fn stream_player(
     // path (bounded-memory data plane, inv #5 / rule 22).
     let mut last_image: Option<Arc<Nv12Image>> = None;
     let mut last_source_pts: Option<MediaTime> = None;
+    // NV12+A (ADR-0058, #391): built on the first alpha frame only, so an
+    // opaque asset never allocates the pool, scratch frames or alpha scaler.
+    let mut media_alpha: Option<media_alpha::MediaAlpha> = None;
     // Whether the decoder has been fully drained (EOF reached with no loop, or a
     // fail-safe gave up): the loop falls through to `heartbeat_player_hold`, which
     // holds last-good forever — the tile rides the framestore state machine and
@@ -20305,6 +20323,15 @@ fn stream_player(
             match player.on_decoded(source_frame) {
                 PlayerAction::Publish { at } => {
                     let image = to_tile.convert(&decoded.frame, tag)?;
+                    // An alpha asset publishes NV12 plus its full-resolution
+                    // straight alpha (same scaler geometry as the luma); an
+                    // opaque asset is untouched (`alpha` is `None`).
+                    let image = match &decoded.alpha {
+                        Some(source) => media_alpha
+                            .get_or_insert_with(Default::default)
+                            .attach(image, source)?,
+                        None => image,
+                    };
                     // Pace to the player's own monotone stamp (invariant #4),
                     // then publish it (latch-on-tick, invariant #1). Re-check
                     // `stop` after the (possibly long) pace wait. Wrap the frame

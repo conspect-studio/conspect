@@ -226,6 +226,7 @@ fn rtsp_live_push_reaches_a_listening_sidecar() {
                 meta,
                 raw_pts: None,
                 a53_cc: None,
+                alpha: None,
             }))
         }
     }
