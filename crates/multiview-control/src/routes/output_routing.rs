@@ -312,7 +312,10 @@ pub(crate) fn refusal_problem(status: u16, kind: &str, detail: String) -> Respon
 }
 
 /// The accepted output body behind an API id (`None` = unknown).
-fn output_of(state: &AppState, api_id: &str) -> ControlResult<Option<multiview_config::Output>> {
+pub(crate) fn output_of(
+    state: &AppState,
+    api_id: &str,
+) -> ControlResult<Option<multiview_config::Output>> {
     let resources = crate::boot_model::accepted_resources(state, "outputs")?
         .map_or_else(|| state.outputs.list(), Ok)?;
     for versioned in resources {
@@ -1104,7 +1107,7 @@ fn audio_unsupported() -> Response {
 
 /// The take-time audio gate (`Some` = refused): an explicit audio choice on
 /// an output without a program-audio slot is `audio-unsupported`.
-fn audio_gate(
+pub(crate) fn audio_gate(
     control: &crate::output_routing::OutputRoutingControl,
     config_id: &str,
     video: Option<&RoutedFeed>,
@@ -1273,7 +1276,8 @@ pub(crate) enum SlotTake {
 /// # Errors
 /// Repository errors, `NotFound` for an unknown output, a missing key, a key
 /// reused for another take (409), or `idempotency-capacity`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+// reason (lines): one ordered admission sequence (subtitle #345 + set limiter #308 merged).
 // reason: the slot-0 take's inputs are the request's parts plus its ONE
 // pre-read layout (T-I1); a struct would only rename them.
 pub(crate) fn take_output_slot0(
@@ -1456,7 +1460,7 @@ fn replay_slot0(
 }
 
 /// The refusal of a take key first used for another take (409 `conflict`).
-fn key_reused() -> ControlError {
+pub(crate) fn key_reused() -> ControlError {
     ControlError::Conflict("Idempotency-Key reused with a different request".into())
 }
 

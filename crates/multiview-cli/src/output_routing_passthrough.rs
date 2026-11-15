@@ -1132,7 +1132,7 @@ impl OutputRouter {
         match bridge {
             Bridge::Opening(id) => {
                 if self.opens.get(&id).is_none_or(|o| tick >= o.deadline) {
-                    self.opens.remove(&id);
+                    self.remove_open(id);
                     if let Some(c) = self.pass.candidates.get_mut(pos) {
                         c.bridge = Bridge::None;
                         c.retry_at = tick.saturating_add(PASS_RETRY_TICKS);
@@ -1191,18 +1191,14 @@ impl OutputRouter {
                         .dynamic
                         .iter()
                         .any(|d| d.key == key && d.principal != principal && !d.reformat);
-                    if unheld && foreign {
-                        if !self.adoption_fits(&principal) {
-                            self.bridge_refused(pos, tick);
-                            return;
-                        }
-                        if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
-                            principal.clone_into(&mut d.principal);
-                        }
+                    if unheld && foreign && !self.adoption_fits(&principal) {
+                        self.bridge_refused(pos, tick);
+                        return;
                     }
-                    if let Some(d) = self.dynamic.iter_mut().find(|d| d.key == key) {
-                        d.linger_deadline = None;
-                    }
+                    // Clears the linger; an adoption also re-attributes the
+                    // key and marks the holdings changed (#308).
+                    let adopt = (unheld && foreign).then_some(principal.as_str());
+                    self.adopt_key(key, adopt);
                     let warm = self.dynamic.iter().any(|d| d.key == key && d.seen_event);
                     if warm {
                         self.move_to_bridge(pos, index, key, tick, dispatcher);
@@ -1230,7 +1226,7 @@ impl OutputRouter {
                     passthrough: None,
                 }) {
                     Ok(()) => {
-                        self.opens.insert(
+                        self.insert_open(
                             id,
                             PendingOpen {
                                 bus,

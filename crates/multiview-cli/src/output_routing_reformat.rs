@@ -102,7 +102,7 @@ impl OutputRouter {
                 passthrough: None,
             }) {
                 Ok(()) => {
-                    self.opens.insert(
+                    self.insert_open(
                         id,
                         PendingOpen {
                             bus,
@@ -219,7 +219,7 @@ impl OutputRouter {
             return true;
         };
         self.last_forced.insert(key, tick);
-        self.dynamic.push(DynamicKey {
+        self.push_key(DynamicKey {
             bus: open.bus.clone(),
             format: open.format,
             settings: open.settings,
@@ -431,7 +431,7 @@ impl OutputRouter {
         match state.phase {
             ReformatPhase::Opening(id) => {
                 // The open's result goes to the reaper (`drain_opens`).
-                self.opens.remove(&id);
+                self.remove_open(id);
             }
             ReformatPhase::Warming(key) => self.close(key, dispatcher),
             ReformatPhase::Moving(key) => {
