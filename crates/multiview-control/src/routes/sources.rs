@@ -640,7 +640,7 @@ fn bound_player(body: &serde_json::Value) -> Option<&str> {
 /// caller must be authorized for that player, and — when an update moves the
 /// binding off a player — for the player it is moved off. Checked before
 /// anything is persisted or submitted to the engine.
-fn authorize_bound_player(
+pub(crate) fn authorize_bound_player(
     principal: &Principal,
     previous: Option<&serde_json::Value>,
     next: &serde_json::Value,
