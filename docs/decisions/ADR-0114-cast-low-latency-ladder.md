@@ -1,7 +1,9 @@
 # ADR-0114: Cast low-latency transport ladder: SRT in a Cast Connect Android TV app, MoQ then WebRTC in the Web Receiver, HLS as the floor, one cast token for every transport
 
-- **Status:** Proposed (design draft; no code in this change). Revised on 2026-11-15 after design review
-  round 1, findings D1 to D4 (reviewer: OpenAI gpt-6-astra, on 9e292130); the revision is not yet re-reviewed
+- **Status:** Accepted as a design on 2026-11-15; no code in this change. Review: round 1 NEEDS_REVISION with
+  findings D1 to D4 (OpenAI gpt-6-astra, on 9e292130); round 2 PASS (OpenAI gpt-5.6-terra, on de3f8e15). Accepted
+  means the design may be built slice by slice. It does not mean anything here is measured: every latency
+  figure is a target until slice 7, and the rungs marked Unverified stay so until their slice closes them
 - **Area:** Streaming / Output / Management / Web/API / Android (invariants #1, #7, #10)
 - **Date:** 2026-11-15
 - **Amends:** [ADR-0111](ADR-0111-cast-output.md) (adds transports beside its CMAF HLS stream; its stream, token
@@ -224,9 +226,10 @@ requirement, not an assumption:
 
 1. The conversion wraps. The WebRTC output on `main` converts with `u32::try_from(ts.max(0)).unwrap_or(0)`
    (Read: `crates/multiview-cli/src/pipeline.rs:10028-10030`), which yields 0 for every frame once the 90 kHz
-   value passes 2^32, 13 h 15 min into a run. Not reproduced at run time. The cast rung uses a masked
-   conversion, as the preview path does (Read: `crates/multiview-cli/src/whep.rs:317-320`). The existing output
-   is outside this ADR and is reported to the lead.
+   value passes 2^32, 13 h 15 min into a run; the audio conversion has the same form and reaches 2^32 at
+   48 kHz after 24 h 51 min. Not reproduced at run time. The cast rung uses wrapping arithmetic from its first
+   version: a masked conversion, as the preview path does (Read: `crates/multiview-cli/src/whep.rs:317-320`).
+   The existing output is outside this ADR; it is issue #492, fixed by ship lane `rtpwrap`.
 2. The library adds no offset. In str0m 0.16.2 the sample's time goes to the header as given (Read:
    `src/packet/payload.rs:58`, `src/streams/send.rs` `write_rtp`). A test reads a sent packet and compares.
 3. Audio is stamped with engine time. The preview path stamps Opus with the encoder's own sample counter (Read:
@@ -319,7 +322,8 @@ Two numbers, kept apart.
    [AWS](https://builder.aws.com/content/3HSKUExqs1fPmQLt7pX5Kk1Qvjp/benchmarking-glass-to-glass-latency-for-amazon-ivs-real-time-streaming)).
    Here "glass" at the sending end is the engine's tick, because the picture is generated, not filmed.
 
-The ADR moves to Accepted only with a table of both numbers per rung and device class (slice 7).
+Slice 7 adds a table of both numbers per rung and device class to this ADR. Until that table exists the
+ladder's order and targets are a plan, not a result.
 
 ### 3. The capability probe and the ladder endpoint
 
@@ -1006,7 +1010,7 @@ Order matters: the first three slices decide whether the later ones are built as
 | 4 | **MoQ rung.** Engine: cast outputs admitted to MoQ leases through the ladder; lease renewal by the ladder call. Receiver: `moq.js` (WebTransport, CMAF wrap, `SourceBuffer`), deadlines, step-down, memory | R3 | 3 passed; the probe data shows a device with `wt` and `mse` | MoQ plays through the real CAF SDK in the harness with media status correct; the receiver soak and the stalled-append, slow-decoder and quota tests of decision 6 pass; reported latency matches the slate's tick (decision 2); the authorization cases of decision 5.4 pass on the real rung; a wedged or stalled MoQ attachment costs the clock zero ticks and other bindings zero packets; device test with glass-to-glass |
 | 5 | **WebRTC rung.** `POST` and `DELETE /cast/<token>/whep`; one Opus encoder per cast output; PLI ignored; receiver `rtc.js`; ICE-TCP | R3 | 3 passed | WebRTC plays in the harness with UDP blocked (TCP 443 only); wire RTP time equals engine time across the 2^32 wrap and latency is `unavailable`, with no step-down, when the frame metadata lacks it (decision 2); the Opus encoder count stays one with several viewers; the egress byte and age ceilings and the authorization cases of decision 5.4 hold; chaos as slice 4; device test |
 | 6 | **SRT rung and the Android TV app.** Engine: listen callback in `multiview-srt-sys`, the cast SRT listener, one-time selectors and the HKDF passphrase, pre-authentication budgets, attachment per token. App: `android/cast-tv/`, CI job that builds the APK. Senders: `androidReceiverCompatible`, `supportedAppTypes`, behind `[cast] android_tv` | R3 | 2, S | Engine: a libsrt caller with the issued selector and the derived passphrase receives valid MPEG-TS; the test table of decision 5.7 passes (a flood of wrong-passphrase handshakes on a known selector neither evicts nor locks out the valid receiver; unknown, expired and reused selectors and a revoked token get nothing); wire PTS equals engine time (decision 2); churn and a wedged caller do not slow the producer. Device: the app launches when installed, the Web Receiver when not; SRT plays; a blocked port falls to HLS and the next cast to the Web Receiver |
-| 7 | **Measured ladder.** Run the matrix; set the offer order, deadlines, SRT latency and player buffers from the data; remove any rung that does not beat the one below it on a class; enable `android_tv` by default if slice 6's first device step passed; runbook; this ADR to Accepted with the table | R2 | 4, 5, 6 as built | The ladder's order and targets are measurements. Every cell of the table is filled or marked as not built, with the reason |
+| 7 | **Measured ladder.** Run the matrix; set the offer order, deadlines, SRT latency and player buffers from the data; remove any rung that does not beat the one below it on a class; enable `android_tv` by default if slice 6's first device step passed; runbook; the measured table added to this ADR | R2 | 4, 5, 6 as built | The ladder's order and targets are measurements. Every cell of the table is filled or marked as not built, with the reason |
 
 Slice S is a security fix for every shipped image, so it is done by ship lane `srtfloor` and not by this team;
 slice 6 still depends on it. Slices 4, 5 and 6 are independent of each other
@@ -1121,5 +1125,8 @@ captain as one list; none blocks slices 0 to 5 from merging.
 | Whether Media3 reports the extractor's sample time unchanged to the frame listener for a progressive source | slice 6 instrumented test; until it passes, SRT latency is `unavailable` |
 | Whether libsrt discards, and neither grows nor blocks, when the app stops reading | slice 6 test, before the rung is enabled |
 | Whether `jitterBufferTarget` exists on a Cast device and what the jitter buffer then holds | slice 5 device test |
-| Existing `webrtc` output: RTP time becomes 0 for every frame after 2^32 ticks of 90 kHz, 13 h 15 min (read in code, not reproduced) | reported to the lead; outside this ADR |
+| Existing `webrtc` output: RTP time becomes 0 for every frame after 2^32 (video after 13 h 15 min, audio after 24 h 51 min; read in code, not reproduced) | issue #492, ship lane `rtpwrap`; outside this ADR |
+| What the app does when ladder calls for a fresh SRT selector run into the rate limit during rapid reconnects (review note R2-N2) | slice 2 design note: retry after the limit, and HLS after 3 refused calls |
+| RTCP wall clock for WebRTC when the run has no validated epoch (review note R2-N3) | slice 5: fall back to the time of writing for both streams, and report latency as `unavailable` |
+| The ladder's answer when no registry subscription is left for MoQ (review note R2-N4) | slice 4 test: the answer names the next rung; it is never an error |
 
