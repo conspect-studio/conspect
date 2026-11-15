@@ -518,17 +518,89 @@ Decisions:
    expiry, and on every feed change before the change is published (Read: `reauth::before_change`,
    `cast_streams/reauth.rs:109`). Setting a fence is one atomic store; no I/O happens under the lock. Closing
    the socket follows on the transport's own thread.
-3. **Feed change (as PR 409).** A token whose owner may read the new feed keeps its attachment; the picture
-   changes in place. A token whose owner may not is revoked first and its attachment is fenced before the new
-   feed's first packet is admitted.
-4. **Engine fallback, fail closed in the data path.** The engine can move an output to another feed by itself.
+3. **Requested feed change (as PR 409).** A change covers any component: the picture, an audio slot, the
+   audio routing, a layout's definition, a subtitle patch. A token whose owner may read the whole new closure
+   keeps its attachment and the content changes in place. A token whose owner may not is revoked first and its
+   attachment is fenced before the first packet of the new content is admitted. Item 4 is what makes "before
+   the first packet" true in the data path.
+4. **Unrequested changes: every media component carries its authorization identity, and the default is deny.**
+   Reviewer finding D2. The engine can change what an output carries by itself (a fallback), and a cast carries
+   more than a picture: each audio slot is routed on its own, and a bus name does not say what is behind it.
    For HLS the media route compares the engine's readback on each request. A push rung has no request, so the
-   check moves to where windows are handed to the attachment: each window carries the picture bus it was
-   encoded from, each attachment holds the set of buses its token is cleared for, and a window from any other
-   bus is dropped and the attachment fenced. The control plane then re-authorizes as today and the receiver
-   re-attaches if its token survives. This needs the dispatcher to label windows with their bus; that code was
-   not read for this draft. Slice 2's design note confirms or replaces the mechanism, and its test is the gate:
-   a forced fallback to a feed the owner may not read delivers zero packets of it on every rung.
+   rule moves into the data path and covers every component.
+
+   **Components.** Video; each audio slot the rung carries; each subtitle slot, on a rung that carries
+   subtitles (none of the push rungs does in the first version, HLS does).
+
+   **Identity.** For each component of each output the engine holds a 64-bit *content identity*. It changes
+   whenever anything that the authorization closure of that component depends on changes: the bus or source the
+   component is taken from; the layout shown and the revision of its definition (cells, sources, layout audio);
+   the audio choice, the track and the input behind it, and the revision of the audio routing; the subtitle
+   patch. These are the inputs of the closure the token check computes today (Read: `video_needs`,
+   `audio_needs`, `cast_streams/reauth.rs:333-393`; lane cast2 adds `subtitle_needs` and the audio slots).
+   A change inside a bus that the closure treats as one grant does not change the identity: Program, Preview
+   and Clean need the bus grant only (Read: `Need::Bus`, `reauth.rs:339`), so a cut on the switcher is not a
+   change here.
+
+   **Captured with the data, not read afterwards.** An encoder emits a packet later than the frame went in, so
+   reading the routing state when the packet comes out can label old content with a new identity or the
+   reverse. Output timestamps are a function of the tick, so the identity is too: per output and component the
+   engine keeps a short change list of `(first tick, identity)`, written by the code that applies the change at
+   that tick. A packet takes the identity of the last entry at or before the tick of its own timestamp. The
+   routing readback already records the tick a feed took effect (Read: `since_tick`,
+   `crates/multiview-control/src/output_routing.rs:379`). The list is bounded (16 entries); a packet whose
+   timestamp cannot be resolved has no identity.
+
+   **Who mints an identity.** The control plane mints one for each change it requests, after it has computed
+   the new closure, and passes it with the request. For a change it did not request, the engine mints one from
+   a range the control plane never uses. Nobody is cleared for an engine-minted identity until the control
+   plane has seen it and authorized against the state it stands for.
+
+   **Clearance.** Each attachment holds the set of identities its token is cleared for, per component: an
+   immutable list of at most 9 values (the current one and the unsettled changes; the registry already bounds
+   those at 8, Read: `MAX_CARRY`, `cast_streams/mod.rs:68`), replaced as a whole by the registry and read
+   without a lock. Clearance for a requested change is added only for tokens whose owner passes the check for
+   the new closure, inside the critical section that re-authorizes tokens today and before the request goes to
+   the engine. The old identity leaves the list when the engine reports the outcome.
+
+   **The gate.** Where a window is offered to an attachment, before it is enqueued, every component in it must
+   have an identity that is in the attachment's list for that component. One miss, or a component without an
+   identity, and the whole window is refused, the attachment is fenced and nothing later is offered to it. The
+   check is a bounded comparison of a few integers at the place the registry already tests its revocation flag
+   and generation. It takes no lock and does not allocate.
+
+   **Packets already buffered.** A fence stops enqueue. The attachment's own queue is then discarded, not
+   drained: nothing more is handed to the transport, and the transport is closed abruptly (QUIC session close,
+   `srt_close`, DTLS close) instead of flushed. What the transport had already accepted is at most its own
+   bounded buffer (decision 6) and consists only of windows that passed the gate, that is, content the owner
+   was cleared for when it was produced. No packet of the refused identity was ever enqueued.
+
+   **Re-attachment.** The receiver sees the transport end with reason `feed-changed` and makes a ladder call.
+   That call runs the shared token check, which first re-authorizes the token against the engine's present
+   state (the existing barrier, `reauth::on_media`). If the token survives, the new attachment is cleared for
+   the identities current at that moment. If not, the call answers 404 and the cast ends, as for HLS. Three
+   `feed-changed` ends inside 10 s make the receiver play HLS for the rest of the session, where every request
+   is checked.
+
+   **What is confirmed and what is not.** The contract above is fixed. Unverified: where the dispatcher can
+   attach the change list to video and audio packets, and whether every unrequested change in the engine goes
+   through code that can mint an identity. Slice 2's design note settles the mechanism and may replace it, but
+   not the contract, and slice 2 does not merge without these tests, each run against every push rung (against
+   a fake push attachment in slice 2, then the real rung in slices 4, 5 and 6), each failing on revert:
+
+   | Case | Must hold |
+   | --- | --- |
+   | Picture fallback to a feed the owner may not read | zero packets of the new feed delivered; attachment fenced |
+   | Same picture, an audio slot moves to a source the owner may not read (unrequested, and by the audio-routing route) | zero audio packets of the new source delivered; the video of that window is refused with it |
+   | Same bus name, new dependency: a layout is edited to include a source the owner may not read, the output stays on that layout | zero packets produced after the edit's tick delivered |
+   | The change lands between production and enqueue | a window produced before the change tick is delivered or dropped, never relabelled; a window produced after it is refused |
+   | A packet without a resolvable identity (change list overflow, injected) | refused; attachment fenced |
+   | Fence with a full attachment queue | queue length is 0 after the fence; the transport receives nothing after it |
+   | Owner cleared for the new feed | the attachment survives the change with no gap beyond the encoder's own |
+   | Re-attachment after a fence, owner cleared for the present state | new attachment admitted; cleared only for the present identities |
+
+   The 5 s sweep of ADR-0111 (re-scoped keys, re-pointed audio tracks) stays as a second line. No push rung
+   relies on it.
 5. **Token lifetime.** Today a live token expires 60 s after its last playlist fetch (Read:
    `cast_streams/registry.rs:48-50`). A push rung fetches no playlist. A successful report or ladder call from
    a stream that has a live attachment counts as that fetch. A device that vanishes stops reporting; its
@@ -820,7 +892,7 @@ captain as one list; none blocks slices 0 to 5 from merging.
 | Whether CAF gives senders a correct media session for a picture it did not load | slice 3 |
 | Whether the receiver page's policy admits a cross-origin WebTransport session | slice 3 |
 | Whether a `cast` output is admitted to the effective-output registry and has the no-reorder proof | slice 2 |
-| How the dispatcher labels windows with their picture bus (the data-path fallback check) | slice 2 design note |
+| Where the dispatcher attaches the per-component identity change list to video and audio packets, and whether every unrequested change can mint an identity (decision 5.4) | slice 2 design note; the contract and its tests are fixed |
 | What the Cast platform does when `androidReceiverCompatible` is set and the app is not installed | slice 6, first device step |
 | Whether `supportedAppTypes` in the engine-side LAUNCH selects the Android TV app | slice 6 device test |
 | Whether UDP 443 and UDP 9010 pass from the network the Cast devices are on | slices 4 and 6 device tests |
