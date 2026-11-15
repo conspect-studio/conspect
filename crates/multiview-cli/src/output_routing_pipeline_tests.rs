@@ -391,9 +391,16 @@ where
 ///   `CLOCK_LEAD_TICKS` of it and no live worker holds more than one
 ///   unencoded frame.
 ///
-/// A wait is bounded by `CLOCK_WAIT_BOUND`; after `CLOCK_GIVE_UP` waits
-/// hit the bound, pacing ends for the run, so a test's deliberately
-/// wedged thread costs a few seconds and still proves what it tests.
+/// A wait is bounded by `CLOCK_WAIT_BOUND`; pacing ends for the run after
+/// `CLOCK_GIVE_UP` waits hit that bound or after `CLOCK_HOLD_BUDGET` of
+/// total hold, so a test's deliberately wedged thread costs a bounded few
+/// seconds and still proves what it tests.
+///
+/// The live policy never waits on the consumer or the router: its hot loop
+/// is still free to outrun the consumer (shed and counted), which is what
+/// its tests prove. It does wait on the aux compose thread, whose staleness
+/// on a loaded host is the documented cause of #455 and whose fallback the
+/// live test asserts never happens.
 /// (A hold never nears the dispatcher's own 2 s wall-clock watchdog.)
 fn spawn_paced_clock(
     clock: Arc<multiview_engine::ManualTimeSource>,
@@ -404,10 +411,15 @@ fn spawn_paced_clock(
     std::thread::spawn(move || {
         let mut ticks = 0_u64;
         let mut timeouts = 0_u32;
+        let mut held = Duration::ZERO;
         while !stop_clock.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(40));
-            let bound = Instant::now() + CLOCK_WAIT_BOUND;
-            while timeouts < CLOCK_GIVE_UP && !stop_clock.load(Ordering::Acquire) {
+            let hold_started = Instant::now();
+            let bound = hold_started + CLOCK_WAIT_BOUND;
+            while timeouts < CLOCK_GIVE_UP
+                && held < CLOCK_HOLD_BUDGET
+                && !stop_clock.load(Ordering::Acquire)
+            {
                 if Instant::now() >= bound {
                     timeouts += 1;
                     break;
@@ -440,6 +452,7 @@ fn spawn_paced_clock(
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
+            held += hold_started.elapsed();
             clock.advance(Duration::from_millis(40));
             ticks += 1;
         }
@@ -458,6 +471,11 @@ const CLOCK_WAIT_BOUND: Duration = Duration::from_millis(300);
 /// After this many waits hit [`CLOCK_WAIT_BOUND`] the clock runs free for the
 /// rest of the run (#461).
 const CLOCK_GIVE_UP: u32 = 20;
+
+/// The most wall time pacing may add to one run in total (#461): after it the
+/// clock runs free, so no sequence of short holds can stretch a run without
+/// bound (a 250-tick run is 10 s free-running).
+const CLOCK_HOLD_BUDGET: Duration = Duration::from_secs(120);
 
 /// Let `ticks` output ticks pass on the router (#461). The controllers used
 /// to sleep the wall-clock equivalent at 25 fps (`ticks * 40 ms`); with the
