@@ -53,6 +53,48 @@ pub struct NativeLoadAck {
     /// Timeline position in nanoseconds.
     pub timeline_ns: i64,
 }
+/// Typed reason a load operation ended `failed`. Stable wire codes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum LoadFailureCode {
+    /// The clip could not be found.
+    NotFound,
+    /// The container or its header could not be parsed.
+    InvalidData,
+    /// The open or prime deadline expired.
+    Timeout,
+    /// The clip frame rate is not the canvas frame rate.
+    WrongCadence,
+    /// The clip is variable frame rate.
+    Vfr,
+    /// The clip declares no frame rate.
+    NoCadence,
+    /// The clip carries an alpha plane.
+    Alpha,
+    /// The container has no video stream.
+    NoVideoStream,
+    /// The clip length is unknown and no out-point was declared.
+    UnknownLength,
+    /// The resolved playout window is invalid or exceeds a bound.
+    InvalidWindow,
+    /// The video decoder could not be opened.
+    DecoderOpen,
+    /// Priming produced no decodable frame.
+    NoFrames,
+    /// The clip carries audio but the player's audio rail is unavailable.
+    AudioUnavailable,
+    /// The durable binding journal refused the commit.
+    JournalFailed,
+    /// The load has no resolvable durable identity.
+    ReferenceMissing,
+    /// Any other failure.
+    Other,
+}
+
+/// Upper bound on [`LoadOperation::detail`] in bytes.
+pub const MAX_LOAD_DETAIL_BYTES: usize = 256;
+
 /// Bounded operation view; completion needs native video and audio adoption.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -63,6 +105,11 @@ pub struct LoadOperation {
     pub state: &'static str,
     /// Native facts once adopted.
     pub native: Option<NativeLoadAck>,
+    /// Typed failure reason; present only when `state` is `failed`.
+    pub reason: Option<LoadFailureCode>,
+    /// Short operator-facing explanation of `reason`. Redacted: never carries
+    /// a filesystem path, URL or credential; at most 256 bytes.
+    pub detail: Option<String>,
 }
 /// Native-only admission, off-clock and after authorization.
 pub trait PlayerLoadProvider: Send + Sync + 'static {
