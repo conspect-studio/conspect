@@ -364,7 +364,13 @@ where
     .with_warning_store(warnings);
     #[cfg(unix)]
     {
-        state = state.with_web_capture(multiview_control::web_capture_startup::from_environment()?);
+        // Every capture is conformed to the canvas cadence (exact rational) so
+        // the artifact loads into a media player, which accepts only that rate.
+        let cadence = config.canvas.fps.rational();
+        state = state.with_web_capture(
+            multiview_control::web_capture_startup::from_environment()?
+                .with_canvas_cadence(cadence.num, cadence.den),
+        );
     }
     #[cfg(feature = "moq-output")]
     if let Some(moq) = moq {
@@ -2973,7 +2979,12 @@ impl CommandDrain {
                     )));
             }
             Command::UpsertSource { ref source, .. } => {
-                self.upsert_source(source, drive);
+                // ADR-M012: a media-player binding is a pure alias (no producer).
+                if let multiview_config::SourceKind::MediaPlayer { player } = &source.kind {
+                    self.upsert_media_player_source(source, player, drive);
+                } else {
+                    self.upsert_source(source, drive);
+                }
             }
             Command::RemoveSource { ref id, .. } => {
                 self.remove_source(id, drive);
@@ -3295,6 +3306,63 @@ impl CommandDrain {
         }
     }
 
+    /// Apply a `media_player` source upsert (ADR-M012) at the frame boundary:
+    /// a pure binding mutation that opens nothing. The source id is registered
+    /// with the drive as an alias of the player channel's store (the player's
+    /// own boot owns its ingest thread), the route key is set so routing and
+    /// switcher buses resolve it, and the working config mirrors it. A player
+    /// with no registered store (it did not boot) binds a never-fed store: the
+    /// source reads no-signal. An edit from a decoded/synthetic kind first asks
+    /// the hub to stop that producer — never when the id is a player's own,
+    /// whose producer is the player channel itself.
+    fn upsert_media_player_source(
+        &mut self,
+        source: &multiview_config::Source,
+        player: &str,
+        drive: &mut CompositorDrive<Nv12Image>,
+    ) {
+        let id = source.id.clone();
+        let replaced_producer = self.config.sources.iter().any(|s| {
+            s.id == id && !matches!(s.kind, multiview_config::SourceKind::MediaPlayer { .. })
+        });
+        let is_player_id = self.config.media_players.iter().any(|p| p.id == id);
+        if replaced_producer && !is_player_id {
+            if let Some(seam) = &self.live_sources {
+                if seam.request_teardown(&id) != crate::live_sources::HubSubmit::Accepted {
+                    tracing::warn!(source = %id, "previous producer teardown shed; it stops at run teardown");
+                }
+            }
+        }
+        if id != player || drive.store(player).is_none() {
+            let store = drive.store(player).map_or_else(
+                || {
+                    tracing::warn!(
+                        source = %id, player = %player,
+                        "media_player source bound to a player with no channel; it reads no-signal"
+                    );
+                    Arc::new(multiview_framestore::TileStore::new(
+                        id.clone(),
+                        multiview_framestore::TileThresholds::default(),
+                        multiview_framestore::NoSignalPolicy::HoldForever,
+                    ))
+                },
+                Arc::clone,
+            );
+            drive.insert_store(id.clone(), store);
+        }
+        let stream = multiview_config::routing::StreamRef::best(
+            id.clone(),
+            multiview_core::stream::StreamKind::Video,
+        );
+        self.resolution.set_video_store_key(&stream, id.clone());
+        match self.config.sources.iter_mut().find(|s| s.id == id) {
+            Some(slot) => *slot = source.clone(),
+            None => self.config.sources.push(source.clone()),
+        }
+        self.applied_media.insert(id.clone(), source.clone());
+        self.unapplied.remove(&id);
+    }
+
     /// An upsert that changes only presentation or standing policy
     /// ([`multiview_config::Source::same_media`]) of a running source, on a run
     /// with no demand manager: there are no leases to re-read, so the running
@@ -3350,6 +3418,20 @@ impl CommandDrain {
     /// teardown (stop-flag raise + bounded join) and the preview-registry RCU
     /// to the off-thread hub. Removing an unknown id is a logged no-op.
     fn remove_source(&mut self, id: &str, drive: &mut CompositorDrive<Nv12Image>) {
+        if self.config.sources.iter().any(|s| {
+            s.id == id && matches!(s.kind, multiview_config::SourceKind::MediaPlayer { .. })
+        }) {
+            // ADR-M012: an alias owns no producer, so nothing is torn down. A
+            // source sharing its player's id leaves the player channel itself
+            // registered (transport still addresses it).
+            if !self.config.media_players.iter().any(|p| p.id == id) {
+                drive.remove_store(id);
+            }
+            self.config.sources.retain(|s| s.id != id);
+            self.applied_media.remove(id);
+            self.unapplied.remove(id);
+            return;
+        }
         let Some(seam) = self.live_sources.clone() else {
             tracing::warn!(
                 source = %id,
