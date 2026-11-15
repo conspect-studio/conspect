@@ -223,12 +223,15 @@ RUN apt-get update \
 COPY --from=ffmpeg /opt/multiview-ffmpeg/lib /usr/local/lib
 # The LGPL-3.0-or-later (+ GPLv3) texts that must accompany those libraries.
 COPY --from=ffmpeg /opt/multiview-ffmpeg/share/licenses/ffmpeg /usr/share/licenses/ffmpeg
+# libsrt (MPL-2.0) ships as /usr/local/lib/libsrt.so.1.5.7; its licence text with it.
+COPY --from=ffmpeg /opt/multiview-ffmpeg/share/licenses/libsrt /usr/share/licenses/libsrt
 RUN ldconfig \
  && test -e /usr/local/lib/libavcodec.so.63 \
  && test -e /usr/local/lib/libavutil.so.61 \
  && test -e /usr/local/lib/libsrt.so.1.5.7 \
+ && test -s /usr/share/licenses/libsrt/LICENSE \
  && ! dpkg-query -W -f='${Package}\n' 'libsrt*' 2>/dev/null | grep -q . \
- && ldd /usr/local/lib/libavformat.so.63 | grep -q 'libsrt.so.1.5 => /usr/local/lib/libsrt.so.1.5 ' \
+ && [ "$(ldd /usr/local/lib/libavformat.so.63 | awk '$1 == "libsrt.so.1.5" { print $3 }')" = /usr/local/lib/libsrt.so.1.5 ] \
  && test -s /usr/share/licenses/ffmpeg/COPYING.LGPLv3
 
 # Driver capabilities the container needs from the NVIDIA Container Toolkit:

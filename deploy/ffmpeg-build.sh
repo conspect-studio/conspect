@@ -438,7 +438,7 @@ done
 export PKG_CONFIG_PATH="${FF_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
 # -----------------------------------------------------------------------------
-# 2b. libsrt — the security floor (GHSA-m96h-3rc9-xx6h, fixed in 1.5.7; the
+# 4a. libsrt — the security floor (GHSA-m96h-3rc9-xx6h, fixed in 1.5.7; the
 #     multiview-srt-sys listener refuses anything older). On Linux build the
 #     pinned, SHA-256-verified upstream 1.5.7 into THIS prefix (it ships with
 #     the libav* libraries), so FFmpeg's srt protocol links it and no distro

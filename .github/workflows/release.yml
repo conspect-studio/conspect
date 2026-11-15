@@ -268,9 +268,9 @@ jobs:
               echo "Then check: ldd ./multiview | grep 'not found' (no output means ready)."
             } > "dist/${STAGE}/RUNTIME-DEPENDENCIES.txt"
             # libsrt is a transitive dependency: check it through libavformat.
-            env -u LD_LIBRARY_PATH ldd "dist/${STAGE}/lib/libavformat.so.63" \
-              | grep -q "libsrt.so.1.5 => .*/dist/${STAGE}/lib/libsrt.so.1.5" \
-              || { echo "::error::libsrt.so.1.5 does not resolve from the bundled lib/"; exit 1; }
+            got="$(env -u LD_LIBRARY_PATH ldd "dist/${STAGE}/lib/libavformat.so.63" | awk '$1 == "libsrt.so.1.5" { print $3 }')"
+            test "$(realpath -- "${got:-/nonexistent}" 2>/dev/null)" = "$(realpath -- "dist/${STAGE}/lib/libsrt.so.1.5")" \
+              || { echo "::error::libsrt.so.1.5 resolves to '${got}', not the bundled lib/"; exit 1; }
             for so in libavcodec.so.63 libavformat.so.63 libavutil.so.61; do
               printf '%s\n' "${out}" | grep -q "${so} => .*/dist/${STAGE}/lib/${so}" \
                 || { echo "::error::${so} does not resolve from the bundled lib/"; exit 1; }

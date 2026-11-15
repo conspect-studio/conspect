@@ -1271,7 +1271,9 @@ jobs:
             || { echo "::error::pinned libsrt ${ver} is below the 1.5.7 floor"; exit 1; }
           test -e "${FFMPEG_PREFIX}/lib/libsrt.so.1.5" \
             || { echo "::error::${FFMPEG_PREFIX}/lib/libsrt.so.1.5 missing"; exit 1; }
-          ldd "${FFMPEG_PREFIX}/lib/libavformat.so.63" | grep -E "libsrt\.so\.1\.5 => ${FFMPEG_PREFIX}/lib/libsrt\.so\.1\.5 " \
+          got="$(ldd "${FFMPEG_PREFIX}/lib/libavformat.so.63" | awk '$1 == "libsrt.so.1.5" { print $3 }')"
+          echo "libavformat -> libsrt.so.1.5 => ${got}"
+          test "${got}" = "${FFMPEG_PREFIX}/lib/libsrt.so.1.5" \
             || { echo "::error::libavformat does not resolve libsrt from the pinned prefix"; exit 1; }
           echo "MULTIVIEW_REQUIRE_LIBSRT_FLOOR=1" >> "$GITHUB_ENV"
       - name: test multiview-output --features ffmpeg,srt-libsrt (SRT push, real libsrt loopback)
