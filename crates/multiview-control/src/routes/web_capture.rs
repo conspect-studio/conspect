@@ -231,6 +231,14 @@ pub(crate) async fn artifact(
         .map_err(|_| ControlError::Repository("artifact response failed".into()))
 }
 
+/// Constant, secret-free 422 for any malformed Windy credential body.
+fn malformed_credential() -> Response {
+    use axum::response::IntoResponse;
+    ControlError::Validation(
+        "body must be a JSON object with exactly the string fields `email` and `password`".into(),
+    )
+    .into_response()
+}
 /// `no-store`: account status is never cached by a browser or proxy.
 fn no_store<T: serde::Serialize>(value: T) -> Response {
     use axum::response::IntoResponse;
@@ -276,9 +284,32 @@ pub(crate) async fn windy_account(
 pub(crate) async fn set_windy_account(
     State(state): State<AppState>,
     principal: Principal,
-    Json(body): Json<crate::web_capture::WindyAccountBody>,
+    raw: axum::body::Bytes,
+) -> Response {
+    use axum::response::IntoResponse;
+    let mut response = put_windy_account(state, principal, raw)
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+async fn put_windy_account(
+    state: AppState,
+    principal: Principal,
+    raw: axum::body::Bytes,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Administer)?;
+    // Parsed by hand: axum's `Json` rejection echoes serde diagnostics, which
+    // can quote credential material (e.g. an unquoted numeric password or an
+    // unknown field's value). Every malformed body gets one constant answer.
+    let Ok(body) = serde_json::from_slice::<crate::web_capture::WindyAccountBody>(&raw) else {
+        drop(raw);
+        return Ok(malformed_credential());
+    };
+    drop(raw);
     let provider = state.web_capture.clone();
     let actor = principal.clone();
     let view = tokio::task::spawn_blocking(move || {

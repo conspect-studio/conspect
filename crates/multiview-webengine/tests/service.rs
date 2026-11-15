@@ -227,6 +227,31 @@ fn refresh_replaces_latest_good_and_preserves_superseded_for_library_release() {
 }
 
 #[test]
+fn only_an_identical_request_coalesces_onto_an_active_fill() {
+    let _g = SERIAL.lock().unwrap();
+    let e = env(&gated_script(), config(2, 8));
+    let running = accepted(e.service.submit(request("a")).unwrap());
+    wait_file(&e.work.join("started"));
+    // A different request for the same fill (here: another document; in the
+    // control plane public vs Premium) is refused, never handed this job.
+    let mut other = request("a");
+    other.capture.document = "different".into();
+    assert_eq!(
+        e.service.submit(other).unwrap_err(),
+        SubmitError::Incompatible
+    );
+    assert_eq!(
+        e.service.submit(request("a")).unwrap(),
+        Submitted::Coalesced(running)
+    );
+    std::fs::write(e.work.join("release"), b"").unwrap();
+    wait(&e.service, running, |s| {
+        matches!(s, State::Succeeded { .. })
+    });
+    assert_eq!(runs(&e), 1);
+}
+
+#[test]
 fn capacity_rejects_and_same_fill_coalesces() {
     let _g = SERIAL.lock().unwrap();
     let e = env(&gated_script(), config(2, 8));

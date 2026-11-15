@@ -188,6 +188,14 @@ impl WindyAccount {
 
     /// Run one bounded verify of the current credential and record the verdict
     /// against it (a credential replaced meanwhile is never marked verified).
+    ///
+    /// Revoke-first: the in-memory Premium gate is cleared before anything
+    /// else, and an `unverified` state is made durable BEFORE the verifier
+    /// runs (if that write fails, nothing is verified). So no unsuccessful or
+    /// unrecorded outcome (verifier failure, credential resolution failure,
+    /// a failed or uncertain write of the verdict) can leave Premium enabled
+    /// now or resurrect a stale success after a restart. A Premium verdict is
+    /// published in memory only after it was persisted.
     /// Blocking; call on a management blocking worker.
     /// # Errors
     /// No credential, a verify already running, or storage failure.
@@ -196,23 +204,46 @@ impl WindyAccount {
             return Err(AccountError::Busy);
         }
         let _reset = Reset(&self.verifying);
-        let reference = self
-            .lock()
-            .secret_ref
-            .clone()
-            .ok_or(AccountError::NotConfigured)?;
-        let verdict = match self.resolve(&reference) {
-            Some(credentials) => (self.verifier)(credentials),
-            None => return Err(AccountError::Storage),
+        let reference = {
+            let mut state = self.lock();
+            let reference = state
+                .secret_ref
+                .clone()
+                .ok_or(AccountError::NotConfigured)?;
+            let unverified = Persisted {
+                secret_ref: Some(reference.clone()),
+                ..Persisted::default()
+            };
+            *state = unverified.clone();
+            self.persist(&unverified)
+                .map_err(|_| AccountError::Storage)?;
+            reference
+        };
+        let (verdict, resolved) = match self.resolve(&reference) {
+            Some(credentials) => ((self.verifier)(credentials), true),
+            None => (WindyVerdict::Unavailable, false),
         };
         let mut state = self.lock();
         if state.secret_ref.as_deref() == Some(reference.as_str()) {
-            let mut next = state.clone();
-            next.verified_ref = Some(reference);
-            next.verdict = Some(verdict);
-            next.verified_at = Some(now_unix);
-            self.persist(&next).map_err(|_| AccountError::Storage)?;
-            *state = next;
+            let next = Persisted {
+                secret_ref: Some(reference.clone()),
+                verified_ref: Some(reference),
+                verdict: Some(verdict),
+                verified_at: Some(now_unix),
+            };
+            if verdict == WindyVerdict::Premium {
+                // Durable first, then publish; a failed write stays unverified.
+                self.persist(&next).map_err(|_| AccountError::Storage)?;
+                *state = next;
+            } else {
+                // Not Premium: memory already denies; the durable state is the
+                // pre-verify `unverified`, so a failed write cannot resurrect.
+                *state = next;
+                self.persist(&state).map_err(|_| AccountError::Storage)?;
+            }
+        }
+        if !resolved {
+            return Err(AccountError::Storage);
         }
         Ok((verdict, view_of(&state, true)))
     }
@@ -378,6 +409,124 @@ mod tests {
         account.set("a@b", "x").unwrap();
         account.verifying.store(true, Ordering::Release);
         assert_eq!(account.verify(1), Err(AccountError::Busy));
+    }
+
+    fn verified(dir: &Path, verifier: Verifier) -> WindyAccount {
+        let account =
+            WindyAccount::open(dir, [3; 32], Arc::new(|_| WindyVerdict::Premium)).unwrap();
+        account.set("ops@example.com", "pw").unwrap();
+        account.verify(1).unwrap();
+        assert!(account.premium_available());
+        drop(account);
+        let account = WindyAccount::open(dir, [3; 32], verifier).unwrap();
+        assert!(account.premium_available());
+        account
+    }
+    fn private_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+    /// Root bypasses directory permissions, so a read-only directory cannot
+    /// simulate a failed write there; those tests then report and return.
+    fn writes_can_be_denied() -> bool {
+        let dir = private_dir();
+        chmod(dir.path(), 0o500);
+        let denied = std::fs::write(dir.path().join("probe"), b"x").is_err();
+        chmod(dir.path(), 0o700);
+        if !denied {
+            eprintln!("SKIPPED: running as a user that bypasses permissions");
+        }
+        denied
+    }
+    fn chmod(dir: &Path, mode: u32) {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    fn reopened_premium(dir: &Path) -> bool {
+        WindyAccount::open(dir, [3; 32], Arc::new(|_| WindyVerdict::Premium))
+            .unwrap()
+            .premium_available()
+    }
+
+    #[test]
+    fn failed_verdict_write_after_premium_revokes_now_and_after_restart() {
+        if !writes_can_be_denied() {
+            return;
+        }
+        let dir = private_dir();
+        let path = dir.path().to_owned();
+        // The verdict write fails: the directory turns read-only mid-verify.
+        let account = verified(
+            dir.path(),
+            Arc::new(move |_| {
+                chmod(&path, 0o500);
+                WindyVerdict::Rejected
+            }),
+        );
+        assert_eq!(account.verify(2), Err(AccountError::Storage));
+        assert!(!account.premium_available());
+        assert!(account.resolve_for_capture().is_none());
+        chmod(dir.path(), 0o700);
+        assert!(!reopened_premium(dir.path()), "stale success resurrected");
+    }
+
+    #[test]
+    fn failed_premium_write_is_not_published() {
+        if !writes_can_be_denied() {
+            return;
+        }
+        let dir = private_dir();
+        let path = dir.path().to_owned();
+        let account = verified(
+            dir.path(),
+            Arc::new(move |_| {
+                chmod(&path, 0o500);
+                WindyVerdict::Premium
+            }),
+        );
+        assert_eq!(account.verify(2), Err(AccountError::Storage));
+        assert!(!account.premium_available());
+        chmod(dir.path(), 0o700);
+        assert!(!reopened_premium(dir.path()));
+    }
+
+    #[test]
+    fn unwritable_store_revokes_in_memory_and_never_runs_the_verifier() {
+        if !writes_can_be_denied() {
+            return;
+        }
+        let dir = private_dir();
+        let calls = Arc::new(Mutex::new(0));
+        let c = calls.clone();
+        let account = verified(
+            dir.path(),
+            Arc::new(move |_| {
+                *c.lock().unwrap() += 1;
+                WindyVerdict::Rejected
+            }),
+        );
+        chmod(dir.path(), 0o500);
+        assert_eq!(account.verify(2), Err(AccountError::Storage));
+        assert!(!account.premium_available());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            0,
+            "verifier ran without durable unverified"
+        );
+        chmod(dir.path(), 0o700);
+    }
+
+    #[test]
+    fn credential_resolution_failure_revokes_the_grant() {
+        let dir = private_dir();
+        let account = verified(dir.path(), Arc::new(|_| WindyVerdict::Premium));
+        // Destroy the ciphertext: resolution fails.
+        let reference = account.lock().secret_ref.clone().unwrap();
+        std::fs::remove_file(dir.path().join(&reference["vault:".len()..])).unwrap();
+        assert_eq!(account.verify(2), Err(AccountError::Storage));
+        assert!(!account.premium_available());
+        assert_eq!(account.view().result, Some(WindyVerdict::Unavailable));
+        assert!(!reopened_premium(dir.path()));
     }
 
     #[test]

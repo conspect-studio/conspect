@@ -70,6 +70,11 @@ fn private(path: &Path) -> PathBuf {
 /// A real capture service whose fake host records argv, environment and stdin
 /// separately, so the test can prove where the credential travelled.
 fn rig() -> Rig {
+    rig_with(false)
+}
+/// `gated`: the fake host waits for `<root>/release` before finishing, so a
+/// job stays running while the test submits a second request for its fill.
+fn rig_with(gated: bool) -> Rig {
     let root = tempfile::tempdir().unwrap();
     let r = root.path();
     let seen = private(&r.join("seen"));
@@ -77,9 +82,17 @@ fn rig() -> Rig {
     std::fs::write(
         &node,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{s}/argv'\nenv > '{s}/env'\ncat > '{s}/stdin'\n\
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{s}/argv'\nenv > '{s}/env'\ncat > '{s}/stdin'\n{gate}\
              printf 'producer-bytes'\nprintf '%s\\n' '{{\"event\":\"capture_complete\",\"frames\":2}}' >&2\n",
-            s = seen.display()
+            s = seen.display(),
+            gate = if gated {
+                format!(
+                    "touch '{s}/started'\nwhile [ ! -e '{s}/release' ]; do sleep 0.02; done\n",
+                    s = seen.display()
+                )
+            } else {
+                String::new()
+            },
         ),
     )
     .unwrap();
@@ -421,4 +434,128 @@ async fn without_an_account_store_premium_is_unavailable_and_the_routes_say_so()
     .await;
     let caps: serde_json::Value = serde_json::from_slice(&body_bytes(r).await).unwrap();
     assert_eq!(caps["premium_available"], false);
+}
+
+fn public_capture() -> serde_json::Value {
+    let mut body = premium_capture();
+    body["view"]["public"] = json!(true);
+    body
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_premium_submit_never_coalesces_onto_a_running_public_capture() {
+    let rig = rig_with(true);
+    *rig.verdict.lock().unwrap() = WindyVerdict::Premium;
+    let h = harness_with(|s| s.with_web_capture(rig.provider.clone()));
+    let body = json!({"email": EMAIL, "password": PASSWORD});
+    assert_eq!(
+        send(&h.router, request("PUT", ACCOUNT, ADMIN_TOKEN, Some(&body)))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&h.router, request("POST", VERIFY, ADMIN_TOKEN, None))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let r = send(
+        &h.router,
+        request(
+            "POST",
+            "/api/v1/media/captures",
+            OPERATOR_TOKEN,
+            Some(&public_capture()),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let public: serde_json::Value = serde_json::from_slice(&body_bytes(r).await).unwrap();
+    let seen = rig.root.path().join("seen");
+    for _ in 0..500 {
+        if seen.join("started").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(seen.join("started").exists(), "public job never started");
+
+    // Same fill, new key, Premium: refused, never handed the public job.
+    let r = send(
+        &h.router,
+        request(
+            "POST",
+            "/api/v1/media/captures",
+            OPERATOR_TOKEN,
+            Some(&premium_capture()),
+        ),
+    )
+    .await;
+    let status = r.status();
+    let problem: serde_json::Value = serde_json::from_slice(&body_bytes(r).await).unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+    assert_ne!(problem.get("job_id"), public.get("job_id"));
+    assert!(problem["detail"]
+        .as_str()
+        .unwrap()
+        .contains("different settings"));
+    // An identical public request (new key) still coalesces onto the same job.
+    let r = send(
+        &h.router,
+        request(
+            "POST",
+            "/api/v1/media/captures",
+            OPERATOR_TOKEN,
+            Some(&public_capture()),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let again: serde_json::Value = serde_json::from_slice(&body_bytes(r).await).unwrap();
+    assert_eq!(again["job_id"], public["job_id"]);
+    std::fs::write(seen.join("release"), b"").unwrap();
+}
+
+#[tokio::test]
+async fn malformed_credential_bodies_never_echo_credential_material() {
+    let rig = rig();
+    let h = harness_with(|s| s.with_web_capture(rig.provider.clone()));
+    let canary = "8675309314159";
+    let bodies = [
+        format!(r#"{{"email":"a@example.com","password":{canary}}}"#),
+        format!(r#"{{"email":"a@example.com","password":"x","extra":"{canary}"}}"#),
+        format!(r#"{{"email":"a@example.com","{canary}":"x"}}"#),
+        format!(r#"{{"email":{canary},"password":"x"}}"#),
+        format!(r#"{{"email":"a@example.com","password":"{canary}""#),
+        format!("not json {canary}"),
+        format!(r#"["{canary}"]"#),
+    ];
+    for body in bodies {
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(ACCOUNT)
+            .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.clone()))
+            .unwrap();
+        let r = send(&h.router, req).await;
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(r.headers().get("cache-control").unwrap(), "no-store");
+        let mut all = Vec::new();
+        for (name, value) in r.headers() {
+            all.extend_from_slice(name.as_str().as_bytes());
+            all.extend_from_slice(value.as_bytes());
+        }
+        all.extend_from_slice(&body_bytes(r).await);
+        assert!(
+            !contains(&all, canary),
+            "echoed credential material for {body}"
+        );
+    }
+    // Nothing was stored.
+    let r = send(&h.router, request("GET", ACCOUNT, ADMIN_TOKEN, None)).await;
+    let view: serde_json::Value = serde_json::from_slice(&body_bytes(r).await).unwrap();
+    assert_eq!(view["set"], false);
 }

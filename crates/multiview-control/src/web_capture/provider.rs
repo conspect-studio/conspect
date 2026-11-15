@@ -475,6 +475,9 @@ fn submit_error(error: SubmitError) -> ControlError {
     match error {
         SubmitError::Invalid => ControlError::Validation("invalid capture request".into()),
         SubmitError::Full | SubmitError::ShuttingDown => ControlError::EngineBusy,
+        SubmitError::Incompatible => ControlError::Conflict(
+            "this fill already has an active capture with different settings (for example public vs Premium); wait for it to finish or cancel it".into(),
+        ),
         SubmitError::Persistence => {
             ControlError::Repository("capture intent could not be persisted".into())
         }
