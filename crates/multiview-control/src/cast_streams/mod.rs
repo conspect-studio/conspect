@@ -92,6 +92,12 @@ pub const RETIRE_SEGMENTS: u64 = 2 * CAST_WINDOW + 1;
 /// Superseded-feed grant sets remembered per output (an overflow merges
 /// into the oldest entry, never dropping a need early).
 pub const MAX_HISTORY: usize = MAX_CARRY;
+/// Distinct grants remembered across ALL of one output's superseded-feed
+/// grant sets (#418 review INV418-FINAL-1). Past it the history collapses
+/// to one undeterminable entry (`needs: None`: fails closed — new tokens are
+/// refused and rechecks revoke) that keeps the latest retention and sink
+/// mark, so it still expires normally.
+pub const MAX_HISTORY_NEEDS: usize = 256;
 /// Output authorization gates kept (one per cast output in practice).
 pub const MAX_GATES: usize = 64;
 /// The background sweep period (a lazy sweep also runs on every API call).

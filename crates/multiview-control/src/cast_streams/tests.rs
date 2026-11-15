@@ -335,3 +335,57 @@ fn gate_history_merges_bounded_and_never_drops_a_need_early() {
     gate.retire(None, 0, None);
     assert!(gate.cleared_needs().is_none());
 }
+
+/// INV418-FINAL-1: the distinct grants retained across the whole history
+/// are bounded, overflow merges included. Past [`MAX_HISTORY_NEEDS`] the
+/// history collapses to one undeterminable entry (fails closed) that keeps
+/// the latest retention and sink mark, and still expires normally.
+#[test]
+fn gate_history_grant_storage_is_bounded_and_overflow_fails_closed() {
+    use super::reauth::Need;
+    let need = |s: String| Need::Object(s);
+    let stalled = mark(true, 7, 100);
+    let mut gate = registry::Gate::default();
+    let stored = |gate: &registry::Gate| -> usize {
+        gate.history
+            .iter()
+            .map(|h| h.needs.as_ref().map_or(0, Vec::len))
+            .sum()
+    };
+    // Below the bound: every grant is still required.
+    let per = 3;
+    let fits = MAX_HISTORY_NEEDS / per;
+    for i in 0..fits {
+        let needs = (0..per).map(|j| need(format!("n{i}-{j}"))).collect();
+        gate.retire(Some(needs), 0, Some(&stalled));
+    }
+    assert!(stored(&gate) <= MAX_HISTORY_NEEDS);
+    assert!(gate
+        .cleared_needs()
+        .unwrap()
+        .contains(&need("n0-0".to_owned())));
+    // Many more distinct grants with the sink stalled: bounded, fail closed.
+    let end = fits + 2_000;
+    // The latest retirement time (`retire` at `i` ms).
+    let last = u64::try_from(end - 1).unwrap();
+    for i in fits..end {
+        let needs = (0..per).map(|j| need(format!("n{i}-{j}"))).collect();
+        gate.retire(Some(needs), u64::try_from(i).unwrap(), Some(&stalled));
+        assert!(stored(&gate) <= MAX_HISTORY_NEEDS, "{i}");
+        assert!(gate.history.len() <= MAX_HISTORY);
+    }
+    assert!(gate.cleared_needs().is_none());
+    // A stalled sink keeps it, however long.
+    gate.prune(last * 1_000, Some(&stalled));
+    assert!(gate.remembers() && gate.cleared_needs().is_none());
+    // The retention not yet elapsed: kept even when the sink replaced it.
+    gate.prune(last + MEDIA_RETENTION_MS - 1, Some(&mark(true, 8, 0)));
+    assert!(gate.cleared_needs().is_none());
+    // Retention elapsed and every file retired: it clears.
+    gate.prune(
+        last + MEDIA_RETENTION_MS,
+        Some(&mark(true, 7, 100 + RETIRE_SEGMENTS)),
+    );
+    assert!(!gate.remembers());
+    assert_eq!(gate.cleared_needs(), Some(Vec::new()));
+}

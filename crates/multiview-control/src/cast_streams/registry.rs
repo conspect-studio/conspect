@@ -183,7 +183,9 @@ pub(super) struct Gate {
     /// replaced `settled`, a settled or forgotten carry) whose media may
     /// still be servable; oldest first, at most [`super::MAX_HISTORY`] (an
     /// overflow merges into the oldest entry, keeping the later retention
-    /// and sink mark: a need is never dropped early). Forgotten only by
+    /// and sink mark: a need is never dropped early), holding at most
+    /// [`super::MAX_HISTORY_NEEDS`] distinct grants (past it: one
+    /// undeterminable entry, fail closed). Forgotten only by
     /// [`Gate::prune`], once [`Superseded::expired`].
     pub history: std::collections::VecDeque<Superseded>,
 }
@@ -268,9 +270,43 @@ impl Gate {
                     needs: union(old.needs, entry.needs),
                 });
             }
+        } else {
+            self.history.push_back(entry);
+        }
+        self.bound_history();
+    }
+
+    /// #418 review INV418-FINAL-1: past [`super::MAX_HISTORY_NEEDS`]
+    /// distinct grants across the whole history, collapse it to ONE entry
+    /// with undeterminable grants (`needs: None`, which fails closed:
+    /// [`Gate::cleared_needs`] is `None`, so new tokens are refused and
+    /// rechecks revoke) and the latest retention and sink mark of them all,
+    /// so it expires only once every collapsed entry could have.
+    fn bound_history(&mut self) {
+        let mut distinct: Vec<&super::reauth::Need> = Vec::new();
+        let over = self
+            .history
+            .iter()
+            .filter_map(|h| h.needs.as_ref())
+            .flatten()
+            .any(|need| {
+                if !distinct.contains(&need) {
+                    distinct.push(need);
+                }
+                distinct.len() > super::MAX_HISTORY_NEEDS
+            });
+        if !over {
             return;
         }
-        self.history.push_back(entry);
+        let collapsed = self.history.drain(..).reduce(|a, b| Superseded {
+            not_before: a.not_before.max(b.not_before),
+            mark: SinkMark::later(a.mark, b.mark),
+            needs: None,
+        });
+        if let Some(mut entry) = collapsed {
+            entry.needs = None;
+            self.history.push_back(entry);
+        }
     }
 
     /// Replace the settled feed with `next`; the grants it replaced move to
