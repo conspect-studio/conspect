@@ -1163,3 +1163,68 @@ async fn an_auto_whose_selection_changed_after_its_check_is_refused_by_the_engin
         "the unauthorized player was not rolled"
     );
 }
+
+/// Review (stinger final, abuse lens): an accepted AUTO replayed with its
+/// original Idempotency-Key answers its original 202 even after another
+/// principal switched the selection to a stinger the caller may not see. The
+/// replay queues nothing and rolls nothing.
+#[tokio::test]
+async fn an_accepted_auto_replays_its_202_after_the_selection_changed() {
+    let (h, handle, mut driver, mut rolls) = scoped_rig();
+    let response = send(
+        &h.router,
+        command(
+            &set(json!({"kind": "mix", "rate": 5})),
+            OPERATOR_TOKEN,
+            "mix",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tick(&mut driver, 1);
+    let first = send(
+        &h.router,
+        auto_request("/api/v1/switcher/commands/auto", ME_ONLY_TOKEN, "b-auto"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first = body_json(first).await;
+    // Let the accepted AUTO resolve at the engine (applied or refused: a
+    // replay must answer its original 202 either way).
+    let mut index = 2;
+    while index < 200 && (index < 4 || handle.snapshot().unwrap().in_flight) {
+        tick(&mut driver, index);
+        index += 1;
+    }
+    assert!(!handle.snapshot().unwrap().in_flight, "the AUTO resolved");
+    let response = send(
+        &h.router,
+        command(&set(stinger("vt1")), OPERATOR_TOKEN, "sel"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tick(&mut driver, index);
+    let mut outcomes = handle.outcomes();
+    let replay = send(
+        &h.router,
+        auto_request("/api/v1/switcher/commands/auto", ME_ONLY_TOKEN, "b-auto"),
+    )
+    .await;
+    assert_eq!(
+        replay.status(),
+        StatusCode::ACCEPTED,
+        "a replay answers its original 202"
+    );
+    assert_eq!(body_json(replay).await, first, "the original operation");
+    tick(&mut driver, index + 1);
+    tick(&mut driver, index + 2);
+    assert!(outcomes.try_recv().is_err(), "the replay queued nothing");
+    assert_eq!(rolls.try_recv(), None, "the denied player was not rolled");
+    // A fresh key is still checked against the current selection.
+    let fresh = send(
+        &h.router,
+        auto_request("/api/v1/switcher/commands/auto", ME_ONLY_TOKEN, "b-new"),
+    )
+    .await;
+    assert_eq!(fresh.status(), StatusCode::FORBIDDEN);
+}

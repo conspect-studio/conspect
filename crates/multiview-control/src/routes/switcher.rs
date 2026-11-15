@@ -610,24 +610,18 @@ pub(crate) async fn submit_switcher(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
         ));
     }
-    // SA-2: the selection AUTO will render is authorized, and bound into the
-    // command, before anything (even a replay) is answered.
-    let selection = if req.action == "auto" {
-        Some(authorize_selection(&principal, handle)?)
-    } else {
-        None
-    };
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
     };
     authorize_target(&principal, target.as_ref())?;
-    let verb = verb(&req, &kind, target.as_ref(), transition, selection)?;
-    // P3R2-C: authorization and static validation are done; an EXISTING
-    // reservation is a replay and answers its original 202 before the
-    // transient admission checks (buses, an active take, the scene), which
-    // describe the engine now rather than the request. `peek` never reserves;
-    // a fresh key still passes every check below before `reserve`.
+    // P3R2-C: authorization of the request's own references and static
+    // validation are done; an EXISTING reservation is a replay and answers
+    // its original 202 before checks that describe the engine now (the
+    // current selection, buses, an active take, the scene). The key is scoped
+    // to this principal, method and path, and a replay queues nothing, so it
+    // never runs anything the caller was not authorized for when accepted.
+    // `peek` never reserves; a fresh key still passes every check below.
     if let Some(op) = idem
         .0
         .as_deref()
@@ -636,6 +630,15 @@ pub(crate) async fn submit_switcher(
     {
         return Ok(accepted(&op, kind));
     }
+    // SA-2: a fresh AUTO authorizes the selection it will render and binds
+    // it into the command; the engine refuses it if the selection changes
+    // before its tick (selection-changed).
+    let selection = if req.action == "auto" {
+        Some(authorize_selection(&principal, handle)?)
+    } else {
+        None
+    };
+    let verb = verb(&req, &kind, target.as_ref(), transition, selection)?;
     validate_buses(handle, &req, target.as_ref())?;
     let scene_version = handle
         .scene_version()

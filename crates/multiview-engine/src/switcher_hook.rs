@@ -298,6 +298,9 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         }
         self.driver.reject_composed_tick(tick, reason);
         let _ = drive.set_mix_overlay(None);
+        // As the before_compose rejection path: the rolled-back flight's clip
+        // leaves the drive too, and its epoch moves (#415).
+        drive.set_stinger_clip(None);
         // Review F2: this tick's `before_compose` swapped its draws in and
         // the committed ones out into `keyer_buf`; swap them back, then
         // settle them against the restored state.

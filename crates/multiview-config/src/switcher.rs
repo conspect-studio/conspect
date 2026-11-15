@@ -469,7 +469,8 @@ impl MixEffectsConfig {
         if !transition.is_valid() {
             return Err(ConfigError::Validation(format!(
                 "switcher M/E {:?} transition has an out-of-range parameter \
-                 (dip rate >= 2 and switch point in (0, 1); wipe numbers in [0, 1])",
+                 (dip rate >= 2 and switch point in (0, 1); wipe numbers in [0, 1]; \
+                 stinger trigger_point + mix_rate <= clip_duration and every count <= 1000)",
                 self.id
             )));
         }

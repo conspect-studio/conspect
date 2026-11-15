@@ -984,3 +984,40 @@ fn a_clip_start_reuses_the_registered_store_and_copies_nothing() {
         "an unregistered player is no clip"
     );
 }
+
+/// Review (stinger final): a tick whose GPU composite misses its deadline
+/// (`on_compose_failed`) during the clip window takes the clip off the drive,
+/// exactly like the `before_compose` rejection path (its scene epoch moves,
+/// #415); the next tick re-derives it from the machine.
+#[test]
+fn a_failed_composite_during_the_clip_clears_the_clip() {
+    let mut rig = rig(None);
+    rig.send("set", SwitcherVerb::SetTransition(stinger(2, 10, 3, 4)));
+    rig.step(0, Some(Clip::Alpha));
+    rig.send("auto", SwitcherVerb::Auto(FrameCount::try_from(5).unwrap()));
+    // AUTO on tick 1; the clip window opens on tick 3 (pre-roll 2).
+    for index in 1..=3 {
+        rig.step(index, Some(Clip::Alpha));
+    }
+    assert_eq!(rig.drive.stinger_clip(), Some("p"), "the clip is drawn");
+    let t = tick(4);
+    rig.p.publish(clip_frame(Clip::Alpha, &rig.pool), t.pts);
+    rig.a.publish(solid(A_Y), t.pts);
+    rig.b.publish(solid(B_Y), t.pts);
+    rig.hook.before_compose(&mut rig.drive, t);
+    rig.hook
+        .on_compose_failed(&mut rig.drive, t, "readback deadline");
+    assert_eq!(
+        rig.drive.stinger_clip(),
+        None,
+        "a rejected tick leaves no clip on the drive"
+    );
+    // The next tick re-derives the clip from the machine's state.
+    rig.step(5, Some(Clip::Alpha));
+    let in_flight = rig.handle.snapshot().unwrap().in_flight;
+    assert_eq!(
+        rig.drive.stinger_clip().is_some(),
+        in_flight,
+        "the clip follows the flight again"
+    );
+}
