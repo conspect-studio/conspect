@@ -77,3 +77,52 @@ fn straight_alpha_blends_once_after_linearization_for_both_cpu_kernels() {
         assert_eq!(actual.y_plane(), expected_y);
     }
 }
+
+#[test]
+fn attach_with_fills_in_place_reuses_one_plane_and_returns_it_on_error() {
+    let pool = Arc::new(AlphaPlanePool::default());
+    assert_eq!(pool.retained(), 0);
+    let image = pool
+        .attach_with(
+            Nv12Image::solid(4, 2, 16, 128, 128, color()).unwrap(),
+            |p| {
+                assert_eq!(p.len(), 8);
+                for (i, b) in p.iter_mut().enumerate() {
+                    *b = u8::try_from(i).unwrap() * 10;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        image.alpha_plane(),
+        Some(&[0, 10, 20, 30, 40, 50, 60, 70][..])
+    );
+    let ptr = image.alpha_plane().unwrap().as_ptr();
+    drop(image);
+    assert_eq!(pool.retained(), 1);
+    // A failing fill hands the lease straight back: still one plane, no leak.
+    let failed = pool.attach_with(
+        Nv12Image::solid(4, 2, 16, 128, 128, color()).unwrap(),
+        |_| Err(multiview_compositor::error::Error::Geometry("x".to_owned())),
+    );
+    assert!(failed.is_err());
+    assert_eq!(pool.retained(), 1);
+    // Steady state: every frame reuses the same allocation; retention stays 1.
+    for frame in 0..8_u8 {
+        let image = pool
+            .attach_with(
+                Nv12Image::solid(4, 2, 16, 128, 128, color()).unwrap(),
+                |p| {
+                    p.fill(frame);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(image.alpha_plane().unwrap().as_ptr(), ptr);
+        assert_eq!(image.alpha_plane().unwrap(), &[frame; 8]);
+        assert_eq!(pool.retained(), 0);
+        drop(image);
+        assert_eq!(pool.retained(), 1);
+    }
+}

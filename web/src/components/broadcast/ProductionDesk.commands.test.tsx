@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../realtime/shared', () => ({ subscribeRealtime: () => () => undefined }));
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
@@ -55,15 +55,16 @@ function outcome(id: string, completed: boolean, error?: string) {
 // Tracker events are supplied as the shell-owned socket supplies them; no second socket.
 // Confirmation needs two polls with an advancing tick (2 s refetch), hence the longer waits.
 describe('ProductionDesk single-authority completion', { timeout: 15000 }, () => {
-  it('keeps unsupported transitions disabled before the dominant CUT in DOM order; AUTO works', async () => {
+  it('enables MIX/WIPE/DIP before the dominant CUT in DOM order; AUTO works', async () => {
     const { container } = page();
     await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });
     const keys = [...container.querySelectorAll('.bd-takes button')];
     expect(keys.map((key) => key.textContent)).toEqual(['MIX', 'WIPE', 'DIP', 'AUTO', 'CUT · cam-2']);
-    for (const key of keys.slice(0, 3)) expect(key).toBeDisabled();
+    // ADR-0112 §4: the transition keys are a supported control contract now.
+    for (const key of keys.slice(0, 3)) expect(key).not.toBeDisabled();
     expect(screen.getByRole('button', { name: 'MIX' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: 'AUTO' })).not.toBeDisabled();
-    expect(screen.getByRole('button', { name: 'AUTO' }).title).toContain('30 frames');
+    expect(screen.getByRole('button', { name: 'AUTO' }).title).toContain('AUTO MIX over 30 frames');
     expect(screen.getByRole('spinbutton', { name: 'Auto frames' })).not.toBeDisabled();
     expect(commandCount).toBe(0);
   });
@@ -277,5 +278,130 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     act(() => { getOperationTracker(client).onEnvelope(frame('op-1', outcome('op-1', true))); });
     await waitFor(() => { expect(screen.getByText(/Switcher applied/i)).toBeTruthy(); });
     expect(screen.getByRole('button', { name: 'CUT' })).toHaveProperty('disabled', false);
+  });
+
+  it('WIPE sends set_transition with the picked pattern and parameters, after a passing plan, without a take confirmation', async () => {
+    const bodies: unknown[] = [];
+    let planned: unknown;
+    server.use(
+      http.post('*/api/v1/switcher/plan', async ({ request }) => { planned = await request.json(); return HttpResponse.json({ can_take: true, class: 'class1', scene_version: 1 }); }),
+      http.post('*/api/v1/switcher/commands/set_transition', async ({ request }) => { bodies.push(await request.json()); commandCount += 1; return HttpResponse.json({ operation_id: `op-t${String(commandCount)}`, kind: 'set_transition' }, { status: 202 }); }),
+    );
+    const { client } = page();
+    const circle = await screen.findByRole('button', { name: 'Circle wipe' });
+    await waitFor(() => { expect(circle).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Reverse' }));
+    expect(screen.getByRole('img', { name: 'Preview of Horizontal wipe at 50%' })).toHaveAttribute('data-reverse', 'true');
+    await userEvent.click(circle);
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(screen.queryByRole('button', { name: 'Confirm take' })).not.toBeInTheDocument();
+    expect(planned).toMatchObject({ action: 'set_transition' });
+    expect(bodies[0]).toMatchObject({ me: 'me1', program: 'main', action: 'set_transition', transition: { kind: 'wipe', pattern: 'circle', rate: 30, reverse: true, softness: 0, border_width: 0 } });
+    expect(bodies[0]).not.toHaveProperty('duration_frames');
+    expect(screen.getByRole('img', { name: 'Preview of Circle wipe at 50%' })).toHaveAttribute('data-pattern', 'circle');
+    // The applied event releases the guard; DIP then sends its colour.
+    await screen.findByText(/waiting for the applied event/i);
+    act(() => { getOperationTracker(client).onEnvelope(frame('op-t1', outcome('op-t1', true))); });
+    await waitFor(() => { expect(screen.getByText(/Switcher applied/i)).toBeTruthy(); });
+    const dip = screen.getByRole('button', { name: 'DIP' });
+    await waitFor(() => { expect(dip).not.toBeDisabled(); });
+    await userEvent.click(dip);
+    await waitFor(() => { expect(commandCount).toBe(2); });
+    expect(bodies[1]).toMatchObject({ action: 'set_transition', transition: { kind: 'dip', rate: 30, color: '#000000' } });
+  });
+
+  it('reflects the engine-selected transition and AUTO uses it', async () => {
+    let body: unknown;
+    server.use(
+      http.get('*/api/v1/switcher/me1', () => { polls += 1; return HttpResponse.json({ ...state, tick: state.tick + polls, transition: { kind: 'wipe', pattern: 'box', rate: 30, reverse: false, softness: 0, border_width: 0 } }); }),
+      http.post('*/api/v1/switcher/commands/auto', async ({ request }) => { body = await request.json(); commandCount += 1; return HttpResponse.json({ operation_id: 'op-auto', kind: 'auto' }, { status: 202 }); }),
+    );
+    page();
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'WIPE' })).toHaveAttribute('aria-pressed', 'true'); }, { timeout: 6000 });
+    expect(screen.getByRole('button', { name: 'MIX' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: 'Box wipe' })).toHaveAttribute('aria-pressed', 'true');
+    const auto = screen.getByRole('button', { name: 'AUTO' });
+    await waitFor(() => { expect(auto).not.toBeDisabled(); }, { timeout: 6000 });
+    expect(auto.title).toContain('AUTO WIPE over 30 frames');
+    await userEvent.click(auto);
+    await userEvent.click(await screen.findByRole('button', { name: 'Confirm take' }));
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    // AUTO carries only its rate; the engine uses the selected WIPE.
+    expect(body).toMatchObject({ action: 'auto', duration_frames: 30 });
+    expect(body).not.toHaveProperty('transition');
+  });
+
+  // MED-P3-2: the draft starts from the engine's confirmed selection, keeps unsaved
+  // local edits across a later engine change, and keeps the fields it does not expose.
+  it('loads the persisted selection into the draft and an edit keeps the other fields', async () => {
+    let selection: Record<string, unknown> = { kind: 'wipe', pattern: 'box', rate: 30, reverse: true, softness: 0.3, border_width: 0, position_xy: [0.2, 0.8], flip_flop: false };
+    const bodies: unknown[] = [];
+    server.use(
+      http.get('*/api/v1/switcher/me1', () => { polls += 1; return HttpResponse.json({ ...state, tick: state.tick + polls, transition: selection }); }),
+      http.post('*/api/v1/switcher/plan', () => HttpResponse.json({ can_take: true, class: 'class1', scene_version: 1 })),
+      http.post('*/api/v1/switcher/commands/set_transition', async ({ request }) => { bodies.push(await request.json()); commandCount += 1; return HttpResponse.json({ operation_id: 'op-t', kind: 'set_transition' }, { status: 202 }); }),
+    );
+    page();
+    const reverse = await screen.findByRole('checkbox', { name: 'Reverse' });
+    await waitFor(() => { expect(reverse).toBeChecked(); }, { timeout: 6000 });
+    expect(screen.getByRole('slider', { name: 'Wipe softness' })).toHaveValue('0.3');
+    expect(screen.getByRole('img', { name: 'Preview of Box wipe at 50%' })).toHaveAttribute('data-reverse', 'true');
+    // One local edit, then the engine changes another field: the edit survives.
+    await waitFor(() => { expect(reverse).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(reverse);
+    expect(reverse).not.toBeChecked();
+    selection = { ...selection, softness: 0.4 };
+    await waitFor(() => { expect(screen.getByRole('slider', { name: 'Wipe softness' })).toHaveValue('0.4'); }, { timeout: 6000 });
+    expect(reverse).not.toBeChecked();
+    const apply = screen.getByRole('button', { name: 'Apply to WIPE' });
+    await waitFor(() => { expect(apply).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(apply);
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(bodies[0]).toMatchObject({ action: 'set_transition', transition: { kind: 'wipe', pattern: 'box', rate: 30, reverse: false, softness: 0.4, border_width: 0, position_xy: [0.2, 0.8], flip_flop: false } });
+    expect(bodies[0]).not.toHaveProperty('transition.border_color');
+  });
+
+  // P3R2-A: a positive-width wipe without a border colour draws no border; editing
+  // only Reverse must not invent a white border colour for later AUTOs.
+  it('keeps border_color absent for a colourless positive-width wipe when only Reverse changes', async () => {
+    const selection: Record<string, unknown> = { kind: 'wipe', pattern: 'box', rate: 30, reverse: false, softness: 0, border_width: 0.05 };
+    const bodies: unknown[] = [];
+    server.use(
+      http.get('*/api/v1/switcher/me1', () => { polls += 1; return HttpResponse.json({ ...state, tick: state.tick + polls, transition: selection }); }),
+      http.post('*/api/v1/switcher/plan', () => HttpResponse.json({ can_take: true, class: 'class1', scene_version: 1 })),
+      http.post('*/api/v1/switcher/commands/set_transition', async ({ request }) => { bodies.push(await request.json()); commandCount += 1; return HttpResponse.json({ operation_id: 'op-t', kind: 'set_transition' }, { status: 202 }); }),
+    );
+    page();
+    await waitFor(() => { expect(screen.getByRole('slider', { name: 'Wipe border width' })).toHaveValue('0.05'); }, { timeout: 6000 });
+    const reverse = screen.getByRole('checkbox', { name: 'Reverse' });
+    await waitFor(() => { expect(reverse).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(reverse);
+    const apply = screen.getByRole('button', { name: 'Apply to WIPE' });
+    await waitFor(() => { expect(apply).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(apply);
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(bodies[0]).toMatchObject({ action: 'set_transition', transition: { kind: 'wipe', pattern: 'box', reverse: true, border_width: 0.05 } });
+    expect(bodies[0]).not.toHaveProperty('transition.border_color');
+  });
+
+  // P3R2-A: an explicit border colour edit is still sent.
+  it('sends border_color once the operator sets it on a colourless positive-width wipe', async () => {
+    const selection: Record<string, unknown> = { kind: 'wipe', pattern: 'box', rate: 30, reverse: false, softness: 0, border_width: 0.05 };
+    const bodies: unknown[] = [];
+    server.use(
+      http.get('*/api/v1/switcher/me1', () => { polls += 1; return HttpResponse.json({ ...state, tick: state.tick + polls, transition: selection }); }),
+      http.post('*/api/v1/switcher/plan', () => HttpResponse.json({ can_take: true, class: 'class1', scene_version: 1 })),
+      http.post('*/api/v1/switcher/commands/set_transition', async ({ request }) => { bodies.push(await request.json()); commandCount += 1; return HttpResponse.json({ operation_id: 'op-t', kind: 'set_transition' }, { status: 202 }); }),
+    );
+    page();
+    await waitFor(() => { expect(screen.getByRole('slider', { name: 'Wipe border width' })).toHaveValue('0.05'); }, { timeout: 6000 });
+    const colour = screen.getByLabelText('Wipe border colour');
+    await waitFor(() => { expect(colour).not.toBeDisabled(); }, { timeout: 6000 });
+    fireEvent.input(colour, { target: { value: '#ff0000' } });
+    const apply = screen.getByRole('button', { name: 'Apply to WIPE' });
+    await waitFor(() => { expect(apply).not.toBeDisabled(); }, { timeout: 6000 });
+    await userEvent.click(apply);
+    await waitFor(() => { expect(commandCount).toBe(1); });
+    expect(bodies[0]).toMatchObject({ action: 'set_transition', transition: { kind: 'wipe', border_width: 0.05, border_color: '#ff0000' } });
   });
 });

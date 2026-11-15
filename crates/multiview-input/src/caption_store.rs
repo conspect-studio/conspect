@@ -31,6 +31,10 @@ const DEFAULT_CAPACITY: usize = 16;
 struct Entry<C> {
     start: MediaTime,
     end: MediaTime,
+    /// Store-wide publish sequence: unique per published cue for the life
+    /// of the store (never reset by a generation change), so a reader can
+    /// identify "the same cue" across ticks without comparing payloads.
+    seq: u64,
     cue: C,
 }
 
@@ -39,6 +43,8 @@ struct Entry<C> {
 struct CueWindow<C> {
     generation: u64,
     entries: Vec<Entry<C>>,
+    /// The sequence the next published cue receives.
+    next_seq: u64,
 }
 
 /// A lock-free, bounded, media-time-ordered store of caption cues for one
@@ -63,6 +69,7 @@ impl<C: Clone> CaptionCueStore<C> {
             window: SwapCell::from_pointee(CueWindow {
                 generation: 1,
                 entries: Vec::new(),
+                next_seq: 1,
             }),
             capacity: capacity.max(1),
         }
@@ -78,6 +85,7 @@ impl<C: Clone> CaptionCueStore<C> {
                 CueWindow {
                     generation,
                     entries: Vec::new(),
+                    next_seq: current.next_seq,
                 }
             }
         });
@@ -123,6 +131,7 @@ impl<C: Clone> CaptionCueStore<C> {
                 Entry {
                     start,
                     end,
+                    seq: current.next_seq,
                     cue: cue.clone(),
                 },
             );
@@ -132,6 +141,7 @@ impl<C: Clone> CaptionCueStore<C> {
             CueWindow {
                 generation,
                 entries,
+                next_seq: current.next_seq.wrapping_add(1),
             }
         });
     }
@@ -162,6 +172,20 @@ impl<C: Clone> CaptionCueStore<C> {
         generation: u64,
         project: impl FnOnce(&C) -> R,
     ) -> Option<R> {
+        self.with_active_entry_at_generation(now, generation, |_, cue| project(cue))
+    }
+
+    /// Like [`with_active_at_generation`](Self::with_active_at_generation),
+    /// also passing the cue's **identity**: a store-wide publish sequence,
+    /// unique per published cue for the life of the store (a generation
+    /// change or a same-window replacement yields a new one), so a reader can
+    /// tell a held cue from its successor without comparing payloads.
+    pub fn with_active_entry_at_generation<R>(
+        &self,
+        now: MediaTime,
+        generation: u64,
+        project: impl FnOnce(u64, &C) -> R,
+    ) -> Option<R> {
         let window = self.window.load();
         if window.generation != generation {
             return None;
@@ -171,7 +195,7 @@ impl<C: Clone> CaptionCueStore<C> {
             .iter()
             .rev()
             .find(|e| e.start <= now && now < e.end)
-            .map(|e| project(&e.cue))
+            .map(|e| project(e.seq, &e.cue))
     }
 }
 
@@ -189,6 +213,27 @@ mod tests {
     /// Build a `MediaTime` from a nanosecond count (test ergonomics).
     fn mt(ns: i64) -> MediaTime {
         MediaTime::from_nanos(ns)
+    }
+
+    #[test]
+    fn active_entry_identity_is_unique_across_replacement_and_generation() {
+        let store = CaptionCueStore::<&str>::new();
+        let id = |s: &CaptionCueStore<&str>, g| {
+            s.with_active_entry_at_generation(mt(15), g, |seq, _| seq)
+        };
+        store.publish(mt(10), mt(30), "a");
+        let first = id(&store, 1).unwrap();
+        assert_eq!(id(&store, 1), Some(first), "a held cue keeps its identity");
+        store.publish(mt(10), mt(30), "a");
+        let replaced = id(&store, 1).unwrap();
+        assert_ne!(replaced, first, "a same-window replacement is a new cue");
+        store.begin_generation(2);
+        store.publish_for_generation(2, mt(10), mt(30), "a");
+        let next = id(&store, 2).unwrap();
+        assert!(
+            next != first && next != replaced,
+            "a new generation is a new cue"
+        );
     }
 
     #[test]
