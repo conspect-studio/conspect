@@ -327,16 +327,34 @@ Decisions:
    (Cited: [access control](https://github.com/Haivision/srt/blob/master/docs/features/access-control.md),
    [`srt_listen_callback`](https://github.com/Haivision/srt/blob/master/docs/API/API-functions.md)).
    `multiview-srt-sys` does not bind that function today (Read: the function table,
-   `crates/multiview-srt-sys/src/lib.rs:139-156`); slice 6 adds it, with `srt_setrejectreason` and
-   `srt_getversion`.
-4. **The cast listener starts only on libsrt 1.5.7 or later.** Cited: advisory
+   `crates/multiview-srt-sys/src/lib.rs:139-156`); slice 6 adds it, with `srt_setrejectreason`.
+4. **No SRT listener starts on libsrt older than 1.5.7.** Cited: advisory
    [GHSA-m96h-3rc9-xx6h](https://github.com/Haivision/srt/security/advisories/GHSA-m96h-3rc9-xx6h) (published
    15 Oct 2026): a handshake packet overflows a heap buffer in a listener before authentication; affected up to
-   1.5.6; fixed in 1.5.7. mda001 runs Debian's 1.5.4-1+deb13u1 (Measured), whose changelog lists patches for
-   CVE-2026-55868 and CVE-2026-55869 only. Whether that package is affected was not tested. A new public
-   listener must not rest on that doubt, so the engine checks the loaded version and reports
-   `cast-srt-libsrt-too-old` instead of listening. The same doubt applies to the listener already on UDP 9000;
-   that is outside this ADR and is reported to the lead.
+   1.5.6; fixed in 1.5.7. The rule covers every listener the engine binds, not only the cast one: SRT listener
+   outputs, SRT listener inputs and the cast listener. All three go through `SrtListener::bind` (Read:
+   `crates/multiview-output/src/sink/push.rs:455`, `crates/multiview-cli/src/srt_ingest.rs:383`), so the check
+   lives there once: it calls `srt_getversion()` on the library it loaded (Cited: the value is `0xXXYYZZ`,
+   [API functions](https://github.com/Haivision/srt/blob/master/docs/API/API-functions.md)) and returns a typed
+   error below `0x010507`. The listener then reports `srt-libsrt-too-old` with both versions as its
+   `last_error`; the rest of the run is unaffected, as with a library that fails to load. Caller-mode SRT is
+   not covered by the advisory and is not changed. This is slice S (decision 8); it does not wait for the ladder.
+
+   State of the test host. At 00:00 UTC on 15 Nov the engine on mda001 had Debian's libsrt 1.5.4-1+deb13u1
+   mapped, with a public listener on UDP 9000 (Measured). The lead then built upstream 1.5.7 on the host. At
+   01:02 UTC the running engine maps `/opt/libsrt-1.5.7/lib/libsrt.so.1.5.7` and UDP 9000 answers an SRT
+   induction on IPv4 and IPv6 (Measured).
+
+   Two costs of the rule, stated plainly. First, the shipped container images install `libsrt1.5-openssl` from
+   Debian trixie, which is 1.5.4 (Read: `deploy/Dockerfile:111`, `:208`, `deploy/Dockerfile.nvidia:108`,
+   `:207`; the version from Debian's tracker). The CI jobs install the same package name on `ubuntu-latest`
+   (Read: `.github/workflows/ci.yml:747`, `:841`, `:965`); its version there was not checked and is assumed to
+   be below 1.5.7. With the check in place every SRT listener in those images refuses to start, and the CI
+   legs that run a real listener fail, until the images and CI carry 1.5.7. Slice S therefore changes both in
+   the same pull request. Second, a distribution that
+   backports the fix without changing the version number is refused too. There is no override: a switch that
+   re-opens a pre-authentication memory fault is not offered. Whether Debian's 1.5.4-1+deb13u1 is in fact
+   affected was not tested and no longer matters to this rule.
 5. **Latency setting.** 250 ms receive latency on both ends at first. Cited: "The recommended value of
    TsbpdDelay is 3-4 times RTT", minimum 120 ms
    ([draft-sharabayko-srt-01](https://www.ietf.org/archive/id/draft-sharabayko-srt-01.txt), section 4.5.1). 250 ms
@@ -568,15 +586,17 @@ Order matters: the first three slices decide whether the later ones are built as
 | # | Pull request | Class | Depends on | What it proves |
 | --- | --- | --- | --- | --- |
 | 0 | This ADR and its line in the index. The cast runbook is not touched: it describes what runs, and nothing here runs yet | R0 | none | The design is reviewed before code |
+| S | **libsrt floor for every SRT listener.** `srt_getversion` in `multiview-srt-sys`; `SrtListener::bind` refuses below 1.5.7 with a typed error; libsrt 1.5.7 in the container images and the CI jobs; runbook line | R2 | none (touches no cast file; does not wait for PR 466) | A listener on an older library does not bind and says why; the existing SRT listener tests pass on 1.5.7; the image's SRT smoke test passes |
 | 1 | **Latency slate and evidence.** A test source that draws the engine clock (ms) and the tick; the reference clock page; tick-to-packet delay of the shared encoder as a metric; the receiver's HLS reports gain tick-to-present | R2 | PR 466 merged | The baseline: glass-to-glass and tick-to-present for today's HLS on the operator's Chromecast, and the encoder delay that bounds every rung. Records the device's user agent |
 | 2 | **Ladder endpoint and one authorization.** `POST /cast/<token>/ladder` with the probe stored and shown; the shared token check; attachment fences set on revoke, expiry and feed change; liveness by report; `[cast] ladder`. The answer offers `hls` only. `receiver.js` sends the probe and still plays HLS | R3 | 1 | One token governs every transport: the PR 409 abuse tests pass against a fake push attachment, including a forced engine fallback (zero packets of a feed the owner may not read). From the first device cast: the real capability table of that device |
 | 3 | **CAF spike, in the harness, no product code path.** A `<video>` element fed from outside CAF's player; LOAD interceptor returning `null`; `setMediaElement`, `setMediaInformation`, `broadcastStatus` | R1 (tools only) | 2 | Whether a Web Receiver can show a picture CAF did not load and still give senders a correct media session. Checks the page policy against a cross-origin WebTransport session. A fail ends slices 4 and 5 |
 | 4 | **MoQ rung.** Engine: cast outputs admitted to MoQ leases through the ladder; lease renewal by the ladder call. Receiver: `moq.js` (WebTransport, CMAF wrap, `SourceBuffer`), deadlines, step-down, memory | R3 | 3 passed; the probe data shows a device with `wt` and `mse` | MoQ plays through the real CAF SDK in the harness with media status correct; a wedged or stalled MoQ attachment costs the clock zero ticks and other bindings zero packets; device test with glass-to-glass |
 | 5 | **WebRTC rung.** `POST` and `DELETE /cast/<token>/whep`; one Opus encoder per cast output; PLI ignored; receiver `rtc.js`; ICE-TCP | R3 | 3 passed | WebRTC plays in the harness with UDP blocked (TCP 443 only); the Opus encoder count stays one with several viewers; chaos as slice 4; device test |
-| 6 | **SRT rung and the Android TV app.** Engine: listen callback in `multiview-srt-sys`, version floor 1.5.7, the cast SRT listener, HKDF derivation, attachment per token. App: `android/cast-tv/`, CI job that builds the APK. Senders: `androidReceiverCompatible`, `supportedAppTypes`, behind `[cast] android_tv` | R3 | 2 | Engine: a libsrt caller with the derived id and passphrase receives valid MPEG-TS; a wrong passphrase, an unknown id and a revoked token get nothing; churn and a wedged caller do not slow the producer. Device: the app launches when installed, the Web Receiver when not; SRT plays; a blocked port falls to HLS and the next cast to the Web Receiver |
+| 6 | **SRT rung and the Android TV app.** Engine: listen callback in `multiview-srt-sys`, the cast SRT listener, HKDF derivation, attachment per token. App: `android/cast-tv/`, CI job that builds the APK. Senders: `androidReceiverCompatible`, `supportedAppTypes`, behind `[cast] android_tv` | R3 | 2, S | Engine: a libsrt caller with the derived id and passphrase receives valid MPEG-TS; a wrong passphrase, an unknown id and a revoked token get nothing; churn and a wedged caller do not slow the producer. Device: the app launches when installed, the Web Receiver when not; SRT plays; a blocked port falls to HLS and the next cast to the Web Receiver |
 | 7 | **Measured ladder.** Run the matrix; set the offer order, deadlines, SRT latency and player buffers from the data; remove any rung that does not beat the one below it on a class; enable `android_tv` by default if slice 6's first device step passed; runbook; this ADR to Accepted with the table | R2 | 4, 5, 6 as built | The ladder's order and targets are measurements. Every cell of the table is filled or marked as not built, with the reason |
 
-Slices 4, 5 and 6 are independent of each other after 2 (and 3 for the web rungs). Slice 6 is the largest and
+Slice S is independent of everything else and goes first. Slices 4, 5 and 6 are independent of each other
+after 2 (and 3 for the web rungs). Slice 6 is the largest and
 has the longest operator lead time, so it starts as soon as 2 is merged. If the probe data from slice 2 shows
 that no device in hand has `wt`, slice 4 is deferred, not built blind.
 
@@ -654,9 +674,9 @@ captain as one list; none blocks slices 0 to 5 from merging.
   exists in the build environment today (Measured: no `java`, `gradle` or Android SDK on the build host).
 - **Default build.** Unchanged: `cargo check --workspace` gains no native dependency. The SRT rung needs the
   existing opt-in `srt-libsrt` feature and libsrt 1.5.7 or later on the host.
-- **Operations.** mda001 needs libsrt 1.5.7 before the SRT rung can be enabled there (Debian trixie ships
-  1.5.4; 1.5.7 is in forky and sid, Read: Debian's security tracker for `srt`). That is a deploy step for the
-  lead. Receiver changes still ship twice, engine copy and hosted copy.
+- **Operations.** Every host that runs an SRT listener needs libsrt 1.5.7 or later once slice S is deployed
+  (Debian trixie ships 1.5.4; 1.5.7 is in forky and sid, Read: Debian's security tracker for `srt`). mda001
+  already loads 1.5.7 from `/opt/libsrt-1.5.7`. Receiver changes still ship twice, engine copy and hosted copy.
 - **What a viewer sees when things go wrong.** A slower start by at most the sum of the deadlines of the rungs
   that failed, once per 15 minutes; then a picture. Never a blank screen that HLS would have filled.
 - **Honest limit.** Until slice 7, every latency figure in this document is a target. If the measured ladder
@@ -676,6 +696,6 @@ captain as one list; none blocks slices 0 to 5 from merging.
 | What the Cast platform does when `androidReceiverCompatible` is set and the app is not installed | slice 6, first device step |
 | Whether `supportedAppTypes` in the engine-side LAUNCH selects the Android TV app | slice 6 device test |
 | Whether UDP 443 and UDP 9010 pass from the network the Cast devices are on | slices 4 and 6 device tests |
-| Whether Debian's libsrt 1.5.4-1+deb13u1 is affected by GHSA-m96h-3rc9-xx6h (concerns the existing listener on UDP 9000) | reported to the lead; outside this ADR |
+| How libsrt 1.5.7 reaches the container images and CI (a Debian backport, or a build in the FFmpeg base image, which links libsrt) | slice S |
 | Minimum Android API of Media3 and the Cast TV library | slice 6 |
 
