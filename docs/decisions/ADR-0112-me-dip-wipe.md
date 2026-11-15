@@ -142,6 +142,11 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
      mix_rate`, so `mix_rate = 1` is a CUT on `trigger_point` and the last mix
      frame is fully incoming. At most three full-canvas tiles above the cell
      (outgoing cell, incoming, clip); the scratch pool is sized once for them.
+     Tile order (after ADR-0113): layout cells, then the transition tiles,
+     then the stinger clip, then the downstream keyers, because the clip is
+     part of the M/E transition and a DSK sits over the M/E output; tied
+     DSKs ride the stinger's mix window (MIX envelope), hold their state
+     through pre-roll, and land on `swap_at` with the take.
    - **Swap and end.** The take completes (Program/Preview swap, outcome
      published, completion counted once) on `swap_at = pre_roll +
      trigger_point + mix_rate`; the flight then stays in flight through the

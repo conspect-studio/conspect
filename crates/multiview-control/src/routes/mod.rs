@@ -49,6 +49,7 @@ pub mod overlays;
 pub mod patch;
 /// Output slots in the patch panel (#342 B2).
 pub(crate) mod patch_output;
+pub mod patch_set;
 pub(crate) mod patch_subtitle;
 pub mod preview;
 pub mod probes;
@@ -1535,6 +1536,7 @@ pub fn api_router() -> Router<AppState> {
         )
         .route("/salvos/{id}/arm", post(salvos::arm_salvo))
         .route("/salvos/{id}/take", post(salvos::take_salvo))
+        .route("/salvos/{id}/plan", post(salvos::plan_salvo))
         .route("/salvos/{id}/cancel", post(salvos::cancel_salvo))
         // Salvo parity (Conspect §11): fire a named salvo through the bus → 202.
         .route("/salvos/{id}/fire", post(account::fire_salvo))
@@ -1558,6 +1560,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/media/players", get(media_players::list_players))
         .route("/media/players/{id}", get(media_players::get_player))
         .route("/media/players/{id}/load", post(media_players::load_player))
+        .route("/media/players/{id}/load-operations/{operation}", get(media_players::load_operation))
         .route("/media/players/{id}/cue", post(media_players::cue_player))
         .route("/media/players/{id}/play", post(media_players::play_player))
         .route("/media/players/{id}/pause", post(media_players::pause_player))

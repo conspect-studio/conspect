@@ -54,6 +54,7 @@ import { Trans, useLingui } from '@lingui/react/macro';
 import {
   CheckCircle2,
   CircleStop,
+  CloudSun,
   FlagTriangleRight,
   FolderInput,
   Pause,
@@ -94,6 +95,7 @@ import {
 } from '../components/ui/dialog';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
+import { WindyFillDialog } from './WindyFillDialog';
 import {
   classifySubmissionError,
   configuredDefaultAsset,
@@ -132,6 +134,7 @@ interface MediaPlayerCardProps {
   readonly onFocus: () => void;
   readonly onSubmit: (player: MediaPlayer, vars: TransportVars, label: string) => void;
   readonly onOpenLoad: (player: MediaPlayer) => void;
+  readonly onOpenFill: (player: MediaPlayer) => void;
   readonly onDismissOutcome: (playerId: string) => void;
   readonly stateLabel: (kind: StateKind) => string;
   readonly operationLabel: (verb: TransportAction, player: MediaPlayer) => string;
@@ -155,6 +158,7 @@ function MediaPlayerCard({
   onFocus,
   onSubmit,
   onOpenLoad,
+  onOpenFill,
   onDismissOutcome,
   stateLabel,
   operationLabel,
@@ -452,6 +456,16 @@ function MediaPlayerCard({
               <FolderInput aria-hidden="true" />
               <Trans>Load</Trans>
             </TouchAction>
+            <TouchAction
+              variant="outline"
+              aria-label={`${t`Fill from web…`}: ${player.id}`}
+              onPress={(): void => {
+                onOpenFill(player);
+              }}
+            >
+              <CloudSun aria-hidden="true" />
+              <Trans>Fill from web…</Trans>
+            </TouchAction>
           </div>
           {unresolved.filter((entry) => entry !== op).length > 0 ? (
             <div role="status" className="mt-2 rounded-md border border-amber-500/50 p-2 text-xs break-words">
@@ -567,6 +581,7 @@ export function MediaPlayersPage(): JSX.Element {
 
   const [mediaTab, setMediaTab] = useState<MediaTab>('transport');
   const [loadFor, setLoadFor] = useState<MediaPlayer | null>(null);
+  const [fillFor, setFillFor] = useState<MediaPlayer | null>(null);
   const [assetDraft, setAssetDraft] = useState('');
   const [assetMissing, setAssetMissing] = useState(false);
   // The focused slot and each card's Details disclosure are caller-owned
@@ -744,6 +759,10 @@ export function MediaPlayersPage(): JSX.Element {
     setLoadFor(player);
   };
 
+  const openFill = (player: MediaPlayer): void => {
+    setFillFor(player);
+  };
+
   const loadOp = loadFor !== null ? ops[loadFor.id] : undefined;
   const dialogPending = loadOp?.phase === 'sending' && loadOp.verb === 'load';
 
@@ -780,6 +799,7 @@ export function MediaPlayersPage(): JSX.Element {
       }}
       onSubmit={submit}
       onOpenLoad={openLoad}
+      onOpenFill={openFill}
       onDismissOutcome={dismissOutcome}
       stateLabel={stateLabel}
       operationLabel={operationLabel}
@@ -905,6 +925,19 @@ export function MediaPlayersPage(): JSX.Element {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <WindyFillDialog
+        // Keyed by player id: a fresh mount for each player resets all the
+        // dialog's draft/job/load state cleanly instead of an effect that
+        // would set state synchronously during render.
+        key={fillFor?.id ?? 'none'}
+        player={fillFor}
+        onOpenChange={(open: boolean): void => {
+          if (!open) {
+            setFillFor(null);
+          }
+        }}
+      />
     </>
   );
 }

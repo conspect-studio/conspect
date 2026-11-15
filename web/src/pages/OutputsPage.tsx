@@ -1585,7 +1585,12 @@ export function OutputsSurface({
                 <RunnabilityNote kind={form.kind} />
                 <OutputKindFields form={form} setForm={setForm} errors={errors} />
                 <CodecFields form={form} setForm={setForm} errors={errors} />
-                <OutputFormatFields form={form} setForm={setForm} editing={!creating} />
+                <OutputFormatFields
+                  form={form}
+                  setForm={setForm}
+                  editing={!creating}
+                  sources={audioSources}
+                />
                 <OutputAdvancedFields
                   form={form}
                   setForm={setForm}

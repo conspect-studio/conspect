@@ -54,6 +54,8 @@ fn me(cfg: &mut MultiviewConfig) {
             preview_input: None,
             transition: None,
         }],
+        downstream_keyers: vec![],
+        keyer_budget: None,
         extra: serde_json::Map::new(),
     });
 }

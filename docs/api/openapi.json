@@ -6811,6 +6811,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required for artifactRef; stable actor-scoped retry key.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -6825,11 +6834,11 @@
         },
         "responses": {
           "202": {
-            "description": "Load accepted; outcome on the realtime stream.",
+            "description": "Legacy load returns an accepted command; artifactRef load returns an operation whose completion requires native video and audio adoption.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AcceptedBody"
+                  "$ref": "#/components/schemas/LoadResponse"
                 }
               }
             }
@@ -6876,6 +6885,89 @@
           },
           "503": {
             "description": "Engine command bus at capacity; shed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media/players/{id}/load-operations/{operation}": {
+      "get": {
+        "tags": [
+          "media-players"
+        ],
+        "summary": "Read one actor- and player-scoped native load operation.",
+        "operationId": "get_player_load_operation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Authorized player identity.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "operation",
+            "in": "path",
+            "description": "Native load generation.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Actual native load outcome.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoadOperation"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Player access denied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Operation is unknown or belongs to another actor.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Native player provider unavailable.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8266,7 +8358,7 @@
         "tags": [
           "patch"
         ],
-        "summary": "Plan 1..64 mixer crosspoints (path, on-air flag, refusals) or the slots of\none output (§12.4 path P1/P2/P3 and cost); no change.",
+        "summary": "Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the\nslots of one output (§12.4 path P1/P2/P3 and cost), or an atomic set\nover many destinations (#308: every member planned, `can_take` only when\nall can and the set's new encoders fit the caller's caps); no change.",
         "operationId": "plan_patch",
         "requestBody": {
           "content": {
@@ -8280,11 +8372,11 @@
         },
         "responses": {
           "200": {
-            "description": "",
+            "description": "The plan: a `PatchPlan`, or for an atomic set of two or more destinations a `SetPlan` that adds `set: {new_encoders, fits}` (#308).",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PatchPlan"
+                  "$ref": "#/components/schemas/PatchPlanResponseDoc"
                 }
               }
             }
@@ -8320,7 +8412,7 @@
             }
           },
           "422": {
-            "description": "`slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; two outputs, mixer + output, or subtitle crosspoints mixed with video/audio ones: multi-destination sets arrive with patch salvos #308), `unknown-source` (a layout or bus on a mixer input; an unknown feed), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A subtitle slot (`{\"source\": id}` or `\"none\"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track).",
+            "description": "`slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; subtitle crosspoints mixed with video/audio ones or naming two outputs), `unknown-source` (a layout or bus on a mixer input; an unknown feed; more than 4 distinct layouts in one set), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A subtitle slot (`{\"source\": id}` or `\"none\"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track).",
             "content": {
               "application/json": {
                 "schema": {
@@ -8347,7 +8439,7 @@
         "tags": [
           "patch"
         ],
-        "summary": "Take 1..64 mixer crosspoints atomically at one engine tick, or one\noutput's video slot 0 (+ audio slot 0 follow) through the same machinery\nas `POST /routing/output/take` (the slot-0 alias; shared idempotency\nstore and limits; the outcome rides `route.output`).",
+        "summary": "Take 1..64 mixer crosspoints atomically at one engine tick, one output's\nvideo slot 0 (+ audio slot 0 follow) through the same machinery as\n`POST /routing/output/take` (the slot-0 alias; shared idempotency store\nand limits; the outcome rides `route.output`), or an atomic set over many\ndestinations (#308; outcome `patch.take`).",
         "operationId": "take_patch",
         "parameters": [
           {
@@ -8372,7 +8464,7 @@
         },
         "responses": {
           "202": {
-            "description": "",
+            "description": "Accepted. A set of two or more destinations (#308) settles on `patch.take` (one delivery per destination, scoped by it); mixer inputs alone on `switcher.operation`; one output on `route.output`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8382,7 +8474,7 @@
             }
           },
           "403": {
-            "description": "Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source; a replayed key is re-authorized.",
+            "description": "Not authorized for a destination (M/E object + Program scope; an output: object AND output axis) or a source (a layout: its id and whole source closure) of ANY member; nothing is enqueued and no key is burned; a replayed key is re-authorized.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8402,7 +8494,7 @@
             }
           },
           "409": {
-            "description": "`conflict` (an output take's Idempotency-Key first used for another output, feed or subtitle slot map; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity`, `aux-capacity` (no free layout canvas), or no source lease.",
+            "description": "`conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions), `aux-capacity` (no free layout canvas), or no source lease.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8412,7 +8504,7 @@
             }
           },
           "422": {
-            "description": "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run`, after an applied one is persisted as the slots' `source` (in swap order). `subtitle:applied` means the route table was swapped. The outcome's `tick` is a completed-tick lower bound observed before the swap: the subtitle sampler had completed that tick (`0`: possibly none yet) before the swap; it is not a landing tick. A sample already in flight finishes on the old table; the first table read that starts after the swap sees the new route, unless a later take supersedes it first (then this one is never sampled) or the run ends first.",
+            "description": "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run` (see the subtitle design note).",
             "content": {
               "application/json": {
                 "schema": {
@@ -8422,7 +8514,7 @@
             }
           },
           "429": {
-            "description": "Over 2 takes/s per destination or 10/s per principal (one request = one take); see Retry-After.",
+            "description": "Over 2 takes/s per destination or 10/s per principal (one request = one take, whatever its crosspoint count; a set counts once per destination); see Retry-After.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8432,7 +8524,7 @@
             }
           },
           "503": {
-            "description": "`engine-busy` (the key and leases are released; a subtitle take between engine runs or after the run ended, or while the bounded subtitle persistence queue is full: nothing changed, the key freed and the rate slot refunded; or an output slot's `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity`.",
+            "description": "`engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity` (also: 256 sets already await their outcome).",
             "content": {
               "application/json": {
                 "schema": {
@@ -10407,7 +10499,7 @@
             }
           },
           "403": {
-            "description": "Not authorized to write.",
+            "description": "Not authorized to write, or (a patch salvo, #308) not authorized for a patch member's destination or source: every member's both ends are authorized at store time.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10427,7 +10519,17 @@
             }
           },
           "422": {
-            "description": "The salvo failed validation.",
+            "description": "The salvo failed validation (a patch salvo: more than 64 crosspoints, a destination twice, an unknown source, mixer input, output or layout, or an unsupported crosspoint shape).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`engine-busy`: a patch member's `{layout}` could not be read now; retry.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10690,6 +10792,98 @@
         }
       }
     },
+    "/api/v1/salvos/{id}/plan": {
+      "post": {
+        "tags": [
+          "salvos"
+        ],
+        "summary": "`POST /api/v1/salvos/{id}/plan` — plan a patch salvo's crosspoints\n(#308): the `POST /patch/plan` answer for the stored crosspoints and\n`on_air`, authorized like the take; no change. `arm` keeps its legacy\nmeaning.",
+        "operationId": "plan_salvo",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Salvo id to plan.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The patch plan of the salvo's crosspoints (as `POST /patch/plan`): a `PatchPlan`, or a `SetPlan` with `set: {new_encoders, fits}` for two or more destinations.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PatchPlanResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for the salvo or for a patch member's destination or source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No salvo with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "As `POST /patch/plan`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The salvo has no patch crosspoints, or as `POST /patch/plan`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`engine-busy`: a `{layout}` could not be read now.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/salvos/{id}/take": {
       "post": {
         "tags": [
@@ -10722,11 +10916,11 @@
         ],
         "responses": {
           "202": {
-            "description": "Take accepted; outcome on the realtime stream.",
+            "description": "Take accepted; outcome on the realtime stream. A salvo with only legacy recalls answers `AcceptedBody` (outcome `salvo.taken`). A patch salvo (#308) answers `{operation_id, status: \"accepted\", recall_operation_id?}`: its crosspoints are taken atomically through the `POST /patch/take` set path (outcome `patch.take`, for one destination too) and a legacy recall, when present, is submitted too (`recall_operation_id`).",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AcceptedBody"
+                  "$ref": "#/components/schemas/SalvoTakeAcceptedDoc"
                 }
               }
             }
@@ -10742,7 +10936,7 @@
             }
           },
           "403": {
-            "description": "Not authorized to take.",
+            "description": "Not authorized to take (a patch salvo: every member's both ends are re-authorized under the caller's current grants).",
             "content": {
               "application/json": {
                 "schema": {
@@ -10761,8 +10955,28 @@
               }
             }
           },
+          "409": {
+            "description": "A patch salvo: as `POST /patch/take` (`conflict`, `capacity`, `on-air-protected`, ...).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "422": {
             "description": "`switcher-owns-program`: a switcher M/E is declared and the salvo recalls a layout or cell sources (Program is the M/E bus; edit the stored layout with `PUT /api/v1/layouts/{id}` or use a switcher select). Refused before the Idempotency-Key is reserved. A salvo of only tally/UMD recalls is unaffected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "A patch salvo: as `POST /patch/take`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14757,6 +14971,27 @@
           "output": {
             "type": "string",
             "description": "The output API id (the id `/api/v1/outputs/{id}` addresses)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArtifactRef": {
+        "type": "object",
+        "description": "Exact immutable completed capture selector; no path or owner override.",
+        "required": [
+          "captureJobId",
+          "artifactId"
+        ],
+        "properties": {
+          "artifactId": {
+            "type": "string",
+            "description": "Exact artifact ID returned by that job."
+          },
+          "captureJobId": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Actor-owned completed capture job.",
+            "minimum": 0
           }
         },
         "additionalProperties": false
@@ -18975,6 +19210,58 @@
         },
         "additionalProperties": false
       },
+      "LoadOperation": {
+        "type": "object",
+        "description": "Bounded operation view; completion needs native video and audio adoption.",
+        "required": [
+          "operation",
+          "state"
+        ],
+        "properties": {
+          "native": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NativeLoadAck",
+                "description": "Native facts once adopted."
+              }
+            ]
+          },
+          "operation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Operation id.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "Lifecycle state name."
+          }
+        }
+      },
+      "LoadResponse": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AcceptedBody",
+            "description": "Existing command-bus receipt, not proof of native adoption."
+          },
+          {
+            "$ref": "#/components/schemas/LoadOperation",
+            "description": "Native operation and its actual adoption state."
+          }
+        ],
+        "description": "Wire responses of the legacy command and explicit native artifact load."
+      },
+      "LoadThen": {
+        "type": "string",
+        "description": "Commit landing intent.",
+        "enum": [
+          "cue",
+          "resume"
+        ]
+      },
       "LogLevelDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of [`multiview_telemetry::LogLevel`] (ADR-0060): the five\n`tracing` severities. Serde-equivalent: a unit enum rendered lowercase.",
@@ -19613,6 +19900,87 @@
           "track": {
             "type": "string",
             "description": "Stable rendition identity inside the family (the published track name)."
+          }
+        }
+      },
+      "NativeLoadAck": {
+        "type": "object",
+        "description": "Actual native facts, never acceptance-derived metadata.",
+        "required": [
+          "operation",
+          "generation",
+          "source_id",
+          "cadence_num",
+          "cadence_den",
+          "width",
+          "height",
+          "has_audio",
+          "timeline_ns"
+        ],
+        "properties": {
+          "cadence_den": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cadence denominator."
+          },
+          "cadence_num": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cadence numerator."
+          },
+          "duration_frames": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Probed duration in whole frames, if known.",
+            "minimum": 0
+          },
+          "duration_ns": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Actual probed duration converted with the exact rational cadence."
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Load generation the player committed.",
+            "minimum": 0
+          },
+          "has_audio": {
+            "type": "boolean",
+            "description": "Whether the clip carries adopted audio."
+          },
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Frame height in pixels.",
+            "minimum": 0
+          },
+          "operation": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Operation id of the load.",
+            "minimum": 0
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Source id the player adopted."
+          },
+          "timeline_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Timeline position in nanoseconds."
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Frame width in pixels.",
+            "minimum": 0
           }
         }
       },
@@ -20520,6 +20888,91 @@
         ],
         "description": "`OpenAPI` mirror of `multiview_config::Output` (tagged by `kind`) — the body\naccepted by `POST`/`PUT /api/v1/outputs/{id}`."
       },
+      "OutputClockReport": {
+        "type": "object",
+        "description": "One per-output clock in [`ProgramMetricsReport::output_clocks`] (#343).",
+        "required": [
+          "fps",
+          "outputs",
+          "ticks_total",
+          "window_ticks",
+          "lateness_max_ms",
+          "skipped_ticks",
+          "dropped_offers",
+          "late_latches",
+          "dropped_audio"
+        ],
+        "properties": {
+          "dropped_audio": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Program audio events dropped on this clock's outputs.",
+            "minimum": 0
+          },
+          "dropped_offers": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Offers a full or ended output worker refused (the output fills).",
+            "minimum": 0
+          },
+          "fps": {
+            "type": "string",
+            "description": "The clock's output rate, `num/den` (e.g. `25/1`)."
+          },
+          "late_latches": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks whose latched Program frame was more than one Program period\nold (Program fell behind the latch delay).",
+            "minimum": 0
+          },
+          "lateness_max_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "Largest wake lateness since the run started, ms."
+          },
+          "lateness_p50_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "p50 wake lateness over the window: the upper edge of its bucket, ms."
+          },
+          "lateness_p99_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "p99 wake lateness over the window: the upper edge of its bucket, ms."
+          },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The config ids of the outputs on this clock."
+          },
+          "skipped_ticks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Tick indices skipped by the catch-up (the clock was late by more than\n8 ticks; the outputs repeat their last picture over the gap).",
+            "minimum": 0
+          },
+          "ticks_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks emitted since the run started.",
+            "minimum": 0
+          },
+          "window_ticks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks in the window (about the last 10 s).",
+            "minimum": 0
+          }
+        }
+      },
       "OutputFlipDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of `multiview_config::OutputFlip` (ADR-0089 §2.2). A flip is\npixel-only (no container \"flip\" tag), so it forces the pixels path.",
@@ -21153,7 +21606,7 @@
       },
       "PatchAccepted": {
         "type": "object",
-        "description": "`POST /patch/take` 202 answer; the outcome arrives as `switcher.operation`.",
+        "description": "`POST /patch/take` 202 answer. The outcome arrives as `switcher.operation`\n(mixer inputs), `route.output` (one output) or, for a set of two or more\ndestinations, `patch.take` (#308).",
         "required": [
           "operation_id",
           "status"
@@ -21162,6 +21615,13 @@
           "operation_id": {
             "type": "string",
             "description": "Correlates with `switcher.operation.operation_id`."
+          },
+          "recall_operation_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A patch salvo that also recalls layout/sources/tally/UMD: the\noperation id of that recall (its outcome rides `salvo.taken`)."
           },
           "status": {
             "type": "string",
@@ -21257,6 +21717,17 @@
             "description": "Per-crosspoint plan, request order."
           }
         }
+      },
+      "PatchPlanResponseDoc": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/PatchPlan"
+          },
+          {
+            "$ref": "#/components/schemas/SetPlan"
+          }
+        ],
+        "description": "A `PatchPlan` for mixer inputs or one output, or a `SetPlan` (with `set: {new_encoders, fits}`) for an atomic set of two or more destinations."
       },
       "PatchRefusal": {
         "type": "object",
@@ -22055,6 +22526,13 @@
             ],
             "format": "double",
             "description": "p99 lateness over the window: the upper edge of its bucket, ms."
+          },
+          "output_clocks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OutputClockReport"
+            },
+            "description": "The per-output clocks of outputs at a rate other than Program's\n(#343, output-routing §12.6). Empty when every output runs at\nProgram's rate."
           },
           "ticks_total": {
             "type": "integer",
@@ -23033,6 +23511,17 @@
             ],
             "description": "Recall a named layout (preset or head layout name)."
           },
+          "on_air": {
+            "$ref": "#/components/schemas/OnAir",
+            "description": "The patch crosspoints' on-air guard (default `protect`)."
+          },
+          "patch": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PatchCrosspoint"
+            },
+            "description": "Patch crosspoints taken atomically at one tick through the\n`POST /patch/take` set path (#308); the `/patch` crosspoint shape."
+          },
           "sources": {
             "type": "array",
             "items": {
@@ -23055,6 +23544,17 @@
             "description": "UMD label changes."
           }
         }
+      },
+      "SalvoTakeAcceptedDoc": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AcceptedBody"
+          },
+          {
+            "$ref": "#/components/schemas/PatchAccepted"
+          }
+        ],
+        "description": "`AcceptedBody` for a salvo with only legacy recalls; `PatchAccepted` for a patch salvo (#308)."
       },
       "SaveCastSessionRequest": {
         "type": "object",
@@ -23240,6 +23740,25 @@
         ],
         "description": "An IS-04 **Sender**: an egress flow (a Conspect program/preview output)."
       },
+      "SetCost": {
+        "type": "object",
+        "description": "The aggregate cost of a set (`POST /patch/plan`, #308): its NEW encoder\ndelta, deduplicated per identical engine encoder identity (feed at the\noutput's format, encoder settings, live reset settings), against the\ncaller's per-principal cap and the global sessions.",
+        "required": [
+          "new_encoders",
+          "fits"
+        ],
+        "properties": {
+          "fits": {
+            "type": "boolean",
+            "description": "Whether that delta fits the caller's cap and the global sessions now."
+          },
+          "new_encoders": {
+            "type": "integer",
+            "description": "New encoder sessions the whole set opens.",
+            "minimum": 0
+          }
+        }
+      },
       "SetModeAccepted": {
         "type": "object",
         "description": "The `202 Accepted` body for `set-mode`: the operation id, the **declared**\npre-apply impact class, and the human-readable impact statement (ADR-M009 —\nthe API surfaces the impact BEFORE applying).",
@@ -23314,6 +23833,27 @@
             "description": "The desired converged work mode (driver vocabulary, e.g. `encoder`)."
           }
         }
+      },
+      "SetPlan": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/PatchPlan",
+            "description": "The per-member plan (same fields as a single-destination plan)."
+          },
+          {
+            "type": "object",
+            "required": [
+              "set"
+            ],
+            "properties": {
+              "set": {
+                "$ref": "#/components/schemas/SetCost",
+                "description": "The whole set's encoder delta and fit (sets only)."
+              }
+            }
+          }
+        ],
+        "description": "The plan body of a set: the [`PatchPlan`] plus its aggregate cost."
       },
       "SetupCodeBody": {
         "type": "object",
@@ -26486,6 +27026,17 @@
         "type": "object",
         "description": "The optional JSON body a transport verb may carry: an `asset` (for `load`)\nand/or a `frame` (for `cue`/`seek`). All fields are optional so a verb that\nneeds no body (`play`/`pause`/`stop`, or `cue`/`seek` to the in-point) may\ncarry an empty body.",
         "properties": {
+          "artifactRef": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArtifactRef",
+                "description": "Exact completed capture identity; mutually exclusive with legacy asset."
+              }
+            ]
+          },
           "asset": {
             "type": [
               "string",
@@ -26501,8 +27052,13 @@
             "format": "int64",
             "description": "The target frame, asset-relative, integer frames at the output cadence\n(ADR-T015); used by `cue`/`seek`. Absent cues/seeks to the in-point.",
             "minimum": 0
+          },
+          "then": {
+            "$ref": "#/components/schemas/LoadThen",
+            "description": "Native commit landing intent; defaults to cue."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "TransportParams": {
         "type": "object",

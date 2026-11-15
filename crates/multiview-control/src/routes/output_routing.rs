@@ -299,6 +299,12 @@ pub(crate) fn routing_unavailable() -> Response {
         .into_response()
 }
 
+/// Refusal kind: Clean while a downstream keyer is defined (ADR-0113, K2a).
+pub(crate) const CLEAN_UNAVAILABLE_WITH_DSK: &str = "clean-unavailable-with-dsk";
+/// Operator text for [`CLEAN_UNAVAILABLE_WITH_DSK`].
+pub(crate) const CLEAN_WITH_DSK_TEXT: &str =
+    "Clean is unavailable while a downstream keyer is defined; pre-DSK Clean is not built yet";
+
 pub(crate) fn refusal_problem(status: u16, kind: &str, detail: String) -> Response {
     Problem::new(status, kind, "Take refused")
         .with_detail(detail)
@@ -306,7 +312,10 @@ pub(crate) fn refusal_problem(status: u16, kind: &str, detail: String) -> Respon
 }
 
 /// The accepted output body behind an API id (`None` = unknown).
-fn output_of(state: &AppState, api_id: &str) -> ControlResult<Option<multiview_config::Output>> {
+pub(crate) fn output_of(
+    state: &AppState,
+    api_id: &str,
+) -> ControlResult<Option<multiview_config::Output>> {
     let resources = crate::boot_model::accepted_resources(state, "outputs")?
         .map_or_else(|| state.outputs.list(), Ok)?;
     for versioned in resources {
@@ -1017,6 +1026,10 @@ fn plan_video(
             kind: "switcher-required".to_owned(),
             detail: "Preview and Clean need a switcher (M/E) in this run".to_owned(),
         }),
+        Err(PlanRefusal::CleanUnavailableWithDsk) => refusals.push(OutputPlanRefusal {
+            kind: CLEAN_UNAVAILABLE_WITH_DSK.to_owned(),
+            detail: CLEAN_WITH_DSK_TEXT.to_owned(),
+        }),
         Err(PlanRefusal::OutputKindUnroutable) => refusals.push(OutputPlanRefusal {
             kind: "output-kind-unroutable".to_owned(),
             detail: "This output's kind cannot switch feeds live in this release".to_owned(),
@@ -1094,7 +1107,7 @@ fn audio_unsupported() -> Response {
 
 /// The take-time audio gate (`Some` = refused): an explicit audio choice on
 /// an output without a program-audio slot is `audio-unsupported`.
-fn audio_gate(
+pub(crate) fn audio_gate(
     control: &crate::output_routing::OutputRoutingControl,
     config_id: &str,
     video: Option<&RoutedFeed>,
@@ -1104,7 +1117,12 @@ fn audio_gate(
         Err(PlanRefusal::AudioUnsupported) => Some(audio_unsupported()),
         Err(PlanRefusal::OutputKindUnroutable) => Some(unroutable_kind()),
         // The video plan answers the video refusals.
-        Err(PlanRefusal::SwitcherRequired | PlanRefusal::AuxCapacity { .. }) | Ok(_) => None,
+        Err(
+            PlanRefusal::SwitcherRequired
+            | PlanRefusal::AuxCapacity { .. }
+            | PlanRefusal::CleanUnavailableWithDsk,
+        )
+        | Ok(_) => None,
     }
 }
 
@@ -1135,6 +1153,11 @@ fn plan_gate(
             409,
             "switcher-required",
             "Preview and Clean need a switcher (M/E) in this run".to_owned(),
+        )),
+        Err(PlanRefusal::CleanUnavailableWithDsk) => Some(refusal_problem(
+            409,
+            CLEAN_UNAVAILABLE_WITH_DSK,
+            CLEAN_WITH_DSK_TEXT.to_owned(),
         )),
         Err(PlanRefusal::OutputKindUnroutable) => Some(unroutable_kind()),
         Err(PlanRefusal::AudioUnsupported) => Some(audio_unsupported()),
@@ -1253,7 +1276,8 @@ pub(crate) enum SlotTake {
 /// # Errors
 /// Repository errors, `NotFound` for an unknown output, a missing key, a key
 /// reused for another take (409), or `idempotency-capacity`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+// reason (lines): one ordered admission sequence (subtitle #345 + set limiter #308 merged).
 // reason: the slot-0 take's inputs are the request's parts plus its ONE
 // pre-read layout (T-I1); a struct would only rename them.
 pub(crate) fn take_output_slot0(
@@ -1436,7 +1460,7 @@ fn replay_slot0(
 }
 
 /// The refusal of a take key first used for another take (409 `conflict`).
-fn key_reused() -> ControlError {
+pub(crate) fn key_reused() -> ControlError {
     ControlError::Conflict("Idempotency-Key reused with a different request".into())
 }
 

@@ -16,6 +16,10 @@ use tokio::sync::mpsc;
 
 use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
+use crate::keyer::{
+    KeyerAction, KeyerCounters, KeyerDraw, KeyerEvent, KeyerRuntime, KeyerSnapshot, KeyerTally,
+    OpSink, TieEnvelope, MAX_DSK,
+};
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
 use crate::switcher::{SwitcherProjection, SwitcherState};
 use crate::switcher_inputs::{InputsReadback, MixerInputs, INPUT_SLOTS, MAX_PATCH_MEMBERS};
@@ -145,6 +149,32 @@ pub enum SwitcherVerb {
     SetTransition(TransitionDescriptor),
     /// Re-patch numbered mixer inputs at one tick (all members or none).
     Patch(PatchSet),
+    /// Downstream keyer `keyer` (config order) on or off at the next tick
+    /// (ADR-0113 §5). Going on passes the fresh gate; going off never waits.
+    /// Engine-internal: the control plane maps keyer ids to indices (K4).
+    KeyerCut {
+        /// Keyer index.
+        keyer: u8,
+        /// Target state.
+        on: bool,
+    },
+    /// Ramp downstream keyer `keyer` on or off over `rate` frames (its own
+    /// configured rate when `None`).
+    KeyerAuto {
+        /// Keyer index.
+        keyer: u8,
+        /// Target state.
+        on: bool,
+        /// Ramp duration.
+        rate: Option<FrameCount>,
+    },
+    /// Tie (or untie) downstream keyer `keyer` to the next background take.
+    KeyerTie {
+        /// Keyer index.
+        keyer: u8,
+        /// Tied.
+        tie: bool,
+    },
     /// The mixer half of an atomic multi-crosspoint set (ADR-0110 §12.8,
     /// #308): validated and primed here, then applied only at the adoption
     /// tick the router proposes through `arm`, never on its own. Held in its
@@ -215,6 +245,12 @@ pub struct SwitcherSnapshot {
     /// this tick (ADR-0112 §4). An AUTO never changes it: the flight renders
     /// its own descriptor (the selection at the AUTO's rate).
     pub transition: TransitionDescriptor,
+    /// Downstream keyer rows, in config order (ADR-0113 §8). Ramps are
+    /// descriptors (start, rate, direction), never per-tick weights.
+    pub keyers: [Option<KeyerSnapshot>; MAX_DSK],
+    /// Engine tally as roles (design note §9, deviation: roles, not store
+    /// indices; the control plane resolves them to source ids).
+    pub tally: KeyerTally,
 }
 
 /// Definitive command result after the engine has processed it at a tick.
@@ -242,6 +278,8 @@ pub struct SwitcherControl {
     composed_count: Arc<std::sync::atomic::AtomicU64>,
     auto_capable: Arc<std::sync::atomic::AtomicBool>,
     inputs: LatestState<InputsReadback>,
+    keyer_events: EventStream<KeyerEvent>,
+    keyer_counters: Arc<KeyerCounters>,
 }
 
 /// Actual paired-bus frame capability, published after the rendering provider
@@ -282,6 +320,7 @@ impl SwitcherControl {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let snapshots = LatestState::new();
         let (outcomes, _) = event_stream(256);
+        let (keyer_events, _) = event_stream(256);
         let handle = Self {
             tx,
             snapshots,
@@ -292,6 +331,8 @@ impl SwitcherControl {
             composed_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auto_capable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inputs: LatestState::new(),
+            keyer_events,
+            keyer_counters: Arc::new(KeyerCounters::default()),
         };
         let driver = SwitcherTickDriver {
             rx,
@@ -317,6 +358,9 @@ impl SwitcherControl {
             published_inputs_version: 0,
             inputs_readback: handle.inputs.clone(),
             player_roll: None,
+            keyers: Box::default(),
+            keyer_events: handle.keyer_events.clone(),
+            keyer_counters: Arc::clone(&handle.keyer_counters),
         };
         (handle, driver)
     }
@@ -427,6 +471,20 @@ impl SwitcherControl {
     pub fn outcomes(&self) -> EventSubscription<SwitcherOutcome> {
         self.outcomes.subscribe()
     }
+
+    /// Subscribe to downstream keyer state changes (`switcher.keyer`,
+    /// ADR-0113 §4). Bounded drop-oldest: published only on committed state
+    /// changes, never per ramp tick; a lagged reader re-fetches the snapshot.
+    #[must_use]
+    pub fn keyer_events(&self) -> EventSubscription<KeyerEvent> {
+        self.keyer_events.subscribe()
+    }
+
+    /// Keyer counters (oversize frames, dropped events, source-lost drops).
+    #[must_use]
+    pub fn keyer_counters(&self) -> Arc<KeyerCounters> {
+        Arc::clone(&self.keyer_counters)
+    }
 }
 
 /// Sole output-clock owner of the M/E state; do not share with REST handlers.
@@ -458,6 +516,12 @@ pub struct SwitcherTickDriver {
     inputs_readback: LatestState<InputsReadback>,
     /// Off-clock media-player roll for a stinger AUTO (ADR-0112 §5).
     player_roll: Option<crate::player_roll::PlayerRollSender>,
+    /// Downstream keyers (ADR-0113); empty unless [`Self::set_keyers`].
+    /// Boxed: built once at attach, it keeps the fixed keyer state out of
+    /// the driver (and so out of the output loop's future).
+    keyers: Box<KeyerRuntime>,
+    keyer_events: EventStream<KeyerEvent>,
+    keyer_counters: Arc<KeyerCounters>,
 }
 
 /// Everything a rejected tick must restore (review SW2-03): the machine and
@@ -473,6 +537,46 @@ struct Staged {
 }
 
 impl SwitcherTickDriver {
+    /// Install the admitted downstream keyers before the clock starts (like
+    /// [`Self::set_inputs`]). Build them with [`crate::keyer::admit`].
+    pub fn set_keyers(&mut self, mut keyers: KeyerRuntime) {
+        keyers.set_counters(Arc::clone(&self.keyer_counters));
+        *self.keyers = keyers;
+    }
+
+    /// The keyer runtime (read-only: flags, last-good pair, tally).
+    #[must_use]
+    pub fn keyers(&self) -> &KeyerRuntime {
+        &self.keyers
+    }
+
+    /// Resolve this tick's downstream keyer draws into `out` (ascending z),
+    /// applying the fresh gate, the loss policy and the last-good pair, and
+    /// recording the tally. `auto_p` is the background AUTO's tie envelope
+    /// while one is in flight (MIX: `p` going on, `1 − p` going off; DIP: `i`
+    /// going on, `1 − d` going off). `incoming_drawn` says whether the
+    /// transition's incoming tile contributes to this frame (the PVW role's
+    /// PROGRAM tally). Called by the frame hook after the background is
+    /// staged. Wait-free; allocation-free.
+    pub fn resolve_keyers(
+        &mut self,
+        tick: Tick,
+        auto_p: Option<TieEnvelope>,
+        incoming_drawn: bool,
+        out: &mut [Option<KeyerDraw>; MAX_DSK],
+    ) {
+        self.keyers
+            .resolve(tick, auto_p, incoming_drawn, out, &self.outcomes);
+    }
+
+    /// After [`Self::reject_composed_tick`]: rebuild the installed keyer
+    /// draws as the committed resting state (an on-air keyer draws its
+    /// restored last-good pair at weight 1, even where the committed tick
+    /// drew it at weight 0; review round 2 G1).
+    pub fn settle_keyer_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
+        self.keyers.settle_draws(draws);
+    }
+
     /// Install the numbered mixer-input table before the clock starts (like
     /// [`Self::set_prime_stores`]). The machine's PGM/PVW must then be input
     /// references (`in:<n>`). Publishes the initial readback.
@@ -755,7 +859,10 @@ impl SwitcherTickDriver {
             SwitcherVerb::SelectPreview(_)
             | SwitcherVerb::Patch(_)
             | SwitcherVerb::PatchArmed { .. }
-            | SwitcherVerb::SetTransition(_) => Err("not a take".into()),
+            | SwitcherVerb::SetTransition(_)
+            | SwitcherVerb::KeyerCut { .. }
+            | SwitcherVerb::KeyerAuto { .. }
+            | SwitcherVerb::KeyerTie { .. } => Err("not a take".into()),
         }
     }
 
@@ -770,9 +877,25 @@ impl SwitcherTickDriver {
         tick: Tick,
     ) {
         if verb.is_auto() && !next.completed {
+            // Tied DSKs take part in this flight in a direction fixed now
+            // (review F1).
+            self.keyers.begin_tied_transition();
             self.active_auto_scenes = scenes;
             self.active_auto = Some(operation_id);
             return;
+        }
+        if matches!(verb, SwitcherVerb::Cut) && next.completed {
+            // ADR-0113 §5: tied DSKs flip on the CUT tick. A CUT during an
+            // AUTO completes that flight's participants; otherwise every
+            // tied keyer takes part from its current state.
+            if self.active_auto.is_none() {
+                self.keyers.begin_tied_transition();
+            }
+            self.keyers.complete_tied(tick);
+        }
+        if matches!(verb, SwitcherVerb::SelectProgram(_)) && self.active_auto.is_some() {
+            // A punch ends the flight without a take: tied keyers stay put.
+            self.keyers.cancel_tied();
         }
         if matches!(verb, SwitcherVerb::Cut | SwitcherVerb::SelectProgram(_)) {
             if let Some(old) = self.active_auto.take() {
@@ -823,6 +946,7 @@ impl SwitcherTickDriver {
     /// expire off the clock as a refusal; successful takes wait for a fresh tick.
     pub fn repeat_tick(&mut self, tick: Tick) {
         self.last_tick = tick.index;
+        self.keyers.expire_on_repeat(tick.index, &self.outcomes);
         // A repeated tick never composes the armed patch: a proposal at or
         // before it is missed and goes back to the router.
         if let Some(armed) = self.armed.as_ref() {
@@ -913,6 +1037,17 @@ impl SwitcherTickDriver {
     // helpers and hide the single-tick atomicity this test set pins.
     pub fn drain_at_tick(&mut self, tick: Tick) -> SwitcherProjection {
         self.last_tick = tick.index;
+        // Keyers: stage the Copy flags a rejected frame restores, then finish
+        // ramps and resolve held keyer commands (ADR-0113 §6).
+        self.keyers.begin_tick();
+        self.keyers.tick_pending(
+            tick,
+            &mut OpSink {
+                success: &mut self.staged_success,
+                outcomes: &self.outcomes,
+                tick: tick.index,
+            },
+        );
         // An AUTO in flight can complete (swap buses) on this tick: snapshot
         // first so a rejected frame restores the whole flight (SW2-03).
         if self.machine.is_in_flight() {
@@ -925,6 +1060,8 @@ impl SwitcherTickDriver {
             let (_, preview) = self.resolved_selections();
             if terminal && self.fresh_at(preview.as_str(), tick) == Some(false) {
                 self.machine.abort();
+                // Aborted: tied keyers keep their state.
+                self.keyers.cancel_tied();
                 if let Some(operation_id) = self.active_auto.take() {
                     self.active_auto_scenes = None;
                     // Already terminal: a rejected frame must not refuse it twice.
@@ -939,6 +1076,11 @@ impl SwitcherTickDriver {
             }
         }
         let mut projection = self.machine.sample(tick);
+        if projection.completed {
+            // The AUTO terminal tick: tied participants land (their envelope
+            // is at its end value). An aborted AUTO cancelled them above.
+            self.keyers.complete_tied(tick);
+        }
         if let Some((command, deadline)) = self.pending_take.take() {
             if let SwitcherVerb::Patch(set) = &command.verb {
                 // A held patch re-validates against the live table: nothing
@@ -956,7 +1098,7 @@ impl SwitcherTickDriver {
                         self.publish_outcome(command.operation_id, tick.index, false, Some(err));
                     }
                 }
-            } else if self.fresh_at(self.incoming(&command.verb), tick) == Some(true) {
+            } else if self.take_fresh(&command.verb, tick) == Some(true) {
                 self.stage();
                 let scenes = self.scenes.latest();
                 match self.apply_take(&command.verb, scenes.as_ref(), tick) {
@@ -989,6 +1131,22 @@ impl SwitcherTickDriver {
             let Ok(command) = self.rx.try_recv() else {
                 break;
             };
+            // Keyer verbs first: they reference no scene geometry, and a held
+            // background take never blocks a DSK (ADR-0113 §6).
+            if let Some((keyer, action)) = KeyerAction::of(&command.verb) {
+                self.keyers.command(
+                    keyer,
+                    action,
+                    command.operation_id,
+                    tick,
+                    &mut OpSink {
+                        success: &mut self.staged_success,
+                        outcomes: &self.outcomes,
+                        tick: tick.index,
+                    },
+                );
+                continue;
+            }
             if let SwitcherVerb::PatchArmed { .. } = &command.verb {
                 self.admit_armed(command, tick);
                 continue;
@@ -1293,7 +1451,7 @@ impl SwitcherTickDriver {
         scenes: Option<&Arc<ScenePair>>,
         tick: Tick,
     ) -> Result<Option<SwitcherProjection>, String> {
-        match self.fresh_at(self.incoming(&command.verb), tick) {
+        match self.take_fresh(&command.verb, tick) {
             Some(true) => self.apply_take(&command.verb, scenes, tick).map(Some),
             Some(false) => {
                 self.pending_take = Some((
@@ -1304,6 +1462,20 @@ impl SwitcherTickDriver {
             }
             None => Err("switcher source prime provider is unavailable".into()),
         }
+    }
+
+    /// The take's fresh gate: the incoming source, and for a CUT or AUTO
+    /// also the fill and key of every tied keyer it would put on air
+    /// (ADR-0113 §6). `None` when no store map is installed.
+    fn take_fresh(&self, verb: &SwitcherVerb, tick: Tick) -> Option<bool> {
+        let incoming = self.fresh_at(self.incoming(verb), tick)?;
+        // A CUT during the background AUTO completes that flight: it puts on
+        // only the flight's surviving going-on participants (review round 2
+        // G2), the same set `stage_take` lands.
+        let in_flight = matches!(verb, SwitcherVerb::Cut) && self.active_auto.is_some();
+        let tied = !(matches!(verb, SwitcherVerb::Cut) || verb.is_auto())
+            || self.keyers.tied_going_on_fresh(tick, in_flight);
+        Some(incoming && tied)
     }
 
     /// End the public snapshot stream at this tick if the output loop is about
@@ -1340,6 +1512,9 @@ impl SwitcherTickDriver {
         } else {
             (None, None)
         };
+        // Copy rows: no allocation unless the snapshot actually changed.
+        let keyers = self.keyers.snapshot();
+        let tally = self.keyers.tally();
         let changed = self.snapshots.latest().is_none_or(|previous| {
             previous.program != *program
                 || previous.preview != *preview
@@ -1351,6 +1526,8 @@ impl SwitcherTickDriver {
                 // A comparison, never a clone: the descriptor is cloned only
                 // below, on a tick whose published state actually changed.
                 || previous.transition != *self.machine.transition()
+                || previous.keyers != keyers
+                || previous.tally != tally
         });
         if changed {
             self.snapshots.publish(SwitcherSnapshot {
@@ -1363,8 +1540,11 @@ impl SwitcherTickDriver {
                 in_flight: self.machine.is_in_flight(),
                 completion_count: self.machine.completion_count(),
                 transition: self.machine.transition().clone(),
+                keyers,
+                tally,
             });
         }
+        self.keyers.commit(&self.keyer_events);
         // Readback only on a committed patch tick (allocates; never steady state).
         if self.inputs_version != self.published_inputs_version {
             if let Some(table) = self.inputs.as_ref() {
@@ -1387,6 +1567,10 @@ impl SwitcherTickDriver {
         // The AUTO admitted or running on this tick, if any: it gets exactly
         // one terminal refusal, never a later second outcome (SW2-03).
         let staged_auto = self.active_auto.take();
+        // Keyers: restore the tick-start flags, refuse ops held in the slots
+        // that moved this tick, drop queued events. Applied keyer ops sit in
+        // `staged_success` and are refused below with everything else.
+        self.keyers.reject(tick.index, reason, &self.outcomes);
         // The armed patch applied on this tick is restored with the table
         // below and goes back to the router (never committed).
         if let Some(armed) = self.armed.as_mut() {
@@ -1408,6 +1592,9 @@ impl SwitcherTickDriver {
         if self.machine.is_in_flight() {
             self.machine.abort();
         }
+        // ... and with it any tied keyer participation: they keep their
+        // committed state.
+        self.keyers.cancel_tied();
         let restored_auto = self.active_auto.take();
         self.active_auto_scenes = None;
         self.spare_success.clear();

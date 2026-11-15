@@ -585,6 +585,8 @@ struct AcceptedFence {
 pub struct AppState {
     /// Optional real background browser capture service.
     pub web_capture: crate::web_capture::Provider,
+    /// Off-clock native artifact-load executor, unavailable by default.
+    pub player_load: Arc<dyn crate::player_load::PlayerLoadProvider>,
     /// The engine's outbound publisher (state slot + event broadcast).
     pub engine: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     /// The inbound, bounded, non-blocking command bus sender.
@@ -794,6 +796,10 @@ pub struct AppState {
     /// Mixer patch take limits (ADR-0110 §12.8: 2/s per destination, 10/s
     /// per principal; one request = one take). Control-plane only.
     pub patch_limiter: Arc<crate::output_routing::TakeLimiter>,
+    /// Atomic multi-destination patch sets (#308): the set-scoped
+    /// idempotency store and the `patch.take` aggregator. Bounded,
+    /// control-plane only.
+    pub patch_sets: Arc<crate::patch_set::PatchSets>,
     /// Admission of the slot-0 routes' stored-layout reads (#342 review
     /// T-I1): each read runs on `spawn_blocking` (the repository is
     /// synchronous, SQLite behind it) only with a permit taken by
@@ -1137,6 +1143,7 @@ impl AppState {
             frontdoor_metrics: None,
             switcher_preview_lease: Arc::new(crate::source_demand::SwitcherPreviewLeases::default()),
             patch_limiter: Arc::new(crate::output_routing::TakeLimiter::default()),
+            patch_sets: Arc::new(crate::patch_set::PatchSets::default()),
             layout_reads: crate::routes::output_routing::layout_read_semaphore(),
             // Bound the in-flight correlations: a generous ceiling for pending
             // command outcomes (drop-oldest beyond it, invariant #10). A backlog
@@ -1154,6 +1161,7 @@ impl AppState {
             moq: Arc::new(crate::moq::MoqRegistry::default()),
             #[allow(clippy::default_constructed_unit_structs)] // unit on non-unix
             web_capture: crate::web_capture::Provider::default(),
+            player_load: Arc::new(crate::player_load::UnavailablePlayerLoad),
             cloudflare: None,
             #[cfg(all(feature = "acme", unix))]
             tls: None,

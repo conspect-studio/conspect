@@ -1102,6 +1102,7 @@ fn inject(
             Arc::clone(&lost),
         )
         .unwrap();
+    r.holdings_dirty = true;
     r.dynamic.push(DynamicKey {
         bus,
         format: None,
@@ -7350,6 +7351,82 @@ fn the_control_adapter_maps_a_set_onto_its_members_and_refuses_it_whole() {
     );
 }
 
+/// ADR-0113 / K2a: with a DSK defined, Clean carries the keyer's pixels, so
+/// the control adapter refuses a Clean take `Unroutable` on both submit paths
+/// — a single take and any member of a take set (the whole set, before
+/// anything is queued) — even for a caller that skipped the plan gate.
+#[test]
+fn the_control_adapter_refuses_clean_with_a_dsk_on_single_takes_and_every_set_member() {
+    use multiview_control::output_routing::{
+        OutputRouting, OutputTakeRequest, OutputTakeSet, RoutedFeed, TakeSubmitError,
+    };
+    let run_output = |id: &str| RunOutput {
+        id: Some(id.into()),
+        codec_name: String::new(),
+        settings: 0,
+        feed_format: None,
+        base_format: None,
+        routable: true,
+        program_audio: false,
+    };
+    let member = |output: &str, video: RoutedFeed| OutputTakeRequest {
+        operation_id: "ignored".into(),
+        output: output.into(),
+        video: Some(video),
+        audio: None,
+        layout: None,
+        principal: "ignored".into(),
+    };
+    let set = |members| OutputTakeSet {
+        operation_id: "salvo".into(),
+        principal: "p".into(),
+        members,
+        arm: None,
+    };
+    let adapter_with = |dsk: bool| {
+        let (r, h, aux) = router(3, 6, Box::new(|_| Err("never".to_owned())));
+        let h = h
+            .with_outputs(vec![run_output("a"), run_output("b")])
+            .with_dsk_defined(dsk);
+        let slot = output_routing_slot();
+        slot.store(Some(Arc::new(h)));
+        let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+        (adapter, r, aux)
+    };
+    let (adapter, _r, _aux) = adapter_with(true);
+    assert_eq!(
+        adapter.try_take(member("a", RoutedFeed::Clean)),
+        Err(TakeSubmitError::Unroutable),
+        "a single Clean take with a DSK is unroutable"
+    );
+    for members in [
+        vec![
+            member("a", RoutedFeed::Program),
+            member("b", RoutedFeed::Clean),
+        ],
+        vec![
+            member("a", RoutedFeed::Clean),
+            member("b", RoutedFeed::Program),
+        ],
+    ] {
+        assert_eq!(
+            adapter.try_take_set(set(members)),
+            Err(TakeSubmitError::Unroutable),
+            "a set with any Clean member is refused whole while a DSK is defined"
+        );
+    }
+    // The same Clean member is admitted when no DSK is defined: the refusal
+    // is the DSK rule, not a generic Clean refusal.
+    let (adapter, _r, _aux) = adapter_with(false);
+    assert_eq!(
+        adapter.try_take_set(set(vec![
+            member("a", RoutedFeed::Program),
+            member("b", RoutedFeed::Clean),
+        ])),
+        Ok(())
+    );
+}
+
 // ---- Review r1 regressions (#308) ----
 
 /// Drive a two-member set with a mixer half until the router proposed `T`.
@@ -8067,4 +8144,130 @@ fn a_rejected_set_never_switches_a_staying_members_private_bus_audio() {
             "no bars sample ever reached the bus on air (block at {start})"
         );
     }
+}
+
+/// #308 review C1: snapshot publication (on the bake consumer, every tick
+/// while an output is pending) rebuilds the per-principal holdings only
+/// when one changed: ticks with unchanged holdings rebuild nothing and
+/// republish the same `Arc` (no allocation). The readback stays right
+/// across a key's create, its adoption by another principal and its
+/// retirement (and every test build checks the cache against a fresh scan
+/// on each publication).
+#[test]
+fn principal_holdings_are_rebuilt_only_when_they_change() {
+    let mut x = harness(5, 6, None);
+    x.tick(0);
+    let rebuilds = |x: &Harness| x.r.holdings_rebuilds;
+    let held = |x: &Harness| (*x.h.snapshot().principals_held).clone();
+    // Idle ticks: nothing changes, nothing is rebuilt.
+    let idle = rebuilds(&x);
+    for t in 1..20 {
+        x.tick(t);
+    }
+    assert_eq!(rebuilds(&x), idle, "idle ticks rebuild nothing");
+    // Create: `q` opens cam on output 3.
+    let mut q_take = take("q-cam", 3, src());
+    q_take.principal = "q".to_owned();
+    x.h.try_take(q_take).unwrap();
+    let mut t = 20;
+    let mut pending_ticks = 0;
+    while x.d.binding_video_key(3) == Some(0) && t < 80 {
+        x.tick(t);
+        pending_ticks += 1;
+        t += 1;
+    }
+    assert!(pending_ticks > 3, "the take was pending for several ticks");
+    let during = rebuilds(&x) - idle;
+    assert!(
+        during < pending_ticks,
+        "rebuilt {during} times over {pending_ticks} pending ticks"
+    );
+    assert_eq!(held(&x), vec![("q".to_owned(), 1)], "created");
+    // Unchanged holdings while the output keeps publishing: same Arc.
+    let before = rebuilds(&x);
+    let published = x.h.snapshot().principals_held.clone();
+    for _ in 0..10 {
+        x.tick(t);
+        // The publication itself, as a pending output runs it every tick.
+        x.r.publish_snapshot_at(t);
+        t += 1;
+    }
+    assert_eq!(
+        rebuilds(&x),
+        before,
+        "unchanged publications rebuild nothing"
+    );
+    assert!(Arc::ptr_eq(&published, &x.h.snapshot().principals_held));
+    // `q` moves away: cam lingers, still charged to `q`.
+    let mut back = take("q-back", 3, PictureBus::Program);
+    back.principal = "q".to_owned();
+    x.h.try_take(back).unwrap();
+    let start = t;
+    while x.d.binding_video_key(3) != Some(0) && t < start + 60 {
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(held(&x), vec![("q".to_owned(), 1)], "lingering, q's");
+    // Adopt: `p` re-takes the lingering cam key onto output 3; the
+    // rebind re-attributes it to `p` at once (the move itself is then
+    // refused in this harness, which does not feed an unsubscribed key,
+    // and the key lingers again, still `p`'s).
+    let _ = x.results();
+    x.h.try_take(take("p-adopt", 3, src())).unwrap();
+    x.tick(t);
+    t += 1;
+    assert_eq!(held(&x), vec![("p".to_owned(), 1)], "re-attributed to p");
+    let start = t;
+    while x.outcomes.try_iter().next().is_none() && t < start + OPEN_DEADLINE_TICKS {
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(held(&x), vec![("p".to_owned(), 1)], "still p's");
+    // Retire: the linger closes the key.
+    for _ in 0..=LINGER_TICKS + 1 {
+        x.tick(t);
+        t += 1;
+    }
+    assert_eq!(x.h.snapshot().dynamic_encoders_live, 0, "retired");
+    assert!(held(&x).is_empty(), "nothing held after the retire");
+    let after = rebuilds(&x);
+    for _ in 0..10 {
+        x.tick(t);
+        x.r.publish_snapshot_at(t);
+        t += 1;
+    }
+    assert_eq!(rebuilds(&x), after, "idle again: nothing rebuilt");
+}
+
+/// #308 review B2: the adapter's encoder identity is the router's sharing
+/// key: equal for two outputs with the same feed, format and settings;
+/// different for other encoder settings or another feed format.
+#[test]
+fn the_encoder_identity_includes_the_output_settings_and_format() {
+    use multiview_control::output_routing::{OutputRouting, RoutedFeed};
+    let x = harness(4, 6, None);
+    let out = |id: &str, settings: usize, feed_format| RunOutput {
+        id: Some(id.into()),
+        settings,
+        feed_format,
+        base_format: None,
+        routable: true,
+        program_audio: true,
+        codec_name: String::new(),
+    };
+    let h = x.h.clone().with_outputs(vec![
+        out("a", 0, None),
+        out("b", 0, None),
+        out("c", 1, None),
+        out("d", 0, Some(vertical_format())),
+    ]);
+    let slot = output_routing_slot();
+    slot.store(Some(Arc::new(h)));
+    let adapter = crate::output_routing_control::OutputRoutingAdapter::new(Arc::clone(&slot));
+    let cam = RoutedFeed::Source("cam".into());
+    let id = |o: &str| adapter.encoder_identity(o, &cam).expect("known output");
+    assert_eq!(id("a"), id("b"), "same feed, format and settings share");
+    assert_ne!(id("a"), id("c"), "other encoder settings: another encoder");
+    assert_ne!(id("a"), id("d"), "other feed format: another encoder");
+    assert_eq!(adapter.encoder_identity("nope", &cam), None);
 }

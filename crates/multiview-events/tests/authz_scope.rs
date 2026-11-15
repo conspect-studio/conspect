@@ -339,3 +339,47 @@ fn route_output_is_object_and_output_of_the_output() {
         }
     );
 }
+
+#[test]
+fn patch_take_is_scoped_by_its_own_destination() {
+    // #308: one `patch.take` delivery per destination, each with that
+    // destination's scope (an output on both axes, the mixer as
+    // `switcher.operation`), so realtime filtering redacts the others.
+    let take = |destination| {
+        Event::PatchTake(multiview_events::PatchTakeEvent {
+            operation_id: "op".into(),
+            tick: 7,
+            outcome: "applied".into(),
+            refusal: None,
+            destination,
+        })
+    };
+    let output = take(multiview_events::PatchTakeDestination {
+        output: Some("out-1".into()),
+        mixer: None,
+        program: None,
+    });
+    assert_eq!(
+        output.authz_scope(),
+        AuthzScope::ObjectAndOutput {
+            object: "out-1",
+            output: "out-1"
+        }
+    );
+    let mixer = take(multiview_events::PatchTakeDestination {
+        output: None,
+        mixer: Some("me1".into()),
+        program: Some("main".into()),
+    });
+    assert_eq!(
+        mixer.authz_scope(),
+        AuthzScope::ObjectAndProgram {
+            object: "me1",
+            program: "main"
+        }
+    );
+    assert_eq!(mixer.type_tag(), "patch.take");
+    let wire = serde_json::to_value(&output).unwrap();
+    assert_eq!(wire["t"], "patch.take");
+    assert_eq!(wire["data"]["destination"], json!({"output": "out-1"}));
+}

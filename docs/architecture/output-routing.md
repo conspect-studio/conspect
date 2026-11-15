@@ -2069,7 +2069,7 @@ comes later. `fit.anchor` is one of `center`, `top`, `bottom`, `left`, `right`, 
 `top_right`, `bottom_left`, `bottom_right`. Validation reports a typed message prefix:
 `slot-medium-mismatch:` (more slots than `Output::slot_capability()` allows, a codec on a raw
 output, a video slot on `aes67`) or `slot-format-unsupported:` (a codec the medium does not carry,
-fps ≠ Program (slice C, #343), `tff`/`bff`, colour ≠ canvas (#310), pixel format ≠ canvas, an
+an fps other than Program's that is not an output rate (`num/den`, `den` 1 or 1001, 4..=120 fps) or is on a kind that does not convert (slice C, #343, §12.6), `tff`/`bff`, colour ≠ canvas (#310), pixel format ≠ canvas, an
 anamorphic `aspect`, a size that is odd, outside 16..=8192 or above 3840×2160 in area, or a
 non-canvas format on a kind slice B does not convert for: `webrtc`, `whip_push`, `ndi`, `display`,
 `aes67`, `rtsp_server`). Only an explicitly declared slot codec is checked. Absent `format` and
@@ -2638,6 +2638,42 @@ invariant #3), so the jitter-buffer delay is applied to audio as well (bounded b
   clock (the clock-thread work of #311 / PR #332 is reused). It never takes a lock Program holds;
   its stores are read wait-free.
 
+**As built in slice C (#343).** `[outputs.format] fps` may differ from the canvas on a
+converting kind (`hls`, `ll_hls`, `srt`, `rist`, `rtmp`) when it is an output rate (`num/den`,
+`den` 1 or 1001, 4..=120 fps: the dispatcher assembles one A/V window per output tick and needs a
+tick of at most 250 ms). `[routing] max_output_clocks` (default 2, max 8) bounds the distinct
+non-Program rates (more is refused `capacity:`); at least one packet output stays at Program's
+rate; a persisted `[[routing.output]]` row feeding a non-Program bus to a rate output is refused
+`slot-format-unsupported:`. Outputs at Program's rate are untouched. A rate output leaves the
+Program egress and runs in a rate lane (`crates/multiview-cli/src/output_lanes.rs`):
+- Program's bake consumer publishes each baked canvas (substituted ticks included) into a
+  `ProgramLatch` (wait-free, 8 entries, drop-oldest) only when a rate lane exists; zero work otherwise.
+- Per distinct rate one output clock thread (`clock-out-<fps>`, ADR-0109 absolute-deadline pacing,
+  same `TimeSource`, seeded with Program's seed, so output tick 0 is Program tick 0). Tick k is due
+  at `seed + k/fps + LATCH_DELAY` (100 ms, so the Program frame for `k/fps` is baked); its PTS is
+  `k`, the delay never enters a stamp. It latches nearest-not-after and offers the frame
+  non-blocking to each output's encode worker (full = dropped + counted; the worker gap-fills,
+  a gap beyond 2 s of ticks fails that output alone). Late by more than 8 ticks, it skips to the
+  tick due now (counted). Before the first Program frame it offers black at the output format.
+- Per output: encode worker (format convert + gap fill, encoder at the output rate), its own
+  dispatcher, delivery and sink thread. Audio deviates from the text above in mechanism, not in
+  result: the lane carries Program's AAC packets themselves (already on the global sample counter
+  and 1024 grid), fanned out by a bounded `try_send` per lane from Program's audio worker, and
+  released to the lane dispatcher at most 4 output ticks ahead of its video. No extra encode.
+- A rate output is listed by the routing API but `routable: false`: a take answers `unroutable`.
+  Subtitle slots (slice F, #345) are sampled at Program's cadence and are refused on a rate output
+  (`slot-format-unsupported:`) until a follow-up carries them.
+  A `cast` output (ADR-0111) at another rate is refused the same way (it is gated by the control
+  plane and has no rate lane yet).
+- A wedged or panicking lane clock, encoder, consumer or sink ends only its outputs and becomes a
+  run-report line; Program and other outputs never wait on it. At run end the lanes run until they
+  pass Program's last frame (at most 2 s), stop, and are joined with bounded graces.
+- `GET /api/v1/metrics/program` gains `output_clocks[]` (fps, outputs, ticks, lateness p50/p99/max,
+  skipped ticks, dropped offers, late latches, dropped audio).
+- **Not in slice C:** takes/patches onto a rate output, latching sources/layouts/Preview (only
+  `bus:program` is latched), a shared encoder per equal-format output on one lane, blended
+  conversion, live fps change (an fps change restarts the run through the normal apply path).
+
 ### 12.7 Program stays special
 
 A slot patched to `me1.program` (or Clean, Preview) carries the mixer's result, so every cut,
@@ -2788,7 +2824,7 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
 
   A request carries either mixer-input crosspoints or one output's crosspoints. Two outputs, or a
   mixer input plus an output, → 422 `unknown-slot`: atomic multi-destination sets arrive with patch
-  salvos (slice E, #308).
+  salvos (slice E, #308). *Superseded by slice E2: such a request is now an atomic set (below).*
 - **Plan.** The plan reports the §12.4 path (`P1` when an encoded bus with key (picture, format,
   settings) is live, with Program at the output's format always its base key; `P2` when the picture
   is identity at the output's format; else `P3`). It also reports `cost` = { `new_encoders`,
@@ -2935,6 +2971,140 @@ honour at boot (source gone, slot removed) starts the slot on its default and ra
     (`SET_SWITCHER_GRACE_TICKS`; the router normally refuses first);
   - `refused:on-air-protected` added to the router's refusal kinds;
   - per-member freshness and open bounds reuse the single-take constants.
+
+**As built in slice E2 (#308, HTTP + salvos; the UI follows in E3).**
+- **What is a set.** A `POST /patch/plan|take` whose crosspoints touch two or more destinations
+  (several outputs, or mixer inputs plus outputs) is an atomic set. One mixer patch, or the slots of
+  one output, keeps its exact single-destination path, bodies and key namespace (the slot-0 alias).
+  The slice-B refusal of multi-destination requests is removed. A destination named twice (the same
+  mixer input, or the same plane of one output slot) is 422 `unknown-slot`.
+- **Order of checks** (the security contract):
+  1. role, then count (1..=64);
+  2. one layout read per DISTINCT layout id, at most 4 per request (else 422 `unknown-source` "too
+     many layouts in one set"), each under the layout-read semaphore and only after every
+     destination and layout id passed authorization;
+  3. authorize EVERY member's both ends (the shared `authorize`), then shape;
+  4. the set key's replay or conflict;
+  5. existence and plan gates per member (mixer `check`, the on-air guard; per output
+     `resolve_feed`, audio gate, engine plan);
+  6. limits, then the encoder delta, then reserve, then enqueue.
+
+  Any 403 or 422 changes nothing and burns no key.
+- **Limits and capacity.** A set's destinations are checked and recorded against the SAME two
+  limiters a plain mixer patch and a single-output take already use, never a third independent
+  budget (#308 review B3, fixed in slice E2): mixer destinations (`me1.in<N>`) against
+  `state.patch_limiter` (as `take_patch`'s own admission), and output destinations (output API
+  ids) against `state.output_routing`'s `control.limiter` (the one `take_output_slot0` uses for
+  `/routing/output/take` and the slot-0 alias of `/patch/take`). Each distinct destination counts
+  one take regardless of how many crosspoints of that destination the set carries, so 64
+  crosspoints never multiply either budget — and alternating single-output takes with
+  multi-destination sets on the SAME output cannot double that output's 2/s budget by routing one
+  path through `patch_limiter` and the other through `control.limiter`. The principal is charged
+  once per limiter the set's destinations touch: a mixer-only set charges only `patch_limiter`'s
+  principal window, an output-only set charges only `control.limiter`'s, and a mixed set charges
+  both, so it cannot escape either principal budget by hiding part of its destinations behind the
+  other limiter. Admission is ONE atomic operation across every limiter the set spans
+  (`TakeLimiter::admit_across`, #308 review A6, fixed in slice E2 round 2): it locks every
+  participating limiter's mutex at once, in one consistent order (by pointer address, so two
+  concurrent set admissions naming the same limiters never deadlock each other), checks every
+  destination and principal window under those locks, and only once every limiter has passed does
+  it record on any of them. The earlier shape (`check_set` on every limiter, then `record_set` on
+  every limiter, two separate lock acquisitions) left a window where a concurrent admission — a
+  single-output `admit` on `control.limiter`, or another set's own two-step admission — could pass
+  its own check before either of this set's `record_set` calls ran, so two concurrent takers of an
+  output's last slot could both be admitted; `admit_across`'s single locked critical section closes
+  it, and single-output `admit` stays mutually exclusive with it because both lock the same mutex.
+  A refusal on any participating limiter charges nothing anywhere (every lock is released first).
+  The charge itself is tracked as a `SetCharge` (which limiter, which destinations, the one
+  principal, the instant) and is refunded — on every destination and the principal window, on
+  every limiter, exactly once each — on every unsuccessful exit AFTER admission: the set's own
+  encoder-delta capacity check, an idempotency-store capacity or conflict, a lease failure, and a
+  failed `try_take_set`/`PatchArmed` enqueue (#308 review A7, fixed in slice E2 round 2); a replay
+  of an earlier 202 answers from the idempotency store before `admit_across` ever runs, so it never
+  charges anything to refund. `take_set` wraps the charge in a drop-refunds-unless-committed guard,
+  so an admission path with several early-return exits cannot forget one; only a set that actually
+  reaches the engine (armed and/or enqueued) keeps its charge, exactly as a single take's own
+  `TakeLimiter::refund` already does for `POST /routing/output/take`. The set's
+  NEW encoder delta counts members whose plan needs an encoder, deduplicated per identical
+  engine encoder identity: the router's sharing key (feed at the output's format, the output's
+  encoder settings and its landed live reset's settings), read through the defaulted seam
+  `OutputRouting::encoder_identity`. Same feed and format with different encoder settings is two
+  encoders; an unknown identity counts the member as its own encoder, never under-counting. It is
+  checked against the caller's cap and the global sessions. The cap
+  comes from a new defaulted seam, `OutputRouting::principal_sessions`, which the run adapter reads
+  from the router snapshot (`principals_held`, `max_per_principal`). The router rebuilds
+  `principals_held` only when a holding changed (a key created, adopted or retired, an open started
+  or ended, a set reservation changed); an unchanged snapshot publication on the bake consumer
+  shares the cached list without a scan or an allocation. Over the cap is 409
+  `capacity`, before anything is enqueued. The engine's own admission still refuses an over-cap
+  set whole.
+- **Enqueue.** With a mixer half and outputs, the switcher's `PatchArmed` is sent first (bounded
+  `try_send`, under the PGM/PVW lease owner exactly as a mixer patch), then `try_take_set` with the
+  shared `SetArm`. If the second fails, the arm is refused `engine-busy`: the switcher drops its
+  half and reports it refused, which releases the leases. The key is then released and the answer
+  is 503. A set of outputs only has no arm.
+- **Idempotency.** The set store is bounded: 1,024 records, 256 per principal, and pending records
+  are never evicted. It is separate from the slot-0 take store and from the global store. Keys are
+  namespaced `patch-set` (`/patch/take`) or `salvo-take:<id>` and bound to a SHA-256 of the
+  canonical body (crosspoints sorted, `on_air`). The same body in any order replays its first 202
+  without re-planning. Another body is 409 `conflict`. The key record and the set's pending
+  outcome slot are reserved under one lock, so concurrent admissions never exceed the 256
+  pending bound; every failed enqueue releases both, and settlement or the deadline frees the slot.
+- **`patch.take`.** The event is `{operation_id, tick, outcome: applied|refused, refusal?,
+  destination}`. An off-clock aggregator task, fed by the bounded engine event stream, collects
+  each output member's `route.output` and the mixer half's `switcher.operation` (all carry the
+  set's operation id).
+  - It publishes one event per destination: an output's on topic `outputs`, scoped ObjectAndOutput
+    on that output; the mixer's on `switcher`, scoped ObjectAndProgram on me1/main. Realtime
+    filtering therefore redacts what a principal may not read.
+  - `applied` requires every member applied at the same tick. Otherwise the set is `refused` with
+    the first cause, mapped to the typed kinds: `unroutable` → `slot-medium-mismatch`,
+    `format-mismatch` → `slot-format-unsupported`; `feed-not-fresh`, `capacity`,
+    `encoder-not-ready`, `on-air-protected` and `superseded` as is. The mixer half's
+    `refused:<code>` goes through the same mapping as an output member's.
+  - At most 256 sets wait for their outcome (admission fails closed with `idempotency-capacity`
+    beyond). A set without a final outcome 10 s after admission is published `refused` /
+    `deadline`.
+  - Nothing new persists: applied outputs persist through the `route.output` relay, the mixer half
+    through the mixer persist relay.
+- **Patch salvos.** `Salvo` gains `patch` (the `/patch` crosspoint JSON; config-side
+  `PatchSourceSpec` with hand-written serde, never `untagged`) and `on_air` (default `protect`).
+  - Validation: ≤ 64 members, no destination twice, and a patch alone counts as changing
+    something. The document validation resolves patched sources and mixer inputs.
+  - `PUT /salvos/{id}` authorizes every member's both ends at store time and checks that the named
+    outputs and layouts exist.
+  - `POST /salvos/{id}/take` re-authorizes the salvo id and every member under the caller's current
+    grants. It then runs the same path with the request's key in `salvo-take:<id>`: the set path
+    for two or more destinations; for one mixer patch or one output, the same set store and
+    `patch.take`, since a salvo is always a set. When the salvo also recalls a
+    layout/sources/tally/UMD, that recall is submitted exactly as before. The 202 carries
+    `recall_operation_id`.
+  - `POST /salvos/{id}/plan` returns the patch plan. `arm` keeps its legacy meaning. A salvo with
+    only legacy fields keeps its path byte-for-byte.
+- **Plan.** A set's plan lists every member in request order. It adds `set: {new_encoders, fits}`,
+  and `can_take` requires every member and the delta to fit. OpenAPI declares the `200` of
+  `POST /patch/plan` and `POST /salvos/{id}/plan` as `anyOf` `PatchPlan` | `SetPlan` (`SetPlan`
+  flattens `PatchPlan`'s fields and adds `set`, and `PatchPlan` has no `additionalProperties:
+  false`, so a genuine `SetPlan` body also matches the `PatchPlan` arm; `oneOf`, which requires
+  exactly one match, would reject every real set-plan response — #308 review A5), and the `202` of
+  `POST /salvos/{id}/take` as `oneOf` `AcceptedBody` | `PatchAccepted` (document-only schemas; the
+  Rust types stay distinct).
+- **Deviations from the E2 design note.**
+  - The set key's replay/conflict is checked right after shape, before existence and plan gates,
+    not after them. This follows the slot-0 alias: a replay never re-plans, which matters because
+    the set may itself hold the encoders a fresh plan would count.
+  - A patch salvo with a single destination also goes through the set store and `patch.take`,
+    rather than the single-destination alias, so a salvo's outcome always has one shape.
+  - `validate_salvos` does not check output ids or layouts: the document has no output API ids,
+    and layouts live in the layouts library. `PUT /salvos/{id}` checks them against the accepted
+    state, and a take re-checks everything.
+  - Sets whose members all applied but not at one tick are reported `refused` / `set-partial`,
+    never `applied`. This is the E1 residual fault.
+  - The pending-set bound (256) refuses new sets at admission instead of evicting the oldest
+    settled set, because settled sets leave the pending map at once. The design note's "evict
+    oldest settled" applies to the key records.
+  - The subtitle plane is not implemented (#345). The event's `destination` and the crosspoint
+    `plane` and `destination` shapes take a later `{output, slot}` subtitle member unchanged.
 
 ### 12.9 The Routing page (#308)
 
