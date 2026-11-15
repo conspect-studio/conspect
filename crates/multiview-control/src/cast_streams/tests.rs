@@ -244,6 +244,40 @@ fn mark(active: bool, generation: u64, video_segments: u64) -> SinkMark {
         active,
         generation,
         video_segments,
+        disabled: false,
+    }
+}
+
+/// #418 review r7: a disabled output (its purge failed: files of the old
+/// generation may be left) never proves a superseded grant set replaced,
+/// neither by a generation change nor by being inactive.
+#[test]
+fn gate_history_never_expires_through_a_disabled_output() {
+    use super::reauth::Need;
+    let need = |s: &str| Need::Object(s.to_owned());
+    let after = 1_000 + MEDIA_RETENTION_MS;
+    let disabled = |active: bool, generation: u64, segments: u64| SinkMark {
+        disabled: true,
+        ..mark(active, generation, segments)
+    };
+    for with_mark in [true, false] {
+        let mut gate = registry::Gate::default();
+        let at = mark(true, 7, 100);
+        gate.retire(Some(vec![need("s2")]), 1_000, with_mark.then_some(&at));
+        for sink in [
+            disabled(false, 9, 0),
+            disabled(true, 8, 0),
+            disabled(true, 7, 1_000),
+        ] {
+            gate.prune(after * 10, Some(&sink));
+            assert!(
+                gate.cleared_needs().unwrap().contains(&need("s2")),
+                "{sink:?}"
+            );
+        }
+        // Enabled again (a later run): replacement proves it as before.
+        gate.prune(after, Some(&mark(false, 9, 0)));
+        assert!(!gate.remembers());
     }
 }
 

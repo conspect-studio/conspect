@@ -92,6 +92,9 @@ pub(crate) struct SinkMark {
     pub generation: u64,
     /// Video segments published for that generation.
     pub video_segments: u64,
+    /// The output is disabled for the run (#418 review r7): files it could
+    /// not remove may be left, so nothing is proven replaced through it.
+    pub disabled: bool,
 }
 
 impl SinkMark {
@@ -101,6 +104,7 @@ impl SinkMark {
             active: status.active,
             generation: status.generation,
             video_segments: status.video_segments,
+            disabled: status.disabled,
         }
     }
 
@@ -109,8 +113,14 @@ impl SinkMark {
     /// or serves another generation (new file names; the old ones are
     /// purged and never served: `routes::cast_public`), or published
     /// [`super::RETIRE_SEGMENTS`] more video segments of this generation
-    /// (every file of the marked era left the packager's retention).
+    /// (every file of the marked era left the packager's retention). Never
+    /// while the output is disabled (#418 review r7: a generation change or
+    /// an inactive output proves the old files gone only when their purge
+    /// succeeded; a failed purge disables the output).
     fn replaced_by(&self, now: &Self) -> bool {
+        if now.disabled {
+            return false;
+        }
         !now.active
             || now.generation != self.generation
             || now.video_segments >= self.video_segments.saturating_add(super::RETIRE_SEGMENTS)
@@ -128,6 +138,7 @@ impl SinkMark {
                 active: a.active || b.active,
                 generation: a.generation,
                 video_segments: a.video_segments.max(b.video_segments),
+                disabled: a.disabled || b.disabled,
             },
         })
     }
@@ -159,7 +170,7 @@ impl Superseded {
         };
         let replaced = match &self.mark {
             Some(mark) => mark.replaced_by(sink),
-            None => !sink.active,
+            None => !sink.active && !sink.disabled,
         };
         now >= self.not_before && replaced
     }

@@ -132,6 +132,8 @@ struct FakeCast {
     segments: Mutex<HashMap<String, u64>>,
     /// The engine status is unavailable (no outputs reported).
     hidden: std::sync::atomic::AtomicBool,
+    /// The outputs report `disabled` (#418 review r7).
+    disabled: std::sync::atomic::AtomicBool,
 }
 
 impl FakeCast {
@@ -173,6 +175,7 @@ impl CastEngine for FakeCast {
                     },
                     dropped_packets: 0,
                     last_error: error.clone(),
+                    disabled: self.disabled.load(Ordering::SeqCst),
                     width: 640,
                     height: 360,
                     fps_num: 25,
@@ -404,6 +407,7 @@ fn rig_mode(doc: &str, mode: Mode, adjust: impl FnOnce(AppState) -> AppState) ->
         error: Mutex::new(None),
         segments: Mutex::new(HashMap::new()),
         hidden: std::sync::atomic::AtomicBool::new(false),
+        disabled: std::sync::atomic::AtomicBool::new(false),
     });
     let routing = FakeRouting::new();
     let now = Arc::new(AtomicU64::new(1_000_000));
@@ -3162,4 +3166,69 @@ async fn a_stale_generation_file_is_never_served() {
             "{file}"
         );
     }
+}
+
+/// #418 review r7: a disabled output (its stream files could not be
+/// removed) serves nothing, not even to a valid token at the current
+/// generation: every media path is the generic 404.
+#[tokio::test]
+async fn a_disabled_output_serves_nothing_to_a_valid_token() {
+    let rig = rig();
+    let (status, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    for file in ["master.m3u8", "seg-v-1-0.m4s", "init-v-1-0.mp4"] {
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{token}/{file}")).await.0,
+            StatusCode::OK,
+            "{file}"
+        );
+    }
+    // Even while the status still reads active (the gate deactivates on
+    // disable, but the flag alone suffices).
+    rig.cast.disabled.store(true, Ordering::SeqCst);
+    for file in ["master.m3u8", "seg-v-1-0.m4s", "init-v-1-0.mp4"] {
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/{file}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{file}");
+        assert_eq!(body, b"not found\n");
+    }
+}
+
+/// #418 review r7: while the output is disabled, a generation change (or
+/// an inactive status) never expires the superseded grants: the old
+/// generation's files may be left on disk.
+#[tokio::test]
+async fn a_generation_change_on_a_disabled_output_keeps_the_history() {
+    let rig = subtitle_history_rig();
+    let (status, admin) =
+        create(&rig, ADMIN_TOKEN, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{admin}");
+    let admin = token_of(&admin);
+    repatched_then_settled(&rig).await;
+    let kept = rig.state.cast_streams.history_len("cast-1");
+    assert!(kept > 0);
+    advance_keeping(&rig, &admin, retention()).await;
+    rig.cast.disabled.store(true, Ordering::SeqCst);
+    rig.cast.set_generation("cast-1", 2);
+    rig.cast.set_segments("cast-1", 9 + 21);
+    multiview_control::cast_streams::lifecycle::sweep_now(&rig.state);
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    assert_eq!(
+        rig.state.cast_streams.history_len("cast-1"),
+        kept,
+        "disabled: kept"
+    );
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "disabled: {doc}");
+    rig.cast
+        .state
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), (false, 3));
+    multiview_control::cast_streams::lifecycle::sweep_now(&rig.state);
+    assert_eq!(
+        rig.state.cast_streams.history_len("cast-1"),
+        kept,
+        "disabled and inactive: kept"
+    );
 }

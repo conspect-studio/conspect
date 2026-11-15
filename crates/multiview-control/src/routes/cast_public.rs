@@ -138,12 +138,14 @@ async fn preflight(
 /// (#418 review ABUSE-HISTORY-R4: a stale file a best-effort purge left
 /// behind, of a superseded activation or a failed packager, is never
 /// served). Playlists carry none: they are always the current activation's.
+/// A disabled output serves nothing (#418 review r7: files it could not
+/// remove may be left in its directory).
 fn output_dir(state: &AppState, config_id: &str, file: &str) -> Option<std::path::PathBuf> {
     let engine = state.cast_engine.as_ref()?;
     let output = engine
         .outputs()
         .into_iter()
-        .find(|o| o.id == config_id && o.active)?;
+        .find(|o| o.id == config_id && o.active && !o.disabled)?;
     current_generation_file(file, output.generation).then_some(output.dir)
 }
 
