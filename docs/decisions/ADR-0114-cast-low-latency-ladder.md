@@ -75,7 +75,8 @@ also runs on Android TV, and its user agent there contains both `Android` and `C
 Decode limits (Cited: [Supported media](https://developers.google.com/cast/docs/media)): Chromecast 1st and 2nd
 generation H.264 High level 4.1 (1080p30); 3rd generation and Ultra level 4.2 (1080p60); Nest Hub level 4.1 at
 720p; Chromecast with Google TV level 5.1; Google TV Streamer level 5.2. AAC-LC and Opus are listed for audio.
-The ADR-0111 envelope (H.264, at most 1920x1080 at 30 fps, AAC-LC) holds for every rung. No rung adds a codec.
+The ADR-0111 envelope (H.264, at most 1920x1080 at 30 fps, AAC-LC) holds for every rung. No rung adds a video
+codec. The WebRTC rung adds one audio codec, Opus (decision 6).
 
 Class membership is never decided from a user agent or a model name. The receiver that starts tells the engine
 what it is and what it can do (decision 3).
@@ -135,8 +136,9 @@ The sender does not choose a rung and does not change. Its LOAD stays `<origin>/
 One decoder means a switch is always visible. The rules keep switches rare and one-directional.
 
 - **Step down** when, on the playing rung: no frame is presented for 2 s; or the transport closes; or the
-  receiver's latency estimate (decision 2, Measurement) stays above three times the rung's target for 10 s and
-  catch-up did not bring it back. The last frame stays on screen; the busy indicator shows after 1 s; no error
+  receiver's `latency_ms` median stays above three times the rung's target for 10 s and catch-up did not bring
+  it back. The latency cause applies only while the report's `method` is `frame` or `playhead` (see "Engine
+  media time on each rung"); with `unavailable` it is switched off. The last frame stays on screen; the busy indicator shows after 1 s; no error
   screen unless HLS also fails.
 - **Never step up inside a picture.** A higher rung is tried again only at the next LOAD (a new cast, or the
   sender's video switch between cast outputs) or the receiver's own reload, and only after the 15 minute memory
@@ -173,16 +175,139 @@ Joining costs up to one GOP (1 s) on every rung, because no rung may ask the sha
 A rung that measures worse than the rung below it on a device class is removed from that class's ladder in the
 engine's offer rules (slice 7). The order above is the starting order, not a promise.
 
+#### Engine media time on each rung
+
+Reviewer finding D1. A presented frame's timestamp is not the engine's timestamp on every rung, so the mapping
+is fixed here per rung, and a rung without a trustworthy mapping reports no latency at all.
+
+**Engine media time `E`** is the output's presentation timestamp in microseconds, derived from the tick counter
+(exact integer rescale of the encoder time base, never a float). It is one timeline per engine run. Takes and
+encoder changes do not reset it. Only an engine restart does, and a restart ends every attachment.
+
+**Wall time of `E`** comes from the pipeline's outbound epoch, the same map that stamps
+`EXT-X-PROGRAM-DATE-TIME` (Read: `crates/multiview-output/src/epoch.rs:1-13`; the cast sink holds it,
+`crates/multiview-cli/src/cast_output/runner.rs:62-63`). The map has a generation that changes when the epoch
+is stepped (Read: `epoch.rs:15-26`). The ladder route returns one pair of that map, never a bare "PTS zero":
+
+```json
+"clock": { "source": "epoch", "epoch_generation": 7,
+           "media_us": 5400000000, "wall_unix_us": 1794705000000000,
+           "t1_unix_us": 1794705012345000, "t2_unix_us": 1794705012345400 }
+```
+
+`clock` is `null` when the run has no validated epoch; the MoQ lease already refuses to invent one (Read:
+`clock_wall_micros: None`, `crates/multiview-cli/src/moq_outputs/factory.rs:756`). `source` is `arrival` when
+the only anchor is the time packets reached the sink (ADR-0111's second choice); a latency computed from it
+leaves out the encoder's delay and is labelled so.
+
+**Receiver clock.** The receiver reads time from a monotonic clock only (`performance.timeOrigin +
+performance.now()`; `System.nanoTime()` on Android), never from the settable wall clock. It estimates its
+offset to the engine from four timestamps of one ladder call, as NTP does: `t0` sent, `t1` received by the
+engine, `t2` answered, `t3` received. Offset is `((t1 - t0) + (t2 - t3)) / 2`; its error is at most
+`((t3 - t0) - (t2 - t1)) / 2`. It keeps the sample with the smallest error of the last 8 and repeats the call
+every 30 s (`{"v":1,"clock":{"t0":...}}`, answered with `clock` only). If the best error is above 250 ms, the
+clock is `unavailable`.
+
+**What the receiver reads, per rung.**
+
+| Rung | Timestamp the receiver gets for a presented frame | How it becomes `E` | When the frame was shown |
+| --- | --- | --- | --- |
+| HLS | Media time on the element's timeline. `tfdt` is the tick-derived timestamp, never rebased (ADR-0111 decision 2) | Not needed: `playerManager.getAbsoluteTimeForMediaTime(t)` returns the wall time from the playlist's date-time (Cited: [PlayerManager](https://developers.google.com/cast/docs/reference/web_receiver/cast.framework.PlayerManager)), which is the epoch's wall time of that frame | `requestVideoFrameCallback`: `mediaTime` and `expectedDisplayTime` |
+| MoQ | Each frame arrives with its timestamp in microseconds, the exact rescale of the encoder PTS (Read: `micros`, `crates/multiview-cli/src/moq_outputs.rs:53-66`). No wrap inside 2^62 | The player writes `tfdt = timestamp - B`, where `B` is the first keyframe's timestamp of this attachment, with `timestampOffset = 0` and `mode = "segments"`. `B` is the player's own number, so `E = mediaTime * 1e6 + B` holds by construction | as HLS |
+| WebRTC | The RTP timestamp of the frame: `metadata.rtpTimestamp` of `requestVideoFrameCallback` (Cited: "SHOULD be present for WebRTC applications", [video.rVFC](https://wicg.github.io/video-rvfc/)). `mediaTime` is not used: the same text says it "MAY have a zero value for live-streams or WebRTC applications" | Engine contract below; unwrapped against the clock | `expectedDisplayTime` of the same callback |
+| SRT | `presentationTimeUs` of Media3's `VideoFrameMetadataListener` (Read: `VideoFrameMetadataListener.java`, Media3 1.8.0) | TS contract below; unwrapped against the clock | `releaseTimeNs` of the same callback, which "can be compared to `System.nanoTime()`" |
+
+**WebRTC contract.** The cast rung writes the wire RTP timestamp as `R = floor(E * clock / 1e6) mod 2^32`, with
+clock 90 000 for video and 48 000 for audio, and no offset. Three things make that true and each is a slice 5
+requirement, not an assumption:
+
+1. The conversion wraps. The WebRTC output on `main` converts with `u32::try_from(ts.max(0)).unwrap_or(0)`
+   (Read: `crates/multiview-cli/src/pipeline.rs:10028-10030`), which yields 0 for every frame once the 90 kHz
+   value passes 2^32, 13 h 15 min into a run. Not reproduced at run time. The cast rung uses a masked
+   conversion, as the preview path does (Read: `crates/multiview-cli/src/whep.rs:317-320`). The existing output
+   is outside this ADR and is reported to the lead.
+2. The library adds no offset. In str0m 0.16.2 the sample's time goes to the header as given (Read:
+   `src/packet/payload.rs:58`, `src/streams/send.rs` `write_rtp`). A test reads a sent packet and compares.
+3. Audio is stamped with engine time. The preview path stamps Opus with the encoder's own sample counter (Read:
+   `whep.rs:315-316`). The cast rung's one Opus encoder per output is seeded from the engine timestamp of the
+   audio block it encodes. Unverified: that the audio tap carries that timestamp; if not, slice 5 adds it.
+
+The receiver unwraps `R`: of all values congruent to `R` modulo 2^32 it takes the one nearest to the engine
+media time it expects now (from `clock`). That is unambiguous while latency is under 6 h 37 min.
+
+**A/V sync on WebRTC** is done by the browser from RTCP sender reports, which pair each stream's RTP time with
+one wall clock. str0m builds that pair from the `wallclock` given with each sample (Read: `sender_info`,
+`src/streams/send.rs:841-873`). The existing driver passes the time of writing (Read:
+`crates/multiview-webrtc/src/transport/whep_serve.rs:563-575`), so audio and video would be aligned on when
+they were sent, which differs by the difference of their encoder delays. The cast rung passes the epoch's wall
+time of the sample's `E` for both streams. It is always in the past when written, as str0m requires.
+
+**TS contract (SRT).** libav's MPEG-TS muxer writes `PTS = packet PTS + 2 * max_delay` in 90 kHz, and
+`max_delay` is 0 unless the caller sets it (Read: FFmpeg 8.0 `libavformat/mpegtsenc.c:1130-1131`,
+`:1877-1900`). The engine's muxer wrapper does not set it (Read: no `max_delay` in
+`crates/multiview-ffmpeg/src/mux.rs` or `crates/multiview-output/src/sink/push.rs`). So the wire PTS should be
+`floor(E * 90000 / 1e6) mod 2^33`. Unverified end to end; slice 6 proves it by demuxing the engine's own SRT
+output and comparing with the packets' timestamps, across a session that starts late in a run.
+
+On the device the mapping must survive extraction. Media3's `TsExtractor` subtracts the first timestamp by
+default: every public constructor without an adjuster passes `new TimestampAdjuster(0)` (Read:
+`TsExtractor.java:190-243`, 1.8.0). The app constructs the extractor with its own
+`TimestampAdjuster(TimestampAdjuster.MODE_NO_OFFSET)` (Read: "if timestamps should not be offset",
+`TimestampAdjuster.java:80`), which still unwraps the 33-bit rollover against the previous timestamp (Read:
+`adjustTsTimestamp`, `:196-212`). The renderer reports `bufferPresentationTimeUs - outputStreamOffsetUs` (Read:
+`MediaCodecVideoRenderer.java:1797`, `:1840`). Unverified: that this equals the extractor's sample time for a
+progressive source in every case. Slice 6 has an instrumented test that plays a stream of known PTS and
+compares. The app resolves the 2^33 cycle (26 h 30 min) against the clock, as for RTP.
+
+**Discontinuities.**
+
+| Event | Effect on the mapping |
+| --- | --- |
+| Take, encoder change, feed change with the attachment kept | None. `E` continues |
+| New attachment (re-attach, step-down, receiver reload) | MoQ: a new `B`. Others: nothing to reset. The measurement window restarts |
+| Player reset inside an attachment (decision 3, Receiver buffers) | MoQ keeps `B`; the buffered range has a gap and the playhead moves to the new range. The window restarts |
+| RTP or TS wrap | Handled by the unwrap rules above |
+| Epoch step | `E` is unaffected; its wall time changes. The receiver learns it from `epoch_generation`. Before it acts on latency it makes one clock call; if the generation changed it discards its samples |
+| Engine restart | Every attachment ends; the next ladder call brings a new `clock` |
+
+**When there is no trustworthy mapping.** Each report says how the number was obtained:
+
+| `method` | Meaning | Latency fallback |
+| --- | --- | --- |
+| `frame` | per presented frame, from the callbacks in the table above | allowed |
+| `playhead` | `requestVideoFrameCallback` is absent: `currentTime` sampled every 100 ms (HLS and MoQ only; error up to one sample period plus one frame) | allowed (the threshold is seconds, the error is 150 ms) |
+| `unavailable` | any of: `clock` is `null` or `unavailable`; WebRTC without `rtpTimestamp` in the frame metadata; SRT before the instrumented test of slice 6 passes on that app build; or the sanity check failed | **disabled** |
+
+Sanity check: a sample is valid only if it lies between 0 and 60 s. More than 5 invalid samples in a window
+set `method` to `unavailable` for the rest of the attachment. With `unavailable` the receiver reports
+`latency_ms: null`, never a guessed number, and the step-down rule keeps only its two other causes: no frame
+for 2 s, and transport closed.
+
+`getSynchronizationSources()` gives an RTP timestamp with the time a frame was delivered to the track (Cited:
+[WebRTC](https://www.w3.org/TR/webrtc/)), which is before decode and display. It is reported as a diagnostic
+only and never drives a fallback.
+
+**Two numbers, never mixed.** `first_frame_ms` is the time from the start of an attempt to the first presented
+frame, on the receiver's monotonic clock alone; it needs no mapping and is what the attempt deadlines use.
+`latency_ms` is steady state: it starts 3 s after the first frame, over windows of 5 s, and reports median,
+95th percentile, sample count, `method` and the clock error.
+
+**Tests (slices 2, 4, 5, 6).** Unit tests of the mapping with: an offset `B`; RTP values on both sides of 2^32
+and TS values on both sides of 2^33; a player reset; an epoch step between two clock calls; metadata without
+`rtpTimestamp`; no `requestVideoFrameCallback`; a clock error above the limit. One end-to-end test per rung
+plays the latency slate and compares the reported latency with the tick number read from the picture. One
+negative test per rung: a healthy stream with an unusable mapping must not step down.
+
 #### Measurement
 
 Two numbers, kept apart.
 
-1. **Tick-to-present (automatic, every cast).** The ladder answer gives the wall-clock time of PTS zero. The
-   receiver estimates its clock offset to the engine from the timestamps on its report exchange (four
-   timestamps, as NTP does; error at most half the round trip). For each presented frame it knows the PTS
-   (`requestVideoFrameCallback` in the Web Receiver, the frame-rendered callback of `MediaCodec` on Android).
-   It reports the median and the 95th percentile every 5 s. This number excludes the TV's own processing and is
-   therefore not glass-to-glass. It is what the fallback rule uses.
+1. **Tick-to-present (automatic, every cast).** For each presented frame the receiver takes the frame's
+   engine media time and the time it was shown, both as defined per rung in the section above, and reports
+   `latency_ms` every 5 s. This number excludes the TV's own processing and is therefore not glass-to-glass.
+   It is what the fallback rule uses, and only when its `method` allows it. Today's HLS report is a different
+   number: Shaka's `liveLatency`, the playlist's date-time against the TV's own wall clock with no offset
+   correction (Read: `receiver.js:194-201`); slice 1 replaces it.
 2. **Glass-to-glass (device test, by the operator).** Slice 1 adds a latency slate: a test source that draws the
    engine's wall clock with milliseconds and the tick number in every frame. The web UI gets a reference clock
    page that shows the same engine clock, corrected by the browser's measured offset. One photograph (or a
@@ -222,7 +347,8 @@ same CORS as the report route.
   `master.m3u8` it already fetches (Read: `receiver.js:735`). Values: `supported`, `unsupported`, `absent`.
   `vdec_hw`: the same check with `hardwareAcceleration: "prefer-hardware"`.
 - `rtc_h264`: the `profile-level-id` values of `RTCRtpReceiver.getCapabilities("video")`, at most 8.
-- `rvfc`: `requestVideoFrameCallback` exists (needed for the latency estimate).
+- `rvfc`: `requestVideoFrameCallback` exists. Without it latency is measured from the playhead on HLS and MoQ
+  and is unavailable on WebRTC (decision 2, "Engine media time on each rung").
 - `srt`: on Android TV, the libsrt version the app loaded; `null` in the Web Receiver.
 - `need`: what the session must carry (decision 2, Tracks).
 - `skip`: rungs in the device's failure memory, with the seconds left.
@@ -235,7 +361,8 @@ The answer:
 
 ```json
 { "v": 1,
-  "clock": { "pts_zero_unix_us": 1794700000000000, "server_unix_us": 1794700012345678 },
+  "clock": { "source": "epoch", "epoch_generation": 7, "media_us": 5400000000,
+             "wall_unix_us": 1794705000000000, "t1_unix_us": 1794705012345000, "t2_unix_us": 1794705012345400 },
   "attach": { "rung": "moq", "url": "https://<host>/moq?...", "broadcast": "...", "protocol": "...",
               "video": { "codec": "avc1.640029", "coded_width": 1920, "coded_height": 1080, "description": "..." },
               "audio": [ { "track": "...", "codec": "mp4a.40.2", "sample_rate": 48000, "number_of_channels": 2 } ],
@@ -244,6 +371,7 @@ The answer:
   "srt": null }
 ```
 
+- `clock` is defined in decision 2, "Engine media time on each rung"; it may be `null`.
 - `attach` is the best rung the engine will serve this receiver now, already admitted. `then` names the rest.
   The receiver gets the next one by calling again with `failed` set; that call is also the failure report.
 - For `webrtc`, `attach` is `{ "rung": "webrtc", "whep": "whep" }`: the receiver posts its SDP offer to
