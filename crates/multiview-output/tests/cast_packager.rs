@@ -1393,3 +1393,38 @@ fn an_adts_stream_at_another_rate_than_configured_is_refused() {
         .unwrap_err();
     assert!(error.to_string().contains("44100"), "{error}");
 }
+
+/// #418 review ABUSE-HISTORY-R4: a retired file that cannot be unlinked
+/// (here: a non-empty directory took the oldest segment's name, so the
+/// unlink fails with something other than "not found" — deterministic, as
+/// root too) fails the push: the caller replaces the packager under a NEW
+/// file generation instead of leaving retired bytes servable under this one.
+#[test]
+fn a_failed_unlink_of_a_retired_segment_fails_the_packager() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut feeder = Feeder::new(config(dir.path(), true));
+    feeder.run(0..361).unwrap();
+    let oldest = dir.path().join("seg-v-7-0.m4s");
+    assert!(oldest.is_file());
+    std::fs::remove_file(&oldest).unwrap();
+    std::fs::create_dir(&oldest).unwrap();
+    std::fs::write(oldest.join("pinned"), b"x").unwrap();
+    // A missing file is fine: the oldest audio segment already went away.
+    std::fs::remove_file(dir.path().join("seg-a-7-0.m4s")).unwrap();
+    let mut failed = None;
+    for index in 361..1800 {
+        if let Err(error) = feeder.run(index..index + 1) {
+            failed = Some((index, error.to_string()));
+            break;
+        }
+    }
+    let (index, error) = failed.expect("the unlink failure is an error");
+    assert!(error.contains("unlinking retired"), "{error}");
+    assert!(error.contains("seg-v-7-0.m4s"), "{error}");
+    // It fails when sequence 0 leaves the 2 x window retention: on the
+    // keyframe that publishes sequence 20 (frame 21 x 60), not earlier.
+    assert_eq!(index, 21 * 60, "{error}");
+    assert_eq!(feeder.packager.published().video_segments, 21);
+    // The record is kept: the following packager cleanup still names it.
+    assert!(oldest.join("pinned").is_file());
+}

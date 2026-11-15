@@ -791,3 +791,42 @@ fn a_move_onto_other_parameter_sets_writes_a_new_init_and_one_discontinuity() {
         "{audio}"
     );
 }
+
+/// #418 review ABUSE-HISTORY-R4: a retired segment that cannot be unlinked
+/// fails the packager; the runner restarts it under a NEW file generation,
+/// which the status reports, so the leftover (named for the old one) is
+/// never served.
+#[test]
+fn a_failed_unlink_of_a_retired_segment_restarts_a_new_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("cast-1");
+    let gate = Arc::new(CastGate::new());
+    let mut runner = CastRunner::new(setup(&dir, &gate, SharedEpoch::new(), true));
+    let mut stream = Stream::new(true);
+    let start = Instant::now();
+    let at = |index: i64| start + Duration::from_millis(u64::try_from(index).unwrap() * 1001 / 30);
+    let generation = gate.activate(false).unwrap();
+    stream.run(&mut runner, 0..300, at(0));
+    assert_eq!(listed_generation(&dir), generation);
+    let oldest = files(&dir)
+        .into_iter()
+        .find(|name| name.starts_with(&format!("seg-v-{generation}-")))
+        .unwrap();
+    let pinned = dir.join(&oldest);
+    std::fs::remove_file(&pinned).unwrap();
+    std::fs::create_dir(&pinned).unwrap();
+    std::fs::write(pinned.join("pinned"), b"x").unwrap();
+    for index in 300..2400 {
+        stream.frame(&mut runner, index, at(index));
+    }
+    let status = gate.status();
+    // Once: the new generation never names (nor retires) the old file.
+    assert_eq!(status.restarts, 1, "{status:?}");
+    let error = status.last_error.clone().unwrap();
+    assert!(error.contains("unlinking retired"), "{error}");
+    assert_ne!(status.generation, generation, "{status:?}");
+    // Restarted and healthy under new file names.
+    assert!(status.ready, "{status:?}");
+    assert!(listed_generation(&dir) > generation);
+    assert_eq!(status.generation, listed_generation(&dir));
+}

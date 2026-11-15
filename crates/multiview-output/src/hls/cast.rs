@@ -321,6 +321,20 @@ fn remove_quietly(path: &Path) {
     }
 }
 
+/// Unlink a retired file this packager published (#418 review
+/// ABUSE-HISTORY-R4). Unlike [`remove_quietly`], only an already missing
+/// file counts as removed: any other failure is an error, so the packager
+/// fails and is replaced under a NEW file generation (which the control
+/// plane never serves) instead of leaving retired bytes servable under the
+/// current one.
+fn remove_retired(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error("unlinking retired", path, &error)),
+    }
+}
+
 /// Whether `text` is `<digits>-<digits>` (the `<generation>-<index>` part of
 /// a packager file name).
 fn is_generation_index(text: &str) -> bool {
@@ -968,9 +982,9 @@ impl CastPackager {
     /// is negative, no parameter sets are known after 300 units ("no H.264
     /// parameter sets in-band or in extradata"), an open segment exceeds its
     /// bounds (no IDR arrives), audio falls more than three segments behind
-    /// or is missing for more than eight segments in a row, or a file cannot
-    /// be written. After an error the packager must be
-    /// replaced by a new one (a new generation).
+    /// or is missing for more than eight segments in a row, a file cannot
+    /// be written, or a retired file cannot be unlinked. After an error the
+    /// packager must be replaced by a new one (a new generation).
     pub fn push_video(&mut self, unit: VideoUnit<'_>) -> Result<()> {
         if self.gap_noted {
             self.handle_gap()?;
@@ -1474,8 +1488,7 @@ impl CastPackager {
             video_init: init_name,
         });
         self.write_master(&closed.sps)?;
-        self.retire_old_files();
-        Ok(())
+        self.retire_old_files()
     }
 }
 
@@ -1726,27 +1739,45 @@ impl CastPackager {
 
     /// Unlink the segment files that left the retention window (the listed
     /// window plus one more window) and the init files nothing refers to.
-    fn retire_old_files(&mut self) {
+    ///
+    /// # Errors
+    /// #418 review ABUSE-HISTORY-R4: an unlink that fails (other than for
+    /// an already missing file) is an error. The record of the file stays
+    /// (in `on_disk` / `inits`), so [`CastPackager::remove_files`] still
+    /// names it; the caller then replaces the packager under a new file
+    /// generation, whose media alone the control plane serves.
+    fn retire_old_files(&mut self) -> Result<()> {
         let keep = self.window.saturating_mul(2);
         while self.on_disk.len() > keep {
-            let Some(old) = self.on_disk.pop_front() else {
+            let Some(old) = self.on_disk.front() else {
                 break;
             };
-            remove_quietly(&self.dir.join(&old.video));
-            for name in old.audio.iter().chain(&old.subtitles) {
-                remove_quietly(&self.dir.join(name));
+            for name in std::iter::once(&old.video)
+                .chain(&old.audio)
+                .chain(&old.subtitles)
+            {
+                remove_retired(&self.dir.join(name))?;
             }
+            self.on_disk.pop_front();
         }
         let current = self.video.init.as_ref().map(|(_, _, name)| name.clone());
         let (on_disk, dir) = (&self.on_disk, &self.dir);
+        let mut failed = None;
         self.inits.retain(|name| {
             let used = Some(name) == current.as_ref()
                 || on_disk.iter().any(|files| &files.video_init == name);
-            if !used {
-                remove_quietly(&dir.join(name));
+            if used {
+                return true;
             }
-            used
+            match remove_retired(&dir.join(name)) {
+                Ok(()) => false,
+                Err(error) => {
+                    failed.get_or_insert(error);
+                    true
+                }
+            }
         });
+        failed.map_or(Ok(()), Err)
     }
 
     /// Feed one AAC frame (1024 samples, raw or ADTS framed) of audio
@@ -1756,8 +1787,9 @@ impl CastPackager {
     /// # Errors
     /// Returns [`Error::Output`] when more than 10 s of audio of one
     /// rendition is buffered waiting for video, an ADTS header contradicts
-    /// the configured sample rate, or a file cannot be written. After an
-    /// error the packager must be replaced by a new one.
+    /// the configured sample rate, a file cannot be written, or a retired
+    /// file cannot be unlinked. After an error the packager must be replaced
+    /// by a new one.
     pub fn push_audio(&mut self, rendition: usize, unit: AudioUnit<'_>) -> Result<()> {
         let Some(audio) = self.audio.get(rendition) else {
             return Ok(());
