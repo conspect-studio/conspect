@@ -92,8 +92,8 @@ jobs:
           export FFMPEG_VERSION FFMPEG_SHA256 FFMPEG_GIT_COMMIT
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config clang nasm build-essential xz-utils gnupg dirmngr patchelf patch \
-            libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev zlib1g-dev
+            pkg-config clang nasm build-essential xz-utils gnupg dirmngr patchelf patch cmake libssl-dev \
+            libopus-dev libgnutls28-dev libdrm-dev libva-dev zlib1g-dev
           case "$(uname -m)" in
             x86_64)
               sudo apt-get install -y --no-install-recommends libvpl-dev
@@ -236,6 +236,17 @@ jobs:
             test -s "dist/${STAGE}/licenses/ffmpeg/COPYING.LGPLv3"
             test -s "dist/${STAGE}/licenses/ffmpeg/COPYING.GPLv3"
             cp -a "${FF_PREFIX}"/lib/lib{avcodec,avdevice,avfilter,avformat,avutil,swresample,swscale}.so.* "dist/${STAGE}/lib/"
+            # The pinned libsrt 1.5.7 (deploy/libsrt-build.sh; security floor
+            # GHSA-m96h-3rc9-xx6h) ships too, with its MPL-2.0 licence. It is a
+            # dependency of libavformat, not of the binary, and the binary's
+            # RUNPATH does not apply to a library's own NEEDED entries, so the
+            # bundled libav* get an $ORIGIN RUNPATH of their own.
+            cp -a "${FF_PREFIX}"/lib/libsrt.so.* "dist/${STAGE}/lib/"
+            cp -a "${FF_PREFIX}/share/licenses/libsrt" "dist/${STAGE}/licenses/libsrt"
+            test -s "dist/${STAGE}/licenses/libsrt/LICENSE"
+            for lib in "dist/${STAGE}"/lib/lib{avcodec,avdevice,avfilter,avformat,avutil,swresample,swscale}.so.*.*.*; do
+              patchelf --set-rpath '$ORIGIN' "${lib}"
+            done
             patchelf --set-rpath '$ORIGIN/lib' "dist/${STAGE}/multiview"
             # Prove the bundle resolves with NO loader override: every libav*
             # must come from the archive's own lib/, and nothing may be missing.
@@ -247,13 +258,18 @@ jobs:
             {
               echo "multiview ${{ github.ref_name }} (${{ matrix.target }}) - host runtime packages"
               echo "The pinned FFmpeg libraries are bundled in lib/. Install these on Debian 13 / Ubuntu 24.04:"
-              echo "  sudo apt-get install libgnutls30t64 libopus0 libsrt1.5-openssl libva2 libva-drm2 libdrm2 zlib1g"
-              echo "  (older releases name the first package libgnutls30)"
+              echo "  sudo apt-get install libgnutls30t64 libopus0 libssl3t64 libva2 libva-drm2 libdrm2 zlib1g"
+              echo "  (older releases name these libgnutls30 and libssl3)"
+              echo "libsrt is bundled in lib/ (1.5.7, the listener security floor); do not install a distro libsrt."
               if [ "$(uname -m)" = x86_64 ]; then
                 echo "  sudo apt-get install libvpl2   # Intel QSV (oneVPL) on amd64"
               fi
               echo "Then check: ldd ./multiview | grep 'not found' (no output means ready)."
             } > "dist/${STAGE}/RUNTIME-DEPENDENCIES.txt"
+            # libsrt is a transitive dependency: check it through libavformat.
+            env -u LD_LIBRARY_PATH ldd "dist/${STAGE}/lib/libavformat.so.63" \
+              | grep -q "libsrt.so.1.5 => .*/dist/${STAGE}/lib/libsrt.so.1.5" \
+              || { echo "::error::libsrt.so.1.5 does not resolve from the bundled lib/"; exit 1; }
             for so in libavcodec.so.63 libavformat.so.63 libavutil.so.61; do
               printf '%s\n' "${out}" | grep -q "${so} => .*/dist/${STAGE}/lib/${so}" \
                 || { echo "::error::${so} does not resolve from the bundled lib/"; exit 1; }

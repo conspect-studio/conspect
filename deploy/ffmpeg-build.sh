@@ -435,8 +435,28 @@ done
 # 4. Build + install. PKG_CONFIG_PATH lets configure see the nv-codec-headers
 #    .pc files installed into the prefix above (NVIDIA path).
 # -----------------------------------------------------------------------------
-cd "${SRC}"
 export PKG_CONFIG_PATH="${FF_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+# -----------------------------------------------------------------------------
+# 2b. libsrt — the security floor (GHSA-m96h-3rc9-xx6h, fixed in 1.5.7; the
+#     multiview-srt-sys listener refuses anything older). On Linux build the
+#     pinned, SHA-256-verified upstream 1.5.7 into THIS prefix (it ships with
+#     the libav* libraries), so FFmpeg's srt protocol links it and no distro
+#     libsrt is needed. macOS (Homebrew) and Windows (vcpkg) supply their own.
+# -----------------------------------------------------------------------------
+case "${FF_HWACCEL}" in
+  vaapi|nvidia)
+    bash "${SCRIPT_DIR}/libsrt-build.sh" build "${FF_PREFIX}"
+    ;;
+  apple)
+    if ! pkg-config --atleast-version=1.5.7 srt; then
+      echo "ffmpeg-build: libsrt $(pkg-config --modversion srt 2>/dev/null || echo missing) is below the 1.5.7 security floor" >&2
+      exit 6
+    fi
+    ;;
+esac
+
+cd "${SRC}"
 
 echo "ffmpeg-build: ./configure ${CONFIGURE_ARGS[*]}"
 ./configure "${CONFIGURE_ARGS[@]}"
@@ -504,5 +524,15 @@ test -e "${FF_PREFIX}/$(soname avutil 61)"
 test -e "${FF_PREFIX}/$(soname avformat 63)"
 test -s "${FF_PREFIX}/share/licenses/ffmpeg/COPYING.LGPLv3"
 test -s "${FF_PREFIX}/share/licenses/ffmpeg/COPYING.GPLv3"
+if [ "${FF_HWACCEL}" = "vaapi" ] || [ "${FF_HWACCEL}" = "nvidia" ]; then
+  # FFmpeg's srt protocol must resolve the pinned libsrt in this prefix, never
+  # a distro copy: the prefix is what every image and CI leg ships.
+  bash "${SCRIPT_DIR}/libsrt-build.sh" assert "${FF_PREFIX}"
+  srt_dep="$(LD_LIBRARY_PATH="${FF_PREFIX}/lib" ldd "${FF_PREFIX}/$(soname avformat 63)" | awk '$1 == "libsrt.so.1.5" { print $3 }')"
+  if [ "$(realpath -- "${srt_dep:-/nonexistent}" 2>/dev/null)" != "$(realpath -- "${FF_PREFIX}/lib/libsrt.so.1.5")" ]; then
+    echo "ffmpeg-build: libavformat resolves libsrt.so.1.5 to '${srt_dep}', not ${FF_PREFIX}/lib" >&2
+    exit 6
+  fi
+fi
 assert_features
 echo "ffmpeg-build: OK — FFmpeg ${FFMPEG_VERSION} installed to ${FF_PREFIX} ($(soname avcodec 63))."

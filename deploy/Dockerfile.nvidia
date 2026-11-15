@@ -4,7 +4,7 @@
 #
 # Multi-stage:
 #   * ffmpeg   — pulled from the SEPARATELY-PUBLISHED FFmpeg base image
-#                (ghcr.io/aperim/multiview-ffmpeg:9.0.2-nvidia, ADR-0031 §5). It
+#                (ghcr.io/aperim/multiview-ffmpeg:9.0.2-srt1.5.7-nvidia, ADR-0031 §5). It
 #                ships OUR OWN pinned, GPG+SHA-256-verified FFmpeg 9.0.2 under the
 #                ADR-0031 LGPL-clean allowlist (NVENC/NVDEC/cuvid/scale_cuda via
 #                nv-codec-headers + --enable-cuda-llvm; NO CUDA SDK; NO GPL/
@@ -51,7 +51,7 @@
 # Base-image pinning: the FFmpeg base (FFMPEG_IMAGE) and the `rust:1-trixie` /
 # `nvidia/cuda:…` tags below are floating lines. For a reproducible release pin
 # each by digest, e.g.
-#   ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-nvidia@sha256:<digest>
+#   ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-srt1.5.7-nvidia@sha256:<digest>
 #   FROM rust:1-trixie@sha256:<digest> AS chef
 #   FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04@sha256:<digest> AS runtime
 # (Renovate adds + bumps these digests; CI provenance/SBOM record them anyway.)
@@ -61,7 +61,7 @@
 # override with `--build-arg FFMPEG_IMAGE=…@sha256:<digest>`. The default stays the public
 # upstream image; docker.yml passes the repo owner's own base once published
 # (scripts/resolve-ffmpeg-image.sh).
-ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-nvidia
+ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-srt1.5.7-nvidia
 
 # -----------------------------------------------------------------------------
 # Stage 0: ffmpeg — the published FFmpeg 9.0.2 base (NVENC/NVDEC, LGPL-clean).
@@ -98,14 +98,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Native build deps: pkg-config + clang/libclang for the FFI bindgen and to
 # locate libav* via pkg-config. The libav* themselves come from the published
 # ffmpeg base (COPY --from=ffmpeg below) — NOT from apt (no libav*-dev here).
-# Also install OUR FFmpeg's transitive runtime libs (libopus/libsrt/gnutls/libdrm)
+# Also install OUR FFmpeg's transitive runtime libs (libopus/libssl3/gnutls/libdrm)
 # here: the `builder` stage's `multiview --version` smoke test dynamically loads
 # libavcodec.so.63, which NEEDs them — without them the loader exits 127
 # ("error while loading shared libraries"). Same set the runtime stage installs.
+# libsrt is NOT an apt package here: the FFmpeg base ships the pinned upstream
+# libsrt 1.5.7 (security floor, GHSA-m96h-3rc9-xx6h; Debian trixie's 1.5.4 lacks
+# the fix) in /opt/multiview-ffmpeg/lib, built against OpenSSL, hence libssl3t64.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       pkg-config clang llvm-dev libclang-dev nasm \
-      libopus0 libsrt1.5-openssl libgnutls30t64 libdrm2 \
+      libopus0 libssl3t64 libstdc++6 libgnutls30t64 libdrm2 \
  && rm -rf /var/lib/apt/lists/*
 
 # Our pinned FFmpeg 9.0.2 (headers + .so + .pc) from the published base image.
@@ -201,10 +204,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # refuses to create an instance (a Vulkan-specific driver fault — NVENC + GL work,
 # Vulkan does not). Without these GLVND loaders wgpu's GL path errors
 # "gl drivers/libraries could not be loaded" and the only adapter left is llvmpipe.
+# libsrt is NOT an apt package here: the FFmpeg base ships the pinned upstream
+# libsrt 1.5.7 (security floor, GHSA-m96h-3rc9-xx6h; Debian trixie's 1.5.4 lacks
+# the fix) in /opt/multiview-ffmpeg/lib, built against OpenSSL, hence libssl3t64.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
-      libopus0 libsrt1.5-openssl libgnutls30t64 libdrm2 \
+      libopus0 libssl3t64 libstdc++6 libgnutls30t64 libdrm2 \
       libvulkan1 libx11-6 libxext6 util-linux \
       libglvnd0 libegl1 libgl1 libgles2 \
  && rm -rf /var/lib/apt/lists/*
@@ -220,6 +226,9 @@ COPY --from=ffmpeg /opt/multiview-ffmpeg/share/licenses/ffmpeg /usr/share/licens
 RUN ldconfig \
  && test -e /usr/local/lib/libavcodec.so.63 \
  && test -e /usr/local/lib/libavutil.so.61 \
+ && test -e /usr/local/lib/libsrt.so.1.5.7 \
+ && ! dpkg-query -W -f='${Package}\n' 'libsrt*' 2>/dev/null | grep -q . \
+ && ldd /usr/local/lib/libavformat.so.63 | grep -q 'libsrt.so.1.5 => /usr/local/lib/libsrt.so.1.5 ' \
  && test -s /usr/share/licenses/ffmpeg/COPYING.LGPLv3
 
 # Driver capabilities the container needs from the NVIDIA Container Toolkit:

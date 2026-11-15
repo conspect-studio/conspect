@@ -25,6 +25,25 @@
 //!   [`recv`](SrtSocket::recv) in libsrt *message* (live) mode, each bounded by a
 //!   timeout so a dead peer surfaces as an error instead of a hang.
 //!
+//! # libsrt security floor
+//!
+//! [`SrtListener::bind`] refuses to open a listener on a libsrt older than
+//! [`MIN_LISTENER_LIBSRT`] (1.5.7) with [`SrtError::LibsrtTooOld`]. Every SRT
+//! listener in the product (the SRT output that callers pull from and the SRT
+//! input an encoder pushes to) goes through `bind`, so none can be exposed on a
+//! vulnerable library. Advisory GHSA-m96h-3rc9-xx6h: before 1.5.7 a
+//! CONCLUSION handshake carrying a tiny MSS makes the *listener* allocate a
+//! 1-byte buffer and write past it, pre-authentication, i.e. any host that can
+//! reach the UDP port can crash (or worse) the process. 1.5.6 fixed
+//! GHSA-6xg9-784j-24rm (KMREQ/KMRSP stack overflow, every mode) and
+//! GHSA-4mc6-qmpp-g7gw (encryption downgrade, receivers); 1.5.7 completed
+//! both. Caller-mode SRT is `FFmpeg`'s own `srt://` protocol, not this crate;
+//! the shipped images link `FFmpeg` against the same pinned 1.5.7, so callers
+//! get the fixes there (`deploy/libsrt-build.sh`). The version is the one the
+//! *loaded* library reports (`srt_getversion`), so a distro build that
+//! back-ports some fixes but still reports 1.5.4 is refused: back-ports do
+//! not cover the 1.5.7 heap overflow (Debian trixie 1.5.4-1+deb13u1 does not).
+//!
 //! All FFI is in this crate (`unsafe_code = deny` with `// SAFETY:` notes); the
 //! consumers stay `forbid(unsafe_code)`. No callback is registered with libsrt,
 //! so no Rust code ever runs on a libsrt thread.
@@ -105,6 +124,79 @@ pub enum SrtError {
     /// An argument was invalid (e.g. a passphrase with an interior NUL).
     #[error("invalid argument: {0}")]
     Invalid(&'static str),
+    /// The loaded libsrt is older than the listener security floor
+    /// ([`MIN_LISTENER_LIBSRT`]); no listener is opened on it. Its text starts
+    /// with the stable code `srt-libsrt-too-old` (ADR-0114 decision 4), which
+    /// the listener's link status carries as its `last_error`. There is no
+    /// override: a switch that re-opens a pre-authentication memory fault is
+    /// not offered.
+    #[error(
+        "srt-libsrt-too-old: libsrt {found} is below the listener security floor {required} \
+         (GHSA-m96h-3rc9-xx6h: pre-authentication heap overflow in the listener \
+         handshake); install libsrt {required} or newer"
+    )]
+    LibsrtTooOld {
+        /// The version the loaded library reports.
+        found: LibsrtVersion,
+        /// The floor.
+        required: LibsrtVersion,
+    },
+}
+
+/// A libsrt release number as `srt_getversion()` encodes it
+/// (`major << 16 | minor << 8 | patch`, libsrt `SrtVersion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LibsrtVersion {
+    /// Major.
+    pub major: u8,
+    /// Minor.
+    pub minor: u8,
+    /// Patch.
+    pub patch: u8,
+}
+
+impl LibsrtVersion {
+    /// A version from its parts.
+    #[must_use]
+    pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    /// Decode `srt_getversion()`'s packed value.
+    #[must_use]
+    pub fn from_raw(raw: u32) -> Self {
+        let byte = |shift: u32| u8::try_from((raw >> shift) & 0xff).unwrap_or(u8::MAX);
+        Self::new(byte(16), byte(8), byte(0))
+    }
+}
+
+impl std::fmt::Display for LibsrtVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// The oldest libsrt a listener may run on: 1.5.7 fixes the pre-authentication
+/// listener heap overflow GHSA-m96h-3rc9-xx6h (and completes the 1.5.6 fixes
+/// for GHSA-6xg9-784j-24rm and GHSA-4mc6-qmpp-g7gw).
+pub const MIN_LISTENER_LIBSRT: LibsrtVersion = LibsrtVersion::new(1, 5, 7);
+
+/// Refuse `found` when it is below [`MIN_LISTENER_LIBSRT`].
+///
+/// # Errors
+/// [`SrtError::LibsrtTooOld`] below the floor.
+pub fn check_listener_floor(found: LibsrtVersion) -> Result<()> {
+    if found < MIN_LISTENER_LIBSRT {
+        return Err(SrtError::LibsrtTooOld {
+            found,
+            required: MIN_LISTENER_LIBSRT,
+        });
+    }
+    Ok(())
 }
 
 /// Result alias.
@@ -119,6 +211,7 @@ struct EpollEvent {
 }
 
 type FnVoid = unsafe extern "C" fn() -> c_int;
+type FnVersion = unsafe extern "C" fn() -> u32;
 type FnCreate = unsafe extern "C" fn() -> SrtSock;
 type FnBind = unsafe extern "C" fn(SrtSock, *const sa::Sockaddr, c_int) -> c_int;
 type FnListen = unsafe extern "C" fn(SrtSock, c_int) -> c_int;
@@ -139,6 +232,7 @@ type FnEpollRelease = unsafe extern "C" fn(c_int) -> c_int;
 pub struct SrtLib {
     _lib: Library,
     cleanup: FnVoid,
+    getversion: FnVersion,
     create_socket: FnCreate,
     bind: FnBind,
     listen: FnListen,
@@ -240,6 +334,7 @@ impl SrtLib {
         let startup = sym!(b"srt_startup\0", FnVoid);
         let table = Self {
             cleanup: sym!(b"srt_cleanup\0", FnVoid),
+            getversion: sym!(b"srt_getversion\0", FnVersion),
             create_socket: sym!(b"srt_create_socket\0", FnCreate),
             bind: sym!(b"srt_bind\0", FnBind),
             listen: sym!(b"srt_listen\0", FnListen),
@@ -261,6 +356,13 @@ impl SrtLib {
             return Err(table.call_error("srt_startup"));
         }
         Ok(table)
+    }
+
+    /// The version the loaded library reports (`srt_getversion`).
+    #[must_use]
+    pub fn version(&self) -> LibsrtVersion {
+        // SAFETY: argument-less query of a compile-time constant in libsrt.
+        LibsrtVersion::from_raw(unsafe { (self.getversion)() })
     }
 
     /// Whether the calling thread's last libsrt error is a transient "again"
@@ -541,12 +643,17 @@ impl SrtListener {
     /// (dual-stack); an IPv4 address binds as a v4-mapped IPv6 address with the
     /// same option, i.e. IPv4 traffic for that address only.
     ///
+    /// Refused, before any socket exists, when the loaded libsrt is older
+    /// than [`MIN_LISTENER_LIBSRT`] (see the crate docs).
+    ///
     /// # Errors
-    /// [`SrtError::Unavailable`] without libsrt; [`SrtError::Call`] when socket
-    /// creation, an option, bind or listen fails (e.g. the port is in use);
+    /// [`SrtError::Unavailable`] without libsrt; [`SrtError::LibsrtTooOld`]
+    /// below the security floor; [`SrtError::Call`] when socket creation, an
+    /// option, bind or listen fails (e.g. the port is in use);
     /// [`SrtError::Invalid`] for a bad passphrase/key length.
     pub fn bind(addr: SocketAddr, options: &ListenerOptions, backlog: u16) -> Result<Self> {
         let lib = SrtLib::shared()?;
+        check_listener_floor(lib.version())?;
         // SAFETY: plain socket creation; the id is closed on every error path
         // below via the guard, and on drop otherwise.
         let sock = unsafe { (lib.create_socket)() };
@@ -872,6 +979,36 @@ mod tests {
         // The same shape surfaces through the public error Display without
         // panicking (mirrors what a listener's retry loop logs).
         assert!(err.to_string().contains("libsrt unavailable"));
+    }
+
+    /// The floor compares the packed `srt_getversion` value field by field:
+    /// Debian trixie's 1.5.4 (even with its back-ports) and 1.5.6 are refused
+    /// with the typed error naming both versions; 1.5.7 and every later
+    /// release (including a minor/major bump with a lower patch) pass.
+    #[test]
+    fn listener_floor_refuses_libsrt_below_1_5_7() {
+        let raw = |major: u32, minor: u32, patch: u32| (major << 16) | (minor << 8) | patch;
+        assert_eq!(LibsrtVersion::from_raw(raw(1, 5, 7)), MIN_LISTENER_LIBSRT);
+        assert_eq!(LibsrtVersion::from_raw(0x0001_0504).to_string(), "1.5.4");
+        for (major, minor, patch) in [(1, 5, 4), (1, 5, 6), (1, 4, 99), (0, 9, 9), (1, 5, 0)] {
+            let found = LibsrtVersion::from_raw(raw(major, minor, patch));
+            let err = check_listener_floor(found).unwrap_err();
+            let SrtError::LibsrtTooOld { found: f, required } = &err else {
+                panic!("expected LibsrtTooOld, got {err:?}");
+            };
+            assert_eq!((*f, *required), (found, MIN_LISTENER_LIBSRT));
+            let text = err.to_string();
+            assert!(
+                text.starts_with("srt-libsrt-too-old: ")
+                    && text.contains(&found.to_string())
+                    && text.contains("1.5.7")
+                    && text.contains("GHSA-m96h-3rc9-xx6h"),
+                "{text}"
+            );
+        }
+        for (major, minor, patch) in [(1, 5, 7), (1, 5, 8), (1, 6, 0), (2, 0, 0)] {
+            check_listener_floor(LibsrtVersion::from_raw(raw(major, minor, patch))).unwrap();
+        }
     }
 
     #[test]

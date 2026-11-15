@@ -499,7 +499,7 @@ jobs:
           # is itself pure-Rust — it links NO ffmpeg — but its lint coverage rides
           # the same ffmpeg-equipped leg as the cli for one cohesive webrtc gate.)
           # Guarding the ffmpeg-linked cli surface needs the pinned FFmpeg base
-          # image (ghcr.io/<owner>/multiview-ffmpeg:9.0.2-lgpl, libavcodec .so.63) —
+          # image (ghcr.io/<owner>/multiview-ffmpeg:9.0.2-srt1.5.7-lgpl, libavcodec .so.63) —
           # that is the dedicated `feature-clippy-ffmpeg-webrtc` job below. The
           # crate leg here already guards the pure-str0m Session/egress API
           # surface that broke.
@@ -682,7 +682,7 @@ jobs:
   # built these features.
   #
   # This leg clippies them against the SAME pinned FFmpeg the deploy images link:
-  # ghcr.io/<owner>/multiview-ffmpeg:9.0.2-lgpl (libavcodec .so.63 — the soname
+  # ghcr.io/<owner>/multiview-ffmpeg:9.0.2-srt1.5.7-lgpl (libavcodec .so.63 — the soname
   # `ffmpeg-sys-next 9.0.1` binds, NOT ubuntu apt's 6.x/so.60, which would
   # generate the WRONG bindings). That base image is `FROM scratch` (it ships
   # ONLY /opt/multiview-ffmpeg — no shell/apt, so it cannot be a job `container:`),
@@ -699,7 +699,7 @@ jobs:
       contents: read
       packages: read
     env:
-      FFMPEG_TAG: 9.0.2-gpl
+      FFMPEG_TAG: 9.0.2-srt1.5.7-gpl
       FFMPEG_PREFIX: /opt/multiview-ffmpeg
     steps:
       - uses: actions/checkout@v7
@@ -744,7 +744,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates build-essential pkg-config clang libclang-dev nasm \
-            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 libx264-dev libx265-dev \
+            libva2 libva-drm2 libopus0 libssl3t64 libvpl2 libx264-dev libx265-dev \
             libnuma1 libdrm2 libgnutls30t64
           export PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig"
           export LD_LIBRARY_PATH="${FFMPEG_PREFIX}/lib"
@@ -798,7 +798,7 @@ jobs:
       contents: read
       packages: read
     env:
-      FFMPEG_TAG: 9.0.2-gpl
+      FFMPEG_TAG: 9.0.2-srt1.5.7-gpl
       FFMPEG_PREFIX: /opt/multiview-ffmpeg
     steps:
       - uses: actions/checkout@v7
@@ -838,7 +838,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates build-essential pkg-config clang libclang-dev nasm \
-            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 libx264-dev libx265-dev \
+            libva2 libva-drm2 libopus0 libssl3t64 libvpl2 libx264-dev libx265-dev \
             libnuma1 libdrm2 libgnutls30t64 \
             nodejs npm chromium curl openssl python3 procps util-linux
           export PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig"
@@ -904,7 +904,7 @@ jobs:
       # scripts/resolve-ffmpeg-image.sh: this owner's ghcr.io/<owner>/multiview-ffmpeg
       # (published by ffmpeg-base.yml) when that tag exists, else the public
       # upstream ghcr.io/aperim/multiview-ffmpeg (before the owner's first publish).
-      FFMPEG_TAG: 9.0.2-lgpl
+      FFMPEG_TAG: 9.0.2-srt1.5.7-lgpl
       # Where we extract /opt/multiview-ffmpeg to on the runner. pkg-config + the
       # dynamic loader are pointed here so ffmpeg-sys-next's build.rs discovers
       # FFmpeg 9.0.2 (detects ffmpeg_9_0 → libavcodec 63) and the link finds .so.63.
@@ -934,13 +934,14 @@ jobs:
         #
         # The RUNTIME libs the pinned LGPL FFmpeg 9.0.2 links (per
         # deploy/ffmpeg-build.sh: --enable-vaapi/--enable-libdrm, --enable-libopus,
-        # --enable-libsrt [gnutls], --enable-libvpl): an ffmpeg-linked TEST binary
+        # --enable-libsrt [pinned 1.5.7 in the prefix], --enable-libvpl): an ffmpeg-linked TEST binary
         # (the aes67 leg below) fails to LOAD with exit 127 without them on the bare
         # runner; clippy never loads the binary, so it did not need them. Mapping
         # soname -> ubuntu-noble package:
         #   libva.so.2 / libva-drm.so.2 -> libva2 / libva-drm2  (VAAPI)
         #   libopus.so.0                -> libopus0
-        #   libsrt.so.1.5               -> libsrt1.5-openssl     (the image builds against libsrt-openssl-dev, whose SONAME is libsrt.so.1.5; the gnutls flavour ships libsrt-gnutls.so.1.5)
+        #   libsrt.so.1.5               -> NOT apt: the pinned prefix ships libsrt 1.5.7 (deploy/libsrt-build.sh,
+        #                                  security floor GHSA-m96h-3rc9-xx6h); it needs libcrypto.so.3 (preinstalled)
         #   libvpl.so.2                 -> libvpl2               (oneVPL)
         # gnutls + libdrm are preinstalled on ubuntu-latest; NO x264/x265 (GPL-gated,
         # absent from the -lgpl build). The `ldd` completeness guard below fails fast
@@ -962,7 +963,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang libclang-dev nasm \
-            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 \
+            libva2 libva-drm2 libopus0 libvpl2 \
             ffmpeg
           shim="${RUNNER_TEMP}/fixture-bin"
           mkdir -p "${shim}"
@@ -998,7 +999,7 @@ jobs:
             echo "::warning::${FFMPEG_IMAGE} is not published yet; building the pinned FFmpeg from source (bootstrap)."
             sudo apt-get install -y --no-install-recommends \
               build-essential xz-utils gnupg dirmngr patch \
-              libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev libvpl-dev zlib1g-dev
+              cmake libssl-dev libopus-dev libgnutls28-dev libdrm-dev libva-dev libvpl-dev zlib1g-dev
             pin() { sed -n "s/^ARG $1=//p" deploy/Dockerfile.ffmpeg | head -1; }
             sudo env FF_PREFIX="${FFMPEG_PREFIX}" FF_LICENSE=lgpl FF_HWACCEL=vaapi TARGETARCH=amd64 \
               FFMPEG_VERSION="$(pin FFMPEG_VERSION)" FFMPEG_SHA256="$(pin FFMPEG_SHA256)" \
@@ -1254,6 +1255,25 @@ jobs:
           --features ffmpeg,srt-libsrt
           --all-targets
           -- -D warnings
+      - name: Verify the SRT tests load the pinned libsrt >= 1.5.7
+        # Security floor (GHSA-m96h-3rc9-xx6h): multiview-srt-sys refuses a
+        # listener below 1.5.7, so the real-socket SRT steps below must run on
+        # the pinned prefix's libsrt, not a distro copy. dlopen("libsrt.so.1.5")
+        # honours LD_LIBRARY_PATH (the prefix, exported above); prove that
+        # resolution and the version here, and make every SRT test below FAIL
+        # instead of skipping if the floor is not met
+        # (MULTIVIEW_REQUIRE_LIBSRT_FLOOR=1, read by the srt-sys suite).
+        run: |
+          set -euo pipefail
+          ver="$(PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig" pkg-config --modversion srt)"
+          echo "pinned libsrt: ${ver}"
+          test "$(printf '%s\n1.5.7\n' "${ver}" | sort -V | head -1)" = "1.5.7" \
+            || { echo "::error::pinned libsrt ${ver} is below the 1.5.7 floor"; exit 1; }
+          test -e "${FFMPEG_PREFIX}/lib/libsrt.so.1.5" \
+            || { echo "::error::${FFMPEG_PREFIX}/lib/libsrt.so.1.5 missing"; exit 1; }
+          ldd "${FFMPEG_PREFIX}/lib/libavformat.so.63" | grep -E "libsrt\.so\.1\.5 => ${FFMPEG_PREFIX}/lib/libsrt\.so\.1\.5 " \
+            || { echo "::error::libavformat does not resolve libsrt from the pinned prefix"; exit 1; }
+          echo "MULTIVIEW_REQUIRE_LIBSRT_FLOOR=1" >> "$GITHUB_ENV"
       - name: test multiview-output --features ffmpeg,srt-libsrt (SRT push, real libsrt loopback)
         # push_resilient_srt.rs drives REAL libsrt caller/listener peers (the
         # apt `ffmpeg` CLI installed above) over loopback: sequential/simultaneous

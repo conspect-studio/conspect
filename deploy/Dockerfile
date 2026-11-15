@@ -4,7 +4,7 @@
 #
 # Multi-stage:
 #   * ffmpeg   — pulled from the SEPARATELY-PUBLISHED FFmpeg base image
-#                (ghcr.io/aperim/multiview-ffmpeg:9.0.2-lgpl, ADR-0031 §5). It
+#                (ghcr.io/aperim/multiview-ffmpeg:9.0.2-srt1.5.7-lgpl, ADR-0031 §5). It
 #                ships OUR OWN pinned, GPG+SHA-256-verified FFmpeg 9.0.2 under the
 #                ADR-0031 LGPL-clean allowlist (VAAPI + Intel QSV via libvpl on
 #                amd64; NO GPL/nonfree) at /opt/multiview-ffmpeg (libavcodec
@@ -38,7 +38,7 @@
 # + soname we did not own). The default build is genuinely LGPL-clean: we
 # DELIBERATELY do NOT enable `gpl-codecs` (x264/x265) here. A separate `-gpl`
 # image tag (built with `--build-arg
-# FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-gpl --build-arg
+# FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-srt1.5.7-gpl --build-arg
 # CARGO_FEATURES=ffmpeg,linux-vaapi,web,ntp,gpl-codecs`) is the opt-in GPL variant.
 #
 # 9.0.2 → libavcodec.so.63 / libavutil.so.61 / libavformat.so.63, matching
@@ -48,7 +48,7 @@
 # Base-image pinning: the FFmpeg base (FFMPEG_IMAGE) and the `rust:1-trixie` /
 # `debian:trixie-slim` tags below are floating lines. For a reproducible release
 # pin each by digest, e.g.
-#   ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-lgpl@sha256:<digest>
+#   ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-srt1.5.7-lgpl@sha256:<digest>
 #   FROM rust:1-trixie@sha256:<digest> AS chef
 #   FROM debian:trixie-slim@sha256:<digest> AS runtime
 # (Renovate adds + bumps these digests; CI provenance/SBOM record them anyway.)
@@ -58,7 +58,7 @@
 # override with `--build-arg FFMPEG_IMAGE=…@sha256:<digest>`. The default stays the public
 # upstream image; docker.yml passes the repo owner's own base once published
 # (scripts/resolve-ffmpeg-image.sh).
-ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-lgpl
+ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:9.0.2-srt1.5.7-lgpl
 
 # -----------------------------------------------------------------------------
 # Stage 0: ffmpeg — the published FFmpeg 9.0.2 base (VAAPI/QSV, LGPL-clean).
@@ -98,17 +98,20 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Native build deps:
 #   * pkg-config + clang/libclang  — FFI bindgen + locating our libav* via .pc.
 #   * libva-dev                    — VAAPI (Intel/AMD) for the `linux-vaapi` path.
-#   * libopus0/libsrt/gnutls/libdrm2 — OUR FFmpeg's transitive runtime libs: the
+#   * libopus0/libssl3/gnutls/libdrm2 — OUR FFmpeg's transitive runtime libs: the
 #     `builder` stage's `multiview --version` smoke test dynamically loads
 #     libavcodec.so.63 which NEEDs them; without them the loader exits 127.
 # The libav* themselves come from the published ffmpeg base (COPY --from=ffmpeg
 # below) — NOT from apt (no libav*-dev here; that opaque apt source is exactly
 # what we replaced).
+# libsrt is NOT an apt package here: the FFmpeg base ships the pinned upstream
+# libsrt 1.5.7 (security floor, GHSA-m96h-3rc9-xx6h; Debian trixie's 1.5.4 lacks
+# the fix) in /opt/multiview-ffmpeg/lib, built against OpenSSL, hence libssl3t64.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       pkg-config clang llvm-dev libclang-dev nasm \
       libva-dev \
-      libopus0 libsrt1.5-openssl libgnutls30t64 libdrm2 \
+      libopus0 libssl3t64 libstdc++6 libgnutls30t64 libdrm2 \
  && rm -rf /var/lib/apt/lists/*
 
 # Our pinned FFmpeg 9.0.2 (headers + .so + .pc) from the published base image.
@@ -149,7 +152,7 @@ FROM chef AS builder
 # it — the linux-vaapi preset already implies it, named here so an override list
 # keeps it deliberately; no GPL deps). Pass
 # `--build-arg CARGO_FEATURES=ffmpeg,linux-vaapi,web,ntp,gpl-codecs` (with
-# `--build-arg FFMPEG_IMAGE=…:9.0.2-gpl`) to produce the GPL `-gpl` image variant.
+# `--build-arg FFMPEG_IMAGE=…:9.0.2-srt1.5.7-gpl`) to produce the GPL `-gpl` image variant.
 # CARGO_FEATURES is threaded IDENTICALLY into `cook` and `build` — a mismatch
 # pre-builds the wrong dependency closure and silently triggers a near-full
 # rebuild while appearing to hit the cache.
@@ -202,10 +205,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # resolves them when the binary pulls in libavcodec.so.63 et al). libva2 +
 # mesa-va-drivers provide VAAPI; intel-media-va-driver is x86_64-only (no arm64
 # package), installed only on amd64; libvpl2 (oneVPL runtime) likewise amd64-only.
+# libsrt is NOT an apt package here: the FFmpeg base ships the pinned upstream
+# libsrt 1.5.7 (security floor, GHSA-m96h-3rc9-xx6h; Debian trixie's 1.5.4 lacks
+# the fix) in /opt/multiview-ffmpeg/lib, built against OpenSSL, hence libssl3t64.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
-      libopus0 libsrt1.5-openssl libgnutls30t64 libdrm2 \
+      libopus0 libssl3t64 libstdc++6 libgnutls30t64 libdrm2 \
       libva2 mesa-va-drivers \
  && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
       apt-get install -y --no-install-recommends intel-media-va-driver libvpl2; \
@@ -223,6 +229,9 @@ COPY --from=ffmpeg /opt/multiview-ffmpeg/share/licenses/ffmpeg /usr/share/licens
 RUN ldconfig \
  && test -e /usr/local/lib/libavcodec.so.63 \
  && test -e /usr/local/lib/libavutil.so.61 \
+ && test -e /usr/local/lib/libsrt.so.1.5.7 \
+ && ! dpkg-query -W -f='${Package}\n' 'libsrt*' 2>/dev/null | grep -q . \
+ && ldd /usr/local/lib/libavformat.so.63 | grep -q 'libsrt.so.1.5 => /usr/local/lib/libsrt.so.1.5 ' \
  && test -s /usr/share/licenses/ffmpeg/COPYING.LGPLv3
 
 # Non-root runtime user (fixed uid/gid 10001). The render group is added at
