@@ -4,13 +4,20 @@ import type { components } from './types';
 import { apiUrl, buildHeaders, OperationApiError, readPendingProblem, newIdempotencyKey } from './operations';
 import type { RequestOptions } from './operations';
 
-// `input` (ADR-0110 §12.8) is served by main; the pending superset still
-// shadows SwitcherRequest without it, so it is added here until pending/ goes.
-export type SwitcherRequest = components['schemas']['SwitcherRequest'] & { input?: number | null };
-export type SwitcherState = components['schemas']['SwitcherStateResponse'];
+/** The five rendered wipe patterns (ADR-0112 §3). */
+export const WIPE_PATTERNS = ['linear_edge', 'vertical', 'diagonal', 'box', 'circle'] as const satisfies readonly components['schemas']['WipePatternDoc'][];
+export type WipePattern = (typeof WIPE_PATTERNS)[number];
+/** The M/E transition descriptor (ADR-0112 §4), generated from OpenAPI: tagged on `kind`. */
+export type TransitionDescriptor = components['schemas']['TransitionDescriptorDoc'];
+
+// `input` (ADR-0110 §12.8) and `transition` (ADR-0112 §4) are served by main;
+// the pending superset still shadows SwitcherRequest/SwitcherStateResponse
+// without them, so main's generated fields are added here until pending/ goes.
+export type SwitcherRequest = components['schemas']['SwitcherRequest'] & { input?: number | null; transition?: TransitionDescriptor | null };
+export type SwitcherState = components['schemas']['SwitcherStateResponse'] & { transition?: TransitionDescriptor };
 export type SwitcherPlan = components['schemas']['SwitcherPlan'];
 export type SwitcherAccepted = components['schemas']['SwitcherAccepted'];
-export type SwitcherAction = 'select_program' | 'select_preview' | 'cut' | 'auto';
+export type SwitcherAction = 'select_program' | 'select_preview' | 'cut' | 'auto' | 'set_transition';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;

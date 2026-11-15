@@ -89,16 +89,7 @@ pub const REFUSE_UNSUPPORTED_TRANSITION: &str =
 /// Is `descriptor` a transition the Program drive renders (ADR-0112)?
 #[must_use]
 pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
-    match descriptor {
-        TransitionDescriptor::Cut | TransitionDescriptor::Mix { .. } => true,
-        TransitionDescriptor::Dip { dip_source, .. } => dip_source.is_none(),
-        TransitionDescriptor::Wipe {
-            border_fill_source,
-            flip_flop,
-            ..
-        } => border_fill_source.is_none() && !flip_flop,
-        _ => false,
-    }
+    descriptor.is_rendered()
 }
 
 /// Typed refusal: a select names an undeclared or unpatched input.
@@ -207,7 +198,7 @@ pub struct SwitcherCommand {
 }
 
 /// Engine-owned bus selection projected at a real output frame boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SwitcherSnapshot {
     /// Output tick on which this snapshot was published.
     pub tick: u64,
@@ -225,6 +216,10 @@ pub struct SwitcherSnapshot {
     pub in_flight: bool,
     /// Number of completed takes, monotonic within one runtime.
     pub completion_count: u64,
+    /// The operator's selected transition, as the machine holds it after
+    /// this tick (ADR-0112 §4). An AUTO never changes it: the flight renders
+    /// its own descriptor (the selection at the AUTO's rate).
+    pub transition: TransitionDescriptor,
     /// Downstream keyer rows, in config order (ADR-0113 §8). Ramps are
     /// descriptors (start, rate, direction), never per-tick weights.
     pub keyers: [Option<KeyerSnapshot>; MAX_DSK],
@@ -799,14 +794,15 @@ impl SwitcherTickDriver {
                 if !is_rendered_transition(&descriptor) {
                     return Err(REFUSE_UNSUPPORTED_TRANSITION.into());
                 }
+                // The flight renders its own descriptor (the selection at the
+                // AUTO's rate); the selection itself is unchanged (ADR-0112 §4).
                 validate_mix(&pair.program, &pair.preview)
                     .map_err(|e| e.to_string())
                     .and_then(|()| {
                         self.machine
-                            .set_transition(descriptor)
+                            .auto_with(descriptor, tick)
                             .map_err(|e| e.to_string())
                     })
-                    .and_then(|()| self.machine.auto(tick).map_err(|e| e.to_string()))
             }
             SwitcherVerb::SelectPreview(_)
             | SwitcherVerb::Patch(_)
@@ -932,9 +928,16 @@ impl SwitcherTickDriver {
         self.machine.auto_window()
     }
 
-    /// The selected (or, during a flight, the frozen in-flight) transition.
+    /// The descriptor the Program drive renders: the in-flight AUTO's own
+    /// descriptor during a take, else the selection.
     #[must_use]
     pub fn transition(&self) -> &TransitionDescriptor {
+        self.machine.active_transition()
+    }
+
+    /// The operator's selected transition (ADR-0112 §4), unchanged by AUTO.
+    #[must_use]
+    pub fn selected_transition(&self) -> &TransitionDescriptor {
         self.machine.transition()
     }
 
@@ -1452,6 +1455,9 @@ impl SwitcherTickDriver {
                 || previous.inputs_version != self.inputs_version
                 || previous.in_flight != self.machine.is_in_flight()
                 || previous.completion_count != self.machine.completion_count()
+                // A comparison, never a clone: the descriptor is cloned only
+                // below, on a tick whose published state actually changed.
+                || previous.transition != *self.machine.transition()
                 || previous.keyers != keyers
                 || previous.tally != tally
         });
@@ -1465,6 +1471,7 @@ impl SwitcherTickDriver {
                 inputs_version: self.inputs_version,
                 in_flight: self.machine.is_in_flight(),
                 completion_count: self.machine.completion_count(),
+                transition: self.machine.transition().clone(),
                 keyers,
                 tally,
             });
