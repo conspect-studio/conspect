@@ -704,7 +704,8 @@ Decisions:
    30 s, and is consumed by the first authenticated connection that uses it. A token has at most one unconsumed
    selector; a new ladder call replaces it. Two attachments of the same cast show unrelated selectors, so an
    observer cannot link them to each other or to a token, and a selector seen on the wire is useless once the
-   connection it belonged to is up. The stream id is `#!::r=cast/<S>,m=request`.
+   connection it belonged to is up. A reconnect after a dropped connection therefore needs a new ladder call,
+   which costs one HTTPS round trip. The stream id is `#!::r=cast/<S>,m=request`.
 
    **Passphrase.** With `T` the 32 token bytes:
 
@@ -846,7 +847,7 @@ the encoder's output, so a byte ceiling is what limits how much encoder output a
 | Hand-off | Count | Bytes | Age | When reached |
 | --- | --- | --- | --- | --- |
 | Dispatcher to a rung's subscription | 2 windows in hand-off; the binding queue behind it 512 packets | 16 MiB | 2 s | whole window dropped, discontinuity, resume at a verified keyframe (Read: `MAX_QUEUE_PACKETS`, `MAX_QUEUE_BYTES`, `MAX_QUEUE_AGE`, `crates/multiview-output/src/batch.rs:30-36`; `WINDOW_HANDOFF`, `output_window_registry.rs:43`) |
-| MoQ subscription | 16 sessions | 8 MiB per subscription, 64 MiB in total (Read: `crates/multiview-moq/src/provider.rs:454-455`, `:867`) | 2 s per track (Read: `with_max_age`, `crates/multiview-moq/src/lib.rs:98`) | window refused; the lease survives or ends by class of error |
+| MoQ subscription | 16 sessions | 8 MiB per subscription, 64 MiB in total (Read: `crates/multiview-moq/src/provider.rs:454-455`, `:867`) | 2 s per track (Read: `with_max_age`, `crates/multiview-moq/src/lib.rs:100`) | window refused; the lease survives or ends by class of error |
 | SRT attachment queue | 512 packets | **8 MiB, new** | **2 s, new** | everything queued is discarded, then the session is re-gated to the next keyframe |
 | SRT library send buffer, per connection | set by `SRTO_SNDBUF` | **2 MiB, set explicitly** (libsrt's default is 8 192 packet buffers, about 12 MiB) | the negotiated latency: libsrt drops packets too late to deliver (Cited: `SRTO_TLPKTDROP`, socket options) | libsrt drops; a send that cannot complete ends at the existing 5 s write deadline and the attachment closes |
 | WebRTC egress feed, per cast output | 512 samples | **8 MiB, new** | **2 s, new** | oldest dropped, then video is held back until the next keyframe |
