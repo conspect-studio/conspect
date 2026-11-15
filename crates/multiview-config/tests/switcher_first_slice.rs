@@ -52,6 +52,7 @@ fn me(cfg: &mut MultiviewConfig) {
             inputs: vec![],
             program_input: None,
             preview_input: None,
+            transition: None,
         }],
         downstream_keyers: vec![],
         keyer_budget: None,

@@ -41,6 +41,7 @@ export const CORRELATED_COMMAND_KINDS: ReadonlySet<string> = new Set([
   'select_preview',
   'cut',
   'auto',
+  'set_transition',
 ]);
 
 /** The `kind` an Idempotency-Key replay acceptance carries (original kind is not echoed). */
