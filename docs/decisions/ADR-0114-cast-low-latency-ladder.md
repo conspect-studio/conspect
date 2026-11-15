@@ -1126,7 +1126,7 @@ captain as one list; none blocks slices 0 to 5 from merging.
 | Whether libsrt discards, and neither grows nor blocks, when the app stops reading | slice 6 test, before the rung is enabled |
 | Whether `jitterBufferTarget` exists on a Cast device and what the jitter buffer then holds | slice 5 device test |
 | Existing `webrtc` output: RTP time becomes 0 for every frame after 2^32 (video after 13 h 15 min, audio after 24 h 51 min; read in code, not reproduced) | issue #492, ship lane `rtpwrap`; outside this ADR |
-| What the app does when ladder calls for a fresh SRT selector run into the rate limit during rapid reconnects (review note R2-N2) | slice 2 design note: retry after the limit, and HLS after 3 refused calls |
-| RTCP wall clock for WebRTC when the run has no validated epoch (review note R2-N3) | slice 5: fall back to the time of writing for both streams, and report latency as `unavailable` |
-| The ladder's answer when no registry subscription is left for MoQ (review note R2-N4) | slice 4 test: the answer names the next rung; it is never an error |
+| What the app does when ladder calls for a fresh SRT selector run into the rate limit during rapid reconnects: step down, or retry (review note R2-N2) | slice 2 design note. Not decided here |
+| Which RTCP wall clock the WebRTC rung uses when the run has no validated epoch (review note R2-N3) | slice 5, as a test requirement. Not decided here |
+| That the ladder answers with the next rung, and not with an error, when no registry subscription is left for MoQ (review note R2-N4; decision 6 already says the receiver gets the next rung) | slice 4 test |
 
