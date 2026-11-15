@@ -183,7 +183,9 @@ const DEFAULT_DRAFT: FillDraft = {
   fps: 10,
   frames: 60,
   then: 'resume',
-  premium: false,
+  // "Use Premium" defaults on; it only takes effect when the server reports
+  // premium_available (a verified Windy account), else the public view is used.
+  premium: true,
   capture: 'steps',
   timing: 'equal',
   frameMs: DEFAULT_FRAME_MS,
@@ -231,7 +233,10 @@ function withLoopDefaults(base: BaseFillDraft, loose: Record<string, unknown>): 
   const frameMs = typeof loose.frameMs === 'number' ? loose.frameMs : DEFAULT_DRAFT.frameMs;
   const endHoldMs = typeof loose.endHoldMs === 'number' ? loose.endHoldMs : DEFAULT_DRAFT.endHoldMs;
   const maxSteps = typeof loose.maxSteps === 'number' ? loose.maxSteps : DEFAULT_DRAFT.maxSteps;
-  return { ...base, capture, timing, frameMs, endHoldMs, maxSteps };
+  // Drafts saved before Premium existed carry a never-chosen `premium: false`;
+  // only an explicit `usePremium` choice overrides the default-on.
+  const premium = typeof loose.usePremium === 'boolean' ? loose.usePremium : DEFAULT_DRAFT.premium;
+  return { ...base, premium, capture, timing, frameMs, endHoldMs, maxSteps };
 }
 
 /** Read a player's last fill draft from `localStorage`, or the default. */
@@ -250,7 +255,10 @@ function loadDraft(playerId: string): FillDraft {
 /** Persist a player's fill draft so the next fill (or re-capture) prefills it. */
 function saveDraft(playerId: string, draft: FillDraft): void {
   try {
-    window.localStorage.setItem(draftStorageKey(playerId), JSON.stringify(draft));
+    window.localStorage.setItem(
+      draftStorageKey(playerId),
+      JSON.stringify({ ...draft, usePremium: draft.premium }),
+    );
   } catch {
     // Best-effort only; a failed write never blocks the fill itself.
   }
@@ -458,8 +466,8 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
   const inFlight = jobId !== undefined && !terminalCaptureState;
   const capsAvailable = capabilities.data?.capture_available === true;
   const premiumAvailable = capabilities.data?.premium_available === true;
-  // Default to public when Premium is not configured; only offer Premium
-  // when the server actually supports it (409 otherwise — provider.rs).
+  // Premium is on by default when the server reports a verified Windy account;
+  // otherwise the public view is used (the server refuses Premium with 409).
   const effectivePremium = draft.premium && premiumAvailable;
 
   const applyPreset = (preset: LocationPreset): void => {
@@ -841,14 +849,15 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                   }}
                 />
                 <Label htmlFor="windy-premium">
-                  <Trans>Premium (authenticated) capture</Trans>
+                  <Trans>Use Premium (authenticated) capture</Trans>
                 </Label>
               </div>
             ) : (
               <p className="text-xs text-muted-foreground">
                 <Trans>
                   Premium Windy capture is not configured on this server; the
-                  public (unauthenticated) view is used.
+                  public (unauthenticated) view is used. An administrator can
+                  set and test the Windy account under Settings → Integrations.
                 </Trans>
               </p>
             )}

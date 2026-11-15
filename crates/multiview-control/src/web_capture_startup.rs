@@ -59,6 +59,7 @@ pub fn from_environment() -> io::Result<Provider> {
             count: 256,
         },
     )?;
+    let verify_tools = tools.clone();
     let service = Service::start_durable(
         tools,
         store,
@@ -69,7 +70,37 @@ pub fn from_environment() -> io::Result<Provider> {
         },
         &journal,
     )?;
-    Ok(Provider::configured(Arc::new(service), terms, ledger))
+    let provider = Provider::configured(Arc::new(service), terms, ledger);
+    Ok(match windy_account(&root, verify_tools)? {
+        Some(account) => provider.with_windy_account(Arc::new(account)),
+        None => provider,
+    })
+}
+/// Opt-in Windy Premium account store (issue #470). Enabled by
+/// `CONSPECT_WINDY_MASTER_KEY_FILE` (an owner-private file of exactly 32 bytes,
+/// e.g. materialised from 1Password); the encrypted vault lives in the private
+/// `<capture root>/windy-account` (0700). Without it Premium stays unavailable.
+fn windy_account(
+    root: &std::path::Path,
+    tools: multiview_webengine::capture::Tools,
+) -> io::Result<Option<crate::web_capture::windy_account::WindyAccount>> {
+    let Some(key_path) = std::env::var_os("CONSPECT_WINDY_MASTER_KEY_FILE") else {
+        return Ok(None);
+    };
+    let key_path = PathBuf::from(key_path);
+    if !key_path.is_absolute() {
+        return Err(io::Error::other("capture deployment path must be absolute"));
+    }
+    reject_symlink(&key_path)?;
+    let key = multiview_credentials::read_master_key_file(&key_path)?;
+    let dir = root.join("windy-account");
+    private_dir(&dir)?;
+    crate::web_capture::windy_account::WindyAccount::open(
+        &dir,
+        *key,
+        crate::web_capture::windy_account::browser_verifier(tools),
+    )
+    .map(Some)
 }
 /// Refuse a symlink at the final component or any existing ancestor.
 /// # Errors

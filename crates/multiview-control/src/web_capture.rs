@@ -7,7 +7,7 @@ pub const ARTIFACT_STREAMS: usize = 2;
 
 /// Windy terms version attached to this built-in template.
 pub const WINDY_TERMS_VERSION: &str = "windy-2023-09-01";
-/// One authorized, bounded public Windy view. Premium needs a configured secret resolver.
+/// One authorized, bounded Windy view. Premium needs a verified Windy account.
 #[derive(Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -153,8 +153,63 @@ pub struct CancelResult {
     /// True only for the first accepted use of the key.
     pub fresh: bool,
 }
+/// Last Windy Premium login-check verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WindyVerdict {
+    /// Logged in with a Premium subscription.
+    Premium,
+    /// Windy refused the email/password ("Login failed. Invalid email or password").
+    Rejected,
+    /// Logged in, but the account has no Premium subscription.
+    NotPremium,
+    /// The check could not complete (network, site change, timeout, tools).
+    Unavailable,
+}
+/// Secret-free Windy account status. The email and password are write-only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct WindyAccountView {
+    /// A credential is stored (encrypted at rest).
+    pub set: bool,
+    /// RFC 3339 time of the last login check of the current credential.
+    pub last_verified_at: Option<String>,
+    /// Verdict of the last login check of the current credential.
+    pub result: Option<WindyVerdict>,
+    /// Premium capture is enabled (the current credential passed its check).
+    pub premium_available: bool,
+    /// A login check is running.
+    pub verifying: bool,
+}
+/// Write-only Windy account input; never echoed, logged or audited.
+#[derive(Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WindyAccountBody {
+    /// Windy account email.
+    pub email: String,
+    /// Windy account password.
+    pub password: String,
+}
+impl std::fmt::Debug for WindyAccountBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WindyAccountBody([REDACTED])")
+    }
+}
+/// Result of `POST /integrations/windy/verify`.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct WindyVerifyResult {
+    /// This check's verdict.
+    pub result: WindyVerdict,
+    /// Status after the check.
+    pub account: WindyAccountView,
+}
 #[cfg(unix)]
 mod provider;
+#[cfg(unix)]
+pub mod windy_account;
 #[cfg(unix)]
 pub use multiview_webengine::artifact::Lease as ArtifactLease;
 #[cfg(unix)]

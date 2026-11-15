@@ -1,6 +1,10 @@
 //! The real capture provider (unix: the browser host needs process groups and
 //! private `openat`-pinned files).
-use super::{Admission, CancelResult, CaptureBody, JobView, ARTIFACT_STREAMS, WINDY_TERMS_VERSION};
+use super::{
+    windy_account::{AccountError, WindyAccount},
+    Admission, CancelResult, CaptureBody, JobView, WindyAccountView, WindyVerifyResult,
+    ARTIFACT_STREAMS, WINDY_TERMS_VERSION,
+};
 use crate::web_capture_store::{digest_hex, Ledger, Reserve, TermsAcceptance, TermsRepository};
 use crate::{
     auth::{authorize_object, Action, Principal},
@@ -21,6 +25,7 @@ pub struct Provider {
     ledger: Arc<Ledger>,
     streams: Arc<Semaphore>,
     pin_requests: Arc<Semaphore>,
+    windy: Option<Arc<WindyAccount>>,
 }
 impl Default for Provider {
     fn default() -> Self {
@@ -30,6 +35,7 @@ impl Default for Provider {
             ledger: Arc::new(Ledger::memory()),
             streams: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
             pin_requests: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
+            windy: None,
         }
     }
 }
@@ -47,7 +53,66 @@ impl Provider {
             ledger,
             streams: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
             pin_requests: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
+            windy: None,
         }
+    }
+    /// Attach the encrypted Windy account store (Premium capture).
+    #[must_use]
+    pub fn with_windy_account(mut self, account: Arc<WindyAccount>) -> Self {
+        self.windy = Some(account);
+        self
+    }
+    fn windy(&self) -> ControlResult<&WindyAccount> {
+        self.windy.as_deref().ok_or_else(|| {
+            ControlError::Conflict(
+                "the Windy account store is not configured on this server".into(),
+            )
+        })
+    }
+    /// Admin-only, whole-system: the Windy account is a deployment integration.
+    fn require_admin(p: &Principal) -> ControlResult<()> {
+        p.role.require(Action::Administer)?;
+        crate::routes::require_unscoped_for_whole_system(p)
+    }
+    /// Secret-free Windy account status (admin only).
+    /// # Errors
+    /// Non-admin or scoped principal; store not configured.
+    pub fn windy_account(&self, p: &Principal) -> ControlResult<WindyAccountView> {
+        Self::require_admin(p)?;
+        Ok(self.windy()?.view())
+    }
+    /// Store (replace) the Windy credential; resets Premium. Blocking.
+    /// # Errors
+    /// Non-admin/scoped, invalid input, store not configured or storage failure.
+    pub fn set_windy_account(
+        &self,
+        p: &Principal,
+        email: &str,
+        password: &str,
+    ) -> ControlResult<WindyAccountView> {
+        Self::require_admin(p)?;
+        self.windy()?.set(email, password).map_err(account_error)
+    }
+    /// Remove the Windy credential. Blocking.
+    /// # Errors
+    /// Non-admin/scoped, store not configured or storage failure.
+    pub fn clear_windy_account(&self, p: &Principal) -> ControlResult<WindyAccountView> {
+        Self::require_admin(p)?;
+        self.windy()?.clear().map_err(account_error)
+    }
+    /// Bounded login check of the stored credential. Blocking (up to ~90 s).
+    /// # Errors
+    /// Non-admin/scoped, nothing stored, a check already running, storage.
+    pub fn verify_windy_account(&self, p: &Principal) -> ControlResult<WindyVerifyResult> {
+        Self::require_admin(p)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let (result, account) = self.windy()?.verify(now).map_err(account_error)?;
+        Ok(WindyVerifyResult { result, account })
+    }
+    fn premium_available(&self) -> bool {
+        self.service.is_some() && self.windy.as_ref().is_some_and(|w| w.premium_available())
     }
     /// Honest runtime capabilities, including the disabled URL download boundary.
     #[must_use]
@@ -58,7 +123,7 @@ impl Provider {
                 "process_tree_estimated"
             }
         };
-        serde_json::json!({"capture_available":self.service.is_some(),"premium_available":false,"url_fetch_available":false,"url_fetch_reason":"enforced download boundary not provisioned","accounting":accounting,"kernel_limits":false})
+        serde_json::json!({"capture_available":self.service.is_some(),"premium_available":self.premium_available(),"url_fetch_available":false,"url_fetch_reason":"enforced download boundary not provisioned","accounting":accounting,"kernel_limits":false})
     }
     /// Authorize all named objects before allocating a background job. Blocking.
     /// # Errors
@@ -75,9 +140,24 @@ impl Provider {
                 "current Windy terms acceptance required".into(),
             ));
         }
-        if !body.view.public {
-            return Err(ControlError::Conflict("authenticated Windy capture is unavailable until the account resolver is configured".into()));
-        }
+        // Premium fails closed: only a credential that passed its latest verify
+        // is resolved, and it travels only inside the job request (host stdin).
+        let credentials = if body.view.public {
+            None
+        } else {
+            Some(
+                self.windy
+                    .as_ref()
+                    .and_then(|w| w.resolve_for_capture())
+                    .ok_or_else(|| {
+                        ControlError::Conflict(
+                            "Windy Premium is not available: set and verify the Windy account \
+                             (Settings → Integrations → Windy)"
+                                .into(),
+                        )
+                    })?,
+            )
+        };
         let capture = Capture {
             width: body.view.width,
             height: body.view.height,
@@ -91,8 +171,8 @@ impl Provider {
                 zoom: body.view.zoom,
                 overlay: body.view.overlay.clone(),
                 terms_accepted: true,
-                require_premium: false,
-                credentials: None,
+                require_premium: credentials.is_some(),
+                credentials,
             }),
             capture: body.view.capture_options(),
         };
@@ -372,6 +452,18 @@ fn correlated_job(service: &Service, owner: &str, fill: &str, token: &str) -> Op
     service
         .lookup_correlated(owner, fill, token)
         .map(|(id, _)| id.raw())
+}
+fn account_error(e: AccountError) -> ControlError {
+    match e {
+        AccountError::Invalid => {
+            ControlError::Validation("a Windy email and a non-empty password are required".into())
+        }
+        AccountError::NotConfigured => ControlError::Conflict("no Windy account is set".into()),
+        AccountError::Busy => {
+            ControlError::Conflict("a Windy login check is already running".into())
+        }
+        AccountError::Storage => ControlError::Repository("Windy account store unavailable".into()),
+    }
 }
 fn missing(id: u64) -> ControlError {
     ControlError::NotFound {

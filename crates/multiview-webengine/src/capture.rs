@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Trusted tools selected by the service, never by an API request.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tools {
     /// Node executable.

@@ -128,6 +128,7 @@ async function main() {
     if (!req.source.view.terms_accepted || req.width < 1024) throw new Error('Windy acceptance or geometry missing');
     // The step timeline is the radar calendar; wind particles are captured in realtime.
     if (steps && req.source.view.overlay !== 'radar') throw new Error('invalid capture limits');
+    if (req.verify === true && (!req.source.view.require_premium || steps)) throw new Error('invalid capture limits');
   } else if (typeof req.source.document !== 'string' || Buffer.byteLength(req.source.document) > 128 * 1024)
     throw new Error('document limit');
   if (typeof req.profile !== 'string' || !path.isAbsolute(req.profile)) throw new Error('private profile required');
@@ -166,39 +167,41 @@ async function main() {
   if (isWindy) {
     await send('Page.navigate', {url: windyTemplate.url(req.source.view)});
     let ready = false;
-    let loginAttempted = false;
+    // Per-job login (no persistent profile): the private profile dies with the job.
+    // A session that expires or drops mid-load shows the login icon again and is
+    // re-submitted (bounded by premiumStep's login budget); never falls back to public.
+    const premium = {logins: 0, notPremium: 0, stuck: 0};
     for (let attempt = 0; attempt < 60; attempt++) {
       const result = await send('Runtime.evaluate', {
         expression: windyTemplate.statusExpression(req.source.view.overlay), returnByValue:true});
       let state;
       try { state = JSON.parse(result.result?.value); } catch {}
-      if (attempt >= 20 && state && !state.noData && state.canvases > 0 && state.tilesLoaded > 0 && state.tilesPending === 0 && state.overlay === req.source.view.overlay) {
-        if (req.source.view.require_premium && (state.loginVisible || !/premium/.test(state.subscription || ''))) {
-          const credentials = req.source.view.credentials;
-          if (!credentials) throw new Error('authenticated Windy session required');
-          if (loginAttempted) { await sleep(500); continue; }
-          loginAttempted = true;
-          await send('Runtime.evaluate', {expression:"document.querySelector('.rhpane__top-icons__login')?.click()"});
-          let formReady = false;
-          for (let j = 0; j < 20; j++) {
-            const form = await send('Runtime.evaluate', {expression:"!!document.querySelector('#email') && !!document.querySelector('#password')",returnByValue:true});
-            if (form.result?.value) { formReady = true; break; }
-            await sleep(250);
-          }
-          if (!formReady) throw new Error('Windy login form unavailable');
-          // Native input events, private CDP pipe only; never stringify this in logs.
-          const expression = `(()=>{const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
-            for(const [id,value] of [['email',${JSON.stringify(credentials.username)}],['password',${JSON.stringify(credentials.password)}]]){
-              const input=document.getElementById(id);setter.call(input,value);input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));}
-            document.querySelector('#submitLogin')?.click();})()`;
-          await send('Runtime.evaluate', {expression});
-          await sleep(2000);
+      if (req.source.view.require_premium && state) {
+        const step = windyTemplate.premiumStep(state, premium.logins);
+        if (step === 'rejected') throw new Error('Windy login rejected');
+        premium.notPremium = step === 'not_premium' ? premium.notPremium + 1 : 0;
+        if (premium.notPremium >= 6) throw new Error('Windy account has no Premium');
+        premium.stuck = step === 'wait' && state.loginVisible ? premium.stuck + 1 : 0;
+        if (premium.stuck >= 20) throw new Error('Windy login did not complete');
+        // Let the app render before clicking its login control.
+        if (step === 'login' && (attempt < 10 || !(state.canvases > 0))) { await sleep(500); continue; }
+        if (step === 'login') {
+          await login(send, req.source.view.credentials);
+          premium.logins++;
           continue;
         }
+        if (step !== 'ready') { await sleep(500); continue; }
+        if (req.verify === true) {
+          process.stderr.write(JSON.stringify({event: 'premium_verify', premium: true}) + '\n');
+          return;
+        }
+      }
+      if (attempt >= 20 && state && !state.noData && state.canvases > 0 && state.tilesLoaded > 0 && state.tilesPending === 0 && state.overlay === req.source.view.overlay) {
         ready = true; break;
       }
       await sleep(500);
     }
+    if (req.verify === true) throw new Error('Windy login did not complete');
     if (!ready) throw new Error('Windy requested layer unavailable');
     for (let i = 0; inflight.size || Date.now() - networkChanged < 1500; i++) {
       if (i > 60) throw new Error('Windy map requests did not settle');
@@ -267,6 +270,8 @@ async function main() {
       const quietNow = async () => {
         const state = await bounded(evalJson(statusExpr));
         if (state && state.canvases === 0) throw new Error('radar layer did not render (GL unavailable?)');
+        if (state && isWindy && req.source.view.require_premium && windyTemplate.premiumStep(state, Infinity) !== 'ready')
+          throw new Error('Windy Premium session lost');
         return stepPlan.stepQuiet(state, t, expectedOverlay, inflight.size);
       };
       // The settling window starts at the set: a previous step's network activity
@@ -314,6 +319,8 @@ async function main() {
       const state = JSON.parse(check.result?.value || '{}');
       if (state.noData || state.overlay !== req.source.view.overlay || state.tilesPending !== 0)
         throw new Error('Windy changed or incomplete during capture');
+      if (req.source.view.require_premium && windyTemplate.premiumStep(state, Infinity) !== 'ready')
+        throw new Error('Windy Premium session lost');
     }
     const tick = await send('Runtime.evaluate', {
       expression: `typeof window.mvCaptureFrame === 'function' ? window.mvCaptureFrame(${i},${req.fps}) : null`,
@@ -351,6 +358,25 @@ async function main() {
     fps: req.fps, width: req.width, height: req.height, codec: 'ffv1', alpha,
     pix_fmt: pixFmt, color: 'bt709/srgb/limited'}) + '\n');
 }
+// Submit the Windy login form over the private CDP pipe. The credential arrives
+// only on this process's stdin; it is never logged or written to disk by us.
+async function login(send, credentials) {
+  if (!credentials) throw new Error('authenticated Windy session required');
+  await send('Runtime.evaluate', {expression:"document.querySelector('.rhpane__top-icons__login')?.click()"});
+  let formReady = false;
+  for (let j = 0; j < 20; j++) {
+    const form = await send('Runtime.evaluate', {expression:"!!document.querySelector('#email') && !!document.querySelector('#password')",returnByValue:true});
+    if (form.result?.value) { formReady = true; break; }
+    await sleep(250);
+  }
+  if (!formReady) throw new Error('Windy login form unavailable');
+  const expression = `(()=>{const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+    for(const [id,value] of [['email',${JSON.stringify(credentials.username)}],['password',${JSON.stringify(credentials.password)}]]){
+      const input=document.getElementById(id);setter.call(input,value);input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));}
+    document.querySelector('#submitLogin')?.click();})()`;
+  await send('Runtime.evaluate', {expression});
+  await sleep(2000);
+}
 // Run ffmpeg to completion, counting stdout bytes (capped) and keeping bounded stderr.
 function runFfmpeg(bin, args, cap) {
   return new Promise((resolve, reject) => {
@@ -365,7 +391,8 @@ function runFfmpeg(bin, args, cap) {
 const timeout = setTimeout(() => { cleanup().finally(() => process.exit(124)); }, 120000);
 main().then(async () => { clearTimeout(timeout); await cleanup(); process.exitCode = 0; })
   .catch(async error => { clearTimeout(timeout);
-    const safe = new Set(['authenticated Windy session required','Windy login form unavailable','Windy requested layer unavailable','Windy map requests did not settle','Windy changed or incomplete during capture',
+    const safe = new Set(['authenticated Windy session required','Windy login form unavailable','Windy login rejected',
+      'Windy account has no Premium','Windy login did not complete','Windy Premium session lost','Windy requested layer unavailable','Windy map requests did not settle','Windy changed or incomplete during capture',
       'radar layer did not render (GL unavailable?)','radar step did not settle','radar timeline unavailable',
       'radar loop has fewer than 2 distinct frames','step loop exceeds frame cap']);
     process.stderr.write((safe.has(error.message) ? error.message : 'capture failed') + '\n');

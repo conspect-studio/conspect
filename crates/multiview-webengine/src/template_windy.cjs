@@ -25,12 +25,29 @@ function statusExpression(overlay) {
     const text=document.body?.innerText||'';
     return {overlay:active||null,timestamp:window.W?.store?.get?.('timestamp')??null,noData:/No data!/i.test(text),
       loginVisible:!!document.querySelector('.rhpane__top-icons__login'),
+      loginFailed:/Login failed/i.test(text),
+      user:(()=>{try{return !!localStorage.getItem('settings_user');}catch{return false;}})(),
       subscription:(()=>{try{return localStorage.getItem('settings_subscription');}catch{return null;}})(),
       time:document.querySelector('.timecode .box,.main-timecode .box')?.textContent||null,
       canvases:document.querySelectorAll('canvas').length,
       tilesLoaded:document.querySelectorAll('.leaflet-tile-loaded').length,
       tilesPending:[...document.querySelectorAll('img.leaflet-tile')].filter(i=>!i.complete||i.naturalWidth===0).length};
   })())`;
+}
+// Premium session decision from one status sample (pure; tested in tests/windy_login.cjs).
+// 'ready': logged in with a Premium subscription. 'rejected': the site refused the
+// email/password. 'not_premium': logged in but the account has no Premium (callers
+// require several consecutive samples). 'login': (re-)submit the login form; a session
+// that expired or was dropped shows the login icon again and is retried up to
+// maxLogins times. 'wait': keep sampling.
+function premiumStep(state, logins, maxLogins = 2) {
+  if (!state || typeof state !== 'object') return 'wait';
+  if (state.loginFailed) return 'rejected';
+  const premium = /premium/.test(state.subscription || '');
+  if (state.loginVisible === false && premium) return 'ready';
+  if (state.loginVisible === false && state.user === true && !premium) return 'not_premium';
+  if (state.loginVisible === true) return logins < maxLogins ? 'login' : 'wait';
+  return 'wait';
 }
 // Radar step timeline (spike-proven): the store's radarCalendar lists step timestamps.
 const CALENDAR_EXPRESSION = `JSON.stringify((()=>{const c=window.W?.store?.get?.('radarCalendar');
@@ -42,4 +59,4 @@ function setTimestampExpression(t) {
   if (!Number.isSafeInteger(t) || t <= 0) throw new Error('invalid step');
   return `window.W.store.set('timestamp',${t})`;
 }
-module.exports = {TERMS_VERSION, CLEAN, validate, url, statusExpression, CALENDAR_EXPRESSION, WEBGL_EXPRESSION, setTimestampExpression};
+module.exports = {TERMS_VERSION, CLEAN, premiumStep, validate, url, statusExpression, CALENDAR_EXPRESSION, WEBGL_EXPRESSION, setTimestampExpression};

@@ -50,6 +50,28 @@ A `202` response means a job was accepted. Follow the returned `status_url`. Onl
 
 A target-player name in a request does not mean playback has occurred. Library promotion and the player load acknowledgement must be verified separately. Do not label the workflow "VT ready" until that acknowledgement exists.
 
+## Windy Premium account (issue #470)
+
+Where an operator configures the Windy login: **Settings → Integrations → Windy** (email + password, then **Test login**). This is admin-only: it needs the `Admin` role and an unscoped key. Operators, viewers and object-scoped admins get `403`.
+
+Provisioning is opt-in. Set `CONSPECT_WINDY_MASTER_KEY_FILE` to an absolute path of an owner-private (`0600`, no symlink) file holding exactly 32 random bytes, for example materialised from 1Password at boot. The encrypted store lives in `<CONSPECT_WEB_CAPTURE_ROOT>/windy-account/`, a `0700` directory created or adopted with the same checks as the other capture directories. Without the key file, `premium_available` stays `false` and the routes answer `409`.
+
+| Route (admin) | Effect |
+| --- | --- |
+| `GET /api/v1/integrations/windy` | `{set, last_verified_at, result, premium_available, verifying}`. Never returns the email or password. |
+| `PUT /api/v1/integrations/windy` `{email,password}` | Stores the credential encrypted and resets Premium. Write-only. |
+| `DELETE /api/v1/integrations/windy` | Removes the credential and disables Premium. |
+| `POST /api/v1/integrations/windy/verify` | Runs one bounded login check (about 10 s, hard cap 90 s; one at a time) and returns `result` = `premium`, `rejected` (wrong email or password), `not_premium` or `unavailable`. |
+
+Decisions:
+
+- **Storage.** The secret uses the same model as the managed Cloudflare credential: a `multiview-credentials` vault (`ChaCha20Poly1305`, AAD bound to the fixed owner `system:windy-account` and the reference) under an external master key. `windy-account.json` holds only the opaque `vault:` reference and the last verdict. The credential never goes into `conspect.toml`, `desired.json`, logs, support bundles, audit detail or API responses. Audit entries record only `set`/`verify` results. All account responses are `Cache-Control: no-store`.
+- **Premium gate.** `capabilities.premium_available` is `true` only when the currently stored credential passed its latest check. Replacing the credential resets it. A verdict computed for a credential that was replaced mid-check is discarded. A capture with `view.public = false` fails closed with `409` unless Premium is available. It never falls back to the public page.
+- **Resolver.** The credential is decrypted only for a Premium capture or a check. It goes to the browser host inside the existing stdin request JSON. It is never passed in argv or the environment; the environment is cleared.
+- **Login per job (no persistent profile).** Each job uses its throwaway `0700` profile and logs in again, which adds about 5 s per job. A persistent logged-in profile would keep a long-lived Windy session cookie at rest outside the encrypted vault, and its lifetime would be shared across concurrent jobs. That was not judged simple or safe enough.
+- **Expiry and re-login.** The host decides from each page sample (`premiumStep` in `template_windy.cjs`). If the login icon reappears (session expired or dropped), it submits the form again, up to two logins per job. A Windy "Login failed" message becomes `Windy login rejected`. Logged in without a Premium subscription becomes `Windy account has no Premium`. A Premium session lost during frame capture fails the job (`Windy Premium session lost`). Premium is detected from `localStorage.settings_subscription` containing `premium` and the login icon being gone.
+- **UI.** The capture dialog's **Use Premium** is on by default when `premium_available`. Otherwise it sends `public: true`.
+
 ## Required verification before deployment
 
 1. Cold/default GPU-free control build and targeted capture tests.
@@ -62,5 +84,6 @@ A target-player name in a request does not mean playback has occurred. Library p
 8. Restart recovers terms/job state without reusing identities or inventing success.
 9. Missing network isolation keeps URL fetch unavailable.
 10. Generated OpenAPI and client schema match the mounted routes.
+11. Windy Premium: a wrong password reports `rejected`, the test account reports `premium`, and the secret appears in no response, audit entry, log or plaintext file (`tests/windy_account.rs`).
 
 No production installation or restart has been performed by this runbook.
