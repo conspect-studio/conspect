@@ -84,7 +84,11 @@ video.m3u8 / audio.m3u8
   was absent, empty, or carries its marker file with this output's id, and deletes only files with the packager's
   own names. Any other directory disables that cast output for the run (the engine still starts).
 - **Failure.** A packager error restarts the stream with a new generation at the next keyframe, at most once per
-  second. A panic in the sink disables only that output.
+  second. A panic in the sink disables only that output. Every packager start takes a fresh file generation and
+  publishes it in the gate before writing any file; a failed or stopped stream publishes a fresh one no file
+  carries (the status `generation` is only ever this file generation, so it never goes back). A purge that leaves
+  any packager-named file (an unlink fails, or the directory holds more than 4096 entries) disables the output for
+  the run, like a foreign directory: no new generation is written, so undeletable files never accumulate.
 
 ## 4. Control plane
 
@@ -128,7 +132,8 @@ provably replaced that media, judged against the engine status recorded when the
 file generation changed (a new activation or packager restart: new file names, the old ones purged), the output
 is inactive, or it published 2 x 10 + 1 = 21 more video segments (the packager keeps the files of 2 x 10
 segments). A stalled sink therefore keeps them indefinitely, and an unavailable engine status never expires
-them (fail closed). As defence in depth, a segment, init or `.vtt` file is served only when the generation in
+them (fail closed). A disabled output (its purge failed, so old files may be left) proves nothing: its history
+never expires and it serves nothing (the generic `404`). As defence in depth, a segment, init or `.vtt` file is served only when the generation in
 its name is the output's current one, so a stale file left by a best-effort purge is the generic `404`.
 
 **Diagnosis without a device log.** The engine records, per stream and for the receiver page, the last fetch

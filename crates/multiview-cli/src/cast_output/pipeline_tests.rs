@@ -623,7 +623,11 @@ fn b0_preroll_publishes_a_full_window_at_once_and_no_preroll_starts_after_the_ac
         );
         assert_eq!(report.audio_segments, report.video_segments);
         assert_eq!(report.discontinuities, 0);
-        assert_eq!(listed_generation(ctl.dir()), generation);
+        // #418 review r7: the files carry the packager's own generation,
+        // which the status reports (not the activation id).
+        let files_generation = ctl.cast.gate.status().generation;
+        assert_ne!(files_generation, generation);
+        assert_eq!(listed_generation(ctl.dir()), files_generation);
         // It reaches back about 20 s before the activation.
         let behind = secs(at) - report.first_video_start;
         assert!((17.0..=21.5).contains(&behind), "{behind} s");
@@ -650,7 +654,9 @@ fn b0_preroll_publishes_a_full_window_at_once_and_no_preroll_starts_after_the_ac
             "first segment at {} s, activated at {activated_at} s",
             report.first_video_start
         );
-        assert_eq!(listed_generation(ctl.dir()), second);
+        let second_files = ctl.cast.gate.status().generation;
+        assert!(second_files > files_generation);
+        assert_eq!(listed_generation(ctl.dir()), second_files);
         ctl.stop.stop();
     });
     assert!(
@@ -691,6 +697,8 @@ fn b_an_activation_publishes_a_valid_stream_within_the_deadline() {
         // lifetime at 2x the nominal 2 s segment.
         assert_eq!(report.target_duration, 4);
         assert_eq!(report.discontinuities, 0);
+        // #418 review r7: the file names carry the packager's generation.
+        let generation = ctl.cast.gate.status().generation;
         let names = files(ctl.dir());
         for name in [
             "master.m3u8".to_owned(),
@@ -753,6 +761,7 @@ fn c_deactivation_empties_the_directory_and_reactivation_is_a_new_generation() {
         let first = ctl.cast.gate.activate(false).unwrap();
         ctl.wait_ready(Duration::from_secs(60));
         validated(ctl);
+        let first_files = ctl.cast.gate.status().generation;
         ctl.cast.gate.deactivate();
         wait_for("an empty directory", Duration::from_secs(5), || {
             files(ctl.dir()).is_empty().then_some(())
@@ -762,7 +771,9 @@ fn c_deactivation_empties_the_directory_and_reactivation_is_a_new_generation() {
             "the marker stays"
         );
         let status = ctl.cast.gate.status();
-        assert!(!status.active && !status.ready && status.generation == 0);
+        // #418 review r7: inactive, the status names a fresh generation no
+        // file carries (never 0, never an earlier one).
+        assert!(!status.active && !status.ready && status.generation > first_files);
         // Stays empty while inactive.
         ctl.run_seconds(12);
         assert_eq!(files(ctl.dir()), Vec::<String>::new());
@@ -773,7 +784,11 @@ fn c_deactivation_empties_the_directory_and_reactivation_is_a_new_generation() {
         // the buffered seconds can have provided them.
         ctl.wait_ready(Duration::from_secs(5));
         let report = validated(ctl);
-        assert_eq!(listed_generation(ctl.dir()), second);
+        assert_eq!(
+            listed_generation(ctl.dir()),
+            ctl.cast.gate.status().generation
+        );
+        assert!(listed_generation(ctl.dir()) > first_files);
         assert_eq!(report.media_sequence, 0, "a new stream");
         assert_eq!(report.discontinuities, 0);
         assert_eq!(first_slice_type(ctl.dir()), 5);
@@ -811,8 +826,10 @@ fn d_a_take_to_a_source_and_back_keeps_one_valid_stream_on_the_real_timeline() {
         let outcomes = ctl.routing.outcomes().expect("one outcome reader");
         // 12 s buffered, then a pre-roll activation: ready at once.
         ctl.wait_tick(12 * FPS);
-        let generation = ctl.cast.gate.activate(true).unwrap();
+        ctl.cast.gate.activate(true).unwrap();
         ctl.wait_ready(Duration::from_secs(5));
+        // #418 review r7: the packager's file generation.
+        let generation = ctl.cast.gate.status().generation;
         let keys_before = ctl.routing.snapshot().video_keys;
         let take = |op: &str, bus: PictureBus| {
             // FeedNotFresh is the correct refusal when the synthetic producer
@@ -1307,8 +1324,10 @@ fn f_a_stalled_then_released_cast_sink_declares_the_gap_and_still_validates() {
             move |ctl| {
                 ctl.wait_tick(11 * FPS);
                 ctl.cast.gate.set_test_hook(Some(hook));
-                let generation = ctl.cast.gate.activate(true).unwrap();
+                ctl.cast.gate.activate(true).unwrap();
                 ctl.wait_ready(Duration::from_secs(5));
+                // #418 review r7: the packager's file generation.
+                let generation = ctl.cast.gate.status().generation;
                 let before = validated(ctl);
                 assert_eq!(before.discontinuities, 0);
                 stall.store(true, Ordering::Release);
@@ -1601,8 +1620,10 @@ fn g_audio_and_subtitle_slots_become_renditions_of_the_cast_stream() {
         |_| {},
         |ctl| {
             ctl.wait_tick(2 * FPS);
-            let generation = ctl.cast.gate.activate(false).unwrap();
+            ctl.cast.gate.activate(false).unwrap();
             ctl.wait_ready(Duration::from_secs(60));
+            // #418 review r7: the packager's file generation.
+            let generation = ctl.cast.gate.status().generation;
             let cue_in_vtt = || {
                 files(ctl.dir())
                     .iter()

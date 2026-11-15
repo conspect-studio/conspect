@@ -20,7 +20,7 @@ use multiview_output::SharedEpoch;
 
 use super::ring::{Preroll, PrerollRing, RingKind, RingPacket};
 use super::{
-    claim_cast_dir, next_generation, purge_owned, unix_nanos, CastGate, CAST_TARGET_SEGMENT_NANOS,
+    claim_cast_dir, purge_owned, unix_nanos, unlink_failed, CastGate, CAST_TARGET_SEGMENT_NANOS,
     CAST_WINDOW, PREROLL_BYTES, PREROLL_NANOS,
 };
 use crate::binding_delivery::LeasedPacket;
@@ -193,7 +193,7 @@ impl CastRunner {
                 self.ring.clear();
                 Preroll::default()
             };
-            self.start_packager(generation, buffered.wall_anchor, now);
+            self.start_packager(buffered.wall_anchor, now);
             for packet in &buffered.packets {
                 if !self.feed(ring_input(packet), now) {
                     break;
@@ -206,7 +206,7 @@ impl CastRunner {
         {
             // After an error: a new generation (new file names) at a
             // keyframe, at most once per `RESTART_INTERVAL`.
-            self.start_packager(next_generation(), None, now);
+            self.start_packager(None, now);
         }
         self.feed(input, now);
     }
@@ -235,7 +235,10 @@ impl CastRunner {
     /// End of run: close the stream and remove its files.
     pub(crate) fn finish(&mut self) {
         self.stop_stream();
-        purge_owned(&self.setup.dir, &self.setup.id);
+        if !self.setup.gate.is_disabled() {
+            // Best effort: the run is over and nothing more is written.
+            let _ = purge_owned(&self.setup.dir, &self.setup.id);
+        }
         self.setup.gate.end();
     }
 
@@ -260,14 +263,47 @@ impl CastRunner {
     fn stop_stream(&mut self) {
         self.packager = None;
         if self.serving != 0 {
-            purge_owned(&self.setup.dir, &self.setup.id);
+            // A fresh generation no file carries first (#418 review r7).
+            self.setup.gate.install_no_files();
+            let _ = self.purge_or_disable();
         }
         self.serving = 0;
     }
 
-    fn start_packager(&mut self, generation: u64, wall_anchor: Option<(i64, i64)>, now: Instant) {
+    /// Remove the stream files; when any packager-named file is left (an
+    /// unlink failed, or the directory has more entries than one bounded
+    /// scan visits) the output is DISABLED for the run (#418 review r7
+    /// INV418-R7-1): no new generation is ever written, so undeletable
+    /// files cannot accumulate across restarts and no purge rescans them.
+    /// Returns whether the output is still usable.
+    fn purge_or_disable(&mut self) -> bool {
+        let gate = &self.setup.gate;
+        if gate.is_disabled() {
+            return false;
+        }
+        if purge_owned(&self.setup.dir, &self.setup.id) {
+            return true;
+        }
+        let reason = unlink_failed(&self.setup.id, &self.setup.dir);
+        tracing::warn!(output = %self.setup.id, %reason, "cast output disabled for this run");
+        gate.disable(reason);
+        self.packager = None;
+        self.serving = 0;
+        self.retry_at = None;
+        false
+    }
+
+    fn start_packager(&mut self, wall_anchor: Option<(i64, i64)>, now: Instant) {
         let gate = Arc::clone(&self.setup.gate);
-        gate.begin_generation(self.serving, generation);
+        // #418 review r7: a FRESH file generation, installed in the gate
+        // BEFORE any file of it is written (the status reports only it).
+        let Some(generation) = gate.install_files(self.serving) else {
+            // Another activation replaced this one meanwhile: the next
+            // packet starts that one.
+            return;
+        };
+        #[cfg(test)]
+        gate.run_transition_hook();
         // The directory may have changed since the run was built: nothing is
         // written into a directory that is not (or no longer) this output's.
         if let Err(reason) = claim_cast_dir(&self.setup.dir, &self.setup.id) {
@@ -336,7 +372,8 @@ impl CastRunner {
     }
 
     /// The packager failed: drop it and its files; a new generation starts
-    /// at a keyframe after [`RESTART_INTERVAL`].
+    /// at a keyframe after [`RESTART_INTERVAL`]. When its files cannot all
+    /// be removed the output is disabled instead (no restart).
     fn fail(&mut self, reason: &str, now: Instant) {
         if !self.error_logged {
             self.error_logged = true;
@@ -347,16 +384,17 @@ impl CastRunner {
             );
         }
         self.packager = None;
-        purge_owned(&self.setup.dir, &self.setup.id);
+        // #418 review r7: a fresh generation no file carries, installed
+        // first, so none of the failed packager's files is served from now.
+        self.setup.gate.install_no_files();
+        #[cfg(test)]
+        self.setup.gate.run_transition_hook();
+        if !self.purge_or_disable() {
+            return;
+        }
         self.restarts = self.restarts.saturating_add(1);
         self.setup.gate.set_error(Some(reason.to_owned()));
         self.setup.gate.note_restart();
-        // The failed packager's files are purged (best effort): report a
-        // fresh generation no file carries, so none of them is served and
-        // the control plane sees them retired (#418 ABUSE-HISTORY-R4).
-        self.setup
-            .gate
-            .begin_generation(self.serving, next_generation());
         self.retry_at = Some(now + RESTART_INTERVAL);
     }
 }
@@ -471,8 +509,9 @@ pub(crate) fn run_cast_sink(
             );
             tracing::error!(output = %id, "cast sink panicked; this output is disabled for the run");
             gate.disable(reason);
-            // The runner is not touched again; its stream files go now.
-            purge_owned(&dir, &id);
+            // The runner is not touched again; its stream files go now
+            // (best effort: the output is disabled already).
+            let _ = purge_owned(&dir, &id);
         }
     }
     report.restarts = runner.restarts();

@@ -461,25 +461,57 @@ pub fn packager_file_generation(name: &str) -> Option<u64> {
     generation.parse().ok()
 }
 
-/// Delete the files a [`CastPackager`] wrote directly in `dir` (best effort):
-/// only names [`is_packager_file_name`] accepts, only regular files (never a
-/// symlink, never a sub-directory). Every other file is left alone, so a
-/// directory that also holds an operator's files loses none of them.
-pub fn purge_dir(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// Directory entries one [`purge_dir`] visits at most (#418 review r7
+/// INV418-R7-1): its work is bounded whatever the directory holds.
+pub const PURGE_SCAN_LIMIT: usize = 4096;
+
+/// Delete the files a [`CastPackager`] wrote directly in `dir`: only names
+/// [`is_packager_file_name`] accepts, only regular files (never a symlink,
+/// never a sub-directory). Every other file is left alone, so a directory
+/// that also holds an operator's files loses none of them.
+///
+/// Returns `true` only when no entry with a packager name is left (a
+/// missing directory is clean): `false` when an unlink failed, when a
+/// packager-named entry is not a regular file, when the directory cannot be
+/// read, or when it holds more than [`PURGE_SCAN_LIMIT`] entries (the scan
+/// stops there and the rest is unknown). The caller then stops writing to
+/// it (#418 review r7 INV418-R7-1), so undeletable files never accumulate.
+#[must_use]
+pub fn purge_dir(dir: &Path) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
-    for entry in entries.flatten() {
+    let mut clean = true;
+    for (visited, entry) in entries.enumerate() {
+        if visited >= PURGE_SCAN_LIMIT {
+            return false;
+        }
+        let Ok(entry) = entry else {
+            clean = false;
+            continue;
+        };
         let ours = entry
             .file_name()
             .to_str()
             .is_some_and(is_packager_file_name);
+        if !ours {
+            continue;
+        }
         // `DirEntry::file_type` does not follow symlinks: a symlink with a
-        // packager name is not a regular file and is left alone.
-        if ours && entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            remove_quietly(&entry.path());
+        // packager name is not a regular file and is left alone (and the
+        // directory is then not clean).
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            clean = false;
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => clean = false,
         }
     }
+    clean
 }
 
 /// Maps video timestamps (time-base units) onto the track timescale.

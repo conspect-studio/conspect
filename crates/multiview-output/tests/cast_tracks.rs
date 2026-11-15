@@ -645,7 +645,7 @@ fn the_new_file_names_are_packager_names_and_purged() {
     for name in ours.iter().chain(&theirs) {
         std::fs::write(dir.path().join(name), b"x").unwrap();
     }
-    purge_dir(dir.path());
+    assert!(purge_dir(dir.path()));
     for name in ours {
         assert!(!dir.path().join(name).exists(), "{name}");
     }

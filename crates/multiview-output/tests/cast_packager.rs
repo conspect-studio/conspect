@@ -357,7 +357,9 @@ fn purge_dir_removes_only_files_the_packager_writes() {
         std::os::unix::fs::symlink(&target, dir.path().join("seg-v-5-0.m4s")).unwrap();
     }
     assert!(files(dir.path()).len() > 20);
-    purge_dir(dir.path());
+    // A directory (and on Unix a symlink) with a packager name is left: not
+    // clean (#418 review r7).
+    assert!(!purge_dir(dir.path()));
     let mut expected: Vec<String> = foreign.iter().map(|name| (*name).to_owned()).collect();
     expected.push("seg-v-9-9.m4s".to_owned());
     #[cfg(unix)]
@@ -1427,4 +1429,28 @@ fn a_failed_unlink_of_a_retired_segment_fails_the_packager() {
     assert_eq!(feeder.packager.published().video_segments, 21);
     // The record is kept: the following packager cleanup still names it.
     assert!(oldest.join("pinned").is_file());
+}
+
+/// #418 review r7 INV418-R7-1: `purge_dir` reports whether every
+/// packager-named entry is gone, and its scan is bounded: a directory with
+/// more than `PURGE_SCAN_LIMIT` entries is never reported clean.
+#[test]
+fn purge_dir_reports_leftovers_and_bounds_its_scan() {
+    use multiview_output::hls::cast::PURGE_SCAN_LIMIT;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(purge_dir(&dir.path().join("absent")), "missing = clean");
+    std::fs::write(dir.path().join("seg-v-3-0.m4s"), b"x").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), b"keep").unwrap();
+    assert!(purge_dir(dir.path()));
+    assert!(dir.path().join("notes.txt").exists());
+    // A packager-named entry that cannot be unlinked (a directory).
+    std::fs::create_dir(dir.path().join("seg-v-3-1.m4s")).unwrap();
+    assert!(!purge_dir(dir.path()));
+    std::fs::remove_dir(dir.path().join("seg-v-3-1.m4s")).unwrap();
+    assert!(purge_dir(dir.path()));
+    // Past the scan bound: not clean, whatever the rest holds.
+    for i in 0..PURGE_SCAN_LIMIT {
+        std::fs::write(dir.path().join(format!("other-{i}")), b"").unwrap();
+    }
+    assert!(!purge_dir(dir.path()));
 }
