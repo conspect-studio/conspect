@@ -681,3 +681,174 @@ fn a_keyer_auto_rate_override_is_bounded() {
         "in flight, no outcome yet"
     );
 }
+
+const LUMA_CLIP: u8 = 180;
+
+/// `(tick, background luma, incoming luma and weight, clip drawn, label)`.
+type Phase = (u64, u8, Option<(u8, f32)>, bool, &'static str);
+
+/// Pre-roll 1, clip 8, trigger 2, mix 2 on player `p`; the AUTO lands on
+/// tick 2 (elapsed `e` = tick − 2): pre-roll on tick 2, clip on ticks 3..11,
+/// mix on ticks 5 and 6 at 1/2 and 2/2, swap on tick 7, end on tick 11.
+fn stinger_rig(
+    keyer: multiview_config::DownstreamKeyerConfig,
+) -> (
+    Rig,
+    rig::Hook,
+    multiview_engine::CompositorDrive<multiview_compositor::pipeline::Nv12Image>,
+    multiview_engine::switcher_control::SwitcherControl,
+) {
+    let rig = Rig::new(&["a", "b", "gfx", "p"]);
+    let (handle, hook, drive) = rig.build(&[keyer], 3.0, "a", "b");
+    let descriptor: TransitionDescriptor = serde_json::from_value(serde_json::json!({
+        "kind": "stinger", "player": "p", "pre_roll": 1,
+        "clip_duration": 8, "trigger_point": 2, "mix_rate": 2,
+    }))
+    .unwrap();
+    handle
+        .try_send(cmd("set", SwitcherVerb::SetTransition(descriptor)))
+        .unwrap();
+    (rig, hook, drive, handle)
+}
+
+fn stinger_fresh(rig: &Rig, index: u64) {
+    keep_fresh(rig, index);
+    rig.publish("p", LUMA_CLIP, index);
+}
+
+/// ADR-0112 §5 x ADR-0113 §3: a DSK is downstream of the M/E, so an on-air
+/// DSK stays above the stinger clip (part of the M/E transition) on every
+/// composed frame, byte for byte against the CPU reference stack: layout,
+/// incoming at the mix weight, the opaque clip, then the keyed fill.
+#[test]
+fn an_on_air_dsk_stays_above_a_stinger_clip() {
+    use multiview_compositor::blend::LinearRgba;
+    use multiview_compositor::pipeline::{self, CanvasColor, Tile};
+    use multiview_compositor::TileKey;
+    let mut cfg = dsk("dsk1", "gfx", None, 1);
+    cfg.fly = Some(multiview_config::KeyerRect {
+        x: 16,
+        y: 16,
+        w: 32,
+        h: 32,
+    });
+    let (rig, mut hook, mut drive, handle) = stinger_rig(cfg);
+    handle
+        .try_send(cmd("on", SwitcherVerb::KeyerCut { keyer: 0, on: true }))
+        .unwrap();
+    stinger_fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    stinger_fresh(&rig, 1);
+    step(&mut hook, &mut drive, 1);
+    assert_eq!(weight_of(&drive, 0), Some(1.0), "the DSK is on air");
+    handle
+        .try_send(cmd(
+            "auto",
+            SwitcherVerb::Auto(FrameCount::try_from(9).unwrap()),
+        ))
+        .unwrap();
+    let side = rig::SIDE;
+    let reference = |under: u8, over: Option<(u8, f32)>, clip: bool| {
+        let under = Rig::solid(under, side, side);
+        let over = over.map(|(y, w)| (Rig::solid(y, side, side), w));
+        let clip_image = Rig::solid(LUMA_CLIP, side, side);
+        let fill = Rig::solid(LUMA_FILL, side, side);
+        let mut tiles = vec![Tile::scaled(&under, 0, 0, side, side, 1.0)];
+        if let Some((image, weight)) = &over {
+            tiles.push(Tile::scaled(image, 0, 0, side, side, *weight));
+        }
+        if clip {
+            tiles.push(Tile::scaled(&clip_image, 0, 0, side, side, 1.0));
+        }
+        tiles.push(Tile::scaled(&fill, 16, 16, 32, 32, 1.0).with_key(TileKey::linear()));
+        pipeline::composite(
+            side,
+            side,
+            CanvasColor::default(),
+            LinearRgba::TRANSPARENT,
+            &tiles,
+        )
+        .unwrap()
+    };
+    let half = kernel::opacity(Progress::new(1, FrameCount::try_from(2).unwrap()));
+    let expected: [Phase; 7] = [
+        (2, LUMA_A, None, false, "pre-roll"),
+        (3, LUMA_A, None, true, "clip before the trigger"),
+        (5, LUMA_A, Some((LUMA_B, half)), true, "mix 1/2"),
+        (6, LUMA_A, Some((LUMA_B, 1.0)), true, "mix 2/2"),
+        (7, LUMA_B, None, true, "after the swap"),
+        (10, LUMA_B, None, true, "clip tail"),
+        (11, LUMA_B, None, false, "the end"),
+    ];
+    let mut index = 2;
+    for (at, under, over, clip, what) in expected {
+        while index <= at {
+            stinger_fresh(&rig, index);
+            let frame = step(&mut hook, &mut drive, index);
+            if index == at {
+                let want = reference(under, over, clip);
+                assert_eq!(frame.canvas.y_plane(), want.y_plane(), "{what}: luma");
+                assert_eq!(frame.canvas.uv_plane(), want.uv_plane(), "{what}: chroma");
+                // The keyed fill is on top inside its fly; the clip (or the
+                // take) shows outside it.
+                assert!(
+                    frame.canvas.sample(32, 32).unwrap().0.abs_diff(LUMA_FILL) < 8,
+                    "{what}"
+                );
+                if clip {
+                    assert!(
+                        frame.canvas.sample(4, 4).unwrap().0.abs_diff(LUMA_CLIP) < 8,
+                        "{what}"
+                    );
+                }
+            }
+            index += 1;
+        }
+    }
+    let snapshot = handle.snapshot().unwrap();
+    assert_eq!(snapshot.program.as_str(), "b");
+    assert!(snapshot.keyers[0].unwrap().on_air, "the DSK stays on air");
+    assert!(snapshot.tally.program.contains(TallyRole::Fill(0)));
+}
+
+/// A tied DSK rides the stinger's take: it holds its state through the
+/// pre-roll and the clip before the trigger, follows the MIX envelope over
+/// the mix window, and lands on air on the swap tick (ADR-0112 §5).
+#[test]
+fn a_tied_dsk_rides_the_stinger_mix_window_and_lands_on_the_swap() {
+    let mut cfg = dsk("dsk1", "gfx", None, 1);
+    cfg.tie = true;
+    let (rig, mut hook, mut drive, handle) = stinger_rig(cfg);
+    let mut outcomes = handle.outcomes();
+    stinger_fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    stinger_fresh(&rig, 1);
+    step(&mut hook, &mut drive, 1);
+    handle
+        .try_send(cmd(
+            "auto",
+            SwitcherVerb::Auto(FrameCount::try_from(9).unwrap()),
+        ))
+        .unwrap();
+    let mix = FrameCount::try_from(2).unwrap();
+    for index in 2..=12_u64 {
+        stinger_fresh(&rig, index);
+        step(&mut hook, &mut drive, index);
+        let weight = weight_of(&drive, 0).unwrap_or(0.0);
+        let expected = match index {
+            2..=4 => 0.0,
+            5 => kernel::opacity(Progress::new(1, mix)),
+            _ => 1.0,
+        };
+        assert!(
+            (weight - expected).abs() < 1e-6,
+            "tick {index}: {weight} vs {expected}"
+        );
+        let on_air = hook.driver.keyers().flags(0).unwrap().on_air;
+        assert_eq!(on_air, index >= 7, "tick {index}: on air");
+    }
+    let done = drain(&mut outcomes).0;
+    let auto = done.iter().find(|o| o.operation_id == "auto").unwrap();
+    assert_eq!((auto.tick, auto.completed), (7, true));
+    assert!(handle.snapshot().unwrap().keyers[0].unwrap().on_air);
+}
