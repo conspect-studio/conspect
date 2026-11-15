@@ -298,6 +298,7 @@ pub struct WorkerProgress {
 #[cfg(test)]
 impl WorkerProgress {
     /// Whether the worker still holds accepted, unprocessed items.
+    #[must_use]
     pub fn behind(&self) -> bool {
         use std::sync::atomic::Ordering;
         self.done.load(Ordering::Acquire) < self.offered.load(Ordering::Acquire)
@@ -412,6 +413,7 @@ impl RenditionWorker {
 
     /// Test observation of this worker's progress (see [`WorkerProgress`]).
     #[cfg(test)]
+    #[must_use]
     pub fn progress(&self) -> &Arc<WorkerProgress> {
         &self.progress
     }

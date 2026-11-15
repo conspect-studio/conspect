@@ -321,73 +321,12 @@ where
         .collect();
     let clock = Arc::new(multiview_engine::ManualTimeSource::new());
     let stop_clock = Arc::new(AtomicBool::new(false));
-    {
-        let (clock, stop_clock) = (Arc::clone(&clock), Arc::clone(&stop_clock));
-        // #461: the synthetic clock stands in for the host. A free-running
-        // 40 ms clock on a loaded host outran the threads that run in wall
-        // time (the routing-aux compose thread, the live routed encoders and
-        // the bake consumer), so a routed layout was not fresh at its take
-        // (`FeedNotFresh`), a routed encoder fell behind, or the consumer
-        // fell beyond its 8-tick substitution envelope ("output fell N ticks
-        // behind the clock"): the tests measured the host. The clock now
-        // holds each tick (bounded) until
-        // - every aux feed has composed what the router will need fresh (both
-        //   policies: the aux thread is not the consumer, so a live-policy
-        //   test still proves the hot loop never waits on the consumer), and
-        // - under the offline policy only (`BlockForExact`, where pacing the
-        //   renderer to the consumer is the design), the router ran within
-        //   `CLOCK_LEAD_TICKS` of it and no live worker holds more than one
-        //   unencoded frame.
-        // A wait is bounded by `CLOCK_WAIT_BOUND`; after `CLOCK_GIVE_UP` waits
-        // hit the bound, pacing ends for the run, so a test's deliberately
-        // wedged thread costs a few seconds and still proves what it tests.
-        // (A hold never nears the dispatcher's own 2 s wall-clock watchdog.)
-        let paced = Arc::clone(&slot);
-        let pace_consumer = policy == SendPolicy::BlockForExact;
-        std::thread::spawn(move || {
-            let mut ticks = 0_u64;
-            let mut timeouts = 0_u32;
-            while !stop_clock.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(40));
-                let bound = Instant::now() + CLOCK_WAIT_BOUND;
-                while timeouts < CLOCK_GIVE_UP && !stop_clock.load(Ordering::Acquire) {
-                    if Instant::now() >= bound {
-                        timeouts += 1;
-                        break;
-                    }
-                    let Some(handle) = paced.load() else {
-                        break;
-                    };
-                    let ticked = handle.ticked.load(Ordering::Acquire);
-                    let consumer_ok = !pace_consumer
-                        || (ticked + CLOCK_LEAD_TICKS >= ticks
-                            && handle.worker_lag.load(Ordering::Acquire) <= 1);
-                    // Program and Clean come from the bake consumer, never
-                    // from the aux thread. The next tick `ticks + 1` finds a
-                    // feed fresh when its frame is at most one tick old (two
-                    // at the halved aux cadence, `slot_fresh`): wait for that.
-                    let lag = u64::from(handle.snapshot().aux_halved);
-                    let aux_ok = handle
-                        .aux_feeds
-                        .load()
-                        .iter()
-                        .filter(|f| !matches!(f.bus, PictureBus::Program | PictureBus::Clean))
-                        .all(|f| {
-                            f.slot
-                                .latest
-                                .load()
-                                .is_some_and(|frame| frame.tick + lag >= ticks)
-                        });
-                    if consumer_ok && aux_ok {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                clock.advance(Duration::from_millis(40));
-                ticks += 1;
-            }
-        });
-    }
+    spawn_paced_clock(
+        Arc::clone(&clock),
+        Arc::clone(&stop_clock),
+        Arc::clone(&slot),
+        policy == SendPolicy::BlockForExact,
+    );
     let hot_ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let control_slot = Arc::clone(&slot);
     let controller = std::thread::spawn(move || control(control_slot));
@@ -432,6 +371,79 @@ where
             .map(|v| std::mem::take(&mut *v.lock().unwrap()))
             .collect(),
     }
+}
+
+/// Advance the synthetic clock every 40 ms of wall time, paced (#461).
+///
+/// The synthetic clock stands in for the host. A free-running
+/// 40 ms clock on a loaded host outran the threads that run in wall
+/// time (the routing-aux compose thread, the live routed encoders and
+/// the bake consumer), so a routed layout was not fresh at its take
+/// (`FeedNotFresh`), a routed encoder fell behind, or the consumer
+/// fell beyond its 8-tick substitution envelope ("output fell N ticks
+/// behind the clock"): the tests measured the host. The clock now
+/// holds each tick (bounded) until
+/// - every aux feed has composed what the router will need fresh (both
+///   policies: the aux thread is not the consumer, so a live-policy
+///   test still proves the hot loop never waits on the consumer), and
+/// - under the offline policy only (`BlockForExact`, where pacing the
+///   renderer to the consumer is the design), the router ran within
+///   `CLOCK_LEAD_TICKS` of it and no live worker holds more than one
+///   unencoded frame.
+///
+/// A wait is bounded by `CLOCK_WAIT_BOUND`; after `CLOCK_GIVE_UP` waits
+/// hit the bound, pacing ends for the run, so a test's deliberately
+/// wedged thread costs a few seconds and still proves what it tests.
+/// (A hold never nears the dispatcher's own 2 s wall-clock watchdog.)
+fn spawn_paced_clock(
+    clock: Arc<multiview_engine::ManualTimeSource>,
+    stop_clock: Arc<AtomicBool>,
+    paced: OutputRoutingSlot,
+    pace_consumer: bool,
+) {
+    std::thread::spawn(move || {
+        let mut ticks = 0_u64;
+        let mut timeouts = 0_u32;
+        while !stop_clock.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(40));
+            let bound = Instant::now() + CLOCK_WAIT_BOUND;
+            while timeouts < CLOCK_GIVE_UP && !stop_clock.load(Ordering::Acquire) {
+                if Instant::now() >= bound {
+                    timeouts += 1;
+                    break;
+                }
+                let Some(handle) = paced.load() else {
+                    break;
+                };
+                let ticked = handle.ticked.load(Ordering::Acquire);
+                let consumer_ok = !pace_consumer
+                    || (ticked + CLOCK_LEAD_TICKS >= ticks
+                        && handle.worker_lag.load(Ordering::Acquire) <= 1);
+                // Program and Clean come from the bake consumer, never
+                // from the aux thread. The next tick `ticks + 1` finds a
+                // feed fresh when its frame is at most one tick old (two
+                // at the halved aux cadence, `slot_fresh`): wait for that.
+                let lag = u64::from(handle.snapshot().aux_halved);
+                let aux_ok = handle
+                    .aux_feeds
+                    .load()
+                    .iter()
+                    .filter(|f| !matches!(f.bus, PictureBus::Program | PictureBus::Clean))
+                    .all(|f| {
+                        f.slot
+                            .latest
+                            .load()
+                            .is_some_and(|frame| frame.tick + lag >= ticks)
+                    });
+                if consumer_ok && aux_ok {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            clock.advance(Duration::from_millis(40));
+            ticks += 1;
+        }
+    });
 }
 
 /// How far (in ticks) the offline synthetic clock may lead the router (#461),
