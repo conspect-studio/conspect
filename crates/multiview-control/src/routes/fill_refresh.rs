@@ -42,6 +42,27 @@ fn visible(principal: &Principal, s: &FillRefreshStatus) -> bool {
         && authorize_object(principal, &s.player).is_ok()
 }
 
+/// Inside the mutation lock: an existing schedule the caller cannot fully
+/// see (fill or ANY player it targets, including a staged replacement) is
+/// answered exactly like an absent one, before its source is inspected.
+fn existing_visible(
+    core: &crate::fill_refresh::Scheduler,
+    principal: &Principal,
+    fill: &str,
+) -> ControlResult<Option<FillSource>> {
+    let Some(players) = core.players(fill) else {
+        return Ok(None);
+    };
+    if authorize_object(principal, fill).is_err()
+        || players
+            .iter()
+            .any(|player| authorize_object(principal, player).is_err())
+    {
+        return Err(missing(fill));
+    }
+    Ok(core.source(fill))
+}
+
 fn epoch_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -176,9 +197,10 @@ pub(crate) async fn put(
     };
     let refresh = state.fill_refresh.clone();
     let fill = id.clone();
+    let actor = principal.clone();
     tokio::task::spawn_blocking(move || {
         refresh.with_core(|core| {
-            if core.source(&fill) == Some(FillSource::Config) {
+            if existing_visible(core, &actor, &fill)? == Some(FillSource::Config) {
                 return Err(ControlError::Conflict(
                     "fill is declared in config; edit [[media_fill]] instead".into(),
                 ));
@@ -228,28 +250,23 @@ pub(crate) async fn delete(
 ) -> ControlResult<StatusCode> {
     principal.role.require(Action::Write)?;
     authorize_object(&principal, &id)?;
-    let current = state
-        .fill_refresh
-        .status()
-        .iter()
-        .find(|s| s.fill_id == id && visible(&principal, s))
-        .cloned()
-        .ok_or_else(|| missing(&id))?;
-    if current.source == FillSource::Config {
-        return Err(ControlError::Conflict(
-            "fill is declared in config; edit [[media_fill]] instead".into(),
-        ));
-    }
     let refresh = state.fill_refresh.clone();
     let fill = id.clone();
-    let removed = tokio::task::spawn_blocking(move || {
-        refresh.with_core(|core| core.source(&fill) == Some(FillSource::Api) && core.remove(&fill))
+    let actor = principal.clone();
+    tokio::task::spawn_blocking(move || {
+        refresh.with_core(|core| match existing_visible(core, &actor, &fill)? {
+            None => Err(missing(&fill)),
+            Some(FillSource::Config) => Err(ControlError::Conflict(
+                "fill is declared in config; edit [[media_fill]] instead".into(),
+            )),
+            Some(FillSource::Api) => {
+                core.remove(&fill);
+                Ok(())
+            }
+        })
     })
     .await
-    .map_err(|_| ControlError::Repository("fill refresh worker failed".into()))?;
-    if !removed {
-        return Err(missing(&id));
-    }
+    .map_err(|_| ControlError::Repository("fill refresh worker failed".into()))??;
     state.audit(
         &principal.key_id,
         crate::audit::AuditAction::Delete,

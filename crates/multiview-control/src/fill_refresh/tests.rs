@@ -333,10 +333,10 @@ fn restart_inside_a_slot_replays_the_same_capture_key() {
     // The next slot uses a different key; a changed body uses a different key.
     let sp = spec("radar", "vt-1", 5);
     let (slot, _) = slot_at("radar", 5, T0);
-    assert_ne!(capture_key(&sp, slot), capture_key(&sp, slot + 1));
+    assert_ne!(capture_key(&sp, slot, 0), capture_key(&sp, slot + 1, 0));
     let mut changed = sp.clone();
     changed.body.view.zoom = 9;
-    assert_ne!(capture_key(&sp, slot), capture_key(&changed, slot));
+    assert_ne!(capture_key(&sp, slot, 0), capture_key(&changed, slot, 0));
     assert_eq!(load_key(&sp, 7), load_key(&sp, 7));
 }
 
@@ -519,4 +519,168 @@ terms_version = "2023-09-01"
     let mut one_shot = fill.clone();
     one_shot.refresh = multiview_config::FillRefresh::OneShot;
     assert!(spec_from_config(&one_shot).is_err());
+}
+
+#[test]
+fn terminal_failure_retries_in_the_same_slot_with_a_new_job() {
+    let fake = Fake::default();
+    let mut s = Scheduler::default();
+    // A long interval: the back-off retry lands inside the same slot.
+    s.upsert(spec("radar", "vt-1", 60), T0, FirstDue::CurrentSlot)
+        .unwrap();
+    let slot_start = entry(&s, "radar").next_due;
+    let now = slot_start.max(T0);
+    s.tick(now, &fake, &no_keys());
+    fake.set_job(1, JobPoll::Failed("capture failed".into()));
+    s.tick(now + 1, &fake, &no_keys());
+    let retry = entry(&s, "radar").next_due;
+    assert_eq!(retry, now + 1 + BACKOFF_BASE_SECS);
+    assert_eq!(
+        slot_at("radar", 60, retry).0,
+        slot_at("radar", 60, now).0,
+        "same slot"
+    );
+    s.tick(retry, &fake, &no_keys());
+    let submits = fake.submits();
+    assert_eq!(submits.len(), 2);
+    assert_ne!(
+        submits[0].1, submits[1].1,
+        "a definite failure gets a new identity"
+    );
+    assert_eq!(
+        entry(&s, "radar").last_job,
+        Some(2),
+        "a NEW job is admitted, not the failed replay"
+    );
+    // The retry succeeds and loads the new artifact.
+    *fake.load_result.lock().unwrap() = Some(LoadPoll::Completed);
+    fake.set_job(
+        2,
+        JobPoll::Succeeded {
+            artifact: "fresh".into(),
+        },
+    );
+    s.tick(retry + 5, &fake, &no_keys());
+    assert_eq!(
+        entry(&s, "radar").last_artifact_id.as_deref(),
+        Some("fresh")
+    );
+    // Identities stay deterministic: a restart re-derives the same keys.
+    let sp = spec("radar", "vt-1", 60);
+    let (slot, _) = slot_at("radar", 60, now);
+    assert_eq!(submits[0].1, capture_key(&sp, slot, 0));
+    assert_eq!(submits[1].1, capture_key(&sp, slot, 1));
+}
+
+#[test]
+fn uncertain_outcome_retries_the_same_identity() {
+    let fake = Fake::default();
+    let mut s = Scheduler::default();
+    s.upsert(spec("radar", "vt-1", 60), T0, FirstDue::CurrentSlot)
+        .unwrap();
+    let now = entry(&s, "radar").next_due.max(T0);
+    s.tick(now, &fake, &no_keys());
+    fake.set_job(1, JobPoll::Uncertain("capture uncertain".into()));
+    s.tick(now + 1, &fake, &no_keys());
+    let retry = entry(&s, "radar").next_due;
+    s.tick(retry, &fake, &no_keys());
+    let submits = fake.submits();
+    assert_eq!(submits.len(), 2);
+    assert_eq!(
+        submits[0].1, submits[1].1,
+        "never a second browser for an unknown outcome"
+    );
+}
+
+#[test]
+fn replacement_during_capture_is_staged_until_the_run_ends() {
+    let fake = Fake::default();
+    let mut s = Scheduler::default();
+    s.upsert(spec("radar", "vt-1", 5), T0, FirstDue::CurrentSlot)
+        .unwrap();
+    s.tick(T0, &fake, &no_keys());
+    // Replace with a different player, landing intent and owner mid-capture.
+    let mut next = spec("radar", "vt-2", 10);
+    next.then = LoadThen::Cue;
+    next.owner = FillOwner::Key("op".into());
+    next.source = FillSource::Api;
+    s.upsert(next, T0 + 1, FirstDue::NextSlot).unwrap();
+    assert!(s.status()[0].update_pending);
+    assert_eq!(
+        s.status()[0].player,
+        "vt-1",
+        "the run keeps its admitted spec"
+    );
+    assert_eq!(
+        s.players("radar").unwrap(),
+        vec!["vt-1".to_owned(), "vt-2".to_owned()]
+    );
+    *fake.load_result.lock().unwrap() = Some(LoadPoll::Completed);
+    fake.set_job(
+        1,
+        JobPoll::Succeeded {
+            artifact: "a".into(),
+        },
+    );
+    s.tick(T0 + 5, &fake, &no_keys());
+    let loads = fake.loads();
+    assert_eq!(loads.len(), 1);
+    assert_eq!(
+        loads[0].0, "vt-1",
+        "the old capture never lands on the new player"
+    );
+    assert_eq!(
+        loads[0].4,
+        LoadThen::Resume,
+        "nor with the new landing intent"
+    );
+    let st = &s.status()[0];
+    assert!(!st.update_pending);
+    assert_eq!(st.player, "vt-2");
+    assert_eq!(st.minutes, 10);
+    assert_eq!(st.source, FillSource::Api);
+    assert!(!st.persistent);
+}
+
+#[test]
+fn replacement_during_load_is_staged_until_the_run_ends() {
+    let fake = Fake::default();
+    let mut s = Scheduler::default();
+    s.upsert(spec("radar", "vt-1", 5), T0, FirstDue::CurrentSlot)
+        .unwrap();
+    s.tick(T0, &fake, &no_keys());
+    fake.set_job(
+        1,
+        JobPoll::Succeeded {
+            artifact: "a".into(),
+        },
+    );
+    s.tick(T0 + 5, &fake, &no_keys());
+    assert_eq!(s.status()[0].phase, "loading");
+    s.upsert(spec("radar", "vt-2", 5), T0 + 6, FirstDue::NextSlot)
+        .unwrap();
+    // The load is polled on the ORIGINAL player and its failure is the old run's.
+    fake.ops
+        .lock()
+        .unwrap()
+        .insert(1, LoadPoll::Failed("native load failed".into()));
+    s.tick(T0 + 10, &fake, &no_keys());
+    let st = &s.status()[0];
+    assert_eq!(st.player, "vt-2");
+    assert!(!st.update_pending);
+    assert!(!st.in_flight);
+    assert_eq!(fake.loads().len(), 1);
+    assert_eq!(fake.loads()[0].0, "vt-1");
+}
+
+#[test]
+fn idle_replacement_applies_immediately() {
+    let mut s = Scheduler::default();
+    s.upsert(spec("radar", "vt-1", 5), T0, FirstDue::NextSlot)
+        .unwrap();
+    s.upsert(spec("radar", "vt-2", 5), T0, FirstDue::NextSlot)
+        .unwrap();
+    assert_eq!(s.status()[0].player, "vt-2");
+    assert!(!s.status()[0].update_pending);
+    assert_eq!(s.players("radar").unwrap(), vec!["vt-2".to_owned()]);
 }

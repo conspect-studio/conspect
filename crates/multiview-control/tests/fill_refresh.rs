@@ -26,6 +26,12 @@ fn config_spec(fill: &str, player: &str) -> FillSpec {
     }
 }
 fn harness() -> support::Harness {
+    harness_sourced(FillSource::Config)
+}
+/// "radar" -> vt-1 (config) plus "scoped-layout" -> vt-1 with `source`: the
+/// scoped principal may touch fill `scoped-layout` and player
+/// `scoped-layout`, but NOT the existing schedule's player `vt-1`.
+fn harness_sourced(source: FillSource) -> support::Harness {
     let players = InMemoryMediaPlayerStore::new();
     for id in ["vt-1", "scoped-layout"] {
         players
@@ -48,12 +54,13 @@ fn harness() -> support::Harness {
             )
             .unwrap();
             // Fill id in the scoped allowlist, player outside it.
-            core.upsert(
-                config_spec("scoped-layout", "vt-1"),
-                1_800_000_000,
-                FirstDue::NextSlot,
-            )
-            .unwrap();
+            let mut scoped = config_spec("scoped-layout", "vt-1");
+            scoped.source = source;
+            if source == FillSource::Api {
+                scoped.owner = FillOwner::Key("operator-key".to_owned());
+            }
+            core.upsert(scoped, 1_800_000_000, FirstDue::NextSlot)
+                .unwrap();
         });
         state.with_media_player_store(players)
     })
@@ -253,4 +260,76 @@ async fn runtime_schedule_registration_rules() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn put_and_delete_never_reach_a_schedule_whose_player_is_unauthorized() {
+    for source in [FillSource::Api, FillSource::Config] {
+        let h = harness_sourced(source);
+        // The caller is authorized for the fill id AND the player it names,
+        // but the existing schedule targets vt-1, outside its scope.
+        let hijack = json!({"minutes": 1, "capture": capture("scoped-layout", "scoped-layout")});
+        let r = send(
+            &h.router,
+            request(
+                "PUT",
+                "/api/v1/media/fills/scoped-layout/refresh",
+                SCOPED_TOKEN,
+                Some(&hijack),
+            ),
+        )
+        .await;
+        assert_eq!(
+            r.status(),
+            StatusCode::NOT_FOUND,
+            "{source:?}: same as absent, no 409 existence leak"
+        );
+        let r = send(
+            &h.router,
+            request(
+                "DELETE",
+                "/api/v1/media/fills/scoped-layout/refresh",
+                SCOPED_TOKEN,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{source:?}");
+        // Unchanged: still targets vt-1 at its original interval.
+        let r = send(
+            &h.router,
+            get("/api/v1/media/fills/scoped-layout/refresh", OPERATOR_TOKEN),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let st = body_json(r).await;
+        assert_eq!(st["player"], "vt-1", "{source:?}");
+        assert_eq!(st["minutes"], 5, "{source:?}");
+    }
+}
+
+#[tokio::test]
+async fn status_reports_whether_a_schedule_survives_restart() {
+    let h = harness();
+    let ok = json!({"minutes": 3, "capture": capture("fresh", "vt-1")});
+    let r = send(
+        &h.router,
+        request(
+            "PUT",
+            "/api/v1/media/fills/fresh/refresh",
+            OPERATOR_TOKEN,
+            Some(&ok),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let st = body_json(r).await;
+    assert_eq!(st["persistent"], false);
+    assert_eq!(st["update_pending"], false);
+    let r = send(
+        &h.router,
+        get("/api/v1/media/fills/radar/refresh", OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(body_json(r).await["persistent"], true);
 }

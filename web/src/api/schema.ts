@@ -5563,6 +5563,8 @@ export interface components {
             minutes: number;
             /** @description Next due time (RFC 3339 UTC); meaningful while idle. */
             next_due?: string | null;
+            /** @description Whether the schedule survives a server restart (config: yes; API: no). */
+            persistent: boolean;
             /** @description `idle`, `capturing` or `loading`. */
             phase: string;
             /** @description Target media player. */
@@ -5571,6 +5573,8 @@ export interface components {
             source: components["schemas"]["FillSource"];
             /** @description Landing intent of scheduled loads. */
             then: components["schemas"]["LoadThen"];
+            /** @description A replacement schedule is staged and takes effect when the in-flight run ends. */
+            update_pending: boolean;
         };
         /**
          * @description Where a scheduled fill came from.

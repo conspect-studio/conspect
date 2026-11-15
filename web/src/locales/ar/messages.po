@@ -6289,7 +6289,7 @@ msgstr ""
 msgid "Last fetched"
 msgstr ""
 
-#: src/pages/FillRefreshStatus.tsx:43
+#: src/pages/FillRefreshStatus.tsx:53
 msgid "Last refresh failed (previous clip kept)"
 msgstr ""
 
@@ -8216,6 +8216,10 @@ msgstr ""
 
 #: src/components/SourceDemandBadge.tsx:44
 msgid "Not in use: this source is not running and costs nothing."
+msgstr ""
+
+#: src/pages/FillRefreshStatus.tsx:48
+msgid "Not kept across a server restart — declare it in [[media_fill]] to make it permanent."
 msgstr ""
 
 #: src/iptv/SourceLinks.tsx:93
@@ -13193,6 +13197,10 @@ msgstr ""
 
 #: src/pages/AudioPage.tsx:748
 msgid "Updated outputs:"
+msgstr ""
+
+#: src/pages/FillRefreshStatus.tsx:43
+msgid "Updated schedule applies after the current refresh finishes."
 msgstr ""
 
 #: src/iptv/Badges.tsx:140

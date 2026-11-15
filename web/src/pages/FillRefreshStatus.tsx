@@ -38,6 +38,16 @@ export function FillRefreshSummary({ status }: { readonly status: FillRefreshSta
           ? <> · <code className="break-all">{status.last_artifact_id}</code></>
           : null}
       </p>
+      {status.update_pending ? (
+        <p className="text-muted-foreground">
+          <Trans>Updated schedule applies after the current refresh finishes.</Trans>
+        </p>
+      ) : null}
+      {!status.persistent ? (
+        <p className="text-amber-700 dark:text-amber-400">
+          <Trans>Not kept across a server restart — declare it in [[media_fill]] to make it permanent.</Trans>
+        </p>
+      ) : null}
       {status.last_error !== null && status.last_error !== undefined ? (
         <p className="text-destructive">
           <Trans>Last refresh failed (previous clip kept)</Trans>: {status.last_error}

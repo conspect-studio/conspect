@@ -852,6 +852,7 @@ describe('WindyFillDialog', () => {
           during_refresh: 'play_last', then: 'resume', phase: 'idle', in_flight: false,
           next_due: '2026-11-15T00:15:00Z', last_success_at: null, last_artifact_id: null,
           last_capture_job_id: null, last_error: null, consecutive_failures: 0,
+          update_pending: false, persistent: false,
         });
       }),
       http.post('*/api/v1/media/captures', () =>
@@ -883,6 +884,7 @@ describe('WindyFillDialog', () => {
     await waitFor(() => {
       expect(screen.getByText(/Refreshes every 15 min/)).toBeInTheDocument();
     });
+    expect(screen.getByText(/Not kept across a server restart/)).toBeInTheDocument();
   });
 
   it('blocks Capture for an out-of-range interval', async () => {
@@ -909,7 +911,7 @@ describe('WindyFillDialog', () => {
           during_refresh: 'play_last', then: 'resume', phase: 'idle', in_flight: false,
           next_due: '2026-11-15T00:05:00Z', last_success_at: '2026-11-15T00:00:00Z',
           last_artifact_id: 'art-1', last_capture_job_id: 3, last_error: 'capture failed',
-          consecutive_failures: 2,
+          consecutive_failures: 2, update_pending: false, persistent: true,
         })),
     );
     renderDialog();
@@ -919,6 +921,7 @@ describe('WindyFillDialog', () => {
     expect(screen.getByText(/previous clip kept/)).toBeInTheDocument();
     expect(screen.getByText('art-1')).toBeInTheDocument();
     expect(screen.getByText(/declared in the configuration/)).toBeInTheDocument();
+    expect(screen.queryByText(/Not kept across a server restart/)).toBeNull();
     expect(screen.queryByRole('button', { name: 'Stop scheduled refresh' })).toBeNull();
   });
 });

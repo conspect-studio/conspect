@@ -18042,7 +18042,9 @@
           "then",
           "phase",
           "in_flight",
-          "consecutive_failures"
+          "consecutive_failures",
+          "update_pending",
+          "persistent"
         ],
         "properties": {
           "consecutive_failures": {
@@ -18106,6 +18108,10 @@
             ],
             "description": "Next due time (RFC 3339 UTC); meaningful while idle."
           },
+          "persistent": {
+            "type": "boolean",
+            "description": "Whether the schedule survives a server restart (config: yes; API: no)."
+          },
           "phase": {
             "type": "string",
             "description": "`idle`, `capturing` or `loading`."
@@ -18121,6 +18127,10 @@
           "then": {
             "$ref": "#/components/schemas/LoadThen",
             "description": "Landing intent of scheduled loads."
+          },
+          "update_pending": {
+            "type": "boolean",
+            "description": "A replacement schedule is staged and takes effect when the in-flight run ends."
           }
         }
       },

@@ -125,8 +125,12 @@ pub enum JobPoll {
         /// Artifact id.
         artifact: String,
     },
-    /// Terminal without an artifact (failed, cancelled, uncertain).
+    /// Definitely terminal without an artifact (failed, cancelled): a retry
+    /// needs a new capture identity.
     Failed(String),
+    /// Outcome unknown (`uncertain`): the same identity must be retried so the
+    /// durable ledger, never a second browser, resolves it.
+    Uncertain(String),
 }
 
 /// A native load's state as the scheduler needs it.
@@ -197,6 +201,7 @@ impl RefreshBackend for LiveBackend {
         Ok(match (view.state, view.artifact_id) {
             ("succeeded", Some(artifact)) => JobPoll::Succeeded { artifact },
             ("queued" | "running", _) => JobPoll::Pending,
+            ("uncertain", _) => JobPoll::Uncertain("capture uncertain".into()),
             (state, _) => JobPoll::Failed(format!("capture {state}")),
         })
     }
@@ -254,6 +259,10 @@ pub struct FillRefreshStatus {
     pub last_error: Option<String>,
     /// Consecutive failed runs (drives the back-off).
     pub consecutive_failures: u32,
+    /// A replacement schedule is staged and takes effect when the in-flight run ends.
+    pub update_pending: bool,
+    /// Whether the schedule survives a server restart (config: yes; API: no).
+    pub persistent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,7 +281,13 @@ enum Phase {
 }
 
 struct Entry {
+    /// The spec of the current (and any in-flight) run; never replaced mid-run.
     spec: FillSpec,
+    /// A replacement installed while a run was in flight, with its due time.
+    staged: Option<(FillSpec, u64)>,
+    /// Capture retry identity within one slot: `(slot, attempt)`. Bumped only
+    /// after a definite terminal failure, never after an uncertain outcome.
+    attempt: (u64, u32),
     next_due: u64,
     phase: Phase,
     last_success_at: Option<u64>,
@@ -326,15 +341,23 @@ fn short_digest(bytes: &[u8]) -> String {
             s
         })
 }
-/// Deterministic capture key for `(fill, slot, body)`.
+/// Deterministic capture key for `(fill, slot, attempt, body)`. Attempt 0 is
+/// the slot's first run; a retry after a definite terminal failure in the same
+/// slot uses the next attempt, so the ledger admits a new job instead of
+/// replaying the failed one.
 #[must_use]
-pub fn capture_key(spec: &FillSpec, slot: u64) -> String {
+pub fn capture_key(spec: &FillSpec, slot: u64, attempt: u32) -> String {
     let body = serde_json::to_vec(&spec.body).unwrap_or_default();
-    format!(
+    let base = format!(
         "fill-refresh:{}:{slot}:{}",
         short_digest(spec.fill_id.as_bytes()),
         short_digest(&body)
-    )
+    );
+    if attempt == 0 {
+        base
+    } else {
+        format!("{base}:r{attempt}")
+    }
 }
 /// Deterministic load key for `(fill, job)`.
 #[must_use]
@@ -375,7 +398,10 @@ impl Scheduler {
         }
     }
 
-    /// Install or replace a fill. A replaced fill keeps its in-flight run and history.
+    /// Install or replace a fill. Replacing an idle fill takes effect at once;
+    /// replacing a fill with a run in flight is **staged**: the run finishes
+    /// with the spec (player, landing intent, owner) it was admitted with, and
+    /// the replacement takes effect when it ends.
     /// # Errors
     /// Out-of-range interval, mismatched body identity, or [`MAX_FILLS`] reached.
     pub fn upsert(&mut self, spec: FillSpec, now: u64, first: FirstDue) -> ControlResult<()> {
@@ -397,8 +423,13 @@ impl Scheduler {
             FirstDue::NextSlot => start + interval_secs(spec.minutes),
         };
         if let Some(entry) = self.entries.get_mut(&spec.fill_id) {
-            entry.spec = spec;
-            entry.next_due = due;
+            if entry.phase == Phase::Idle {
+                entry.spec = spec;
+                entry.next_due = due;
+                entry.staged = None;
+            } else {
+                entry.staged = Some((spec, due));
+            }
             return Ok(());
         }
         if self.entries.len() >= MAX_FILLS {
@@ -410,6 +441,8 @@ impl Scheduler {
             spec.fill_id.clone(),
             Entry {
                 spec,
+                staged: None,
+                attempt: (0, 0),
                 next_due: due,
                 phase: Phase::Idle,
                 last_success_at: None,
@@ -431,6 +464,22 @@ impl Scheduler {
     #[must_use]
     pub fn source(&self, fill: &str) -> Option<FillSource> {
         self.entries.get(fill).map(|e| e.spec.source)
+    }
+
+    /// Every player a scheduled fill touches: the current spec's and any
+    /// staged replacement's. Callers authorize all of them before revealing or
+    /// mutating the schedule.
+    #[must_use]
+    pub fn players(&self, fill: &str) -> Option<Vec<String>> {
+        self.entries.get(fill).map(|e| {
+            let mut players = vec![e.spec.player.clone()];
+            if let Some((staged, _)) = &e.staged {
+                if staged.player != e.spec.player {
+                    players.push(staged.player.clone());
+                }
+            }
+            players
+        })
     }
 
     /// Runs in flight.
@@ -496,6 +545,8 @@ impl Scheduler {
                 last_capture_job_id: e.last_job,
                 last_error: e.last_error.clone(),
                 consecutive_failures: e.failures,
+                update_pending: e.staged.is_some(),
+                persistent: e.spec.source == FillSource::Config,
             })
             .collect()
     }
@@ -514,32 +565,65 @@ fn run_principal(spec: &FillSpec, resolve: &PrincipalResolver) -> ControlResult<
     Ok(principal)
 }
 
-fn fail(entry: &mut Entry, now: u64, error: &str) {
+/// How a failed run's capture identity is retried.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// Definite terminal failure: the next try in this slot is a new attempt.
+    NewAttempt,
+    /// Uncertain or still-running outcome: retry the same identity.
+    SameKey,
+}
+
+/// End the run: apply a staged replacement (it owns the next due time).
+fn finish(entry: &mut Entry) {
     entry.phase = Phase::Idle;
+    if let Some((spec, due)) = entry.staged.take() {
+        entry.spec = spec;
+        entry.next_due = due;
+        entry.attempt = (0, 0);
+    }
+}
+
+fn fail(entry: &mut Entry, now: u64, error: &str, retry: Retry) {
+    if retry == Retry::NewAttempt {
+        let (slot, _) = slot_at(&entry.spec.fill_id, entry.spec.minutes, now);
+        let run_slot = entry.attempt.0;
+        // The failed run belonged to `run_slot`; a retry inside that slot
+        // moves to the next attempt, a later slot starts again at 0.
+        entry.attempt = if slot == run_slot {
+            (run_slot, entry.attempt.1.saturating_add(1))
+        } else {
+            (slot, 0)
+        };
+    }
     entry.failures = entry.failures.saturating_add(1);
     entry.last_error = Some(bounded(error));
     let shift = entry.failures.saturating_sub(1).min(16);
     let backoff = BACKOFF_BASE_SECS.saturating_mul(1_u64 << shift);
     entry.next_due = now + backoff.min(interval_secs(entry.spec.minutes));
+    finish(entry);
 }
 
 fn succeed(entry: &mut Entry, now: u64, artifact: String) {
-    entry.phase = Phase::Idle;
     entry.failures = 0;
     entry.last_error = None;
     entry.last_success_at = Some(now);
     entry.last_artifact_id = Some(artifact);
     let (_, start) = slot_at(&entry.spec.fill_id, entry.spec.minutes, now);
     entry.next_due = start + interval_secs(entry.spec.minutes);
+    finish(entry);
 }
 
 fn start(entry: &mut Entry, now: u64, backend: &dyn RefreshBackend, resolve: &PrincipalResolver) {
     let principal = match run_principal(&entry.spec, resolve) {
         Ok(p) => p,
-        Err(e) => return fail(entry, now, &e.to_string()),
+        Err(e) => return fail(entry, now, &e.to_string(), Retry::SameKey),
     };
     let (slot, _) = slot_at(&entry.spec.fill_id, entry.spec.minutes, now);
-    let key = capture_key(&entry.spec, slot);
+    if entry.attempt.0 != slot {
+        entry.attempt = (slot, 0);
+    }
+    let key = capture_key(&entry.spec, slot, entry.attempt.1);
     match backend.submit(&principal, &key, &entry.spec.body) {
         Ok(job) => {
             entry.last_job = Some(job);
@@ -548,20 +632,26 @@ fn start(entry: &mut Entry, now: u64, backend: &dyn RefreshBackend, resolve: &Pr
                 deadline: now + CAPTURE_DEADLINE_SECS,
             };
         }
-        Err(e) => fail(entry, now, &e.to_string()),
+        // An uncertain or in-progress receipt keeps its key (fail closed);
+        // any other refusal was definite and released the reservation.
+        Err(e @ (ControlError::CaptureOutcomeUncertain | ControlError::Conflict(_))) => {
+            fail(entry, now, &e.to_string(), Retry::SameKey);
+        }
+        Err(e) => fail(entry, now, &e.to_string(), Retry::NewAttempt),
     }
 }
 
 fn advance(entry: &mut Entry, now: u64, backend: &dyn RefreshBackend, resolve: &PrincipalResolver) {
     let principal = match run_principal(&entry.spec, resolve) {
         Ok(p) => p,
-        Err(e) => return fail(entry, now, &e.to_string()),
+        Err(e) => return fail(entry, now, &e.to_string(), Retry::SameKey),
     };
     match entry.phase.clone() {
         Phase::Idle => {}
         Phase::Capturing { job, deadline } => match backend.job(&principal, job) {
+            // Still running: the same key re-attaches to that job later.
             Ok(JobPoll::Pending) if now >= deadline => {
-                fail(entry, now, "capture deadline exceeded");
+                fail(entry, now, "capture deadline exceeded", Retry::SameKey);
             }
             Ok(JobPoll::Pending) => {}
             Ok(JobPoll::Succeeded { artifact }) => {
@@ -577,12 +667,15 @@ fn advance(entry: &mut Entry, now: u64, backend: &dyn RefreshBackend, resolve: &
                             deadline: now + LOAD_DEADLINE_SECS,
                         };
                     }
-                    Ok((_, LoadPoll::Failed(reason))) => fail(entry, now, &reason),
-                    Err(e) => fail(entry, now, &e.to_string()),
+                    Ok((_, LoadPoll::Failed(reason))) => {
+                        fail(entry, now, &reason, Retry::NewAttempt);
+                    }
+                    Err(e) => fail(entry, now, &e.to_string(), Retry::NewAttempt),
                 }
             }
-            Ok(JobPoll::Failed(reason)) => fail(entry, now, &reason),
-            Err(e) => fail(entry, now, &e.to_string()),
+            Ok(JobPoll::Failed(reason)) => fail(entry, now, &reason, Retry::NewAttempt),
+            Ok(JobPoll::Uncertain(reason)) => fail(entry, now, &reason, Retry::SameKey),
+            Err(e) => fail(entry, now, &e.to_string(), Retry::SameKey),
         },
         Phase::Loading {
             job: _,
@@ -592,11 +685,11 @@ fn advance(entry: &mut Entry, now: u64, backend: &dyn RefreshBackend, resolve: &
         } => match backend.load_state(&principal, &entry.spec.player, op) {
             Ok(LoadPoll::Completed) => succeed(entry, now, artifact),
             Ok(LoadPoll::Pending) if now >= deadline => {
-                fail(entry, now, "native load deadline exceeded");
+                fail(entry, now, "native load deadline exceeded", Retry::SameKey);
             }
             Ok(LoadPoll::Pending) => {}
-            Ok(LoadPoll::Failed(reason)) => fail(entry, now, &reason),
-            Err(e) => fail(entry, now, &e.to_string()),
+            Ok(LoadPoll::Failed(reason)) => fail(entry, now, &reason, Retry::NewAttempt),
+            Err(e) => fail(entry, now, &e.to_string(), Retry::SameKey),
         },
     }
 }
