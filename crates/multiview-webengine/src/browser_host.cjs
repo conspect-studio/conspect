@@ -204,7 +204,7 @@ async function main() {
       if (i > 60) throw new Error('Windy map requests did not settle');
       await sleep(250);
     }
-    await send('Runtime.evaluate', {expression:`(()=>{const s=document.createElement('style');s.textContent=${JSON.stringify(windyTemplate.CLEAN)};document.head.appendChild(s)})()`});
+    await send('Runtime.evaluate', {expression: windyTemplate.ENSURE_CLEAN_EXPRESSION});
     if (!steps) {
       await send('Runtime.evaluate', {expression:"document.querySelector('.play-pause')?.click()"});
       await sleep(1500);
@@ -246,6 +246,14 @@ async function main() {
     return Buffer.from(result.data, 'base64');
   };
   const writeFrame = async png => { if (!encoder.stdin.write(png)) await once(encoder.stdin, 'drain'); };
+  // Windy-only: re-assert the hide style (Windy may replace head/style) and fail the
+  // capture if any known chrome is still rendered. One evaluate pair per call.
+  const assertClean = async () => {
+    if (!isWindy) return;
+    await send('Runtime.evaluate', {expression: windyTemplate.ENSURE_CLEAN_EXPRESSION});
+    const r = await send('Runtime.evaluate', {expression: windyTemplate.CHROME_VISIBLE_EXPRESSION, returnByValue: true});
+    if (r.exceptionDetails || typeof r.result?.value !== 'string' || r.result.value !== '') throw new Error('Windy page chrome visible in capture');
+  };
   let written = 0;
   let report = {capture: req.capture};
   if (steps) {
@@ -285,6 +293,7 @@ async function main() {
           const mark = networkChanged;
           if (await quietNow() && networkChanged === mark) {
             stepPlan.checkDeadline(Date.now(), deadline);
+            await bounded(assertClean());
             const shot = await bounded(screenshot());
             if (await quietNow() && networkChanged === mark) {
               stepPlan.checkDeadline(Date.now(), deadline);
@@ -319,6 +328,7 @@ async function main() {
       expression: `typeof window.mvCaptureFrame === 'function' ? window.mvCaptureFrame(${i},${req.fps}) : null`,
       awaitPromise: true, returnByValue: true});
     if (tick.exceptionDetails) throw new Error('template frame hook failed');
+    await assertClean();
     await writeFrame(await screenshot());
     written++;
   }
@@ -367,7 +377,7 @@ main().then(async () => { clearTimeout(timeout); await cleanup(); process.exitCo
   .catch(async error => { clearTimeout(timeout);
     const safe = new Set(['authenticated Windy session required','Windy login form unavailable','Windy requested layer unavailable','Windy map requests did not settle','Windy changed or incomplete during capture',
       'radar layer did not render (GL unavailable?)','radar step did not settle','radar timeline unavailable',
-      'radar loop has fewer than 2 distinct frames','step loop exceeds frame cap']);
+      'radar loop has fewer than 2 distinct frames','Windy page chrome visible in capture','step loop exceeds frame cap']);
     process.stderr.write((safe.has(error.message) ? error.message : 'capture failed') + '\n');
     await cleanup(); process.exitCode = 1;
   });

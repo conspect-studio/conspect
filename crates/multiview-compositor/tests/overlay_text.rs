@@ -142,3 +142,43 @@ fn atlas_respects_byte_cap_via_eviction() {
         distinct
     );
 }
+
+/// Issue #430 (ABU-1): text that rotates through distinct glyphs (Unicode
+/// ranges × sizes, missing glyphs included) never grows the rasterization
+/// cache past its entry/byte cap; the cap is enforced by clearing (counted).
+#[test]
+fn rasterization_cache_stays_bounded_under_rotating_glyphs() {
+    let mut engine = TextEngine::new().expect("bundled fonts load");
+    let ranges: [(u32, u32); 6] = [
+        (0x21, 0x7e),     // ASCII
+        (0xa1, 0x17f),    // Latin-1 + Extended-A
+        (0x370, 0x3ff),   // Greek
+        (0x400, 0x4ff),   // Cyrillic
+        (0x4e00, 0x4e80), // CJK (likely missing: notdef / fallback)
+        (0x2190, 0x22ff), // arrows + math
+    ];
+    let mut peak_entries = 0;
+    let mut peak_bytes = 0;
+    for size in 12..40_u16 {
+        for &(lo, hi) in &ranges {
+            let text: String = (lo..=hi).filter_map(char::from_u32).collect();
+            let _ = engine
+                .rasterize_run(&text, FontFamily::Sans, f32::from(size), WHITE)
+                .expect("rasterize");
+            peak_entries = peak_entries.max(engine.swash_cache_entries());
+            peak_bytes = peak_bytes.max(engine.swash_cache_bytes());
+            assert!(engine.swash_cache_entries() <= TextEngine::SWASH_CACHE_MAX_ENTRIES);
+            assert!(engine.swash_cache_bytes() <= TextEngine::SWASH_CACHE_MAX_BYTES);
+            assert!(engine.atlas_used_bytes() <= engine.atlas_byte_cap());
+        }
+    }
+    assert!(
+        engine.swash_cache_clears() > 0,
+        "the workload exceeded the cap (peak {peak_entries} entries / {peak_bytes} B)"
+    );
+    // Rendering still works after clears.
+    let run = engine
+        .rasterize_run("Hello", FontFamily::Sans, 24.0, WHITE)
+        .expect("rasterize after clear");
+    assert_ne!(run.glyphs().len(), 0, "text still renders after a clear");
+}
