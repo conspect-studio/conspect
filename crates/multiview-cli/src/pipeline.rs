@@ -4380,6 +4380,7 @@ impl Pipeline {
         let spawner = DemandSpawner {
             live: self.live_spawner(),
             registry: Arc::clone(&self.stop_registry),
+            catalogue: Arc::clone(&self.catalogue),
         };
         let rails = crate::source_rails::SourceRails::new(
             Arc::clone(&self.catalogue),
@@ -11902,6 +11903,10 @@ fn spawn_live_youtube_reresolve(
 struct DemandSpawner {
     live: LiveIngestSpawner,
     registry: crate::live_sources::StopRegistry,
+    /// The run's catalogue, held directly (the demand manager does not exist
+    /// yet when this spawner is built): every start re-checks that its
+    /// definition is still the catalogued one (review #477).
+    catalogue: crate::source_rails::Catalogue,
 }
 
 impl crate::source_rails::RailSpawner for DemandSpawner {
@@ -12009,15 +12014,10 @@ impl DemandSpawner {
         let mut tokens = anchor_lifecycle()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((catalogue, _)) = &self.live.demand {
-            let current = catalogue.load().get(&source.id).is_some_and(|entry| {
-                Arc::ptr_eq(entry.store(), store) && entry.source().same_media(source)
-            });
-            if !current {
-                return None;
-            }
-        }
-        Some(advance_live_lifecycle(&source.id, &mut tokens))
+        let current = self.catalogue.load().get(&source.id).is_some_and(|entry| {
+            Arc::ptr_eq(entry.store(), store) && entry.source().same_media(source)
+        });
+        current.then(|| advance_live_lifecycle(&source.id, &mut tokens))
     }
 
     /// Start a synthetic generator: the same fenced loop the startup and live
@@ -26957,6 +26957,7 @@ segment_ms = 1000
             Arc::new(DemandSpawner {
                 live: pipeline.live_spawner(),
                 registry: pipeline.stop_registry(),
+                catalogue: pipeline.catalogue(),
             }),
         );
         let retained = rails.store("cam1").expect("boot store exists");
@@ -27043,13 +27044,18 @@ segment_ms = 1000
 
         let config = two_cells_one_source_config();
         let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
-        let _manager = pipeline.demand();
-        let mut guarded = pipeline.live_spawner();
-        guarded.clear_on_remove = true;
+        // Exactly the production wiring (review #477 round 2): `demand()`
+        // builds its rail spawner BEFORE the manager exists, so its live half
+        // carries no demand handle — the fence must not depend on it.
         let starter = DemandSpawner {
             live: pipeline.live_spawner(),
             registry: pipeline.stop_registry(),
+            catalogue: pipeline.catalogue(),
         };
+        assert!(starter.live.demand.is_none(), "the production shape");
+        let _manager = pipeline.demand();
+        let mut guarded = pipeline.live_spawner();
+        guarded.clear_on_remove = true;
         // A synthetic definition A, catalogued; the demand worker "captures"
         // it (the entry the start would run with).
         let a: Source = serde_json::from_value(

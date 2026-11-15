@@ -986,3 +986,119 @@ fn a_shed_teardown_is_retried_until_the_producer_stops() {
     );
     rig.hub.shutdown();
 }
+
+/// Review #477 round 2 (abuse lens): under a hub queue that stays FULL,
+/// unique-id add/remove churn never grows the drain's retry state past the
+/// live source cap: the hub-known sources plus pending removals stay bounded,
+/// new adds are held at the cap, and once the queue drains every pending
+/// removal reaches the hub.
+#[test]
+fn shed_teardowns_stay_within_the_source_cap_under_sustained_full_churn() {
+    const CAP: usize = 4;
+    let config = two_cell_config();
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+    let (sender, command_rx) = command_bus(64);
+    let registry = stop_registry();
+    let hub = LiveSourceHub::start(Arc::clone(&registry), shared_stores(HashMap::new()));
+    let fault = multiview_cli::live_sources::SubmitFault::default();
+    let mut drain = multiview_cli::control::CommandDrain::new(
+        command_rx,
+        config.clone(),
+        Arc::clone(&publisher),
+    )
+    .with_live_sources(hub.handle().with_fault(fault.clone()))
+    .with_source_cap(CAP);
+    let mut drive = test_drive(&config);
+    let boot = drain.applied_sources();
+    // Admit live sources up to the cap while the hub accepts.
+    let mut admitted = Vec::new();
+    for n in 0..CAP.saturating_sub(boot) {
+        let id = format!("churn{n}");
+        sender
+            .try_submit(Command::UpsertSource {
+                op: OperationId::new(),
+                source: Box::new(source_doc(serde_json::json!({ "id": id, "kind": "bars" }))),
+            })
+            .unwrap();
+        drain.apply(&mut drive);
+        admitted.push(id);
+    }
+    assert_eq!(drain.applied_sources(), CAP);
+    // The queue fills and stays full; remove everything, then churn new ids.
+    fault.full();
+    for id in &admitted {
+        sender
+            .try_submit(Command::RemoveSource {
+                op: OperationId::new(),
+                id: id.clone(),
+            })
+            .unwrap();
+        drain.apply(&mut drive);
+    }
+    for n in 0..50_usize {
+        let id = format!("fresh{n}");
+        for command in [
+            Command::UpsertSource {
+                op: OperationId::new(),
+                source: Box::new(source_doc(serde_json::json!({ "id": id, "kind": "bars" }))),
+            },
+            Command::RemoveSource {
+                op: OperationId::new(),
+                id: id.clone(),
+            },
+        ] {
+            sender.try_submit(command).unwrap();
+            drain.apply(&mut drive);
+        }
+        assert!(
+            drain.applied_sources() + drain.pending_teardowns() <= CAP,
+            "hub-known + pending stays within the cap: {} + {}",
+            drain.applied_sources(),
+            drain.pending_teardowns()
+        );
+    }
+    // The queue recovers: every pending removal reaches the hub.
+    fault.clear();
+    for _ in 0..(CAP * 2) {
+        drain.apply(&mut drive);
+    }
+    assert_eq!(
+        drain.pending_teardowns(),
+        0,
+        "every removal reached the hub"
+    );
+    for id in &admitted {
+        assert!(
+            wait_for(Duration::from_secs(5), || producer(&registry, id).is_none()),
+            "{id}'s producer stopped"
+        );
+    }
+    hub.shutdown();
+}
+
+/// Review #477 round 2 (abuse lens): a shed removal is NOT cancelled by a
+/// re-add of the same id that was itself shed — the old producer still goes.
+#[test]
+fn a_shed_re_add_does_not_cancel_a_pending_teardown() {
+    let mut rig = ShedRig::start();
+    let a = rig.running();
+    rig.fault.full();
+    rig.sender
+        .try_submit(Command::RemoveSource {
+            op: OperationId::new(),
+            id: "in_a".to_owned(),
+        })
+        .unwrap();
+    (rig.drain)(&mut rig.drive);
+    // Re-add while still full: shed too.
+    rig.upsert(serde_json::json!({ "id": "in_a", "kind": "solid", "color": "#22aa44" }));
+    (rig.drain)(&mut rig.drive);
+    assert!(!a.stop_requested());
+    rig.fault.clear();
+    (rig.drain)(&mut rig.drive);
+    assert!(
+        wait_for(Duration::from_secs(5), || a.stop_requested()),
+        "the pending teardown of the old producer still reached the hub"
+    );
+    rig.hub.shutdown();
+}

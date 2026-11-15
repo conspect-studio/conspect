@@ -78,7 +78,9 @@ could be dropped on the clock thread.
 
 A demand start captures its catalogue entry before it spawns. The edit fence
 advances the lifecycle and withdraws the old entry in one critical section
-under the lifecycle lock. A start mints its lifecycle under the same lock, and
+under the lifecycle lock. The demand rail spawner holds the catalogue
+directly: it is built before the demand manager exists, so it must not depend
+on the manager handle. A start mints its lifecycle under the same lock, and
 only if its definition is still the catalogued one with the same store. So a
 start of definition A that resumes after the edit fails instead of publishing
 A into the reused store, even when B never starts. Removal is covered the same
@@ -86,9 +88,13 @@ way.
 
 ## Shed removals
 
-A removal whose hub teardown is shed (`Full`) is kept in a bounded set (one
-entry per id, only while unregistered). The drain retries it one per tick until
-the hub takes it, so the catalogue entry, the pins and the producer always go.
+A removal whose hub teardown is shed (`Full`) moves its id from the drain's
+hub-known set (`applied_media`) into a pending set. The drain retries it one per
+tick until the hub takes it, so the catalogue entry, the pins and the producer
+always go. Only an ACCEPTED re-add of the same id cancels it; a shed re-add
+does not. A new id is admitted only while hub-known plus pending stays under
+`MAX_ADMITTED_SOURCES`, so this state is bounded however long the queue stays
+full. Over the cap, an add is held like a shed submit (re-apply retries).
 
 ## Invariants
 
