@@ -379,8 +379,9 @@ The answer:
   answer; `DELETE /cast/<token>/whep` ends it. The answer carries the UDP 443 host candidates and the passive
   ICE-TCP candidates on TCP 443 together (Read: [front door](../architecture/network-front-door.md) "Slice 4
   PR2"), so a network without UDP costs no extra round trip.
-- For `srt`, `attach` is `{ "rung": "srt", "host": "<public host>", "port": 9010, "latency_ms": 250 }`. It holds
-  no secret: the app derives the stream id and the passphrase from the token (decision 5).
+- For `srt`, `attach` is `{ "rung": "srt", "host": "<public host>", "port": 9010, "latency_ms": 250,
+  "sid": "<22 characters>", "expires_in_ms": 30000 }`. `sid` is a one-time selector, not a secret: SRT sends
+  it in clear. The app derives the passphrase from the token and `sid` (decision 5.7).
 - For `hls`, `attach` is `{ "rung": "hls" }`.
 
 What the engine leaves out, in this order: rungs the build or the run cannot serve (no MoQ provider, no SRT
@@ -450,12 +451,13 @@ Decisions:
    behind NAT. One dedicated listener for every cast output: `[cast.srt] port`, default 9010, dual-stack `[::]`.
    On mda001 9010 is inside the existing SRT grant (9000 to 9100) and is free. It is not the port of any
    configured SRT output: those have one passphrase per output and their own caller limit.
-3. **Streams are told apart by stream id, on one port.** The listener installs libsrt's listen callback, which
-   receives the caller's stream id before the connection is accepted and sets that connection's passphrase
+3. **Attachments are told apart by a one-time stream id, on one port.** The listener installs libsrt's listen
+   callback, which receives the caller's stream id before the connection is accepted and sets that
+   connection's passphrase
    (Cited: [access control](https://github.com/Haivision/srt/blob/master/docs/features/access-control.md),
    [`srt_listen_callback`](https://github.com/Haivision/srt/blob/master/docs/API/API-functions.md)).
    `multiview-srt-sys` does not bind that function today (Read: the function table,
-   `crates/multiview-srt-sys/src/lib.rs:139-156`); slice 6 adds it, with `srt_setrejectreason`.
+   `crates/multiview-srt-sys/src/lib.rs:139-156`); slice 6 adds it, with `srt_setrejectreason` and `srt_getsockflag`.
 4. **No SRT listener starts on libsrt older than 1.5.7.** Cited: advisory
    [GHSA-m96h-3rc9-xx6h](https://github.com/Haivision/srt/security/advisories/GHSA-m96h-3rc9-xx6h) (published
    15 Oct 2026): a handshake packet overflows a heap buffer in a listener before authentication; affected up to
@@ -606,38 +608,113 @@ Decisions:
    a stream that has a live attachment counts as that fetch. A device that vanishes stops reporting; its
    transport times out (SRT peer idle 5 s, QUIC idle, ICE consent) and the token expires 60 s later, as today.
 6. **Per-object authorization.** No new route takes an object id from the caller. The token names one stream,
-   which names one output. The SRT stream id and the MoQ broadcast name are looked up, never trusted as an
-   address: an id that matches no live stream is refused the same way as a wrong passphrase. The new fields of
+   which names one output. The SRT selector and the MoQ broadcast name are looked up, never trusted as an
+   address: a selector that matches no pending attachment is refused before any key work (item 7). The new fields of
    `GET /api/v1/cast/streams/{id}` follow the route's existing rule (owner or admin). MoQ and WebRTC admission
    run with the token owner's current principal (Read: `resolve_owner`, `reauth.rs:282`), so the providers'
    own dependency checks see the owner's present grants.
-7. **SRT stream id and passphrase come from the token.** With `T` the 32 token bytes:
+7. **SRT: a one-time selector in clear, a passphrase from the token, and no state an unauthenticated peer can
+   change.** Reviewer finding D3. SRT sends the stream id in clear before any key exchange; that cannot be
+   avoided. So what travels there must identify nothing durable, and a failed handshake must cost its sender
+   only.
+
+   **Selector.** Each ladder answer for the SRT rung carries a fresh selector `S`: 16 bytes from the OS random
+   source, base64url (22 characters). It is not derived from the token. It names one pending attachment, lives
+   30 s, and is consumed by the first authenticated connection that uses it. A token has at most one unconsumed
+   selector; a new ladder call replaces it. Two attachments of the same cast show unrelated selectors, so an
+   observer cannot link them to each other or to a token, and a selector seen on the wire is useless once the
+   connection it belonged to is up. The stream id is `#!::r=cast/<S>,m=request`.
+
+   **Passphrase.** With `T` the 32 token bytes:
 
    ```
-   prk        = HKDF-SHA256-Extract(salt = "conspect-cast-srt-v1", ikm = T)
-   id         = base64url(HKDF-Expand(prk, "stream-id", 16))        22 characters
-   passphrase = base64url(HKDF-Expand(prk, "passphrase", 32))       43 characters
-   stream id  = "#!::r=cast/" + id + ",m=request"
+   prk        = HKDF-SHA256-Extract(salt = "conspect-cast-srt-v2", ikm = T)
+   passphrase = base64url(HKDF-Expand(prk, "passphrase" || S, 32))      43 characters
    ```
 
-   - The passphrase has 256 bits of entropy and fits SRT's 10 to 80 characters (Cited: `SRTO_PASSPHRASE`,
+   - 256 bits of entropy, inside SRT's 10 to 80 characters (Cited: `SRTO_PASSPHRASE`,
      [socket options](https://github.com/Haivision/srt/blob/master/docs/API/API-socket-options.md)). Key length
      32 bytes (AES-256), counter mode. GCM is a preview build option in libsrt (Cited, same page) and is not used.
-   - The stream id travels in clear in the handshake. It reveals neither the token nor the passphrase: the two
-     HKDF outputs are independent. It only selects which passphrase the listener sets.
-   - A wrong passphrase is rejected by libsrt itself (Cited: access control). The callback cannot and does not
-     compare passphrases.
-   - The engine stores nothing new. It can already derive the token from its stored seed and process pepper
-     (Read: `cast_streams/token.rs:85-98`), so it derives `id` and `passphrase` when the stream is created and
-     keeps them in the registry entry, whose `Debug` prints no secret.
-   - One SRT attachment per token. A second authenticated caller with the same id replaces the first (a
-     reconnect). At most 4 failed handshakes per id per minute; then the id is refused for a minute.
+   - Each attachment has its own key. Knowing `S` gives nothing without `T`.
+   - The app computes it from the token it holds and the `S` it was given. The engine computes it when it
+     issues `S` (it can derive the token from its stored seed and process pepper, Read:
+     `cast_streams/token.rs:85-98`) and keeps it with the pending entry, which is erased on use or expiry and
+     whose `Debug` prints nothing.
+
+   **The listen callback, in this order.** It runs for a caller that has returned the listener's cookie; the
+   cookie is "crafted based on host, port and current time" (Cited: draft-sharabayko-srt-01, section 4.3.1.1),
+   so the source address is one that receives the listener's replies.
+
+   1. Budget check for the source and for the listener (below). Over budget: reject. Nothing else is touched.
+   2. Look up `S` among the pending entries (at most 16, compared in constant time over all of them). Unknown,
+      expired or consumed: reject. No key derivation happens for an unknown selector.
+   3. Set the entry's passphrase and key length on the new socket and return. libsrt then does the key exchange
+      and rejects a caller whose passphrase differs (Cited:
+      [access control](https://github.com/Haivision/srt/blob/master/docs/features/access-control.md)). The
+      callback cannot compare passphrases and does not try.
+
+   Every rejection by the callback uses one code, so the answer does not say which step refused. The callback
+   never writes to a pending entry, a token or an attachment. A failed handshake therefore changes two
+   counters, the source's budget and the listener's, and nothing else. There is no count of failures per
+   selector or per token, and no refusal period for either: the rule of the first draft (four failures lock the
+   id for a minute) is withdrawn.
+
+   **Attach, after authentication only.** `srt_accept` returns a socket only when libsrt has completed the
+   handshake. With enforced encryption, which is the default and is set explicitly, a connection whose key
+   state is not secured on both sides is rejected (Cited: `SRTO_ENFORCEDENCRYPTION`, socket options). The
+   accept thread still reads `SRTO_KMSTATE` and `SRTO_RCVKMSTATE` and requires `SRT_KM_S_SECURED`. Then one
+   call into the token registry does all of this in one critical section, or none of it: the entry for `S`
+   exists, is unexpired and unconsumed; its token is live and armed at the output's current authorization
+   generation; the entry is marked consumed; the new attachment is registered with its fence and its cleared
+   identities (item 4); and an older SRT attachment of the same token, if any, is fenced. On any failure the
+   new socket is closed and the older attachment is left exactly as it was. An attachment that is playing is
+   thus replaced only by a caller that proved it holds the token, at the current generation.
+
+   **Budgets before authentication.**
+
+   | Budget | Size | Over budget |
+   | --- | --- | --- |
+   | Per source: one IPv4 address, or one IPv6 /64 | burst 32, refill 4 per second | callback rejects that source's handshakes |
+   | Source table | 1 024 sources; the least recently seen is evicted | an evicted source starts with a full budget; the listener budget still applies |
+   | Listener, all sources | burst 128, refill 32 per second | callback rejects every new handshake |
+   | Accepted, not yet attached | the listen backlog, 16 | libsrt rejects (`SRT_REJ_BACKLOG`) |
+   | Pending selectors | 16 (the SRT attachment cap, decision 6) | the ladder does not offer SRT |
+
+   Before the cookie is returned the listener keeps no state per caller; the nftables floor of decision 4
+   limits packets per source there.
+
+   **What the budgets do not protect, stated.**
+
+   - *Shared address.* Devices behind one NAT address share one source budget. It is sized so that legitimate
+     use cannot reach it: the whole engine has at most 32 live cast tokens (Read: `MAX_STREAMS`,
+     `cast_streams/mod.rs:46`), each needing one handshake per attachment. But a hostile host behind the same
+     address as a viewer can spend that budget, and new SRT attachments from that address then fail.
+   - *Many real addresses.* Eight sources at their full rate use up the listener budget; an IPv6 /48 holds
+     65 536 such sources. New SRT attachments from anyone then fail.
+   - *On the path.* An attacker who can read the viewer's packets can also drop them.
+
+   In all three cases the damage is bounded the same way: an attachment that is already playing is not
+   affected, because a playing attachment needs no handshake and no failed handshake can reach it; and a
+   viewer whose new attachment is refused plays HLS over TCP 443 (decision 2), which this listener cannot
+   influence. The worst outcome of an attack on the SRT port is "no SRT for new casts", never "no picture".
+
+   **Tests (slice 6), each failing on revert.**
+
+   | Case | Must hold |
+   | --- | --- |
+   | A valid receiver is playing; a second host sends 1 000 handshakes with that attachment's selector and wrong passphrases | the attachment keeps playing with no gap; its counters show no reconnect |
+   | The same flood runs while a valid receiver makes its first connection from another address | the valid receiver attaches within its deadline |
+   | A valid caller reconnects with a fresh selector while its old attachment still exists | the old one is fenced only after the new one attached; a failed new one leaves the old one playing |
+   | A selector is used twice | the second use is rejected by the callback |
+   | Unknown selector; expired selector; right selector with a wrong passphrase; right selector after the token was revoked | no media; the three callback rejections carry the same code |
+   | One source exceeds its budget | that source is rejected; another source attaches |
+   | Selectors of two attachments of one token | no common substring beyond chance; neither equals any HKDF output of the token |
 8. **No secret on argv or in logs.** The passphrase goes to libsrt through the socket option
    (`ListenerOptions::with_encryption`, Read: `multiview-srt-sys/src/lib.rs:350`), never through a `srt://` URL,
    a libav option string or a process argument, on the engine and in the app. The MoQ lease URL is marked "never
    log" (Read: `moq.rs:77`) and stays so. The ladder answer is `no-store`. Logs carry a token's first 6
    characters at most, as `receiver.js` does today. The engine's SRT link status shows the peer address and
-   counters, never the stream id.
+   counters, never the selector.
 9. **Bounds.** Ladder calls: 1 per second per token, burst 4, body 2 KiB. Attachments: one per token per rung,
    so at most 32 per rung (the token cap, Read: `MAX_STREAMS`, `cast_streams/mod.rs:46`). WHEP offer 64 KiB.
    Stored probe and fallback history: fixed size per stream.
@@ -792,7 +869,7 @@ Order matters: the first three slices decide whether the later ones are built as
 | 3 | **CAF spike, in the harness, no product code path.** A `<video>` element fed from outside CAF's player; LOAD interceptor returning `null`; `setMediaElement`, `setMediaInformation`, `broadcastStatus` | R1 (tools only) | 2 | Whether a Web Receiver can show a picture CAF did not load and still give senders a correct media session. Checks the page policy against a cross-origin WebTransport session. A fail ends slices 4 and 5 |
 | 4 | **MoQ rung.** Engine: cast outputs admitted to MoQ leases through the ladder; lease renewal by the ladder call. Receiver: `moq.js` (WebTransport, CMAF wrap, `SourceBuffer`), deadlines, step-down, memory | R3 | 3 passed; the probe data shows a device with `wt` and `mse` | MoQ plays through the real CAF SDK in the harness with media status correct; a wedged or stalled MoQ attachment costs the clock zero ticks and other bindings zero packets; device test with glass-to-glass |
 | 5 | **WebRTC rung.** `POST` and `DELETE /cast/<token>/whep`; one Opus encoder per cast output; PLI ignored; receiver `rtc.js`; ICE-TCP | R3 | 3 passed | WebRTC plays in the harness with UDP blocked (TCP 443 only); the Opus encoder count stays one with several viewers; chaos as slice 4; device test |
-| 6 | **SRT rung and the Android TV app.** Engine: listen callback in `multiview-srt-sys`, the cast SRT listener, HKDF derivation, attachment per token. App: `android/cast-tv/`, CI job that builds the APK. Senders: `androidReceiverCompatible`, `supportedAppTypes`, behind `[cast] android_tv` | R3 | 2, S | Engine: a libsrt caller with the derived id and passphrase receives valid MPEG-TS; a wrong passphrase, an unknown id and a revoked token get nothing; churn and a wedged caller do not slow the producer. Device: the app launches when installed, the Web Receiver when not; SRT plays; a blocked port falls to HLS and the next cast to the Web Receiver |
+| 6 | **SRT rung and the Android TV app.** Engine: listen callback in `multiview-srt-sys`, the cast SRT listener, one-time selectors and the HKDF passphrase, pre-authentication budgets, attachment per token. App: `android/cast-tv/`, CI job that builds the APK. Senders: `androidReceiverCompatible`, `supportedAppTypes`, behind `[cast] android_tv` | R3 | 2, S | Engine: a libsrt caller with the issued selector and the derived passphrase receives valid MPEG-TS; the test table of decision 5.7 passes (a flood of wrong-passphrase handshakes on a known selector neither evicts nor locks out the valid receiver; unknown, expired and reused selectors and a revoked token get nothing); wire PTS equals engine time (decision 2); churn and a wedged caller do not slow the producer. Device: the app launches when installed, the Web Receiver when not; SRT plays; a blocked port falls to HLS and the next cast to the Web Receiver |
 | 7 | **Measured ladder.** Run the matrix; set the offer order, deadlines, SRT latency and player buffers from the data; remove any rung that does not beat the one below it on a class; enable `android_tv` by default if slice 6's first device step passed; runbook; this ADR to Accepted with the table | R2 | 4, 5, 6 as built | The ladder's order and targets are measurements. Every cell of the table is filled or marked as not built, with the reason |
 
 Slice S is independent of everything else and goes first. Slices 4, 5 and 6 are independent of each other
@@ -845,8 +922,10 @@ captain as one list; none blocks slices 0 to 5 from merging.
   Every other rung may be absent on a given device or network, and the cast must still play.
 - **Why no automatic step up.** With one decoder a step up is a visible glitch on a picture that was playing.
   A step down fixes something the viewer already sees as broken; a step up does not.
-- **Why one port and derived SRT credentials.** One firewall rule covers any number of casts, and nothing
-  secret is added to the LOAD, to argv, or to storage: the token already in the URL is the only secret.
+- **Why one port, a one-time selector and a derived passphrase.** One firewall rule covers any number of casts.
+  The only secret is the token already in the LOAD: the passphrase is computed from it at both ends and is
+  never sent. The selector that SRT must show in clear is random and used once, so it identifies no token and
+  gives an observer nothing to aim at later.
 
 ## Alternatives considered
 
@@ -860,6 +939,8 @@ captain as one list; none blocks slices 0 to 5 from merging.
 | The sender picks the rung and sends it in `customData` | The sender does not know the device's capabilities; the engine-side sender and Google Home would need the same logic |
 | A second, zero-delay encode for cast | An encoder session per cast output. Decided only by data: if slice 1 shows the shared encoder's delay is a large part of the budget, a tuned encode becomes its own decision |
 | A per-stream SRT passphrase sent in the LOAD or the ladder answer | A second secret in transit and in device logs. Derivation needs none |
+| An SRT stream id derived from the token (the first draft) | It is the same for every connection of a cast, so an observer can recognise a cast and aim handshakes at it. A random one-time selector costs one field in the ladder answer |
+| Locking a selector or token after failed handshakes | Lets anyone who saw the selector deny the real viewer. Budgets are per source and per listener only |
 | One SRT port per cast stream | A firewall rule per stream; the listen callback gives per-stream keys on one port |
 | Canvas rendering for MoQ on the device (the desk player as it is) | The receiver page is a 720p graphics plane on a Chromecast; see decision 3 |
 
