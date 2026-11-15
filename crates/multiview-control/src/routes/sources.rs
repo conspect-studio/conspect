@@ -540,6 +540,7 @@ pub(crate) async fn create_source(
         body: validated_body(TypedCollection::Sources, &id, &input.body)?,
     };
     authorize_written_automation(&principal, None, &input.body)?;
+    authorize_bound_player(&principal, None, &input.body)?;
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // store-write → submit → adopt-snapshot sequence, so the persister (which
     // takes the same lock) can never compose mid-mutation and the adopted
@@ -627,6 +628,34 @@ pub(crate) fn validate_source_body(
     validated_body(TypedCollection::Sources, id, body)
 }
 
+/// The media player a `media_player` source body binds (ADR-M012), if any.
+fn bound_player(body: &serde_json::Value) -> Option<&str> {
+    (body.get("kind").and_then(serde_json::Value::as_str) == Some("media_player"))
+        .then(|| body.get("player").and_then(serde_json::Value::as_str))
+        .flatten()
+}
+
+/// Per-object authorization of the player a `media_player` source binds
+/// (BOLA): binding a player puts its picture and audio on the desk, so the
+/// caller must be authorized for that player, and — when an update moves the
+/// binding off a player — for the player it is moved off. Checked before
+/// anything is persisted or submitted to the engine.
+fn authorize_bound_player(
+    principal: &Principal,
+    previous: Option<&serde_json::Value>,
+    next: &serde_json::Value,
+) -> ControlResult<()> {
+    if let Some(player) = bound_player(next) {
+        crate::auth::authorize_object(principal, player)?;
+    }
+    if let Some(old) = previous.and_then(bound_player) {
+        if bound_player(next) != Some(old) {
+            crate::auth::authorize_object(principal, old)?;
+        }
+    }
+    Ok(())
+}
+
 /// `PUT /api/v1/sources/{id}` — replace a source (role: write; If-Match → 412).
 #[cfg_attr(
     feature = "openapi",
@@ -664,6 +693,9 @@ pub(crate) async fn update_source(
     // this check.
     if let Ok(current) = accepted_source(&state, &id) {
         authorize_written_automation(&principal, Some(&current.resource.body), &input.body)?;
+        authorize_bound_player(&principal, Some(&current.resource.body), &input.body)?;
+    } else {
+        authorize_bound_player(&principal, None, &input.body)?;
     }
     let (mode, versioned) =
         apply_source_update(&state, &principal.key_id, &id, Some(&if_match), input)
