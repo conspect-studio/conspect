@@ -56,6 +56,29 @@ impl EgressMedia {
             Self::Audio => 48_000,
         }
     }
+
+    /// Derive the 32-bit wire RTP timestamp for a packet stamped `pts` in
+    /// `time_base` (the packet's tick-derived PTS, invariant #3): rescale it
+    /// exactly onto this kind's RTP clock ([`Self::rtp_clock_hz`]) and **wrap it
+    /// modulo 2^32** (#492).
+    ///
+    /// RTP timestamps are modular (RFC 3550 §5.1): a receiver unwraps them by
+    /// serial-number arithmetic, so the stamp must keep advancing through the
+    /// 2^32 boundary — never clamp. A clamp pinned every packet to 0 once the
+    /// 64-bit PTS passed `u32::MAX` (video after 2^32 / 90 000 s ≈ 13 h 15 min,
+    /// audio after 2^32 / 48 000 s ≈ 24.9 h), freezing every viewer on an engine
+    /// that is expected to run forever (invariant #1). The wrap is Euclidean, so a
+    /// (pre-roll) negative PTS also maps onto the same modular timeline instead
+    /// of collapsing to 0. There is no random initial offset on this path: str0m
+    /// writes the timestamp it is given verbatim.
+    #[must_use]
+    pub fn rtp_timestamp(self, pts: i64, time_base: multiview_core::time::Rational) -> u32 {
+        let clock = multiview_core::time::Rational::new(1, i64::from(self.rtp_clock_hz()));
+        let ticks = multiview_core::time::rescale(pts, time_base, clock);
+        let wrapped = ticks.rem_euclid(1_i64 << 32);
+        // `rem_euclid` by 2^32 is always in `0..2^32`, so this never falls back.
+        u32::try_from(wrapped).unwrap_or(0)
+    }
 }
 
 /// One encoded program access unit handed to a WebRTC output's egress.
@@ -226,6 +249,87 @@ mod tests {
     fn rtp_clock_rates_are_per_kind() {
         assert_eq!(EgressMedia::Video.rtp_clock_hz(), 90_000);
         assert_eq!(EgressMedia::Audio.rtp_clock_hz(), 48_000);
+    }
+
+    /// #492: the video stamp wraps mod 2^32 across the 90 kHz boundary
+    /// (≈ 13 h 15 min of program), it is never clamped to 0.
+    #[test]
+    fn video_rtp_timestamp_wraps_mod_2_32() {
+        use multiview_core::time::Rational;
+        let tb = Rational::new(1, 90_000);
+        let max = i64::from(u32::MAX);
+        assert_eq!(
+            EgressMedia::Video.rtp_timestamp(max - 2999, tb),
+            u32::MAX - 2999
+        );
+        assert_eq!(EgressMedia::Video.rtp_timestamp(max, tb), u32::MAX);
+        assert_eq!(EgressMedia::Video.rtp_timestamp(max + 1, tb), 0);
+        assert_eq!(EgressMedia::Video.rtp_timestamp(max + 3001, tb), 3000);
+        // A 30 fps encoder time-base (1/30) one frame either side of the wrap:
+        // frame n stamps n * 3000 (mod 2^32) on the 90 kHz clock.
+        let fps30 = Rational::new(1, 30);
+        let n = max / 3000; // last frame before the 90 kHz wrap
+        let before = EgressMedia::Video.rtp_timestamp(n, fps30);
+        let after = EgressMedia::Video.rtp_timestamp(n + 1, fps30);
+        assert_eq!(i64::from(before), n * 3000);
+        assert_eq!(
+            after.wrapping_sub(before),
+            3000,
+            "one frame later, mod 2^32"
+        );
+        assert!(after < before, "the stamp wrapped, it did not clamp");
+        assert_ne!(after, 0);
+        // Far past the boundary (≈ 3 days) it still advances, never pinned.
+        let days3 = 3 * 86_400 * 30;
+        assert_eq!(
+            EgressMedia::Video
+                .rtp_timestamp(days3 + 1, fps30)
+                .wrapping_sub(EgressMedia::Video.rtp_timestamp(days3, fps30)),
+            3000
+        );
+    }
+
+    /// #492: the 48 kHz Opus stamp wraps mod 2^32 (≈ 24.9 h of program).
+    #[test]
+    fn audio_rtp_timestamp_wraps_mod_2_32() {
+        use multiview_core::time::Rational;
+        let tb = Rational::new(1, 48_000);
+        let max = i64::from(u32::MAX);
+        let last = max - (max % 960); // last 20 ms Opus frame before the wrap
+        let before = EgressMedia::Audio.rtp_timestamp(last, tb);
+        let after = EgressMedia::Audio.rtp_timestamp(last + 960, tb);
+        assert_eq!(i64::from(before), last);
+        assert_eq!(after.wrapping_sub(before), 960);
+        assert!(after < before && after != 0, "wrapped, not clamped");
+        assert_eq!(EgressMedia::Audio.rtp_timestamp(max + 1, tb), 0);
+        assert_eq!(EgressMedia::Audio.rtp_timestamp(max + 961, tb), 960);
+    }
+
+    /// Below the boundary the stamp is the exact rescale (no behaviour change),
+    /// and a negative pre-roll PTS lands on the same modular timeline.
+    #[test]
+    fn rtp_timestamp_is_exact_below_the_wrap_and_modular_below_zero() {
+        use multiview_core::time::Rational;
+        assert_eq!(
+            EgressMedia::Video.rtp_timestamp(1, Rational::new(1, 30)),
+            3000
+        );
+        assert_eq!(
+            EgressMedia::Video.rtp_timestamp(1, Rational::new(1001, 30_000)),
+            3003
+        );
+        assert_eq!(
+            EgressMedia::Audio.rtp_timestamp(960, Rational::new(1, 48_000)),
+            960
+        );
+        let tb = Rational::new(1, 90_000);
+        assert_eq!(EgressMedia::Video.rtp_timestamp(-1, tb), u32::MAX);
+        assert_eq!(
+            EgressMedia::Video
+                .rtp_timestamp(0, tb)
+                .wrapping_sub(EgressMedia::Video.rtp_timestamp(-3000, tb)),
+            3000
+        );
     }
 
     #[test]

@@ -1061,6 +1061,18 @@ jobs:
           --features webrtc
           --all-targets
           -- -D warnings
+      - name: test multiview-cli --features webrtc-native (WebRTC egress RTP wrap)
+        # #492: the WebRTC output egress must wrap RTP timestamps mod 2^32
+        # through the real fan-out → `run_webrtc_output` path. That test only
+        # builds with `webrtc-native` (ffmpeg-linked), which no other test leg
+        # enables. Scoped to the one module, NOT the full suite (#163).
+        timeout-minutes: 15
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features webrtc-native
+          --lib webrtc_rtp_wrap_tests
       - name: clippy multiview-cli --features ffmpeg,aes67
         # AES67 / SMPTE ST 2110-30 raw-PCM audio wiring (#96 / #103). The CLI RX
         # (`drive_aes67_rx`) + TX (`build_aes67_output` / `run_aes67_output`) sit
