@@ -1256,6 +1256,9 @@ pub struct AuxWiring {
     /// Aux sizing (§2.4): the cells of every composing layout, for the
     /// decoders (`None`: no decode follows them, e.g. tests).
     pub sizing: Option<crate::display_size::AuxSizingSlot>,
+    /// Direct source routes (#469): each routed `src:<id>` feed's source at
+    /// the size it is composed at, for the decoders (`None`: none follow).
+    pub source_sizing: Option<crate::display_size::SourceSizingSlot>,
 }
 
 /// What the opener receives: the rendition settings index (which already
@@ -3783,6 +3786,7 @@ impl OutputRouter {
     /// sizing). Runs only when the feed set or a layout body changes; one
     /// O(cells) allocation and a wait-free store, never per tick.
     fn publish_sizing(&self) {
+        self.publish_source_sizing();
         let Some(slot) = &self.aux.sizing else {
             return;
         };
@@ -3796,6 +3800,32 @@ impl OutputRouter {
         }
         if *slot.load() != cells {
             slot.store(Arc::new(cells));
+        }
+    }
+
+    /// Publish every source routed to an output as a bare `src:<id>` feed,
+    /// at the size it is composed at (#469): the feed's format, or the
+    /// canvas (`u32::MAX`, capped to the canvas by the reader). Same cadence
+    /// as [`Self::publish_sizing`]: a feed-set change only, never per tick.
+    fn publish_source_sizing(&self) {
+        let Some(slot) = &self.aux.source_sizing else {
+            return;
+        };
+        let mut routes: Vec<(Arc<str>, (u32, u32))> = self
+            .feeds
+            .keys()
+            .filter_map(|(bus, format)| match bus {
+                PictureBus::Source(id) => Some((
+                    Arc::from(id.as_str()),
+                    format.map_or((u32::MAX, u32::MAX), |f| (f.width, f.height)),
+                )),
+                _ => None,
+            })
+            .collect();
+        routes.sort_unstable();
+        routes.dedup();
+        if *slot.load() != routes {
+            slot.store(Arc::new(routes));
         }
     }
 

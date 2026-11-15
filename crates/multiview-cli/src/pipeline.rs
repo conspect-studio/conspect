@@ -2166,6 +2166,8 @@ pub struct ProgramMetricsHandles {
     pub compose_deadline_misses: Arc<std::sync::atomic::AtomicU64>,
     /// The run's per-output clocks (#343; empty without a rate output).
     pub output_clocks: Vec<OutputClockMetrics>,
+    /// Decodes producing the full canvas now (#469 GPU-cost bound).
+    pub full_canvas_decodes: crate::display_size::FullCanvasGauge,
 }
 
 /// One per-output clock's wait-free counters (#343, output-routing §12.6).
@@ -2221,6 +2223,12 @@ pub struct Pipeline {
     /// Aux sizing (ADR-0108 §2.4): the routed layouts' cells, written by the
     /// output router, merged into every decode's size decision.
     aux_sizing: crate::display_size::AuxSizingSlot,
+    /// Direct source routes (#469), written by the output router.
+    source_sizing: crate::display_size::SourceSizingSlot,
+    /// The M/E PGM/PVW selections (#469), written by the switcher hook.
+    bus_sizing: crate::display_size::BusSizing,
+    /// Decodes producing the full canvas now (#469 cost bound).
+    full_canvas_decodes: crate::display_size::FullCanvasGauge,
     /// The fixed output cadence (exact rational).
     cadence: Rational,
     /// The single program this pipeline runs (ADR-0030 MP-0). The legacy
@@ -3169,6 +3177,10 @@ impl Pipeline {
         let display_layout: DisplayLayoutSlot =
             Arc::new(multiview_framestore::SwapCell::new(Arc::clone(&layout)));
         let aux_sizing = crate::display_size::aux_sizing_slot();
+        let source_sizing = crate::display_size::source_sizing_slot();
+        let bus_sizing = crate::display_size::BusSizing::new();
+        let full_canvas_decodes: crate::display_size::FullCanvasGauge =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut source_handles: Vec<SourceHandle<Nv12Image>> =
             Vec::with_capacity(config.sources.len());
 
@@ -3260,6 +3272,9 @@ impl Pipeline {
                     Some(Arc::clone(&source_registry)),
                 )
                 .with_aux_sizing(Arc::clone(&aux_sizing))
+                .with_source_sizing(Arc::clone(&source_sizing))
+                .with_bus_sizing(bus_sizing.clone())
+                .with_full_canvas_gauge(Arc::clone(&full_canvas_decodes))
             });
             // Reserve the authoritative epoch before either startup rail starts.
             // Old detached publishers from a previous run retain their old token.
@@ -3698,6 +3713,9 @@ impl Pipeline {
             layout,
             display_layout,
             aux_sizing,
+            source_sizing,
+            bus_sizing,
+            full_canvas_decodes,
             cadence,
             program_spec,
             switcher_me,
@@ -4186,6 +4204,7 @@ impl Pipeline {
                 preview_selection: preview_selection.clone(),
                 halved: Arc::clone(&aux.halved),
                 sizing: Some(Arc::clone(&self.aux_sizing)),
+                source_sizing: Some(Arc::clone(&self.source_sizing)),
             },
             open,
             Some(reformat_open),
@@ -4499,7 +4518,10 @@ impl Pipeline {
                 Arc::clone(&self.display_layout),
                 Some(Arc::clone(&self.source_registry)),
             )
-            .with_aux_sizing(Arc::clone(&self.aux_sizing)),
+            .with_aux_sizing(Arc::clone(&self.aux_sizing))
+            .with_source_sizing(Arc::clone(&self.source_sizing))
+            .with_bus_sizing(self.bus_sizing.clone())
+            .with_full_canvas_gauge(Arc::clone(&self.full_canvas_decodes)),
             canvas_color: self.canvas_color,
             cadence: self.cadence,
             output_origin: Arc::clone(&self.epoch_anchor),
@@ -6094,6 +6116,7 @@ impl Pipeline {
                 output_clocks: running_lanes
                     .as_deref()
                     .map_or_else(Vec::new, output_lanes::RunningLanes::metrics),
+                full_canvas_decodes: Arc::clone(&self.full_canvas_decodes),
             })));
         // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
         // the shared slot — a single lock-free store the off-hot-path
@@ -6443,6 +6466,11 @@ impl Pipeline {
                     hook.preview_slot = Some(preview_slot);
                     hook.preview_stores = Some(self.catalogue_stores());
                     hook.preview_selection = preview_selection;
+                    // #469: the decoders size the PGM/PVW sources full-canvas.
+                    hook.bus_sizing = Some([
+                        Arc::clone(&self.bus_sizing.program),
+                        Arc::clone(&self.bus_sizing.preview),
+                    ]);
                     // The only clock-side routing duty: one non-blocking `try_send`
                     // after a fresh compose, and only while a routed feed is active.
                     // The engine run future is boxed (one allocation per run, never
@@ -15090,6 +15118,7 @@ pub(crate) fn nv12_to_decoded(image: &Nv12Image) -> Result<DecodedVideoFrame, Pi
         meta,
         raw_pts: None,
         a53_cc: None,
+        alpha: None,
     })
 }
 
@@ -19556,14 +19585,24 @@ fn open_and_stream(
     );
     let reopen_params = params.clone();
     let reopen_ordinal = cuda_ordinal.map(str::to_owned);
-    let (decoder, used_hw) = StreamVideoDecoder::new_preferring_hw_at(
-        params,
-        time_base,
-        want_hw,
-        cuda_ordinal,
-        display_resize,
-    )
-    .map_err(|e| e.to_string())?;
+    // A media player's VP9-with-alpha asset (WebM `alpha_mode=1`) opens
+    // `libvpx-vp9`, the only libav decoder that merges the alpha side stream
+    // (ADR-0058 §3, #391); without it the asset plays opaque, as today.
+    let vp9_alpha =
+        media_alpha::vp9_alpha_decoder(&plan.id, plan.player.is_some(), &input, stream_index);
+    let (decoder, used_hw) = match vp9_alpha
+        .and_then(|name| media_alpha::open_named(&plan.id, params.clone(), time_base, name))
+    {
+        Some(decoder) => (decoder, false),
+        None => StreamVideoDecoder::new_preferring_hw_at(
+            params,
+            time_base,
+            want_hw,
+            cuda_ordinal,
+            display_resize,
+        )
+        .map_err(|e| e.to_string())?,
+    };
     // Feed the declared cadence so the decoder's genpts fallback advances at the
     // source's true rate (PAL 25, film 24, …) rather than an NTSC-shaped guess;
     // an unusable rate is ignored inside `with_declared_fps` (invariant #3).
@@ -20035,6 +20074,10 @@ fn open_and_stream(
     }
 }
 
+/// Media-player NV12+A: attaches a decoded asset's straight alpha plane (#391).
+#[path = "pipeline_alpha.rs"]
+mod media_alpha;
+
 /// Convert a source frame index to a libav `AV_TIME_BASE` (microsecond) seek
 /// target at the given `cadence`, using exact integer rationals — never float
 /// fps (invariant #3). `target_us = frame * 1_000_000 * cadence.den /
@@ -20170,6 +20213,9 @@ fn stream_player(
     // path (bounded-memory data plane, inv #5 / rule 22).
     let mut last_image: Option<Arc<Nv12Image>> = None;
     let mut last_source_pts: Option<MediaTime> = None;
+    // NV12+A (ADR-0058, #391): built on the first alpha frame only, so an
+    // opaque asset never allocates the pool, scratch frames or alpha scaler.
+    let mut media_alpha: Option<media_alpha::MediaAlpha> = None;
     // Whether the decoder has been fully drained (EOF reached with no loop, or a
     // fail-safe gave up): the loop falls through to `heartbeat_player_hold`, which
     // holds last-good forever — the tile rides the framestore state machine and
@@ -20295,6 +20341,15 @@ fn stream_player(
             match player.on_decoded(source_frame) {
                 PlayerAction::Publish { at } => {
                     let image = to_tile.convert(&decoded.frame, tag)?;
+                    // An alpha asset publishes NV12 plus its full-resolution
+                    // straight alpha (same scaler geometry as the luma); an
+                    // opaque asset is untouched (`alpha` is `None`).
+                    let image = match &decoded.alpha {
+                        Some(source) => media_alpha
+                            .get_or_insert_with(Default::default)
+                            .attach(image, source)?,
+                        None => image,
+                    };
                     // Pace to the player's own monotone stamp (invariant #4),
                     // then publish it (latch-on-tick, invariant #1). Re-check
                     // `stop` after the (possibly long) pace wait. Wrap the frame
