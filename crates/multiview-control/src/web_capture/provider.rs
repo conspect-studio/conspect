@@ -11,7 +11,7 @@ use crate::{
     error::{ControlError, ControlResult},
 };
 use multiview_webengine::{
-    capture::{Background, Capture, OutputCadence, WindyView},
+    capture::{Background, Capture, OutputCadence, WindyCredentials, WindyView},
     service::{CancelOutcome, JobId, Request, Service, State, SubmitError, Submitted},
 };
 use std::{sync::Arc, time::Duration};
@@ -144,6 +144,24 @@ impl Provider {
         };
         serde_json::json!({"capture_available":self.service.is_some(),"premium_available":self.premium_available(),"url_fetch_available":false,"url_fetch_reason":"enforced download boundary not provisioned","accounting":accounting,"kernel_limits":false})
     }
+    /// Premium fails closed: only a credential that passed its latest verify
+    /// is resolved, and it travels only inside the job request (host stdin).
+    fn capture_credentials(&self, public: bool) -> ControlResult<Option<WindyCredentials>> {
+        if public {
+            return Ok(None);
+        }
+        self.windy
+            .as_ref()
+            .and_then(|w| w.resolve_for_capture())
+            .map(Some)
+            .ok_or_else(|| {
+                ControlError::Conflict(
+                    "Windy Premium is not available: set and verify the Windy account \
+                     (Settings → Integrations → Windy)"
+                        .into(),
+                )
+            })
+    }
     /// Authorize all named objects before allocating a background job. Blocking.
     /// # Errors
     /// Rejects unauthorized objects, stale terms, unsupported Premium, divergent
@@ -159,24 +177,7 @@ impl Provider {
                 "current Windy terms acceptance required".into(),
             ));
         }
-        // Premium fails closed: only a credential that passed its latest verify
-        // is resolved, and it travels only inside the job request (host stdin).
-        let credentials = if body.view.public {
-            None
-        } else {
-            Some(
-                self.windy
-                    .as_ref()
-                    .and_then(|w| w.resolve_for_capture())
-                    .ok_or_else(|| {
-                        ControlError::Conflict(
-                            "Windy Premium is not available: set and verify the Windy account \
-                             (Settings → Integrations → Windy)"
-                                .into(),
-                        )
-                    })?,
-            )
-        };
+        let credentials = self.capture_credentials(body.view.public)?;
         let capture = Capture {
             width: body.view.width,
             height: body.view.height,
