@@ -354,6 +354,8 @@ same CORS as the report route.
 - `rtc_h264`: the `profile-level-id` values of `RTCRtpReceiver.getCapabilities("video")`, at most 8.
 - `rvfc`: `requestVideoFrameCallback` exists. Without it latency is measured from the playhead on HLS and MoQ
   and is unavailable on WebRTC (decision 2, "Engine media time on each rung").
+- `frames`: `"rvfc"`, `"quality"` (`getVideoPlaybackQuality`) or `null`: the counter of presented frames the
+  stall watchdog uses ("Cast media status", rule 1). With `null` the MoQ and WebRTC rungs are not offered.
 - `srt`: on Android TV, the libsrt version the app loaded; `null` in the Web Receiver.
 - `need`: what the session must carry (decision 2, Tracks).
 - `skip`: rungs in the device's failure memory, with the seconds left.
@@ -459,8 +461,9 @@ at most one GOP.
 
 **Hard reset** (no `updateend` or `error` within 2 s of an `appendBuffer` or `remove`; a `SourceBuffer` error
 event; a media element decode error; retained ceilings exceeded; a second `QuotaExceededError`). The player
-drops the `MediaSource`: it detaches the element, revokes the object URL, creates a new `MediaSource` and new
-`SourceBuffer`s, appends the initialisation segments, and continues as after a soft reset. The transport
+drops the `MediaSource` and starts a new one through a new load in CAF (`playerManager.load`, see "Cast media
+status"): senders see `IDLE` / `INTERRUPTED`, `BUFFERING`, `PLAYING`. It revokes the old object URL, appends
+the initialisation segments to the new `SourceBuffer`s, and continues as after a soft reset. The transport
 session is kept.
 
 **`QuotaExceededError`.** The player does not retry the same append at once. It removes everything up to
@@ -499,17 +502,84 @@ than 3 flushes in 60 s: the app steps down to HLS.
 
 #### Cast media status
 
-**Cast media status in the Web Receiver is the open risk of the MoQ and WebRTC rungs.** CAF builds the media
-status that senders and Google Home show from its own player. The MoQ player feeds a `<video>` element through
-a `MediaSource` of its own and the WebRTC player gives one a `MediaStream`; neither goes through CAF's player. Cited: a LOAD interceptor may return `null` so that CAF does
-not handle the request, and `PlayerManager` has `setMediaElement`, `setMediaInformation` and `broadcastStatus`
-([PlayerManager](https://developers.google.com/cast/docs/reference/web_receiver/cast.framework.PlayerManager)).
-Both players here end in a `<video>` element, which is what `setMediaElement` takes. Unverified: whether any
-combination of these gives senders a correct, stable media session for a picture CAF did not load itself. Slice 3 settles it first, in the existing harness with the real CAF SDK (`tools/cast-proof/`),
-before any player is written. Pass means: the sender's `loadMedia` settles; the session shows as playing with
-the title; volume, mute and stop work; the receiver's own reports arrive. If nothing passes, class A keeps HLS
-only, slices 4 and 5 are dropped, and the SRT rung is unaffected. The Android TV app does not have this risk:
-Cast Connect takes media status from the app's `MediaSession` (Cited: Android TV receiver core features).
+CAF builds the media status that senders and Google Home show from its own player. The MoQ and WebRTC players
+do not get their media from a URL CAF can fetch. Slice 3 tested, with the real CAF receiver SDK 3.0.0157 in the
+harness, how such a picture can still have a correct media session. Method and numbers are in the appendix
+"Slice 3 spike". **None of this has run on a Cast device.**
+
+**The route this ADR first named does not work.** A LOAD interceptor that returns `null`, with the picture in an
+element of the receiver's own and `setMediaInformation`, `setMediaElement` and `broadcastStatus` called
+afterwards: every call returns without error, and senders only ever see `IDLE`. `GET_STATUS` gets no answer;
+`PAUSE` and `STOP` do nothing. It is not used.
+
+**MoQ rung: a `blob:` URL of the receiver's own `MediaSource`, loaded by CAF.** In the LOAD interceptor the
+receiver creates the `MediaSource`, sets `media.contentUrl = URL.createObjectURL(mediaSource)` and
+`media.contentType = "video/mp4"`, leaves `contentId` as the sender sent it, and returns the request. CAF loads
+that URL into its own media element, and `moq.js` appends to the `SourceBuffer`s. CAF's player owns the element,
+so play, pause, stop, volume, title, idle reasons and tracks are reported as for any media. Only documented
+calls are used. Consequences for the design above:
+
+- The "hard reset" of "Receiver buffers" is a new load through `playerManager.load`, as `receiver.js` does for
+  its retries today, with a new `MediaSource`. Senders see `IDLE` with reason `INTERRUPTED`, then `BUFFERING`,
+  then `PLAYING`, and the media session id changes. The spike tested no other way to replace a `MediaSource`
+  that CAF is playing. The design keeps the transport session across such a reset, handing it to the new load
+  (rule 2 below); the spike did not test that, it reopened its stream.
+- The audio and subtitle tracks senders see are the ones the receiver declares in `media.tracks`; CAF publishes
+  them, delivers `EDIT_TRACKS_INFO` to the receiver and reports the new `activeTrackIds`. The receiver makes
+  the switch itself and does not rely on CAF for it; what CAF does to the element's tracks on such an edit was
+  not examined.
+- A status carries the `blob:` URL in `contentUrl`. A `MEDIA_STATUS` interceptor puts the sender's URL back; it
+  must return a modified copy (rule 3 below).
+- A live session of this kind reports no duration and no seekable range, which is right for these rungs.
+
+**WebRTC rung: a hook on CAF's media element, which Google does not document.** CAF has no call that takes a
+`MediaStream`. The receiver defines a `src` property on the one media element instance: when CAF assigns the
+placeholder URL the receiver put in `contentUrl`, the setter assigns `srcObject` to the remote stream instead;
+when CAF removes `src`, it clears `srcObject`. CAF then drives the element as usual and the session is correct.
+This rests on how CAF 3.0.0157 loads and unloads media (`element.src = url`, `removeAttribute("src")`), and
+Google can change that in any SDK release. Three rules follow:
+
+- *Harness pin.* `tools/cast-proof/` gets a check that loads a WebRTC picture through the hook with the SDK
+  version Google serves that day, and fails when the picture or the session is wrong. The cast proof job runs
+  it, so an SDK change is seen in CI and not first on a device.
+- *Fall to HLS.* If, 1 s after the LOAD interceptor returned, the element has no `srcObject`, or `currentSrc`
+  shows that CAF loaded the placeholder URL itself, the receiver ends the attempt with stage `hook`, falls to
+  HLS and writes the 15 minute memory for the WebRTC rung.
+- *Kill switch.* The rung can be turned off for every receiver without a receiver release, by `[cast] ladder`
+  on the engine (decision 3): the engine then never offers it.
+
+**Rules for the receiver that the spike showed are needed, for both rungs.**
+
+1. **The frame watchdog is mandatory and is the only stall detector.** CAF reports `PLAYING` while the picture
+   stands still. With no RTP for 4 s on WebRTC the element stayed ready, CAF sent no status at all, and the
+   picture showed 0 frames per second. With whole fragments of noise appended on the MoQ path the playhead kept
+   advancing at 1.00 x with 0 frames per second; CAF reported `BUFFERING` only 4.0 s after the noise began and
+   never an error. The rule of decision 2, "no frame presented for 2 s", is therefore implemented by counting
+   presented frames (`requestVideoFrameCallback`, else `getVideoPlaybackQuality().totalVideoFrames`), never by
+   `currentTime` or by CAF's state. While the watchdog has fired and the picture is not back, the receiver's
+   own report says `stalled`, because the Cast media status may still say `PLAYING`. A receiver with neither
+   frame counter does not get these rungs: the probe gains `frames` (which counter exists) and the engine
+   leaves the MoQ and WebRTC rungs out when it is absent.
+2. **Resources belong to the load that made them.** On a LOAD while something plays, CAF calls the interceptor
+   for the new item first and fires `MEDIA_FINISHED` (`INTERRUPTED`) for the old item afterwards. A receiver
+   that closes "the current transport" on `MEDIA_FINISHED` closes the new one. Each `MediaSource`, transport
+   session and peer connection carries the number of the load that created it, and `MEDIA_FINISHED` closes only
+   those of the item that was playing.
+3. **A status interceptor returns a copy.** The object CAF passes to a `MEDIA_STATUS` interceptor shares its
+   `media` with CAF's own state. Writing `contentUrl` into it made CAF load that URL (errors 310, then 905).
+4. **The receiver cannot name the reason of an end it causes.** `setIdleReason(ERROR)` followed by `stop()`
+   reached senders as `IDLE` with reason `CANCELLED`. When the receiver ends a cast itself (revoked token, no
+   rung left), the reason travels in its custom-namespace report, sent before the stop, as `receiver.js` does
+   for a token that is gone.
+
+**What a device can still overturn.** The harness has no Cast platform, so CAF uses the HTML media element for
+everything. Unverified: that a device's CAF plays a `blob:` `contentUrl` in the page's own element instead of
+handing `video/mp4` to a platform player that cannot read a page-local URL. If it does not, the MoQ rung fails
+on that device class and it keeps HLS; the same question applies to the WebRTC hook. Slices 4 and 5 therefore
+each begin with a device test of the bare mechanism (the spike page, or the first build of the rung) before
+the rest is built, and their probe data decides the class's ladder as slice 7 says. The Android TV app does not
+have this risk: Cast Connect takes media status from the app's `MediaSession` (Cited: Android TV receiver core
+features).
 
 ### 4. Network
 
@@ -812,8 +882,9 @@ Decisions:
    subscriptions, shared with the desk (decision 6). WHEP offer 64 KiB. Stored probe, reset counters and
    fallback history: fixed size per stream. Media buffers: decision 6.
 10. **The receiver page.** The policy already allows `connect-src 'self' https:` and `worker-src blob:` (Read:
-    `RECEIVER_CSP`, `routes/cast_public.rs:36`). Unverified in a browser: that this admits a WebTransport
-    session to another `https` origin. Slice 3 checks it in the harness. The hosted copy at
+    `RECEIVER_CSP`, `routes/cast_public.rs:36`). Measured in the harness (appendix): under this policy
+    a WebTransport session to another `https` origin opens with no violation, and under `connect-src 'self'`
+    alone it is refused. Unverified: the same on a Cast device. The hosted copy at
     `cast.conspect.studio` must send the same policy and the same new files, byte for byte.
 
 ### 6. Engine cost and invariants
@@ -1006,9 +1077,9 @@ Order matters: the first three slices decide whether the later ones are built as
 | S | **libsrt floor for every SRT listener.** *Owned by ship lane `srtfloor`, from `main`; not a task of this team.* `srt_getversion` in `multiview-srt-sys`; `SrtListener::bind` refuses below 1.5.7 with a typed error; libsrt 1.5.7 in the container images and the CI jobs; runbook line | R2 | none (touches no cast file; does not wait for PR 466) | A listener on an older library does not bind and says why; the existing SRT listener tests pass on 1.5.7; the image's SRT smoke test passes |
 | 1 | **Latency slate and evidence.** A test source that draws the engine clock (ms) and the tick; the reference clock page; tick-to-packet delay of the shared encoder as a metric; the receiver's HLS reports gain tick-to-present | R2 | PR 466 merged | The baseline: glass-to-glass and tick-to-present for today's HLS on the operator's Chromecast, and the encoder delay that bounds every rung. Records the device's user agent |
 | 2 | **Ladder endpoint and one authorization.** `POST /cast/<token>/ladder` with the probe stored and shown; the shared token check; attachment fences set on revoke, expiry and feed change; liveness by report; `[cast] ladder`. The answer offers `hls` only. `receiver.js` sends the probe and still plays HLS | R3 | 1 | One token governs every transport: the PR 409 abuse tests pass against a fake push attachment, and so does every case of the table in decision 5.4 (picture fallback, same picture with a new forbidden audio source, same bus with a new dependency, the production-to-enqueue race, a packet without identity). The clock exchange and its error bound are tested. From the first device cast: the real capability table of that device |
-| 3 | **CAF spike, in the harness, no product code path.** A `<video>` element fed from outside CAF's player; LOAD interceptor returning `null`; `setMediaElement`, `setMediaInformation`, `broadcastStatus` | R1 (tools only) | 2 | Whether a Web Receiver can show a picture CAF did not load and still give senders a correct media session. Checks the page policy against a cross-origin WebTransport session. A fail ends slices 4 and 5 |
-| 4 | **MoQ rung.** Engine: cast outputs admitted to MoQ leases through the ladder; lease renewal by the ladder call. Receiver: `moq.js` (WebTransport, CMAF wrap, `SourceBuffer`), deadlines, step-down, memory | R3 | 3 passed; the probe data shows a device with `wt` and `mse` | MoQ plays through the real CAF SDK in the harness with media status correct; the receiver soak and the stalled-append, slow-decoder and quota tests of decision 6 pass; reported latency matches the slate's tick (decision 2); the authorization cases of decision 5.4 pass on the real rung; a wedged or stalled MoQ attachment costs the clock zero ticks and other bindings zero packets; device test with glass-to-glass |
-| 5 | **WebRTC rung.** `POST` and `DELETE /cast/<token>/whep`; one Opus encoder per cast output; PLI ignored; receiver `rtc.js`; ICE-TCP | R3 | 3 passed | WebRTC plays in the harness with UDP blocked (TCP 443 only); wire RTP time equals engine time across the 2^32 wrap and latency is `unavailable`, with no step-down, when the frame metadata lacks it (decision 2); the Opus encoder count stays one with several viewers; the egress byte and age ceilings and the authorization cases of decision 5.4 hold; chaos as slice 4; device test |
+| 3 | **CAF spike, in the harness, no product code path. Done on 15 Nov 2026; result in the appendix.** A picture CAF did not fetch, by three routes: a `blob:` URL of the receiver's `MediaSource`, a hook on CAF's media element for a `MediaStream`, and the LOAD interceptor returning `null` | R1 (scratch only, no pull request) | ran before 2 | Passed in the harness for the first two routes; the third fails. The production policy admits a cross-origin WebTransport session. Not run on a device, so slices 4 and 5 each start with a device test of the bare mechanism |
+| 4 | **MoQ rung.** Engine: cast outputs admitted to MoQ leases through the ladder; lease renewal by the ladder call. Receiver: `moq.js` (WebTransport, CMAF wrap, `SourceBuffer` of a `MediaSource` given to CAF as a `blob:` URL), frame watchdog, deadlines, step-down, memory | R3 | 2; 3 passed in the harness; the probe data shows a device with `wt` and `mse`; **first step: a device plays a `blob:` URL through CAF** | MoQ plays through the real CAF SDK in the harness with media status correct; the receiver soak and the stalled-append, slow-decoder and quota tests of decision 6 pass; reported latency matches the slate's tick (decision 2); the authorization cases of decision 5.4 pass on the real rung; a wedged or stalled MoQ attachment costs the clock zero ticks and other bindings zero packets; device test with glass-to-glass |
+| 5 | **WebRTC rung.** `POST` and `DELETE /cast/<token>/whep`; one Opus encoder per cast output; PLI ignored; receiver `rtc.js` with the media-element hook, its harness pin and its fall to HLS; frame watchdog; ICE-TCP | R3 | 2; 3 passed in the harness; **first step: the hook takes on a device** | WebRTC plays in the harness with UDP blocked (TCP 443 only); wire RTP time equals engine time across the 2^32 wrap and latency is `unavailable`, with no step-down, when the frame metadata lacks it (decision 2); the Opus encoder count stays one with several viewers; the egress byte and age ceilings and the authorization cases of decision 5.4 hold; chaos as slice 4; device test |
 | 6 | **SRT rung and the Android TV app.** Engine: listen callback in `multiview-srt-sys`, the cast SRT listener, one-time selectors and the HKDF passphrase, pre-authentication budgets, attachment per token. App: `android/cast-tv/`, CI job that builds the APK. Senders: `androidReceiverCompatible`, `supportedAppTypes`, behind `[cast] android_tv` | R3 | 2, S | Engine: a libsrt caller with the issued selector and the derived passphrase receives valid MPEG-TS; the test table of decision 5.7 passes (a flood of wrong-passphrase handshakes on a known selector neither evicts nor locks out the valid receiver; unknown, expired and reused selectors and a revoked token get nothing); wire PTS equals engine time (decision 2); churn and a wedged caller do not slow the producer. Device: the app launches when installed, the Web Receiver when not; SRT plays; a blocked port falls to HLS and the next cast to the Web Receiver |
 | 7 | **Measured ladder.** Run the matrix; set the offer order, deadlines, SRT latency and player buffers from the data; remove any rung that does not beat the one below it on a class; enable `android_tv` by default if slice 6's first device step passed; runbook; the measured table added to this ADR | R2 | 4, 5, 6 as built | The ladder's order and targets are measurements. Every cell of the table is filled or marked as not built, with the reason |
 
@@ -1043,6 +1114,7 @@ captain as one list; none blocks slices 0 to 5 from merging.
 | 3 | On the test device: enable developer options and USB or network debugging; install the APK from the CI artifact with `adb install` | slice 6 | when slice 6's pull request has a green build |
 | 4 | Estate firewall: confirm UDP 9010 reaches mda001 from the test TV's network (it is inside the existing 9000 to 9100 SRT grant; no new rule is expected). If the TV is on a network other than the office's, name it | slice 6 | before the device test |
 | 5 | Baseline device test: cast the latency slate to the Chromecast over HLS; one photograph or slow-motion clip showing the TV and the reference clock page | slice 1 | after slice 1 is deployed |
+| 5a | Device test of the bare mechanisms, before slices 4 and 5 are built out: cast once to a page that plays a `blob:` `MediaSource` and a `MediaStream` through CAF. It needs a second, unpublished Cast application in the Cast Console that points at that page, and the test Chromecast registered for it | slices 4 and 5, first step | as soon as the page is hosted |
 | 6 | Device tests per rung: the same photograph for MoQ and WebRTC on the Chromecast, and for SRT on the Android TV device, plus "app not installed" and "SRT port blocked" on the Android TV device | slices 4, 5, 6, 7 | as each is deployed |
 | 7 | Deploy the receiver files to `cast.conspect.studio` (the Worker in `conspect-studio/web`) at each receiver change. The lead did this for PR 439; listed here because it uses the operator's Cloudflare account | slices 2, 4, 5 | at each merge |
 | 8 | Release signing key for the APK: create it, store it in 1Password, add it as a CI secret | a release-signed APK; not needed for debug builds on registered devices | before any device outside the test set |
@@ -1111,8 +1183,9 @@ captain as one list; none blocks slices 0 to 5 from merging.
 | --- | --- |
 | Chrome version, `WebTransport`, WebCodecs, `RTCPeerConnection` and MSE support on the operator's Chromecast and on a Google TV device's Web Receiver | slice 2 (probe stored on the first cast) |
 | Delay of the shared encoder from tick to packet | slice 1 |
-| Whether CAF gives senders a correct media session for a picture it did not load | slice 3 |
-| Whether the receiver page's policy admits a cross-origin WebTransport session | slice 3 |
+| Whether CAF gives senders a correct media session for a picture it did not load | Closed in the harness by slice 3: yes, by the two methods of decision 3; no, by an interceptor that returns `null` |
+| Whether a device's CAF plays a `blob:` `contentUrl` in the page's own media element, and whether the WebRTC element hook takes there | first device step of slices 4 and 5 |
+| Whether the receiver page's policy admits a cross-origin WebTransport session | Closed in the harness by slice 3: yes. On a device: slice 4 |
 | Whether a `cast` output is admitted to the effective-output registry and has the no-reorder proof | slice 2 |
 | Where the dispatcher attaches the per-component identity change list to video and audio packets, and whether every unrequested change can mint an identity (decision 5.4) | slice 2 design note; the contract and its tests are fixed |
 | What the Cast platform does when `androidReceiverCompatible` is set and the app is not installed | slice 6, first device step |
@@ -1130,3 +1203,91 @@ captain as one list; none blocks slices 0 to 5 from merging.
 | Which RTCP wall clock the WebRTC rung uses when the run has no validated epoch (review note R2-N3) | slice 5, as a test requirement. Not decided here |
 | That the ladder answers with the next rung, and not with an error, when no registry subscription is left for MoQ (review note R2-N4; decision 6 already says the receiver gets the next rung) | slice 4 test |
 
+## Appendix: slice 3 spike (2026-11-15)
+
+Question: can a CAF v3 Web Receiver show a picture that CAF's player did not fetch, and still give senders a
+correct Cast media session? Result: **yes in the harness** for both rungs, by the two methods of decision 3,
+"Cast media status". **No in the harness** for the route this ADR first named. **Not run on any Cast device.**
+
+The spike was throwaway code in the build host's scratch directory
+(`.worktrees/.scratch/ship-1111/castll/spike/`, with every run's log; not in the repository). What a later
+slice needs from it is on this page.
+
+### Setup
+
+| Piece | Value |
+| --- | --- |
+| CAF receiver SDK | 3.0.0157, the file Google served on 15 Nov 2026 |
+| Browser | Google Chrome for Testing 156.0.8078.4, headless, the launch flags of `tools/cast-proof/` (audio muted, no GPU) |
+| Cast platform | `tools/cast-proof/fake-cast-platform.mjs`, unchanged; it plays the senders |
+| Receiver page | the production page structure and `receiver.css` byte for byte, a spike script in place of `receiver.js` |
+| Policy | the production `RECEIVER_CSP`, read from `routes/cast_public.rs` at run time |
+| Media | H.264 High 1280x720 at 30000/1001, no B-frames, keyframe every 30 frames; AAC-LC 48 kHz stereo; one CMAF fragment per frame |
+| Stand-in for MoQ | one chunked HTTPS response that delivers each fragment at its media time. The transport was not under test |
+| Stand-in for the engine's WebRTC | two `RTCPeerConnection`s in the receiver page, H.264 (`42001f`) and Opus negotiated |
+
+Differences from what slice 3 was written to be: it ran before slice 2, so with no engine, no token and no
+ladder call; and it ran from scratch, not as a pull request in `tools/cast-proof/`.
+
+### Result
+
+The final code ran three times with the same outcome: 86 checks with a pass rule, 0 failed, each time. Four
+earlier runs failed (13, 3, 4 and 1 failures). Their causes: a bug in the spike receiver (rule 2 of "Cast media
+status"), two test stimuli that did not do what they were meant to, and two checks that read state too early.
+Two stimuli and two checks were changed after failing; the scratch record lists each change. No check was
+removed.
+
+| What a sender needs | MoQ method (`blob:` URL) | WebRTC method (element hook) | Interceptor returns `null` |
+| --- | --- | --- | --- |
+| The LOAD is answered | status with the LOAD's request id, no `LOAD_FAILED` | same | an `IDLE` status only |
+| Session shows as playing, with title, `LIVE`, picture size | `PLAYING` 34 to 45 ms after LOAD | `PLAYING` after 255 to 274 ms | never: `IDLE` only |
+| Picture moves | 29.9 to 30.0 frames per second over 20 s, 0 dropped | 30.0 to 30.1 over 12 s | moves, but senders cannot know |
+| Audio | AAC decoded | Opus received | not checked |
+| Volume and mute | reported and applied | reported | not checked |
+| Pause, play | `PAUSED`, `PLAYING`; picture follows | same | no status; picture keeps playing |
+| Stop | `IDLE` / `CANCELLED`; stream closed | `IDLE` / `CANCELLED`; peer connection closed | no status; picture keeps playing |
+| `GET_STATUS` | answered | not checked | no answer |
+| A second sender joins | gets the playing session | not checked | not checked |
+| End of stream; undecodable video | `IDLE` / `FINISHED`; `IDLE` / `ERROR` (CAF error 102) | not checked | not checked |
+| Tracks (#418) | declared tracks published; `EDIT_TRACKS_INFO` delivered | not checked | not checked |
+| The receiver replaces its player | `INTERRUPTED`, `BUFFERING`, `PLAYING` in 20 to 27 ms | not checked | not checked |
+| Step-down on one element | plays after a WebRTC session on the same element | plays again after that | not checked |
+
+Also measured on the MoQ method: the stream silent for 4 s gives `BUFFERING` then `PLAYING`; two lost GOPs that
+resume at a keyframe are crossed by moving the playhead, with no element error; `setMediaElement(own)` before
+the load makes CAF play the `blob:` URL in an element of the receiver's own, with pause, stop and status
+correct. The playhead ran 0.26 to 0.27 s behind the stream. That figure is loopback HTTPS and a desktop
+decoder; it is not a latency result for any rung.
+
+WebTransport against the receiver policy, three runs, same result each time. The server was on another port,
+hence another origin, with a self-signed certificate pinned by hash:
+
+| Page | `connect-src` | Session |
+| --- | --- | --- |
+| Receiver page with the CAF SDK | production: `'self' https: ws://localhost:8008` | opened; 0 policy violations |
+| Plain page | production | opened; 0 violations |
+| Plain page (control) | `'self' ws://localhost:8008` | refused, with a `connect-src` violation |
+
+Not tested there: a certificate from a public authority, which production uses.
+
+### What only a device can show
+
+In order of how much each could change the result:
+
+1. Whether the device's CAF plays a `blob:` `contentUrl` in the page's own media element. If it does not, the
+   MoQ method fails on that class.
+2. Whether the device's Chrome has `WebTransport`, and `RTCPeerConnection` with H.264 receive.
+3. Whether one fragment per frame with about 0.3 s of buffer plays smoothly on the hardware decoder at 1080p.
+   The spike used 720p and a desktop software decoder.
+4. Whether the element hook takes on the device's Chrome and CAF build.
+5. Whether the picture is on the video plane at full resolution, for `blob:` and for `srcObject`.
+6. Real senders: Chrome's `loadMedia` resolving, Google Home and the TV remote showing title and controls. The
+   fake platform shows only that the right messages are sent.
+7. Audio output and audio/video sync. The harness muted output and measured neither.
+8. Every latency figure.
+
+### Not covered
+
+No engine, token, ladder call, MoQ session, WHEP exchange or network. The buffer ceilings, reset budgets and
+soak test of decisions 3 and 6 were not implemented. The spike script was not written for old Chrome. No second
+vendor reviewed the spike or its checks.
