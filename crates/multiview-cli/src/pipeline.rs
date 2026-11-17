@@ -9219,6 +9219,7 @@ mod switcher_shed_audio_tests {
                 start: -4,
                 style: multiview_engine::TransitionStyle::Mix,
                 audio_remaining: 4 - k,
+                canvas: (64, 64),
             });
             item
         };
