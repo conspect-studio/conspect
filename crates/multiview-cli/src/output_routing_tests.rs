@@ -448,10 +448,11 @@ impl RouterCost {
     /// interval, and `(wd - wa) - Δrun_delay` is its on-CPU plus blocked time
     /// plus only the preemption between `wa` and the first sample and between
     /// the second sample and `wd`. That is at least the call's work plus
-    /// waits whatever the host does (sound: a wait can never hide), and at
-    /// most [`SAMPLE_WINDOW`] per side plus the reads' few microseconds more
-    /// ([`ThreadTimes::tight`] retakes a read until it is that tight), so
-    /// host preemption cannot flake it either. Off Linux the wall time counts.
+    /// waits whatever the host does (sound: a wait can never hide). It is
+    /// more by at most [`SAMPLE_WINDOW`] per side plus the reads' own CPU
+    /// time (~20 us each, retakes included): [`ThreadTimes::tight`] retakes
+    /// a read until it is that tight, or fails as inconclusive, so host
+    /// preemption cannot flake it either. Off Linux the wall time counts.
     fn of(
         before: Option<ThreadTimes>,
         after: Option<ThreadTimes>,
@@ -476,9 +477,15 @@ impl RouterCost {
 /// healthy read is ~20 us); [`ThreadTimes::tight`] retakes it until it is.
 const SAMPLE_WINDOW: std::time::Duration = std::time::Duration::from_micros(100);
 
-/// Reads retaken at most per sample: past it the last read is used, still
-/// sound, only less tight.
-const SAMPLE_TRIES: u32 = 64;
+/// How long [`ThreadTimes::tight`] keeps retaking a read before it reports
+/// the accounting inconclusive (a panic naming it): a non-tight sample is
+/// never used as if it were tight. Reaching it takes the host stalling every
+/// ~20 us read by over 100 us for this long.
+const SAMPLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The failure when no tight sample can be taken: the measurement is
+/// inconclusive, which is reported, never taken as a pass or a router cost.
+const INCONCLUSIVE: &str = "scheduler accounting inconclusive: every /proc/thread-self/schedstat read stalled > 100 us for 10 s";
 
 /// One sample of the calling thread's scheduler accounting (Linux,
 /// `/proc/thread-self/schedstat`: field 1 on-CPU ns, current to the last
@@ -507,31 +514,33 @@ impl ThreadTimes {
 
     /// A sample taken within [`SAMPLE_WINDOW`] after the returned wall
     /// instant (retaken while the host stalls the read; nothing else runs).
+    /// `None` off Linux.
     fn tight() -> (Instant, Option<Self>) {
-        let mut tries = 0;
+        let deadline = Instant::now() + SAMPLE_DEADLINE;
         loop {
             let at = Instant::now();
             let sample = Self::sample();
-            tries += 1;
-            if at.elapsed() < SAMPLE_WINDOW || tries >= SAMPLE_TRIES {
+            if sample.is_none() || at.elapsed() < SAMPLE_WINDOW {
                 return (at, sample);
             }
+            assert!(Instant::now() < deadline, "{INCONCLUSIVE}");
         }
     }
 
     /// A sample taken within [`SAMPLE_WINDOW`] before the returned wall
-    /// instant. A retake only moves both later: the time in between is the
-    /// harness's own reads, preempted time in it is in the later sample.
+    /// instant. Each retake moves both later; the retakes before it are
+    /// charged to the call as the harness's own cost (each a ~20 us read on
+    /// a CPU; their preemption is in the final sample's run delay).
     fn tight_after() -> (Option<Self>, Instant) {
-        let mut tries = 0;
+        let deadline = Instant::now() + SAMPLE_DEADLINE;
         loop {
             let from = Instant::now();
             let sample = Self::sample();
             let at = Instant::now();
-            tries += 1;
-            if at - from < SAMPLE_WINDOW || tries >= SAMPLE_TRIES {
+            if sample.is_none() || at - from < SAMPLE_WINDOW {
                 return (sample, at);
             }
+            assert!(Instant::now() < deadline, "{INCONCLUSIVE}");
         }
     }
 }
