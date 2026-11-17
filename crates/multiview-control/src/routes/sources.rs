@@ -968,6 +968,9 @@ pub(crate) async fn delete_source(
         &id,
         None,
     );
+    // Issue #519: the in-memory audit log does not survive a restart, so the
+    // journal carries who removed an accepted source.
+    tracing::info!(source = %id, actor = %principal.key_id, "source deleted through the API");
     let mode = live_apply_remove(&state, &id);
     Ok(with_apply(mode, StatusCode::NO_CONTENT.into_response()))
 }

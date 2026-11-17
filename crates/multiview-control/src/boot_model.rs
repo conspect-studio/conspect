@@ -617,7 +617,20 @@ pub async fn commit_resource(
             output_ids.retain(|existing| existing != id);
         }
     }
-    commit_desired_with_output_ids(state, config, layouts, output_ids, Some((key, id, name))).await
+    let intended = if is_create {
+        IntendedRemovals::Nothing
+    } else {
+        IntendedRemovals::Resource(key, id)
+    };
+    commit_desired_with_output_ids(
+        state,
+        config,
+        layouts,
+        output_ids,
+        Some((key, id, name)),
+        intended,
+    )
+    .await
 }
 
 /// The accepted output identity map, or the seeded positional ids before the
@@ -686,7 +699,16 @@ async fn commit_section(
     })?;
     let layouts = layout_library(state)?;
     let output_ids = current_output_ids(state, model)?;
-    commit_desired_with_output_ids(state, config, layouts, output_ids, None).await
+    let intended = if key == GRAPHICS_KEY {
+        IntendedRemovals::Families(&[
+            GRAPHICS_DATA_SOURCES_KEY,
+            GRAPHICS_ITEMS_KEY,
+            GRAPHICS_CHANNELS_KEY,
+        ])
+    } else {
+        IntendedRemovals::Families(&[IPTV_KEY])
+    };
+    commit_desired_with_output_ids(state, config, layouts, output_ids, None, intended).await
 }
 
 /// Commit a multi-resource edit that keeps the accepted output identities: the
@@ -704,7 +726,15 @@ pub async fn commit_keeping_output_ids(
     };
     let layouts = layout_library(state)?;
     let output_ids = current_output_ids(state, model)?;
-    commit_desired_with_output_ids(state, config, layouts, output_ids, None).await
+    commit_desired_with_output_ids(
+        state,
+        config,
+        layouts,
+        output_ids,
+        None,
+        IntendedRemovals::Nothing,
+    )
+    .await
 }
 
 /// The accepted output identities, aligned with the prospective `outputs`.
@@ -727,6 +757,7 @@ async fn commit_desired_with_output_ids(
     layouts: Vec<crate::repository::Layout>,
     output_ids: Vec<String>,
     name_change: Option<(&str, &str, Option<String>)>,
+    intended: IntendedRemovals<'_>,
 ) -> ControlResult<()> {
     let selected_layout_id = selected_layout_id(state, &config, &layouts)?;
     // Boxed: the transaction future is large, and every route awaits it.
@@ -737,6 +768,7 @@ async fn commit_desired_with_output_ids(
         selected_layout_id,
         output_ids,
         name_change,
+        intended,
     ))
     .await
 }
@@ -761,8 +793,109 @@ pub async fn commit_desired_document(
         selected_layout_id,
         output_ids,
         None,
+        IntendedRemovals::Nothing,
     ))
     .await
+}
+
+/// Which accepted resources a commit is MEANT to remove (issue #519). Any
+/// other identity that disappears from the accepted state is an implicit
+/// removal: it is committed (the whole-document callers — the boot-file
+/// watcher, revert, a layout or patch edit — are authoritative), but never
+/// silently: it is logged at WARN and audited as a `delete` by the
+/// `accepted-state` actor.
+#[derive(Debug, Clone, Copy)]
+enum IntendedRemovals<'a> {
+    /// The commit names no removal (a create, an edit, a whole document).
+    Nothing,
+    /// An explicit delete of exactly this `(family, id)`.
+    Resource(&'a str, &'a str),
+    /// A section commit that owns these families outright (graphics, iptv).
+    Families(&'a [&'a str]),
+}
+
+impl IntendedRemovals<'_> {
+    fn covers(self, key: &str, id: &str) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Resource(k, i) => k == key && i == id,
+            Self::Families(keys) => keys.contains(&key),
+        }
+    }
+}
+
+/// The audit `object_kind` for an envelope family.
+fn audit_kind_for(key: &str) -> &str {
+    match key {
+        "sources" => crate::resource_store::SOURCE_KIND,
+        "outputs" => crate::resource_store::OUTPUT_KIND,
+        "overlays" => crate::resource_store::OVERLAY_KIND,
+        "probes" => crate::resource_store::PROBE_KIND,
+        "devices" => crate::resource_store::DEVICE_KIND,
+        "sync_groups" => crate::resource_store::SYNC_GROUP_KIND,
+        "salvos" => crate::salvo_store::SALVO_KIND,
+        "tally_profiles" => crate::tally_state::TALLY_PROFILE_KIND,
+        "audio" => crate::audio_routing::AUDIO_ROUTING_KIND,
+        IPTV_KEY => crate::routes::iptv::IPTV_KIND,
+        other => other,
+    }
+}
+
+/// The audit actor for an accepted-state removal no request named.
+pub const IMPLICIT_REMOVAL_ACTOR: &str = "accepted-state";
+
+/// Every `(family, id)` present in `before` and absent from `after`, over the
+/// versioned families, in family then id order.
+fn removed_identities(
+    before: &MultiviewConfig,
+    before_output_ids: &[String],
+    after: &MultiviewConfig,
+    after_output_ids: &[String],
+) -> ControlResult<Vec<(&'static str, String)>> {
+    let mut removed = Vec::new();
+    for key in VERSIONED_KEYS {
+        let old = resource_bodies(before, before_output_ids, key)?;
+        let new = resource_bodies(after, after_output_ids, key)?;
+        removed.extend(
+            old.into_keys()
+                .filter(|id| !new.contains_key(id))
+                .map(|id| (key, id)),
+        );
+    }
+    Ok(removed)
+}
+
+/// Make every removal a commit carried visible (issue #519): an intended
+/// delete is logged with its family and id; any other one is a WARN and an
+/// audit entry. Runs after the rename, on the control plane only.
+fn report_removals(
+    state: &AppState,
+    removed: &[(&'static str, String)],
+    intended: IntendedRemovals<'_>,
+) {
+    for (key, id) in removed {
+        if intended.covers(key, id) {
+            tracing::info!(family = %key, id = %id, "accepted state: resource removed by an explicit delete");
+            continue;
+        }
+        tracing::warn!(
+            family = %key,
+            id = %id,
+            code = "accepted-state-implicit-removal",
+            "accepted state: a commit removed a resource no request named for removal (issue #519)"
+        );
+        state.audit(
+            IMPLICIT_REMOVAL_ACTOR,
+            crate::audit::AuditAction::Delete,
+            audit_kind_for(key),
+            id,
+            Some(serde_json::json!({
+                "implicit": true,
+                "family": key,
+                "reason": "removed by a commit that did not name it for removal",
+            })),
+        );
+    }
 }
 
 #[allow(
@@ -776,12 +909,35 @@ async fn commit_desired_document_named(
     selected_layout_id: String,
     output_ids: Vec<String>,
     name_change: Option<(&str, &str, Option<String>)>,
+    intended: IntendedRemovals<'_>,
 ) -> ControlResult<()> {
     let model = state
         .boot_model
         .as_ref()
         .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
     let previous = model.accepted().map_err(ControlError::Repository)?;
+    // Issue #519: what this commit drops from the accepted state, against the
+    // previous envelope (or, before the first one, the document the run
+    // started from), so no removal is ever silent.
+    let removed = match &previous {
+        Some(prior) => removed_identities(&prior.config, &prior.output_ids, &config, &output_ids)?,
+        None => {
+            let base = current_desired_config(state)
+                .ok()
+                .and_then(|value| serde_json::from_value::<MultiviewConfig>(value).ok());
+            match base {
+                Some(base) => {
+                    let base_ids = current_output_ids(state, model)?;
+                    if base_ids.len() == base.outputs.len() {
+                        removed_identities(&base, &base_ids, &config, &output_ids)?
+                    } else {
+                        Vec::new()
+                    }
+                }
+                None => Vec::new(),
+            }
+        }
+    };
     if previous.is_none() && !layouts.iter().any(|layout| layout.id == selected_layout_id) {
         layouts.push(crate::repository::Layout {
             id: selected_layout_id.clone(),
@@ -992,6 +1148,7 @@ async fn commit_desired_document_named(
     // Every commit is also the repair point for an earlier projection fault. An
     // indeterminate commit is already the visible envelope, so it projects too.
     if matches!(written, Ok(()) | Err(ControlError::CommitIndeterminate(_))) {
+        report_removals(state, &removed, intended);
         crate::layout_projection::after_commit(state).await;
     }
     written

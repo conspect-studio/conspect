@@ -18,6 +18,15 @@ Shed revert-to-start (bounded, not fixed): a shed revert commits Loaded to the e
 
 Graphics, IPTV, weather and events sections (later release branches) must follow the same rule when they land.
 
+## No silent removal (issue #519)
+
+Every commit compares the per-resource identities of the versioned families (sources, outputs, audio, overlays, probes, devices, sync groups, salvos, tally profiles, `iptv` and the graphics collections) before and after. Before the first envelope exists, the "before" is the document the run started from. After a successful (or visible-but-indeterminate) rename, each identity that disappeared is reported:
+
+* A removal the commit was asked for is logged at `info` with its family and id. Only an explicit delete of exactly that `(family, id)` through `commit_resource`, or a section commit (`graphics`, `iptv`) for its own collections, counts as asked for. The route has already written the caller's audit entry. `DELETE /sources/{id}` also writes a journal line with the actor, because the audit log is in memory and does not survive a restart.
+* Any other removal is committed, because whole-document callers are authoritative: the boot-file watcher, revert, layout and patch edits. It is logged at `warn` (`code = "accepted-state-implicit-removal"`) and audited as a `delete` by the actor `accepted-state`, with `detail.implicit = true`.
+
+`accepted_source_integrity` pins three things: a live `media_player` add on a switcher run with N sources persists N + 1, with every earlier name and version unchanged; an explicit delete is audited under the caller; and a whole-document commit that drops a source is audited as implicit. The check runs on the control plane after the write; it never touches the engine or the output clock.
+
 ## Layout projection faults
 
 `desired.json` is the only truth for accepted layouts. `layouts.db` (or the in-memory repository) is a replaceable projection of it. Every layout read, precondition and working-document composition uses the envelope, so a failed projection write cannot change an API answer or an `ETag`, and no restart is needed.
