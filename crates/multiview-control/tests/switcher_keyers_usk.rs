@@ -970,3 +970,36 @@ async fn a_take_replay_answers_its_first_202_after_an_inaccessible_key_is_armed(
         while outcomes.try_recv().is_ok() {}
     }
 }
+
+/// Review R3-KEYONLY-1: a key-only take moves neither bus, so the stored
+/// layout on Preview is neither authorized nor guarded for it. With an
+/// unregistered (unreadable) `layout:` on Preview, a background take is
+/// refused while a key-only CUT is admitted and puts the key on air.
+#[tokio::test]
+async fn a_key_only_take_ignores_the_preview_layout() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = build_buses(&path, DOC, "a", "layout:nowhere");
+    let mut outcomes = rig.handle.outcomes();
+    let cut = body("cut", json!({}));
+    assert_ne!(
+        plan(&rig, ADMIN, &cut).await.status(),
+        StatusCode::OK,
+        "a background take authorizes the Preview layout"
+    );
+    let arm = body("arm", json!({ "background": false, "keys": ["usk2"] }));
+    assert_eq!(
+        command(&rig, ADMIN, "arm", &arm).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    assert_eq!(plan(&rig, ADMIN, &cut).await.status(), StatusCode::OK);
+    assert_eq!(
+        command(&rig, ADMIN, "kcut", &cut).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 2);
+    let outcome = outcomes.try_recv().unwrap().event;
+    assert!(outcome.completed, "{outcome:?}");
+    assert!(on_air(&rig, 2));
+}

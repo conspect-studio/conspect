@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use multiview_core::switcher::{FrameCount, SourceRef, TransitionDescriptor};
+use multiview_engine::switcher_control::SwitcherSnapshot;
 use multiview_engine::switcher_control::{
     SelectionGuard, SwitcherCommand, SwitcherControl, SwitcherVerb,
 };
@@ -466,18 +467,27 @@ fn authorize_target(
 /// unauthorized source. When that Preview is `layout:<id>` the caller needs
 /// Read on the layout and on every source its registered body binds (one
 /// generic 403). `None` for any other verb, or before the first snapshot.
+///
+/// A key-only take (K3: the arm set excludes the background) moves neither
+/// bus, so it neither authorizes nor guards Preview (review R3-KEYONLY-1).
+/// The decision reads the same `snapshot` whose `arm_version` the take is
+/// bound to, so an arm change that adds the background makes the engine
+/// refuse the take (`arm-changed`) instead of taking an unguarded Preview.
 fn authorize_take_of_layout(
     state: &AppState,
     principal: &Principal,
-    handle: &SwitcherControl,
+    snapshot: Option<&SwitcherSnapshot>,
     req: &SwitcherRequest,
 ) -> ControlResult<Option<SelectionGuard>> {
     if !matches!(req.action.as_str(), "cut" | "auto") {
         return Ok(None);
     }
-    let Some(snapshot) = handle.snapshot() else {
+    let Some(snapshot) = snapshot else {
         return Ok(None);
     };
+    if !snapshot.next.background {
+        return Ok(None);
+    }
     let layout_revision = match snapshot.preview.as_str().strip_prefix("layout:") {
         Some(id) => Some(authorize_registered_layout(state, principal, id)?),
         None => None,
@@ -708,7 +718,10 @@ pub(crate) async fn plan_switcher(
     if let Some(Err(response)) = resolve_layout_select(&state, &principal, &req).await? {
         return Ok(response);
     }
-    authorize_take_of_layout(&state, &principal, handle, &req)?;
+    // One snapshot for the take's Preview authorization and its armed-set
+    // binding (review R3-KEYONLY-1).
+    let take_snapshot = handle.snapshot();
+    authorize_take_of_layout(&state, &principal, take_snapshot.as_deref(), &req)?;
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
@@ -790,12 +803,11 @@ pub(crate) async fn submit_switcher(
         }
         (_, registry) => registry,
     };
-    let take_guard = authorize_take_of_layout(&state, &principal, handle, &req)?;
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
     };
-    let mut expect = authorize_target(&state, &principal, &req, target.as_ref())?.or(take_guard);
+    let target_guard = authorize_target(&state, &principal, &req, target.as_ref())?;
     let verb = verb(&req, &kind, target.as_ref(), transition)?;
     // P3R2-C: authorization of every EXPLICIT request field and static
     // validation are done; an EXISTING reservation is a replay and answers
@@ -818,8 +830,21 @@ pub(crate) async fn submit_switcher(
     // of the request, so a replay (above) is not re-authorized against a set
     // another operator armed since; the original op already carries the
     // versions it was bound to.
+    //
+    // Review R3-IDEMP-1: the current Preview of a CUT/AUTO is engine state
+    // too, so its layout authorization and guard also run only for a NEW
+    // take, after the replay above, from the same snapshot the armed-set
+    // binding reads (a key-only take guards no Preview: R3-KEYONLY-1).
+    let take_snapshot = handle.snapshot();
+    let take_guard = authorize_take_of_layout(&state, &principal, take_snapshot.as_deref(), &req)?;
+    let mut expect = target_guard.or(take_guard);
     let bound = if matches!(kind.as_str(), "cut" | "auto") {
-        super::switcher_keyers::authorize_armed(&principal, &req.me, handle)?
+        super::switcher_keyers::authorize_armed_at(
+            &principal,
+            &req.me,
+            take_snapshot.as_deref(),
+            handle,
+        )?
     } else {
         None
     };

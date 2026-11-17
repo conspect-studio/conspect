@@ -284,7 +284,22 @@ pub fn authorize_armed(
     me: &str,
     handle: &SwitcherControl,
 ) -> ControlResult<Option<(u64, u64)>> {
-    let (Some(snapshot), Some(defs)) = (handle.snapshot(), handle.keyer_definitions()) else {
+    authorize_armed_at(principal, me, handle.snapshot().as_deref(), handle)
+}
+
+/// [`authorize_armed`] against a snapshot the caller already read (so the
+/// Preview decision and the arm binding come from one state).
+///
+/// # Errors
+/// As [`authorize_armed`]: a missing grant on an armed keyer object or its
+/// fill or key.
+pub fn authorize_armed_at(
+    principal: &Principal,
+    me: &str,
+    snapshot: Option<&SwitcherSnapshot>,
+    handle: &SwitcherControl,
+) -> ControlResult<Option<(u64, u64)>> {
+    let (Some(snapshot), Some(defs)) = (snapshot, handle.keyer_definitions()) else {
         return Ok(None);
     };
     for (slot, def) in defs.defs.iter().enumerate() {

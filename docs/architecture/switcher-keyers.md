@@ -1361,6 +1361,18 @@ merge (see "K1 GPU key path as built", wipe masks).
   figure is not recorded (`keyer_composite_bench` has no chroma case); the RTX 4060
   calibration is still owed by the lead as for K1.
 
+
+### K3 × #436 merge (stored layout as an M/E source)
+
+- A held take keeps both checks: K3's `Bound` versions (arm set, keyer definitions) and #436's
+  `SelectionGuard`. The guard rides the outer `SwitcherCommand` (`expect`) through the `Bound`
+  unwrap at drain; `guard_violated` exempts `Arm` and `Bound` (a held take holds the inner verb).
+- The current Preview of a CUT/AUTO is engine state like the armed set: its layout authorization
+  and guard run only for a NEW take, after the idempotent replay (review R3-IDEMP-1), from the same
+  snapshot the arm binding reads.
+- A key-only take (background not armed) moves neither bus, so it neither authorizes nor guards
+  Preview (review R3-KEYONLY-1). If an arm change adds the background before the take drains, the
+  bound arm version refuses it (`arm-changed`); it never takes an unguarded Preview.
 ### K3 × K7 merge (K3 branch merged with main after PR #507)
 
 - **`KeyParams` (96 bytes).** K3 put the WIPE merge in the existing `merge` / `dip_colour` lanes
