@@ -302,6 +302,7 @@ async fn switcher_run_adds_and_edits_network_sources_live_and_takes_them() {
                     operation_id: op.into(),
                     scene_version: 1,
                     verb,
+                    expect: None,
                 })
                 .unwrap();
             let done = tokio::time::timeout(Duration::from_secs(8), async {

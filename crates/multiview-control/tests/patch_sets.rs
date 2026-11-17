@@ -608,6 +608,42 @@ async fn duplicate_destinations_and_oversize_sets_are_422() {
     assert!(rig.fake.state.lock().unwrap().offered.is_empty());
 }
 
+/// A stored layout on a mixer input (#307) is registered, fenced and
+/// revision-guarded on the single-destination mixer take only: inside a
+/// multi-destination set it is refused 422 `unknown-source` by plan and take
+/// alike, and nothing reaches either engine half.
+#[tokio::test]
+async fn a_mixer_layout_member_in_a_set_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    store_layout(&rig, "NewsOne", "bars");
+    let body = set(vec![
+        video(0, bars()),
+        json!({ "plane": "video", "destination": {"mixer": "me1", "input": 4}, "source": {"layout": "NewsOne"} }),
+    ]);
+    for path in ["/api/v1/patch/plan", "/api/v1/patch/take"] {
+        let resp = send(&rig.router, post(path, OPERATOR_TOKEN, Some("ml"), &body)).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+        let problem = body_json(resp).await;
+        assert!(
+            problem["type"]
+                .as_str()
+                .unwrap()
+                .ends_with("unknown-source"),
+            "{problem}"
+        );
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap()
+                .contains("multi-destination set"),
+            "{problem}"
+        );
+    }
+    assert!(rig.fake.sets().is_empty(), "nothing reached the router");
+    assert_eq!(rig.state.patch_sets.pending_len(), 0, "no key burned");
+}
+
 /// More than four distinct layouts in one set is refused before any read.
 #[tokio::test]
 async fn at_most_four_layouts_are_read_per_set() {
