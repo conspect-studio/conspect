@@ -322,6 +322,7 @@ impl SwitcherControl {
             active_auto: None,
             active_auto_scenes: None,
             primed_stores: None,
+            live_stores: HashMap::new(),
             pending_take: None,
             armed: None,
             last_tick: 0,
@@ -476,6 +477,12 @@ pub struct SwitcherTickDriver {
     composed_count: Arc<std::sync::atomic::AtomicU64>,
     auto_capable: Arc<std::sync::atomic::AtomicBool>,
     primed_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    /// The Program drive's current store set (issue #464), owned by the
+    /// driver and resynced by the frame hook only when the drive's store
+    /// generation changes, so a source added live can be primed, patched,
+    /// taken and monitored. Consulted before the boot map: a source removed
+    /// and re-added live has a NEW store here. No shared state is read.
+    live_stores: HashMap<String, Arc<TileStore<Nv12Image>>>,
     pending_take: Option<(SwitcherCommand, u64)>,
     /// The armed mixer half of an atomic set (#308), if any.
     armed: Option<ArmedSet>,
@@ -630,10 +637,7 @@ impl SwitcherTickDriver {
             let on_bus = on_program || preview_input == Some(*number);
             match source {
                 Some(source) => {
-                    let known = self
-                        .primed_stores
-                        .as_ref()
-                        .is_some_and(|stores| stores.contains_key(source.as_str()));
+                    let known = self.store_for(source.as_str()).is_some();
                     if !known {
                         return Err(format!(
                             "unknown-source: {:?} has no frame store in this run",
@@ -714,6 +718,28 @@ impl SwitcherTickDriver {
         self.primed_stores = Some(stores);
     }
 
+    /// Resync the drive's current store set (issue #464). Called by the frame
+    /// hook on the clock only when the drive's store generation changed, i.e.
+    /// on an operator-paced live add/remove; the steady state never calls it.
+    /// Bounded by the drive's store count (the drain bounds that).
+    pub fn sync_live_stores(&mut self, stores: &HashMap<String, Arc<TileStore<Nv12Image>>>) {
+        self.live_stores.clone_from(stores);
+    }
+
+    /// The drive's current store for `source`, if any (the PVW monitor reads
+    /// this first).
+    #[must_use]
+    pub fn live_store(&self, source: &str) -> Option<&Arc<TileStore<Nv12Image>>> {
+        self.live_stores.get(source)
+    }
+
+    /// The store for `source`: the drive's current set first, then the boot
+    /// map. `None` when no prime map is installed.
+    fn store_for(&self, source: &str) -> Option<&Arc<TileStore<Nv12Image>>> {
+        let stores = self.primed_stores.as_ref()?;
+        self.live_stores.get(source).or_else(|| stores.get(source))
+    }
+
     /// Advertise AUTO. Called only by the frame hook that renders the
     /// dissolve inside the Program drive (ADR-0104 §3).
     pub fn advertise_auto(&self) {
@@ -725,10 +751,9 @@ impl SwitcherTickDriver {
     /// latch-and-classify rule (ADR-0104 §2). `None` when no store map is
     /// installed. Wait-free: atomic loads and a ring snapshot, no allocation.
     fn fresh_at(&self, source: &str, tick: Tick) -> Option<bool> {
-        let stores = self.primed_stores.as_ref()?;
+        self.primed_stores.as_ref()?;
         Some(
-            stores
-                .get(source)
+            self.store_for(source)
                 .is_some_and(|store| store.state_at(tick.pts).is_live()),
         )
     }

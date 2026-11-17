@@ -179,6 +179,8 @@ pub async fn apply_auto_decision(
     crate::routes::sources::apply_source_update(
         state,
         actor,
+        // The system auto-follow: no principal to redact for.
+        None,
         &decision.source_id,
         Some(&if_match),
         input,

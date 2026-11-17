@@ -1250,6 +1250,13 @@ mod tests {
         // completed. Its reservation must remain charged until the sink acks.
         assert_eq!(delivery.statuses()[0].reserved_packets, 1);
         drop(packet);
+        // The pump may still hold its local Arc of the lease briefly after
+        // sending (#385). Wait (bounded) only for that finite handoff, as the
+        // sibling test does; the reservation must still be released.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while delivery.statuses()[0].reserved_packets != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(delivery.statuses()[0].reserved_packets, 0);
     }
 
@@ -1371,8 +1378,10 @@ mod tests {
         // are briefly behind their sinks. With the same producer and the same
         // elapsed time the wedged binding's backlog must be strictly larger:
         // its pump is blocked on a sink that never reads, while its sibling's
-        // pump keeps handing whole windows to a sink that does.
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // pump keeps handing whole windows to a sink that does. The wait
+        // ends as soon as that holds; its bound only covers a loaded host's
+        // scheduling of the healthy pump and collector threads (#385).
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let statuses = delivery.statuses();
             let wedged = statuses[0].reserved_packets + statuses[0].queued_windows;
