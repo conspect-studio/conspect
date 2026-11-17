@@ -389,11 +389,13 @@ impl FeedWorker {
                 }
                 StreamKind::Audio => {
                     let (base, span) = self.audio?;
-                    out.push((Component::Audio, tick_of(pts, base, self.cadence)?));
-                    out.push((
-                        Component::Audio,
-                        tick_of(pts.checked_add(span - 1)?, base, self.cadence)?,
-                    ));
+                    // Every tick the frame covers (three at 60 fps).
+                    let first = tick_of(pts, base, self.cadence)?;
+                    let last = tick_of(pts.checked_add(span - 1)?, base, self.cadence)?;
+                    if last < first || last - first > 64 {
+                        return None;
+                    }
+                    out.extend((first..=last).map(|t| (Component::Audio, t)));
                 }
                 // The WebRTC rung carries the program-audio slot only.
                 _ => {}
