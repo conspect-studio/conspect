@@ -2992,8 +2992,9 @@ pub enum Output {
         /// consumes** to a stable GPU ([`DevicePin`], ADR-0018 §2.1).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         gpu_pin: Option<DevicePin>,
-        /// Per-output audio selection. A cast stream carries the program
-        /// audio only: discrete tracks are rejected at validation.
+        /// Per-output audio selection, with the HLS rules: every selected
+        /// track becomes one CMAF audio rendition of the cast stream and the
+        /// receiver plays one at a time (#418).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         audio: Option<OutputAudio>,
         /// Per-output declarative metadata intent (ADR-0088). A cast stream
@@ -3008,8 +3009,10 @@ pub enum Output {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         format: Option<OutputFormat>,
         /// The output's media slots (ADR-0110 / §12.3): at most one H.264
-        /// video slot and one (program) audio slot. Absent ⇒ one video slot
-        /// with the output's codec and one program audio slot.
+        /// video slot, any number of audio slots (one CMAF audio rendition
+        /// each) and up to [`MAX_SUBTITLE_SLOTS`](crate::MAX_SUBTITLE_SLOTS)
+        /// `webvtt` subtitle slots (one `WebVTT` rendition each). Absent ⇒ one
+        /// video slot with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
     },
@@ -3432,8 +3435,9 @@ impl Output {
             Output::RtspServer { .. } | Output::Srt { .. } | Output::Rist { .. } => {
                 OutputAudioCapability::new(TrackDelivery::Simultaneous, TrackCapacity::Unlimited)
             }
-            // HLS/LL-HLS: N renditions, but the player plays one at a time.
-            Output::Hls { .. } | Output::LlHls { .. } => {
+            // HLS/LL-HLS and a cast stream (ADR-0111, #418): N renditions, but
+            // the player plays one at a time.
+            Output::Hls { .. } | Output::LlHls { .. } | Output::Cast { .. } => {
                 OutputAudioCapability::new(TrackDelivery::SelectOne, TrackCapacity::Unlimited)
             }
             // NDI, AES67 / ST 2110-30, and a local display head all carry one
@@ -3441,12 +3445,7 @@ impl Output {
             // a discrete-track route is a capability error for any of them.
             // (HDMI/DP audio is the sink's ELD-gated LPCM channel map; multiple
             // program tracks would be multiple heads/senders/sessions.)
-            // A cast stream has exactly one audio rendition (the program
-            // audio), so a discrete-track selection is a capability error too.
-            Output::Ndi { .. }
-            | Output::Aes67 { .. }
-            | Output::Display { .. }
-            | Output::Cast { .. } => {
+            Output::Ndi { .. } | Output::Aes67 { .. } | Output::Display { .. } => {
                 OutputAudioCapability::new(TrackDelivery::None, TrackCapacity::AtMost(0))
             }
             // WebRTC (WHEP serve and WHIP push): one Opus m-line per session —

@@ -2,7 +2,8 @@
 //! in memory while no cast stream is active.
 //!
 //! Whole GOPs only: a GOP starts at an IDR and holds every video and audio
-//! packet that arrived until the next IDR. The ring is bounded twice. By
+//! packet (of every audio rendition, each tagged with its rendition index)
+//! that arrived until the next IDR. All renditions share the bounds below. The ring is bounded twice. By
 //! time: the oldest GOP goes as soon as the GOPs after it still cover the
 //! configured duration, so the ring holds at least that duration (once the
 //! output has run that long) and at most one GOP more. By memory: over the
@@ -22,14 +23,16 @@ const PACKET_OVERHEAD: usize = 64;
 /// two AAC frames at 48 kHz).
 const AUDIO_CARRY_NANOS: i64 = 50_000_000;
 const NANOS: Rational = Rational::new(1, 1_000_000_000);
+/// The AAC encoder's time base (`1/sample_rate`, 48 kHz).
+const DEFAULT_AUDIO_TB: Rational = Rational::new(1, 48_000);
 
 /// Which elementary stream a buffered packet belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RingKind {
     /// An H.264 access unit.
     Video,
-    /// A program-audio AAC frame.
-    Audio,
+    /// An AAC frame of the audio rendition with this index (#418).
+    Audio(usize),
 }
 
 /// One buffered packet: a copy of the payload with its timing and flags.
@@ -77,7 +80,8 @@ pub(crate) struct Preroll {
 #[derive(Debug)]
 pub(crate) struct PrerollRing {
     video_tb: Rational,
-    audio_tb: Rational,
+    /// Per audio rendition; a rendition without an entry uses 1/48000.
+    audio_tbs: Vec<Rational>,
     max_nanos: i64,
     max_bytes: usize,
     gops: VecDeque<Gop>,
@@ -88,18 +92,18 @@ pub(crate) struct PrerollRing {
 }
 
 impl PrerollRing {
-    /// A ring for video packets in `video_tb` and audio packets in
-    /// `audio_tb` (seconds per timestamp unit), holding about `max_nanos` of
-    /// media and at most `max_bytes`.
+    /// A ring for video packets in `video_tb` and the packets of audio
+    /// rendition `i` in `audio_tbs[i]` (seconds per timestamp unit), holding
+    /// about `max_nanos` of media and at most `max_bytes`.
     pub(crate) fn new(
         video_tb: Rational,
-        audio_tb: Rational,
+        audio_tbs: Vec<Rational>,
         max_nanos: i64,
         max_bytes: usize,
     ) -> Self {
         Self {
             video_tb,
-            audio_tb,
+            audio_tbs,
             max_nanos,
             max_bytes,
             gops: VecDeque::new(),
@@ -171,12 +175,19 @@ impl PrerollRing {
             return;
         };
         let keep_from = next.start_ns.saturating_sub(AUDIO_CARRY_NANOS);
-        let audio_tb = self.audio_tb;
+        let audio_tbs = &self.audio_tbs;
         let mut carried: Vec<RingPacket> = gone
             .packets
             .into_iter()
-            .filter(|packet| {
-                packet.kind == RingKind::Audio && rescale(packet.pts, audio_tb, NANOS) >= keep_from
+            .filter(|packet| match packet.kind {
+                RingKind::Audio(rendition) => {
+                    let tb = audio_tbs
+                        .get(rendition)
+                        .copied()
+                        .unwrap_or(DEFAULT_AUDIO_TB);
+                    rescale(packet.pts, tb, NANOS) >= keep_from
+                }
+                RingKind::Video => false,
             })
             .collect();
         if carried.is_empty() {
@@ -272,7 +283,7 @@ mod tests {
 
     fn audio(frame: i64) -> RingPacket {
         RingPacket {
-            kind: RingKind::Audio,
+            kind: RingKind::Audio(0),
             pts: frame * 1024,
             dts: frame * 1024,
             keyframe: false,
@@ -295,7 +306,7 @@ mod tests {
 
     #[test]
     fn it_starts_at_an_idr_and_holds_whole_gops() {
-        let mut ring = PrerollRing::new(VIDEO_TB, AUDIO_TB, 20 * SECOND, 1 << 30);
+        let mut ring = PrerollRing::new(VIDEO_TB, vec![AUDIO_TB], 20 * SECOND, 1 << 30);
         // Nothing is kept before the first IDR, audio included.
         ring.push_audio(audio(0));
         ring.push_video(video(3, false, 10), 0);
@@ -322,7 +333,7 @@ mod tests {
 
     #[test]
     fn it_holds_between_20_and_21_seconds_whatever_the_run_length() {
-        let mut ring = PrerollRing::new(VIDEO_TB, AUDIO_TB, 20 * SECOND, 1 << 30);
+        let mut ring = PrerollRing::new(VIDEO_TB, vec![AUDIO_TB], 20 * SECOND, 1 << 30);
         let mut next_audio = 0;
         let mut peak = 0;
         for chunk in 0..200 {
@@ -346,7 +357,7 @@ mod tests {
     #[test]
     fn the_byte_cap_evicts_the_oldest_gops_and_an_oversized_gop_empties_the_ring() {
         let gop_bytes = 25 * (1000 + PACKET_OVERHEAD);
-        let mut ring = PrerollRing::new(VIDEO_TB, AUDIO_TB, 20 * SECOND, 3 * gop_bytes);
+        let mut ring = PrerollRing::new(VIDEO_TB, vec![AUDIO_TB], 20 * SECOND, 3 * gop_bytes);
         for index in 0..250 {
             ring.push_video(video(index, index % 25 == 0, 1000), 0);
             assert!(ring.bytes() <= 3 * gop_bytes, "{}", ring.bytes());
@@ -358,7 +369,7 @@ mod tests {
 
         // No IDR for a long time: the single open GOP outgrows the cap and
         // the ring empties; it refills only from the next IDR.
-        let mut ring = PrerollRing::new(VIDEO_TB, AUDIO_TB, 20 * SECOND, 10_000);
+        let mut ring = PrerollRing::new(VIDEO_TB, vec![AUDIO_TB], 20 * SECOND, 10_000);
         ring.push_video(video(0, true, 1000), 0);
         for index in 1..200 {
             ring.push_video(video(index, false, 1000), 0);
@@ -368,7 +379,7 @@ mod tests {
         ring.push_video(video(200, true, 1000), 0);
         assert_eq!(ring.gops(), 1);
         // A flood of empty packets is bounded by the per-packet charge.
-        let mut ring = PrerollRing::new(VIDEO_TB, AUDIO_TB, 20 * SECOND, 10_000);
+        let mut ring = PrerollRing::new(VIDEO_TB, vec![AUDIO_TB], 20 * SECOND, 10_000);
         ring.push_video(video(0, true, 0), 0);
         for index in 1..10_000 {
             ring.push_video(video(index, false, 0), 0);
@@ -378,7 +389,7 @@ mod tests {
 
     #[test]
     fn clear_and_a_backwards_timestamp_drop_everything() {
-        let mut ring = PrerollRing::new(VIDEO_TB, AUDIO_TB, 20 * SECOND, 1 << 30);
+        let mut ring = PrerollRing::new(VIDEO_TB, vec![AUDIO_TB], 20 * SECOND, 1 << 30);
         let mut next_audio = 0;
         feed(&mut ring, 0..60, &mut next_audio);
         assert_eq!(ring.gops(), 3);
@@ -400,7 +411,7 @@ mod tests {
     #[test]
     fn audio_that_runs_ahead_of_video_stays_with_the_gop_it_belongs_to() {
         // Audio arrives 2 frames (43 ms) before the video of the same time.
-        let mut ring = PrerollRing::new(VIDEO_TB, AUDIO_TB, 2 * SECOND, 1 << 30);
+        let mut ring = PrerollRing::new(VIDEO_TB, vec![AUDIO_TB], 2 * SECOND, 1 << 30);
         let mut next_audio = 0;
         for index in 0..200 {
             while next_audio * 1024 * 25 < (index + 1) * 48_000 + 2 * 1024 * 25 {
@@ -416,7 +427,7 @@ mod tests {
         let earliest_audio = preroll
             .packets
             .iter()
-            .filter(|p| p.kind == RingKind::Audio)
+            .filter(|p| p.kind == RingKind::Audio(0))
             .map(|p| p.pts)
             .min()
             .unwrap();
@@ -430,7 +441,7 @@ mod tests {
         let audio_pts: Vec<i64> = preroll
             .packets
             .iter()
-            .filter(|p| p.kind == RingKind::Audio)
+            .filter(|p| p.kind == RingKind::Audio(0))
             .map(|p| p.pts)
             .collect();
         assert!(audio_pts.windows(2).all(|w| w[0] < w[1]));

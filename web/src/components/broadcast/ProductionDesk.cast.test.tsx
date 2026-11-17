@@ -7,7 +7,7 @@ vi.mock('../../realtime/useEngineEvents', () => ({ useEngineEvents: () => ({ sta
 vi.mock('../../preview/PreviewSurface', () => ({ PreviewSurface: () => null }));
 vi.mock('../../preview/useJpegPreview', () => ({ useJpegPreview: () => undefined, useJpegStill: () => ({ url: undefined, state: 'loading' }) }));
 
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
@@ -17,9 +17,11 @@ import { renderWithProviders } from '../../test/render';
 import { resetCastSdkLoaderForTests } from '../../cast/sdkLoader';
 import { installMemoryStorage } from '../../cast/testApi';
 import { installMockCastSdk } from '../../cast/testMocks';
+import type { MockCastSdk } from '../../cast/testMocks';
 import { ProductionDesk } from './ProductionDesk';
 
 const created: unknown[] = [];
+let refuseCreate = true;
 
 const server = setupServer(
   http.get('*/api/v1/switcher/me1', () => HttpResponse.json({ program_source: 'cam-1', preview_source: 'cam-2', tick: 1, in_flight: false })),
@@ -33,18 +35,36 @@ const server = setupServer(
   http.get('*/api/v1/cast/streams', () => HttpResponse.json([])),
   http.post('*/api/v1/cast/streams', async ({ request }) => {
     created.push(await request.json());
-    return HttpResponse.json({ type: '/problems/cast-capacity', title: 'Cast refused', status: 409, detail: 'busy' }, { status: 409 });
+    if (refuseCreate) {
+      return HttpResponse.json({ type: '/problems/cast-capacity', title: 'Cast refused', status: 409, detail: 'busy' }, { status: 409 });
+    }
+    return HttpResponse.json({
+      id: 'cs-1',
+      output: 'cast-1',
+      feed: {},
+      path: '/cast/token-1/master.m3u8',
+      content_type: 'application/vnd.apple.mpegurl',
+      hls_segment_format: 'fmp4',
+      hls_video_segment_format: 'fmp4',
+      ready: true,
+      segments: 12,
+      expires_unix_ms: 0,
+      fetches: { playlists: 0, segments: 0, cast_device: false },
+    }, { status: 201 });
   }),
 );
 
 beforeAll(() => {
   server.listen();
 });
+let sdk: MockCastSdk;
+
 beforeEach(() => {
   installMemoryStorage();
   resetCastSdkLoaderForTests();
-  installMockCastSdk();
+  sdk = installMockCastSdk();
   created.length = 0;
+  refuseCreate = true;
 });
 afterEach(() => {
   server.resetHandlers();
@@ -79,5 +99,36 @@ describe('ProductionDesk Cast buttons', () => {
     // The refusal shows as the Retry button's name/title, never opens the picker.
     expect(await within(pvwSlot).findByRole('button', { name: 'Retry cast: Preview' })).toBeInTheDocument();
     expect(screen.getAllByRole('alert').some((n) => n.textContent.includes('Every cast output is in use'))).toBe(true);
+  });
+
+  it('opens the Cast panel (Video/Audio/Subtitles pickers) from the desk once a cast is active', async () => {
+    refuseCreate = false;
+    const user = userEvent.setup();
+    const { container } = renderWithProviders(<MemoryRouter><ProductionDesk /></MemoryRouter>);
+    const pgmSlot = container.querySelector<HTMLElement>('[data-monitor-actions="program"]');
+    if (pgmSlot === null) throw new Error('monitor action slot missing');
+    const pgm = await within(pgmSlot).findByRole('button', { name: 'Cast: Program' });
+    await waitFor(() => {
+      expect(pgm).toBeEnabled();
+    });
+    await user.click(pgm);
+    await waitFor(() => {
+      expect(sdk.loadMedia).toHaveBeenCalledTimes(1);
+    });
+    const settingsButton = await within(pgmSlot).findByRole('button', { name: 'Cast settings' });
+    await user.click(settingsButton);
+    expect(await screen.findByText('Casting from this browser')).toBeInTheDocument();
+    // Only one audio track so far: Audio/Subtitles stay hidden.
+    expect(screen.queryByLabelText('Audio')).toBeNull();
+    act(() => {
+      sdk.emitTracks(
+        [
+          { trackId: 1, type: 'AUDIO', name: 'English', language: 'en' },
+          { trackId: 2, type: 'AUDIO', name: 'French', language: 'fr' },
+        ],
+        [1],
+      );
+    });
+    expect(await screen.findByLabelText('Audio')).toBeInTheDocument();
   });
 });

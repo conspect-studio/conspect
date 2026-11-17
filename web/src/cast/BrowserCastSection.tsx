@@ -98,7 +98,7 @@ export function BrowserCastSection(): JSX.Element {
             </div>
             {target !== null ? <CastButton target={target} /> : null}
           </div>
-          <ActiveCastCard options={options} />
+          <ActiveCastCard options={options} outputs={config.data.outputs} />
         </>
       )}
       <p className="text-xs text-muted-foreground">

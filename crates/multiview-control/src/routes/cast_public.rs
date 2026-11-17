@@ -132,14 +132,33 @@ async fn preflight(
     with_cors(no_store(response), headers.get(header::ORIGIN))
 }
 
-/// The directory of the active cast output `config_id`.
-fn output_dir(state: &AppState, config_id: &str) -> Option<std::path::PathBuf> {
+/// The directory of the active cast output `config_id`, when `file` may be
+/// served from it now: a file whose name carries a generation (segments,
+/// init files, `.vtt`) only when that is the output's CURRENT generation
+/// (#418 review ABUSE-HISTORY-R4: a stale file a best-effort purge left
+/// behind, of a superseded activation or a failed packager, is never
+/// served). Playlists carry none: they are always the current activation's.
+/// A disabled output serves nothing (#418 review r7: files it could not
+/// remove may be left in its directory).
+fn output_dir(state: &AppState, config_id: &str, file: &str) -> Option<std::path::PathBuf> {
     let engine = state.cast_engine.as_ref()?;
-    engine
+    let output = engine
         .outputs()
         .into_iter()
-        .find(|o| o.id == config_id && o.active)
-        .map(|o| o.dir)
+        .find(|o| o.id == config_id && o.active && !o.disabled)?;
+    current_generation_file(file, output.generation).then_some(output.dir)
+}
+
+/// Whether `file` may be served while the output's files are of
+/// `generation`: a playlist always, a generation-carrying media file only
+/// of that generation.
+fn current_generation_file(file: &str, generation: u64) -> bool {
+    let playlist = std::path::Path::new(file)
+        .extension()
+        .is_some_and(|e| e == "m3u8");
+    playlist
+        || multiview_output::hls::cast::packager_file_generation(file)
+            .is_some_and(|g| g != 0 && g == generation)
 }
 
 async fn media(
@@ -176,7 +195,7 @@ async fn serve_media(
     let Some((stream_id, config_id)) = state.cast_streams.serve(&token) else {
         return not_found();
     };
-    let Some(dir) = output_dir(state, &config_id) else {
+    let Some(dir) = output_dir(state, &config_id, &file) else {
         return not_found();
     };
     state.cast_streams.run_before_open().await;
@@ -199,7 +218,9 @@ async fn serve_media(
     // byte is released. On failure the open handle is dropped unread and
     // the answer is the generic 404.
     crate::cast_streams::reauth::on_media(state, &config_id);
-    if state.cast_streams.serve(&token).as_ref() != Some(&(stream_id.clone(), config_id.clone())) {
+    if state.cast_streams.serve(&token).as_ref() != Some(&(stream_id.clone(), config_id.clone()))
+        || output_dir(state, &config_id, &file).is_none()
+    {
         return not_found();
     }
     if status.is_success() || status == StatusCode::NOT_MODIFIED {
