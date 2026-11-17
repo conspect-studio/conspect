@@ -617,11 +617,7 @@ pub async fn commit_resource(
             output_ids.retain(|existing| existing != id);
         }
     }
-    let intended = if is_create {
-        IntendedRemovals::Nothing
-    } else {
-        IntendedRemovals::Resource(key, id)
-    };
+    let intended = IntendedRemovals::for_resource(is_create, key, id);
     commit_desired_with_output_ids(
         state,
         config,
@@ -814,7 +810,17 @@ enum IntendedRemovals<'a> {
     Families(&'a [&'a str]),
 }
 
-impl IntendedRemovals<'_> {
+impl<'a> IntendedRemovals<'a> {
+    /// A `commit_resource` replacement (`is_create`) names no removal; a
+    /// delete names exactly `(key, id)`.
+    const fn for_resource(is_create: bool, key: &'a str, id: &'a str) -> Self {
+        if is_create {
+            Self::Nothing
+        } else {
+            Self::Resource(key, id)
+        }
+    }
+
     fn covers(self, key: &str, id: &str) -> bool {
         match self {
             Self::Nothing => false,
@@ -863,6 +869,31 @@ fn removed_identities(
         );
     }
     Ok(removed)
+}
+
+/// The identities a prospective commit drops, against the previous envelope or,
+/// before the first one, the document the run started from.
+fn removed_by_commit(
+    state: &AppState,
+    model: &BootModel,
+    previous: Option<&DesiredState>,
+    config: &MultiviewConfig,
+    output_ids: &[String],
+) -> ControlResult<Vec<(&'static str, String)>> {
+    if let Some(prior) = previous {
+        return removed_identities(&prior.config, &prior.output_ids, config, output_ids);
+    }
+    let Some(base) = current_desired_config(state)
+        .ok()
+        .and_then(|value| serde_json::from_value::<MultiviewConfig>(value).ok())
+    else {
+        return Ok(Vec::new());
+    };
+    let base_ids = current_output_ids(state, model)?;
+    if base_ids.len() != base.outputs.len() {
+        return Ok(Vec::new());
+    }
+    removed_identities(&base, &base_ids, config, output_ids)
 }
 
 /// Make every removal a commit carried visible (issue #519): an intended
@@ -919,25 +950,7 @@ async fn commit_desired_document_named(
     // Issue #519: what this commit drops from the accepted state, against the
     // previous envelope (or, before the first one, the document the run
     // started from), so no removal is ever silent.
-    let removed = match &previous {
-        Some(prior) => removed_identities(&prior.config, &prior.output_ids, &config, &output_ids)?,
-        None => {
-            let base = current_desired_config(state)
-                .ok()
-                .and_then(|value| serde_json::from_value::<MultiviewConfig>(value).ok());
-            match base {
-                Some(base) => {
-                    let base_ids = current_output_ids(state, model)?;
-                    if base_ids.len() == base.outputs.len() {
-                        removed_identities(&base, &base_ids, &config, &output_ids)?
-                    } else {
-                        Vec::new()
-                    }
-                }
-                None => Vec::new(),
-            }
-        }
-    };
+    let removed = removed_by_commit(state, model, previous.as_deref(), &config, &output_ids)?;
     if previous.is_none() && !layouts.iter().any(|layout| layout.id == selected_layout_id) {
         layouts.push(crate::repository::Layout {
             id: selected_layout_id.clone(),
