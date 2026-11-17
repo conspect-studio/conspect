@@ -1363,3 +1363,234 @@ fn a_foreign_directory_disables_the_cast_output_without_touching_it_or_the_run()
         Err(CastEngineError::NotRunning)
     );
 }
+
+/// One HTTP/1.1 request on a fresh connection; the status code (0 when the
+/// connection failed). Plain std I/O: the flood threads are not tokio.
+fn http_status(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    auth: Option<&str>,
+    body: &str,
+) -> u16 {
+    use std::io::{Read as _, Write as _};
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) else {
+        return 0;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let auth = auth.map_or_else(String::new, |token| {
+        format!("Authorization: Bearer {token}\r\n")
+    });
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: [::1]\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return 0;
+    }
+    let mut head = [0_u8; 12];
+    if stream.read_exact(&mut head).is_err() {
+        return 0;
+    }
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest);
+    std::str::from_utf8(&head[9..12])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The body of a `201` create answer: the token path.
+fn create_stream(addr: std::net::SocketAddr, token: &str) -> String {
+    use std::io::{Read as _, Write as _};
+    let body = "{\"feed\":{\"bus\":\"program\"}}";
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    write!(
+        stream,
+        "POST /api/v1/cast/streams HTTP/1.1\r\nHost: [::1]\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 201"), "{answer}");
+    let json = answer.split("\r\n\r\n").nth(1).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(json).unwrap();
+    doc["path"].as_str().unwrap().to_owned()
+}
+
+/// The control plane (the real router, served on `[::1]`) over this run's
+/// cast and routing slots, as `multiview run` wires it.
+fn serve_control(
+    cast: &CastOutputEntry,
+    routing: Arc<OutputRoutingHandle>,
+) -> (std::net::SocketAddr, tokio::runtime::Runtime) {
+    use multiview_control::auth::{ApiKeyStore, Principal, Role};
+    let config = multiview_config::MultiviewConfig::load_from_toml(
+        &CONFIG.replace('@', "cast_l").replace('%', "/nonexistent"),
+    )
+    .unwrap();
+    let mut keys = ApiKeyStore::new(b"chaos-pepper".to_vec());
+    keys.register(
+        "op",
+        "op-secret",
+        Principal {
+            key_id: "op".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: None,
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        },
+    );
+    let cast_slot = super::cast_outputs_slot();
+    cast_slot.store(Arc::new(vec![cast.clone()]));
+    let routing_slot = crate::output_routing::output_routing_slot();
+    routing_slot.store(Some(routing));
+    let publisher = Arc::new(multiview_engine::EnginePublisher::<
+        multiview_control::EngineStateSnapshot,
+        multiview_events::Event,
+    >::new(8));
+    let (commands, _rx) = multiview_control::command_bus(8);
+    let state = multiview_control::AppState::new(
+        publisher,
+        commands,
+        Arc::new(multiview_control::InMemoryRepository::new()),
+        Arc::new(keys),
+    )
+    .with_seeded_resources(multiview_control::seed_resources(&config).unwrap())
+    .with_base_document(serde_json::to_value(&config).unwrap())
+    .with_output_routing(Arc::new(
+        crate::output_routing_control::OutputRoutingAdapter::new(routing_slot),
+    ))
+    .with_cast_engine(Arc::new(super::CastEngineAdapter(cast_slot)));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("[::1]:0"))
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    runtime.spawn(multiview_control::serve(
+        listener,
+        state,
+        std::future::pending::<()>(),
+    ));
+    (addr, runtime)
+}
+
+/// What the ladder flood saw.
+#[derive(Default)]
+struct Flood {
+    /// Status code -> count, over every flood call.
+    statuses: std::collections::BTreeMap<u16, u64>,
+    /// The clock pair of the first answered probe (`media_us`), when the
+    /// run had an epoch.
+    answered: u64,
+}
+
+/// (l) R3 chaos test, invariants #1 and #10 (ADR-0114 slice 2): a flood of
+/// ladder calls (valid, invalid, oversized, unknown-token, over the rate)
+/// through the real control plane, on a live cast of the real pipeline,
+/// costs the output clock zero ticks and the HLS output zero packets. The
+/// same isolation assertions as (e), with the same control run and the
+/// negative controls (n) proving they see a shared stall.
+#[test]
+fn l_a_ladder_flood_costs_the_clock_zero_ticks_and_the_hls_output_zero_packets() {
+    let control = chaos_run("cast_l0", Setup::LIVE, None, None);
+    let seen = Arc::new(Mutex::new((ChaosSeen::default(), Flood::default())));
+    let record = Arc::clone(&seen);
+    let run = bounded(Duration::from_secs(120), move || {
+        drive_in(
+            "cast_l1",
+            Until::Ticks(CHAOS_TICKS),
+            Setup::LIVE,
+            |_| {},
+            move |ctl| {
+                let (addr, runtime) = serve_control(&ctl.cast, Arc::clone(&ctl.routing));
+                ctl.wait_tick(CHAOS_AT);
+                // The real create route activates the cast output.
+                let path = create_stream(addr, "op.op-secret");
+                let token = path.split('/').nth(2).unwrap().to_owned();
+                let stop = Arc::new(AtomicBool::new(false));
+                let bodies = [
+                "{\"v\":1,\"receiver\":{\"kind\":\"web\"},\"caps\":{\"wt\":false,\"mse\":true,\"rvfc\":true,\"frames\":\"rvfc\"},\"clock\":{\"t0\":1}}".to_owned(),
+                "{\"v\":1,\"clock\":{\"t0\":1}}".to_owned(),
+                "{\"v\":1,\"caps\":{\"wt\":\"yes\"}}".to_owned(),
+                format!("{{\"v\":1,\"pad\":\"{}\"}}", "x".repeat(4000)),
+                "[not json".to_owned(),
+            ];
+                let flooders: Vec<_> = (0..8)
+                    .map(|i| {
+                        let (stop, token, bodies) =
+                            (Arc::clone(&stop), token.clone(), bodies.clone());
+                        std::thread::spawn(move || {
+                            let mut statuses = std::collections::BTreeMap::<u16, u64>::new();
+                            let mut n = i;
+                            while !stop.load(Ordering::Acquire) {
+                                n += 1;
+                                let target = if n % 7 == 0 {
+                                    "C".repeat(43)
+                                } else {
+                                    token.clone()
+                                };
+                                let status = http_status(
+                                    addr,
+                                    "POST",
+                                    &format!("/cast/{target}/ladder"),
+                                    None,
+                                    &bodies[n % bodies.len()],
+                                );
+                                *statuses.entry(status).or_insert(0) += 1;
+                            }
+                            statuses
+                        })
+                    })
+                    .collect();
+                let progress = ctl.sample_progress(CHAOS_TICKS);
+                stop.store(true, Ordering::Release);
+                let mut flood = Flood::default();
+                for flooder in flooders {
+                    for (status, count) in flooder.join().unwrap() {
+                        *flood.statuses.entry(status).or_insert(0) += count;
+                    }
+                }
+                flood.answered = flood.statuses.get(&200).copied().unwrap_or(0);
+                let mut seen = record.lock().unwrap();
+                seen.0.progress = progress;
+                seen.0.status = Some(ctl.cast.gate.status());
+                seen.1 = flood;
+                runtime.shutdown_background();
+            },
+        )
+    });
+    let (seen, flood) = std::mem::take(&mut *seen.lock().unwrap());
+    assert_unaffected(&control, &run, &seen);
+    let total: u64 = flood.statuses.values().sum();
+    assert!(total >= 200, "the flood ran: {:?}", flood.statuses);
+    assert!(
+        flood.answered >= 1,
+        "some calls were answered: {:?}",
+        flood.statuses
+    );
+    assert!(
+        flood.statuses.get(&429).copied().unwrap_or(0) > flood.answered,
+        "the per-token rate refused most of the flood: {:?}",
+        flood.statuses
+    );
+    assert!(
+        flood.statuses.get(&404).copied().unwrap_or(0) > 0,
+        "unknown tokens: {:?}",
+        flood.statuses
+    );
+    let status = seen.status.unwrap();
+    assert!(
+        status.active,
+        "the cast was live during the flood: {status:?}"
+    );
+    assert!(run.cast_packets > 0, "the cast sink received packets");
+}

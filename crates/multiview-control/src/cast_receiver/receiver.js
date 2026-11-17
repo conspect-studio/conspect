@@ -237,8 +237,15 @@
       shaka: shakaVersion(),
       caf: String(cast.framework.VERSION || ''),
       device: String(navigator.userAgent).slice(0, 200),
+      transport: ladder('transport'),
       at_ms: now()
     };
+  }
+
+  /** probe.js (ADR-0114 slice 2), when it loaded: ladder('start', opts), ladder('stop'), ladder('transport'). */
+  function ladder(what, opts) {
+    var p = window.ConspectProbe;
+    try { return p && typeof p[what] === 'function' ? p[what](opts) || null : null; } catch (e) { return null; }
   }
 
   function broadcast(report, senderId) {
@@ -385,6 +392,7 @@
   function endCast(status) {
     if (terminal) { return; }
     terminal = true;
+    ladder('stop');
     retryTimer = clear(retryTimer);
     bufferingTimer = clear(bufferingTimer);
     var base = lastError || {};
@@ -491,6 +499,7 @@
     // A sender stopped the stream.
     if (state === 'error' && !current) { return; }   // keep the rejected-LOAD screen
     current = null;
+    ladder('stop');
     lastError = null;
     retryTimer = clear(retryTimer);
     loadGeneration += 1;    // invalidates every probe/report in flight for the stream that just stopped (MEDIA-2)
@@ -733,7 +742,14 @@
     info('LOAD accepted: stream', parsed.tag, mine ? '(retry ' + retryCount + ')' : '', 'title:', current.title);
     if (!mine) {
       // One GET of master.m3u8: learns the H.264 profile/level for the decode message and ends at once on a dead token.
-      probe(function (status) { if (gone(status)) { endCast(status); } });
+      var loadUs = window.performance && performance.now ? (performance.timeOrigin || 0) * 1000 + performance.now() * 1000 : null;
+      ladder('stop');
+      probe(function (status, text) {
+        if (gone(status)) { endCast(status); return; }
+        if (status === 200) {
+          ladder('start', { base: current.base, master: text, video: mediaElement, playerManager: playerManager, loadUs: loadUs });
+        }
+      });
     }
     if (custom.debug === true) { loadDebugOverlay(); }
     setState('loading', 'load accepted');

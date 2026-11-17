@@ -23,6 +23,7 @@
 //! Isolation (invariant #10): one short `Mutex`, never held across an
 //! `.await`; nothing here touches an engine channel.
 
+pub mod ladder;
 pub mod lifecycle;
 pub(crate) mod reauth;
 mod registry;
@@ -34,7 +35,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use registry::Registry;
-pub use registry::{Claim, ClaimError, Ended, ReportError, StreamView};
+pub use registry::{Admitted, Claim, ClaimError, Ended, LadderError, ReportError, StreamView};
 
 /// A never-fetched token expires this long after creation.
 pub const PENDING_TTL: Duration = Duration::from_secs(90);
@@ -161,6 +162,8 @@ pub struct CastStreams {
     sweeper: std::sync::atomic::AtomicBool,
     /// The registered custom receiver app id (8 upper-case hex characters).
     app_id: Mutex<Option<String>>,
+    /// The rungs `[cast] ladder` enables, best first (ADR-0114).
+    ladder: Mutex<Vec<String>>,
     #[cfg(any(test, feature = "_test-seams"))]
     before_arm: Mutex<Option<ArmHook>>,
     #[cfg(any(test, feature = "_test-seams"))]
@@ -197,6 +200,7 @@ impl CastStreams {
             clock,
             sweeper: std::sync::atomic::AtomicBool::new(false),
             app_id: Mutex::new(None),
+            ladder: Mutex::new(vec!["hls".to_owned()]),
             #[cfg(any(test, feature = "_test-seams"))]
             before_arm: Mutex::new(None),
             #[cfg(any(test, feature = "_test-seams"))]
@@ -217,6 +221,21 @@ impl CastStreams {
     #[must_use]
     pub fn receiver_app_id(&self) -> Option<String> {
         self.app_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Set the rungs `[cast] ladder` enables, best first (already
+    /// validated).
+    pub fn set_ladder(&self, ladder: Vec<String>) {
+        *self.ladder.lock().unwrap_or_else(PoisonError::into_inner) = ladder;
+    }
+
+    /// The rungs `[cast] ladder` enables, best first.
+    #[must_use]
+    pub fn ladder(&self) -> Vec<String> {
+        self.ladder
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()

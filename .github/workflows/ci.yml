@@ -853,6 +853,8 @@ jobs:
             2>&1 | tee cast-pipeline-tests.log
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed;' cast-pipeline-tests.log
           npm ci --prefix tools/cast-proof --no-audit --no-fund
+          # The receiver's probe.js: clock, latency windows, ES5-only (gating, no browser).
+          node tools/cast-proof/test-probe-unit.mjs
           export CHROME_PATH=/usr/bin/chromium
           status=0
           # Playback proof: reported, not gating (see the job comment).

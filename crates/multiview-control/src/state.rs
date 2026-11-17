@@ -1611,6 +1611,13 @@ impl AppState {
         self
     }
 
+    /// Set the rungs `[cast] ladder` enables (ADR-0114; already validated).
+    #[must_use]
+    pub fn with_cast_ladder(self, ladder: Vec<String>) -> Self {
+        self.cast_streams.set_ladder(ladder);
+        self
+    }
+
     /// Install the engine seam of the cast outputs (ADR-0111).
     #[must_use]
     pub fn with_cast_engine(mut self, engine: crate::cast_engine::SharedCastEngine) -> Self {

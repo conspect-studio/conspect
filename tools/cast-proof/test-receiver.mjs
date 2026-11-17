@@ -100,6 +100,18 @@ try {
     checks.push(check('engine counted the fetches (not a Cast device)', f.playlists > seconds / 4 && f.segments > seconds / 2 && f.cast_device === false, `playlists ${f.playlists}, segments ${f.segments}, cast_device ${f.cast_device}`, `> ${seconds / 4} / > ${seconds / 2} / false`));
     const lr = engineDoc && engineDoc.last_report && engineDoc.last_report.report;
     checks.push(check(`engine last_report: playing, width ${W}`, !!lr && lr.state === 'playing' && lr.stats && lr.stats.width === W, lr ? `${lr.state} ${lr.stats && lr.stats.width}` : 'none', `playing ${W}`));
+    // ADR-0114 slice 2: the receiver probed the device on the ladder route, was offered hls, and reports its
+    // tick-to-present figures with a method (frame on desktop Chrome: requestVideoFrameCallback exists).
+    const rx = engineDoc && engineDoc.receiver; const tr = engineDoc && engineDoc.transport;
+    checks.push(check('engine stored the receiver probe (ladder route)', !!rx && rx.kind === 'web' && rx.caps && rx.caps.mse === true && rx.caps.rvfc === true && rx.caps.frames === 'rvfc' && Array.isArray(rx.caps.rtc_h264), rx ? JSON.stringify(rx.caps).slice(0, 200) : 'none', 'web, mse, rvfc'));
+    checks.push(check('the ladder offered hls', !!tr && tr.rung === 'hls', tr ? tr.rung : 'none', 'hls'));
+    checks.push(check('first_frame_ms reported', !!tr && typeof tr.first_frame_ms === 'number' && tr.first_frame_ms > 0 && tr.first_frame_ms <= 15000, tr ? tr.first_frame_ms : 'none', '1..15000 ms'));
+    const methodOk = !!tr && ['frame', 'playhead', 'unavailable'].includes(tr.latency_method);
+    checks.push(check('latency reported with a method', methodOk && (tr.latency_method === 'unavailable' ? tr.latency_ms === null : !!tr.latency_ms), tr ? `${tr.latency_method} ${JSON.stringify(tr.latency_ms)}` : 'none', 'frame|playhead|unavailable'));
+    const lm = tr && tr.latency_ms;
+    checks.push(check('tick-to-present latency by frame, 0.5..20 s, >= 50 samples', !!lm && tr.latency_method === 'frame' && lm.method === 'frame' && lm.median >= 500 && lm.median <= 20000 && lm.p95 >= lm.median && lm.samples >= 50 && typeof lm.clock_error_ms === 'number', lm ? JSON.stringify(lm) : 'none', 'frame, 500..20000 ms'));
+    const ladderCalls = log.console.filter((l) => l.includes('[conspect-cast]') && /ladder: attach hls/.test(l)).length;
+    checks.push(check('the receiver logged the ladder answer', ladderCalls >= 1, ladderCalls, '>= 1'));
   }
   checks.push(check(args.engine ? 'engine received POSTed reports' : '/_reports holds POSTed reports', postedGood.length >= Math.floor((seconds - 15) / 5), `${postedGood.length} of ${posted.length}`, `>= ${Math.floor((seconds - 15) / 5)}`));
   const maxBytes = Math.max(0, ...posted.map((r) => r.bytes)); const jsonType = posted.every((r) => /^application\/json/.test(r.contentType));

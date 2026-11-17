@@ -5253,6 +5253,7 @@ impl Pipeline {
                     height: encode.map_or(0, |cfg| cfg.height),
                     fps: self.cadence,
                     codec: encode.map_or_else(String::new, |cfg| cfg.codec_name.clone()),
+                    epoch: self.epoch.clone(),
                 })
             })
             .collect()

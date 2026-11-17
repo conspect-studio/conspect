@@ -37,10 +37,11 @@ receiver page must be HTTPS, creates a stream with `POST /api/v1/cast/streams {f
 | a `cast_validate` | the cast directory is a valid CMAF HLS stream (playlists, init, segment timing, PDT) |
 | b Shaka, SDK defaults, 60 s | the stream plays with the configuration a Default-Media-Receiver device uses: start, continuity, latency, buffer, frames, audio |
 | b' Shaka, receiver config | the same with the playback config our receiver app sets (read from receiver.js) |
-| c receiver SDK + engine receiver, 60 s | MEDIA_STATUS PLAYING within 15 s, no BUFFERING > 1 s, latency 6-10 s, overlay, custom-namespace reports, reports reach the ENGINE (`last_report`, `fetches`, `cast_device: false`), CSP clean, token never logged |
+| c receiver SDK + engine receiver, 60 s | the receiver's probe reaches the engine's ladder route and is stored, the ladder offers `hls`, `first_frame_ms` and a tick-to-present latency by `frame` reach the engine (ADR-0114 slice 2), MEDIA_STATUS PLAYING within 15 s, no BUFFERING > 1 s, latency 6-10 s, overlay, custom-namespace reports, reports reach the ENGINE (`last_report`, `fetches`, `cast_device: false`), CSP clean, token never logged |
 | d Default Media Receiver equivalent, 30 s | a bare SDK page on another origin plays the stream: the engine's CORS headers work for real |
 | e takes during playback | `POST /api/v1/routing/output/take` to source `b` and back: no IDLE, BUFFERING < 3 s in total, no reload, the validator still passes, at most 2 discontinuities |
 | f revoke | `DELETE` → master 404, the receiver shows "ended" and stops requesting, the cast directory empties after the linger, a second stream works (new token, new init files) |
+| probe-unit (`test-probe-unit.mjs`, no browser) | the receiver's `probe.js` (ADR-0114 slice 2): clock offset and its error bound, an epoch step discards samples, latency windows and the 0-60 s sanity rule, `playhead` without rVFC, `unavailable` without a clock, the probe body, and that `probe.js` and `receiver.js` are ES5 syntax only. Also a gating step of the CI job |
 | g authz | one changed token character → 404 with the unknown-file body; wrong bearer → 401 |
 | HLS comparison (informational) | Shaka with SDK defaults on the existing `/hls/` output; expected to miss (3 s seek range), never a failure |
 
