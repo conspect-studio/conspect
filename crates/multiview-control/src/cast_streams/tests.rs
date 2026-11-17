@@ -423,3 +423,140 @@ fn gate_history_grant_storage_is_bounded_and_overflow_fails_closed() {
     assert!(!gate.remembers());
     assert_eq!(gate.cleared_needs(), Some(Vec::new()));
 }
+
+// ---- ADR-0114 decision 5.2 / 5.4: push attachments in the registry ------
+
+mod attachments {
+    use super::*;
+    use crate::cast_streams::identity::{CastAttachment, Clearance, Component, OutputLabels};
+    use crate::cast_streams::reauth::Need;
+
+    fn armed(streams: &CastStreams, owner: &str) -> (Claim, u64) {
+        let claim = streams
+            .claim(owner, "o", "c1", &RoutedFeed::Program, false)
+            .unwrap();
+        let arm = streams.arm_snapshot("c1", None);
+        streams
+            .arm(&claim.id, arm.generation, Some(("program".into(), Some(vec![Need::Bus]))))
+            .unwrap();
+        (claim, arm.generation)
+    }
+
+    fn attachment(id: &str, rung: &'static str) -> Arc<CastAttachment> {
+        Arc::new(CastAttachment::new(
+            id,
+            "c1",
+            rung,
+            Arc::new(OutputLabels::new()),
+            Clearance::of(&[(Component::Video, 1)]),
+        ))
+    }
+
+    #[test]
+    fn an_attachment_is_registered_only_at_the_current_generation() {
+        let (_, streams) = clocked();
+        let (claim, generation) = armed(&streams, "op");
+        let stale = attachment(&claim.id, "moq");
+        assert!(!streams.attach(Arc::clone(&stale), generation + 1));
+        let ok = attachment(&claim.id, "moq");
+        assert!(streams.attach(Arc::clone(&ok), generation));
+        assert_eq!(streams.attachments(&claim.id).len(), 1);
+        // Another output's attachment never registers on this stream.
+        let foreign = Arc::new(CastAttachment::new(
+            &claim.id,
+            "c2",
+            "moq",
+            Arc::new(OutputLabels::new()),
+            Clearance::default(),
+        ));
+        assert!(!streams.attach(foreign, generation));
+    }
+
+    #[test]
+    fn revoke_remove_and_expiry_fence_every_attachment() {
+        let (now, streams) = clocked();
+        let (a, ga) = armed(&streams, "op");
+        let (b, gb) = armed(&streams, "op2");
+        let (c, gc) = armed(&streams, "op3");
+        let (xa, xb, xc) = (attachment(&a.id, "moq"), attachment(&b.id, "moq"), attachment(&c.id, "moq"));
+        assert!(streams.attach(Arc::clone(&xa), streams.generation("c1").unwrap()));
+        let _ = (ga, gb, gc);
+        assert!(streams.attach(Arc::clone(&xb), streams.generation("c1").unwrap()));
+        assert!(streams.attach(Arc::clone(&xc), streams.generation("c1").unwrap()));
+        streams.revoke(&a.id, "test").unwrap();
+        assert!(xa.is_fenced());
+        streams.remove(&b.id).unwrap();
+        assert!(xb.is_fenced());
+        // A push attachment keeps the token live only through ladder calls
+        // or reports; with none it expires and is fenced by the sweep.
+        assert!(!xc.is_fenced());
+        advance(&now, IDLE_TTL + Duration::from_secs(1));
+        streams.sweep();
+        assert!(xc.is_fenced());
+    }
+
+    #[test]
+    fn a_requested_change_clears_only_the_tokens_that_pass_it() {
+        let (_, streams) = clocked();
+        let (keep, _) = armed(&streams, "op");
+        let (lose, _) = armed(&streams, "op2");
+        let generation = streams.generation("c1").unwrap();
+        let xk = attachment(&keep.id, "moq");
+        let xl = attachment(&lose.id, "moq");
+        assert!(streams.attach(Arc::clone(&xk), generation));
+        assert!(streams.attach(Arc::clone(&xl), generation));
+        let lose_id = lose.id.clone();
+        let check = move |s: &OwnedStream, _: Option<&[Need]>| {
+            if s.id == lose_id {
+                Err("revoked: no")
+            } else {
+                Ok(())
+            }
+        };
+        let revoked = streams.commit(
+            "c1",
+            Change {
+                op: Some("op-1".into()),
+                bus: Some("src:cam2".into()),
+                needs: Some(vec![Need::Object("cam2".into())]),
+                ids: vec![(Component::Video, 42)],
+            },
+            None,
+            &check,
+        );
+        assert_eq!(revoked.len(), 1);
+        assert!(xk.clearance().clears(&Component::Video, 42));
+        assert!(xk.clearance().clears(&Component::Video, 1), "the current one stays");
+        assert!(xl.is_fenced(), "revoked before the request goes to the engine");
+        assert!(!xl.clearance().clears(&Component::Video, 42));
+    }
+
+    #[test]
+    fn at_most_two_per_rung_make_before_break() {
+        let (_, streams) = clocked();
+        let (claim, generation) = armed(&streams, "op");
+        let first = attachment(&claim.id, "moq");
+        let second = attachment(&claim.id, "moq");
+        let third = attachment(&claim.id, "moq");
+        assert!(streams.attach(Arc::clone(&first), generation));
+        assert!(streams.attach(Arc::clone(&second), generation));
+        assert!(!first.is_fenced() && !second.is_fenced());
+        assert!(streams.attach(Arc::clone(&third), generation));
+        assert!(first.is_fenced(), "the oldest of the rung goes");
+        assert!(!second.is_fenced() && !third.is_fenced());
+        assert_eq!(streams.attachments(&claim.id).len(), MAX_PER_RUNG);
+    }
+
+    #[test]
+    fn a_live_attachment_keeps_its_token_live_through_ladder_calls() {
+        let (now, streams) = clocked();
+        let (claim, generation) = armed(&streams, "op");
+        assert!(streams.attach(attachment(&claim.id, "moq"), generation));
+        for _ in 0..5 {
+            advance(&now, IDLE_TTL - Duration::from_secs(1));
+            let request = crate::cast_streams::ladder::parse_request(br#"{"v":1}"#, streams.now_ms()).unwrap();
+            streams.record_ladder(&claim.id, request, Some("moq")).unwrap();
+        }
+        assert!(streams.lookup(&claim.token).is_some());
+    }
+}
