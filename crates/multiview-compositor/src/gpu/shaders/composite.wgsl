@@ -16,6 +16,17 @@
 // linear light, after primaries conversion (invariant #8 order untouched).
 // Opaque tiles never touch `a_planes`.
 //
+// Keyers (ADR-0113, design note switcher-keyers.md §3): `keys[i]` runs
+// parallel to `tiles[i]`. A keyed tile's coverage multiplies
+// mask(sx, sy) × matte(kx, ky) into the same single premultiply; the matte
+// reads only post-range-expand Y (step 1), of the fill or of a separate key
+// source resident in its own `y_planes` layer, sampled with its own
+// nearest-neighbour map (kx = floor(ddx × key_w / dst_w)). Mirrors
+// `key::key_factor`. Scene groups fold into a second pair of vec4 registers
+// (outgoing / incoming) merged at the next top tile or the end of the list,
+// mirroring the CPU oracle's segment semantics (the last grouped tile's
+// merge wins).
+//
 // `common.wgsl` is prepended at load time (transfer fns, mat3_apply, ids).
 
 struct TileParams {
@@ -43,6 +54,30 @@ struct TileParams {
     prim2: vec4<f32>,
 };
 
+// Mirrors `uniforms::KeyParams`; all zero = an ordinary top tile, no key.
+struct KeyParams {
+    // x: key layer in `y_planes`, y,z: key source w,h, w: flags (KEY_* bits;
+    // bits 8-9 the scene group: 0 top, 1 both, 2 out, 3 in).
+    head: vec4<u32>,
+    // x,y: key source luma range expand (scale, offset); z: clip (or the
+    // constant matte); w: gain (>= 0, finite).
+    luma: vec4<f32>,
+    // Mask rectangle in fill-source pixels: x, y, w, h (half-open).
+    mask: vec4<u32>,
+    // x: merge kind (0 MIX, 1 DIP); y: p | d; z: i (all in [0, 1]).
+    merge: vec4<f32>,
+    // Opaque DIP colour (linear, canvas gamut), a = 1.
+    dip_colour: vec4<f32>,
+};
+
+const KEY_KIND_BITS: u32 = 3u;
+const KEY_KIND_LINEAR: u32 = 1u;
+const KEY_INVERT: u32 = 4u;
+const KEY_HAS_SOURCE: u32 = 8u;
+const KEY_HAS_MASK: u32 = 16u;
+const KEY_CONST_MATTE: u32 = 32u;
+const KEY_GROUP_SHIFT: u32 = 8u;
+
 struct CompositeUniforms {
     // x,y: canvas width,height (pixels). z: tile count. w: padding.
     canvas: vec4<u32>,
@@ -56,6 +91,72 @@ struct CompositeUniforms {
 @group(0) @binding(3) var uv_planes: texture_2d_array<f32>;
 @group(0) @binding(4) var canvas_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var a_planes: texture_2d_array<f32>;
+@group(0) @binding(6) var<storage, read> keys: array<KeyParams>;
+
+// Nearest-neighbour index of destination offset d (< dst) on a source axis of
+// src samples: floor(d × src / dst), clamped. Mirrors `key::axis`. d < dst and
+// src are bounded by the texture dimension limit (<= 16384), so the u32
+// product cannot overflow.
+fn key_axis(d: u32, src: u32, dst: u32) -> u32 {
+    if dst == 0u || src == 0u {
+        return 0u;
+    }
+    return min((d * src) / dst, src - 1u);
+}
+
+// The straight key factor mask × matte (before the single premultiply).
+// Mirrors `key::key_factor`: a pixel outside the source-space mask is 0; a
+// linear self key is 1 and ignores invert; a NaN/negative gain was sanitized
+// to a constant matte on the CPU side (`KeyParams::build`).
+fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, dst_h: u32,
+              fill_y: f32) -> f32 {
+    let flags = k.head.w;
+    let kind = flags & KEY_KIND_BITS;
+    if kind == 0u {
+        return 1.0;
+    }
+    if (flags & KEY_HAS_MASK) != 0u {
+        // Half-open and overflow safe: compare the offsets, never x + w.
+        let m = k.mask;
+        if sx < m.x || sy < m.y || (sx - m.x) >= m.z || (sy - m.y) >= m.w {
+            return 0.0;
+        }
+    }
+    let has_source = (flags & KEY_HAS_SOURCE) != 0u;
+    var signal = fill_y;
+    if has_source {
+        let kx = key_axis(ddx, k.head.y, dst_w);
+        let ky = key_axis(ddy, k.head.z, dst_h);
+        let y8 = textureLoad(y_planes, vec2<i32>(i32(kx), i32(ky)), i32(k.head.x), 0).r * 255.0;
+        signal = (y8 - k.luma.y) / k.luma.x;
+    }
+    var matte = 1.0;
+    if kind == KEY_KIND_LINEAR {
+        if !has_source {
+            return 1.0;
+        }
+        matte = clamp(signal, 0.0, 1.0);
+    } else if (flags & KEY_CONST_MATTE) != 0u {
+        matte = k.luma.z;
+    } else {
+        matte = clamp((signal - k.luma.z) * k.luma.w, 0.0, 1.0);
+    }
+    if (flags & KEY_INVERT) != 0u {
+        matte = 1.0 - matte;
+    }
+    return matte;
+}
+
+// Merge the two scene accumulators (premultiplied linear). Mirrors
+// `SceneMerge::apply`: MIX lerp(out, in, p); DIP lerp(lerp(out, c, d), in, i).
+fn scene_merge(o: vec4<f32>, inc: vec4<f32>, m: vec4<f32>, dip: vec4<f32>) -> vec4<f32> {
+    if m.x > 0.5 {
+        let c = vec4<f32>(dip.rgb, 1.0);
+        let od = o * (1.0 - m.y) + c * m.y;
+        return od * (1.0 - m.z) + inc * m.z;
+    }
+    return o * (1.0 - m.y) + inc * m.y;
+}
 
 // Straight per-pixel alpha at integer tile-local (sx, sy), full resolution
 // (no subsampling), or 1.0 for an opaque tile. Mirrors `pipeline::tile_alpha`.
@@ -161,9 +262,36 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bg = comp.background;
     var acc = vec4<f32>(bg.rgb * bg.a, bg.a);
 
+    // The scene segment (ADR-0113 §2): two extra registers, open while a run
+    // of grouped tiles is being folded.
+    var seg_open = false;
+    var seg_out = acc;
+    var seg_in = acc;
+    var seg_merge = vec4<f32>(0.0);
+    var seg_dip = vec4<f32>(0.0);
+
     let count = comp.canvas.z;
     for (var i: u32 = 0u; i < count; i = i + 1u) {
         let t = tiles[i];
+        let k = keys[i];
+        let group = (k.head.w >> KEY_GROUP_SHIFT) & 3u;
+        // Segment bookkeeping happens before the coverage test: a grouped
+        // tile that covers nothing still opens (and re-merges) its segment,
+        // and a top tile closes it, exactly as on the CPU oracle.
+        if group == 0u {
+            if seg_open {
+                acc = scene_merge(seg_out, seg_in, seg_merge, seg_dip);
+                seg_open = false;
+            }
+        } else {
+            if !seg_open {
+                seg_out = acc;
+                seg_in = acc;
+                seg_open = true;
+            }
+            seg_merge = k.merge;
+            seg_dip = k.dip_colour;
+        }
         let dst = t.placement.xy;
         let src_w = t.placement.z;
         let src_h = t.placement.w;
@@ -221,11 +349,25 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // 5. premultiplied-alpha source-over in linear light. Straight
         //    per-pixel alpha folds into the opacity here, premultiplied ONCE.
+        //    A keyer's mask × matte (ADR-0113 §3) folds in at the same step;
+        //    its luma is the post-range-expand Y of step 1 (never steps 2-4).
         let a = clamp(t.opacity_transfer.x, 0.0, 1.0) * sample_tile_alpha(t, sx, sy)
-            * wipe_coverage(t, px, py, cw, ch);
+            * wipe_coverage(t, px, py, cw, ch)
+            * key_factor(k, sx, sy, ddx, ddy, dst_w, dst_h, yexp);
         let src = vec4<f32>(lin * a, a);
         let inv = 1.0 - src.a;
-        acc = src + acc * inv;
+        switch group {
+            case 0u: { acc = src + acc * inv; }
+            case 2u: { seg_out = src + seg_out * inv; }
+            case 3u: { seg_in = src + seg_in * inv; }
+            default: {
+                seg_out = src + seg_out * inv;
+                seg_in = src + seg_in * inv;
+            }
+        }
+    }
+    if seg_open {
+        acc = scene_merge(seg_out, seg_in, seg_merge, seg_dip);
     }
 
     // Store the straight (un-premultiplied) linear RGBA for the encode pass.

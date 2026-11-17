@@ -39,7 +39,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::gpu::compositor::MAX_TILES;
-use crate::gpu::uniforms::{CompositeUniforms, EncodeUniforms, TileParams};
+use crate::gpu::uniforms::{CompositeUniforms, EncodeUniforms, KeyParams, TileParams};
 
 /// Whether a cached resource of `have` extent can serve a request needing
 /// `need` — i.e. it is at least as large in every dimension. Pure (no GPU), so
@@ -196,6 +196,18 @@ pub(crate) struct SurfacePool {
     pub enc_uniform: Option<wgpu::Buffer>,
     /// Tile-params storage buffer, sized for [`MAX_TILES`] tiles.
     pub tile_buf: Option<wgpu::Buffer>,
+    /// Key / scene-group params storage buffer (binding 6, ADR-0113 §3.3),
+    /// parallel to `tile_buf` and sized for [`MAX_TILES`] tiles: allocated
+    /// once, refilled in place.
+    pub key_buf: Option<wgpu::Buffer>,
+
+    // --- CPU-side param scratch (grow-only, cleared and refilled per tick) ---
+    /// The packed tile params of the current composite. Its capacity reaches
+    /// the frame's tile count once and is reused, so a steady-state tick
+    /// allocates no Vec (not a GPU allocation, so not counted).
+    pub tile_params: Vec<TileParams>,
+    /// The packed key params, parallel to `tile_params`.
+    pub key_params: Vec<KeyParams>,
     /// Overlay-pass uniform buffer.
     #[cfg(feature = "overlay")]
     pub ov_uniform: Option<wgpu::Buffer>,
@@ -364,6 +376,13 @@ impl SurfacePool {
 #[must_use]
 pub(crate) fn tile_buf_size() -> u64 {
     let stride = u64::try_from(core::mem::size_of::<TileParams>()).unwrap_or(0);
+    stride.saturating_mul(u64::from(MAX_TILES.max(1)))
+}
+
+/// The byte size of the [`MAX_TILES`]-sized key-params storage buffer.
+#[must_use]
+pub(crate) fn key_buf_size() -> u64 {
+    let stride = u64::try_from(core::mem::size_of::<KeyParams>()).unwrap_or(0);
     stride.saturating_mul(u64::from(MAX_TILES.max(1)))
 }
 

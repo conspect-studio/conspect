@@ -116,6 +116,137 @@ pub struct CompositeUniforms {
     pub background: [f32; 4],
 }
 
+/// `KeyParams::head[3]` bits 0-1: the key kind (`0` = no key).
+pub const KEY_KIND_BITS: u32 = 0b11;
+/// Key kind: linear (matte 1 with no key source, else the key's clamped Y).
+pub const KEY_KIND_LINEAR: u32 = 1;
+/// Key kind: luma (`clamp((y − clip) × gain, 0, 1)`).
+pub const KEY_KIND_LUMA: u32 = 2;
+/// Invert the matte (a matte from a signal only; ignored by a linear self key).
+pub const KEY_INVERT: u32 = 1 << 2;
+/// The key signal is a separate source resident at `head[0]` of `y_planes`.
+pub const KEY_HAS_SOURCE: u32 = 1 << 3;
+/// A source-space mask in `KeyParams::mask` applies.
+pub const KEY_HAS_MASK: u32 = 1 << 4;
+/// The luma matte (before invert) is the constant in `luma[2]` (a NaN clip,
+/// a zero gain or an infinite clip: the CPU result is constant there, and the
+/// shader must not evaluate `inf × 0` or a NaN, whose clamp is undefined).
+pub const KEY_CONST_MATTE: u32 = 1 << 5;
+/// Shift of the 2-bit scene group (`0` top, `1` both, `2` out, `3` in).
+pub const KEY_GROUP_SHIFT: u32 = 8;
+
+/// Per-tile key and scene-group block (ADR-0113, design note §3.3), one entry
+/// per tile, parallel to `tiles`. Mirrors `KeyParams` in `composite.wgsl`.
+/// All zero is an ordinary `Top` tile with no key.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct KeyParams {
+    /// `[key_layer, key_w, key_h, flags]`: the key source's layer in the tile
+    /// Y array and its size (zero without a source), then the `KEY_*` bits.
+    pub head: [u32; 4],
+    /// `[key_luma_scale, key_luma_off, clip, gain]`: the key source's own
+    /// range expand, then the sanitized luma parameters (or the constant
+    /// matte in `clip` under [`KEY_CONST_MATTE`]).
+    pub luma: [f32; 4],
+    /// `[x, y, w, h]` of the mask in fill-source pixels.
+    pub mask: [u32; 4],
+    /// `[kind, p | d, i, 0]` of the segment merge (`0` MIX, `1` DIP), weights
+    /// already clamped to `[0, 1]` with NaN read as 0.
+    pub merge: [f32; 4],
+    /// The opaque DIP colour (linear, canvas gamut), alpha 1.
+    pub dip_colour: [f32; 4],
+}
+
+impl KeyParams {
+    /// Build the key/group block of `tile`. `key_layer` is the `y_planes`
+    /// layer its key source was uploaded to (`None` without a key source).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnresolvedColor`] when the key source's range is unresolved
+    /// (exactly what the CPU oracle raises).
+    pub fn build(tile: &crate::pipeline::Tile<'_>, key_layer: Option<u32>) -> Result<Self> {
+        use crate::key::{unit, KeyKind, SceneMember, SceneMerge, TileGroup};
+        let mut out = Self::zeroed();
+        if let Some(key) = &tile.key {
+            let mut flags = match key.kind {
+                KeyKind::Linear => KEY_KIND_LINEAR,
+                KeyKind::Luma { clip, gain } => {
+                    if let Some(c) = luma_constant(clip, gain) {
+                        out.luma[2] = c;
+                        KEY_KIND_LUMA | KEY_CONST_MATTE
+                    } else {
+                        out.luma[2] = clip;
+                        // A finite gain (an infinite one saturates the same
+                        // way: any positive excess reads as 1).
+                        out.luma[3] = gain.min(f32::MAX);
+                        KEY_KIND_LUMA
+                    }
+                }
+            };
+            if key.invert {
+                flags |= KEY_INVERT;
+            }
+            if let Some(mask) = key.mask {
+                flags |= KEY_HAS_MASK;
+                out.mask = [mask.x, mask.y, mask.w, mask.h];
+            }
+            if let (Some(src), Some(layer)) = (key.source, key_layer) {
+                let r = range::require_resolved(src.color().range)?;
+                let e = expand_range_params(r);
+                out.luma[0] = e[0];
+                out.luma[1] = e[1];
+                out.head[0] = layer;
+                out.head[1] = src.width();
+                out.head[2] = src.height();
+                flags |= KEY_HAS_SOURCE;
+            }
+            out.head[3] = flags;
+        }
+        if let TileGroup::Scene { member, merge } = tile.group {
+            let g: u32 = match member {
+                SceneMember::Both => 1,
+                SceneMember::Out => 2,
+                SceneMember::In => 3,
+            };
+            out.head[3] |= g << KEY_GROUP_SHIFT;
+            match merge {
+                SceneMerge::Mix { p } => out.merge = [0.0, unit(p), 0.0, 0.0],
+                SceneMerge::Dip { colour, d, i } => {
+                    out.merge = [1.0, unit(d), unit(i), 0.0];
+                    out.dip_colour = [colour.r, colour.g, colour.b, 1.0];
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `y_planes` layer of the key source, or `None`.
+    #[must_use]
+    pub const fn key_layer(&self) -> Option<u32> {
+        if self.head[3] & KEY_HAS_SOURCE == 0 {
+            None
+        } else {
+            Some(self.head[0])
+        }
+    }
+}
+
+/// The luma matte (before invert) when it is the same for every `y`, as
+/// [`crate::key::luma_matte`] computes it: a NaN clip or a zero (NaN,
+/// negative) gain gives 0 (`(y − clip) × 0` is 0, or NaN read as 0); an
+/// infinite clip gives 0 (`+∞`) or 1 (`−∞`) with a positive gain.
+fn luma_constant(clip: f32, gain: f32) -> Option<f32> {
+    let gain = if gain.is_nan() { 0.0 } else { gain.max(0.0) };
+    if clip.is_nan() || gain == 0.0 {
+        return Some(0.0);
+    }
+    if clip.is_infinite() {
+        return Some(if clip > 0.0 { 0.0 } else { 1.0 });
+    }
+    None
+}
+
 /// Encode-pass uniform block. Mirrors `EncodeUniforms` in `encode.wgsl`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -289,7 +420,9 @@ impl TileParams {
         Ok(Self {
             placement: [dst_x, dst_y, src_w, src_h],
             dst_size: [dw, dh, 0, 0],
-            opacity_transfer: [opacity.clamp(0.0, 1.0), transfer.as_f32(), 0.0, 0.0],
+            // `unit` reads a NaN opacity (a keyer weight rides it) as 0, as the
+            // CPU oracle does; a NaN must never reach the shader's clamp.
+            opacity_transfer: [crate::key::unit(opacity), transfer.as_f32(), 0.0, 0.0],
             range: expand_range_params(tile_range),
             yuv2rgb0: yuv[0],
             yuv2rgb1: yuv[1],
@@ -388,5 +521,125 @@ impl EncodeUniforms {
             rgb2yuv2: rgb2yuv[2],
             range: compress_range_params(canvas.range),
         })
+    }
+}
+
+#[cfg(test)]
+mod key_params_tests {
+    #![allow(clippy::unwrap_used, clippy::float_cmp)]
+
+    use multiview_core::color::{
+        ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
+    };
+
+    use super::*;
+    use crate::key::{KeyMask, SceneMember, SceneMerge, TileGroup, TileKey};
+    use crate::pipeline::{Nv12Image, Tile};
+
+    fn img(w: u32, h: u32, range: ColorRange) -> Nv12Image {
+        let color = ColorInfo {
+            primaries: ColorPrimaries::Bt709,
+            transfer: TransferCharacteristic::Bt709,
+            matrix: MatrixCoefficients::Bt709,
+            range,
+        };
+        Nv12Image::solid(w, h, 100, 128, 128, color).unwrap()
+    }
+
+    #[test]
+    fn an_ordinary_tile_packs_all_zero() {
+        let a = img(4, 4, ColorRange::Limited);
+        let k = KeyParams::build(&Tile::placed(&a, 0, 0, 1.0), None).unwrap();
+        assert_eq!(k, KeyParams::zeroed());
+        assert_eq!(core::mem::size_of::<KeyParams>(), 80);
+    }
+
+    #[test]
+    fn a_key_source_carries_its_own_size_range_and_layer() {
+        let fill = img(4, 4, ColorRange::Limited);
+        let key = img(8, 6, ColorRange::Full);
+        let t = Tile::placed(&fill, 0, 0, 1.0).with_key(
+            TileKey::luma(0.25, 2.0)
+                .with_source(&key)
+                .inverted(true)
+                .masked(KeyMask {
+                    x: 1,
+                    y: 2,
+                    w: 3,
+                    h: u32::MAX,
+                }),
+        );
+        let k = KeyParams::build(&t, Some(9)).unwrap();
+        assert_eq!(k.key_layer(), Some(9));
+        assert_eq!(&k.head[..3], &[9, 8, 6]);
+        let flags = k.head[3];
+        assert_eq!(flags & KEY_KIND_BITS, KEY_KIND_LUMA);
+        assert_ne!(flags & KEY_INVERT, 0);
+        assert_ne!(flags & KEY_HAS_MASK, 0);
+        assert_eq!(flags & KEY_CONST_MATTE, 0);
+        assert_eq!(k.luma, [255.0, 0.0, 0.25, 2.0]);
+        assert_eq!(k.mask, [1, 2, 3, u32::MAX]);
+    }
+
+    #[test]
+    fn degenerate_luma_params_become_the_oracle_constant() {
+        let fill = img(4, 4, ColorRange::Limited);
+        let matte = |clip: f32, gain: f32| {
+            let t = Tile::placed(&fill, 0, 0, 1.0).with_key(TileKey::luma(clip, gain));
+            let k = KeyParams::build(&t, None).unwrap();
+            assert_ne!(k.head[3] & KEY_CONST_MATTE, 0, "{clip} {gain}");
+            // The CPU oracle's matte is the same for every y.
+            for y in [-1.0, 0.0, 0.5, 1.0, 2.0] {
+                assert_eq!(crate::key::luma_matte(y, clip, gain), k.luma[2]);
+            }
+        };
+        matte(0.2, f32::NAN);
+        matte(0.2, -1.0);
+        matte(0.2, 0.0);
+        matte(f32::NAN, 2.0);
+        matte(f32::INFINITY, 2.0);
+        matte(f32::NEG_INFINITY, f32::INFINITY);
+    }
+
+    #[test]
+    fn scene_merge_weights_are_clamped_and_nan_safe() {
+        let a = img(4, 4, ColorRange::Limited);
+        let g = |member, merge| {
+            KeyParams::build(
+                &Tile::placed(&a, 0, 0, 1.0).in_group(TileGroup::Scene { member, merge }),
+                None,
+            )
+            .unwrap()
+        };
+        let k = g(SceneMember::Out, SceneMerge::Mix { p: f32::NAN });
+        assert_eq!(k.head[3] >> KEY_GROUP_SHIFT, 2);
+        assert_eq!(k.merge, [0.0, 0.0, 0.0, 0.0]);
+        let k = g(
+            SceneMember::In,
+            SceneMerge::Dip {
+                colour: crate::blend::LinearRgba::opaque(0.1, 0.2, 0.3),
+                d: 2.0,
+                i: -1.0,
+            },
+        );
+        assert_eq!(k.head[3] >> KEY_GROUP_SHIFT, 3);
+        assert_eq!(k.merge, [1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(k.dip_colour, [0.1, 0.2, 0.3, 1.0]);
+        let k = g(SceneMember::Both, SceneMerge::Mix { p: 0.4 });
+        assert_eq!(k.head[3] >> KEY_GROUP_SHIFT, 1);
+        // A NaN tile opacity (a keyer weight) reads as 0, never a NaN lane.
+        let p = TileParams::build(
+            0,
+            0,
+            4,
+            4,
+            4,
+            4,
+            f32::NAN,
+            a.color(),
+            crate::pipeline::CanvasColor::default(),
+        )
+        .unwrap();
+        assert_eq!(p.opacity_transfer[0], 0.0);
     }
 }
