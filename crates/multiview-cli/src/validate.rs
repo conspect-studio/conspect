@@ -190,6 +190,7 @@ pub fn validate_config(path: &Path) -> anyhow::Result<ValidationReport> {
         .validate()
         .map_err(|e| e.to_string())
         .and_then(|()| crate::tls_cli::ensure_acme_supported(&config))
+        .and_then(|()| crate::outputs::ensure_subtitle_slots_supported(&config.outputs))
     {
         Ok(()) => {
             let summary = summarize(&config);

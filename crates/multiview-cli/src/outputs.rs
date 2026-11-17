@@ -71,6 +71,38 @@ pub fn ensure_aes67_outputs_supported(outputs: &[Output]) -> Result<(), String> 
     ))
 }
 
+/// Ensure every output's subtitle slots can carry cues in this build (#508).
+///
+/// A subtitle slot's `WebVTT` rendition is filled from the patched source's
+/// caption store, and caption sources (sidecar/HLS `WebVTT`, in-container
+/// `subrip`/`ass`/`mov_text`/DVB, embedded CEA-608) are wired only in an `overlay`
+/// build. Without `overlay` the engine would publish the rendition with every
+/// segment empty, a subtitle track that never shows a cue and that nobody can
+/// explain (seen locally as `0 cues` in the cast proof, #508). So, like a
+/// `display` output in a non-`display-kms` build, it is refused up front. In an
+/// `overlay` build this always succeeds.
+///
+/// # Errors
+///
+/// A human-readable message naming each output with subtitle slots and the
+/// `overlay` build requirement, when this binary was built without the feature.
+pub fn ensure_subtitle_slots_supported(outputs: &[Output]) -> Result<(), String> {
+    let with_slots: Vec<String> = outputs
+        .iter()
+        .filter(|o| o.slots().is_some_and(|slots| !slots.subtitle.is_empty()))
+        .map(Output::id)
+        .collect();
+    if with_slots.is_empty() || cfg!(feature = "overlay") {
+        return Ok(());
+    }
+    Err(format!(
+        "subtitle slots require the overlay build: this binary was built without the \
+         `overlay` feature, which wires caption sources, so the subtitle slots of \
+         output(s) {with_slots:?} would carry no cues (rebuild with `--features overlay` \
+         or a preset, or remove the [[outputs.slots.subtitle]] entries)"
+    ))
+}
+
 /// Ensure every `SourceKind::Aes67` in `sources` is runnable in this build (#103).
 ///
 /// AES67 / ST 2110-30 PCM-audio ingest exists only in an `aes67` build. In an
