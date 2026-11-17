@@ -3181,6 +3181,9 @@ impl Pipeline {
         let display_layout: DisplayLayoutSlot =
             Arc::new(multiview_framestore::SwapCell::new(Arc::clone(&layout)));
         let aux_sizing = crate::display_size::aux_sizing_slot();
+        // One M/E layout-source adapter per pipeline (#307), created before
+        // the boot decodes so they size for its registered bodies (#485).
+        let me_layouts = Arc::new(crate::me_layouts::MeLayoutAdapter::new());
         let source_sizing = crate::display_size::source_sizing_slot();
         let bus_sizing = crate::display_size::BusSizing::new();
         let full_canvas_decodes: crate::display_size::FullCanvasGauge =
@@ -3276,6 +3279,7 @@ impl Pipeline {
                     Some(Arc::clone(&source_registry)),
                 )
                 .with_aux_sizing(Arc::clone(&aux_sizing))
+                .with_me_layout_sizing(me_layouts.sizing_slot())
                 .with_source_sizing(Arc::clone(&source_sizing))
                 .with_bus_sizing(bus_sizing.clone())
                 .with_full_canvas_gauge(Arc::clone(&full_canvas_decodes))
@@ -3729,7 +3733,7 @@ impl Pipeline {
             switcher_cell_id,
             switcher_control: None,
             switcher_driver: None,
-            me_layouts: Arc::new(crate::me_layouts::MeLayoutAdapter::new()),
+            me_layouts,
             switcher_preview: None,
             stores,
             source_registry,
@@ -4519,6 +4523,7 @@ impl Pipeline {
                 Some(Arc::clone(&self.source_registry)),
             )
             .with_aux_sizing(Arc::clone(&self.aux_sizing))
+            .with_me_layout_sizing(self.me_layouts.sizing_slot())
             .with_source_sizing(Arc::clone(&self.source_sizing))
             .with_bus_sizing(self.bus_sizing.clone())
             .with_full_canvas_gauge(Arc::clone(&self.full_canvas_decodes)),

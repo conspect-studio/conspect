@@ -29,6 +29,12 @@
 //! control's bounded (≤ 1 s) adoption wait covers prime + adoption. One
 //! writer mutex, control-plane only; the clock reads atomics and
 //! `SwapCell`s only.
+//!
+//! Decode sizing (#485): every registered body's cells are published into
+//! the adapter's own [`AuxSizingSlot`] (a sibling of the routed-layout
+//! one) whenever the compose set is, change-only and wait-free for the
+//! readers. Every registered body composes on the aux thread whether or not
+//! a bus selects it, so all of them are sized.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -42,6 +48,7 @@ use multiview_control::output_routing::LayoutBody;
 use multiview_engine::switcher_layouts::{LayoutSourceSet, LayoutSources, MAX_ME_LAYOUT_SOURCES};
 use multiview_framestore::{SwapCell, TileStore};
 
+use crate::display_size::AuxSizingSlot;
 use crate::routing_aux::{MeLayoutCompose, MeLayoutComposeSet};
 
 /// How long a new body's store may take to hold its first frame before the
@@ -75,6 +82,8 @@ struct Writer {
 struct Shared {
     engine: Arc<LayoutSources>,
     compose: MeLayoutComposeSet,
+    /// The registered bodies' cells, for the decoders (#485).
+    sizing: AuxSizingSlot,
     active: Arc<AtomicBool>,
     /// The generation of the last engine publish.
     published: AtomicU64,
@@ -93,6 +102,21 @@ impl Shared {
         ));
         self.active
             .store(!writer.slots.is_empty(), Ordering::Release);
+        self.publish_sizing(writer);
+    }
+
+    /// Publish every registered body's cells for the decoders (#485): one
+    /// O(cells) allocation on a register / body change / unregister (never
+    /// per tick), stored only when the cells changed.
+    fn publish_sizing(&self, writer: &Writer) {
+        let cells: Vec<multiview_core::layout::Cell> = writer
+            .slots
+            .iter()
+            .flat_map(|s| s.compose.body.layout.cells.iter().cloned())
+            .collect();
+        if *self.sizing.load() != cells {
+            self.sizing.store(Arc::new(cells));
+        }
     }
 
     fn publish_engine(&self, writer: &Writer) {
@@ -199,6 +223,7 @@ impl MeLayoutAdapter {
             shared: Arc::new(Shared {
                 engine: Arc::new(LayoutSources::new()),
                 compose: Arc::new(SwapCell::from_pointee(Vec::new())),
+                sizing: crate::display_size::aux_sizing_slot(),
                 active: Arc::new(AtomicBool::new(false)),
                 published: AtomicU64::new(0),
                 prime_wait,
@@ -217,6 +242,13 @@ impl MeLayoutAdapter {
     #[must_use]
     pub fn compose_set(&self) -> MeLayoutComposeSet {
         Arc::clone(&self.shared.compose)
+    }
+
+    /// The registered bodies' cells for decode sizing (#485; for
+    /// `DisplayFollow::with_me_layout_sizing`).
+    #[must_use]
+    pub fn sizing_slot(&self) -> AuxSizingSlot {
+        Arc::clone(&self.shared.sizing)
     }
 
     /// The aux tick channel's M/E gate flag (raised while anything is
@@ -469,6 +501,63 @@ mod tests {
         adapter.register(body("a", 2)).unwrap();
         assert!(Arc::ptr_eq(&compose_store(&adapter, KEY), &second));
         assert_eq!(engine.generation(), generation);
+    }
+
+    fn body_with_cells(
+        id: &str,
+        revision: u64,
+        cells: Vec<multiview_core::layout::Cell>,
+    ) -> LayoutBody {
+        let mut body = Arc::unwrap_or_clone(body(id, revision).0);
+        body.layout.cells = cells;
+        LayoutBody(Arc::new(body))
+    }
+
+    fn sized_cell(source: &str, w: f32, h: f32) -> multiview_core::layout::Cell {
+        multiview_core::layout::Cell {
+            w,
+            h,
+            source: Some(source.to_owned()),
+            ..multiview_core::layout::Cell::default()
+        }
+    }
+
+    /// #485: register publishes the body's cells into the sizing slot (a
+    /// body change replaces them; an unchanged set is not re-stored) and
+    /// unregister empties it, so the decode size returns after removal.
+    #[test]
+    fn me_layouts_registered_bodies_are_published_for_decode_sizing() {
+        let adapter = MeLayoutAdapter::new();
+        let sizing = adapter.sizing_slot();
+        assert!(sizing.load().is_empty());
+        let a = vec![sized_cell("cam", 0.5, 0.5)];
+        adapter
+            .register(body_with_cells("a", 1, a.clone()))
+            .unwrap();
+        assert_eq!(*sizing.load(), a);
+        let b = vec![sized_cell("pip", 0.25, 0.25)];
+        adapter
+            .register(body_with_cells("b", 1, b.clone()))
+            .unwrap();
+        let both: Vec<_> = a.iter().chain(b.iter()).cloned().collect();
+        assert_eq!(*sizing.load(), both, "every registered body is sized");
+        // A body change of `a`: its new cells replace the old ones.
+        let a2 = vec![sized_cell("cam", 1.0, 1.0)];
+        adapter
+            .register(body_with_cells("a", 2, a2.clone()))
+            .unwrap();
+        let both: Vec<_> = a2.iter().chain(b.iter()).cloned().collect();
+        assert_eq!(*sizing.load(), both);
+        // A change elsewhere that leaves the cells equal keeps the same Arc.
+        let before = sizing.load();
+        adapter
+            .register(body_with_cells("b", 2, b.clone()))
+            .unwrap();
+        assert!(Arc::ptr_eq(&before, &sizing.load()), "change-only");
+        assert!(adapter.unregister("a"));
+        assert_eq!(*sizing.load(), b);
+        assert!(adapter.unregister("b"));
+        assert!(sizing.load().is_empty(), "removal empties the sizing");
     }
 
     /// The bound: a store that never primes (aux wedged or failed) is
