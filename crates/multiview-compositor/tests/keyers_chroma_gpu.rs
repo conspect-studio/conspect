@@ -17,8 +17,9 @@
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::too_many_lines
-)]
+    clippy::too_many_lines,
+    clippy::many_single_char_names
+)] // Test fixtures: one table of cases, short pixel-math names.
 
 use multiview_compositor::backend::{GpuTarget, RunBackend, RunBackendKind};
 use multiview_compositor::blend::LinearRgba;

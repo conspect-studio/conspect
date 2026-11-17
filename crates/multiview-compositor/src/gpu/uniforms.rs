@@ -861,7 +861,7 @@ mod key_params_tests {
         );
         let mut mattes = Vec::new();
         let k = KeyParams::build(&t, None, &mut mattes).unwrap();
-        assert!(mattes.is_empty());
+        assert_eq!(mattes.len(), 0);
         assert_eq!(k.head[3] & KEY_KIND_BITS, KEY_KIND_CHROMA);
         assert_eq!(k.head[3] & (KEY_HAS_TABLE | KEY_HAS_SOURCE), 0);
         assert_ne!(k.head[3] & KEY_INVERT, 0);

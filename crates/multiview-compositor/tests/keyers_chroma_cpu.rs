@@ -10,8 +10,9 @@
     clippy::indexing_slicing,
     clippy::float_cmp,
     clippy::as_conversions,
-    clippy::cast_possible_truncation
-)]
+    clippy::cast_possible_truncation,
+    clippy::many_single_char_names
+)] // Test fixtures: short pixel-math names (r, g, b, a, m, s).
 
 use multiview_compositor::blend::{over, LinearRgba, PremulRgba};
 use multiview_compositor::pipeline::{

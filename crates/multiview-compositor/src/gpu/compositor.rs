@@ -921,7 +921,11 @@ impl GpuCompositor {
         for tile in tiles {
             max_w = max_w.max(tile.image.width());
             max_h = max_h.max(tile.image.height());
-            if let Some(src) = tile.key.as_ref().and_then(|k| k.signal_source()) {
+            if let Some(src) = tile
+                .key
+                .as_ref()
+                .and_then(crate::key::TileKey::signal_source)
+            {
                 max_w = max_w.max(src.width());
                 max_h = max_h.max(src.height());
             }
@@ -1068,7 +1072,9 @@ impl GpuCompositor {
         for (kp, tile) in key_params.iter().zip(tiles) {
             if let (Some(layer), Some(src)) = (
                 kp.key_layer(),
-                tile.key.as_ref().and_then(|k| k.signal_source()),
+                tile.key
+                    .as_ref()
+                    .and_then(crate::key::TileKey::signal_source),
             ) {
                 write_tile_plane(
                     queue,
@@ -1595,7 +1601,11 @@ fn pack_params(
             }
             None => params,
         };
-        let key_layer = match tile.key.as_ref().and_then(|k| k.signal_source()) {
+        let key_layer = match tile
+            .key
+            .as_ref()
+            .and_then(crate::key::TileKey::signal_source)
+        {
             Some(src) => {
                 require_even_positive(src.width(), src.height(), "key source")?;
                 let layer = next_key_layer;
