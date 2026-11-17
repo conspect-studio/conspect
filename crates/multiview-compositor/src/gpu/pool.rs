@@ -39,7 +39,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::gpu::compositor::MAX_TILES;
-use crate::gpu::uniforms::{CompositeUniforms, EncodeUniforms, KeyParams, TileParams};
+use crate::gpu::uniforms::{
+    CompositeUniforms, EncodeUniforms, KeyParams, TileParams, MATTE_TABLE_LEN,
+};
 
 /// Whether a cached resource of `have` extent can serve a request needing
 /// `need` — i.e. it is at least as large in every dimension. Pure (no GPU), so
@@ -200,6 +202,10 @@ pub(crate) struct SurfacePool {
     /// parallel to `tile_buf` and sized for [`MAX_TILES`] tiles: allocated
     /// once, refilled in place.
     pub key_buf: Option<wgpu::Buffer>,
+    /// Matte-table storage buffer (binding 7, review MEDIA-1): one 256-entry
+    /// `f32` table per signal-keyed tile, sized for [`MAX_TILES`] tables:
+    /// allocated once, refilled in place.
+    pub matte_buf: Option<wgpu::Buffer>,
 
     // --- CPU-side param scratch (grow-only, cleared and refilled per tick) ---
     /// The packed tile params of the current composite. Its capacity reaches
@@ -208,6 +214,9 @@ pub(crate) struct SurfacePool {
     pub tile_params: Vec<TileParams>,
     /// The packed key params, parallel to `tile_params`.
     pub key_params: Vec<KeyParams>,
+    /// The packed matte tables (256 `f32` per signal-keyed tile), indexed by
+    /// `KeyParams::table[0]`; grow-only like `tile_params`.
+    pub mattes: Vec<f32>,
     /// Overlay-pass uniform buffer.
     #[cfg(feature = "overlay")]
     pub ov_uniform: Option<wgpu::Buffer>,
@@ -384,6 +393,14 @@ pub(crate) fn tile_buf_size() -> u64 {
 pub(crate) fn key_buf_size() -> u64 {
     let stride = u64::try_from(core::mem::size_of::<KeyParams>()).unwrap_or(0);
     stride.saturating_mul(u64::from(MAX_TILES.max(1)))
+}
+
+/// The byte size of the [`MAX_TILES`]-sized matte-table storage buffer (one
+/// table of [`MATTE_TABLE_LEN`] `f32` per tile at most).
+#[must_use]
+pub(crate) fn matte_buf_size() -> u64 {
+    let table = u64::try_from(MATTE_TABLE_LEN * core::mem::size_of::<f32>()).unwrap_or(0);
+    table.saturating_mul(u64::from(MAX_TILES.max(1)))
 }
 
 /// The byte size of the composite-pass uniform buffer.

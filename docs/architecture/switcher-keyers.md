@@ -144,10 +144,20 @@ buffer `key_params` (binding 6, one entry per tile, parallel to `tiles`, pooled 
 the tile buffer) carries:
 
 ```text
-KeyParams { key_layer, key_w, key_h, kind|invert|group (u32 bits),
-            key_luma_scale, key_luma_off, clip, gain,
-            mask: vec4<u32>, merge: vec4<f32> /* kind, p | d, i */ }
+KeyParams { key_layer, key_w, key_h, kind|invert|has_table|group (u32 bits),
+            table_base: u32,
+            mask: vec4<u32>, merge: vec4<f32> /* kind, p | d, i */, dip_colour }
 ```
+
+A matte from a signal (luma, or linear with a key source) is a pure function of the signal's
+8-bit Y code, its resolved range, clip, gain and invert. So the CPU builds it per keyed tile as
+a 256-entry `f32` table with the oracle's own functions (`range::expand_luma`, then
+`key::luma_matte` or `key::unit`, then invert), using the key source's range, or the fill's for
+a luma self key. The tables live in a second storage buffer `mattes` (binding 7, pooled and
+refilled in place like `key_params`); the shader rounds the texel to its integer code and looks
+it up at `table_base + code`. This is exact by construction: a huge or infinite gain makes the
+matte a step at the clip, and a shader evaluation of `(y − clip) × gain` could flip whole
+pixels on float fuzz (review MEDIA-1).
 
 Nothing is borrowed from the fill's `TileParams`, so fill and key can differ in size and range.
 Layer count: at most 1 Program cell + 3 transition tiles + 6 keyers × 2 (fill, key) = 16 ≤ 64.
@@ -519,25 +529,28 @@ keyers.
 - **Parameters (§3.3).** `KeyParams` (80 bytes) is binding 6, one entry per tile, parallel to
   `tiles`. It holds:
   - `head`: key layer, key w and h, and the flags (kind, invert, has-source, has-mask,
-    constant-matte, and the 2-bit group).
-  - `luma`: the key source's own range expand (scale and offset), clip and gain.
+    has-table, and the 2-bit group).
+  - `table`: the base of the tile's matte table in `mattes`.
   - `mask`: a `vec4<u32>` in fill-source pixels.
   - `merge`: kind, p or d, and i, plus the DIP colour.
 
-  The buffer is allocated once at `MAX_TILES` entries and refilled in place, like the tile
-  buffer. The CPU-side `TileParams`/`KeyParams` scratch lives in `SurfacePool` and is cleared
-  and refilled, so a steady-state tick allocates no `Vec`.
+  `mattes` is binding 7: one 256-entry `f32` table per signal-keyed tile (see §3.3). Both
+  buffers are allocated once at `MAX_TILES` entries (tables) and refilled in place, like the
+  tile buffer. The CPU-side `TileParams`/`KeyParams`/matte scratch lives in `SurfacePool` and is
+  cleared and refilled, so a steady-state tick allocates no `Vec`.
 - **Key sources.** Each key source uploads only its Y plane, into its own `y_planes` layer
   after the fill layers. It is sampled with its own nearest map, `kx = floor(ddx × key_w / dst_w)`,
-  and expanded with its own range. The matte reads post-range-expand Y only. `mask × matte`
+  and its matte table is built with its own range. The matte reads the Y code only (the input
+  of range expand), never the colour math. `mask × matte`
   multiplies into alpha before the single premultiply, so the #8 order is unchanged and nothing
   is materialised as RGBA (#5).
 - **Matte math is the oracle's.**
   - A linear self key is 1 and ignores invert.
   - The mask test is half-open and compares offsets, so it cannot overflow.
-  - Degenerate luma parameters become the oracle's constant matte on the CPU side, so the
-    shader never clamps a NaN: a NaN, negative or zero gain, or a NaN clip, gives 0; an
-    infinite clip gives 0 or 1.
+  - Every signal matte is the oracle's own value for the Y code: the shader computes
+    `round(texel × 255)` clamped to [0, 255] and reads the CPU-built table, so degenerate
+    parameters (NaN, negative, zero or infinite gain; NaN, infinite or subnormal clip) and the
+    step of a huge gain cannot diverge from the CPU, and the shader never clamps a NaN.
   - A NaN tile opacity reads as 0, as on the CPU.
 - **Scene groups.** Two extra `vec4` registers (outgoing and incoming) hold the open segment.
   It merges (MIX, DIP) at the next `Top` tile or the end of the list, and the last grouped
@@ -547,22 +560,28 @@ keyers.
   - Tiles plus key sources past the 64-layer tile array. §3.3's worst case is 16 layers.
   - A fill or key larger than the device's `max_texture_dimension_2d`.
 - **Tests.**
-  - `tests/keyers_gpu.rs` (`wgpu`, 3 tests) compares GPU and CPU oracle output (SSIM ≥ 0.98,
-    PSNR ≥ 40 dB on Y and UV) across 18 frames. The cases cover:
+  - `tests/keyers_gpu.rs` (`wgpu`, 5 tests) compares GPU and CPU oracle output (SSIM ≥ 0.98,
+    PSNR ≥ 40 dB on Y and UV) across 18 frames, plus the MEDIA-1 frames below. The cases cover:
     - a luma self key, and a luma key with a key source of another size and range (up- and
       downscaled tile);
     - a linear key with a key source, and a linear self key with fill alpha;
     - luma and linear invert, and a mask on a flying key;
     - two keyers at non-unit scale, and degenerate parameters;
     - MIX at p 0, 0.3, 0.5 and 1, and DIP at three (d, i);
-    - two segments with an off-canvas grouped tile whose merge wins.
+    - two segments with an off-canvas grouped tile whose merge wins;
+    - review MEDIA-1: a full-range black key source, clip −1e-40, gain +∞ (matte 1, and
+      inverted 0) under a white fill, and a limited-range key whose codes sit one below, on and
+      one above the clip with gain 1e30 and +∞. These also bound every pixel to |ΔY| ≤ 2, so a
+      flipped step pixel fails.
 
     The suite also checks that a keyed or grouped frame on the GPU backend leaves
     `gpu_cpu_fallback_frames` at 0, that there is no GPU pool growth over 30 keyed and grouped
     composites, and that the layer-limit refusal falls back to the oracle.
   - On lavapipe (llvmpipe, Vulkan) the minima were SSIM 0.99998 and PSNR 60.9 dB, with a
     maximum |ΔY| of 2 codes.
-  - GPU-free `KeyParams` packing unit tests run in `cargo test` without an adapter.
+  - GPU-free `KeyParams` packing unit tests run in `cargo test` without an adapter, including
+    a check that the matte table equals `key::luma_matte` for all 256 codes over NaN, negative
+    and infinite gains and NaN, ±∞ and subnormal clips, in both ranges.
 - **Bench.** `keyer_composite_bench` times the GPU key path. It prints the adapter and a
   per-case fallback delta, which must be 0. RTX 4060 figures and the calibration of `u` and
   `fold` are still owed by the lead; no numbers are recorded here. lavapipe timings measure

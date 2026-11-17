@@ -59,9 +59,9 @@ struct KeyParams {
     // x: key layer in `y_planes`, y,z: key source w,h, w: flags (KEY_* bits;
     // bits 8-9 the scene group: 0 top, 1 both, 2 out, 3 in).
     head: vec4<u32>,
-    // x,y: key source luma range expand (scale, offset); z: clip (or the
-    // constant matte); w: gain (>= 0, finite).
-    luma: vec4<f32>,
+    // x: base of this tile's 256-entry matte table in `mattes` (valid under
+    // KEY_HAS_TABLE); y,z,w: padding.
+    table: vec4<u32>,
     // Mask rectangle in fill-source pixels: x, y, w, h (half-open).
     mask: vec4<u32>,
     // x: merge kind (0 MIX, 1 DIP); y: p | d; z: i (all in [0, 1]).
@@ -75,7 +75,7 @@ const KEY_KIND_LINEAR: u32 = 1u;
 const KEY_INVERT: u32 = 4u;
 const KEY_HAS_SOURCE: u32 = 8u;
 const KEY_HAS_MASK: u32 = 16u;
-const KEY_CONST_MATTE: u32 = 32u;
+const KEY_HAS_TABLE: u32 = 32u;
 const KEY_GROUP_SHIFT: u32 = 8u;
 
 struct CompositeUniforms {
@@ -92,6 +92,10 @@ struct CompositeUniforms {
 @group(0) @binding(4) var canvas_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var a_planes: texture_2d_array<f32>;
 @group(0) @binding(6) var<storage, read> keys: array<KeyParams>;
+// Per-key matte tables (review MEDIA-1): `mattes[base + c]` is the final
+// matte (after invert) of 8-bit Y code c, built on the CPU with the oracle's
+// own functions, so a step matte (a huge or infinite gain) is exact.
+@group(0) @binding(7) var<storage, read> mattes: array<f32>;
 
 // Nearest-neighbour index of destination offset d (< dst) on a source axis of
 // src samples: floor(d × src / dst), clamped. Mirrors `key::axis`. d < dst and
@@ -104,12 +108,19 @@ fn key_axis(d: u32, src: u32, dst: u32) -> u32 {
     return min((d * src) / dst, src - 1u);
 }
 
+// The integer 8-bit code of a code value v8 = unorm texel × 255 (texture-to-
+// float fuzz is far below 0.5): round, clamped to [0, 255].
+fn y_code(v8: f32) -> u32 {
+    return u32(clamp(round(v8), 0.0, 255.0));
+}
+
 // The straight key factor mask × matte (before the single premultiply).
 // Mirrors `key::key_factor`: a pixel outside the source-space mask is 0; a
-// linear self key is 1 and ignores invert; a NaN/negative gain was sanitized
-// to a constant matte on the CPU side (`KeyParams::build`).
+// linear self key is 1 and ignores invert; every other matte is a pure
+// function of the signal's 8-bit Y code (the key source's, else the fill's),
+// looked up in the tile's table (`KeyParams::build` / `push_matte_table`).
 fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, dst_h: u32,
-              fill_y: f32) -> f32 {
+              fill_y8: f32) -> f32 {
     let flags = k.head.w;
     let kind = flags & KEY_KIND_BITS;
     if kind == 0u {
@@ -122,29 +133,17 @@ fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, ds
             return 0.0;
         }
     }
-    let has_source = (flags & KEY_HAS_SOURCE) != 0u;
-    var signal = fill_y;
-    if has_source {
+    if (flags & KEY_HAS_TABLE) == 0u {
+        // A linear self key: no signal, matte 1.
+        return 1.0;
+    }
+    var code = y_code(fill_y8);
+    if (flags & KEY_HAS_SOURCE) != 0u {
         let kx = key_axis(ddx, k.head.y, dst_w);
         let ky = key_axis(ddy, k.head.z, dst_h);
-        let y8 = textureLoad(y_planes, vec2<i32>(i32(kx), i32(ky)), i32(k.head.x), 0).r * 255.0;
-        signal = (y8 - k.luma.y) / k.luma.x;
+        code = y_code(textureLoad(y_planes, vec2<i32>(i32(kx), i32(ky)), i32(k.head.x), 0).r * 255.0);
     }
-    var matte = 1.0;
-    if kind == KEY_KIND_LINEAR {
-        if !has_source {
-            return 1.0;
-        }
-        matte = clamp(signal, 0.0, 1.0);
-    } else if (flags & KEY_CONST_MATTE) != 0u {
-        matte = k.luma.z;
-    } else {
-        matte = clamp((signal - k.luma.z) * k.luma.w, 0.0, 1.0);
-    }
-    if (flags & KEY_INVERT) != 0u {
-        matte = 1.0 - matte;
-    }
-    return matte;
+    return mattes[k.table.x + code];
 }
 
 // Merge the two scene accumulators (premultiplied linear). Mirrors
@@ -350,10 +349,11 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // 5. premultiplied-alpha source-over in linear light. Straight
         //    per-pixel alpha folds into the opacity here, premultiplied ONCE.
         //    A keyer's mask × matte (ADR-0113 §3) folds in at the same step;
-        //    its luma is the post-range-expand Y of step 1 (never steps 2-4).
+        //    its matte is a table lookup on the fill's (or key source's) 8-bit
+        //    Y code, the input of step 1 (never steps 2-4).
         let a = clamp(t.opacity_transfer.x, 0.0, 1.0) * sample_tile_alpha(t, sx, sy)
             * wipe_coverage(t, px, py, cw, ch)
-            * key_factor(k, sx, sy, ddx, ddy, dst_w, dst_h, yexp);
+            * key_factor(k, sx, sy, ddx, ddy, dst_w, dst_h, yuv8.x);
         let src = vec4<f32>(lin * a, a);
         let inv = 1.0 - src.a;
         switch group {

@@ -468,3 +468,118 @@ fn a_frame_past_the_layer_limit_is_refused_and_falls_back_to_the_oracle() {
     assert_eq!(out, oracle, "the fallback is the CPU oracle, keyed");
     assert_eq!(backend.gpu_cpu_fallback_frames(), 1);
 }
+
+/// Composite on both paths, hold the §11 floors AND require no pixel to
+/// differ by more than `max_dy` on Y: a matte flipped at the step of a huge or
+/// infinite gain moves a whole pixel by far more than float fuzz does.
+fn gate_exact(gpu: &GpuCompositor, name: &str, tiles: &[Tile<'_>], max_dy: u8) -> (f64, f64) {
+    let canvas = CanvasColor::default();
+    let bg = LinearRgba::opaque(0.02, 0.05, 0.1);
+    let cpu_out = cpu_composite(W, H, canvas, bg, tiles).expect("CPU oracle");
+    let gpu_out = gpu
+        .composite(W, H, canvas, bg, tiles)
+        .expect("GPU composite");
+    let worst = gpu_out
+        .y_plane()
+        .iter()
+        .zip(cpu_out.y_plane())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        worst <= max_dy,
+        "{name}: a GPU pixel differs from the oracle by {worst} > {max_dy} on Y"
+    );
+    gate(gpu, name, tiles)
+}
+
+/// Y pixels (beyond 8 codes) that differ between two CPU composites.
+fn changed_px(a: &[Tile<'_>], b: &[Tile<'_>]) -> usize {
+    let canvas = CanvasColor::default();
+    let bg = LinearRgba::opaque(0.02, 0.05, 0.1);
+    let a = cpu_composite(W, H, canvas, bg, a).unwrap();
+    let b = cpu_composite(W, H, canvas, bg, b).unwrap();
+    a.y_plane()
+        .iter()
+        .zip(b.y_plane())
+        .filter(|(x, y)| x.abs_diff(**y) > 8)
+        .count()
+}
+
+/// Review MEDIA-1: a positive excess times an infinite gain is a matte of 1
+/// on the CPU oracle; the GPU must not approximate `+inf` (with `f32::MAX`,
+/// `1e-40 × f32::MAX ≈ 0.034`, or 0 when subnormals flush).
+#[test]
+fn an_infinite_gain_on_a_subnormal_excess_keys_exactly_like_the_oracle() {
+    let Some(gpu) = try_gpu() else { return };
+    let bg = gradient(W, H, ColorRange::Limited, 7);
+    let white = Nv12Image::solid(W, H, 235, 128, 128, color(ColorRange::Limited)).unwrap();
+    // Full-range black key source: y = 0 exactly, so y − clip = +1e-40.
+    let black_key = Nv12Image::solid(W, H, 0, 128, 128, color(ColorRange::Full)).unwrap();
+    let clip = -1e-40_f32;
+    assert!(clip.is_subnormal());
+    let mut floor = (f64::INFINITY, f64::INFINITY);
+    for invert in [false, true] {
+        let tiles = [
+            Tile::placed(&bg, 0, 0, 1.0),
+            Tile::placed(&white, 0, 0, 1.0).with_key(
+                TileKey::luma(clip, f32::INFINITY)
+                    .with_source(&black_key)
+                    .inverted(invert),
+            ),
+        ];
+        // The key is visible: matte 1 shows the white fill over the gradient
+        // (the picture differs from the background alone); inverted, matte 0
+        // hides it (the picture differs from the un-keyed fill).
+        let reference: Vec<Tile<'_>> = if invert {
+            vec![tiles[0].clone(), Tile::placed(&white, 0, 0, 1.0)]
+        } else {
+            vec![tiles[0].clone()]
+        };
+        let changed = changed_px(&tiles, &reference);
+        assert!(
+            changed >= (W * H / 2) as usize,
+            "invert={invert}: the key must decide the picture ({changed} px)"
+        );
+        let (s, p) = gate_exact(&gpu, &format!("MEDIA-1 invert={invert}"), &tiles, 2);
+        floor = (floor.0.min(s), floor.1.min(p));
+    }
+    println!("MEDIA-1 minimum: SSIM={:.5} PSNR={:.2}dB", floor.0, floor.1);
+}
+
+/// The luma matte of a huge or infinite gain is a step at the clip: a
+/// limited-range key code that lands exactly on the clip (matte 0: zero
+/// excess, and `0 × inf` is NaN read as 0), one code above (1) and one below
+/// (0) must key exactly as the oracle does, inverted or not.
+#[test]
+fn a_step_matte_at_the_clip_keys_exactly_like_the_oracle() {
+    let Some(gpu) = try_gpu() else { return };
+    let limited = ColorRange::Limited;
+    let bg = gradient(W, H, limited, 7);
+    let white = Nv12Image::solid(W, H, 235, 128, 128, color(limited)).unwrap();
+    // Columns cycle below / at / above the clip code.
+    let codes = [125u8, 126, 127];
+    let wu = W as usize;
+    let y: Vec<u8> = (0..wu * H as usize).map(|i| codes[(i % wu) % 3]).collect();
+    let key = Nv12Image::new(W, H, y, vec![128u8; wu * H as usize / 2], color(limited)).unwrap();
+    let clip = multiview_compositor::range::expand_luma(126, limited);
+    let mut floor = (f64::INFINITY, f64::INFINITY);
+    for gain in [1e30_f32, f32::INFINITY] {
+        for invert in [false, true] {
+            let tiles = [
+                Tile::placed(&bg, 0, 0, 1.0),
+                Tile::placed(&white, 0, 0, 1.0)
+                    .with_key(TileKey::luma(clip, gain).with_source(&key).inverted(invert)),
+            ];
+            assert_key_visible("step", &tiles);
+            let (s, p) = gate_exact(
+                &gpu,
+                &format!("step gain={gain:e} invert={invert}"),
+                &tiles,
+                2,
+            );
+            floor = (floor.0.min(s), floor.1.min(p));
+        }
+    }
+    println!("step minimum: SSIM={:.5} PSNR={:.2}dB", floor.0, floor.1);
+}

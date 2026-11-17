@@ -944,20 +944,34 @@ impl GpuCompositor {
             comp_uniform,
             tile_buf,
             key_buf,
+            matte_buf,
             tile_params,
             key_params,
+            mattes,
             ..
         } = pool;
         // The param scratch is pooled (cleared and refilled, grow-only), so a
         // steady-state tick allocates no Vec here. Packing runs before any GPU
         // surface is touched, so a color/geometry error grows nothing.
-        pack_params(tiles, canvas, canvas_w, canvas_h, tile_params, key_params)?;
+        pack_params(
+            tiles,
+            canvas,
+            canvas_w,
+            canvas_h,
+            tile_params,
+            key_params,
+            mattes,
+        )?;
         // The texture array must have at least one layer even with zero tiles;
         // pad the params buffers so the storage bindings are non-empty (the
         // shader reads only the `tile_count` entries either way).
         if tile_params.is_empty() {
             tile_params.push(TileParams::zeroed());
             key_params.push(KeyParams::zeroed());
+        }
+        // The matte binding must be non-empty too (no keyed tile reads it).
+        if mattes.is_empty() {
+            mattes.push(0.0);
         }
 
         // --- size / reuse the pooled tile texture arrays ---------------------
@@ -1122,6 +1136,17 @@ impl GpuCompositor {
             0,
             bytemuck::cast_slice(key_params.as_slice()),
         );
+        // The matte tables (binding 7): at most one per tile, so they always
+        // fit the MAX_TILES-sized buffer (tile_count was bounded above).
+        let matte_table_buf = SurfacePool::fixed_buffer(matte_buf, alloc_count, || {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("multiview matte tables"),
+                size: pool::matte_buf_size(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        queue.write_buffer(matte_table_buf, 0, bytemuck::cast_slice(mattes.as_slice()));
 
         let composite_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("multiview composite bind"),
@@ -1154,6 +1179,10 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: key_param_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: matte_table_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1517,9 +1546,11 @@ fn pack_params(
     canvas_h: u32,
     tile_params: &mut Vec<TileParams>,
     key_params: &mut Vec<KeyParams>,
+    mattes: &mut Vec<f32>,
 ) -> Result<()> {
     tile_params.clear();
     key_params.clear();
+    mattes.clear();
     let mut next_alpha_layer = 0_u32;
     let mut next_key_layer = u32::try_from(tiles.len())
         .map_err(|_| Error::GpuLimit("tile layer overflows u32".to_owned()))?;
@@ -1572,7 +1603,7 @@ fn pack_params(
             }
             None => None,
         };
-        key_params.push(KeyParams::build(tile, key_layer)?);
+        key_params.push(KeyParams::build(tile, key_layer, mattes)?);
         tile_params.push(params);
     }
     Ok(())
@@ -1797,6 +1828,18 @@ fn composite_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
                     min_binding_size: min_binding_size::<KeyParams>(),
+                },
+                count: None,
+            },
+            // Per-key matte tables (review MEDIA-1): 256 f32 per signal-keyed
+            // tile, indexed by `KeyParams::table[0]` + the 8-bit Y code.
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: min_binding_size::<f32>(),
                 },
                 count: None,
             },
