@@ -422,6 +422,12 @@ fn settle_workers(r: &OutputRouter, bound: std::time::Duration) {
     }
 }
 
+/// No router call may cost this much: work plus waits, the bound before
+/// #501, now without host preemption.
+const ROUTER_COST_BOUND: std::time::Duration = std::time::Duration::from_millis(50);
+/// Nor run this long on a CPU (a healthy call uses ~1 ms in a debug build).
+const ROUTER_CPU_BOUND: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// The router's cost over a span of calls (maxima per call).
 #[derive(Clone, Copy, Debug, Default)]
 struct RouterCost {
@@ -431,12 +437,27 @@ struct RouterCost {
     /// Largest on-CPU delta over one call: an extra cap only, accurate to one
     /// scheduler tick (a running thread's own runtime is folded in at ticks).
     on_cpu: std::time::Duration,
+    /// Calls over a bound only by the wall time of the harness's own
+    /// rejected after-call reads ([`ThreadTimes::tight_after`]): the
+    /// accounting is inconclusive for them, so they fail the test as such,
+    /// never as a router verdict, and never pass.
+    inconclusive: u64,
 }
 
 impl RouterCost {
-    fn add(&mut self, call: Self) {
+    /// Fold in one call, whose rejected after-call reads took `retakes` of
+    /// wall time (included in its cost: an upper bound stays one).
+    fn add(&mut self, call: Self, retakes: std::time::Duration) {
+        let over = call.cost >= ROUTER_COST_BOUND || call.on_cpu >= ROUTER_CPU_BOUND;
+        let over_without_retakes = call.cost.saturating_sub(retakes) >= ROUTER_COST_BOUND
+            || call.on_cpu.saturating_sub(retakes) >= ROUTER_CPU_BOUND;
+        if over && !over_without_retakes {
+            self.inconclusive += 1;
+            return;
+        }
         self.cost = self.cost.max(call.cost);
         self.on_cpu = self.on_cpu.max(call.on_cpu);
+        self.inconclusive += call.inconclusive;
     }
 
     /// Upper bounds on the cost of the one router call made between samples
@@ -464,11 +485,13 @@ impl RouterCost {
             return Self {
                 cost: span,
                 on_cpu: span,
+                inconclusive: 0,
             };
         };
         Self {
             cost: span.saturating_sub(a.queued.saturating_sub(b.queued)),
             on_cpu: a.on_cpu.saturating_sub(b.on_cpu),
+            inconclusive: 0,
         }
     }
 }
@@ -528,17 +551,20 @@ impl ThreadTimes {
     }
 
     /// A sample taken within [`SAMPLE_WINDOW`] before the returned wall
-    /// instant. Each retake moves both later; the retakes before it are
-    /// charged to the call as the harness's own cost (each a ~20 us read on
-    /// a CPU; their preemption is in the final sample's run delay).
-    fn tight_after() -> (Option<Self>, Instant) {
-        let deadline = Instant::now() + SAMPLE_DEADLINE;
+    /// instant, and the wall time spent in rejected reads before it. Each
+    /// retake moves both later and stays inside the measured span, so it is
+    /// charged to the call (the cost stays an upper bound) and reported, so
+    /// a violation that only the retakes explain is classified inconclusive
+    /// ([`RouterCost::add`]).
+    fn tight_after() -> (Option<Self>, Instant, std::time::Duration) {
+        let started = Instant::now();
+        let deadline = started + SAMPLE_DEADLINE;
         loop {
             let from = Instant::now();
             let sample = Self::sample();
             let at = Instant::now();
             if sample.is_none() || at - from < SAMPLE_WINDOW {
-                return (sample, at);
+                return (sample, at, from - started);
             }
             assert!(Instant::now() < deadline, "{INCONCLUSIVE}");
         }
@@ -756,8 +782,9 @@ impl Harness {
             .on_tick(t, pts(t), &mut self.d, &mut self.rec)
             .unwrap();
         self.max_router = self.max_router.max(w1.elapsed());
-        let (after, wd) = ThreadTimes::tight_after();
-        self.router_cost.add(RouterCost::of(before, after, wa, wd));
+        let (after, wd, retakes) = ThreadTimes::tight_after();
+        self.router_cost
+            .add(RouterCost::of(before, after, wa, wd), retakes);
         // A live worker encodes within the tick period.
         std::thread::sleep(std::time::Duration::from_millis(2));
         settle_workers(&self.r, self.settle);
@@ -1335,15 +1362,17 @@ fn a_slow_close_never_blocks_the_consumer() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
-    // No call may cost 50 ms (work plus waits: the original wall bound
-    // without host preemption), nor run 20 ms on a CPU (a healthy call uses
-    // ~1 ms in a debug build).
+    // Measurement first: a window the harness's own reads made
+    // inconclusive fails as that, never as a router verdict.
+    assert!(
+        windows.iter().all(|w| w.inconclusive == 0),
+        "scheduler accounting inconclusive: a call is over a bound only by the harness's own stalled after-call reads: {windows:?}"
+    );
     assert!(
         windows
             .iter()
-            .all(|w| w.cost < std::time::Duration::from_millis(50)
-                && w.on_cpu < std::time::Duration::from_millis(20)),
-        "a router call during a held close cost >= 50 ms or ran >= 20 ms on a CPU: {windows:?}"
+            .all(|w| w.cost < ROUTER_COST_BOUND && w.on_cpu < ROUTER_CPU_BOUND),
+        "a router call during a held close cost >= {ROUTER_COST_BOUND:?} or ran >= {ROUTER_CPU_BOUND:?} on a CPU: {windows:?}"
     );
     x.tick(t);
     t += 1;
