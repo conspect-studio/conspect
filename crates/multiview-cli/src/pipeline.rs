@@ -4399,6 +4399,7 @@ impl Pipeline {
         let spawner = DemandSpawner {
             live: self.live_spawner(),
             registry: Arc::clone(&self.stop_registry),
+            catalogue: Arc::clone(&self.catalogue),
         };
         let rails = crate::source_rails::SourceRails::new(
             Arc::clone(&self.catalogue),
@@ -10050,8 +10051,9 @@ fn run_webrtc_output(
     // packet PTS in encoder ticks rescales to 90 kHz video RTP units. Audio
     // packets are stamped in `1/sample_rate` already; the AAC→Opus distinction
     // does not change the 48 kHz Opus RTP clock the driver writes them at.
-    let video_rtp = Rational::new(1, 90_000);
-    let audio_rtp = Rational::new(1, 48_000);
+    // `EgressMedia::rtp_timestamp` wraps the 64-bit result mod 2^32 (RFC 3550;
+    // #492) — never a clamp, which froze viewers at 0 after ~13 h / ~24.9 h.
+    let audio_time_base = Rational::new(1, 48_000);
     let mut delivered = 0usize;
     let mut dropped = 0u64;
     // Block on each fanned packet; the iterator ends when the channel closes
@@ -10063,18 +10065,18 @@ fn run_webrtc_output(
             continue;
         };
         let (media, rtp_timestamp) = match packet.kind() {
-            StreamKind::Video => {
-                let ts =
-                    multiview_core::time::rescale(packet.pts().unwrap_or(0), time_base, video_rtp);
-                (EgressMedia::Video, u32::try_from(ts.max(0)).unwrap_or(0))
-            }
+            StreamKind::Video => (
+                EgressMedia::Video,
+                EgressMedia::Video.rtp_timestamp(packet.pts().unwrap_or(0), time_base),
+            ),
             StreamKind::Audio => {
                 // Audio packets carry their PTS in the audio encoder time-base
                 // (1/sample_rate); it is already the 48 kHz Opus RTP clock unit, so
                 // the rescale is identity — kept explicit for the timeline contract.
-                let ts =
-                    multiview_core::time::rescale(packet.pts().unwrap_or(0), audio_rtp, audio_rtp);
-                (EgressMedia::Audio, u32::try_from(ts.max(0)).unwrap_or(0))
+                (
+                    EgressMedia::Audio,
+                    EgressMedia::Audio.rtp_timestamp(packet.pts().unwrap_or(0), audio_time_base),
+                )
             }
             // A future elementary-stream kind is not carried over WebRTC.
             _ => continue,
@@ -10102,6 +10104,99 @@ fn run_webrtc_output(
         line: format!("{label}: {delivered} packet(s) fanned to WebRTC egress"),
         playlist: None,
         frames: delivered,
+    }
+}
+
+/// #492: the WebRTC output egress stamps RTP timestamps modulo 2^32 (RFC 3550),
+/// never clamped to 0, for a program that has run past the 32-bit boundary
+/// (video ≈ 13 h 15 min at 90 kHz, audio ≈ 24.9 h at 48 kHz).
+#[cfg(all(test, feature = "webrtc-native"))]
+mod webrtc_rtp_wrap_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::run_webrtc_output;
+    use crate::binding_delivery::{BindingDelivery, BindingPolicy, DeliveryLimits};
+    use multiview_core::time::Rational;
+    use multiview_ffmpeg::{EncodedPacket, StreamKind};
+    use multiview_webrtc::egress::{egress_feed, EgressMedia};
+    use std::time::{Duration, Instant};
+
+    fn packet(kind: StreamKind, pts: i64, key: bool) -> EncodedPacket {
+        let mut packet =
+            ffmpeg_next::Packet::copy(&[0, 0, 0, 1, if key { 0x65 } else { 0x41 }, 0x88]);
+        packet.set_pts(Some(pts));
+        packet.set_dts(Some(pts));
+        if key {
+            packet.set_flags(ffmpeg_next::packet::Flags::KEY);
+        }
+        EncodedPacket::with_kind(packet, kind)
+    }
+
+    /// Drive 30 fps video ticks and 20 ms Opus frames whose PTS straddle each
+    /// media's 2^32 RTP boundary through the real fan-out → `run_webrtc_output`
+    /// → egress feed, and check every consecutive stamp advances by exactly one
+    /// frame duration modulo 2^32 (and that none is pinned to 0).
+    #[test]
+    fn webrtc_egress_rtp_timestamps_wrap_mod_2_32_through_the_fan_out() {
+        const N: i64 = 12;
+        let fps30 = Rational::new(1, 30);
+        let max = i64::from(u32::MAX);
+        // Video: the last 90 kHz-RTP frame before the wrap is n = ⌊max/3000⌋.
+        let v0 = max / 3000 - 5;
+        // Audio: start 5 Opus frames (960 samples) before the 48 kHz wrap.
+        let a0 = max - (max % 960) - 5 * 960;
+
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::Bounded],
+            DeliveryLimits::default(),
+            vec![None],
+        );
+        let rx = receivers.pop().unwrap();
+        let (sink, feed) = egress_feed();
+        let runner = std::thread::spawn(move || run_webrtc_output(&sink, "webrtc-test", rx, fps30));
+        let now = Instant::now();
+        for i in 0..N {
+            delivery.stage(&[
+                packet(StreamKind::Video, v0 + i, i == 0),
+                packet(StreamKind::Audio, a0 + i * 960, false),
+            ]);
+            delivery.flush_tick(now, Duration::from_millis(33));
+        }
+        delivery.finish();
+        drop(delivery);
+        let outcome = runner.join().unwrap();
+        assert_eq!(outcome.frames, usize::try_from(2 * N).unwrap());
+
+        let mut video = Vec::new();
+        let mut audio = Vec::new();
+        while let Some(sample) = feed.pop() {
+            match sample.media {
+                EgressMedia::Video => video.push(sample.rtp_timestamp),
+                EgressMedia::Audio => audio.push(sample.rtp_timestamp),
+                _ => panic!("unexpected media"),
+            }
+        }
+        assert_eq!(video.len(), usize::try_from(N).unwrap());
+        assert_eq!(audio.len(), usize::try_from(N).unwrap());
+        assert_eq!(i64::from(video[0]), v0 * 3000, "exact below the wrap");
+        assert_eq!(i64::from(audio[0]), a0, "exact below the wrap");
+        for (stamps, step, name) in [(&video, 3000_u32, "video"), (&audio, 960_u32, "audio")] {
+            for pair in stamps.windows(2) {
+                assert_eq!(
+                    pair[1].wrapping_sub(pair[0]),
+                    step,
+                    "{name} RTP timestamps advance one frame mod 2^32: {stamps:?}"
+                );
+            }
+            assert!(
+                stamps.windows(2).any(|p| p[1] < p[0]),
+                "{name} crossed the 2^32 boundary in this run: {stamps:?}"
+            );
+            assert!(
+                stamps.iter().filter(|&&t| t == 0).count() <= 1,
+                "{name} stamps were not clamped to 0: {stamps:?}"
+            );
+        }
     }
 }
 
@@ -11460,9 +11555,11 @@ struct LiveIngestSpawner {
         crate::source_rails::Catalogue,
         multiview_engine::DemandManager<Nv12Image>,
     )>,
-    /// First-slice switcher runs fail closed on a live media edit and retire a
-    /// removed or edited source's store pixels, so the M/E can never resolve
-    /// stale media (PR 224). Policy-only edits still apply live.
+    /// First-slice switcher runs retire a removed or media-edited source's
+    /// store pixels before the new definition is catalogued, so the M/E can
+    /// never resolve stale media (PR 224, issue #464). An edit of a source on
+    /// a bus is refused by the control plane before it reaches the engine;
+    /// policy-only edits apply live without a restart.
     clear_on_remove: bool,
     source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved startup layout: the pinned canvas, which a live layout swap
@@ -11542,14 +11639,41 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn invalidate_live_edit(&self, id: &str) -> bool {
-        if !self.clear_on_remove || self.demand.is_none() {
+        if !self.clear_on_remove {
             return false;
         }
-        // Invalidate before reconciliation can resolve a stale configured rail.
-        // Fencing also excludes any detached old producer's late publications.
-        self.source_removed(id);
-        tracing::warn!(source = %id, "switcher source edit requires restart; stale demand catalogue entry invalidated");
-        true
+        let Some((catalogue, _)) = &self.demand else {
+            return false;
+        };
+        // Issue #464: a NEW id has no previous definition and no stale
+        // pixels, so it is never refused — the caller catalogues it live.
+        let Some(entry) = catalogue.load().get(id).cloned() else {
+            return false;
+        };
+        // A media edit (the control plane refused it already if the source
+        // was on a bus). The hub's teardown has stopped and awaited the old
+        // producer; fence any detached writer with a fresh lifecycle, then
+        // retire the old pixels BEFORE the new definition is catalogued, so
+        // the M/E can never prime or take the previous media (PR 224).
+        {
+            // One critical section with the start-time check in
+            // `DemandSpawner::begin_current_lifecycle`: the fence and the
+            // withdrawal of the old definition are seen together, so a start
+            // that captured the old entry can never mint a newer lifecycle.
+            // The hub catalogues the new definition right after this returns.
+            let mut tokens = anchor_lifecycle()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            advance_live_lifecycle(id, &mut tokens);
+            crate::source_rails::catalogue_remove(catalogue, id);
+        }
+        entry.store().clear();
+        // A demand start of the OLD definition that captured its catalogue
+        // entry before this point must not mint a fresh lifecycle and
+        // republish old media: `DemandSpawner::start_video` re-checks the
+        // catalogue definition under the lifecycle lock (review #477).
+        tracing::info!(source = %id, "switcher source edit: old media retired; the new definition starts live");
+        false
     }
 
     fn update_policy(&self, spawn: &crate::live_sources::SourceSpawn) -> bool {
@@ -11901,6 +12025,10 @@ fn spawn_live_youtube_reresolve(
 struct DemandSpawner {
     live: LiveIngestSpawner,
     registry: crate::live_sources::StopRegistry,
+    /// The run's catalogue, held directly (the demand manager does not exist
+    /// yet when this spawner is built): every start re-checks that its
+    /// definition is still the catalogued one (review #477).
+    catalogue: crate::source_rails::Catalogue,
 }
 
 impl crate::source_rails::RailSpawner for DemandSpawner {
@@ -11916,8 +12044,14 @@ impl crate::source_rails::RailSpawner for DemandSpawner {
             return self.start_generator(source, kind, store).map(|h| vec![h]);
         }
         probe_on_start(source);
-        // A fresh lifecycle fences any detached writer of a previous run.
-        let lifecycle = begin_live_lifecycle(&source.id);
+        // A fresh lifecycle fences any detached writer of a previous run. It
+        // is minted only while `source` is STILL the catalogued definition
+        // (issue #464 review): a start that captured an edited or removed
+        // definition before the hub retired it fails instead of publishing
+        // stale media into the reused store.
+        let lifecycle = self
+            .begin_current_lifecycle(source, store)
+            .ok_or_else(|| "the source definition changed; restarting".to_owned())?;
         let produced = self
             .live
             .spawn_video(source, Arc::clone(store), &self.registry, lifecycle, size)
@@ -11990,6 +12124,24 @@ impl crate::source_rails::RailSpawner for DemandSpawner {
 }
 
 impl DemandSpawner {
+    /// Advance `source`'s lifecycle only if it is still the catalogued
+    /// definition with this very store. Checked under the lifecycle lock the
+    /// hub's edit fence also takes, so either the hub's fence comes after
+    /// (and fences this start) or this check sees the new definition.
+    fn begin_current_lifecycle(
+        &self,
+        source: &Source,
+        store: &Arc<TileStore<Nv12Image>>,
+    ) -> Option<u64> {
+        let mut tokens = anchor_lifecycle()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.catalogue.load().get(&source.id).is_some_and(|entry| {
+            Arc::ptr_eq(entry.store(), store) && entry.source().same_media(source)
+        });
+        current.then(|| advance_live_lifecycle(&source.id, &mut tokens))
+    }
+
     /// Start a synthetic generator: the same fenced loop the startup and live
     /// paths run, at the canvas size.
     fn start_generator(
@@ -12002,7 +12154,9 @@ impl DemandSpawner {
             return Err("this build cannot render this source (needs overlay)".to_owned());
         }
         let id = source.id.clone();
-        let lifecycle = begin_live_lifecycle(&id);
+        let lifecycle = self
+            .begin_current_lifecycle(source, store)
+            .ok_or_else(|| "the source definition changed; restarting".to_owned())?;
         let stop = crate::source_rails::register(&self.registry, &id);
         let thread_store = Arc::clone(store);
         let (width, height) = (
@@ -26926,6 +27080,10 @@ segment_ms = 1000
         assert_eq!(size("news"), Some(req((320, 180))));
     }
 
+    /// Issue #464 (supersedes the PR 224 restart-only fence): on a switcher
+    /// run a media edit retires the old pixels and fences the old producer,
+    /// then lets the new definition be catalogued live into the same store; a
+    /// removal still retires the store and drops the catalogue entry.
     #[test]
     fn switcher_live_edits_and_removal_cannot_resolve_stale_media() {
         use crate::live_sources::IngestSpawner;
@@ -26948,17 +27106,152 @@ segment_ms = 1000
             Arc::new(DemandSpawner {
                 live: pipeline.live_spawner(),
                 registry: pipeline.stop_registry(),
+                catalogue: pipeline.catalogue(),
             }),
         );
         let retained = rails.store("cam1").expect("boot store exists");
-        assert!(guarded.invalidate_live_edit("cam1"));
-        assert!(retained.read_at(MediaTime::from_nanos(0)).frame().is_none());
-        assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
+        retained.publish(
+            Nv12Image::solid(
+                16,
+                16,
+                200,
+                128,
+                128,
+                multiview_core::color::ColorInfo::default().resolve_defaults(16, 16),
+            )
+            .expect("frame"),
+            MediaTime::from_nanos(0),
+        );
+        assert!(retained.read_at(MediaTime::from_nanos(0)).frame().is_some());
+        let before = live_lifecycle("cam1");
+        // The edit is never refused: the hub goes on to catalogue it live.
+        assert!(!guarded.invalidate_live_edit("cam1"));
+        assert!(
+            retained.read_at(MediaTime::from_nanos(0)).frame().is_none(),
+            "the old media is retired before the new definition is catalogued"
+        );
+        assert_ne!(
+            live_lifecycle("cam1"),
+            before,
+            "a detached old writer is fenced"
+        );
+        // The old definition is withdrawn with the fence; the hub's upsert
+        // catalogues the new one right after.
         assert!(rails.store("cam1").is_none());
-        crate::source_rails::catalogue_upsert(&pipeline.catalogue(), &config.sources[0]);
+        crate::source_rails::catalogue_upsert_with(
+            &pipeline.catalogue(),
+            &config.sources[0],
+            &retained,
+        );
         guarded.source_removed("cam1");
         assert_eq!(rails.resolve("cam1", Rails::VIDEO), Rails::NONE);
         assert!(rails.store("cam1").is_none());
+    }
+
+    /// Issue #464: a NEW id on a switcher run is catalogued live (never
+    /// refused, never clearing anything) with the drain's store; removing it
+    /// drops it.
+    #[test]
+    fn live_source_switcher_new_id_is_catalogued_and_visible_to_the_me() {
+        use crate::live_sources::IngestSpawner;
+
+        let config = two_cells_one_source_config();
+        let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
+        let _manager = pipeline.demand();
+        let mut guarded = pipeline.live_spawner();
+        guarded.clear_on_remove = true;
+        assert!(
+            !guarded.invalidate_live_edit("fresh"),
+            "a new id is never refused"
+        );
+        let source: Source = serde_json::from_value(
+            serde_json::json!({"id": "fresh", "kind": "hls", "url": "http://[::1]:9/f.m3u8"}),
+        )
+        .expect("source");
+        let store = Arc::new(TileStore::<Nv12Image>::with_defaults("fresh"));
+        assert!(guarded.catalogue(&crate::live_sources::SourceSpawn {
+            source,
+            store: Arc::clone(&store),
+        }));
+        let catalogued = pipeline.catalogue().load().get("fresh").cloned();
+        assert!(
+            catalogued.is_some_and(|entry| Arc::ptr_eq(entry.store(), &store)),
+            "the drain's store is catalogued"
+        );
+        guarded.source_removed("fresh");
+        assert!(pipeline.catalogue().load().get("fresh").is_none());
+    }
+
+    /// Review #477 (media lens): a demand start that captured the OLD
+    /// definition before a switcher-run edit retired it must not mint a
+    /// lifecycle newer than the fence and republish old media into the reused
+    /// store — even when the new definition never starts.
+    #[test]
+    fn live_source_switcher_in_flight_start_of_an_edited_definition_is_refused() {
+        use crate::live_sources::IngestSpawner;
+        use crate::source_rails::RailSpawner;
+
+        let config = two_cells_one_source_config();
+        let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
+        // Exactly the production wiring (review #477 round 2): `demand()`
+        // builds its rail spawner BEFORE the manager exists, so its live half
+        // carries no demand handle — the fence must not depend on it.
+        let starter = DemandSpawner {
+            live: pipeline.live_spawner(),
+            registry: pipeline.stop_registry(),
+            catalogue: pipeline.catalogue(),
+        };
+        assert!(starter.live.demand.is_none(), "the production shape");
+        let _manager = pipeline.demand();
+        let mut guarded = pipeline.live_spawner();
+        guarded.clear_on_remove = true;
+        // A synthetic definition A, catalogued; the demand worker "captures"
+        // it (the entry the start would run with).
+        let a: Source = serde_json::from_value(
+            serde_json::json!({"id": "race1", "kind": "solid", "color": "#f0f0f0"}),
+        )
+        .expect("A");
+        let store = crate::source_rails::catalogue_upsert(&pipeline.catalogue(), &a);
+        let captured = pipeline
+            .catalogue()
+            .load()
+            .get("race1")
+            .cloned()
+            .expect("A catalogued");
+        // The hub edits it to B (fence + clear + withdraw), and B is
+        // catalogued into the same store.
+        assert!(!guarded.invalidate_live_edit("race1"));
+        let b: Source = serde_json::from_value(
+            serde_json::json!({"id": "race1", "kind": "solid", "color": "#101010"}),
+        )
+        .expect("B");
+        crate::source_rails::catalogue_upsert_with(&pipeline.catalogue(), &b, &store);
+        // The delayed start of A resumes: refused, nothing published.
+        let late = starter.start_video(captured.source(), captured.store(), None, false);
+        assert!(
+            late.is_err(),
+            "a start of the retired definition is refused"
+        );
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(store.sequence(), 0, "no old frame reached the reused store");
+        // The same race against a removal: nothing republishes either.
+        guarded.source_removed("race1");
+        assert!(starter
+            .start_video(captured.source(), captured.store(), None, false)
+            .is_err());
+        assert_eq!(store.sequence(), 0);
+        // The current definition still starts.
+        crate::source_rails::catalogue_upsert_with(&pipeline.catalogue(), &b, &store);
+        let b_handles = starter
+            .start_video(&b, &store, None, false)
+            .expect("the current definition starts");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.sequence() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(store.sequence() > 0, "B publishes");
+        crate::live_sources::stop_rail(&pipeline.stop_registry(), "race1", true, false, b_handles);
+        super::remove_live_lifecycle("race1");
     }
 
     #[test]
