@@ -155,12 +155,41 @@ impl OutputRouter {
         self.sets.clock = Some(applied_tick);
     }
 
+    /// Share the switcher's Clean / DSK gate (K4 review H3): a take or set
+    /// member to Clean is admitted at the drain only by taking a Clean
+    /// reservation on it, so it and a `keyer_set` defining a DSK can never
+    /// both win, in either order.
+    pub(crate) fn set_clean_gate(&mut self, gate: Arc<multiview_engine::clean_gate::CleanDskGate>) {
+        self.clean_gate = gate;
+    }
+
     /// The set output `index`'s pending take belongs to.
     pub(super) fn group_of(&self, index: usize) -> Option<u64> {
         self.outputs
             .get(index)
             .and_then(|o| o.pending.as_ref())
             .and_then(|p| p.group)
+    }
+
+    /// Test seam: an admitted set of `principal` holding `reserved`
+    /// unissued encoder opens (a set whose members are still priming).
+    #[cfg(test)]
+    pub(super) fn reserve_for_test(&mut self, principal: &str, reserved: usize, tick: u64) {
+        let id = self.sets.next_id;
+        self.sets.next_id = self.sets.next_id.wrapping_add(1);
+        self.sets.active.push(ActiveSet {
+            id,
+            operation_id: "reserved".to_owned(),
+            principal: principal.to_owned(),
+            members: Vec::new(),
+            arm: None,
+            admitted: tick,
+            reserved,
+            proposed: None,
+            grouped: false,
+        });
+        // A reservation is a holding (#308).
+        self.holdings_dirty = true;
     }
 
     /// Unissued open reservations of every set, and of `principal`'s.
@@ -231,7 +260,7 @@ impl OutputRouter {
 
     /// Encoders charged to `principal`: live keys, opens in flight and its
     /// sets' unissued reservations.
-    fn principal_held(&self, principal: &str) -> usize {
+    pub(super) fn principal_held(&self, principal: &str) -> usize {
         self.dynamic
             .iter()
             .filter(|d| d.principal == principal)
@@ -394,6 +423,18 @@ impl OutputRouter {
                 && !stale
                 && !set.members.iter().take(i).any(|o| o.output_index == index);
         }
+        // Every Clean member takes its Clean reservation (review H3; one
+        // refused member refuses the set whole, and the reservations taken
+        // are released by the tick's reconcile).
+        routable = routable
+            && set
+                .members
+                .iter()
+                .filter(|m| m.bus == Some(PictureBus::Clean))
+                .map(|m| m.output_index)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .all(|index| self.hold_clean(index));
         if !routable {
             self.refuse_unadmitted(&set, RefuseReason::Unroutable, tick);
             return;
@@ -524,6 +565,12 @@ impl OutputRouter {
             }
             set.operation_id.clone_into(&mut m.operation_id);
             set.principal.clone_into(&mut m.principal);
+            // A set member is a video take like any other: it ends the
+            // output's passthrough candidate for another feed (#344 D2b
+            // review R1-I-1/A-3).
+            if let Some(bus) = m.bus.as_ref() {
+                self.pass_take_started(index, bus);
+            }
             if let Some(out) = self.outputs.get_mut(index) {
                 out.pending = Some(Pending {
                     take: m,
@@ -631,6 +678,7 @@ impl OutputRouter {
             settings,
             bus: bus.clone(),
             reformat: reset.clone(),
+            passthrough: None,
         }) {
             Ok(()) => {
                 if let Some(s) = self.sets.active.iter_mut().find(|s| s.id == group) {
@@ -647,6 +695,7 @@ impl OutputRouter {
                         principal: principal.to_owned(),
                         deadline: tick.saturating_add(OPEN_DEADLINE_TICKS),
                         waiter: Some(index),
+                        bridge_for: None,
                     },
                 );
                 if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.as_mut()) {

@@ -31,7 +31,9 @@ master.m3u8
   #EXT-X-VERSION:7
   #EXT-X-INDEPENDENT-SEGMENTS
   #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Program",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="audio.m3u8"
-  #EXT-X-STREAM-INF:BANDWIDTH=..,AVERAGE-BANDWIDTH=..,CODECS="avc1.640029,mp4a.40.2",RESOLUTION=1920x1080,FRAME-RATE=29.970,AUDIO="aud"
+  #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Commentary",LANGUAGE="de",DEFAULT=NO,AUTOSELECT=YES,CHANNELS="2",URI="audio1.m3u8"
+  #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=YES,URI="subs0.m3u8"
+  #EXT-X-STREAM-INF:BANDWIDTH=..,AVERAGE-BANDWIDTH=..,CODECS="avc1.640029,mp4a.40.2",RESOLUTION=1920x1080,FRAME-RATE=29.970,AUDIO="aud",SUBTITLES="subs"
   video.m3u8
 video.m3u8 / audio.m3u8
   #EXT-X-TARGETDURATION:4, #EXT-X-MEDIA-SEQUENCE, #EXT-X-MAP:URI="init-v-<gen>-<k>.mp4"
@@ -55,6 +57,15 @@ video.m3u8 / audio.m3u8
 - **Names.** `<gen>` is unique per activation (at least the Unix time in ms), so a URL is never reused for other
   bytes. The token routes still send `Cache-Control: no-store` on every response, so no shared cache can serve
   a revoked or expired token's URL.
+- **Audio and subtitle slots (#418).** One audio rendition per audio slot: rendition 0 keeps `audio.m3u8`,
+  `seg-a-<gen>-<n>.m4s`, `init-a-<gen>-0.mp4` (a one-audio stream is unchanged); rendition `i > 0` uses
+  `audio<i>.m3u8`, `seg-a<i>-<gen>-<n>.m4s`, `init-a<i>-<gen>-0.mp4`. A sequence number is published only when
+  every rendition has its frames for it; missing audio in any rendition drops the pair for all. `BANDWIDTH` adds
+  the largest audio rendition (a player plays one). One WebVTT rendition per subtitle slot: `subs<i>.m3u8` and one
+  `sub<i>-<gen>-<n>.vtt` per sequence number with the video segment's `EXTINF`, discontinuity and PDT (a
+  header-only file when no cue), cues from the slot's patched source through the same bounded `SlotCues` the
+  TS-segment HLS sink uses. `X-TIMESTAMP-MAP=MPEGTS:<video tfdt at the segment start, 90 kHz, mod 2^33>`
+  (ADR-0111 decision 8 has the Shaka evidence). At most 16 audio and 8 subtitle renditions.
 - **Window.** 10 listed; an evicted segment stays on disk for 10 more closes; bounded file count.
 
 ## 3. The engine
@@ -73,7 +84,11 @@ video.m3u8 / audio.m3u8
   was absent, empty, or carries its marker file with this output's id, and deletes only files with the packager's
   own names. Any other directory disables that cast output for the run (the engine still starts).
 - **Failure.** A packager error restarts the stream with a new generation at the next keyframe, at most once per
-  second. A panic in the sink disables only that output.
+  second. A panic in the sink disables only that output. Every packager start takes a fresh file generation and
+  publishes it in the gate before writing any file; a failed or stopped stream publishes a fresh one no file
+  carries (the status `generation` is only ever this file generation, so it never goes back). A purge that leaves
+  any packager-named file (an unlink fails, or the directory holds more than 4096 entries) disables the output for
+  the run, like a foreign directory: no new generation is written, so undeletable files never accumulate.
 
 ## 4. Control plane
 
@@ -110,6 +125,16 @@ are fixed at open); a token revoked or moved off the current generation in betwe
 authentication provenance (native API key, JWT, local admin with auth off) comes from the authentication that
 succeeded and is recorded at issuance: a native key always re-resolves from the key store and a
 revoked key fails closed. A 5 s sweep catches re-scoped or revoked keys and re-pointed audio tracks.
+Superseded feeds keep counting while their media stays servable: when a take, audio change or subtitle re-patch
+is settled, the grants of what it replaced stay required, so a new token, and every re-check under current
+grants, must still cover them. They expire only when BOTH at least 120 s have passed AND the output's sink has
+provably replaced that media, judged against the engine status recorded when they were superseded: the output's
+file generation changed (a new activation or packager restart: new file names, the old ones purged), the output
+is inactive, or it published 2 x 10 + 1 = 21 more video segments (the packager keeps the files of 2 x 10
+segments). A stalled sink therefore keeps them indefinitely, and an unavailable engine status never expires
+them (fail closed). A disabled output (its purge failed, so old files may be left) proves nothing: its history
+never expires and it serves nothing (the generic `404`). As defence in depth, a segment, init or `.vtt` file is served only when the generation in
+its name is the output's current one, so a stale file left by a best-effort purge is the generic `404`.
 
 **Diagnosis without a device log.** The engine records, per stream and for the receiver page, the last fetch
 time and User-Agent (a Cast device contains `CrKey`). No fetch from a Cast device after a cast starts means the

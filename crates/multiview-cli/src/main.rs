@@ -1052,6 +1052,16 @@ fn attach_run_switcher(
             Arc::clone(&attached.leases),
         ),
     );
+    // ADR-0113 §8 (K4): committed keyer changes as `switcher.keyer`, scoped
+    // and redacted per client by the realtime projection.
+    tokio::spawn(
+        multiview_control::routes::switcher_keyers::forward_keyer_events(
+            attached.control.clone(),
+            Arc::clone(publisher),
+            attached.me_id.clone(),
+            attached.program.clone(),
+        ),
+    );
     // The correlated relay above is the primary lease resolver, but it can die
     // or lag; this off-clock, bounded sweep reconciles any accepted-but-
     // unresolved selection against the engine's own applied snapshot so a

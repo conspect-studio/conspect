@@ -99,6 +99,7 @@ impl OutputRouter {
                 settings,
                 bus: bus.clone(),
                 reformat: Some(req.settings.clone()),
+                passthrough: None,
             }) {
                 Ok(()) => {
                     self.insert_open(
@@ -114,6 +115,7 @@ impl OutputRouter {
                             // A reformat's open is waited for by the
                             // reformat, not a take.
                             waiter: None,
+                            bridge_for: None,
                         },
                     );
                     if let Some(out) = self.outputs.get_mut(index) {
@@ -387,6 +389,9 @@ impl OutputRouter {
                 }
             }
         }
+        // #344 D2b review R1-M-3: P0 is decided on the boot slot; a reset
+        // output is off P0 for the rest of the run.
+        self.pass_reset_landed(index);
         self.emit(req.operation_id, index, at, TakeResult::ResetApplied);
         true
     }

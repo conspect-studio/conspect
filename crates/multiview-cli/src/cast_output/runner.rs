@@ -13,13 +13,14 @@ use multiview_ffmpeg::{EncodedPacket, StreamKind};
 
 use multiview_core::time::Rational;
 use multiview_output::hls::cast::{
-    AudioUnit, CastAudioConfig, CastPackager, CastPackagerConfig, CastVideoConfig, VideoUnit,
+    AudioUnit, CastAudioRendition, CastPackager, CastPackagerConfig, CastVideoConfig, VideoUnit,
 };
+use multiview_output::hls::{SubtitleFeedReceiver, SubtitleRendition};
 use multiview_output::SharedEpoch;
 
 use super::ring::{Preroll, PrerollRing, RingKind, RingPacket};
 use super::{
-    claim_cast_dir, next_generation, purge_owned, unix_nanos, CastGate, CAST_TARGET_SEGMENT_NANOS,
+    claim_cast_dir, purge_owned, unix_nanos, unlink_failed, CastGate, CAST_TARGET_SEGMENT_NANOS,
     CAST_WINDOW, PREROLL_BYTES, PREROLL_NANOS,
 };
 use crate::binding_delivery::LeasedPacket;
@@ -32,8 +33,8 @@ const RESTART_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) enum CastInputKind {
     /// An H.264 access unit of the output's video rendition.
     Video,
-    /// An AAC frame of the output's program-audio slot.
-    Audio,
+    /// An AAC frame of the audio rendition with this index (#418).
+    Audio(usize),
 }
 
 /// One packet for the cast sink (borrowed from the delivery lease).
@@ -63,8 +64,40 @@ pub(crate) struct CastSetup {
     pub(crate) epoch: SharedEpoch,
     /// The video rendition, from the opened encoder.
     pub(crate) video: CastVideoConfig,
-    /// The audio rendition, when the run carries program audio.
-    pub(crate) audio: Option<CastAudioConfig>,
+    /// The audio renditions, in order (empty = video only). Rendition 0 is
+    /// the `DEFAULT=YES` one.
+    pub(crate) audio: Vec<CastAudioRendition>,
+    /// Which audio packets feed which rendition (#418).
+    pub(crate) audio_routes: CastAudioRoutes,
+    /// The `WebVTT` subtitle renditions, one per subtitle slot (#418).
+    pub(crate) subtitles: Vec<SubtitleRendition>,
+    /// The subtitle cue feed (the bake consumer's sampler is the sender).
+    /// The same receiver goes to every packager generation; while none runs
+    /// the runner drains and discards it (bounded per call).
+    pub(crate) subtitle_feed: Option<Arc<SubtitleFeedReceiver>>,
+}
+
+/// Which delivered audio stream feeds which audio rendition of a cast
+/// stream: built once per run from the output's audio selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CastAudioRoutes {
+    /// The rendition of the program audio ([`StreamKind::Audio`]), when it
+    /// is selected.
+    pub(crate) program: Option<usize>,
+    /// `tracks[i]` = the rendition of discrete track `i`
+    /// ([`StreamKind::AudioTrack`]`(i)`), when it is selected.
+    pub(crate) tracks: Vec<Option<usize>>,
+}
+
+impl CastAudioRoutes {
+    /// The rendition a packet of stream `kind` feeds; `None` = not carried.
+    pub(crate) fn rendition(&self, kind: StreamKind) -> Option<usize> {
+        match kind {
+            StreamKind::Audio => self.program,
+            StreamKind::AudioTrack(index) => self.tracks.get(usize::from(index)).copied().flatten(),
+            _ => None,
+        }
+    }
 }
 
 /// See the module docs.
@@ -85,13 +118,14 @@ pub(crate) struct CastRunner {
 
 impl CastRunner {
     pub(crate) fn new(setup: CastSetup) -> Self {
-        let audio_tb = setup
+        let audio_tbs: Vec<Rational> = setup
             .audio
-            .as_ref()
-            .map_or(Rational::new(1, 48_000), |audio| audio.time_base);
+            .iter()
+            .map(|rendition| rendition.config.time_base)
+            .collect();
         let ring = PrerollRing::new(
             setup.video.time_base,
-            audio_tb,
+            audio_tbs,
             PREROLL_NANOS,
             PREROLL_BYTES,
         );
@@ -122,6 +156,8 @@ impl CastRunner {
     /// [`Self::handle`] with the wall clock of the packet's arrival given
     /// (`unix_ns`, Unix nanoseconds).
     pub(crate) fn handle_at(&mut self, input: CastInput<'_>, now: Instant, unix_ns: i64) {
+        // No stream: the cues offered meanwhile are dropped, never kept.
+        self.discard_cues();
         let gate = Arc::clone(&self.setup.gate);
         if gate.is_disabled() {
             return;
@@ -157,7 +193,7 @@ impl CastRunner {
                 self.ring.clear();
                 Preroll::default()
             };
-            self.start_packager(generation, buffered.wall_anchor, now);
+            self.start_packager(buffered.wall_anchor, now);
             for packet in &buffered.packets {
                 if !self.feed(ring_input(packet), now) {
                     break;
@@ -170,9 +206,21 @@ impl CastRunner {
         {
             // After an error: a new generation (new file names) at a
             // keyframe, at most once per `RESTART_INTERVAL`.
-            self.start_packager(next_generation(), None, now);
+            self.start_packager(None, now);
         }
         self.feed(input, now);
+    }
+
+    /// While no packager runs, drain the subtitle feed and drop what it
+    /// held: cues offered with no stream are never kept (one bounded,
+    /// non-blocking batch per call, at most the feed's capacity).
+    fn discard_cues(&self) {
+        if self.packager.is_some() {
+            return;
+        }
+        if let Some(feed) = self.setup.subtitle_feed.as_ref() {
+            drop(feed.drain());
+        }
     }
 
     /// No packet arrived for a while: honour a deactivation anyway, so a
@@ -181,12 +229,16 @@ impl CastRunner {
         if self.serving != 0 && self.setup.gate.activation().is_none() {
             self.stop_stream();
         }
+        self.discard_cues();
     }
 
     /// End of run: close the stream and remove its files.
     pub(crate) fn finish(&mut self) {
         self.stop_stream();
-        purge_owned(&self.setup.dir, &self.setup.id);
+        if !self.setup.gate.is_disabled() {
+            // Best effort: the run is over and nothing more is written.
+            let _ = purge_owned(&self.setup.dir, &self.setup.id);
+        }
         self.setup.gate.end();
     }
 
@@ -194,7 +246,7 @@ impl CastRunner {
         let packet = RingPacket {
             kind: match input.kind {
                 CastInputKind::Video => RingKind::Video,
-                CastInputKind::Audio => RingKind::Audio,
+                CastInputKind::Audio(rendition) => RingKind::Audio(rendition),
             },
             pts: input.pts,
             dts: input.dts,
@@ -204,21 +256,54 @@ impl CastRunner {
         };
         match input.kind {
             CastInputKind::Video => self.ring.push_video(packet, unix_ns),
-            CastInputKind::Audio => self.ring.push_audio(packet),
+            CastInputKind::Audio(_) => self.ring.push_audio(packet),
         }
     }
 
     fn stop_stream(&mut self) {
         self.packager = None;
         if self.serving != 0 {
-            purge_owned(&self.setup.dir, &self.setup.id);
+            // A fresh generation no file carries first (#418 review r7).
+            self.setup.gate.install_no_files();
+            let _ = self.purge_or_disable();
         }
         self.serving = 0;
     }
 
-    fn start_packager(&mut self, generation: u64, wall_anchor: Option<(i64, i64)>, now: Instant) {
+    /// Remove the stream files; when any packager-named file is left (an
+    /// unlink failed, or the directory has more entries than one bounded
+    /// scan visits) the output is DISABLED for the run (#418 review r7
+    /// INV418-R7-1): no new generation is ever written, so undeletable
+    /// files cannot accumulate across restarts and no purge rescans them.
+    /// Returns whether the output is still usable.
+    fn purge_or_disable(&mut self) -> bool {
+        let gate = &self.setup.gate;
+        if gate.is_disabled() {
+            return false;
+        }
+        if purge_owned(&self.setup.dir, &self.setup.id) {
+            return true;
+        }
+        let reason = unlink_failed(&self.setup.id, &self.setup.dir);
+        tracing::warn!(output = %self.setup.id, %reason, "cast output disabled for this run");
+        gate.disable(reason);
+        self.packager = None;
+        self.serving = 0;
+        self.retry_at = None;
+        false
+    }
+
+    fn start_packager(&mut self, wall_anchor: Option<(i64, i64)>, now: Instant) {
         let gate = Arc::clone(&self.setup.gate);
-        gate.begin_generation(self.serving);
+        // #418 review r7: a FRESH file generation, installed in the gate
+        // BEFORE any file of it is written (the status reports only it).
+        let Some(generation) = gate.install_files(self.serving) else {
+            // Another activation replaced this one meanwhile: the next
+            // packet starts that one.
+            return;
+        };
+        #[cfg(test)]
+        gate.run_transition_hook();
         // The directory may have changed since the run was built: nothing is
         // written into a directory that is not (or no longer) this output's.
         if let Err(reason) = claim_cast_dir(&self.setup.dir, &self.setup.id) {
@@ -234,6 +319,8 @@ impl CastRunner {
             target_segment_ns: CAST_TARGET_SEGMENT_NANOS,
             video: self.setup.video.clone(),
             audio: self.setup.audio.clone(),
+            subtitles: self.setup.subtitles.clone(),
+            subtitle_feed: self.setup.subtitle_feed.clone(),
             epoch: Some(self.setup.epoch.clone()),
             wall_anchor,
         };
@@ -259,10 +346,13 @@ impl CastRunner {
                 config_changed: input.config_changed,
                 data: input.data,
             }),
-            CastInputKind::Audio => packager.push_audio(AudioUnit {
-                pts: input.pts,
-                data: input.data,
-            }),
+            CastInputKind::Audio(rendition) => packager.push_audio(
+                rendition,
+                AudioUnit {
+                    pts: input.pts,
+                    data: input.data,
+                },
+            ),
         };
         match result {
             Ok(()) => {
@@ -282,7 +372,8 @@ impl CastRunner {
     }
 
     /// The packager failed: drop it and its files; a new generation starts
-    /// at a keyframe after [`RESTART_INTERVAL`].
+    /// at a keyframe after [`RESTART_INTERVAL`]. When its files cannot all
+    /// be removed the output is disabled instead (no restart).
     fn fail(&mut self, reason: &str, now: Instant) {
         if !self.error_logged {
             self.error_logged = true;
@@ -293,11 +384,17 @@ impl CastRunner {
             );
         }
         self.packager = None;
-        purge_owned(&self.setup.dir, &self.setup.id);
+        // #418 review r7: a fresh generation no file carries, installed
+        // first, so none of the failed packager's files is served from now.
+        self.setup.gate.install_no_files();
+        #[cfg(test)]
+        self.setup.gate.run_transition_hook();
+        if !self.purge_or_disable() {
+            return;
+        }
         self.restarts = self.restarts.saturating_add(1);
         self.setup.gate.set_error(Some(reason.to_owned()));
         self.setup.gate.note_restart();
-        self.setup.gate.begin_generation(self.serving);
         self.retry_at = Some(now + RESTART_INTERVAL);
     }
 }
@@ -306,7 +403,7 @@ fn ring_input(packet: &RingPacket) -> CastInput<'_> {
     CastInput {
         kind: match packet.kind {
             RingKind::Video => CastInputKind::Video,
-            RingKind::Audio => CastInputKind::Audio,
+            RingKind::Audio(rendition) => CastInputKind::Audio(rendition),
         },
         pts: packet.pts,
         dts: packet.dts,
@@ -348,7 +445,7 @@ pub(crate) fn run_cast_sink(
     let gate = Arc::clone(&setup.gate);
     let id = setup.id.clone();
     let dir = setup.dir.clone();
-    let has_audio = setup.audio.is_some();
+    let routes = setup.audio_routes.clone();
     let mut runner = CastRunner::new(setup);
     let mut report = CastSinkReport {
         packets: 0,
@@ -382,10 +479,12 @@ pub(crate) fn run_cast_sink(
         let packet = &leased.packet;
         let kind = match packet.kind() {
             StreamKind::Video => CastInputKind::Video,
-            StreamKind::Audio if has_audio => CastInputKind::Audio,
-            // A cast stream carries the program audio only (no discrete
-            // track, no future stream kind).
-            _ => continue,
+            // An unselected audio stream (and any future stream kind) is
+            // not carried.
+            other => match routes.rendition(other) {
+                Some(rendition) => CastInputKind::Audio(rendition),
+                None => continue,
+            },
         };
         let (Some(data), Some(pts)) = (packet.payload(), packet.pts()) else {
             continue;
@@ -410,8 +509,9 @@ pub(crate) fn run_cast_sink(
             );
             tracing::error!(output = %id, "cast sink panicked; this output is disabled for the run");
             gate.disable(reason);
-            // The runner is not touched again; its stream files go now.
-            purge_owned(&dir, &id);
+            // The runner is not touched again; its stream files go now
+            // (best effort: the output is disabled already).
+            let _ = purge_owned(&dir, &id);
         }
     }
     report.restarts = runner.restarts();

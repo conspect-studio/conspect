@@ -62,20 +62,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # generic (VAAPI/QSV) — both arches; FFmpeg base = …:9.0.2-lgpl.
+          # generic (VAAPI/QSV) — both arches; FFmpeg base = …:9.0.2-srt1.5.7-lgpl.
           - variant: generic
             dockerfile: deploy/Dockerfile
             platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-            ffmpeg_tag: 9.0.2-lgpl
+            ffmpeg_tag: 9.0.2-srt1.5.7-lgpl
             features: "ffmpeg,linux-vaapi,web"
           - variant: generic
             dockerfile: deploy/Dockerfile
             platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
-            ffmpeg_tag: 9.0.2-lgpl
+            ffmpeg_tag: 9.0.2-srt1.5.7-lgpl
             features: "ffmpeg,linux-vaapi,web"
           # nvidia (CUDA/NVENC) — amd64 ONLY until arm64 CUDA base + nv-codec are validated.
           - variant: nvidia
@@ -83,7 +83,7 @@ jobs:
             platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-            ffmpeg_tag: 9.0.2-nvidia
+            ffmpeg_tag: 9.0.2-srt1.5.7-nvidia
             features: "ffmpeg,nvidia,web"
     runs-on: ${{ matrix.runner }}
     outputs:

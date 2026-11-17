@@ -7,12 +7,15 @@ import type { Mock } from 'vitest';
 import type {
   CastContext,
   CastDevice,
+  CastError,
   CastSession,
   CastSessionStateEventData,
   CastVolumeEventData,
   ChromeCastMedia,
+  ChromeCastMediaInfo,
   ChromeCastMediaNamespace,
   ChromeCastNamespace,
+  ChromeCastTrack,
 } from './castTypes';
 
 // `castTypes.ts` declares the SDK's media constructors as `declare class`
@@ -28,6 +31,7 @@ class MockMediaInfo {
   hlsSegmentFormat?: string;
   hlsVideoSegmentFormat?: string;
   metadata?: { metadataType: number; title?: string };
+  tracks?: readonly ChromeCastTrack[] | null;
   constructor(contentId: string, contentType: string) {
     this.contentId = contentId;
     this.contentType = contentType;
@@ -43,6 +47,13 @@ class MockLoadRequest {
   media: MockMediaInfo;
   constructor(media: MockMediaInfo) {
     this.media = media;
+  }
+}
+
+class MockEditTracksInfoRequest {
+  activeTrackIds: readonly number[];
+  constructor(activeTrackIds: readonly number[]) {
+    this.activeTrackIds = activeTrackIds;
   }
 }
 
@@ -64,6 +75,11 @@ export interface MockCastSdk {
   emitMessage: (namespace: string, message: unknown) => void;
   /** Simulate a receiver volume change (properties change, then VOLUME_CHANGED). */
   emitVolume: (level: number, muted?: boolean) => void;
+  /**
+   * Simulate the receiver publishing `media.tracks` + `activeTrackIds` in
+   * MEDIA_STATUS (CAF: properties change, then the update listener fires).
+   */
+  emitTracks: (tracks: readonly ChromeCastTrack[], activeTrackIds: readonly number[]) => void;
   /** Active custom-namespace listeners (leak checks). */
   readonly messageListenerCount: () => number;
   /** Whether a SESSION_STATE_CHANGED handler is registered (leak checks). */
@@ -74,6 +90,9 @@ export interface MockCastSdk {
   readonly sendMessage: Mock<(namespace: string, data: unknown) => Promise<void>>;
   readonly loadMedia: Mock<(request: unknown) => Promise<void>>;
   readonly endSession: Mock<(stopCasting: boolean) => void>;
+  readonly editTracksInfo: Mock<(request: { activeTrackIds: readonly number[] }, successCallback?: () => void, errorCallback?: (error: CastError) => void) => void>;
+  /** Make the next `editTracksInfo` call reject with this CAF error (code string or object). */
+  readonly failNextEditTracksInfo: (error: CastError | string) => void;
 }
 
 /**
@@ -84,10 +103,34 @@ export interface MockCastSdk {
 export function installMockCastSdk(options: { deviceName?: string } = {}): MockCastSdk {
   const deviceName = options.deviceName ?? 'Living Room TV';
   let mediaUpdateListener: ((isAlive?: boolean) => void) | null = null;
-  // The real `chrome.cast.media.Media` exposes its state as properties.
+  let nextEditTracksInfoError: CastError | string | null = null;
+  const toCastError = (error: CastError | string): CastError => (typeof error === 'string' ? { code: error } : error);
+  const editTracksInfo = vi.fn(
+    (request: { activeTrackIds: readonly number[] }, successCallback?: () => void, errorCallback?: (error: CastError) => void) => {
+      const error = nextEditTracksInfoError;
+      nextEditTracksInfoError = null;
+      if (error !== null) {
+        errorCallback?.(toCastError(error));
+        return;
+      }
+      mutableMedia.activeTrackIds = request.activeTrackIds;
+      successCallback?.();
+    },
+  );
+  // The real `chrome.cast.media.Media` exposes its state as properties; the
+  // tracks list lives on the nested `media` (`MediaInfo`), not on `Media`
+  // itself — only `activeTrackIds` is on the outer `Media`.
+  const nestedMediaInfo: ChromeCastMediaInfo = {
+    contentId: '',
+    contentType: '',
+    streamType: '',
+    tracks: null,
+  };
   const mediaSession: ChromeCastMedia & { playerState?: string; idleReason?: string | null } = {
+    media: nestedMediaInfo,
     playerState: 'PLAYING',
     idleReason: null,
+    activeTrackIds: null,
     addUpdateListener: (listener: (isAlive?: boolean) => void) => {
       mediaUpdateListener = listener;
     },
@@ -97,7 +140,9 @@ export function installMockCastSdk(options: { deviceName?: string } = {}): MockC
     stop: vi.fn((_request, successCallback: () => void) => {
       successCallback();
     }),
+    editTracksInfo,
   };
+  const mutableMedia = mediaSession as { activeTrackIds?: readonly number[] | null };
 
   const device: CastDevice = { friendlyName: deviceName };
 
@@ -186,11 +231,13 @@ export function installMockCastSdk(options: { deviceName?: string } = {}): MockC
     MediaInfo: MockMediaInfo,
     GenericMediaMetadata: MockGenericMediaMetadata,
     LoadRequest: MockLoadRequest,
+    EditTracksInfoRequest: MockEditTracksInfoRequest,
     StreamType: { LIVE: 'LIVE', BUFFERED: 'BUFFERED', OTHER: 'OTHER' },
     HlsSegmentFormat: { TS: 'TS', FMP4: 'FMP4' },
     HlsVideoSegmentFormat: { MPEG2_TS: 'MPEG2_TS', FMP4: 'FMP4' },
     MetadataType: { GENERIC: 0 },
     PlayerState: { IDLE: 'IDLE', PLAYING: 'PLAYING', PAUSED: 'PAUSED', BUFFERING: 'BUFFERING' },
+    TrackType: { AUDIO: 'AUDIO', TEXT: 'TEXT', VIDEO: 'VIDEO' },
     DEFAULT_MEDIA_RECEIVER_APP_ID: 'CC1AD845',
   };
 
@@ -249,6 +296,11 @@ export function installMockCastSdk(options: { deviceName?: string } = {}): MockC
       muted = isMute;
       notifyVolume();
     },
+    emitTracks: (tracks, activeTrackIds): void => {
+      nestedMediaInfo.tracks = tracks;
+      mutableMedia.activeTrackIds = activeTrackIds;
+      mediaUpdateListener?.(true);
+    },
     messageListenerCount: (): number =>
       [...messageListeners.values()].reduce((n, set) => n + set.size, 0),
     hasSessionStateHandler: (): boolean => sessionStateHandler !== null,
@@ -257,6 +309,10 @@ export function installMockCastSdk(options: { deviceName?: string } = {}): MockC
     endSession,
     setVolume,
     setMute,
+    editTracksInfo,
+    failNextEditTracksInfo: (error: CastError | string): void => {
+      nextEditTracksInfoError = error;
+    },
     sendMessage,
   };
 }

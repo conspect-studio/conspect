@@ -163,10 +163,15 @@ pub struct SlotCost {
 pub struct PlannedCrosspoint {
     /// The destination as requested.
     pub destination: PatchDestination,
-    /// The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`
+    /// The path this crosspoint takes: `mixer-input`, `P0`, `P1`, `P2`, `P3`
     /// (§12.4), `follow` (an audio slot riding the video take) or
     /// `subtitle` (a subtitle slot's route-table re-point).
     pub path: &'static str,
+    /// For an output video slot fed by a source that is not P0: the first
+    /// passthrough miss (#344 D2b), e.g. `passthrough-not-supported-on-medium`
+    /// or `not-enough-history`. Never names a source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<String>,
     /// Whether the destination input is on Program now (mixer inputs).
     pub on_air: bool,
     /// The cost of an output video slot (absent for mixer inputs and audio).
@@ -540,6 +545,7 @@ pub(crate) fn check(
         planned.push(PlannedCrosspoint {
             destination: xp.destination.clone(),
             path: "mixer-input",
+            passthrough: None,
             on_air: on_program,
             cost: None,
             refusal,
@@ -570,7 +576,7 @@ pub(crate) fn validate_count(req: &PatchRequest) -> ControlResult<()> {
 /// The live patch (mixer plane), built from the engine's readback.
 #[cfg_attr(feature = "openapi", utoipa::path(get, path = "/api/v1/patch", tag = "patch",
     responses(
-        (status = 200, description = "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.", body = Object),
+        (status = 200, description = "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P0|P1|P2|P3|null, passthrough: {state, reason}|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. `path` is P0 while the output passes its source's compressed video through (#344: 0 decode, 0 encode); `passthrough` is that output's passthrough state (`metering`, `moving`, `passthrough`, `slate`, `bridging`, `returning`, `unavailable`, …) and its reason (a match-rule miss, a bridge reason, or `bridging on slate: no encoder session`), null when the output has no passthrough candidate; a reason never names a source. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.", body = Object),
         (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
         (status = 403, description = "Role lacks Read.", body = crate::problem::Problem),
         (status = 503, description = "engine-busy: every layout-read slot is in use (a layout on air on a visible output); retry", body = crate::problem::Problem),
@@ -625,9 +631,10 @@ pub(crate) async fn get_patch(
 }
 
 /// Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the
-/// slots of one output (§12.4 path P1/P2/P3 and cost), or an atomic set
-/// over many destinations (#308: every member planned, `can_take` only when
-/// all can and the set's new encoders fit the caller's caps); no change.
+/// slots of one output (§12.4 path P0/P1/P2/P3, cost and the first
+/// passthrough miss), or an atomic set over many destinations (#308: every
+/// member planned, `can_take` only when all can and the set's new encoders
+/// fit the caller's caps); no change.
 #[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/patch/plan", tag = "patch", request_body = PatchRequest,
     responses(
         (status = 200, description = "The plan: a `PatchPlan`, or for an atomic set of two or more destinations a `SetPlan` that adds `set: {new_encoders, fits}` (#308).", body = PatchPlanResponseDoc),
